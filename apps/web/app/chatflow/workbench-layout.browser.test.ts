@@ -6784,7 +6784,13 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     onTestFinished,
     task,
   }) => {
-    const f = await fixture();
+    const f = await fixture({
+      nativeSubagents: {
+        rootId: A,
+        root: { source: 'live', cursor: -1 },
+        descendants: [],
+      },
+    });
     const started = performance.now();
     const timeline: { ms: number; event: string; details?: unknown }[] = [];
     const mark = (event: string, details?: unknown) =>
@@ -6806,6 +6812,7 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       missingTraces: [...expectedTraces].filter((runId) => !traces.has(runId)),
       timeline,
       cpuProfileBase64,
+      nativeFollowFixture: f.nativeFixture,
     });
     const evidence = createFailureEvidence({
       file: import.meta.url,
