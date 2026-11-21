@@ -4,7 +4,7 @@
 
 ## 公开合同与五面
 
-公开入口`@allrice/vm-memory`（当前包0.1.0、`VM_MEMORY_CONTRACT_VERSION=1`）。本片开始前依赖`@allrice/person-vm#PersonVmBinding`来自`34c6589b`，基线`0c9d0e27c37a39dbec3e6c5be7230e3d77eed84f`的`packages/person-vm/src/contract.ts`；仅import公共barrel，不读其表或内部实现。新端口实现/source固定在本片提交的`packages/vm-memory/src/index.ts`，交接回执给确切SHA，`sourceAtSha`不伪指旧基线的不存在符号。
+公开入口`@allrice/vm-memory`（当前包0.1.0、`VM_MEMORY_CONTRACT_VERSION=1`）。本片开始前依赖`@allrice/person-vm#PersonVmBinding`来自`34c6589bcfbb0283a886da2759277424718d6047`，基线`0c9d0e27c37a39dbec3e6c5be7230e3d77eed84f`的`packages/person-vm/src/contract.ts`；仅import公共barrel，不读其表或内部实现。新导出是existing源码合同：sourceAtSha=`529431d3f0e44e0e557513483cd45d8149ea3a7f`，allowlist在`packages/vm-memory/src/index.ts`，具名type/error在`src/contract.ts`，方法在`src/admission.ts`和`src/guest-config.ts`。该SHA也固定本片gateway装配改动；后续封版提交只补文档，产品源码相同。可信observer的生产实现和MET266 staging仍是proposed依赖，已有type不等于装配完成。
 
 | 面        | 明确归属                                                                                                                                                                                                                                                                                                                              |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -15,6 +15,16 @@
 | 权限/开关 | VM/person/org/instance/leaseEpoch全量绑定；网关沿`ModelGatewayAuthority.assertCall`实时核本人、员工、原生根/子树、Run/call、当前代际和配置。没有独立企业/员工开关或资料授权，资料级别none：仅宿主运行诊断；员工不可自行启用。                                                                                                         |
 
 allowlist：`VM_MEMORY_CONTRACT_VERSION`、`VM_MEMORY_POLICY`、`VmMemoryError`、`VmMemoryErrorCode`、`GuestMemorySample`、`VmMemoryObservation`、`VmMemorySource`、`VmMemorySourceWatch`、`VmMemoryAdmissionPort`、`VmMemoryAdmissionWatch`、`createVmMemoryAdmission`、`createVmMemoryGuestPlan`、`VmMemoryGuestPlan`。guest工件由`createVmMemoryGuestPlan({persistentDirectory})`返回，消费者不deep-import脚本实现。没有通用object/any、guest身份输入或跨模块SQL。
+
+| 方法                                             | 入参/结果/错误与调用方                                                                                                                                                                                      |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createVmMemoryAdmission(source)`                | host-only `VmMemorySource` → `VmMemoryAdmissionPort`；不执行guest/模型、不建额外身份。                                                                                                                      |
+| `VmMemoryAdmissionPort.watch(binding,signal)`    | host-only `PersonVmBinding`、原生`AbortSignal` → `Promise<VmMemoryAdmissionWatch>`；错误`VmMemoryError`或原signal取消。source建立后若已取消，先等close再返回取消。                                          |
+| `VmMemoryAdmissionWatch.read/wait/close`         | 无guest业务入参；read同步返回`ready/queued`或具名错误；wait返回通知的`Promise<void>`并沿原signal取消；close幂等，所有调用等待同一真实detach Promise。没有业务幂等键或副作用重放。                           |
+| `VmMemorySource.watch`及其`read/wait/close`      | 相同host binding/signal；read返回`VmMemoryObservation                                                                                                                                                       | null`，其他返回`Promise<void>`；source必须先订阅并缓冲通知、在失效时notify、honor取消和真实close。owner实现尚未绑定，不能由guest实现此权威口。 |
+| `createVmMemoryGuestPlan({persistentDirectory})` | host选择的guest加密盘绝对路径 → `Promise<VmMemoryGuestPlan>`；非法目录用明确`Error('invalid_guest_memory_directory')`，工件读取失败保留原错误。仅生成计划，无stream或执行副作用，不能从模型参数取宿主路径。 |
+
+兼容规则：wire/model消息保持DSH当前单代及gateway v1；host创建gateway增加必填memoryAdmission，旧host消费者须显式升级装配，不能缺省放行。新旧guest工件按同一发布树/contractVersion固定，初始化拒绝不支持的版本，不并存两代DSH。私有数据仅进程内订阅/首次错误和guest资源配置，无新DB模式；诊断投影不是Agent事件/状态机。
 
 ## 参数与可信观察
 
@@ -31,6 +41,8 @@ gateway创建必须显式注入memoryAdmission，没有未配置自动放行。�
 slot提交期间压力变为queued时，先持久结算`dispatchObserved:false/outcome:canceled`并释放此slot，再回内存等待，下一次新intent使用新ID。没有HTTP被发送；既有usage按false排除，所以不计作模型调用。结算失败保留原unknown slot并失败，不在占用slot时等压力。开始实际HTTP之后不因新压力强杀该流，取消/撤权继续等实际transport收尾。source订阅覆盖最后同步read到dispatch之间，避免异步close打开新窗口。
 
 原生SDK可能把fetch异常变为自己通用错误终态，transport独立保留宿主首次memory failure，drain之后返回具名错误；ledger失败仍优先。未知账本保留既有恢复门禁，无TTL自动释放/原生call重放。业务operation/账本、原生日志/工作文件/employee配置与VM盘一同纳入BOUNDARY-CONTRACT第7节恢复集合。观察是当前外部事实，重启后须重新建立，旧快照不是当前压力权威；不会恢复“允许”缓存或重发命令。
+
+启用顺序为owner核当前本人/epoch→provider实核物理cap→stage/initialize成功→建立可信source→显式注入gateway→原生runtime就绪；本片没有开启4.0。关闭/撤权由宿主先`gateway.revoke(binding)`取消等待及实际请求并等待owned drain；source同时invalidate/notify，关闭所有订阅后VM owner再停机。更新/删除沿owner当前epoch与原生配置生命周期，本模块不删盘、不创建线程。事件投影仅资源诊断，streamRef=none（通知不是原生会话事件流，没有自建游标/重建执行）；source revision/evidenceRef供旁证关联。恢复后重建当前source，副作用未知仍走既有账本对账。
 
 ## Guest工件与原生接缝
 
