@@ -6798,11 +6798,14 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     const expectedTraces = new Set(
       Array.from({ length: 100 }, (_, i) => id(3000 + i)),
     );
+    let cpuProfileBase64: string | undefined;
+    let collectProfile: (() => Promise<void>) | undefined;
     const observation = () => ({
       internalErrors,
       finishedTraces: traces.size,
       missingTraces: [...expectedTraces].filter((runId) => !traces.has(runId)),
       timeline,
+      cpuProfileBase64,
     });
     const evidence = createFailureEvidence({
       file: import.meta.url,
@@ -6812,6 +6815,23 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     evidence.observePage(f.page);
     let probe: ReturnType<typeof observeCdpExceptions> | undefined = undefined;
     onTestFinished(async () => {
+      // Bound diagnostics only; never alter the original assertion's deadline.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          collectProfile?.(),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(Error('CPU profile capture timed out')),
+              2000,
+            );
+          }),
+        ]);
+      } catch (cause) {
+        mark('cpu-profile-capture-failed', String(cause));
+      } finally {
+        clearTimeout(timer);
+      }
       mark('test-finished', { state: task.result?.state });
       // One final write retains successful diagnostic runs as well as failures.
       console.log('HISTORY_RESTORE_DIAGNOSTIC', JSON.stringify(observation()));
@@ -6830,6 +6850,16 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       }
     });
     const cdp = await f.context.newCDPSession(f.page);
+    let profiling = false;
+    collectProfile = async () => {
+      if (!profiling) return;
+      profiling = false;
+      const { profile } = await cdp.send('Profiler.stop');
+      cpuProfileBase64 = Buffer.from(JSON.stringify(profile)).toString(
+        'base64',
+      );
+      mark('performance-final', await cdp.send('Performance.getMetrics'));
+    };
     cdp.on('Debugger.paused', (event) =>
       mark('cdp-paused', {
         reason: event.reason,
@@ -6901,6 +6931,11 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     await cdp.send('Runtime.enable');
     await cdp.send('Debugger.enable');
     await cdp.send('Debugger.setPauseOnExceptions', { state: 'all' });
+    await cdp.send('Performance.enable');
+    mark('performance-before', await cdp.send('Performance.getMetrics'));
+    await cdp.send('Profiler.enable');
+    await cdp.send('Profiler.start');
+    profiling = true;
     f.state.messages = navigationHistory(100, 2);
     mark('reload-started');
     await f.page.reload();
@@ -6929,6 +6964,7 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       )
       .toBe(true);
     mark('restore-passed');
+    await collectProfile();
     await probe.drain();
     expect(internalErrors).toEqual([]);
     await expect
