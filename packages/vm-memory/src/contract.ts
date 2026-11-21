@@ -1,11 +1,26 @@
 import type { PersonVmBinding } from '@allrice/person-vm';
 
 export const VM_MEMORY_CONTRACT_VERSION = 1 as const;
+export const VM_PHYSICAL_MEMORY_BYTES = 2048 * 1024 * 1024;
 
-/** Phase4's approved prototype configuration; RAM and swap are separate limits.
- * The VM owner must enforce/read back physical RAM outside the root guest. */
-export const VM_MEMORY_POLICY = Object.freeze({
-  physicalBytes: 2048 * 1024 * 1024,
+/** Explicit host platform configuration with an approved source, not defaults. */
+export type VmMemoryPolicy = Readonly<{
+  physicalBytes: number;
+  swapBytes: number;
+  dshLowBytes: number;
+  dshSwapMaxBytes: number;
+  commandHighBytes: number;
+  commandMaxBytes: number;
+  commandSwapMaxBytes: number;
+  commandOomGroup: 0;
+  dshOomScoreAdj: number;
+  commandOomScoreAdj: number;
+}>;
+
+/** Historical reference/fixture only. Phase4 authorized an isolated prototype,
+ * not platform defaults. Production must explicitly provide approved policy. */
+export const VM_MEMORY_PHASE4_REFERENCE_POLICY: VmMemoryPolicy = Object.freeze({
+  physicalBytes: VM_PHYSICAL_MEMORY_BYTES,
   swapBytes: 2048 * 1024 * 1024,
   dshLowBytes: 256 * 1024 * 1024,
   dshSwapMaxBytes: 512 * 1024 * 1024,

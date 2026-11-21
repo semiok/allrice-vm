@@ -1,10 +1,12 @@
 export {
   VM_MEMORY_CONTRACT_VERSION,
-  VM_MEMORY_POLICY,
+  VM_PHYSICAL_MEMORY_BYTES,
+  VM_MEMORY_PHASE4_REFERENCE_POLICY,
   VmMemoryError,
 } from './contract.ts';
 export type {
   GuestMemorySample,
+  VmMemoryPolicy,
   VmMemoryObservation,
   VmMemorySourceWatch,
   VmMemorySource,

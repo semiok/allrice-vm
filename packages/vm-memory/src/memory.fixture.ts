@@ -1,6 +1,6 @@
 /** Synthetic, event-driven host source. Never production telemetry. */
 import type { PersonVmBinding } from '@allrice/person-vm';
-import { VM_MEMORY_POLICY } from './contract.ts';
+import { VM_PHYSICAL_MEMORY_BYTES } from './contract.ts';
 import type { VmMemoryObservation, VmMemorySource } from './contract.ts';
 
 function deferred() {
@@ -20,8 +20,8 @@ export function memoryObservation(
     evidenceRef: 'fixture:external-observer',
     pressure,
     physical: {
-      configuredBytes: VM_MEMORY_POLICY.physicalBytes,
-      enforcedBytes: VM_MEMORY_POLICY.physicalBytes,
+      configuredBytes: VM_PHYSICAL_MEMORY_BYTES,
+      enforcedBytes: VM_PHYSICAL_MEMORY_BYTES,
     },
     host: { vmRssBytes: 1234, helperRssBytes: 567, swapBytes: 0 },
     guest: null,

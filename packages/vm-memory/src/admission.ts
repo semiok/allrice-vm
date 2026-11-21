@@ -1,5 +1,5 @@
 import type { PersonVmBinding } from '@allrice/person-vm';
-import { VM_MEMORY_POLICY, VmMemoryError } from './contract.ts';
+import { VM_PHYSICAL_MEMORY_BYTES, VmMemoryError } from './contract.ts';
 import type { VmMemoryAdmissionPort, VmMemorySource } from './contract.ts';
 
 const bindingKey = (binding: PersonVmBinding) =>
@@ -71,9 +71,8 @@ export function createVmMemoryAdmission(
               throw new VmMemoryError('MEMORY_BINDING_INVALID');
             if (
               observation.physical.configuredBytes !==
-                VM_MEMORY_POLICY.physicalBytes ||
-              observation.physical.enforcedBytes !==
-                VM_MEMORY_POLICY.physicalBytes
+                VM_PHYSICAL_MEMORY_BYTES ||
+              observation.physical.enforcedBytes !== VM_PHYSICAL_MEMORY_BYTES
             )
               throw new VmMemoryError('VM_MEMORY_CAP_INVALID');
             if (!['normal', 'pressure'].includes(observation.pressure))

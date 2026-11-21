@@ -4,7 +4,7 @@
 
 ## MET-267：内存准入与命令保护
 
-`allrice-vm-memory-v1` 保留DSH 0.2.1-rc.2的原生shell、工具结果、取消、会话和Agent Loop。AllRice在宿主模型fetch前加外部资源门卫与等待资源收尾；RAM/swap/host helper诊断单向投影，不驱动第二套Agent状态。参数沿已批准phase4样机，公开BASH_ENV与exec前保护组只做同人root协作，不承诺安全隔离或父组/全局OOM绝不杀会话。
+`allrice-vm-memory-v1` 保留DSH 0.2.1-rc.2的原生shell、工具结果、取消、会话和Agent Loop。AllRice在宿主模型fetch前加外部资源门卫与等待资源收尾；RAM/swap/host helper诊断单向投影，不驱动第二套Agent状态。guest plan必填经批准的平台policy与来源policyRef，phase4仅为历史reference/fixture，无产品默认。公开BASH_ENV与exec前保护组只做同人root协作，不承诺安全隔离或父组/全局OOM绝不杀会话。
 
 没有默认压力阈值、TTL、轮询、队列上限、DB schema、UI、自动重放或4.0启用；宿主可信observer、物理cap与runtime staging尚待MET266公开装配。升级核对原生shell环境继承、非零退出/取消的模型呈现、OS cgroup/swap、实际HTTP门卫和逐attempt计量。若原生/VM provider提供等价资源准入与可读OOM接缝，可替换该协作层，保留当前本人/epoch与外部身份门卫。公开合同、参数来源、恢复集合及真实验收缺口见[vm-memory.md](vm-memory.md)，MET-225新增同名行交主会话登记。
 

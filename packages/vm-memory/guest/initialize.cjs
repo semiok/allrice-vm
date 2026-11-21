@@ -5,6 +5,8 @@ const path = require('node:path');
 
 function initialize(config, io = fs, run = cp.execFileSync) {
   if (config.contractVersion !== 1) throw Error('memory_contract_unsupported');
+  if (typeof config.policyRef !== 'string' || !config.policyRef.trim())
+    throw Error('approved_memory_policy_required');
   const { cgroupRoot, dshGroup, commandsGroup, swapFile, procRoot, policy } =
     config;
   for (const value of [cgroupRoot, dshGroup, commandsGroup, swapFile, procRoot])
@@ -20,11 +22,23 @@ function initialize(config, io = fs, run = cp.execFileSync) {
     dshGroup === commandsGroup
   )
     throw Error('invalid_memory_groups');
-  const values = Object.values(policy);
+  const values = [
+    policy.physicalBytes,
+    policy.swapBytes,
+    policy.dshLowBytes,
+    policy.dshSwapMaxBytes,
+    policy.commandHighBytes,
+    policy.commandMaxBytes,
+    policy.commandSwapMaxBytes,
+  ];
+  const scores = [policy.dshOomScoreAdj, policy.commandOomScoreAdj];
   if (
-    !values.every(Number.isSafeInteger) ||
+    !values.every((value) => Number.isSafeInteger(value) && value >= 0) ||
+    !scores.every(
+      (value) => Number.isInteger(value) && value >= -1000 && value <= 1000,
+    ) ||
     policy.physicalBytes !== 2147483648 ||
-    policy.swapBytes !== 2147483648 ||
+    !(policy.swapBytes > 0) ||
     policy.commandHighBytes > policy.commandMaxBytes ||
     policy.commandOomGroup !== 0
   )
@@ -108,6 +122,7 @@ function initialize(config, io = fs, run = cp.execFileSync) {
     throw Error('command_memory_subtree_not_enabled');
   return {
     contractVersion: 1,
+    policyRef: config.policyRef,
     swapFileBytes: io.statSync(swapFile).size,
     swaps: read(path.join(procRoot, 'swaps')),
     groups: observed,

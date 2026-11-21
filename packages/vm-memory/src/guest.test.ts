@@ -12,12 +12,22 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { VM_MEMORY_PHASE4_REFERENCE_POLICY } from './contract.ts';
 import type { GuestMemorySample } from './contract.ts';
-import { createVmMemoryGuestPlan } from './guest-config.ts';
+import { createVmMemoryGuestPlan as createPlan } from './guest-config.ts';
+
+// Explicit historical policy is a fixture choice, never a production fallback.
+const createVmMemoryGuestPlan = (input: { persistentDirectory: string }) =>
+  createPlan({
+    ...input,
+    policy: VM_MEMORY_PHASE4_REFERENCE_POLICY,
+    policyRef: 'fixture:phase4-reference-not-product-approval',
+  });
 
 const require = createRequire(import.meta.url);
 type Config = {
   contractVersion: number;
+  policyRef: string;
   cgroupRoot: string;
   dshGroup: string;
   commandsGroup: string;
@@ -105,6 +115,20 @@ async function virtualGuest() {
 describe.sequential(
   'guest artifacts without VM, kernel mutation or pressure allocation',
   () => {
+    it('产品计划必须显式给平台policy和批准来源，不把样机值当默认', async () => {
+      await expect(
+        createPlan({
+          persistentDirectory: '/fixture/encrypted',
+          policy: VM_MEMORY_PHASE4_REFERENCE_POLICY,
+          policyRef: '',
+        }),
+      ).rejects.toThrow('approved_memory_policy_required');
+      const f = await virtualGuest();
+      expect(() =>
+        initialize({ ...f.config, policyRef: '' }, f.io, f.run),
+      ).toThrow('approved_memory_policy_required');
+      expect(f.run).not.toHaveBeenCalled();
+    });
     it('初始化读取真实接口回值，RAM/swap分开，重复启动不重格式化已用swap', async () => {
       const f = await virtualGuest();
       const result = initialize(f.config, f.io, f.run);
