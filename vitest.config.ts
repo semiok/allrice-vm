@@ -21,6 +21,9 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      '@allrice/vm-memory': fileURLToPath(
+        new URL('./packages/vm-memory/src/index.ts', import.meta.url),
+      ),
       '@allrice/skill-import/personal-skill-import': fileURLToPath(
         new URL(
           './packages/skill-import/src/personal-skill-import.ts',

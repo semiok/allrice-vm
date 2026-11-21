@@ -737,6 +737,9 @@ importers:
       '@allrice/person-vm':
         specifier: workspace:*
         version: link:../person-vm
+      '@allrice/vm-memory':
+        specifier: workspace:*
+        version: link:../vm-memory
       '@deepseek-ai/dsh-llm':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
@@ -759,6 +762,12 @@ importers:
       '@earendil-works/pi-ai':
         specifier: 1.1.0
         version: 1.1.0(@aws-sdk/credential-provider-node@3.972.86)(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.21.3)(zod@4.4.3)
+
+  packages/vm-memory:
+    dependencies:
+      '@allrice/person-vm':
+        specifier: workspace:*
+        version: link:../person-vm
 
   packages/person-vm:
     dependencies:

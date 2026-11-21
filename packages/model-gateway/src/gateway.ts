@@ -14,6 +14,8 @@ import type {
   GatewayProvider,
 } from './contract.ts';
 import type { PersonVmBinding } from '@allrice/person-vm';
+import { VmMemoryError } from '@allrice/vm-memory';
+import type { VmMemoryAdmissionPort } from '@allrice/vm-memory';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createMeteredTransport, installScopedFetch } from './transport.ts';
 
@@ -201,8 +203,11 @@ export function createModelGateway(options: {
   authority: ModelGatewayAuthority;
   store: ModelGatewayStore;
   provider: GatewayProvider;
+  memoryAdmission: VmMemoryAdmissionPort;
 }): ModelGatewayPort {
   if (!options.ownerId.trim()) throw new ModelGatewayError('BINDING_INVALID');
+  if (typeof options.memoryAdmission?.watch !== 'function')
+    throw new VmMemoryError('MEMORY_OBSERVATION_UNAVAILABLE');
   const uninstall = installScopedFetch();
   const active = new Set<{
     key: string;
@@ -379,12 +384,17 @@ export function createModelGateway(options: {
         controller.abort(error);
         // Drain before any error response; a ledger failure supersedes an
         // apparently successful provider and keeps its unresolved DB lease.
+        let failure = error;
         let code =
-          error instanceof ModelGatewayError ? error.code : 'PROVIDER_FAILED';
+          error instanceof ModelGatewayError || error instanceof VmMemoryError
+            ? error.code
+            : 'PROVIDER_FAILED';
         try {
           await transport?.drain();
-        } catch {
-          code = 'LEDGER_UNAVAILABLE';
+        } catch (cause) {
+          failure = cause;
+          code =
+            cause instanceof VmMemoryError ? cause.code : 'LEDGER_UNAVAILABLE';
         }
         if (!response.destroyed) {
           if (!response.headersSent)
@@ -403,8 +413,12 @@ export function createModelGateway(options: {
               type: 'finish',
               reason: {
                 kind: 'error',
-                failure: new LlmError('Host model gateway request failed', code)
-                  .failure,
+                failure: new LlmError(
+                  failure instanceof VmMemoryError && code === failure.code
+                    ? failure.message
+                    : 'Host model gateway request failed',
+                  code,
+                ).failure,
               },
             }) + '\n',
           );

@@ -73,6 +73,8 @@ slot在reader EOF、成功awaited cancel，或原生实际请求关闭被确认�
 
 ## 验证和未接事项
 
+MET-267在本基线上新增必填`memoryAdmission: VmMemoryAdmissionPort`宿主装配参数，公开wire仍为v1。每个实际model fetch先等外部内存门卫再申请8路，slot提交期间压力变为queued时结算未派发intent并释放后重等；`dispatchObserved:false`沿既有汇总排除，已派发HTTP不重放。原生provider转换fetch异常时由host保留首次memory failure；取消、现权/epoch/代际、auth-refresh事务与ledger失败保留原合同。见[vm-memory.md](vm-memory.md)的可信source/guest工件及未接真实验收；不能把本片fixture或新增必填端口当成已在VM装配。
+
 本地单包loopback检查走真实HTTP fake upstream→固定代际原生DSH provider→host gateway HTTP→公开guest adapter：文本/工具增量/工具结果往返、401/429/5xx、无terminal/usage、取消、9路队列/两人隔离、跨gateway同person、guest伪造/child/跨await归属、重连去重、模型重试/刷新独立回执、redirect拒绝、撤权/epoch及ledger失败。原有20项断言保留。R1新增纯合成OAuth原生锁/刷新/落盘HTTP夹具，覆盖client/revoke/close；Responses/Codex合法与失败终止、图片卸载原生插件恢复，以及本地LISTEN fan-out重连所有权。R2恢复严格失败回执/slot断言，真实失败SSE带usage且body保持打开，连续8次确认关闭后第9路正常成功；另有真正关闭未知/DB提交失败反例与初次LISTEN失败残留callback回归。R3保留全部36项并新增原生SDK maxRetries=0的421→下一显式调用200、空刷新POST 421及GET/HEAD拒绝四项；首败原件与40项结果见主会话证据目录FIX-R3-CHECKS.json，本文不替代独立复核。
 
 `postgres-store.integration.test.ts`声明db资源，默认环境不运行；由主会话m5-test执行跨store真实PG8路、NOTIFY/恢复、无TTL、claim幂等、receipt/slot事务回滚与不可变事实，另含真实LISTEN backend断线重连后100次waiter释放和pool终止清理、初次连接失败→恢复/取消、unknown回执保留事实/租约及一次性可信恢复旁证。新增收敛登记须跑直接受影响的既有`dsh-convergence-gate.test.ts`/`.integration.test.ts`，以及既有`route-usage-unknown.integration.test.ts`，保护unknown语义。本片不声称这些检查已通过。

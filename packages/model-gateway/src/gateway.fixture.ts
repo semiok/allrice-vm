@@ -8,6 +8,7 @@ import type { Server, ServerResponse } from 'node:http';
 import { Context } from '@deepseek-ai/cordis';
 import Llm, { LlmError } from '@deepseek-ai/dsh-llm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
+import type { VmMemoryAdmissionPort } from '@allrice/vm-memory';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import Credentials from '@deepseek-ai/dsh-credentials-local';
 import { ModelGatewayError } from './contract.ts';
@@ -470,6 +471,7 @@ export async function gatewayFixture(options: {
   binding?: ModelCallBinding;
   authority?: ModelGatewayAuthority;
   nextBinding?: (index: number) => ModelCallBinding;
+  memoryAdmission?: VmMemoryAdmissionPort;
 }) {
   const store = options.store ?? new FixtureStore();
   const binding = options.binding ?? modelBinding();
@@ -497,6 +499,18 @@ export async function gatewayFixture(options: {
     authority,
     store,
     provider: options.provider,
+    // Explicit synthetic baseline only, never a production fallback.
+    memoryAdmission: options.memoryAdmission ?? {
+      async watch() {
+        return {
+          read: () => 'ready' as const,
+          async wait() {
+            throw Error('fixture_memory_wait_unexpected');
+          },
+          async close() {},
+        };
+      },
+    },
   });
   let index = 0;
   const errors: unknown[] = [];

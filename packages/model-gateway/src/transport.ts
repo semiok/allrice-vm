@@ -1,6 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
+import { VmMemoryError } from '@allrice/vm-memory';
+import type {
+  VmMemoryAdmissionPort,
+  VmMemoryAdmissionWatch,
+} from '@allrice/vm-memory';
 import type {
   ModelCallBinding,
   ModelGatewayStore,
@@ -75,6 +80,7 @@ export function createMeteredTransport(options: {
   ownerId: string;
   store: ModelGatewayStore;
   provider: GatewayProvider;
+  memoryAdmission: VmMemoryAdmissionPort;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
 }) {
@@ -84,6 +90,7 @@ export function createMeteredTransport(options: {
   const cancellations = new Set<() => Promise<void>>();
   const activeAuth = new Set<symbol>();
   let ledgerFailure: unknown;
+  let admissionFailure: VmMemoryError | undefined;
   let stopped = false;
   const scope: FetchScope = {
     async authTransaction(operation) {
@@ -136,7 +143,7 @@ export function createMeteredTransport(options: {
         resolveDone = resolve;
       });
       pending.add(done);
-      const attempt = {
+      let attempt = {
         id: randomUUID(),
         callId: options.callId,
         ownerId: options.ownerId,
@@ -149,6 +156,9 @@ export function createMeteredTransport(options: {
       let dispatched = false;
       let status: number | null = null;
       let completed: Promise<void> | undefined;
+      let capacityWatch:
+        Awaited<ReturnType<ModelGatewayStore['watchCapacity']>> | undefined;
+      let memoryWatch: VmMemoryAdmissionWatch | undefined;
       const finish = (outcome: ModelAttemptReceipt['outcome']) =>
         (completed ??= (async () => {
           try {
@@ -177,27 +187,53 @@ export function createMeteredTransport(options: {
       try {
         // Listen first, then atomically try admission: a release between those
         // operations is remembered, so a waiter cannot lose its wakeup.
-        const watch =
-          classification.kind === 'model'
-            ? await options.store.watchCapacity(attempt.personId, requestSignal)
-            : null;
-        try {
-          for (;;) {
-            requestSignal.throwIfAborted();
-            if (!refreshing) await options.assertCurrent(requestSignal);
-            if (await options.store.tryStartAttempt(attempt)) {
-              started = true;
-              break;
-            }
-            if (!watch) throw new ModelGatewayError('LEDGER_UNAVAILABLE');
-            await watch.wait();
-          }
-        } finally {
-          await watch?.close();
+        if (!refreshing) {
+          memoryWatch = await options.memoryAdmission.watch(
+            options.binding.vm,
+            requestSignal,
+          );
+          capacityWatch = await options.store.watchCapacity(
+            attempt.personId,
+            requestSignal,
+          );
         }
-        // Current epoch/membership may have changed while the intent committed.
-        if (!refreshing) await options.assertCurrent(requestSignal);
-        requestSignal.throwIfAborted();
+        for (;;) {
+          requestSignal.throwIfAborted();
+          if (!refreshing) await options.assertCurrent(requestSignal);
+          if (memoryWatch?.read() === 'queued') {
+            // No durable model slot is occupied during memory pressure waits.
+            await memoryWatch.wait();
+            continue;
+          }
+          if (!(await options.store.tryStartAttempt(attempt))) {
+            if (!capacityWatch)
+              throw new ModelGatewayError('LEDGER_UNAVAILABLE');
+            await capacityWatch.wait();
+            continue;
+          }
+          started = true;
+          // Current epoch/permission and memory may change while DB intent commits.
+          if (!refreshing) await options.assertCurrent(requestSignal);
+          requestSignal.throwIfAborted();
+          if (memoryWatch?.read() !== 'queued') break;
+          try {
+            await options.store.finishAttempt({
+              ...attempt,
+              dispatchObserved: false,
+              httpStatus: null,
+              terminal: null,
+              outcome: 'canceled',
+              usage: unknownUsage(),
+            });
+          } catch (error) {
+            // Failed settlement must retain the exact slot; do not retry or dispatch.
+            ledgerFailure ??= error;
+            started = false;
+            throw error;
+          }
+          started = false;
+          attempt = { ...attempt, id: randomUUID() };
+        }
         // Construct only after admission and durable intent. A replayable body
         // (including null) lets native Fetch resend 421 inside one call. Use the
         // public Request's exact bytes/headers as a one-shot stream, without tee.
@@ -333,8 +369,19 @@ export function createMeteredTransport(options: {
           headers: response.headers,
         });
       } catch (error) {
+        // Native SDKs can turn fetch rejection into their own error terminal.
+        // Retain the host's first admission fact independently of that rendering.
+        if (error instanceof VmMemoryError) admissionFailure ??= error;
         await finish(requestSignal.aborted ? 'canceled' : 'failed');
         throw error;
+      } finally {
+        // Keep the synchronous pressure read adjacent to dispatch: closing an
+        // asynchronous subscription before dispatch would open a new race.
+        try {
+          await capacityWatch?.close();
+        } finally {
+          await memoryWatch?.close();
+        }
       }
     },
   };
@@ -351,6 +398,7 @@ export function createMeteredTransport(options: {
         throw new ModelGatewayError('LEDGER_UNAVAILABLE', {
           cause: ledgerFailure,
         });
+      if (admissionFailure) throw admissionFailure;
     },
   };
 }

@@ -9,6 +9,15 @@ import type { BaselineEntry } from './dsh-convergence-gate.ts';
 
 export const baseline: readonly BaselineEntry[] = [
   {
+    kind: 'patch',
+    id: 'allrice-vm-memory-v1',
+    category: '门卫',
+    basis:
+      'MET-267：VM外可信压力控制新模型准入，等待不占实际模型流；guest memcg/swap与BASH_ENV可读OOM仅同人root协作，不替代原生shell、工具、会话或Agent状态。无阈值/TTL/队列上限、DB模式或自动重放。',
+    approvedBy:
+      '2026-11-21 MET-267用户开工指令由Workflow父会话转达；范围沿冻结BOUNDARY-CONTRACT v1.0第6/7节及本卡2G/swap/排队/OOM。',
+  },
+  {
     kind: 'table',
     id: 'allrice_model_gateway_calls',
     category: '账本',

@@ -2,6 +2,12 @@
 
 > 2026-10-27 起，复用 DSH 但和 DSH 默认不同的地方，总览以 Linear MET-225（DSH 定制点清单）为准，规则见 `AGENTS.md` 第 0 节。本文继续保留 `CONTRIBUTING.md` 和 `pnpm dsh:verify` 要求的逐项决策记录（每个 `patch-ledger.json` id）：新增、删除 patch-ledger 项或升级 DSH 时，按 `CONTRIBUTING.md` 更新对应 id 的段落；其余按日期记的流水账不再续写。
 
+## MET-267：内存准入与命令保护
+
+`allrice-vm-memory-v1` 保留DSH 0.2.1-rc.2的原生shell、工具结果、取消、会话和Agent Loop。AllRice在宿主模型fetch前加外部资源门卫与等待资源收尾；RAM/swap/host helper诊断单向投影，不驱动第二套Agent状态。参数沿已批准phase4样机，公开BASH_ENV与exec前保护组只做同人root协作，不承诺安全隔离或父组/全局OOM绝不杀会话。
+
+没有默认压力阈值、TTL、轮询、队列上限、DB schema、UI、自动重放或4.0启用；宿主可信observer、物理cap与runtime staging尚待MET266公开装配。升级核对原生shell环境继承、非零退出/取消的模型呈现、OS cgroup/swap、实际HTTP门卫和逐attempt计量。若原生/VM provider提供等价资源准入与可读OOM接缝，可替换该协作层，保留当前本人/epoch与外部身份门卫。公开合同、参数来源、恢复集合及真实验收缺口见[vm-memory.md](vm-memory.md)，MET-225新增同名行交主会话登记。
+
 ## MET-268：VM外模型网关与实际尝试账本
 
 `allrice-host-model-gateway-v1` 使用固定 `0.2.1-rc.2` 的公开 `LlmAdapter`、`LlmRuntime.prepareCall`、`GenerateOptions`、`StreamChunk`，保留原生消息、工具增量、工具结果和取消语义。开发注入现有订阅 loader 已初始化的宿主 LlmRuntime，生产注入同一 provider port；SSE 配置由宿主 loader 固定。没有凭据复制、账户路由、原生 loop 或 Agent 状态机；包需显式装配，本片没有启用4.0或改动现有3.x composition。

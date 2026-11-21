@@ -2,6 +2,14 @@
   "schemaVersion": 2,
   "patches": [
     {
+      "id": "allrice-vm-memory-v1",
+      "issue": "MET-267",
+      "upstreamVersion": "0.2.1-rc.2",
+      "kind": "protocol-extension",
+      "path": "packages/vm-memory/src/index.ts",
+      "reason": "Host-only external memory observation gates new model HTTP admission before the existing eight-stream lease, retaining current authorization, cancellation and per-dispatch receipts. Guest BASH_ENV and pre-exec DSH placement apply cooperative memcg/swap configuration and readable local-OOM output without replacing native shell, tool, loop or session semantics. Root can bypass these guest optimizations. No default pressure threshold, TTL, queue bound, replay, DB schema, UI or automatic 4.0 activation; physical cap, trusted observer and runtime staging remain VM-owner integration requirements."
+    },
+    {
       "id": "allrice-host-model-gateway-v1",
       "issue": "MET-268",
       "upstreamVersion": "0.2.1-rc.2",

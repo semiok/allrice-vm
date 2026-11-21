@@ -17,6 +17,7 @@
       "@allrice/contracts": ["packages/contracts/src/index.ts"],
       "@allrice/person-vm": ["packages/person-vm/src/index.ts"],
       "@allrice/model-gateway": ["packages/model-gateway/src/index.ts"],
+      "@allrice/vm-memory": ["packages/vm-memory/src/index.ts"],
       "@allrice/contracts/native-runtime": [
         "packages/contracts/src/native-runtime.ts"
       ],
