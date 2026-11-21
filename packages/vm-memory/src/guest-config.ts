@@ -101,6 +101,7 @@ export async function createVmMemoryGuestPlan(input: {
     launcher: join(directory, 'launch-dsh.sh'),
     env: {
       BASH_ENV: join(directory, 'bash-env.sh'),
+      ALLRICE_MEMORY_CGROUP_ROOT: cgroupRoot,
       ALLRICE_MEMORY_DSH_GROUP: dshGroup,
       ALLRICE_MEMORY_COMMANDS_GROUP: commandsGroup,
       ALLRICE_MEMORY_COMMAND_HIGH: String(policy.commandHighBytes),

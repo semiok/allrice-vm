@@ -24,7 +24,7 @@ allowlist：`VM_MEMORY_CONTRACT_VERSION`、`VM_PHYSICAL_MEMORY_BYTES`、`VM_MEMO
 | `VmMemorySource.watch`及其`read/wait/close`                       | 相同host binding/signal；read返回`VmMemoryObservation                                                                                                                                                                                                                                                                   | null`，其他返回`Promise<void>`；source必须先订阅并缓冲通知、在失效时notify、honor取消和真实close。owner实现尚未绑定，不能由guest实现此权威口。 |
 | `createVmMemoryGuestPlan({persistentDirectory,policy,policyRef})` | host选择的guest加密盘绝对路径、完整`VmMemoryPolicy`与已批来源`policyRef` → `Promise<VmMemoryGuestPlan>`；缺来源`approved_memory_policy_required`，非法policy为`invalid_memory_policy`，非法目录为`invalid_guest_memory_directory`，工件读取失败保留原错误。仅生成计划，无stream或执行副作用，不能从模型参数取宿主路径。 |
 
-兼容规则：wire/model消息保持DSH当前单代及gateway v1；host创建gateway增加必填memoryAdmission，旧host消费者须显式升级装配，不能缺省放行。新旧guest工件按同一发布树/contractVersion固定，初始化拒绝不支持的版本，不并存两代DSH。私有数据仅进程内订阅/首次错误和guest资源配置，无新DB模式；诊断投影不是Agent事件/状态机。
+兼容规则：wire/model消息保持DSH当前单代及gateway v1；host创建gateway增加必填memoryAdmission，旧host消费者须显式升级装配，不能缺省放行。新旧guest工件按同一发布树/contractVersion固定，初始化拒绝不支持的版本，不并存两代DSH。私有数据仅进程内订阅/最终尝试错误和guest资源配置，无新DB模式；诊断投影不是Agent事件/状态机。
 
 ## 参数与可信观察
 
@@ -40,20 +40,26 @@ gateway创建必须显式注入memoryAdmission，没有未配置自动放行。�
 
 slot提交期间压力变为queued时，先持久结算`dispatchObserved:false/outcome:canceled`并释放此slot，再回内存等待，下一次新intent使用新ID。没有HTTP被发送；既有usage按false排除，所以不计作模型调用。结算失败保留原unknown slot并失败，不在占用slot时等压力。开始实际HTTP之后不因新压力强杀该流，取消/撤权继续等实际transport收尾。source订阅覆盖最后同步read到dispatch之间，避免异步close打开新窗口。
 
-原生SDK可能把fetch异常变为自己通用错误终态，transport独立保留宿主首次memory failure，drain之后返回具名错误；ledger失败仍优先。未知账本保留既有恢复门禁，无TTL自动释放/原生call重放。业务operation/账本、原生日志/工作文件/employee配置与VM盘一同纳入BOUNDARY-CONTRACT第7节恢复集合。观察是当前外部事实，重启后须重新建立，旧快照不是当前压力权威；不会恢复“允许”缓存或重发命令。
+原生SDK可能把fetch异常变为自己通用错误终态，transport仅保留最终model fetch的memory failure，drain之后返回具名错误；后续原生retry会重新准入并取代先前失败，成功及usage不能被首次拒绝覆盖，auth-refresh不取代模型尝试结果。文案仅描述该次被拦的模型尝试，不声称整个调用从未发送；ledger失败仍优先。固定DSH 0.2.1-rc.2的pi-ai适配层本身传maxRetries=0；测试另以公开pi-ai Codex API显式开启一次重试，验证通用transport仍保留原生重试语义。未知账本保留既有恢复门禁，无TTL自动释放/原生call重放。业务operation/账本、原生日志/工作文件/employee配置与VM盘一同纳入BOUNDARY-CONTRACT第7节恢复集合。观察是当前外部事实，重启后须重新建立，旧快照不是当前压力权威；不会恢复“允许”缓存或重发命令。
 
 启用顺序为owner核当前本人/epoch及已批平台资源policy→provider实核物理cap→stage/initialize成功→建立可信source→显式注入gateway→原生runtime就绪；本片没有开启4.0。关闭/撤权由宿主先`gateway.revoke(binding)`取消等待及实际请求并等待owned drain；source同时invalidate/notify，关闭所有订阅后VM owner再停机。更新/删除沿owner当前epoch与原生配置生命周期，本模块不删盘、不创建线程。事件投影仅资源诊断，streamRef=none（通知不是原生会话事件流，没有自建游标/重建执行）；source revision/evidenceRef供旁证关联。恢复后重建当前source，副作用未知仍走既有账本对账。
 
 ## Guest工件与原生接缝
 
-`createVmMemoryGuestPlan`返回文件、显式initialize命令、launcher和环境；生成工件无副作用。VM owner只将它们stage到本人加密持久盘，Linux guest root执行initialize成功并回读swap/memcg后，以`/bin/sh <launcher> <原生DSH可执行文件> ...原argv`启动。launcher在exec前进入DSH组并设置policy中的OOM优先级，原生bash继承BASH_ENV，shell在每命令child组设置对应命令优先级（phase4参考分别-900/800，非本模块默认）。原生DSH仍负责工具调用、超时、进程取消、stdout/stderr、退出码、会话和继续，无第二shell executor或私有DSH接缝。
+`createVmMemoryGuestPlan`返回文件、显式initialize命令、launcher和环境；生成工件无副作用。VM owner只将它们stage到本人加密持久盘；必须在starting owner持有覆盖所有合法入组来源的门禁、原生DSH launch之前，执行Linux guest root initialize并回读swap/memcg，成功后才释放启动边界并以`/bin/sh <launcher> <原生DSH可执行文件> ...原argv`启动。launcher在exec前进入DSH组并设置policy中的OOM优先级，原生bash继承BASH_ENV，shell在每命令child组设置对应命令优先级（phase4参考分别-900/800，非本模块默认）。原生DSH仍负责工具调用、超时、进程取消、stdout/stderr、退出码、会话和继续，无第二shell executor或私有DSH接缝。
 
-初始化拒绝错误已有swap、不重格式化活动swap、不悄悄更改live组不同配置；失败退出75。原生bash EXIT trap按自己的`memory.events.local`增量判断OOM；`oom_kill`来自任何OOM killer，只有同时见本child的`oom`增量才称`COMMAND_MEMORY_LIMIT`，否则`COMMAND_OOM_KILLED`明确原因需核。137本身不当OOM。局部OOM复用样机中文说明和137，不制造原生isError/成功或执行第二遍。退出前移出child再删除空组；仍有后代时组保留，native进程owner须真实收尾，不能为了清理回执杀未知任务。
+初始化拒绝错误已有swap、不重格式化活动swap；所有组先读cgroup.events populated（包含后代）并预检，才写新组限额；现存组差异限额即使空也拒绝，同配置限额只读校验，不提供running重配。populated=0不能阻止下一刻新命令入组，首次新组初始化仍必须由owner门禁覆盖check+write+readback。当前公开端口没有该装配适配器，R1-02因此尚未整体关闭；仅传starting字符串、调用running-only resolve/assertCurrentBinding或raw class.exec不能替代门禁。失败退出75。原生bash EXIT trap按自己的`memory.events.local`增量判断OOM；`oom_kill`来自任何OOM killer，只有同时见本child的`oom`增量才称`COMMAND_MEMORY_LIMIT`，否则`COMMAND_OOM_KILLED`明确原因需核。137本身不当OOM。局部OOM复用样机中文说明和137，不制造原生isError/成功或执行第二遍。同PID的exec bash重入先验证进程starttime、当前统一cgroup路径和相同限额，再复用首次导出的数字OOM基线；不会mkdir -p或重置基线，身份/配置不符则拒绝。该验证是guest root协作事实，不授予外部身份。退出前移出child再删除空组；仍有后代时组保留，native进程owner须真实收尾，不能为了清理回执杀未知任务。
+
+R1-04仍未关闭：EXIT trap仅在shell存活且仍拥有trap时尽力生成解释。合法exec node/python替换shell，或shell自身遭SIGKILL/OOM时，不能靠trap自动解释；必须保留原生exit/signal与会话事实，不能把137/SIGKILL猜成OOM，也不能用共享父组计数增量归因并发单命令。自动可读局部OOM要求仍保留，尚未兑现全路径覆盖。
+
+已核DSH 0.2.1-rc.2公开SubprocessHandle.done/terminate/waitForExit、ShellExecution.done/result/observed及tools/post-execute/result；它们提供精确原生命令的退出/输出或tool outcome，但没有普通child的可靠PID birth/cgroup/OOM关联。最小拟议上游接缝须由现有native process owner在同一execution范围创建并持有唯一command resource关联，在入组前取本child baseline，完成/managed range收束后由被执行shell之外的owner读取本child计数，并返回可核的关联及未知状态；不改写原始退出、取消、输出或工具成功。并发child、存活后代、exec替换和shell死亡都须纳入该公开合同。这里不臆造签名、不接private handle、不另造executor或服务，待原生owner公开冻结后再实施。
 
 guest内保留root，配置可被改写/绕过，不构成员工隔离或外部授权。low是尽力保护，-900不是绝对免杀，父组/全局OOM下不能承诺任意负载会话永活。[Linux cgroup v2文档](https://docs.kernel.org/admin-guide/cgroup-v2.html)规定high主要慢化、max触发局部OOM、swap.max单独限制交换；events.local避免把后代事件当父组局部事实，oom_kill本身不能证明哪级触发OOM。
 
 ## 验收与移除边界
 
 本片受影响测试覆盖原HTTP→真实原生provider→loopback上游，guest测试只注入合成sysfs或短bash；均无真实模型、VM、PG、浏览器、QA/M5/压力分配。新测试为普通native单测，由vitest实际收集；未创建假手工integration叶冒充VM验收。首败、后续修复、计数与资源释放以本卡QA回执为准。
+
+固定MET266 bb38e59e07146a0cb5928d066f4591b327b47e82公开MicrosandboxPersonVm/PersonVmNativePort/PersonVmRuntimePort及class.exec只提供既有底层入口，未提供stage/launch服务或可在shell死亡后完成exact child OOM归因的可信owner。MemTotal、ps、配置inspect或可能fallback配置的metrics不填enforcedBytes。F4冻结增量由其他owner单独收敛，本次未引入。
 
 仍待MET266/父线公开冻结：物理cap运行证明、经批准的平台swap/memcg/OOM参数与来源、guest初始化/launcher挂载、可信外部observer和判压来源；仍待父线真实测：多线程压力/排队，局部、命令父组、全局OOM及恢复、同会话原生日志保持、host helper额外RSS/swap、CPU/容量包络。未通过不能报整卡/模块迁入或“可慢可排队、不能杀会话”已验收。没有删除任何原生功能。MET-225新增行`allrice-vm-memory-v1`交父线登记，监控owner须对observer失效和OOM诊断补真实告警接线。

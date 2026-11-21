@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   mkdtemp,
@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VM_MEMORY_PHASE4_REFERENCE_POLICY } from './contract.ts';
-import type { GuestMemorySample } from './contract.ts';
+import type { GuestMemorySample, VmMemoryPolicy } from './contract.ts';
 import { createVmMemoryGuestPlan as createPlan } from './guest-config.ts';
 
 // Explicit historical policy is a fixture choice, never a production fallback.
@@ -33,7 +33,7 @@ type Config = {
   commandsGroup: string;
   procRoot: string;
   swapFile: string;
-  policy: Record<string, number>;
+  policy: VmMemoryPolicy;
 };
 const { initialize } = require('../guest/initialize.cjs') as {
   initialize(
@@ -68,17 +68,32 @@ async function virtualGuest() {
   const io = {
     readFileSync(file: string) {
       const value = files.get(file);
+      // cgroup files are kernel-created even when the fixture first inserts a
+      // direct process (the existing negative input stays unchanged).
+      if (value === undefined && file.endsWith('/cgroup.events')) {
+        const procs = files.get(
+          join(file.slice(0, -'/cgroup.events'.length), 'cgroup.procs'),
+        );
+        if (procs !== undefined)
+          return `populated ${procs.trim() ? 1 : 0}\nfrozen 0\n`;
+      }
       if (value === undefined) throw enoent();
       return value;
     },
-    writeFileSync(file: string, value: string) {
+    writeFileSync: vi.fn((file: string, value: string) => {
       files.set(file, value === '+memory' ? 'memory' : String(value));
-    },
-    mkdirSync(directory: string) {
+    }),
+    mkdirSync(directory: string, options?: { recursive?: boolean }) {
+      if (!options?.recursive && files.has(join(directory, 'cgroup.procs')))
+        throw Object.assign(Error('fixture-directory-exists'), {
+          code: 'EEXIST',
+        });
       files.set(
         join(directory, 'cgroup.procs'),
         files.get(join(directory, 'cgroup.procs')) ?? '',
       );
+      const events = join(directory, 'cgroup.events');
+      files.set(events, files.get(events) ?? 'populated 0\nfrozen 0\n');
     },
     chmodSync: vi.fn(),
     lstatSync() {
@@ -108,6 +123,98 @@ async function virtualGuest() {
     run,
     setSwapSize(value: number) {
       swapSize = value;
+    },
+  };
+}
+
+async function writeSyntheticGuestBinaries(bin: string) {
+  await writeFile(
+    join(bin, 'cat'),
+    `#!/bin/sh
+case "$1" in
+  "$ALLRICE_MEMORY_PROC_ROOT/"*/stat)
+    if [ ! -f "$1" ]; then
+      printf '1 (fixture bash) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\\n'
+      exit
+    fi;;
+esac
+exec /bin/cat "$@"
+`,
+    { mode: 0o700 },
+  );
+  await writeFile(
+    join(bin, 'mkdir'),
+    `#!/bin/sh
+/bin/mkdir "$1" || exit $?
+printf 'oom 0\\noom_kill 0\\n' > "$1/memory.events.local"
+pid=\${1##*-}
+/bin/mkdir -p "$ALLRICE_MEMORY_PROC_ROOT/$pid"
+: > "$ALLRICE_MEMORY_PROC_ROOT/$pid/oom_score_adj"
+printf '%s (fixture bash) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\\n' "$pid" > "$ALLRICE_MEMORY_PROC_ROOT/$pid/stat"
+printf '0::/commands/command-%s\\n' "$pid" > "$ALLRICE_MEMORY_PROC_ROOT/$pid/cgroup"
+`,
+    { mode: 0o700 },
+  );
+}
+
+async function bashGuest() {
+  const directory = await realpath(
+    await mkdtemp(join(tmpdir(), 'met267-reexec-')),
+  );
+  directories.push(directory);
+  const plan = await createVmMemoryGuestPlan({
+    persistentDirectory: '/fixture/encrypted',
+  });
+  const bin = join(directory, 'bin');
+  const commands = join(directory, 'commands');
+  const dsh = join(directory, 'dsh');
+  const proc = join(directory, 'proc');
+  await Promise.all([bin, commands, dsh, proc].map((file) => mkdir(file)));
+  const guard = join(directory, 'bash-env.sh');
+  await writeFile(
+    guard,
+    plan.files.find((file) => file.path.endsWith('/bash-env.sh'))!.contents,
+  );
+  await writeSyntheticGuestBinaries(bin);
+  const env = {
+    ...plan.env,
+    PATH: `${bin}:/usr/bin:/bin`,
+    BASH_ENV: guard,
+    ALLRICE_MEMORY_CGROUP_ROOT: directory,
+    ALLRICE_MEMORY_COMMANDS_GROUP: commands,
+    ALLRICE_MEMORY_DSH_GROUP: dsh,
+    ALLRICE_MEMORY_PROC_ROOT: proc,
+  };
+  return {
+    directory,
+    async run(command: string) {
+      // On macOS, Node's pipe is a socket and Bash -c can take its remote-shell
+      // startup branch instead of BASH_ENV. A real /dev/null stdin isolates the
+      // intended noninteractive BASH_ENV path without changing command text.
+      const child = spawn(
+        '/bin/bash',
+        ['--noprofile', '--norc', '-c', command],
+        {
+          env,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      return await new Promise<{
+        code: number | null;
+        stdout: string;
+        stderr: string;
+      }>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (code) => resolve({ code, stdout, stderr }));
+      });
     },
   };
 }
@@ -180,6 +287,107 @@ describe.sequential(
       expect(() =>
         initialize(f.config, { ...f.io, writeFileSync() {} }, f.run),
       ).toThrow();
+    });
+
+    it('父组为空但child仍活时，在任何组限额写入前拒绝差异policy', async () => {
+      const f = await virtualGuest();
+      initialize(f.config, f.io, f.run);
+      f.files.set(join(f.config.commandsGroup, 'cgroup.procs'), '');
+      f.files.set(
+        join(f.config.commandsGroup, 'command-123/cgroup.procs'),
+        '123\n',
+      );
+      f.files.set(
+        join(f.config.commandsGroup, 'cgroup.events'),
+        'populated 1\nfrozen 0\n',
+      );
+      f.io.writeFileSync.mockClear();
+      const policy = {
+        ...f.config.policy,
+        commandMaxBytes: f.config.policy.commandMaxBytes - 1,
+      };
+      expect(() => initialize({ ...f.config, policy }, f.io, f.run)).toThrow(
+        'memory_group_has_live_processes',
+      );
+      expect(
+        f.io.writeFileSync.mock.calls.filter(([file]) =>
+          /\/memory\./.test(file),
+        ),
+      ).toEqual([]);
+      expect(f.files.get(join(f.config.dshGroup, 'memory.low'))).toBe(
+        String(f.config.policy.dshLowBytes),
+      );
+      expect(f.files.get(join(f.config.commandsGroup, 'memory.max'))).toBe(
+        String(f.config.policy.commandMaxBytes),
+      );
+    });
+
+    it('已建组同配置只读幂等，空组也不开放running重配', async () => {
+      const f = await virtualGuest();
+      initialize(f.config, f.io, f.run);
+      f.files.set(
+        join(f.config.commandsGroup, 'cgroup.events'),
+        'populated 1\nfrozen 0\n',
+      );
+      f.io.writeFileSync.mockClear();
+      initialize(f.config, f.io, f.run);
+      expect(
+        f.io.writeFileSync.mock.calls.filter(([file]) =>
+          /\/memory\./.test(file),
+        ),
+      ).toEqual([]);
+      f.files.set(
+        join(f.config.commandsGroup, 'cgroup.events'),
+        'populated 0\nfrozen 0\n',
+      );
+      expect(() =>
+        initialize(
+          {
+            ...f.config,
+            policy: {
+              ...f.config.policy,
+              commandMaxBytes: f.config.policy.commandMaxBytes - 1,
+            },
+          },
+          f.io,
+          f.run,
+        ),
+      ).toThrow();
+    });
+
+    it('后一个组拒绝时不提前写第一个新组的限额，子树事实缺失也失败', async () => {
+      const f = await virtualGuest();
+      f.files.set(join(f.config.commandsGroup, 'cgroup.procs'), '');
+      f.files.set(
+        join(f.config.commandsGroup, 'cgroup.events'),
+        'populated 1\nfrozen 0\n',
+      );
+      f.files.set(
+        join(f.config.commandsGroup, 'command-123/cgroup.procs'),
+        '123\n',
+      );
+      expect(() => initialize(f.config, f.io, f.run)).toThrow(
+        'memory_group_has_live_processes',
+      );
+      expect(
+        f.io.writeFileSync.mock.calls.filter(([file]) =>
+          /\/memory\./.test(file),
+        ),
+      ).toEqual([]);
+      const unknown = await virtualGuest();
+      unknown.files.set(join(unknown.config.commandsGroup, 'cgroup.procs'), '');
+      unknown.files.set(
+        join(unknown.config.commandsGroup, 'cgroup.events'),
+        'frozen 0\n',
+      );
+      expect(() => initialize(unknown.config, unknown.io, unknown.run)).toThrow(
+        'memory_group_population_unknown',
+      );
+      expect(
+        unknown.io.writeFileSync.mock.calls.filter(([file]) =>
+          /\/memory\./.test(file),
+        ),
+      ).toEqual([]);
     });
 
     it('诊断按键取RAM/swap/局部/父组/全局计数，缺失保持null', async () => {
@@ -264,6 +472,56 @@ describe.sequential(
       expect(result?.stderr).toContain('COMMAND_MEMORY_SETUP_FAILED');
     });
 
+    it.each(['-c', 'script'] as const)(
+      'exec bash %s保持同PID受管命令的合法原生语义',
+      async (kind) => {
+        const f = await bashGuest();
+        const script = join(f.directory, 'script.sh');
+        await writeFile(script, 'printf "ok\\n"\n');
+        const result = await f.run(
+          kind === '-c'
+            ? 'exec /bin/bash -c \'printf "ok\\n"\''
+            : `exec /bin/bash '${script}'`,
+        );
+        expect('code' in result ? result.code : 0, JSON.stringify(result)).toBe(
+          0,
+        );
+        expect(result.stdout).toBe('ok\n');
+        expect(result.stderr).not.toContain('COMMAND_');
+      },
+    );
+
+    it('exec bash重入沿用首次OOM基线，不因新shell启动抹去先前增量', async () => {
+      const f = await bashGuest();
+      const result = await f.run(
+        'printf "oom 1\\noom_kill 1\\n" > "$allrice_memory_child/memory.events.local"; exec /bin/bash -c \'printf "ok\\n"\'',
+      );
+      expect('code' in result ? result.code : 0, JSON.stringify(result)).toBe(
+        137,
+      );
+      expect(result.stdout).toBe('ok\n');
+      expect(result.stderr).toContain('COMMAND_MEMORY_LIMIT');
+    });
+
+    it.each(['birth', 'membership', 'limit'] as const)(
+      '同PID重入的%s事实不符时拒绝，不运行新shell命令',
+      async (kind) => {
+        const f = await bashGuest();
+        const mismatch =
+          kind === 'birth'
+            ? 'export ALLRICE_MEMORY_MANAGED_START=999'
+            : kind === 'membership'
+              ? 'printf "0::/dsh\\n" > "$ALLRICE_MEMORY_PROC_ROOT/$$/cgroup"'
+              : 'printf 9 > "$allrice_memory_child/memory.max"';
+        const result = await f.run(
+          `${mismatch}; exec /bin/bash -c 'printf must-not-run'`,
+        );
+        expect(result.code).toBe(75);
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('COMMAND_MEMORY_SETUP_FAILED');
+      },
+    );
+
     it.each([
       {
         events: 'oom 1\noom_kill 1\n',
@@ -302,12 +560,8 @@ describe.sequential(
           plan.files.find((file) => file.path.endsWith('/bash-env.sh'))!
             .contents,
         );
-        // Synthetic sysfs: mkdir creates the kernel-owned files in a temporary tree.
-        await writeFile(
-          join(bin, 'mkdir'),
-          '#!/bin/sh\n/bin/mkdir "$1" || exit $?\nprintf "oom 0\\noom_kill 0\\n" > "$1/memory.events.local"\npid=${1##*-}\n/bin/mkdir -p "$ALLRICE_MEMORY_PROC_ROOT/$pid"\n: > "$ALLRICE_MEMORY_PROC_ROOT/$pid/oom_score_adj"\n',
-          { mode: 0o700 },
-        );
+        // Synthetic sysfs/proc: no actual kernel cgroup or score is changed.
+        await writeSyntheticGuestBinaries(bin);
         const command =
           'printf "%s" "$SYNTHETIC_EVENTS" > "$allrice_memory_child/memory.events.local"; printf "ran-once\\n"; exit "$SYNTHETIC_EXIT"';
         let result: { stdout: string; stderr: string; code?: number };
@@ -320,6 +574,7 @@ describe.sequential(
                 ...plan.env,
                 PATH: `${bin}:/usr/bin:/bin`,
                 BASH_ENV: guard,
+                ALLRICE_MEMORY_CGROUP_ROOT: directory,
                 ALLRICE_MEMORY_COMMANDS_GROUP: commands,
                 ALLRICE_MEMORY_DSH_GROUP: dsh,
                 ALLRICE_MEMORY_PROC_ROOT: proc,

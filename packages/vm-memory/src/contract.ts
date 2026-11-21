@@ -104,10 +104,11 @@ export type VmMemoryErrorCode =
 
 const messages: Record<VmMemoryErrorCode, string> = {
   MEMORY_OBSERVATION_UNAVAILABLE:
-    '内存状态暂不可核实，本次请求未发送，会话保留。',
+    '内存状态暂不可核实，该次模型尝试未获准发送，会话保留。',
   MEMORY_BINDING_INVALID:
-    '内存观察与当前会话实例不一致，本次请求未发送，会话保留。',
-  VM_MEMORY_CAP_INVALID: '虚拟机内存配置未通过核实，本次请求未发送，会话保留。',
+    '内存观察与当前会话实例不一致，该次模型尝试未获准发送，会话保留。',
+  VM_MEMORY_CAP_INVALID:
+    '虚拟机内存配置未通过核实，该次模型尝试未获准发送，会话保留。',
 };
 export class VmMemoryError extends Error {
   constructor(

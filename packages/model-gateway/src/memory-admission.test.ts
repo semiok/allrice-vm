@@ -13,6 +13,7 @@ import {
   nativeProviderFixture,
   upstreamFixture,
 } from './gateway.fixture.ts';
+import { responsesFixture } from './revision.fixture.ts';
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -45,6 +46,75 @@ const slots = (f: Awaited<ReturnType<typeof setup>>) =>
 describe.sequential(
   'native provider → original gateway HTTP: memory admission',
   () => {
+    it('首次内存拒绝后原生Codex retry成功，保留真实成功和usage', async () => {
+      const upstream = await responsesFixture({
+        codex: true,
+        nativeCodexRetries: 1,
+      });
+      cleanup.push(() => upstream.close());
+      const source = new FixtureMemorySource(upstream.binding.vm, 'normal');
+      source.publish(memoryObservation(upstream.binding.vm, 'unavailable'));
+      const f = await gatewayFixture({
+        provider: upstream.provider,
+        binding: upstream.binding,
+        memoryAdmission: createVmMemoryAdmission(source),
+      });
+      cleanup.push(() => f.close());
+      const pending = f.collect();
+      await source.detached.promise;
+      expect(upstream.requests).toHaveLength(0);
+      source.publish(memoryObservation(f.binding.vm));
+      expect(finish(await pending)).toMatchObject({ reason: { kind: 'stop' } });
+      expect(upstream.requests).toHaveLength(1);
+      expect([...f.store.rows.values()]).toMatchObject([
+        { dispatchObserved: true, terminal: 'completed' },
+      ]);
+      expect(
+        await f.store.usage(f.binding.vm.personId, f.binding.vm.organizationId),
+      ).toMatchObject({ attemptCount: 1, inputTokens: 12, outputTokens: 3 });
+      expect(source.subscribers.size).toBe(0);
+    });
+
+    it('先发送HTTP再被内存门卫拒绝原生retry，错误不声称整调用未发送', async () => {
+      const upstream = await responsesFixture({
+        codex: true,
+        nativeCodexRetries: 1,
+        firstRequestStatus: 503,
+        onRequest() {
+          source.publish(memoryObservation(upstream.binding.vm, 'unavailable'));
+        },
+      });
+      cleanup.push(() => upstream.close());
+      const source = new FixtureMemorySource(upstream.binding.vm, 'normal');
+      const f = await gatewayFixture({
+        provider: upstream.provider,
+        binding: upstream.binding,
+        memoryAdmission: createVmMemoryAdmission(source),
+      });
+      cleanup.push(() => f.close());
+      const terminal = finish(await f.collect());
+      expect(terminal).toMatchObject({
+        reason: {
+          kind: 'error',
+          failure: { code: 'MEMORY_OBSERVATION_UNAVAILABLE' },
+        },
+      });
+      expect(JSON.stringify(terminal)).not.toContain('本次请求未发送');
+      expect(upstream.requests).toHaveLength(1);
+      expect([...f.store.rows.values()]).toMatchObject([
+        { dispatchObserved: true, httpStatus: 503 },
+      ]);
+      expect(
+        (
+          await f.store.usage(
+            f.binding.vm.personId,
+            f.binding.vm.organizationId,
+          )
+        ).attemptCount,
+      ).toBe(1);
+      expect(source.subscribers.size).toBe(0);
+    });
+
     it('用户“请查一下大米价格”在压力中排队不占实际模型流，恢复后只发送一次并正常落账', async () => {
       const f = await setup();
       const pending = f.collect();

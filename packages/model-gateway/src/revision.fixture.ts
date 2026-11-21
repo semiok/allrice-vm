@@ -1,7 +1,12 @@
 /** Real loopback HTTP and public native APIs; all credentials are synthetic. */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { createModels, fauxProvider } from '@earendil-works/pi-ai';
+import {
+  createModels,
+  fauxProvider,
+  normalizeContext,
+} from '@earendil-works/pi-ai';
+import { stream as streamCodex } from '@earendil-works/pi-ai/api/openai-codex-responses';
 import type { Credential } from '@earendil-works/pi-ai';
 import { recordKeyFor } from '@deepseek-ai/dsh-llm-pi-ai';
 import { parseCredentialsDocument } from '@deepseek-ai/dsh-credentials-local';
@@ -13,6 +18,7 @@ import {
   listen,
   modelBinding,
   nativeProviderFixture,
+  nativeFailure,
   upstreamFixture,
 } from './gateway.fixture.ts';
 
@@ -186,6 +192,10 @@ export async function responsesFixture(
     tools?: boolean;
     holdFailedBody?: boolean;
     failuresBeforeSuccess?: number;
+    /** Exercise the public pi-ai retry primitive; DSH profileOptions pins zero. */
+    nativeCodexRetries?: number;
+    firstRequestStatus?: number;
+    onRequest?: (count: number) => void;
   } = {},
 ) {
   const requests: string[] = [];
@@ -196,6 +206,12 @@ export async function responsesFixture(
     void (async () => {
       for await (const part of request) void part;
       requests.push(request.url!);
+      options.onRequest?.(requests.length);
+      if (requests.length === 1 && options.firstRequestStatus) {
+        response.writeHead(options.firstRequestStatus);
+        response.end('synthetic retryable upstream refusal');
+        return;
+      }
       active++;
       response.once('close', () => {
         active--;
@@ -296,8 +312,66 @@ export async function responsesFixture(
   const native = await nativeProviderFixture(url, {
     api: options.codex ? 'openai-codex-responses' : 'openai-responses',
   });
+  const retryProvider: GatewayProvider = {
+    classify: native.provider.classify,
+    async *stream(binding, input, signal) {
+      const events = streamCodex(
+        {
+          id: binding.model,
+          name: 'Synthetic loopback Codex',
+          api: 'openai-codex-responses',
+          provider: binding.provider,
+          baseUrl: url + '/v1',
+          input: ['text'],
+          reasoning: false,
+          contextWindow: 4096,
+          maxTokens: 512,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        },
+        normalizeContext({
+          messages: input.messages.map((message) => {
+            if (message.role !== 'user') throw Error('fixture-only-user-input');
+            return {
+              role: 'user',
+              content: message.content.map((block) => {
+                if (block.type !== 'text')
+                  throw Error('fixture-only-text-input');
+                return { type: 'text', text: block.text };
+              }),
+              timestamp: 0,
+            };
+          }),
+        }),
+        {
+          apiKey: [
+            'synthetic',
+            Buffer.from(
+              JSON.stringify({
+                'https://api.openai.com/auth': {
+                  chatgpt_account_id: 'synthetic-account',
+                },
+              }),
+            ).toString('base64url'),
+            'unsigned-fixture',
+          ].join('.'),
+          transport: 'sse',
+          maxRetries: options.nativeCodexRetries,
+          signal,
+        },
+      );
+      for await (const event of events) {
+        if (event.type === 'done')
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        else if (event.type === 'error')
+          yield nativeFailure('NATIVE_RETRY_FAILED');
+      }
+    },
+  };
   return {
-    provider: native.provider,
+    provider:
+      options.nativeCodexRetries === undefined
+        ? native.provider
+        : retryProvider,
     binding: { ...modelBinding(), ...native.route },
     requests,
     get active() {

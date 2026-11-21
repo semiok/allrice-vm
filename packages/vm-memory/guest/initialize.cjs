@@ -85,22 +85,48 @@ function initialize(config, io = fs, run = cp.execFileSync) {
       'memory.oom.group': policy.commandOomGroup,
     },
   };
+  // Initial setup is owned by the starting VM lifecycle, before DSH launch.
+  // This module cannot establish that host fence. Existing groups are never
+  // reconfigured: populated=0 alone cannot exclude a new command joining.
+  const pendingLimits = [];
+  for (const [group, limits] of Object.entries(groups)) {
+    let created = true;
+    try {
+      io.mkdirSync(group);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      created = false;
+    }
+    const populated = read(path.join(group, 'cgroup.events'))
+      .split('\n')
+      .find((line) => line.split(/\s+/)[0] === 'populated')
+      ?.split(/\s+/)[1];
+    if (populated !== '0' && populated !== '1')
+      throw Error('memory_group_population_unknown');
+    // cgroup.events includes descendants; cgroup.procs is only a conservative
+    // extra check and must never be used to infer an empty subtree.
+    const live =
+      populated === '1' || read(path.join(group, 'cgroup.procs')) !== '';
+    for (const [name, value] of Object.entries(limits)) {
+      let current;
+      try {
+        current = read(path.join(group, name));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (current === String(value)) continue;
+      if (live) throw Error('memory_group_has_live_processes');
+      if (!created) throw Error('memory_group_reconfiguration_unsupported');
+      pendingLimits.push([path.join(group, name), value]);
+    }
+  }
+  // Preflight every group before changing any limit. No running reconfigure
+  // path is offered; a startup owner fence must cover new-group check + write.
+  for (const [file, value] of pendingLimits) write(file, value);
   const observed = {};
   for (const [group, limits] of Object.entries(groups)) {
-    io.mkdirSync(group, { recursive: true });
-    const live = read(path.join(group, 'cgroup.procs')) !== '';
     observed[group] = {};
     for (const [name, value] of Object.entries(limits)) {
-      if (live) {
-        let current;
-        try {
-          current = read(path.join(group, name));
-        } catch {
-          /* fail below */
-        }
-        if (current !== String(value))
-          throw Error('memory_group_has_live_processes');
-      } else write(path.join(group, name), value);
       const actual = read(path.join(group, name));
       if (actual !== String(value)) throw Error('memory_limit_readback_failed');
       observed[group][name] = actual;

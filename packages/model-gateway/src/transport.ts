@@ -91,6 +91,7 @@ export function createMeteredTransport(options: {
   const activeAuth = new Set<symbol>();
   let ledgerFailure: unknown;
   let admissionFailure: VmMemoryError | undefined;
+  let modelFetchSequence = 0;
   let stopped = false;
   const scope: FetchScope = {
     async authTransaction(operation) {
@@ -115,6 +116,10 @@ export function createMeteredTransport(options: {
       const classification = options.provider.classify(input, init);
       if (!classification) throw new ModelGatewayError('UNCLASSIFIED_UPSTREAM');
       const refreshing = classification.kind === 'auth-refresh';
+      // A native retry supersedes the previous model fetch's admission result.
+      // Refresh is a separate credential transaction and cannot supersede it.
+      const modelFetch = refreshing ? undefined : ++modelFetchSequence;
+      if (!refreshing) admissionFailure = undefined;
       if (refreshing) {
         const token = authTransactions.getStore();
         if (!token || !activeAuth.has(token))
@@ -370,8 +375,10 @@ export function createMeteredTransport(options: {
         });
       } catch (error) {
         // Native SDKs can turn fetch rejection into their own error terminal.
-        // Retain the host's first admission fact independently of that rendering.
-        if (error instanceof VmMemoryError) admissionFailure ??= error;
+        // Retain only the final model fetch's fact independently of rendering.
+        // An earlier rejected attempt must not override a later native success.
+        if (error instanceof VmMemoryError && modelFetch === modelFetchSequence)
+          admissionFailure = error;
         await finish(requestSignal.aborted ? 'canceled' : 'failed');
         throw error;
       } finally {
