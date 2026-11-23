@@ -13,7 +13,7 @@ import TypertRegistry, {
   type TypertContribution,
 } from '@deepseek-ai/dsh-typert-registry';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import NativeHistorySource from './host.ts';
+import NativeHistorySource from '@allrice/dsh-native-history-source';
 import type { NativeHistoryCut } from './types.ts';
 
 // Native transport test identity, never a production SaaS authority.
