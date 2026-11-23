@@ -290,11 +290,13 @@ describe('native fixed-cut exporter', () => {
     expect(
       method
         .input({ strict: true })
+        .create()
         .parse({ request: { rootSessionId: 'root' } }),
     ).toEqual({ request: { rootSessionId: 'root' } });
     expect(() =>
       method
         .input({ strict: true })
+        .create()
         .parse({ request: { rootSessionId: 'root', path: '/arbitrary' } }),
     ).toThrow();
   });
