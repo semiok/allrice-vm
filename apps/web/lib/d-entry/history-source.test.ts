@@ -316,7 +316,7 @@ describe('request-owned cold history composition', () => {
       .serve();
     expect(downloaded.status).toBe(200);
     await expect(downloaded.arrayBuffer()).resolves.toEqual(f.bytes.buffer);
-    const fresh = await f.compose(f.request(), 'history').serve();
+    const fresh = await f.compose(f.request({ limit: 1 }), 'history').serve();
     expect(((await fresh.json()) as HostHistoryPage).snapshotDigest).toBe(
       nextDigest,
     );
@@ -326,7 +326,9 @@ describe('request-owned cold history composition', () => {
         .compose(
           f.request({
             snapshotDigest: unpublished,
-            ...(method === 'download' ? { objectId: f.object.id } : {}),
+            ...(method === 'download'
+              ? { objectId: f.object.id }
+              : { limit: 1 }),
           }),
           method,
         )
