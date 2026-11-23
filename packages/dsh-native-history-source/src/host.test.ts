@@ -103,7 +103,10 @@ describe('native fixed-cut exporter', () => {
     expect(cut.sessions[0]!.catalog).toEqual([
       { id: child.id, createdAt: 2, mode: 'one-shot' },
     ]);
-    expect(cut.sessions[0]!.events).toEqual([...root.events]);
+    using observation = await ctx.sessionQuery.observeSession(root.id, {
+      signal: signal(),
+    });
+    expect(cut.sessions[0]!.events).toEqual(observation.events);
     expect(ctx.get('agents')).toBeUndefined();
   });
   it('materializes the same observation prefix and catalog even if the live log appends', async () => {
@@ -302,7 +305,10 @@ describe('native fixed-cut exporter', () => {
     expect(typeof result).toBe('string');
     const cut = JSON.parse(result as string) as NativeHistoryCut;
     expect(cut.sessions.map((row) => row.meta.id)).toEqual([root.id, child.id]);
-    expect(cut.sessions[0]!.events).toEqual([...root.events]);
+    using observation = await ctx.sessionQuery.observeSession(root.id, {
+      signal: signal(),
+    });
+    expect(cut.sessions[0]!.events).toEqual(observation.events);
     expect(ctx.get('agents')).toBeUndefined();
   });
   it('joins a cancelled native observation before the real Gateway call rejects', async () => {
