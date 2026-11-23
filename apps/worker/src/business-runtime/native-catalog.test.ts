@@ -5,6 +5,7 @@ import type * as Database from '@allrice/database';
 import { DataAccessError } from '@allrice/database';
 import type { NativeWebOwner } from '../native-web/owner.js';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   hostFixture,
   issue as principalIssue,
@@ -427,6 +428,95 @@ it('lifetime abort uninstalls synchronously and revokes previously issued discov
     dEntryNativeOwnerPort.resolve(f.base.context, f.base.identity, signal),
   ).toThrow(DEntryNativeUnavailable);
   expect(f.native.close).not.toHaveBeenCalled();
+});
+
+it('the installed lifetime observes a real control child unknown without changing the explicit close rejection', async () => {
+  const f = fixture(),
+    selected = { ...principalIssue(), identity: f.base.identity },
+    native = await hostFixture(selected),
+    control = createDEntryPrincipalControl(native.node, {
+      carrier: new AbortController().signal,
+      cleanupTimeoutMs: 1000,
+    });
+  f.native.acquirePrincipal.mockImplementation((issue, signal) =>
+    control.acquire(issue, signal),
+  );
+  const installed = installAssignedDEntryNativeCatalog({
+    vm: f.vm,
+    startup: { catalog: () => ({ ...f.publication(), owner: f.native }) },
+    lifetime: f.lifetime.signal,
+  });
+  cleanups.push(async () => {
+    try {
+      // The explicit unknown is asserted below; teardown still drains the real resources.
+      await Promise.allSettled([installed.close(), control.drainLocal()]);
+    } finally {
+      await native.close();
+    }
+  });
+  const owner = await dEntryNativeOwnerPort.resolve(
+    f.base.context,
+    f.base.identity,
+    new AbortController().signal,
+  );
+  const activity = owner.acquirePrincipal(
+    f.base.context,
+    selected,
+    new AbortController().signal,
+  );
+  const scope = await activity.run(new AbortController().signal);
+  const failure = new RemoteError(
+    'subagent/catalog-diagnostic',
+    'installed lifetime native follow failure',
+    { reason: 'unavailable' },
+  );
+  native.catalog.beforeFollow = async () => {
+    throw failure;
+  };
+  const stream = scope
+    .stream(
+      {
+        scopeId: selected.scopeId,
+        endpoint: 'session/follow',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
+          },
+        },
+      },
+      new AbortController().signal,
+    )
+    [Symbol.asyncIterator]();
+  await expect(stream.next()).rejects.toMatchObject({
+    code: failure.code,
+    message: failure.message,
+    details: failure.details,
+  });
+  const unhandled: unknown[] = [];
+  const observe = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', observe);
+  try {
+    f.lifetime.abort(); // Exercise the installer callback, with no close handler attached by this test yet.
+    expect(owner.revoked.aborted).toBe(true);
+    expect(() =>
+      dEntryNativeOwnerPort.resolve(
+        f.base.context,
+        f.base.identity,
+        new AbortController().signal,
+      ),
+    ).toThrow(DEntryNativeUnavailable);
+    await new Promise<void>((done) => setImmediate(done));
+    expect(unhandled).toEqual([]);
+    const closing = installed.close();
+    expect(installed.close()).toBe(closing);
+    await expect(closing).rejects.toThrow('PRINCIPAL_CHILD_JOIN_UNKNOWN');
+    const original = await closing.catch((error: unknown) => error);
+    await expect(installed.close()).rejects.toBe(original);
+    expect(f.native.close).not.toHaveBeenCalled();
+  } finally {
+    process.removeListener('unhandledRejection', observe);
+    await Promise.allSettled([installed.close(), control.drainLocal()]);
+  }
 });
 
 async function actualPrincipal(f: ReturnType<typeof fixture>) {

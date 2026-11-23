@@ -151,11 +151,13 @@ export async function openNativeWebOwner(input: {
             );
         })(),
       ]);
-      if (
-        scopes.status === 'rejected' ||
-        results.some((r) => r.status === 'rejected')
-      )
-        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      const failures = [scopes, ...results].flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length)
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError(failures, 'Native owner cleanup failed'),
+        });
     });
     ready = false;
     principals.fence(new PersonVmError('LEASE_LOST'));

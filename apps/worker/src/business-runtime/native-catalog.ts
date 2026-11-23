@@ -231,7 +231,7 @@ export function installDEntryNativeCatalog(input: {
   try {
     uninstall = installDEntryNativeOwnerPort(assembly.port);
   } catch (error) {
-    void assembly.close();
+    void assembly.close().catch(() => {});
     throw error;
   }
   const close = () => {
@@ -240,7 +240,7 @@ export function installDEntryNativeCatalog(input: {
     return assembly.close();
   };
   const abort = () => {
-    void close();
+    void close().catch(() => {});
   };
   input.lifetime.addEventListener('abort', abort, { once: true });
   if (input.lifetime.aborted) abort();

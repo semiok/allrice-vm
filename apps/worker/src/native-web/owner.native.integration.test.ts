@@ -9,6 +9,10 @@ import type { RequestContext } from '@allrice/contracts';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
+import { SessionId } from '@deepseek-ai/dsh-session';
+import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import * as PrincipalControl from '../d-entry/principal-control.js';
 import {
   PersonVmError,
   nativeWebAuthArtifact,
@@ -207,9 +211,16 @@ async function setup(
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
   });
-  cleanup.push(() => owner.close());
+  let expectedCloseFailure: unknown;
+  cleanup.push(async () => {
+    if (expectedCloseFailure === undefined) await owner.close();
+    else await expect(owner.close()).rejects.toBe(expectedCloseFailure);
+  });
   return {
     owner,
+    expectCloseFailure(error: unknown) {
+      expectedCloseFailure = error;
+    },
     principalProfile,
     startup,
     lifetime,
@@ -1106,5 +1117,130 @@ it.skipIf(!cli)(
     release.resolve();
     expect(await opening).toMatchObject({ code: 'PROVIDER_FAILED' });
     expect(cancel).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.skipIf(!cli)(
+  'owner close保留真实control的native错误链及并存cleanup原因，等待实际job收尾并复用失败memo',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    // This boundary test routes the real control to the public S1 fixture so its
+    // native catalog can deterministically fail. Other manual cases cover the
+    // actual same-Host/Peer installation; the owner job and its cleanup stay real.
+    const native = await hostFixture(),
+      create = PrincipalControl.createDEntryPrincipalControl,
+      cancelEntered = latch(),
+      cancelRelease = latch(),
+      cleanupFailure = Error('actual joined job cleanup diagnostic');
+    vi.spyOn(
+      PrincipalControl,
+      'createDEntryPrincipalControl',
+    ).mockImplementation((_root, input) => create(native.node, input));
+    let cancel: MockInstance<PersonVmManagedJob['cancelAndWait']> | undefined;
+    let closing: Promise<unknown> | undefined;
+    let nativeClosed = false,
+      holdCancel = false;
+    cleanup.push(async () => {
+      cancelRelease.resolve();
+      await Promise.allSettled([closing]);
+      if (!nativeClosed) await native.close();
+    });
+    const f = await setup((scope) => {
+      const launch = scope.launch.bind(scope);
+      vi.spyOn(scope, 'launch').mockImplementation(async (...args) => {
+        const job = await launch(...args),
+          actual = job.cancelAndWait.bind(job);
+        cancel = vi
+          .spyOn(job, 'cancelAndWait')
+          .mockImplementation(async (...request) => {
+            await actual(...request);
+            if (!holdCancel) return;
+            cancelEntered.resolve();
+            await cancelRelease.promise;
+            throw cleanupFailure;
+          });
+        return job;
+      });
+    });
+    cleanup.push(async () => {
+      cancelRelease.resolve();
+      await Promise.allSettled([closing]);
+    });
+    const activity = f.owner.acquirePrincipal(
+      native.selected,
+      new AbortController().signal,
+    );
+    const scope = await activity.run(new AbortController().signal);
+    const failure = new RemoteError(
+      'subagent/catalog-diagnostic',
+      'owner boundary native setup failure',
+      { reason: 'unavailable' },
+    );
+    native.catalog.beforeFollow = async () => {
+      throw failure;
+    };
+    const stream = scope
+      .stream(
+        {
+          scopeId: native.selected.scopeId,
+          endpoint: 'session/follow',
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: SessionId('root') },
+            },
+          },
+        },
+        new AbortController().signal,
+      )
+      [Symbol.asyncIterator]();
+    await expect(stream.next()).rejects.toMatchObject({
+      code: failure.code,
+      message: failure.message,
+      details: failure.details,
+    });
+    let settled = false;
+    holdCancel = true;
+    closing = f.owner
+      .close()
+      .catch((error: unknown) => error)
+      .finally(() => {
+        settled = true;
+      });
+    try {
+      await cancelEntered.promise;
+      await f.exited;
+      await new Promise<void>((done) => setImmediate(done));
+      expect(settled).toBe(false);
+      expect(f.kills()).toBe(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      cancelRelease.resolve();
+    }
+    const outcome = await closing;
+    f.expectCloseFailure(outcome);
+    expect(outcome).toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+      cause: expect.any(AggregateError),
+    });
+    const reasons: unknown[] = [];
+    function collect(error: unknown) {
+      if (reasons.includes(error)) return;
+      reasons.push(error);
+      if (error instanceof AggregateError) error.errors.forEach(collect);
+      if (error instanceof Error && error.cause) collect(error.cause);
+    }
+    collect(outcome);
+    expect(reasons).toContainEqual(
+      expect.objectContaining({
+        code: failure.code,
+        message: failure.message,
+        details: failure.details,
+      }),
+    );
+    expect(reasons).toContain(cleanupFailure);
+    await expect(f.owner.close()).rejects.toBe(outcome);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    await native.close();
+    nativeClosed = true;
   },
 );
