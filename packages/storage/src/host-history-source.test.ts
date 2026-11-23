@@ -135,6 +135,24 @@ describe('committed host history source', () => {
     expect((await store.read(f.b, signal()))!.digest).toBe(
       f.manifest.sessions[0]!.snapshotDigest,
     );
+    const older = (await f.sources.read(f.key, signal(), {
+      nativeSessionId: f.b.nativeSessionId,
+      snapshotDigest: f.manifest.sessions[0]!.snapshotDigest,
+    }))!;
+    expect(older.manifest).toEqual(f.manifest);
+    const unpublished = await f.raw.publish(f.snapshot(f.b, 2), signal());
+    await expect(
+      f.sources.read(f.key, signal(), {
+        nativeSessionId: f.b.nativeSessionId,
+        snapshotDigest: unpublished,
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    await expect(
+      f.sources.read(f.key, signal(), {
+        nativeSessionId: 'other-session',
+        snapshotDigest: longer,
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
   });
   it('persists/reopens immutable original facts and rejects replacement config', async () => {
     const f = await fixture();

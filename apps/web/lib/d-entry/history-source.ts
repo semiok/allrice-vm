@@ -21,7 +21,11 @@ import { DEntryDependencyUnavailable } from './release-policy';
 export function createColdHistorySource(input: {
   sources: HostHistorySourceStore;
   signal: AbortSignal;
+  /** Existing parseDEntryHistoryRequest output, before the first resolution.
+   * A requested digest selects a committed cut; it never grants authority. */
+  selection?: Readonly<{ nativeSessionId: string; snapshotDigest?: string }>;
 }) {
+  const selection = input.selection && { ...input.selection };
   const closed = new AbortController();
   const operations = new Set<Promise<unknown>>();
   let selected: Promise<CommittedHostHistorySource> | undefined;
@@ -29,12 +33,15 @@ export function createColdHistorySource(input: {
   let caller: string | undefined;
   let authority: AbortSignal | undefined;
   let closing: Promise<void> | undefined;
+  let accepting = true;
   const fail = (): never => {
     throw new DataAccessError('authorization_denied');
   };
   const check = (signal: AbortSignal) =>
     AbortSignal.any([input.signal, closed.signal, signal]);
   const own = <T>(work: () => Promise<T>): Promise<T> => {
+    if (!accepting)
+      return Promise.reject(new DataAccessError('authorization_denied'));
     const operation = Promise.resolve().then(work);
     operations.add(operation);
     void operation.then(
@@ -110,6 +117,7 @@ export function createColdHistorySource(input: {
       return own(async () => {
         const active = check(signal);
         active.throwIfAborted();
+        if (selection && selection.nativeSessionId !== nativeSessionId) fail();
         const identity = root.identity;
         if (
           !identity.threadId ||
@@ -152,11 +160,23 @@ export function createColdHistorySource(input: {
             rootBindingRef: root.rootBindingRef,
             vmId: root.vmId,
           };
-          selected = input.sources.read(key, active).then((source) => {
-            active.throwIfAborted();
-            if (!source) throw new DEntryDependencyUnavailable('native-route');
-            return source;
-          });
+          selected = input.sources
+            .read(
+              key,
+              active,
+              selection?.snapshotDigest
+                ? {
+                    nativeSessionId: selection.nativeSessionId,
+                    snapshotDigest: selection.snapshotDigest,
+                  }
+                : undefined,
+            )
+            .then((source) => {
+              active.throwIfAborted();
+              if (!source)
+                throw new DEntryDependencyUnavailable('native-route');
+              return source;
+            });
         }
         const source = await readSelection(active);
         const row = source.manifest.sessions.find(
@@ -182,11 +202,12 @@ export function createColdHistorySource(input: {
         };
       });
     },
-    /** Compose with the existing closeAuthority; downloads retain that owner
-     * through real body EOF/cancel/error. Abort is followed by actual I/O join. */
+    /** A successful EOF releases authority without revoking its completed body.
+     * Pending work is still aborted and actually joined; new work is refused. */
     close() {
       return (closing ??= (async () => {
-        closed.abort();
+        accepting = false;
+        if (operations.size) closed.abort();
         await Promise.allSettled([...operations]);
       })());
     },

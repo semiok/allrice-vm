@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -7,17 +7,37 @@ import type {
   HostHistoryBinding,
   HostHistorySnapshot,
   HostHistoryStorePort,
+  HostHistoryPage,
   RequestContext,
+  StorageObject,
 } from '@allrice/contracts';
+import { makeObjectKey } from '@allrice/contracts';
+import type * as Database from '@allrice/database';
 import { DataAccessError, type DEntryHistoryRootPin } from '@allrice/database';
 import {
   HostHistoryStore,
   hostHistoryDigest,
   HostHistoryIntegrityError,
   HostHistorySourceStore,
+  LocalStorageAdapter,
   type HostHistorySource,
 } from '@allrice/storage';
 import { createColdHistorySource } from './history-source';
+import {
+  createDEntryHistoryHandlers,
+  parseDEntryHistoryRequest,
+} from './history';
+import type { DEntryHistoryAttachmentPort } from './history-download';
+
+const authority = vi.hoisted(() => ({
+  identity: vi.fn(),
+  generation: vi.fn(),
+}));
+vi.mock('./identity', () => ({ resolveDEntryIdentity: authority.identity }));
+vi.mock('@allrice/database', async (original) => ({
+  ...(await original<typeof Database>()),
+  getSessionExecutionGeneration: authority.generation,
+}));
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -74,6 +94,8 @@ async function fixture() {
     sessionId: randomUUID(),
     actor: { id: b.personId, type: 'user' },
   } as RequestContext;
+  authority.identity.mockResolvedValue(pin.identity);
+  authority.generation.mockResolvedValue('4.0');
   const header = {
     id: 'root',
     version: 4 as const,
@@ -129,7 +151,190 @@ async function fixture() {
   };
 }
 
+async function contentFixture() {
+  const f = await fixture();
+  const bytes = new TextEncoder().encode('nonempty committed attachment');
+  const object: StorageObject = {
+    id: randomUUID(),
+    organizationId: f.b.organizationId,
+    workspaceId: f.b.workspaceId,
+    ownerId: f.b.personId,
+    key: '',
+    checksum: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+    sizeBytes: bytes.byteLength,
+    mediaType: 'text/plain',
+    immutable: true,
+    deletedAt: null,
+    retentionUntil: null,
+  };
+  object.key = makeObjectKey({
+    organizationId: object.organizationId,
+    workspaceId: object.workspaceId,
+    ownerId: object.ownerId,
+    category: 'exports',
+    objectId: object.id,
+  });
+  const objects = new LocalStorageAdapter(join(f.root, 'objects'));
+  await objects.put(object, new Blob([bytes]).stream());
+  const attachment = {
+    sourceSeq: 0,
+    objectId: object.id,
+    checksum: object.checksum,
+    sizeBytes: object.sizeBytes,
+    mediaType: object.mediaType,
+    fileName: 'history.txt',
+  };
+  const snapshot = (count: number): HostHistorySnapshot => ({
+    ...f.snapshot(count),
+    entries: Array.from({ length: count }, (_, seq) => ({
+      kind: 'message',
+      seq,
+      time: seq,
+      role: 'user',
+      text: `original-${seq}`,
+      interrupted: false,
+    })),
+    attachments: [attachment],
+  });
+  f.manifest.sessions[0]!.snapshotDigest = await f.raw.publish(
+    snapshot(3),
+    signal(),
+  );
+  await f.sources.publish(f.manifest, signal());
+  const owner = {
+    object,
+    revoked: signal(),
+    reauthorize: vi.fn(async (active: AbortSignal) => {
+      active.throwIfAborted();
+      return object;
+    }),
+    open: vi.fn(async (active: AbortSignal) => {
+      active.throwIfAborted();
+      return objects.get(object);
+    }),
+    close: vi.fn(async () => undefined),
+  };
+  const files: DEntryHistoryAttachmentPort = {
+    spoolDirectory: join(f.root, 'spool'),
+    acquire: vi.fn(async (_context, _id, active) => {
+      active.throwIfAborted();
+      return owner;
+    }),
+  };
+  const request = (params: Record<string, string | number> = {}) => {
+    const query = new URLSearchParams({
+      workspaceId: f.b.workspaceId,
+      employeeInstanceId: f.b.employeeInstanceId,
+      threadId: f.b.threadId,
+      nativeSessionId: f.b.nativeSessionId,
+    });
+    for (const [key, value] of Object.entries(params))
+      query.set(key, String(value));
+    return new Request(`https://allrice.example/history?${query}`);
+  };
+  const compose = (request: Request, method: 'history' | 'download') => {
+    const scope = createColdHistorySource({
+      sources: f.sources,
+      signal: request.signal,
+      selection: parseDEntryHistoryRequest(request, method),
+    });
+    const close = vi.fn(() => scope.close());
+    const handlers = createDEntryHistoryHandlers({
+      context: async () => f.context,
+      binding: scope.binding,
+      store: scope.store,
+      files,
+      resources: {
+        resolve: (_identity, id, active) =>
+          scope.resolveColdResource(f.context, f.pin, id, active),
+      },
+      closeAuthority: close,
+    });
+    return {
+      scope,
+      close,
+      async serve() {
+        const response = await handlers[method](request);
+        if (method !== 'download' || response.status !== 200 || !response.body)
+          await close();
+        return response;
+      },
+    };
+  };
+  return {
+    ...f,
+    bytes,
+    object,
+    owner,
+    files,
+    request,
+    compose,
+    snapshot,
+    digest: f.manifest.sessions[0]!.snapshotDigest,
+  };
+}
+
 describe('request-owned cold history composition', () => {
+  it('joins a nonempty successful attachment EOF without aborting its completed authority signal', async () => {
+    const f = await contentFixture();
+    const composed = f.compose(
+      f.request({ snapshotDigest: f.digest, objectId: f.object.id }),
+      'download',
+    );
+    const response = await composed.serve();
+    expect(response.status).toBe(200);
+    await expect(response.arrayBuffer()).resolves.toEqual(f.bytes.buffer);
+    expect(composed.close).toHaveBeenCalledTimes(1);
+    expect(f.owner.close).toHaveBeenCalledTimes(1);
+    await expect(
+      composed.scope.resolveColdResource(f.context, f.pin, 'root', signal()),
+    ).rejects.toBeDefined();
+  });
+  it('reopens the original committed page cursor and attachment after a newer checkpoint, refusing unpublished digests', async () => {
+    const f = await contentFixture();
+    const first = await f.compose(f.request({ limit: 1 }), 'history').serve();
+    expect(first.status).toBe(200);
+    const page = (await first.json()) as HostHistoryPage;
+    expect(page.nextCursor).toEqual({ snapshotDigest: f.digest, afterSeq: 0 });
+    const nextDigest = await f.raw.publish(f.snapshot(4), signal());
+    const next = structuredClone(f.manifest);
+    next.sessions[0]!.snapshotDigest = nextDigest;
+    await f.sources.publish(next, signal());
+    const old = await f
+      .compose(f.request({ ...page.nextCursor!, limit: 1 }), 'history')
+      .serve();
+    expect(old.status).toBe(200);
+    const continued = (await old.json()) as HostHistoryPage;
+    expect(continued.snapshotDigest).toBe(f.digest);
+    expect(continued.entries.map((entry) => entry.seq)).toEqual([1]);
+    expect(continued.source.throughSeq).toBe(2);
+    const downloaded = await f
+      .compose(
+        f.request({ snapshotDigest: f.digest, objectId: f.object.id }),
+        'download',
+      )
+      .serve();
+    expect(downloaded.status).toBe(200);
+    await expect(downloaded.arrayBuffer()).resolves.toEqual(f.bytes.buffer);
+    const fresh = await f.compose(f.request(), 'history').serve();
+    expect(((await fresh.json()) as HostHistoryPage).snapshotDigest).toBe(
+      nextDigest,
+    );
+    const unpublished = await f.raw.publish(f.snapshot(5), signal());
+    for (const method of ['history', 'download'] as const) {
+      const response = await f
+        .compose(
+          f.request({
+            snapshotDigest: unpublished,
+            ...(method === 'download' ? { objectId: f.object.id } : {}),
+          }),
+          method,
+        )
+        .serve();
+      expect(response.status).toBe(409);
+    }
+    expect(f.files.acquire).toHaveBeenCalledTimes(1);
+  });
   it('reads a stopped/absent VM entirely from committed host files and original config', async () => {
     const f = await fixture();
     await f.sources.publish(f.manifest, signal());

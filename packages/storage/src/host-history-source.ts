@@ -243,8 +243,16 @@ export class HostHistorySourceStore {
   async read(
     keyInput: HostHistorySourceKey,
     signal: AbortSignal,
+    requestedSnapshot?: Readonly<{
+      nativeSessionId: string;
+      snapshotDigest: string;
+    }>,
   ): Promise<CommittedHostHistorySource | null> {
     const key = HostHistorySourceKeySchema.parse(keyInput);
+    const requested = requestedSnapshot && {
+      nativeSessionId: ref.parse(requestedSnapshot.nativeSessionId),
+      snapshotDigest: ChecksumSchema.parse(requestedSnapshot.snapshotDigest),
+    };
     signal.throwIfAborted();
     const directory = this.directory(key);
     let names: string[];
@@ -285,6 +293,17 @@ export class HostHistorySourceStore {
       for (const previous of candidates)
         compare(manifest, previous.manifest, snapshots, previous.snapshots);
       candidates.push({ manifest, snapshots });
+      // Still validate/compare every committed vector. A browser digest may
+      // only select a manifest that actually committed this exact member.
+      if (
+        requested &&
+        !manifest.sessions.some(
+          (row) =>
+            row.binding.nativeSessionId === requested.nativeSessionId &&
+            row.snapshotDigest === requested.snapshotDigest,
+        )
+      )
+        continue;
       if (selected) {
         const direction = compare(
           manifest,
@@ -299,6 +318,7 @@ export class HostHistorySourceStore {
       selectedSnapshots = snapshots;
     }
     signal.throwIfAborted();
+    if (requested && !selected) fail();
     if (selected) this.verified.add(selected);
     return selected;
   }
