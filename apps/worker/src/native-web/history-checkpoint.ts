@@ -118,7 +118,7 @@ export async function checkpointNativeHistory(input: {
   const root = bindings.find(
     (binding) => binding.nativeSessionId === key.rootNativeSessionId,
   );
-  const fail = (): never => {
+  const fail: () => never = () => {
     throw new HostHistoryIntegrityError();
   };
   if (
