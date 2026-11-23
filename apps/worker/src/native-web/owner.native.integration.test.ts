@@ -1137,12 +1137,12 @@ it.skipIf(!cli)(
       'createDEntryPrincipalControl',
     ).mockImplementation((_root, input) => create(native.node, input));
     let cancel: MockInstance<PersonVmManagedJob['cancelAndWait']> | undefined;
-    let closing: Promise<unknown> | undefined;
+    const pendingCloses: Promise<unknown>[] = [];
     let nativeClosed = false,
       holdCancel = false;
     cleanup.push(async () => {
       cancelRelease.resolve();
-      await Promise.allSettled([closing]);
+      await Promise.allSettled(pendingCloses);
       if (!nativeClosed) await native.close();
     });
     const f = await setup((scope) => {
@@ -1164,7 +1164,7 @@ it.skipIf(!cli)(
     });
     cleanup.push(async () => {
       cancelRelease.resolve();
-      await Promise.allSettled([closing]);
+      await Promise.allSettled(pendingCloses);
     });
     const activity = f.owner.acquirePrincipal(
       native.selected,
@@ -1179,20 +1179,19 @@ it.skipIf(!cli)(
     native.catalog.beforeFollow = async () => {
       throw failure;
     };
-    const stream = scope
-      .stream(
-        {
-          scopeId: native.selected.scopeId,
-          endpoint: 'session/follow',
-          args: {
-            request: {
-              address: { kind: 'session', sessionId: SessionId('root') },
-            },
+    const follow = scope.stream(
+      {
+        scopeId: native.selected.scopeId,
+        endpoint: 'session/follow',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
           },
         },
-        new AbortController().signal,
-      )
-      [Symbol.asyncIterator]();
+      },
+      new AbortController().signal,
+    );
+    const stream = follow[Symbol.asyncIterator]();
     await expect(stream.next()).rejects.toMatchObject({
       code: failure.code,
       message: failure.message,
@@ -1200,12 +1199,13 @@ it.skipIf(!cli)(
     });
     let settled = false;
     holdCancel = true;
-    closing = f.owner
+    const closing = f.owner
       .close()
       .catch((error: unknown) => error)
       .finally(() => {
         settled = true;
       });
+    pendingCloses.push(closing);
     try {
       await cancelEntered.promise;
       await f.exited;

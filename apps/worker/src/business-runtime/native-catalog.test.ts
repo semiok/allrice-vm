@@ -473,20 +473,19 @@ it('the installed lifetime observes a real control child unknown without changin
   native.catalog.beforeFollow = async () => {
     throw failure;
   };
-  const stream = scope
-    .stream(
-      {
-        scopeId: selected.scopeId,
-        endpoint: 'session/follow',
-        args: {
-          request: {
-            address: { kind: 'session', sessionId: SessionId('root') },
-          },
+  const follow = scope.stream(
+    {
+      scopeId: selected.scopeId,
+      endpoint: 'session/follow',
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: SessionId('root') },
         },
       },
-      new AbortController().signal,
-    )
-    [Symbol.asyncIterator]();
+    },
+    new AbortController().signal,
+  );
+  const stream = follow[Symbol.asyncIterator]();
   await expect(stream.next()).rejects.toMatchObject({
     code: failure.code,
     message: failure.message,
