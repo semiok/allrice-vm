@@ -1153,8 +1153,8 @@ it.skipIf(!cli)(
         cancel = vi
           .spyOn(job, 'cancelAndWait')
           .mockImplementation(async (...request) => {
-            await actual(...request);
-            if (!holdCancel) return;
+            const result = await actual(...request);
+            if (!holdCancel) return result;
             cancelEntered.resolve();
             await cancelRelease.promise;
             throw cleanupFailure;
@@ -1174,7 +1174,11 @@ it.skipIf(!cli)(
     const failure = new RemoteError(
       'subagent/catalog-diagnostic',
       'owner boundary native setup failure',
-      { reason: 'unavailable' },
+      {
+        parentSessionId: SessionId('root'),
+        childSessionId: SessionId('child'),
+        reason: 'unavailable',
+      },
     );
     native.catalog.beforeFollow = async () => {
       throw failure;

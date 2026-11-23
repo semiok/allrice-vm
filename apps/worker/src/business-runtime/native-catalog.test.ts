@@ -57,6 +57,11 @@ function fixture() {
       ok: true as const,
       value: base.catalog,
     })),
+    readModelCatalogFor: vi.fn<NativeWebOwner['readModelCatalogFor']>(
+      async () => {
+        throw new DEntryNativeUnavailable();
+      },
+    ),
     retireAfterNativeStop: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
   };
@@ -468,7 +473,11 @@ it('the installed lifetime observes a real control child unknown without changin
   const failure = new RemoteError(
     'subagent/catalog-diagnostic',
     'installed lifetime native follow failure',
-    { reason: 'unavailable' },
+    {
+      parentSessionId: SessionId('root'),
+      childSessionId: SessionId('child'),
+      reason: 'unavailable',
+    },
   );
   native.catalog.beforeFollow = async () => {
     throw failure;
