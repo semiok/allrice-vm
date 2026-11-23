@@ -34,7 +34,7 @@ export function createColdHistorySource(input: {
   let authority: AbortSignal | undefined;
   let closing: Promise<void> | undefined;
   let accepting = true;
-  const fail = (): never => {
+  const fail: () => never = () => {
     throw new DataAccessError('authorization_denied');
   };
   const check = (signal: AbortSignal) =>
