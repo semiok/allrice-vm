@@ -63,7 +63,7 @@ export async function openNativeWebOwner(input: {
     );
     return operation;
   }
-  function setup<T>(work: () => Promise<T>): Promise<T> {
+  function setup<T>(work: () => PromiseLike<T>): Promise<T> {
     signal.throwIfAborted();
     return own(
       Promise.resolve().then(() => {
