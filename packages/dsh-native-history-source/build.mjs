@@ -1,9 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import {
   cpSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -34,8 +36,9 @@ execFileSync(
 // rc.2 recognizes Remote identity only from a registered protocol project.
 // Use unchanged published public declaration bytes as analyzer-only sources;
 // never author a protocol declaration/model/descriptor or alter native runtime.
-const scratch = mkdtempSync(join(tmpdir(), 'allrice-history-typert-'));
+const createdScratch = mkdtempSync(join(tmpdir(), 'allrice-history-typert-'));
 try {
+  const scratch = realpathSync(createdScratch);
   const protocol = dirname(
     require.resolve('@deepseek-ai/dsh-typert-protocol/package.json'),
   );
@@ -50,18 +53,19 @@ try {
   const source = join(protocolRoot, 'src');
   // The eight files are the public index/type export's relative declaration
   // closure in locked rc.2. Their contents remain byte-for-byte published.
-  const names = readdirSync(declared).sort();
+  const names = readdirSync(declared)
+    .filter((name) => name.endsWith('.d.ts'))
+    .sort();
   if (
     names.join(',') !==
     'index.d.ts,json-value.d.ts,owned-value.d.ts,principal.d.ts,remote-access.d.ts,remote-error.d.ts,remote-info.d.ts,types.d.ts'
   )
     throw new Error('HISTORY_PROTOCOL_DECLARATIONS_CHANGED');
-  cpSync(declared, source, { recursive: true });
+  mkdirSync(source, { recursive: true });
   cpSync(join(protocol, 'package.json'), join(protocolRoot, 'package.json'));
   for (const name of names) {
     const bytes = readFileSync(join(declared, name));
     writeFileSync(join(source, name.replace(/\.d\.ts$/, '.ts')), bytes);
-    rmSync(join(source, name));
   }
   symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
   symlinkSync(
@@ -112,5 +116,5 @@ try {
     { ...artifact, packageRoot: 'packages/dsh-native-history-source' },
   ]);
 } finally {
-  rmSync(scratch, { recursive: true, force: true });
+  rmSync(createdScratch, { recursive: true, force: true });
 }
