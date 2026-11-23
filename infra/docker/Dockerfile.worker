@@ -10,6 +10,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY apps/worker/package.json apps/worker/package.json
 COPY packages/browser-control/package.json packages/browser-control/package.json
 COPY packages/contracts/package.json packages/contracts/package.json
+COPY packages/d-entry-principal/package.json packages/d-entry-principal/package.json
 COPY packages/dsh-native-history-source/package.json packages/dsh-native-history-source/package.json
 COPY packages/egress-gateway/package.json packages/egress-gateway/package.json
 COPY packages/model-gateway/package.json packages/model-gateway/package.json
