@@ -10,6 +10,10 @@ import type {
   DEntryOwnedActivity,
 } from '@allrice/database';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
+import {
+  assertDEntryPrincipalIssueForOwner,
+  createDEntryPrincipalChildren,
+} from './principal-activity.js';
 import type { parseDEntryNativeInvocation } from './native-invocation.js';
 
 export type DEntryNativeInvocation = Awaited<
@@ -87,6 +91,8 @@ export function ownDEntryCatalog(
   signal: AbortSignal,
 ) {
   const abort = new AbortController();
+  const lifetime = AbortSignal.any([signal, abort.signal, owner.revoked]);
+  const principalChildren = createDEntryPrincipalChildren(lifetime);
   const reads = new Set<
     ReturnType<ResolvedDEntryNativeOwner['readSessions']>
   >();
@@ -99,6 +105,14 @@ export function ownDEntryCatalog(
     revoked: owner.revoked,
     controlReady: owner.controlReady.bind(owner),
     assertCurrent: owner.assertCurrent.bind(owner),
+    acquirePrincipal(context, issue, caller) {
+      assertDEntryPrincipalIssueForOwner(issue, owner);
+      return principalChildren.acquire({
+        signal: caller,
+        assertCurrent: (active) => owner.assertCurrent(context, active),
+        acquire: (active) => owner.acquirePrincipal(context, issue, active),
+      });
+    },
     readSessions(caller) {
       const current = AbortSignal.any([
         signal,
@@ -128,14 +142,18 @@ export function ownDEntryCatalog(
     owner: scoped,
     close() {
       if (closing) return closing;
-      abort.abort();
-      closing = (async () => {
-        await Promise.allSettled([...reads]);
+      closing = Promise.resolve().then(async () => {
+        const [principals] = await Promise.allSettled([
+          principalChildren.close(),
+          ...reads,
+        ]);
+        if (principals.status === 'rejected') failures.push(principals.reason);
         if (failures.length)
           throw new AggregateError(failures, 'Catalog read join is unknown', {
             cause: failures[0],
           });
-      })();
+      });
+      abort.abort();
       return closing;
     },
   };

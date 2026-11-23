@@ -7,6 +7,11 @@ import {
 } from '@allrice/database';
 import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
 import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
+import { createDEntryPrincipalChildren } from '../d-entry/principal-activity.js';
+import type {
+  DEntryPrincipalActivity,
+  DEntryPrincipalIssue,
+} from '@allrice/d-entry-principal/types';
 import {
   DEntryNativeUnavailable,
   dEntryOwnerViewSchema,
@@ -38,6 +43,10 @@ export type PublishedNativeCatalog = Readonly<{
   owner: Readonly<{
     revoked: AbortSignal;
     controlReady(): boolean;
+    acquirePrincipal(
+      issue: DEntryPrincipalIssue,
+      signal: AbortSignal,
+    ): DEntryPrincipalActivity;
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
@@ -78,6 +87,7 @@ export function createDEntryNativeCatalogPort(input: {
   const stopped = new AbortController();
   const lifetime = AbortSignal.any([input.lifetime, stopped.signal]);
   const pending = new Set<Promise<unknown>>();
+  const principalChildren = createDEntryPrincipalChildren(lifetime);
   let closing: Promise<void> | undefined;
   function own<T>(work: () => Promise<T>): Promise<T> {
     if (lifetime.aborted) return Promise.reject(lifetime.reason);
@@ -168,6 +178,16 @@ export function createDEntryNativeCatalogPort(input: {
               context = who;
             });
           },
+          acquirePrincipal(who, issue, caller) {
+            if (!sameDEntryIdentity(issue.identity, identity)) deny();
+            return principalChildren.acquire({
+              signal: AbortSignal.any([caller, revoked]),
+              async assertCurrent(active) {
+                await current(who, active);
+              },
+              acquire: (active) => owner.owner.acquirePrincipal(issue, active),
+            });
+          },
           readSessions(reading: AbortSignal) {
             return own(async () => {
               const who = context;
@@ -186,9 +206,15 @@ export function createDEntryNativeCatalogPort(input: {
     port,
     close() {
       if (closing) return closing;
+      // Publish before abort callbacks can reenter this same wrapper.
+      closing = Promise.resolve().then(async () => {
+        const [principals] = await Promise.allSettled([
+          principalChildren.close(),
+          ...pending,
+        ]);
+        if (principals.status === 'rejected') throw principals.reason;
+      });
       stopped.abort(new DEntryNativeUnavailable());
-      // Await actual guards/SQL/native reads; this does not close the shared VM.
-      closing = Promise.allSettled([...pending]).then(() => {});
       return closing;
     },
   };

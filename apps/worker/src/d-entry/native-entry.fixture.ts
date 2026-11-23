@@ -16,7 +16,10 @@ import {
 import { dEntryNativePrewarmPort } from './native-prewarm.js';
 import { createDEntryMuxHandler } from './mux.js';
 import type { DEntryNativeDataPort } from './native-data.js';
-import type { ResolvedDEntryNativeOwner } from './native-owner.js';
+import {
+  DEntryNativeUnavailable,
+  type ResolvedDEntryNativeOwner,
+} from './native-owner.js';
 export { WebSocket } from 'ws';
 
 export function deferred<T>() {
@@ -139,6 +142,12 @@ export function nativeEntryFixture(preset?: {
     bindingRef: 'fixture-exact-native-owner',
     revoked: revoked.signal,
     controlReady: () => true,
+    // Discovery/RPC consumer double has no issued principal source. Refuse it explicitly.
+    acquirePrincipal: vi.fn<ResolvedDEntryNativeOwner['acquirePrincipal']>(
+      () => {
+        throw new DEntryNativeUnavailable();
+      },
+    ),
     assertCurrent: vi.fn(async () => {}),
     readSessions: vi.fn(async () => ({ ok: true as const, value: catalog })),
   };

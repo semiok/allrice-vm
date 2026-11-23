@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import type { DEntryIdentity } from '@allrice/contracts';
+import { readDEntryPrincipalHostArtifact } from '../d-entry/principal-artifact.js';
 import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { posix } from 'node:path';
@@ -23,6 +25,13 @@ export type NativeWebConfiguration = Readonly<{
   workdir: string;
   cliPath: string;
   startupTimeoutMs: number;
+  principalProfile: Pick<
+    DEntryIdentity,
+    | 'workspaceId'
+    | 'employeeInstanceId'
+    | 'employeeRevision'
+    | 'employeeVersionId'
+  >;
 }>;
 export type NativeWebLaunch = Readonly<{
   binding: PersonVmBinding;
@@ -69,6 +78,8 @@ export async function prepareNativeWebLaunch(
   )
     throw new PersonVmError('PROVIDER_FAILED');
   const directory = `${config.dshHome}/native-web`;
+  const principalPlugin = `${directory}/current-principal.mjs`;
+  const principalSource = await readDEntryPrincipalHostArtifact();
   const plugin = `${directory}/owner.mjs`,
     patch = `${directory}/owner.patch.json`;
   const source = await readFile(
@@ -80,6 +91,7 @@ export async function prepareNativeWebLaunch(
     auth,
     files: Object.freeze([
       { path: plugin, contents: source, mode: 0o600 },
+      { path: principalPlugin, contents: principalSource, mode: 0o600 },
       {
         path: patch,
         contents: JSON.stringify([
@@ -95,6 +107,15 @@ export async function prepareNativeWebLaunch(
           },
           {
             insert: [
+              {
+                id: 'allrice-current-principal',
+                name: `file://${principalPlugin}`,
+                config: {
+                  profile: config.principalProfile,
+                  binding,
+                  moduleBase: config.cliPath,
+                },
+              },
               {
                 id: 'allrice-native-web-owner',
                 name: `file://${plugin}`,

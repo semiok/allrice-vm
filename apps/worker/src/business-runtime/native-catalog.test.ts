@@ -4,6 +4,13 @@ import type { RequestContext } from '@allrice/contracts';
 import type * as Database from '@allrice/database';
 import { DataAccessError } from '@allrice/database';
 import type { NativeWebOwner } from '../native-web/owner.js';
+import { SessionId } from '@deepseek-ai/dsh-session';
+import {
+  hostFixture,
+  issue as principalIssue,
+} from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
+import { ownDEntryCatalog } from '../d-entry/native-data.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -38,6 +45,9 @@ function fixture() {
     binding: base.binding,
     revoked: base.revoked.signal,
     controlReady: vi.fn(() => true),
+    acquirePrincipal: vi.fn<NativeWebOwner['acquirePrincipal']>(() => {
+      throw new DEntryNativeUnavailable();
+    }),
     readSessions: vi.fn<NativeWebOwner['readSessions']>(async () => ({
       ok: true as const,
       value: base.catalog,
@@ -417,4 +427,228 @@ it('lifetime abort uninstalls synchronously and revokes previously issued discov
     dEntryNativeOwnerPort.resolve(f.base.context, f.base.identity, signal),
   ).toThrow(DEntryNativeUnavailable);
   expect(f.native.close).not.toHaveBeenCalled();
+});
+
+async function actualPrincipal(f: ReturnType<typeof fixture>) {
+  // Use the formal public rc.2 Host/Peer/codec/control fixture, never a resolved helper scope.
+  const selected = { ...principalIssue(), identity: f.base.identity };
+  const native = await hostFixture(selected);
+  cleanups.push(native.close);
+  const control = createDEntryPrincipalControl(native.node, {
+    carrier: new AbortController().signal,
+    cleanupTimeoutMs: 1000,
+  });
+  cleanups.push(() => control.close());
+  f.native.acquirePrincipal.mockImplementation((issue, signal) =>
+    control.acquire(issue, signal),
+  );
+  return { selected, native, control };
+}
+
+it('真实catalog+request两层先登记惰性child，同原现权前后复核；request close只join本页，另一页仍可读', async () => {
+  const f = fixture(),
+    real = await actualPrincipal(f),
+    owner = await f.resolve();
+  const first = ownDEntryCatalog(owner, new AbortController().signal);
+  const second = ownDEntryCatalog(owner, new AbortController().signal);
+  cleanups.push(second.close, first.close);
+  const otherIssue = { ...real.selected, scopeId: randomUUID() };
+  const one = first.owner.acquirePrincipal(
+    f.base.context,
+    real.selected,
+    new AbortController().signal,
+  );
+  const two = second.owner.acquirePrincipal(
+    f.base.context,
+    otherIssue,
+    new AbortController().signal,
+  );
+  const list = vi.spyOn(real.native.catalog, 'list');
+  expect(list).not.toHaveBeenCalled();
+  const oneScope = await one.run(new AbortController().signal),
+    twoScope = await two.run(new AbortController().signal);
+  expect(oneScope.opened.baseline.owner).toBe(false);
+  expect(twoScope.opened.baseline.owner).toBe(false);
+  await first.close();
+  expect(oneScope.revoked.aborted).toBe(true);
+  expect(twoScope.revoked.aborted).toBe(false);
+  await expect(one.run(new AbortController().signal)).rejects.toThrow(
+    'PRINCIPAL_SCOPE_CLOSED',
+  );
+  expect(
+    await twoScope.invoke(
+      {
+        scopeId: otherIssue.scopeId,
+        endpoint: 'session/page',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
+            throughSeq: 0,
+          },
+        },
+      },
+      new AbortController().signal,
+    ),
+  ).toMatchObject({ endpoint: 'session/page' });
+  expect(f.native.close).not.toHaveBeenCalled();
+  expect(f.native.retireAfterNativeStop).not.toHaveBeenCalled();
+  await second.close();
+});
+
+it('两层消费正式I1：request close等待真实session/follow setup read，禁止late follow/item且不毒另一页', async () => {
+  const f = fixture(),
+    real = await actualPrincipal(f),
+    owner = await f.resolve();
+  const first = ownDEntryCatalog(owner, new AbortController().signal),
+    second = ownDEntryCatalog(owner, new AbortController().signal);
+  cleanups.push(second.close, first.close);
+  const otherIssue = { ...real.selected, scopeId: randomUUID() };
+  const one = first.owner.acquirePrincipal(
+    f.base.context,
+    real.selected,
+    new AbortController().signal,
+  );
+  const two = second.owner.acquirePrincipal(
+    f.base.context,
+    otherIssue,
+    new AbortController().signal,
+  );
+  const oneScope = await one.run(new AbortController().signal),
+    twoScope = await two.run(new AbortController().signal);
+  const entered = deferred<void>(),
+    release = deferred<void>();
+  cleanups.push(async () => {
+    release.resolve();
+  });
+  let readJoined = false;
+  real.native.catalog.beforeList = async () => {
+    entered.resolve();
+    await release.promise;
+    readJoined = true;
+  };
+  const streamSource = oneScope.stream(
+    {
+      scopeId: real.selected.scopeId,
+      endpoint: 'session/follow',
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: SessionId('root') },
+        },
+      },
+    },
+    new AbortController().signal,
+  );
+  const stream = streamSource[Symbol.asyncIterator]();
+  const pending = stream.next();
+  void pending.catch(() => {});
+  await entered.promise;
+  let closed = false;
+  const closing = first.close().then(() => {
+    closed = true;
+  });
+  void closing.catch(() => {});
+  await new Promise<void>((done) => setImmediate(done));
+  expect(readJoined).toBe(false);
+  expect(closed).toBe(false);
+  expect(real.native.catalog.follows).toHaveLength(0);
+  release.resolve();
+  await closing;
+  await expect(pending).rejects.toBeDefined();
+  expect(readJoined).toBe(true);
+  expect(real.native.catalog.follows).toHaveLength(0);
+  real.native.catalog.beforeList = undefined;
+  expect(twoScope.revoked.aborted).toBe(false);
+  expect(
+    await twoScope.invoke(
+      {
+        scopeId: otherIssue.scopeId,
+        endpoint: 'session/page',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
+            throughSeq: 0,
+          },
+        },
+      },
+      new AbortController().signal,
+    ),
+  ).toMatchObject({ endpoint: 'session/page' });
+  expect(f.native.close).not.toHaveBeenCalled();
+});
+
+it('两层消费正式I3：post-open原现权自拒绝主动关闭真实child，保原错误，另一活动可继续且无shared close', async () => {
+  const f = fixture(),
+    real = await actualPrincipal(f),
+    owner = await f.resolve();
+  const first = ownDEntryCatalog(owner, new AbortController().signal),
+    second = ownDEntryCatalog(owner, new AbortController().signal);
+  cleanups.push(second.close, first.close);
+  const otherIssue = { ...real.selected, scopeId: randomUUID() };
+  const other = second.owner.acquirePrincipal(
+    f.base.context,
+    otherIssue,
+    new AbortController().signal,
+  );
+  const otherScope = await other.run(new AbortController().signal);
+  const denied = new DataAccessError('authorization_denied');
+  let checks = 0;
+  authority.identity.mockImplementation(async () => {
+    if (++checks === 3) throw denied; // request-pre, catalog-pre, then catalog-post after actual opened.
+    return f.base.identity;
+  });
+  const original = f.native.acquirePrincipal.getMockImplementation();
+  if (!original)
+    throw Error('actual principal acquisition not installed in test');
+  let joined: Promise<void> | undefined;
+  f.native.acquirePrincipal.mockImplementation((issue, signal) => {
+    const child = original(issue, signal),
+      run = child.run.bind(child),
+      close = child.close.bind(child);
+    vi.spyOn(child, 'run').mockImplementation(async (active) => {
+      const scope = await run(active);
+      await scope.invoke(
+        {
+          scopeId: issue.scopeId,
+          endpoint: 'session/page',
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: SessionId('root') },
+              throughSeq: 0,
+            },
+          },
+        },
+        active,
+      );
+      return scope;
+    });
+    vi.spyOn(child, 'close').mockImplementation(() => (joined = close()));
+    return child;
+  });
+  const activity = first.owner.acquirePrincipal(
+    f.base.context,
+    real.selected,
+    new AbortController().signal,
+  );
+  await expect(activity.run(new AbortController().signal)).rejects.toBe(denied);
+  await first.close();
+  expect(joined).toBeDefined();
+  await joined;
+  expect(real.native.catalog.pages[0]?.signal.aborted).toBe(true);
+  expect(f.native.close).not.toHaveBeenCalled();
+  expect(otherScope.revoked.aborted).toBe(false);
+  expect(
+    await otherScope.invoke(
+      {
+        scopeId: otherIssue.scopeId,
+        endpoint: 'session/page',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
+            throughSeq: 0,
+          },
+        },
+      },
+      new AbortController().signal,
+    ),
+  ).toMatchObject({ endpoint: 'session/page' });
 });
