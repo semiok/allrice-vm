@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
+import { DataAccessError } from '@allrice/database';
 import {
   hostFixture,
   issue,
@@ -42,6 +43,7 @@ type ProfileProof = {
   directory: string;
   graph: unknown;
   read(reference: string, signal: AbortSignal): Promise<Uint8Array>;
+  beforeGraphRead?: (signal: AbortSignal) => Promise<void>;
 };
 
 async function fixture(release?: ProfileProof) {
@@ -79,6 +81,7 @@ async function fixture(release?: ProfileProof) {
       fixedProfile: {
         revoked: profileSource.signal,
         async readImmutableGraph(signal) {
+          await release.beforeGraphRead?.(signal);
           signal.throwIfAborted();
           return release.graph;
         },
@@ -110,6 +113,11 @@ async function fixture(release?: ProfileProof) {
     release?.directory,
   );
   const worker = createServer(async (request, response) => {
+    if (request.url === '/fixture-before-profile') {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.write('unrelated handler still running');
+      return;
+    }
     if (await profile.handle(request, response)) return;
     if (!(await rpc.handle(request, response))) response.writeHead(404).end();
   });
@@ -443,7 +451,8 @@ it(
     );
     // This runs the released app profile builder and actual non-owner Cordis
     // Peer. Only the VM receipt/current PostgreSQL lease is fixture-owned.
-    const f = await fixture({ directory, graph, read });
+    const ownerProof: ProfileProof = { directory, graph, read };
+    const f = await fixture(ownerProof);
     const { peer, receive, scopeId } = await open(f);
     const address = await f.publish('bootstrap', scopeId, {}, 'document');
     expect(address.status).toBe(200);
@@ -543,10 +552,9 @@ it(
     );
     const foreground = await open(f);
     const waiting = await open(f);
-    const pipeline = await pipelineAfterEvents(
-      foreground.scopeId,
-      waiting.scopeId,
-    );
+    const pipeline = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: waiting.scopeId,
+    });
     const [active, queuedAsset, queuedDenial, next] = pipeline.responses;
     for (const item of [queuedAsset!, queuedDenial!, next!]) {
       expect(item.socket).toBeNull();
@@ -582,6 +590,98 @@ it(
     );
     pipeline.client.destroy();
 
+    const noNotification = await open(f);
+    const afterRoleChange = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: noNotification.scopeId,
+      onlyAsset: true,
+    });
+    const [roleHead, roleAsset, roleNext] = afterRoleChange.responses;
+    expect(roleAsset!.socket).toBeNull();
+    // The authoritative lookup now denies B. Its watcher has not sent any
+    // cancellation signal. The HTTP writer must read again after its turn.
+    f.owner.assertCurrent.mockRejectedValueOnce(
+      new DataAccessError('authorization_denied'),
+    );
+    roleHead!.end();
+    await expect
+      .poll(() => afterRoleChange.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
+    expect(roleAsset!.getHeader('content-length')).toBe('0');
+    expect(roleNext!.writableFinished).toBe(true);
+    expect((await f.invoke(noNotification.scopeId)).status).toBe(404);
+    expect((await f.invoke(foreground.scopeId)).status).toBe(200);
+    afterRoleChange.client.destroy();
+
+    const beforeHeaders = await open(f);
+    const assigned = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: beforeHeaders.scopeId,
+      onlyAsset: true,
+    });
+    const [assignHead, assignedAsset, assignedNext] = assigned.responses;
+    const checking = deferred();
+    const finishCheck = deferred();
+    closes.push(async () => finishCheck.resolve());
+    f.owner.assertCurrent.mockImplementationOnce(async () => {
+      checking.resolve();
+      await finishCheck.promise;
+    });
+    assignHead!.end();
+    await checking.promise;
+    expect(assignedAsset!.socket).not.toBeNull();
+    expect(assignedAsset!.headersSent).toBe(false);
+    const rejected = beforeHeaders.receive();
+    closePage(beforeHeaders.peer);
+    await expect
+      .poll(async () => (await f.invoke(beforeHeaders.scopeId)).status)
+      .toBe(404);
+    expect(assignedAsset!.headersSent).toBe(false);
+    expect(assignedNext!.headersSent).toBe(false);
+    finishCheck.resolve();
+    expect(await rejected).toMatchObject({ value: { type: 'closed' } });
+    await expect
+      .poll(() => assigned.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
+    expect(assignedAsset!.getHeader('content-length')).toBe('0');
+    expect(assignedNext!.writableFinished).toBe(true);
+    assigned.client.destroy();
+
+    const reading = await open(f);
+    const readingGraph = deferred();
+    const finishRead = deferred();
+    closes.push(async () => finishRead.resolve());
+    const preRead = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: reading.scopeId,
+      onlyAsset: true,
+      beforeQueued: () => {
+        ownerProof.beforeGraphRead = async () => {
+          ownerProof.beforeGraphRead = undefined;
+          readingGraph.resolve();
+          await finishRead.promise;
+        };
+      },
+      beforeNext: () => readingGraph.promise,
+    });
+    const [readHead, preReadAsset, preReadNext] = preRead.responses;
+    await readingGraph.promise;
+    expect(preReadAsset!.listenerCount('socket')).toBe(0);
+    closePage(reading.peer);
+    await expect
+      .poll(async () => (await f.invoke(reading.scopeId)).status)
+      .toBe(404);
+    finishRead.resolve();
+    expect(await reading.receive()).toMatchObject({
+      value: { type: 'closed' },
+    });
+    expect(preReadAsset!.getHeader('content-length')).toBe('0');
+    expect(readHead!.writableEnded).toBe(false);
+    expect(preReadNext!.headersSent).toBe(false);
+    readHead!.end();
+    await expect
+      .poll(() => preRead.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
+    expect(preRead.raw()).not.toContain('UNAVAILABLE');
+    preRead.client.destroy();
+
     const draining = await pipelineAfterEvents(foreground.scopeId);
     const held = holdSocket(draining.responses[0]!);
     let terminal: Awaited<ReturnType<typeof receive>> | undefined;
@@ -605,12 +705,19 @@ it(
     const firstResponse = await f.publish('bootstrap', second.scopeId);
     expect(firstResponse.status).toBe(200);
     await firstResponse.json();
-    const errors = await pipelineAfterEvents(second.scopeId, undefined, true);
+    const errors = await pipelineAfterEvents(second.scopeId, { errors: true });
     expect(
       errors.responses
         .slice(1)
         .every((r) => r.socket === null && !r.headersSent),
     ).toBe(true);
+    const unrelated = await pipelineAfterEvents(second.scopeId, {
+      unrelated: true,
+    });
+    const [unrelatedHead, unrelatedDenial] = unrelated.responses;
+    const unrelatedFinish = once(unrelatedDenial!, 'finish');
+    expect(unrelatedDenial!.socket).toBeNull();
+    expect(unrelatedDenial!.headersSent).toBe(false);
     const heldErrors = holdSocket(errors.responses[0]!);
     let joined = false;
     const stopping = f.closeProfile().then(() => {
@@ -620,7 +727,17 @@ it(
     expect(joined).toBe(false);
     heldErrors.release.resolve();
     await heldErrors.closed;
+    expect(unrelatedDenial!.writableFinished).toBe(false);
+    expect(unrelatedHead!.writableEnded).toBe(false);
+    expect(joined).toBe(false);
+    unrelatedHead!.end();
+    await unrelatedFinish;
     await stopping;
+    expect(unrelated.raw()).toContain('unrelated handler still running');
+    await expect
+      .poll(() => unrelated.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404']);
+    unrelated.client.destroy();
     expect(await pending).toBe(true);
     closePage(peer);
     expect(await receive()).toMatchObject({ value: { type: 'closed' } });
@@ -650,8 +767,21 @@ it(
 
     async function pipelineAfterEvents(
       id: string,
-      awaitingId?: string,
-      errors = false,
+      {
+        awaitingId,
+        errors = false,
+        unrelated = false,
+        onlyAsset = false,
+        beforeQueued,
+        beforeNext,
+      }: {
+        awaitingId?: string;
+        errors?: boolean;
+        unrelated?: boolean;
+        onlyAsset?: boolean;
+        beforeQueued?: () => void;
+        beforeNext?: () => Promise<void>;
+      } = {},
     ) {
       const worker = f.worker.address() as AddressInfo;
       const client = createConnection({ host: '127.0.0.1', port: worker.port });
@@ -671,14 +801,27 @@ it(
       const serialize = (url: URL, headers = '') =>
         `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
       try {
-        client.write(serialize(events));
+        const head = unrelated
+          ? new URL('/fixture-before-profile', events)
+          : events;
+        client.write(serialize(head));
         await expect.poll(() => body.split('\r\n')[0]).toBe('HTTP/1.1 200 OK');
-        await expect.poll(() => body.includes('text/event-stream')).toBe(true);
-        if (errors) {
+        await expect
+          .poll(() =>
+            body.includes(
+              unrelated
+                ? 'unrelated handler still running'
+                : 'text/event-stream',
+            ),
+          )
+          .toBe(true);
+        if (unrelated || errors) {
           const invalid = new URL(events);
           invalid.searchParams.append('scopeId', id);
-          client.write(serialize(events) + serialize(invalid));
-          await expect.poll(() => responses.length).toBe(3);
+          client.write(
+            (unrelated ? '' : serialize(events)) + serialize(invalid),
+          );
+          await expect.poll(() => responses.length).toBe(unrelated ? 2 : 3);
         } else if (awaitingId) {
           const asset = f.profileUrl('assets', awaitingId, {
             bindingRef,
@@ -689,14 +832,20 @@ it(
           const invalid = new URL(asset);
           invalid.searchParams.set('path', 'managed/absent.js');
           const document = f.profileUrl('bootstrap', id);
+          beforeQueued?.();
           client.write(
             serialize(asset, 'x-allrice-profile-request: static\r\n') +
-              serialize(invalid, 'x-allrice-profile-request: static\r\n') +
-              serialize(document, 'x-allrice-profile-request: document\r\n'),
+              (onlyAsset
+                ? ''
+                : serialize(invalid, 'x-allrice-profile-request: static\r\n')),
           );
-          await expect.poll(() => responses.length).toBe(4);
+          await beforeNext?.();
+          client.write(
+            serialize(document, 'x-allrice-profile-request: document\r\n'),
+          );
+          await expect.poll(() => responses.length).toBe(onlyAsset ? 3 : 4);
         }
-        for (const queued of responses.slice(1))
+        for (const queued of responses.slice(beforeNext ? 2 : 1))
           await expect.poll(() => queued.listenerCount('socket')).toBe(1);
       } finally {
         f.worker.off('request', observed);

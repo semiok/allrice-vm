@@ -104,7 +104,8 @@ export function createDEntryProfile(
           : path === '/internal/d-entry/profile/events'
             ? 'events'
             : undefined;
-    if (!operation) return Promise.resolve(false);
+    if (!operation || lifetime.signal.aborted || serviceSignal.aborted)
+      return Promise.resolve(false);
     const running = handle();
     track(running);
     return running;
@@ -118,7 +119,11 @@ export function createDEntryProfile(
         serviceSignal,
         disconnected.signal,
       ]);
-      async function writeOwned(active: AbortSignal, write: () => void) {
+      async function writeOwned(
+        active: AbortSignal,
+        write: () => void,
+        verify?: () => Promise<void>,
+      ) {
         const { socket } = request;
         if (response.writableFinished || response.closed || socket.closed)
           return false;
@@ -161,10 +166,9 @@ export function createDEntryProfile(
           closed();
           return false;
         }
-        if (active.aborted && !response.socket) {
-          // No page output reached Node. Transfer only an empty, order-
-          // preserving denial to the service; the earlier response can keep
-          // writing. The service owns this framing until finish/socket close.
+        const refuse = () => {
+          // No page output reached this response. Hand only an empty,
+          // order-preserving denial to the service and retain the actual wire.
           track(wire);
           response.writeHead(404, {
             'cache-control': 'private, no-store',
@@ -172,7 +176,26 @@ export function createDEntryProfile(
           });
           response.end();
           return false;
+        };
+        if (active.aborted && !response.headersSent) return refuse();
+        try {
+          if (verify) await verify();
+        } catch (error) {
+          if (socket.closed || response.closed) {
+            closed();
+            return false;
+          }
+          if (active.aborted && !response.headersSent) return refuse();
+          // The writer still owns no response. Its page callback will deliver
+          // the classified error under this same borrowed lifetime.
+          closed();
+          throw error;
         }
+        if (socket.closed || response.closed) {
+          closed();
+          return false;
+        }
+        if (active.aborted && !response.headersSent) return refuse();
         // Once a fixed-length response has started, only transport closure
         // can both stop its bytes and avoid corrupting HTTP/1.1 framing.
         const abort = () => {
@@ -196,21 +219,32 @@ export function createDEntryProfile(
         headers: Record<string, string>,
         write: () => void,
         status = 200,
+        verify?: () => Promise<void>,
       ) {
-        return writeOwned(active, () => {
-          response.writeHead(status, {
-            'cache-control': 'private, no-store',
-            ...headers,
-          });
-          write();
-        });
+        return writeOwned(
+          active,
+          () => {
+            response.writeHead(status, {
+              'cache-control': 'private, no-store',
+              ...headers,
+            });
+            write();
+          },
+          verify,
+        );
       }
-      function json(active: AbortSignal, value: unknown, status = 200) {
+      function json(
+        active: AbortSignal,
+        value: unknown,
+        status = 200,
+        verify?: () => Promise<void>,
+      ) {
         return send(
           active,
           { 'content-type': 'application/json' },
           () => response.end(JSON.stringify(value)),
           status,
+          verify,
         );
       }
       function busy(active: AbortSignal) {
@@ -283,21 +317,32 @@ export function createDEntryProfile(
                 throw new DataAccessError('not_found');
               const held = await publication(page, active);
               const { release } = held;
-              await release.assertCurrent(active).catch((error) => {
-                if (!active.aborted) page.invalidate(error);
-                throw error;
-              });
+              async function verifyRelease() {
+                await release.assertCurrent(active).catch((error) => {
+                  if (!active.aborted) page.invalidate(error);
+                  throw error;
+                });
+              }
+              async function verify() {
+                await verifyRelease();
+                await page.assertCurrent(active);
+              }
+              await verifyRelease();
               if (operation === 'bootstrap') {
                 if (mode === 'document') {
-                  await page.assertCurrent(active);
-                  await json(active, {
-                    ...DEntryProfileAddressSchema.parse({
-                      bindingRef: page.bindingRef,
-                      graphRev: release.graph.rev,
-                      manifestSha256: release.manifestSha256,
-                    }),
-                    nativeSessionId: page.root.rootNativeSessionId,
-                  });
+                  await json(
+                    active,
+                    {
+                      ...DEntryProfileAddressSchema.parse({
+                        bindingRef: page.bindingRef,
+                        graphRev: release.graph.rev,
+                        manifestSha256: release.manifestSha256,
+                      }),
+                      nativeSessionId: page.root.rootNativeSessionId,
+                    },
+                    200,
+                    verify,
+                  );
                   return;
                 }
                 if (held.bootstrap !== 'available') {
@@ -342,8 +387,8 @@ export function createDEntryProfile(
                       },
                     ],
                   });
-                  await page.assertCurrent(active);
-                  if (await json(active, body)) held.bootstrap = 'sent';
+                  if (await json(active, body, 200, verify))
+                    held.bootstrap = 'sent';
                 } finally {
                   if (held.bootstrap === 'sending')
                     held.bootstrap = 'available';
@@ -357,7 +402,6 @@ export function createDEntryProfile(
                 }
                 held.events = true;
                 try {
-                  await page.assertCurrent(active);
                   await send(
                     active,
                     { 'content-type': 'text/event-stream; charset=utf-8' },
@@ -365,6 +409,8 @@ export function createDEntryProfile(
                       response.write(
                         `data: ${JSON.stringify({ type: 'graph', graph: release.graph })}\n\n`,
                       ),
+                    200,
+                    verify,
                   );
                 } finally {
                   held.events = false;
@@ -393,7 +439,6 @@ export function createDEntryProfile(
                   page.invalidate(error);
                 throw error;
               }
-              await page.assertCurrent(active);
               await send(
                 active,
                 {
@@ -402,9 +447,10 @@ export function createDEntryProfile(
                   'x-content-type-options': 'nosniff',
                 },
                 () => response.end(asset.data),
+                200,
+                verify,
               );
             } catch (error) {
-              if (active.aborted) throw error;
               await writeOwned(active, () =>
                 sendDEntryHttpProblem(response, error),
               );
@@ -424,8 +470,13 @@ export function createDEntryProfile(
     handle: service,
     close() {
       if (closing) return closing;
+      closing = Promise.resolve().then(async () => {
+        // An admitted handler can move a queued denial to the wire set after
+        // observing the abort. Keep taking ownership until both are empty.
+        while (pending.size) await Promise.allSettled([...pending]);
+      });
       lifetime.abort();
-      return (closing = Promise.allSettled([...pending]).then(() => {}));
+      return closing;
     },
   };
 }
