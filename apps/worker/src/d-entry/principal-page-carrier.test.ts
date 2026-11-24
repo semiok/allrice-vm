@@ -12,6 +12,7 @@ import {
   type AddressInfo,
   type Socket,
 } from 'node:net';
+import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -42,8 +43,8 @@ import {
 
 // These loopback responses use either a fixed body length or Node's chunked
 // encoding. The TCP packets can split any of those framing boundaries.
-function observeProfileWire(socket: Socket) {
-  const chunks = on(socket, 'data', { close: ['end', 'close'] });
+function observeProfileWire(source: Readable) {
+  const chunks = on(source, 'data', { close: ['end', 'close'] });
   let pending = Buffer.alloc(0);
 
   async function receive(boundary: string) {
@@ -107,8 +108,50 @@ function observeProfileWire(socket: Socket) {
     expect(Number.isSafeInteger(Number(length))).toBe(true);
     return bytes(Number(length), 'fixed-length response body');
   }
-  return { head, chunk, body, dispose: () => chunks.return?.() };
+  async function expectEnd() {
+    let trailing = pending.length;
+    for await (const [data] of chunks) trailing += (data as Buffer).length;
+    expect(source.readableEnded).toBe(true);
+    if (trailing)
+      throw Error(`Profile socket delivered ${trailing} trailing bytes`);
+  }
+  return { head, chunk, body, expectEnd, dispose: () => chunks.return?.() };
 }
+
+it('parses split and coalesced profile responses through a clean end', async () => {
+  const packets = [
+    'HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r',
+    '\n5\r\nhe',
+    'llo\r\n0\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nwo',
+    'rldHTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n',
+  ].map((part) => Buffer.from(part));
+  const input = Readable.from(packets);
+  const wire = observeProfileWire(input);
+  const received: Buffer[] = [];
+  input.on('data', (data: Buffer) => received.push(data));
+  const chunked = await wire.head(200);
+  expect((await wire.body(chunked)).toString()).toBe('hello');
+  const fixed = await wire.head(200);
+  expect((await wire.body(fixed)).toString()).toBe('world');
+  const last = await wire.head(404);
+  expect(last.get('connection')).toBe('close');
+  expect(await wire.body(last)).toHaveLength(0);
+  await wire.expectEnd();
+  expect(received).toEqual(packets);
+});
+
+it('sees buffered and later bytes after a zero-length final response', async () => {
+  const wire = observeProfileWire(
+    Readable.from([
+      Buffer.from('HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\na'),
+      Buffer.from('b'),
+    ]),
+  );
+  expect(await wire.body(await wire.head(404))).toHaveLength(0);
+  await expect(wire.expectEnd()).rejects.toThrow(
+    'Profile socket delivered 2 trailing bytes',
+  );
+});
 
 it.each(['EOF', 'socket error'] as const)(
   'settles the actual profile wire on %s before a full header',
@@ -1135,7 +1178,7 @@ it(
     await unrelatedFinish;
     await stoppingWire;
     await unrelated.remaining(404);
-    await unrelated.disconnect();
+    await unrelated.endFromWorker();
     closePage(peer);
     expect(await receive()).toMatchObject({ value: { type: 'closed' } });
     closePage(second.peer);
@@ -1345,7 +1388,8 @@ it(
           const invalid = new URL(events);
           invalid.searchParams.append('scopeId', id);
           client.write(
-            (unrelated ? '' : serialize(events)) + serialize(invalid),
+            (unrelated ? '' : serialize(events)) +
+              serialize(invalid, unrelated ? 'Connection: close\r\n' : ''),
           );
         } else if (awaitingId) {
           const asset = subject.profileUrl('assets', awaitingId, {
@@ -1387,6 +1431,7 @@ it(
         const bodies = [];
         for (const status of statuses) {
           const headers = await wire.head(status);
+          if (unrelated) expect(headers.get('connection')).toBe('close');
           expect(headers.get('content-length')).not.toBe(
             String(largeBytes.length),
           );
@@ -1397,7 +1442,11 @@ it(
         }
         return bodies;
       }
-      return { responses, remaining, disconnect };
+      async function endFromWorker() {
+        await wire.expectEnd();
+        await closed;
+      }
+      return { responses, remaining, disconnect, endFromWorker };
     }
     function holdSocket(response: ServerResponse) {
       const socket = response.socket!;
