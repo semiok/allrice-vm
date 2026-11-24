@@ -254,6 +254,10 @@ export async function startInstalledProfile(
       LANG: 'zh_CN.UTF-8',
       DO_NOT_TRACK: '1',
       COREPACK_ENABLE_NETWORK: '0',
+      // Only the runner's package-manager cache crosses the test HOME boundary.
+      ...(process.env.COREPACK_HOME && {
+        COREPACK_HOME: process.env.COREPACK_HOME,
+      }),
     };
     const pnpmVersion = (
       await runInstalledProfilePnpm(['--version'], repoRoot, env)

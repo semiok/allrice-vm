@@ -143,7 +143,10 @@ async function fixture() {
         endpoint: 'session/page',
         payload: {
           args: {
-            request: { address: { kind: 'session', sessionId: 'root' } },
+            request: {
+              address: { kind: 'session', sessionId: 'root' },
+              throughSeq: 0,
+            },
           },
         },
         ...extra,
@@ -247,10 +250,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
     endpoint: 'session/follow',
     payload: {
       args: {
-        request: {
-          address: { kind: 'session', sessionId: 'root' },
-          throughSeq: 0,
-        },
+        request: { address: { kind: 'session', sessionId: 'root' } },
       },
     },
   });
