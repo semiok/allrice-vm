@@ -73,44 +73,20 @@ const fail = (message: string): never => {
   throw Error('Invalid native placement experiment: ' + message);
 };
 
-/** The one extra ancestor must be the test-owned host around the same app. */
-export function placementWrapperIdentity(
+// The empty stylesheet must leave the existing app and all its ancestors exact.
+export function placementRootIdentity(
   before: PanelsCausalSnapshot,
   attached: PanelsCausalSnapshot,
 ) {
-  const oldIds = new Set(before.ancestors.map((node) => node.identity));
-  const extras = attached.ancestors.filter(
-    (node) => !oldIds.has(node.identity),
+  if (!same(before.ancestors, attached.ancestors))
+    fail('ancestor identity, geometry or paint changed during attachment');
+  const body = before.ancestors.find((node) => node.tag === 'BODY');
+  const roots = before.ancestors.filter(
+    (node) => node.parentIdentity === body?.identity,
   );
-  if (extras.length !== 1) fail('not exactly one new owned ancestor');
-  const wrapper = extras[0]!;
-  const index = attached.ancestors.indexOf(wrapper);
-  const app = attached.ancestors[index - 1];
-  const oldApp = before.ancestors[index - 1];
-  if (
-    !app ||
-    !oldApp ||
-    app.identity !== oldApp.identity ||
-    app.parentIdentity !== wrapper.identity ||
-    wrapper.parentIdentity !== oldApp.parentIdentity ||
-    wrapper.tag !== 'DIV' ||
-    wrapper.className !== null ||
-    wrapper.styles.display !== 'contents' ||
-    wrapper.styles.position !== 'static' ||
-    wrapper.styles.transform !== 'none' ||
-    !same(wrapper.rect, { x: 0, y: 0, width: 0, height: 0 })
-  )
-    fail('host is not the planned identity wrapper around the same app');
-  const normalized = attached.ancestors
-    .filter((node) => node.identity !== wrapper.identity)
-    .map((node) =>
-      node.identity === app!.identity
-        ? { ...node, parentIdentity: oldApp!.parentIdentity }
-        : node,
-    );
-  if (!same(before.ancestors, normalized))
-    fail('existing ancestor geometry/clip/paint changed during attachment');
-  return wrapper.identity;
+  if (!body || roots.length !== 1 || roots[0]!.tag !== 'DIV')
+    fail('native application root identity missing');
+  return roots[0]!.identity;
 }
 
 /** Fixed viewport coordinates: only this host's known transform matrix differs.
@@ -118,7 +94,7 @@ export function placementWrapperIdentity(
 export function assertPlacementAncestors(
   transform: PanelsCausalSnapshot,
   layout: PanelsCausalSnapshot,
-  wrapperIdentity: number,
+  placementIdentity: number,
   offset: { x: number; y: number },
 ) {
   const allowed = [
@@ -126,14 +102,14 @@ export function assertPlacementAncestors(
     `matrix(1, 0, 0, 1, ${offset.x}, ${offset.y})`,
   ];
   const normalized = (value: PanelsCausalSnapshot) => {
-    const wrappers = value.ancestors.filter(
-      (node) => node.identity === wrapperIdentity,
+    const roots = value.ancestors.filter(
+      (node) => node.identity === placementIdentity,
     );
-    if (wrappers.length !== 1) fail('owned ancestor identity lost');
-    if (!allowed.includes(wrappers[0]!.styles.transform!))
+    if (roots.length !== 1) fail('owned ancestor identity lost');
+    if (!allowed.includes(roots[0]!.styles.transform!))
       fail('unplanned host transform');
     return value.ancestors.map((node) =>
-      node.identity === wrapperIdentity
+      node.identity === placementIdentity
         ? {
             ...node,
             styles: { ...node.styles, transform: '<owned placement matrix>' },

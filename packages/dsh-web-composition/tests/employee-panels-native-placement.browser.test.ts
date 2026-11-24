@@ -29,7 +29,7 @@ import {
 import {
   assertPlacementAncestors,
   classifyNativePlacementEffect,
-  placementWrapperIdentity,
+  placementRootIdentity,
 } from './employee-panels-native-placement';
 
 const suite =
@@ -132,211 +132,173 @@ async function dismissInitialNativeCatalog(page: Page, out: string) {
   );
 }
 
-// This closure owns a new DOM host only. Existing product nodes/styles are never edited.
+// Own a positioning stylesheet on the existing app root. Keep the actual
+// native nodes, their layout ancestry and the unread badge mounted throughout.
 async function nativeHost(page: Page, offset: { x: number; y: number }) {
-  return page.evaluateHandle(
-    ({ offset, nonce }) => {
-      const panel = document.querySelector('section[aria-label="Rice · 记忆"]');
-      if (!(panel instanceof HTMLElement))
-        throw Error('Missing isolated native panel');
-      const surface = panel.parentElement!;
-      let app = panel;
-      while (app.parentElement && app.parentElement !== document.body)
-        app = app.parentElement;
-      if (app.parentElement !== document.body)
-        throw Error('Missing native application root');
-      const parent = document.body,
-        next = app.nextSibling;
-      const original = {
-        app: app.getAttribute('style'),
-        surface: surface.getAttribute('style'),
-      };
-      const wrapper = document.createElement('div');
-      wrapper.dataset.nativePlacementOwner = nonce;
-      wrapper.style.display = 'contents';
-      let expectedStyle = wrapper.getAttribute('style');
-      let mode: 'identity' | 'transform' | 'layout' = 'identity';
-      const moveBefore = (destination: Element, before: Element | null) => {
-        const move: unknown = Reflect.get(destination, 'moveBefore');
-        if (typeof move !== 'function')
-          throw Error(
-            'Expected the locked browser to support state-preserving DOM moves',
-          );
-        Reflect.apply(move, destination, [app, before]);
-      };
-      const sameNodes = () => {
-        if (
-          panel.parentElement !== surface ||
-          !app.contains(surface) ||
-          app.getAttribute('style') !== original.app ||
-          surface.getAttribute('style') !== original.surface
-        )
-          throw Error('Native identity/style changed; refuse mutation');
-      };
-      const wrapped = () => {
-        sameNodes();
-        if (
-          wrapper.parentNode !== parent ||
-          app.parentNode !== wrapper ||
-          wrapper.nextSibling !== next ||
-          wrapper.childNodes.length !== 1 ||
-          wrapper.attributes.length !== 2 ||
-          wrapper.dataset.nativePlacementOwner !== nonce ||
-          wrapper.getAttribute('style') !== expectedStyle
-        )
-          throw Error('Native host ownership changed; refuse mutation');
-      };
-      const measure = () => {
-        const rect = (node: Element) => {
-          const { x, y, width, height } = node.getBoundingClientRect();
-          return { x, y, width, height };
-        };
-        const clipMetrics = [];
-        for (
-          let node: HTMLElement | null = panel.parentElement;
-          node;
-          node = node.parentElement
-        )
-          clipMetrics.push({
-            tag: node.tagName,
-            className: node.getAttribute('class'),
-            ownedWrapper: node === wrapper,
-            rect: rect(node),
-            clientLeft: node.clientLeft,
-            clientTop: node.clientTop,
-            clientWidth: node.clientWidth,
-            clientHeight: node.clientHeight,
-            scrollLeft: node.scrollLeft,
-            scrollTop: node.scrollTop,
-            scrollWidth: node.scrollWidth,
-            scrollHeight: node.scrollHeight,
-            offsetWidth: node.offsetWidth,
-            offsetHeight: node.offsetHeight,
-          });
-        const scroll = document.scrollingElement,
-          viewport = window.visualViewport;
-        return {
-          clipMetrics,
-          document: {
-            innerWidth,
-            innerHeight,
-            scrollX,
-            scrollY,
-            scrollWidth: scroll?.scrollWidth,
-            scrollHeight: scroll?.scrollHeight,
-            clientWidth: document.documentElement.clientWidth,
-            clientHeight: document.documentElement.clientHeight,
-            viewport: viewport && {
-              width: viewport.width,
-              height: viewport.height,
-              offsetLeft: viewport.offsetLeft,
-              offsetTop: viewport.offsetTop,
-              pageLeft: viewport.pageLeft,
-              pageTop: viewport.pageTop,
-              scale: viewport.scale,
-            },
-          },
-        };
-      };
-      const inspect = () => {
-        wrapped();
-        const style = getComputedStyle(wrapper);
-        const placement = {
-          display: style.display,
-          position: style.position,
-          left: style.left,
-          top: style.top,
-          transform: style.transform,
-        };
-        const x = mode === 'layout' ? offset.x : 0;
-        const y = mode === 'layout' ? offset.y : 0;
-        const tx = mode === 'transform' ? offset.x : 0;
-        const ty = mode === 'transform' ? offset.y : 0;
-        const expected =
-          mode === 'identity'
-            ? {
-                display: 'contents',
-                position: 'static',
-                left: 'auto',
-                top: 'auto',
-                transform: 'none',
-              }
-            : {
-                display: 'block',
-                position: 'relative',
-                left: `${x}px`,
-                top: `${y}px`,
-                transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
-              };
-        if (
-          JSON.stringify(placement) !== JSON.stringify(expected) ||
-          (mode === 'identity' && wrapper.getClientRects().length !== 0)
-        )
-          throw Error('Owned placement does not equal the declared mechanism');
-        return {
-          mode,
-          offset,
-          original,
-          rawStyle: expectedStyle,
-          placement,
-          metrics: measure(),
-        };
-      };
+  return page.evaluateHandle((offset) => {
+    const panel = document.querySelector('section[aria-label="Rice · 记忆"]');
+    const surface = panel?.parentElement;
+    const roots = document.querySelectorAll<HTMLElement>('body > #root');
+    const app = roots[0];
+    if (!panel || !surface || roots.length !== 1 || !app?.contains(surface))
+      throw Error('Missing isolated native application root');
+    const parent = document.body,
+      next = app.nextSibling;
+    const sheets = [...document.adoptedStyleSheets];
+    const sheet = new CSSStyleSheet();
+    let mode: 'identity' | 'transform' | 'layout' = 'identity';
+    let expectedCss = '';
+    const inputs = () => ({
+      app: app.getAttribute('style'),
+      surface: surface.getAttribute('style'),
+    });
+    const position = () => {
+      const style = getComputedStyle(app);
       return {
-        attach() {
-          sameNodes();
-          if (
-            app.parentNode !== parent ||
-            app.nextSibling !== next ||
-            wrapper.parentNode
-          )
-            throw Error('Native order changed before attachment');
-          parent.insertBefore(wrapper, app);
-          moveBefore(wrapper, null);
-          return inspect();
-        },
-        place(value: 'transform' | 'layout') {
-          wrapped();
-          wrapper.style.cssText =
-            'display:block;width:100%;height:100%;min-height:0;position:relative';
-          wrapper.style.left = `${value === 'layout' ? offset.x : 0}px`;
-          wrapper.style.top = `${value === 'layout' ? offset.y : 0}px`;
-          wrapper.style.transform = `translate(${value === 'transform' ? offset.x : 0}px,${value === 'transform' ? offset.y : 0}px)`;
-          mode = value;
-          expectedStyle = wrapper.getAttribute('style');
-          return inspect();
-        },
-        inspect,
-        restore() {
-          sameNodes();
-          if (app.parentNode === wrapper) {
-            wrapped();
-            moveBefore(parent, wrapper);
-            wrapper.remove();
-          } else if (
-            wrapper.parentNode ||
-            app.parentNode !== parent ||
-            app.nextSibling !== next
-          )
-            throw Error('Native attachment cannot be safely restored');
-          const restored =
-            app.parentNode === parent &&
-            app.nextSibling === next &&
-            !wrapper.isConnected;
-          if (!restored) throw Error('Native DOM order not restored');
-          return {
-            restored,
-            original,
-            actual: {
-              app: app.getAttribute('style'),
-              surface: surface.getAttribute('style'),
-            },
-          };
+        display: style.display,
+        position: style.position,
+        left: style.left,
+        top: style.top,
+        transform: style.transform,
+      };
+    };
+    const original = inputs(),
+      initial = position();
+    const sameNodes = () => {
+      if (
+        panel.parentElement !== surface ||
+        !app.contains(surface) ||
+        app.parentNode !== parent ||
+        app.nextSibling !== next ||
+        document.querySelector('body > #root') !== app ||
+        JSON.stringify(inputs()) !== JSON.stringify(original)
+      )
+        throw Error('Native identity, ancestry or inline style changed');
+    };
+    const sameSheets = (attached: boolean) => {
+      const expected = attached ? [...sheets, sheet] : sheets;
+      const current = document.adoptedStyleSheets;
+      if (
+        expected.length !== current.length ||
+        expected.some((value, index) => current[index] !== value)
+      )
+        throw Error('Native placement stylesheet ownership changed');
+    };
+    const measure = () => {
+      const rect = (node: Element) => {
+        const { x, y, width, height } = node.getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      const clipMetrics = [];
+      for (
+        let node: HTMLElement | null = panel.parentElement;
+        node;
+        node = node.parentElement
+      )
+        clipMetrics.push({
+          tag: node.tagName,
+          className: node.getAttribute('class'),
+          placementRoot: node === app,
+          rect: rect(node),
+          clientLeft: node.clientLeft,
+          clientTop: node.clientTop,
+          clientWidth: node.clientWidth,
+          clientHeight: node.clientHeight,
+          scrollLeft: node.scrollLeft,
+          scrollTop: node.scrollTop,
+          scrollWidth: node.scrollWidth,
+          scrollHeight: node.scrollHeight,
+          offsetWidth: node.offsetWidth,
+          offsetHeight: node.offsetHeight,
+        });
+      const scroll = document.scrollingElement,
+        viewport = window.visualViewport;
+      return {
+        clipMetrics,
+        document: {
+          innerWidth,
+          innerHeight,
+          scrollX,
+          scrollY,
+          scrollWidth: scroll?.scrollWidth,
+          scrollHeight: scroll?.scrollHeight,
+          clientWidth: document.documentElement.clientWidth,
+          clientHeight: document.documentElement.clientHeight,
+          viewport: viewport && {
+            width: viewport.width,
+            height: viewport.height,
+            offsetLeft: viewport.offsetLeft,
+            offsetTop: viewport.offsetTop,
+            pageLeft: viewport.pageLeft,
+            pageTop: viewport.pageTop,
+            scale: viewport.scale,
+          },
         },
       };
-    },
-    { offset, nonce: randomUUID() },
-  );
+    };
+    let attached = false;
+    const inspect = () => {
+      sameNodes();
+      sameSheets(true);
+      const css = Array.from(sheet.cssRules, (rule) => rule.cssText).join('\n');
+      const placement = position();
+      const x = mode === 'layout' ? offset.x : 0;
+      const y = mode === 'layout' ? offset.y : 0;
+      const tx = mode === 'transform' ? offset.x : 0;
+      const ty = mode === 'transform' ? offset.y : 0;
+      const expected =
+        mode === 'identity'
+          ? initial
+          : {
+              ...initial,
+              position: 'relative',
+              left: `${x}px`,
+              top: `${y}px`,
+              transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
+            };
+      if (
+        css !== expectedCss ||
+        JSON.stringify(placement) !== JSON.stringify(expected)
+      )
+        throw Error('Owned placement does not equal the declared mechanism');
+      return { mode, offset, original, css, placement, metrics: measure() };
+    };
+    return {
+      attach() {
+        sameNodes();
+        sameSheets(false);
+        document.adoptedStyleSheets = [...sheets, sheet];
+        attached = true;
+        return inspect();
+      },
+      place(value: 'transform' | 'layout') {
+        inspect();
+        const x = value === 'layout' ? offset.x : 0;
+        const y = value === 'layout' ? offset.y : 0;
+        const tx = value === 'transform' ? offset.x : 0;
+        const ty = value === 'transform' ? offset.y : 0;
+        sheet.replaceSync(
+          `body > #root { position: relative; left: ${x}px; top: ${y}px; transform: translate(${tx}px, ${ty}px); }`,
+        );
+        expectedCss = sheet.cssRules[0]!.cssText;
+        mode = value;
+        return inspect();
+      },
+      inspect,
+      restore() {
+        if (attached) {
+          sameSheets(true);
+          document.adoptedStyleSheets = sheets;
+          attached = false;
+        }
+        sameNodes();
+        sameSheets(false);
+        if (JSON.stringify(position()) !== JSON.stringify(initial))
+          throw Error('Native app positioning did not restore');
+        return { restored: true, original, actual: inputs() };
+      },
+    };
+  }, offset);
 }
 
 suite(
@@ -421,7 +383,7 @@ suite(
         layout: Awaited<ReturnType<typeof capture>> | undefined,
         returned: Awaited<ReturnType<typeof capture>> | undefined;
       let valid = false,
-        wrapperIdentity: number | undefined;
+        placementIdentity: number | undefined;
       const compare = (
         a: Awaited<ReturnType<typeof capture>>,
         b: Awaited<ReturnType<typeof capture>>,
@@ -750,13 +712,13 @@ suite(
         await settle(native);
         baseline = await capture(native, 'native-attached', true);
         assertCausalInvariant(original.value, baseline.value);
-        wrapperIdentity = placementWrapperIdentity(
+        placementIdentity = placementRootIdentity(
           original.value,
           baseline.value,
         );
         await save(
           'attachment-control.json',
-          unchanged(original, baseline, 'native host identity attachment'),
+          unchanged(original, baseline, 'native empty stylesheet attachment'),
         );
         for (const [label, mode] of [
           ['native-transform', 'transform'],
@@ -774,7 +736,7 @@ suite(
             assertPlacementAncestors(
               transform.value,
               current.value,
-              wrapperIdentity,
+              placementIdentity,
               offset,
             );
             expect(current.owner!.metrics).toEqual(transform.owner!.metrics);
@@ -843,7 +805,7 @@ suite(
               );
               await save(
                 'restored-control.json',
-                unchanged(original, restored, 'native exact detach'),
+                unchanged(original, restored, 'native exact stylesheet detach'),
               );
             }
           }
@@ -944,7 +906,7 @@ suite(
           pointerControl,
           valid,
           effect,
-          wrapperIdentity,
+          placementIdentity,
           phases: phaseRecords,
           captures,
           comparisons: values,
