@@ -1303,6 +1303,9 @@ suite(
             '在当前弹窗里等待核对的独立上传。',
           );
           expect([pendingId, independentId]).not.toContain(currentFormId);
+          console.info('publication-receipt-fixture-current-form', {
+            D: currentFormId,
+          });
           await formWaiting.waitFor();
           const currentDialog = await material.elementHandle();
           await withdraw('fixture-current-form-receipt-withdrawal');
@@ -1337,15 +1340,26 @@ suite(
               times: 2,
             },
           );
-          await Promise.all([receiptFailure(independentId), materials()]);
+          const [, sideD] = await Promise.all([
+            receiptFailure(independentId),
+            page.waitForResponse(receiptResponse(currentFormId), {
+              timeout: 5000,
+            }),
+            materials(),
+          ]);
+          expect(sideD.status()).toBe(200);
+          expect(await sideD.finished()).toBeNull();
+          await sideReceipt(currentFormId).waitFor();
           await sidebarRetry.waitFor();
-          await Promise.all([
+          const [, dialogD] = await Promise.all([
             receiptFailure(independentId),
             page.waitForResponse(receiptResponse(currentFormId), {
               timeout: 5000,
             }),
             openUpload(),
           ]);
+          expect(dialogD.status()).toBe(200);
+          expect(await dialogD.finished()).toBeNull();
           const modalRetry = material.getByRole('button', {
             name: '核对结果',
             exact: true,
