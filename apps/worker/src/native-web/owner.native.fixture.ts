@@ -418,7 +418,7 @@ export async function setupNativeWebFixture(
             DO_NOT_TRACK: '1',
             NPM_CONFIG_OFFLINE: 'true',
           },
-          stdio: isolateProfile ? ['ignore', 'pipe', 'pipe'] : 'ignore',
+          stdio: isolateProfile ? ['ignore', 'ignore', 'pipe'] : 'ignore',
         },
       );
       child.stderr?.setEncoding('utf8');
@@ -430,25 +430,21 @@ export async function setupNativeWebFixture(
         ))
           diagnostics.add('missing ' + missing[1]);
       });
-      if (isolated) {
-        for (const stream of [child.stdout, child.stderr]) {
-          if (!stream) continue;
-          const lines = createInterface({ input: stream });
-          lines.on('line', (line) => {
-            const visible = stripVTControlCharacters(line);
-            const start = visible.indexOf('Native web auth publication failed');
-            if (start < 0) return;
-            const message = visible.slice(start);
-            const safe =
-              !visible.includes(root) &&
-              /^Native web auth publication failed \[(readiness|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
-                message,
-              );
-            isolated.onPublicationDiagnostic?.(
-              safe ? message : '<invalid auth diagnostic>',
+      if (isolated?.onPublicationDiagnostic && child.stderr) {
+        const report = isolated.onPublicationDiagnostic;
+        const lines = createInterface({ input: child.stderr });
+        lines.on('line', (line) => {
+          const visible = stripVTControlCharacters(line);
+          const start = visible.indexOf('Native web auth publication failed');
+          if (start < 0) return;
+          const message = visible.slice(start);
+          const safe =
+            !visible.includes(root) &&
+            /^Native web auth publication failed \[(readiness|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
+              message,
             );
-          });
-        }
+          report(safe ? message : '<invalid auth diagnostic>');
+        });
       }
       exited = new Promise<{ exitCode: number; timedOut: boolean }>(
         (done, reject) => {

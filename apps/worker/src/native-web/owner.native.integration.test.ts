@@ -9,6 +9,7 @@ import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-con
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
 import {
@@ -172,12 +173,60 @@ it.skipIf(!cli)(
   '真实retire先进入：wait abort重入lifetime/close不另发cancel，完整read与I/O实际join前不成功',
   { tags: [tag], timeout: 30000 },
   async () => {
-    const f = await setup(),
-      entered = latch(),
-      release = latch(),
-      reentered = latch();
+    const entered = latch(),
+      release = latch();
+    const nativeExit = latch(),
+      socketClose = latch(),
+      deliverExit = latch();
+    const queued: (() => void)[] = [];
+    let holdingSocketEvents = true;
+    const deliverSocketEvents = () => {
+      holdingSocketEvents = false;
+      for (const deliver of queued.splice(0)) deliver();
+    };
+    const makeTransport = NativeTransport.nativeWebTransport;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        const transport = makeTransport(...args);
+        return {
+          ...transport,
+          createWebSocket(url) {
+            const wire = transport.createWebSocket(url);
+            const socket = wire as unknown as WebSocket;
+            const emit = socket.emit.bind(socket);
+            vi.spyOn(socket, 'emit').mockImplementation((event, ...args) => {
+              if (
+                !holdingSocketEvents ||
+                (event !== 'close' && event !== 'error')
+              )
+                return emit(event, ...args);
+              queued.push(() => emit(event, ...args));
+              if (event === 'close') socketClose.resolve();
+              return true;
+            });
+            return wire;
+          },
+        };
+      },
+    );
     cleanup.push(async () => {
+      deliverExit.resolve();
+      deliverSocketEvents();
       release.resolve();
+    });
+    const f = await setup((scope) => {
+      const launch = scope.launch.bind(scope);
+      scope.launch = async (command) => {
+        const job = await launch(command);
+        const wait = job.wait.bind(job);
+        vi.spyOn(job, 'wait').mockImplementation(async (active) => {
+          const exit = await wait(active);
+          nativeExit.resolve();
+          await deliverExit.promise;
+          return exit;
+        });
+        return job;
+      };
     });
     f.current.mockImplementationOnce(async () => {
       entered.resolve();
@@ -187,8 +236,6 @@ it.skipIf(!cli)(
       .readSessions(new AbortController().signal)
       .catch((error: unknown) => error);
     await entered.promise;
-    f.child.kill('SIGKILL');
-    await f.exited;
     const cancel = vi.spyOn(f.job, 'cancelAndWait');
     let closed = false,
       retired = false,
@@ -201,10 +248,14 @@ it.skipIf(!cli)(
           closed = true;
         });
         void reentrant.catch(() => {});
-        reentered.resolve();
       },
       { once: true },
     );
+    f.child.kill('SIGKILL');
+    // Hold only loss delivery. The PID, actual job wait and socket all ended
+    // before invoking the trusted stop hook; neither notification has won.
+    await Promise.all([f.exited, nativeExit.promise, socketClose.promise]);
+    expect(f.waitSignal().aborted).toBe(false);
     const retiring = f.owner
       .retireAfterNativeStop(f.owner.binding, new AbortController().signal)
       .finally(() => {
@@ -214,11 +265,16 @@ it.skipIf(!cli)(
     cleanup.push(async () => {
       await Promise.allSettled([reading, retiring, reentrant]);
     });
-    await reentered.promise; // Synchronous reentry from the actual host join.
+    expect(reentrant).toBeDefined(); // Synchronous reentry from the actual host join.
     expect(cancel).not.toHaveBeenCalled();
     expect(closed).toBe(false);
     expect(retired).toBe(false);
     expect(f.owner.controlReady()).toBe(false);
+    deliverExit.resolve();
+    deliverSocketEvents();
+    await new Promise<void>((done) => setImmediate(done));
+    expect(closed).toBe(false);
+    expect(retired).toBe(false);
     release.resolve();
     expect(await reading).toBeInstanceOf(Error);
     await Promise.all([retiring, reentrant]);
