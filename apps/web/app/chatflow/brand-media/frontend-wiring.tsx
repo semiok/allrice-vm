@@ -23,6 +23,7 @@ import {
   useModalLayer,
 } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
+  ApiErrorSchema,
   BrandMediaReadResultSchema,
   BrandMediaCandidateSchema,
   BrandMediaMutationResultSchema,
@@ -149,6 +150,28 @@ export const imageRequestId = (
   scope: BrandMediaClientScope,
   ...identity: string[]
 ) => moduleRequestId(scope, 'brand-media-image', ...identity);
+class BrandMediaRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: z.infer<typeof ApiErrorSchema>['error']['code'],
+  ) {
+    super(message);
+  }
+}
+
+function mayBeScopeDenial(cause: unknown): cause is BrandMediaRequestError {
+  return (
+    cause instanceof BrandMediaRequestError &&
+    ((cause.status === 401 && cause.code === 'AUTHENTICATION_REQUIRED') ||
+      (cause.status === 403 && cause.code === 'AUTHORIZATION_DENIED') ||
+      (cause.status === 404 && cause.code === 'RESOURCE_NOT_FOUND') ||
+      (cause.status === 409 &&
+        (cause.code === 'EMPLOYEE_INSTANCE_ARCHIVED' ||
+          cause.code === 'VERSION_CONFLICT')))
+  );
+}
+
 async function json(
   url: string,
   headers: Record<string, string>,
@@ -165,40 +188,125 @@ async function json(
   });
   const body = await response.json();
   if (!response.ok)
-    throw Error(
-      body.message ?? body.error?.message ?? '暂时无法完成，请刷新后重试。',
+    throw new BrandMediaRequestError(
+      body?.message ?? body?.error?.message ?? '暂时无法完成，请刷新后重试。',
+      response.status,
+      ApiErrorSchema.safeParse(body).data?.error.code,
     );
   return body;
 }
 type Scoped<T> = T extends unknown
   ? Omit<T, 'workspaceId' | 'instanceId'>
   : never;
-export function createBrandMediaClient(
+type OnBrandMediaRunAccepted = (
+  sessionId: string,
+  run: z.infer<typeof RunSnapshotSchema>,
+) => void;
+type BrandMediaPanelAccess = {
+  signal: AbortSignal;
+  hide: (cause: Error) => void;
+  reveal: () => void;
+  revoke: (cause: Error) => void;
+};
+type BrandMediaScopeCheck = 'enabled' | 'unavailable' | 'unknown';
+
+function brandMediaOperations(
   scope: BrandMediaClientScope,
-  onAccepted?: (
-    sessionId: string,
-    run: z.infer<typeof RunSnapshotSchema>,
-  ) => void,
+  onAccepted?: OnBrandMediaRunAccepted,
+  access?: BrandMediaPanelAccess,
 ) {
   const base = `/api/v1/employee-instances/${scope.instanceId}`,
     q = `?workspaceId=${encodeURIComponent(scope.workspaceId)}`;
+  const scopedSignal = (signal?: AbortSignal | null) =>
+    access && signal
+      ? AbortSignal.any([access.signal, signal])
+      : (access?.signal ?? signal);
+  const request = async (url: string, options?: RequestInit) => {
+    const signal = scopedSignal(options?.signal);
+    signal?.throwIfAborted();
+    const raw = await json(
+      url,
+      scope.headers,
+      signal ? { ...options, signal } : options,
+    );
+    signal?.throwIfAborted();
+    return raw;
+  };
+  const catalog = async (signal?: AbortSignal) =>
+    z
+      .object({
+        modules: z.array(
+          z.object({
+            descriptor: z.object({ id: z.string(), displayName: z.string() }),
+            binding: EmployeeModuleBindingSchema.nullable(),
+            available: z.boolean(),
+            enabled: z.boolean(),
+          }),
+        ),
+      })
+      .parse(await request(base + '/modules' + q, { signal }));
+  async function readAccess(): Promise<BrandMediaScopeCheck> {
+    try {
+      const result = await catalog();
+      const entry = result.modules.find(
+        (item) => item.descriptor.id === brandMediaModule.id,
+      );
+      if (!entry) return 'unknown';
+      return entry.enabled ? 'enabled' : 'unavailable';
+    } catch (cause) {
+      return mayBeScopeDenial(cause) && cause.code !== 'VERSION_CONFLICT'
+        ? 'unavailable'
+        : 'unknown';
+    }
+  }
+  let pendingCheck: Promise<BrandMediaScopeCheck> | undefined;
+  const checkScope = () =>
+    (pendingCheck ??= readAccess().finally(() => {
+      pendingCheck = undefined;
+    }));
+  async function readOrWriteModule(
+    query: string,
+    options?: RequestInit,
+    scopeOnly = false,
+  ) {
+    try {
+      return await request(base + '/brand-media' + query, options);
+    } catch (cause) {
+      if (
+        access &&
+        !access.signal.aborted &&
+        !options?.signal?.aborted &&
+        mayBeScopeDenial(cause)
+      ) {
+        if (
+          scopeOnly ||
+          cause.code === 'AUTHENTICATION_REQUIRED' ||
+          cause.code === 'EMPLOYEE_INSTANCE_ARCHIVED'
+        ) {
+          access.revoke(cause);
+        } else {
+          // Brand records can fail a downstream ACL with the same status.
+          // Suppress old reads while verifying the current employee's catalog.
+          if (
+            options?.method !== 'POST' &&
+            cause.code === 'AUTHORIZATION_DENIED'
+          )
+            access.hide(cause);
+          const outcome = await checkScope();
+          if (!access.signal.aborted) {
+            if (outcome === 'unavailable') access.revoke(cause);
+            if (outcome === 'enabled') access.reveal();
+          }
+        }
+      }
+      throw cause;
+    }
+  }
   return {
     scope,
-    catalog: async (signal?: AbortSignal) =>
-      z
-        .object({
-          modules: z.array(
-            z.object({
-              descriptor: z.object({ id: z.string(), displayName: z.string() }),
-              binding: EmployeeModuleBindingSchema.nullable(),
-              available: z.boolean(),
-              enabled: z.boolean(),
-            }),
-          ),
-        })
-        .parse(await json(base + '/modules' + q, scope.headers, { signal })),
+    catalog,
     add: (requestId: string) =>
-      json(base + '/modules', scope.headers, {
+      request(base + '/modules', {
         method: 'POST',
         body: JSON.stringify({
           workspaceId: scope.workspaceId,
@@ -216,7 +324,7 @@ export function createBrandMediaClient(
             typeof value === 'object' ? JSON.stringify(value) : String(value),
           );
       return BrandMediaReadResultSchema.parse(
-        await json(base + '/brand-media?' + params, scope.headers, { signal }),
+        await readOrWriteModule('?' + params, { signal }),
       );
     },
     command: async (command: Scoped<BrandMediaUserCommand>) => {
@@ -226,7 +334,7 @@ export function createBrandMediaClient(
           replayed: z.boolean(),
         })
         .parse(
-          await json(base + '/brand-media', scope.headers, {
+          await readOrWriteModule('', {
             method: 'POST',
             body: JSON.stringify({
               ...command,
@@ -245,7 +353,7 @@ export function createBrandMediaClient(
           userMessage: z.object({ sessionId: z.uuid() }),
         })
         .parse(
-          await json(base + '/brand-media', scope.headers, {
+          await readOrWriteModule('', {
             method: 'POST',
             body: JSON.stringify({
               ...intent,
@@ -254,23 +362,22 @@ export function createBrandMediaClient(
             }),
           }),
         );
+      access?.signal.throwIfAborted();
       onAccepted?.(result.userMessage.sessionId, result.run);
       return result;
     },
     runs: async (signal?: AbortSignal) =>
       runsSchema.parse(
-        await json(base + '/brand-media' + q + '&view=runs', scope.headers, {
+        await readOrWriteModule(q + '&view=runs', {
           signal,
         }),
       ),
     help: async (signal?: AbortSignal) =>
-      z.object({ content: z.string(), checksum: z.string() }).parse(
-        await json(base + '/brand-media' + q + '&view=help', scope.headers, {
-          signal,
-        }),
-      ),
+      z
+        .object({ content: z.string(), checksum: z.string() })
+        .parse(await readOrWriteModule(q + '&view=help', { signal }, true)),
     cancel: (runId: string) =>
-      json(`/api/v1/runs/${runId}/cancel${q}`, scope.headers, {
+      request(`/api/v1/runs/${runId}/cancel${q}`, {
         method: 'POST',
         body: JSON.stringify({ reason: '用户取消品牌自媒体生成' }),
       }),
@@ -278,12 +385,16 @@ export function createBrandMediaClient(
       file: NonNullable<BrandMediaArticle['body']>,
       signal?: AbortSignal,
     ) => {
+      const current = scopedSignal(signal);
+      current?.throwIfAborted();
       const response = await fetch(
         `/api/v1/files/${file.objectId}/download${q}`,
-        { headers: scope.headers, signal, cache: 'no-store' },
+        { headers: scope.headers, signal: current, cache: 'no-store' },
       );
       if (!response.ok) throw Error('正文文件暂时不可读，请重新核对权限。');
-      return response.text();
+      const text = await response.text();
+      current?.throwIfAborted();
+      return text;
     },
     references: async (
       query: string,
@@ -304,18 +415,15 @@ export function createBrandMediaClient(
           nextCursor: ReferenceSearchCursorSchema.nullable(),
         })
         .parse(
-          await json(
-            '/api/v1/references/publications?' + params,
-            scope.headers,
-            { signal },
-          ),
+          await request('/api/v1/references/publications?' + params, {
+            signal,
+          }),
         );
     },
     selectReference: async (reference: ReferenceRevision) => {
       const result = ReferenceInputSelectionResultSchema.parse(
-        await json(
+        await request(
           `/api/v1/references/revisions/${reference.revisionId}/selection${q}`,
-          scope.headers,
         ),
       );
       if (
@@ -337,9 +445,8 @@ export function createBrandMediaClient(
     ) => {
       if (reference.origin === 'reference') {
         const result = ReferenceInputSelectionResultSchema.parse(
-          await json(
+          await request(
             `/api/v1/references/revisions/${reference.revisionId}/selection${q}`,
-            scope.headers,
             { signal },
           ),
         );
@@ -353,12 +460,11 @@ export function createBrandMediaClient(
         return result.selection.fileName;
       }
       const catalog = WorkbenchDeliverablesCatalogSchema.parse(
-        await json(
+        await request(
           '/api/v1/workbench/files' +
             q +
             '&view=deliverables&objectId=' +
             reference.file.objectId,
-          scope.headers,
           { signal },
         ),
       );
@@ -376,28 +482,27 @@ export function createBrandMediaClient(
         throw Error('资料暂时不可读。');
       return file.fileName;
     },
-    upload: async (request: {
+    upload: async (input: {
       requestId: string;
       fileName: string;
       mediaType: string;
       contentBase64: string;
     }) => {
       const uploaded = z.object({ objectId: z.uuid() }).parse(
-        await json('/api/v1/workbench/files' + q, scope.headers, {
+        await request('/api/v1/workbench/files' + q, {
           method: 'POST',
           body: JSON.stringify({
-            ...request,
+            ...input,
             workspaceId: scope.workspaceId,
           }),
         }),
       );
       const catalog = WorkbenchDeliverablesCatalogSchema.parse(
-        await json(
+        await request(
           '/api/v1/workbench/files' +
             q +
             '&view=deliverables&objectId=' +
             uploaded.objectId,
-          scope.headers,
         ),
       );
       const file = catalog.files.find(
@@ -415,23 +520,25 @@ export function createBrandMediaClient(
           base64: z.string(),
         })
         .parse(
-          await json(
-            `/api/v1/workbench/files/${objectId}/preview${q}`,
-            scope.headers,
-            { signal },
-          ),
+          await request(`/api/v1/workbench/files/${objectId}/preview${q}`, {
+            signal,
+          }),
         );
       return `data:${preview.mediaType};base64,${preview.base64}`;
     },
     downloadImage: async (objectId: string) => {
+      const signal = scopedSignal();
+      signal?.throwIfAborted();
       const response = await fetch(
         `/api/v1/workbench/files/${objectId}/download${q}`,
-        { headers: scope.headers, cache: 'no-store' },
+        { headers: scope.headers, signal, cache: 'no-store' },
       );
       if (!response.ok) throw Error('原图暂时不可下载，请核对权限后重试。');
       const disposition = response.headers.get('Content-Disposition') ?? '';
       const name = disposition.split("filename*=UTF-8''")[1];
-      const url = URL.createObjectURL(await response.blob());
+      const bytes = await response.blob();
+      signal?.throwIfAborted();
+      const url = URL.createObjectURL(bytes);
       const link = document.createElement('a');
       link.href = url;
       link.download = name ? decodeURIComponent(name) : '配图.png';
@@ -440,7 +547,17 @@ export function createBrandMediaClient(
     },
   };
 }
-export type BrandMediaClient = ReturnType<typeof createBrandMediaClient>;
+export type BrandMediaClient = ReturnType<typeof brandMediaOperations>;
+export function createBrandMediaClient(
+  scope: BrandMediaClientScope,
+  onAccepted?: OnBrandMediaRunAccepted,
+) {
+  return {
+    ...brandMediaOperations(scope, onAccepted),
+    forPanel: (access: BrandMediaPanelAccess) =>
+      brandMediaOperations(scope, onAccepted, access),
+  };
+}
 /** Display metadata only. Exact pins and current ACLs remain authoritative;
  * no label is stored in the business record or reused across client scopes. */
 export function ReferenceChips({

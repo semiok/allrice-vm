@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  ApiErrorSchema,
   brandMediaRelease,
   type BrandMediaArticle,
   type BrandMediaTopic,
@@ -802,6 +803,143 @@ suite('MET-224 main-area brand media text workflow', () => {
         req.body?.operation === 'article' ||
         req.body?.operation === 'image',
     );
+
+  it('removes cached brand content on current access loss and never restores a late result or a reopened copy', async () => {
+    const f = await fixture();
+    const { page } = f;
+    function gate<T = void>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+    const lateEntered = gate();
+    const releaseLate = gate();
+    const lateFinished = gate<{ canceled: boolean; error?: unknown }>();
+    const checkEntered = gate();
+    const releaseCheck = gate();
+    const accessDenied = ApiErrorSchema.parse({
+      error: {
+        code: 'AUTHORIZATION_DENIED',
+        message: '当前员工尚未添加这个插件，或绑定已撤销。',
+        requestId: id(777),
+        retryable: false,
+      },
+    });
+    const brandView = (url: URL, view: string) =>
+      url.pathname.endsWith('/brand-media') &&
+      url.searchParams.get('view') === view;
+    const directory = (url: URL) => url.pathname.endsWith('/modules');
+    try {
+      await f.open();
+      await topicsPage(page);
+      await panel(page).getByText('新品故事 10', { exact: true }).waitFor();
+      await page.getByRole('tab', { name: '文章库', exact: true }).click();
+      await expect
+        .poll(() => page.getByLabel('文章正文').textContent())
+        .toContain('不可直接改写的正文');
+      await page.getByRole('tab', { name: '排期表', exact: true }).click();
+
+      await page.route(
+        (url) => brandView(url, 'articles'),
+        async (route) => {
+          lateEntered.resolve();
+          await releaseLate.promise;
+          try {
+            await route.fulfill({
+              json: {
+                view: 'articles',
+                items: [article(99)],
+                nextCursor: null,
+              },
+            });
+            lateFinished.resolve({ canceled: false });
+          } catch (error) {
+            lateFinished.resolve({
+              canceled:
+                route.request().failure()?.errorText === 'net::ERR_ABORTED',
+              error,
+            });
+          }
+        },
+      );
+      await page.route(
+        (url) => brandView(url, 'calendar'),
+        async (route) => {
+          await lateEntered.promise;
+          await route.fulfill({ status: 403, json: accessDenied });
+        },
+      );
+      await page.route(directory, async (route) => {
+        checkEntered.resolve();
+        await releaseCheck.promise;
+        await route.fulfill({
+          json: {
+            modules: [
+              {
+                descriptor: {
+                  id: 'allrice.brand-media',
+                  displayName: '品牌自媒体',
+                },
+                binding: { ...binding, revokedAt: stamp },
+                enabled: false,
+                available: false,
+              },
+            ],
+          },
+        });
+      });
+
+      await page.getByRole('button', { name: '下个月', exact: true }).click();
+      await checkEntered.promise;
+      await panel(page).getByRole('alert').waitFor();
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|新品故事|文章 20/,
+      );
+
+      const checked = page.waitForResponse((response) =>
+        directory(new URL(response.url())),
+      );
+      releaseCheck.resolve();
+      expect((await checked).ok()).toBe(true);
+      releaseLate.resolve();
+      const late = await lateFinished.promise;
+      if (!late.canceled && late.error) throw late.error;
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|月历里的旧文章/,
+      );
+      await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+      await page.getByRole('heading', { name: '原聊天' }).waitFor();
+      expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+        '未发送的聊天草稿',
+      );
+      await page.getByLabel('草稿附件').waitFor();
+
+      await page.route(
+        (url) => url.pathname.endsWith('/brand-media'),
+        (route) => route.fulfill({ status: 403, json: accessDenied }),
+      );
+      await page
+        .getByRole('button', { name: '打开 品牌自媒体', exact: true })
+        .click();
+      await panel(page).getByRole('alert').waitFor();
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|新品故事|月历里的旧文章/,
+      );
+      expect(
+        f.state.requests.filter((request) => request.method === 'POST'),
+      ).toHaveLength(0);
+    } finally {
+      lateEntered.resolve();
+      releaseLate.resolve();
+      releaseCheck.resolve();
+      await f.close();
+    }
+  });
 
   it('opening only the main area preserves the original draft/attachment, sidebar geometry and visible focus across all tabs', async () => {
     const f = await fixture();

@@ -33,6 +33,7 @@ import {
   useBrandMediaRunEvents,
   type BrandMediaClient,
   type BrandMediaRun,
+  type createBrandMediaClient,
 } from './frontend-wiring';
 import { Images } from './images';
 import layout from './panel.module.css';
@@ -91,17 +92,86 @@ type Scoped<T> = T extends unknown
   ? Omit<T, 'workspaceId' | 'instanceId'>
   : never;
 type NoRequest<T> = T extends unknown ? Omit<T, 'requestId'> : never;
-export function BrandMediaPanel({
-  client,
-  sessionId,
-  onReturn,
-  active = true,
-}: {
+
+type BrandMediaPanelProps = {
   client: BrandMediaClient;
   sessionId: string | null;
   onReturn: () => void;
   active?: boolean;
+};
+
+function BrandMediaAccessFeedback({
+  message,
+  onReturn,
+}: {
+  message: string;
+  onReturn: () => void;
 }) {
+  return (
+    <section className={ui.page} aria-label="品牌自媒体">
+      <header className={ui.header}>
+        <Button data-brand-return onClick={onReturn}>
+          ← 回到对话
+        </Button>
+        <strong className={ui.brand}>
+          <Tag tone="success">文</Tag>品牌自媒体
+        </strong>
+      </header>
+      <div className={`${ui.content} ${layout.content}`}>
+        <p role="alert" className={layout.feedback}>
+          {message}
+        </p>
+      </div>
+    </section>
+  );
+}
+
+export function BrandMediaPanel({
+  client,
+  ...props
+}: Omit<BrandMediaPanelProps, 'client'> & {
+  client: ReturnType<typeof createBrandMediaClient>;
+}) {
+  const [lifetime] = useState(() => new AbortController());
+  const [accessProblem, setAccessProblem] = useState<{
+    message: string;
+    revoked: boolean;
+  } | null>(null);
+  const scopedClient = useMemo(
+    () =>
+      client.forPanel({
+        signal: lifetime.signal,
+        hide: (cause) =>
+          setAccessProblem({ message: cause.message, revoked: false }),
+        reveal: () => setAccessProblem(null),
+        revoke(cause) {
+          lifetime.abort(cause);
+          setAccessProblem({ message: cause.message, revoked: true });
+        },
+      }),
+    [client, lifetime],
+  );
+  return accessProblem?.revoked ? (
+    <BrandMediaAccessFeedback
+      message={accessProblem.message}
+      onReturn={props.onReturn}
+    />
+  ) : (
+    <BrandMediaPanelContent
+      {...props}
+      client={scopedClient}
+      accessWarning={accessProblem?.message}
+    />
+  );
+}
+
+function BrandMediaPanelContent({
+  client,
+  sessionId,
+  onReturn,
+  active = true,
+  accessWarning,
+}: BrandMediaPanelProps & { accessWarning?: string }) {
   const [tab, setTab] = useState<Tab>('calendar'),
     [month, setMonth] = useState(() =>
       localDate(
@@ -175,6 +245,7 @@ export function BrandMediaPanel({
     selected?.id,
     selected?.body,
     active,
+    accessWarning,
   ]);
   const copyLifetime = useRef({
     key: copyKey,
@@ -535,6 +606,10 @@ export function BrandMediaPanel({
       {children}
     </GenerationForm>
   );
+  if (accessWarning)
+    return (
+      <BrandMediaAccessFeedback message={accessWarning} onReturn={onReturn} />
+    );
   return (
     <section className={ui.page} aria-label="品牌自媒体">
       {!(tab === 'topics' && form?.kind === 'candidates') && (

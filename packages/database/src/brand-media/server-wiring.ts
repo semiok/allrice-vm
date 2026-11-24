@@ -27,6 +27,7 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import { getDatabase } from '../core/client.ts';
+import { readContentPrincipal } from '../content-maintenance.ts';
 import { DataAccessError } from '../data.ts';
 import { workbenchOriginFileAccess } from '../workbench-file-access.ts';
 import { employeeAccessTransaction } from '../employees/employee-access-cancellation.ts';
@@ -329,13 +330,21 @@ export async function listEmployeeInstanceModules(
         brandMediaModule.id,
         false,
       );
+      const available =
+        !binding &&
+        (
+          await readContentPrincipal(
+            { ...context, workspaceId: scope.workspaceId },
+            tx,
+          )
+        )?.writable === true;
       // Static assembly, no second registration or mutable catalog authority.
       return {
         modules: [
           {
             descriptor: brandMediaModule,
             binding,
-            available: !binding,
+            available,
             enabled:
               !!binding &&
               !binding.revokedAt &&

@@ -533,6 +533,45 @@ suite(
       expect(await removed.json()).not.toHaveProperty('applicationModules');
     });
 
+    it('projects the current ability to add for the same readable employee and leaves POST to its existing gate', async () => {
+      const a = await actor();
+      await f.db`update allrice_memberships set role='viewer'
+        where organization_id=${a.context.organizationId} and user_id=${a.context.actor.id}`;
+      const get = () =>
+        catalog.GET(request(a, 'modules'), params(a.scope.instanceId));
+      const readonly = await get();
+      expect(readonly.status).toBe(200);
+      expect((await readonly.json()).modules[0]).toMatchObject({
+        binding: null,
+        available: false,
+        enabled: false,
+      });
+      const denied = await catalog.POST(
+        request(a, 'modules', installInput(a)),
+        params(a.scope.instanceId),
+      );
+      expect(denied.status).toBe(403);
+      expect(
+        await f.db`select instance_id from allrice_employee_module_bindings
+          where instance_id=${a.scope.instanceId}`,
+      ).toHaveLength(0);
+      await f.db`update allrice_memberships set role='member'
+        where organization_id=${a.context.organizationId} and user_id=${a.context.actor.id}`;
+      const writable = await get();
+      expect(writable.status).toBe(200);
+      expect((await writable.json()).modules[0]).toMatchObject({
+        binding: null,
+        available: true,
+        enabled: false,
+      });
+      const added = await install(a);
+      expect((await (await get()).json()).modules[0]).toMatchObject({
+        binding: added.binding,
+        available: false,
+        enabled: true,
+      });
+    });
+
     it('rechecks real membership after a pending build read and joins that read before refusing the late response', async () => {
       const a = await actor();
       let entered!: () => void, finish!: (value: null) => void;
