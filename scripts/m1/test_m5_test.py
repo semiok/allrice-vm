@@ -65,7 +65,22 @@ exec pnpm exec vitest "$@"
 '''
 NODE = r'''#!/bin/sh
 # Isolated stand-in for path resolution and the stray-process cleanup test.
-[ "$1" != -e ] || { printf '%s/cached Chromium\n' "$HOME"; exit 0; }
+if [ "$1" = -e ]; then
+  case "$2" in
+    *'("playwright-core").chromium.executablePath())') printf '%s/cached Chromium\n' "$HOME"; exit 0 ;;
+    'process.exit(require("./package.json").scripts?.["build:test-sources"] ? 0 : 1)')
+      exec /usr/bin/python3 -c '
+import json, sys
+try:
+    with open("package.json") as package:
+        scripts = json.load(package).get("scripts", {})
+except FileNotFoundError:
+    sys.exit(1)
+sys.exit(0 if scripts.get("build:test-sources") else 1)
+' ;;
+    *) echo 'Unexpected Node test probe' >&2; exit 2 ;;
+  esac
+fi
 sleep "$1"
 '''
 CODEX = r'''#!/bin/sh
@@ -204,6 +219,21 @@ class M5Test(unittest.TestCase):
         self.assertEqual(os.listdir(self.leases), [])  # the lease went with the run
         log = p.stdout.strip().splitlines()[-1].split('; log ')[1]
         self.assertIn('vitest says hello', read(log))
+
+    def test_default_build_uses_only_a_declared_test_sources_script(self):
+        for package, build in [
+            ('{"scripts":{"build":"node build.js"}}', '--filter @allrice/contracts build'),
+            ('{"scripts":{"build:test-sources":"node build-test.js"}}', 'build:test-sources'),
+        ]:
+            with self.subTest(build=build):
+                write(os.path.join(self.repo, 'package.json'), package)
+                self.git('add', 'package.json')
+                self.git('commit', '-qm', 'test source build fixture')
+                before = len(self.calls(self.th))
+                p = self.run_m5('--', 'sources.test.ts')
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                steps = [call[0] for call in self.calls(self.th)[before:]]
+                self.assertEqual(steps[1:], [build, 'exec vitest run sources.test.ts --maxWorkers=8'])
 
     def test_requested_workers_are_capped(self):
         self.assertEqual(self.run_m5('--', '--maxWorkers=50', 'b.test.ts').returncode, 0)
