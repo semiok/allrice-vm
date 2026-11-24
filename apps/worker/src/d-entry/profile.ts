@@ -382,9 +382,9 @@ export function createDEntryProfile(
                 throw error;
               });
             }
-            async function verify() {
+            async function verify(nativeSessionIds?: readonly string[]) {
               await verifyRelease();
-              await page.assertCurrent(active);
+              await page.assertCurrent(active, nativeSessionIds);
             }
             await verifyRelease();
             if (operation === 'bootstrap') {
@@ -410,22 +410,35 @@ export function createDEntryProfile(
               }
               const followAccess = (
                 observed?: Parameters<DEntryPageHandle['scope']['stream']>[2],
-              ) =>
-                page.scope
-                  .stream(
-                    {
-                      scopeId,
-                      endpoint: 'remoteAccess/follow',
-                      args: {},
-                    },
-                    active,
-                    observed,
-                  )
-                  [Symbol.asyncIterator]();
+              ) => {
+                const access = page.scope.stream(
+                  {
+                    scopeId,
+                    endpoint: 'remoteAccess/follow',
+                    args: {},
+                  },
+                  active,
+                  observed,
+                );
+                const iterator = access[Symbol.asyncIterator]();
+                return {
+                  iterator,
+                  async close() {
+                    try {
+                      await access.close();
+                    } catch (error) {
+                      page.invalidate(error);
+                      throw error;
+                    } finally {
+                      await iterator.return?.().catch(() => {});
+                    }
+                  },
+                };
+              };
               async function readBaseline(
-                iterator: ReturnType<typeof followAccess>,
+                reader: ReturnType<typeof followAccess>,
               ) {
-                const first = await iterator.next();
+                const first = await reader.iterator.next();
                 if (
                   first.done ||
                   first.value.scopeId !== scopeId ||
@@ -451,22 +464,31 @@ export function createDEntryProfile(
                     await verify();
                     const initialAccess = followAccess();
                     await readBaseline(initialAccess).catch(async (error) => {
-                      await initialAccess.return?.().catch(() => {});
+                      await initialAccess.close().catch(() => {});
                       throw error;
                     });
-                    await initialAccess.return?.().catch((error) => {
-                      page.invalidate(error);
-                      throw error;
-                    });
+                    await initialAccess.close();
                     // Closing the initial native reader can block while its
                     // grants change. Read from the same Peer after that join.
                     // Keep this reader owned through the actual response.
-                    latestAccess = followAccess(() => {
-                      if (firstItem) firstItem = false;
-                      else superseded = true;
+                    latestAccess = followAccess({
+                      item() {
+                        if (firstItem) firstItem = false;
+                        else superseded = true;
+                      },
+                      terminal() {
+                        superseded = true;
+                      },
                     });
                     const baseline = await readBaseline(latestAccess);
-                    await verify();
+                    const nativeSessionIds = baseline.grants.map(
+                      ({ resource }) => {
+                        if (resource.kind !== 'session')
+                          throw new DEntryNativeUnavailable();
+                        return String(resource.id);
+                      },
+                    );
+                    await verify(nativeSessionIds);
                     body = JSON.stringify(
                       DEntryProfileBootstrapSchema.parse({
                         version: 1,
@@ -491,9 +513,9 @@ export function createDEntryProfile(
                 if (sent) held.bootstrap = 'sent';
               } finally {
                 try {
-                  await latestAccess?.return?.();
-                } catch (error) {
-                  page.invalidate(error);
+                  await latestAccess?.close();
+                } catch {
+                  // The exact failed close already fenced the page.
                 }
                 if (held.bootstrap === 'sending') held.bootstrap = 'available';
               }

@@ -60,7 +60,10 @@ export type DEntryPageHandle = Readonly<{
   identity: DEntryIdentity;
   root: DEntryHistoryRootPin;
   signal: AbortSignal;
-  assertCurrent(signal: AbortSignal): Promise<void>;
+  assertCurrent(
+    signal: AbortSignal,
+    nativeSessionIds?: readonly string[],
+  ): Promise<void>;
   authorize(
     nativeSessionId: string,
     effect: 'read' | 'write',
@@ -259,10 +262,13 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             run(caller) {
               const runningSignal = AbortSignal.any([caller, lifetime]);
               running = Promise.resolve().then(async () => {
-                const authorize: DEntryPageHandle['authorize'] = async (
-                  nativeSessionId,
-                  effect,
-                  active,
+                const authorize = async (
+                  nativeSessionId: string,
+                  effect: 'read' | 'write',
+                  active: AbortSignal,
+                  checkGrants?: Parameters<
+                    typeof resolveDEntryNativeResource
+                  >[0]['checkGrants'],
                 ) => {
                   const resource = await resolveDEntryNativeResource({
                     ...auth,
@@ -270,6 +276,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     nativeSessionId,
                     signal: active,
                     root: deps.root,
+                    checkGrants,
                   });
                   if (
                     resource.rootNativeSessionId !== pin.rootNativeSessionId ||
@@ -322,17 +329,29 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   identity: auth.identity,
                   root: pin,
                   signal: lifetime,
-                  async assertCurrent(caller) {
+                  async assertCurrent(caller, nativeSessionIds) {
                     const active = AbortSignal.any([lifetime, caller]);
+                    let currentGrants = true;
                     try {
                       await assertCurrent(active);
-                      await authorize(pin.rootNativeSessionId, 'read', active);
+                      await authorize(
+                        pin.rootNativeSessionId,
+                        'read',
+                        active,
+                        nativeSessionIds && {
+                          nativeSessionIds,
+                          checked: (current) => {
+                            currentGrants = current;
+                          },
+                        },
+                      );
                     } catch (error) {
                       // A canceled finite request cannot revoke a live page.
                       if (!caller.aborted) invalidate(error);
                       throw error;
                     }
                     active.throwIfAborted();
+                    if (!currentGrants) throw new DataAccessError('not_found');
                   },
                   authorize,
                   invalidate,

@@ -302,9 +302,10 @@ export function createDEntryPrincipalControl(
                   ].result.create(),
                   (frame) => {
                     if (!current.aborted && frame.type === 'item')
-                      observed?.(frame);
+                      observed?.item(frame);
                     return true;
                   },
+                  () => observed?.terminal(),
                 );
                 children.add(child);
                 const cancelled = () => {
@@ -323,6 +324,7 @@ export function createDEntryPrincipalControl(
                 if (current.aborted) cancelled();
                 let taken = false;
                 return {
+                  close: () => child.close(),
                   async *[Symbol.asyncIterator]() {
                     if (taken) throw Error('PRINCIPAL_STREAM_ALREADY_CONSUMED');
                     taken = true;

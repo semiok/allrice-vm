@@ -12,6 +12,7 @@ import { chromium } from 'playwright-core';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { DataAccessError } from '@allrice/database';
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   hostFixture,
   issue,
@@ -100,13 +101,39 @@ async function fixture(release?: ProfileProof) {
   closes.push(() =>
     controlCloseChecked ? control.drainLocal() : control.close(),
   );
-  vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) =>
-    control.acquire(input, active),
-  );
-  vi.mocked(f.owner.readSessions).mockResolvedValue({
+  const profileObserved = vi.fn<(part: 'item' | 'terminal') => void>();
+  vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) => {
+    const activity = control.acquire(input, active);
+    return {
+      ...activity,
+      async run(signal) {
+        const scope = await activity.run(signal);
+        return {
+          ...scope,
+          stream(call, caller, observer) {
+            return scope.stream(
+              call,
+              caller,
+              observer && {
+                item(frame) {
+                  observer.item(frame);
+                  profileObserved('item');
+                },
+                terminal() {
+                  observer.terminal();
+                  profileObserved('terminal');
+                },
+              },
+            );
+          },
+        };
+      },
+    };
+  });
+  vi.mocked(f.owner.readSessions).mockImplementation(async () => ({
     ok: true,
     value: { items: host.catalog.items },
-  });
+  }));
   f.root.mockImplementation(async () => ({
     identity: f.identity,
     rootNativeSessionId: selected.root.nativeSessionId,
@@ -152,6 +179,7 @@ async function fixture(release?: ProfileProof) {
   const mux = createDEntryPageMux(pages, service.signal);
   const rpc = createDEntryPageRpc(pages, authenticate, service.signal);
   const profileBorrows = vi.fn<(active: AbortSignal) => void>();
+  const profileFailures = vi.fn<(error: unknown) => void>();
   const profilePages: typeof pages = {
     ...pages,
     borrow(token, selection, scopeId, caller, operation, failed) {
@@ -164,7 +192,11 @@ async function fixture(release?: ProfileProof) {
           profileBorrows(active);
           return operation(page, active);
         },
-        failed,
+        failed &&
+          ((error, active) => {
+            profileFailures(error);
+            return failed(error, active);
+          }),
       );
     },
   };
@@ -304,6 +336,8 @@ async function fixture(release?: ProfileProof) {
     probe,
     publish,
     profileBorrows,
+    profileObserved,
+    profileFailures,
     profileSource,
     profileUrl,
     historyIdentity,
@@ -629,18 +663,23 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
   },
 );
 
-it(
-  'rejects the second baseline when a native grant update reaches the relay during final verification',
+it.each([
+  'native update',
+  'catalog drift before any update',
+  'true terminal',
+] as const)(
+  'rejects the second baseline when final verification sees %s',
   { timeout: 30_000 },
-  async () => {
+  async (mode) => {
     const release = await buildProfileFixture();
     const f = await fixture(release);
     const page = await open(f);
     const terminal = deferred<ServerResponse>();
     const checking = deferred();
     const allowCheck = deferred();
-    const updated = deferred();
+    const finishReader = deferred();
     closes.push(async () => allowCheck.resolve());
+    closes.push(async () => finishReader.resolve());
     const wire = f.host.host.typertGateway.wireStream;
     const openNative = wire.open.bind(wire);
     let access = 0;
@@ -660,8 +699,12 @@ it(
                 await allowCheck.promise;
               };
               first = false;
-            } else updated.resolve();
+            }
             yield item;
+            if (mode === 'true terminal') {
+              await finishReader.promise;
+              return;
+            }
           }
         },
       };
@@ -673,24 +716,37 @@ it(
     void result.catch(() => {});
     try {
       await checking.promise;
-      const nativeChild = summary('child', 'root');
-      f.host.catalog.items = f.host.catalog.items.filter(
-        (row) => row.sessionId !== nativeChild.sessionId,
-      );
-      f.host.host.emit('api-session/removed', nativeChild.sessionId);
-      await updated.promise;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === 'true terminal') {
+        finishReader.resolve();
+        await expect
+          .poll(() => f.profileObserved.mock.calls)
+          .toContainEqual(['terminal']);
+      } else {
+        const nativeChild = summary('child', 'root');
+        f.host.catalog.items = f.host.catalog.items.filter(
+          (row) => row.sessionId !== nativeChild.sessionId,
+        );
+        if (mode === 'native update') {
+          f.host.host.emit('api-session/removed', nativeChild.sessionId);
+          await expect
+            .poll(() => f.profileObserved.mock.calls.length)
+            .toBeGreaterThan(1);
+        } else expect(f.profileObserved.mock.calls).toEqual([['item']]);
+      }
       expect((await terminal.promise).headersSent).toBe(false);
       expect(access).toBe(2);
     } finally {
       allowCheck.resolve();
+      finishReader.resolve();
     }
     const refused = await result;
     expect(refused.status).toBe(404);
     expect(await refused.text()).not.toContain('"id":"child"');
     const retry = await f.publish('bootstrap', page.scopeId);
     expect(retry.status).toBe(200);
-    expect(await retry.text()).not.toContain('"id":"child"');
+    const refreshed = await retry.text();
+    if (mode === 'true terminal') expect(refreshed).toContain('"id":"child"');
+    else expect(refreshed).not.toContain('"id":"child"');
   },
 );
 
@@ -749,16 +805,20 @@ it.each(['waiting to read', 'waiting for a newer projection'] as const)(
   },
 );
 
-it(
-  'fences bootstrap and later borrows when the initial native follow cannot confirm its close',
+it.each(['with baseline', 'with independent baseline failure'] as const)(
+  'fences bootstrap and later borrows when the initial native follow cannot confirm its close %s',
   { timeout: 30_000 },
-  async () => {
+  async (mode) => {
     const f = await fixture(await buildProfileFixture());
     const page = await open(f);
     const neighbor = await open(f);
     const initial = deferred();
     const failed = deferred<unknown>();
     const failure = Error('initial native follow return failed');
+    const businessError = new RemoteError(
+      'gateway/cancelled',
+      'original native access business error',
+    );
     const wire = f.host.host.typertGateway.wireStream;
     const openNative = wire.open.bind(wire);
     let access = 0;
@@ -772,6 +832,8 @@ it(
             async next() {
               const item = await underlying.next();
               if (!item.done) initial.resolve();
+              if (mode === 'with independent baseline failure')
+                throw businessError;
               return item;
             },
             async return() {
@@ -793,6 +855,10 @@ it(
     expect((await f.invoke(page.scopeId)).status).toBe(404);
     expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
     expect(access).toBe(1);
+    if (mode === 'with independent baseline failure')
+      expect(f.profileFailures.mock.calls[0]?.[0]).toMatchObject({
+        message: businessError.message,
+      });
     await f.checkUnknownControlClose();
   },
 );

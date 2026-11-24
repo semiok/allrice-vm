@@ -168,13 +168,12 @@ export async function setupNativeWebFixture(
     await rename(profilePatch, removed);
     try {
       const without = loadProfileDirectory('dsh', profileDirectory, anchor);
-      expect(without.skippedBundles).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            packageName: '@allrice/dsh-web-composition',
-          }),
-        ]),
-      );
+      expect(
+        without.layers.find(
+          (layer: { packageName: string }) =>
+            layer.packageName === '@allrice/dsh-web-composition',
+        ),
+      ).toMatchObject({ patchPaths: [], patches: [] });
     } finally {
       await rename(removed, profilePatch);
     }

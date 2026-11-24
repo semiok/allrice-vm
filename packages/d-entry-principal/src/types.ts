@@ -108,6 +108,10 @@ export type DEntryScopedStreamFrame =
         | OutputOf<AccessMethods['remoteAccess/follow']>
         | ScopedEventFrame;
     }>;
+type StreamItem = Extract<DEntryScopedStreamFrame, { type: 'item' }>;
+export type DEntryPrincipalStream = AsyncIterable<StreamItem> & {
+  close(): Promise<void>;
+};
 export interface DEntryPrincipalControlScope {
   readonly opened: Extract<ScopeFrame, { type: 'opened' }>;
   readonly revoked: AbortSignal;
@@ -118,10 +122,11 @@ export interface DEntryPrincipalControlScope {
   stream(
     call: DEntryScopedStreamCall,
     signal: AbortSignal,
-    observed?: (
-      frame: Extract<DEntryScopedStreamFrame, { type: 'item' }>,
-    ) => void,
-  ): AsyncIterable<DEntryScopedStreamFrame & { type: 'item' }>;
+    observed?: {
+      item(frame: StreamItem): void;
+      terminal(): void;
+    },
+  ): DEntryPrincipalStream;
   close(): Promise<void>;
 }
 export interface DEntryPrincipalActivity {
