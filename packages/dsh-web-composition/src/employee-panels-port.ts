@@ -34,6 +34,7 @@ export interface EmployeePanelsSnapshot {
   readonly scopeKey: string;
   /** Existing files-unread semantics. null means unknown, not successful zero. */
   readonly filesUnread: number | null;
+  readonly publicationManagement?: true;
   readonly materials: Omit<Materials, 'active' | 'onUse'>;
   readonly files: Omit<Files, 'active' | 'onUse'>;
   readonly filePreview?: { readonly objectId: string; close(): void };

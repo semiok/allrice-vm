@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import type { Context } from '@deepseek-ai/cordis';
 import type {
   PropsRuntime,
@@ -32,6 +40,9 @@ import type {
   EmployeePanelsSnapshot,
 } from './employee-panels-port';
 import { WorkbenchDeliverablePreview } from '../../../apps/web/app/chatflow/workspace-file-preview';
+import type { ReferencePublicationTarget } from '../../../apps/web/app/chatflow/reference-publication-dialog';
+import type { ReferencePublicationOptions } from '../../../apps/web/app/chatflow/use-reference-publication-options';
+import publicationCss from '../../../apps/web/app/chatflow/enterprise-materials-panel.module.css';
 import '@allrice/ui/tokens.css';
 import css from './employee-panels.module.css';
 import {
@@ -42,6 +53,21 @@ import {
   createEmployeePanelsHttpResolver,
   type EmployeePanelsHttpOptions,
 } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
+
+const ReferencePublicationDialog = lazy(() =>
+  import('../../../apps/web/app/chatflow/reference-publication-dialog').then(
+    ({ ReferencePublicationDialog }) => ({
+      default: ReferencePublicationDialog,
+    }),
+  ),
+);
+const publicationNotices = {
+  file: '已添加为企业资料',
+  upload: '已发布',
+  audience: '范围已修改',
+  revoke: '资料已撤销',
+  delete: '资料已删除',
+};
 
 function useOwner(binding: EmployeePanelsBinding, sessionId: SessionIdOf) {
   const subscribe = useCallback(
@@ -72,6 +98,15 @@ export function EmployeePanelContent({
   signal: AbortSignal;
   kind: EmployeePanelKind;
 }) {
+  const [publication, setPublication] = useState<{
+    target: ReferencePublicationTarget;
+    options?: ReferencePublicationOptions;
+  } | null>(null);
+  const [notice, setNotice] = useState('');
+  const [createdMaterial, setCreatedMaterial] = useState<{
+    sourceId: string;
+    revisionId: string;
+  }>();
   const current = () => {
     assertEmployeePanelSession(ctx, sessionId);
     assertEmployeePanelsCurrent(binding, sessionId, snapshot, signal);
@@ -84,36 +119,112 @@ export function EmployeePanelContent({
   };
   switch (kind) {
     case 'materials':
-      return (
-        <EnterpriseMaterialsPanel
-          {...guardEmployeePanelProps(snapshot.materials, current)}
-          active
-          readOnly={snapshot.materials.readOnly || !binding.port.useReference}
-          onUse={reference}
-        />
+    case 'files': {
+      const props = kind === 'materials' ? snapshot.materials : snapshot.files;
+      const manages = !!(
+        snapshot.publicationManagement &&
+        props.viewerId &&
+        props.dataClient
       );
-    case 'files':
-      if (snapshot.filePreview)
-        return (
-          <WorkbenchDeliverablePreview
-            scope={snapshot.scopeKey}
-            viewerId={snapshot.files.viewerId}
-            objectId={snapshot.filePreview.objectId}
-            workspaceId={snapshot.files.workspaceId}
-            tenantHeaders={snapshot.files.headers}
-            dataClient={snapshot.files.dataClient}
-            active
-            onBack={snapshot.filePreview.close}
-          />
-        );
-      return (
-        <WorkbenchFilesPanel
-          {...guardEmployeePanelProps(snapshot.files, current)}
-          active
-          readOnly={snapshot.files.readOnly || !binding.port.useReference}
-          onUse={reference}
-        />
+      const edit = (
+        target: ReferencePublicationTarget,
+        options?: ReferencePublicationOptions,
+      ) => {
+        current();
+        setNotice('');
+        setPublication({ target, options });
+      };
+      const publish: typeof snapshot.files.onPublish = manages
+        ? (file) => edit({ kind: 'file', file })
+        : snapshot.files.onPublish;
+      const materialProps = guardEmployeePanelProps(
+        snapshot.materials,
+        current,
       );
+      const fileProps = guardEmployeePanelProps(snapshot.files, current);
+      return (
+        <>
+          {kind === 'materials' ? (
+            <EnterpriseMaterialsPanel
+              {...materialProps}
+              active
+              readOnly={
+                snapshot.materials.readOnly || !binding.port.useReference
+              }
+              initialReference={
+                createdMaterial ?? materialProps.initialReference
+              }
+              onUse={reference}
+              onUpload={
+                manages
+                  ? (options) => edit({ kind: 'upload' }, options)
+                  : materialProps.onUpload
+              }
+              onManage={
+                manages
+                  ? (reference, kind, options) =>
+                      edit({ kind, reference }, options)
+                  : materialProps.onManage
+              }
+            />
+          ) : snapshot.filePreview ? (
+            <WorkbenchDeliverablePreview
+              scope={snapshot.scopeKey}
+              viewerId={fileProps.viewerId}
+              objectId={snapshot.filePreview.objectId}
+              workspaceId={fileProps.workspaceId}
+              tenantHeaders={fileProps.headers}
+              dataClient={fileProps.dataClient}
+              active
+              onBack={() => {
+                current();
+                snapshot.filePreview?.close();
+              }}
+              onPublish={manages ? publish : undefined}
+            />
+          ) : (
+            <WorkbenchFilesPanel
+              {...fileProps}
+              active
+              readOnly={snapshot.files.readOnly || !binding.port.useReference}
+              onUse={reference}
+              onPublish={manages ? publish : fileProps.onPublish}
+            />
+          )}
+          {publication && manages && props.viewerId && (
+            <Suspense fallback={null}>
+              <ReferencePublicationDialog
+                workspaceId={props.workspaceId}
+                viewerId={props.viewerId}
+                headers={props.headers}
+                dataClient={props.dataClient}
+                target={publication.target}
+                options={publication.options}
+                onClose={() => setPublication(null)}
+                onSaved={(saved) => {
+                  if (signal.aborted || binding.signal.aborted) return;
+                  if (publication.target.kind === 'upload' && saved.revisionId)
+                    setCreatedMaterial({
+                      sourceId: saved.sourceId,
+                      revisionId: saved.revisionId,
+                    });
+                  setPublication(null);
+                  setNotice(publicationNotices[publication.target.kind]);
+                  window.dispatchEvent(
+                    new Event('allrice:workbench-files-changed'),
+                  );
+                }}
+              />
+            </Suspense>
+          )}
+          {notice && (
+            <div className={publicationCss.toast} role="status">
+              {notice}
+            </div>
+          )}
+        </>
+      );
+    }
     case 'experience':
       if (!snapshot.experience) return null;
       return (
