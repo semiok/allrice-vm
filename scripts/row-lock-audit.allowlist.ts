@@ -42,6 +42,22 @@ export const writingGetCalls: readonly {
       'MET-247 v1.7 approved reference-time permission check: short principal/publication/exact-pin transaction before returning a chip; no text extraction, Run, receipt or remote work.',
   },
   {
+    route:
+      'apps/web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/materials/route.ts',
+    file: 'packages/database/src/reference-search.ts',
+    owner: 'assertPreparedReferencesReadable',
+    reason:
+      'The D panel calls the same MET-247 publication search owner and final principal/publication/exact-pin SHARE transaction, after the unlocked text scan. BFF checks and the remainder of the route stay audited.',
+  },
+  {
+    route:
+      'apps/web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/materials/revisions/[revisionId]/selection/route.ts',
+    file: 'packages/database/src/reference-runtime.ts',
+    owner: 'readReferenceInputSelection',
+    reason:
+      'The D panel calls the same MET-247 v1.7 exact revision-to-chip owner with its original short principal/publication/pin check. This does not exempt any other materials or receipt method.',
+  },
+  {
     route: BRIDGE_FILE_TRANSFERS,
     file: 'packages/database/src/runtime-ledger/ledger.ts',
     owner: 'heartbeat',
@@ -80,6 +96,46 @@ export const reviewedUnresolvedCalls: readonly {
   reason: string;
 }[] = [
   {
+    target: 'apps/web/lib/d-entry/employee-panels-context.ts authorize',
+    reason:
+      'The registered production BFF dependency is requireEmployeePanelsAccess. On GET current and currentModule pass only context and selection, using the unlocked instance/thread and rollout read. The transactional branch is called only from the deliverable upload owner, and this entry does not stop traversal of the implementation.',
+  },
+  {
+    target: 'apps/web/lib/d-entry/employee-panels-context.ts context',
+    reason:
+      'Both production uses call getRequestContext on the original request. It resolves the Cookie session and current tenant with the existing lock-free identity reads.',
+  },
+  {
+    target: 'apps/web/lib/d-entry/employee-panels-context.ts storage',
+    reason:
+      'The production dependency is getStorageAdapter, which initializes the configured LocalStorageAdapter and returns the same object storage port. No SQL runs here.',
+  },
+  {
+    target: 'apps/web/lib/d-entry/employee-panels-download.ts open',
+    reason:
+      'The only production PanelResource values passed to preview bytes and spool are the exact materials or deliverable owner resources selected in employee-panels-http. Both open the verified byte stream after lock-free current resource reads, with SQL callbacks still audited.',
+  },
+  {
+    target: 'apps/web/lib/runtime/static-artifact-preview.ts bytes',
+    reason:
+      'The D panel installs a bounded readPanelResourceBytes callback for its pinned object. It drains the same authorized byte stream and never completes a reservation or writes.',
+  },
+  {
+    target: 'packages/database/src/authorized-file-resource.ts openSource',
+    reason:
+      'For GET panel reads the two production closures open storage.get on the exact owner-checked object supplied by recheck. This callback itself has no SQL.',
+  },
+  {
+    target: 'packages/database/src/authorized-file-resource.ts recheck',
+    reason:
+      'The D GET closures are the current deliverable ownedFile and materials authorized revision reads. They verify the fixed resource and requalify the Cookie without a transaction. Their actual SQL call sites, including any future locking changes, stay audited.',
+  },
+  {
+    target: 'packages/database/src/builtin-modules.ts require',
+    reason:
+      'The production D panel module callback is createApplicationBuiltinModuleAuthority(web). It reads the verified application build and checks the fixed builtin policy without SQL.',
+  },
+  {
     target: 'apps/web/server/preview-diagnostics.d.mts emit',
     reason:
       'preview-diagnostics.mjs emit hashes the reference id and logs fixed diagnostic fields and bounded error causes; its current implementation runs no SQL.',
@@ -103,6 +159,11 @@ export const reviewedUnresolvedCalls: readonly {
     target: 'packages/database/src/d-entry-authority.ts lost',
     reason:
       'MET-260 11528559 exact review: module-private Subscription has one current production registration in watchDEntryAuthority; lost is invalidate -> abort.abort(error), with no SQL. This unresolved-target review does not stop implementation traversal; callback/producer changes require review and the existing stale-entry check still applies.',
+  },
+  {
+    target: 'packages/database/src/d-entry-authority.ts close',
+    reason:
+      'The only production history subscription comes from watchDEntryHistoryAuthority. Its close fences abort, detaches and unregisters the exact listener and joins the existing current-read queue. Neither teardown nor those reads hold row locks.',
   },
   {
     target: 'packages/contracts/src/storage.ts get',
