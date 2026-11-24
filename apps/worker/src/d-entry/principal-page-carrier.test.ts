@@ -165,11 +165,14 @@ function send(peer: WebSocket, value: object) {
 }
 function messages(peer: WebSocket) {
   const events = on(peer, 'message', { close: ['close'] });
-  return async () => {
-    const next = await events.next();
-    if (next.done)
-      throw Error('Socket closed before the expected native frame');
-    return JSON.parse(String(next.value[0]));
+  return async (streamId?: string) => {
+    while (true) {
+      const next = await events.next();
+      if (next.done)
+        throw Error('Socket closed before the expected native frame');
+      const frame = JSON.parse(String(next.value[0]));
+      if (!streamId || frame.streamId === streamId) return frame;
+    }
   };
 }
 async function open(f: Awaited<ReturnType<typeof fixture>>) {
@@ -232,7 +235,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
     endpoint: '$events',
     payload: { args: {} },
   });
-  expect(await next()).toMatchObject({
+  expect(await next('events')).toMatchObject({
     type: 'item',
     streamId: 'events',
     value: { type: 'ready', host: { home: '/home/native-fixture' } },
@@ -240,6 +243,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
 
   const finishNative = deferred(),
     finishingNative = deferred();
+  closes.push(async () => finishNative.resolve());
   f.host.catalog.afterFollow = async () => {
     finishingNative.resolve();
     await finishNative.promise;
@@ -254,7 +258,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
       },
     },
   });
-  expect(await next()).toMatchObject({
+  expect(await next('root')).toMatchObject({
     type: 'item',
     streamId: 'root',
     value: { type: 'snapshot' },
