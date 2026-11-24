@@ -15,6 +15,7 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import type * as MemoryClientModule from '../../../apps/web/lib/memory/employee-memory-client.ts';
+import { readPersonalEmployeeMemorySource } from '../../../apps/web/lib/memory/employee-memory-personal-source.ts';
 import * as client from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import {
@@ -28,10 +29,16 @@ import {
   createSession,
   ensureBootstrapPortalPrincipal,
 } from './identity.ts';
-import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
+import {
+  createEmployeeInstance,
+  ensureGeneralEmployeeInstance,
+} from './employees/employee-instances.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 import { seedPersonalMemoryPair } from './workspace/employee-memory-pair.fixture.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
+import {
+  createManagedEmployeeMemory,
+  ensureDefaultEmployee,
+} from './workspace/service.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -78,10 +85,12 @@ suite('memory public management port: real transactions without a Run', () => {
     await fixture?.close();
   }, 30000);
 
-  async function setup() {
+  async function setup(existingOrganizationSlug?: string) {
     const suffix = randomUUID();
+    const organizationSlug =
+      existingOrganizationSlug ?? `memory-port-${suffix}`;
     const principal = await ensureBootstrapPortalPrincipal({
-      organizationSlug: `memory-port-${suffix}`,
+      organizationSlug,
       organizationName: 'Memory port fixture',
       workspaceSlug: 'default',
       workspaceName: 'Default',
@@ -103,6 +112,7 @@ suite('memory public management port: real transactions without a Run', () => {
     // execution context, issued pin or synthetic 4.0 host is created.
     return {
       context,
+      organizationSlug,
       organizationId: principal.organizationId,
       workspaceId: principal.workspaceId,
       ownerId: principal.user.id,
@@ -338,6 +348,102 @@ suite('memory public management port: real transactions without a Run', () => {
     ).rejects.toBeInstanceOf(DataAccessError);
     expect(await snapshot(saved.memory.id)).toEqual(before);
   });
+
+  it('reads the owner’s stored source with real Web qualification and an employee without a thread', async () => {
+    const f = await setup();
+    const saved = await createManagedEmployeeMemory(f.context, createInput(f));
+    const before = await snapshot(saved.id);
+
+    await expect(
+      readPersonalEmployeeMemorySource(
+        f.context,
+        { ...query(f), memoryId: saved.id },
+        signal(),
+      ),
+    ).resolves.toEqual({
+      sourceType: 'user',
+      sourceLabel: '用户保存的记忆',
+      capturedAt: saved.capturedAt,
+    });
+    expect(await snapshot(saved.id)).toEqual(before);
+    const [counts] = await fixture.db`select
+      (select count(*)::int from allrice_employee_module_bindings where instance_id=${f.instanceId}) as bindings,
+      (select count(*)::int from allrice_chat_sessions where employee_assignment_id=${f.instanceId}) as threads`;
+    expect(counts).toEqual({ bindings: 0, threads: 0 });
+  });
+
+  it('rejects other employees, same-workspace peers, other tenants and admin selectors for a personal source', async () => {
+    const f = await setup();
+    const peer = await setup(f.organizationSlug);
+    const foreign = await setup();
+    const otherEmployee = await createEmployeeInstance(f.context, {
+      workspaceId: f.workspaceId,
+      assignmentId: f.instanceId,
+      requestId: randomUUID(),
+      profile: { name: 'Other memory source employee' },
+    });
+    const saved = await createManagedEmployeeMemory(f.context, createInput(f));
+    const before = await snapshot(saved.id);
+    const target = { ...query(f), memoryId: saved.id };
+    expect(peer.workspaceId).toBe(f.workspaceId);
+
+    await expect(
+      readPersonalEmployeeMemorySource(
+        f.context,
+        { ...target, instanceId: otherEmployee.id },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      readPersonalEmployeeMemorySource(peer.context, target, signal()),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      readPersonalEmployeeMemorySource(
+        peer.context,
+        { ...query(peer), memoryId: saved.id },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      readPersonalEmployeeMemorySource(foreign.context, target, signal()),
+    ).rejects.toMatchObject({ code: 'authorization_denied' });
+    const mixed = {
+      ...target,
+      organizationId: f.organizationId,
+      ownerId: f.ownerId,
+    };
+    await expect(
+      readPersonalEmployeeMemorySource(admin, mixed, signal()),
+    ).rejects.toMatchObject({ name: 'ZodError' });
+    expect(await snapshot(saved.id)).toEqual(before);
+  });
+
+  it.each(['login', 'membership', 'assignment', 'instance'] as const)(
+    'rejects the actual owner when the current %s is revoked',
+    async (revocation) => {
+      const f = await setup();
+      const saved = await createManagedEmployeeMemory(
+        f.context,
+        createInput(f),
+      );
+      const before = await snapshot(saved.id);
+      const target = { ...query(f), memoryId: saved.id };
+
+      if (revocation === 'login')
+        await fixture.db`update allrice_sessions set revoked_at=clock_timestamp() where id=${f.context.sessionId}`;
+      if (revocation === 'membership')
+        await fixture.db`update allrice_memberships set active=false where organization_id=${f.organizationId} and user_id=${f.ownerId}`;
+      if (revocation === 'assignment')
+        await fixture.db`update allrice_employee_assignments set active=false where id=${f.instanceId}`;
+      if (revocation === 'instance')
+        await fixture.db`update allrice_employee_instances set archived_at=clock_timestamp() where id=${f.instanceId}`;
+
+      await expect(
+        readPersonalEmployeeMemorySource(f.context, target, signal()),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      expect(await snapshot(saved.id)).toEqual(before);
+    },
+  );
 
   it.each(['personal', 'admin'] as const)(
     'joins the actual %s source transaction on cancellation, including a committed admin audit',
