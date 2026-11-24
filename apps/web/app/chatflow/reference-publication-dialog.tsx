@@ -72,6 +72,7 @@ const receiptSchema = z.strictObject({
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
 type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
+type ReceiptCheckStage = 'checking' | 'waiting' | 'settled' | 'unavailable';
 const settledPublications = new Map<string, ReceiptOutcome>();
 const settledKey = (key: string, requestId: string) => key + '/' + requestId;
 const receiptPrefix = 'allrice:publication-receipts:v2:';
@@ -159,6 +160,13 @@ async function publicationFingerprint(value: unknown) {
 class ReceiptStorageUnavailable extends Error {}
 
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
+
+function receiptAccessDenied(error: unknown) {
+  return (
+    error instanceof EmployeePanelsHttpError &&
+    [401, 403, 404].includes(error.status)
+  );
+}
 
 async function checkPublication(
   data: EmployeePanelDataClient,
@@ -310,10 +318,7 @@ export function ReferencePublicationPending({
         window.dispatchEvent(new Event('allrice:workbench-files-changed'));
     } catch (error) {
       if (signal.aborted) return;
-      if (
-        error instanceof EmployeePanelsHttpError &&
-        [401, 403, 404].includes(error.status)
-      ) {
+      if (receiptAccessDenied(error)) {
         setRecords([]);
         setNotes({});
       } else note(waitingForReceipt);
@@ -435,10 +440,7 @@ function PublicationForm({
   const [initialReceipts] = useState(() => restorePublications(receiptKey));
   const [receipts, setReceipts] = useState(initialReceipts);
   const [receiptNotes, setReceiptNotes] = useState<
-    Record<
-      string,
-      { stage: 'checking' | 'waiting' | 'settled'; message: string }
-    >
+    Record<string, { stage: ReceiptCheckStage; message: string }>
   >({});
   const completion = receiptActions[target.kind] + '已完成。';
   useEffect(() => {
@@ -456,15 +458,23 @@ function PublicationForm({
       if (!receiptKey || checks.has(value.requestId)) return;
       const controller = new AbortController();
       const note = (
-        stage: 'checking' | 'waiting' | 'settled',
+        stage: ReceiptCheckStage,
         message: string,
+        keepUnavailable = false,
       ) =>
-        setReceiptNotes((prior) => ({
-          ...prior,
-          [value.requestId]: { stage, message },
-        }));
+        setReceiptNotes((prior) =>
+          keepUnavailable && prior[value.requestId]?.stage === 'unavailable'
+            ? prior
+            : { ...prior, [value.requestId]: { stage, message } },
+        );
+      const clearWaitingError = () =>
+        setError((current) =>
+          current?.pendingRequestId === value.requestId ? undefined : current,
+        );
       checks.set(value.requestId, controller);
-      note('checking', '正在核对原发布结果…');
+      // Rechecking the same intent keeps a denied receipt hidden until an
+      // authorized response establishes its current state.
+      note('checking', '正在核对原发布结果…', true);
       try {
         const outcome = await checkPublication(
           data,
@@ -481,9 +491,7 @@ function PublicationForm({
         setReceipts((prior) =>
           prior.filter((pending) => pending.requestId !== value.requestId),
         );
-        setError((current) =>
-          current?.pendingRequestId === value.requestId ? undefined : current,
-        );
+        clearWaitingError();
         note(
           'settled',
           outcome === 'recorded'
@@ -493,9 +501,14 @@ function PublicationForm({
         if (outcome === 'recorded') {
           window.dispatchEvent(new Event('allrice:workbench-files-changed'));
         }
-      } catch {
-        if (alive.current && !controller.signal.aborted)
-          note('waiting', waitingForReceipt);
+      } catch (error) {
+        if (!alive.current || controller.signal.aborted) return;
+        if (receiptAccessDenied(error)) {
+          clearWaitingError();
+          // Read denial says nothing about whether the original write ran.
+          // Keep its scoped key for a later authorized lookup.
+          note('unavailable', '当前无法核对原发布请求。');
+        } else note('waiting', waitingForReceipt, true);
       } finally {
         if (checks.get(value.requestId) === controller)
           checks.delete(value.requestId);
@@ -716,6 +729,9 @@ function PublicationForm({
   }
 
   const shownError = error?.message || download.error || available.error;
+  const visibleReceipts = receipts.filter(
+    ({ requestId }) => receiptNotes[requestId]?.stage !== 'unavailable',
+  );
   return (
     <DshDialog
       title={title}
@@ -896,7 +912,9 @@ function PublicationForm({
       )}
       {Object.entries(receiptNotes).map(([id, note]) => (
         <p className={css.description} role="status" key={id}>
-          {Object.keys(receiptNotes).length > 1 && id.slice(0, 8) + ' · '}
+          {note.stage !== 'unavailable' &&
+            Object.keys(receiptNotes).length > 1 &&
+            id.slice(0, 8) + ' · '}
           {note.message}
         </p>
       ))}
@@ -933,14 +951,14 @@ function PublicationForm({
               先下载
             </a>
           ))}
-        {receipts.map((receipt) => (
+        {visibleReceipts.map((receipt) => (
           <Button
             key={receipt.requestId}
             type="button"
             variant="ghost"
             disabled={receiptNotes[receipt.requestId]?.stage === 'checking'}
             aria-label={
-              receipts.length === 1
+              visibleReceipts.length === 1
                 ? '核对结果'
                 : '核对结果 ' + receipt.requestId.slice(0, 8)
             }

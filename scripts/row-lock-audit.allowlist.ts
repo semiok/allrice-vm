@@ -138,11 +138,6 @@ export const reviewedUnresolvedCalls: readonly {
       'The D GET closures are the current deliverable ownedFile and materials authorized revision reads. They verify the fixed resource and requalify the Cookie without a transaction. Their actual SQL call sites, including any future locking changes, stay audited.',
   },
   {
-    target: 'packages/database/src/builtin-modules.ts require',
-    reason:
-      'The production D panel module callback is createApplicationBuiltinModuleAuthority(web). It reads the verified application build and checks the fixed builtin policy without SQL.',
-  },
-  {
     target: 'apps/web/server/preview-diagnostics.d.mts emit',
     reason:
       'preview-diagnostics.mjs emit hashes the reference id and logs fixed diagnostic fields and bounded error causes; its current implementation runs no SQL.',
@@ -178,7 +173,7 @@ export const reviewedUnresolvedCalls: readonly {
   },
   {
     target: 'packages/database/src/builtin-modules.ts require',
-    reason: `The personal Web assembly uses createApplicationBuiltinModuleAuthority('web'). The require implementation reads build identity from the filesystem or process cache and checks the frozen built-in policy without SQL. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
+    reason: `The D panel module callback and personal Web memory-source GET both use createApplicationBuiltinModuleAuthority('web'). The require implementation reads the verified build identity from the filesystem or process cache and checks the frozen built-in policy without SQL. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
   },
   {
     target:
