@@ -85,7 +85,9 @@ suite(
       const { build } = createRequire(require.resolve('tsx'))('esbuild');
       const built = await build({
         absWorkingDir: process.cwd(),
-        entryPoints: ['apps/web/test/employee-panel-data-page.tsx'],
+        entryPoints: [
+          'packages/dsh-web-composition/tests/fixtures/employee-panels/employee-panel-data-page.tsx',
+        ],
         bundle: true,
         format: 'esm',
         splitting: true,

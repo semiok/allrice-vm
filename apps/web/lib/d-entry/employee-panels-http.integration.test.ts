@@ -399,7 +399,9 @@ suite(
         const { build } = createRequire(require.resolve('tsx'))('esbuild');
         const output = await build({
           absWorkingDir: process.cwd(),
-          entryPoints: ['apps/web/test/employee-panel-live-page.tsx'],
+          entryPoints: [
+            'packages/dsh-web-composition/tests/fixtures/employee-panels/employee-panel-live-page.tsx',
+          ],
           outdir: '/unused-live-panel',
           bundle: true,
           splitting: true,

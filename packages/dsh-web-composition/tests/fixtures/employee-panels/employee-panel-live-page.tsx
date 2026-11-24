@@ -1,17 +1,17 @@
 // Isolated document host for a browser test. Business authority and data are
 // supplied by the original Cookie and production Web handlers.
-import '../app/dsh-upstream/design-platform.css';
-import '../app/dsh-upstream/base.css';
-import '../app/dsh-upstream/scrollbar.css';
+import '../../../../../apps/web/app/dsh-upstream/design-platform.css';
+import '../../../../../apps/web/app/dsh-upstream/base.css';
+import '../../../../../apps/web/app/dsh-upstream/scrollbar.css';
 import '@allrice/ui/tokens.css';
-import '../app/styles/base.css';
+import '../../../../../apps/web/app/styles/base.css';
 import '@allrice/ui/styles.css';
 import type { SessionIdOf } from '@deepseek-ai/dsh-client-ui-slots';
 import { Context } from '@deepseek-ai/cordis';
 import { useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
-import { EmployeePanelContent } from '../../../packages/dsh-web-composition/src/employee-panels';
-import { installEmployeeProductOwner } from '../../../packages/dsh-web-composition/src/employee-product-owner';
+import { EmployeePanelContent } from '../../../src/employee-panels';
+import { installEmployeeProductOwner } from '../../../src/employee-product-owner';
 
 const container = document.getElementById('app')!;
 const sessionId = container.dataset.nativeSessionId as SessionIdOf;

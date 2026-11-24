@@ -7,7 +7,9 @@ beforeAll(async () => {
   // Same graph/options as the real component browser fixture, without opening
   // a server/browser. Keep child and parent styles in their actual output order.
   const result = await build({
-    entryPoints: ['apps/web/test/employee-panel-data-page.tsx'],
+    entryPoints: [
+      'packages/dsh-web-composition/tests/fixtures/employee-panels/employee-panel-data-page.tsx',
+    ],
     bundle: true,
     format: 'esm',
     splitting: true,

@@ -1,44 +1,44 @@
 // Test-only business port substitute. The panels, preview and publication form
 // are product components; no backend identity, storage or delivery is claimed.
-import '../app/dsh-upstream/design-platform.css';
-import '../app/dsh-upstream/base.css';
-import '../app/dsh-upstream/scrollbar.css';
+import '../../../../../apps/web/app/dsh-upstream/design-platform.css';
+import '../../../../../apps/web/app/dsh-upstream/base.css';
+import '../../../../../apps/web/app/dsh-upstream/scrollbar.css';
 import '@allrice/ui/tokens.css';
-import '../app/styles/base.css';
-import '../app/styles/focus.css';
+import '../../../../../apps/web/app/styles/base.css';
+import '../../../../../apps/web/app/styles/focus.css';
 import '@allrice/ui/styles.css';
 import { createRoot } from 'react-dom/client';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives';
 import { Context } from '@deepseek-ai/cordis';
-import { bindEmployeePanels } from '../../../packages/dsh-web-composition/src/employee-panels';
-import type { EmployeePanelsPort } from '../../../packages/dsh-web-composition/src/employee-panels-port';
-import { syntheticPanelSnapshot } from '../../../packages/dsh-web-composition/tests/fixtures/employee-panels/presentation';
+import { bindEmployeePanels } from '../../../src/employee-panels';
+import type { EmployeePanelsPort } from '../../../src/employee-panels-port';
+import { syntheticPanelSnapshot } from './presentation';
 import type {
   ReferenceRevision,
   WorkbenchDeliverable,
-} from '@allrice/contracts';
+} from '../../../../contracts/src/index';
 import {
   createEmployeePanelDataClient,
   type EmployeePanelDataMethod,
-} from '../lib/chatflow/employee-panel-data';
-import { uploadPersonalDeliverable } from '../lib/chatflow/employee-panel-upload';
-import { EmployeePanelsWriteUnknownError } from '../lib/chatflow/employee-panel-data-http';
-import { EnterpriseMaterialsPanel } from '../app/chatflow/enterprise-materials-panel';
-import { WorkbenchFilesPanel } from '../app/chatflow/workbench-files-panel';
-import { WorkbenchDeliverablePreview } from '../app/chatflow/workspace-file-preview';
+} from '../../../../../apps/web/lib/chatflow/employee-panel-data';
+import { uploadPersonalDeliverable } from '../../../../../apps/web/lib/chatflow/employee-panel-upload';
+import { EmployeePanelsWriteUnknownError } from '../../../../../apps/web/lib/chatflow/employee-panel-data-http';
+import { EnterpriseMaterialsPanel } from '../../../../../apps/web/app/chatflow/enterprise-materials-panel';
+import { WorkbenchFilesPanel } from '../../../../../apps/web/app/chatflow/workbench-files-panel';
+import { WorkbenchDeliverablePreview } from '../../../../../apps/web/app/chatflow/workspace-file-preview';
 import {
   ReferencePublicationDialog,
   type ReferencePublicationTarget,
-} from '../app/chatflow/reference-publication-dialog';
-import { applyTheme } from '../lib/theme/theme';
+} from '../../../../../apps/web/app/chatflow/reference-publication-dialog';
+import { applyTheme } from '../../../../../apps/web/lib/theme/theme';
 import {
   createSyntheticPanelsData,
   panelsEmployee,
   panelsViewer,
   panelsWorkspace,
   uid,
-} from '../../../packages/dsh-web-composition/tests/fixtures/employee-panels/data';
+} from './data';
 
 export type PanelDataState =
   'list' | 'empty' | 'loading' | 'error' | 'denied' | 'unbound' | 'longname';

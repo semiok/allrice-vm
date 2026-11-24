@@ -18,6 +18,8 @@
     "src/**/*.mjs",
     "src/**/*.tsx",
     "src/**/*.ts",
-    "src/**/*.d.ts"
+    "src/**/*.d.ts",
+    "tests/fixtures/employee-panels/employee-panel-data-page.tsx",
+    "tests/fixtures/employee-panels/employee-panel-live-page.tsx"
   ]
 }
