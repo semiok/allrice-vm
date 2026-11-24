@@ -163,7 +163,9 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
     expect((error as Error).cause).toBe(sqlError);
   });
 
-  function transactionFixture() {
+  function transactionFixture(
+    read?: () => PromiseLike<[]> & { cancel(): void },
+  ) {
     const committing = deferred<void>(),
       commit = deferred<void>(),
       rollingBack = deferred<void>(),
@@ -175,6 +177,7 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
         if (!('raw' in parts)) return { values: parts };
         const sql = parts.join('');
         statements.push(sql.trim().split(' ', 1)[0]!);
+        if (read && sql.startsWith('select ')) return read();
         if (sql === 'commit') {
           committing.resolve();
           return pending(commit.promise);
@@ -219,6 +222,86 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
       statements,
     };
   }
+
+  it.each([
+    ['commitBatch', 'before observing SQL'],
+    ['readExactReceipt', 'before attaching the listener'],
+    ['commitBatch', 'after observing SQL'],
+    ['readExactReceipt', 'after observing SQL'],
+  ] as const)(
+    '%s joins the original rejection when aborted %s',
+    async (method, timing) => {
+      const abort = new AbortController();
+      const reason = Error('caller canceled the receipt operation');
+      const hostFailure = Object.assign(Error('postgres connection failed'), {
+        code: 'ECONNREFUSED',
+      });
+      const driverError = Object.assign(
+        new AggregateError(
+          [hostFailure],
+          'postgres connection attempts failed',
+          {
+            cause: hostFailure,
+          },
+        ),
+        { code: 'ECONNREFUSED' },
+      );
+      const driverStack = driverError.stack;
+      const response = deferred<[]>();
+      const observed = deferred<void>();
+      const thenable: PromiseLike<[]> & { cancel(): void } = {
+        then(onValue, onError) {
+          observed.resolve();
+          if (timing === 'before attaching the listener') abort.abort(reason);
+          return response.promise.then(onValue, onError);
+        },
+        cancel: vi.fn(() => response.reject(driverError)),
+      };
+      const read = () => {
+        // Race a queued abort against thenable assimilation inside the guarded
+        // transaction, before its raw query would establish a rejection handler.
+        if (timing === 'before observing SQL')
+          queueMicrotask(() => abort.abort(reason));
+        return thenable;
+      };
+      const transaction =
+        method === 'commitBatch' ? transactionFixture(read) : undefined;
+      transaction?.rollback.resolve();
+      const db = transaction?.db ?? (vi.fn(read) as unknown as Sql);
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        const operation = createPostgresNativeScheduleObservationLedger(db)[
+          method
+        ](input(), abort.signal);
+        const rejected = operation.catch((error: unknown) => error);
+        if (timing === 'after observing SQL') {
+          await observed.promise;
+          abort.abort(reason);
+        }
+        const error = await rejected;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(unhandled).not.toHaveBeenCalled();
+        expect(thenable.cancel).toHaveBeenCalledOnce();
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toHaveLength(2);
+        expect((error as AggregateError).errors[0]).toBe(driverError);
+        expect((error as AggregateError).cause).toBe(driverError);
+        expect(driverError).toMatchObject({
+          code: 'ECONNREFUSED',
+          stack: driverStack,
+          cause: hostFailure,
+        });
+        expect((error as AggregateError).errors[1]).toBe(reason);
+        if (transaction) {
+          expect(transaction.statements).toEqual(['begin', 'select']);
+          expect(transaction.end).toHaveBeenCalledOnce();
+        }
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+    },
+  );
 
   it('joins COMMIT and dedicated client end before suppressing a canceled success', async () => {
     const f = transactionFixture(),
@@ -296,16 +379,25 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
         const error = await outcome;
         expect(error).toBeInstanceOf(AggregateError);
         const failures = (error as AggregateError).errors as unknown[];
-        expect(failures).toHaveLength(cancelDuringRollback ? 4 : 2);
-        expect(failures[0]).toMatchObject({
+        expect(failures).toHaveLength(2);
+        expect((error as Error).cause).toBe(failures[0]);
+        let transactionErrors = failures;
+        if (cancelDuringRollback) {
+          expect(failures[1]).toBe(abort.signal.reason);
+          expect(failures[0]).toBeInstanceOf(AggregateError);
+          const closeErrors = (failures[0] as AggregateError)
+            .errors as unknown[];
+          expect(closeErrors).toHaveLength(2);
+          expect(closeErrors[1]).toBe(closeError);
+          expect(closeErrors[0]).toBeInstanceOf(AggregateError);
+          transactionErrors = (closeErrors[0] as AggregateError)
+            .errors as unknown[];
+        }
+        expect(transactionErrors).toHaveLength(2);
+        expect(transactionErrors[0]).toMatchObject({
           code: 'invalid_receipt_reference',
         });
-        expect((error as Error).cause).toBe(failures[0]);
-        expect(failures[1]).toBe(rollbackError);
-        if (cancelDuringRollback) {
-          expect(failures[2]).toBe(closeError);
-          expect(failures[3]).toBe(abort.signal.reason);
-        }
+        expect(transactionErrors[1]).toBe(rollbackError);
         expect(f.reserve).toHaveBeenCalledOnce();
         expect(f.statements).toEqual(['begin', 'select', 'select', 'rollback']);
         expect(f.end).toHaveBeenCalledOnce();

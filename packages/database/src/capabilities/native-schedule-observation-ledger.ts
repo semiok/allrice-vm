@@ -194,12 +194,18 @@ async function joined<T>(
   work: (query: Query) => Promise<T>,
 ): Promise<T> {
   signal?.throwIfAborted();
-  const query: Query = async (pending) => {
+  const query = async <T>(pending: Pending<T>) => {
+    signal?.throwIfAborted();
+    // Subscribe synchronously: the transaction proxy registers SQL on its
+    // first then(). await/Promise.resolve would defer it until after cancel.
+    const observed = new Promise<T>((resolve, reject) => {
+      void pending.then(resolve, reject);
+    });
     const cancel = () => pending.cancel();
     signal?.addEventListener('abort', cancel, { once: true });
     try {
       if (signal?.aborted) cancel();
-      const result = await pending;
+      const result = await observed;
       signal?.throwIfAborted();
       return result;
     } finally {
@@ -212,23 +218,10 @@ async function joined<T>(
     return result;
   } catch (error) {
     if (!signal?.aborted || Object.is(error, signal.reason)) throw error;
-    const reason: unknown = signal.reason;
-    const failures = new Set<unknown>();
-    function collect(failure: unknown) {
-      if (Object.is(failure, reason) || failures.has(failure)) return;
-      if (failure instanceof AggregateError && failure.errors.length) {
-        for (const item of failure.errors as unknown[]) collect(item);
-      } else {
-        failures.add(failure);
-      }
-    }
-    collect(error);
-    if (!failures.size) throw reason;
-    const errors = [...failures, reason];
     throw new AggregateError(
-      errors,
+      [error, signal.reason],
       'native_schedule_ledger_operation_failed',
-      { cause: errors[0] },
+      { cause: error },
     );
   }
 }
