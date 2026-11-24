@@ -131,7 +131,7 @@ personal read-only 与写前校验由**真实 caller 工厂选择**，不让 gue
 | 285 后续 installed/usable、私有包资源 | 企业许可∩binding∩操作/资源；精确release/resource | 目录/管理不要求B；实际运行只消费真实执行事实 | 仅具体业务需真人来源时消费，不全局加门槛 | 具体业务写沿owner原事务                                     | 仅复用记忆来源业务时消费，不给静态Skill加筛选 |
 | 离线历史/关机目录                     | 真实history现权                                  | 不mint/启动B；需要时只读原B                  | 只读原受权来源                           | 宿主投影查询，不起VM                                        | 适用时原语义，不虚构运行                      |
 
-scope FK 只记录既有候选目标 `allrice_employee_instances(organization_id,workspace_id,owner_id,id)` 的四列 unique；这是 FK 讨论依据，**不是新 FK/ON DELETE 政策批准**。0253 当前无 scope FK；员工模板/实例归档或删除、thread 删除时 context/已发索引/预算的删除保留政策未封，不擅加 cascade。person VM 盘不随删员工误删。
+scope FK 只记录既有候选目标 `allrice_employee_instances(organization_id,workspace_id,owner_id,id)` 的四列 unique；这是 FK 讨论依据，**不是新 FK/ON DELETE 政策批准**。0256 当前无 scope FK；员工模板/实例归档或删除、thread 删除时 context/已发索引/预算的删除保留政策未封，不擅加 cascade。person VM 盘不随删员工误删。
 
 一致恢复仍缺：thread/root/真实B/child/call 的原始关联、冻结 module/config pin、issued document/pins/spent、真实业务 receipt 的一致 capture cut/source。G2 可读原 B 不代表该集合已闭合。恢复只核原事实和已花预算；不重放 root 创建、崩溃前 call、已提交候选或原生 delivery，不把新线程伪装旧恢复。
 
