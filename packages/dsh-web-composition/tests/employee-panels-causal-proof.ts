@@ -1,5 +1,10 @@
 import type { PanelsCausalSnapshot } from './employee-panels-causal-dom';
 
+function isRoundCorner(value: string | undefined) {
+  // Chromium also serializes the standard round keyword as its exponent.
+  return value === 'round' || value === 'superellipse(1)';
+}
+
 /** A paint-sampling scope, never a waiver of full-root/acceptance pixels. */
 export function assertCausalSampling(value: PanelsCausalSnapshot) {
   const fail = (message: string): never => {
@@ -228,7 +233,7 @@ export function assertCausalSampling(value: PanelsCausalSnapshot) {
       }
       if (
         subject.coordinateSpace !== 'border-box' ||
-        subjectNode!.styles['corner-shape'] !== 'round' ||
+        !isRoundCorner(subjectNode!.styles['corner-shape']) ||
         !noExtraPaint(subjectNode!)
       )
         fail('ancestor subject hit is not a standard round cutout');
@@ -446,7 +451,7 @@ export function assertCausalInvariant(
         if (a[part][key] !== b[part][key])
           fail(`node ${i} ${part}.${key} changed`);
       }
-    if (change.corner && b.styles['corner-shape'] !== 'round')
+    if (change.corner && !isRoundCorner(b.styles['corner-shape']))
       fail(`node ${i} no longer round`);
     // SVG path/g world bounds are float32-sensitive. Check the exact local shape
     // and screen matrix instead of inventing a new pixel epsilon for those bounds.

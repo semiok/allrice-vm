@@ -291,6 +291,7 @@ it.each([
   'native update',
   'catalog drift before any update',
   'true terminal',
+  'native terminal error',
 ] as const)(
   'rejects the second baseline when final verification sees %s',
   { timeout: 30_000 },
@@ -298,6 +299,7 @@ it.each([
     const release = await buildProfileFixture();
     const f = await fixture(release);
     const page = await open(f);
+    const neighbor = await open(f);
     const terminal = deferred<ServerResponse>();
     const checking = deferred();
     const allowCheck = deferred();
@@ -325,8 +327,14 @@ it.each([
               first = false;
             }
             yield item;
-            if (mode === 'true terminal') {
+            if (mode === 'true terminal' || mode === 'native terminal error') {
               await finishReader.promise;
+              if (mode === 'native terminal error')
+                throw new RemoteError(
+                  'gateway/service-unavailable',
+                  'native access feed failed',
+                  {},
+                );
               return;
             }
           }
@@ -340,7 +348,7 @@ it.each([
     void result.catch(() => {});
     try {
       await checking.promise;
-      if (mode === 'true terminal') {
+      if (mode === 'true terminal' || mode === 'native terminal error') {
         finishReader.resolve();
         await expect
           .poll(() => f.profileObserved.mock.calls)
@@ -366,6 +374,14 @@ it.each([
     const refused = await result;
     expect(refused.status).toBe(404);
     expect(await refused.text()).not.toContain('"id":"child"');
+    if (mode === 'native terminal error') {
+      const response = await terminal.promise;
+      await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
+      expect((await f.invoke(page.scopeId)).status).toBe(404);
+      expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+      await f.checkUnknownControlClose();
+      return;
+    }
     const retry = await f.publish('bootstrap', page.scopeId);
     expect(retry.status).toBe(200);
     const refreshed = await retry.text();

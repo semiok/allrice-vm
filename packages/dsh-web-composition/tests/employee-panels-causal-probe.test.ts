@@ -408,17 +408,23 @@ describe('specific subject hit ownership, not whole-section membership', () => {
       expect(() => assertCausalSampling(value)).toThrow('SVG blank');
     },
   );
-  it('allows an empty standard round cutout but rejects its painted center', () => {
-    const value = blankSnapshot('round');
-    expect(() => assertCausalSampling(value)).not.toThrow();
-    const center = value.sampling.subjects[0]!.hits[4]!;
-    center.element = structuredClone(
-      value.sampling.subjects[0]!.hits[0]!.element,
-    );
-    center.relation = 'ancestor';
-    center.blank = structuredClone(value.sampling.subjects[0]!.hits[0]!.blank);
-    expect(() => assertCausalSampling(value)).toThrow('clear round cutout');
-  });
+  it.each(['round', 'superellipse(1)'])(
+    'accepts the exact %s cutout and rejects its painted center',
+    (shape) => {
+      const value = blankSnapshot('round');
+      value.nodes[1]!.styles['corner-shape'] = shape;
+      expect(() => assertCausalSampling(value)).not.toThrow();
+      const center = value.sampling.subjects[0]!.hits[4]!;
+      center.element = structuredClone(
+        value.sampling.subjects[0]!.hits[0]!.element,
+      );
+      center.relation = 'ancestor';
+      center.blank = structuredClone(
+        value.sampling.subjects[0]!.hits[0]!.blank,
+      );
+      expect(() => assertCausalSampling(value)).toThrow('clear round cutout');
+    },
+  );
   it('rejects text paint inside a purported round cutout', () => {
     const value = blankSnapshot('round'),
       blank = value.sampling.subjects[0]!.hits[0]!.blank!;
