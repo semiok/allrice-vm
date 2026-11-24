@@ -1,7 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import type { Browser, Response as BrowserResponse } from 'playwright-core';
+import type {
+  Browser,
+  Locator,
+  Response as BrowserResponse,
+} from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
@@ -794,6 +798,140 @@ suite(
           ).toMatchObject({ status: 'recorded', ready: false });
           expect(referenceWrites).toBe(0);
 
+          const receiptResponse =
+            (requestId: string) => (response: BrowserResponse) =>
+              response.request().method() === 'GET' &&
+              new URL(response.url()).pathname.endsWith(
+                '/write-receipts/' + requestId,
+              );
+          async function checkReceipt(button: Locator, requestId: string) {
+            const [response] = await Promise.all([
+              page.waitForResponse(receiptResponse(requestId)),
+              button.click(),
+            ]);
+            return response;
+          }
+          await page.route(
+            '**/api/v1/d-entry/panels/*/materials/publications?*',
+            (route) => route.abort('failed'),
+            { times: 1 },
+          );
+          await selectFile(
+            '浏览器企业资料C.txt',
+            '与 A 无关且回包未确认的资料。',
+          );
+          const [unadmitted] = await Promise.all([
+            page.waitForRequest(
+              (request) =>
+                request.method() === 'POST' &&
+                new URL(request.url()).pathname.endsWith(
+                  '/materials/publications',
+                ),
+            ),
+            publishMaterial(),
+          ]);
+          const { requestId: independentId } = unadmitted.postDataJSON() as {
+            requestId: string;
+          };
+          expect(independentId).not.toBe(pendingId);
+          expect(publishWrites).toHaveLength(3);
+          const checkAction = (requestId: string) =>
+            material.getByRole('button', {
+              name: '核对结果 ' + requestId.slice(0, 8),
+              exact: true,
+            });
+          await checkAction(independentId).waitFor();
+          const absentReceipt = await checkReceipt(
+            checkAction(independentId),
+            independentId,
+          );
+          expect(absentReceipt.status()).toBe(200);
+          expect(await absentReceipt.json()).toMatchObject({
+            requestId: independentId,
+            status: 'unknown',
+          });
+          await expect
+            .poll(() => checkAction(independentId).isEnabled())
+            .toBe(true);
+
+          await page.route(
+            '**/write-receipts/' + independentId + '?*',
+            (route) => route.abort('failed'),
+            { times: 1 },
+          );
+          const [interrupted] = await Promise.all([
+            page.waitForEvent('requestfailed', {
+              predicate: (request) =>
+                request.method() === 'GET' &&
+                new URL(request.url()).pathname.endsWith(
+                  '/write-receipts/' + independentId,
+                ),
+            }),
+            checkAction(independentId).click(),
+          ]);
+          expect(interrupted.failure()).not.toBeNull();
+          await expect
+            .poll(() => checkAction(independentId).isEnabled())
+            .toBe(true);
+
+          const openDialog = await material.elementHandle();
+          await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+          const withdraw = (revision: string) =>
+            updateDEntryReleasePolicy(p.context, {
+              revision,
+              defaultGeneration: '3.x',
+              selections: [],
+            });
+          await withdraw('fixture-open-dialog-receipt-withdrawal');
+          const readsBeforeOpenDenial = receiptReads.length;
+          const deniedInDialog = await checkReceipt(
+            checkAction(pendingId),
+            pendingId,
+          );
+          expect(deniedInDialog.status()).toBe(403);
+          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
+            true,
+          );
+          await material
+            .getByRole('status')
+            .filter({ hasText: '当前无法核对原发布请求。' })
+            .waitFor({ timeout: 5000 });
+          expect(await material.isVisible()).toBe(true);
+          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
+            true,
+          );
+          expect(await material.getByText(pendingId.slice(0, 8)).count()).toBe(
+            0,
+          );
+          expect(receiptReads.slice(readsBeforeOpenDenial)).toEqual([
+            pendingId,
+          ]);
+          expect(publishWrites).toHaveLength(3);
+
+          await updateDEntryReleasePolicy(p.context, {
+            revision: 'fixture-open-dialog-receipt-restored',
+            defaultGeneration: '3.x',
+            selections: [
+              {
+                organizationId: p.context.organizationId,
+                personId: p.context.actor.id,
+                employeeInstanceId: p.selection.employeeInstanceId,
+                generation: '4.0',
+              },
+            ],
+          });
+          const onlyCheck = material.getByRole('button', {
+            name: '核对结果',
+            exact: true,
+          });
+          const survivingReceipt = await checkReceipt(onlyCheck, independentId);
+          expect(survivingReceipt.status()).toBe(200);
+          expect(await survivingReceipt.json()).toMatchObject({
+            requestId: independentId,
+            status: 'unknown',
+          });
+          expect(publishWrites).toHaveLength(3);
+
           await material
             .getByRole('button', { name: '取消', exact: true })
             .click();
@@ -803,16 +941,8 @@ suite(
             exact: true,
           });
           await pendingPublication.waitFor();
-          const receiptRequest = (response: BrowserResponse) =>
-            response.request().method() === 'GET' &&
-            new URL(response.url()).pathname.endsWith(
-              '/write-receipts/' + pendingId,
-            );
           const readsBeforeUnknown = receiptReads.length;
-          const [unknown] = await Promise.all([
-            page.waitForResponse(receiptRequest),
-            pendingPublication.click(),
-          ]);
+          const unknown = await checkReceipt(pendingPublication, pendingId);
           expect(unknown.status()).toBe(200);
           expect(await unknown.json()).toMatchObject({
             requestId: pendingId,
@@ -825,17 +955,9 @@ suite(
             .waitFor();
           expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
 
-          await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
-          await updateDEntryReleasePolicy(p.context, {
-            revision: 'fixture-browser-receipt-withdrawal',
-            defaultGeneration: '3.x',
-            selections: [],
-          });
+          await withdraw('fixture-browser-receipt-withdrawal');
           const readsBeforeDenial = receiptReads.length;
-          const [denied] = await Promise.all([
-            page.waitForResponse(receiptRequest),
-            pendingPublication.click(),
-          ]);
+          const denied = await checkReceipt(pendingPublication, pendingId);
           expect(denied.status()).toBe(403);
           await pendingPublication.waitFor({
             state: 'detached',
