@@ -55,9 +55,13 @@ same-rank ordering resolves duplicates (selected static entries precede personal
 bindings). Existing installation name-conflict rules are unchanged. Consumers
 still apply native model/user invocation policy at their own boundary.
 The host must call the returned `invalidate()` on configuration/current/binding
-changes. A cached list can remain visible until that notification; `get` still
-checks current access. Native provider discovery failure produces an incomplete
-snapshot and a warning; an empty/incomplete native list is not proof of access.
+changes. This invalidates the native cache and prevents a list or get already in
+flight from returning data read before that notification. New reads retain exact
+pin semantics, including still-authorized old personal pins after a version
+pointer change. A cached list can remain visible before notification. Each
+`get` checks current access. Native provider discovery failure produces an
+incomplete snapshot and a warning. The empty or incomplete list carries no
+access decision.
 
 Every asynchronous source/current/config promise is actually awaited. Caller
 and native registration cancellation are combined and forwarded to the existing
@@ -71,8 +75,9 @@ cleanup-error logging semantics. Failures that settle after caller cancellation
 are retained by identity until owner disposal, even if their IO already left
 the pending set. Each actual operation records once; disposal joins pending IO,
 deduplicates the retained/joined failures, clears those references and preserves
-original failures and distinct cancellation reasons. Successful operations,
-pure caller cancellation and ordinary delivered failures are not accumulated.
+original failures and distinct cancellation reasons. The disposer reports
+genuine failures after cancellation. Normal caller cancellation or unregister
+joins pending reads and cleanup without reporting a cleanup error.
 
 Only instruction bodies are exposed. The native `opaque` resource base says
 relative resource bytes are unavailable through this provider. No directory,

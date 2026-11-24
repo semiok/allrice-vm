@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { UuidSchema } from '@allrice/contracts';
-import type { Sql, TransactionSql } from 'postgres';
+import type { Sql } from 'postgres';
 import { z } from 'zod';
+import { withDedicatedCallerTransaction } from '../business-runtime/caller-transaction.ts';
 
 const digestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const instant = z.iso
@@ -186,15 +187,13 @@ function receipt(row: Row): NativeScheduleObservationReceipt {
 type Pending<T> = PromiseLike<T> & { cancel(): void };
 type Query = <T>(pending: Pending<T>) => Promise<T>;
 
-/** Own actual SQL cancellation and await the whole transaction, including its
- * COMMIT/ROLLBACK. Internal COMMIT has no public cancel handle: join it instead.
- * Keep separately observed query/transaction failures and the caller's reason. */
+/** Forward cancellation to actual SQL, await its settlement, and suppress late
+ * success. Keep real query/cleanup errors alongside the caller's reason. */
 async function joined<T>(
   signal: AbortSignal | undefined,
-  work: (query: Query, recordFailure: (error: unknown) => void) => Promise<T>,
+  work: (query: Query) => Promise<T>,
 ): Promise<T> {
   signal?.throwIfAborted();
-  const failures: unknown[] = [];
   const query: Query = async (pending) => {
     const cancel = () => pending.cancel();
     signal?.addEventListener('abort', cancel, { once: true });
@@ -203,28 +202,29 @@ async function joined<T>(
       const result = await pending;
       signal?.throwIfAborted();
       return result;
-    } catch (error) {
-      failures.push(error);
-      throw error;
     } finally {
       signal?.removeEventListener('abort', cancel);
     }
   };
   try {
-    const result = await work(query, (error) => {
-      failures.push(error);
-    });
+    const result = await work(query);
     signal?.throwIfAborted();
     return result;
   } catch (error) {
-    if (!failures.includes(error)) failures.push(error);
-    const errors = failures.filter(
-      (item, index) =>
-        failures.indexOf(item) === index &&
-        (!signal?.aborted || item !== signal.reason),
-    );
-    if (signal?.aborted) errors.push(signal.reason);
-    if (errors.length === 1) throw errors[0];
+    if (!signal?.aborted || Object.is(error, signal.reason)) throw error;
+    const reason: unknown = signal.reason;
+    const failures = new Set<unknown>();
+    function collect(failure: unknown) {
+      if (Object.is(failure, reason) || failures.has(failure)) return;
+      if (failure instanceof AggregateError && failure.errors.length) {
+        for (const item of failure.errors as unknown[]) collect(item);
+      } else {
+        failures.add(failure);
+      }
+    }
+    collect(error);
+    if (!failures.size) throw reason;
+    const errors = [...failures, reason];
     throw new AggregateError(
       errors,
       'native_schedule_ledger_operation_failed',
@@ -235,14 +235,10 @@ async function joined<T>(
 
 /** Concrete storage backend for this module's own append-only receipt table.
  * No current-authority/producer ordering, native identity, latest head or wake.
- * Caller owns the SQL client and trusted composition; this factory creates none.
+ * Caller supplies trusted SQL configuration. Writes use a dedicated session.
  * A rejected write has unknown commit status until its exact receipt is found. */
 export function createPostgresNativeScheduleObservationLedger(db: Sql) {
-  async function existing(
-    sql: Sql | TransactionSql,
-    operation: Operation,
-    query: Query,
-  ) {
+  async function existing(sql: Sql, operation: Operation, query: Query) {
     const o = operation.origin;
     const rows = await query(sql<
       Row[]
@@ -267,48 +263,43 @@ export function createPostgresNativeScheduleObservationLedger(db: Sql) {
     kind: Operation['kind'],
     signal?: AbortSignal,
   ) {
-    return joined(signal, async (query, recordFailure) => {
+    return joined(signal, async (query) => {
       const expected = prepare(input, kind);
       const { operation, inputDigest } = expected;
       const o = operation.origin;
-      const transaction = async (tx: TransactionSql) => {
-        const previous = await existing(tx, operation, query);
-        if (previous) return exact(previous, expected);
-        if (operation.invalidateReceiptIds.length) {
-          const targets = await query(tx<
-            Row[]
-          >`select receipt_id,input_digest,input_payload,received_at
+      return withDedicatedCallerTransaction(
+        db,
+        async (tx) => {
+          const previous = await existing(tx, operation, query);
+          if (previous) return exact(previous, expected);
+          if (operation.invalidateReceiptIds.length) {
+            const targets = await query(tx<
+              Row[]
+            >`select receipt_id,input_digest,input_payload,received_at
             from allrice_native_schedule_observation_receipts
             where receipt_id in ${tx([...operation.invalidateReceiptIds])} and organization_id=${o.organizationId}
               and workspace_id=${o.workspaceId} and person_id=${o.personId}
               and vm_id=${o.vmId} and employee_instance_id=${o.employeeInstanceId}`);
-          if (
-            targets.length !== operation.invalidateReceiptIds.length ||
-            targets.some((row) => receipt(row).operation.kind !== 'snapshot')
-          )
-            throw new LedgerError('invalid_receipt_reference');
-        }
-        signal?.throwIfAborted();
-        const rows = await query(tx<
-          Row[]
-        >`insert into allrice_native_schedule_observation_receipts
+            if (
+              targets.length !== operation.invalidateReceiptIds.length ||
+              targets.some((row) => receipt(row).operation.kind !== 'snapshot')
+            )
+              throw new LedgerError('invalid_receipt_reference');
+          }
+          signal?.throwIfAborted();
+          const rows = await query(tx<
+            Row[]
+          >`insert into allrice_native_schedule_observation_receipts
           (receipt_id,organization_id,workspace_id,person_id,vm_id,employee_instance_id,input_digest,input_payload)
           values(${operation.receiptId},${o.organizationId},${o.workspaceId},${o.personId},${o.vmId},${o.employeeInstanceId},
             ${inputDigest},${tx.json(JSON.parse(canonical(operation)))})
           on conflict(receipt_id) do nothing returning receipt_id,input_digest,input_payload,received_at`);
-        const row = rows[0] ?? (await existing(tx, operation, query));
-        if (!row) throw new LedgerError('receipt_conflict');
-        return exact(row, expected);
-      };
-      return db.begin(async (tx) => {
-        try {
-          return await transaction(tx);
-        } catch (error) {
-          // The driver may replace this rejection if its rollback also fails.
-          recordFailure(error);
-          throw error;
-        }
-      });
+          const row = rows[0] ?? (await existing(tx, operation, query));
+          if (!row) throw new LedgerError('receipt_conflict');
+          return exact(row, expected);
+        },
+        signal,
+      );
     });
   }
   return {

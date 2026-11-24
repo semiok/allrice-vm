@@ -156,16 +156,17 @@ suite(
         personalSkills: true,
       };
       const personal = createPostgresPersonalSkillPackageSource(f.db, host);
+      const readConfiguration = vi.fn(async (signal: AbortSignal) => {
+        signal.throwIfAborted();
+        return configuration;
+      });
       let mounted!: ReturnType<typeof registerNativeCapabilitySkillProvider>;
       await ctx.inject(['skills'], (target) => {
         mounted = registerNativeCapabilitySkillProvider(target, {
           builtin,
           personal,
           requireCurrent: host.requireCurrent,
-          readConfiguration: async (signal) => {
-            signal.throwIfAborted();
-            return configuration;
-          },
+          readConfiguration,
         });
       });
       return {
@@ -174,6 +175,7 @@ suite(
         personal,
         web,
         builtin,
+        readConfiguration,
         configure(value: NativeCapabilitySkillConfiguration) {
           configuration = value;
         },
@@ -201,6 +203,9 @@ suite(
           )
         ).content,
       );
+      const [originalPin] = await m.personal.listPackagePins(
+        new AbortController().signal,
+      );
       const nextId = randomUUID();
       const next = {
         ...installed.definition,
@@ -218,6 +223,14 @@ suite(
       );
       m.mounted.invalidate();
       expect((await m.ctx.skills.get(next.name))?.content).toBe(next.content);
+      expect(
+        (
+          await m.personal.readPackage(
+            originalPin,
+            new AbortController().signal,
+          )
+        ).definition.content,
+      ).toBe(installed.definition.content);
       await f.db`update allrice_personal_skill_bindings set enabled=false,epoch=epoch+1
       where instance_id=${host.scope.instanceId} and installation_id=${installed.installationId}`;
       await expect(m.ctx.skills.get(next.name)).rejects.toThrow(
@@ -229,6 +242,52 @@ suite(
       ]);
       await m.mounted.dispose();
       expect(await m.ctx.skills.list()).toEqual([]);
+    });
+
+    it('does not disclose an in-flight body after its PG binding is revoked and the host invalidates', async () => {
+      const selected = await install(),
+        unaffected = await install();
+      const m = await mount();
+      expect((await m.ctx.skills.list()).map((skill) => skill.name)).toContain(
+        selected.definition.name,
+      );
+      let entered!: () => void, release!: () => void;
+      const checking = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const configuration = m.readConfiguration.getMockImplementation()!;
+      m.readConfiguration
+        .mockImplementationOnce(configuration)
+        .mockImplementationOnce(async (signal) => {
+          // The source already finished both body and binding/epoch reads.
+          entered();
+          await gate;
+          return configuration(signal);
+        });
+      const pending = m.ctx.skills.get(selected.definition.name);
+      const settled = pending.catch((error: unknown) => error);
+      try {
+        await checking;
+        await f.db`update allrice_personal_skill_bindings set enabled=false,epoch=epoch+1
+          where instance_id=${host.scope.instanceId} and installation_id=${selected.installationId}`;
+        m.mounted.invalidate();
+        release();
+        await expect(pending).rejects.toThrow(
+          'native_capability_skill_unavailable',
+        );
+        expect(
+          (await m.ctx.skills.get(unaffected.definition.name))?.content,
+        ).toBe(unaffected.definition.content);
+        expect(
+          await m.ctx.skills.get(selected.definition.name),
+        ).toBeUndefined();
+      } finally {
+        release();
+        await settled;
+      }
     });
 
     it('rechecks actual PG body current/config and keeps an unavailable producer fail closed', async () => {

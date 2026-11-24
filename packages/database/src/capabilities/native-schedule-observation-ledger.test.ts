@@ -1,10 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { Sql, TransactionSql } from 'postgres';
-import { describe, expect, it, vi } from 'vitest';
+import postgres, { type ReservedSql, type Sql } from 'postgres';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as client from '../core/client.ts';
 import {
   createPostgresNativeScheduleObservationLedger,
   type NativeScheduleSnapshotReceiptInput,
 } from './native-schedule-observation-ledger.ts';
+
+vi.mock('../core/client.ts', async (original) => ({
+  ...(await original<typeof client>()),
+  createDedicatedDatabase: vi.fn(),
+}));
 
 function input(): NativeScheduleSnapshotReceiptInput {
   const items = [
@@ -53,6 +59,10 @@ function pending<T>(promise: Promise<T>) {
 }
 
 describe('receipt storage contracts; scripted SQL is not migration or authority evidence', () => {
+  beforeEach(() => {
+    vi.mocked(client.createDedicatedDatabase).mockReset();
+  });
+
   it.each(['commitBatch', 'readExactReceipt'] as const)(
     'does not start a pre-canceled %s',
     async (method) => {
@@ -67,6 +77,7 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
       ).rejects.toBe(abort.signal.reason);
       expect(db).not.toHaveBeenCalled();
       expect(db.begin).not.toHaveBeenCalled();
+      expect(client.createDedicatedDatabase).not.toHaveBeenCalled();
     },
   );
 
@@ -109,6 +120,7 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
     ).rejects.toBeDefined();
     expect(db.begin).not.toHaveBeenCalled();
     expect(db).not.toHaveBeenCalled();
+    expect(client.createDedicatedDatabase).not.toHaveBeenCalled();
   });
 
   it('cancels actual pending SQL, waits for settlement, and does not manufacture an empty receipt', async () => {
@@ -153,10 +165,25 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
 
   function transactionFixture() {
     const committing = deferred<void>(),
-      commit = deferred<void>();
-    const tx = Object.assign(
-      vi.fn((parts: TemplateStringsArray, ...values: unknown[]) => {
-        const rows = parts.join('').includes('insert into')
+      commit = deferred<void>(),
+      rollingBack = deferred<void>(),
+      rollback = deferred<void>();
+    const release = vi.fn();
+    const statements: string[] = [];
+    const session = Object.assign(
+      vi.fn((parts: TemplateStringsArray | string[], ...values: unknown[]) => {
+        if (!('raw' in parts)) return { values: parts };
+        const sql = parts.join('');
+        statements.push(sql.trim().split(' ', 1)[0]!);
+        if (sql === 'commit') {
+          committing.resolve();
+          return pending(commit.promise);
+        }
+        if (sql === 'rollback') {
+          rollingBack.resolve();
+          return pending(rollback.promise);
+        }
+        const rows = sql.includes('insert into')
           ? [
               {
                 receipt_id: values[0],
@@ -168,22 +195,40 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
           : [];
         return pending(Promise.resolve(rows));
       }),
-      { json: (value: unknown) => structuredClone(value) },
-    ) as unknown as TransactionSql;
+      { json: (value: unknown) => structuredClone(value), release },
+    ) as unknown as ReservedSql;
+    const reserve = vi.fn(async () => session),
+      end = vi.fn(async () => {});
+    vi.mocked(client.createDedicatedDatabase).mockReturnValueOnce({
+      reserve,
+      end,
+    } as unknown as Sql);
     const db = Object.assign(vi.fn(), {
-      begin: vi.fn(async (run: (value: TransactionSql) => Promise<unknown>) => {
-        const result = await run(tx);
-        committing.resolve();
-        await commit.promise;
-        return result;
-      }),
+      PostgresError: postgres.PostgresError,
+      begin: vi.fn(),
     }) as unknown as Sql;
-    return { db, tx, committing, commit };
+    return {
+      db,
+      committing,
+      commit,
+      rollingBack,
+      rollback,
+      reserve,
+      release,
+      end,
+      statements,
+    };
   }
 
-  it('joins a pending transaction COMMIT before suppressing a canceled success', async () => {
+  it('joins COMMIT and dedicated client end before suppressing a canceled success', async () => {
     const f = transactionFixture(),
       abort = new AbortController();
+    const closing = deferred<void>(),
+      closed = deferred<void>();
+    f.end.mockImplementationOnce(() => {
+      closing.resolve();
+      return closed.promise;
+    });
     const result = createPostgresNativeScheduleObservationLedger(
       f.db,
     ).commitBatch(input(), abort.signal);
@@ -193,10 +238,17 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
     abort.abort();
     await Promise.resolve();
     expect(settled).not.toHaveBeenCalled();
+    expect(f.end).not.toHaveBeenCalled();
     f.commit.resolve();
+    await closing.promise;
+    expect(settled).not.toHaveBeenCalled();
+    closed.resolve();
     await expect(result).rejects.toBe(abort.signal.reason);
     await handled;
-    expect(f.db.begin).toHaveBeenCalledOnce();
+    expect(f.reserve).toHaveBeenCalledOnce();
+    expect(f.release).toHaveBeenCalledOnce();
+    expect(f.statements).toEqual(['begin', 'select', 'insert', 'commit']);
+    expect(f.db.begin).not.toHaveBeenCalled();
   });
 
   it('preserves a lost COMMIT acknowledgement error and never retries the write', async () => {
@@ -209,40 +261,23 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
     await f.committing.promise;
     f.commit.reject(error);
     expect(await caught).toBe(error);
-    expect(f.db.begin).toHaveBeenCalledOnce();
+    expect(f.reserve).toHaveBeenCalledOnce();
+    expect(f.statements).toEqual(['begin', 'select', 'insert', 'commit']);
+    expect(f.end).toHaveBeenCalledOnce();
+    expect(f.release).not.toHaveBeenCalled();
+    expect(f.db.begin).not.toHaveBeenCalled();
   });
 
   it.each([false, true])(
     'joins rollback and retains the original callback and rollback failures (abort=%s)',
     async (cancelDuringRollback) => {
-      const rollingBack = deferred<unknown>(),
-        rollback = deferred<void>();
+      const f = transactionFixture();
       const rollbackError = Error('driver rollback failed');
-      // Empty reads make the real ledger reject a missing reference. The SQL
-      // list helper is a fragment; only tagged requests return pending results.
-      const tx = vi.fn((parts: TemplateStringsArray | string[]) =>
-        'raw' in parts ? pending(Promise.resolve([])) : { values: parts },
-      ) as unknown as TransactionSql;
-      const db = Object.assign(vi.fn(), {
-        begin: vi.fn(
-          async (run: (value: TransactionSql) => Promise<unknown>) => {
-            let original: unknown;
-            try {
-              await run(tx);
-            } catch (error) {
-              original = error;
-            }
-            rollingBack.resolve(original);
-            await rollback.promise;
-            // Model the driver's distinct rollback rejection replacing the
-            // actual callback error; do not synthesize a ledger error here.
-            if (original !== undefined) throw rollbackError;
-          },
-        ),
-      }) as unknown as Sql;
+      const closeError = Error('dedicated client close failed');
+      if (cancelDuringRollback) f.end.mockRejectedValueOnce(closeError);
       const abort = new AbortController();
       const result = createPostgresNativeScheduleObservationLedger(
-        db,
+        f.db,
       ).commitBatch(
         { ...input(), invalidateReceiptIds: [randomUUID()] },
         abort.signal,
@@ -250,25 +285,34 @@ describe('receipt storage contracts; scripted SQL is not migration or authority 
       const settled = vi.fn();
       const outcome = result.finally(settled).catch((error: unknown) => error);
       try {
-        const original = await rollingBack.promise;
-        expect(original).toMatchObject({ code: 'invalid_receipt_reference' });
+        await f.rollingBack.promise;
         if (cancelDuringRollback)
           abort.abort(Error('caller canceled during rollback'));
         // Drain the event-loop turn without a timer or settling the driver.
         await new Promise<void>((resolve) => setImmediate(resolve));
         expect(settled).not.toHaveBeenCalled();
-        rollback.resolve();
+        expect(f.end).not.toHaveBeenCalled();
+        f.rollback.reject(rollbackError);
         const error = await outcome;
         expect(error).toBeInstanceOf(AggregateError);
         const failures = (error as AggregateError).errors as unknown[];
-        expect((error as Error).cause).toBe(original);
-        expect(failures).toHaveLength(cancelDuringRollback ? 3 : 2);
-        expect(failures[0]).toBe(original);
+        expect(failures).toHaveLength(cancelDuringRollback ? 4 : 2);
+        expect(failures[0]).toMatchObject({
+          code: 'invalid_receipt_reference',
+        });
+        expect((error as Error).cause).toBe(failures[0]);
         expect(failures[1]).toBe(rollbackError);
-        if (cancelDuringRollback) expect(failures[2]).toBe(abort.signal.reason);
-        expect(db.begin).toHaveBeenCalledOnce();
+        if (cancelDuringRollback) {
+          expect(failures[2]).toBe(closeError);
+          expect(failures[3]).toBe(abort.signal.reason);
+        }
+        expect(f.reserve).toHaveBeenCalledOnce();
+        expect(f.statements).toEqual(['begin', 'select', 'select', 'rollback']);
+        expect(f.end).toHaveBeenCalledOnce();
+        expect(f.release).not.toHaveBeenCalled();
+        expect(f.db.begin).not.toHaveBeenCalled();
       } finally {
-        rollback.resolve();
+        f.rollback.resolve();
         await outcome;
       }
     },

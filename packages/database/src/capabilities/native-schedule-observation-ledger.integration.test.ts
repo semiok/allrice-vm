@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import postgres, { type TransactionSql } from 'postgres';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import postgres from 'postgres';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
+import * as client from '../core/client.ts';
 import { assertRuntimeFixtureDatabase } from '../runtime-fixture-database.ts';
 import {
   createPostgresNativeScheduleObservationLedger,
@@ -75,6 +84,9 @@ suite(
         connection: { search_path: schema, application_name: schema },
       });
       await db.unsafe(ddl);
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
     afterAll(async () => {
       try {
@@ -207,21 +219,36 @@ suite(
     it('reads the original durable receipt after the real COMMIT succeeds but its reply is lost', async () => {
       const request = input(),
         error = Error('synthetic reply lost after actual commit');
-      const lost = new Proxy(db, {
-        get(target, key, receiver) {
-          if (key === 'begin')
-            return async (run: (tx: TransactionSql) => Promise<unknown>) => {
-              await target.begin(run);
-              throw error;
-            };
-          return Reflect.get(target, key, receiver);
-        },
-      });
-      await expect(
-        createPostgresNativeScheduleObservationLedger(lost).commitBatch(
-          request,
-        ),
-      ).rejects.toBe(error);
+      const create = client.createDedicatedDatabase;
+      const dedicated = vi
+        .spyOn(client, 'createDedicatedDatabase')
+        .mockImplementationOnce((source) => {
+          const owned = create(source);
+          return new Proxy(owned, {
+            get(target, key, receiver) {
+              if (key !== 'reserve') return Reflect.get(target, key, receiver);
+              return async () => {
+                const session = await owned.reserve();
+                return new Proxy(session, {
+                  apply(target, receiver, args) {
+                    const query: unknown = Reflect.apply(
+                      target,
+                      receiver,
+                      args,
+                    );
+                    if (Array.isArray(args[0]) && args[0].join('') === 'commit')
+                      return Promise.resolve(query).then(() => {
+                        throw error;
+                      });
+                    return query;
+                  },
+                });
+              };
+            },
+          });
+        });
+      await expect(ledger().commitBatch(request)).rejects.toBe(error);
+      expect(dedicated).toHaveBeenCalledOnce();
       expect((await ledger().readExactReceipt(request))!.operation).toEqual(
         request,
       );
@@ -229,6 +256,75 @@ suite(
         { count: number }[]
       >`select count(*)::int count from allrice_native_schedule_observation_receipts where receipt_id=${request.receiptId}`;
       expect(row!.count).toBe(1);
+    });
+
+    it('joins dedicated client cleanup after an actual blocked write disconnects', async () => {
+      const old = input(),
+        original = await ledger().commitBatch(old);
+      const blocker = await db.reserve();
+      const request = input({ invalidateReceiptIds: [old.receiptId] });
+      const create = client.createDedicatedDatabase;
+      let closed!: () => void, releaseEnd!: () => void;
+      const clientClosed = new Promise<void>((resolve) => {
+        closed = resolve;
+      });
+      const finishEnd = new Promise<void>((resolve) => {
+        releaseEnd = resolve;
+      });
+      vi.spyOn(client, 'createDedicatedDatabase').mockImplementationOnce(
+        (source) => {
+          const owned = create(source);
+          const end = owned.end;
+          vi.spyOn(owned, 'end').mockImplementationOnce(async (options) => {
+            await end(options);
+            closed();
+            await finishEnd;
+          });
+          return owned;
+        },
+      );
+      const settled = vi.fn();
+      let outcome: Promise<unknown> | undefined;
+      try {
+        await blocker`begin`;
+        await blocker`lock table allrice_native_schedule_observation_receipts in share mode`;
+        const [holder] = await blocker<
+          { pid: number }[]
+        >`select pg_backend_pid() pid`;
+        outcome = ledger()
+          .commitBatch(request)
+          .finally(settled)
+          .catch((error: unknown) => error);
+        async function blockedWrite() {
+          return admin<{ pid: number }[]>`select pid from pg_stat_activity
+            where datname=current_database() and application_name=${schema}
+            and state='active' and wait_event_type='Lock'
+            and query like 'insert into allrice_native_schedule_observation_receipts%'
+            and ${holder!.pid}=any(pg_blocking_pids(pid))`;
+        }
+        await expect.poll(blockedWrite).toHaveLength(1);
+        const [victim] = await blockedWrite();
+        const [terminated] = await admin<
+          { stopped: boolean }[]
+        >`select pg_terminate_backend(pid, 5000) stopped from pg_stat_activity
+          where datname=current_database() and application_name=${schema}
+          and pid=${victim!.pid} and ${holder!.pid}=any(pg_blocking_pids(pid))`;
+        expect(terminated?.stopped).toBe(true);
+        await clientClosed;
+        expect(settled).not.toHaveBeenCalled();
+        releaseEnd();
+        expect(await outcome).toMatchObject({ code: '57P01' });
+        expect(
+          await admin`select pid from pg_stat_activity where pid=${victim!.pid}`,
+        ).toEqual([]);
+      } finally {
+        releaseEnd();
+        await blocker`rollback`;
+        blocker.release();
+        await outcome;
+      }
+      expect(await ledger().readExactReceipt(request)).toBeNull();
+      expect(await ledger().readExactReceipt(old)).toEqual(original);
     });
 
     it('cancels real lock-wait SQL and joins rollback before returning both observed failures', async () => {

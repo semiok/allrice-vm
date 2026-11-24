@@ -31,7 +31,7 @@
       "version": "1.1.2",
       "checksum": "sha256:eb5869e6bf96f851052ba47e01813d025734f0314b8907dbb6631f48595360fa",
       "source": "allrice",
-      "sourceRef": "https://github.com/semiok/allrice/tree/main/skills/web-research?content-sha256=eb5869e6bf96f851052ba47e01813d025734f0314b8907dbb6631f48595360fa",
+      "sourceRef": "https://github.com/semiok/allrice-vm/blob/e542464a9bb3c4b181efb9a1af66b0a4ff9f7a19/skills/web-research/SKILL.md?content-sha256=eb5869e6bf96f851052ba47e01813d025734f0314b8907dbb6631f48595360fa",
       "license": "Apache-2.0",
       "reviewStatus": "reviewed",
       "reviewedByLabel": "MET-285 native web guidance dedup",

@@ -382,4 +382,36 @@ describe('actual native registry consuming AllRice sources; authority substitute
     expect(closed).toBe(true);
     expect(f.host.personal.listPackagePins).not.toHaveBeenCalled();
   });
+
+  it('explicit disposal joins pending current IO and succeeds after normal abort', async () => {
+    const f = await fixture();
+    const entered = deferred<AbortSignal>();
+    const gate = deferred<void>();
+    f.host.requireCurrent.mockImplementationOnce(async (signal) => {
+      entered.resolve(signal);
+      await gate.promise;
+      signal.throwIfAborted();
+    });
+    const listing = f.ctx.skills.snapshot();
+    const actualSignal = await entered.promise;
+    const aborted = deferred<void>();
+    actualSignal.addEventListener('abort', () => aborted.resolve(), {
+      once: true,
+    });
+    const disposal = f.mounted.dispose();
+    const done = vi.fn();
+    const handled = disposal.then(done, done);
+    try {
+      await aborted.promise;
+      expect(done).not.toHaveBeenCalled();
+      expect(f.host.personal.listPackagePins).not.toHaveBeenCalled();
+      gate.resolve();
+      await expect(disposal).resolves.toBeUndefined();
+      expect((await listing).skills).toEqual([]);
+      expect(await f.ctx.skills.list()).toEqual([]);
+    } finally {
+      gate.resolve();
+      await handled;
+    }
+  });
 });

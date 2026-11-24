@@ -6,8 +6,9 @@ implementation prepared, awaiting fixed-head tests and independent review. It is
 not an installed production receiver or a complete external wake chain.
 
 `createPostgresNativeScheduleObservationLedger(db)` is a concrete PostgreSQL
-storage implementation. The caller owns the SQL client and trusted composition;
-the factory does not authenticate a native Host, create authority, or open a VM.
+storage implementation. The caller supplies the SQL client and trusted composition.
+Writes use a dedicated transaction client configured from that client. The factory
+does not authenticate a native Host, create authority, or open a VM.
 Its only table is `allrice_native_schedule_observation_receipts`.
 
 The three operations are `commitBatch`, `invalidateReceipts`, and
@@ -40,11 +41,14 @@ operation. Invalidation links record evidence; they do not authorize a consumer 
 choose a latest snapshot or start a task. receivedAt is audit metadata only.
 
 Actual SQL cancellation calls the driver's cancel and waits for query settlement.
-The enclosing transaction is awaited through COMMIT/ROLLBACK. Internal COMMIT has
-no separate public cancel handle: cancellation joins it and suppresses a late
-success. Separately observed SQL/transaction failures and the original cancellation
-reason are retained, with a real failure as AggregateError cause. No timeout,
-SQLSTATE inference, retry, or automatic write reconciliation is added.
+The existing dedicated transaction lifecycle joins the callback, COMMIT or
+ROLLBACK, and client close, including when the connection is lost. On an
+unconfirmed transport outcome it closes the owned client. Cancellation during
+COMMIT waits for it and suppresses a late success. Separately observed
+SQL/transaction/cleanup failures and the original cancellation reason are
+retained, with a real failure as AggregateError cause. The ledger uses the
+existing transaction helper's close timeout and reconciles only by explicit
+exact-receipt reads.
 
 A rejected write does not prove rollback. After the original operation settles,
 the caller uses readExactReceipt with its original immutable input. Only an exact

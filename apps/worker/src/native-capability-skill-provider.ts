@@ -66,21 +66,6 @@ function allowed(config: NativeCapabilitySkillConfiguration, locator: Locator) {
       pin.bundleChecksum === locator.selector.bundleChecksum,
   );
 }
-function throwFailures(errors: unknown[]) {
-  const distinct = errors.filter(
-    (error, index) => errors.indexOf(error) === index,
-  );
-  if (distinct.length === 1) throw distinct[0];
-  if (distinct.length)
-    throw new AggregateError(
-      distinct,
-      'native_capability_skill_cleanup_failed',
-      {
-        cause: distinct[0],
-      },
-    );
-}
-
 /** Call synchronously in the target's Cordis context with `skills` injected
  * (e.g. ctx.inject(['skills'], apply)). No production mount or identity/config
  * producer is installed here. DSH owns registration/cache.
@@ -96,6 +81,7 @@ export function registerNativeCapabilitySkillProvider(
   )
     return unavailable();
   let control: SkillProviderControl;
+  let generation = 0;
   const pending = new Set<Promise<unknown>>();
   const settledFailures = new Set<unknown>();
   const configuration = async (signal: AbortSignal) => {
@@ -120,6 +106,7 @@ export function registerNativeCapabilitySkillProvider(
     caller: AbortSignal | undefined,
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> => {
+    const started = generation;
     const signal = caller
       ? AbortSignal.any([control.signal, caller])
       : control.signal;
@@ -128,6 +115,9 @@ export function registerNativeCapabilitySkillProvider(
         signal.throwIfAborted();
         const result = await work(signal);
         signal.throwIfAborted();
+        // A notified host change can invalidate the binding while the last
+        // current/config check is pending. Require a new authorized read.
+        if (started !== generation) return unavailable();
         return result;
       } catch (error) {
         if (
@@ -200,15 +190,18 @@ export function registerNativeCapabilitySkillProvider(
   const dispose = ctx.effect(function* () {
     // Cordis disposes in reverse order: native unregister/abort, then actual IO.
     yield async () => {
-      const results = await Promise.allSettled([...pending]);
-      const errors = [
-        ...settledFailures,
-        ...results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        ),
-      ];
+      // The pending observers retain genuine failures, including ones that
+      // settle during this join. Expected cancellation is not a failure.
+      await Promise.allSettled([...pending]);
+      const errors = [...settledFailures];
       settledFailures.clear();
-      throwFailures(errors);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length)
+        throw new AggregateError(
+          errors,
+          'native_capability_skill_cleanup_failed',
+          { cause: errors[0] },
+        );
     };
     yield ctx.skills.registerProvider((nativeControl) => {
       control = nativeControl;
@@ -267,5 +260,11 @@ export function registerNativeCapabilitySkillProvider(
       };
     });
   }, 'AllRice capability Skill sources');
-  return { invalidate: () => control.invalidate(), dispose };
+  return {
+    invalidate() {
+      generation++;
+      control.invalidate();
+    },
+    dispose,
+  };
 }
