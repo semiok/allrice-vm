@@ -57,6 +57,7 @@ function rejectedBeforeUpload(error: EmployeePanelsHttpError) {
     (error.status === 413 && error.code === 'QUOTA_EXCEEDED') ||
     (error.status === 400 &&
       error.code === 'VALIDATION_FAILED' &&
+      // r1-exempt(own-text): 固定文案来自同源 referenceError 的 invalid_content 响应，其他通用 400 仍按原回执未决处理。
       error.message === '文件为空、格式无效或超过 50 MiB。')
   );
 }

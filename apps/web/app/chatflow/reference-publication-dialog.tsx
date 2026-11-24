@@ -421,18 +421,25 @@ function PublicationForm({
   const [purpose, setPurpose] = useState(reference?.purpose ?? '');
   const [upload, setUpload] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<{
+    message: string;
+    pendingRequestId?: string;
+  }>();
   const fileInput = useRef<HTMLInputElement>(null);
   const pending = useRef(false);
   const transport = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
   const edits = useRef(0);
-  const waitingFor = useRef<string | undefined>(undefined);
   const checks = useRef(new Map<string, AbortController>()).current;
   const [initialReceipts] = useState(() => restorePublications(receiptKey));
   const [receipts, setReceipts] = useState(initialReceipts);
-  const [receiptNotes, setReceiptNotes] = useState<Record<string, string>>({});
+  const [receiptNotes, setReceiptNotes] = useState<
+    Record<
+      string,
+      { stage: 'checking' | 'waiting' | 'settled'; message: string }
+    >
+  >({});
   const completion = receiptActions[target.kind] + '已完成。';
   useEffect(() => {
     alive.current = true;
@@ -448,10 +455,16 @@ function PublicationForm({
     async (value: PublicationReceipt) => {
       if (!receiptKey || checks.has(value.requestId)) return;
       const controller = new AbortController();
-      const note = (message: string) =>
-        setReceiptNotes((prior) => ({ ...prior, [value.requestId]: message }));
+      const note = (
+        stage: 'checking' | 'waiting' | 'settled',
+        message: string,
+      ) =>
+        setReceiptNotes((prior) => ({
+          ...prior,
+          [value.requestId]: { stage, message },
+        }));
       checks.set(value.requestId, controller);
-      note('正在核对原发布结果…');
+      note('checking', '正在核对原发布结果…');
       try {
         const outcome = await checkPublication(
           data,
@@ -462,17 +475,17 @@ function PublicationForm({
         );
         if (!alive.current || controller.signal.aborted) return;
         if (!outcome) {
-          note(waitingForReceipt);
+          note('waiting', waitingForReceipt);
           return;
         }
         setReceipts((prior) =>
           prior.filter((pending) => pending.requestId !== value.requestId),
         );
-        if (waitingFor.current === value.requestId) {
-          waitingFor.current = undefined;
-          setError((current) => (current === waitingForReceipt ? '' : current));
-        }
+        setError((current) =>
+          current?.pendingRequestId === value.requestId ? undefined : current,
+        );
         note(
+          'settled',
           outcome === 'recorded'
             ? completion
             : receiptActions[target.kind] + '已拒绝。',
@@ -482,7 +495,7 @@ function PublicationForm({
         }
       } catch {
         if (alive.current && !controller.signal.aborted)
-          note(waitingForReceipt);
+          note('waiting', waitingForReceipt);
       } finally {
         if (checks.get(value.requestId) === controller)
           checks.delete(value.requestId);
@@ -549,7 +562,7 @@ function PublicationForm({
       return;
     pending.current = true;
     setBusy(true);
-    setError('');
+    setError(undefined);
     const controller = new AbortController();
     const formVersion = edits.current;
     transport.current = controller;
@@ -675,21 +688,24 @@ function PublicationForm({
       if (issued && !definite) {
         if (alive.current && !controller.signal.aborted) {
           setReceipts(restorePublications(receiptKey));
-          waitingFor.current = issued.requestId;
-          setError(waitingForReceipt);
+          setError({
+            message: waitingForReceipt,
+            pendingRequestId: issued.requestId,
+          });
         }
         return;
       }
       if (issued) forget(issued, 'rejected');
       if (alive.current && !controller.signal.aborted) {
-        setError(
-          definite ||
+        setError({
+          message:
+            definite ||
             (reference && caught instanceof Error && 'status' in caught)
-            ? caught.message
-            : caught instanceof ReceiptStorageUnavailable
-              ? '无法保留原发布请求，请重试。'
-              : '发布未完成，请重试。',
-        );
+              ? caught.message
+              : caught instanceof ReceiptStorageUnavailable
+                ? '无法保留原发布请求，请重试。'
+                : '发布未完成，请重试。',
+        });
       }
     } finally {
       if (alive.current && !controller.signal.aborted) {
@@ -699,6 +715,7 @@ function PublicationForm({
     }
   }
 
+  const shownError = error?.message || download.error || available.error;
   return (
     <DshDialog
       title={title}
@@ -872,15 +889,15 @@ function PublicationForm({
           </p>
         </>
       )}
-      {(error || download.error || available.error) && (
+      {shownError && (
         <p role="alert" className={css.error}>
-          {error || download.error || available.error}
+          {shownError}
         </p>
       )}
       {Object.entries(receiptNotes).map(([id, note]) => (
         <p className={css.description} role="status" key={id}>
           {Object.keys(receiptNotes).length > 1 && id.slice(0, 8) + ' · '}
-          {note}
+          {note.message}
         </p>
       ))}
       <footer className={css.actions}>
@@ -921,7 +938,7 @@ function PublicationForm({
             key={receipt.requestId}
             type="button"
             variant="ghost"
-            disabled={receiptNotes[receipt.requestId] === '正在核对原发布结果…'}
+            disabled={receiptNotes[receipt.requestId]?.stage === 'checking'}
             aria-label={
               receipts.length === 1
                 ? '核对结果'
