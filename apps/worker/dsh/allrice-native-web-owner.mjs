@@ -1,8 +1,10 @@
+import { Buffer } from 'node:buffer';
 import { renameSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { dirname } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { URL } from 'node:url';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -148,7 +150,7 @@ export function apply(ctx, config) {
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
   );
   const temporary = `${artifactPath}.${randomUUID()}.tmp`;
-  const lifetime = new AbortController();
+  const lifetime = new globalThis.AbortController();
   const { signal } = lifetime;
   const canceled = Error('Native auth publication canceled');
   let publishing;
