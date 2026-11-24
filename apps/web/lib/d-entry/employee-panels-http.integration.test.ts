@@ -1403,7 +1403,15 @@ suite(
     });
     it('selects only authenticated current 4.0 threads across the private directory cursor', async () => {
       const p = await person();
-      const legacy = await createChatSession(p.context, p.selection);
+      const legacy = randomUUID();
+      // Preexisting legacy row. This directory test only needs its durable
+      // writer generation, not a 3.x execution artifact or provider.
+      await f.db`insert into allrice_chat_sessions(
+        id, organization_id, workspace_id, owner_id, title, employee_assignment_id,
+        employee_instance_id, employee_version_id, execution_generation
+      ) values(${legacy},${p.context.organizationId},${p.selection.workspaceId},
+        ${p.context.actor.id},'Legacy thread',${p.selection.employeeInstanceId},
+        ${p.selection.employeeInstanceId},${p.versionId},'3.x')`;
       await release(p);
       const create = () =>
         createChatSession(p.context, p.selection, {
@@ -1437,13 +1445,13 @@ suite(
       expect(directory.sessions.map(({ id }) => id).sort()).toEqual(
         expected.sort(),
       );
-      expect(directory.sessions.map(({ id }) => id)).not.toContain(legacy.id);
+      expect(directory.sessions.map(({ id }) => id)).not.toContain(legacy);
       expect(directory.sessions.map(({ id }) => id)).not.toContain(unbound.id);
       expect(directory.sessions.map(({ id }) => id)).not.toContain(archived.id);
       await expect(
         readDEntryEmployeeDirectory(
           p.context,
-          { ...selection, threadId: legacy.id },
+          { ...selection, threadId: legacy },
           signal(),
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
