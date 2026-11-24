@@ -18,7 +18,10 @@ import { describe, expect, it } from 'vitest';
 import type { WorkspaceAnalyzerOptions } from '@deepseek-ai/dsh-typert-generator';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import { TYPERT } from '@allrice/d-entry-principal/typert';
-import { withPrincipalGeneratorInput } from '../build.mjs';
+import {
+  sealPrincipalArtifacts,
+  withPrincipalGeneratorInput,
+} from '../build.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -228,6 +231,44 @@ describe('official generator inputs and same-release artifact closure', () => {
           !entry.specifier.includes('/internal'),
       ),
     ).toBe(true);
+  });
+  it('refuses to seal independently changed official output files', async () => {
+    const receiptPath = require.resolve('@allrice/d-entry-principal/artifact');
+    const receipt = await readFile(receiptPath, 'utf8');
+    const release = JSON.parse(receipt);
+    const scratch = await mkdtemp(join(tmpdir(), 'principal-output-seal-'));
+    const scratchReceipt = join(scratch, 'current-principal.manifest.json');
+    try {
+      const expectedGenerated: Record<string, string> = {};
+      for (const { path } of release.files) {
+        const bytes = await readFile(join(dirname(receiptPath), path));
+        const target = join(scratch, path);
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, bytes);
+        if (path.startsWith('typert.'))
+          expectedGenerated[path] = bytes.toString();
+      }
+      Object.freeze(expectedGenerated);
+      await sealPrincipalArtifacts(scratch, expectedGenerated, release.modules);
+      expect(await readFile(scratchReceipt, 'utf8')).toBe(receipt);
+      await rm(scratchReceipt);
+
+      for (const [path, expected] of Object.entries(expectedGenerated)) {
+        const target = join(scratch, path);
+        const changed = Buffer.from(expected);
+        changed[0] = changed[0]! ^ 1;
+        await writeFile(target, changed);
+        await expect(
+          sealPrincipalArtifacts(scratch, expectedGenerated, release.modules),
+        ).rejects.toThrow(`PRINCIPAL_GENERATED_OUTPUT_CHANGED: ${path}`);
+        await expect(stat(scratchReceipt)).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+        await writeFile(target, expected);
+      }
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
   it('removes only its scratch when the analysis consumer rejects and leaves dependency symlink targets intact', async () => {
     const originals = await Promise.all(

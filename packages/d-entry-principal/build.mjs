@@ -251,19 +251,68 @@ export async function withPrincipalGeneratorInput(
   }
 }
 
+/** @param {string} directory
+ * @param {Readonly<Record<string, string>>} expectedGenerated
+ * @param {readonly {specifier: string, version: string, sha256: string}[]} modules
+ */
+export async function sealPrincipalArtifacts(
+  directory,
+  expectedGenerated,
+  modules,
+) {
+  const files = [];
+  for (const path of [
+    'host.js',
+    'types.js',
+    'policy.js',
+    'artifacts.js',
+    'typert.host.js',
+    'typert.host.d.ts',
+    'typert.remote-client.js',
+    'typert.remote-client.d.ts',
+    'typert.remote-client.d.ts.map',
+    'types/host.d.ts',
+    'types/types.d.ts',
+    'types/policy.d.ts',
+  ]) {
+    const bytes = await readFile(resolve(directory, path));
+    const expected = expectedGenerated[path];
+    if (
+      path.startsWith('typert.') &&
+      (expected === undefined || !bytes.equals(Buffer.from(expected)))
+    )
+      throw Error(`PRINCIPAL_GENERATED_OUTPUT_CHANGED: ${path}`);
+    files.push({ path, sha256: digest(bytes) });
+  }
+  await writeFile(
+    resolve(directory, 'current-principal.manifest.json'),
+    `${JSON.stringify({ schema: 1, package: manifest.name, version: manifest.version, dshVersion, files, modules }, null, 2)}\n`,
+  );
+}
+
 async function buildPrincipal() {
   // A partial generation/build is never a prepared artifact: remove the old
   // receipt first and only publish the new receipt after all outputs validate.
   await rm(resolve(lib, 'current-principal.manifest.json'), { force: true });
   await mkdir(lib, { recursive: true });
-  const generated = await withPrincipalGeneratorInput((options) => {
-    const analysis = new WorkspaceAnalyzer(options).analyze();
-    const host = analysis.faces.find((face) => face.face === 'host');
-    if (!host) throw Error('PRINCIPAL_HOST_MODEL_MISSING');
-    const artifact = new FaceModelEmitter(host).emit(manifest.name);
-    if (!artifact.remote) throw Error('PRINCIPAL_REMOTE_MODEL_MISSING');
-    return artifact;
-  });
+  const { generated, expectedGenerated } = await withPrincipalGeneratorInput(
+    (options) => {
+      const analysis = new WorkspaceAnalyzer(options).analyze();
+      const host = analysis.faces.find((face) => face.face === 'host');
+      if (!host) throw Error('PRINCIPAL_HOST_MODEL_MISSING');
+      const generated = new FaceModelEmitter(host).emit(manifest.name);
+      if (!generated.remote) throw Error('PRINCIPAL_REMOTE_MODEL_MISSING');
+      // Keep the emitter's immutable strings before running any output writers.
+      const expectedGenerated = Object.freeze({
+        'typert.host.js': generated.js,
+        'typert.host.d.ts': generated.dts,
+        'typert.remote-client.js': generated.remote.js,
+        'typert.remote-client.d.ts': generated.remote.dts,
+        'typert.remote-client.d.ts.map': generated.remote.dtsMap,
+      });
+      return { generated, expectedGenerated };
+    },
+  );
   writePackageArtifacts(root, [
     { ...generated, packageRoot: relative(workspace, root) },
   ]);
@@ -373,27 +422,7 @@ ${compiled.text}
     { stdio: 'inherit' },
   );
   if (declarations.status !== 0) throw Error('PRINCIPAL_DECLARATIONS_FAILED');
-  const files = [];
-  for (const path of [
-    'host.js',
-    'types.js',
-    'policy.js',
-    'artifacts.js',
-    'typert.host.js',
-    'typert.host.d.ts',
-    'typert.remote-client.js',
-    'typert.remote-client.d.ts',
-    'typert.remote-client.d.ts.map',
-    'types/host.d.ts',
-    'types/types.d.ts',
-    'types/policy.d.ts',
-  ]) {
-    files.push({ path, sha256: digest(await readFile(resolve(lib, path))) });
-  }
-  await writeFile(
-    resolve(lib, 'current-principal.manifest.json'),
-    `${JSON.stringify({ schema: 1, package: manifest.name, version: manifest.version, dshVersion, files, modules }, null, 2)}\n`,
-  );
+  await sealPrincipalArtifacts(lib, expectedGenerated, modules);
 }
 
 if (
