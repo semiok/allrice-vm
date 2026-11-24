@@ -528,24 +528,27 @@ it(
       () => false,
       () => true,
     );
-    const transfer = await pipelineAfterEvents(scopeId);
+    const draining = await open(f);
+    const transfer = await pipelineAfterEvents(draining.scopeId);
     const queuedAsset = transfer.responses[1]!;
     await expect.poll(() => queuedAsset.writableEnded).toBe(true);
     expect(queuedAsset.socket).toBeNull();
     expect(queuedAsset.writableFinished).toBe(false);
     let terminal: Awaited<ReturnType<typeof receive>> | undefined;
-    const terminalPromise = receive().then((frame) => (terminal = frame));
-    closePage(peer);
-    await transfer.fenced.promise;
+    const terminalPromise = draining
+      .receive()
+      .then((frame) => (terminal = frame));
+    closePage(draining.peer);
+    await expect.poll(() => transfer.responses[0]!.destroyed).toBe(true);
     expect(queuedAsset.writableFinished).toBe(false);
     expect(queuedAsset.destroyed).toBe(true);
-    expect((await f.invoke(scopeId)).status).toBe(404);
+    expect((await f.invoke(draining.scopeId)).status).toBe(404);
+    expect((await f.invoke(scopeId)).status).toBe(200);
     expect(terminal).toBeUndefined();
     transfer.release.resolve();
     await transfer.closed;
     expect(await terminalPromise).toMatchObject({ value: { type: 'closed' } });
-    expect(await receive()).toEqual({ type: 'end', streamId: 'life' });
-    expect(await pending).toBe(true);
+    expect(await draining.receive()).toEqual({ type: 'end', streamId: 'life' });
 
     const second = await open(f);
     const firstResponse = await f.publish('bootstrap', second.scopeId);
@@ -573,6 +576,9 @@ it(
     await errors.closed;
     await stopping;
     expect(joined).toBe(true);
+    expect(await pending).toBe(true);
+    closePage(peer);
+    expect(await receive()).toMatchObject({ value: { type: 'closed' } });
     closePage(second.peer);
     expect(await second.receive()).toMatchObject({ value: { type: 'closed' } });
 
@@ -607,9 +613,9 @@ it(
       const observed = (_request: unknown, response: ServerResponse) =>
         responses.push(response);
       f.worker.on('request', observed);
-      const headReady = deferred();
+      let initial = '';
       client.on('data', (data) => {
-        if (data.toString().includes('text/event-stream')) headReady.resolve();
+        initial += data.toString();
       });
       const events = f.profileUrl('events', id, {
         bindingRef: f.owner.bindingRef,
@@ -617,14 +623,13 @@ it(
       const serialize = (url: URL, headers = '') =>
         `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
       try {
-        // A separate page uses this active writer when the target page
-        // already has an event reader; release the old reader first.
-        if (!errors) {
-          keep.abort();
-          await pending;
-        }
         client.write(serialize(events));
-        await headReady.promise;
+        await expect
+          .poll(() => initial.split('\r\n')[0])
+          .toBe('HTTP/1.1 200 OK');
+        await expect
+          .poll(() => initial.includes('text/event-stream'))
+          .toBe(true);
         if (errors) {
           const invalid = new URL(events);
           invalid.searchParams.append('scopeId', id);
