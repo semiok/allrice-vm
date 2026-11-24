@@ -49,8 +49,9 @@ type ProfileProof = {
 };
 
 async function buildProfileFixture(): Promise<ProfileProof> {
-  const directory = await mkdtemp(join(tmpdir(), 'allrice-profile-finite-'));
-  closes.push(() => rm(directory, { recursive: true, force: true }));
+  const parent = await mkdtemp(join(tmpdir(), 'allrice-profile-finite-'));
+  closes.push(() => rm(parent, { recursive: true, force: true }));
+  const directory = join(parent, 'release');
   await promisify(execFile)(
     process.execPath,
     ['packages/dsh-web-composition/build-web-entry.mjs', directory],
