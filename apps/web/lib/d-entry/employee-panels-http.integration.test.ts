@@ -556,11 +556,10 @@ suite(
             .getByRole('button', { name: '取消', exact: true })
             .click();
           await openPublication();
-          await page
-            .getByText('已添加为企业资料', { exact: true })
-            .filter({ visible: true })
-            .first()
-            .waitFor();
+          await dialog.getByText('原发布已完成。', { exact: true }).waitFor();
+          await dialog
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
           await dialog.waitFor({ state: 'hidden' });
           expect(publishWrites).toHaveLength(1);
           expect(receiptReads).toEqual([publishWrites[0]]);

@@ -54,6 +54,7 @@ let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
 let publicationReplyLost = false;
 let receiptReady = false;
+let receiptGate: PromiseWithResolvers<void> | undefined;
 let serial = 850;
 const calls: PanelDataCall[] = [];
 const used: unknown[] = [];
@@ -263,6 +264,9 @@ const bound = createEmployeePanelDataClient({
   },
   async readWriteReceipt(input, signal) {
     await call('readWriteReceipt', input, signal);
+    const gate = receiptGate;
+    if (gate) await gate.promise;
+    signal.throwIfAborted();
     const result = writes.get(input.requestId) ?? null;
     return {
       requestId: input.requestId,
@@ -330,6 +334,10 @@ function Fixture() {
   const [opened, setOpened] = useState<string | null>(null);
   const [publication, setPublication] =
     useState<ReferencePublicationTarget | null>(null);
+  const [scope, setScope] = useState({
+    employeeInstanceId: panelsEmployee,
+    threadId: uid(7),
+  });
   const [error, setError] = useState('');
   const uploadInput = useRef<HTMLInputElement>(null);
   const client = state === 'unbound' ? unbound : bound;
@@ -374,6 +382,14 @@ function Fixture() {
       },
       finishReceipt() {
         receiptReady = true;
+        receiptGate?.resolve();
+        receiptGate = undefined;
+      },
+      holdReceipt() {
+        receiptGate = Promise.withResolvers<void>();
+      },
+      selectReceiptScope(employeeInstanceId, threadId) {
+        setScope({ employeeInstanceId, threadId });
       },
       evidence: () => ({
         calls,
@@ -476,6 +492,7 @@ function Fixture() {
           viewerId={panelsViewer}
           headers={headers}
           dataClient={client}
+          receiptScope={{ organizationId: uid(1), ...scope }}
           options={sample.options}
           target={publication}
           onClose={() => setPublication(null)}

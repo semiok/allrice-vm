@@ -6,6 +6,8 @@ import type { WorkbenchFilesPanel } from '../../../apps/web/app/chatflow/workben
 import type { EmployeeMemorySidebar } from '../../../apps/web/app/chatflow/employee-memory-sidebar';
 import type { EmployeeCapabilitiesPanel } from '../../../apps/web/app/chatflow/employee-capabilities-panel';
 
+import type { ReferencePublicationScope } from '../../../apps/web/app/chatflow/reference-publication-dialog';
+
 type Materials = ComponentProps<typeof EnterpriseMaterialsPanel>;
 type Files = ComponentProps<typeof WorkbenchFilesPanel>;
 type Memory = ComponentProps<typeof EmployeeMemorySidebar>;
@@ -34,7 +36,7 @@ export interface EmployeePanelsSnapshot {
   readonly scopeKey: string;
   /** Existing files-unread semantics. null means unknown, not successful zero. */
   readonly filesUnread: number | null;
-  readonly publicationManagement?: true;
+  readonly publicationManagement?: ReferencePublicationScope;
   readonly materials: Omit<Materials, 'active' | 'onUse'>;
   readonly files: Omit<Files, 'active' | 'onUse'>;
   readonly filePreview?: { readonly objectId: string; close(): void };

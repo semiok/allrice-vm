@@ -33,6 +33,13 @@ import {
   type ReferencePublicationOptions,
 } from './use-reference-publication-options';
 
+const receiptScopeSchema = z.strictObject({
+  organizationId: UuidSchema,
+  employeeInstanceId: UuidSchema,
+  threadId: UuidSchema.nullable(),
+});
+export type ReferencePublicationScope = z.infer<typeof receiptScopeSchema>;
+
 export type ReferencePublicationTarget =
   | { kind: 'file'; file: WorkbenchDeliverable }
   | { kind: 'upload' }
@@ -46,6 +53,7 @@ type Props = {
   headers: Record<string, string>;
   options?: ReferencePublicationOptions;
   dataClient?: EmployeePanelDataClient;
+  receiptScope?: ReferencePublicationScope;
   target: ReferencePublicationTarget;
   onClose: () => void;
   onSaved: (result: { sourceId: string; revisionId?: string }) => void;
@@ -55,34 +63,29 @@ const receiptSchema = z.strictObject({
   operation: z.enum(['publish-file', 'publish-upload', 'change-publication']),
   requestId: UuidSchema,
   sourceId: UuidSchema.optional(),
-  uploadDigest: z
-    .string()
-    .regex(/^[a-f0-9]{64}$/)
-    .optional(),
+  intentDigest: z.string().regex(/^[a-f0-9]{64}$/),
 });
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
-const unresolvedPublications = new Map<string, PublicationReceipt[]>();
 
-// Only the original receipt selectors and an upload fingerprint survive a
-// reload of this tab. Keep file content and display metadata in the form.
-function pendingPublications(key: string) {
-  const known = unresolvedPublications.get(key);
-  if (known) return known;
-  try {
-    const value = sessionStorage.getItem(key);
-    const parsed = receiptList.safeParse(value ? JSON.parse(value) : []);
-    if (parsed.success) return parsed.data;
-  } catch {}
-  return [];
+// Only the full intent fingerprint and original scoped receipt selectors
+// survive reload. File bytes and display metadata stay in the active form.
+function pendingPublications(key: string | undefined) {
+  if (!key) return [];
+  const value = sessionStorage.getItem(key);
+  return receiptList.parse(value ? JSON.parse(value) : []);
 }
 
 function rememberPublications(key: string, values: PublicationReceipt[]) {
-  unresolvedPublications.set(key, values);
+  if (values.length) sessionStorage.setItem(key, JSON.stringify(values));
+  else sessionStorage.removeItem(key);
+}
+function restorePublications(key: string | undefined) {
   try {
-    if (values.length) sessionStorage.setItem(key, JSON.stringify(values));
-    else sessionStorage.removeItem(key);
-  } catch {}
+    return pendingPublications(key);
+  } catch {
+    return [];
+  }
 }
 
 async function publicationFingerprint(value: unknown) {
@@ -94,6 +97,8 @@ async function publicationFingerprint(value: unknown) {
     byte.toString(16).padStart(2, '0'),
   ).join('');
 }
+
+class ReceiptStorageUnavailable extends Error {}
 
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
 
@@ -109,7 +114,14 @@ export function ReferencePublicationDialog(props: Props) {
         : 'upload';
   return (
     <PublicationForm
-      key={`${props.workspaceId}:${props.viewerId}:${target.kind}:${identity}:${JSON.stringify(props.headers)}`}
+      key={JSON.stringify([
+        props.workspaceId,
+        props.viewerId,
+        target.kind,
+        identity,
+        props.receiptScope,
+        props.headers,
+      ])}
       {...props}
     />
   );
@@ -121,6 +133,7 @@ function PublicationForm({
   headers,
   options: suppliedOptions,
   dataClient,
+  receiptScope,
   target,
   onClose,
   onSaved,
@@ -142,15 +155,20 @@ function PublicationForm({
   });
   const options = available.options;
   const reference = 'reference' in target ? target.reference : null;
+  const parsedScope = receiptScopeSchema.safeParse(receiptScope);
   const receiptKey =
-    'allrice:publication-receipts:v1:' +
-    JSON.stringify([
-      headers['x-allrice-organization-id'],
-      workspaceId,
-      viewerId,
-      target.kind,
-      target.kind === 'file' ? target.file.objectId : reference?.sourceId,
-    ]);
+    dataClient && parsedScope.success
+      ? 'allrice:publication-receipts:v2:' +
+        JSON.stringify([
+          parsedScope.data.organizationId,
+          viewerId,
+          workspaceId,
+          parsedScope.data.employeeInstanceId,
+          parsedScope.data.threadId,
+          target.kind,
+          target.kind === 'file' ? target.file.objectId : reference?.sourceId,
+        ])
+      : undefined;
   const publication = reference?.publication;
   const destructive = target.kind === 'revoke' || target.kind === 'delete';
   const [scope, setScope] = useState(publication?.audience.scope ?? 'personal');
@@ -166,30 +184,29 @@ function PublicationForm({
   const transport = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
-  const [initialReceipts] = useState(() =>
-    dataClient ? pendingPublications(receiptKey) : [],
-  );
+  const edits = useRef(0);
+  const checks = useRef(new Map<string, AbortController>()).current;
+  const [initialReceipts] = useState(() => restorePublications(receiptKey));
   const [receipts, setReceipts] = useState(initialReceipts);
-  const receipt = receipts[0];
-  const checking = !!receipt && (target.kind !== 'upload' || !upload);
-  const savedResult = useRef(onSaved);
-  savedResult.current = onSaved;
+  const [receiptNotes, setReceiptNotes] = useState<Record<string, string>>({});
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
       transport.current?.abort();
+      for (const check of checks.values()) check.abort();
+      checks.clear();
     };
-  }, []);
+  }, [checks]);
 
   const reconcile = useCallback(
     async (value: PublicationReceipt) => {
-      if (pending.current) return;
-      pending.current = true;
-      setBusy(true);
-      setError(waitingForReceipt);
+      if (!receiptKey || checks.has(value.requestId)) return;
       const controller = new AbortController();
-      transport.current = controller;
+      const note = (message: string) =>
+        setReceiptNotes((prior) => ({ ...prior, [value.requestId]: message }));
+      checks.set(value.requestId, controller);
+      note('正在核对原发布结果…');
       try {
         const result = await data.readWriteReceipt(
           {
@@ -202,37 +219,31 @@ function PublicationForm({
         );
         if (!alive.current || controller.signal.aborted) return;
         if (
-          result.status === 'recorded' &&
-          result.ready !== false &&
-          result.result &&
-          'sourceId' in result.result
+          result.status !== 'recorded' ||
+          result.ready === false ||
+          !result.result
         ) {
-          const previous = pendingPublications(receiptKey);
-          if (
-            !previous.some((pending) => pending.requestId === value.requestId)
-          )
-            return;
-          const remaining = previous.filter(
-            (pending) => pending.requestId !== value.requestId,
-          );
-          rememberPublications(receiptKey, remaining);
-          setReceipts(remaining);
-          setError('');
-          savedResult.current(result.result);
+          note(waitingForReceipt);
+          return;
         }
+        const remaining = pendingPublications(receiptKey).filter(
+          (pending) => pending.requestId !== value.requestId,
+        );
+        rememberPublications(receiptKey, remaining);
+        setReceipts(remaining);
+        note('原发布已完成。');
       } catch {
-        // A refused or interrupted receipt read still leaves the write unknown.
+        if (alive.current && !controller.signal.aborted)
+          note(waitingForReceipt);
       } finally {
-        if (alive.current && !controller.signal.aborted) {
-          pending.current = false;
-          setBusy(false);
-        }
+        if (checks.get(value.requestId) === controller)
+          checks.delete(value.requestId);
       }
     },
-    [data, receiptKey, workspaceId],
+    [data, checks, receiptKey, workspaceId],
   );
   useEffect(() => {
-    if (initialReceipts[0]) void reconcile(initialReceipts[0]);
+    for (const prior of initialReceipts) void reconcile(prior);
   }, [initialReceipts, reconcile]);
 
   const title = {
@@ -272,20 +283,19 @@ function PublicationForm({
             (target.kind === 'delete' && publication.origin === 'upload')));
 
   function forget(value: PublicationReceipt) {
-    const remaining = pendingPublications(receiptKey).filter(
-      (pending) => pending.requestId !== value.requestId,
-    );
-    rememberPublications(receiptKey, remaining);
-    if (alive.current) setReceipts(remaining);
+    if (!receiptKey) return;
+    try {
+      const remaining = pendingPublications(receiptKey).filter(
+        (pending) => pending.requestId !== value.requestId,
+      );
+      rememberPublications(receiptKey, remaining);
+      if (alive.current) setReceipts(remaining);
+    } catch {
+      // Acknowledgement is still valid; this receipt can be read again.
+    }
   }
 
   async function save() {
-    const previous = dataClient ? pendingPublications(receiptKey) : [];
-    if (previous[0] && (target.kind !== 'upload' || !upload)) {
-      setReceipts(previous);
-      await reconcile(previous[0]);
-      return;
-    }
     if (
       !permitted ||
       pending.current ||
@@ -297,12 +307,13 @@ function PublicationForm({
     setBusy(true);
     setError('');
     const controller = new AbortController();
+    const formVersion = edits.current;
     transport.current = controller;
     let issued: PublicationReceipt | undefined;
     try {
       const audience = ReferenceAudienceSchema.parse({
         scope,
-        departmentIds: scope === 'departments' ? departmentIds : [],
+        departmentIds: scope === 'departments' ? [...departmentIds].sort() : [],
       });
       let value: Record<string, unknown>;
       if (target.kind === 'file') {
@@ -339,32 +350,33 @@ function PublicationForm({
         : ReferencePublishInputSchema;
       const parsed = schema.parse({ ...value, requestId: crypto.randomUUID() });
       const { requestId: proposed, ...canonical } = parsed;
-      const uploadDigest =
-        parsed && 'origin' in parsed && parsed.origin === 'upload'
-          ? await publicationFingerprint({
-              fileName: parsed.fileName,
-              mediaType: parsed.mediaType,
-              contentBase64: parsed.contentBase64,
-            })
-          : undefined;
-      const key = dataClient
-        ? undefined
-        : await publicationFingerprint(canonical);
-      if (!alive.current || controller.signal.aborted) return;
-      const requestId = (key && requestIds.current.get(key)) || proposed;
-      if (key) requestIds.current.set(key, requestId);
+      const intentDigest = await publicationFingerprint(canonical);
+      if (
+        !alive.current ||
+        controller.signal.aborted ||
+        edits.current !== formVersion
+      )
+        return;
+      let requestId = requestIds.current.get(intentDigest) ?? proposed;
       if (dataClient) {
-        const held = pendingPublications(receiptKey);
-        const prior = uploadDigest
-          ? held.find((pending) => pending.uploadDigest === uploadDigest)
-          : held[0];
+        if (!receiptKey) throw new ReceiptStorageUnavailable();
+        const held = (() => {
+          try {
+            return pendingPublications(receiptKey);
+          } catch {
+            throw new ReceiptStorageUnavailable();
+          }
+        })();
+        const prior = held.find(
+          (pending) => pending.intentDigest === intentDigest,
+        );
         if (prior) {
           setReceipts(held);
-          pending.current = false;
-          await reconcile(prior);
+          void reconcile(prior);
           return;
         }
-        issued = {
+        requestId = proposed;
+        const record: PublicationReceipt = {
           requestId,
           operation: reference
             ? 'change-publication'
@@ -372,10 +384,16 @@ function PublicationForm({
               ? 'publish-file'
               : 'publish-upload',
           ...(reference ? { sourceId: reference.sourceId } : {}),
-          ...(uploadDigest ? { uploadDigest } : {}),
+          intentDigest,
         };
-        rememberPublications(receiptKey, [issued, ...held]);
-      }
+        // Save the exact selector and intent before admitting its POST.
+        try {
+          rememberPublications(receiptKey, [record, ...held]);
+        } catch {
+          throw new ReceiptStorageUnavailable();
+        }
+        issued = record;
+      } else requestIds.current.set(intentDigest, requestId);
       const saved = reference
         ? await data.changePublication(
             {
@@ -397,15 +415,19 @@ function PublicationForm({
               : data.publishUpload(body, controller.signal);
           })();
       if (issued) forget(issued);
-      if (alive.current && !controller.signal.aborted) onSaved(saved);
+      if (
+        alive.current &&
+        !controller.signal.aborted &&
+        edits.current === formVersion
+      )
+        onSaved(saved);
     } catch (caught) {
       const definite =
         caught instanceof EmployeePanelDataUnavailableError ||
         caught instanceof EmployeePanelsWriteRejectedError;
       if (issued && !definite) {
         if (alive.current && !controller.signal.aborted) {
-          setReceipts(pendingPublications(receiptKey));
-          setUpload(null);
+          setReceipts(restorePublications(receiptKey));
           setError(waitingForReceipt);
         }
         return;
@@ -416,7 +438,9 @@ function PublicationForm({
           definite ||
             (reference && caught instanceof Error && 'status' in caught)
             ? caught.message
-            : '发布未完成，请重试。',
+            : caught instanceof ReceiptStorageUnavailable
+              ? '无法保留原发布请求，请重试。'
+              : '发布未完成，请重试。',
         );
       }
     } finally {
@@ -495,8 +519,8 @@ function PublicationForm({
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault();
-                if (!busy && event.dataTransfer.files[0])
-                  setUpload(event.dataTransfer.files[0]);
+                if (!busy && event.dataTransfer.files[0]) edits.current++;
+                setUpload(event.dataTransfer.files[0]);
               }}
             >
               <WorkbenchFileIcon kind="upload" />
@@ -519,6 +543,7 @@ function PublicationForm({
                 hidden
                 disabled={busy}
                 onChange={(event) => {
+                  edits.current++;
                   setUpload(event.target.files?.[0] ?? null);
                 }}
               />
@@ -535,7 +560,10 @@ function PublicationForm({
                       name="publication-audience"
                       value={value}
                       checked={scope === value}
-                      onChange={() => setScope(value)}
+                      onChange={() => {
+                        edits.current++;
+                        setScope(value);
+                      }}
                     />
                     {['仅自己', '指定部门', '全公司'][index]}
                   </label>
@@ -552,13 +580,14 @@ function PublicationForm({
                     <input
                       type="checkbox"
                       checked={departmentIds.includes(department.id)}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        edits.current++;
                         setDepartmentIds((ids) =>
                           event.target.checked
                             ? [...ids, department.id]
                             : ids.filter((id) => id !== department.id),
-                        )
-                      }
+                        );
+                      }}
                     />
                     {department.name}
                   </label>
@@ -573,7 +602,10 @@ function PublicationForm({
               value={purpose}
               maxLength={1000}
               disabled={busy || !permitted}
-              onChange={(event) => setPurpose(event.target.value)}
+              onChange={(event) => {
+                edits.current++;
+                setPurpose(event.target.value);
+              }}
               placeholder="例如：每月经营报告的格式参考"
             />
           </label>
@@ -594,6 +626,12 @@ function PublicationForm({
           {error || download.error || available.error}
         </p>
       )}
+      {Object.entries(receiptNotes).map(([id, note]) => (
+        <p className={css.description} role="status" key={id}>
+          {Object.keys(receiptNotes).length > 1 && id.slice(0, 8) + ' · '}
+          {note}
+        </p>
+      ))}
       <footer className={css.actions}>
         <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
           取消
@@ -627,32 +665,37 @@ function PublicationForm({
               先下载
             </a>
           ))}
-        {receipt && !checking && (
+        {receipts.map((receipt) => (
           <Button
+            key={receipt.requestId}
             type="button"
             variant="ghost"
-            disabled={busy}
+            disabled={receiptNotes[receipt.requestId] === '正在核对原发布结果…'}
+            aria-label={
+              receipts.length === 1
+                ? '核对结果'
+                : '核对结果 ' + receipt.requestId.slice(0, 8)
+            }
             onClick={() => void reconcile(receipt)}
           >
             核对结果
           </Button>
-        )}
+        ))}
         <Button
           type="button"
           variant="primary"
           className={destructive ? css.danger : undefined}
           disabled={
             busy ||
-            (!checking &&
-              (!permitted ||
-                (!destructive &&
-                  scope === 'departments' &&
-                  !departmentIds.length) ||
-                (target.kind === 'upload' && !upload)))
+            !permitted ||
+            (!destructive &&
+              scope === 'departments' &&
+              !departmentIds.length) ||
+            (target.kind === 'upload' && !upload)
           }
           onClick={() => void save()}
         >
-          {checking ? '核对结果' : confirmation}
+          {confirmation}
         </Button>
       </footer>
     </DshDialog>

@@ -255,10 +255,16 @@ suite(
               ).length,
           )
           .toBe(1);
+        await dialog.getByRole('textbox').fill('只改当前表单，不属于原请求');
         await page.evaluate(() => window.__panelDataFixture.finishReceipt());
         await dialog
           .getByRole('button', { name: '核对结果', exact: true })
           .click();
+        await dialog.getByText('原发布已完成。', { exact: true }).waitFor();
+        expect(await dialog.getByRole('textbox').inputValue()).toBe(
+          '只改当前表单，不属于原请求',
+        );
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
         await dialog.waitFor({ state: 'hidden' });
         const calls = (await evidence(page)).calls;
         const uploads = calls.filter((call) => call.method === 'publishUpload');
@@ -273,6 +279,157 @@ suite(
           expect.objectContaining({ requestId, operation: 'publish-upload' }),
           expect.objectContaining({ requestId, operation: 'publish-upload' }),
         ]);
+      } finally {
+        await page.close();
+      }
+    });
+
+    it('keeps two different intents and permits the second while the first receipt GET is held', async () => {
+      const page = await browser.newPage();
+      const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+      const writes = async () =>
+        (await evidence(page)).calls
+          .filter((call) => call.method === 'publishUpload')
+          .map(
+            (call) =>
+              call.input as {
+                requestId: string;
+                purpose: string;
+                audience: { scope: string };
+              },
+          );
+      const inquiries = async () =>
+        (await evidence(page)).calls
+          .filter((call) => call.method === 'readWriteReceipt')
+          .map((call) => (call.input as { requestId: string }).requestId);
+      const open = () =>
+        root(page).getByRole('button', { name: '上传', exact: true }).click();
+      async function chooseMaterials() {
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+      }
+      async function selectFile() {
+        await dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+          name: '同一个文件.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('相同字节'),
+        });
+      }
+      try {
+        await page.goto(origin);
+        await chooseMaterials();
+        await page.evaluate(() =>
+          window.__panelDataFixture.losePublicationReply(),
+        );
+        await open();
+        await selectFile();
+        await dialog.getByRole('radio', { name: '全公司' }).check();
+        await dialog.getByRole('textbox').fill('A 的用途');
+        await dialog.getByRole('button', { name: '发布', exact: true }).click();
+        await dialog.getByRole('alert').waitFor();
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        const [a] = await writes();
+        expect(a).toMatchObject({
+          purpose: 'A 的用途',
+          audience: { scope: 'company' },
+        });
+        await page.evaluate(() => window.__panelDataFixture.holdReceipt());
+        await open();
+        await expect.poll(inquiries).toEqual([a!.requestId]);
+        await selectFile();
+        await dialog.getByRole('radio', { name: '仅自己' }).check();
+        await dialog.getByRole('textbox').fill('B 的用途');
+        const publish = dialog.getByRole('button', {
+          name: '发布',
+          exact: true,
+        });
+        expect(await publish.isEnabled()).toBe(true);
+        await publish.click();
+        await expect.poll(async () => (await writes()).length).toBe(2);
+        const [, b] = await writes();
+        expect(b).toMatchObject({
+          purpose: 'B 的用途',
+          audience: { scope: 'personal' },
+        });
+        expect(b!.requestId).not.toBe(a!.requestId);
+        expect(await inquiries()).toEqual([a!.requestId]);
+        expect(
+          await dialog
+            .getByRole('button', {
+              name: '核对结果 ' + a!.requestId.slice(0, 8),
+            })
+            .isDisabled(),
+        ).toBe(true);
+        await page.reload();
+        await chooseMaterials();
+        await open();
+        await expect.poll(inquiries).toEqual([b!.requestId, a!.requestId]);
+        expect(await writes()).toEqual([]);
+        // Employee and thread are both required to restore a saved request.
+        for (const scope of [
+          {
+            employee: '00000000-0000-4000-8000-000000000099',
+            thread: '00000000-0000-4000-8000-000000000007',
+          },
+          {
+            employee: '00000000-0000-4000-8000-000000000099',
+            thread: '00000000-0000-4000-8000-000000000098',
+          },
+        ]) {
+          await page.evaluate(
+            ({ employee, thread }) =>
+              window.__panelDataFixture.selectReceiptScope(employee, thread),
+            scope,
+          );
+          await expect
+            .poll(() =>
+              dialog.getByRole('button', { name: /核对结果/ }).count(),
+            )
+            .toBe(0);
+          expect(await inquiries()).toEqual([b!.requestId, a!.requestId]);
+        }
+      } finally {
+        await page.close();
+      }
+    });
+
+    it('blocks the POST if session storage refuses the original key', async () => {
+      const page = await browser.newPage();
+      try {
+        await page.addInitScript(() => {
+          const write = Storage.prototype.setItem;
+          Storage.prototype.setItem = function (key, value) {
+            if (key.startsWith('allrice:publication-receipts:v2:'))
+              throw new DOMException(
+                'Storage is unavailable',
+                'QuotaExceededError',
+              );
+            write.call(this, key, value);
+          };
+        });
+        await page.goto(origin);
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+        await root(page)
+          .getByRole('button', { name: '上传', exact: true })
+          .click();
+        const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+        await dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+          name: '未获保留的发布.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('内容'),
+        });
+        await dialog.getByRole('button', { name: '发布', exact: true }).click();
+        await dialog
+          .getByText('无法保留原发布请求，请重试。', { exact: true })
+          .waitFor();
+        expect(
+          (await evidence(page)).calls.filter(
+            (call) => call.method === 'publishUpload',
+          ),
+        ).toEqual([]);
       } finally {
         await page.close();
       }

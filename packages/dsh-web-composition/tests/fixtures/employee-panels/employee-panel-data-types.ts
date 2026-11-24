@@ -16,6 +16,8 @@ export interface PanelDataFixture {
   refusePreview(status: number, code?: string): void;
   losePublicationReply(): void;
   finishReceipt(): void;
+  holdReceipt(): void;
+  selectReceiptScope(employee: string, thread: string): void;
   evidence(): {
     calls: PanelDataCall[];
     used: unknown[];

@@ -191,7 +191,11 @@ export function installEmployeeProductOwner(ctx: Context) {
       };
       const initial: EmployeePanelsSnapshot = {
         scopeKey: ownerKey,
-        publicationManagement: true,
+        publicationManagement: {
+          organizationId,
+          employeeInstanceId: selection.employeeInstanceId,
+          threadId,
+        },
         filesUnread: previous
           ? keys.filter((key) => !previous.has(key)).length
           : 0,

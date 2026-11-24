@@ -150,6 +150,7 @@ function EmployeePublicationPanel({
             viewerId={viewerId}
             headers={headers}
             dataClient={dataClient}
+            receiptScope={snapshot.publicationManagement}
             target={publication.target}
             options={publication.options}
             onClose={() => setPublication(null)}
