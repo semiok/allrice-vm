@@ -836,7 +836,7 @@ suite('diagnostic-only panels causal probes; no acceptance claim', () => {
       new URL('../../../apps/web/public/favicon.ico', import.meta.url),
     );
     const html =
-      '<!doctype html><html><head><title>Tool-only route probe</title></head><body>Not panel acceptance.</body></html>';
+      '<!doctype html><html><head><title>Tool-only route probe</title><link rel="icon" href="/favicon.ico" type="image/x-icon"></head><body>Not panel acceptance.</body></html>';
     let active: 'OFF' | 'ON' = 'OFF',
       valid = false;
     const failures: unknown[] = [];

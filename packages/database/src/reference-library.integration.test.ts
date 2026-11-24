@@ -45,6 +45,8 @@ import {
   getReferenceFile,
   listReferenceRevisions,
   changeReference,
+  changeReferencePublication,
+  publishReference,
   referenceLibraryOptions,
   readReferenceWriteReceipt,
 } from './reference-library.ts';
@@ -888,6 +890,89 @@ suite(
       await expect(
         f.db`update allrice_knowledge_sources set ownership=${f.db.json({ scope: 'company', organizationId: a.company.organizationId })} where id=${p.sourceId}`,
       ).rejects.toThrow('immutable');
+    });
+    it('binds an action receipt to its submitted workspace and preserves only the original scope for a legacy input', async () => {
+      const a = await setup();
+      const workspaceB = randomUUID();
+      await f.db`insert into allrice_workspaces(id,organization_id,slug,name)
+        values(${workspaceB},${a.company.organizationId},'receipt-b','Receipts B')`;
+      const inB = { ...a.owner, workspaceId: workspaceB };
+      const audience = { scope: 'personal' as const, departmentIds: [] };
+      const storage = runtimeFixtureStorage(f.db);
+      const source = await publishReference(
+        a.owner,
+        {
+          origin: 'upload',
+          workspaceId: a.owner.workspaceId!,
+          requestId: randomUUID(),
+          audience,
+          purpose: 'created in A',
+          fileName: 'receipt.txt',
+          mediaType: 'text/plain',
+          contentBase64: Buffer.from('reference content').toString('base64'),
+        },
+        storage,
+      );
+      const input = {
+        workspaceId: workspaceB,
+        requestId: randomUUID(),
+        expectedRevision: 1,
+        action: 'edit' as const,
+        audience,
+        purpose: 'edited in B',
+      };
+      await changeReferencePublication(inB, source.sourceId, input);
+      const query = {
+        workspaceId: workspaceB,
+        requestId: input.requestId,
+        sourceId: source.sourceId,
+        operation: 'change-publication',
+      };
+      expect(await readReferenceWriteReceipt(inB, query)).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
+      expect(
+        await readReferenceWriteReceipt(a.owner, {
+          ...query,
+          workspaceId: a.owner.workspaceId,
+        }),
+      ).toMatchObject({ status: 'unknown', result: null });
+      expect(
+        await readReferenceWriteReceipt(
+          { ...a.reader, workspaceId: workspaceB },
+          query,
+        ),
+      ).toMatchObject({
+        status: 'unknown',
+        result: null,
+      });
+
+      const prior = randomUUID();
+      await f.db`insert into allrice_knowledge_reference_actions(source_id,actor_id,request_id,input)
+        values(${source.sourceId},${a.owner.actor.id},${prior},${f.db.json({
+          action: 'edit',
+          requestId: prior,
+          expectedRevision: 1,
+          audience,
+          purpose: 'previous input',
+        })})`;
+      expect(
+        await readReferenceWriteReceipt(inB, { ...query, requestId: prior }),
+      ).toMatchObject({
+        status: 'unknown',
+        result: null,
+      });
+      expect(
+        await readReferenceWriteReceipt(a.owner, {
+          ...query,
+          workspaceId: a.owner.workspaceId,
+          requestId: prior,
+        }),
+      ).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
     });
     it('reconciles only the current maintainer own retry key on another publisher source without replay or writes', async () => {
       for (const scope of ['department', 'company'] as const) {

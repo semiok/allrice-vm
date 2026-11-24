@@ -1955,6 +1955,79 @@ suite(
         handlers = createEmployeePanelsHandlers(defaults);
       }
     });
+    it('keeps the real release writer waiting on an already authorized panel transaction', async () => {
+      const p = await person();
+      await release(p);
+      await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+      const uploaded = await p.client.uploadDeliverable(
+        uploadInput(p),
+        signal(),
+      );
+      const held = Promise.withResolvers<number>();
+      const finish = Promise.withResolvers<void>();
+      const defaults = {
+        ...employeePanelsDependencies,
+        storage: () => runtimeFixtureStorage(f.db),
+      };
+      let used = false;
+      handlers = createEmployeePanelsHandlers({
+        ...defaults,
+        async authorize(context, selection, tx) {
+          const current = await defaults.authorize(context, selection, tx);
+          if (tx && !used) {
+            used = true;
+            const [row] = await tx<
+              { pid: number }[]
+            >`select pg_backend_pid() pid`;
+            held.resolve(row!.pid);
+            await finish.promise;
+          }
+          return current;
+        },
+      });
+      const favorite = (value: boolean) =>
+        p.client.favorite(
+          {
+            workspaceId: p.selection.workspaceId,
+            objectId: uploaded.objectId,
+            body: { favorite: value },
+          },
+          signal(),
+        );
+      const writing = favorite(true);
+      void writing.catch(() => {});
+      let revoking: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
+      try {
+        const writer = await held.promise;
+        revoking = updateDEntryReleasePolicy(p.context, {
+          revision: randomUUID(),
+          defaultGeneration: '3.x',
+          selections: [],
+        });
+        void revoking.catch(() => {});
+        await expect
+          .poll(
+            async () =>
+              (
+                await f.db`select pid from pg_stat_activity
+            where datname=current_database() and ${writer}=any(pg_blocking_pids(pid))`
+              ).length,
+          )
+          .toBe(1);
+      } finally {
+        finish.resolve();
+        try {
+          await Promise.all([writing, revoking]);
+        } finally {
+          handlers = createEmployeePanelsHandlers(defaults);
+        }
+      }
+      expect(await writing).toMatchObject({ favorite: true });
+      await expect(favorite(false)).rejects.toMatchObject({ status: 403 });
+      expect(
+        await f.db`select object_id from allrice_workbench_file_favorites where object_id=${uploaded.objectId}`,
+      ).toEqual([{ object_id: uploaded.objectId }]);
+    });
     it('replays the same material reservation from verified copy bytes after the original is withdrawn', async () => {
       const p = await person();
       await release(p);

@@ -59,6 +59,7 @@ import {
   getStoredFile,
   createStorageMetadata,
   markStorageReady,
+  completeStorageDelete,
   saveStorageGrant,
   resolveStorageGrant,
 } from './data.ts';
@@ -570,6 +571,80 @@ suite(
       },
       30000,
     );
+    it('serializes favorites with the real soft delete on the original personal object', async () => {
+      const { context } = await runtimeTaskFixture(fixture.db);
+      const makeFile = () =>
+        uploadWorkbenchFile(
+          context,
+          {
+            workspaceId: context.workspaceId!,
+            requestId: randomUUID(),
+            fileName: 'favorite.txt',
+            mediaType: 'text/plain',
+            contentBase64: Buffer.from('favorite source').toString('base64'),
+          },
+          runtimeFixtureStorage(fixture.db),
+        );
+      const first = await makeFile();
+      const deletedFirst = await makeFile();
+      await completeStorageDelete(context, deletedFirst.objectId);
+      await expect(
+        setWorkbenchFileFavorite(context, deletedFirst.objectId, {
+          favorite: true,
+        }),
+      ).rejects.toThrow('not_found');
+      await fixture.db`
+        create function fixture_hold_favorite() returns trigger language plpgsql as $$
+        begin
+          perform pg_advisory_xact_lock(7032,hashtext(new.object_id::text));
+          return new;
+        end $$`;
+      await fixture.db`create trigger fixture_hold_favorite before insert on allrice_workbench_file_favorites
+        for each row execute function fixture_hold_favorite()`;
+      const acquired = Promise.withResolvers<number>();
+      const release = Promise.withResolvers<void>();
+      const gate = fixture.db.begin(async (tx) => {
+        const [row] = await tx<{ pid: number }[]>`
+          select pg_backend_pid() pid from (select pg_advisory_xact_lock(7032,hashtext(${first.objectId}::text))) held`;
+        acquired.resolve(row!.pid);
+        await release.promise;
+      });
+      void gate.catch(() => {});
+      let favorite: ReturnType<typeof setWorkbenchFileFavorite> | undefined;
+      let deleting: ReturnType<typeof completeStorageDelete> | undefined;
+      async function blockedBy(owner: number) {
+        const [row] = await fixture.db<{ pid: number }[]>`
+          select pid from pg_stat_activity
+          where datname=current_database() and ${owner}=any(pg_blocking_pids(pid))
+          order by pid`;
+        return row?.pid ?? 0;
+      }
+      try {
+        const advisory = await acquired.promise;
+        favorite = setWorkbenchFileFavorite(context, first.objectId, {
+          favorite: true,
+        });
+        void favorite.catch(() => {});
+        await expect.poll(() => blockedBy(advisory)).toBeGreaterThan(0);
+        const writer = await blockedBy(advisory);
+        deleting = completeStorageDelete(context, first.objectId);
+        void deleting.catch(() => {});
+        await expect.poll(() => blockedBy(writer)).toBeGreaterThan(0);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([gate, favorite, deleting]);
+        await fixture.db`drop trigger fixture_hold_favorite on allrice_workbench_file_favorites`;
+        await fixture.db`drop function fixture_hold_favorite()`;
+      }
+      expect(await favorite).toMatchObject({ favorite: true });
+      expect(await deleting).toMatchObject({ id: first.objectId });
+      await expect(
+        setWorkbenchFileFavorite(context, first.objectId, { favorite: false }),
+      ).rejects.toThrow('not_found');
+      expect(
+        await fixture.db`select object_id from allrice_workbench_file_favorites where object_id in (${first.objectId},${deletedFirst.objectId})`,
+      ).toEqual([{ object_id: first.objectId }]);
+    });
     it('never treats legacy company sharing or worker intermediate bytes as my uploads', async () => {
       const t = await setup();
       const shared = await uploadWorkbenchFile(

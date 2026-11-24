@@ -512,6 +512,7 @@ export async function readReferenceWriteReceipt(
     | {
         input: unknown;
         source_id: string;
+        source_workspace_id?: string;
         revision_id?: string;
         ready?: boolean;
       }
@@ -522,18 +523,28 @@ export async function readReferenceWriteReceipt(
   ) {
     if (!value.sourceId) throw new DataAccessError('not_found');
     [row] =
-      await db`select a.input,s.id source_id from allrice_knowledge_reference_actions a
+      await db`select a.input,s.id source_id,s.workspace_id source_workspace_id
+      from allrice_knowledge_reference_actions a
       join allrice_knowledge_sources s on s.id=a.source_id
-      where s.organization_id=${context.organizationId} and s.workspace_id=${value.workspaceId}
+      where s.organization_id=${context.organizationId}
+        and (case when a.input ? 'workspaceId' then a.input->>'workspaceId' else s.workspace_id::text end)=${value.workspaceId}
         and a.actor_id=${context.actor.id} and a.request_id=${value.requestId} and s.id=${value.sourceId}
         and (${value.operation !== 'change-publication'} or s.created_by=${context.actor.id})`;
+    const submitted = row?.input;
+    const authenticatedInput =
+      submitted &&
+      typeof submitted === 'object' &&
+      !Array.isArray(submitted) &&
+      !Object.hasOwn(submitted, 'workspaceId')
+        ? { ...submitted, workspaceId: row?.source_workspace_id }
+        : submitted;
     if (
       row &&
       !(
         value.operation === 'change-publication'
           ? ReferencePublicationActionSchema
           : ReferenceActionSchema
-      ).safeParse(row.input).success
+      ).safeParse(authenticatedInput).success
     )
       row = undefined;
     if (row && value.operation === 'change-source') {

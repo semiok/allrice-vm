@@ -87,7 +87,10 @@ export async function writeEmployeePanelsBaseline(
     return sources.get(path)!;
   };
   // Seed the complete public real-component identities even when tree-shaken.
-  for (const name of components) readBase('apps/web/app/chatflow/' + name);
+  for (const [name, expected] of Object.entries(panelsRev2Sources)) {
+    if (sha256(readBase('apps/web/app/chatflow/' + name)) !== expected)
+      throw Error('Approved rev2 component bytes changed: ' + name);
+  }
   const snapshot = createLegacySidebarSnapshot(readBase);
   const common = {
     absWorkingDir: repoRoot,

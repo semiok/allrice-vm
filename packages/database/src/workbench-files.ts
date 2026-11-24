@@ -658,6 +658,15 @@ export async function setWorkbenchFileFavorite(
     if (!(await readContentPrincipal(context, tx, true)))
       throw new DataAccessError('authorization_denied');
     await qualification?.current(tx);
+    const [locked] = await tx`
+      select id from allrice_storage_objects
+      where id=${objectId} and organization_id=${context.organizationId}
+        and workspace_id=${context.workspaceId!} and owner_id=${context.actor.id}
+        and state='ready' and deleted_at is null
+        and (retention_until is null or retention_until>clock_timestamp())
+      for share
+    `;
+    if (!locked) throw new DataAccessError('not_found');
     const [eligible] = await tx<
       { id: string }[]
     >`with ${personalWorkbenchOrigins(tx, {
