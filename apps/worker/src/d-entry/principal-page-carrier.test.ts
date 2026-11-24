@@ -442,7 +442,7 @@ it.each(['with baseline', 'with independent baseline failure'] as const)(
     const businessError = new RemoteError(
       'gateway/service-unavailable',
       'original native access business error',
-      { source: 'initial follow' },
+      { endpoint: 'remoteAccess/follow' },
     );
     const wire = f.host.host.typertGateway.wireStream;
     const openNative = wire.open.bind(wire);
