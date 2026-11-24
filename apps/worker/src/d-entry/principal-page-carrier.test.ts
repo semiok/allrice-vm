@@ -9,6 +9,7 @@ import { createServer, get, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
+import { employeeWebKernelOptions } from '../../../../packages/dsh-web-composition/build-web-entry.mjs';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import {
@@ -614,6 +615,214 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
         .then((value) => value.status),
     ).toBe(404);
     expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    await context.close();
+  },
+);
+
+it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
+  'waits for the real document dispose before navigation and cancels a partial bundle on child pagehide',
+  { timeout: 30_000 },
+  async () => {
+    const f = await fixture();
+    const root = process.cwd();
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    function bundle(resolveDir: string, source: string) {
+      return require('esbuild')
+        .build({
+          ...employeeWebKernelOptions,
+          stdin: { contents: source, resolveDir, loader: 'tsx' },
+          format: 'esm',
+          write: false,
+          outdir: '/page-close-test',
+          jsx: 'automatic',
+          loader: Object.fromEntries(
+            Object.keys(employeeWebKernelOptions.loader!).map((key) => [
+              key,
+              'dataurl',
+            ]),
+          ),
+        })
+        .then(
+          (result: { outputFiles: { path: string; text: string }[] }) =>
+            result.outputFiles.find((file) => file.path.endsWith('.js'))!.text,
+        );
+    }
+    const [outer, child] = await Promise.all([
+      bundle(
+        join(root, 'apps/web'),
+        `
+        import { createRoot } from 'react-dom/client';
+        import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+        createRoot(document.getElementById('root')).render(<EmployeeNativePage query={location.search.slice(1)} />);
+      `,
+      ),
+      bundle(
+        join(root, 'packages/dsh-web-composition'),
+        `
+        import { AppWebEntry } from '@deepseek-ai/dsh-client-web';
+        const dispose = AppWebEntry.prototype.dispose;
+        const gate = Promise.withResolvers();
+        window.releaseDispose = gate.resolve;
+        AppWebEntry.prototype.dispose = async function () {
+          document.body.dataset.dispose = 'waiting';
+          const shouldFail = await gate.promise;
+          await dispose.call(this);
+          if (shouldFail) throw Error('Dispose outcome unknown');
+        };
+        await import('./src/employee-product-entry');
+      `,
+      ),
+    ]);
+    let transfer = deferred<ServerResponse>();
+    let cancelled = deferred<void>();
+    const graph = DEntryProfileGraphSchema.parse({
+      rev: 'test-graph',
+      release: { version: '0.2.1-rc.2' },
+      entries: [{ id: 'held', url: 'plugins/??held', rev: 'held-entry' }],
+      batches: [
+        {
+          phase: 'bootstrap',
+          url: 'plugins/??held-batch',
+          rev: 'held-batch',
+          entries: ['held'],
+        },
+      ],
+    });
+    f.web.on('request', (request, response) => {
+      const url = new URL(request.url!, f.origin);
+      const send = (type: string, body: string) =>
+        response.writeHead(200, { 'Content-Type': type }).end(body);
+      if (url.pathname === '/outer.js')
+        return send('application/javascript', outer);
+      if (url.pathname === '/child.js')
+        return send('application/javascript', child);
+      if (url.pathname === '/api/v1/d-entry/identity')
+        return send(
+          'application/json',
+          JSON.stringify({ identity: f.identity }),
+        );
+      if (url.pathname === '/chatflow/4.0/document') {
+        const fields = {
+          'scope-id': url.searchParams.get('scopeId'),
+          'workspace-id': f.identity.workspaceId,
+          'employee-instance-id': f.identity.employeeInstanceId,
+          'organization-id': f.identity.organizationId,
+          'viewer-id': f.identity.personId,
+          'binding-ref': f.owner.bindingRef,
+          'graph-rev': graph.rev,
+        };
+        const attributes = Object.entries(fields)
+          .map(([key, value]) => `data-${key}="${value}"`)
+          .join(' ');
+        return send(
+          'text/html',
+          `<!doctype html><div id="app" ${attributes}></div><script type="module" src="/child.js"></script>`,
+        );
+      }
+      if (url.pathname === '/api/v1/d-entry/profile/bootstrap')
+        return send(
+          'application/json',
+          JSON.stringify({
+            version: 1,
+            scopeReference: { scopeId: url.searchParams.get('scopeId') },
+            bindingRef: f.owner.bindingRef,
+            graph,
+            injections: [
+              {
+                kind: 'script-src',
+                placement: 'head',
+                src: graph.batches[0]!.url,
+              },
+            ],
+          }),
+        );
+      if (url.pathname === '/api/v1/d-entry/profile/assets') {
+        const close = cancelled;
+        response.once('close', () => close.resolve());
+        response.writeHead(200, { 'Content-Type': 'application/javascript' });
+        response.write('window.nativeLateRegistration = ');
+        transfer.resolve(response);
+        return;
+      }
+      // The next URL is enough to detect navigation. A second VM and launch
+      // are outside this test's close boundary.
+      if (url.pathname === '/chatflow/4.0')
+        return send('text/html', '<!doctype html><p>Next selection</p>');
+      return send(
+        'text/html',
+        '<!doctype html><div id="root"></div><script type="module" src="/outer.js"></script>',
+      );
+    });
+    const browser = await chromium.launch({
+      executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
+    });
+    closes.push(() => browser.close());
+    const context = await browser.newContext();
+    await context.addCookies([
+      { name: 'allrice_session', value: sessionToken, url: f.origin },
+    ]);
+    const start = f.origin + '/old?' + new URLSearchParams(f.selection);
+    for (const scenario of ['navigate', 'unknown', 'child-hides'] as const) {
+      transfer = deferred<ServerResponse>();
+      cancelled = deferred<void>();
+      const page = await context.newPage();
+      try {
+        await page.goto(start);
+        const blocked = await transfer.promise;
+        expect(blocked.writableFinished).toBe(false);
+        const frame = page
+          .frames()
+          .find((candidate) =>
+            candidate.url().includes('/chatflow/4.0/document'),
+          )!;
+        const scopeId = new URL(frame.url()).searchParams.get('scopeId')!;
+        expect((await f.invoke(scopeId)).status).toBe(200);
+        const next = { ...f.selection, threadId: randomUUID() };
+        await frame.evaluate(
+          ({ scenario, scopeId, next }) => {
+            if (scenario === 'child-hides')
+              window.dispatchEvent(new Event('pagehide'));
+            else
+              parent.postMessage(
+                { type: 'allrice:d-entry:navigate', scopeId, selection: next },
+                location.origin,
+              );
+          },
+          { scenario, scopeId, next },
+        );
+        await cancelled.promise;
+        expect(blocked.destroyed).toBe(true);
+        expect(blocked.writableFinished).toBe(false);
+        await frame.locator('body[data-dispose=waiting]').waitFor();
+        expect((await f.invoke(scopeId)).status).toBe(404);
+        expect(page.url()).toBe(start);
+        expect(
+          await frame.evaluate(() =>
+            Object.hasOwn(window, 'nativeLateRegistration'),
+          ),
+        ).toBe(false);
+        await frame.evaluate(
+          (fail) =>
+            (
+              window as unknown as { releaseDispose(fail: boolean): void }
+            ).releaseDispose(fail),
+          scenario === 'unknown',
+        );
+        if (scenario === 'navigate')
+          await page.waitForURL('**/chatflow/4.0?**');
+        else if (scenario === 'unknown') {
+          await page.getByRole('alert').waitFor();
+          expect(page.url()).toBe(start);
+        }
+      } finally {
+        await page.close();
+      }
+    }
     await context.close();
   },
 );

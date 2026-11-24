@@ -106,6 +106,7 @@ export function nativeProfileDocument(
   return {
     signal: lifetime.signal,
     close: stop,
+    cancel: () => lifetime.abort(),
     async bootstrap(signal: AbortSignal) {
       const active = AbortSignal.any([lifetime.signal, signal]);
       const response = await fetch(profileUrl('bootstrap'), {
@@ -199,8 +200,9 @@ export function nativeProfileDocument(
       },
       loadBundle(reference: string) {
         return owned(
-          new Promise<void>((resolve, reject) => {
-            lifetime.signal.throwIfAborted();
+          (async () => {
+            const signal = lifetime.signal;
+            signal.throwIfAborted();
             const graph = published?.graph;
             const resource =
               graph &&
@@ -212,21 +214,41 @@ export function nativeProfileDocument(
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);
+            const response = await fetch(target, {
+              signal,
+              credentials: 'same-origin',
+              cache: 'no-store',
+            });
+            if (!response.ok) {
+              await response.body?.cancel();
+              throw Error('Employee profile bundle unavailable');
+            }
+            const bytes = await response.arrayBuffer();
+            signal.throwIfAborted();
+            // rc.2 payloads are classic registration scripts. Download belongs
+            // to the abortable request; only the received, certified bytes can
+            // enter the synchronous native registration callback.
             const script = document.createElement('script');
-            script.src = target.href;
-            const finish = (error?: unknown) => {
-              lifetime.signal.removeEventListener('abort', cancel);
-              script.remove();
-              if (error) reject(error);
-              else resolve();
+            script.textContent = new TextDecoder('utf-8', {
+              fatal: true,
+            }).decode(bytes);
+            let registrationError: Error | undefined;
+            const failed = (event: ErrorEvent) => {
+              registrationError =
+                event.error instanceof Error
+                  ? event.error
+                  : Error('Employee profile bundle failed');
             };
-            const cancel = () => finish(lifetime.signal.reason);
-            script.onload = () => finish();
-            script.onerror = () =>
-              finish(Error('Employee profile bundle unavailable'));
-            lifetime.signal.addEventListener('abort', cancel, { once: true });
-            document.head.append(script);
-          }),
+            window.addEventListener('error', failed);
+            try {
+              signal.throwIfAborted();
+              document.head.append(script);
+              if (registrationError) throw registrationError;
+            } finally {
+              window.removeEventListener('error', failed);
+              script.remove();
+            }
+          })(),
         );
       },
     },

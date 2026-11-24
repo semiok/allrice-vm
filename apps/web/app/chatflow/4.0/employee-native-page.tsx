@@ -11,6 +11,7 @@ import {
   pageCompletion,
   pageNavigate,
   pageRevoked,
+  pendingPageResult,
 } from '../../../lib/d-entry/page-carrier';
 
 export function EmployeeNativePage({ query }: { query: string }) {
@@ -22,6 +23,8 @@ export function EmployeeNativePage({ query }: { query: string }) {
     const lifetime = new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
+    let navigating = false;
+    const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
     setFailed(false);
     const send = (type: string, state?: 'closed' | 'unknown') => {
@@ -31,12 +34,18 @@ export function EmployeeNativePage({ query }: { query: string }) {
           location.origin,
         );
     };
-    const close = () => {
-      void carrier?.close().then(
-        () => send(pageCompletion, 'closed'),
-        () => send(pageCompletion, 'unknown'),
+    function close() {
+      return carrier?.close().then(
+        () => {
+          send(pageCompletion, 'closed');
+          return 'closed' as const;
+        },
+        () => {
+          send(pageCompletion, 'unknown');
+          return 'unknown' as const;
+        },
       );
-    };
+    }
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -45,26 +54,31 @@ export function EmployeeNativePage({ query }: { query: string }) {
         event.data?.scopeId !== scopeId
       )
         return;
-      if (event.data.type === pageClosing) close();
+      if (event.data.type === pageClosing) void close();
+      if (
+        event.data.type === pageCompletion &&
+        ['closed', 'unknown'].includes(event.data.state)
+      )
+        local.resolve(event.data.state);
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
-        if (!next.success || !carrier) return;
+        if (!next.success || !carrier || navigating) return;
+        navigating = true;
         const params = new URLSearchParams(
           Object.entries(next.data).filter(
             (entry): entry is [string, string] => typeof entry[1] === 'string',
           ),
         );
-        void carrier.close().then(
-          () => {
-            send(pageCompletion, 'closed');
-            if (!lifetime.signal.aborted)
-              location.assign('/chatflow/4.0?' + params);
-          },
-          () => {
-            send(pageCompletion, 'unknown');
-            if (!lifetime.signal.aborted) setFailed(true);
-          },
-        );
+        // Both messages refer only to this exact iframe and page scope. The
+        // carrier completion proves the remote side; terminate local entry
+        // work independently and keep the frame until both report back.
+        send(pageRevoked);
+        void Promise.all([close(), local.promise]).then(([remote, entry]) => {
+          if (lifetime.signal.aborted) return;
+          if (remote === 'closed' && entry === 'closed')
+            location.assign('/chatflow/4.0?' + params);
+          else setFailed(true);
+        });
       }
     };
     window.addEventListener('message', receive);

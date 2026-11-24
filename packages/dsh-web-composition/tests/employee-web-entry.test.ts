@@ -101,11 +101,13 @@ it('joins pending injection/startup and real cleanup before the public dispose a
   const cleaning = Promise.withResolvers<void>();
   const cleanup = Promise.withResolvers<void>();
   let signal: AbortSignal | undefined;
+  const cancelled = vi.fn();
   const lifetime = native.startEmployeeWebEntry(native.container, {
     applyRequiredInjections: async (current) => {
       signal = current;
       await injection.promise;
     },
+    cancel: cancelled,
     cleanup: () => {
       cleaning.resolve();
       return cleanup.promise;
@@ -122,6 +124,7 @@ it('joins pending injection/startup and real cleanup before the public dispose a
   const closing = lifetime.close();
   expect(lifetime.close()).toBe(closing);
   expect(signal!.aborted).toBe(true);
+  expect(cancelled).toHaveBeenCalledExactlyOnceWith();
   await expect(lifetime.started).resolves.toEqual({ state: 'cancelled' });
   expect(native.dispose).not.toHaveBeenCalled();
   injection.resolve();

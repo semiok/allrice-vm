@@ -7,6 +7,8 @@ export interface EmployeeWebEntryWork {
   /** Abort has already fenced new work. Join/release this document's actual
    * transport, owner and references; never report a timeout as cleanup. */
   cleanup(): Promise<void>;
+  /** Synchronously fence the actual document transport before joining startup. */
+  cancel?(): void;
 }
 
 export type EmployeeWebEntryStart =
@@ -78,10 +80,10 @@ export function startEmployeeWebEntry(
       // The carrier owns this readiness gate, so cancellation must settle it
       // without allowing an owner baseline or a fake success through.
       readiness.reject(lifetime.signal.reason);
+      const errors: unknown[] = [];
       closePromise = (async (): Promise<EmployeeWebEntryClose> => {
         await injecting;
         await started;
-        const errors: unknown[] = [];
         try {
           await work.cleanup();
         } catch (reason) {
@@ -107,6 +109,11 @@ export function startEmployeeWebEntry(
         state: 'unknown',
         reason,
       }));
+      try {
+        work.cancel?.();
+      } catch (reason) {
+        errors.push(reason);
+      }
       return closePromise;
     },
   });
