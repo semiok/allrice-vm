@@ -461,7 +461,10 @@ suite(
       const conflicting = f.request();
       conflicting.headers.set('x-allrice-workspace-id', randomUUID());
       const denied = await handlers.history(conflicting);
-      expect([401, 404]).toContain(denied.status);
+      expect(denied.status).toBe(403);
+      expect(await denied.json()).toMatchObject({
+        error: { code: 'AUTHORIZATION_DENIED' },
+      });
       expect(f.createColdSource).toHaveBeenCalledTimes(1);
     });
 
