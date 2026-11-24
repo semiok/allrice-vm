@@ -208,9 +208,11 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
             async readImmutableBundle(reference, bytes) {
               requested.push(reference);
               const value = await current.readImmutableBundle(reference, bytes);
-              return reference === corrupt
-                ? Buffer.concat([Buffer.from('x'), value])
-                : value;
+              if (reference !== corrupt) return value;
+              const changed = Buffer.from(value);
+              changed[0] = changed[0]! ^ 1;
+              expect(changed.byteLength).toBe(bytes);
+              return changed;
             },
           },
           lifetime,

@@ -40,13 +40,21 @@ export function nativeWebTransport(
       ),
     );
   }
-  const agent = new (class extends Agent {
-    override createConnection(...args: Parameters<Agent['createConnection']>) {
-      const socket = super.createConnection(...args);
-      if (socket) socketJoin(socket); // Before ClientRequest's asynchronous assignment.
-      return socket;
-    }
-  })({ keepAlive: false });
+  function newAgent(ownSocket?: (socket: Duplex) => void) {
+    return new (class extends Agent {
+      override createConnection(
+        ...args: Parameters<Agent['createConnection']>
+      ) {
+        const socket = super.createConnection(...args);
+        if (socket) {
+          socketJoin(socket);
+          ownSocket?.(socket);
+        }
+        return socket;
+      }
+    })({ keepAlive: false });
+  }
+  const agent = newAgent();
   function requestJoin(call: ClientRequest) {
     calls.add(call);
     joined(
@@ -75,6 +83,7 @@ export function nativeWebTransport(
     input: string | URL,
     init: Parameters<RpcFetch>[1],
     receive: (response: IncomingMessage) => void,
+    connectionPool = agent,
   ) {
     const url = target(input);
     const headers = new Headers(init.headers);
@@ -93,7 +102,7 @@ export function nativeWebTransport(
       {
         method: init.method,
         headers: Object.fromEntries(headers),
-        agent,
+        agent: connectionPool,
         signal: callSignal,
       },
       receive,
@@ -159,7 +168,15 @@ export function nativeWebTransport(
       let received = 0;
       let complete = false;
       let failure: { reason: unknown } | undefined;
-      let socket: Duplex | undefined;
+      let physicalClose: Promise<void> | undefined;
+      // This agent owns exactly this request, even when the request dies
+      // before Node assigns the already created socket to ClientRequest.
+      const connection = newAgent((socket) => {
+        physicalClose = new Promise<void>((done) => {
+          if (socket.closed) done();
+          else socket.once('close', done);
+        });
+      });
       const fail = () => {
         failure ??= {
           reason: active.aborted
@@ -172,7 +189,13 @@ export function nativeWebTransport(
         { method: 'GET', headers: { connection: 'close' }, signal: active },
         (response) => {
           response.once('error', fail);
-          if (response.statusCode !== 200) {
+          const declared = response.headers['content-length'];
+          if (
+            response.statusCode !== 200 ||
+            (declared !== undefined &&
+              /^\d+$/.test(declared) &&
+              BigInt(declared) !== BigInt(bytes))
+          ) {
             fail();
             response.destroy();
             return;
@@ -191,17 +214,17 @@ export function nativeWebTransport(
             if (!complete) fail();
           });
         },
+        connection,
       );
-      call.once('socket', (assigned) => (socket = assigned));
       call.on('error', fail);
       call.once('close', () => {
-        const finish = () => {
+        void (async () => {
+          await physicalClose;
+          connection.destroy();
           if (!complete || active.aborted) fail();
           if (failure) reject(failure.reason);
           else resolve(data);
-        };
-        if (socket && !socket.closed) socket.once('close', finish);
-        else finish();
+        })();
       });
       send();
     });
