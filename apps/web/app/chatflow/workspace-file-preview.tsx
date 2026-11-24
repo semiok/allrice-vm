@@ -338,8 +338,9 @@ export function WorkspaceFilePreview(props: {
   const base = `${baseUrl}/${encodeURIComponent(props.objectId)}`;
   const query = `?workspaceId=${encodeURIComponent(props.workspaceId)}&name=${encodeURIComponent(props.title)}`;
   const downloadUrl = `${base}/download${query}`;
+  const previewActive = !props.dataClient || props.active !== false;
   useEffect(() => {
-    if (props.dataClient && props.active === false) return;
+    if (!previewActive) return;
     const controller = new AbortController();
     setError('');
     setDenied(false);
@@ -380,7 +381,7 @@ export function WorkspaceFilePreview(props: {
     attempt,
     data,
     props.dataClient,
-    props.active,
+    previewActive,
     props.workspaceId,
     props.objectId,
     props.title,
