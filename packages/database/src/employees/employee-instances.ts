@@ -1225,12 +1225,15 @@ export async function resolveEmployeeSessionInstance(
   assignmentId: string,
   instanceId: string | undefined,
   tx: Tx,
-  lock = true,
+  lock: boolean | 'read' = true,
 ) {
-  await authority(context, tx, lock);
-  await assignment(context, assignmentId, tx, lock);
+  if (lock === 'read') {
+    if (!(await readContentPrincipal(context, tx, true)))
+      throw new DataAccessError('authorization_denied');
+  } else await authority(context, tx, lock);
+  await assignment(context, assignmentId, tx, lock !== false);
   // A read never creates the general instance; a missing one is not found.
-  if (!instanceId && lock)
+  if (!instanceId && lock === true)
     await ensureGeneralEmployeeInstance(tx, assignmentId);
   await tx`select id from allrice_employee_instances where id=${instanceId ?? assignmentId} ${lock ? tx`for share` : tx``}`;
   const instance = await getEmployeeInstance(

@@ -43,6 +43,7 @@ export async function requireEmployeePanelsAccess(
       employee.assignmentId,
       employee.id,
       transaction,
+      'read',
     );
   if (
     employee.ownerId !== context.actor.id ||

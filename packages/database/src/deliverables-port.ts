@@ -231,6 +231,12 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
         context,
         value.target.objectId,
         value.body,
+        {
+          signal,
+          async current(transaction) {
+            await current(context, signal, transaction);
+          },
+        },
       );
       await current(context, signal);
       return DeliverableFavoriteResultProjectionSchema.parse(result);

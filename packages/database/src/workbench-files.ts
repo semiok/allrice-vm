@@ -434,6 +434,7 @@ async function snapshotFile(
       contentBase64: Buffer.from(bytes).toString('base64'),
     },
     { originObjectId: file.object.id },
+    options ? { qualification: options } : undefined,
   );
   await options?.requireCurrentAccess();
   if (!prepared.alreadyReady) {
@@ -645,6 +646,10 @@ export async function setWorkbenchFileFavorite(
   contextInput: RequestContext,
   objectIdInput: string,
   input: unknown,
+  qualification?: {
+    signal: AbortSignal;
+    current(tx: TransactionSql): Promise<void>;
+  },
 ) {
   const value = WorkbenchFileFavoriteSchema.parse(input);
   const context = scoped(contextInput, contextInput.workspaceId!);
@@ -652,6 +657,7 @@ export async function setWorkbenchFileFavorite(
   return getDatabase().begin(async (tx) => {
     if (!(await readContentPrincipal(context, tx, true)))
       throw new DataAccessError('authorization_denied');
+    await qualification?.current(tx);
     const [eligible] = await tx<
       { id: string }[]
     >`with ${personalWorkbenchOrigins(tx, {
@@ -663,6 +669,7 @@ export async function setWorkbenchFileFavorite(
     const file = await readWorkbenchFile(context, objectId, tx);
     if (file.object.ownerId !== context.actor.id)
       throw new DataAccessError('not_found');
+    qualification?.signal.throwIfAborted();
     if (value.favorite)
       await tx`insert into allrice_workbench_file_favorites(organization_id,workspace_id,user_id,object_id)
         values(${context.organizationId},${context.workspaceId!},${context.actor.id},${objectId}) on conflict do nothing`;

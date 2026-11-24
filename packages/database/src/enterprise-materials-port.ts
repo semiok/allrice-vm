@@ -71,6 +71,18 @@ export function createEnterpriseMaterialsPort(
     signal.throwIfAborted();
     return context;
   }
+  function qualify(
+    context: RequestContext,
+    workspaceId: string,
+    signal: AbortSignal,
+  ) {
+    return {
+      signal,
+      async requireCurrentAccess(transaction?: TransactionSql) {
+        await current(context, workspaceId, signal, transaction);
+      },
+    };
+  }
   return {
     async authorizedRevisionResource(contextInput, input, signal) {
       const value = MaterialsSelectionQueryProjectionSchema.parse(input);
@@ -150,10 +162,7 @@ export function createEnterpriseMaterialsPort(
       const result = await publishReference(context, value, options.storage, {
         namePolicy: 'independent-material',
         source,
-        signal,
-        requireCurrentAccess: async (transaction) => {
-          await current(context, value.workspaceId, signal, transaction);
-        },
+        ...qualify(context, value.workspaceId, signal),
       });
       await current(context, value.workspaceId, signal);
       return ReferenceSaveResultSchema.parse(result);
@@ -226,12 +235,15 @@ export function createEnterpriseMaterialsPort(
     async save(contextInput, input, signal) {
       const value = MaterialsSaveInputProjectionSchema.parse(input);
       const context = await current(contextInput, value.workspaceId, signal);
+      const qualification = qualify(context, value.workspaceId, signal);
       const prepared = await prepareReferenceUpload(context, value, undefined, {
         namePolicy: 'independent-material',
+        qualification,
       });
       signal.throwIfAborted();
       if (!prepared.alreadyReady) {
         if (!prepared.object) throw new Error('Reference reservation missing');
+        await qualification.requireCurrentAccess();
         await options.storage.put(
           prepared.object,
           new Blob([new Uint8Array(prepared.bytes)]).stream(),
@@ -241,12 +253,7 @@ export function createEnterpriseMaterialsPort(
           context,
           value.workspaceId,
           prepared.revisionId,
-          {
-            signal,
-            async requireCurrentAccess(transaction) {
-              await current(context, value.workspaceId, signal, transaction);
-            },
-          },
+          qualification,
         );
       }
       await current(context, value.workspaceId, signal);
@@ -261,10 +268,7 @@ export function createEnterpriseMaterialsPort(
       const context = await current(contextInput, value.workspaceId, signal);
       const result = await publishReference(context, value, options.storage, {
         namePolicy: 'independent-material',
-        signal,
-        requireCurrentAccess: async (transaction) => {
-          await current(context, value.workspaceId, signal, transaction);
-        },
+        ...qualify(context, value.workspaceId, signal),
       });
       // Owner Promise joins storage/transaction. A revoked response does not
       // roll back a publication; reconcile this original requestId.
@@ -282,6 +286,7 @@ export function createEnterpriseMaterialsPort(
         context,
         value.target.sourceId,
         value.body,
+        qualify(context, value.body.workspaceId, signal),
       );
       await current(context, value.body.workspaceId, signal);
       return MaterialsActionResultProjectionSchema.parse(result);
@@ -297,6 +302,7 @@ export function createEnterpriseMaterialsPort(
         context,
         value.target.sourceId,
         value.body,
+        qualify(context, value.body.workspaceId, signal),
       );
       await current(context, value.body.workspaceId, signal);
       return MaterialsActionResultProjectionSchema.parse(result);

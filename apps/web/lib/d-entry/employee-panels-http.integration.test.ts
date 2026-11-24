@@ -32,7 +32,10 @@ import {
 } from '../../../../packages/database/src/reference-processing.ts';
 import { referenceLibraryOptions } from '../../../../packages/database/src/reference-library.ts';
 import { createEmployeePanelsHandlers } from './employee-panels-http';
-import { employeePanelsDependencies } from './employee-panels-context';
+import {
+  employeePanelsDependencies,
+  requireEmployeePanelsContext,
+} from './employee-panels-context';
 import {
   createEmployeePanelsHttpClient,
   readEmployeePanelsWriteReceipt,
@@ -1627,6 +1630,124 @@ suite(
         }
       },
     );
+    it('serializes original reference reservations and publication changes with a real D release withdrawal', async () => {
+      const p = await person();
+      await release(p);
+      await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+      const session = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const selection = { ...p.selection, threadId: session.id };
+      const client = createEmployeePanelsHttpClient(selection, p.options);
+      const file = await client.uploadDeliverable(uploadInput(p), signal());
+      const audience = { scope: 'personal' as const, departmentIds: [] };
+      const saved = await client.publishUpload(
+        { ...uploadInput(p), origin: 'upload', purpose: '', audience },
+        signal(),
+      );
+      const storage = runtimeFixtureStorage(f.db);
+      const authorize = async (
+        ...args: Parameters<typeof employeePanelsDependencies.authorize>
+      ) => {
+        if (args[2])
+          await updateDEntryReleasePolicy(p.context, {
+            revision: randomUUID(),
+            defaultGeneration: '3.x',
+            selections: [],
+          });
+        return employeePanelsDependencies.authorize(...args);
+      };
+      const defaults = {
+        ...employeePanelsDependencies,
+        storage: () => storage,
+      };
+      handlers = createEmployeePanelsHandlers({ ...defaults, authorize });
+      try {
+        const captureId = randomUUID();
+        await expect(
+          client.captureReference(
+            {
+              workspaceId: selection.workspaceId,
+              objectId: file.objectId,
+              requestId: captureId,
+            },
+            signal(),
+          ),
+        ).rejects.toMatchObject({ cause: { status: 403 } });
+        await release(p);
+        const save = uploadInput(p);
+        const scoped = await requireEmployeePanelsContext(
+          new Request(base + '?' + new URLSearchParams(selection)),
+          selection.employeeInstanceId,
+          false,
+          { ...defaults, context: async () => p.context, authorize },
+        );
+        await expect(
+          scoped.materials.save(
+            p.context,
+            { ...save, scope: 'personal', purpose: '' },
+            signal(),
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await release(p);
+        await expect(
+          client.favorite(
+            {
+              workspaceId: selection.workspaceId,
+              objectId: file.objectId,
+              body: { favorite: true },
+            },
+            signal(),
+          ),
+        ).rejects.toMatchObject({ status: 403 });
+        expect(
+          await f.db`select object_id from allrice_workbench_file_favorites where object_id=${file.objectId}`,
+        ).toEqual([]);
+        for (const action of ['edit', 'delete', 'retry'] as const) {
+          await release(p);
+          const body = {
+            workspaceId: selection.workspaceId,
+            requestId: randomUUID(),
+            expectedRevision: 1,
+          };
+          const writing =
+            action === 'retry'
+              ? client.changeSource(
+                  { sourceId: saved.sourceId, body: { ...body, action } },
+                  signal(),
+                )
+              : client.changePublication(
+                  {
+                    sourceId: saved.sourceId,
+                    body:
+                      action === 'edit'
+                        ? {
+                            ...body,
+                            action,
+                            purpose: 'revoked change',
+                            audience,
+                          }
+                        : { ...body, action },
+                  },
+                  signal(),
+                );
+          await expect(writing).rejects.toMatchObject({
+            cause: { status: 403 },
+          });
+          expect(
+            await f.db`select request_id from allrice_knowledge_reference_actions where request_id=${body.requestId}`,
+          ).toEqual([]);
+        }
+        expect(
+          await f.db`select request_id from allrice_knowledge_save_requests where request_id in (${captureId},${save.requestId})`,
+        ).toEqual([]);
+        expect(
+          await f.db`select description,status from allrice_knowledge_sources where id=${saved.sourceId}`,
+        ).toEqual([{ description: '企业资料', status: 'active' }]);
+      } finally {
+        handlers = createEmployeePanelsHandlers(defaults);
+      }
+    });
     it('replays the same material reservation from verified copy bytes after the original is withdrawn', async () => {
       const p = await person();
       await release(p);

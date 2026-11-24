@@ -62,6 +62,10 @@ import {
 } from './workbench-file-access.ts';
 
 type Sql = ReturnType<typeof getDatabase> | postgres.TransactionSql;
+type ReferenceWriteQualification = {
+  signal?: AbortSignal;
+  requireCurrentAccess(transaction: postgres.TransactionSql): Promise<void>;
+};
 type PublicationFileFacts = Awaited<ReturnType<typeof readWorkbenchFile>>;
 export class ReferenceLibraryError extends Error {
   constructor(
@@ -243,7 +247,10 @@ export async function referenceSourceAccess(
   return {
     source: s,
     ownership,
-    access: legacy ? { ...access, canMaintain: false } : access,
+    access:
+      legacy && !allowLegacyProcessing
+        ? { ...access, canMaintain: false }
+        : access,
     legacy,
     publication: null,
   };
@@ -587,7 +594,10 @@ export async function prepareReferenceUpload(
   contextInput: RequestContext,
   input: unknown,
   binding?: { originObjectId: string },
-  options?: { namePolicy: 'independent-material' },
+  options?: {
+    namePolicy?: 'independent-material';
+    qualification?: ReferenceWriteQualification;
+  },
 ) {
   const v = ReferenceUploadInputSchema.parse(input),
     context = scoped(contextInput, v.workspaceId);
@@ -595,7 +605,8 @@ export async function prepareReferenceUpload(
     throw new DataAccessError('authentication_required');
   if (v.scope !== 'platform' && (v.scope !== 'personal' || v.sourceId))
     throw new DataAccessError('authorization_denied');
-  if (options && v.sourceId) throw new ReferenceLibraryError('invalid_content');
+  if (options?.namePolicy && v.sourceId)
+    throw new ReferenceLibraryError('invalid_content');
   const { contentBase64, ...metadata } = v;
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(contentBase64) || contentBase64.length % 4)
     throw new ReferenceLibraryError('invalid_content');
@@ -613,10 +624,12 @@ export async function prepareReferenceUpload(
       ? { originObjectId: UuidSchema.parse(binding.originObjectId) }
       : {}),
   };
+  const qualification = options?.qualification;
   const result = await getDatabase().begin(async (tx) => {
     await lockWorkspaceStorageQuota(tx, context.organizationId, v.workspaceId);
     if (!(await referenceAccess(context, ownership, tx, true)).canMaintain)
       throw new DataAccessError('authorization_denied');
+    await qualification?.requireCurrentAccess(tx);
     if (
       binding &&
       !(
@@ -656,9 +669,10 @@ export async function prepareReferenceUpload(
       requestInput,
     );
     if (prior) return readReferenceReservation(tx, context, prior, binding);
-    const fileName = options
+    const fileName = options?.namePolicy
       ? await independentReferenceFileName(tx, context, v.fileName)
       : v.fileName;
+    qualification?.signal?.throwIfAborted();
     const saved = await reserveReferenceFile(
       tx,
       context,
@@ -974,10 +988,7 @@ export async function completeReferenceUpload(
   context: RequestContext,
   workspaceId: string,
   revisionId: string,
-  qualification?: {
-    signal?: AbortSignal;
-    requireCurrentAccess(transaction: postgres.TransactionSql): Promise<void>;
-  },
+  qualification?: ReferenceWriteQualification,
 ) {
   const c = scoped(context, workspaceId);
   await getDatabase().begin(async (tx) => {
@@ -1045,10 +1056,15 @@ export async function changeReference(
   contextInput: RequestContext,
   sourceId: string,
   input: unknown,
+  qualification?: ReferenceWriteQualification,
 ) {
   const v = ReferenceActionSchema.parse(input),
     context = scoped(contextInput, v.workspaceId);
   return getDatabase().begin(async (tx) => {
+    if (qualification) {
+      await readContentPrincipal(context, tx, true);
+      await qualification.requireCurrentAccess(tx);
+    }
     const { source, legacy } = await referenceSourceAccess(
       context,
       sourceId,
@@ -1074,6 +1090,7 @@ export async function changeReference(
       and (${!legacy} or r.revision=${v.expectedRevision}) order by r.revision desc limit 1`;
     if (!r || r.revision !== v.expectedRevision)
       throw new ReferenceLibraryError('version_conflict');
+    qualification?.signal?.throwIfAborted();
     if (v.action === 'retry') {
       if (source.status !== 'active') throw new DataAccessError('not_found');
       if (legacy) await assertLegacyReferenceRevision(tx, r.id, legacy.id);
@@ -1543,12 +1560,14 @@ export async function changeReferencePublication(
   contextInput: RequestContext,
   sourceId: string,
   input: unknown,
+  qualification?: ReferenceWriteQualification,
 ) {
   const v = ReferencePublicationActionSchema.parse(input);
   const context = scoped(contextInput, v.workspaceId);
   return getDatabase().begin(async (tx) => {
     const principal = await readContentPrincipal(context, tx, true);
     if (!principal?.writable) throw new DataAccessError('authorization_denied');
+    await qualification?.requireCurrentAccess(tx);
     const [source] = await tx<
       SourceRow[]
     >`select * from allrice_knowledge_sources
@@ -1568,6 +1587,7 @@ export async function changeReferencePublication(
     const policy = await readPublicationPolicy(source.id, tx);
     if (!policy || policy.revision !== v.expectedRevision)
       throw new ReferenceLibraryError('version_conflict');
+    qualification?.signal?.throwIfAborted();
     if (v.action === 'audience' || v.action === 'edit') {
       await validatePublicationAudience(context, v.audience, tx);
       await tx`update allrice_workbench_file_policies

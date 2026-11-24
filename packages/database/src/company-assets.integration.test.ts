@@ -25,6 +25,7 @@ import {
   getReferenceFile,
   changeReference,
   prepareReferenceUpload,
+  readReferenceWriteReceipt,
 } from './reference-library.ts';
 import { readReferenceSelection } from './reference-runtime.ts';
 import { captureCompanyRunAssets } from './company-run-assets.ts';
@@ -1099,6 +1100,22 @@ suite(
       ).rejects.toThrow('not_found');
       await changeReference(owner, sourceId, retry);
       await changeReference(owner, sourceId, retry);
+      const receipt = {
+        workspaceId: owner.workspaceId!,
+        sourceId,
+        requestId: retry.requestId,
+        operation: 'change-source' as const,
+      };
+      expect(await readReferenceWriteReceipt(owner, receipt)).toMatchObject({
+        status: 'recorded',
+        result: { sourceId },
+      });
+      expect(
+        await readReferenceWriteReceipt(member, {
+          ...receipt,
+          workspaceId: member.workspaceId!,
+        }),
+      ).toMatchObject({ status: 'unknown' });
       expect(
         (
           await f.db`select state from allrice_knowledge_processing where revision_id=${claim.revisionId}`
@@ -1119,6 +1136,9 @@ suite(
           assetId,
           expectedRevision: current.revision,
         });
+        await expect(readReferenceWriteReceipt(owner, receipt)).rejects.toThrow(
+          'not_found',
+        );
         expect(
           await listReferenceRevisions(member, member.workspaceId!, sourceId),
         ).toEqual([]);
