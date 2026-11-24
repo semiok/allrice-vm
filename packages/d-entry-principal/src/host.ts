@@ -391,7 +391,6 @@ class PrincipalService extends TypertRemoteService {
     signal: AbortSignal,
   ): RemoteStream<ScopeFrame, CloseCommand> {
     const { args, invocation } = this.raw('allricePrincipal/openScope');
-    if (!this.graphObserver?.ready) throw closed();
     issue = issueSchema.parse(args.issue);
     const { profile, binding } = this.config;
     if (
@@ -404,6 +403,12 @@ class PrincipalService extends TypertRemoteService {
       this.scopes.has(issue.scopeId)
     )
       throw Error('PRINCIPAL_ISSUE_INVALID');
+    if (!this.graphObserver?.ready) {
+      // The authenticated issue has not created a scope or opened a native
+      // reader. Close its private stream with the ordinary pre-open terminal.
+      yield { type: 'closed', scopeId: issue.scopeId };
+      return;
+    }
     const scope = new Scope(
       this,
       this.hostContext,
