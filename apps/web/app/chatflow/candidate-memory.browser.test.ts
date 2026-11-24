@@ -25,6 +25,7 @@ import { getPersonalEmployeeMemory } from '../../../../packages/database/src/emp
 import {
   createSession,
   authenticateSession,
+  revokeSession,
 } from '../../../../packages/database/src/identity.ts';
 import {
   listWorkspaceMemories,
@@ -32,6 +33,8 @@ import {
 } from '../../../../packages/database/src/workspace/service.ts';
 import { GET as adminMemories } from '../api/v1/admin/organizations/[organizationId]/employee-memories/route';
 import { GET as adminMemoryDetail } from '../api/v1/admin/organizations/[organizationId]/employee-memories/[id]/route';
+import { GET as adminMemorySource } from '../api/v1/admin/organizations/[organizationId]/employee-memories/[id]/source/route';
+import { GET as personalMemorySource } from '../api/v1/memories/[id]/source/route';
 import { GET as manage } from '../api/v1/memories/manage/route';
 import { GET as list, POST as create } from '../api/v1/memories/route';
 import { GET as instanceContent } from '../api/v1/employee-instances/[id]/content/route';
@@ -254,7 +257,9 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
             if (parts[3] === 'admin' && parts[6] === 'employee-memories')
               return request.method === 'GET'
                 ? parts[7]
-                  ? adminMemoryDetail(request, {
+                  ? (parts[8] === 'source'
+                      ? adminMemorySource
+                      : adminMemoryDetail)(request, {
                       params: Promise.resolve({
                         organizationId: parts[5]!,
                         id: parts[7],
@@ -273,6 +278,12 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
               );
               return new Response(null, { status: 404 });
             }
+            if (parts[5] === 'source')
+              return req.method === 'GET'
+                ? personalMemorySource(request, {
+                    params: Promise.resolve({ id }),
+                  })
+                : new Response(null, { status: 405 });
             if (req.method !== 'GET') {
               mutations.push(request.method + ' ' + url.pathname);
               httpWrites.push({
@@ -452,7 +463,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
     path: string,
     init: RequestInit = {},
     token = ownerToken,
-    workspace = identity.workspace,
+    workspace: string = identity.workspace,
     instance: string = token === foreignToken
       ? foreign.assignment
       : identity.assignment,
@@ -484,13 +495,14 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
     theme = 'light',
     width = 1280,
     instance?: string,
+    token = ownerToken,
   ) {
     const context = await browser.newContext({
       viewport: { width, height: width < 600 ? 844 : 1000 },
       colorScheme: theme === 'dark' ? 'dark' : 'light',
     });
     await context.addCookies([
-      { name: 'allrice_session', value: ownerToken, url: origin },
+      { name: 'allrice_session', value: token, url: origin },
     ]);
     const page = await context.newPage();
     page.on('pageerror', (error) => failures.push(error.message));
@@ -746,6 +758,158 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
         ),
       identity.workspace,
     );
+  it('reads an actual owner source from the production workbench and refuses unknown or crossed HTTP targets', async () => {
+    const instance = await isolatedInstance();
+    const memory = await createPair(
+      instance,
+      '每周报告先列风险',
+      '只用于本员工的私密说明',
+    );
+    const path = `/${memory.id}/source`;
+    const sourcePath = `/api/v1/memories${path}`;
+    const ui = await open('management', 'light', 390, instance);
+    try {
+      let reads = 0;
+      ui.page.on('request', (request) => {
+        if (new URL(request.url()).pathname === sourcePath) reads++;
+      });
+      await card(ui.page, memory.id).locator('button').click();
+      const dialog = ui.page.getByRole('dialog');
+      await dialog.getByText(memory.details!, { exact: true }).waitFor();
+      expect(reads).toBe(0);
+      const response = ui.page.waitForResponse(
+        (value) => new URL(value.url()).pathname === sourcePath,
+      );
+      await dialog.getByRole('button', { name: '来源', exact: true }).click();
+      const receipt = await response;
+      expect(receipt.status()).toBe(200);
+      expect(receipt.headers()['cache-control']).toBe('private, no-store');
+      expect(await receipt.json()).toEqual({
+        sourceType: 'user',
+        sourceLabel: '用户保存的记忆',
+        capturedAt: memory.capturedAt,
+      });
+      const region = dialog.getByRole('region', {
+        name: '记忆来源',
+        exact: true,
+      });
+      await region.locator('dl').waitFor();
+      expect(await region.getByText('手动添加', { exact: true }).count()).toBe(
+        2,
+      );
+      expect(await region.locator('time').getAttribute('datetime')).toBe(
+        memory.capturedAt,
+      );
+      expect(reads).toBe(1);
+
+      for (const [request, expected] of [
+        [[path, {}, '', identity.workspace, instance], 401],
+        [[path, {}, readerToken, identity.workspace, instance], 404],
+        [[path, {}, foreignToken, foreign.workspace, foreign.assignment], 404],
+        [[path, {}, ownerToken, identity.workspace, identity.assignment], 404],
+        [
+          [
+            `/${randomUUID()}/source`,
+            {},
+            ownerToken,
+            identity.workspace,
+            instance,
+          ],
+          404,
+        ],
+        [
+          [
+            path,
+            { headers: { 'x-allrice-workspace-id': identity.workspace } },
+            ownerToken,
+            otherWorkspace,
+            instance,
+          ],
+          403,
+        ],
+      ] as const) {
+        const [path, init, login, workspace, instance] = request;
+        const denied = await api(path, init, login, workspace, instance);
+        expect(denied.status).toBe(expected);
+        expect(denied.headers.get('cache-control')).toBe('private, no-store');
+        expect(await denied.json()).not.toHaveProperty('sourceLabel');
+      }
+    } finally {
+      await ui.close();
+    }
+  });
+
+  it.each([401, 403, 404, 503])(
+    'handles personal source %s with private clearing or read-only retry',
+    async (status) => {
+      const instance = await isolatedInstance();
+      const raw = '拒绝后应清理的本人私密说明';
+      const memory = await createPair(
+        instance,
+        `个人来源读取边界 ${status}`,
+        raw,
+      );
+      const token =
+        status === 401
+          ? (await createSession(identity.user)).token
+          : ownerToken;
+      const ui = await open('management', 'light', 390, instance, token);
+      const matchSource = (url: URL) =>
+        url.pathname === `/api/v1/memories/${memory.id}/source`;
+      try {
+        await card(ui.page, memory.id).locator('button').click();
+        const dialog = ui.page.getByRole('dialog');
+        await dialog.getByText(raw, { exact: true }).waitFor();
+        if (status === 401) await revokeSession(token);
+        else if (status === 403)
+          await f.db`update allrice_employee_instances set archived_at=clock_timestamp() where id=${instance}`;
+        else if (status === 404)
+          expect(
+            (
+              await api(
+                '/' + memory.id,
+                write(exact(memory, instance), 'DELETE'),
+                ownerToken,
+                identity.workspace,
+                instance,
+              )
+            ).status,
+          ).toBe(204);
+        else
+          await ui.page.route(matchSource, (route) =>
+            route.fulfill({ status: 503, body: '{}' }),
+          );
+
+        const writesBeforeRead = mutations.length;
+        const response = ui.page.waitForResponse((value) =>
+          matchSource(new URL(value.url())),
+        );
+        await dialog.getByRole('button', { name: '来源', exact: true }).click();
+        expect((await response).status()).toBe(status);
+        await ui.page.getByRole('alert').waitFor();
+        if (status === 503) {
+          expect(await card(ui.page, memory.id).count()).toBe(1);
+          expect(await dialog.getByText(raw, { exact: true }).count()).toBe(1);
+          await ui.page.unroute(matchSource);
+          const source = dialog.getByRole('region', {
+            name: '记忆来源',
+            exact: true,
+          });
+          await source
+            .getByRole('button', { name: '重试', exact: true })
+            .click();
+          await source.locator('dl').waitFor();
+        } else {
+          expect(await card(ui.page, memory.id).count()).toBe(0);
+          expect(await dialog.count()).toBe(0);
+          expect(await ui.page.getByText(raw, { exact: true }).count()).toBe(0);
+        }
+        expect(mutations.length).toBe(writesBeforeRead);
+      } finally {
+        await ui.close();
+      }
+    },
+  );
 
   it('keeps real cookie/same-origin/owner scope gates and replays one complete-pair confirmation', async () => {
     const row = await detail(candidate.id),
@@ -1700,6 +1864,39 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
         },
       ]);
       expect(JSON.stringify(audits)).not.toContain(raw);
+      const sourcePath = `/api/v1/admin/organizations/${identity.org}/employee-memories/${memory.id}/source`;
+      const sourceResponse = ui.page.waitForResponse(
+        (response) => new URL(response.url()).pathname === sourcePath,
+      );
+      await ui.page.getByRole('button', { name: '来源', exact: true }).click();
+      const receipt = await sourceResponse;
+      expect(receipt.status()).toBe(200);
+      expect(Object.keys(await receipt.json()).sort()).toEqual([
+        'capturedAt',
+        'sourceLabel',
+        'sourceType',
+      ]);
+      const source = ui.page.getByRole('region', {
+        name: '记忆来源',
+        exact: true,
+      });
+      await source.getByText('手动添加', { exact: true }).first().waitFor();
+      const sourceAudits = await f.db.unsafe(
+        "select actor_id,metadata from allrice_audit_events where action='employee_memory.admin_read' and organization_id=$1 and resource_id=$2",
+        [identity.org, memory.id],
+      );
+      expect(sourceAudits).toHaveLength(2); // Detail plus explicit source read.
+      expect(
+        sourceAudits.every((audit) => audit.actor_id === identity.user),
+      ).toBe(true);
+      expect(
+        sourceAudits.every(
+          (audit) =>
+            audit.metadata.ownerId === identity.user &&
+            audit.metadata.instanceId === identity.assignment,
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(sourceAudits)).not.toContain(raw);
       await noOverflow(ui.page);
       await capture(ui.page, 'v10-admin-read-only');
     } finally {
@@ -1711,6 +1908,87 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it.each([401, 403, 404, 503])(
+    'clears all administrator private memory after source %s, retaining detail only for a read-only 5xx retry',
+    async (status) => {
+      const raw = '来源读取失权时必须一起清掉的完整说明';
+      const memory = await createPair(
+        identity.assignment,
+        '后台来源读取边界 ' + status,
+        raw,
+      );
+      const [user] = await f.db.unsafe(
+        'select email from allrice_users where id=$1',
+        [identity.user],
+      );
+      vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', user!.email);
+      const ui = await open('admin');
+      const sourcePath = `/api/v1/admin/organizations/${identity.org}/employee-memories/${memory.id}/source`;
+      const matcher = (url: URL) => url.pathname === sourcePath;
+      try {
+        const article = ui.page
+          .locator('article')
+          .filter({ hasText: memory.summary });
+        await article
+          .getByRole('button', { name: '查看', exact: true })
+          .click();
+        await ui.page
+          .getByRole('dialog')
+          .getByText(raw, { exact: true })
+          .waitFor();
+        if (status === 401) await ui.page.context().clearCookies();
+        else if (status === 403)
+          vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+        else if (status === 404)
+          expect(
+            (await api('/' + memory.id, write(exact(memory), 'DELETE'))).status,
+          ).toBe(204);
+        else
+          await ui.page.route(matcher, (route) =>
+            route.fulfill({ status: 503, body: '{}' }),
+          );
+        const before = mutations.length;
+        const response = ui.page.waitForResponse((value) =>
+          matcher(new URL(value.url())),
+        );
+        await ui.page
+          .getByRole('button', { name: '来源', exact: true })
+          .click();
+        expect((await response).status()).toBe(status);
+        await ui.page.getByRole('alert').waitFor();
+        if (status === 503) {
+          expect(await article.count()).toBe(1);
+          expect(
+            await ui.page
+              .getByRole('dialog')
+              .getByText(raw, { exact: true })
+              .count(),
+          ).toBe(1);
+          await ui.page.unroute(matcher);
+          const source = ui.page.getByRole('region', {
+            name: '记忆来源',
+            exact: true,
+          });
+          await source
+            .getByRole('button', { name: '重试', exact: true })
+            .click();
+          await source.locator('dl').waitFor();
+        } else {
+          expect(await ui.page.locator('article').count()).toBe(0);
+          expect(await ui.page.getByRole('dialog').count()).toBe(0);
+          expect(
+            await ui.page.getByText(memory.summary, { exact: true }).count(),
+          ).toBe(0);
+          expect(await ui.page.getByText(raw, { exact: true }).count()).toBe(0);
+        }
+        expect(mutations.length).toBe(before);
+      } finally {
+        await ui.close();
+        vi.unstubAllEnvs();
+      }
+    },
+  );
 
   it.each([401, 403, 404, 503])(
     'clears cached administrator scope after detail %s and retains lawful context for 5xx',

@@ -435,3 +435,5 @@ export {
   createLegacyDeliverablesMcpPort,
   type PreparedMcpDeliverable,
 } from './deliverables-mcp-port.ts';
+
+export * from './employee-memory-port.ts';
