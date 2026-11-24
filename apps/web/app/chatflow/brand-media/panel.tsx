@@ -2,10 +2,12 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ReactNode,
+  type SetStateAction,
 } from 'react';
 import {
   BrandMediaCandidatesSchema,
@@ -26,6 +28,7 @@ import {
   ReferenceChips,
   ui,
   runActive,
+  isAbortError,
   candidateRequestId,
   retryRequestId,
   imageRequestId,
@@ -33,10 +36,47 @@ import {
   useBrandMediaRunEvents,
   type BrandMediaClient,
   type BrandMediaRun,
+  type createBrandMediaClient,
 } from './frontend-wiring';
 import { Images } from './images';
 import layout from './panel.module.css';
 type Tab = 'calendar' | 'topics' | 'articles';
+type ReadProjection = Tab | 'runs';
+type ReadFailure = { message: string; target: string; version: number };
+type ActionSource = 'copy' | 'help' | 'panel';
+const relatedArticle = ({ invocation: { intent } }: BrandMediaRun) =>
+  intent.operation === 'candidates' ? undefined : intent.articleId;
+function findArticleRun(runs: BrandMediaRun[], articleId: string | null) {
+  return runs.find(
+    ({ invocation: { intent } }) =>
+      intent.operation === 'article' && intent.articleId === articleId,
+  );
+}
+type BodyPin = NonNullable<BrandMediaArticle['body']>;
+const articleBodyKey = (id: string, body: BodyPin) =>
+  [id, body.objectId, body.versionId, body.checksum].join('/');
+function hasArticleDelivery(
+  runs: BrandMediaRun[],
+  articleId: string,
+  runId: string,
+  key: string,
+) {
+  const run = findArticleRun(runs, articleId);
+  return (
+    run?.run.id === runId &&
+    !run.unavailable &&
+    run.deliveries.some(({ file }) => articleBodyKey(articleId, file) === key)
+  );
+}
+function filterDeliveries(
+  row: BrandMediaRun,
+  keep: (file: BodyPin) => boolean,
+) {
+  const deliveries = row.deliveries.filter(({ file }) => keep(file));
+  return deliveries.length === row.deliveries.length
+    ? row
+    : { ...row, deliveries };
+}
 type References = BrandMediaTopic['references'];
 type Cursor = { createdAt: string; id: string };
 const stateNames = { draft: '草稿', scheduled: '已排期', published: '已发布' };
@@ -91,17 +131,119 @@ type Scoped<T> = T extends unknown
   ? Omit<T, 'workspaceId' | 'instanceId'>
   : never;
 type NoRequest<T> = T extends unknown ? Omit<T, 'requestId'> : never;
-export function BrandMediaPanel({
-  client,
-  sessionId,
-  onReturn,
-  active = true,
-}: {
+
+type BrandMediaPanelProps = {
   client: BrandMediaClient;
   sessionId: string | null;
   onReturn: () => void;
   active?: boolean;
+};
+
+function BrandMediaAccessFeedback({
+  message,
+  onReturn,
+}: {
+  message: string;
+  onReturn: () => void;
 }) {
+  return (
+    <section className={ui.page} aria-label="品牌自媒体">
+      <header className={ui.header}>
+        <Button data-brand-return onClick={onReturn}>
+          ← 回到对话
+        </Button>
+        <strong className={ui.brand}>
+          <Tag tone="success">文</Tag>品牌自媒体
+        </strong>
+      </header>
+      <div className={`${ui.content} ${layout.content}`}>
+        <p role="alert" className={layout.feedback}>
+          {message}
+        </p>
+      </div>
+    </section>
+  );
+}
+
+export function BrandMediaPanel({
+  client,
+  active = true,
+  onReturn,
+  ...props
+}: Omit<BrandMediaPanelProps, 'client'> & {
+  client: ReturnType<typeof createBrandMediaClient>;
+}) {
+  const scopeKey = [
+    client.scope.organizationId,
+    client.scope.workspaceId,
+    client.scope.ownerId,
+    client.scope.instanceId,
+  ].join('/');
+  const [visit, setVisit] = useState<{
+    lifetime: AbortController;
+    ordinal: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    if (!active) return;
+    const lifetime = new AbortController();
+    setVisit((old) => ({ lifetime, ordinal: (old?.ordinal ?? 0) + 1 }));
+    return () => lifetime.abort();
+  }, [active, scopeKey]);
+  const lifetime = visit?.lifetime;
+  const [accessProblem, setAccessProblem] = useState<{
+    lifetime: AbortController;
+    cause: Error;
+    revoked: boolean;
+  } | null>(null);
+  const scopedClient = useMemo(
+    () =>
+      lifetime
+        ? client.forPanel({
+            signal: lifetime.signal,
+            hide: (cause) =>
+              setAccessProblem({ lifetime, cause, revoked: false }),
+            reveal: (cause) =>
+              setAccessProblem((old) =>
+                old?.lifetime === lifetime && old.cause === cause ? null : old,
+              ),
+            revoke(cause) {
+              lifetime.abort(cause);
+              setAccessProblem({ lifetime, cause, revoked: true });
+            },
+          })
+        : null,
+    [client, lifetime],
+  );
+  const problem = accessProblem?.lifetime === lifetime ? accessProblem : null;
+  const returnToChat = () => {
+    lifetime?.abort();
+    onReturn();
+  };
+  if (!visit || !scopedClient) return null;
+  return problem?.revoked ? (
+    <BrandMediaAccessFeedback
+      message={problem.cause.message}
+      onReturn={returnToChat}
+    />
+  ) : (
+    <BrandMediaPanelContent
+      {...props}
+      key={visit.ordinal}
+      client={scopedClient}
+      active={active}
+      onReturn={returnToChat}
+      accessWarning={problem?.cause.message}
+    />
+  );
+}
+
+function BrandMediaPanelContent({
+  client,
+  sessionId,
+  onReturn,
+  active = true,
+  accessWarning,
+}: BrandMediaPanelProps & { accessWarning?: string }) {
   const [tab, setTab] = useState<Tab>('calendar'),
     [month, setMonth] = useState(() =>
       localDate(
@@ -114,7 +256,7 @@ export function BrandMediaPanel({
     [],
   );
   const [topics, setTopics] = useState<BrandMediaTopic[]>([]),
-    [articles, setArticles] = useState<BrandMediaArticle[]>([]),
+    [articles, setArticles] = useState<BrandMediaArticle[] | null>([]),
     [calendar, setCalendar] = useState<BrandMediaArticle[]>([]);
   const [topicCursor, setTopicCursor] = useState<Cursor | null>(null),
     [articleCursor, setArticleCursor] = useState<Cursor | null>(null);
@@ -122,12 +264,74 @@ export function BrandMediaPanel({
       'all' | BrandMediaArticle['publication']['state']
     >('all'),
     [selectedId, setSelectedId] = useState<string | null>(null);
-  const [runs, setRuns] = useState<BrandMediaRun[]>([]),
+  const [runs, setRenderedRuns] = useState<BrandMediaRun[]>([]),
+    [readFailures, setReadFailures] = useState<ReadFailure[]>([]),
     [error, setError] = useState(''),
+    [actionErrors, setActionErrors] = useState<
+      Partial<Record<ActionSource, string>>
+    >({}),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
+  const projectedRuns = useRef({ rows: runs, readVersion: 0 });
+  const pendingSaves = useRef(
+    new Map<(runs: BrandMediaRun[]) => boolean, number>(),
+  );
+  const invalidateSaves = useCallback(
+    (next: BrandMediaRun[], readVersion: number) => {
+      const saves = pendingSaves.current;
+      for (const [allowedIn, authorizedBy] of saves) {
+        if (authorizedBy <= readVersion && !allowedIn(next))
+          saves.delete(allowedIn);
+      }
+    },
+    [],
+  );
+  const publishRuns = useCallback(
+    (
+      update: SetStateAction<BrandMediaRun[]>,
+      readVersion = projectedRuns.current.readVersion,
+    ) => {
+      const next =
+        typeof update === 'function'
+          ? update(projectedRuns.current.rows)
+          : update;
+      invalidateSaves(next, readVersion);
+      // A pending file save can finish before React renders this same snapshot.
+      projectedRuns.current = { rows: next, readVersion };
+      setRenderedRuns(next);
+    },
+    [invalidateSaves],
+  );
+  const withdrawRunDeliveries = useCallback(
+    (allowed: BrandMediaRun[], readVersion: number) => {
+      if (projectedRuns.current.readVersion > readVersion) {
+        invalidateSaves(allowed, readVersion);
+        return;
+      }
+      // A superseded read can withdraw deliveries from the displayed snapshot.
+      publishRuns((rows) =>
+        rows.map((row) => {
+          const { intent } = row.invocation;
+          if (intent.operation !== 'article') return row;
+          return filterDeliveries(row, (file) =>
+            hasArticleDelivery(
+              allowed,
+              intent.articleId,
+              row.run.id,
+              articleBodyKey(intent.articleId, file),
+            ),
+          );
+        }),
+      );
+    },
+    [invalidateSaves, publishRuns],
+  );
   const [help, setHelp] = useState<string | null>(null),
-    [body, setBody] = useState('');
+    [body, setBody] = useState<{
+      articleId: string;
+      key: string;
+      text: string;
+    } | null>(null);
   const [form, setForm] = useState<
     | { kind: 'candidates' }
     | { kind: 'start'; topic: BrandMediaTopic }
@@ -157,6 +361,60 @@ export function BrandMediaPanel({
   }, [active]);
   const [detail, setDetail] = useState<BrandMediaArticle | null>(null);
   const detailGeneration = useRef(0);
+  const readEpoch = useRef<Record<ReadProjection, number>>({
+    topics: 0,
+    articles: 0,
+    calendar: 0,
+    runs: 0,
+  });
+  const readDenials = useRef({
+    version: 0,
+    byId: new Map<string, number>(),
+    byBody: new Map<string, number>(),
+  });
+  const actionGeneration = useRef({ copy: 0, help: 0, panel: 0 });
+  const beginAction = (source: ActionSource = 'panel') => {
+    const version = ++actionGeneration.current[source];
+    const report = (message: string) => {
+      if (version === actionGeneration.current[source])
+        setActionErrors((previous) => ({ ...previous, [source]: message }));
+    };
+    report('');
+    return report;
+  };
+  const recordReadFailure = useCallback((failure: ReadFailure) => {
+    setReadFailures((previous) => [
+      ...previous.filter(({ target }) => target !== failure.target),
+      failure,
+    ]);
+  }, []);
+  const clearReadFailure = useCallback((target: string, started: number) => {
+    setReadFailures((previous) =>
+      previous.filter(
+        (failure) => failure.target !== target || failure.version > started,
+      ),
+    );
+  }, []);
+  const pinAllowedSince = useCallback(
+    (id: string | undefined, version: number, pin: BodyPin) =>
+      !id ||
+      (readDenials.current.byBody.get(articleBodyKey(id, pin)) ?? 0) <= version,
+    [],
+  );
+  const articleAllowedSince = useCallback(
+    (
+      id: string | undefined,
+      version: number,
+      body?: BrandMediaArticle['body'],
+    ) => {
+      if (!id) return true;
+      return (
+        (readDenials.current.byId.get(id) ?? 0) <= version &&
+        (!body || pinAllowedSince(id, version, body))
+      );
+    },
+    [pinAllowedSince],
+  );
   const acceptDetail = useCallback((article: BrandMediaArticle) => {
     detailGeneration.current++;
     setDetail((old) =>
@@ -165,16 +423,87 @@ export function BrandMediaPanel({
   }, []);
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
-  const listed = articles.find((article) => article.id === selectedId);
-  const selected =
+  const discardRead = useCallback(
+    (projection: ReadProjection, cause: Error) => {
+      readEpoch.current[projection]++;
+      recordReadFailure({
+        message: cause.message,
+        target: projection,
+        version: ++readDenials.current.version,
+      });
+      switch (projection) {
+        case 'topics':
+          setTopics([]);
+          setTopicCursor(null);
+          setForm((old) => (old?.kind === 'start' ? null : old));
+          break;
+        case 'articles':
+          setArticles(null);
+          setArticleCursor(null);
+          break;
+        case 'calendar':
+          setCalendar([]);
+          break;
+        case 'runs':
+          publishRuns([]);
+      }
+    },
+    [publishRuns, recordReadFailure],
+  );
+  const discardArticle = useCallback(
+    (id: string, cause: Error, body?: BodyPin) => {
+      const denials = readDenials.current;
+      const key = body && articleBodyKey(id, body);
+      const version = ++denials.version;
+      if (key) denials.byBody.set(key, version);
+      else denials.byId.set(id, version);
+      const matches = (row: BrandMediaArticle) =>
+        row.id === id &&
+        (!key || (!!row.body && articleBodyKey(id, row.body) === key));
+      recordReadFailure({ message: cause.message, target: key ?? id, version });
+      setArticles((old) => old?.filter((item) => !matches(item)) ?? null);
+      setCalendar((old) => old.filter((item) => !matches(item)));
+      if (key)
+        publishRuns((old) =>
+          old.map((row) =>
+            relatedArticle(row) === id
+              ? filterDeliveries(
+                  row,
+                  (file) => articleBodyKey(id, file) !== key,
+                )
+              : row,
+          ),
+        );
+      setForm((old) =>
+        old?.kind === 'article' && matches(old.article) ? null : old,
+      );
+      setPublication((old) => (old && matches(old.article) ? null : old));
+      setReferenceArticle((old) => (old && matches(old) ? null : old));
+      setDetail((old) => (old && matches(old) ? null : old));
+      setBody((old) =>
+        old?.articleId === id && (!key || old.key === key) ? null : old,
+      );
+    },
+    [publishRuns, recordReadFailure],
+  );
+  const listed = articles?.find((article) => article.id === selectedId);
+  const availableDetail =
     detail?.id === selectedId && (!listed || detail.revision >= listed.revision)
       ? detail
       : listed;
+  // A fresh list can authorize its rows while the detail read is pending.
+  const selected = readFailures.some(({ target }) => target === selectedId)
+    ? undefined
+    : availableDetail;
+  const bodyKey = selected?.body
+    ? articleBodyKey(selected.id, selected.body)
+    : '';
   const copyKey = JSON.stringify([
     client.scope,
     selected?.id,
     selected?.body,
     active,
+    accessWarning,
   ]);
   const copyLifetime = useRef({
     key: copyKey,
@@ -200,69 +529,157 @@ export function BrandMediaPanel({
     };
   }, []);
   const readDetail = useCallback(
-    async (articleId: string, signal?: AbortSignal) => {
+    async (articleId: string) => {
       const version = ++detailGeneration.current;
+      const observed = readDenials.current.version;
       const current = () =>
         version === detailGeneration.current &&
-        !signal?.aborted &&
-        selectedIdRef.current === articleId;
+        selectedIdRef.current === articleId &&
+        articleAllowedSince(articleId, observed);
+      // Navigation fences a successful detail result. The open visit still
+      // owns a denial for the article that was requested.
       const result = await client
-        .read({ view: 'article', articleId }, signal)
+        .read({ view: 'article', articleId }, undefined, (cause) =>
+          discardArticle(articleId, cause),
+        )
         .catch((cause) => {
           if (current()) throw cause;
           return null;
         });
-      if (current() && result?.view === 'article') acceptDetail(result.article);
+      if (
+        current() &&
+        result?.view === 'article' &&
+        result.article.id === articleId &&
+        articleAllowedSince(articleId, observed, result.article.body)
+      ) {
+        acceptDetail(result.article);
+        clearReadFailure(articleId, observed);
+      }
     },
-    [client, acceptDetail],
+    [
+      client,
+      acceptDetail,
+      discardArticle,
+      articleAllowedSince,
+      clearReadFailure,
+    ],
   );
   const reload = useCallback(async () => {
     const version = ++generation.current;
     detailGeneration.current++;
+    const observed = { ...readEpoch.current };
+    const observedDenial = readDenials.current.version;
+    const allowed = (
+      id: string | undefined,
+      body?: BrandMediaArticle['body'],
+    ) => articleAllowedSince(id, observedDenial, body);
+    const latest = () => version === generation.current;
+    const current = (projection: ReadProjection) =>
+      latest() && observed[projection] === readEpoch.current[projection];
+    const deny = (projection: ReadProjection) => (cause: Error) => {
+      if (latest()) discardRead(projection, cause);
+    };
+    const denyRunRead = (cause: Error) => {
+      if (latest()) discardRead('runs', cause);
+      else withdrawRunDeliveries([], version);
+    };
     try {
       const [topicPage, articlePage, schedule, recovery] =
         await Promise.allSettled([
-          client.read({ view: 'topics' }),
-          client.read({
-            view: 'articles',
-            ...(state === 'all' ? {} : { state }),
+          client.read({ view: 'topics' }, undefined, deny('topics')),
+          client.read(
+            { view: 'articles', ...(state === 'all' ? {} : { state }) },
+            undefined,
+            deny('articles'),
+          ),
+          client.read(
+            { view: 'calendar', month, timezone },
+            undefined,
+            deny('calendar'),
+          ),
+          client.runs(undefined, denyRunRead).then(({ runs }) => {
+            if (!current('runs')) {
+              withdrawRunDeliveries(runs, version);
+              return;
+            }
+            publishRuns(
+              runs.map((row) =>
+                filterDeliveries(row, (file) =>
+                  pinAllowedSince(relatedArticle(row), observedDenial, file),
+                ),
+              ),
+              version,
+            );
+            clearReadFailure('runs', observedDenial);
           }),
-          client.read({ view: 'calendar', month, timezone }),
-          client.runs(),
         ]);
-      if (version !== generation.current) return;
+      if (!latest()) return;
       if (
+        current('topics') &&
         topicPage.status === 'fulfilled' &&
         topicPage.value.view === 'topics'
       ) {
         setTopics(topicPage.value.items);
         setTopicCursor(topicPage.value.nextCursor);
+        clearReadFailure('topics', observedDenial);
       }
       if (
+        current('articles') &&
         articlePage.status === 'fulfilled' &&
         articlePage.value.view === 'articles'
       ) {
         const page = articlePage.value;
-        setArticles(page.items);
+        const items = page.items.filter((item) => allowed(item.id, item.body));
+        setArticles(items);
         setArticleCursor(page.nextCursor);
-        setSelectedId((old) => old ?? page.items[0]?.id ?? null);
+        setSelectedId((old) => old ?? items[0]?.id ?? null);
+        clearReadFailure('articles', observedDenial);
       }
-      if (schedule.status === 'fulfilled' && schedule.value.view === 'calendar')
-        setCalendar(schedule.value.items);
-      if (recovery.status === 'fulfilled') setRuns(recovery.value.runs);
-      const failed = [topicPage, articlePage, schedule, recovery].find(
-        (value) => value.status === 'rejected',
+      if (
+        current('calendar') &&
+        schedule.status === 'fulfilled' &&
+        schedule.value.view === 'calendar'
+      ) {
+        setCalendar(
+          schedule.value.items.filter((item) => allowed(item.id, item.body)),
+        );
+        clearReadFailure('calendar', observedDenial);
+      }
+      const failed = (
+        [
+          ['topics', topicPage],
+          ['articles', articlePage],
+          ['calendar', schedule],
+          ['runs', recovery],
+        ] as const
+      ).find(
+        ([projection, result]) =>
+          current(projection) && result.status === 'rejected',
       );
-      setError(failed?.status === 'rejected' ? failed.reason.message : '');
+      const result = failed?.[1];
+      setError(result?.status === 'rejected' ? result.reason.message : '');
       const currentId = selectedIdRef.current;
       if (currentId) await readDetail(currentId);
     } catch (cause) {
-      if (version === generation.current)
+      if (latest())
         setError(
           cause instanceof Error ? cause.message : '暂时无法读取，请刷新重试。',
         );
     }
-  }, [client, month, timezone, state, readDetail]);
+  }, [
+    client,
+    month,
+    timezone,
+    state,
+    readDetail,
+    discardRead,
+    articleAllowedSince,
+    pinAllowedSince,
+    withdrawRunDeliveries,
+    publishRuns,
+    clearReadFailure,
+    setError,
+  ]);
   useEffect(() => {
     void reload();
     return () => {
@@ -270,40 +687,57 @@ export function BrandMediaPanel({
       detailGeneration.current++;
     };
   }, [reload]);
-  useBrandMediaRunEvents(client, runs, reload, setError);
+  useBrandMediaRunEvents(client, active ? runs : [], reload, setError);
   useEffect(() => {
     if (!selectedId) {
       detailGeneration.current++;
       setDetail(null);
       return;
     }
-    const controller = new AbortController();
-    void readDetail(selectedId, controller.signal).catch((cause) => {
-      if (!controller.signal.aborted) setError(cause.message);
-    });
+    void readDetail(selectedId).catch((cause) => setError(cause.message));
     return () => {
-      controller.abort();
       detailGeneration.current++;
     };
-  }, [readDetail, selectedId]);
+  }, [readDetail, selectedId, setError]);
   useEffect(() => {
     const controller = new AbortController();
-    setBody('');
-    if (selected?.body)
+    const version = readDenials.current.version;
+    const articleId = selected?.id;
+    const pin = selected?.body;
+    const current = () =>
+      !controller.signal.aborted &&
+      articleAllowedSince(articleId, version, pin);
+    setBody(null);
+    if (articleId && pin) {
       void client
-        .body(selected.body, controller.signal)
+        .body(pin, controller.signal, (cause) =>
+          discardArticle(articleId, cause, pin),
+        )
         .then((value) => {
-          if (!controller.signal.aborted) setBody(value);
+          if (current()) {
+            setBody({ articleId, key: bodyKey, text: value });
+            clearReadFailure(bodyKey, version);
+          }
         })
         .catch((cause) => {
-          if (!controller.signal.aborted) setError(cause.message);
+          if (current()) setError(cause.message);
         });
+    }
     return () => controller.abort();
-  }, [client, selected?.id, selected?.body?.objectId]);
+  }, [
+    client,
+    bodyKey,
+    discardArticle,
+    articleAllowedSince,
+    clearReadFailure,
+    setError,
+  ]);
   const command = async (
     input: NoRequest<Scoped<BrandMediaUserCommand>>,
     key: string,
   ) => {
+    const fail = beginAction();
+    const observedArticle = readDenials.current.version;
     const previous = pendingCommands.current.get(key);
     const request =
       previous &&
@@ -334,10 +768,20 @@ export function BrandMediaPanel({
     } as Scoped<BrandMediaUserCommand>;
     pendingCommands.current.set(key, request);
     setBusy(true);
-    setError('');
     try {
       const result = await client.command(request.input);
-      if (result.kind === 'article') acceptDetail(result.article);
+      if (result.kind === 'article') {
+        if (
+          !articleAllowedSince(
+            result.article.id,
+            observedArticle,
+            result.article.body,
+          )
+        )
+          throw Error('文章访问状态已变化，请刷新后继续。');
+        if (selectedIdRef.current === result.article.id)
+          acceptDetail(result.article);
+      }
       if (result.kind === 'deleted' && selectedIdRef.current === result.id) {
         detailGeneration.current++;
         selectedIdRef.current = null;
@@ -347,9 +791,7 @@ export function BrandMediaPanel({
       await reload();
       return result;
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : '保存失败，请重试原操作。',
-      );
+      fail(cause instanceof Error ? cause.message : '保存失败，请重试原操作。');
       throw cause;
     } finally {
       setBusy(false);
@@ -362,13 +804,7 @@ export function BrandMediaPanel({
     (row) =>
       !row.unavailable && row.invocation.intent.operation === 'candidates',
   );
-  const articleRun =
-    selected &&
-    runs.find(
-      (row) =>
-        row.invocation.intent.operation === 'article' &&
-        row.invocation.intent.articleId === selected.id,
-    );
+  const articleRun = findArticleRun(runs, selectedId);
   const candidateDeliveries =
     candidatesRun?.deliveries
       .filter((delivery) => delivery.format === 'json')
@@ -381,27 +817,38 @@ export function BrandMediaPanel({
         }
       }) ?? [];
   const generate = async (intent: Scoped<BrandMediaGenerateInput>) => {
+    const observedRuns = readEpoch.current.runs;
+    const observedArticle = readDenials.current.version;
     const result = await client.generate(intent);
-    // The receipt identifies this new Run, including follow-up queueing.
-    // Preserve its native facts even if the subsequent cold read fails.
-    setRuns((old) => [
-      {
-        run: result.run,
-        sessionId: result.userMessage.sessionId,
-        invocation: result.invocation,
-        deliveries: [],
-        submission: null,
-        addedCandidates: [],
-        unavailable: false,
-        image: null,
-      },
-      ...old.filter((row) => row.run.id !== result.run.id),
-    ]);
+    // Keep a new Run's receipt through a failed cold read. An existing Run
+    // projection carries delivery facts that a receipt omits.
+    if (
+      observedRuns === readEpoch.current.runs &&
+      articleAllowedSince(
+        'articleId' in intent ? intent.articleId : undefined,
+        observedArticle,
+      ) &&
+      !projectedRuns.current.rows.some(({ run }) => run.id === result.run.id)
+    )
+      publishRuns((old) => [
+        {
+          run: result.run,
+          sessionId: result.userMessage.sessionId,
+          invocation: result.invocation,
+          deliveries: [],
+          submission: null,
+          addedCandidates: [],
+          unavailable: false,
+          image: null,
+        },
+        ...old,
+      ]);
     await reload();
     return result;
   };
   const retry = (row: BrandMediaRun) => {
     if (busy || row.unavailable || runActive(row)) return;
+    const fail = beginAction();
     setBusy(true);
     const {
       workspaceId: _workspace,
@@ -415,13 +862,17 @@ export function BrandMediaPanel({
       .then((requestId) =>
         generate({ ...intent, requestId, sessionId: row.sessionId }),
       )
-      .catch((cause) => setError(cause.message))
+      .catch((cause) => {
+        if (!isAbortError(cause)) fail(cause.message);
+      })
       .finally(() => setBusy(false));
   };
   const openArticle = (article: BrandMediaArticle) => {
     setState('all');
     setArticles((old) =>
-      old.some((item) => item.id === article.id) ? old : [article, ...old],
+      !old || old.some((item) => item.id === article.id)
+        ? old
+        : [article, ...old],
     );
     acceptDetail(article);
     selectedIdRef.current = article.id;
@@ -430,36 +881,101 @@ export function BrandMediaPanel({
   };
   const copyBody = async () => {
     if (!selected?.body || !active) return;
+    const fail = beginAction('copy');
     const owner = copyLifetime.current,
-      revision = owner.revision;
+      revision = owner.revision,
+      articleVersion = readDenials.current.version;
+    const id = selected.id,
+      file = selected.body;
     const current = () =>
       copyLifetime.current === owner &&
       owner.alive &&
-      owner.revision === revision;
-    const id = selected.id,
-      file = selected.body;
+      owner.revision === revision &&
+      articleAllowedSince(id, articleVersion, file);
     try {
-      const text = await client.body(file);
+      const text = await client.body(file, undefined, (cause) =>
+        discardArticle(id, cause, file),
+      );
       if (!current() || selectedIdRef.current !== id) return;
+      clearReadFailure(articleBodyKey(id, file), articleVersion);
       if (!(await writeClipboard(text))) throw Error('未能复制正文，请重试。');
       if (current()) setNotice('正文已复制');
     } catch (cause) {
-      if (current())
-        setError(cause instanceof Error ? cause.message : '复制失败');
+      if (current()) fail(cause instanceof Error ? cause.message : '复制失败');
     }
   };
+  const downloadDelivery = async (
+    articleId: string,
+    runId: string,
+    file: BodyPin,
+  ) => {
+    const key = articleBodyKey(articleId, file);
+    const observed = readDenials.current.version;
+    const allowedIn = (runs: BrandMediaRun[]) =>
+      hasArticleDelivery(runs, articleId, runId, key);
+    const { rows, readVersion } = projectedRuns.current;
+    if (!allowedIn(rows)) return;
+    const saves = pendingSaves.current;
+    saves.set(allowedIn, readVersion);
+    const current = () =>
+      saves.has(allowedIn) && pinAllowedSince(articleId, observed, file);
+    const fail = beginAction();
+    try {
+      await client.download(file.objectId, 'delivery', {
+        current,
+        onDenied: (cause) => discardArticle(articleId, cause, file),
+      });
+      if (current()) clearReadFailure(key, observed);
+    } catch (cause) {
+      if (current())
+        fail(
+          cause instanceof Error
+            ? cause.message
+            : '正文文件暂时不可读，请重新核对权限。',
+        );
+    } finally {
+      saves.delete(allowedIn);
+    }
+  };
+  // The Run read authorizes its own deliveries when the article body is gone.
+  const deliveries =
+    selectedId &&
+    articleRun &&
+    !articleRun.unavailable &&
+    articleRun.deliveries.map(({ file }) => (
+      <p key={file.versionId}>
+        <button
+          type="button"
+          className={layout.deliveryDownload}
+          onClick={() =>
+            void downloadDelivery(selectedId, articleRun.run.id, file)
+          }
+        >
+          查看本次正文成果
+        </button>
+      </p>
+    ));
   const pageMore = async (view: 'topics' | 'articles') => {
     const cursor = view === 'topics' ? topicCursor : articleCursor;
     if (!cursor || busy) return;
+    const fail = beginAction();
     const version = generation.current;
+    const observed = readEpoch.current[view];
+    const observedArticle = readDenials.current.version;
+    const latest = () => version === generation.current;
+    const current = () => latest() && observed === readEpoch.current[view];
     setBusy(true);
     try {
       const result = await client.read(
         view === 'topics'
           ? { view, cursor }
           : { view, cursor, ...(state === 'all' ? {} : { state }) },
+        undefined,
+        (cause) => {
+          if (latest()) discardRead(view, cause);
+        },
       );
-      if (version !== generation.current) return;
+      if (!current()) return;
       if (result.view === 'topics') {
         setTopics((old) => [
           ...old,
@@ -470,16 +986,21 @@ export function BrandMediaPanel({
         setTopicCursor(result.nextCursor);
       }
       if (result.view === 'articles') {
-        setArticles((old) => [
-          ...old,
-          ...result.items.filter(
-            (item) => !old.some((previous) => previous.id === item.id),
-          ),
-        ]);
+        setArticles(
+          (old) =>
+            old && [
+              ...old,
+              ...result.items.filter(
+                (item) =>
+                  articleAllowedSince(item.id, observedArticle, item.body) &&
+                  !old.some((previous) => previous.id === item.id),
+              ),
+            ],
+        );
         setArticleCursor(result.nextCursor);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '读取失败');
+      if (current()) fail(cause instanceof Error ? cause.message : '读取失败');
     } finally {
       setBusy(false);
     }
@@ -535,6 +1056,17 @@ export function BrandMediaPanel({
       {children}
     </GenerationForm>
   );
+  if (accessWarning)
+    return (
+      <BrandMediaAccessFeedback message={accessWarning} onReturn={onReturn} />
+    );
+  const errors = new Set(
+    [
+      ...readFailures.map(({ message }) => message),
+      error,
+      ...Object.values(actionErrors),
+    ].filter(Boolean),
+  );
   return (
     <section className={ui.page} aria-label="品牌自媒体">
       {!(tab === 'topics' && form?.kind === 'candidates') && (
@@ -574,10 +1106,11 @@ export function BrandMediaPanel({
           <Button
             className={ui.helpAction}
             onClick={() => {
+              const fail = beginAction('help');
               void client
                 .help()
                 .then((value) => setHelp(value.content))
-                .catch((cause) => setError(cause.message));
+                .catch((cause) => fail(cause.message));
             }}
           >
             ⓘ 使用说明
@@ -585,9 +1118,10 @@ export function BrandMediaPanel({
         </header>
       )}
       <div className={`${ui.content} ${layout.content}`}>
-        {error && (
+        {errors.size > 0 && (
           <p role="alert" className={layout.feedback}>
-            {error} <Button onClick={() => void reload()}>刷新</Button>
+            {[...errors].join(' ')}{' '}
+            <Button onClick={() => void reload()}>刷新</Button>
           </p>
         )}
         {runs
@@ -887,7 +1421,7 @@ export function BrandMediaPanel({
                     ),
                   )}
                 </div>
-                {articles.length ? (
+                {articles?.length ? (
                   articles.map((article) => (
                     <div
                       className={layout.listRow}
@@ -1074,7 +1608,7 @@ export function BrandMediaPanel({
                     <div className={`${ui.body} ${layout.articleBody}`}>
                       <h3 className={layout.title}>{selected.title}</h3>
                       <div aria-label="文章正文">
-                        {body ||
+                        {(body?.key === bodyKey && body.text) ||
                           (selected.body ? '正在读取正文…' : '正文还未生成')}
                       </div>
                     </div>
@@ -1092,15 +1626,7 @@ export function BrandMediaPanel({
                       generate={generate}
                       command={command}
                     />
-                    {articleRun?.deliveries.map((delivery) => (
-                      <p key={delivery.file.versionId}>
-                        <a
-                          href={`/api/v1/files/${delivery.file.objectId}/download?workspaceId=${client.scope.workspaceId}`}
-                        >
-                          查看本次正文成果
-                        </a>
-                      </p>
-                    ))}
+                    {deliveries}
                     <div className={layout.referenceLine}>
                       <span className={layout.meta}>参考资料：</span>
                       <ReferenceChips
@@ -1145,6 +1671,7 @@ export function BrandMediaPanel({
                     )}
                   </>
                 )}
+                {!selected && deliveries}
               </article>
             </div>
           </section>
@@ -1351,6 +1878,7 @@ function GenerationForm({
       if (form.kind === 'article') setText('');
       onStarted();
     } catch (cause) {
+      if (isAbortError(cause)) return;
       setError(
         cause instanceof Error ? cause.message : '请求失败，请重试同一次生成。',
       );

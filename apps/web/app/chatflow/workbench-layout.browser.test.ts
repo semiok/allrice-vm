@@ -23050,6 +23050,14 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     'scope-changed',
     'unlisted',
     'terminal',
+    'retired image 409',
+    'current image 409',
+    'retired article 409',
+    'current article 409',
+    'retired retry 409',
+    'current retry 409',
+    'stale sidebar 401',
+    'current sidebar 401',
   ] as const)(
     'projects real plugin %s receipts into the authorized host sidebar without changing the selected chat',
     async (kind) => {
@@ -23072,7 +23080,14 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       const { page } = f,
         changed = kind === 'scope-changed',
         unlisted = kind === 'unlisted',
-        terminal = kind === 'terminal';
+        rejected = kind.endsWith(' 409'),
+        image = kind === 'image' || kind.includes('image 409'),
+        retry = kind === 'retired retry 409' || kind === 'current retry 409',
+        sidebarExpired =
+          kind === 'stale sidebar 401' || kind === 'current sidebar 401',
+        terminal = kind === 'terminal' || sidebarExpired;
+      const rejection = '旧文章已更新，请刷新记录版本';
+      const originalInstructions = '原始修改意见，保留文章结构';
       const sessionId = unlisted ? id(7401) : A,
         runId = id(7400);
       const topic = {
@@ -23105,18 +23120,19 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
         images: [],
         publication: { state: 'draft', schedule: null, links: null },
       };
+      const status = retry ? 'failed' : terminal ? 'succeeded' : 'queued';
       const snapshot = RunSnapshotSchema.parse({
         id: runId,
         organizationId: org,
         workspaceId: workspace,
         ownerId: user,
-        status: terminal ? 'succeeded' : 'queued',
+        status,
         job: {
           id: id(7402),
           organizationId: org,
           workspaceId: workspace,
           ownerId: user,
-          status: terminal ? 'succeeded' : 'queued',
+          status,
           idempotencyKey: 'plugin-host-receipt',
           priority: 0,
           attempt: 0,
@@ -23136,13 +23152,41 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
         createdAt: now,
         updatedAt: now,
       });
-      let accepted: Record<string, unknown> | undefined,
-        receipt: Record<string, unknown> | undefined;
+      const runProjection = (intent: Record<string, unknown>) => ({
+        run: snapshot,
+        sessionId,
+        invocation: { module: binding, intent },
+        addedCandidates: [],
+        unavailable: false,
+        submission: null,
+        deliveries: [],
+        image: null,
+      });
+      const firstIntent = {
+        operation: 'article',
+        workspaceId: workspace,
+        instanceId: id(7),
+        sessionId: A,
+        requestId: id(7404),
+        articleId: article.id,
+        expectedRevision: article.revision,
+        instructions: originalInstructions,
+        references: [],
+      };
+      let accepted: Record<string, unknown> | undefined;
+      let receipt = retry ? runProjection(firstIntent) : undefined;
       let release = () => {},
-        list = () => {};
+        list = () => {},
+        releaseSidebar = () => {};
       const gate = new Promise<void>((done) => {
         release = done;
       });
+      const generationResponse = () =>
+        page.waitForResponse(
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname.endsWith('/brand-media'),
+        );
       await page.route(
         (url) =>
           url.pathname === `/api/v1/employee-instances/${id(7)}/brand-media`,
@@ -23184,17 +23228,27 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
             sessionId: A,
           });
           expect(body).not.toHaveProperty('deliveryMode');
+          if (retry) {
+            const { requestId, ...original } = firstIntent;
+            expect(body).toMatchObject(original);
+            expect(body.requestId).not.toBe(requestId);
+          }
           accepted = body;
-          receipt = {
-            run: snapshot,
-            sessionId,
-            invocation: { module: binding, intent: body },
-            addedCandidates: [],
-            unavailable: false,
-            submission: null,
-            deliveries: [],
-            image: null,
-          };
+          if (rejected) {
+            await gate;
+            return route.fulfill({
+              status: 409,
+              json: {
+                error: {
+                  code: 'CONFLICT',
+                  message: rejection,
+                  requestId: id(7403),
+                  retryable: false,
+                },
+              },
+            });
+          }
+          receipt = runProjection(body);
           f.state.sidebarRunIds[sessionId] = terminal ? [] : [runId];
           await gate;
           return reply({
@@ -23231,9 +23285,13 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
             .getByRole('dialog', { name: '写正文', exact: true })
             .getByRole('button', { name: '开始写', exact: true })
             .click();
-        } else if (kind === 'article' || kind === 'image') {
+        } else if (kind === 'article' || image || rejected) {
           await brand.getByRole('tab', { name: '文章库', exact: true }).click();
-          if (kind === 'image') {
+          if (retry) {
+            await brand
+              .getByRole('button', { name: '重试', exact: true })
+              .click();
+          } else if (image) {
             await brand
               .getByRole('button', { name: '＋ 加配图', exact: true })
               .click();
@@ -23267,6 +23325,24 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
             .click();
         }
         await expect.poll(() => !!accepted).toBe(true);
+        if (rejected && kind.startsWith('current ')) {
+          const response = generationResponse();
+          release();
+          expect((await response).status()).toBe(409);
+          const feedback = image
+            ? page.getByRole('dialog', { name: '加配图', exact: true })
+            : brand;
+          if (retry) {
+            const alert = feedback
+              .getByRole('alert')
+              .filter({ hasText: rejection });
+            await alert.waitFor();
+            expect(await alert.textContent()).toBe(`${rejection} 刷新`);
+          } else {
+            await feedback.getByText(rejection, { exact: true }).waitFor();
+          }
+          return;
+        }
         await page.keyboard.press('Escape');
         await page.locator(`[data-row-key="session:${B}"]`).click();
         await expect
@@ -23306,13 +23382,124 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
         }
         await page.evaluate(() => new Promise(requestAnimationFrame));
         const reads = f.state.sessionListRequests;
-        const response = page.waitForResponse(
-          (value) =>
-            value.request().method() === 'POST' &&
-            new URL(value.url()).pathname.endsWith('/brand-media'),
-        );
+        let sidebarCaptured = false;
+        const loginRequests: string[] = [];
+        if (sidebarExpired) {
+          list();
+          f.state.sessionListDelay = null;
+          const sidebarGate = new Promise<void>((done) => {
+            releaseSidebar = done;
+          });
+          await page.route(
+            (url) =>
+              url.pathname === '/api/v1/sessions' &&
+              url.searchParams.get('workspaceId') === workspace,
+            async (route) => {
+              if (sidebarCaptured || route.request().method() !== 'GET')
+                return route.fallback();
+              sidebarCaptured = true;
+              await sidebarGate;
+              return route.fulfill({
+                status: 401,
+                json: { error: { message: '登录已过期' } },
+              });
+            },
+          );
+          await page.route(
+            (url) => url.pathname === '/login',
+            (route) => {
+              loginRequests.push(new URL(route.request().url()).search);
+              return route.fulfill({ contentType: 'text/html', body: '登录' });
+            },
+          );
+        }
+        const response = generationResponse();
         release();
-        await (await response).finished();
+        const generation = await response;
+        await generation.finished();
+        if (rejected) {
+          expect(generation.status()).toBe(409);
+          await page.evaluate(
+            () =>
+              new Promise<void>((done) =>
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => done()),
+                ),
+              ),
+          );
+          const hidden = page.locator('[data-brand-media-host]');
+          expect(
+            await hidden.getByText(rejection, { exact: true }).count(),
+          ).toBe(0);
+          expect(
+            await hidden.locator('[role="alert"]').allTextContents(),
+          ).toEqual([]);
+          expect(
+            await hidden.getByText('正文还未生成', { exact: true }).count(),
+          ).toBe(1);
+          expect(await hidden.getAttribute('data-open')).toBe('false');
+          expect(await input.inputValue()).toBe('B的草稿保留');
+          expect(f.state.sessionListRequests).toBe(reads);
+          return;
+        }
+        if (sidebarExpired) {
+          expect(generation.status()).toBe(200);
+          await expect.poll(() => sidebarCaptured).toBe(true);
+          if (kind === 'stale sidebar 401') {
+            f.state.employeeDetailStatus = 403;
+            f.state.viewer = id(999);
+            f.state.workspace = id(998);
+            const newer = page.waitForResponse((response) => {
+              const url = new URL(response.url());
+              return (
+                url.pathname === '/api/v1/sessions' &&
+                url.searchParams.get('workspaceId') === id(998)
+              );
+            });
+            await page
+              .getByRole('button', { name: '查看Rice详情', exact: true })
+              .click();
+            await (await newer).finished();
+            await page
+              .getByRole('dialog', { name: /员工详情/ })
+              .getByRole('button', { name: '关闭', exact: true })
+              .click();
+          }
+          const expired = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return (
+              response.status() === 401 &&
+              url.pathname === '/api/v1/sessions' &&
+              url.searchParams.get('workspaceId') === workspace
+            );
+          });
+          releaseSidebar();
+          await expired;
+          if (kind === 'current sidebar 401') {
+            await page.waitForURL(
+              (url) =>
+                url.pathname === '/login' &&
+                url.searchParams.get('next') === '/chatflow',
+            );
+            expect(loginRequests).toEqual(['?next=/chatflow']);
+          } else {
+            await page
+              .evaluate(
+                () =>
+                  new Promise<void>((done) =>
+                    requestAnimationFrame(() =>
+                      requestAnimationFrame(() => done()),
+                    ),
+                  ),
+              )
+              .catch((cause: unknown) => {
+                if (!loginRequests.length) throw cause;
+              });
+            expect(loginRequests).toEqual([]);
+            expect(new URL(page.url()).pathname).toBe('/');
+          }
+          return;
+        }
         const a = page.locator(`[data-row-key="session:${A}"]`);
         if (!changed)
           await expect
@@ -23354,6 +23541,7 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       } finally {
         release();
         list();
+        releaseSidebar();
         await f.close();
       }
     },
@@ -23991,6 +24179,115 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       await f.close();
     }
   });
+
+  it.each([
+    { read: 'direct page', background: false, current: false },
+    { read: 'direct page', background: false, current: true },
+    { read: 'background reread', background: true, current: false },
+    { read: 'background reread', background: true, current: true },
+  ])(
+    'handles employee $read authentication loss only for the current request (current=$current)',
+    async ({ background, current }) => {
+      const f = await fixture({
+        employeeCount: 2,
+        employeeHistory: true,
+        employeeHistoryCount: 65,
+      });
+      const { page } = f;
+      let release = () => {};
+      const gate = new Promise<void>((done) => {
+        release = done;
+      });
+      try {
+        const rice = page
+          .locator('#chat-sidebar')
+          .getByRole('region', { name: 'Rice', exact: true });
+        await rice.getByText('65 个工作', { exact: true }).waitFor();
+        const more = rice.getByRole('button', { name: /展开其余/ });
+        if (background) {
+          await more.click();
+          await rice.getByText('历史工作 60', { exact: true }).waitFor();
+        }
+        const scope = (url: URL) =>
+          url.pathname === '/api/v1/sessions' &&
+          url.searchParams.get('workspaceId') === workspace &&
+          url.searchParams.get('archived') === 'false';
+        const employeePage = (url: URL) =>
+          scope(url) &&
+          url.searchParams.get('employeeInstanceId') === id(7) &&
+          url.searchParams.get('cursor') === (background ? null : '30');
+        let captured = false;
+        await page.route(employeePage, async (route) => {
+          if (captured || route.request().method() !== 'GET')
+            return route.fallback();
+          captured = true;
+          await gate;
+          return route.fulfill({ status: 401, json: {} });
+        });
+        const loginRequests: string[] = [];
+        await page.route(
+          (url) => url.pathname === '/login',
+          (route) => {
+            loginRequests.push(new URL(route.request().url()).search);
+            return route.fulfill({ contentType: 'text/html', body: '登录' });
+          },
+        );
+        const refresh = () =>
+          page.evaluate(() => window.dispatchEvent(new Event('focus')));
+        if (background) await refresh();
+        else await more.click();
+        await expect.poll(() => captured).toBe(true);
+        const previousUrl = page.url();
+        if (!current) {
+          const updated = page.waitForResponse((response) => {
+            if (
+              response.request().method() !== 'GET' ||
+              response.status() !== 200
+            )
+              return false;
+            const url = new URL(response.url());
+            return background
+              ? employeePage(url)
+              : scope(url) && !url.searchParams.has('employeeInstanceId');
+          });
+          await refresh();
+          await (await updated).finished();
+        }
+        const expired = page.waitForResponse(
+          (response) =>
+            response.status() === 401 && employeePage(new URL(response.url())),
+        );
+        release();
+        await expired;
+        if (current) {
+          await page.waitForURL(
+            (url) =>
+              url.pathname === '/login' &&
+              url.searchParams.get('next') === '/chatflow',
+          );
+          expect(loginRequests).toEqual(['?next=/chatflow']);
+        } else {
+          await page
+            .evaluate(
+              () =>
+                new Promise<void>((done) =>
+                  requestAnimationFrame(() =>
+                    requestAnimationFrame(() => done()),
+                  ),
+                ),
+            )
+            .catch((cause: unknown) => {
+              if (!loginRequests.length) throw cause;
+            });
+          expect(loginRequests).toEqual([]);
+          expect(page.url()).toBe(previousUrl);
+        }
+      } finally {
+        release();
+        await f.close();
+      }
+    },
+  );
 
   it.each([1440, 390, 320])(
     'keeps a readable retry notice and cached sessions through failed and successful list refreshes at %ipx',

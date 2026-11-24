@@ -5,22 +5,6 @@ import { useEmployeeSkillsHostView } from './employee-skills-host';
 import css from './employee-capabilities-panel.module.css';
 import { useCapabilityEscape } from './use-capability-escape';
 
-export function EmployeeCapabilitiesSections({
-  children,
-  onSkillNavigate,
-}: {
-  children: ReactNode;
-  onSkillNavigate: () => void;
-}) {
-  const skills = useEmployeeSkillsHostView();
-  return (
-    <div className={css.sections}>
-      {children}
-      {skills?.renderSection(onSkillNavigate)}
-    </div>
-  );
-}
-
 /** The native Dock owns navigation/focus. This is the current employee's body;
  * its children consume the same U1 controllers as EmployeeDetailsDialog. */
 export function EmployeeCapabilitiesPanel({
