@@ -8,9 +8,9 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { nativeWebTransport } from './transport.js';
 
 const cleanup: (() => Promise<void>)[] = [];
-function latch() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
+function latch<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
     resolve = done;
   });
   return { promise, resolve };
@@ -28,7 +28,7 @@ afterEach(async () => {
 });
 
 it('bounds actual streamed profile bytes and joins the socket of an oversized response before rejecting', async () => {
-  const reply = Promise.withResolvers<ServerResponse>();
+  const reply = latch<ServerResponse>();
   const server = createServer((_request, response) => {
     response.writeHead(200);
     response.flushHeaders();
@@ -37,7 +37,7 @@ it('bounds actual streamed profile bytes and joins the socket of an oversized re
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-  const assigned = Promise.withResolvers<Duplex>();
+  const assigned = latch<Duplex>();
   const create = Agent.prototype.createConnection;
   vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
     this: Agent,
