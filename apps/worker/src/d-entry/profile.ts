@@ -51,7 +51,14 @@ export function createDEntryProfile(
   trustedReleaseDirectory = directory,
 ) {
   const publications = new WeakMap<DEntryPageHandle, Promise<Publication>>();
-  const pending = new Set<Promise<boolean>>();
+  const pending = new Set<Promise<unknown>>();
+  function track(work: Promise<unknown>) {
+    pending.add(work);
+    void work.then(
+      () => pending.delete(work),
+      () => pending.delete(work),
+    );
+  }
   const lifetime = new AbortController();
   let closing: Promise<void> | undefined;
 
@@ -99,11 +106,7 @@ export function createDEntryProfile(
             : undefined;
     if (!operation) return Promise.resolve(false);
     const running = handle();
-    pending.add(running);
-    void running.then(
-      () => pending.delete(running),
-      () => pending.delete(running),
-    );
+    track(running);
     return running;
 
     async function handle() {
@@ -116,39 +119,75 @@ export function createDEntryProfile(
         disconnected.signal,
       ]);
       async function writeOwned(active: AbortSignal, write: () => void) {
-        if (response.writableFinished || response.closed) return;
         const { socket } = request;
+        if (response.writableFinished || response.closed || socket.closed)
+          return false;
         let settle!: (sent: boolean) => void;
-        const joined = new Promise<boolean>((resolve) => {
+        const wire = new Promise<boolean>((resolve) => {
           settle = resolve;
         });
         const finished = () => settle(true);
         const closed = () => settle(false);
-        const abort = () => {
-          if (response.writableFinished || response.closed) return;
-          const queued = response.socket === null;
-          response.destroy();
-          // While an earlier HTTP/1.1 response owns the socket, Node cannot
-          // cancel this queued response through the response object alone.
-          if (queued && !socket.destroyed) socket.destroy();
-        };
         response.once('finish', finished);
         response.once('close', closed);
         socket.once('close', closed);
-        active.addEventListener('abort', abort, { once: true });
-        try {
-          if (socket.closed) closed();
-          else if (active.aborted) abort();
-          else write();
-          return await joined;
-        } catch (error) {
-          abort();
-          await joined;
-          throw error;
-        } finally {
+        void wire.then(() => {
           response.off('finish', finished);
           response.off('close', closed);
           socket.off('close', closed);
+        });
+
+        if (!response.socket && !active.aborted) {
+          // A pipelined response cannot write or cancel another response's
+          // socket. Wait for Node to assign this exact response before handing
+          // it any headers or business bytes.
+          let wake!: () => void;
+          const turn = new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+          response.once('socket', wake);
+          socket.once('close', wake);
+          active.addEventListener('abort', wake, { once: true });
+          try {
+            if (!response.socket && !active.aborted && !socket.closed)
+              await turn;
+          } finally {
+            response.off('socket', wake);
+            socket.off('close', wake);
+            active.removeEventListener('abort', wake);
+          }
+        }
+        if (socket.closed) {
+          closed();
+          return false;
+        }
+        if (active.aborted && !response.socket) {
+          // No page output reached Node. Transfer only an empty, order-
+          // preserving denial to the service; the earlier response can keep
+          // writing. The service owns this framing until finish/socket close.
+          track(wire);
+          response.writeHead(404, {
+            'cache-control': 'private, no-store',
+            'content-length': '0',
+          });
+          response.end();
+          return false;
+        }
+        // Once a fixed-length response has started, only transport closure
+        // can both stop its bytes and avoid corrupting HTTP/1.1 framing.
+        const abort = () => {
+          if (!response.writableFinished && response.socket) response.destroy();
+        };
+        active.addEventListener('abort', abort, { once: true });
+        try {
+          if (active.aborted) abort();
+          else write();
+          return await wire;
+        } catch (error) {
+          abort();
+          await wire;
+          throw error;
+        } finally {
           active.removeEventListener('abort', abort);
         }
       }
@@ -236,129 +275,140 @@ export function createDEntryProfile(
           scopeId,
           signal,
           async (page, active) => {
-            if (bindingRequest && bindingRequest.bindingRef !== page.bindingRef)
-              throw new DataAccessError('not_found');
-            const held = await publication(page, active);
-            const { release } = held;
-            await release.assertCurrent(active).catch((error) => {
-              if (!active.aborted) page.invalidate(error);
-              throw error;
-            });
-            if (operation === 'bootstrap') {
-              if (mode === 'document') {
-                await page.assertCurrent(active);
-                await json(active, {
-                  ...DEntryProfileAddressSchema.parse({
-                    bindingRef: page.bindingRef,
-                    graphRev: release.graph.rev,
-                    manifestSha256: release.manifestSha256,
-                  }),
-                  nativeSessionId: page.root.rootNativeSessionId,
-                });
-                return;
-              }
-              if (held.bootstrap !== 'available') {
-                await busy(active);
-                return;
-              }
-              held.bootstrap = 'sending';
-              try {
-                const iterator = page.scope
-                  .stream(
-                    {
-                      scopeId,
-                      endpoint: 'remoteAccess/follow',
-                      args: {},
-                    },
-                    active,
-                  )
-                  [Symbol.asyncIterator]();
-                const first = await iterator
-                  .next()
-                  .finally(() => iterator.return?.());
-                if (
-                  first.done ||
-                  first.value.scopeId !== scopeId ||
-                  first.value.value.type !== 'baseline' ||
-                  !('owner' in first.value.value) ||
-                  first.value.value.owner !== false
-                )
-                  throw new DEntryNativeUnavailable();
-                const baseline = first.value.value;
-                const body = DEntryProfileBootstrapSchema.parse({
-                  version: 1,
-                  scopeReference: { scopeId },
-                  bindingRef: page.bindingRef,
-                  graph: release.graph,
-                  injections: [
-                    ...release.injections,
-                    {
-                      kind: 'global',
-                      name: '__DSH_REMOTE_ACCESS__',
-                      value: baseline,
-                    },
-                  ],
-                });
-                await page.assertCurrent(active);
-                if (await json(active, body)) held.bootstrap = 'sent';
-              } finally {
-                if (held.bootstrap === 'sending') held.bootstrap = 'available';
-              }
-              return;
-            }
-            if (operation === 'events') {
-              if (held.events) {
-                await busy(active);
-                return;
-              }
-              held.events = true;
-              try {
-                await page.assertCurrent(active);
-                await send(
-                  active,
-                  { 'content-type': 'text/event-stream; charset=utf-8' },
-                  () =>
-                    response.write(
-                      `data: ${JSON.stringify({ type: 'graph', graph: release.graph })}\n\n`,
-                    ),
-                );
-              } finally {
-                held.events = false;
-              }
-              return;
-            }
-
-            let asset: Awaited<ReturnType<Release['readStatic']>>;
             try {
-              if (staticFile) {
-                if (
-                  staticFile.manifestSha256 !== release.manifestSha256 ||
-                  staticFile.graphRev !== release.graph.rev
-                )
-                  throw new DataAccessError('not_found');
-                asset = await release.readStatic(staticFile.path, active);
-              } else if (bundle) {
-                asset = await release.readReference(
-                  bundle.reference,
-                  bundle.revision,
-                  active,
-                );
-              } else throw new DataAccessError('not_found');
+              if (
+                bindingRequest &&
+                bindingRequest.bindingRef !== page.bindingRef
+              )
+                throw new DataAccessError('not_found');
+              const held = await publication(page, active);
+              const { release } = held;
+              await release.assertCurrent(active).catch((error) => {
+                if (!active.aborted) page.invalidate(error);
+                throw error;
+              });
+              if (operation === 'bootstrap') {
+                if (mode === 'document') {
+                  await page.assertCurrent(active);
+                  await json(active, {
+                    ...DEntryProfileAddressSchema.parse({
+                      bindingRef: page.bindingRef,
+                      graphRev: release.graph.rev,
+                      manifestSha256: release.manifestSha256,
+                    }),
+                    nativeSessionId: page.root.rootNativeSessionId,
+                  });
+                  return;
+                }
+                if (held.bootstrap !== 'available') {
+                  await busy(active);
+                  return;
+                }
+                held.bootstrap = 'sending';
+                try {
+                  const iterator = page.scope
+                    .stream(
+                      {
+                        scopeId,
+                        endpoint: 'remoteAccess/follow',
+                        args: {},
+                      },
+                      active,
+                    )
+                    [Symbol.asyncIterator]();
+                  const first = await iterator
+                    .next()
+                    .finally(() => iterator.return?.());
+                  if (
+                    first.done ||
+                    first.value.scopeId !== scopeId ||
+                    first.value.value.type !== 'baseline' ||
+                    !('owner' in first.value.value) ||
+                    first.value.value.owner !== false
+                  )
+                    throw new DEntryNativeUnavailable();
+                  const baseline = first.value.value;
+                  const body = DEntryProfileBootstrapSchema.parse({
+                    version: 1,
+                    scopeReference: { scopeId },
+                    bindingRef: page.bindingRef,
+                    graph: release.graph,
+                    injections: [
+                      ...release.injections,
+                      {
+                        kind: 'global',
+                        name: '__DSH_REMOTE_ACCESS__',
+                        value: baseline,
+                      },
+                    ],
+                  });
+                  await page.assertCurrent(active);
+                  if (await json(active, body)) held.bootstrap = 'sent';
+                } finally {
+                  if (held.bootstrap === 'sending')
+                    held.bootstrap = 'available';
+                }
+                return;
+              }
+              if (operation === 'events') {
+                if (held.events) {
+                  await busy(active);
+                  return;
+                }
+                held.events = true;
+                try {
+                  await page.assertCurrent(active);
+                  await send(
+                    active,
+                    { 'content-type': 'text/event-stream; charset=utf-8' },
+                    () =>
+                      response.write(
+                        `data: ${JSON.stringify({ type: 'graph', graph: release.graph })}\n\n`,
+                      ),
+                  );
+                } finally {
+                  held.events = false;
+                }
+                return;
+              }
+
+              let asset: Awaited<ReturnType<Release['readStatic']>>;
+              try {
+                if (staticFile) {
+                  if (
+                    staticFile.manifestSha256 !== release.manifestSha256 ||
+                    staticFile.graphRev !== release.graph.rev
+                  )
+                    throw new DataAccessError('not_found');
+                  asset = await release.readStatic(staticFile.path, active);
+                } else if (bundle) {
+                  asset = await release.readReference(
+                    bundle.reference,
+                    bundle.revision,
+                    active,
+                  );
+                } else throw new DataAccessError('not_found');
+              } catch (error) {
+                if (!active.aborted && !(error instanceof DataAccessError))
+                  page.invalidate(error);
+                throw error;
+              }
+              await page.assertCurrent(active);
+              await send(
+                active,
+                {
+                  'content-type': asset.media,
+                  'content-length': String(asset.data.byteLength),
+                  'x-content-type-options': 'nosniff',
+                },
+                () => response.end(asset.data),
+              );
             } catch (error) {
-              if (!active.aborted && !(error instanceof DataAccessError))
-                page.invalidate(error);
-              throw error;
+              if (active.aborted) throw error;
+              await writeOwned(active, () =>
+                sendDEntryHttpProblem(response, error),
+              );
             }
-            await page.assertCurrent(active);
-            await send(
-              active,
-              {
-                'content-type': asset.media,
-                'content-length': String(asset.data.byteLength),
-                'x-content-type-options': 'nosniff',
-              },
-              () => response.end(asset.data),
-            );
           },
         );
       } catch (error) {

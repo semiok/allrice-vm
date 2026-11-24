@@ -528,54 +528,86 @@ it(
       () => false,
       () => true,
     );
-    const draining = await open(f);
-    const transfer = await pipelineAfterEvents(draining.scopeId);
-    const queuedAsset = transfer.responses[1]!;
-    await expect.poll(() => queuedAsset.writableEnded).toBe(true);
-    expect(queuedAsset.socket).toBeNull();
-    expect(queuedAsset.writableFinished).toBe(false);
+    const foreground = await open(f);
+    const waiting = await open(f);
+    const pipeline = await pipelineAfterEvents(
+      foreground.scopeId,
+      waiting.scopeId,
+    );
+    const [active, queuedAsset, queuedDenial, next] = pipeline.responses;
+    for (const item of [queuedAsset!, queuedDenial!, next!]) {
+      expect(item.socket).toBeNull();
+      expect(item.headersSent).toBe(false);
+      expect(item.writableEnded).toBe(false);
+    }
+    closePage(waiting.peer);
+    expect(await waiting.receive()).toMatchObject({
+      value: { type: 'closed' },
+    });
+    expect(await waiting.receive()).toEqual({ type: 'end', streamId: 'life' });
+    expect((await f.invoke(waiting.scopeId)).status).toBe(404);
+    expect((await f.invoke(foreground.scopeId)).status).toBe(200);
+    expect(active!.destroyed).toBe(false);
+    expect(active!.writableEnded).toBe(false);
+    expect(queuedAsset!.statusCode).toBe(404);
+    expect(queuedDenial!.statusCode).toBe(404);
+    expect(next!.headersSent).toBe(false);
+    active!.end();
+    await expect
+      .poll(() => pipeline.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual([
+        'HTTP/1.1 200',
+        'HTTP/1.1 404',
+        'HTTP/1.1 404',
+        'HTTP/1.1 200',
+      ]);
+    await expect
+      .poll(() => pipeline.raw().includes(target.manifestSha256))
+      .toBe(true);
+    expect(pipeline.raw()).not.toContain(
+      'content-length: ' + largeBytes.length,
+    );
+    pipeline.client.destroy();
+
+    const draining = await pipelineAfterEvents(foreground.scopeId);
+    const held = holdSocket(draining.responses[0]!);
     let terminal: Awaited<ReturnType<typeof receive>> | undefined;
-    const terminalPromise = draining
+    const terminalPromise = foreground
       .receive()
       .then((frame) => (terminal = frame));
-    closePage(draining.peer);
-    await expect.poll(() => transfer.responses[0]!.destroyed).toBe(true);
-    expect(queuedAsset.writableFinished).toBe(false);
-    expect(queuedAsset.destroyed).toBe(true);
-    expect((await f.invoke(draining.scopeId)).status).toBe(404);
+    closePage(foreground.peer);
+    await expect.poll(() => held.fenced()).toBe(true);
+    expect((await f.invoke(foreground.scopeId)).status).toBe(404);
     expect((await f.invoke(scopeId)).status).toBe(200);
     expect(terminal).toBeUndefined();
-    transfer.release.resolve();
-    await transfer.closed;
+    held.release.resolve();
+    await held.closed;
     expect(await terminalPromise).toMatchObject({ value: { type: 'closed' } });
-    expect(await draining.receive()).toEqual({ type: 'end', streamId: 'life' });
+    expect(await foreground.receive()).toEqual({
+      type: 'end',
+      streamId: 'life',
+    });
 
     const second = await open(f);
     const firstResponse = await f.publish('bootstrap', second.scopeId);
     expect(firstResponse.status).toBe(200);
     await firstResponse.json();
-    const errors = await pipelineAfterEvents(second.scopeId, true);
-    await expect
-      .poll(() =>
-        errors.responses.slice(1).map((r) => [r.statusCode, r.writableEnded]),
-      )
-      .toEqual([
-        [409, true],
-        [400, true],
-      ]);
-    expect(errors.responses.slice(1).every((r) => r.socket === null)).toBe(
-      true,
-    );
+    const errors = await pipelineAfterEvents(second.scopeId, undefined, true);
+    expect(
+      errors.responses
+        .slice(1)
+        .every((r) => r.socket === null && !r.headersSent),
+    ).toBe(true);
+    const heldErrors = holdSocket(errors.responses[0]!);
     let joined = false;
     const stopping = f.closeProfile().then(() => {
       joined = true;
     });
-    await errors.fenced.promise;
+    await expect.poll(() => heldErrors.fenced()).toBe(true);
     expect(joined).toBe(false);
-    errors.release.resolve();
-    await errors.closed;
+    heldErrors.release.resolve();
+    await heldErrors.closed;
     await stopping;
-    expect(joined).toBe(true);
     expect(await pending).toBe(true);
     closePage(peer);
     expect(await receive()).toMatchObject({ value: { type: 'closed' } });
@@ -603,61 +635,68 @@ it(
     expect(await withdrew).toBe(true);
     expect((await withdrawn.invoke(live.scopeId)).status).toBe(404);
 
-    async function pipelineAfterEvents(id: string, errors = false) {
+    async function pipelineAfterEvents(
+      id: string,
+      awaitingId?: string,
+      errors = false,
+    ) {
       const worker = f.worker.address() as AddressInfo;
       const client = createConnection({ host: '127.0.0.1', port: worker.port });
       client.on('error', () => {});
       closes.push(async () => client.destroy());
-      await once(client, 'connect');
+      await once(client, 'connect', { signal: AbortSignal.timeout(5000) });
       const responses: ServerResponse[] = [];
       const observed = (_request: unknown, response: ServerResponse) =>
         responses.push(response);
       f.worker.on('request', observed);
-      let initial = '';
+      let body = '';
       client.on('data', (data) => {
-        initial += data.toString();
+        body += data.toString();
       });
-      const events = f.profileUrl('events', id, {
-        bindingRef: f.owner.bindingRef,
-      });
+      const bindingRef = f.owner.bindingRef;
+      const events = f.profileUrl('events', id, { bindingRef });
       const serialize = (url: URL, headers = '') =>
         `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
       try {
         client.write(serialize(events));
-        await expect
-          .poll(() => initial.split('\r\n')[0])
-          .toBe('HTTP/1.1 200 OK');
-        await expect
-          .poll(() => initial.includes('text/event-stream'))
-          .toBe(true);
+        await expect.poll(() => body.split('\r\n')[0]).toBe('HTTP/1.1 200 OK');
+        await expect.poll(() => body.includes('text/event-stream')).toBe(true);
         if (errors) {
           const invalid = new URL(events);
           invalid.searchParams.append('scopeId', id);
           client.write(serialize(events) + serialize(invalid));
           await expect.poll(() => responses.length).toBe(3);
-        } else {
+        } else if (awaitingId) {
+          const asset = f.profileUrl('assets', awaitingId, {
+            bindingRef,
+            graphRev: target.graphRev,
+            manifestSha256: target.manifestSha256,
+            path: largeAsset,
+          });
+          const invalid = new URL(asset);
+          invalid.searchParams.set('path', 'managed/absent.js');
+          const document = f.profileUrl('bootstrap', id);
           client.write(
-            serialize(
-              f.profileUrl('assets', id, {
-                bindingRef: f.owner.bindingRef,
-                graphRev: target.graphRev,
-                manifestSha256: target.manifestSha256,
-                path: largeAsset,
-              }),
-              'x-allrice-profile-request: static\r\n',
-            ),
+            serialize(asset, 'x-allrice-profile-request: static\r\n') +
+              serialize(invalid, 'x-allrice-profile-request: static\r\n') +
+              serialize(document, 'x-allrice-profile-request: document\r\n'),
           );
-          await expect.poll(() => responses.length).toBe(2);
+          await expect.poll(() => responses.length).toBe(4);
         }
+        for (const queued of responses.slice(1))
+          await expect.poll(() => queued.listenerCount('socket')).toBe(1);
       } finally {
         f.worker.off('request', observed);
       }
-      const socket = responses[0]!.socket!;
+      return { responses, client, raw: () => body };
+    }
+    function holdSocket(response: ServerResponse) {
+      const socket = response.socket!;
       const close = socket.destroy.bind(socket);
-      const fenced = deferred(),
-        release = deferred();
+      let entered = false;
+      const release = deferred();
       const hold = vi.spyOn(socket, 'destroy').mockImplementation((error) => {
-        fenced.resolve();
+        entered = true;
         void release.promise.then(() => close(error));
         return socket;
       });
@@ -665,7 +704,7 @@ it(
         hold.mockRestore();
         release.resolve();
       });
-      return { responses, fenced, release, closed: once(socket, 'close') };
+      return { fenced: () => entered, release, closed: once(socket, 'close') };
     }
   },
 );
