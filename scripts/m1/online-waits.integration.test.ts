@@ -37,10 +37,67 @@ const monitorPath = fileURLToPath(new URL('./monitor', import.meta.url));
 // Complete production SQL, collector, CLI and alert reducer, against our schema.
 // Never load shared Dev configuration or credentials. Alerts remain in memory.
 const collectPython = String.raw`
-import copy, json, os, re, runpy, subprocess, sys, tempfile, urllib.parse
+import copy, json, os, plistlib, re, runpy, subprocess, sys, tempfile
+from pathlib import Path
 m = runpy.run_path(os.environ['ALLRICE_MONITOR_TEST_MODULE'])
 schema = os.environ['ALLRICE_MONITOR_TEST_SCHEMA']
 assert re.fullmatch(r'p25_[a-f0-9]{32}', schema)
+
+def run_cli(home, cfg):
+    worker_dsn = 'postgres://monitor_fixture@127.0.0.1:5434/allrice40_dev'
+    release = home/'allrice40-dev-releases'/'fixture'
+    for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js', '.local/dev-build-identity.json'):
+        path = release/entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    sha = 'a'*40
+    (release/'.local/dev-build-identity.json').write_text(json.dumps(dict(
+        repository='semiok/allrice-vm', repositoryId=1469490636, environment='dev',
+        sourceSha=sha, sourceTree='b'*40, manifestDigest='sha256:'+'c'*64)))
+    dev_home = home/'allrice40-dev'
+    dev_home.mkdir()
+    (dev_home/'.env').touch()
+    state = dev_home/'.local'
+    label = 'ai.bplabs.allrice40-dev-worker'
+    worker = home/'Library/LaunchAgents'/(label+'.plist')
+    worker.parent.mkdir(parents=True)
+    worker.write_bytes(plistlib.dumps({
+        'Label': label, 'WorkingDirectory': str(release),
+        'ProgramArguments': ['/fixture/bin/node', str(release/'apps/worker/dist/index.js')],
+        'EnvironmentVariables': dict(DATABASE_URL=worker_dsn, ALLRICE_WORKER_PORT='3312', ALLRICE_RELEASE_SHA=sha,
+            ALLRICE_STORAGE_ROOT=str(state/'storage'), ALLRICE_EXECUTION_ROOT=str(state/'executions'),
+            ALLRICE_DSH_RUNTIME_ROOT=str(state/'dsh-runtime-m1'), ALLRICE_DSH_PLATFORM_HOME=str(state/'dsh-platform')),
+    }))
+    # The formal CLI must select the verified Worker. This test-only transport
+    # forwards its unchanged SQL and read-only options to the actual fixture schema.
+    adapter = home/'fixture-psql'
+    adapter.write_text('''#!/usr/bin/env python3
+import os, sys, urllib.parse
+if sys.argv[1] != os.environ['ALLRICE_MONITOR_TEST_WORKER_DSN']:
+    sys.exit('expected the verified Worker DSN')
+if '-c default_transaction_read_only=on' not in os.environ.get('PGOPTIONS', ''):
+    sys.exit('expected read-only SQL')
+url = urllib.parse.urlsplit(os.environ['ALLRICE_TEST_DATABASE_URL'])
+os.environ.pop('PGPASSWORD', None)
+if url.password is not None:
+    os.environ['PGPASSWORD'] = urllib.parse.unquote(url.password)
+    url = url._replace(netloc=f'{url.username}@{url.hostname}:{url.port}')
+os.environ['PGOPTIONS'] += ' -c search_path=' + os.environ['ALLRICE_MONITOR_TEST_SCHEMA']
+psql = os.environ['ALLRICE_MONITOR_TEST_PSQL']
+os.execv(psql, [psql, urllib.parse.urlunsplit(url), *sys.argv[2:]])
+''')
+    adapter.chmod(0o700)
+    cfg.update(psql=str(adapter), workerPlist=str(worker))
+    config = home/'config.json'
+    config.write_text(json.dumps(cfg))
+    env = dict(os.environ, HOME=str(home), ALLRICE_MONITOR_TEST_WORKER_DSN=worker_dsn)
+    command = [sys.executable, os.environ['ALLRICE_MONITOR_TEST_MODULE'], 'online-waits', '--config', str(config)]
+    snapshot = json.loads(subprocess.check_output(command+['--json'], env=env, text=True))
+    text = subprocess.check_output(command, env=env, text=True)
+    worker.unlink()
+    missing_worker = json.loads(subprocess.check_output(command+['--json'], env=env, text=True))
+    return dict(snapshot=snapshot, text=text, missingWorker=missing_worker, files=os.listdir(cfg['stateDir']))
+
 with tempfile.TemporaryDirectory(prefix='monitor-sql-') as tmp:
     cfg = json.loads(json.dumps(m['M1']))
     cfg.update(stateDir=tmp+'/state', psql=os.environ['ALLRICE_MONITOR_TEST_PSQL'],
@@ -55,17 +112,7 @@ with tempfile.TemporaryDirectory(prefix='monitor-sql-') as tmp:
     if mode == 'raw':
         out = m['biz'](r, m['SQL_ONLINE_WAITS'])
     elif mode == 'cli':
-        url = urllib.parse.urlsplit(cfg['databaseUrl'])
-        query = urllib.parse.parse_qsl(url.query)
-        query.append(('options', '-c search_path='+schema))
-        cfg['databaseUrl'] = urllib.parse.urlunsplit(url._replace(
-            query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)))
-        config = tmp+'/config.json'
-        with open(config, 'w') as f: json.dump(cfg, f)
-        command = [sys.executable, os.environ['ALLRICE_MONITOR_TEST_MODULE'],
-                   'online-waits', '--config', config]
-        out = dict(snapshot=json.loads(subprocess.check_output(command+['--json'], text=True)),
-                   text=subprocess.check_output(command, text=True), files=os.listdir(cfg['stateDir']))
+        out = run_cli(Path(tmp).resolve(), cfg)
     elif mode == 'alerts':
         g = m['check_online_waits'].__globals__
         out = []
@@ -763,6 +810,7 @@ suite('MET-222 online human waits through real monitor SQL', () => {
     const result = python<{
       snapshot: Snapshot;
       text: string;
+      missingWorker: Snapshot;
       files: string[];
     }>('cli');
     expect(result.snapshot).toMatchObject({
@@ -772,6 +820,15 @@ suite('MET-222 online human waits through real monitor SQL', () => {
       occupancy_pct: 25,
     });
     expect(result.text).toContain('Run 1个，占Worker执行位 1/4，占比25.0%');
+    expect(result.missingWorker).toMatchObject({
+      online_runs: null,
+      occupied_slots: null,
+      total_slots: null,
+      occupancy_pct: null,
+    });
+    expect(result.missingWorker.unknown_reasons).toContain(
+      '采集失败：no database URL configured',
+    );
     expect(result.files).toEqual([]);
     expect(JSON.stringify(result)).not.toContain('DO_NOT_EXPORT');
   });
