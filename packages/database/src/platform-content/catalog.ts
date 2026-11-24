@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { z } from 'zod';
@@ -49,7 +49,11 @@ const canonicalToolNames: ReadonlySet<string> = new Set(
   allRiceToolManifest.map((tool) => tool.canonicalName),
 );
 
-const repositoryRoot = fileURLToPath(new URL('../../../../', import.meta.url));
+// Keep the checkout path out of Turbopack's static URL asset resolver.
+const repositoryRoot = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../../../..',
+);
 
 export type PlatformSkillCatalogEntry = z.infer<
   typeof PlatformSkillCatalogEntrySchema
