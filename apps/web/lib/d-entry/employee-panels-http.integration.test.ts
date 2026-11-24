@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type { Browser } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import {
@@ -237,7 +238,13 @@ suite(
               Object.fromEntries(response.headers),
             );
             if (response.body)
-              await pipeline(response.body, outgoing, { signal: stop.signal });
+              await pipeline(
+                Readable.fromWeb(
+                  response.body as Parameters<typeof Readable.fromWeb>[0],
+                ),
+                outgoing,
+                { signal: stop.signal },
+              );
             else outgoing.end();
           },
         );
