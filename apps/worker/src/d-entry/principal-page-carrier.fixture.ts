@@ -1,0 +1,443 @@
+import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { on, once } from 'node:events';
+import { createServer, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterEach, expect, vi } from 'vitest';
+import { WebSocket } from 'ws';
+import {
+  hostFixture,
+  issue,
+  summary,
+} from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { createDEntryNativeGateway } from '../../../web/server/d-entry-native.mjs';
+import { nativeEntryFixture } from './native-entry.fixture.js';
+import { createDEntryPrincipalControl } from './principal-control.js';
+import { createDEntryPageRpc } from './principal-page-rpc.js';
+import { createDEntryPageMux } from './principal-profile-mux.js';
+import { createDEntryPageRequests } from './principal-requests.js';
+import { createDEntryProfile } from './profile.js';
+import {
+  DEntryProfileGraphSchema,
+  DEntrySelectionInputSchema,
+} from '@allrice/contracts';
+
+export const closes: (() => Promise<unknown>)[] = [];
+afterEach(async () => {
+  const failures: unknown[] = [];
+  for (const close of closes.splice(0).reverse()) {
+    try {
+      await close();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  vi.unstubAllEnvs();
+  if (failures.length)
+    throw new AggregateError(failures, 'Fixture close failed');
+});
+export const sessionToken = 'original_session_token_for_page';
+export const otherToken = 'different_session_of_same_person';
+
+export type ProfileProof = {
+  directory: string;
+  graph: unknown;
+  read(reference: string, signal: AbortSignal): Promise<Uint8Array>;
+  beforeGraphRead?: (signal: AbortSignal) => Promise<void>;
+};
+
+export async function buildProfileFixture(): Promise<ProfileProof> {
+  const parent = await mkdtemp(join(tmpdir(), 'allrice-profile-finite-'));
+  closes.push(() => rm(parent, { recursive: true, force: true }));
+  const directory = join(parent, 'release');
+  await promisify(execFile)(
+    process.execPath,
+    ['packages/dsh-web-composition/build-web-entry.mjs', directory],
+    { timeout: 20_000 },
+  );
+  const raw = JSON.parse(
+    await readFile(join(directory, 'artifact.json'), 'utf8'),
+  );
+  return {
+    directory,
+    graph: DEntryProfileGraphSchema.parse(raw.profile.graph),
+    read(reference, signal) {
+      const file = raw.profile.files.find(
+        (row: { reference: string }) => row.reference === reference,
+      );
+      if (!file) throw Error('Named release proof missing');
+      return readFile(join(directory, file.path), { signal });
+    },
+  };
+}
+
+export async function fixture(release?: ProfileProof) {
+  const selected = issue('execute');
+  const f = nativeEntryFixture();
+  const host = await hostFixture({
+    ...selected,
+    identity: f.identity,
+  });
+  const roots = new Map([
+    [f.selection.threadId, selected.root.nativeSessionId],
+  ]);
+  const registerThread = (threadId: string) => {
+    const id = 'root-' + threadId;
+    roots.set(threadId, id);
+    host.catalog.items.push(summary(id));
+  };
+  const selectionIdentity = (value: unknown) => {
+    const selection = DEntrySelectionInputSchema.parse(value);
+    const threadId = selection.threadId;
+    return threadId && roots.has(threadId)
+      ? { ...f.identity, threadId }
+      : f.identity;
+  };
+  closes.push(() => host.close());
+  const service = new AbortController();
+  const control = createDEntryPrincipalControl(host.node, {
+    carrier: service.signal,
+    cleanupTimeoutMs: 3000,
+  });
+  let controlCloseChecked = false;
+  closes.push(() =>
+    controlCloseChecked ? control.drainLocal() : control.close(),
+  );
+  const profileObserved = vi.fn<(part: 'item' | 'terminal') => void>();
+  vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) => {
+    const activity = control.acquire(input, active);
+    return {
+      ...activity,
+      async run(signal) {
+        const scope = await activity.run(signal);
+        return {
+          ...scope,
+          stream(call, caller, observer) {
+            return scope.stream(
+              call,
+              caller,
+              observer && {
+                item(frame) {
+                  observer.item(frame);
+                  profileObserved('item');
+                },
+                terminal() {
+                  observer.terminal();
+                  profileObserved('terminal');
+                },
+              },
+            );
+          },
+        };
+      },
+    };
+  });
+  vi.mocked(f.owner.readSessions).mockImplementation(async () => ({
+    ok: true,
+    value: { items: host.catalog.items },
+  }));
+  f.root.mockImplementation(async () => ({
+    identity: f.identity,
+    rootNativeSessionId: selected.root.nativeSessionId,
+    rootOriginDigest: selected.root.rootOriginDigest,
+    rootBindingRef: selected.root.rootBindingRef,
+    vmId: f.binding.vmId,
+  }));
+  const profileSource = new AbortController();
+  if (release)
+    f.deps.owners.resolve.mockResolvedValue({
+      ...f.owner,
+      fixedProfile: {
+        revoked: profileSource.signal,
+        async readImmutableGraph(signal) {
+          await release.beforeGraphRead?.(signal);
+          signal.throwIfAborted();
+          return release.graph;
+        },
+        readImmutableBundle: (reference, _bytes, signal) =>
+          release.read(reference, signal),
+      },
+    });
+  const otherSession = { ...f.context, sessionId: randomUUID() };
+  const authenticate = vi.fn(async (token: string) =>
+    token === sessionToken
+      ? f.context
+      : token === otherToken
+        ? otherSession
+        : null,
+  );
+  const historyIdentity = vi.fn(async (_context: unknown, selection: unknown) =>
+    selectionIdentity(selection),
+  );
+  const selectedRoot = async (_context: unknown, selection: unknown) => {
+    const root = await f.root();
+    const identity = selectionIdentity(selection);
+    return {
+      ...root,
+      identity,
+      rootNativeSessionId: roots.get(identity.threadId!)!,
+    };
+  };
+  const pages = createDEntryPageRequests({
+    ...f.deps,
+    authenticate,
+    async identity(_context, selection) {
+      return selectionIdentity(selection);
+    },
+    root: selectedRoot,
+    historyIdentity,
+    historyRoot: selectedRoot,
+  });
+  const mux = createDEntryPageMux(pages, service.signal);
+  const rpc = createDEntryPageRpc(pages, authenticate, service.signal);
+  const profileBorrows = vi.fn<(active: AbortSignal) => void>();
+  const profileFailures = vi.fn<(error: unknown) => void>();
+  const profilePages: typeof pages = {
+    ...pages,
+    borrow(token, selection, scopeId, caller, operation, failed) {
+      return pages.borrow(
+        token,
+        selection,
+        scopeId,
+        caller,
+        (page, active) => {
+          profileBorrows(active);
+          return operation(page, active);
+        },
+        failed &&
+          ((error, active) => {
+            profileFailures(error);
+            return failed(error, active);
+          }),
+      );
+    },
+  };
+  const profile = createDEntryProfile(
+    profilePages,
+    service.signal,
+    release?.directory,
+  );
+  const completedProfiles = new WeakSet<ServerResponse>();
+  const worker = createServer(async (request, response) => {
+    if (request.url === '/fixture-before-profile') {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.write('unrelated handler still running');
+      return;
+    }
+    if (await profile.handle(request, response)) {
+      completedProfiles.add(response);
+      return;
+    }
+    if (!(await rpc.handle(request, response))) response.writeHead(404).end();
+  });
+  worker.on('upgrade', (request, socket, head) => {
+    if (mux.matches(request)) void mux.upgrade(request, socket, head);
+    else socket.destroy();
+  });
+  const workerOrigin = await listen(worker);
+  vi.stubEnv('ALLRICE_WORKER_INTERNAL_URL', workerOrigin);
+  closes.push(async () => {
+    await Promise.all([mux.close(), rpc.close(), profile.close()]);
+    worker.closeAllConnections();
+    await new Promise<void>((resolve) => worker.close(() => resolve()));
+  });
+  const web = createServer();
+  const origin = await listen(web);
+  const probe = vi.fn<
+    (target: string | URL, init: RequestInit) => Promise<Response>
+  >(async (target) => {
+    const requested = new URL(target);
+    expect(requested.pathname).toBe('/api/v1/d-entry/identity');
+    return Response.json({
+      identity: {
+        ...f.identity,
+        threadId: requested.searchParams.get('threadId'),
+      },
+    });
+  });
+  const gateway = createDEntryNativeGateway({
+    port: (web.address() as AddressInfo).port,
+    probe,
+  });
+  web.on(
+    'upgrade',
+    (request, socket, head) => void gateway.upgrade(request, socket, head),
+  );
+  const clients: WebSocket[] = [];
+  closes.push(async () => {
+    clients.forEach((client) => client.terminate());
+    await gateway.close();
+    await new Promise<void>((resolve) => web.close(() => resolve()));
+  });
+  const connect = (scopeId?: string, token = sessionToken, suffix = '') => {
+    const query = new URLSearchParams({
+      carrier: 'page',
+      organizationId: f.identity.organizationId,
+      ...f.selection,
+      ...(scopeId && { scopeId }),
+    });
+    const client = new WebSocket(
+      origin.replace('http:', 'ws:') +
+        '/api/v1/d-entry/native-mux?' +
+        query +
+        suffix,
+      { headers: { origin, cookie: 'allrice_session=' + token } },
+    );
+    client.on('error', () => {});
+    clients.push(client);
+    return client;
+  };
+  const invoke = (scopeId: string, token = sessionToken, extra: object = {}) =>
+    fetch(workerOrigin + '/internal/d-entry/native-rpc?carrier=page', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer ' + token,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...f.body,
+        scopeId,
+        rpcId: '',
+        endpoint: 'session/page',
+        payload: {
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: 'root' },
+              throughSeq: 0,
+            },
+          },
+        },
+        ...extra,
+      }),
+    });
+  const invokeThread = (scopeId: string, threadId: string) =>
+    invoke(scopeId, sessionToken, {
+      selection: { ...f.selection, threadId },
+      payload: {
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: roots.get(threadId) },
+            throughSeq: 0,
+          },
+        },
+      },
+    });
+  function profileUrl(
+    kind: 'bootstrap' | 'assets' | 'events',
+    scopeId: string,
+    selectors: Record<string, string> = {},
+  ) {
+    const url = new URL('/internal/d-entry/profile/' + kind, workerOrigin);
+    url.search = new URLSearchParams({
+      ...f.selection,
+      organizationId: f.identity.organizationId,
+      scopeId,
+      ...selectors,
+    }).toString();
+    return url;
+  }
+  function publish(
+    kind: 'bootstrap' | 'assets' | 'events',
+    scopeId: string,
+    selectors: Record<string, string> = {},
+    mode?: 'document' | 'static',
+    signal?: AbortSignal,
+  ) {
+    const url = profileUrl(kind, scopeId, selectors);
+    return fetch(url, {
+      signal,
+      headers: {
+        authorization: 'Bearer ' + sessionToken,
+        ...(mode && { 'x-allrice-profile-request': mode }),
+      },
+    });
+  }
+  return {
+    ...f,
+    host,
+    connect,
+    invoke,
+    probe,
+    publish,
+    registerThread,
+    selectionIdentity,
+    invokeThread,
+    profileBorrows,
+    profileObserved,
+    profileFailures,
+    profileSource,
+    profileUrl,
+    historyIdentity,
+    completedProfiles,
+    closeProfile: profile.close,
+    async checkUnknownControlClose() {
+      controlCloseChecked = true;
+      await expect(control.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');
+    },
+    worker,
+    web,
+    origin,
+  };
+}
+
+async function listen(server: ReturnType<typeof createServer>) {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return 'http://127.0.0.1:' + (server.address() as AddressInfo).port;
+}
+
+export function send(peer: WebSocket, value: object) {
+  peer.send(JSON.stringify(value));
+}
+export function messages(peer: WebSocket) {
+  const events = on(peer, 'message', { close: ['close'] });
+  return async (streamId?: string) => {
+    while (true) {
+      const next = await events.next();
+      if (next.done)
+        throw Error('Socket closed before the expected native frame');
+      const frame = JSON.parse(String(next.value[0]));
+      if (!streamId || frame.streamId === streamId) return frame;
+    }
+  };
+}
+export async function open(f: Awaited<ReturnType<typeof fixture>>) {
+  const peer = f.connect();
+  await once(peer, 'open');
+  const receive = messages(peer);
+  send(peer, {
+    type: 'open',
+    streamId: 'life',
+    endpoint: '$d-entry/page',
+    payload: { args: {} },
+  });
+  const frame = await receive();
+  expect(frame).toMatchObject({
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'opened', bindingRef: f.owner.bindingRef },
+  });
+  expect(Object.keys(frame.value).sort()).toEqual([
+    'bindingRef',
+    'scopeReference',
+    'type',
+  ]);
+  return {
+    peer,
+    receive,
+    scopeId: frame.value.scopeReference.scopeId as string,
+  };
+}
+export async function status(peer: WebSocket) {
+  const [request, response] = await once(peer, 'unexpected-response');
+  response.resume();
+  request.destroy();
+  return response.statusCode;
+}
+export function closePage(peer: WebSocket) {
+  send(peer, { type: 'item', streamId: 'life', value: 'close' });
+  send(peer, { type: 'end', streamId: 'life' });
+}

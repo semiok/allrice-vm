@@ -1,0 +1,496 @@
+import { randomUUID } from 'node:crypto';
+import type { ServerResponse } from 'node:http';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import { chromium, type Page } from 'playwright-core';
+import { expect, it } from 'vitest';
+import {
+  type DEntryPageOpenedSchema,
+  DEntryProfileGraphSchema,
+} from '@allrice/contracts';
+import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
+import {
+  fixture,
+  closes,
+  sessionToken,
+} from './principal-page-carrier.fixture.js';
+
+const browserExecutable =
+  process.env.ALLRICE_BROWSER_EXECUTABLE ??
+  process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
+
+it.skipIf(!browserExecutable)(
+  'joins the native page carrier in Chromium with the original browser Cookie',
+  { timeout: 25_000 },
+  async () => {
+    const f = await fixture();
+    f.web.on('request', (_, outgoing) => {
+      outgoing.writeHead(200, { 'content-type': 'text/html' });
+      outgoing.end('<!doctype html><title>Owned native carrier test</title>');
+    });
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const result: { outputFiles: { text: string }[] } =
+      await require('esbuild').build({
+        entryPoints: ['apps/web/lib/d-entry/page-carrier.ts'],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        globalName: 'DEntryCarrier',
+        write: false,
+      });
+    const browser = await chromium.launch({
+      executablePath: browserExecutable,
+    });
+    closes.push(() => browser.close());
+    const context = await browser.newContext();
+    await context.addCookies([
+      { name: 'allrice_session', value: sessionToken, url: f.origin },
+    ]);
+    const page = await context.newPage();
+    await page.goto(f.origin);
+    await page.addScriptTag({ content: result.outputFiles[0]!.text });
+    const receipt = await page.evaluate(
+      async ({ identity, selection }) => {
+        const { openNativePageCarrier } = (
+          window as unknown as {
+            DEntryCarrier: {
+              openNativePageCarrier(
+                original: typeof identity,
+                selectors: typeof selection,
+                revoked: () => void,
+              ): {
+                ready: Promise<ReturnType<typeof DEntryPageOpenedSchema.parse>>;
+                close(): Promise<void>;
+              };
+            };
+          }
+        ).DEntryCarrier;
+        let revoked = false;
+        const carrier = openNativePageCarrier(identity, selection, () => {
+          revoked = true;
+        });
+        const opened = await carrier.ready;
+        await carrier.close();
+        return { opened, revoked };
+      },
+      { identity: f.identity, selection: f.selection },
+    );
+    expect(receipt).toMatchObject({
+      opened: {
+        type: 'opened',
+        scopeReference: { scopeId: expect.any(String) },
+        bindingRef: f.owner.bindingRef,
+      },
+      revoked: false,
+    });
+    expect(
+      await f
+        .invoke(receipt.opened.scopeReference.scopeId)
+        .then((value) => value.status),
+    ).toBe(404);
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    await context.close();
+  },
+);
+
+it.skipIf(!browserExecutable)(
+  'waits for the real document dispose before navigation and cancels a partial bundle on child pagehide',
+  { timeout: 30_000 },
+  async () => {
+    const f = await fixture();
+    const root = process.cwd();
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const { employeeWebKernelOptions } = (await import(
+      new URL(
+        '../../../../packages/dsh-web-composition/build-web-entry.mjs',
+        import.meta.url,
+      ).href
+    )) as { employeeWebKernelOptions: { loader: Record<string, string> } };
+    function bundle(resolveDir: string, source: string) {
+      return require('esbuild')
+        .build({
+          ...employeeWebKernelOptions,
+          stdin: { contents: source, resolveDir, loader: 'tsx' },
+          format: 'esm',
+          write: false,
+          outdir: '/page-close-test',
+          jsx: 'automatic',
+          loader: Object.fromEntries(
+            Object.keys(employeeWebKernelOptions.loader!).map((key) => [
+              key,
+              'dataurl',
+            ]),
+          ),
+        })
+        .then(
+          (result: { outputFiles: { path: string; text: string }[] }) =>
+            result.outputFiles.find((file) => file.path.endsWith('.js'))!.text,
+        );
+    }
+    const [outer, child] = await Promise.all([
+      bundle(
+        join(root, 'apps/web'),
+        `
+        import { createRoot } from 'react-dom/client';
+        import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+        const root = createRoot(document.getElementById('root'));
+        window.updateEmployeeQuery = (query) => root.render(<EmployeeNativePage query={query} />);
+        window.updateEmployeeQuery(location.search.slice(1));
+      `,
+      ),
+      bundle(
+        join(root, 'packages/dsh-web-composition'),
+        `
+        import { AppWebEntry } from '@deepseek-ai/dsh-client-web';
+        const dispose = AppWebEntry.prototype.dispose;
+        const gate = Promise.withResolvers();
+        window.releaseDispose = gate.resolve;
+        AppWebEntry.prototype.dispose = async function () {
+          document.body.dataset.dispose = 'waiting';
+          const shouldFail = document.body.dataset.autoDispose ? false : await gate.promise;
+          await dispose.call(this);
+          if (shouldFail) throw Error('Dispose outcome unknown');
+        };
+        await import('./src/employee-product-entry');
+      `,
+      ),
+    ]);
+    let transfer = deferred<ServerResponse>();
+    let cancelled = deferred<void>();
+    let firstScript = deferred<ServerResponse>();
+    let firstStyle = deferred<ServerResponse>();
+    let initialScriptClose = deferred<void>();
+    let initialStyleClose = deferred<void>();
+    let startup:
+      | 'style'
+      | 'entry'
+      | 'pending-elements'
+      | 'document'
+      | 'redirect'
+      | 'claimed-sync'
+      | 'claimed-async'
+      | undefined;
+    const directoryQueries: string[] = [];
+    const knownScopes = new Map<string, string>();
+    const graph = DEntryProfileGraphSchema.parse({
+      rev: 'test-graph',
+      release: { version: '0.2.1-rc.2' },
+      entries: [{ id: 'held', url: 'plugins/??held', rev: 'held-entry' }],
+      batches: [
+        {
+          phase: 'bootstrap',
+          url: 'plugins/??held-batch',
+          rev: 'held-batch',
+          entries: ['held'],
+        },
+      ],
+    });
+    f.web.on('request', (request, response) => {
+      const url = new URL(request.url!, f.origin);
+      const send = (type: string, body: string) =>
+        response.writeHead(200, { 'Content-Type': type }).end(body);
+      if (url.pathname === '/outer.js')
+        return send('application/javascript', outer);
+      if (url.pathname === '/child.js')
+        return send('application/javascript', child);
+      if (url.pathname === '/first.js') {
+        if (startup === 'entry') return response.writeHead(503).end();
+        response.once('close', () => initialScriptClose.resolve());
+        response.writeHead(200, { 'content-type': 'application/javascript' });
+        response.write('/* the managed module has not loaded */\n');
+        firstScript.resolve(response);
+        return;
+      }
+      if (url.pathname === '/first.css') {
+        response.once('close', () => initialStyleClose.resolve());
+        firstStyle.resolve(response);
+        return;
+      }
+      if (url.pathname === '/api/v1/d-entry/identity') {
+        directoryQueries.push(url.searchParams.get('threadId')!);
+        return send(
+          'application/json',
+          JSON.stringify({
+            identity: f.selectionIdentity(Object.fromEntries(url.searchParams)),
+          }),
+        );
+      }
+      if (url.pathname === '/chatflow/4.0/document') {
+        const scope = url.searchParams.get('scopeId')!;
+        const thread = url.searchParams.get('threadId')!;
+        knownScopes.set(scope, thread);
+        const mode = thread === f.selection.threadId ? startup : undefined;
+        if (mode === 'document')
+          return response
+            .writeHead(503, { 'content-type': 'application/json' })
+            .end('{}');
+        if (mode === 'redirect')
+          return response
+            .writeHead(307, {
+              location:
+                '/chatflow/4.0/document/' + scope + '/proof/native/index.html',
+            })
+            .end();
+        const fields = {
+          'scope-id': scope,
+          'thread-id': thread,
+          'workspace-id': f.identity.workspaceId,
+          'employee-instance-id': f.identity.employeeInstanceId,
+          'organization-id': f.identity.organizationId,
+          'viewer-id': f.identity.personId,
+          'binding-ref': f.owner.bindingRef,
+          'graph-rev': graph.rev,
+        };
+        const attributes = Object.entries(fields)
+          .map(([key, value]) => `data-${key}="${value}"`)
+          .join(' ');
+        return send(
+          'text/html',
+          `<!doctype html><head><script data-scope-id="${scope}">${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
+        );
+      }
+      if (url.pathname.startsWith('/chatflow/4.0/document/'))
+        return response
+          .writeHead(503, { 'content-type': 'application/json' })
+          .end('{}');
+      if (url.pathname === '/api/v1/d-entry/profile/bootstrap') {
+        if (
+          startup === 'claimed-async' &&
+          knownScopes.get(url.searchParams.get('scopeId')!) ===
+            f.selection.threadId
+        )
+          return response.writeHead(503).end();
+        return send(
+          'application/json',
+          JSON.stringify({
+            version: 1,
+            scopeReference: { scopeId: url.searchParams.get('scopeId') },
+            bindingRef: f.owner.bindingRef,
+            graph,
+            injections: [
+              {
+                kind: 'script-src',
+                placement: 'head',
+                src: graph.batches[0]!.url,
+              },
+            ],
+          }),
+        );
+      }
+      if (url.pathname === '/api/v1/d-entry/profile/assets') {
+        const close = cancelled;
+        response.once('close', () => close.resolve());
+        response.writeHead(200, { 'Content-Type': 'application/javascript' });
+        response.write('window.nativeLateRegistration = ');
+        transfer.resolve(response);
+        return;
+      }
+      // The next URL is enough to detect navigation. A second VM and launch
+      // are outside this test's close boundary.
+      if (url.pathname === '/chatflow/4.0')
+        return send('text/html', '<!doctype html><p>Next selection</p>');
+      return send(
+        'text/html',
+        '<!doctype html><div id="root"></div><script type="module" src="/outer.js"></script>',
+      );
+    });
+    const browser = await chromium.launch({
+      executablePath: browserExecutable,
+    });
+    closes.push(() => browser.close());
+    const context = await browser.newContext();
+    await context.addCookies([
+      { name: 'allrice_session', value: sessionToken, url: f.origin },
+    ]);
+    const start = f.origin + '/old?' + new URLSearchParams(f.selection);
+    const select = (page: Page, selection: typeof f.selection) =>
+      page.evaluate(
+        (query) =>
+          (
+            window as unknown as { updateEmployeeQuery(value: string): void }
+          ).updateEmployeeQuery(query),
+        new URLSearchParams(selection).toString(),
+      );
+    async function issued(page: Page, threadId: string, previous?: string) {
+      let found: string | undefined;
+      await expect
+        .poll(async () => {
+          const input = await page.locator('iframe').getAttribute('src');
+          if (!input) return false;
+          const address = new URL(input, f.origin);
+          const scope = address.searchParams.get('scopeId');
+          if (
+            address.searchParams.get('threadId') !== threadId ||
+            !scope ||
+            scope === previous
+          )
+            return false;
+          found = scope;
+          return (await f.invokeThread(scope, threadId)).status === 200;
+        })
+        .toBe(true);
+      return found!;
+    }
+    async function finishLocal(
+      frame: ReturnType<Page['frames']>[number],
+      shouldFail: boolean,
+    ) {
+      await frame.evaluate(
+        (fail) =>
+          (
+            window as unknown as { releaseDispose(fail: boolean): void }
+          ).releaseDispose(fail),
+        shouldFail,
+      );
+    }
+    for (const scenario of [
+      'navigate',
+      'unknown',
+      'child-hides',
+      'query',
+      'query-unknown',
+      'query-roundtrip',
+    ] as const) {
+      transfer = deferred<ServerResponse>();
+      cancelled = deferred<void>();
+      const page = await context.newPage();
+      try {
+        await page.goto(start);
+        const blocked = await transfer.promise;
+        expect(blocked.writableFinished).toBe(false);
+        const frame = page
+          .frames()
+          .find((candidate) =>
+            candidate.url().includes('/chatflow/4.0/document'),
+          )!;
+        const scopeId = new URL(frame.url()).searchParams.get('scopeId')!;
+        expect((await f.invoke(scopeId)).status).toBe(200);
+        const next = { ...f.selection, threadId: randomUUID() };
+        f.registerThread(next.threadId);
+        if (scenario.startsWith('query')) {
+          await select(page, next);
+        } else
+          await frame.evaluate(
+            ({ scenario, scopeId, next }) => {
+              if (scenario === 'child-hides')
+                window.dispatchEvent(new Event('pagehide'));
+              else
+                parent.postMessage(
+                  {
+                    type: 'allrice:d-entry:navigate',
+                    scopeId,
+                    selection: next,
+                  },
+                  location.origin,
+                );
+            },
+            { scenario, scopeId, next },
+          );
+        await cancelled.promise;
+        expect(blocked.destroyed).toBe(true);
+        expect(blocked.writableFinished).toBe(false);
+        await frame.locator('body[data-dispose=waiting]').waitFor();
+        expect((await f.invoke(scopeId)).status).toBe(404);
+        expect(page.url()).toBe(start);
+        expect(directoryQueries).not.toContain(next.threadId);
+        expect(
+          await frame.evaluate(() =>
+            Object.hasOwn(window, 'nativeLateRegistration'),
+          ),
+        ).toBe(false);
+        if (scenario === 'query-roundtrip') {
+          await select(page, f.selection);
+          transfer = deferred<ServerResponse>();
+        }
+        await finishLocal(
+          frame,
+          scenario === 'unknown' || scenario === 'query-unknown',
+        );
+        if (scenario === 'navigate')
+          await page.waitForURL('**/chatflow/4.0?**');
+        else if (scenario === 'query') {
+          await issued(page, next.threadId, scopeId);
+        } else if (scenario === 'query-roundtrip') {
+          const fresh = await issued(page, f.selection.threadId, scopeId);
+          await transfer.promise;
+          const freshFrame = page
+            .frames()
+            .find((candidate) => candidate.url().includes(fresh))!;
+          expect(directoryQueries).not.toContain(next.threadId);
+          const final = { ...f.selection, threadId: randomUUID() };
+          f.registerThread(final.threadId);
+          await select(page, final);
+          await finishLocal(freshFrame, false);
+          await issued(page, final.threadId, fresh);
+        } else if (scenario === 'unknown' || scenario === 'query-unknown') {
+          await page.getByRole('alert').waitFor();
+          expect(page.url()).toBe(start);
+          expect(directoryQueries).not.toContain(next.threadId);
+        }
+      } finally {
+        await page.close();
+      }
+    }
+    for (const phase of [
+      'style',
+      'entry',
+      'pending-elements',
+      'document',
+      'redirect',
+      'claimed-sync',
+      'claimed-async',
+    ] as const) {
+      startup = phase;
+      firstScript = deferred<ServerResponse>();
+      firstStyle = deferred<ServerResponse>();
+      initialScriptClose = deferred();
+      initialStyleClose = deferred();
+      const page = await context.newPage();
+      try {
+        await page.goto(start, { waitUntil: 'commit' });
+        const frameAddress = await page.locator('iframe').getAttribute('src');
+        const scopeId = new URL(frameAddress!, f.origin).searchParams.get(
+          'scopeId',
+        )!;
+        const next = { ...f.selection, threadId: randomUUID() };
+        f.registerThread(next.threadId);
+        if (phase === 'style' || phase === 'pending-elements') {
+          const [script, style] = await Promise.all([
+            firstScript.promise,
+            firstStyle.promise,
+          ]);
+          expect(script.writableFinished).toBe(false);
+          if (phase === 'style') style.writeHead(503).end();
+          else await select(page, next);
+          await initialScriptClose.promise;
+          expect(script.writableFinished).toBe(false);
+          if (phase === 'pending-elements') {
+            await initialStyleClose.promise;
+            expect(style.writableFinished).toBe(false);
+          }
+        }
+        if (phase !== 'pending-elements')
+          await page.getByRole('alert').waitFor();
+        await expect
+          .poll(async () => (await f.invoke(scopeId)).status)
+          .toBe(404);
+        if (phase !== 'pending-elements') await select(page, next);
+        await issued(page, next.threadId, scopeId);
+      } finally {
+        await page.close();
+      }
+    }
+    await context.close();
+  },
+);

@@ -6,6 +6,7 @@ resources:
   db:
     - ALLRICE_RUN_DB_INTEGRATION
   browser:
+    - apps/worker/src/d-entry/principal-page-carrier.browser.test.ts
     - ALLRICE_RUN_BROWSER_INTEGRATION
   browser+db:
     - ALLRICE_RUN_BROWSER_INTEGRATION

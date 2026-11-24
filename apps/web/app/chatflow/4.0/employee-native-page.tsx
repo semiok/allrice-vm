@@ -22,7 +22,11 @@ export function EmployeeNativePage({ query }: { query: string }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
-  const [activeQuery, setActiveQuery] = useState(query);
+  const [activation, setActivation] = useState({ query });
+  const activeQuery = activation.query;
+  const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
+    undefined,
+  );
   const replace = useRef<(() => void) | undefined>(undefined);
   const nextQuery = useRef(query);
   nextQuery.current = query;
@@ -33,6 +37,8 @@ export function EmployeeNativePage({ query }: { query: string }) {
     let scopeId: string | undefined;
     let navigating = false;
     let mounted = false;
+    let documentStarted = false;
+    let remoteRevoked = false;
     let replacing: Promise<boolean> | undefined;
     let setting: Promise<void> | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
@@ -71,12 +77,54 @@ export function EmployeeNativePage({ query }: { query: string }) {
         return remote === 'closed' && entry === 'closed';
       })());
     }
+    function failedDocument(state: 'closed' | 'unknown') {
+      local.resolve(state);
+      setFailed(true);
+      void close();
+    }
+    const documentLoaded = (node: HTMLIFrameElement) => {
+      if (!scopeId || node !== frame.current || !mounted) return;
+      try {
+        const doc = node.contentDocument;
+        if (doc?.URL === 'about:blank') return;
+        if (!doc) return failedDocument('unknown');
+        const address = new URL(doc.URL);
+        const path = '/chatflow/4.0/document';
+        const exact =
+          address.origin === location.origin &&
+          ((address.pathname === path &&
+            address.searchParams.getAll('scopeId').length === 1 &&
+            address.searchParams.get('scopeId') === scopeId) ||
+            address.pathname.startsWith(path + '/' + scopeId + '/'));
+        const child = node.contentWindow as
+          | (Window & { __ALLRICE_EMPLOYEE_DOCUMENT__?: { scopeId: string } })
+          | null;
+        if (
+          exact &&
+          child?.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId === scopeId
+        ) {
+          documentStarted = true;
+          return;
+        }
+        // The two authenticated document handlers return a JSON problem
+        // before any owned document exists. An uninspectable or changed
+        // document has no equivalent local completion proof.
+        failedDocument(
+          exact && !documentStarted && doc.contentType === 'application/json'
+            ? 'closed'
+            : 'unknown',
+        );
+      } catch {
+        failedDocument('unknown');
+      }
+    };
+    loaded.current = documentLoaded;
     const applyQuery = () => {
       if (navigating) return;
       navigating = true;
       void retire().then((closed) => {
         if (replace.current !== applyQuery) return;
-        if (closed) setActiveQuery(nextQuery.current);
+        if (closed) setActivation({ query: nextQuery.current });
         else setFailed(true);
       });
     };
@@ -90,8 +138,14 @@ export function EmployeeNativePage({ query }: { query: string }) {
       )
         return;
       if (event.data.type === pageClosing) void close();
-      if (event.data.type === pageStartupFailed) setFailed(true);
-      if (event.data.type === pageDocumentReady && replacing) send(pageRevoked);
+      if (event.data.type === pageStartupFailed) {
+        setFailed(true);
+        void close();
+      }
+      if (event.data.type === pageDocumentReady) {
+        documentStarted = true;
+        if (replacing || remoteRevoked) send(pageRevoked);
+      }
       if (
         event.data.type === pageCompletion &&
         ['closed', 'unknown'].includes(event.data.state)
@@ -113,7 +167,7 @@ export function EmployeeNativePage({ query }: { query: string }) {
           if (replace.current !== applyQuery) return;
           if (closed) {
             if (nextQuery.current !== activeQuery)
-              setActiveQuery(nextQuery.current);
+              setActivation({ query: nextQuery.current });
             else location.assign('/chatflow/4.0?' + params);
           } else setFailed(true);
         });
@@ -145,6 +199,7 @@ export function EmployeeNativePage({ query }: { query: string }) {
       )
         throw Error('Employee selection changed');
       carrier = openNativePageCarrier(identity, selection, () => {
+        remoteRevoked = true;
         send(pageRevoked);
         if (!lifetime.signal.aborted) setFailed(true);
       });
@@ -161,11 +216,12 @@ export function EmployeeNativePage({ query }: { query: string }) {
     return () => {
       lifetime.abort();
       close();
+      if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', close);
     };
-  }, [activeQuery]);
+  }, [activation, activeQuery]);
 
   useEffect(() => {
     if (nextQuery.current !== activeQuery) replace.current?.();
@@ -178,6 +234,7 @@ export function EmployeeNativePage({ query }: { query: string }) {
           ref={frame}
           title="员工工作区"
           src={source}
+          onLoad={(event) => loaded.current?.(event.currentTarget)}
           referrerPolicy="no-referrer"
           style={{
             display: 'block',

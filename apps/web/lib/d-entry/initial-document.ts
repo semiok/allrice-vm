@@ -24,7 +24,11 @@ export const initialDocumentLifecycle = `(() => {
   const stop = () => {
     if (controller.signal.aborted) return;
     controller.abort();
-    if (!claimed) send(protocol.close);
+    if (!claimed) {
+      send(protocol.close);
+      window.stop();
+      if (document.readyState === 'complete') finish('closed');
+    }
   };
   const received = (event) => {
     if (event.source === parent && event.origin === location.origin &&
@@ -35,9 +39,9 @@ export const initialDocumentLifecycle = `(() => {
     if (!asset) return;
     send(protocol.fail);
     stop();
-    // A terminal error of the module tag proves that no managed entry may
-    // still start. An unrelated stylesheet error supplies no such proof.
-    if (asset === 'entry' && !claimed) finish('closed');
+  };
+  const loaded = () => {
+    if (controller.signal.aborted && !claimed) finish('closed');
   };
   const finish = (state) => {
     if (complete) return;
@@ -45,12 +49,15 @@ export const initialDocumentLifecycle = `(() => {
     window.removeEventListener('message', received);
     window.removeEventListener('error', error, true);
     window.removeEventListener('pagehide', stop);
+    window.removeEventListener('load', loaded);
     send(protocol.complete, state);
   };
   window.addEventListener('error', error, true);
   window.addEventListener('message', received);
   window.addEventListener('pagehide', stop, { once: true });
+  window.addEventListener('load', loaded, { once: true });
   globalThis.__ALLRICE_EMPLOYEE_DOCUMENT__ = Object.freeze({
+    scopeId,
     signal: controller.signal,
     claim() {
       if (controller.signal.aborted) return false;

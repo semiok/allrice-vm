@@ -36,11 +36,20 @@ export async function apply(ctx, config) {
   );
   const temporary = `${artifactPath}.${randomUUID()}.tmp`;
   let publishing;
+  let stagingFailure;
   let published = false;
   let retiring = false;
+  let activated = false;
+  let restarting = false;
+  const sameConfig = (value) =>
+    value?.artifactPath === artifactPath &&
+    value?.nonce === nonce &&
+    value?.baseUrl === baseUrl;
+  const entry = fiber.entry;
   const current = () =>
     !retiring &&
     fiber.uid !== null &&
+    (!entry || sameConfig(entry.options.config)) &&
     providers.every(([name, provider, value]) => {
       const live = ctx.get(name);
       return provider.uid !== null && live != null && original(live) === value;
@@ -53,7 +62,17 @@ export async function apply(ctx, config) {
     async retire() {
       retiring = true;
       await publishing?.catch(() => {});
-      if (published) await rm(artifactPath, { force: true });
+      try {
+        if (published) await rm(artifactPath, { force: true });
+      } catch (error) {
+        if (stagingFailure)
+          throw new AggregateError(
+            [stagingFailure.error, error],
+            'Native auth cleanup failed',
+          );
+        throw error;
+      }
+      if (stagingFailure) throw stagingFailure.error;
     },
   });
   const retire = () => {
@@ -69,9 +88,26 @@ export async function apply(ctx, config) {
   // reach a disposer. That notification also fences existing scopes now.
   ctx.on('internal/plugin', retireMissingOwner);
   ctx.on('internal/service', retireMissingOwner);
+  ctx.on('loader/partial-dispose', (changed) => {
+    if (!entry || changed !== entry || sameConfig(entry.options.config)) return;
+    const stopped = retire();
+    void stopped.catch(() => {});
+    if (activated || restarting) return;
+    restarting = true;
+    // rc.2 records a loading entry's new raw config before its old apply
+    // returns. Let that transition settle, then update the same live entry.
+    void stopped
+      .then(async () => {
+        await fiber.await();
+        if (fiber.uid !== null && fiber.entry === entry)
+          fiber.update(entry.options.config, true);
+      })
+      .catch(() => {});
+  });
   ctx.effect(() => retire, 'allrice native profile and local auth lifetime');
   try {
     await observed.ready;
+    activated = true;
   } catch (error) {
     if (current()) {
       await retire().catch(() => {});
@@ -82,6 +118,7 @@ export async function apply(ctx, config) {
   async function publish() {
     await mkdir(dirname(artifactPath), { recursive: true, mode: 0o700 });
     if (!current()) return;
+    let primary;
     try {
       await writeFile(
         temporary,
@@ -98,8 +135,23 @@ export async function apply(ctx, config) {
         renameSync(temporary, artifactPath);
         published = true;
       }
+    } catch (error) {
+      primary = { error };
+      throw error;
     } finally {
-      await rm(temporary, { force: true });
+      try {
+        await rm(temporary, { force: true });
+      } catch (error) {
+        stagingFailure = {
+          error: primary
+            ? new AggregateError(
+                [primary.error, error],
+                'Native auth staging failed',
+              )
+            : error,
+        };
+        throw stagingFailure.error;
+      }
     }
   }
 }

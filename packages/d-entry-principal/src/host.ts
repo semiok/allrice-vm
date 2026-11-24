@@ -422,6 +422,7 @@ class PrincipalService extends TypertRemoteService {
   ) {
     if (this.stopped || this.graphObserver) throw closed();
     let retiring: Promise<void> | undefined;
+    const graphClosures = new Set<Promise<void>>();
     const observer = {
       ready: false,
       current: () => owner?.current() ?? true,
@@ -430,18 +431,22 @@ class PrincipalService extends TypertRemoteService {
         observer.ready = false;
         this.graphObserver = undefined;
         const previous = this.graphRetirement;
+        const closingGraph = [...graphClosures];
         retiring = this.graphRetirement = Promise.resolve().then(async () => {
           const results = await Promise.allSettled([
             previous,
+            ...closingGraph,
             closedScopes,
             Promise.resolve().then(() => unsubscribe()),
             Promise.resolve().then(() => owner?.retire()),
           ]);
-          const failures = results.flatMap((result) =>
-            result.status === 'rejected' ? [result.reason] : [],
+          const failures = new Set(
+            results.flatMap((result) =>
+              result.status === 'rejected' ? [result.reason] : [],
+            ),
           );
-          if (failures.length === 1) throw failures[0];
-          if (failures.length)
+          if (failures.size === 1) throw failures.values().next().value;
+          if (failures.size)
             throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
         });
         // Fence each scope now, including scopes still performing their
@@ -456,9 +461,15 @@ class PrincipalService extends TypertRemoteService {
         void observer.close().catch(() => {});
         return;
       }
-      void this.closeScopes()
-        .catch(() => observer.close())
-        .catch(() => {});
+      const fenced = this.closeScopes();
+      graphClosures.add(fenced);
+      void fenced.then(
+        () => graphClosures.delete(fenced),
+        () => {
+          void observer.close().catch(() => {});
+          graphClosures.delete(fenced);
+        },
+      );
     });
     this.graphObserver = observer;
     const assertObserver = () => {

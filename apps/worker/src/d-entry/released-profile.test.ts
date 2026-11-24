@@ -37,7 +37,10 @@ vi.mock('node:fs/promises', async (load) => {
   };
 });
 
-async function observerFixture() {
+async function observerFixture(options?: {
+  loader?: boolean;
+  graphEvents?: boolean;
+}) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
   const local = await hostFixture(issue('execute'), true, null);
   const lifetime = new AbortController().signal;
@@ -58,8 +61,29 @@ async function observerFixture() {
   const native = await import(
     pathToFileURL(install.resolve('@deepseek-ai/dsh-client-modules')).href
   );
-  local.host.provide('loader', { entries: () => [] });
-  await local.host.plugin(native.ClientModuleRegistry);
+  let loader;
+  if (options?.loader) {
+    const fromBoot = createRequire(
+      install.resolve('@deepseek-ai/dsh-app-boot'),
+    );
+    const plugin = await import(
+      pathToFileURL(fromBoot.resolve('@deepseek-ai/cordis-plugin-loader')).href
+    );
+    await local.host.plugin(plugin.default);
+    loader = local.host.get('loader');
+  } else local.host.provide('loader', { entries: () => [] });
+  const callbacks = new Set<() => void>();
+  if (options?.graphEvents) {
+    local.host.provide('clientModules', {
+      graph: () => ({ rev: 'fixture-current-graph' }),
+      onGraphChanged(listener: () => void) {
+        callbacks.add(listener);
+        return () => {
+          callbacks.delete(listener);
+        };
+      },
+    });
+  } else await local.host.plugin(native.ClientModuleRegistry);
   const mount = (nonce: string, entered?: () => void) =>
     local.host.plugin({
       inject: ['allricePrincipal', 'connection', 'clientModules'],
@@ -79,6 +103,10 @@ async function observerFixture() {
     owner,
     artifacts,
     mount,
+    loader,
+    graphChanged() {
+      for (const callback of callbacks) callback();
+    },
     async open(scopeId = randomUUID()) {
       return control
         .acquire({ ...local.selected, scopeId }, lifetime)
@@ -91,6 +119,154 @@ async function observerFixture() {
     },
   };
 }
+
+it('keeps the first graph withdrawal terminal failure after its scope leaves the Host', async () => {
+  const f = await observerFixture({ graphEvents: true });
+  const writingClosed = deferred();
+  const finishWrite = deferred();
+  const broken = Error('old control downlink refused the terminal item');
+  try {
+    const previous = f.mount('graph-owner');
+    await previous;
+    const wire = f.local.host.typertGateway.wireStream;
+    const open = wire.open.bind(wire);
+    let first = true;
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await open(...args);
+      if (args[0] !== 'allricePrincipal/openScope' || !first) return source;
+      first = false;
+      return {
+        async *[Symbol.asyncIterator]() {
+          for await (const row of source) {
+            if (Reflect.get(row as object, 'type') === 'closed') {
+              writingClosed.resolve();
+              await finishWrite.promise;
+              throw broken;
+            }
+            yield row;
+          }
+        },
+      };
+    });
+    const scopeId = randomUUID();
+    const page = await f.open(scopeId);
+    const service = f.local.host.allricePrincipal;
+    const terminal = [...service['scopeControls']][0]!;
+    const rightFailure = terminal.catch((error: unknown) => error);
+    f.graphChanged();
+    await writingClosed.promise;
+    expect(page.revoked.aborted).toBe(true);
+    expect(service.scopes.has(scopeId)).toBe(false);
+    finishWrite.resolve();
+    const original = await rightFailure;
+    expect(original).toBeInstanceOf(Error);
+    expect(service['scopeControls'].size).toBe(0);
+    await expect(f.owner.unloadNativeWebOwner(previous)).rejects.toBe(original);
+    const successor = f.mount('cannot-overtake-failed-control');
+    await expect(successor.await()).rejects.toBe(original);
+    await expect(f.open()).rejects.toBeDefined();
+  } finally {
+    finishWrite.resolve();
+    await f.close();
+  }
+});
+
+it('retains the real staging removal failure even when disposal canceled publication', async () => {
+  const f = await observerFixture();
+  const staging = deferred<string>();
+  const release = deferred();
+  try {
+    authStage.afterWrite = async (filename) => {
+      if (!filename.startsWith(f.artifacts + '.')) return;
+      staging.resolve(filename);
+      await release.promise;
+    };
+    const owner = f.mount('staging-cleanup-failure');
+    const temporary = await staging.promise;
+    await rm(temporary);
+    await mkdir(temporary);
+    const stopped = f.owner.unloadNativeWebOwner(owner);
+    void stopped.catch(() => {});
+    await expect(f.open()).rejects.toBeDefined();
+    release.resolve();
+    const error = await stopped.catch((reason: unknown) => reason);
+    expect(error).toMatchObject({ code: 'ERR_FS_EISDIR', path: temporary });
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    const successor = f.mount('staged-owner-failure-successor');
+    await expect(successor.await()).rejects.toBe(error);
+    await expect(f.open()).rejects.toBeDefined();
+  } finally {
+    release.resolve();
+    authStage.afterWrite = undefined;
+    await f.close();
+  }
+});
+
+it('replaces a real Cordis loader entry updated during auth staging without publishing its old nonce', async () => {
+  const f = await observerFixture({ loader: true });
+  const neighbor = await hostFixture();
+  const signal = new AbortController().signal;
+  const control = createDEntryPrincipalControl(neighbor.node, {
+    carrier: signal,
+    cleanupTimeoutMs: 3000,
+  });
+  const staging = deferred();
+  const release = deferred();
+  const newArtifact = join(f.directory, 'replacement-auth.json');
+  try {
+    const other = await control.acquire(neighbor.selected, signal).run(signal);
+    const loader = f.loader!;
+    loader.builtins['observer-test-owner'] = {
+      inject: ['allricePrincipal', 'connection', 'clientModules'],
+      apply: f.owner.apply,
+    };
+    authStage.afterWrite = async (filename) => {
+      if (!filename.startsWith(f.artifacts + '.')) return;
+      staging.resolve();
+      await release.promise;
+    };
+    const baseUrl = 'http://127.0.0.1:18881/';
+    const id = await loader.create({
+      name: 'cordis:observer-test-owner',
+      config: { artifactPath: f.artifacts, nonce: 'old', baseUrl },
+    });
+    const entry = loader.resolve(id)!;
+    const exactFiber = entry.fiber!;
+    await staging.promise;
+    await entry.update({
+      config: { artifactPath: newArtifact, nonce: 'new', baseUrl },
+    });
+    expect(entry.fiber).toBe(exactFiber);
+    await expect(f.open()).rejects.toBeDefined();
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(other.revoked.aborted).toBe(false);
+    release.resolve();
+    await expect
+      .poll(async () => {
+        const value = await readFile(newArtifact, 'utf8').catch(
+          () => undefined,
+        );
+        return value === undefined ? undefined : JSON.parse(value).nonce;
+      })
+      .toBe('new');
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(entry.fiber).toBe(exactFiber);
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    expect(other.revoked.aborted).toBe(false);
+    await f.owner.unloadNativeWebOwner(exactFiber);
+  } finally {
+    release.resolve();
+    authStage.afterWrite = undefined;
+    await Promise.allSettled([f.close(), control.close()]);
+    await neighbor.close();
+  }
+});
 
 it('retirement waits for the real old control downlink and a disposed waiter cannot publish', async () => {
   const f = await observerFixture();
