@@ -41,6 +41,22 @@ import {
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
 
+function observeProfileRequest(
+  f: Awaited<ReturnType<typeof fixture>>,
+  url: URL,
+) {
+  const ready = deferred<ServerResponse>();
+  const observe = (request: IncomingMessage, response: ServerResponse) => {
+    if (request.method !== 'GET' || request.url !== url.pathname + url.search)
+      return;
+    f.worker.off('request', observe);
+    ready.resolve(response);
+  };
+  f.worker.prependListener('request', observe);
+  closes.push(async () => f.worker.off('request', observe));
+  return ready.promise;
+}
+
 // These loopback responses use either a fixed body length or Node's chunked
 // encoding. The TCP packets can split any of those framing boundaries.
 function observeProfileWire(source: Readable) {
@@ -411,11 +427,9 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
       joined.resolve();
       signal.throwIfAborted();
     };
-    const pendingResponse = deferred<ServerResponse>();
-    f.worker.once('request', (_request, response) =>
-      pendingResponse.resolve(response),
-    );
-    const client = get(f.profileUrl('bootstrap', page.scopeId), {
+    const url = f.profileUrl('bootstrap', page.scopeId);
+    const pendingResponse = observeProfileRequest(f, url);
+    const client = get(url, {
       headers: { authorization: 'Bearer ' + sessionToken },
     });
     client.on('error', () => {});
@@ -423,6 +437,7 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
     closes.push(async () => client.destroy());
     let shutdown: Promise<void> | undefined;
     let stopped = false;
+    const completion = f.profileCompletion(await pendingResponse);
     try {
       const actualCatalogSignal = await entered.promise;
       expect(actualCatalogSignal.aborted).toBe(false);
@@ -433,18 +448,16 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
         });
       await sawAbort.promise;
       expect(actualCatalogSignal.aborted).toBe(true);
-      const response = await pendingResponse.promise;
-      expect(f.completedProfiles.has(response)).toBe(false);
+      expect(completion.done).toBe(false);
       expect(stopped).toBe(false);
       expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
-      expect(f.completedProfiles.has(response)).toBe(false);
+      expect(completion.done).toBe(false);
     } finally {
       allowJoin.resolve();
     }
     await joined.promise;
     await shutdown;
-    const response = await pendingResponse.promise;
-    await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
+    await completion.promise;
     expect((await f.invoke(page.scopeId)).status).toBe(200);
     if (change === 'HTTP disconnect') {
       const retry = await f.publish('bootstrap', page.scopeId);
@@ -467,10 +480,14 @@ it.each([
     const f = await fixture(release);
     const page = await open(f);
     const neighbor = await open(f);
-    const terminal = deferred<ServerResponse>();
     const checking = deferred();
     const allowCheck = deferred();
     const finishReader = deferred();
+    const nextFrame = deferred<'item' | 'terminal'>();
+    f.profileObserved.mockImplementation((part) => {
+      if (part === 'terminal' || f.profileObserved.mock.calls.length > 1)
+        nextFrame.resolve(part);
+    });
     closes.push(async () => allowCheck.resolve());
     closes.push(async () => finishReader.resolve());
     const wire = f.host.host.typertGateway.wireStream;
@@ -508,18 +525,19 @@ it.each([
         },
       };
     });
-    f.worker.once('request', (_request, response) =>
-      terminal.resolve(response),
+    const terminal = observeProfileRequest(
+      f,
+      f.profileUrl('bootstrap', page.scopeId),
     );
     const result = f.publish('bootstrap', page.scopeId);
     void result.catch(() => {});
+    const response = await terminal;
+    const completion = f.profileCompletion(response);
     try {
       await checking.promise;
       if (mode === 'true terminal' || mode === 'native terminal error') {
         finishReader.resolve();
-        await expect
-          .poll(() => f.profileObserved.mock.calls)
-          .toContainEqual(['terminal']);
+        expect(await nextFrame.promise).toBe('terminal');
       } else {
         const nativeChild = summary('child', 'root');
         f.host.catalog.items = f.host.catalog.items.filter(
@@ -527,12 +545,10 @@ it.each([
         );
         if (mode === 'native update') {
           f.host.host.emit('api-session/removed', nativeChild.sessionId);
-          await expect
-            .poll(() => f.profileObserved.mock.calls.length)
-            .toBeGreaterThan(1);
+          expect(await nextFrame.promise).toBe('item');
         } else expect(f.profileObserved.mock.calls).toEqual([['item']]);
       }
-      expect((await terminal.promise).headersSent).toBe(false);
+      expect(response.headersSent).toBe(false);
       expect(access).toBe(2);
     } finally {
       allowCheck.resolve();
@@ -542,8 +558,7 @@ it.each([
     expect(refused.status).toBe(404);
     expect(await refused.text()).not.toContain('"id":"child"');
     if (mode === 'native terminal error') {
-      const response = await terminal.promise;
-      await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
+      await completion.promise;
       expect((await f.invoke(page.scopeId)).status).toBe(404);
       expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
       await f.checkUnknownControlClose();
@@ -563,49 +578,135 @@ it.each(['waiting to read', 'waiting for a newer projection'] as const)(
   async (mode) => {
     const f = await fixture(await buildProfileFixture());
     const page = await open(f);
-    const reading = deferred<AbortSignal>();
+    const scope = f.host.host.allricePrincipal.scopes.get(page.scopeId);
+    if (!scope) throw Error('Guest scope missing');
+    const waitingToRead = mode === 'waiting to read';
+    const unrelatedRead = deferred<AbortSignal>();
+    const firstChildRead = deferred<AbortSignal>();
     const finish = deferred();
+    const finishFirstChild = deferred();
     closes.push(async () => finish.resolve());
-    let calls = 0;
+    closes.push(async () => finishFirstChild.resolve());
+    const reads: AbortSignal[] = [];
+    let unrelatedReadDone = false;
     f.host.catalog.beforeList = async (signal) => {
-      const call = ++calls;
-      if (mode === 'waiting for a newer projection' && call === 1) {
-        // Fence this follower with a newer page-owned refresh while its own
-        // read is still the only one in progress.
-        f.host.host.emit('api-session/added', summary('child', 'root'));
+      reads.push(signal);
+      if (waitingToRead ? reads.length === 1 : signal === scope.abort.signal) {
+        unrelatedRead.resolve(signal);
+        await finish.promise;
+        unrelatedReadDone = true;
+      } else if (!waitingToRead && reads.length === 1) {
+        firstChildRead.resolve(signal);
+        await finishFirstChild.promise;
       }
-      if (call !== (mode === 'waiting to read' ? 1 : 2)) return;
-      reading.resolve(signal);
-      await finish.promise;
     };
-    const predecessor =
-      mode === 'waiting to read' ? f.invoke(page.scopeId) : undefined;
+    const predecessor = waitingToRead ? f.invoke(page.scopeId) : undefined;
     void predecessor?.catch(() => {});
-    if (predecessor) await reading.promise;
-    const responseReady = deferred<ServerResponse>();
-    f.worker.once('request', (_request, response) =>
-      responseReady.resolve(response),
-    );
-    const client = get(f.profileUrl('bootstrap', page.scopeId), {
+    if (predecessor) await unrelatedRead.promise;
+
+    // A list call held by another owner does not establish this HTTP child's
+    // arrival. Observe the exact guest scope after it registers its refresh.
+    const childRefresh = deferred<{
+      signal: AbortSignal;
+      work: Promise<void>;
+    }>();
+    const refresh = scope.refresh.bind(scope);
+    vi.spyOn(scope, 'refresh').mockImplementation((signal) => {
+      const work = refresh(signal);
+      if (signal && signal !== scope.abort.signal)
+        childRefresh.resolve({ signal, work });
+      return work;
+    });
+    const url = f.profileUrl('bootstrap', page.scopeId);
+    const responseReady = observeProfileRequest(f, url);
+    const client = get(url, {
       headers: { authorization: 'Bearer ' + sessionToken },
     });
     client.on('error', () => {});
     closes.push(async () => client.destroy());
+    let projection: Promise<void> | undefined;
     try {
-      const nativeSignal = await reading.promise;
-      const scope = f.host.host.allricePrincipal.scopes.get(page.scopeId);
-      await expect.poll(() => scope?.children.size).toBe(1);
-      const callsBeforeCancel = calls;
+      const response = await responseReady;
+      const completion = f.profileCompletion(response);
+      const endedEarly = completion.promise.then(() => {
+        throw Error('Profile finished before reaching its owned read phase');
+      });
+      const finite = await Promise.race([childRefresh.promise, endedEarly]);
+      expect(scope.children.size).toBe(1);
+      const guestChild = [...scope.children][0]!;
+      let blocked: Promise<unknown> = finite.work;
+      if (waitingToRead) {
+        expect(scope['catalogQueue'].size).toBe(1);
+        expect(reads).toEqual([await unrelatedRead.promise]);
+      } else {
+        expect(await Promise.race([firstChildRead.promise, endedEarly])).toBe(
+          finite.signal,
+        );
+        f.host.host.emit('api-session/added', summary('child', 'root'));
+        expect(scope['catalogQueue'].size).toBe(1);
+        const newer = (projection = scope['refreshQueue']);
+        expect(newer).not.toBe(finite.work);
+
+        // Observe registration on the exact pending projection from current(),
+        // after refresh itself and the native hint have installed their joins.
+        const waiting = deferred();
+        const entered = deferred<{ work: Promise<unknown> }>();
+        const current = scope.current.bind(scope);
+        vi.spyOn(scope, 'current').mockImplementationOnce(
+          (dispatch, signal) => {
+            expect(signal).toBe(finite.signal);
+            const subscribe = newer.then.bind(newer);
+            const observer = vi
+              .spyOn(newer, 'then')
+              .mockImplementationOnce((...callbacks) => {
+                const continuation = subscribe(...callbacks);
+                waiting.resolve();
+                return continuation;
+              });
+            closes.push(async () => observer.mockRestore());
+            const work = current(dispatch, signal);
+            entered.resolve({ work });
+            return work;
+          },
+        );
+        finishFirstChild.resolve();
+        const [enteredCurrent, nativeSignal] = await Promise.race([
+          Promise.all([
+            entered.promise,
+            unrelatedRead.promise,
+            waiting.promise,
+          ]),
+          endedEarly,
+        ]);
+        blocked = enteredCurrent.work;
+        expect(nativeSignal).toBe(scope.abort.signal);
+        expect(reads).toEqual([finite.signal, nativeSignal]);
+      }
+      expect(scope.children.has(guestChild)).toBe(true);
+      const heldSignal = await unrelatedRead.promise;
+      expect(heldSignal).not.toBe(finite.signal);
+      expect(finite.signal.aborted).toBe(false);
+      expect(completion.done).toBe(false);
+      expect(response.headersSent).toBe(false);
+      const callsBeforeCancel = reads.length;
+      const cancelled = once(finite.signal, 'abort');
       client.destroy();
-      const response = await responseReady.promise;
-      await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
-      expect(nativeSignal.aborted).toBe(false);
-      expect(calls).toBe(callsBeforeCancel);
-      expect(scope?.children.size).toBe(0);
+      await cancelled;
+      await expect(blocked).rejects.toBe(finite.signal.reason);
+      await completion.promise;
+      expect(response.headersSent).toBe(false);
+      expect(heldSignal.aborted).toBe(false);
+      expect(unrelatedReadDone).toBe(false);
+      expect(reads).toHaveLength(callsBeforeCancel);
+      expect(scope.children.size).toBe(0);
+      expect(scope['catalogQueue'].size).toBe(0);
     } finally {
+      finishFirstChild.resolve();
       finish.resolve();
     }
     if (predecessor) expect((await predecessor).status).toBe(200);
+    await projection;
+    expect(unrelatedReadDone).toBe(true);
     const retry = await f.publish('bootstrap', page.scopeId);
     expect(retry.status).toBe(200);
     await retry.arrayBuffer();
@@ -687,8 +788,22 @@ it(
     };
     const f = await fixture(release);
     const page = await open(f);
-    const pendingPublications = vi.spyOn(PendingPublication.prototype, 'wait');
+    const bothSubscribed = deferred();
+    const wait = PendingPublication.prototype.wait;
+    let subscriptions = 0;
+    const pendingPublications = vi
+      .spyOn(PendingPublication.prototype, 'wait')
+      .mockImplementation(function (this: PendingPublication, signal) {
+        const result = wait.call(this, signal);
+        if (++subscriptions === 2) bothSubscribed.resolve();
+        return result;
+      });
+    closes.push(async () => pendingPublications.mockRestore());
     const cancel = new AbortController();
+    const firstWire = observeProfileRequest(
+      f,
+      f.profileUrl('bootstrap', page.scopeId),
+    );
     const first = f.publish(
       'bootstrap',
       page.scopeId,
@@ -697,14 +812,16 @@ it(
       cancel.signal,
     );
     void first.catch(() => {});
+    const firstDone = f.profileCompletion(await firstWire);
     const sharedSignal = await shared.promise;
     const other = f.publish('bootstrap', page.scopeId, {}, 'document');
     void other.catch(() => {});
     try {
-      await expect.poll(() => f.profileBorrows.mock.calls.length).toBe(2);
+      await bothSubscribed.promise;
+      expect(f.profileBorrows.mock.calls).toHaveLength(2);
       const [one, two] = f.profileBorrows.mock.calls.map(([signal]) => signal);
-      await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(1);
-      await expect.poll(() => getEventListeners(two!, 'abort').length).toBe(1);
+      expect(getEventListeners(one!, 'abort')).toHaveLength(1);
+      expect(getEventListeners(two!, 'abort')).toHaveLength(1);
       const proof = pendingPublications.mock.contexts[0] as PendingPublication;
       expect(pendingPublications.mock.contexts).toEqual([proof, proof]);
       const [firstWaiter, secondWaiter] = [...proof['waiters']];
@@ -712,14 +829,14 @@ it(
       expect(secondWaiter).toBeTypeOf('function');
       cancel.abort(Error('the first wire left'));
       await expect(first).rejects.toThrow('the first wire left');
-      await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(0);
+      await firstDone.promise;
+      expect(getEventListeners(one!, 'abort')).toHaveLength(0);
       expect(getEventListeners(two!, 'abort')).toHaveLength(1);
       expect([...proof['waiters']]).toEqual([secondWaiter]);
       expect(sharedSignal.aborted).toBe(false);
       expect(reads).toBe(1);
     } finally {
       finish.resolve();
-      pendingPublications.mockRestore();
     }
     const result = await other;
     expect(result.status).toBe(200);
@@ -963,10 +1080,11 @@ it(
     expect(assignedAsset!.socket).not.toBeNull();
     expect(assignedAsset!.headersSent).toBe(false);
     const rejected = beforeHeaders.receive();
+    expect(beforeHeaders.revoked.aborted).toBe(false);
+    const revokedBeforeHeaders = once(beforeHeaders.revoked, 'abort');
     closePage(beforeHeaders.peer);
-    await expect
-      .poll(async () => (await f.invoke(beforeHeaders.scopeId)).status)
-      .toBe(404);
+    await revokedBeforeHeaders;
+    expect((await f.invoke(beforeHeaders.scopeId)).status).toBe(404);
     expect(assignedAsset!.headersSent).toBe(false);
     expect(assignedNext!.headersSent).toBe(false);
     finishCheck.resolve();
@@ -994,10 +1112,11 @@ it(
     const [readHead, preReadAsset, preReadNext] = preRead.responses;
     await readingGraph.promise;
     expect(preReadAsset!.listenerCount('socket')).toBe(0);
+    expect(reading.revoked.aborted).toBe(false);
+    const revokedDuringRead = once(reading.revoked, 'abort');
     closePage(reading.peer);
-    await expect
-      .poll(async () => (await f.invoke(reading.scopeId)).status)
-      .toBe(404);
+    await revokedDuringRead;
+    expect((await f.invoke(reading.scopeId)).status).toBe(404);
     finishRead.resolve();
     expect(await reading.receive()).toMatchObject({
       value: { type: 'closed' },
@@ -1034,10 +1153,11 @@ it(
     });
     const [earlyHead, earlyAsset] = early.responses;
     expect(earlyAsset!.listenerCount('socket')).toBe(0);
+    expect(borrowing.revoked.aborted).toBe(false);
+    const revokedDuringBorrow = once(borrowing.revoked, 'abort');
     closePage(borrowing.peer);
-    await expect
-      .poll(async () => (await f.invoke(borrowing.scopeId)).status)
-      .toBe(404);
+    await revokedDuringBorrow;
+    expect((await f.invoke(borrowing.scopeId)).status).toBe(404);
     finishHistory.resolve();
     expect(await borrowing.receive()).toMatchObject({
       value: { type: 'closed' },
@@ -1076,10 +1196,9 @@ it(
     });
     const disconnectedAsset = disconnected.responses[1]!;
     expect(disconnectedAsset.socket).toBeNull();
+    const disconnectedDone = f.profileCompletion(disconnectedAsset);
     await disconnected.disconnect();
-    await expect
-      .poll(() => f.completedProfiles.has(disconnectedAsset))
-      .toBe(true);
+    await disconnectedDone.promise;
     await cancelledAsset.promise;
     expect((await f.invoke(warm.scopeId)).status).toBe(200);
     expect((await f.invoke(foreground.scopeId)).status).toBe(200);
@@ -1119,7 +1238,7 @@ it(
       .receive()
       .then((frame) => (terminal = frame));
     closePage(foreground.peer);
-    await expect.poll(() => held.fenced()).toBe(true);
+    await held.fenced;
     expect((await f.invoke(foreground.scopeId)).status).toBe(404);
     expect((await f.invoke(scopeId)).status).toBe(200);
     expect(terminal).toBeUndefined();
@@ -1146,7 +1265,7 @@ it(
     const stopping = f.closeProfile().then(() => {
       joined = true;
     });
-    await expect.poll(() => heldErrors.fenced()).toBe(true);
+    await heldErrors.fenced;
     expect(joined).toBe(false);
     heldErrors.release.resolve();
     await heldErrors.closed;
@@ -1161,15 +1280,14 @@ it(
     );
     const [unrelatedHead, unrelatedDenial] = unrelated.responses;
     const unrelatedFinish = once(unrelatedDenial!, 'finish');
+    const unrelatedDone = wireOnly.profileCompletion(unrelatedDenial!);
     expect(unrelatedDenial!.socket).toBeNull();
     expect(unrelatedDenial!.headersSent).toBe(false);
     let wireJoined = false;
     const stoppingWire = wireOnly.closeProfile().then(() => {
       wireJoined = true;
     });
-    await expect
-      .poll(() => wireOnly.completedProfiles.has(unrelatedDenial!))
-      .toBe(true);
+    await unrelatedDone.promise;
     expect(unrelatedDenial!.statusCode).toBe(404);
     expect(unrelatedDenial!.writableFinished).toBe(false);
     expect(unrelatedHead!.writableEnded).toBe(false);
@@ -1200,9 +1318,9 @@ it(
     const shared = await fixture(sharedProof);
     const sharedPage = await open(shared);
     const caller = new AbortController();
-    const firstResponseOnWire = deferred<ServerResponse>();
-    shared.worker.once('request', (_request, response) =>
-      firstResponseOnWire.resolve(response),
+    const firstResponseOnWire = observeProfileRequest(
+      shared,
+      shared.profileUrl('bootstrap', sharedPage.scopeId),
     );
     const canceledRequest = shared.publish(
       'bootstrap',
@@ -1211,7 +1329,7 @@ it(
       'document',
       caller.signal,
     );
-    const firstWire = await firstResponseOnWire.promise;
+    const firstHandler = shared.profileCompletion(await firstResponseOnWire);
     const sharedSignal = await firstProof.promise;
     const secondBorrow = deferred();
     vi.mocked(shared.owner.assertCurrent).mockImplementationOnce(async () => {
@@ -1227,7 +1345,7 @@ it(
     await new Promise<void>((resolve) => setImmediate(resolve));
     caller.abort();
     await expect(canceledRequest).rejects.toMatchObject({ name: 'AbortError' });
-    await expect.poll(() => shared.completedProfiles.has(firstWire)).toBe(true);
+    await firstHandler.promise;
     expect(sharedSignal.aborted).toBe(false);
     finishFirstProof.resolve();
     const responseWithSharedProof = await secondRequest;
@@ -1451,10 +1569,10 @@ it(
     function holdSocket(response: ServerResponse) {
       const socket = response.socket!;
       const close = socket.destroy.bind(socket);
-      let entered = false;
+      const fenced = deferred();
       const release = deferred();
       const hold = vi.spyOn(socket, 'destroy').mockImplementation((error) => {
-        entered = true;
+        fenced.resolve();
         void release.promise.then(() => close(error));
         return socket;
       });
@@ -1462,7 +1580,7 @@ it(
         hold.mockRestore();
         release.resolve();
       });
-      return { fenced: () => entered, release, closed: once(socket, 'close') };
+      return { fenced: fenced.promise, release, closed: once(socket, 'close') };
     }
   },
 );

@@ -10,6 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, expect, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import {
+  deferred,
   hostFixture,
   issue,
   summary,
@@ -194,7 +195,26 @@ export async function fixture(release?: ProfileProof) {
     historyIdentity,
     historyRoot: selectedRoot,
   });
-  const mux = createDEntryPageMux(pages, service.signal);
+  const pageSignals = new Map<string, AbortSignal>();
+  const mux = createDEntryPageMux(
+    {
+      ...pages,
+      own(token, selection, active, stop, opened, revoked) {
+        return pages.own(
+          token,
+          selection,
+          active,
+          stop,
+          (page) => {
+            pageSignals.set(page.scope.opened.scopeId, page.signal);
+            return opened(page);
+          },
+          revoked,
+        );
+      },
+    },
+    service.signal,
+  );
   const rpc = createDEntryPageRpc(pages, authenticate, service.signal);
   const profileBorrows = vi.fn<(active: AbortSignal) => void>();
   const profileFailures = vi.fn<(error: unknown) => void>();
@@ -223,7 +243,18 @@ export async function fixture(release?: ProfileProof) {
     service.signal,
     release?.directory,
   );
-  const completedProfiles = new WeakSet<ServerResponse>();
+  const profileCompletions = new WeakMap<
+    ServerResponse,
+    { done: boolean; promise: Promise<void>; resolve(): void }
+  >();
+  function profileCompletion(response: ServerResponse) {
+    let completion = profileCompletions.get(response);
+    if (!completion) {
+      completion = { ...deferred(), done: false };
+      profileCompletions.set(response, completion);
+    }
+    return completion;
+  }
   const worker = createServer(async (request, response) => {
     if (request.url === '/fixture-before-profile') {
       response.writeHead(200, { 'content-type': 'text/plain' });
@@ -231,7 +262,9 @@ export async function fixture(release?: ProfileProof) {
       return;
     }
     if (await profile.handle(request, response)) {
-      completedProfiles.add(response);
+      const completion = profileCompletion(response);
+      completion.done = true;
+      completion.resolve();
       return;
     }
     if (!(await rpc.handle(request, response))) response.writeHead(404).end();
@@ -374,7 +407,8 @@ export async function fixture(release?: ProfileProof) {
     profileSource,
     profileUrl,
     historyIdentity,
-    completedProfiles,
+    pageSignals,
+    profileCompletion,
     closeProfile: profile.close,
     async checkUnknownControlClose() {
       controlCloseChecked = true;
@@ -427,10 +461,14 @@ export async function open(f: Awaited<ReturnType<typeof fixture>>) {
     'scopeReference',
     'type',
   ]);
+  const scopeId = frame.value.scopeReference.scopeId as string;
+  const revoked = f.pageSignals.get(scopeId);
+  if (!revoked) throw Error('Worker page lifetime missing');
   return {
     peer,
     receive,
-    scopeId: frame.value.scopeReference.scopeId as string,
+    scopeId,
+    revoked,
   };
 }
 export async function status(peer: WebSocket) {
