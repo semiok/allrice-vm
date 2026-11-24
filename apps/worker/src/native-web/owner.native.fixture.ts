@@ -159,21 +159,33 @@ export async function setupNativeWebFixture(
   );
   const tracer = join(root, 'trace-profile-patch.mjs');
   if (isolateProfile) {
-    const { loadProfileDirectory } = await import(
-      pathToFileURL(createRequire(cliPath).resolve('@deepseek-ai/dsh-app-boot'))
-        .href
-    );
+    const appBoot = pathToFileURL(
+      createRequire(cliPath).resolve('@deepseek-ai/dsh-app-boot'),
+    ).href;
     const anchor = resolve(dirname(cliPath), '../package.json');
     const removed = profilePatch + '.test-hidden';
     await rename(profilePatch, removed);
     try {
-      const without = loadProfileDirectory('dsh', profileDirectory, anchor);
-      expect(
-        without.layers.find(
-          (layer: { packageName: string }) =>
-            layer.packageName === '@allrice/dsh-web-composition',
-        ),
-      ).toMatchObject({ patchPaths: [], patches: [] });
+      const probe = await runCommand({
+        executable: process.execPath,
+        args: [
+          '--input-type=module',
+          '-e',
+          `import { loadProfileDirectory } from ${JSON.stringify(appBoot)};
+           const layer = loadProfileDirectory('dsh', ...process.argv.slice(1))
+             .layers.find(({ packageName }) => packageName === '@allrice/dsh-web-composition');
+           process.stdout.write(JSON.stringify(layer?.patchPaths ?? []));`,
+          profileDirectory,
+          anchor,
+        ],
+        env: {
+          PATH: dirname(process.execPath),
+          HOME: root,
+          ...launch.command.env,
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      expect(JSON.parse(probe)).toEqual([]);
     } finally {
       await rename(removed, profilePatch);
     }

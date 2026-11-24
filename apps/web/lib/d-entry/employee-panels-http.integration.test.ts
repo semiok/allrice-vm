@@ -1976,9 +1976,13 @@ suite(
         storage: () => runtimeFixtureStorage(f.db),
       };
       let used = false;
+      let revoking: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
       handlers = createEmployeePanelsHandlers({
         ...defaults,
         async authorize(context, selection, tx) {
+          // Let the writer that waited on this transaction commit before the
+          // final unlocked reply check, independently of pool scheduling.
+          if (!tx && used) await revoking;
           const current = await defaults.authorize(context, selection, tx);
           if (tx && !used) {
             used = true;
@@ -2002,7 +2006,6 @@ suite(
         );
       const writing = favorite(true);
       void writing.catch(() => {});
-      let revoking: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
       try {
         const writer = await held;
         revoking = updateDEntryReleasePolicy(p.context, {
@@ -2022,13 +2025,11 @@ suite(
           .toBe(1);
       } finally {
         finish();
-        try {
-          await Promise.all([writing, revoking]);
-        } finally {
-          handlers = createEmployeePanelsHandlers(defaults);
-        }
+        await Promise.allSettled([writing, revoking]);
+        handlers = createEmployeePanelsHandlers(defaults);
       }
-      expect(await writing).toMatchObject({ favorite: true });
+      await revoking;
+      await expect(writing).rejects.toMatchObject({ status: 403 });
       await expect(favorite(false)).rejects.toMatchObject({ status: 403 });
       expect(
         await f.db`select object_id from allrice_workbench_file_favorites where object_id=${uploaded.objectId}`,

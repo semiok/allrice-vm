@@ -240,13 +240,9 @@ export function createDEntryProfile(
         try {
           if (verify) await verify();
         } catch (error) {
-          if (socket.closed || response.closed) {
-            closed();
-            return false;
-          }
-          if (active.aborted && !response.headersSent) return refuse();
-          // The writer still owns no response. Its page callback will deliver
-          // the classified error under this same borrowed lifetime.
+          // Keep the original verification failure with the caller even if
+          // verification fenced its page. The borrowed error path will either
+          // deliver an empty denial or find that the caller has disconnected.
           closed();
           throw error;
         }

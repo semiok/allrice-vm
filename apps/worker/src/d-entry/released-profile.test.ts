@@ -443,6 +443,10 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
     '@allrice/dsh-web-composition',
     '@allrice/independent-profile-module',
     '@allrice/dependent-profile-module',
+    ...Array.from(
+      { length: 22 },
+      (_, index) => '@allrice/probe-' + index + '-' + 'q'.repeat(233),
+    ),
   ];
   type Registry = {
     graph(): ReturnType<typeof DEntryProfileGraphSchema.parse>;
@@ -451,7 +455,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
     rebuilt(id: string): string | undefined;
   };
   const contexts: Context[] = [];
-  async function installed(name: string, mtime: number, reverse = false) {
+  async function installed(name: string, mtime: number, reorder = false) {
     const directory = join(root, name);
     const entries = await Promise.all(
       names.map(async (name, index) => {
@@ -491,7 +495,17 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
     const context = new Context();
     contexts.push(context);
     context.provide('loader', {
-      entries: () => (reverse ? [...entries].reverse() : entries),
+      entries: () =>
+        reorder
+          ? [
+              entries[0],
+              entries[2],
+              ...entries.slice(4, 16),
+              entries[1],
+              entries[3],
+              ...entries.slice(16),
+            ]
+          : entries,
     } as unknown as Context['loader']);
     await context.plugin(api.ClientModuleRegistry);
     const registry = context.get('clientModules') as Registry;
@@ -524,6 +538,8 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       graph.entries.map(({ id }) => id),
     );
     expect(native.batches[1]!.entries).not.toEqual(graph.batches[1]!.entries);
+    expect(native.batches).toHaveLength(3);
+    expect(graph.batches).toHaveLength(4);
     const directory = join(root, 'sealed');
     const files: Array<{ path: string; bytes: number; sha256: string }> = [];
     async function seal(path: string, data: Buffer) {

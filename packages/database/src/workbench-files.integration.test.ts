@@ -572,19 +572,9 @@ suite(
       30000,
     );
     it('serializes favorites with the real soft delete on the original personal object', async () => {
-      const { context } = await runtimeTaskFixture(fixture.db);
+      const { a: context } = await setup();
       const makeFile = () =>
-        uploadWorkbenchFile(
-          context,
-          {
-            workspaceId: context.workspaceId!,
-            requestId: randomUUID(),
-            fileName: 'favorite.txt',
-            mediaType: 'text/plain',
-            contentBase64: Buffer.from('favorite source').toString('base64'),
-          },
-          runtimeFixtureStorage(fixture.db),
-        );
+        uploadWorkbenchFile(context, uploadInput(context), storage());
       const first = await makeFile();
       const deletedFirst = await makeFile();
       await completeStorageDelete(context, deletedFirst.objectId);
@@ -643,7 +633,10 @@ suite(
         await fixture.db`drop function fixture_hold_favorite()`;
       }
       expect(await favorite).toMatchObject({ favorite: true });
-      expect(await deleting).toMatchObject({ id: first.objectId });
+      await deleting;
+      expect(
+        await fixture.db`select state,(deleted_at is not null) deleted from allrice_storage_objects where id=${first.objectId}`,
+      ).toEqual([{ state: 'deleted', deleted: true }]);
       await expect(
         setWorkbenchFileFavorite(context, first.objectId, { favorite: false }),
       ).rejects.toThrow('not_found');

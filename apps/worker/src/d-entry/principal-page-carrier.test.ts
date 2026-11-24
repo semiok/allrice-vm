@@ -480,11 +480,11 @@ it.each(['with baseline', 'with independent baseline failure'] as const)(
     expect((await f.invoke(page.scopeId)).status).toBe(404);
     expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
     expect(access).toBe(1);
+    await f.checkUnknownControlClose();
     if (mode === 'with independent baseline failure')
       expect(f.profileFailures.mock.calls[0]?.[0]).toMatchObject({
         message: businessError.message,
       });
-    await f.checkUnknownControlClose();
   },
 );
 
