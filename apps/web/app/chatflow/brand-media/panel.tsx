@@ -42,6 +42,18 @@ type Tab = 'calendar' | 'topics' | 'articles';
 type ReadProjection = Tab | 'runs';
 const relatedArticle = ({ invocation: { intent } }: BrandMediaRun) =>
   intent.operation === 'candidates' ? undefined : intent.articleId;
+type BodyPin = NonNullable<BrandMediaArticle['body']>;
+const articleBodyKey = (id: string, body: BodyPin) =>
+  [id, body.objectId, body.versionId, body.checksum].join('/');
+function filterDeliveries(
+  row: BrandMediaRun,
+  keep: (file: BodyPin) => boolean,
+) {
+  const deliveries = row.deliveries.filter(({ file }) => keep(file));
+  return deliveries.length === row.deliveries.length
+    ? row
+    : { ...row, deliveries };
+}
 type References = BrandMediaTopic['references'];
 type Cursor = { createdAt: string; id: string };
 const stateNames = { draft: '草稿', scheduled: '已排期', published: '已发布' };
@@ -277,10 +289,21 @@ function BrandMediaPanelContent({
   const articleDenials = useRef({
     version: 0,
     byId: new Map<string, number>(),
+    byBody: new Map<string, number>(),
   });
   const articleAllowedSince = useCallback(
-    (id: string | undefined, version: number) =>
-      !id || (articleDenials.current.byId.get(id) ?? 0) <= version,
+    (
+      id: string | undefined,
+      version: number,
+      body?: BrandMediaArticle['body'],
+    ) => {
+      if (!id) return true;
+      const { byId, byBody } = articleDenials.current;
+      return (
+        (byId.get(id) ?? 0) <= version &&
+        (!body || (byBody.get(articleBodyKey(id, body)) ?? 0) <= version)
+      );
+    },
     [],
   );
   const acceptDetail = useCallback((article: BrandMediaArticle) => {
@@ -314,37 +337,54 @@ function BrandMediaPanelContent({
     },
     [],
   );
-  const discardArticle = useCallback((id: string, cause: Error) => {
-    const denials = articleDenials.current;
-    denials.byId.set(id, ++denials.version);
-    setError(cause.message);
-    setArticles((old) => old?.filter((item) => item.id !== id) ?? null);
-    setCalendar((old) => old.filter((item) => item.id !== id));
-    setRuns((old) => old.filter((row) => relatedArticle(row) !== id));
-    setForm((old) =>
-      old?.kind === 'article' && old.article.id === id ? null : old,
-    );
-    setPublication((old) => (old?.article.id === id ? null : old));
-    setReferenceArticle((old) => (old?.id === id ? null : old));
-    setDetail((old) => (old?.id === id ? null : old));
-    setBody((old) => (old?.articleId === id ? null : old));
-    if (selectedIdRef.current === id) {
-      selectedIdRef.current = null;
-      setSelectedId(null);
-    }
-  }, []);
+  const discardArticle = useCallback(
+    (id: string, cause: Error, body?: BodyPin) => {
+      const denials = articleDenials.current;
+      const key = body && articleBodyKey(id, body);
+      const version = ++denials.version;
+      if (key) denials.byBody.set(key, version);
+      else denials.byId.set(id, version);
+      const matches = (row: BrandMediaArticle) =>
+        row.id === id &&
+        (!key || (!!row.body && articleBodyKey(id, row.body) === key));
+      setError(cause.message);
+      setArticles((old) => old?.filter((item) => !matches(item)) ?? null);
+      setCalendar((old) => old.filter((item) => !matches(item)));
+      setRuns((old) =>
+        key
+          ? old.map((row) =>
+              relatedArticle(row) === id
+                ? filterDeliveries(
+                    row,
+                    (file) => articleBodyKey(id, file) !== key,
+                  )
+                : row,
+            )
+          : old.filter((row) => relatedArticle(row) !== id),
+      );
+      setForm((old) =>
+        old?.kind === 'article' && matches(old.article) ? null : old,
+      );
+      setPublication((old) => (old && matches(old.article) ? null : old));
+      setReferenceArticle((old) => (old && matches(old) ? null : old));
+      setDetail((old) => (old && matches(old) ? null : old));
+      setBody((old) =>
+        old?.articleId === id && (!key || old.key === key) ? null : old,
+      );
+      if (!key && selectedIdRef.current === id) {
+        selectedIdRef.current = null;
+        setSelectedId(null);
+      }
+    },
+    [],
+  );
   const listed = articles?.find((article) => article.id === selectedId);
   const selected =
     detail?.id === selectedId && (!listed || detail.revision >= listed.revision)
       ? detail
       : listed;
   const bodyKey = selected?.body
-    ? [
-        selected.id,
-        selected.body.objectId,
-        selected.body.versionId,
-        selected.body.checksum,
-      ].join('/')
+    ? articleBodyKey(selected.id, selected.body)
     : '';
   const copyKey = JSON.stringify([
     client.scope,
@@ -397,7 +437,8 @@ function BrandMediaPanelContent({
       if (
         current() &&
         result?.view === 'article' &&
-        result.article.id === articleId
+        result.article.id === articleId &&
+        articleAllowedSince(articleId, observed, result.article.body)
       )
         acceptDetail(result.article);
     },
@@ -408,8 +449,10 @@ function BrandMediaPanelContent({
     detailGeneration.current++;
     const observed = { ...readEpoch.current };
     const observedArticle = articleDenials.current.version;
-    const allowed = (id: string | undefined) =>
-      articleAllowedSince(id, observedArticle);
+    const allowed = (
+      id: string | undefined,
+      body?: BrandMediaArticle['body'],
+    ) => articleAllowedSince(id, observedArticle, body);
     const latest = () => version === generation.current;
     const current = (projection: ReadProjection) =>
       latest() && observed[projection] === readEpoch.current[projection];
@@ -447,7 +490,7 @@ function BrandMediaPanelContent({
         articlePage.value.view === 'articles'
       ) {
         const page = articlePage.value;
-        const items = page.items.filter((item) => allowed(item.id));
+        const items = page.items.filter((item) => allowed(item.id, item.body));
         setArticles(items);
         setArticleCursor(page.nextCursor);
         setSelectedId((old) => old ?? items[0]?.id ?? null);
@@ -457,10 +500,18 @@ function BrandMediaPanelContent({
         schedule.status === 'fulfilled' &&
         schedule.value.view === 'calendar'
       )
-        setCalendar(schedule.value.items.filter((item) => allowed(item.id)));
+        setCalendar(
+          schedule.value.items.filter((item) => allowed(item.id, item.body)),
+        );
       if (current('runs') && recovery.status === 'fulfilled')
         setRuns(
-          recovery.value.runs.filter((row) => allowed(relatedArticle(row))),
+          recovery.value.runs
+            .filter((row) => allowed(relatedArticle(row)))
+            .map((row) =>
+              filterDeliveries(row, (file) =>
+                allowed(relatedArticle(row), file),
+              ),
+            ),
         );
       const failed = [topicPage, articlePage, schedule, recovery].find(
         (value) => value.status === 'rejected',
@@ -506,13 +557,15 @@ function BrandMediaPanelContent({
     const controller = new AbortController();
     const version = articleDenials.current.version;
     const articleId = selected?.id;
+    const pin = selected?.body;
     const current = () =>
-      !controller.signal.aborted && articleAllowedSince(articleId, version);
+      !controller.signal.aborted &&
+      articleAllowedSince(articleId, version, pin);
     setBody(null);
-    if (articleId && selected?.body) {
+    if (articleId && pin) {
       void client
-        .body(selected.body, controller.signal, (cause) =>
-          discardArticle(articleId, cause),
+        .body(pin, controller.signal, (cause) =>
+          discardArticle(articleId, cause, pin),
         )
         .then((value) => {
           if (current()) setBody({ articleId, key: bodyKey, text: value });
@@ -562,7 +615,13 @@ function BrandMediaPanelContent({
     try {
       const result = await client.command(request.input);
       if (result.kind === 'article') {
-        if (!articleAllowedSince(result.article.id, observedArticle))
+        if (
+          !articleAllowedSince(
+            result.article.id,
+            observedArticle,
+            result.article.body,
+          )
+        )
           throw Error('文章访问状态已变化，请刷新后继续。');
         if (selectedIdRef.current === result.article.id)
           acceptDetail(result.article);
@@ -679,10 +738,10 @@ function BrandMediaPanelContent({
       copyLifetime.current === owner &&
       owner.alive &&
       owner.revision === revision &&
-      articleAllowedSince(id, articleVersion);
+      articleAllowedSince(id, articleVersion, file);
     try {
       const text = await client.body(file, undefined, (cause) =>
-        discardArticle(id, cause),
+        discardArticle(id, cause, file),
       );
       if (!current() || selectedIdRef.current !== id) return;
       if (!(await writeClipboard(text))) throw Error('未能复制正文，请重试。');
@@ -728,7 +787,7 @@ function BrandMediaPanelContent({
               ...old,
               ...result.items.filter(
                 (item) =>
-                  articleAllowedSince(item.id, observedArticle) &&
+                  articleAllowedSince(item.id, observedArticle, item.body) &&
                   !old.some((previous) => previous.id === item.id),
               ),
             ],

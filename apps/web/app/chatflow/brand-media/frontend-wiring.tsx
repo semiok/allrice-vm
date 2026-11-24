@@ -18,6 +18,7 @@ import {
   Modal,
   SegmentedTabs,
   Tag,
+  TextShimmer,
   MarkdownText,
   MarkdownDelegateProvider,
   writeClipboard,
@@ -612,7 +613,11 @@ function brandMediaOperations(
       signal?.throwIfAborted();
       const denied = imageAccess.denial(objectId);
       if (image && denied && denied !== observed) throw denied;
-      const url = URL.createObjectURL(bytes);
+      // The HTTP attachment supplies the exact name. Save body bytes as an
+      // opaque blob so Chromium does not infer a suffix from their media type.
+      const url = URL.createObjectURL(
+        image ? bytes : bytes.slice(0, bytes.size, 'application/octet-stream'),
+      );
       const link = document.createElement('a');
       link.href = url;
       link.download = name
@@ -774,6 +779,11 @@ export function Image({
     <p role="status">正在读取图片…</p>
   );
 }
+type PluginDirectory = { key: string; enabled: boolean } & (
+  | { status: 'loading' }
+  | { status: 'ready'; available: boolean }
+  | { status: 'error'; message: string }
+);
 export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
   const key = scope
     ? `${scope.organizationId}/${scope.workspaceId}/${scope.ownerId}/${scope.instanceId}`
@@ -782,11 +792,7 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     () => (scope ? createBrandMediaClient(scope) : null),
     [key, scope?.headers],
   );
-  const [directory, setDirectory] = useState<{
-    key: string;
-    enabled: boolean;
-    available: boolean;
-  } | null>(null);
+  const [directory, setDirectory] = useState<PluginDirectory | null>(null);
   const [picker, setPicker] = useState(false),
     [checked, setChecked] = useState(false),
     [busy, setBusy] = useState(false),
@@ -797,25 +803,43 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
   const directoryRead = useRef(0);
   const reload = useCallback(
     async (signal?: AbortSignal) => {
-      if (!client) return;
+      if (!client) return false;
       const version = ++directoryRead.current;
       const latest = () =>
         current.current === key &&
         directoryRead.current === version &&
         !signal?.aborted;
-      const result = await client.catalog(signal).catch((cause) => {
-        if (latest()) throw cause;
-        return null;
-      });
-      if (!result || !latest()) return;
-      const entry = result.modules.find(
-        (module) => module.descriptor.id === brandMediaModule.id,
-      );
-      setDirectory({
+      setDirectory((old) => ({
         key,
-        enabled: !!entry?.enabled,
-        available: !!entry?.available,
-      });
+        enabled: old?.key === key && old.enabled,
+        status: 'loading',
+      }));
+      try {
+        const result = await client.catalog(signal);
+        if (!latest()) return false;
+        const entry = result.modules.find(
+          (module) => module.descriptor.id === brandMediaModule.id,
+        );
+        setDirectory({
+          key,
+          enabled: !!entry?.enabled,
+          status: 'ready',
+          available: !!entry?.available,
+        });
+        return true;
+      } catch (cause) {
+        if (latest())
+          setDirectory((old) => ({
+            key,
+            enabled: old?.key === key && old.enabled,
+            status: 'error',
+            message:
+              cause instanceof Error
+                ? cause.message
+                : '暂时无法读取插件，请重试。',
+          }));
+        return false;
+      }
     },
     [client, key],
   );
@@ -826,24 +850,17 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     pending.current = null;
     setChecked(false);
     setError('');
-    void reload(controller.signal).catch((cause) => {
-      if (!controller.signal.aborted && current.current === key)
-        setError(cause.message);
-    });
+    void reload(controller.signal);
     return () => controller.abort();
   }, [reload, key]);
   const openPicker = () => {
     setPicker(true);
     setChecked(false);
     setError('');
-    setDirectory((old) =>
-      old?.key === key ? { ...old, available: false } : old,
-    );
-    void reload().catch((cause) => {
-      if (current.current === key) setError(cause.message);
-    });
+    void reload();
   };
-  const available = directory?.key === key && directory.available;
+  const projection = directory?.key === key ? directory : null;
+  const available = projection?.status === 'ready' && projection.available;
   const add = async () => {
     if (!client || busy || !checked || !available) return;
     const capturedKey = key;
@@ -859,8 +876,7 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     try {
       await client.add(request.requestId);
       if (!ownsRequest()) return;
-      await reload();
-      if (!ownsRequest()) return;
+      if (!(await reload()) || !ownsRequest()) return;
       setBusy(false);
       pending.current = null;
       setPicker(false);
@@ -869,12 +885,7 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
       setError(cause instanceof Error ? cause.message : '添加失败');
       if (mayBeScopeDenial(cause)) {
         setChecked(false);
-        setDirectory(null);
-        try {
-          await reload();
-        } catch {
-          // The rejected installation has no current selectable directory.
-        }
+        await reload();
         if (ownsRequest()) {
           pending.current = null;
           setBusy(false);
@@ -892,9 +903,10 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     checked,
     setChecked,
     busy,
-    error,
+    error: projection?.status === 'error' ? projection.message : error,
     add,
-    enabled: directory?.key === key && directory.enabled,
+    enabled: !!projection?.enabled,
+    directoryStatus: projection?.status ?? 'loading',
     available,
   };
 }
@@ -950,7 +962,11 @@ export function BrandMediaPluginPicker({
         <h3>添加插件</h3>
       </header>
       <p>选择插件，添加给 {employeeName}。</p>
-      {controller.available ? (
+      {controller.directoryStatus === 'loading' ? (
+        <p role="status" aria-busy="true">
+          <TextShimmer active>正在读取…</TextShimmer>
+        </p>
+      ) : controller.available ? (
         <div className={css.selectionCard}>
           <Checkbox
             checked={controller.checked}
@@ -960,12 +976,12 @@ export function BrandMediaPluginPicker({
           />
           <p>想选题、写文章、安排发布计划</p>
         </div>
-      ) : (
+      ) : controller.directoryStatus === 'ready' ? (
         <>
           <h4>暂无可添加的插件</h4>
           <p>有可用插件时，会显示在这里。</p>
         </>
-      )}
+      ) : null}
       {controller.error && <p role="alert">{controller.error}</p>}
       <footer className={css.pickerFooter}>
         <Button onClick={() => controller.setPicker(false)}>取消</Button>

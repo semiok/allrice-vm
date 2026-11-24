@@ -1565,25 +1565,40 @@ suite('MET-224 main-area brand media text workflow', () => {
             path: prefix + '-mounted.png',
             animations: 'disabled',
           });
+          await seat.evaluate((el) =>
+            el.style.setProperty('--met224-probe-color', 'cyan'),
+          );
           const probe = await page.addStyleTag({
-            content:
-              '[data-composer-seat], [data-composer-seat] * { background: var(--met224-probe-color) !important; color: var(--met224-probe-color) !important; border-color: var(--met224-probe-color) !important; box-shadow: none !important; }',
+            // Hide the caret for both frames without Playwright changing the
+            // visible article editor's inline style for each screenshot.
+            content: `input, textarea, [contenteditable] { caret-color: transparent !important; }
+              [data-composer-seat], [data-composer-seat] * { background: var(--met224-probe-color) !important; color: var(--met224-probe-color) !important; border-color: var(--met224-probe-color) !important; box-shadow: none !important; }`,
           });
-          try {
-            await seat.evaluate((el) =>
-              el.style.setProperty('--met224-probe-color', 'cyan'),
+          const paint = () =>
+            page.evaluate(
+              () =>
+                new Promise<void>((done) =>
+                  requestAnimationFrame(() =>
+                    requestAnimationFrame(() => done()),
+                  ),
+                ),
             );
+          try {
+            await paint();
             const cyan = await page.screenshot({
               path: prefix + '-composer-cyan.png',
               animations: 'disabled',
+              caret: 'initial',
               clip: composerClip,
             });
             await seat.evaluate((el) =>
               el.style.setProperty('--met224-probe-color', 'magenta'),
             );
+            await paint();
             const magenta = await page.screenshot({
               path: prefix + '-composer-magenta.png',
               animations: 'disabled',
+              caret: 'initial',
               clip: composerClip,
             });
             // Every pixel in the native seat/viewport intersection is exact.
@@ -1854,6 +1869,71 @@ suite('MET-224 main-area brand media text workflow', () => {
       }
     },
   );
+
+  it('distinguishes loading, confirmed empty and directory errors on picker reopen', async () => {
+    const f = await fixture({ installed: new Set() });
+    const { page } = f;
+    const reply = [gate(), gate(), gate()];
+    let requested = 0;
+    const picker = page.getByRole('region', { name: '选择插件', exact: true });
+    const open = page.getByRole('button', { name: '添加插件', exact: true });
+    const empty = picker.getByRole('heading', {
+      name: '暂无可添加的插件',
+      exact: true,
+    });
+    const add = picker.getByRole('button', { name: '添加', exact: true });
+    const loading = picker.getByRole('status').filter({ hasText: '正在读取…' });
+    const checkbox = picker.getByRole('checkbox', {
+      name: '品牌自媒体',
+      exact: true,
+    });
+    try {
+      await page.route(moduleDirectory, async (route) => {
+        if (route.request().method() !== 'GET') return route.fallback();
+        const step = requested++;
+        await reply[step]?.promise;
+        if (step === 0)
+          return route.fulfill({
+            status: 503,
+            json: { message: '当前目录暂时无法读取' },
+          });
+        if (step === 1) return route.fulfill({ json: { modules: [] } });
+        return route.fallback();
+      });
+      for (const step of [0, 1, 2]) {
+        await open.click();
+        await expect.poll(() => requested).toBe(step + 1);
+        expect(await empty.count()).toBe(0);
+        await loading.waitFor();
+        expect(await add.isDisabled()).toBe(true);
+        reply[step]!.resolve();
+        if (step === 0) {
+          await picker
+            .getByRole('alert')
+            .filter({ hasText: '当前目录暂时无法读取' })
+            .waitFor();
+          expect(await empty.count()).toBe(0);
+        } else if (step === 1) {
+          await empty.waitFor();
+          expect(await picker.getByRole('alert').count()).toBe(0);
+        } else {
+          await checkbox.waitFor();
+          expect(await checkbox.isChecked()).toBe(false);
+          expect(await empty.count()).toBe(0);
+          expect(await picker.getByRole('alert').count()).toBe(0);
+        }
+        expect(await loading.count()).toBe(0);
+        expect(await add.isDisabled()).toBe(true);
+        await picker.getByRole('button', { name: '取消', exact: true }).click();
+      }
+      expect(
+        f.state.requests.filter((request) => request.method === 'POST'),
+      ).toHaveLength(0);
+    } finally {
+      for (const pending of reply) pending.resolve();
+      await f.close();
+    }
+  });
 
   it('candidate direction, references and immutable candidates stay on one page, and only a human adds a topic', async () => {
     const f = await fixture({
@@ -2840,17 +2920,42 @@ suite('MET-224 main-area brand media text workflow', () => {
         })
         .isVisible(),
     ).toBe(true);
-    const requested = page.waitForRequest((request) => {
-      const url = new URL(request.url());
-      return (
-        url.pathname === `/api/v1/files/${file.objectId}/download` &&
-        url.searchParams.get('workspaceId') === scope.workspaceId
-      );
+    await expect
+      .poll(() => page.getByLabel('文章正文').textContent())
+      .toBe('不可直接改写的正文\n第二段');
+    const url = new URL(
+      `/api/v1/files/${file.objectId}/download?workspaceId=${scope.workspaceId}`,
+      page.url(),
+    ).href;
+    const requested = page.waitForRequest((request) => request.url() === url);
+    const response = page.waitForResponse((reply) => reply.url() === url);
+    await page.evaluate(() => {
+      const click = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+        if (this.download)
+          document.body.dataset.requestedAttachmentName = this.download;
+        click.call(this);
+      };
     });
     const delivered = page.waitForEvent('download');
-    await page.getByText('查看本次正文成果', { exact: true }).click();
+    const action = page.getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    await action.focus();
+    expect(
+      await action.evaluate((element) => document.activeElement === element),
+    ).toBe(true);
+    await page.keyboard.press('Enter');
     expect((await requested).method()).toBe('GET');
+    expect((await response).headers()).toMatchObject({
+      'content-type': 'text/plain',
+      'content-disposition': "attachment; filename*=UTF-8''allrice-export",
+    });
     const download = await delivered;
+    expect(
+      await page.locator('body').getAttribute('data-requested-attachment-name'),
+    ).toBe('allrice-export');
     expect(download.suggestedFilename()).toBe('allrice-export');
     expect(await readFile((await download.path())!, 'utf8')).toBe(
       '不可直接改写的正文\n第二段',
@@ -3268,11 +3373,12 @@ suite('MET-224 main-area brand media text workflow', () => {
             await route.fallback();
           },
         );
-        await panel(page)
-          .getByText(kind === 'body' ? '查看本次正文成果' : '下载全部', {
-            exact: true,
-          })
-          .click();
+        const action = panel(page).getByRole('button', {
+          name: kind === 'body' ? '查看本次正文成果' : '下载全部',
+          exact: true,
+        });
+        if (kind === 'body') await action.press('Enter');
+        else await action.click();
         await requested.promise;
         await panel(page).getByRole('button', { name: '← 回到对话' }).click();
         await page
@@ -3463,6 +3569,158 @@ suite('MET-224 main-area brand media text workflow', () => {
     expect(await page.getByText('正文已复制', { exact: true }).count()).toBe(0);
     await f.close();
   });
+
+  it.each(['new-pin', 'switch-to-B'] as const)(
+    'a late denial for the copied body evicts only its exact article and pin (%s)',
+    async (change) => {
+      const old = article();
+      const month = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+      }).format(new Date());
+      old.publication = {
+        state: 'scheduled',
+        schedule: {
+          plannedAt: month + '-16T08:00:00.000Z',
+          timezone: 'Asia/Shanghai',
+        },
+        links: null,
+      };
+      const newPin = {
+        objectId: id(82),
+        versionId: id(83),
+        checksum: 'sha256:' + 'b'.repeat(64),
+      };
+      const next = {
+        ...old,
+        id: change === 'new-pin' ? old.id : id(21),
+        revision: 2,
+        body: newPin,
+        title: '独立授权的新文章正文',
+      };
+      const run = recovery('article');
+      run.invocation.intent.articleId = next.id;
+      run.submission = { articleUpdated: false, revision: null };
+      const delivery = { ...run.deliveries[0]!, file: newPin };
+      run.deliveries =
+        change === 'new-pin' ? [run.deliveries[0]!, delivery] : [delivery];
+      const f = await fixture({
+        articles: change === 'new-pin' ? [old] : [old, next],
+        runs: [run],
+      });
+      const { page } = f;
+      const requested = gate();
+      const refuse = gate();
+      const bodyPath = (objectId: string) =>
+        '/api/v1/files/' + objectId + '/download';
+      try {
+        await page
+          .context()
+          .grantPermissions(['clipboard-read', 'clipboard-write']);
+        await page.evaluate(() =>
+          navigator.clipboard.writeText('保持原剪贴板'),
+        );
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toContain('不可直接改写的正文');
+        await page.route(
+          (url) => url.pathname === bodyPath(file.objectId),
+          async (route) => {
+            requested.resolve();
+            await refuse.promise;
+            await route.fulfill({
+              status: 403,
+              json: accessProblem('旧正文的文件授权已撤销'),
+            });
+          },
+        );
+        await page.route(
+          (url) => url.pathname === bodyPath(newPin.objectId),
+          (route) =>
+            route.fulfill({
+              contentType: 'text/plain',
+              body: '经独立读取的新版本字节',
+            }),
+        );
+        await panel(page)
+          .getByRole('button', { name: '复制正文', exact: true })
+          .click();
+        await requested.promise;
+        const authorized = page.waitForResponse((response) => {
+          const url = new URL(response.url());
+          return (
+            brandView(url, 'article') &&
+            url.searchParams.get('articleId') === next.id
+          );
+        });
+        if (change === 'new-pin') {
+          f.state.articles[0] = next;
+          await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        } else {
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .click();
+        }
+        const receipt = await authorized;
+        expect((await receipt.json()).article.body).toEqual(newPin);
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe('经独立读取的新版本字节');
+        refuse.resolve();
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: '正文文件暂时不可读' })
+          .waitFor();
+        expect(
+          await panel(page)
+            .getByRole('heading', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(await page.getByLabel('文章正文').textContent()).toBe(
+          '经独立读取的新版本字节',
+        );
+        expect(
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: old.title, exact: true })
+            .count(),
+        ).toBe(0);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: '查看本次正文成果', exact: true })
+            .count(),
+        ).toBe(1);
+        expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+          '保持原剪贴板',
+        );
+        await panel(page)
+          .getByRole('tab', { name: '排期表', exact: true })
+          .click();
+        expect(
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: old.title, exact: true })
+            .count(),
+        ).toBe(0);
+      } finally {
+        refuse.resolve();
+        await f.close();
+      }
+    },
+  );
 
   it.each(['body-pin', 'host-hidden', 'scope-unmount'] as const)(
     'a delayed copy read cannot overwrite the clipboard after %s changes',
