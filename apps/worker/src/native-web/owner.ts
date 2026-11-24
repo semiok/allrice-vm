@@ -217,6 +217,7 @@ export async function openNativeWebOwner(input: {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
     await setup(() => transport.authenticate(auth.authenticatedUrl));
+    await setup(() => transport.authenticateIndex(auth.authenticatedUrl));
     await setup(() => root.plugin(TypertRegistry));
     signal.throwIfAborted();
     installConnection(root, {
@@ -302,10 +303,7 @@ export async function openNativeWebOwner(input: {
             current.throwIfAborted();
             if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const response = await transport.fetch(
-              new URL('/', input.launch.auth.origin),
-              { method: 'GET', redirect: 'error', signal: current },
-            );
+            const response = await transport.readIndex(current);
             if (
               !response.ok ||
               !response.headers.get('content-type')?.includes('text/html')

@@ -27,6 +27,55 @@ afterEach(async () => {
   if (failed?.status === 'rejected') throw failed.reason;
 });
 
+it('keeps the native index exchange private and separate from API and resource requests', async () => {
+  const seen: [string, string | undefined][] = [];
+  const server = createServer((request, response) => {
+    const pathname = new URL(request.url!, 'http://fixture').pathname;
+    seen.push([pathname, request.headers.cookie]);
+    if (pathname === '/connect') {
+      response.writeHead(302, {
+        location: './api/remote.mux',
+        'set-cookie': 'fixture-api=owner; HttpOnly',
+      });
+    } else if (request.url?.startsWith('/?token=')) {
+      response.writeHead(303, {
+        location: './',
+        'set-cookie': 'fixture-index=browser; HttpOnly',
+      });
+    } else response.write('abc');
+    response.end();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const active = new AbortController().signal;
+  const transport = nativeWebTransport(origin, active, () => {});
+  cleanup.push(async () => {
+    await transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  });
+  const nativeLaunch = origin + '/?token=fixture-only';
+  await transport.authenticate(nativeLaunch);
+  await transport.authenticateIndex(nativeLaunch);
+  expect(await (await transport.readIndex(active)).text()).toBe('abc');
+  expect(
+    await (await transport.fetch(origin + '/api', { method: 'GET' })).text(),
+  ).toBe('abc');
+  expect(
+    Buffer.from(
+      await transport.readExact(new URL('/plugins/', origin), 3, active),
+    ).toString(),
+  ).toBe('abc');
+  expect(seen).toEqual([
+    ['/connect', undefined],
+    ['/', undefined],
+    ['/', 'fixture-index=browser'],
+    ['/api', 'fixture-api=owner'],
+    ['/plugins/', undefined],
+  ]);
+});
+
 it('bounds actual streamed profile bytes and joins the socket of an oversized response before rejecting', async () => {
   const reply = latch<ServerResponse>();
   const server = createServer((_request, response) => {

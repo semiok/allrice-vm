@@ -23,6 +23,7 @@ export function nativeWebTransport(
   const calls = new Set<ClientRequest>();
   const joins = new Set<Promise<void>>();
   let cookie: string | undefined,
+    indexCookie: string | undefined,
     closing = false;
   function joined(promise: Promise<void>) {
     joins.add(promise);
@@ -84,12 +85,20 @@ export function nativeWebTransport(
     init: Parameters<RpcFetch>[1],
     receive: (response: IncomingMessage) => void,
     connectionPool = agent,
+    credential: 'api' | 'index' | 'none' = 'api',
   ) {
     const url = target(input);
     const headers = new Headers(init.headers);
     headers.set('host', url.host);
     headers.set('origin', new URL(origin).origin);
-    if (cookie) headers.set('cookie', cookie);
+    headers.delete('cookie');
+    const selected =
+      credential === 'api'
+        ? cookie
+        : credential === 'index'
+          ? indexCookie
+          : undefined;
+    if (selected) headers.set('cookie', selected);
     const callSignal = init.signal
       ? AbortSignal.any([signal, init.signal])
       : signal;
@@ -110,40 +119,50 @@ export function nativeWebTransport(
     requestJoin(call);
     return { call, send: () => call.end(body) };
   }
-  const fetch: RpcFetch = (input, init) =>
+  const requestResponse = (
+    input: Parameters<RpcFetch>[0],
+    init: Parameters<RpcFetch>[1],
+    credential: 'api' | 'index' | 'none',
+  ): Promise<Response> =>
     new Promise((resolve, reject) => {
       try {
-        const { call, send } = prepareRequest(input, init, (response) => {
-          const chunks: Buffer[] = [];
-          response.on('data', (chunk: Buffer) => chunks.push(chunk));
-          response.on('error', () =>
-            reject(new PersonVmError('PROVIDER_FAILED')),
-          );
-          response.on('end', () => {
-            try {
-              const output = new Headers();
-              for (const [key, value] of Object.entries(response.headers))
-                for (const item of Array.isArray(value)
-                  ? value
-                  : value === undefined
-                    ? []
-                    : [value])
-                  output.append(key, item);
-              const body = Buffer.concat(chunks);
-              resolve(
-                new Response(
-                  body.length ? Uint8Array.from(body).buffer : null,
-                  {
-                    status: response.statusCode!,
-                    headers: output,
-                  },
-                ),
-              );
-            } catch {
-              reject(new PersonVmError('PROVIDER_FAILED'));
-            }
-          });
-        });
+        const { call, send } = prepareRequest(
+          input,
+          init,
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on('data', (chunk: Buffer) => chunks.push(chunk));
+            response.on('error', () =>
+              reject(new PersonVmError('PROVIDER_FAILED')),
+            );
+            response.on('end', () => {
+              try {
+                const output = new Headers();
+                for (const [key, value] of Object.entries(response.headers))
+                  for (const item of Array.isArray(value)
+                    ? value
+                    : value === undefined
+                      ? []
+                      : [value])
+                    output.append(key, item);
+                const body = Buffer.concat(chunks);
+                resolve(
+                  new Response(
+                    body.length ? Uint8Array.from(body).buffer : null,
+                    {
+                      status: response.statusCode!,
+                      headers: output,
+                    },
+                  ),
+                );
+              } catch {
+                reject(new PersonVmError('PROVIDER_FAILED'));
+              }
+            });
+          },
+          agent,
+          credential,
+        );
         // A closed, unanswered request is not a reply.
         call.once('close', () => reject(new PersonVmError('PROVIDER_FAILED')));
         call.on('error', () => reject(new PersonVmError('PROVIDER_FAILED')));
@@ -152,6 +171,7 @@ export function nativeWebTransport(
         reject(new PersonVmError('PROVIDER_FAILED'));
       }
     });
+  const fetch: RpcFetch = (input, init) => requestResponse(input, init, 'api');
   /** Profile attestation already holds the sealed length. Limit the actual
    * response stream and keep ownership through physical cancellation. */
   async function readExact(
@@ -215,6 +235,7 @@ export function nativeWebTransport(
           });
         },
         connection,
+        'none',
       );
       call.on('error', fail);
       call.once('close', () => {
@@ -245,6 +266,31 @@ export function nativeWebTransport(
       )
         throw new PersonVmError('PROVIDER_FAILED');
       cookie = values[0]!.split(';', 1)[0]!;
+    },
+    async authenticateIndex(authenticatedUrl: string) {
+      const url = target(authenticatedUrl);
+      if (url.pathname !== '/') throw new PersonVmError('PROVIDER_FAILED');
+      const response = await requestResponse(
+        url,
+        { method: 'GET', redirect: 'manual' },
+        'none',
+      );
+      const values = response.headers.getSetCookie();
+      if (
+        response.status !== 303 ||
+        response.headers.get('location') !== './' ||
+        values.length !== 1
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+      indexCookie = values[0]!.split(';', 1)[0]!;
+    },
+    readIndex(signal: AbortSignal) {
+      if (!indexCookie) throw new PersonVmError('PROVIDER_FAILED');
+      return requestResponse(
+        new URL('/', origin),
+        { method: 'GET', redirect: 'error', signal },
+        'index',
+      );
     },
     createWebSocket(input: string): ConnectionWebSocket {
       const url = new URL(input);
@@ -291,6 +337,7 @@ export function nativeWebTransport(
     async close() {
       closing = true;
       cookie = undefined;
+      indexCookie = undefined;
       agent.destroy();
       for (const call of calls) call.destroy();
       for (const socket of sockets) socket.destroy();
