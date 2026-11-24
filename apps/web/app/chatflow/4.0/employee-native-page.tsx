@@ -7,14 +7,16 @@ import {
 } from '@allrice/contracts';
 import {
   openNativePageCarrier,
+  pendingPageResult,
+} from '../../../lib/d-entry/page-carrier';
+import {
   pageClosing,
   pageCompletion,
   pageDocumentReady,
   pageNavigate,
   pageRevoked,
   pageStartupFailed,
-  pendingPageResult,
-} from '../../../lib/d-entry/page-carrier';
+} from '../../../lib/d-entry/page-messages';
 
 export function EmployeeNativePage({ query }: { query: string }) {
   const frame = useRef<HTMLIFrameElement>(null);
