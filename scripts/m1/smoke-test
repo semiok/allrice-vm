@@ -45,7 +45,7 @@ case "${1:-}" in
     qa_db=allrice40_qa_${task//-/_}
     qa_web="$HOME/Library/LaunchAgents/$qa_label-web.plist"
     qa_worker="$HOME/Library/LaunchAgents/$qa_label-worker.plist"
-    service_plist_config "$qa_web" "$qa_label-web" ALLRICE_WEB_PORT "$web" "$qa_db" || exit 2
+    service_plist_config "$qa_web" "$qa_label-web" ALLRICE_WEB_PORT "$web" "$qa_db" "worker-port=$worker" || exit 2
     service_plist_config "$qa_worker" "$qa_label-worker" ALLRICE_WORKER_PORT "$worker" "$qa_db" || exit 2
     dbenv=$(printf '%s\n%s' "$(penv "$qa_worker" DATABASE_URL)" "$(json "$f" nativeArtifactId)")
     extra=(); [[ " $* " == *" --only "* ]] || extra=(--only chat,continue,browser,reminder) ;;

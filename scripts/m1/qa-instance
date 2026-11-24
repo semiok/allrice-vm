@@ -227,7 +227,7 @@ cmd_up() {
     >> "$dir/logs/build.log" 2>&1 || die "build identity preparation failed, see $dir/logs/build.log"
 
   /usr/bin/python3 - "$task" "$dir" "$db" "$web" "$worker" "$sha" "$artifact" "$(dev_plist web)" "$(dev_plist worker)" <<'PY'
-import json, os, plistlib, re, sys, uuid
+import json, os, plistlib, re, shlex, sys, uuid
 task, d, db, web, worker, sha, art, web_src, worker_src = sys.argv[1:]
 def retired_setting(key):
     return key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_'))
@@ -235,27 +235,29 @@ home = os.path.expanduser('~'); rel = f'{d}/release'; L = f'{d}/.local'
 for sub in ('storage', 'executions', 'dsh-runtime', 'native-once-control', 'native-recurring-control', 'project-preview'):
     os.makedirs(f'{L}/{sub}', mode=0o700, exist_ok=True); os.chmod(f'{L}/{sub}', 0o700)
 dburl = f'postgres://{os.environ.get("USER","snow")}@127.0.0.1:5434/{db}'
+worker_url = f'http://127.0.0.1:{worker}'
+once = {'artifactId': art, 'profileId': 'allrice-once-control-v1', 'storageId': f'allrice-qa-{task}-once-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-once-control'}
+rec = {'artifactId': art, 'profileId': 'allrice-recurring-control-v1', 'storageId': f'allrice-qa-{task}-recurring-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-recurring-control'}
+overrides = {
+    'DATABASE_URL': dburl, 'ALLRICE_WEB_PORT': web, 'ALLRICE_WORKER_PORT': worker,
+    'ALLRICE_WORKER_INTERNAL_URL': worker_url, 'ALLRICE_STORAGE_ROOT': f'{L}/storage',
+    'ALLRICE_NATIVE_ONCE_REFERENCE': json.dumps(once, separators=(',', ':')),
+    'ALLRICE_NATIVE_RECURRING_REFERENCE': json.dumps(rec, separators=(',', ':')),
+}
 # .env: shared Dev values with this instance's database, ports and storage.
 out = []
 for line in open(f'{home}/allrice40-dev/.env').read().splitlines():
     key = re.match(r'^\s*(?:export\s+)?([A-Z0-9_]+)\s*=', line)
-    if key and retired_setting(key[1]): continue
-    m = re.match(r'^([A-Z0-9_]+)=(.*)$', line)
-    if not m: out.append(line); continue
-    k, v = m.groups()
-    v = {'DATABASE_URL': dburl, 'ALLRICE_WEB_PORT': web, 'ALLRICE_WORKER_PORT': worker,
-         'ALLRICE_STORAGE_ROOT': f'{L}/storage'}.get(k, v)
-    out.append(f'{k}={v}')
+    if key and (retired_setting(key[1]) or key[1] in overrides): continue
+    out.append(line)
+out.extend(f'{key}={shlex.quote(value)}' for key,value in overrides.items())
 open(f'{d}/.env', 'w').write('\n'.join(out) + '\n'); os.chmod(f'{d}/.env', 0o600)
-once = {'artifactId': art, 'profileId': 'allrice-once-control-v1', 'storageId': f'allrice-qa-{task}-once-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-once-control'}
-rec = {'artifactId': art, 'profileId': 'allrice-recurring-control-v1', 'storageId': f'allrice-qa-{task}-recurring-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-recurring-control'}
 common = {
-    'DATABASE_URL': dburl, 'ALLRICE_RELEASE_SHA': sha,
+    **overrides,
+    'ALLRICE_RELEASE_SHA': sha,
     'ALLRICE_DSH_NATIVE_ARTIFACT_ID': art,
-    'ALLRICE_NATIVE_ONCE_REFERENCE': json.dumps(once, separators=(',', ':')),
-    'ALLRICE_NATIVE_RECURRING_REFERENCE': json.dumps(rec, separators=(',', ':')),
     'ALLRICE_DSH_CORDIS_CONFIG': f'{rel}/apps/worker/dsh/allrice-restricted.cordis.yml',
-    'ALLRICE_DSH_RUNTIME_ROOT': f'{L}/dsh-runtime', 'ALLRICE_STORAGE_ROOT': f'{L}/storage',
+    'ALLRICE_DSH_RUNTIME_ROOT': f'{L}/dsh-runtime',
     'ALLRICE_EXECUTION_ROOT': f'{L}/executions',
     'ALLRICE_DSH_PLATFORM_HOME': f'{home}/allrice40-dev/.local/dsh-platform',
     'ALLRICE_CLOUD_PREVIEW_SOCKET': f'{L}/project-preview/p.sock',
@@ -273,9 +275,7 @@ for role, source in (('web', web_src), ('worker', worker_src)):
         if retired_setting(key):
             del env[key]
     env.update(common)
-    if role == 'web': env['ALLRICE_WEB_PORT'] = web
-    else:
-        env.update({'ALLRICE_WORKER_PORT': worker, 'ALLRICE_WORKER_CONCURRENCY': '2'})
+    if role == 'worker': env['ALLRICE_WORKER_CONCURRENCY'] = '2'
     args = src['ProgramArguments']
     node = args[2] if os.path.basename(args[0]) == 'with-env' else args[0]
     script = f'{rel}/apps/web/server.mjs' if role == 'web' else f'{rel}/apps/worker/dist/index.js'
@@ -286,7 +286,7 @@ for role, source in (('web', web_src), ('worker', worker_src)):
              'StandardOutPath': f'{d}/logs/{role}.log', 'StandardErrorPath': f'{d}/logs/{role}.err.log'}
     plistlib.dump(plist, open(f'{d}/{role}.plist', 'wb')); os.chmod(f'{d}/{role}.plist', 0o600)
 PY
-  service_plist_config "$dir/web.plist" "$(label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" || die 'invalid QA Web configuration'
+  service_plist_config "$dir/web.plist" "$(label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" "worker-port=$worker" || die 'invalid QA Web configuration'
   service_plist_config "$dir/worker.plist" "$(label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
 
   psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"

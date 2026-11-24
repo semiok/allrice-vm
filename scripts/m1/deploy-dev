@@ -52,6 +52,11 @@ penv() { "$M1_PY" -c 'import plistlib,sys;print(plistlib.load(open(sys.argv[1],"
 release_of() { "$M1_PY" -c 'import plistlib,sys;print(plistlib.load(open(sys.argv[1],"rb"))["WorkingDirectory"])' "${1:-$(dev_plist worker)}"; }
 web_port() { penv "$(dev_plist web)" ALLRICE_WEB_PORT; }
 worker_port() { penv "$(dev_plist worker)" ALLRICE_WORKER_PORT; }
+recovery_pair() { # Web plist, Worker plist, [expected SHA]
+  dev_plist_config web "$1" && dev_plist_config worker "$2" || return 1
+  local rel; rel=$(release_of "$2") || return 1
+  [ "$(release_of "$1")" = "$rel/apps/web" ] && dev_release_config "$rel" "${3:-$(penv "$2" ALLRICE_RELEASE_SHA)}"
+}
 ready_sha() { # url role release -> prints a matching verified sourceSha
   curl -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
 worker_boot() { # prints the bootId the ready Worker reports, or nothing; never fails
@@ -117,9 +122,8 @@ snapshot() ( # name -> 0 when $SNAPSHOTS/<name> is complete
   exit 0
 )
 start_both_on() { # sha -> start Worker then Web, both must identify this release
-  dev_plist_pair || return 1
+  recovery_pair "$WEB_PLIST" "$WORKER_PLIST" "$1" || return 1
   local rel; rel=$(release_of) || return 1
-  [ "$(release_of "$WEB_PLIST")" = "$rel/apps/web" ] && dev_release_config "$rel" "$1" || return 1
   start_job "$WORKER_LABEL" "$WORKER_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 180 worker "$rel" || { say "worker did not become ready on ${1:0:8}"; return 1; }
   start_job "$WEB_LABEL" "$WEB_PLIST" || return 1
@@ -135,10 +139,15 @@ point_plists() { # release sha artifact stage-dir
 import os,plistlib,sys
 out,rel,sha,art,web_src,worker_src,loader,tools=sys.argv[1:]
 sys.path.insert(0,tools)
-from service_target import DEV_DATABASE, DEV_PORTS, service_identity
+from service_target import DEV_DATABASE, DEV_PORTS, service_config
 plists={}
 for role,src in (('web',web_src),('worker',worker_src)):
     d=plistlib.load(open(src,'rb')); e=d['EnvironmentVariables']
+    port_key='ALLRICE_'+role.upper()+'_PORT'
+    config=service_config(d,'ai.bplabs.allrice40-dev-'+role,port_key,str(DEV_PORTS[role]),DEV_DATABASE,tools)
+    if not config:
+        sys.exit('refusing source 4.0 '+role+' launch configuration')
+    e.update(config['controllers'])
     args=d['ProgramArguments']
     if os.path.basename(args[0]) == 'with-env': args=args[2:] # a previous deploy, possibly with older tools
     if args[1].startswith('--env-file='): del args[1]
@@ -153,8 +162,7 @@ for role,src in (('web',web_src),('worker',worker_src)):
         if key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_')):
             del e[key]
     e['ALLRICE_DSH_NATIVE_ARTIFACT_ID']=art
-    port_key='ALLRICE_'+role.upper()+'_PORT'
-    if not service_identity(d,'ai.bplabs.allrice40-dev-'+role,port_key,str(DEV_PORTS[role]),DEV_DATABASE,tools):
+    if not service_config(d,'ai.bplabs.allrice40-dev-'+role,port_key,str(DEV_PORTS[role]),DEV_DATABASE,tools):
         sys.exit('refusing generated 4.0 '+role+' launch configuration')
     plists[role]=d
 for role,d in plists.items():
@@ -179,10 +187,12 @@ os.replace(sys.argv[1]+".tmp",sys.argv[1])' "$LOCK.owner" $$ "${MODE:-}"
 }
 release_lock() { if [ -n "$LOCKED" ]; then exec 9>&-; LOCKED=""; fi; return 0; }
 inflight_begin() { # prev_sha
-  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
+  local web worker; web=$(dev_plist web); worker=$(dev_plist worker)
+  recovery_pair "$web" "$worker" "$1" || die "Dev cannot provide a same-release recovery pair" 2
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish (qa/deploy-inflight exists); run deploy-dev --release-manager --recover"
   mkdir -p "$INFLIGHT.tmp"
-  cp -p "$(dev_plist web)" "$INFLIGHT.tmp/web.plist" && cp -p "$(dev_plist worker)" "$INFLIGHT.tmp/worker.plist" || die "could not save the launchd files"
+  cp -p "$web" "$INFLIGHT.tmp/web.plist" && cp -p "$worker" "$INFLIGHT.tmp/worker.plist" || die "could not save the launchd files"
+  recovery_pair "$INFLIGHT.tmp/web.plist" "$INFLIGHT.tmp/worker.plist" "$1" || die "saved launchd files do not form a recovery pair" 2
   printf 'stopping\n%s\n' "$1" > "$INFLIGHT.tmp/state"
   mv "$INFLIGHT.tmp" "$INFLIGHT"; INFLIGHT_MINE=1
 }
@@ -216,11 +226,7 @@ refuse_restore() { # phase previous_sha reason
 restore() {
   local prev; prev=$(sed -n 2p "$INFLIGHT/state" 2>/dev/null) && [ -n "$prev" ] || { say "no saved previous version to restore"; return 1; }
   local why rel; rel=$(release_of "$INFLIGHT/worker.plist") || return 1
-  dev_plist_config web "$INFLIGHT/web.plist" &&
-    dev_plist_config worker "$INFLIGHT/worker.plist" &&
-    [ "$(release_of "$INFLIGHT/web.plist")" = "$rel/apps/web" ] &&
-    dev_release_config "$rel" "$prev" &&
-    dev_plist_pair || return 1
+  recovery_pair "$INFLIGHT/web.plist" "$INFLIGHT/worker.plist" "$prev" && dev_plist_pair || return 1
   say "restoring the previous version ${prev:0:8}"
   stop_both || { say "could not stop the services to restore them"; return 1; }
   if ! why=$(check_migrations_known "$rel"); then
@@ -427,7 +433,7 @@ rollback_gate() { # target sha -> dies, before anything stops, when the target c
 }
 
 rollback() { # [release-dir]
-  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
+  recovery_pair "$(dev_plist web)" "$(dev_plist worker)" || die "refusing a mismatched Dev configuration" 2
   local cur_rel cur_sha cur_art target="${1:-}"
   cur_rel=$(release_of); cur_sha=$(penv "$(dev_plist worker)" ALLRICE_RELEASE_SHA); cur_art=$(penv "$(dev_plist worker)" ALLRICE_DSH_NATIVE_ARTIFACT_ID)
   if [ -z "$target" ]; then
@@ -444,7 +450,7 @@ rollback() { # [release-dir]
   say "checking that ${sha:0:8} covers the current native references"
   local why; why=$(precheck "$target" "$sha" "$art" "$BLOG") || die "$why. Dev untouched."
   take_lock || die "deploy lock is held; $("$BIN/deploy-lock" status)" 3
-  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
+  recovery_pair "$(dev_plist web)" "$(dev_plist worker)" "$cur_sha" || die "refusing a mismatched Dev configuration" 2
   [ "$(release_of)" = "$cur_rel" ] || die "the current release changed while checking; start again"
   stage_plists "$target" "$sha" "$art" || die "rollback configuration failed validation. Dev untouched" 2
   rollback_gate "$target" "$sha" # a deploy that ended meanwhile may have raised either
@@ -470,7 +476,7 @@ deploy() {
   local t0; t0=$(date +%s)
   ! lock_held "$LOCK" || die "a deploy is in progress ($("$BIN/deploy-lock" status)); stop and retry later" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run deploy-dev --release-manager --recover first"
-  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
+  recovery_pair "$(dev_plist web)" "$(dev_plist worker)" || die "refusing a mismatched Dev configuration" 2
   local avail; avail=$(df -g "$HOME" | awk 'NR==2{print $4}')
   [ "$avail" -ge 20 ] || die "only ${avail}G free; clean up before building"
 
@@ -507,7 +513,7 @@ deploy() {
   take_lock || die "another deploy started meanwhile; build kept at $rel (rerun deploy-dev later)" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; build kept at $rel. Run deploy-dev --release-manager --recover first"
   [ "$(release_of)" = "$cur_rel" ] || die "Dev changed while this version was building; build kept at $rel, start again"
-  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
+  recovery_pair "$(dev_plist web)" "$(dev_plist worker)" "$cur_sha" || die "refusing a mismatched Dev configuration" 2
   stage_plists "$rel" "$sha" "$art" || die "release configuration failed validation. Dev untouched" 2
   local pending; pending=$(check_migrations_known "$rel") || {
     log_deploy kind failed phase migrations sha "$sha" reason "$pending" log "$BLOG"

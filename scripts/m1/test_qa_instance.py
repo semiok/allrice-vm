@@ -32,8 +32,18 @@ if command == 'git':
 elif command == 'node':
     if args[0].endswith('/prepare-native-artifact.mjs'):
         print(json.dumps({'artifactId': 'sha256:' + 'b' * 64}))
-    elif args[0].endswith('/prepare-identity.mjs') and os.environ.get('QA_TEST_IDENTITY_FAIL'):
-        sys.exit(42)
+    elif args[0].endswith('/prepare-identity.mjs'):
+        if os.environ.get('QA_TEST_IDENTITY_FAIL'):
+            sys.exit(42)
+        release = Path(args[1].split('=', 1)[1]); sha = args[2].split('=', 1)[1]
+        for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js'):
+            path = release / entry
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        identity = release / '.local/dev-build-identity.json'
+        identity.parent.mkdir(exist_ok=True)
+        identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
+            environment='dev', sourceSha=sha, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
     elif args[0].endswith('/qa-bootstrap.mjs'):
         template = args[args.index('--rice') + 1] if '--rice' in args else str(Path(args[0]).with_name('rice-standard.json'))
         if json.loads(Path(template).read_text()).get('version') != 'ref':
@@ -89,19 +99,37 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         dev = os.path.join(self.home, 'allrice40-dev')
         os.makedirs(dev)
         with open(os.path.join(dev, '.env'), 'w') as f:
-            f.write('DATABASE_URL=postgres://stub/allrice_dev\nUNRELATED_SETTING=keep\n')
+            f.write('DATABASE_URL=postgres://stub/allrice_dev\nUNRELATED_SETTING=keep\n'
+                    'ALLRICE_WORKER_PORT=3012\nALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012\n')
+        release = Path(self.home, 'allrice40-dev-releases', 'sealed')
+        for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js'):
+            path = release / entry
+            path.parent.mkdir(parents=True)
+            path.touch()
+        identity = release / '.local/dev-build-identity.json'
+        identity.parent.mkdir()
+        identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
+            environment='dev', sourceSha=SOURCE_SHA, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
         agents = os.path.join(self.home, 'Library/LaunchAgents')
         os.makedirs(agents)
         for role in ('web', 'worker'):
+            entry = 'apps/web/server.mjs' if role == 'web' else 'apps/worker/dist/index.js'
             with open(os.path.join(agents, 'ai.bplabs.allrice40-dev-' + role + '.plist'), 'wb') as f:
                 plistlib.dump({
                     'Label': 'ai.bplabs.allrice40-dev-' + role,
                     'ProgramArguments': [os.path.join(node_bin, 'node'),
                                          '--env-file=' + os.path.join(dev, '.env'),
-                                         '/fake/apps/web/server.mjs' if role == 'web' else '/fake/apps/worker/dist/index.js'],
+                                         str(release / entry)],
+                    'WorkingDirectory': str(release / 'apps/web' if role == 'web' else release),
                     'EnvironmentVariables': {
                         'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev',
                         'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',
+                        'ALLRICE_WORKER_INTERNAL_URL': 'http://127.0.0.1:3312',
+                        'ALLRICE_RELEASE_SHA': SOURCE_SHA,
+                        'ALLRICE_STORAGE_ROOT': dev + '/.local/storage',
+                        'ALLRICE_EXECUTION_ROOT': dev + '/.local/executions',
+                        'ALLRICE_DSH_RUNTIME_ROOT': dev + '/.local/dsh-runtime-m1',
+                        'ALLRICE_DSH_PLATFORM_HOME': dev + '/.local/dsh-platform',
                         'ALLRICE_DEV_MAINTENANCE_ENABLED': '1',
                         'ALLRICE_CLOUD_RUNNER_ENABLED': '1',
                         'ALLRICE_CLOUD_MCP_ENABLED': '1',
@@ -135,9 +163,11 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             'scripts/dev-release/prepare-identity.mjs', '--root=' + self.release,
             '--release-sha=' + SOURCE_SHA,
         ])
+        envs = {}
         for role in ('web', 'worker'):
             with open(os.path.join(os.path.dirname(self.release), role + '.plist'), 'rb') as f:
                 env = plistlib.load(f)['EnvironmentVariables']
+            envs[role] = env
             self.assertEqual(env['ALLRICE_DEV_MAINTENANCE_ENABLED'], '0')
             self.assertEqual(env['ALLRICE_CLOUD_RUNNER_ENABLED'], '0')
             self.assertEqual(env['ALLRICE_CLOUD_MCP_ENABLED'], '0')
@@ -154,6 +184,13 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             self.assertEqual(data['repository'], 'semiok/allrice-vm')
             self.assertEqual(data['repositoryId'], 1469490636)
             self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
+        worker = str(data['workerPort'])
+        self.assertEqual(envs['web']['ALLRICE_WORKER_PORT'], worker)
+        self.assertEqual(envs['worker']['ALLRICE_WORKER_PORT'], worker)
+        self.assertEqual(envs['web']['ALLRICE_WORKER_INTERNAL_URL'], f'http://127.0.0.1:{worker}')
+        dotenv = Path(self.release).parent.joinpath('.env').read_text()
+        self.assertIn(f'ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:{worker}\n', dotenv)
+        self.assertNotIn('ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012', dotenv)
         bootstrap = next(e for e in events if e['command'] == 'node' and e['args'][0].endswith('/qa-bootstrap.mjs'))
         self.assertEqual(bootstrap['args'][bootstrap['args'].index('--rice') + 1], self.release + '/scripts/m1/rice-standard.json')
 

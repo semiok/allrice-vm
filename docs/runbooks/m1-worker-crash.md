@@ -18,18 +18,18 @@ curl -s -m 5 http://127.0.0.1:3312/health/ready | head -c 600; echo
 
 ## 判断
 
-| 现象                                           | 多半是                                                       |
-| ---------------------------------------------- | ------------------------------------------------------------ |
-| 刚部署完就开始                                 | 新版本问题（启动自检拒绝、迁移和代码不匹配）                 |
-| 日志里 `ECONNREFUSED 127.0.0.1:5434`           | 数据库，转 [m1-database.md](m1-database.md)                  |
-| 日志里执行包、`REFERENCES_UNCOVERED`、启动自检 | 执行包或数据不匹配（AGENTS.md 第 5 节“已知限制”）            |
-| 内存（`memory_pressure` 低、进程被 kill -9）   | 内存不够：先停自己不用的验收实例                             |
-| `versions` 不一致                              | 部署中途失败或只重启了一个服务：`deploy-dev --status` 会显示 |
+| 现象                                           | 多半是                                                                           |
+| ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| 刚部署完就开始                                 | 新版本问题（启动自检拒绝、迁移和代码不匹配）                                     |
+| 日志里 `ECONNREFUSED 127.0.0.1:5434`           | 数据库，转 [m1-database.md](m1-database.md)                                      |
+| 日志里执行包、`REFERENCES_UNCOVERED`、启动自检 | 执行包或数据不匹配（AGENTS.md 第 5 节“已知限制”）                                |
+| 内存（`memory_pressure` 低、进程被 kill -9）   | 内存不够：先停自己不用的验收实例                                                 |
+| `versions` 不一致                              | 部署中途失败或只重启了一个服务：`~/allrice40-dev/bin/deploy-dev --status` 会显示 |
 
 ## 处理
 
-1. **部署后出现**：发布负责人回滚 `deploy-dev --release-manager --rollback`（会先检查迁移和执行包兼容性，不兼容会拒绝），再在 MET 卡上记录。
-2. **部署中断留下半成品**（`--status` 提示未完成的部署）：发布负责人 `deploy-dev --release-manager --recover`。
+1. **部署后出现**：发布负责人执行 `~/allrice40-dev/bin/deploy-dev --release-manager --rollback`。工具先检查迁移和执行包兼容性，完成后在 MET 卡记录结果。
+2. **部署中断留下半成品**（`--status` 提示未完成的部署）：发布负责人执行 `~/allrice40-dev/bin/deploy-dev --release-manager --recover`。
 3. **依赖问题**（数据库、磁盘、沙箱）：先按对应手册处理依赖，Worker 一般会自己恢复。
 4. **原因不明**：保留日志，派 `gpt-6.2-sol` `max` 只读诊断（命令见 [m1-monitor.md](m1-monitor.md#诊断交给-codex)）。不要反复手动重启掩盖问题。
 
@@ -60,7 +60,7 @@ ps -axo rss,command | sort -nr | head -15
 
 处理：
 
-1. 先停掉自己不用的验收实例（`qa-instance list` / `qa-instance down <task>`）。
+1. 用 `~/allrice40-dev/bin/qa-instance list` 核对实例归属，再用 `~/allrice40-dev/bin/qa-instance down <task>` 停掉自己不用的 4.0 实例。
 2. DSH 进程多、内存吃紧时，由发布负责人在没人用的时段重启 Worker（命令同上一节）。重启会中断正在进行的对话和任务，先确认没有进行中的 run。
 3. 进程不多但内存仍然紧张：看第三条命令里谁占得多，按对应手册处理。
 

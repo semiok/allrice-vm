@@ -902,6 +902,92 @@ class Peer(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_formal_peer_and_timer_refuse_a_drill_config_without_the_flag(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / '.local/state/allrice40-monitor-peer-drills/outage'
+            state.mkdir(parents=True)
+            config = state / 'config.json'
+            config.write_text(json.dumps({'stateDir': str(state)}))
+            original = state / 'state.json'
+            queue = json.dumps({'incidentOutbox': [dict(metadata=dict(label='演练', drill='outage'))]})
+            original.write_text(queue)
+            for command in (['peer'], ['launchd', 'install', '--peer']):
+                with self.subTest(command=command):
+                    with self.assertRaisesRegex(SystemExit, 'require --drill'), mock.patch.object(monitor, 'run') as run:
+                        monitor.main([*command, '--config', str(config)])
+                    run.assert_not_called()
+                    self.assertEqual(original.read_text(), queue)
+
+    def test_drill_timer_bootstraps_only_its_own_label(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / '.local/state/allrice40-monitor-peer-drills/outage'
+            state.mkdir(parents=True)
+            config = state / 'config.json'
+            config.write_text(json.dumps({'stateDir': str(state)}))
+            agents = home / 'Library/LaunchAgents'
+            agents.mkdir(parents=True)
+            formal = agents / 'ai.bplabs.allrice40-dev-monitor-peer.plist'
+            formal.write_text('formal fixture')
+
+            def launchctl(args, _timeout):
+                self.assertTrue('ai.bplabs.allrice40-dev-monitor-drill-outage-peer' in args[-1])
+                return (113 if args[1] == 'print' else 0), '', ''
+
+            with mock.patch.object(monitor, 'run', side_effect=launchctl), mock.patch('builtins.print'):
+                monitor.main(['launchd', 'install', '--peer', '--drill', '--config', str(config)])
+            args = monitor.plistlib.loads((agents / 'ai.bplabs.allrice40-dev-monitor-drill-outage-peer.plist').read_bytes())['ProgramArguments']
+            self.assertEqual(args[-4:], ['peer', '--config', str(config), '--drill'])
+            self.assertEqual(formal.read_text(), 'formal fixture')
+
+    def test_cross_target_incident_rows_are_kept_at_sender_and_refused_at_receiver(self):
+        r = make_round(peer=True)
+        metadata = {'label': '演练', 'drill': 'outage'}
+        row = dict(id=str(uuid.uuid4()), kind='monitor_alert', detailCode='monitor.disk', metadata=metadata)
+        r.state['incidentOutbox'] = [row]
+        with mock.patch.object(monitor, 'run') as run:
+            monitor.flush_incidents_remote(r)
+            run.assert_not_called()
+        self.assertEqual(r.state['incidentOutbox'], [row])
+        self.assertIn('different', r.state['incidentError']['error'])
+        for tag in (None, 'other'):
+            cfg = dict(r.cfg, drillTag=tag)
+            with self.assertRaisesRegex(SystemExit, 'different monitor target'), mock.patch.object(monitor, 'psql') as psql:
+                monitor.ingest_incidents(cfg, io.StringIO(json.dumps([row])))
+            psql.assert_not_called()
+        for old_metadata in ({'label': ''}, {'label': '演练'}):
+            with self.assertRaisesRegex(SystemExit, 'different monitor target'), mock.patch.object(monitor, 'psql') as psql:
+                monitor.ingest_incidents(dict(r.cfg, drillTag='outage'), io.StringIO(json.dumps([dict(row, metadata=old_metadata)])))
+            psql.assert_not_called()
+
+    def test_copied_drill_checkpoint_keeps_its_queue_owner(self):
+        r = make_round()
+        drill_cfg = dict(r.cfg, drillTag='outage')
+        drill = monitor.Round(drill_cfg)
+        drill.state['outbox'] = ['drill Telegram message']
+        drill.save()
+        with self.assertRaisesRegex(monitor.CheckError, 'state belongs to a different target'):
+            monitor.Round(r.cfg)
+        with self.assertRaisesRegex(monitor.CheckError, 'state belongs to a different target'):
+            monitor.Round(drill_cfg, peer=True)
+        self.assertEqual(monitor.Round(drill_cfg).state['outbox'], ['drill Telegram message'])
+
+    def test_generated_alert_steps_target_4_0_and_the_current_drill(self):
+        r = make_round()
+        with mock.patch.object(monitor.os.path, 'exists', return_value=True), mock.patch.object(monitor, 'deploying', return_value=False):
+            deploy = monitor.check_deploy(r)[0]
+        self.assertEqual(deploy['step'], '~/allrice40-dev/bin/deploy-dev --status')
+        self.assertIn('~/allrice40-dev/bin/deploy-dev --release-manager --recover', deploy['detail'])
+        with mock.patch.object(r, 'psql', side_effect=monitor.CheckError('no database')):
+            self.assertIn('-p 5434 -d allrice40_dev', monitor.check_postgres(r)[0]['step'])
+        step = monitor.check_disk(r)[0]['step']
+        self.assertIn('~/allrice40-backups', step)
+        self.assertNotIn('~/allrice-*', step)
+        r.cfg['drillTag'] = 'outage'
+        with mock.patch.object(monitor, 'read_remote_heartbeat', return_value=(None, 'down', False, [])):
+            self.assertIn('ai.bplabs.allrice40-dev-monitor-drill-outage-peer', monitor.check_peer(r)[0]['step'])
+
     def test_formal_monitor_never_uses_foreign_plists_or_incident_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg=monitor.load_config(None,False)
@@ -996,8 +1082,10 @@ class Config(unittest.TestCase):
         test_url = os.environ.get('ALLRICE_TEST_DATABASE_URL')
         target = urllib.parse.urlsplit(test_url or '')
         psql = shutil.which('psql')
-        if not psql or target.hostname != '127.0.0.1' or target.port != 54329 or target.path != '/allrice':
-            self.skipTest('requires the isolated M5 test PostgreSQL')
+        m5_fixture = target.port == 54329 and target.path == '/allrice'
+        private_fixture = target.port not in (None, 5432, 5434) and target.path == '/allrice_monitor_drill_fixture'
+        if not psql or target.hostname != '127.0.0.1' or not (m5_fixture or private_fixture):
+            self.skipTest('requires an isolated monitor test PostgreSQL')
         tag = 'm5-' + uuid.uuid4().hex[:12]
         database = 'allrice40_monitor_drill_' + tag.replace('-', '_')
         drill_url = urllib.parse.urlunsplit(target._replace(path='/' + database, query='', fragment=''))
@@ -1035,8 +1123,8 @@ class Config(unittest.TestCase):
                     mock.patch.object(monitor, 'run', side_effect=run):
                 monitor.main(['run', '--drill', '--config', str(config)])
                 monitor.main(['peer', '--drill', '--config', str(peer_config)])
-            self.assertEqual(sql(drill_url, 'select detail_code from allrice_operational_incidents order by detail_code').splitlines(),
-                             ['monitor.disk', 'monitor.m1_heartbeat'])
+            self.assertEqual(sql(drill_url, "select detail_code || ':' || (metadata->>'drill') from allrice_operational_incidents order by detail_code").splitlines(),
+                             ['monitor.disk:' + tag, 'monitor.m1_heartbeat:' + tag])
             for directory in (state, peer):
                 self.assertEqual(json.loads((directory / 'state.json').read_text())['incidentOutbox'], [])
 

@@ -46,9 +46,12 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from service_target import DEV_DATABASE, DEV_PORTS, canonical, database_matches, ready_identity, service_identity
+from service_target import DEV_DATABASE, DEV_PORTS, canonical, database_matches, ready_identity, service_config
 SYS_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 RANK = {'ok': 0, 'warning': 1, 'critical': 2}
+DRILL_ROOT = Path('allrice40-dev/monitor-drills')
+DRILL_PEER_ROOT = Path('.local/state/allrice40-monitor-peer-drills')
+DRILL_LABEL = 'ai.bplabs.allrice40-dev-monitor-drill-'
 ICON = {'warning': '🟠', 'critical': '🔴', 'ok': '✅'}
 WORD = {'warning': '警告', 'critical': '严重'}
 
@@ -299,8 +302,8 @@ def derive_m1(cfg, *, formal=True):
         for role, plist in (('web', web), ('worker', worker)):
             label, port = 'ai.bplabs.allrice40-dev-' + role, DEV_PORTS[role]
             port_key = 'ALLRICE_' + role.upper() + '_PORT'
-            valid = service_identity(plist, label, port_key, str(port), DEV_DATABASE, HERE)
-            cfg[role + 'Identity'] = valid
+            valid = service_config(plist, label, port_key, str(port), DEV_DATABASE, HERE)
+            cfg[role + 'Identity'] = valid['identity'] if valid else None
             cfg[role + 'Label'] = label if valid else None
             cfg[role + 'Url'] = 'http://127.0.0.1:%s' % port if valid else None
             if not valid:
@@ -352,29 +355,30 @@ def derive_m1(cfg, *, formal=True):
 def configure_drill(cfg, peer):
     """Keep the timer, checkpoint and sink of a rehearsal separate from Dev."""
     home = Path.home().resolve()
-    local_root = Path('allrice40-dev/monitor-drills')
-    peer_root = Path('.local/state/allrice40-monitor-peer-drills')
     state = Path(cfg['stateDir'])
     tag = state.name
-    if not (cfg['configFile'] and state.parent == home / (peer_root if peer else local_root)
-            and canonical(state) and re.fullmatch(r'[a-z][a-z0-9-]{0,30}', tag)):
+    config = Path(cfg['configFile']).absolute()
+    if not (state.parent == home / (DRILL_PEER_ROOT if peer else DRILL_ROOT)
+            and canonical(state) and config == state / 'config.json' and canonical(config)
+            and re.fullmatch(r'[a-z][a-z0-9-]{0,30}', tag)):
         sys.exit('monitor --drill requires --config and a dedicated monitor drill state directory')
     credentials = Path(cfg['telegramEnv'])
     if peer and credentials == Path(expand(PEER['telegramEnv'])):
         credentials = state / 'telegram.env'
     if credentials.parent != state or not canonical(credentials):
         sys.exit('monitor --drill requires a Telegram configuration inside its state directory')
-    cfg.update(drill=True, label='演练', telegramEnv=str(credentials),
-               launchdLabel='ai.bplabs.allrice40-dev-monitor-drill-' + tag + ('-peer' if peer else ''))
+    cfg.update(drill=True, drillTag=tag, configFile=str(config), label='演练', telegramEnv=str(credentials),
+               launchdLabel=DRILL_LABEL + tag + ('-peer' if peer else '-m1'))
     allowed = ('m1', 'monitor') if peer else ('postgres', 'sandbox_vm', 'images', 'disk', 'peer', 'monitor')
     if cfg['checks'] is None:
         cfg['checks'] = list(allowed)
     elif not isinstance(cfg['checks'], list) or any(check not in allowed for check in cfg['checks']):
         sys.exit('monitor --drill: checks must target the rehearsal')
     if peer:
-        cfg['m1Heartbeat'] = str(local_root / tag / 'heartbeat.json')
-        cfg['m1DeployLock'] = str(local_root / tag / 'deploy.lock')
-        cfg['m1MonitorConfig'] = str(local_root / tag / 'config.json')
+        cfg['m1Heartbeat'] = str(DRILL_ROOT / tag / 'heartbeat.json')
+        cfg['m1DeployLock'] = str(DRILL_ROOT / tag / 'deploy.lock')
+        cfg['m1MonitorConfig'] = str(DRILL_ROOT / tag / 'config.json')
+        cfg['m1Monitor'] = PEER['m1Monitor']
         return
     dsn = cfg['incidentDatabaseUrl']
     try:
@@ -387,7 +391,30 @@ def configure_drill(cfg, peer):
     if not valid:
         sys.exit('monitor --drill requires the dedicated loopback drill database on a test port')
     cfg.update(databaseUrl=dsn, publicUrl=None, extraPublicUrls=[], images={},
-               deployLock=str(state / 'deploy.lock'), peerHeartbeat=str(peer_root / tag / 'heartbeat.json'))
+               deployLock=str(state / 'deploy.lock'), peerHeartbeat=str(DRILL_PEER_ROOT / tag / 'heartbeat.json'))
+
+
+def configure_formal(cfg):
+    """A formal command must not consume a drill checkpoint or manage its timer."""
+    home = Path.home().resolve()
+    roots = (home / DRILL_ROOT, home / DRILL_PEER_ROOT)
+    paths = [Path(path).absolute() for path in (cfg['stateDir'], cfg['configFile']) if path]
+    if (cfg.get('drill') or cfg.get('drillTag') or cfg.get('label') == '演练'
+            or (cfg.get('launchdLabel') or '').startswith(DRILL_LABEL)
+            or any(path.is_relative_to(root) or path.resolve().is_relative_to(root.resolve())
+                   for path in paths for root in roots)):
+        sys.exit('monitor: drill state, configuration and timers require --drill')
+    cfg.update(drill=False, drillTag=None)
+
+
+def status_command(cfg, peer):
+    command = ('/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor status --peer' if peer else
+               '~/allrice40-dev/bin/monitor status')
+    if cfg.get('configFile'):
+        command += ' --config ' + shlex.quote(cfg['configFile'])
+    if cfg.get('drill'):
+        command += ' --drill'
+    return command
 
 
 def finding(key, severity, title, detail='', runbook='', step=''):
@@ -419,6 +446,12 @@ class Round:
                     self.state_lost = '%s.corrupt-%d' % (self.state_file, self.now)
                     os.replace(self.state_file, self.state_lost)
                     self.state = {'stateLost': self.state_lost}
+        drill = cfg.get('drillTag')
+        target = {'tag': drill, 'role': 'peer' if peer else 'm1'} if drill else None
+        if self.state and not self.state_lost and self.state.get('drillTarget') != target:
+            raise CheckError('monitor state belongs to a different target')
+        if target:
+            self.state['drillTarget'] = target
         self.facts, self.progress = {}, None
 
     def save(self):
@@ -594,14 +627,17 @@ def compose(r, events):
 def incident(r, kind, severity, f, alert, incident_id=None, event=None):
     if not r.cfg.get('incidents'):
         return
-    r.state.setdefault('incidentOutbox', []).append({
+    row = {
         'id': incident_id or str(uuid.uuid4()), 'kind': kind, 'severity': severity,
         'detailCode': 'monitor.' + f['key'], 'createdAt': time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(r.now)),
         'metadata': {'source': 'allrice-monitor', 'monitor': r.cfg['name'], 'label': r.cfg['label'], 'host': socket.gethostname(),
                      'event': event, 'title': alert['title'], 'detail': f['detail'] or alert.get('detail', ''),
                      'runbook': alert.get('runbook', ''), 'alertId': alert['incidentId'], 'since': int(alert['since']),
                      'durationSeconds': int(r.now - alert['since'])},
-    })
+    }
+    if r.cfg.get('drillTag'):
+        row['metadata']['drill'] = r.cfg['drillTag']
+    r.state.setdefault('incidentOutbox', []).append(row)
 
 
 INSERT_INCIDENTS = """
@@ -612,22 +648,46 @@ on conflict (id) do nothing;
 """
 
 
-def flush_incidents(r):
-    """Write queued incidents; on failure keep them (bounded) for the next round."""
+def incident_mode_matches(cfg, row):
+    metadata = row.get('metadata') if isinstance(row, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    drill = cfg.get('drillTag')
+    if drill:
+        return metadata.get('drill') == drill and metadata.get('label') == '演练'
+    return 'drill' not in metadata and metadata.get('label') != '演练'
+
+
+def incident_failure(r, error):
+    r.state['incidentError'] = {'at': r.now, 'error': error}
+    r.state.setdefault('incidentFailingSince', r.now)
+
+
+def pending_incidents(r):
     box = r.state.get('incidentOutbox', [])
+    if not box or not r.cfg['incidents']:
+        return []
+    if not all(incident_mode_matches(r.cfg, row) for row in box):
+        incident_failure(r, 'incident outbox belongs to a different monitor target')
+        return []
     if len(box) > 200:
         r.state['incidentDropped'] = r.state.get('incidentDropped', 0) + len(box) - 200
         box = box[-200:]
     r.state['incidentOutbox'] = box
-    if not box or not r.cfg['incidents']:
+    return box
+
+
+def flush_incidents(r):
+    """Write queued incidents; on failure keep them (bounded) for the next round."""
+    box = pending_incidents(r)
+    if not box:
         return
     try:
         r.psql(INSERT_INCIDENTS, r.cfg['incidentDatabaseUrl'], {'rows': json.dumps(box, ensure_ascii=False)}, readonly=False)
         r.state['incidentOutbox'] = []
         r.state['incidentError'] = None
     except CheckError as err:
-        r.state['incidentError'] = {'at': r.now, 'error': str(err)}
-        r.state.setdefault('incidentFailingSince', r.now)
+        incident_failure(r, str(err))
     else:
         r.state.pop('incidentFailingSince', None)
 
@@ -635,12 +695,8 @@ def flush_incidents(r):
 def flush_incidents_remote(r):
     """The huihuimac side has no database: its incidents go to M1's table through the
     monitor installed there (`monitor ingest-incidents`), as soon as M1 answers again."""
-    box = r.state.get('incidentOutbox', [])
-    if len(box) > 200:
-        r.state['incidentDropped'] = r.state.get('incidentDropped', 0) + len(box) - 200
-        box = box[-200:]
-    r.state['incidentOutbox'] = box
-    if not box or not r.cfg['incidents']:
+    box = pending_incidents(r)
+    if not box:
         return
     cmd = '/usr/bin/python3 %s ingest-incidents' % shlex.quote(r.cfg['m1Monitor'])
     if r.cfg.get('m1MonitorConfig'):
@@ -650,8 +706,7 @@ def flush_incidents_remote(r):
     rc, _, err = run(['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', r.cfg['m1Ssh'], cmd], 60,
                      stdin=json.dumps(box, ensure_ascii=False))
     if rc:
-        r.state['incidentError'] = {'at': r.now, 'error': 'ingest on %s failed (exit %d): %s' % (r.cfg['m1Ssh'], rc, short(err, 200))}
-        r.state.setdefault('incidentFailingSince', r.now)
+        incident_failure(r, 'ingest on %s failed (exit %d): %s' % (r.cfg['m1Ssh'], rc, short(err, 200)))
     else:
         r.state['incidentOutbox'], r.state['incidentError'] = [], None
         r.state.pop('incidentFailingSince', None)
@@ -665,6 +720,8 @@ def ingest_incidents(cfg, stream):
         and isinstance(i.get('metadata'), dict) and re.match(r'^[0-9a-f-]{36}$', str(i.get('id', ''))) for i in rows)
     if not ok:
         sys.exit('ingest-incidents: expected a JSON list of monitor incidents')
+    if not all(incident_mode_matches(cfg, row) for row in rows):
+        sys.exit('ingest-incidents: events belong to a different monitor target')
     if not cfg['incidents'] or not cfg['incidentDatabaseUrl']:
         sys.exit('ingest-incidents: no verified incident delivery target')
     try:
@@ -814,8 +871,9 @@ def deploying(r):
 def check_deploy(r):
     if not os.path.exists(expand(r.cfg['deployInflight'])) or deploying(r):
         return [finding('deploy', 'ok', '部署中断未恢复')]
-    return [finding('deploy', 'critical', '部署中断未恢复', '%s 还在，但没有部署在进行：上一次部署被强行中止，Dev 可能停在半途' % r.cfg['deployInflight'],
-                    'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status（恢复由发布负责人 deploy-dev --release-manager --recover）')]
+    detail = ('%s 还在，上一次部署被中止。发布负责人可执行 '
+              '~/allrice40-dev/bin/deploy-dev --release-manager --recover' % r.cfg['deployInflight'])
+    return [finding('deploy', 'critical', '部署中断未恢复', detail, 'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status')]
 
 
 def check_service(r, role):
@@ -1130,7 +1188,7 @@ def check_subscription(r):
     count; an unreadable quota is unknown, which keeps an open quota alert as it is, and
     alerts by itself only once it has lasted subscriptionStaleMinutes."""
     rows = json.loads(r.psql(SUBSCRIPTION_SQL, r.cfg['databaseUrl']) or '[]')
-    step = '后台「模型与订阅」查看授权与额度；psql 查 allrice_provider_status'
+    step = '后台「模型与订阅」查看授权与额度。查 allrice_provider_status 时连接 127.0.0.1:5434/allrice40_dev'
     if not rows:
         return [finding('subscription', 'critical', '模型订阅不可用', '没有启用的 Codex 订阅槽位', 'm1-model-subscription.md', step)]
     auth, auth_sev, quota, quota_sev, judged, auth_unsure, quota_unsure = [], 'ok', [], 'ok', False, False, False
@@ -1464,7 +1522,7 @@ def check_model_authorization(r):
     if state.get('gap'):
         issues.append(state['gap']['reason'] + '；历史计数不完整，需新有效到期版本及完整安静窗口')
     data = finding('model_authorization_data', 'warning' if issues else 'ok', '模型授权无法判断',
-                   '；'.join(issues), 'm1-model-subscription.md', 'monitor status 查看未知原因，核对授权文件与 Worker 日志可读性')
+                   '；'.join(issues), 'm1-model-subscription.md', status_command(r.cfg, r.peer))
     data['noRepeat'] = True
     expiry_phase = None if expires is None or expires / 1000 - r.now > 72 * 3600 \
         else 24 if expires / 1000 - r.now <= 24 * 3600 else 72
@@ -1592,7 +1650,7 @@ def check_disk(r):
         r.facts.setdefault('disks', {})[d['path']] = free
         out.append(finding('disk:' + d['path'], sev, '磁盘余量不足（%s）' % d['path'],
                            '剩 %s GiB（警告线 %s GiB，严重线 %s GiB）' % ('%.1f' % free if free >= 10 else '%.2f' % free, d['warnFreeGiB'], d['criticalFreeGiB']),
-                           'm1-disk-space.md', 'df -h %s; du -sh ~/allrice-* ~/Library/Caches 2>/dev/null | sort -h | tail' % shlex.quote(path)))
+                           'm1-disk-space.md', 'df -h %s; du -sh ~/allrice40-dev ~/allrice40-dev-releases ~/allrice40-worktrees ~/allrice40-backups ~/Library/Caches 2>/dev/null | sort -h | tail' % shlex.quote(path)))
     return out
 
 
@@ -1702,7 +1760,9 @@ def judge_heartbeat(r, hb, keys, titles, stale, unfinished, stuck, severity, run
 def check_peer(r):
     """The huihuimac watchdog: without it nobody would notice M1 itself going down."""
     hb, err, _, _ = read_remote_heartbeat(r.cfg['peerSsh'], r.cfg['peerHeartbeat'])
-    step = 'ssh %s "launchctl print gui/\\$(id -u)/ai.bplabs.allrice40-dev-monitor-peer | head -20"' % r.cfg['peerSsh']
+    tag = r.cfg.get('drillTag')
+    label = DRILL_LABEL + tag + '-peer' if tag else 'ai.bplabs.allrice40-dev-monitor-peer'
+    step = 'ssh %s %s' % (shlex.quote(r.cfg['peerSsh']), shlex.quote('launchctl print gui/$(id -u)/' + label + ' | head -20'))
     if not hb:
         return [finding('peer', 'warning', 'huihuimac 看门失效', err + '；M1 整机故障时将没人报警', 'm1-monitor.md', step)]
     r.facts['peer'] = hb
@@ -1718,7 +1778,7 @@ def check_monitor(r):
     err = (r.state.get('incidentError') or {}).get('error', '')
     return [finding('monitor', 'warning', '告警写不进事件表', '已 %s，积压 %d 条%s：%s' % (
         ago(r.now - since), len(r.state.get('incidentOutbox', [])), '（另有 %d 条超出上限已丢弃）' % dropped if dropped else '', err),
-        'm1-monitor.md', 'monitor status')]
+        'm1-monitor.md', status_command(r.cfg, r.peer))]
 
 
 # ---------- business checks (SQL, read-only) ----------
@@ -2011,7 +2071,7 @@ select coalesce(json_agg(g order by g.today desc, g.code), '[]') as groups from 
   from f group by code having count(*) filter (where today) > 0) g"""
 
 BUSINESS_RUNBOOK = 'm1-monitor.md#业务巡检'
-SQL_STEP = 'psql 查 allrice40_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
+SQL_STEP = '连接 127.0.0.1:5434/allrice40_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
 
 
 def biz(r, sql):
@@ -2396,7 +2456,7 @@ def run_checks(r, checks):
         except Exception as err:  # a bug in one check must not stop the others or the round
             results[name] = None
             text = str(err) if isinstance(err, CheckError) else '%s: %s' % (type(err).__name__, short(err, 200))
-            errors[name] = finding('check:' + name, 'warning', '检查 %s 本身出错' % name, text, 'm1-monitor.md', 'monitor status')
+            errors[name] = finding('check:' + name, 'warning', '检查 %s 本身出错' % name, text, 'm1-monitor.md', status_command(r.cfg, r.peer))
         p['current'] = None
 
     def bad(name):
@@ -2517,11 +2577,11 @@ def do_round(cfg, peer):
         error = 'round timed out after %ss in check %s' % (cfg['roundTimeoutSeconds'], stuck)
         findings, ran = collect_checks(r) if r.progress else ([], set())
         findings.append(finding('monitor_round', 'critical', '监控本轮超时', '检查 %s 卡住，%s 秒没跑完；其余检查的结果照常报告' % (
-            stuck, cfg['roundTimeoutSeconds']), 'm1-monitor.md', 'monitor status'))
+            stuck, cfg['roundTimeoutSeconds']), 'm1-monitor.md', status_command(cfg, peer)))
     lost = r.state.pop('stateLost', None)
     findings.append(finding('monitor_state', 'warning' if lost else 'ok', '监控状态文件损坏',
                             '读不出来，已另存为 %s；之前的待发通知和告警状态丢了，已有的故障会重新报一次' % lost,
-                            'm1-monitor.md', 'monitor status'))
+                            'm1-monitor.md', status_command(cfg, peer)))
     preparation_state = r.state
     signal.alarm(90)  # delivery has its own timeouts; this only bounds a hung write
     try:
@@ -2724,11 +2784,12 @@ def main(argv):
     if a.drill and (not a.config or a.command not in ('run', 'peer', 'status', 'test-alert', 'launchd', 'ingest-incidents')):
         p.error('--drill requires --config for run, peer, status, test-alert, launchd or ingest-incidents')
     cfg = load_config(a.config, peer)
-    cfg['drill'] = False  # a config file alone cannot select the drill sink
     if a.drill:
         configure_drill(cfg, peer)
-    elif not peer:
-        derive_m1(cfg, formal=not (a.dry_run and a.command in ('run','daily')))
+    else:
+        configure_formal(cfg)
+        if not peer:
+            derive_m1(cfg, formal=not (a.dry_run and a.command in ('run','daily')))
     os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     if a.command in ('run', 'peer') and a.dry_run:
         r = Round(cfg, peer)

@@ -9,6 +9,7 @@ import os
 import plistlib
 import re
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -484,7 +485,9 @@ class DeployDevMigrations(unittest.TestCase):
                     'ALLRICE_DSH_ORIGIN_READER_ENV_ROOT=/old-reader\n'
                     'ALLRICE_DSH_RETAINEDNESS=keep-similar-key\n'
                     'ALLRICE_STORAGE_ROOT=' + self.home + '/allrice-dev/.local/storage\n'
-                    'ALLRICE_DSH_PLATFORM_HOME=' + self.home + '/allrice-dev/.local/dsh-platform\n')
+                    'ALLRICE_DSH_PLATFORM_HOME=' + self.home + '/allrice-dev/.local/dsh-platform\n'
+                    'ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012\n'
+                    'ALLRICE_WORKER_PORT=3012\n')
         write(env_file, contents, 0o600)
         base_env = dict(HOME=self.home, PATH=os.path.dirname(NODE) + ':/usr/bin:/bin')
         # Use the real Node parser, not an env-file stub: these bytes do reintroduce
@@ -547,6 +550,8 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
             self.assertEqual(actual['ALLRICE_STORAGE_ROOT'], qa + '/.local/storage')
             self.assertEqual(actual['ALLRICE_DSH_PLATFORM_HOME'], self.home + '/allrice40-dev/.local/dsh-platform')
+            self.assertEqual(actual['ALLRICE_WORKER_INTERNAL_URL'], 'http://127.0.0.1:3201')
+            self.assertEqual(actual['ALLRICE_WORKER_PORT'], '3201')
             self.assert_no_legacy_settings(actual)
         monitor = runpy.run_path(os.path.join(HERE, 'monitor'))
         cfg = dict(monitor['M1'], webPlist=self.live_plist('web'),
@@ -888,7 +893,7 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertFalse(os.path.exists(saved))
                 self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')))
 
-    def test_forward_fix_after_partial_plist_write_replaces_both_seals(self):
+    def test_recovery_after_partial_plist_write_uses_the_consistent_saved_pair(self):
         stubs, smoke = self.successful_deploy_stubs()
         candidate = self.release(sha='c' * 40)
         self.saved_release(self.release(files=FILES[:-1]))
@@ -904,8 +909,12 @@ class DeployDevMigrations(unittest.TestCase):
         parked = os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')
         for role, letter in (('web', 'c'), ('worker', 'a')):
             self.assertEqual(self.read_plist(os.path.join(parked, role + '.plist'))['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'sha256:' + letter * 64)
-        shutil.move(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight'), os.path.join(self.tmp, 'failed-deploy'))
-        # The repair reuses the Worker's original artifact. Both plists must converge.
+        p = self.run_dd('take_lock() { :; }; stop_job() { :; }; start_job() { :; }; wait_ready() { :; }; recover',
+                        FILES[:-1] + ARCHIVED, CONTRACT='row:1')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        for role in ('web', 'worker'):
+            self.assertEqual(self.read_plist(self.live_plist(role))['EnvironmentVariables']['ALLRICE_RELEASE_SHA'], 'a' * 40)
+        # The repaired pair can now be safely used for a subsequent release.
         p = self.run_dd(stubs + 'deploy', FILES + ARCHIVED, CONTRACT='row:1',
                         CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'a' * 64, SMOKE=smoke)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -915,7 +924,20 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(env['ALLRICE_RELEASE_SHA'], 'b' * 40)
         self.assertIn('SMOKE:--dev --expect-sha ' + 'b' * 40, p.stdout)
         self.assertFalse(os.path.exists(parked))
-        self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/.previous-release')))
+        self.assertTrue(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/.previous-release')))
+
+    def test_deploy_and_rollback_refuse_an_unrecoverable_pair_before_side_effects(self):
+        other = self.release(sha='a' * 40)  # Same commit, different sealed build directory.
+        with open(self.live_plist('web'), 'wb') as f:
+            plistlib.dump(self.plist('web', other), f)
+        for command in ('deploy', 'rollback "$TARGET"'):
+            with self.subTest(command=command):
+                p = self.run_dd('git() { echo GIT; }; stop_both() { echo STOPPED; }; ' + command, [], TARGET=other)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn('refusing a mismatched Dev configuration', p.stderr)
+                self.assertNotIn('STOPPED', p.stdout)
+                self.assertNotIn('GIT', p.stdout)
+                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')))
 
     def test_dev_operations_refuse_old_or_miswired_plists_before_effects(self):
         rejected = [
@@ -986,6 +1008,57 @@ class DeployDevMigrations(unittest.TestCase):
             plistlib.dump(valid, f)
         p = self.run_dd('dev_plist_pair', [])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_loaded_native_controller_roots_are_covered_by_snapshot(self):
+        dotenv = os.path.join(self.home, 'allrice40-dev/.env')
+        local = os.path.join(self.home, 'allrice40-dev/.local')
+        root = os.path.join(local, 'native-once-control-m1')
+        write(os.path.join(root, 'controller.data'), 'once fixture')
+        worker = self.plist('worker')
+        worker['EnvironmentVariables'].pop('ALLRICE_NATIVE_ONCE_REFERENCE')
+        for index, loader in enumerate((False, True)):
+            with self.subTest(loader=loader):
+                if loader:
+                    worker['ProgramArguments'] = [os.path.join(HERE, 'with-env'), 'worker', NODE,
+                                                  worker['ProgramArguments'][-1]]
+                with open(self.live_plist('worker'), 'wb') as f:
+                    plistlib.dump(worker, f)
+                for valid in (False, True):
+                    target = root if valid else self.home + '/allrice-dev/.local/native-once-control-m1'
+                    reference = shlex.quote(json.dumps({'stateRoot': target}))
+                    write(dotenv, 'ALLRICE_NATIVE_ONCE_ENABLED=1\nALLRICE_NATIVE_ONCE_REFERENCE=' + reference + '\n')
+                    name = '20261124-030%d-aaaaaaaa' % index
+                    p = self.run_dd('snapshot "$NAME"', [], NAME=name)
+                    self.assertEqual(p.returncode, 0 if valid else 1, p.stdout + p.stderr)
+                    self.assertEqual(os.path.exists(os.path.join(self.snapshots, name, 'native-once-control-m1/controller.data')), valid)
+
+    def test_disabled_native_controller_can_leave_reference_empty(self):
+        worker = self.plist('worker')
+        worker['EnvironmentVariables'].update(ALLRICE_NATIVE_ONCE_ENABLED='0', ALLRICE_NATIVE_ONCE_REFERENCE='')
+        with open(self.live_plist('worker'), 'wb') as f:
+            plistlib.dump(worker, f)
+        write(os.path.join(self.home, 'allrice40-dev/.env'), 'ALLRICE_NATIVE_ONCE_ENABLED=1\nALLRICE_NATIVE_ONCE_REFERENCE=bad\n')
+        p = self.run_dd('"$BIN/with-env" worker /bin/bash -c '
+                        "'printf \"%s\\n%s\\n\" \"$ALLRICE_NATIVE_ONCE_ENABLED\" \"$ALLRICE_NATIVE_ONCE_REFERENCE\"'", [])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout, '0\n\n')
+
+    def test_qa_smoke_refuses_a_web_route_to_a_different_worker(self):
+        task = 'tool-test'
+        qa = self.write_qa_plists(task)
+        write(os.path.join(qa, 'instance.json'), json.dumps(dict(repository='semiok/allrice-vm',
+            repositoryId=1469490636, webPort=3200, workerPort=3201, nativeArtifactId='new-art')))
+        for role in ('web', 'worker'):
+            live = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-%s-%s.plist' % (task, role))
+            plist = self.read_plist(os.path.join(qa, role + '.plist'))
+            if role == 'web':
+                plist['EnvironmentVariables'].update(ALLRICE_WORKER_PORT='3211', ALLRICE_WORKER_INTERNAL_URL='http://127.0.0.1:3211')
+            with open(live, 'wb') as f:
+                plistlib.dump(plist, f)
+        p = self.run_config_tool('smoke-test', '--instance', task)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('expected ai.bplabs.allrice-qa-tool-test-web', p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(qa, 'smoke')))
 
     def test_smoke_and_recovery_share_allocator_lock_before_reading_instance(self):
         from concurrent.futures import ThreadPoolExecutor
