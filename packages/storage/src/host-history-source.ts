@@ -162,6 +162,15 @@ function contentDigest(manifest: HostHistorySource) {
   });
 }
 
+async function syncDirectory(directory: string) {
+  const file = await open(directory, 'r');
+  try {
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
+
 /** Validate the complete ancestry against the exact referenced snapshots.
  * Header.parentSession is fork lineage and is deliberately not an edge. */
 async function validate(
@@ -331,7 +340,7 @@ export class HostHistorySourceStore {
   ) {
     signal.throwIfAborted();
     const directory = this.directory(key);
-    const digests = new Map<string, string>();
+    const knownCuts = new Map<string, CommittedHostHistorySource>();
     let names: string[];
     try {
       names = await readdir(directory);
@@ -341,7 +350,7 @@ export class HostHistorySourceStore {
       return {
         selected: null,
         selectedSnapshots: undefined,
-        digests,
+        knownCuts,
         slot: { index: 0, previous: null },
       };
     }
@@ -378,7 +387,7 @@ export class HostHistorySourceStore {
         compare(manifest, previous.manifest, snapshots, previous.snapshots);
       candidates.push({ manifest, snapshots });
       const content = contentDigest(manifest);
-      if (!digests.has(content)) digests.set(content, digest);
+      if (!knownCuts.has(content)) knownCuts.set(content, { digest, manifest });
       // Still validate/compare every committed vector. A browser digest may
       // only select a manifest that actually committed this exact member.
       if (
@@ -408,7 +417,7 @@ export class HostHistorySourceStore {
     return {
       selected,
       selectedSnapshots,
-      digests,
+      knownCuts,
       slot: { index: commits.size, previous },
     };
   }
@@ -416,6 +425,12 @@ export class HostHistorySourceStore {
     input: HostHistorySource,
     signal: AbortSignal,
   ): Promise<string> {
+    return (await this.publishCut(input, signal)).digest;
+  }
+  async publishCut(
+    input: HostHistorySource,
+    signal: AbortSignal,
+  ): Promise<CommittedHostHistorySource> {
     const manifest = HostHistorySourceSchema.parse(input);
     const snapshots = await validate(manifest, this.raw, signal);
     const digest = hostHistoryDigest(manifest),
@@ -423,10 +438,16 @@ export class HostHistorySourceStore {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const content = contentDigest(manifest);
     for (;;) {
-      const { selected, selectedSnapshots, digests, slot } =
+      const { selected, selectedSnapshots, knownCuts, slot } =
         await this.readCommitted(manifest.key, signal);
-      const committed = digests.get(content);
-      if (committed) return committed;
+      const committed = knownCuts.get(content);
+      if (committed) {
+        // Another publisher can expose a hard link before syncing its parent.
+        // A successful reuse must independently ensure that link is durable.
+        await syncDirectory(directory);
+        signal.throwIfAborted();
+        return committed;
+      }
       if (
         selected &&
         compare(manifest, selected.manifest, snapshots, selectedSnapshots!) < 0
@@ -435,7 +456,7 @@ export class HostHistorySourceStore {
       // A lost atomic claim leaves only private staging bytes. Verify the
       // winner and retry only if this immutable cut still extends that history.
       if (await this.commit(directory, { ...slot, digest, manifest }, signal))
-        return digest;
+        return { digest, manifest };
     }
   }
   private async commit(
@@ -459,12 +480,7 @@ export class HostHistorySourceStore {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         return false;
       }
-      const parent = await open(directory, 'r');
-      try {
-        await parent.sync();
-      } finally {
-        await parent.close();
-      }
+      await syncDirectory(directory);
     } finally {
       await file.close().catch(() => undefined);
       await rm(temporary, { force: true });

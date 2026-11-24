@@ -128,6 +128,8 @@ export async function checkpointNativeHistory(input: {
   key: HostHistorySourceKey;
   originalBindings: readonly HostHistoryBinding[];
   native: NativeHistoryReader;
+  /** Current authorization also retrieves this session's original binding
+   * from its trusted creation owner. The expected binding is a selector. */
   authorize: Capture['authorize'];
   attachments: Capture['attachments'];
   snapshots: Capture['store'];
@@ -147,6 +149,7 @@ export async function checkpointNativeHistory(input: {
   const native = input.native;
   const instance = native.binding.instanceId;
   let previous: CommittedHostHistorySource | null = null;
+  const births = new Map<string, HostHistoryBinding>();
   const priorBinding = (id: string) =>
     previous?.manifest.sessions.find(
       (row) => row.binding.nativeSessionId === id,
@@ -158,7 +161,11 @@ export async function checkpointNativeHistory(input: {
     personId: native.binding.personId,
     employeeInstanceId: native.endpoint.employeeInstanceId,
     nativeInstanceRef:
-      priorBinding(binding.nativeSessionId)?.nativeInstanceRef ?? instance,
+      priorBinding(binding.nativeSessionId)?.nativeInstanceRef ??
+      (previous
+        ? births.get(binding.nativeSessionId)?.nativeInstanceRef
+        : undefined) ??
+      instance,
     nativeProfileRef: native.profile.nativeProfileRef,
     configurationRef: native.profile.configurationRef,
     configurationDigest: native.profile.configurationDigest,
@@ -233,7 +240,13 @@ export async function checkpointNativeHistory(input: {
     return grant;
   };
   try {
-    for (const binding of bindings) await authorize(binding, signal);
+    for (const binding of bindings) {
+      const initial = await authorize(binding, signal);
+      births.set(
+        binding.nativeSessionId,
+        HostHistoryBindingSchema.parse(initial.binding),
+      );
+    }
     await native.assertCurrent(signal);
     signal.throwIfAborted();
     if (root.nativeInstanceRef !== instance) {
@@ -362,9 +375,9 @@ export async function checkpointNativeHistory(input: {
       sessions,
       edges,
     };
-    const digest = await input.sources.publish(manifest, signal);
+    const committed = await input.sources.publishCut(manifest, signal);
     signal.throwIfAborted();
-    return { digest, manifest };
+    return committed;
   } finally {
     for (const subscription of revocations.values())
       subscription[Symbol.dispose]();

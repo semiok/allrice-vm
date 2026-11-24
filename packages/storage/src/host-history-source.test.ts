@@ -9,7 +9,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   type HostHistoryBinding,
   type HostHistorySnapshot,
@@ -26,7 +26,27 @@ import {
 } from './host-history-source.ts';
 
 const roots: string[] = [];
+const syncHooks = vi.hoisted(() => new Map<string, () => unknown>());
+vi.mock('node:fs/promises', async (load) => {
+  const fs = await load<typeof import('node:fs/promises')>();
+  return {
+    ...fs,
+    open: async (...args: Parameters<typeof fs.open>) => {
+      const file = await fs.open(...args);
+      const hook = args[1] === 'r' && syncHooks.get(String(args[0]));
+      if (hook) {
+        const sync = file.sync.bind(file);
+        file.sync = async () => {
+          await hook();
+          await sync();
+        };
+      }
+      return file;
+    },
+  };
+});
 afterEach(async () => {
+  syncHooks.clear();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -484,6 +504,43 @@ describe('committed host history source', () => {
     await expect(f.sources.read(f.key, signal())).rejects.toBeInstanceOf(
       HostHistoryIntegrityError,
     );
+  });
+  it('requires actual directory durability before reusing a visible winner and retains synchronization errors', async () => {
+    const f = await fixture();
+    const directory = join(
+      f.root,
+      'sources',
+      hostHistoryDigest(f.key).slice(7),
+    );
+    const pending = gate(),
+      finish = gate();
+    const unavailable = Error('directory fsync failure');
+    let syncs = 0;
+    syncHooks.set(directory, async () => {
+      syncs++;
+      if (syncs === 1) {
+        pending.release();
+        await finish.promise;
+      } else if (syncs === 2) {
+        throw unavailable;
+      }
+    });
+    const publisher = f.sources.publishCut(f.manifest, signal());
+    const another = new HostHistorySourceStore(f.root, f.raw);
+    try {
+      await pending.promise;
+      await expect(another.publishCut(f.manifest, signal())).rejects.toBe(
+        unavailable,
+      );
+      expect(await another.publishCut(f.manifest, signal())).toEqual({
+        digest: hostHistoryDigest(f.manifest),
+        manifest: f.manifest,
+      });
+    } finally {
+      finish.release();
+      await publisher;
+    }
+    expect(syncs).toBe(3);
   });
 
   it('retains the privately verified manifest even when the caller changes its digest and members', async () => {

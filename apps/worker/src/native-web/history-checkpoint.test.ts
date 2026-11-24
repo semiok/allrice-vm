@@ -284,6 +284,76 @@ describe('native history checkpoint', () => {
       manifest: original.manifest,
     });
   });
+  it('captures a child born after the prior root checkpoint and before the verified VM restart', async () => {
+    const f = await fixture();
+    const ownerBirths = new Map(
+      f.input.originalBindings.map((binding) => [
+        binding.nativeSessionId,
+        structuredClone(binding),
+      ]),
+    );
+    f.input.authorize.mockImplementation(async (selection) => ({
+      binding: ownerBirths.get(selection.nativeSessionId)!,
+      revoked: signal(),
+    }));
+    const beforeChild = {
+      rootSessionId: 'root',
+      sessions: [{ ...f.cut.sessions[0]!, events: [], catalog: [] }],
+    };
+    f.input.native.readCut.mockResolvedValueOnce(JSON.stringify(beforeChild));
+    const original = await checkpointNativeHistory({
+      ...f.input,
+      originalBindings: [f.binding],
+    });
+    expect(original.manifest.sessions).toHaveLength(1);
+    const actual = structuredClone(f.cut);
+    (actual.sessions[1]!.events as unknown[]).push({
+      type: 'turn/start',
+      seq: 0,
+      time: 5,
+      data: { turn: 1 },
+    });
+    const native = {
+      ...f.input.native,
+      binding: {
+        ...f.input.native.binding,
+        instanceId: randomUUID(),
+        leaseEpoch: 2,
+      },
+      readCut: vi.fn(async () => JSON.stringify(actual)),
+    };
+    const continued = await checkpointNativeHistory({ ...f.input, native });
+    expect(
+      continued.manifest.sessions.map(({ binding }) => [
+        binding.nativeSessionId,
+        binding.nativeInstanceRef,
+      ]),
+    ).toEqual([
+      ['root', f.binding.nativeInstanceRef],
+      ['child', f.binding.nativeInstanceRef],
+    ]);
+    const child = continued.manifest.sessions[1]!;
+    expect(
+      (
+        await f.input.snapshots.read(
+          child.binding,
+          signal(),
+          child.snapshotDigest,
+        )
+      )?.snapshot.source.eventHashes,
+    ).toEqual(actual.sessions[1]!.events.map(hostHistoryDigest));
+
+    const reordered = { ...actual, sessions: [...actual.sessions].reverse() };
+    native.readCut.mockResolvedValueOnce(JSON.stringify(reordered));
+    const receipt = await checkpointNativeHistory({ ...f.input, native });
+    expect(receipt).toEqual(continued);
+    expect(hostHistoryDigest(receipt.manifest)).toBe(receipt.digest);
+    ownerBirths.delete('child');
+    await expect(
+      checkpointNativeHistory({ ...f.input, native }),
+    ).rejects.toBeDefined();
+    expect(native.readCut).toHaveBeenCalledTimes(2);
+  });
   it('does not reconstruct missing original facts or dispatch a read without them', async () => {
     const f = await fixture();
     await expect(
@@ -331,7 +401,7 @@ describe('native history checkpoint', () => {
   });
   it('leaves published snapshots uncommitted if the real manifest publication fails', async () => {
     const f = await fixture();
-    vi.spyOn(f.input.sources, 'publish').mockRejectedValue(
+    vi.spyOn(f.input.sources, 'publishCut').mockRejectedValue(
       new Error('fixture-manifest-failed'),
     );
     await expect(checkpointNativeHistory(f.input)).rejects.toThrow(
