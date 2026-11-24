@@ -66,6 +66,36 @@ export class MemoryAccessLost extends MemoryClientError {
   }
 }
 
+async function fetchMemorySource(
+  url: string,
+  signal: AbortSignal,
+  options: { headers?: MemoryTarget['headers'] } = {},
+) {
+  signal.throwIfAborted();
+  const response = await fetch(url, { ...options, cache: 'no-store', signal });
+  signal.throwIfAborted();
+  if ([401, 403, 404].includes(response.status)) throw new MemoryAccessLost();
+  if (response.status !== 200) throw Error(memorySourceReadFailed);
+  const source = MemorySourceViewProjectionSchema.parse(await response.json());
+  signal.throwIfAborted();
+  return source;
+}
+
+/** Bind the same session scope headers as the personal list and detail. */
+export function personalEmployeeMemorySourceReader(
+  requestHeaders: MemoryTarget['headers'],
+): EmployeeMemorySourceReader {
+  const headers = { ...requestHeaders };
+  return ({ workspaceId, instanceId, memoryId }, signal) => {
+    const params = new URLSearchParams({ workspaceId, instanceId });
+    return fetchMemorySource(
+      `/api/v1/memories/${encodeURIComponent(memoryId)}/source?${params}`,
+      signal,
+      { headers },
+    );
+  };
+}
+
 /** A real administrator keeps their own audited audience and never borrows
  * the owner's endpoint, credentials or module qualification. */
 export function adminEmployeeMemorySourceReader(target: {
@@ -88,16 +118,10 @@ export function adminEmployeeMemorySourceReader(target: {
       ownerId: input.ownerId,
       instanceId: input.instanceId,
     });
-    const response = await fetch(
+    return fetchMemorySource(
       `/api/v1/admin/organizations/${encodeURIComponent(input.organizationId)}/employee-memories/${encodeURIComponent(input.memoryId)}/source?${params}`,
-      { cache: 'no-store', signal },
+      signal,
     );
-    signal.throwIfAborted();
-    if ([401, 403, 404].includes(response.status)) throw new MemoryAccessLost();
-    if (response.status !== 200) throw Error(memorySourceReadFailed);
-    const value = MemorySourceViewProjectionSchema.parse(await response.json());
-    signal.throwIfAborted();
-    return value;
   };
 }
 

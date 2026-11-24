@@ -8,6 +8,7 @@ import {
   memorySaveUnknown,
   memoryUnknown,
   memorySourceReadFailed,
+  personalEmployeeMemorySourceReader,
   type MemoryWriteStore,
 } from './employee-memory-client';
 
@@ -324,6 +325,46 @@ describe('employee memory source projection consumer', () => {
       client.source(record, controller.signal),
     ).rejects.toMatchObject({ name: 'AbortError' });
     expect(readSource).not.toHaveBeenCalled();
+  });
+  it('binds the personal source URL and existing tenant headers, with a read-only retry and request cancellation', async () => {
+    const headers = { 'x-allrice-workspace-id': target.workspaceId };
+    const readSource = personalEmployeeMemorySourceReader(headers);
+    // The browser uses the captured session scope even if the caller replaces
+    // its selection headers while an old request is pending.
+    headers['x-allrice-workspace-id'] = id(90);
+    const client = employeeMemoryClient(target, new Map(), { readSource });
+    let complete!: (value: Response) => void;
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('{}', { status: 503 }))
+      .mockResolvedValueOnce(Response.json(source))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            complete = resolve;
+          }),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const controller = new AbortController();
+    await expect(client.source(record, controller.signal)).rejects.toThrow(
+      memorySourceReadFailed,
+    );
+    await expect(client.source(record, controller.signal)).resolves.toEqual(
+      source,
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      `/api/v1/memories/${record.id}/source?workspaceId=${target.workspaceId}&instanceId=${target.instanceId}`,
+      {
+        headers: { 'x-allrice-workspace-id': target.workspaceId },
+        cache: 'no-store',
+        signal: controller.signal,
+      },
+    );
+    const pending = client.source(record, controller.signal);
+    controller.abort();
+    complete(Response.json(source));
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
   });
   it.each([401, 403, 404])(
     'preserves admin source %s as whole-memory access loss',
