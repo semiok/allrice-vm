@@ -9,9 +9,9 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import type { IncomingMessage } from 'node:http';
+import { Agent, ClientRequest, type IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
@@ -49,10 +49,25 @@ async function waitForAuthNonce(path: string, nonce: string) {
     .toBe(nonce);
 }
 
+type ObserverWebServer = {
+  readonly host: string;
+  readonly port: number | undefined;
+  getOrigin(): string;
+  registerUpgrade(route: {
+    path: string;
+    handler(
+      req: IncomingMessage,
+      socket: Duplex,
+      head: Buffer,
+    ): void | Promise<void>;
+  }): () => void;
+};
+
 async function installObserverWeb(
   host: Context,
   source: NodeRequire,
   manual = false,
+  listenHost = '127.0.0.1',
 ) {
   let committed = false;
   const listeners = new Set<() => void>();
@@ -69,7 +84,7 @@ async function installObserverWeb(
   const { WebServer } = await import(
     pathToFileURL(resolve.resolve('@deepseek-ai/dsh-host-webserver')).href
   );
-  await host.plugin(WebServer, { host: '127.0.0.1', port: 0 });
+  await host.plugin(WebServer, { host: listenHost, port: 0 });
   function commit(reverse = false) {
     committed = true;
     const pending = [...listeners];
@@ -77,12 +92,13 @@ async function installObserverWeb(
     listeners.clear();
   }
   if (!manual) commit();
-  const server = host.webServer;
+  const server = host.get('webServer') as ObserverWebServer | undefined;
+  if (!server?.port) throw Error('DSH did not bind the web server');
   return {
     commit,
     pendingReady: () => listeners.size,
     server,
-    baseUrl: server.getOrigin(),
+    baseUrl: `http://127.0.0.1:${server.port}/`,
   };
 }
 
@@ -91,6 +107,7 @@ async function observerFixture(options?: {
   graphEvents?: boolean;
   manualReady?: boolean;
   beforeLoader?: () => Promise<void>;
+  listenHost?: string;
 }) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
   const local = await hostFixture(issue('execute'), true, null);
@@ -133,6 +150,7 @@ async function observerFixture(options?: {
     local.host,
     install,
     options?.manualReady,
+    options?.listenHost,
   );
   const callbacks = new Set<() => void>();
   if (options?.graphEvents) {
@@ -261,21 +279,92 @@ it('reports the real startup transport fault without publishing when the mux was
   }
 });
 
+it('addresses the actual IPv6-bound mux with its unmodified interface zone', async () => {
+  const internal = Object.entries(networkInterfaces()).flatMap(
+    ([name, interfaces]) =>
+      (interfaces ?? [])
+        .filter((address) => address.family === 'IPv6' && address.internal)
+        .map(({ address }) => ({ name, address: address.split('%')[0] })),
+  );
+  const linkLocal = internal.find(({ address }) =>
+    address?.startsWith('fe80:'),
+  );
+  const scoped = linkLocal ?? internal.find(({ address }) => address === '::1');
+  if (!scoped) throw Error('The test host has no IPv6 loopback interface');
+  const listenHost = `${scoped.address}%${scoped.name}`;
+  const f = await observerFixture({ listenHost });
+  const connect = vi.spyOn(Agent.prototype, 'createConnection');
+  try {
+    expect(f.web.server.host).toBe(listenHost);
+    if (linkLocal)
+      expect(() => f.web.server.getOrigin()).toThrow('interface zone id');
+    const active = f.mount('scoped-listener');
+    await waitForAuthNonce(f.artifacts, 'scoped-listener');
+    expect(connect).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        hostname: listenHost,
+        port: f.web.server.port,
+      }),
+      expect.any(Function),
+    );
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(active);
+  } finally {
+    connect.mockRestore();
+    await f.close();
+  }
+});
+
 it('joins the single anonymous Upgrade on retirement before permitting new publication', async () => {
   const f = await observerFixture({ manualReady: true });
   const arrived = deferred<IncomingMessage>();
   const disconnected = deferred();
+  const requestClose = deferred();
+  const physicalClose = deferred();
+  const acknowledge = deferred();
+  let probeSocket: Duplex | undefined;
+  const emit = ClientRequest.prototype.emit;
+  const requestEvents = vi
+    .spyOn(ClientRequest.prototype, 'emit')
+    .mockImplementation(function (this: ClientRequest, ...args) {
+      const result = emit.apply(this, args);
+      if (args[0] === 'close' && this.socket === probeSocket)
+        requestClose.resolve();
+      return result;
+    });
+  const connect = Agent.prototype.createConnection;
+  const capture = vi
+    .spyOn(Agent.prototype, 'createConnection')
+    .mockImplementation(function (this: Agent, ...args) {
+      const socket = connect.apply(this, args);
+      if (!socket) throw Error('The real probe socket was not allocated');
+      probeSocket = socket;
+      capture.mockRestore();
+      const once = socket.once.bind(socket);
+      const confirm = vi
+        .spyOn(socket, 'once')
+        .mockImplementation((event, listener) => {
+          if (event !== 'close') return once(event, listener);
+          confirm.mockRestore();
+          return once('close', (...args: unknown[]) => {
+            physicalClose.resolve();
+            void acknowledge.promise.then(() => listener(...args));
+          });
+        });
+      return socket;
+    });
   const registerUpgrade = f.web.server.registerUpgrade.bind(f.web.server);
-  let holdProbe = true;
+  let probes = 0;
   const register = vi
     .spyOn(f.web.server, 'registerUpgrade')
     .mockImplementation((route: Parameters<typeof registerUpgrade>[0]) => {
       return registerUpgrade({
         ...route,
         handler(req: IncomingMessage, socket: Duplex, head: Buffer) {
-          if (!holdProbe) return route.handler(req, socket, head);
-          holdProbe = false;
+          if (++probes !== 1) return route.handler(req, socket, head);
           socket.once('close', () => disconnected.resolve());
+          socket.once('end', () => socket.end());
+          socket.resume();
           arrived.resolve(req);
           // Leave the actual accepted Upgrade in flight until the owner cancels.
         },
@@ -294,8 +383,21 @@ it('joins the single anonymous Upgrade on retirement before permitting new publi
     await expect(readFile(f.artifacts)).rejects.toMatchObject({
       code: 'ENOENT',
     });
-    await f.owner.unloadNativeWebOwner(active);
+    const retiring: Promise<void> = f.owner.unloadNativeWebOwner(active);
+    let retired = false;
+    void retiring.then(
+      () => (retired = true),
+      () => (retired = true),
+    );
+    // Real socket close was dispatched. Only the owner's acknowledgement is
+    // held, so a return based solely on ClientRequest.close can settle now.
+    await Promise.all([requestClose.promise, physicalClose.promise]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(retired).toBe(false);
+    acknowledge.resolve();
+    await retiring;
     await disconnected.promise;
+    expect(probes).toBe(1);
     await expect(readFile(f.artifacts)).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -304,9 +406,49 @@ it('joins the single anonymous Upgrade on retirement before permitting new publi
     await waitForAuthNonce(f.artifacts, 'current-probe');
     expect((await f.open()).opened.baseline.owner).toBe(false);
     await f.owner.unloadNativeWebOwner(restored);
-    expect(register).toHaveBeenCalledTimes(1);
+    expect(probes).toBe(2);
   } finally {
+    acknowledge.resolve();
+    requestEvents.mockRestore();
+    capture.mockRestore();
     register.mockRestore();
+    await f.close();
+  }
+});
+
+it('reports an atomic publication failure, cleans staging and lets a new owner start on the same Host', async () => {
+  const f = await observerFixture();
+  const staged = deferred<string>();
+  try {
+    // A file cannot be atomically renamed over this directory. The temporary
+    // file itself is written normally, so its observed removal proves cleanup.
+    await mkdir(f.artifacts);
+    authStage.afterWrite = async (filename) => {
+      if (filename.startsWith(`${f.artifacts}.`)) staged.resolve(filename);
+    };
+    const failed = f.mount('failed-publication');
+    const temporary = await staged.promise;
+    await expect
+      .poll(() => Reflect.get(f.local.host.allricePrincipal, 'graphObserver'))
+      .toBeUndefined();
+    await expect(f.owner.unloadNativeWebOwner(failed)).rejects.toMatchObject({
+      code: 'EISDIR',
+      syscall: 'rename',
+      path: temporary,
+      dest: f.artifacts,
+    });
+    await expect(stat(temporary)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await stat(f.artifacts)).isDirectory()).toBe(true);
+    await expect(f.open()).rejects.toBeDefined();
+
+    authStage.afterWrite = undefined;
+    await rm(f.artifacts, { recursive: true });
+    const successor = f.mount('publication-recovered');
+    await waitForAuthNonce(f.artifacts, 'publication-recovered');
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(successor);
+  } finally {
+    authStage.afterWrite = undefined;
     await f.close();
   }
 });

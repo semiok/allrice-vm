@@ -114,7 +114,7 @@ it(
     const firstNonce = nativeWebAuthArtifact(f.launch.auth).path;
     await access(firstNonce);
     await f.owner.close();
-    expect((await f.exited).timedOut).toBe(false);
+    expect(await f.exited).toEqual({ exitCode: 0, timedOut: false });
     await expect(access(firstNonce)).rejects.toMatchObject({ code: 'ENOENT' });
     const second = await f.restartRetained();
     expect(second.launch.auth.dshHome).toBe(f.launch.auth.dshHome);
@@ -125,7 +125,7 @@ it(
     const secondNonce = nativeWebAuthArtifact(second.launch.auth).path;
     await access(secondNonce);
     await second.owner.close();
-    expect((await second.exited).timedOut).toBe(false);
+    expect(await second.exited).toEqual({ exitCode: 0, timedOut: false });
     await expect(access(secondNonce)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(f.kills()).toBe(2);
     const patchFile = join(f.seal.directory, 'guest/cordis.patch.yml');

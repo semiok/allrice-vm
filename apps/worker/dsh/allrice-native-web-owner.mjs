@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { renameSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
+import { isIP } from 'node:net';
 import { dirname } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
@@ -45,8 +46,16 @@ async function waitWhileOwned(signal, subscribe) {
 
 /** One credential-free Upgrade on this sealed listener. rc.2 destroys the
  * socket for an absent route and emits this bounded reply from the real mux. */
-async function confirmGatewayMux(origin, baseUrl, signal) {
+async function confirmGatewayMux(webServer, baseUrl, signal) {
   signal.throwIfAborted();
+  const { host, port, protocol } = webServer;
+  if (
+    !isIP(host) ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    protocol !== 'http:'
+  )
+    throw Error('Native gateway listener is unavailable');
   const expected = Buffer.from('unauthorized');
   const bytes = Buffer.alloc(expected.length);
   let physicalClose, failure;
@@ -64,8 +73,12 @@ async function confirmGatewayMux(origin, baseUrl, signal) {
   try {
     await new Promise((resolve) => {
       const call = request(
-        new URL('/api/remote.mux', origin),
         {
+          // Node retains an IPv6 interface zone in hostname. URL does not.
+          hostname: host,
+          port,
+          protocol,
+          path: '/api/remote.mux',
           agent,
           signal,
           headers: {
@@ -155,6 +168,7 @@ export function apply(ctx, config) {
   const canceled = Error('Native auth publication canceled');
   let publishing;
   let publicationFailure;
+  let stagingCleanupFailure;
   let published = false;
   let retiring = false;
   const stop = () => {
@@ -189,22 +203,35 @@ export function apply(ctx, config) {
       try {
         if (published) await rm(artifactPath, { force: true });
       } catch (error) {
-        if (publicationFailure)
+        if (stagingCleanupFailure)
           throw new AggregateError(
-            [publicationFailure.error, error],
+            [stagingCleanupFailure.error, error],
             'Native auth cleanup failed',
           );
         throw error;
       }
-      if (publicationFailure) throw publicationFailure.error;
+      if (stagingCleanupFailure) throw stagingCleanupFailure.error;
     },
   });
   const retire = () => {
     stop();
     return observed.close();
   };
-  // Cordis exposes an awaitable facade over the same actual disposer.
-  activeOwners.set(fiber.dispose, retire);
+  // An explicit caller can observe the generation's publication failure.
+  // Successors wait for the real shared retirement and its cleanup failures.
+  activeOwners.set(fiber.dispose, async () => {
+    try {
+      await retire();
+    } catch (error) {
+      if (publicationFailure && publicationFailure.error !== error)
+        throw new AggregateError(
+          [publicationFailure.error, error],
+          'Native web owner retirement failed',
+        );
+      throw error;
+    }
+    if (publicationFailure) throw publicationFailure.error;
+  });
   const retireMissingOwner = () => {
     if (!current()) void retire().catch(() => {});
   };
@@ -238,7 +265,7 @@ export function apply(ctx, config) {
     )
       return;
     if (!current()) return;
-    await confirmGatewayMux(ctx.webServer.getOrigin(), baseUrl, signal);
+    await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;
     await mkdir(dirname(artifactPath), { recursive: true, mode: 0o700 });
     if (!current()) return;
@@ -258,6 +285,7 @@ export function apply(ctx, config) {
       if (current()) {
         renameSync(temporary, artifactPath);
         published = true;
+        return;
       }
     } catch (error) {
       primary = { error };
@@ -265,12 +293,14 @@ export function apply(ctx, config) {
     try {
       await rm(temporary, { force: true });
     } catch (error) {
-      if (primary)
-        throw new AggregateError(
-          [primary.error, error],
-          'Native auth staging failed',
-        );
-      throw error;
+      const failure = primary
+        ? new AggregateError(
+            [primary.error, error],
+            'Native auth staging failed',
+          )
+        : error;
+      stagingCleanupFailure = { error: failure };
+      throw failure;
     }
     if (primary) throw primary.error;
   }
