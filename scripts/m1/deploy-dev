@@ -44,6 +44,7 @@ KEEP_RELEASES=3; BLOG=""; FAIL_REASON=""; INFLIGHT_MINE=""; LOCKED=""; BUILD_DIR
 WEB_LABEL=ai.bplabs.allrice40-dev-web; WORKER_LABEL=ai.bplabs.allrice40-dev-worker
 WEB_PLIST="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
 WORKER_PLIST="$HOME/Library/LaunchAgents/$WORKER_LABEL.plist"
+DEPLOY_COMMAND='~/allrice40-dev/bin/deploy-dev'
 RECOVERY_HINT="Restore the pre-migration snapshot according to docs/runbooks/m1-database.md or fix forward (move $INFLIGHT aside first if it exists; keep $DISABLED for the next deploy); manual intervention required."
 
 say() { echo "[deploy-dev $(date +%H:%M:%S)] $*"; }
@@ -144,10 +145,8 @@ plists={}
 for role,src in (('web',web_src),('worker',worker_src)):
     d=plistlib.load(open(src,'rb')); e=d['EnvironmentVariables']
     port_key='ALLRICE_'+role.upper()+'_PORT'
-    config=service_config(d,'ai.bplabs.allrice40-dev-'+role,port_key,str(DEV_PORTS[role]),DEV_DATABASE,tools)
-    if not config:
+    if not service_config(d,'ai.bplabs.allrice40-dev-'+role,port_key,str(DEV_PORTS[role]),DEV_DATABASE,tools):
         sys.exit('refusing source 4.0 '+role+' launch configuration')
-    e.update(config['controllers'])
     args=d['ProgramArguments']
     if os.path.basename(args[0]) == 'with-env': args=args[2:] # a previous deploy, possibly with older tools
     if args[1].startswith('--env-file='): del args[1]
@@ -189,7 +188,7 @@ release_lock() { if [ -n "$LOCKED" ]; then exec 9>&-; LOCKED=""; fi; return 0; }
 inflight_begin() { # prev_sha
   local web worker; web=$(dev_plist web); worker=$(dev_plist worker)
   recovery_pair "$web" "$worker" "$1" || die "Dev cannot provide a same-release recovery pair" 2
-  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish (qa/deploy-inflight exists); run deploy-dev --release-manager --recover"
+  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish (qa/deploy-inflight exists); run $DEPLOY_COMMAND --release-manager --recover"
   mkdir -p "$INFLIGHT.tmp"
   cp -p "$web" "$INFLIGHT.tmp/web.plist" && cp -p "$worker" "$INFLIGHT.tmp/worker.plist" || die "could not save the launchd files"
   recovery_pair "$INFLIGHT.tmp/web.plist" "$INFLIGHT.tmp/worker.plist" "$1" || die "saved launchd files do not form a recovery pair" 2
@@ -275,7 +274,7 @@ on_exit() { # rc
       inflight_end
     else
       log_deploy kind failed phase "$phase" reason "${FAIL_REASON:-exit $rc}" restored no log "$BLOG" || true
-      echo "[deploy-dev] Dev may be down. Saved launchd files: $INFLIGHT. After fixing the cause: deploy-dev --release-manager --recover" >&2
+      echo "[deploy-dev] Dev may be down. Saved launchd files: $INFLIGHT. After fixing the cause: $DEPLOY_COMMAND --release-manager --recover" >&2
     fi
   fi
   release_lock
@@ -321,7 +320,7 @@ status() {
   if ! row=$(contract_row 2>/dev/null); then hw="unknown (database not readable)"
   elif [ -z "$row" ]; then hw="not written yet"; else hw=${row#row:}; fi
   echo "journal contract:   high water $hw"
-  if ! prev=$(previous_release); then echo "rollback check:     no recorded previous release (roll back with --rollback <release-dir>)"
+  if ! prev=$(previous_release); then echo "rollback check:     no recorded previous release (use $DEPLOY_COMMAND --release-manager --rollback <release-dir>)"
   elif ! dev_release_config "$prev" 2>/dev/null; then echo "rollback check:     $(basename "$prev") would be REFUSED: expected a sealed 4.0 release"
   elif ! why=$(check_migrations_known "$prev") || ! why=$(check_contract_known "$prev"); then
     echo "rollback check:     $(basename "$prev") would be REFUSED: $why"
@@ -330,7 +329,7 @@ status() {
   else echo "rollback check:     $(basename "$prev") knows every applied migration; it predates the journal contract, fine while the journals are at contract 1 (pre-stop check not run)"; fi
   if [ -e "$INFLIGHT" ]; then
     if lock_held "$LOCK"; then echo "DEPLOY IN PROGRESS (phase '$(sed -n 1p "$INFLIGHT/state" 2>/dev/null)')"
-    else echo "UNFINISHED DEPLOY (phase '$(sed -n 1p "$INFLIGHT/state" 2>/dev/null)'): run deploy-dev --release-manager --recover"; fi
+    else echo "UNFINISHED DEPLOY (phase '$(sed -n 1p "$INFLIGHT/state" 2>/dev/null)'): run $DEPLOY_COMMAND --release-manager --recover"; fi
   fi
   "$BIN/deploy-lock" status || true
   [ -f "$LOG" ] && { echo "recent deploys:"; tail -5 "$LOG"; }
@@ -475,7 +474,7 @@ deploy() {
     *) die "unknown option $1" 2 ;; esac; done
   local t0; t0=$(date +%s)
   ! lock_held "$LOCK" || die "a deploy is in progress ($("$BIN/deploy-lock" status)); stop and retry later" 3
-  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run deploy-dev --release-manager --recover first"
+  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run $DEPLOY_COMMAND --release-manager --recover first"
   recovery_pair "$(dev_plist web)" "$(dev_plist worker)" || die "refusing a mismatched Dev configuration" 2
   local avail; avail=$(df -g "$HOME" | awk 'NR==2{print $4}')
   [ "$avail" -ge 20 ] || die "only ${avail}G free; clean up before building"
@@ -511,7 +510,7 @@ deploy() {
   BUILT=1 # from here the build is kept, also when the lock is busy
 
   take_lock || die "another deploy started meanwhile; build kept at $rel (rerun deploy-dev later)" 3
-  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; build kept at $rel. Run deploy-dev --release-manager --recover first"
+  [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; build kept at $rel. Run $DEPLOY_COMMAND --release-manager --recover first"
   [ "$(release_of)" = "$cur_rel" ] || die "Dev changed while this version was building; build kept at $rel, start again"
   recovery_pair "$(dev_plist web)" "$(dev_plist worker)" "$cur_sha" || die "refusing a mismatched Dev configuration" 2
   stage_plists "$rel" "$sha" "$art" || die "release configuration failed validation. Dev untouched" 2
@@ -549,8 +548,8 @@ deploy() {
     log_deploy kind smoke sha "$sha" result "$([ $ok = 1 ] && echo passed || echo failed)" out "$out"
     if [ $ok != 1 ]; then
       local hint
-      if previous_release >/dev/null; then hint="to switch back run: deploy-dev --release-manager --rollback"
-      else hint="no default rollback target is recorded; fix forward or choose a compatible target: deploy-dev --release-manager --rollback <release-dir>"; fi
+      if previous_release >/dev/null; then hint="to switch back run: $DEPLOY_COMMAND --release-manager --rollback"
+      else hint="no default rollback target is recorded; fix forward or choose a compatible target: $DEPLOY_COMMAND --release-manager --rollback <release-dir>"; fi
       die "smoke test failed on ${sha:0:8}. Inspect $out/result.json; $hint" 5
     fi
     say "smoke passed"

@@ -372,7 +372,7 @@ def configure_drill(cfg, peer):
     if credentials.parent != state or not canonical(credentials):
         sys.exit('monitor --drill requires a Telegram configuration inside its state directory')
     cfg.update(drill=True, drillTag=tag, configFile=str(config), label='演练', telegramEnv=str(credentials),
-               launchdLabel=DRILL_LABEL + tag + ('-peer' if peer else '-m1'))
+               launchdLabel=DRILL_LABEL + tag + ('-peer' if peer else ''))
     allowed = ('m1', 'monitor') if peer else ('postgres', 'sandbox_vm', 'images', 'disk', 'peer', 'monitor')
     if cfg['checks'] is None:
         cfg['checks'] = list(allowed)
@@ -431,6 +431,41 @@ def unknown(key, title=''):
     return finding(key, 'unknown', title)
 
 
+def checkpoint_for_target(cfg, peer, state):
+    if not isinstance(state, dict):
+        raise CheckError('monitor state is not an object')
+    tag = cfg.get('drillTag')
+    target = {'tag': tag, 'role': 'peer' if peer else 'm1'} if tag else None
+    if 'drillTarget' in state:
+        if state['drillTarget'] != target:
+            raise CheckError('monitor state belongs to a different target')
+        return state
+
+    if state:
+        rows, messages = state.get('incidentOutbox', []), state.get('outbox', [])
+        if not isinstance(rows, list) or not isinstance(messages, list):
+            raise CheckError('monitor state has an invalid outbox')
+        metadata = [row.get('metadata') if isinstance(row, dict) else None for row in rows]
+        drill_rows = [isinstance(m, dict) and (m.get('label') == '演练' or 'drill' in m) for m in metadata]
+        drill_messages = [isinstance(message, str) and re.match(r'^\S+ \[演练\] ', message) for message in messages]
+        heartbeat = read_json(os.path.join(cfg['stateDir'], 'heartbeat.json'), {})
+        drill_heartbeat = isinstance(heartbeat, dict) and heartbeat.get('label') == '演练'
+        if target:
+            # Legacy drills had the label but no tag. Only the validated drill
+            # command may adopt its old checkpoint and retain its event IDs.
+            if (not cfg.get('drill') or not (drill_heartbeat or rows or messages)
+                    or not all(drill_rows) or not all(drill_messages)
+                    or any(m.get('source') != 'allrice-monitor' or 'drill' in m for m in metadata)):
+                raise CheckError('monitor state belongs to a different target')
+            for m in metadata:
+                m['drill'] = tag
+        elif drill_heartbeat or any(drill_rows) or any(drill_messages):
+            raise CheckError('monitor state belongs to a different target')
+    if target:
+        state['drillTarget'] = target
+    return state
+
+
 class Round:
     """One round: its config, the persistent state and what the checks learned. Only a
     real round, holding the lock, moves a corrupt state file aside (recover=True); a dry
@@ -449,13 +484,9 @@ class Round:
                 if recover:  # keep the unreadable file for a person, and say so
                     self.state_lost = '%s.corrupt-%d' % (self.state_file, self.now)
                     os.replace(self.state_file, self.state_lost)
-                    self.state = {'stateLost': self.state_lost}
-        drill = cfg.get('drillTag')
-        target = {'tag': drill, 'role': 'peer' if peer else 'm1'} if drill else None
-        if self.state and not self.state_lost and self.state.get('drillTarget') != target:
-            raise CheckError('monitor state belongs to a different target')
-        if target:
-            self.state['drillTarget'] = target
+        self.state = checkpoint_for_target(cfg, peer, self.state)
+        if self.state_lost:
+            self.state['stateLost'] = self.state_lost
         self.facts, self.progress = {}, None
 
     def save(self):
@@ -2729,6 +2760,13 @@ PEER_CHECKS = [
 
 
 def launchd(cfg, action, peer):
+    if action == 'install':
+        state = read_json(os.path.join(cfg['stateDir'], 'state.json'), {})
+        try:
+            checkpoint_for_target(cfg, peer, state)
+        except CheckError as err:
+            sys.exit('monitor: ' + str(err))
+        os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     label = cfg['launchdLabel'] or ('ai.bplabs.allrice40-dev-monitor-peer' if peer else 'ai.bplabs.allrice40-dev-monitor')
     path = expand('~/Library/LaunchAgents/%s.plist' % label)
     domain = 'gui/%d' % os.getuid()
@@ -2794,7 +2832,8 @@ def main(argv):
         configure_formal(cfg)
         if not peer:
             derive_m1(cfg, formal=not (a.dry_run and a.command in ('run','daily')))
-    os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
+    if a.command != 'launchd':
+        os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     if a.command in ('run', 'peer') and a.dry_run:
         r = Round(cfg, peer)
         findings, ran = run_checks(r, PEER_CHECKS if peer else M1_CHECKS)

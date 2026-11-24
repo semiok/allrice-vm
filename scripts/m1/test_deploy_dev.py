@@ -785,7 +785,7 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertNotRegex(p.stderr, r'--rollback\s*$')
                 else:
                     self.assertEqual(default.returncode, 0, default.stderr)
-                    self.assertIn('to switch back run: deploy-dev --release-manager --rollback', p.stderr)
+                    self.assertIn('to switch back run: ~/allrice40-dev/bin/deploy-dev --release-manager --rollback', p.stderr)
                     self.assertNotIn('<release-dir>', p.stderr)
                 with open(os.path.join(self.home, 'allrice40-dev/qa/deploys.jsonl')) as f:
                     self.assertEqual(json.loads(f.readlines()[-1])['result'], 'failed')
@@ -797,7 +797,7 @@ class DeployDevMigrations(unittest.TestCase):
                         'git() { echo GIT_CALLED; return 91; }; deploy',
                         FILES + ARCHIVED, CONTRACT='row:1')
         self.assertNotEqual(p.returncode, 0)
-        self.assertIn('run deploy-dev --release-manager --recover first', p.stderr)
+        self.assertIn('run ~/allrice40-dev/bin/deploy-dev --release-manager --recover first', p.stderr)
         self.assertNotIn('GIT_CALLED', p.stdout)
         self.assert_parked()
         self.assertTrue(os.path.isfile(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight/state')))
@@ -873,6 +873,7 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stderr)
                 self.assertEqual(p.stderr, '')
                 self.assertIn('UNFINISHED DEPLOY', p.stdout)
+                self.assertIn('run ~/allrice40-dev/bin/deploy-dev --release-manager --recover', p.stdout)
                 self.assertFalse(os.path.exists(self.live_plist('web')))
                 self.assertTrue(os.path.exists(self.live_plist('worker')))
                 script = ('take_lock() { :; }; stop_job() { echo STOPPED:$2; }; '
@@ -1042,6 +1043,51 @@ class DeployDevMigrations(unittest.TestCase):
                         "'printf \"%s\\n%s\\n\" \"$ALLRICE_NATIVE_ONCE_ENABLED\" \"$ALLRICE_NATIVE_ONCE_REFERENCE\"'", [])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(p.stdout, '0\n\n')
+
+    def test_deploy_preserves_controller_setting_sources_after_dotenv_changes(self):
+        dotenv = os.path.join(self.home, 'allrice40-dev/.env')
+        recurring_root = self.home + '/allrice40-dev/.local/native-recurring-control-m1'
+        recurring_dotenv = json.dumps({'artifactId': 'dotenv', 'stateRoot': recurring_root})
+        recurring_plist = json.dumps({'artifactId': 'plist', 'stateRoot': recurring_root})
+
+        def write_settings(once, recurring):
+            write(dotenv, f'ALLRICE_NATIVE_ONCE_ENABLED={once}\n'
+                  f'ALLRICE_NATIVE_ONCE_REFERENCE={shlex.quote(self.once_reference)}\n'
+                  f'ALLRICE_NATIVE_RECURRING_ENABLED={recurring}\n'
+                  f'ALLRICE_NATIVE_RECURRING_REFERENCE={shlex.quote(recurring_dotenv)}\n')
+
+        for role in ('web', 'worker'):
+            value = self.plist(role)
+            env = value['EnvironmentVariables']
+            del env['ALLRICE_NATIVE_ONCE_REFERENCE']
+            if role == 'worker':
+                env['ALLRICE_NATIVE_RECURRING_REFERENCE'] = recurring_plist
+            with open(self.live_plist(role), 'wb') as f:
+                plistlib.dump(value, f)
+        write_settings('1', '0')
+        stubs, _ = self.successful_deploy_stubs()
+        contract = os.path.join(self.tmp, 'contract-cli.txt')
+        write(contract, 'row:1')
+        write(self.applied, '\n'.join(FILES + ARCHIVED) + '\n')
+        p = self.run_config_tool('deploy-dev', '--release-manager', '--skip-smoke',
+                deploy_stubs=stubs.replace('BIN=$SMOKE; ', ''), APPLIED=self.applied, CONTRACT_FILE=contract,
+                CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'b' * 64)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        for role in ('web', 'worker'):
+            env = self.read_plist(self.live_plist(role))['EnvironmentVariables']
+            self.assertNotIn('ALLRICE_NATIVE_ONCE_ENABLED', env)
+            self.assertNotIn('ALLRICE_NATIVE_RECURRING_ENABLED', env)
+            self.assertNotIn('ALLRICE_NATIVE_ONCE_REFERENCE', env)
+            self.assertEqual(env.get('ALLRICE_NATIVE_RECURRING_REFERENCE'), recurring_plist if role == 'worker' else None)
+
+        for once, recurring in (('0', '1'), ('1', '0')):
+            write_settings(once, recurring)
+            for role in ('web', 'worker'):
+                p = self.run_config_tool('with-env', role, sys.executable, '-c',
+                    'import json,os; print(json.dumps([os.environ[k] for k in ('
+                    '"ALLRICE_NATIVE_ONCE_ENABLED", "ALLRICE_NATIVE_RECURRING_ENABLED", "ALLRICE_NATIVE_RECURRING_REFERENCE")]))')
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertEqual(json.loads(p.stdout), [once, recurring, recurring_plist if role == 'worker' else recurring_dotenv])
 
     def test_qa_smoke_refuses_a_web_route_to_a_different_worker(self):
         task = 'tool-test'

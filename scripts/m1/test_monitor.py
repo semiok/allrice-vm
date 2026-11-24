@@ -233,13 +233,19 @@ class Delivery(unittest.TestCase):
 
     def test_psql_keeps_the_password_off_the_command_line(self):
         r = make_round()
-        with mock.patch.object(monitor, 'run', return_value=(0, '1', '')) as run:
-            r.psql('select 1;', 'postgres://snow:s3cret@127.0.0.1:5432/allrice_dev')
-        cmd, env = run.call_args[0][0], run.call_args[0][2]
+        parent = {'PGHOSTADDR': '127.0.0.2', 'PGSERVICE': 'foreign-test', 'PGSERVICEFILE': '/fixture/foreign.conf',
+                  'ALLRICE_MONITOR_TEST_ENV': 'keep'}
+        result = subprocess.CompletedProcess([], 0, '1\n', '')
+        with mock.patch.dict(os.environ, parent), mock.patch.object(monitor.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(r.psql('select 1;', 'postgres://snow:s3cret@127.0.0.1:5432/allrice_dev'), '1')
+            self.assertEqual({key: os.environ[key] for key in parent}, parent)
+        cmd, env = run.call_args.args[0], run.call_args.kwargs['env']
         self.assertNotIn('s3cret', ' '.join(cmd))
         self.assertIn('postgres://snow@127.0.0.1:5432/allrice_dev', cmd)
         self.assertEqual(env['PGPASSWORD'], 's3cret')
-        self.assertTrue(all(env[key] is None for key in ('PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE')))
+        self.assertEqual(env['ALLRICE_MONITOR_TEST_ENV'], 'keep')
+        for key in ('PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE'):
+            self.assertNotIn(key, env)
 
     def test_backlog_is_bounded(self):
         r = make_round()
@@ -903,6 +909,63 @@ class Peer(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_formal_install_checks_checkpoint_before_touching_live_timer(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / 'restored-monitor-state'
+            state.mkdir()
+            config = home / 'peer-config.json'
+            config.write_text(json.dumps({'stateDir': str(state)}))
+            checkpoint = state / 'state.json'
+            checkpoint.write_text(json.dumps({'drillTarget': {'tag': 'outage', 'role': 'peer'}}))
+            original = checkpoint.read_bytes()
+            agents = home / 'Library/LaunchAgents'
+            agents.mkdir(parents=True)
+            for label in ('ai.bplabs.allrice40-dev-monitor', 'ai.bplabs.allrice40-dev-monitor-peer'):
+                (agents / (label + '.plist')).write_bytes(b'existing timer')
+            for peer_flag in ([], ['--peer']):
+                with self.subTest(peer_flag=peer_flag):
+                    with self.assertRaisesRegex(SystemExit, 'state belongs to a different target'), \
+                            mock.patch.object(monitor, 'run') as run:
+                        monitor.main(['launchd', 'install', *peer_flag, '--config', str(config)])
+                    run.assert_not_called()
+                    self.assertEqual(checkpoint.read_bytes(), original)
+                    self.assertEqual(sorted(p.read_bytes() for p in agents.iterdir()), [b'existing timer'] * 2)
+
+    def test_legacy_drill_resumes_same_queue_and_removes_its_original_timer(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / 'allrice40-dev/monitor-drills/outage'
+            state.mkdir(parents=True)
+            config = state / 'config.json'
+            config.write_text(json.dumps({'stateDir': str(state),
+                'incidentDatabaseUrl': 'postgres://tester@127.0.0.1:5544/allrice40_monitor_drill_outage'}))
+            incident_id = str(uuid.uuid4())
+            legacy = dict(id=incident_id, kind='monitor_alert', detailCode='monitor.disk',
+                          metadata={'label': '演练', 'source': 'allrice-monitor'})
+            checkpoint = state / 'state.json'
+            checkpoint.write_text(json.dumps({'incidentOutbox': [legacy], 'outbox': ['🟠 [演练] 旧告警']}))
+            flags = ['--drill', '--config', str(config)]
+            with mock.patch.object(monitor, 'run_checks', return_value=([], set())), \
+                 mock.patch.object(monitor, 'send_telegram') as send, mock.patch.object(monitor, 'psql') as psql:
+                monitor.main(['run', *flags])
+            row = json.loads(psql.call_args.args[3]['rows'])[0]
+            self.assertEqual(row['id'], incident_id)
+            self.assertEqual(row['metadata'], {'label': '演练', 'source': 'allrice-monitor', 'drill': 'outage'})
+            self.assertEqual(send.call_args.args[1], '🟠 [演练] 旧告警')
+            saved = json.loads(checkpoint.read_text())
+            self.assertEqual(saved['incidentOutbox'], [])
+            self.assertEqual(saved['drillTarget'], {'tag': 'outage', 'role': 'm1'})
+
+            agents = home / 'Library/LaunchAgents'
+            agents.mkdir(parents=True)
+            previous = agents / 'ai.bplabs.allrice40-dev-monitor-drill-outage.plist'
+            previous.write_bytes(b'legacy timer')
+            with mock.patch.object(monitor, 'run', side_effect=[(0, '', ''), (113, '', '')]) as run, mock.patch('builtins.print'):
+                monitor.main(['launchd', 'remove', *flags])
+            self.assertTrue(all(call.args[0][-1].endswith('/' + previous.stem) for call in run.call_args_list))
+            self.assertFalse(previous.exists())
+
     def test_formal_peer_and_timer_refuse_a_drill_config_without_the_flag(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
             home = Path(tmp).resolve()
