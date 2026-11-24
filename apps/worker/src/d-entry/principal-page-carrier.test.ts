@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { on, once } from 'node:events';
 import { createServer, get, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createConnection, type AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -223,6 +223,7 @@ async function fixture(release?: { directory: string; graph: unknown }) {
     publish,
     profileSource,
     profileUrl,
+    closeProfile: profile.close,
     worker,
     web,
     origin,
@@ -390,7 +391,7 @@ it('refuses duplicate selectors, unauthorized login and cross-session borrow wit
 });
 
 it(
-  'publishes the real released graph and exact bytes through the same live page and closes an active event reader on revocation',
+  'publishes the released graph and bytes, and waits for all queued HTTP writers to settle',
   { timeout: 30_000 },
   async () => {
     const root = await mkdtemp(join(tmpdir(), 'allrice-profile-release-'));
@@ -474,13 +475,9 @@ it(
 
     async function blockedAsset() {
       const serverResponse = deferred<ServerResponse>();
-      let finished = false;
-      f.worker.once('request', (_request, response) => {
-        response.once('finish', () => {
-          finished = true;
-        });
-        serverResponse.resolve(response);
-      });
+      f.worker.once('request', (_request, response) =>
+        serverResponse.resolve(response),
+      );
       const url = f.profileUrl('assets', scopeId, {
         bindingRef: f.owner.bindingRef,
         graphRev: target.graphRev,
@@ -501,18 +498,12 @@ it(
       expect(paused.statusCode).toBe(200);
       const response = await serverResponse.promise;
       expect(response.writableFinished).toBe(false);
-      return {
-        request,
-        response,
-        closed: once(response, 'close'),
-        didFinish: () => finished,
-      };
+      return { request, closed: once(response, 'close') };
     }
     const cancelled = await blockedAsset();
     cancelled.request.destroy();
     await cancelled.closed;
     expect((await f.invoke(scopeId)).status).toBe(200);
-    const backpressured = await blockedAsset();
 
     const keep = new AbortController();
     closes.push(async () => keep.abort());
@@ -533,18 +524,144 @@ it(
     });
     expect(clash.status).toBe(409);
     await clash.body?.cancel();
-    const pending = expect(reader.read()).rejects.toThrow();
-    f.profileSource.abort(Error('The native profile source was retired'));
-    await backpressured.closed;
-    expect(backpressured.response.destroyed).toBe(true);
-    expect(backpressured.didFinish()).toBe(false);
-    expect(await receive()).toMatchObject({
+    const pending = reader.read().then(
+      () => false,
+      () => true,
+    );
+    const transfer = await pipelineAfterEvents(scopeId);
+    const asset = transfer.responses[1]!;
+    await expect.poll(() => asset.writableEnded).toBe(true);
+    expect(asset.socket).toBeNull();
+    expect(asset.writableFinished).toBe(false);
+    let terminal: Awaited<ReturnType<typeof receive>> | undefined;
+    const terminalPromise = receive().then((frame) => (terminal = frame));
+    closePage(peer);
+    await transfer.fenced.promise;
+    expect(asset.writableFinished).toBe(false);
+    expect(asset.destroyed).toBe(true);
+    expect((await f.invoke(scopeId)).status).toBe(404);
+    expect(terminal).toBeUndefined();
+    transfer.release.resolve();
+    await transfer.closed;
+    expect(await terminalPromise).toMatchObject({ value: { type: 'closed' } });
+    expect(await receive()).toEqual({ type: 'end', streamId: 'life' });
+    expect(await pending).toBe(true);
+
+    const second = await open(f);
+    const firstResponse = await f.publish('bootstrap', second.scopeId);
+    expect(firstResponse.status).toBe(200);
+    await firstResponse.json();
+    const errors = await pipelineAfterEvents(second.scopeId, true);
+    await expect
+      .poll(() =>
+        errors.responses.slice(1).map((r) => [r.statusCode, r.writableEnded]),
+      )
+      .toEqual([
+        [409, true],
+        [400, true],
+      ]);
+    expect(errors.responses.slice(1).every((r) => r.socket === null)).toBe(
+      true,
+    );
+    let joined = false;
+    const stopping = f.closeProfile().then(() => {
+      joined = true;
+    });
+    await errors.fenced.promise;
+    expect(joined).toBe(false);
+    errors.release.resolve();
+    await errors.closed;
+    await stopping;
+    expect(joined).toBe(true);
+    closePage(second.peer);
+    expect(await second.receive()).toMatchObject({ value: { type: 'closed' } });
+
+    const withdrawn = await fixture({ directory, graph });
+    const live = await open(withdrawn);
+    const watching = await withdrawn.publish('events', live.scopeId, {
+      bindingRef: withdrawn.owner.bindingRef,
+    });
+    const updates = watching.body!.getReader();
+    expect((await updates.read()).done).toBe(false);
+    const withdrew = updates.read().then(
+      () => false,
+      () => true,
+    );
+    withdrawn.profileSource.abort(
+      Error('The native profile source was retired'),
+    );
+    expect(await live.receive()).toMatchObject({
       type: 'error',
       streamId: 'life',
     });
-    await pending;
-    expect((await f.invoke(scopeId)).status).toBe(404);
-    peer.terminate();
+    expect(await withdrew).toBe(true);
+    expect((await withdrawn.invoke(live.scopeId)).status).toBe(404);
+
+    async function pipelineAfterEvents(id: string, errors = false) {
+      const worker = f.worker.address() as AddressInfo;
+      const client = createConnection({ host: '127.0.0.1', port: worker.port });
+      client.on('error', () => {});
+      closes.push(async () => client.destroy());
+      await once(client, 'connect');
+      const responses: ServerResponse[] = [];
+      const observed = (_request: unknown, response: ServerResponse) =>
+        responses.push(response);
+      f.worker.on('request', observed);
+      const headReady = deferred();
+      client.on('data', (data) => {
+        if (data.toString().includes('text/event-stream')) headReady.resolve();
+      });
+      const events = f.profileUrl('events', id, {
+        bindingRef: f.owner.bindingRef,
+      });
+      const serialize = (url: URL, headers = '') =>
+        `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
+      try {
+        // A separate page uses this active writer when the target page
+        // already has an event reader; release the old reader first.
+        if (!errors) {
+          keep.abort();
+          await pending;
+        }
+        client.write(serialize(events));
+        await headReady.promise;
+        if (errors) {
+          const invalid = new URL(events);
+          invalid.searchParams.append('scopeId', id);
+          client.write(serialize(events) + serialize(invalid));
+          await expect.poll(() => responses.length).toBe(3);
+        } else {
+          client.write(
+            serialize(
+              f.profileUrl('assets', id, {
+                bindingRef: f.owner.bindingRef,
+                graphRev: target.graphRev,
+                manifestSha256: target.manifestSha256,
+                path: largeAsset,
+              }),
+              'x-allrice-profile-request: static\r\n',
+            ),
+          );
+          await expect.poll(() => responses.length).toBe(2);
+        }
+      } finally {
+        f.worker.off('request', observed);
+      }
+      const socket = responses[0]!.socket!;
+      const close = socket.destroy.bind(socket);
+      const fenced = deferred(),
+        release = deferred();
+      const hold = vi.spyOn(socket, 'destroy').mockImplementation((error) => {
+        fenced.resolve();
+        void release.promise.then(() => close(error));
+        return socket;
+      });
+      closes.push(async () => {
+        hold.mockRestore();
+        release.resolve();
+      });
+      return { responses, fenced, release, closed: once(socket, 'close') };
+    }
   },
 );
 

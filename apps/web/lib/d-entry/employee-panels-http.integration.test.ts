@@ -482,6 +482,22 @@ suite(
             name: '引用到对话 ' + input.fileName,
           });
           expect(await disabledQuote.isDisabled()).toBe(true);
+          const captured = async () => ({
+            requests: await f.db`select q.request_id
+              from allrice_knowledge_save_requests q
+              join allrice_knowledge_revisions r on r.id=q.revision_id
+              join allrice_knowledge_sources s on s.id=r.knowledge_source_id
+              where q.organization_id=${p.context.organizationId} and q.actor_id=${p.context.actor.id}
+                and s.workspace_id=${p.selection.workspaceId} and q.operation='upload'
+                and q.input->>'originObjectId'=${original.objectId} order by q.request_id`,
+            revisions: await f.db`select r.id
+              from allrice_workbench_reference_bindings b
+              join allrice_knowledge_revisions r on r.knowledge_source_id=b.source_id
+              where b.organization_id=${p.context.organizationId} and r.created_by=${p.context.actor.id}
+                and r.workspace_id=${p.selection.workspaceId} and b.origin_object_id=${original.objectId} order by r.id`,
+          });
+          const noCapture = await captured();
+          expect(noCapture).toEqual({ requests: [], revisions: [] });
           await row.click();
           const quote = page.getByRole('button', {
             name: '引用到对话',
@@ -500,6 +516,8 @@ suite(
           await files
             .getByRole('button', { name: '我的上传', exact: true })
             .click();
+
+          expect(await captured()).toEqual(noCapture);
 
           async function openPublication() {
             await options.click();

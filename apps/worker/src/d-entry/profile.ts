@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { finished } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import {
   DEntryPageBorrowSchema,
@@ -46,7 +45,6 @@ type Publication = {
   events: boolean;
 };
 
-class ProfileBusy extends Error {}
 export function createDEntryProfile(
   pages: ReturnType<typeof createDEntryPageRequests>,
   serviceSignal: AbortSignal,
@@ -89,41 +87,6 @@ export function createDEntryProfile(
     return current;
   }
 
-  async function send(
-    response: ServerResponse,
-    signal: AbortSignal,
-    headers: Record<string, string>,
-    write: () => void,
-  ) {
-    signal.throwIfAborted();
-    const stop = () => {
-      if (!response.writableFinished) response.destroy();
-    };
-    signal.addEventListener('abort', stop, { once: true });
-    const done = finished(response, { cleanup: true });
-    try {
-      signal.throwIfAborted();
-      response.writeHead(200, {
-        'cache-control': 'private, no-store',
-        ...headers,
-      });
-      write();
-      await done;
-    } catch (error) {
-      stop();
-      await done.catch(() => {});
-      throw error;
-    } finally {
-      signal.removeEventListener('abort', stop);
-    }
-  }
-
-  function json(response: ServerResponse, value: unknown, signal: AbortSignal) {
-    return send(response, signal, { 'content-type': 'application/json' }, () =>
-      response.end(JSON.stringify(value)),
-    );
-  }
-
   function service(request: IncomingMessage, response: ServerResponse) {
     const path = request.url?.split('?')[0];
     const operation =
@@ -152,6 +115,76 @@ export function createDEntryProfile(
         serviceSignal,
         disconnected.signal,
       ]);
+      async function writeOwned(active: AbortSignal, write: () => void) {
+        if (response.writableFinished || response.closed) return;
+        const { socket } = request;
+        const joined = Promise.withResolvers<boolean>();
+        const finished = () => joined.resolve(true);
+        const closed = () => joined.resolve(false);
+        const abort = () => {
+          if (response.writableFinished || response.closed) return;
+          const queued = response.socket === null;
+          response.destroy();
+          // While an earlier HTTP/1.1 response owns the socket, Node cannot
+          // cancel this queued response through the response object alone.
+          if (queued && !socket.destroyed) socket.destroy();
+        };
+        response.once('finish', finished);
+        response.once('close', closed);
+        socket.once('close', closed);
+        active.addEventListener('abort', abort, { once: true });
+        try {
+          if (socket.closed) closed();
+          else if (active.aborted) abort();
+          else write();
+          return await joined.promise;
+        } catch (error) {
+          abort();
+          await joined.promise;
+          throw error;
+        } finally {
+          response.off('finish', finished);
+          response.off('close', closed);
+          socket.off('close', closed);
+          active.removeEventListener('abort', abort);
+        }
+      }
+      function send(
+        active: AbortSignal,
+        headers: Record<string, string>,
+        write: () => void,
+        status = 200,
+      ) {
+        return writeOwned(active, () => {
+          response.writeHead(status, {
+            'cache-control': 'private, no-store',
+            ...headers,
+          });
+          write();
+        });
+      }
+      function json(active: AbortSignal, value: unknown, status = 200) {
+        return send(
+          active,
+          { 'content-type': 'application/json' },
+          () => response.end(JSON.stringify(value)),
+          status,
+        );
+      }
+      function busy(active: AbortSignal) {
+        return json(
+          active,
+          {
+            error: {
+              code: 'CONFLICT',
+              message: 'A profile request already owns this response',
+              requestId: randomUUID(),
+              retryable: false,
+            },
+          },
+          409,
+        );
+      }
       try {
         signal.throwIfAborted();
         if (request.method !== 'GET' || request.headers.origin)
@@ -211,20 +244,20 @@ export function createDEntryProfile(
             if (operation === 'bootstrap') {
               if (mode === 'document') {
                 await page.assertCurrent(active);
-                return json(
-                  response,
-                  {
-                    ...DEntryProfileAddressSchema.parse({
-                      bindingRef: page.bindingRef,
-                      graphRev: release.graph.rev,
-                      manifestSha256: release.manifestSha256,
-                    }),
-                    nativeSessionId: page.root.rootNativeSessionId,
-                  },
-                  active,
-                );
+                await json(active, {
+                  ...DEntryProfileAddressSchema.parse({
+                    bindingRef: page.bindingRef,
+                    graphRev: release.graph.rev,
+                    manifestSha256: release.manifestSha256,
+                  }),
+                  nativeSessionId: page.root.rootNativeSessionId,
+                });
+                return;
               }
-              if (held.bootstrap !== 'available') throw new ProfileBusy();
+              if (held.bootstrap !== 'available') {
+                await busy(active);
+                return;
+              }
               held.bootstrap = 'sending';
               try {
                 const iterator = page.scope
@@ -264,20 +297,21 @@ export function createDEntryProfile(
                   ],
                 });
                 await page.assertCurrent(active);
-                await json(response, body, active);
-                held.bootstrap = 'sent';
+                if (await json(active, body)) held.bootstrap = 'sent';
               } finally {
                 if (held.bootstrap === 'sending') held.bootstrap = 'available';
               }
               return;
             }
             if (operation === 'events') {
-              if (held.events) throw new ProfileBusy();
+              if (held.events) {
+                await busy(active);
+                return;
+              }
               held.events = true;
               try {
                 await page.assertCurrent(active);
                 await send(
-                  response,
                   active,
                   { 'content-type': 'text/event-stream; charset=utf-8' },
                   () =>
@@ -314,7 +348,6 @@ export function createDEntryProfile(
             }
             await page.assertCurrent(active);
             await send(
-              response,
               active,
               {
                 'content-type': asset.media,
@@ -326,28 +359,7 @@ export function createDEntryProfile(
           },
         );
       } catch (error) {
-        if (
-          error instanceof ProfileBusy &&
-          !response.headersSent &&
-          !response.destroyed
-        ) {
-          response.writeHead(409, {
-            'content-type': 'application/json',
-            'cache-control': 'private, no-store',
-          });
-          response.end(
-            JSON.stringify({
-              error: {
-                code: 'CONFLICT',
-                message: 'A profile request already owns this response',
-                requestId: randomUUID(),
-                retryable: false,
-              },
-            }),
-          );
-        } else {
-          sendDEntryHttpProblem(response, error);
-        }
+        await writeOwned(signal, () => sendDEntryHttpProblem(response, error));
       } finally {
         response.off('close', stop);
       }
