@@ -29,6 +29,7 @@ import {
   DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
+  DEntrySelectionInputSchema,
 } from '@allrice/contracts';
 
 const closes: (() => Promise<unknown>)[] = [];
@@ -98,9 +99,9 @@ async function fixture(release?: ProfileProof) {
         : null,
   );
   const historyIdentity = vi.fn(
-    async (_context: unknown, selection: { threadId?: string }) => ({
+    async (_context: unknown, selection: unknown) => ({
       ...f.identity,
-      threadId: selection.threadId ?? null,
+      threadId: DEntrySelectionInputSchema.parse(selection).threadId ?? null,
     }),
   );
   const pages = createDEntryPageRequests({
@@ -706,7 +707,11 @@ it(
           async (_context, selection) => {
             authorizing.resolve();
             await finishHistory.promise;
-            return { ...f.identity, threadId: selection.threadId ?? null };
+            return {
+              ...f.identity,
+              threadId:
+                DEntrySelectionInputSchema.parse(selection).threadId ?? null,
+            };
           },
         );
       },

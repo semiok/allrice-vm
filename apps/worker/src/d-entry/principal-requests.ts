@@ -258,7 +258,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
             run(caller) {
               const runningSignal = AbortSignal.any([caller, lifetime]);
               running = Promise.resolve().then(async () => {
-                const authorize: Page['authorize'] = async (
+                const authorize: DEntryPageHandle['authorize'] = async (
                   nativeSessionId,
                   effect,
                   active,
