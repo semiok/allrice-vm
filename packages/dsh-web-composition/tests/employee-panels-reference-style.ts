@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export const referenceStyleBoundaryId = 'pinned-rev2-surface-style-v1';
+export const referenceStyleBoundaryId = 'pinned-rev2-surface-style-v2';
 export const referenceDocumentSelector =
   '[data-panels-reference-document="pinned-rev2-public-slot-v1"]';
 const body = '[data-panels-reference-body]';
@@ -10,6 +10,12 @@ const rawIdentities = {
   globals: '3493206a01188bb0c4ad32c7481c1cd17c1462da796b441908aa468c3f314669',
   components:
     'd59114f7892cb8c28c933c2683bd2c1896ce436c7d728cf9b82896ab9267199e',
+};
+const acceptedFileToolbar = {
+  rule: '.workbench_files_panel_scopePicker{flex:none;width:126px}',
+  selector: '.workbench_files_panel_toolbar .workbench_files_panel_scopePicker',
+  policy: 'met-282-accepted-file-toolbar-specificity',
+  decision: '0d144053-874b-40ac-983f-ad9a141c6709',
 };
 const groups = new Set([
   '@media(max-width:760px)',
@@ -41,9 +47,9 @@ const rename = (value: string) =>
   );
 
 /** A closed codec for these two fixed compiled snapshots, not a CSS loader.
- * Rules keep their original declaration bytes and order. Only document
- * selectors are projected onto unboxed owners; original viewport rules have
- * no meaning inside a native pane. @scope also contains every class/pseudo. */
+ * Rules retain their declaration bytes and order. Document selectors project
+ * to unboxed owners, and the approved file filter retains its width inside the
+ * toolbar. The native pane owns the viewport within its own scope. */
 export function projectReferenceStyleSnapshot(
   css: string,
   artifact: 'globals' | 'components',
@@ -163,7 +169,13 @@ export function projectReferenceStyleSnapshot(
       const viewportPolicy =
         artifact === 'globals' ? viewport.get(rule) : undefined;
       if (viewportPolicy) omitted.add(viewportPolicy);
-      const outputSelector = viewportPolicy ? null : projectSelector(selector);
+      const toolbar =
+        artifact === 'components' && rule === acceptedFileToolbar.rule;
+      const outputSelector = viewportPolicy
+        ? null
+        : toolbar
+          ? acceptedFileToolbar.selector
+          : projectSelector(selector);
       mappings.push({
         artifact,
         offset,
@@ -173,9 +185,11 @@ export function projectReferenceStyleSnapshot(
         context,
         policy:
           viewportPolicy ??
-          (rename(rule) === rule
-            ? 'same-declarations-inside-owned-scope'
-            : 'same-declarations-with-reference-only-css-names'),
+          (toolbar
+            ? acceptedFileToolbar.policy
+            : rename(rule) === rule
+              ? 'same-declarations-inside-owned-scope'
+              : 'same-declarations-with-reference-only-css-names'),
       });
       if (outputSelector !== null)
         output += outputSelector + rename(css.slice(open, close + 1));
@@ -200,6 +214,12 @@ export function derivePinnedReferenceStyle(
     components,
     'components',
   );
+  if (
+    componentRules.mappings.filter(
+      ({ policy }) => policy === acceptedFileToolbar.policy,
+    ).length !== 1
+  )
+    throw Error('Missing or ambiguous approved reference toolbar rule');
   // The only added native paint inputs, proven by official rc.2 ui-theme
   // corner-shape.css and client/web/base.css versus the fixed old HTML/UA.
   // initial is the old UA behavior, not values read from the actual product.
@@ -211,6 +231,9 @@ export function derivePinnedReferenceStyle(
         id: referenceStyleBoundaryId,
         pinnedHead: '4c2e1069e087e645365100850756afe742c35e3d',
         rawArtifacts: rawIdentities,
+        decisions: {
+          [acceptedFileToolbar.policy]: acceptedFileToolbar.decision,
+        },
         cssNames: names,
         sourceMapping:
           'Offsets and rule hashes refer to the separately preserved, exact fixed-source compiled CSS artifacts; their complete git source closure is in carrier metadata.',

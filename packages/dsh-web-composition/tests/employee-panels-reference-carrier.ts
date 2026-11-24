@@ -272,6 +272,8 @@ export async function writeEmployeePanelsReferenceCarrier(
       'utf8',
     );
     metadata = JSON.parse(preparedMetadata);
+    if (metadata.cssScope !== cssScope)
+      throw Error('Prepared reference carrier has a different style boundary');
   } else {
     const sources = new Map<string, string>();
     const readBase = (path: string) => {

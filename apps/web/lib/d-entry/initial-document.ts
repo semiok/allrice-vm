@@ -4,7 +4,7 @@ import {
   pageDocumentReady,
   pageRevoked,
   pageStartupFailed,
-} from './page-messages.js';
+} from './page-messages';
 
 /** Inline in the authenticated document, before the browser sees any asset. */
 export const initialDocumentLifecycle = `(() => {

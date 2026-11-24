@@ -1078,6 +1078,32 @@ suite('installed native employee panels with synthetic business owner', () => {
                 path: join(artifacts, `${prefix}-rev2-frame.png`),
                 fullPage: true,
               });
+              if (kind === 'files') {
+                for (const [view, geometry] of [
+                  [page, actual],
+                  [baseline, expected],
+                ] as const) {
+                  const files = body(view, kind);
+                  const picker = await files
+                    .locator('[data-select-field]')
+                    .boundingBox();
+                  const search = await files
+                    .getByRole('searchbox', { name: '查找文件' })
+                    .boundingBox();
+                  expect
+                    .soft(picker?.width, prefix + ' approved employee picker')
+                    .toBe(126);
+                  expect
+                    .soft(search?.width ?? 0, prefix + ' visible search')
+                    .toBeGreaterThan(0);
+                  expect
+                    .soft(
+                      (search?.x ?? 0) + (search?.width ?? 0),
+                      prefix + ' search fits in the pane',
+                    )
+                    .toBeLessThanOrEqual(geometry.root.x + geometry.root.width);
+                }
+              }
               // Scoped legacy content must leave the real native chrome,
               // independent pane/clip budget and actual placement unchanged.
               expect

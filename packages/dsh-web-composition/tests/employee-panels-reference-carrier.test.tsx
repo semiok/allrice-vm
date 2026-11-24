@@ -945,6 +945,29 @@ it('contains CSS-only named definitions without changing their values or leaking
   ).toThrow('Unrecognized');
 });
 
+it('gives only the approved 126px file filter toolbar priority', () => {
+  const picker = '.workbench_files_panel_scopePicker{flex:none;width:126px}';
+  const ordinary = '.select_field_root{width:100%}';
+  const raw = picker + ordinary;
+  const { projected, mappings } = projectReferenceStyleSnapshot(
+    raw,
+    'components',
+  );
+  expect(projected).toBe('.workbench_files_panel_toolbar ' + picker + ordinary);
+  expect(mappings).toMatchObject([
+    {
+      originalRuleSha256:
+        'b79a04e93ad340cedecb6d5a936502bd0ef0f0095c6a562f36630dbb63daa999',
+      policy: 'met-282-accepted-file-toolbar-specificity',
+    },
+    { policy: 'same-declarations-inside-owned-scope' },
+  ]);
+  const different = raw.replace('126px', '130px');
+  expect(projectReferenceStyleSnapshot(different, 'components').projected).toBe(
+    different,
+  );
+});
+
 it.each(['light', 'dark'] as const)(
   'projects the pinned %s root/body attributes onto unboxed contribution owners, not the Host',
   (theme) => {
