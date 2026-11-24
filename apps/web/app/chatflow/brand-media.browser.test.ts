@@ -13,6 +13,7 @@ import {
 } from '@allrice/contracts';
 import type {
   Browser,
+  Download,
   Page,
   Request,
 } from '../../../worker/node_modules/playwright-core/index.js';
@@ -3398,6 +3399,105 @@ suite('MET-224 main-area brand media text workflow', () => {
       }
     },
   );
+
+  it('saves an authorized response across a same-Run generation receipt replay', async () => {
+    const f = await fixture({ loseGenerateResponseOnce: true });
+    const { page } = f;
+    const expected = '不可直接改写的正文\n第二段';
+    const pin = { ...file, objectId: id(82), versionId: id(83) };
+    const path = `/api/v1/files/${pin.objectId}/download`;
+    const deliveries = panel(page).getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    const action = page.getByRole('button', { name: '修改', exact: true });
+    const refreshEntered = gate();
+    const releaseRefresh = gate();
+    const downloads: Download[] = [];
+    page.on('download', (download) => downloads.push(download));
+    const runResponse = () =>
+      page.waitForResponse((response) =>
+        brandView(new URL(response.url()), 'runs'),
+      );
+    const finishDownload = () =>
+      page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+
+    try {
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect
+        .poll(() => page.getByLabel('文章正文').textContent())
+        .toBe(expected);
+      await page.getByLabel('修改意见').fill('保留正文并生成一份改稿');
+      await action.click();
+      await page.getByText('生成已受理但回执丢失', { exact: true }).waitFor();
+
+      const originalRequest = generates(f.state)[0]!.body;
+      const row = f.state.runs[0]!;
+      const runId = row.run.id;
+      row.run = runSnapshot(Number(runId.slice(-12)), 'succeeded');
+      row.deliveries = [{ file: pin, format: 'txt', content: expected }];
+      row.submission = { articleUpdated: false, revision: null };
+      const initial = runResponse();
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      const initialSnapshot = await (await initial).json();
+      expect(initialSnapshot).toEqual({ runs: [row] });
+      await expect.poll(() => deliveries.count()).toBe(1);
+
+      await holdBodyDelivery(page, path);
+      const requested = page.waitForRequest(
+        (request) => new URL(request.url()).pathname === path,
+      );
+      await deliveries.press('Enter');
+      expect((await requested).method()).toBe('GET');
+      await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+      let refreshes = 0;
+      await page.route(
+        (url) => brandView(url, 'runs'),
+        async (route) => {
+          refreshes++;
+          refreshEntered.resolve();
+          await releaseRefresh.promise;
+          await route.fallback();
+        },
+      );
+      const replay = page.waitForResponse(
+        (response) =>
+          brandEndpoint(new URL(response.url())) &&
+          response.request().method() === 'POST',
+      );
+      await action.click();
+      expect((await (await replay).json()).run.id).toBe(runId);
+      expect(generates(f.state)).toHaveLength(2);
+      expect(generates(f.state)[1]!.body).toEqual(originalRequest);
+      await refreshEntered.promise;
+
+      await finishDownload();
+      await page
+        .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+        .waitFor();
+      expect(
+        await page.locator('body').getAttribute('data-delivery-save'),
+      ).toBe('allrice-export');
+      await expect.poll(() => downloads.length).toBe(1);
+      const download = downloads[0]!;
+      expect(download.suggestedFilename()).toBe('allrice-export');
+      expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      expect(await deliveries.count()).toBe(1);
+
+      const refreshed = runResponse();
+      releaseRefresh.resolve();
+      expect(await (await refreshed).json()).toEqual(initialSnapshot);
+      expect(refreshes).toBe(1);
+    } finally {
+      releaseRefresh.resolve();
+      await finishDownload();
+      await f.close();
+    }
+  });
 
   it('keeps only independently authorized Run deliveries while article detail is refused', async () => {
     const stored = article();

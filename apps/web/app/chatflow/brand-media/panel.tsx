@@ -757,14 +757,15 @@ function BrandMediaPanelContent({
     const observedRuns = readEpoch.current.runs;
     const observedArticle = readDenials.current.version;
     const result = await client.generate(intent);
-    // The receipt identifies this new Run, including follow-up queueing.
-    // Preserve its native facts even if the subsequent cold read fails.
+    // Keep a new Run's receipt through a failed cold read. An existing Run
+    // projection carries delivery facts that a receipt omits.
     if (
       observedRuns === readEpoch.current.runs &&
       articleAllowedSince(
         'articleId' in intent ? intent.articleId : undefined,
         observedArticle,
-      )
+      ) &&
+      !projectedRuns.current.some(({ run }) => run.id === result.run.id)
     )
       publishRuns((old) => [
         {
@@ -777,7 +778,7 @@ function BrandMediaPanelContent({
           unavailable: false,
           image: null,
         },
-        ...old.filter((row) => row.run.id !== result.run.id),
+        ...old,
       ]);
     await reload();
     return result;
