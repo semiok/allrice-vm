@@ -31,6 +31,7 @@ import type {
   EmployeePanelsPort,
   EmployeePanelsSnapshot,
 } from './employee-panels-port';
+import { WorkbenchDeliverablePreview } from '../../../apps/web/app/chatflow/workspace-file-preview';
 import '@allrice/ui/tokens.css';
 import css from './employee-panels.module.css';
 import {
@@ -92,6 +93,19 @@ export function EmployeePanelContent({
         />
       );
     case 'files':
+      if (snapshot.filePreview)
+        return (
+          <WorkbenchDeliverablePreview
+            scope={snapshot.scopeKey}
+            viewerId={snapshot.files.viewerId}
+            objectId={snapshot.filePreview.objectId}
+            workspaceId={snapshot.files.workspaceId}
+            tenantHeaders={snapshot.files.headers}
+            dataClient={snapshot.files.dataClient}
+            active
+            onBack={snapshot.filePreview.close}
+          />
+        );
       return (
         <WorkbenchFilesPanel
           {...guardEmployeePanelProps(snapshot.files, current)}
@@ -101,6 +115,7 @@ export function EmployeePanelContent({
         />
       );
     case 'experience':
+      if (!snapshot.experience) return null;
       return (
         <EmployeeMemorySidebar
           {...guardEmployeePanelProps(snapshot.experience, current)}
@@ -108,6 +123,7 @@ export function EmployeePanelContent({
         />
       );
     case 'workflow':
+      if (!snapshot.workflow) return null;
       return (
         <EmployeeCapabilitiesPanel
           {...guardEmployeePanelProps(
@@ -201,8 +217,8 @@ export function EmployeePanelsEntries({
         experience: 0,
         workflow: 0,
       }}
-      experience
-      workflow
+      experience={!!snapshot.experience}
+      workflow={!!snapshot.workflow}
       open={ctx.sidebarRight.isExpanded()}
       showToggle={false}
       onToggle={() => ctx.sidebarRight.toggleExpanded()}
@@ -231,8 +247,8 @@ export function EmployeePanelsGuide({
   return (
     <div className={`${css.surface} ${css.body}`}>
       <WorkbenchStart
-        experience
-        workflow
+        experience={!!snapshot.experience}
+        workflow={!!snapshot.workflow}
         onOpen={(kind) => {
           assertEmployeePanelSession(ctx, sessionId);
           assertEmployeePanelsCurrent(binding, sessionId, snapshot, tab.signal);

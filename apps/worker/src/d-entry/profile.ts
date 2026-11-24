@@ -186,11 +186,14 @@ export function createDEntryProfile(
                 await page.assertCurrent(active);
                 return json(
                   response,
-                  DEntryProfileAddressSchema.parse({
-                    bindingRef: page.bindingRef,
-                    graphRev: release.graph.rev,
-                    manifestSha256: release.manifestSha256,
-                  }),
+                  {
+                    ...DEntryProfileAddressSchema.parse({
+                      bindingRef: page.bindingRef,
+                      graphRev: release.graph.rev,
+                      manifestSha256: release.manifestSha256,
+                    }),
+                    nativeSessionId: page.root.rootNativeSessionId,
+                  },
                   active,
                 );
               }

@@ -36,10 +36,11 @@ export interface EmployeePanelsSnapshot {
   readonly filesUnread: number | null;
   readonly materials: Omit<Materials, 'active' | 'onUse'>;
   readonly files: Omit<Files, 'active' | 'onUse'>;
-  readonly experience: Omit<Memory, 'active'>;
+  readonly filePreview?: { readonly objectId: string; close(): void };
+  readonly experience?: Omit<Memory, 'active'>;
   /** Pure props composition. Existing controllers/providers remain in the
    * authenticated owner; do not create hooks or a second catalog here. */
-  readonly workflow: (
+  readonly workflow?: (
     actions: EmployeePanelsActions,
   ) => Omit<Capabilities, 'active'>;
 }

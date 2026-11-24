@@ -6,9 +6,12 @@ import {
 } from '@allrice/contracts';
 import { parseRemoteStreamServerMessage } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
 
-export const pageClosing = 'allrice:d-entry:close';
-export const pageCompletion = 'allrice:d-entry:completion';
-export const pageRevoked = 'allrice:d-entry:revoked';
+export {
+  pageClosing,
+  pageCompletion,
+  pageNavigate,
+  pageRevoked,
+} from './page-messages';
 
 export function nativeMuxUrl(
   origin: string,

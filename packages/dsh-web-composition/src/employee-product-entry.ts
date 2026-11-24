@@ -10,8 +10,10 @@ const profile = nativeProfileDocument(container, () => {
 });
 const scope = globalThis as typeof globalThis & {
   __DSH_TRANSPORT__?: typeof profile.transport;
+  __ALLRICE_D_ENTRY_LIFETIME__?: AbortSignal;
 };
 scope.__DSH_TRANSPORT__ = profile.transport;
+scope.__ALLRICE_D_ENTRY_LIFETIME__ = profile.signal;
 const entry = startEmployeeWebEntry(container, {
   async applyRequiredInjections(signal) {
     const injections = await profile.bootstrap(signal);

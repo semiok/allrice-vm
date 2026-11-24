@@ -18,6 +18,11 @@ const unavailable = () =>
     message: 'This native route requires the Host owner',
     retryable: false,
   });
+const escapeAttribute = (value: string) =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('"', '&quot;')
+    .replaceAll('<', '&lt;');
 type Params = { params: Promise<{ publicationPath: string[] }> };
 export async function GET(request: Request, { params }: Params) {
   try {
@@ -40,6 +45,8 @@ export async function GET(request: Request, { params }: Params) {
     const assets = profileDirectory('static', address);
     const { scopeId, bindingRef, graphRev, selection } = address;
     const tenant = input.context.organizationId;
+    if (input.context.actor.type !== 'user')
+      throw new DataAccessError('not_found');
     const attributes = [
       ['scope-id', scopeId],
       ['binding-ref', bindingRef],
@@ -48,8 +55,10 @@ export async function GET(request: Request, { params }: Params) {
       ['workspace-id', selection.workspaceId],
       ['employee-instance-id', selection.employeeInstanceId],
       ['thread-id', selection.threadId ?? ''],
+      ['viewer-id', input.context.actor.id],
+      ['native-session-id', address.nativeSessionId],
     ]
-      .map(([key, value]) => `data-${key}="${value}"`)
+      .map(([key, value]) => `data-${key}="${escapeAttribute(value!)}"`)
       .join(' ');
     const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><link rel="stylesheet" href="assets/index-BxpfOGf3.css"><link rel="stylesheet" href="assets/vendor-DV2921Zo.css"><link rel="stylesheet" href="${assets}/managed/employee-web-entry.css"></head><body><div id="app" ${attributes}></div><script type="module" src="${assets}/managed/employee-web-entry.js"></script></body></html>`;
     return new Response(html, {

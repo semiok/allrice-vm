@@ -28,7 +28,7 @@ type Frame = ComponentProps<typeof ChatSidebarFrame>;
 export interface EmployeeSidebarSnapshot {
   tree: Omit<Tree, 'collapsed' | 'onVisibleSessionsChange' | 'archive'> &
     Required<Pick<Tree, 'onNewSession' | 'onDetails' | 'onEmployeeNavigate'>>;
-  archive: NonNullable<Frame['archive']>;
+  archive?: NonNullable<Frame['archive']>;
   employeeArchiveOpen?: boolean;
   settingsOpen: boolean;
   /** Existing owner failure. Absence means no navigation error is being shown. */
@@ -36,7 +36,7 @@ export interface EmployeeSidebarSnapshot {
 }
 
 export interface EmployeeSidebarPort {
-  getSnapshot: () => EmployeeSidebarSnapshot;
+  getSnapshot: () => EmployeeSidebarSnapshot | null;
   subscribe: (listener: () => void) => () => void;
   createEmployee: () => void;
   openArchive: () => void;
@@ -68,6 +68,7 @@ export function EmployeeSidebar({
     compactSnapshot,
     () => false,
   );
+  if (!snapshot) return null;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
   };
@@ -96,7 +97,7 @@ export function EmployeeSidebar({
             archive={snapshot.archive}
             collapsed={collapsed}
             onNewSession={(id) => {
-              snapshot.archive.setFilter('default');
+              snapshot.archive?.setFilter('default');
               snapshot.tree.onNewSession(id);
               closeMobile();
             }}

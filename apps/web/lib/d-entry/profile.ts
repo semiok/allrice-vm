@@ -89,10 +89,13 @@ export async function profileInput(
 export async function profileAddress(
   input: Awaited<ReturnType<typeof profileInput>>,
   scopeId: string,
-): Promise<ProfileLocation> {
+): Promise<ProfileLocation & { nativeSessionId: string }> {
   const address = await readDEntryWorkerJson(
     await requestDEntryProfile(input, 'bootstrap', { scopeId }, 'document'),
-    (value) => DEntryProfileAddressSchema.parse(value),
+    (value) =>
+      DEntryProfileAddressSchema.extend({
+        nativeSessionId: z.string().min(1),
+      }).parse(value),
   );
   return { ...address, scopeId, selection: input.selection };
 }

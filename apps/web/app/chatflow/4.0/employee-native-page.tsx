@@ -9,6 +9,7 @@ import {
   openNativePageCarrier,
   pageClosing,
   pageCompletion,
+  pageNavigate,
   pageRevoked,
 } from '../../../lib/d-entry/page-carrier';
 
@@ -38,12 +39,33 @@ export function EmployeeNativePage({ query }: { query: string }) {
     };
     const receive = (event: MessageEvent) => {
       if (
-        event.origin === location.origin &&
-        event.source === frame.current?.contentWindow &&
-        event.data?.type === pageClosing &&
-        event.data?.scopeId === scopeId
+        event.origin !== location.origin ||
+        event.source !== frame.current?.contentWindow ||
+        !scopeId ||
+        event.data?.scopeId !== scopeId
       )
-        close();
+        return;
+      if (event.data.type === pageClosing) close();
+      if (event.data.type === pageNavigate) {
+        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+        if (!next.success || !carrier) return;
+        const params = new URLSearchParams(
+          Object.entries(next.data).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string',
+          ),
+        );
+        void carrier.close().then(
+          () => {
+            send(pageCompletion, 'closed');
+            if (!lifetime.signal.aborted)
+              location.assign('/chatflow/4.0?' + params);
+          },
+          () => {
+            send(pageCompletion, 'unknown');
+            if (!lifetime.signal.aborted) setFailed(true);
+          },
+        );
+      }
     };
     window.addEventListener('message', receive);
     window.addEventListener('pagehide', close);

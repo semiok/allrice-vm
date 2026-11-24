@@ -18,17 +18,31 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+export function readEmployeeDocument(data: DOMStringMap) {
+  const { scopeId, ...selection } = DEntryPageBorrowSchema.parse({
+    scopeId: data.scopeId,
+    workspaceId: data.workspaceId,
+    employeeInstanceId: data.employeeInstanceId,
+    threadId: data.threadId || undefined,
+  });
+  const organizationId = UuidSchema.parse(data.organizationId);
+  const viewerId = UuidSchema.parse(data.viewerId);
+  return {
+    scopeId,
+    selection,
+    organizationId,
+    viewerId,
+    nativeSessionId: data.nativeSessionId,
+  };
+}
+
 export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
 ) {
-  const { scopeId, ...selection } = DEntryPageBorrowSchema.parse({
-    scopeId: container.dataset.scopeId,
-    workspaceId: container.dataset.workspaceId,
-    employeeInstanceId: container.dataset.employeeInstanceId,
-    threadId: container.dataset.threadId || undefined,
-  });
-  const organizationId = UuidSchema.parse(container.dataset.organizationId);
+  const { scopeId, selection, organizationId } = readEmployeeDocument(
+    container.dataset,
+  );
   const bindingRef = container.dataset.bindingRef!;
   const graphRev = container.dataset.graphRev!;
   const lifetime = new AbortController();
@@ -89,6 +103,7 @@ export function nativeProfileDocument(
     return closing;
   }
   return {
+    signal: lifetime.signal,
     close: stop,
     async bootstrap(signal: AbortSignal) {
       const active = AbortSignal.any([lifetime.signal, signal]);
