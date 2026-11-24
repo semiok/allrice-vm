@@ -232,7 +232,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
   expect(await next()).toMatchObject({
     type: 'item',
     streamId: 'events',
-    value: { type: 'ready', home: '/home/native-fixture' },
+    value: { type: 'ready', host: { home: '/home/native-fixture' } },
   });
 
   const finishNative = deferred(),
@@ -246,7 +246,12 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
     streamId: 'root',
     endpoint: 'session/follow',
     payload: {
-      args: { request: { address: { kind: 'session', sessionId: 'root' } } },
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: 'root' },
+          throughSeq: 0,
+        },
+      },
     },
   });
   expect(await next()).toMatchObject({
@@ -262,7 +267,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
   });
   expect(f.host.catalog.pages[0]).toBe(f.host.catalog.follows[0]);
   expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
-  expect(f.probe.mock.calls[0][1].method).toBe('GET');
+  expect(f.probe.mock.calls[0]?.[1].method).toBe('GET');
 
   let ack: unknown;
   const closed = life.receive().then((frame) => (ack = frame));

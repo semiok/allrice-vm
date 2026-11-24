@@ -111,10 +111,11 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     // A viewer must never start a Host to make a missing live/cold source exist.
     const original = await history(token, input, signal);
     if (!input.selection.threadId) throw new DEntryNativeUnavailable();
-    const pin = await deps.historyRoot(original.context, input.selection);
+    const existing = await deps.historyRoot(original.context, input.selection);
     signal.throwIfAborted();
-    if (!pin || !sameDEntryIdentity(pin.identity, original.identity))
+    if (!existing || !sameDEntryIdentity(existing.identity, original.identity))
       throw new DEntryNativeUnavailable();
+    const pin = existing;
     const data = deps.data();
     if (!data) throw new DEntryNativeUnavailable();
     const auth = await currentDEntryRequest(deps, token, input, signal);
