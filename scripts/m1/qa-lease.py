@@ -324,6 +324,8 @@ def main(args):
         return
     data = read(path)
     if command == 'database-claim':
+        if 'databaseClaim' not in data and args[1:] == ['--allow-unrecorded']:
+            return
         if 'databaseClaim' not in data or not valid_database_claim(data['databaseClaim']):
             raise ValueError('unknown database ownership')
         print(data['databaseClaim'] or '')

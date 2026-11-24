@@ -119,6 +119,18 @@ def ready_identity(doc, role, expected=None):
                 identity.get(key) == expected[key] for key in ('sourceSha', 'sourceTree', 'manifestDigest'))))
 
 
+def dotenv_environment(contents, node, keys=()):
+    """Read declarative Node dotenv values without using them to start Node."""
+    result = subprocess.run([node, '-e', '''
+const { readFileSync } = require('node:fs');
+const { parseEnv } = require('node:util');
+const env = parseEnv(readFileSync(0, 'utf8'));
+const keys = process.argv.slice(1);
+process.stdout.write(JSON.stringify(keys.length ? Object.fromEntries(keys.map(key => [key, env[key]])) : env));
+''', *keys], input=contents, text=True, capture_output=True, check=True, timeout=5, env={})
+    return json.loads(result.stdout)
+
+
 def controller_settings(env, loaded_env_file):
     """Read the same declarative values Node's --env-file supplies, without sourcing the file."""
     missing = [key for key in CONTROLLER_KEYS if key not in env]
@@ -130,14 +142,7 @@ def controller_settings(env, loaded_env_file):
             node = shutil.which(str(pinned)) or shutil.which('node') or shutil.which('node', path='/opt/homebrew/bin:/usr/local/bin')
             if not node:
                 raise ValueError('Node is required to read the controller environment')
-            result = subprocess.run([node, '-e', '''
-const { readFileSync } = require('node:fs');
-const { parseEnv } = require('node:util');
-const env = parseEnv(readFileSync(0, 'utf8'));
-const keys = process.argv.slice(1);
-process.stdout.write(JSON.stringify(Object.fromEntries(keys.map(key => [key, env[key]]))));
-''', *missing], input=dotenv, text=True, capture_output=True, check=True, timeout=5, env={})
-            defaults = json.loads(result.stdout)
+            defaults = dotenv_environment(dotenv, node, missing)
     return {key: env.get(key, defaults.get(key, '')) for key in CONTROLLER_KEYS}
 
 

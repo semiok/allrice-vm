@@ -4,6 +4,7 @@
 -- the partitions is left. psql variables:
 --   targets   [{partitionId, ownerId, epoch, tokenDigest}] as the tool read them
 --   evidence  the exit it verified (an object), kept in each proof
+--   database_claim  expected PostgreSQL OID and ownership marker when recorded by QA
 -- Writes what releaseClosedWriter writes after a clean shutdown
 -- (packages/database/src/native-schedule-control-sql.ts): the audit row, then closed=true
 -- with the same proof, so the next Worker's validClose accepts it. Owner, epoch and token
@@ -11,14 +12,21 @@
 -- exactly as read, still open with an expired lease and no proof yet raises, and nothing
 -- of the transaction is written.
 SELECT set_config('allrice.recover_targets', :'targets', true), set_config('allrice.recover_evidence', :'evidence', true);
+SELECT set_config('allrice.recover_database_claim', :'database_claim', true);
 DO $recover$
 DECLARE
   targets jsonb := current_setting('allrice.recover_targets')::jsonb;
   evidence jsonb := current_setting('allrice.recover_evidence')::jsonb;
+  expected_database text := current_setting('allrice.recover_database_claim');
   t jsonb;
   p allrice_native_once_partitions%ROWTYPE;
   proof jsonb;
 BEGIN
+  IF expected_database <> '' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database
+    WHERE datname = current_database()
+      AND oid::text || ':' || coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '') = expected_database) THEN
+    RAISE EXCEPTION 'schedule-recover: database ownership changed';
+  END IF;
   IF jsonb_typeof(targets) IS DISTINCT FROM 'array' OR jsonb_array_length(targets) = 0
      OR jsonb_typeof(evidence) IS DISTINCT FROM 'object' OR evidence = '{}'::jsonb THEN
     RAISE EXCEPTION 'schedule-recover: targets or evidence missing';

@@ -24,6 +24,7 @@ _pinned = os.path.expanduser('~/.local/opt/node-22.23.2/bin/node')
 NODE = _pinned if os.path.exists(_pinned) else shutil.which('node')
 QA_DATABASE = 'allrice40_qa_tool_test'
 QA_DATABASE_URL = 'postgres://tester@127.0.0.1:5434/' + QA_DATABASE
+QA_DATABASE_CLAIM = '49000:allrice40-qa:' + 'b' * 32
 ARCHIVED = [
     '0073_gemini_model_provider.sql',
     '0213_native_chat_executor_transitions.sql',
@@ -68,8 +69,10 @@ class DeployDevMigrations(unittest.TestCase):
               'case "$q" in *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
-        for name, env in (('ps', 'PROCESS_ARGS'), ('lsof', 'PROCESS_CWD')):
-            write(os.path.join(self.stubs, name), '#!/bin/sh\nprintf "%s" "$' + env + '"\n', 0o755)
+        write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\nexit 113\n', 0o755)
+        write(os.path.join(self.stubs, 'ps'), '#!/bin/sh\nif [ "$1" = -E ]; then printf "%s" "${PROCESS_FULL:-$PROCESS_ARGS}"; '
+              'else printf "%s" "$PROCESS_ARGS"; fi\n', 0o755)
+        write(os.path.join(self.stubs, 'lsof'), '#!/bin/sh\nprintf "%s" "$PROCESS_CWD"\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
@@ -575,6 +578,7 @@ class DeployDevMigrations(unittest.TestCase):
         write(os.path.join(directory, 'instance.json'), json.dumps(dict(
             task=task, repository='semiok/allrice-vm', repositoryId=1469490636,
             webPort=3200, workerPort=3201, nativeArtifactId='new-art', database=database,
+            databaseClaim=QA_DATABASE_CLAIM, plistClaims={},
             worktree=dict(name=os.path.basename(release), device=entry.st_dev, inode=entry.st_ino))))
         p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=$QA_DATABASE; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
@@ -1187,8 +1191,9 @@ class DeployDevMigrations(unittest.TestCase):
         # configuration selection and writes still use the source scripts and lib.sh.
         directory = os.path.join(self.tmp, 'config-tools')
         with open(os.path.join(HERE, 'lib.sh')) as f:
-            write(os.path.join(directory, 'lib.sh'), f.read() + '\n'
-                  'job_state() { echo gone; }; stop_job() { :; };\n'
+            write(os.path.join(directory, 'lib.sh'), f.read() + '\n' +
+                  ('' if name == 'schedule-recover' else 'job_state() { echo gone; };\n') +
+                  'stop_job() { :; };\n'
                   'start_job() { echo UNEXPECTED_START >&2; return 90; };\n'
                   'M1_LAUNCHCTL="$TEST_STUBS/launchctl"\n')
         shutil.copyfile(os.path.join(HERE, 'with-env'), os.path.join(directory, 'with-env'))
@@ -1198,12 +1203,26 @@ class DeployDevMigrations(unittest.TestCase):
             script = re.sub(r'^export PATH=.*$', 'export PATH="$TEST_PATH"', f.read(), flags=re.M)
         if name == 'schedule-recover':
             script = script.replace('PG=/opt/homebrew/opt/postgresql@17/bin', 'PG="$TEST_STUBS"')
+            shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(directory, 'qa-lease.py'))
             node = os.path.join(self.home, '.local/opt/node-22.23.2/bin/node')
             os.makedirs(os.path.dirname(node), exist_ok=True)
             if not os.path.exists(node):
                 os.symlink(NODE, node)
+            with open(os.path.join(HERE, 'schedule-recover-processes.py')) as f:
+                source = f.read()
+            source = source.replace('def observe_process(pid):', 'def native_observe_process(pid):', 1)
+            marker = "if __name__ == '__main__':"
+            source = source.replace(marker, '''def observe_process(pid):
+    import json
+    row = json.loads(os.environ.get('PROCESS_SNAPSHOT', 'null'))
+    if row is None:
+        raise OSError('fixture process environment unavailable')
+    return row['executable'], row['args'], row['environment'], row['started']
+
+''' + marker)
             for path in ('/bin/ps', '/usr/sbin/lsof'):
-                script = script.replace('"' + path + '"', f'os.environ["TEST_STUBS"] + "/{os.path.basename(path)}"')
+                source = source.replace(repr(path), f'os.environ["TEST_STUBS"] + "/{os.path.basename(path)}"')
+            write(os.path.join(directory, 'schedule-recover-processes.py'), source)
             start, rest = script.split('boot_at() {', 1)
             script = start + 'sleep() { :; }; boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
         if name == 'deploy-dev':
@@ -1346,7 +1365,8 @@ class DeployDevMigrations(unittest.TestCase):
               'import json,os,sys\n'
               'if "-f" in sys.argv:\n'
               '    if os.environ.get("SQL_FAIL"): sys.exit(1)\n'
-              '    open(os.environ["PROOF"],"w").write("committed"); sys.exit(0)\n'
+              '    claim=next((a.split("=",1)[1] for a in sys.argv if a.startswith("database_claim=")), "")\n'
+              '    open(os.environ["PROOF"],"w").write(claim); sys.exit(0)\n'
               'if "pg_stat_activity" in sys.argv[-1]: print(0); sys.exit(0)\n'
               'rows=json.loads(os.environ["ROWS"])\n'
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
@@ -1357,23 +1377,36 @@ class DeployDevMigrations(unittest.TestCase):
         task = 'recover-scan'
         instance = self.write_qa_plists(task)
         worker = self.read_plist(os.path.join(instance, 'worker.plist'))
-        live = os.path.join(self.home, 'Library/LaunchAgents', worker['Label'] + '.plist')
-        shutil.copyfile(os.path.join(instance, 'worker.plist'), live)
+        web = self.read_plist(os.path.join(instance, 'web.plist'))
+        agents = os.path.join(self.home, 'Library/LaunchAgents')
+        for role, plist in (('worker', worker), ('web', web)):
+            destination = os.path.join(agents, plist['Label'] + '.plist')
+            subprocess.run([sys.executable, os.path.join(HERE, 'qa-lease.py'), 'publish-plist',
+                            os.path.join(instance, 'instance.json'), role, destination],
+                           env=dict(HOME=self.home, PATH=os.defpath), capture_output=True, text=True, check=True)
+        self.recovery_web_plist = destination
+        self.recovery_web_cwd = web['WorkingDirectory']
+        write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\n'
+              'case "$2" in *-web) [ -n "$PROCESS_WEB_PID" ] || exit 113 ;; *) exit 113 ;; esac\n'
+              'printf "path = %s\\nworking directory = %s\\npid = %s\\n" '
+              '"$PROCESS_WEB_PLIST" "$PROCESS_WEB_CWD" "$PROCESS_WEB_PID"\n', 0o755)
         release = worker['WorkingDirectory']
-        web_entry = os.path.join(release, 'apps/web/server.mjs')
+        web_entry = web['ProgramArguments'][2]
         old = os.path.join(self.home, 'allrice-qa', task, 'release')
         old_entry = os.path.join(old, 'apps/worker/dist/index.js')
+        old_web_entry = os.path.join(old, 'apps/web/server.mjs')
         write(old_entry, '')
+        write(old_web_entry, '')
         relative = os.path.relpath(os.path.join(release, 'apps/worker/dist/index.js'), self.home)
         rows = self.seed_recovery_partition()
         for name, script, cwd, allowed in (
-            ('release cwd', '/tmp/unrelated.mjs', release, False),
+            ('release cwd', old_entry, release, False),
             ('absolute release script', os.path.join(release, 'apps/worker/dist/index.js'), self.home, False),
             ('relative release script', relative, self.home, False),
             ('script after end of options', '-- ' + relative, self.home, False),
             ('separate unhandled rejection value', '--unhandled-rejections strict ' + relative, self.home, False),
             ('separate numeric value before delimiter', '--max-http-header-size 16384 -- ' + relative, self.home, False),
-            ('instance cwd', '/tmp/unrelated.mjs', instance, False),
+            ('instance cwd', old_entry, instance, False),
             ('3.x script after end of options', '-- ' + old_entry, self.home, True),
             ('same name 3.x with documented options', '--unhandled-rejections strict --max-http-header-size 16384 ' + old_entry, old, True),
             ('same name 3.x release', old_entry, old, True),
@@ -1383,18 +1416,79 @@ class DeployDevMigrations(unittest.TestCase):
             ('unrecognized args cannot use the Web exemption', '--unknown-runtime-option /elsewhere/apps/web/server.mjs', old, False),
             ('inline execution with apparent 3.x entry', '--eval=process.exit() ' + old_entry, old, False),
             ('ambiguous apparent Web entry with Worker argument', '--title demo ' + web_entry + ' ' + relative, self.home, False),
-            ('recognized Web entry', '--env-file=' + os.path.join(instance, '.env') + ' ' + web_entry
-             + ' --hostname 127.0.0.1 --port 3200', self.home, True),
         ):
             with self.subTest(name=name):
-                proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
-                p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
-                                         ROWS=json.dumps(rows), PROOF=proof,
-                                         PROCESS_ARGS=f'999999 1 node {script}\n', PROCESS_CWD=f'p999999\nn{cwd}\n')
-                self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
-                self.assertEqual(os.path.exists(proof), allowed)
-                if not allowed:
-                    self.assertIn('processes that could own the partitions are still running', p.stderr)
+                self.check_recovery_scan(task, rows, name, ['node', *shlex.split(script)], cwd, allowed)
+
+        duplicate = os.path.join(instance, '.local/project/apps/web/server.mjs')
+        nested = os.path.join(release, 'nested/apps/web/server.mjs')
+        for path in (duplicate, nested):
+            write(path, '// inert fixture\n')
+        db_env = {'DATABASE_URL': worker['EnvironmentVariables']['DATABASE_URL']}
+        env_file = os.path.join(self.tmp, 'node-config.env')
+        clean_env = os.path.join(self.tmp, 'clean.env')
+        old_env = os.path.join(os.path.dirname(old), '.env')
+        write(env_file, 'export NODE_OPTIONS="--require /outside/unexecuted-fixture.js"\n')
+        write(clean_env, 'NODE_OPTIONS="--unhandled-rejections strict"\n')
+        write(old_env, 'DATABASE_URL=postgres://tester@127.0.0.1:5432/allrice_qa_recover_scan\n')
+        old_args = [NODE, old_entry]
+        web_args, web_cwd = web['ProgramArguments'], web['WorkingDirectory']
+        web_state = {'web_pid': '999999'}
+        for name, args, cwd, allowed, facts in (
+            ('verified Web with environment file', web_args, web_cwd, True, dict(web_state, environment=db_env)),
+            ('Web argv without confirmed service', web_args, web_cwd, False, dict(environment=db_env)),
+            ('Web argv with another service PID', web_args, web_cwd, False, dict(web_pid='999998', environment=db_env)),
+            ('Web argv under an unrelated loaded plist', web_args, web_cwd, False,
+             dict(web_state, environment=db_env, job_plist=self.recovery_web_plist + '.other')),
+            ('Web argv with wrong cwd', web_args, old, False, dict(web_state, environment=db_env)),
+            ('Web suffix in instance data', [NODE, duplicate], instance, False, dict(web_state, environment=db_env)),
+            ('Web suffix in nested release', [NODE, nested], release, False, dict(web_state, environment=db_env)),
+            ('Web with inherited preload', web_args, web_cwd, False,
+             dict(web_state, environment=dict(db_env, NODE_OPTIONS='--require /outside/unexecuted-fixture.js'))),
+            ('startup snapshot', [NODE, '--snapshot-blob', '/outside/unexecuted.blob', old_entry], old, False, {}),
+            ('snapshot builder', [NODE, '--build-snapshot-config=/outside/unexecuted.json', old_entry], old, False, {}),
+            ('inherited preload', old_args, old, False, dict(environment={'NODE_OPTIONS': '--import /outside/unexecuted.mjs'})),
+            ('file preload', [NODE, '--env-file', env_file, old_entry], old, False, {}),
+            ('env file after apparent script', [*old_args, '--env-file=' + env_file], old, False, {}),
+            ('config file after apparent script', [*old_args, '--experimental-config-file=/outside/unexecuted.json'], old, False, {}),
+            ('inherited native loader setting', old_args, old, False,
+             dict(environment={'DYLD_INSERT_LIBRARIES': '/outside/unexecuted.dylib'})),
+            ('inherited empty options override the file', [NODE, '--env-file=' + env_file, old_entry], old, True,
+             dict(environment={'NODE_OPTIONS': ''})),
+            ('ordinary env options', [NODE, '--env-file=' + clean_env, old_entry], old, True, {}),
+            ('ordinary 3.x Web', [NODE, '--env-file=' + old_env, old_web_entry, '--hostname', '127.0.0.1', '--port', '3200'],
+             os.path.dirname(old_web_entry), True, {}),
+            ('env file edited since launch', [NODE, '--env-file=' + clean_env, old_entry], old, False,
+             dict(started=os.stat(clean_env).st_ctime_ns - 1)),
+            ('unavailable optional env file', [NODE, '--env-file-if-exists=' + clean_env + '.missing', old_entry], old, False, {}),
+            ('unavailable process environment', old_args, old, False, dict(observed=False)),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, **facts)
+        os.unlink(self.recovery_web_plist)
+        shutil.copyfile(os.path.join(instance, 'web.plist'), self.recovery_web_plist)
+        self.check_recovery_scan(task, rows, 'Web plist has an unrelated inode', web_args, web_cwd, False,
+                                 environment=db_env, **web_state)
+
+    def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
+                            web_pid='', observed=True, job_plist=None):
+        proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
+        environment = dict(HOME=self.home, **(environment or {}))
+        snapshot = dict(executable=NODE, args=args, environment=environment, started=started or time.time_ns()) if observed else None
+        command = '999999 1 node ' + ' '.join(args)
+        full = command + ' ' + ' '.join(f'{key}={value}' for key, value in environment.items())
+        p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
+                                 ROWS=json.dumps(rows), PROOF=proof, PROCESS_WEB_PID=web_pid,
+                                 PROCESS_WEB_PLIST=job_plist or self.recovery_web_plist, PROCESS_WEB_CWD=self.recovery_web_cwd,
+                                 PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=command + '\n',
+                                 PROCESS_FULL=full + '\n', PROCESS_CWD=f'p999999\nn{cwd}\n')
+        self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
+        self.assertEqual(os.path.exists(proof), allowed)
+        if allowed:
+            with open(proof) as f:
+                self.assertEqual(f.read(), QA_DATABASE_CLAIM)
+        else:
+            self.assertIn('processes that could own the partitions are still running', p.stderr)
 
     def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
         worker = self.plist('worker')
