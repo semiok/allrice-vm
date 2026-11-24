@@ -20,8 +20,235 @@ import {
 } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { createDEntryPrincipalControl } from './principal-control.js';
 import { DEntryProfileGraphSchema } from '@allrice/contracts';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { holdReleasedProfile } from './released-profile.js';
+
+const authStage = vi.hoisted(() => ({
+  afterWrite: undefined as ((filename: string) => Promise<void>) | undefined,
+}));
+vi.mock('node:fs/promises', async (load) => {
+  const fs = await load<typeof import('node:fs/promises')>();
+  return {
+    ...fs,
+    async writeFile(...args: Parameters<typeof fs.writeFile>) {
+      await fs.writeFile(...args);
+      if (typeof args[0] === 'string') await authStage.afterWrite?.(args[0]);
+    },
+  };
+});
+
+async function observerFixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
+  const local = await hostFixture(issue('execute'), true, null);
+  const lifetime = new AbortController().signal;
+  const control = createDEntryPrincipalControl(local.node, {
+    carrier: lifetime,
+    cleanupTimeoutMs: 3000,
+  });
+  const owner = await import(
+    new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
+  );
+  const artifacts = join(directory, 'guest-auth.json');
+  const install = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  const native = await import(
+    pathToFileURL(install.resolve('@deepseek-ai/dsh-client-modules')).href
+  );
+  local.host.provide('loader', { entries: () => [] });
+  await local.host.plugin(native.ClientModuleRegistry);
+  const mount = (nonce: string, entered?: () => void) =>
+    local.host.plugin({
+      inject: ['allricePrincipal', 'connection', 'clientModules'],
+      apply(ctx: Context) {
+        const applying = owner.apply(ctx, {
+          artifactPath: artifacts,
+          nonce,
+          baseUrl: 'http://127.0.0.1:18881/',
+        });
+        entered?.();
+        return applying;
+      },
+    });
+  return {
+    directory,
+    local,
+    owner,
+    artifacts,
+    mount,
+    async open(scopeId = randomUUID()) {
+      return control
+        .acquire({ ...local.selected, scopeId }, lifetime)
+        .run(lifetime);
+    },
+    async close() {
+      await Promise.allSettled([control.close()]);
+      await local.close();
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+it('retirement waits for the real old control downlink and a disposed waiter cannot publish', async () => {
+  const f = await observerFixture();
+  const neighbor = await hostFixture();
+  const signal = new AbortController().signal;
+  const other = createDEntryPrincipalControl(neighbor.node, {
+    carrier: signal,
+    cleanupTimeoutMs: 3000,
+  });
+  const firstDelivery = deferred();
+  const finishDelivery = deferred();
+  const finalDelivery = deferred();
+  const finishFinal = deferred();
+  try {
+    const previous = f.mount('first-owner');
+    await previous;
+    const scopeId = randomUUID();
+    const wire = f.local.host.typertGateway.wireStream;
+    const open = wire.open.bind(wire);
+    let watched = false;
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await open(...args);
+      if (args[0] !== 'allricePrincipal/openScope' || watched) return source;
+      watched = true;
+      return {
+        async *[Symbol.asyncIterator]() {
+          for await (const row of source) {
+            if (Reflect.get(row as object, 'type') === 'revoked') {
+              firstDelivery.resolve();
+              await finishDelivery.promise;
+            }
+            if (Reflect.get(row as object, 'type') === 'closed') {
+              finalDelivery.resolve();
+              await finishFinal.promise;
+            }
+            yield row;
+          }
+        },
+      };
+    });
+    const opened = await f.open(scopeId);
+    const unaffected = await other
+      .acquire(neighbor.selected, signal)
+      .run(signal);
+    let retired = false;
+    const stopping = f.owner.unloadNativeWebOwner(previous).then(() => {
+      retired = true;
+    });
+    void stopping.catch(() => {});
+    await firstDelivery.promise;
+    await expect
+      .poll(() => f.local.host.allricePrincipal.scopes.has(scopeId))
+      .toBe(false);
+    expect(opened.revoked.aborted).toBe(false);
+    expect(retired).toBe(false);
+
+    const loading = deferred();
+    const canceled = f.mount('canceled-owner', loading.resolve);
+    await loading.promise;
+    const disposedWhileLoading = canceled.dispose();
+    await expect(f.open()).rejects.toBeDefined();
+    const ready = deferred();
+    const successor = f.mount('successor', ready.resolve);
+    await ready.promise;
+    let restarted = false;
+    void Promise.resolve(successor).then(
+      () => {
+        restarted = true;
+      },
+      () => {},
+    );
+    expect(restarted).toBe(false);
+    expect(unaffected.revoked.aborted).toBe(false);
+
+    finishDelivery.resolve();
+    await finalDelivery.promise;
+    await expect.poll(() => opened.revoked.aborted).toBe(true);
+    expect(retired).toBe(false);
+    expect(restarted).toBe(false);
+    await expect(f.open()).rejects.toBeDefined();
+    finishFinal.resolve();
+    await stopping;
+    await disposedWhileLoading;
+    await successor;
+    expect(JSON.parse(await readFile(f.artifacts, 'utf8')).nonce).toBe(
+      'successor',
+    );
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    expect(unaffected.revoked.aborted).toBe(false);
+    await f.owner.unloadNativeWebOwner(successor);
+  } finally {
+    finishDelivery.resolve();
+    finishFinal.resolve();
+    await Promise.allSettled([other.close(), f.close()]);
+    await neighbor.close();
+  }
+});
+
+it('a Cordis owner disposed during actual local auth staging issues no scope and commits no nonce', async () => {
+  const f = await observerFixture();
+  const staging = deferred();
+  const finish = deferred();
+  try {
+    authStage.afterWrite = async (filename) => {
+      if (!filename.startsWith(f.artifacts + '.')) return;
+      staging.resolve();
+      await finish.promise;
+    };
+    const loading = f.mount('staged-but-disposed');
+    await staging.promise;
+    // The actual staging write returned from the filesystem while the rename
+    // and enablement remain governed by this Cordis activation.
+    const disposing = loading.dispose();
+    await expect(f.open()).rejects.toBeDefined();
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    finish.resolve();
+    await disposing;
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(f.open()).rejects.toBeDefined();
+    const fresh = f.mount('next-owner');
+    await fresh;
+    expect(JSON.parse(await readFile(f.artifacts, 'utf8')).nonce).toBe(
+      'next-owner',
+    );
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(fresh);
+  } finally {
+    finish.resolve();
+    authStage.afterWrite = undefined;
+    await f.close();
+  }
+});
+
+it('returns the real local retirement failure to an explicit unloader and keeps the same Host closed', async () => {
+  const f = await observerFixture();
+  try {
+    const previous = f.mount('owner-with-failing-cleanup');
+    await previous;
+    await rm(f.artifacts);
+    await mkdir(f.artifacts);
+    await expect(f.owner.unloadNativeWebOwner(previous)).rejects.toMatchObject({
+      code: 'ERR_FS_EISDIR',
+      path: f.artifacts,
+    });
+    const successor = f.mount('must-not-issue');
+    await expect(successor.await()).rejects.toMatchObject({
+      code: 'ERR_FS_EISDIR',
+      path: f.artifacts,
+    });
+    await expect(f.open()).rejects.toBeDefined();
+  } finally {
+    await f.close();
+  }
+});
 
 it('attests each exact resource in independent rc.2 graph orders and rejects a modified bundle, map or URL', async () => {
   const root = await mkdtemp(join(tmpdir(), 'allrice-native-profile-copies-'));
@@ -264,23 +491,16 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
     );
     const artifactPath = join(root, 'guest-auth.json');
+    local.host.provide('clientModules', two.registry);
     const installOwner = (started?: () => void) =>
       local.host.plugin({
-        inject: ['allricePrincipal', 'connection'],
+        inject: ['allricePrincipal', 'connection', 'clientModules'],
         apply(ctx: Context) {
-          const loading = owner.apply(
-            {
-              effect: ctx.effect.bind(ctx),
-              allricePrincipal: ctx.allricePrincipal,
-              connection: ctx.connection,
-              clientModules: two.registry,
-            },
-            {
-              artifactPath,
-              nonce: randomUUID(),
-              baseUrl: 'http://127.0.0.1:18881/',
-            },
-          );
+          const loading = owner.apply(ctx, {
+            artifactPath,
+            nonce: randomUUID(),
+            baseUrl: 'http://127.0.0.1:18881/',
+          });
           started?.();
           return loading;
         },
@@ -316,7 +536,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       );
       await held.promise;
       let ownerUnloaded = false;
-      const unloading = firstOwner.dispose().then(() => {
+      const unloading = owner.unloadNativeWebOwner(firstOwner).then(() => {
         ownerUnloaded = true;
       });
       await expect.poll(() => page.revoked.aborted).toBe(true);

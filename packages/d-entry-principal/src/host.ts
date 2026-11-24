@@ -295,6 +295,7 @@ class PrincipalService extends TypertRemoteService {
     'sessionController',
   ];
   readonly scopes = new Map<string, Scope>();
+  private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: { ready: boolean; close(): Promise<void> };
   private graphRetirement = Promise.resolve();
@@ -316,11 +317,18 @@ class PrincipalService extends TypertRemoteService {
     });
   }
   private closeScopes() {
-    return Promise.allSettled(
-      [...this.scopes.values()].map((scope) => scope.close()),
-    ).then((results) => {
-      if (results.some((result) => result.status === 'rejected'))
-        throw Error('PRINCIPAL_JOIN_UNKNOWN');
+    return Promise.allSettled([
+      ...this.scopeControls,
+      ...[...this.scopes.values()].map((scope) => scope.close()),
+    ]).then((results) => {
+      const failures = new Set(
+        results.flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        ),
+      );
+      if (failures.size === 1) throw failures.values().next().value;
+      if (failures.size)
+        throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
     });
   }
   /** Internal Cordis consumer of the installed native graph revision. The
@@ -330,12 +338,17 @@ class PrincipalService extends TypertRemoteService {
       graph(): { rev: string };
       onGraphChanged(listener: () => void): () => void;
     },
-    retireOwner?: () => Promise<void>,
+    owner?: {
+      current(): boolean;
+      publish(): Promise<void>;
+      retire(): Promise<void>;
+    },
   ) {
     if (this.stopped || this.graphObserver) throw closed();
     let retiring: Promise<void> | undefined;
     const observer = {
       ready: false,
+      current: () => owner?.current() ?? true,
       close: () => {
         if (retiring) return retiring;
         observer.ready = false;
@@ -346,10 +359,14 @@ class PrincipalService extends TypertRemoteService {
             previous,
             closedScopes,
             Promise.resolve().then(() => unsubscribe()),
-            Promise.resolve().then(() => retireOwner?.()),
+            Promise.resolve().then(() => owner?.retire()),
           ]);
-          if (results.some((result) => result.status === 'rejected'))
-            throw Error('PRINCIPAL_JOIN_UNKNOWN');
+          const failures = results.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          );
+          if (failures.length === 1) throw failures[0];
+          if (failures.length)
+            throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
         });
         // Fence each scope now, including scopes still performing their
         // initial lookup. The retired owner's effect joins the actual reads.
@@ -359,16 +376,30 @@ class PrincipalService extends TypertRemoteService {
     };
     const unsubscribe = source.onGraphChanged(() => {
       if (this.graphObserver !== observer || !observer.ready) return;
+      if (!observer.current()) {
+        void observer.close().catch(() => {});
+        return;
+      }
       void this.closeScopes()
         .catch(() => observer.close())
         .catch(() => {});
     });
     this.graphObserver = observer;
-    const ready = this.graphRetirement.then(() => {
-      if (this.stopped || this.graphObserver !== observer) throw closed();
+    const assertObserver = () => {
+      if (
+        this.stopped ||
+        this.graphObserver !== observer ||
+        !observer.current() ||
+        !source.graph().rev
+      )
+        throw closed();
+    };
+    const ready = this.graphRetirement.then(async () => {
       // The subscription is already listening; the snapshot taken here sees
       // changes between the previous unsubscribe and this registration.
-      if (!source.graph().rev) throw closed();
+      assertObserver();
+      await owner?.publish();
+      assertObserver();
       observer.ready = true;
     });
     return { ready, close: observer.close };
@@ -416,7 +447,10 @@ class PrincipalService extends TypertRemoteService {
       this.scopes.has(issue.scopeId)
     )
       throw Error('PRINCIPAL_ISSUE_INVALID');
-    if (!this.graphObserver?.ready) {
+    const observer = this.graphObserver;
+    if (!observer?.ready || !observer.current()) {
+      if (observer && !observer.current())
+        void observer.close().catch(() => {});
       // The authenticated issue has not created a scope or opened a native
       // reader. Close its private stream with the ordinary pre-open terminal.
       yield { type: 'closed', scopeId: issue.scopeId };
@@ -433,6 +467,14 @@ class PrincipalService extends TypertRemoteService {
       }),
     );
     this.scopes.set(issue.scopeId, scope);
+    let confirmTerminal!: () => void;
+    let failTerminal!: (error: unknown) => void;
+    const terminal = new Promise<void>((resolve, reject) => {
+      confirmTerminal = resolve;
+      failTerminal = reject;
+    });
+    this.scopeControls.add(terminal);
+    void terminal.catch(() => {});
     const gate = signalGate(signal);
     let withdrawn = false;
     let opened = false;
@@ -471,6 +513,8 @@ class PrincipalService extends TypertRemoteService {
         }
       }));
     let failed = false;
+    let failureReason: unknown;
+    let closedDelivered = false;
     try {
       try {
         await scope.ready;
@@ -502,11 +546,25 @@ class PrincipalService extends TypertRemoteService {
         yield { type: 'revoked', scopeId: issue.scopeId };
       await join();
       yield { type: 'closed', scopeId: issue.scopeId };
+      // The native mux pulls again only after writing this closed item.
+      // Awaiting the control here would make the generator join itself.
+      closedDelivered = true;
     } catch (error) {
       failed = true;
+      failureReason = error;
       throw error;
     } finally {
-      await (failed ? join().catch(() => {}) : join());
+      try {
+        await (failed ? join().catch(() => {}) : join());
+        if (failed) failTerminal(failureReason);
+        else if (closedDelivered && !signal.aborted) confirmTerminal();
+        else failTerminal(signal.reason ?? Error('PRINCIPAL_JOIN_UNKNOWN'));
+      } catch (error) {
+        failTerminal(error);
+        throw error;
+      } finally {
+        this.scopeControls.delete(terminal);
+      }
     }
   }
   private async native<T>(
