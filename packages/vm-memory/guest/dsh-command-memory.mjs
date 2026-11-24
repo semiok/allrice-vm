@@ -165,6 +165,7 @@ export function createCommandMemoryPresentation(ctx) {
  * the tool returns. Disposal shares the same attempt and bounds its own wait. */
 export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
   const owned = new Set();
+  const cgroupObservation = new AbortController();
   let closing;
 
   async function release(attempt, signal) {
@@ -179,7 +180,9 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
           throw new Error('native-subprocess-not-joined');
       }
       signal?.throwIfAborted();
-      ({ released, evidence } = attempt.owner.release());
+      ({ released, evidence } = await attempt.owner.release(
+        cgroupObservation.signal,
+      ));
     } catch {
       evidence = { error: 'command-memory-cleanup-unconfirmed' };
     }
@@ -234,7 +237,7 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
         const drained = Promise.allSettled(
           attempts.map(async (attempt) => {
             try {
-              attempt.handle?.terminate();
+              if (!attempt.joined) attempt.handle?.terminate();
             } catch {
               /* Only actual join can certify cleanup. */
             }
@@ -244,7 +247,10 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
           }),
         );
         const timeout = Promise.withResolvers();
-        const listener = addAbortListener(signal, () => timeout.resolve());
+        const listener = addAbortListener(signal, () => {
+          cgroupObservation.abort(signal.reason);
+          timeout.resolve();
+        });
         try {
           await Promise.race([drained, timeout.promise]);
         } finally {

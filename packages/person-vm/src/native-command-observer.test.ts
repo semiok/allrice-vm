@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
@@ -32,6 +33,7 @@ const cfg = {
 };
 const childPath = `${cfg.commandsGroup}/command-${cfg.pid}`;
 const receiptPath = `${cfg.receiptDirectory}/${cfg.executionRef}.json`;
+const nonce = 'b33762b1-1180-4a35-a2d6-7c7db01c3d08';
 const gate = () => {
   let resolve!: () => void;
   const promise = new Promise<void>((yes) => {
@@ -74,10 +76,11 @@ function guest() {
   const commandChildren = new Set([childPath]);
   const descriptors = new Map<number, string>();
   const aliases = new Map<string, string>();
+  const inodeByPath = new Map([[childPath, 27n]]);
   let next = 10;
-  let inode = 27n;
   let cgroupType = 0x63677270n;
   let cleanupFails = false;
+  let watchStarted: (() => void) | undefined;
   let cleanupStep:
     ((step: 'before-rmdir' | 'before-unlink') => void) | undefined;
   const missing = () =>
@@ -86,7 +89,7 @@ function guest() {
     if (!directories.has(p) && !files.has(p)) throw missing();
     return {
       dev: p.startsWith(cfg.cgroupRoot) ? 5n : 7n,
-      ino: p === childPath ? inode : 1n,
+      ino: inodeByPath.get(p) ?? 1n,
       nlink: 1n,
       mode: 0o600n,
       size: BigInt(Buffer.byteLength(files.get(p) ?? '')),
@@ -94,7 +97,25 @@ function guest() {
       isFile: () => files.has(p),
     };
   };
+  const events = new EventEmitter();
+  const watcher = Object.assign(events, {
+    close: vi.fn(() => events.emit('close')),
+  });
+  let onChange: ((event: string) => void) | undefined;
+  const watch = vi.fn(
+    (
+      p: string,
+      _options: { persistent: boolean },
+      change: (event: string) => void,
+    ) => {
+      stat(p);
+      onChange = change;
+      watchStarted?.();
+      return watcher;
+    },
+  );
   const fs = {
+    watch,
     constants: {
       O_RDONLY: 0,
       O_WRONLY: 1,
@@ -162,11 +183,12 @@ function guest() {
   const run = (
     phase: 'baseline' | 'admitted' | 'complete' | 'complete-and-release',
     readAdmittedPid = false,
+    request: typeof cfg & { dshDispatch?: boolean } = cfg,
   ) => {
     let output = '';
     const process = {
       pid: 99,
-      argv: ['node', JSON.stringify(cfg), phase],
+      argv: ['node', JSON.stringify(request), phase],
       stdout: {
         write: (text: string) => {
           output += text;
@@ -181,7 +203,7 @@ function guest() {
         name === 'node:fs' ? fs : name === 'node:path' ? { posix } : undefined,
     };
     if (readAdmittedPid) {
-      const { pid: _pid, ...roots } = cfg;
+      const { pid: _pid, ...roots } = request;
       const data = runInNewContext(
         `${PERSON_VM_COMMAND_MEMORY_VERIFIER}\nverifyCommandMemoryReceipt(cfg, phase, true)`,
         { ...context, cfg: roots, phase },
@@ -217,7 +239,11 @@ function guest() {
               ? { posix }
               : undefined,
       },
-    ) as { release(): { released: boolean; evidence: unknown } };
+    ) as {
+      release(
+        signal: AbortSignal,
+      ): Promise<{ released: boolean; evidence: unknown }>;
+    };
   const makeChild = (ref: string, pid?: number) => {
     const child = `${cfg.commandsGroup}/command-${ref}`;
     directories.add(child);
@@ -249,8 +275,14 @@ function guest() {
     baseline,
     admit,
     finish,
-    replaceChild: () => {
-      inode++;
+    watch,
+    watcher,
+    notify: (event = 'change') => onChange?.(event),
+    onWatch: (callback: () => void) => {
+      watchStarted = callback;
+    },
+    replaceChild: (p = childPath) => {
+      inodeByPath.set(p, (inodeByPath.get(p) ?? 1n) + 1n);
     },
     ordinaryFilesystem: () => {
       cgroupType = 0x1234n;
@@ -262,6 +294,26 @@ function guest() {
       cleanupStep = step;
     },
   };
+}
+
+function admittedDshGroup() {
+  const g = guest();
+  const owner = g.prepareOwner(nonce);
+  const child = g.makeChild(nonce);
+  const receipt = `${cfg.receiptDirectory}/${nonce}.json`;
+  const request = { ...cfg, executionRef: nonce, dshDispatch: true };
+  const memoryEvents = `${child}/memory.events`;
+  g.files.set(memoryEvents, 'oom 0\noom_kill 0');
+  expect(g.run('baseline', false, request).exitCode).toBe(0);
+  g.files.set(
+    `${cfg.procRoot}/${cfg.pid}/cgroup`,
+    `0::/commands/command-${nonce}`,
+  );
+  g.makeChild(nonce, cfg.pid);
+  expect(g.run('admitted', false, request).exitCode).toBe(0);
+  g.directories.delete(`${cfg.procRoot}/${cfg.pid}`);
+  g.makeChild(nonce, 77);
+  return { g, owner, child, receipt };
 }
 
 function fixture(signalValue: number | null | undefined = 9) {
@@ -333,24 +385,163 @@ function fixture(signalValue: number | null | undefined = 9) {
 }
 
 describe('command memory observer (synthetic kernel/native sources; not DSH/VM acceptance)', () => {
-  it('retains a pending native nonce until its exact group is empty, then reaps early or partial setup without manufacturing evidence', () => {
+  it('retains a pending native nonce until its exact group is empty, then reaps early or partial setup without manufacturing evidence', async () => {
     const g = guest();
-    const nonce = 'b33762b1-1180-4a35-a2d6-7c7db01c3d08';
     const owner = g.prepareOwner(nonce);
+    const { signal } = new AbortController();
     const child = g.makeChild(nonce, 77);
     const partial = `${cfg.receiptDirectory}/${nonce}.json`;
     g.files.set(partial, '{"version":1');
-    expect(() => owner.release()).toThrow('owned-child-not-empty');
+    await expect(owner.release(signal)).rejects.toThrow(
+      'owned-child-not-empty',
+    );
+    expect(g.watch).not.toHaveBeenCalled();
     expect(g.directories.has(child)).toBe(true);
     expect(g.files.has(partial)).toBe(true);
     g.makeChild(nonce);
-    expect(owner.release()).toMatchObject({
+    expect(await owner.release(signal)).toMatchObject({
       released: true,
       evidence: { error: 'command-memory-admission-unconfirmed' },
     });
     expect(g.directories.has(child)).toBe(false);
     expect(g.files.has(partial)).toBe(false);
     expect(g.directories.has(childPath)).toBe(true);
+  });
+
+  it('watches only the admitted group and releases it once it is naturally unpopulated', async () => {
+    const { g, owner, child, receipt } = admittedDshGroup();
+    const released = vi.fn();
+    g.onCleanup(released);
+    const pending = owner.release(new AbortController().signal);
+    expect(g.watch).toHaveBeenCalledExactlyOnceWith(
+      `${child}/cgroup.events`,
+      { persistent: false },
+      expect.any(Function),
+    );
+    g.files.set(`${child}/cgroup.procs`, '');
+    g.notify();
+    expect(released).not.toHaveBeenCalled();
+    g.makeChild(nonce);
+    g.notify();
+    expect(await pending).toMatchObject({
+      released: true,
+      evidence: { childJoined: true, childReleased: true },
+    });
+    g.notify();
+    expect(g.watcher.close).toHaveBeenCalledOnce();
+    expect(released.mock.calls).toEqual([['before-rmdir'], ['before-unlink']]);
+    expect(g.directories.has(child)).toBe(false);
+    expect(g.files.has(receipt)).toBe(false);
+  });
+
+  it('rechecks after arming a watch when the last member exited during setup', async () => {
+    const { g, owner } = admittedDshGroup();
+    g.onWatch(() => g.makeChild(nonce));
+    expect(await owner.release(new AbortController().signal)).toMatchObject({
+      released: true,
+    });
+    expect(g.watcher.close).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'child-inode',
+    'receipt-inode',
+    'receipt-birth',
+    'boot',
+    'remaining-member',
+  ] as const)(
+    'does not release a group or receipt after %s changed during observation',
+    async (change) => {
+      const { g, owner, child, receipt } = admittedDshGroup();
+      const { signal } = new AbortController();
+      const pending = owner.release(signal);
+      g.makeChild(nonce);
+      if (change === 'child-inode') g.replaceChild(child);
+      if (change === 'receipt-inode') g.replaceChild(receipt);
+      if (change === 'receipt-birth')
+        g.files.set(
+          receipt,
+          JSON.stringify({
+            ...JSON.parse(g.files.get(receipt)!),
+            startTicks: '4567',
+          }),
+        );
+      if (change === 'boot')
+        g.files.set(
+          `${cfg.procRoot}/sys/kernel/random/boot_id`,
+          'ffffffff-ffff-ffff-ffff-ffffffffffff',
+        );
+      if (change === 'remaining-member')
+        g.files.set(`${child}/cgroup.procs`, '77');
+      g.notify();
+      if (change === 'boot')
+        await expect(pending).rejects.toThrow('command-memory-owner-changed');
+      else await expect(pending).resolves.toMatchObject({ released: false });
+      expect(g.watcher.close).toHaveBeenCalledOnce();
+      expect(g.directories.has(child)).toBe(true);
+      expect(g.files.has(receipt)).toBe(true);
+      if (change === 'boot')
+        await expect(owner.release(signal)).rejects.toThrow(
+          'command-memory-owner-changed',
+        );
+      else
+        await expect(owner.release(signal)).resolves.toMatchObject({
+          released: false,
+        });
+      expect(g.watch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(['abort', 'error', 'rename'] as const)(
+    'disposes the watch after %s while retaining the owned artifacts',
+    async (stop) => {
+      const { g, owner, child, receipt } = admittedDshGroup();
+      const abort = new AbortController();
+      const pending = owner.release(abort.signal);
+      if (stop === 'abort') abort.abort(new Error('cleanup deadline'));
+      if (stop === 'error') g.watcher.emit('error', new Error('watch failed'));
+      if (stop === 'rename') g.notify('rename');
+      await expect(pending).rejects.toThrow();
+      expect(g.watcher.close).toHaveBeenCalledOnce();
+      g.makeChild(nonce);
+      g.notify();
+      expect(g.directories.has(child)).toBe(true);
+      expect(g.files.has(receipt)).toBe(true);
+    },
+  );
+
+  it('does not arm a watch after disposal cancelled further observations', async () => {
+    const { g, owner } = admittedDshGroup();
+    await expect(owner.release(AbortSignal.abort())).rejects.toThrow();
+    expect(g.watch).not.toHaveBeenCalled();
+  });
+
+  it('retries unlink for the same admitted receipt after certifying group removal', async () => {
+    const { g, owner, child, receipt } = admittedDshGroup();
+    const { signal } = new AbortController();
+    const pending = owner.release(signal);
+    const steps = vi.fn();
+    g.onCleanup((step) => {
+      steps(step);
+      if (step === 'before-unlink' && steps.mock.calls.length === 2)
+        throw new Error('synthetic unlink failure');
+    });
+    g.makeChild(nonce);
+    g.notify();
+    await expect(pending).rejects.toThrow('synthetic unlink failure');
+    expect(g.watcher.close).toHaveBeenCalledOnce();
+    expect(g.directories.has(child)).toBe(false);
+    expect(g.files.has(receipt)).toBe(true);
+    expect(await owner.release(signal)).toMatchObject({
+      released: true,
+      evidence: { childJoined: true, childReleased: true },
+    });
+    expect(g.files.has(receipt)).toBe(false);
+    expect(steps.mock.calls).toEqual([
+      ['before-rmdir'],
+      ['before-unlink'],
+      ['before-unlink'],
+    ]);
   });
 
   it('only consumes the admitted PID of its own bounded receipt after the child is empty', () => {

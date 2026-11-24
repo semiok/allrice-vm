@@ -99,6 +99,59 @@ it('retries an unsuccessful release on disposal using the joined ownership once'
   ]);
 });
 
+it('shares memcg observation after native join with disposal and releases it once', async () => {
+  const f = observation();
+  const empty = Promise.withResolvers();
+  f.owner.release.mockImplementation(() => empty.promise);
+  f.done.resolve(f.outcome);
+  await vi.waitFor(() => expect(f.native.waitForExit).toHaveBeenCalledOnce());
+  expect(f.owner.release).not.toHaveBeenCalled();
+  f.quiescent.resolve(true);
+  await vi.waitFor(() => expect(f.owner.release).toHaveBeenCalledOnce());
+  const closing = f.cleanup.close();
+  await Promise.resolve();
+  expect(f.native.terminate).not.toHaveBeenCalled();
+  expect(f.owner.release).toHaveBeenCalledOnce();
+  empty.resolve({ released: true, evidence: { childReleased: true } });
+  await closing;
+  expect(f.report).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ outcome: f.outcome, released: true }),
+  );
+  expect(f.native.waitForExit).toHaveBeenCalledOnce();
+  expect(f.owner.release).toHaveBeenCalledOnce();
+});
+
+it('closes a pending memcg observation at the disposal deadline without certifying release', async () => {
+  const f = observation(20);
+  const watcherClosed = vi.fn();
+  f.owner.release.mockImplementation(
+    (signal) =>
+      new Promise((_, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            watcherClosed();
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      }),
+  );
+  f.done.resolve(f.outcome);
+  f.quiescent.resolve(true);
+  await vi.waitFor(() => expect(f.owner.release).toHaveBeenCalledOnce());
+  await expect(f.cleanup.close()).rejects.toThrow(
+    'COMMAND_MEMORY_CLEANUP_INCOMPLETE',
+  );
+  expect(watcherClosed).toHaveBeenCalledOnce();
+  expect(await f.reported.promise).toMatchObject({
+    released: false,
+    evidence: { error: 'command-memory-cleanup-unconfirmed' },
+  });
+  expect(f.native.terminate).not.toHaveBeenCalled();
+  expect(f.owner.release).toHaveBeenCalledOnce();
+});
+
 it('preserves an explicit 137 without presenting OOM when the observed group count is unchanged', async () => {
   const f = observation();
   const outcome = { exitCode: 137, signal: null };

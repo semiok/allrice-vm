@@ -110,7 +110,7 @@ const populated = (p, device) => {
   if (!pair || pair.length !== 2 || !/^[01]$/.test(pair[1])) fail('invalid-populated');
   return Number(pair[1]);
 };
-const readReceipt = p => {
+const readReceipt = (p, confirm) => {
   if (!canonical(p)) fail('noncanonical-file');
   const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
@@ -119,7 +119,10 @@ const readReceipt = p => {
     const buffer = Buffer.alloc(4097);
     const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
     if (BigInt(bytes) !== st.size) fail('invalid-receipt-file');
-    return JSON.parse(buffer.toString('utf8', 0, bytes));
+    const body = buffer.subarray(0, bytes);
+    const receipt = JSON.parse(body.toString('utf8'));
+    confirm?.(receipt, JSON.stringify([String(st.dev), String(st.ino), body.toString('base64')]));
+    return receipt;
   } finally { fs.closeSync(fd); }
 };
 const currentBoot = procRoot => {
@@ -133,6 +136,43 @@ const atPath = p => {
   try { return fs.lstatSync(p); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
 };
+const sameGroup = (a, b) => a.device === b.device && a.inode === b.inode;
+
+// Linux emits a file modification notification when its cgroup populated
+// state changes. Check after subscribing as well, in case the last member
+// exited between the first sample and the watch being armed.
+function waitForUnpopulated(file, check, signal) {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    let finished = false;
+    function finish(error, result) {
+      if (finished) return;
+      finished = true;
+      watcher.close();
+      signal.removeEventListener('abort', abort);
+      if (error) reject(error);
+      else resolve(result);
+    }
+    function abort() {
+      finish(signal.reason);
+    }
+    function changed(event) {
+      if (finished) return;
+      try {
+        if (event !== 'change') fail('owned-child-watch-changed');
+        const result = check();
+        if (result) finish(null, result);
+      } catch (error) {
+        finish(error);
+      }
+    }
+    const watcher = fs.watch(file, { persistent: false }, changed);
+    watcher.once('error', finish);
+    watcher.once('close', () => finish(new Error('owned-child-watch-closed')));
+    signal.addEventListener('abort', abort, { once: true });
+    changed('change');
+  });
+}
 
 // The in-guest owner reserves a previously absent nonce namespace before the
 // native spawn. Cleanup may retire that exact namespace even if the starter
@@ -150,43 +190,70 @@ function prepareDshCommandMemoryReceipt(roots, executionRef) {
     const stateNow = fs.statSync(cfg.receiptDirectory, { bigint: true });
     if (currentBoot(cfg.procRoot) !== boot || now.device !== commands.device || now.inode !== commands.inode || !canonical(cfg.receiptDirectory) || !stateNow.isDirectory() || stateNow.dev !== state.dev || stateNow.ino !== state.ino) fail('command-memory-owner-changed');
   };
+  let claimedReceipt, removedChild;
+  const confirmReceipt = (receipt, fingerprint) => {
+    if (claimedReceipt && claimedReceipt !== fingerprint) fail('owned-receipt-changed');
+    if (receipt?.stage === 'admitted') claimedReceipt = fingerprint;
+  };
+  const retireReceipt = () => {
+    if (atPath(childPath)) fail('owned-child-changed');
+    readReceipt(receiptPath, confirmReceipt);
+    fs.unlinkSync(receiptPath);
+    return { released: true, evidence: { ...removedChild, childReleased: true } };
+  };
+  const check = () => {
+    assertCurrent();
+    if (removedChild) return retireReceipt();
+    const evidence = verifyCommandMemoryReceipt(cfg, 'complete', true, confirmReceipt);
+    if (evidence?.populated) return null;
+    if (evidence?.childJoined) {
+      assertCurrent();
+      if (!sameGroup(directory(childPath), evidence.receipt.child)) fail('owned-child-changed');
+      readReceipt(receiptPath, confirmReceipt);
+      fs.rmdirSync(childPath);
+      removedChild = evidence;
+      return retireReceipt();
+    }
+    if (claimedReceipt) return { released: false, evidence };
+    // Retire setup that never admitted a process only under the original
+    // reserved namespace. An unconfirmed namespace cannot start a watch.
+    if (atPath(childPath)) {
+      const identity = directory(childPath);
+      if (identity.device !== commands.device || members(childPath, identity.device).length || populated(childPath, identity.device) !== 0) fail('owned-child-not-empty');
+      if (!sameGroup(directory(childPath), identity)) fail('owned-child-changed');
+      fs.rmdirSync(childPath);
+    }
+    const receipt = atPath(receiptPath);
+    if (receipt) {
+      if (!receipt.isFile() || receipt.nlink !== 1 || (receipt.mode & 0o777) !== 0o600) fail('owned-receipt-unconfirmed');
+      fs.unlinkSync(receiptPath);
+    }
+    return { released: true, evidence: { error: 'command-memory-admission-unconfirmed', stage: evidence?.stage } };
+  };
   return {
     observe() {
       assertCurrent();
-      return verifyCommandMemoryReceipt(cfg, 'observe', true);
+      return verifyCommandMemoryReceipt(cfg, 'observe', true, confirmReceipt);
     },
-    release() {
-      assertCurrent();
-      const evidence = verifyCommandMemoryReceipt(cfg, 'complete-and-release', true);
-      if (evidence?.childReleased) return { released: true, evidence };
-      if (atPath(childPath)) {
-        const identity = directory(childPath);
-        if (identity.device !== commands.device || members(childPath, identity.device).length || populated(childPath, identity.device) !== 0) fail('owned-child-not-empty');
-        const confirmed = directory(childPath);
-        if (confirmed.device !== identity.device || confirmed.inode !== identity.inode) fail('owned-child-changed');
-        fs.rmdirSync(childPath);
-      }
-      const receipt = atPath(receiptPath);
-      if (receipt) {
-        if (!receipt.isFile() || receipt.nlink !== 1 || (receipt.mode & 0o777) !== 0o600) fail('owned-receipt-unconfirmed');
-        fs.unlinkSync(receiptPath);
-      }
-      return { released: true, evidence: { error: 'command-memory-admission-unconfirmed', stage: evidence?.stage } };
+    async release(signal) {
+      return check() ?? waitForUnpopulated(path.join(childPath, 'cgroup.events'), check, signal);
     },
   };
 }
 
-function verifyCommandMemoryReceipt(cfg, phase, readAdmittedPid = false) {
+function verifyCommandMemoryReceipt(cfg, phase, readAdmittedPid = false, confirmReceipt) {
 let stage = 'read';
 try {
   const validPid = pid => Number.isSafeInteger(pid) && pid > 0;
-  const observe = readAdmittedPid && cfg.dshDispatch === true && phase === 'observe';
-  if ((!observe && !['baseline', 'admitted', 'complete', 'complete-and-release'].includes(phase)) || typeof cfg.executionRef !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cfg.executionRef) || (cfg.dshDispatch && !dshNonce(cfg.executionRef)) || (readAdmittedPid ? !observe && phase !== 'complete-and-release' : !validPid(cfg.pid))) fail('invalid-request');
+  const owned = readAdmittedPid && cfg.dshDispatch === true && typeof confirmReceipt === 'function';
+  const observe = owned && phase === 'observe';
+  const ownedCompletion = owned && phase === 'complete';
+  if ((!observe && !['baseline', 'admitted', 'complete', 'complete-and-release'].includes(phase)) || typeof cfg.executionRef !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cfg.executionRef) || (cfg.dshDispatch && !dshNonce(cfg.executionRef)) || (readAdmittedPid ? !observe && !ownedCompletion && phase !== 'complete-and-release' : !validPid(cfg.pid))) fail('invalid-request');
   const root = directory(cfg.cgroupRoot), commands = directory(cfg.commandsGroup), dsh = directory(cfg.dshGroup);
   if (![cfg.commandsGroup, cfg.dshGroup].every(p => p.startsWith(cfg.cgroupRoot + '/')) || commands.device !== root.device || dsh.device !== root.device) fail('invalid-group-root');
   if (!canonical(cfg.receiptDirectory) || !fs.statSync(cfg.receiptDirectory).isDirectory() || !canonical(cfg.procRoot) || fs.statfsSync(cfg.procRoot, { bigint: true }).type !== 0x9fa0n) fail('invalid-source-root');
   const receiptPath = path.join(cfg.receiptDirectory, cfg.executionRef + '.json');
-  let receipt = phase === 'baseline' ? undefined : readReceipt(receiptPath);
+  let receipt = phase === 'baseline' ? undefined : readReceipt(receiptPath, confirmReceipt);
   const pid = readAdmittedPid ? receipt?.pid : cfg.pid;
   if (!validPid(pid)) fail('invalid-request');
   const childPath = commandGroup(cfg, pid);
@@ -235,7 +302,15 @@ try {
       }
       try { fs.statSync(path.join(cfg.procRoot, String(pid))); fail('command-process-not-gone'); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
-      if (members(childPath, child.device).length || populated(childPath, child.device) !== 0) fail('child-not-joined');
+      const active = populated(childPath, child.device), processes = members(childPath, child.device);
+      if (active || processes.length) {
+        if (active === 1 && ownedCompletion) {
+          if (!sameGroup(directory(childPath), child) || currentBoot(cfg.procRoot) !== bootId) fail('observation-changed');
+          readReceipt(receiptPath, confirmReceipt);
+          return { version: 1, populated: true };
+        }
+        fail('child-not-joined');
+      }
       const after = events(childPath, child.device), again = events(childPath, child.device), identity = directory(childPath);
       if (after.oom !== again.oom || after.oomKill !== again.oomKill || identity.device !== child.device || identity.inode !== child.inode || members(childPath, child.device).length || populated(childPath, child.device) !== 0) fail('completion-changed');
       if (BigInt(after.oom) < BigInt(receipt.baseline.oom) || BigInt(after.oomKill) < BigInt(receipt.baseline.oomKill)) fail('counter-reset');
