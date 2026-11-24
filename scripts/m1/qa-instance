@@ -45,7 +45,8 @@ instance = {'task': task, 'ref': ref, 'sha': sha, 'webPort': int(web), 'workerPo
            'owner': owner, 'card': card,
            # 3.x counts the slot but sees a legacy lease and never reclaims it.
            'repositoryCreatedAt': old.get('repositoryCreatedAt', lease['stamp'](now)),
-           'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)}
+           'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now),
+           'databaseClaim': old.get('databaseClaim'), 'plistClaims': old.get('plistClaims', {})}
 if 'worktree' in old:
     instance['worktree'] = old['worktree']
 elif release:
@@ -55,11 +56,81 @@ lease['write'](p, instance)
 PY
 }
 
-stop_services() { # task -> 0 once both jobs are gone, their processes exited and ports closed
-  local task=$1 f=$2 wp="" kp="" role
-  if [ -f "$f" ]; then wp=$(json_get "$f" webPort 2>/dev/null || true); kp=$(json_get "$f" workerPort 2>/dev/null || true); fi
-  stop_job "$(qa_label "$task" web)" "$wp" && stop_job "$(qa_label "$task" worker)" "$kp" || return 1
-  for role in web worker; do rm -f "$HOME/Library/LaunchAgents/$(qa_label "$task" "$role").plist"; done
+admin_sql() { psql -XqAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -d postgres -c "$1"; }
+
+database_identity() {
+  admin_sql "select oid::text || ':' || coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '')
+             from pg_catalog.pg_database where datname='$1'"
+}
+
+create_database() {
+  local f=$1 db=$2 current token expected
+  current=$(database_identity "$db") || die "cannot inspect database $db"
+  [ -z "$current" ] || die "database $db already exists"
+  # A lost response from createdb leaves ownership unknown until PostgreSQL confirms our marker.
+  token=$("$M1_PY" -c 'import uuid; print(uuid.uuid4().hex)') || return 1
+  "$M1_PY" "$LEASE" record-database "$f" pending || die "cannot record database creation intent"
+  createdb -h 127.0.0.1 "$db" || die "database creation failed for $db"
+  current=$(database_identity "$db") || die "cannot inspect newly created database $db"
+  [[ "$current" =~ ^[1-9][0-9]*:$ ]] || die "cannot identify newly created database $db"
+  expected="${current}allrice40-qa:$token"
+  "$M1_PY" "$LEASE" record-database "$f" "$expected" || die "cannot record database identity"
+  admin_sql "comment on database \"$db\" is 'allrice40-qa:$token'" || die "cannot mark database $db"
+  current=$(database_identity "$db") || die "cannot verify database $db"
+  [ "$current" = "$expected" ] || die "database $db does not match the instance ownership marker"
+}
+
+database_to_drop() { # Never act on an unmarked or replaced database at the same name.
+  local f=$1 db=$2 claim actual
+  claim=$("$M1_PY" "$LEASE" database-claim "$f") || return 1
+  [ -n "$claim" ] || return 0
+  actual=$(database_identity "$db") || return 1
+  [ -n "$actual" ] || return 0
+  [ "$claim" = "$actual" ] && [ "$claim" != pending ] || return 1
+  printf '%s\n' "$actual"
+}
+
+launch_plist_path() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$1"; }
+launch_directory() {
+  if [ "$2" = web ] && [ -n "$1" ]; then printf '%s/apps/web\n' "$1"; else printf '%s\n' "$1"; fi
+}
+
+require_launch_slot() {
+  local label=$1 plist=$2 state
+  [ ! -e "$plist" ] && [ ! -L "$plist" ] || die "LaunchAgent plist already exists: $plist"
+  state=$(job_state "$label") || die "cannot inspect LaunchAgent $label"
+  [ "$state" = gone ] || die "LaunchAgent $label already loaded"
+}
+
+published_services() { # Preflight both roles before any stop, unlink or database drop.
+  local task=$1 f=$2 release=$3 role label plist state job
+  for role in web worker; do
+    label=$(qa_label "$task" "$role"); plist=$(launch_plist_path "$label")
+    state=$("$M1_PY" "$LEASE" plist-claim "$f" "$role" "$plist") || return 1
+    [ "$state" != unpublished ] || continue
+    job=$(job_state "$label" "$plist" "$(launch_directory "$release" "$role")") || return 1
+    if [ "$state" = published ]; then
+      printf '%s\n' "$role"
+    elif [ "$job" != gone ]; then
+      return 1
+    fi
+  done
+}
+
+stop_services() {
+  local task=$1 f=$2 release=$3 roles=$4 role label plist port state
+  for role in $roles; do
+    label=$(qa_label "$task" "$role"); plist=$(launch_plist_path "$label")
+    port=$(json_get "$f" "${role}Port") || return 1
+    state=$("$M1_PY" "$LEASE" plist-claim "$f" "$role" "$plist") || return 1
+    [ "$state" = published ] || return 1
+    stop_job "$label" "$port" "$plist" "$(launch_directory "$release" "$role")" || return 1
+  done
+  for role in $roles; do
+    plist=$(launch_plist_path "$(qa_label "$task" "$role")")
+    state=$("$M1_PY" "$LEASE" plist-claim "$f" "$role" "$plist") || return 1
+    if [ "$state" = published ]; then rm -- "$plist" || return 1; fi
+  done
 }
 
 cmd_list() {
@@ -122,16 +193,19 @@ reclaim_one() {
 
 cmd_down() {
   local task=$1; valid_task "$task"
-  local dir db release; dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
-  qa_owned "$dir/instance.json" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
-  release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$dir/instance.json") \
+  local dir db release f owned_db roles; dir=$(qa_instance_dir "$task"); db=$(db_name "$task"); f="$dir/instance.json"
+  qa_owned "$f" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
+  release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$f") \
     || die "cannot verify the reserved worktree of $task; instance left in place"
-  stop_services "$task" "$dir/instance.json" || die "services of $task did not stop within 90s; database and files left in place"
-  local exists
-  exists=$(psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'") || die "cannot inspect database $db; files left in place"
-  if [[ "$exists" = *1* ]]; then
-    dropdb -h 127.0.0.1 --force "$db" || die "cannot drop database $db; files left in place"
-    say "dropped database $db"
+  owned_db=$(database_to_drop "$f" "$db") || die "cannot verify ownership of database $db; instance left in place"
+  roles=$(published_services "$task" "$f" "$release") || die "cannot verify LaunchAgent ownership for $task; instance left in place"
+  stop_services "$task" "$f" "$release" "$roles" || die "cannot cleanly stop services for $task; database and instance left in place"
+  if [ -n "$owned_db" ]; then
+    owned_db=$(database_to_drop "$f" "$db") || die "database ownership changed for $db; instance left in place"
+    if [ -n "$owned_db" ]; then
+      dropdb -h 127.0.0.1 --force "$db" || die "cannot drop database $db; instance left in place"
+      say "dropped database $db"
+    fi
   fi
   if [ -n "$release" ]; then
     # A failed worktree add can leave the reserved directory empty and unregistered.
@@ -316,8 +390,12 @@ PY
   service_plist_config "$dir/web.plist" "$(qa_label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" "worker-port=$worker" || die 'invalid QA Web configuration'
   service_plist_config "$dir/worker.plist" "$(qa_label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
 
-  psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
-  createdb -h 127.0.0.1 "$db"
+  local role label launch_plist job
+  for role in web worker; do
+    label=$(qa_label "$task" "$role"); launch_plist=$(launch_plist_path "$label")
+    require_launch_slot "$label" "$launch_plist"
+  done
+  create_database "$dir/instance.json" "$db"
 
   say "preparing database"
   ( cd "$release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
@@ -328,10 +406,13 @@ PY
 
   say "starting services"
   for role in worker web; do
-    local launch_plist="$HOME/Library/LaunchAgents/$(qa_label "$task" "$role").plist"
-    cp -p "$dir/$role.plist" "$launch_plist"
-    launchctl bootstrap "gui/$UID_" "$launch_plist"
-    launchctl kickstart "gui/$UID_/$(qa_label "$task" "$role")"
+    label=$(qa_label "$task" "$role"); launch_plist=$(launch_plist_path "$label")
+    require_launch_slot "$label" "$launch_plist"
+    "$M1_PY" "$LEASE" publish-plist "$dir/instance.json" "$role" "$launch_plist" || die "cannot publish $launch_plist"
+    "$M1_LAUNCHCTL" bootstrap "gui/$UID_" "$launch_plist"
+    job=$(job_state "$label" "$launch_plist" "$(launch_directory "$release" "$role")") \
+      && [ "$job" != gone ] || die "cannot verify the launched $label"
+    "$M1_LAUNCHCTL" kickstart "gui/$UID_/$label"
   done
   local ok=0
   for _ in $(seq 1 60); do

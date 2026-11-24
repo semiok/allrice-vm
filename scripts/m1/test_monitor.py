@@ -933,7 +933,8 @@ class Config(unittest.TestCase):
                 ('history container', b'{"history": {}}', 'invalid history'),
                 ('rounds container', b'{"rounds": null}', 'invalid rounds'),
             )
-            for value in (None, True, '1700000000', [], {}, float('nan'), float('inf'), float('-inf'), 10**400):
+            for value in (None, True, '1700000000', [], {}, float('nan'), float('inf'), float('-inf'), 10**400,
+                          -1, 1795478400000, 1e300, time.time() + 7 * 86400):
                 cases += (
                     ('history timestamp', json.dumps({'history': [{'at': value, 'event': 'opened'}]}).encode(), 'invalid history'),
                     ('round timestamp', json.dumps({'rounds': [1, value]}).encode(), 'invalid rounds'),
@@ -968,13 +969,17 @@ class Config(unittest.TestCase):
             config.write_text(json.dumps({'stateDir': str(state)}))
             (home / 'Library/LaunchAgents').mkdir(parents=True)
             checkpoint = state / 'state.json'
-            original = (b'{"history": [{"at": 1700000000, "event": "opened", "key": "disk", "severity": "warning"},'
-                        b' {"at": 1700000000.5, "event": "recovered"}], "rounds": [1700000000, 1700000000.5]}\n')
+            clock = 1795478400
+            skewed = clock + 600.5
+            original = (json.dumps({'history': [{'at': clock, 'event': 'opened', 'key': 'disk', 'severity': 'warning'},
+                                               {'at': skewed, 'event': 'recovered'}],
+                                    'rounds': [clock, skewed]}) + '\n').encode()
             checkpoint.write_bytes(original)
             for peer in (False, True):
                 with self.subTest(peer=peer):
                     calls = [(0, '', ''), (113, '', ''), (0, '', '')]
-                    with mock.patch.object(monitor, 'run', side_effect=calls) as run, mock.patch('builtins.print'):
+                    with mock.patch.object(monitor, 'run', side_effect=calls) as run, mock.patch('builtins.print'), \
+                            mock.patch.object(monitor.time, 'time', return_value=clock):
                         monitor.main(['launchd', 'install', '--config', str(config), *(['--peer'] if peer else [])])
                     self.assertEqual([call.args[0][1] for call in run.call_args_list], ['bootout', 'print', 'bootstrap'])
                     self.assertEqual(checkpoint.read_bytes(), original)

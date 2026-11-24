@@ -66,6 +66,8 @@ class DeployDevMigrations(unittest.TestCase):
               'case "$q" in *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
+        for name, env in (('ps', 'PROCESS_ARGS'), ('lsof', 'PROCESS_CWD')):
+            write(os.path.join(self.stubs, name), '#!/bin/sh\nprintf "%s" "$' + env + '"\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
@@ -1180,10 +1182,10 @@ class DeployDevMigrations(unittest.TestCase):
             script = re.sub(r'^export PATH=.*$', 'export PATH="$TEST_PATH"', f.read(), flags=re.M)
         if name == 'schedule-recover':
             script = script.replace('PG=/opt/homebrew/opt/postgresql@17/bin', 'PG="$TEST_STUBS"')
-            start, rest = script.split('worker_procs() {', 1)
-            script = start + 'worker_procs() { :; };\nworker_sessions() {' + rest.split('worker_sessions() {', 1)[1]
+            for path in ('/bin/ps', '/usr/sbin/lsof'):
+                script = script.replace('"' + path + '"', f'os.environ["TEST_STUBS"] + "/{os.path.basename(path)}"')
             start, rest = script.split('boot_at() {', 1)
-            script = start + 'boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
+            script = start + 'sleep() { :; }; boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
         if name == 'deploy-dev':
             shutil.copyfile(os.path.join(HERE, 'deploy-result.py'), os.path.join(directory, 'deploy-result.py'))
             marker = '# --release-manager is a deliberate speed bump'
@@ -1316,12 +1318,7 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(json.load(f)['nativeArtifactId'], 'sha256:' + 'a' * 64)
         self.assert_parked()
 
-    def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
-        worker = self.plist('worker')
-        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
-        with open(self.live_plist('worker'), 'wb') as f:
-            plistlib.dump(worker, f)
-        self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+    def seed_recovery_partition(self):
         rows = [{'partitionId': 'once', 'ownerId': 'old-worker', 'epoch': 1, 'tokenDigest': 'token',
                  'expiresAt': '2000-01-01', 'closed': False, 'expired': True, 'proofNull': True, 'audit': None}]
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\necho \'{}\'\n', 0o755)
@@ -1334,6 +1331,43 @@ class DeployDevMigrations(unittest.TestCase):
               'rows=json.loads(os.environ["ROWS"])\n'
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
               'print(json.dumps(rows))\n', 0o755)
+        return rows
+
+    def test_schedule_recover_checks_the_verified_worktree_and_instance_directory(self):
+        task = 'recover-scan'
+        instance = self.write_qa_plists(task)
+        worker = self.read_plist(os.path.join(instance, 'worker.plist'))
+        live = os.path.join(self.home, 'Library/LaunchAgents', worker['Label'] + '.plist')
+        shutil.copyfile(os.path.join(instance, 'worker.plist'), live)
+        release = worker['WorkingDirectory']
+        old = os.path.join(self.home, 'allrice-qa', task, 'release')
+        os.makedirs(old)
+        relative = os.path.relpath(os.path.join(release, 'apps/worker/dist/index.js'), self.home)
+        rows = self.seed_recovery_partition()
+        for name, script, cwd, allowed in (
+            ('release cwd', '/tmp/unrelated.mjs', release, False),
+            ('absolute release script', os.path.join(release, 'apps/worker/dist/index.js'), self.home, False),
+            ('relative release script', relative, self.home, False),
+            ('instance cwd', '/tmp/unrelated.mjs', instance, False),
+            ('same name 3.x release', os.path.join(old, 'apps/worker/dist/index.js'), old, True),
+        ):
+            with self.subTest(name=name):
+                proof = os.path.join(self.tmp, 'scan-proof')
+                p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
+                                         ROWS=json.dumps(rows), PROOF=proof,
+                                         PROCESS_ARGS=f'999999 1 node {script}\n', PROCESS_CWD=f'p999999\nn{cwd}\n')
+                self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
+                self.assertEqual(os.path.exists(proof), allowed)
+                if not allowed:
+                    self.assertIn('processes that could own the partitions are still running', p.stderr)
+
+    def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
+        worker = self.plist('worker')
+        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
+        with open(self.live_plist('worker'), 'wb') as f:
+            plistlib.dump(worker, f)
+        self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+        rows = self.seed_recovery_partition()
         instance = self.write_qa_plists('recover-test')
         shutil.copyfile(os.path.join(instance, 'worker.plist'),
                         os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-qa-recover-test-worker.plist'))

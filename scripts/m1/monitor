@@ -28,7 +28,6 @@ import datetime
 import fcntl
 import hashlib
 import json
-import math
 import os
 import plistlib
 import re
@@ -2760,12 +2759,9 @@ PEER_CHECKS = [
 # ---------- launchd ----------
 
 
-def checkpoint_timestamp(value):
-    # Both the round and the daily report subtract this from a float clock.
-    try:
-        return type(value) in (int, float) and math.isfinite(value)
-    except OverflowError:
-        return False
+def checkpoint_timestamp(value, latest):
+    # The bound admits clock skew between hosts and rejects non-finite values and milliseconds.
+    return type(value) in (int, float) and 0 <= value <= latest
 
 
 def launchd(cfg, action, peer):
@@ -2789,12 +2785,13 @@ def launchd(cfg, action, peer):
                 raise CheckError('monitor state has an invalid alert')
             if state.get('lastRound') is not None and not isinstance(state['lastRound'], dict):
                 raise CheckError('monitor state has an invalid lastRound')
+            latest = time.time() + 86400
             for index, entry in enumerate(state.get('history', [])):
-                if (not isinstance(entry, dict) or not checkpoint_timestamp(entry.get('at'))
+                if (not isinstance(entry, dict) or not checkpoint_timestamp(entry.get('at'), latest)
                         or entry.get('event') not in ('opened', 'recovered')):
                     raise CheckError('monitor state has an invalid history[%d]' % index)
             for index, at in enumerate(state.get('rounds', [])):
-                if not checkpoint_timestamp(at):
+                if not checkpoint_timestamp(at, latest):
                     raise CheckError('monitor state has an invalid rounds[%d]' % index)
         except (OSError, ValueError, CheckError) as err:
             sys.exit('monitor: cannot use checkpoint %s: %s' % (path, err))

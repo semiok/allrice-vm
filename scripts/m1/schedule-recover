@@ -69,8 +69,10 @@ case "$mode" in
     dir=$(qa_instance_dir "$task")
     INSTANCE="$dir/instance.json"
     qa_owned "$INSTANCE" || die "no QA instance in this repository: $task" 2
+    release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$INSTANCE") && [ -n "$release" ] \
+      || die "cannot verify the reserved worktree of $task" 2
     DBNAME=allrice40_qa_${task//-/_}
-    ROOTS="$dir/"; ENVFILE="$dir/.env"
+    ROOTS="$dir/|$release/"; ENVFILE="$dir/.env"
     OUT="$dir/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;
   *) usage ;;
 esac
@@ -138,6 +140,9 @@ for l in lsof.stdout.splitlines():
 mine,p=set(),str(os.getpid())
 while p in args and p not in mine: mine.add(p); p=args[p][0]
 roots,target=os.environ["ROOTS"].split("|"),os.path.realpath(os.environ["ENVFILE"])
+roots=tuple(os.path.realpath(root)+"/" for root in roots)
+def in_scope(path):
+    return (os.path.realpath(path)+"/").startswith(roots)
 def ours(url):
     q=u.urlsplit(url); return q.hostname in (None,"127.0.0.1","localhost") and q.path.lstrip("/")==os.environ["DBNAME"]
 def dotenv_url(line): # the DATABASE_URL a line sets, as Node 22 reads it (export, spaces, quotes, # comments)
@@ -172,7 +177,9 @@ for pid,(_,cmd) in args.items():
         if here is None: hit=alive(pid) # no working directory: only a process that is gone is cleared
         else:
             files,head=env_files(toks)
-            hit=any(envfile(o,os.path.join(here,f)) for o,f in files) or any(r in " ".join(head) or (here+"/").startswith(r) for r in roots)
+            script = os.path.join(here, head[-1]) if len(head) > 1 else None
+            hit=(any(envfile(o,os.path.join(here,f)) for o,f in files) or in_scope(here)
+                 or (script is not None and in_scope(script)) or any(r in " ".join(head) for r in roots))
     if hit: print(pid,cmd[:160])'; }
 worker_sessions() { RO=1 sql -c "select count(*) from pg_stat_activity where datname = current_database() and application_name = 'allrice-worker'"; }
 boot_at() { "$M1_PY" -c 'import re,subprocess,time

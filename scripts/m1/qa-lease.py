@@ -6,6 +6,7 @@ have a separate cross-waiter lock and never hold the allocation lock over HTTP.
 """
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ import time
 import urllib.request
 import uuid
 
-from service_target import QA_DIRECTORY_PREFIX, QA_LABEL_PREFIX, qa_worktree
+from service_target import QA_DIRECTORY_PREFIX, QA_LABEL_PREFIX, canonical, qa_worktree
 
 FIELDS = ('task ref sha webPort workerPort database nativeArtifactId cloudExecution '
           'setup updatedAt owner card createdAt expiresAt repository repositoryId repositoryCreatedAt repositoryExpiresAt').split()
@@ -65,6 +66,40 @@ def write(path, data):
 
 def read(path):
     return json.loads(Path(path).read_text())
+
+
+def valid_database_claim(claim):
+    return claim is None or (isinstance(claim, str) and (
+        claim == 'pending' or re.fullmatch(r'[1-9][0-9]*:allrice40-qa:[0-9a-f]{32}', claim)))
+
+
+def plist_identity(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('expected a regular LaunchAgent file')
+        return {'device': info.st_dev, 'inode': info.st_ino, 'sha256': hashlib.sha256(file.read()).hexdigest()}
+
+
+def plist_claim(data, role, destination):
+    claims = data.get('plistClaims')
+    if not isinstance(claims, dict):
+        raise ValueError('unknown LaunchAgent ownership')
+    if role not in claims:
+        return 'unpublished'
+    expected = claims[role]
+    if (not isinstance(expected, dict) or type(expected.get('device')) is not int
+            or type(expected.get('inode')) is not int or not isinstance(expected.get('sha256'), str)
+            or not re.fullmatch(r'[a-f0-9]{64}', expected['sha256'])):
+        raise ValueError('invalid LaunchAgent ownership record')
+    try:
+        current = plist_identity(destination)
+    except FileNotFoundError:
+        return 'absent'
+    if current != expected:
+        raise ValueError('LaunchAgent file does not match the one published by this instance')
+    return 'published'
 
 
 def lease_fields(data):
@@ -288,7 +323,35 @@ def main(args):
             remind(f, *args[1:])
         return
     data = read(path)
-    if command == 'renew':
+    if command == 'database-claim':
+        if 'databaseClaim' not in data or not valid_database_claim(data['databaseClaim']):
+            raise ValueError('unknown database ownership')
+        print(data['databaseClaim'] or '')
+    elif command == 'record-database':
+        claim = args[1]
+        if not valid_database_claim(claim):
+            raise ValueError('invalid database ownership record')
+        data['databaseClaim'] = claim
+        write(path, data)
+    elif command in ('publish-plist', 'plist-claim'):
+        role, destination = args[1:]
+        if role not in ('web', 'worker'):
+            raise ValueError('unknown LaunchAgent role')
+        if not canonical(Path(destination).parent):
+            raise ValueError('LaunchAgent directory is not canonical')
+        state = plist_claim(data, role, destination)
+        if command == 'publish-plist':
+            if state != 'unpublished':
+                raise ValueError('LaunchAgent publication already recorded')
+            source = path.parent / (role + '.plist')
+            data['plistClaims'][role] = plist_identity(source)
+            write(path, data)
+            # The destination must be absent. Publish the verified file without overwriting or exposing partial data.
+            os.link(source, destination, follow_symlinks=False)
+            plist_claim(data, role, destination)
+        else:
+            print(state)
+    elif command == 'renew':
         created_field, field = lease_fields(data)
         if not data.get(created_field) or not data.get('owner') or not data.get('card'):
             raise ValueError('legacy instance: down then up with owner/card to adopt a lease')

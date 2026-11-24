@@ -1,6 +1,7 @@
 # Exercise the production cmd_up in a private HOME. Only external commands and
 # port availability are stubbed; no PostgreSQL, launchd, network or live QA state.
 # CI collects this with python3 -m unittest discover -s scripts/m1 -p 'test_*.py'.
+import fcntl
 import json
 import os
 import plistlib
@@ -9,18 +10,44 @@ import subprocess
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE_SHA = 'a' * 40
 ARTIFACT_ID = 'sha256:' + 'b' * 64
 
+SYSTEM_STUB = '''
+import fcntl, os, socket
+
+def no_listener(*args, **kwargs):
+    raise ConnectionRefusedError
+
+socket.create_connection = no_listener
+attempts = os.environ.get('QA_TEST_LOCK_ATTEMPTS')
+if attempts:
+    flock = fcntl.flock
+
+    def record_blocked_allocator(fd, operation):
+        try:
+            flock(fd, operation)
+        except BlockingIOError:
+            with open(os.path.expanduser('~/allrice-qa/.alloc.lock')) as allocator:
+                if os.path.sameopenfile(fd, allocator.fileno()):
+                    with open(attempts, 'a') as log:
+                        log.write(os.environ['QA_TEST_TASK'] + '\\n')
+            raise
+
+    fcntl.flock = record_blocked_allocator
+'''
+
 COMMAND_STUB = '''#!/usr/bin/python3
-import json, os, sys, shutil, fcntl
+import json, os, plistlib, re, sys, shutil, fcntl
 from pathlib import Path
 command, args = Path(sys.argv[0]).name, sys.argv[1:]
 with open(os.environ['QA_TEST_EVENTS'], 'a') as f:
     f.write(json.dumps({'command': command, 'args': args, 'cwd': os.getcwd()}) + '\\n')
+databases, jobs = Path.home() / 'qa-databases', Path.home() / 'qa-jobs'
 if command == 'git':
     if 'rev-parse' in args:
         print('a' * 40)
@@ -54,15 +81,59 @@ elif command == 'node':
         template = args[args.index('--rice') + 1] if '--rice' in args else str(Path(args[0]).with_name('rice-standard.json'))
         if json.loads(Path(template).read_text()).get('version') != 'ref':
             sys.exit(43)
-elif command == 'launchctl' and args[0] == 'print':
-    if any(name in args[-1] for name in os.environ.get('QA_TEST_LIVE', '').split(',') if name):
-        print('state = running\\npid = 12345')
+elif command == 'launchctl':
+    verb, target = args[0], args[-1]
+    if verb == 'bootstrap':
+        path = Path(target)
+        if os.environ.get('QA_TEST_BOOTSTRAP_FAIL') and path.stem.endswith(os.environ['QA_TEST_BOOTSTRAP_FAIL']):
+            sys.exit(46)
+        plist = plistlib.loads(path.read_bytes())
+        job = jobs / plist['Label']
+        with job.open('x') as file:
+            json.dump(dict(path=str(path), cwd=plist['WorkingDirectory']), file)
     else:
-        sys.exit(113)
+        job = jobs / target.rsplit('/', 1)[-1]
+        if verb == 'print':
+            if os.environ.get('QA_TEST_LAUNCHCTL_UNKNOWN') and job.name.endswith(os.environ['QA_TEST_LAUNCHCTL_UNKNOWN']):
+                sys.exit(47)
+            elif job.is_file():
+                data = json.loads(job.read_text())
+                print('path = %s\\nworking directory = %s\\nstate = waiting' % (data['path'], data['cwd']))
+            elif any(name in target for name in os.environ.get('QA_TEST_LIVE', '').split(',') if name):
+                print('state = running\\npid = 12345')
+            else:
+                sys.exit(113)
+        elif verb == 'bootout':
+            job.unlink(missing_ok=True)
+        elif verb == 'kickstart':
+            assert job.is_file()
 elif command == 'lsof':
     print('p999999\\nfcwd\\nn/private/tmp/unrelated')
 elif command == 'ps':
     print('999999 1 node /tmp/unrelated.mjs')
+elif command == 'psql':
+    query = args[-1]
+    lookup = re.search(r"datname='([a-z0-9_]+)'", query)
+    comment = re.fullmatch('comment on database "([a-z0-9_]+)" is .([^\"]+).', query)
+    if lookup:
+        if os.environ.get('QA_TEST_DB_UNKNOWN'):
+            sys.exit(48)
+        path = databases / lookup[1]
+        if path.is_file():
+            print(path.read_text() if 'oid::text' in query else 1)
+    elif comment:
+        path = databases / comment[1]
+        path.write_text(path.read_text().split(':')[0] + ':' + comment[2])
+elif command == 'createdb':
+    path = databases / args[-1]
+    with path.open('x') as f:
+        f.write('49000:')
+    if os.environ.get('QA_TEST_CREATE_UNKNOWN'):
+        sys.exit(49)
+elif command == 'dropdb':
+    (databases / args[-1]).unlink()
+elif command == 'pnpm' and args == ['db:prepare'] and os.environ.get('QA_TEST_DB_PREP_FAIL'):
+    sys.exit(50)
 elif command == 'sleep' and os.environ.get('QA_TEST_RELEASE'):
     # The waiting process must release the allocator so an owner can down.
     with open(Path.home() / 'allrice-qa/.alloc.lock', 'rb') as f:
@@ -70,6 +141,76 @@ elif command == 'sleep' and os.environ.get('QA_TEST_RELEASE'):
         shutil.rmtree(Path.home() / 'allrice-qa' / os.environ['QA_TEST_RELEASE'])
 elif command not in ('pnpm', 'psql', 'dropdb', 'createdb', 'launchctl', 'curl'):
     sys.exit(99)
+'''
+
+# Relevant 3.x behavior from 4c2e1069. This independent fixture freezes the task
+# grammar, paths and allocator contract while skipping builds and lease expiry.
+LEGACY_QA = '''
+import fcntl, json, os, plistlib, re, shutil, subprocess, sys, time
+from pathlib import Path
+
+op, task = sys.argv[1:]
+if not re.fullmatch('[a-z0-9][a-z0-9-]{0,30}', task):
+    sys.exit('task name must match [a-z0-9-], max 31 chars')
+home = Path.home()
+qa = home / 'allrice-qa'
+qa.mkdir(exist_ok=True)
+directory = qa / task
+task_lock = qa / ('.task-' + task + '.lock')
+db = 'allrice_qa_' + task.replace('-', '_')
+agents = home / 'Library/LaunchAgents'
+bin_dir = home / '.local/opt/node-22.23.2/bin'
+
+def allocate():
+    records = [json.loads(p.read_text()) for p in qa.glob('*/instance.json') if not p.parent.name.startswith('.')]
+    if len(records) >= 3:
+        print('all 3 slots occupied', file=sys.stderr)
+        sys.exit(75)
+    claimed = {port for data in records for port in (data['webPort'], data['webPort'] + 1)}
+    web = next(port for port in range(3200, 3300, 2) if not claimed.intersection((port, port + 1)))
+    directory.mkdir()
+    (directory / 'instance.json').write_text(json.dumps(dict(
+        task=task, webPort=web, workerPort=web+1, database=db, owner='legacy', card='MET-260')))
+
+def lock_allocator(allocator):
+    for _ in range(300):
+        try:
+            fcntl.flock(allocator.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            time.sleep(.05)
+    sys.exit('legacy allocation lock timed out')
+
+with (qa / '.alloc.lock').open('a') as allocator:
+    lock_allocator(allocator)
+    with task_lock.open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if op == 'up':
+                allocate()
+            fcntl.flock(allocator.fileno(), fcntl.LOCK_UN)
+            if op == 'up':
+                (directory / 'release').mkdir()
+                subprocess.run([bin_dir / 'createdb', '-h', '127.0.0.1', db], check=True)
+            for role in ('web', 'worker'):
+                label = 'ai.bplabs.allrice-qa-' + task + '-' + role
+                plist = agents / (label + '.plist')
+                if op == 'up':
+                    plist.write_bytes(plistlib.dumps(dict(Label=label, WorkingDirectory=str(directory / 'release'))))
+                    subprocess.run([bin_dir / 'launchctl', 'bootstrap', 'gui/%d' % os.getuid(), plist], check=True)
+                else:
+                    subprocess.run([bin_dir / 'launchctl', 'bootout', 'gui/%d/%s' % (os.getuid(), label)], check=True)
+                    plist.unlink(missing_ok=True)
+            if op == 'down':
+                exists = subprocess.check_output([bin_dir / 'psql', '-h', '127.0.0.1', '-d', 'postgres',
+                                                  '-Atc', "select 1 from pg_database where datname='%s'" % db], text=True)
+                if '1' in exists:
+                    subprocess.run([bin_dir / 'dropdb', '-h', '127.0.0.1', '--force', db], check=True)
+                if directory.is_dir():
+                    shutil.rmtree(directory)
+        finally:
+            lock_allocator(allocator)
+            task_lock.unlink()
 '''
 
 
@@ -80,12 +221,16 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.home = os.path.join(self.tmp, 'home')
         self.instance = Path(self.home, 'allrice-qa/_allrice40-met-218-test')
         self.worktrees = Path(self.home, 'allrice40-worktrees')
+        self.db_dir = Path(self.home, 'qa-databases')
+        self.jobs = Path(self.home, 'qa-jobs')
         self.events = os.path.join(self.tmp, 'events.jsonl')
-        Path(self.tmp, 'sitecustomize.py').write_text(
-            'import socket\ndef no_listener(*args, **kwargs): raise ConnectionRefusedError\n'
-            'socket.create_connection = no_listener\n')
+        Path(self.tmp, 'sitecustomize.py').write_text(SYSTEM_STUB)
+        self.legacy_script = Path(self.tmp, 'legacy-qa-instance.py')
+        self.legacy_script.write_text(LEGACY_QA)
         node_bin = os.path.join(self.home, '.local/opt/node-22.23.2/bin')
         os.makedirs(node_bin)
+        self.db_dir.mkdir()
+        self.jobs.mkdir()
         for name in ('git', 'pnpm', 'node', 'psql', 'dropdb', 'createdb', 'launchctl', 'curl', 'lsof', 'ps', 'sleep'):
             path = os.path.join(node_bin, name)
             with open(path, 'w') as f:
@@ -117,11 +262,11 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         identity.parent.mkdir()
         identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
             environment='dev', sourceSha=SOURCE_SHA, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
-        agents = os.path.join(self.home, 'Library/LaunchAgents')
-        os.makedirs(agents)
+        self.agents = Path(self.home, 'Library/LaunchAgents')
+        self.agents.mkdir(parents=True)
         for role in ('web', 'worker'):
             entry = 'apps/web/server.mjs' if role == 'web' else 'apps/worker/dist/index.js'
-            with open(os.path.join(agents, 'ai.bplabs.allrice40-dev-' + role + '.plist'), 'wb') as f:
+            with (self.agents / ('ai.bplabs.allrice40-dev-' + role + '.plist')).open('wb') as f:
                 plistlib.dump({
                     'Label': 'ai.bplabs.allrice40-dev-' + role,
                     'ProgramArguments': [os.path.join(node_bin, 'node'),
@@ -144,10 +289,10 @@ class QaInstanceBuildIdentity(unittest.TestCase):
                     },
                 }, f)
 
-    def up(self, identity_fail=False):
+    def up(self, identity_fail=False, **extra):
         # A caller's SHA cannot replace resolve_ref's Git result.
         result = self.cli('up', 'met-218-test', '--owner', 'test-line', '--card', 'MET-218', '--ref', SOURCE_SHA,
-                          ALLRICE_RELEASE_SHA='c' * 40, QA_TEST_IDENTITY_FAIL='1' if identity_fail else '')
+                          ALLRICE_RELEASE_SHA='c' * 40, QA_TEST_IDENTITY_FAIL='1' if identity_fail else '', **extra)
         with open(self.events) as f:
             return result, [json.loads(line) for line in f]
 
@@ -271,10 +416,222 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             self.assertFalse(Path(self.events).exists())
 
     def cli(self, *args, **extra):
-        return subprocess.run(['/bin/bash', self.dispatch_script, *args],
-                              env=dict(os.environ, HOME=self.home, USER='tester', QA_TEST_EVENTS=self.events,
-                                       PYTHONPATH=self.tmp, **extra),
-                              capture_output=True, text=True, timeout=20)
+        return self.run_cli(['/bin/bash', self.dispatch_script, *args], **extra)
+
+    def legacy_cli(self, *args, **extra):
+        return self.run_cli(['/usr/bin/python3', self.legacy_script, *args], **extra)
+
+    def run_cli(self, args, **extra):
+        env = dict(os.environ, HOME=self.home, USER='tester', QA_TEST_EVENTS=self.events, PYTHONPATH=self.tmp, **extra)
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=35)
+
+    def assert_no_cleanup_since(self, offset):
+        for line in Path(self.events).read_text()[offset:].splitlines():
+            event = json.loads(line)
+            self.assertNotEqual(event['command'], 'dropdb')
+            self.assertNotEqual((event['command'], event['args'][0]), ('launchctl', 'bootout'))
+            self.assertFalse(event['command'] == 'git' and 'remove' in event['args'])
+
+    def test_existing_database_survives_refused_up_and_down(self):
+        db = self.db_dir / 'allrice40_qa_met_218_test'
+        db.write_text('49001:existing database')
+        up, events = self.up()
+        self.assertNotEqual(up.returncode, 0)
+        self.assertIn('already exists', up.stderr)
+        self.assertFalse(any(event['command'] == 'createdb' for event in events))
+        self.assertIsNone(json.loads((self.instance / 'instance.json').read_text())['databaseClaim'])
+        down = self.cli('down', 'met-218-test')
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertEqual(db.read_text(), '49001:existing database')
+        self.assertFalse(self.instance.exists())
+
+    def test_uncertain_create_keeps_database_and_slot_until_absence_is_confirmed(self):
+        up, _ = self.up(QA_TEST_CREATE_UNKNOWN='1')
+        self.assertNotEqual(up.returncode, 0)
+        self.assertIn('database creation failed', up.stderr)
+        checkpoint = self.instance / 'instance.json'
+        self.assertEqual(json.loads(checkpoint.read_text())['databaseClaim'], 'pending')
+        db = self.db_dir / 'allrice40_qa_met_218_test'
+        before = len(Path(self.events).read_text())
+        down = self.cli('down', 'met-218-test')
+        self.assertNotEqual(down.returncode, 0)
+        self.assertIn('cannot verify ownership of database', down.stderr)
+        self.assert_no_cleanup_since(before)
+        self.assertEqual(db.read_text(), '49000:')
+        self.assertTrue(checkpoint.is_file())
+        db.unlink()
+        retry = self.cli('down', 'met-218-test')
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertFalse(self.instance.exists())
+
+    def test_down_drops_confirmed_database_after_setup_failed_and_rejects_replacement(self):
+        up, _ = self.up(QA_TEST_DB_PREP_FAIL='1')
+        self.assertNotEqual(up.returncode, 0)
+        self.assertIn('db:prepare failed', up.stderr)
+        checkpoint = self.instance / 'instance.json'
+        claim = json.loads(checkpoint.read_text())['databaseClaim']
+        db = self.db_dir / 'allrice40_qa_met_218_test'
+        self.assertEqual(db.read_text(), claim)
+        for actual, extra in (('1:' + claim.split(':', 1)[1], {}), ('49000:other generation', {}),
+                              (claim, {'QA_TEST_DB_UNKNOWN': '1'})):
+            with self.subTest(actual=actual, extra=extra):
+                db.write_text(actual)
+                before = len(Path(self.events).read_text())
+                down = self.cli('down', 'met-218-test', **extra)
+                self.assertNotEqual(down.returncode, 0)
+                self.assertIn('cannot verify ownership of database', down.stderr)
+                self.assert_no_cleanup_since(before)
+                self.assertEqual(db.read_text(), actual)
+                self.assertTrue(checkpoint.is_file())
+        db.write_text(claim)
+        down = self.cli('down', 'met-218-test')
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertFalse(db.exists())
+        self.assertFalse(self.instance.exists())
+
+    def test_preexisting_launchagent_survives_failed_up_and_down(self):
+        label = 'ai.bplabs.allrice40-qa-met-218-test-worker'
+        plist, job = self.agents / (label + '.plist'), self.jobs / label
+        for path, original, message in (
+            (plist, 'pre-existing plist', 'LaunchAgent plist already exists'),
+            (job, json.dumps(dict(path='/other.plist', cwd='/other')), 'already loaded'),
+        ):
+            with self.subTest(path=path):
+                path.write_text(original)
+                before = path.stat().st_ino
+                up, events = self.up()
+                self.assertIn(message, up.stderr)
+                self.assertNotEqual(up.returncode, 0)
+                self.assertFalse(any(e['command'] == 'createdb' for e in events))
+                down = self.cli('down', 'met-218-test')
+                self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+                self.assertEqual((path.stat().st_ino, path.read_text()), (before, original))
+                path.unlink()
+
+    def test_down_preflights_both_owned_roles_before_stopping_either(self):
+        up, _ = self.up()
+        self.assertEqual(up.returncode, 0, up.stdout + up.stderr)
+        label = 'ai.bplabs.allrice40-qa-met-218-test-worker'
+        worker_plist, worker_job = self.agents / (label + '.plist'), self.jobs / label
+        original_plist, original_job = worker_plist.read_bytes(), worker_job.read_text()
+        for mutation in ('different inode', 'loaded job from another worktree', 'unknown job state'):
+            with self.subTest(mutation=mutation):
+                extra = {}
+                if mutation == 'different inode':
+                    worker_plist.unlink()
+                    worker_plist.write_bytes(original_plist)
+                elif mutation == 'loaded job from another worktree':
+                    unexpected = dict(json.loads(original_job), cwd='/elsewhere')
+                    worker_job.write_text(json.dumps(unexpected))
+                else:
+                    extra['QA_TEST_LAUNCHCTL_UNKNOWN'] = '-worker'
+                before = len(Path(self.events).read_text())
+                down = self.cli('down', 'met-218-test', **extra)
+                self.assertNotEqual(down.returncode, 0)
+                self.assertIn('cannot verify LaunchAgent ownership', down.stderr)
+                self.assert_no_cleanup_since(before)
+                self.assertTrue(worker_plist.is_file() and worker_job.is_file())
+                if mutation == 'different inode':
+                    worker_plist.unlink()
+                    os.link(self.instance / 'worker.plist', worker_plist)
+                elif mutation == 'loaded job from another worktree':
+                    worker_job.write_text(original_job)
+        down = self.cli('down', 'met-218-test')
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertFalse(worker_plist.exists() or worker_job.exists())
+
+    def test_down_after_partial_bootstrap_stops_only_the_loaded_role(self):
+        up, _ = self.up(QA_TEST_BOOTSTRAP_FAIL='-web')
+        self.assertEqual(up.returncode, 46, up.stdout + up.stderr)
+        self.assertEqual([job.name for job in self.jobs.iterdir()], ['ai.bplabs.allrice40-qa-met-218-test-worker'])
+        before = len(Path(self.events).read_text())
+        down = self.cli('down', 'met-218-test')
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        events = [json.loads(line) for line in Path(self.events).read_text()[before:].splitlines()]
+        self.assertEqual([e['args'][-1].rsplit('/', 1)[-1] for e in events
+                          if e['command'] == 'launchctl' and e['args'][0] == 'bootout'],
+                         ['ai.bplabs.allrice40-qa-met-218-test-worker'])
+        self.assertFalse(list(self.agents.glob('ai.bplabs.allrice40-qa-*.plist')))
+        self.assertFalse(list(self.db_dir.iterdir()))
+
+    def test_mixed_generations_share_three_slots_and_port_pairs_concurrently(self):
+        qa = self.instance.parent
+        qa.mkdir()
+        allocator = qa / '.alloc.lock'
+        attempts = Path(self.tmp, 'allocator-attempts')
+        attempts.touch()
+        tasks = ('old-one', 'new-one', 'old-two', 'new-two')
+
+        def request(task):
+            env = dict(QA_TEST_LOCK_ATTEMPTS=str(attempts), QA_TEST_TASK=task)
+            if task.startswith('old-'):
+                return self.legacy_cli('up', task, **env)
+            return self.cli('up', task, '--owner', 'new', '--card', 'MET-260', **env)
+
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            with allocator.open('a') as lock:
+                inode = os.fstat(lock.fileno()).st_ino
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                pending = [workers.submit(request, task) for task in tasks]
+                deadline = time.monotonic() + 10
+                while set(attempts.read_text().splitlines()) != set(tasks) and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertEqual(set(attempts.read_text().splitlines()), set(tasks))
+                self.assertFalse(list(qa.glob('*/instance.json')))
+            results = [future.result() for future in pending]
+        self.assertEqual(sorted(r.returncode for r in results), [0, 0, 0, 75],
+                         [r.stdout + r.stderr for r in results])
+        records = [json.loads(p.read_text()) for p in qa.glob('*/instance.json')]
+        self.assertEqual(len(records), 3)
+        self.assertEqual({data['task'] for data in records}, {task for task, r in zip(tasks, results) if r.returncode == 0})
+        self.assertEqual(sorted(port for data in records for port in (data['webPort'], data['workerPort'])),
+                         list(range(3200, 3206)))
+        self.assertEqual(allocator.stat().st_ino, inode)
+        self.assertEqual(request('old-extra').returncode, 75)
+        self.assertEqual(request('new-extra').returncode, 75)
+
+    def test_same_task_down_preserves_the_other_generation_in_both_directions(self):
+        task = 'met-218-test'
+        qa = self.instance.parent
+        old_instance = qa / task
+        up, _ = self.up()
+        self.assertEqual(up.returncode, 0, up.stdout + up.stderr)
+        old = self.legacy_cli('up', task)
+        self.assertEqual(old.returncode, 0, old.stdout + old.stderr)
+        record = json.loads((self.instance / 'instance.json').read_text())
+        new_release = self.worktrees / record['worktree']['name']
+
+        def snapshot(directory, release, prefix, db):
+            paths = [directory, release, self.db_dir / db]
+            paths += list(directory.rglob('*')) + list(release.rglob('*'))
+            for role in ('web', 'worker'):
+                name = f'ai.bplabs.{prefix}-qa-{task}-{role}'
+                paths.extend((self.agents / (name + '.plist'), self.jobs / name))
+            return {path: (path.stat().st_ino, path.read_bytes() if path.is_file() else None) for path in paths}
+
+        for old_down in (True, False):
+            with self.subTest(old_down=old_down):
+                if old_down:
+                    protected = (self.instance, new_release, 'allrice40', 'allrice40_qa_met_218_test')
+                    protected_lock, removed, down = qa / ('.task40-' + task + '.lock'), old_instance, self.legacy_cli
+                    invalid = self.legacy_cli('down', self.instance.name)
+                    self.assertIn('task name must match', invalid.stderr)
+                    self.assertEqual(invalid.returncode, 1)
+                else:
+                    old = self.legacy_cli('up', task)
+                    self.assertEqual(old.returncode, 0, old.stdout + old.stderr)
+                    protected = (old_instance, old_instance / 'release', 'allrice', 'allrice_qa_met_218_test')
+                    protected_lock, removed, down = qa / ('.task-' + task + '.lock'), self.instance, self.cli
+                original = snapshot(*protected)
+                with protected_lock.open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    result = down('down', task)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(removed.exists())
+                    retry = down('down', task)
+                    self.assertEqual(retry.returncode, 0 if old_down else 1, retry.stdout + retry.stderr)
+                    self.assertEqual(protected_lock.stat().st_ino, os.fstat(lock.fileno()).st_ino)
+                    self.assertEqual(snapshot(*protected), original)
 
     def seed(self, task, expired=True, old_version=False):
         directory = Path(self.home, 'allrice-qa', task if old_version else '_allrice40-' + task)
@@ -284,6 +641,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         stamp = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
         data = {'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'task': task, 'webPort': 3298, 'workerPort': 3299, 'sha': SOURCE_SHA,
                 'ref': SOURCE_SHA, 'database': 'allrice40_qa_' + task.replace('-', '_'),
+                'databaseClaim': None, 'plistClaims': {},
                 'owner': 'owner-' + task, 'card': 'MET-220', 'repositoryCreatedAt': stamp(now - 86400),
                 'repositoryExpiresAt': stamp(now - 60 if expired else now + 600)}
         if old_version:

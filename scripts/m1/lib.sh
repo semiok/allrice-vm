@@ -88,13 +88,22 @@ except BlockingIOError: sys.exit(0)
 sys.exit(1)' "$1"
 }
 
-# job_state <label>: prints "running <pid>", "loaded" or "gone". Exit 2 when launchctl
-# itself fails, so a failed query is never mistaken for a stopped service.
+# job_state <label> [plist cwd]: prints "running <pid>", "loaded" or "gone".
+# With a plist and cwd, require the loaded job to match both before accepting it.
 job_state() {
   local out rc=0
   out=$("$M1_LAUNCHCTL" print "gui/$M1_UID/$1" 2>&1) || rc=$?
   if [ "$rc" = 113 ]; then echo gone; return 0; fi # "Could not find service"
   [ "$rc" = 0 ] || { echo "launchctl print $1 failed (exit $rc)" >&2; return 2; }
+  if [ "$#" -eq 3 ] && ! "$M1_PY" -c 'import sys
+lines = [line.strip() for line in sys.stdin]
+for field, expected in zip(("path", "working directory"), sys.argv[1:]):
+    key = field + " = "
+    if [line[len(key):] for line in lines if line.startswith(key)] != [expected]:
+        sys.exit(1)' "$2" "$3" <<<"$out"; then
+    echo "loaded LaunchAgent $1 does not match its published plist and worktree" >&2
+    return 2
+  fi
   local pid; pid=$(printf '%s\n' "$out" | /usr/bin/awk '$1=="pid" && $2=="=" {print $3; exit}')
   if [ -n "$pid" ]; then echo "running $pid"; else echo loaded; fi
 }
@@ -106,17 +115,20 @@ try: socket.create_connection(("127.0.0.1",int(sys.argv[1])),0.5).close()
 except OSError: sys.exit(1)' "$1"
 }
 
-# stop_job <label> [port]: boot the job out and wait (max 90s) until launchd no longer
+# stop_job <label> [port [plist cwd]]: boot the job out and wait (max 90s) until launchd no longer
 # knows it, its last process has exited and the port is closed. launchd kills the job's
 # whole process group when the job ends (AbandonProcessGroup is not set), so children go
 # with it. Exit 1 on timeout or when the state cannot be read.
 stop_job() {
   local label=$1 port=${2:-} state pid="" i
-  state=$(job_state "$label") || return 1
+  shift; if [ "$#" -gt 0 ]; then shift; fi
+  state=$(job_state "$label" "$@") || return 1
   case "$state" in running*) pid=${state#running } ;; esac
-  "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$label" 2>/dev/null || true
+  if [ "$#" -eq 0 ] || [ "$state" != gone ]; then
+    "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$label" 2>/dev/null || true
+  fi
   for i in $(seq 1 90); do
-    state=$(job_state "$label") || return 1
+    state=$(job_state "$label" "$@") || return 1
     if [ "$state" = gone ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } && { [ -z "$port" ] || ! port_open "$port"; }; then
       return 0
     fi
