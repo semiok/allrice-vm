@@ -286,6 +286,8 @@ jobs:
 
   developer-bootstrap:
     runs-on: ubuntu-latest
+    env:
+      ALLRICE_RUN_RETIREMENT_BEFORE_SHA: 9daa017c3ae370a0b63938c2228217ba570af8f2
     # Run 41078519901 attempts 1/2 hit the 50m job cap at the final
     # build/Bridge boundary; all completed test batches passed.
     # Allow ~10m headroom while keeping test deadlines and every gate.
@@ -306,6 +308,22 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Seed the pinned retirement predecessor in the offline fixture store
+        shell: bash
+        run: |
+          store="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            import { isAbsolute } from 'node:path';
+            import { parse } from 'yaml';
+            const { storeDir } = parse(readFileSync('node_modules/.modules.yaml', 'utf8'));
+            if (typeof storeDir !== 'string' || !isAbsolute(storeDir)) process.exit(1);
+            process.stdout.write(storeDir);
+          ")"
+          seed="$(mktemp -d "$RUNNER_TEMP/allrice-retirement-seed.XXXXXX")"
+          trap 'rm -rf -- "$seed"' EXIT
+          git archive "$ALLRICE_RUN_RETIREMENT_BEFORE_SHA" .npmrc package.json pnpm-lock.yaml pnpm-workspace.yaml patches |
+            tar -xf - -C "$seed"
+          pnpm --dir "$seed" fetch --frozen-lockfile --ignore-scripts --store-dir "$store"
       - run: pnpm doctor:ci
       - run: pnpm db:setup
       - name: Check DSH convergence after all migrations (MET-210 #4)
