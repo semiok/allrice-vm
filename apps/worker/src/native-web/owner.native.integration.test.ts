@@ -13,7 +13,10 @@ import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
-import type { RequestContext } from '@allrice/contracts';
+import {
+  DEntryProfileGraphSchema,
+  type RequestContext,
+} from '@allrice/contracts';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
@@ -291,6 +294,25 @@ it(
       'allrice-web',
     ]);
     expect(f.owner.controlReady()).toBe(true);
+    const built = JSON.parse(
+      await readFile(join(f.seal.directory, 'artifact.json'), 'utf8'),
+    );
+    const expected = DEntryProfileGraphSchema.parse(built.profile.graph);
+    const native = DEntryProfileGraphSchema.parse(
+      await f.owner.readImmutableGraphFor(f.context, active),
+    );
+    const ids = native.entries.map(({ id }) => id);
+    const sealedIds = expected.entries.map(({ id }) => id);
+    expect({
+      missing: sealedIds.filter((id) => !ids.includes(id)),
+      extra: ids.filter((id) => !sealedIds.includes(id)),
+      release: native.release,
+    }).toEqual({ missing: [], extra: [], release: expected.release });
+    const offset = ids.findIndex((id, index) => id !== sealedIds[index]);
+    expect(
+      offset < 0 ? [] : [offset, ids[offset], sealedIds[offset]],
+      'first difference in the native module order',
+    ).toEqual([]);
     const proof = await holdReleasedProfile(
       f.seal.directory,
       {
