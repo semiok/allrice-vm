@@ -35,6 +35,8 @@ describe('approved memory source display copy', () => {
     [' \n\t', '来源说明未记录'],
     ['  自定义来源\n完整说明  ', '  自定义来源\n完整说明  '],
     ['模型提取候选（自定义）', '模型提取候选（自定义）'],
+    ['自定义周报记录 · 用户确认（备注）', '自定义周报记录 · 用户确认（备注）'],
+    ['__proto__', '__proto__'],
   ])('formats only the approved exact label %j', (sourceLabel, label) => {
     expect(memorySourceCopy({ ...source, sourceLabel }).label).toBe(label);
   });
