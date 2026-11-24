@@ -606,7 +606,7 @@ it(
     await expect
       .poll(() => afterRoleChange.raw().match(/HTTP\/1\.1 (200|404)/g))
       .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expect(roleAsset!.getHeader('content-length')).toBe('0');
+    expectEmptyDenial(afterRoleChange.raw());
     expect(roleNext!.writableFinished).toBe(true);
     expect((await f.invoke(noNotification.scopeId)).status).toBe(404);
     expect((await f.invoke(foreground.scopeId)).status).toBe(200);
@@ -641,7 +641,7 @@ it(
     await expect
       .poll(() => assigned.raw().match(/HTTP\/1\.1 (200|404)/g))
       .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expect(assignedAsset!.getHeader('content-length')).toBe('0');
+    expectEmptyDenial(assigned.raw());
     expect(assignedNext!.writableFinished).toBe(true);
     assigned.client.destroy();
 
@@ -672,14 +672,15 @@ it(
     expect(await reading.receive()).toMatchObject({
       value: { type: 'closed' },
     });
-    expect(preReadAsset!.getHeader('content-length')).toBe('0');
+    expect(preReadAsset!.statusCode).toBe(404);
+    expect(preReadAsset!.writableEnded).toBe(true);
     expect(readHead!.writableEnded).toBe(false);
     expect(preReadNext!.headersSent).toBe(false);
     readHead!.end();
     await expect
       .poll(() => preRead.raw().match(/HTTP\/1\.1 (200|404)/g))
       .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expect(preRead.raw()).not.toContain('UNAVAILABLE');
+    expectEmptyDenial(preRead.raw());
     preRead.client.destroy();
 
     const draining = await pipelineAfterEvents(foreground.scopeId);
@@ -765,6 +766,13 @@ it(
     expect(await withdrew).toBe(true);
     expect((await withdrawn.invoke(live.scopeId)).status).toBe(404);
 
+    function expectEmptyDenial(output: string) {
+      const denial = output
+        .split(/\r\n(?=HTTP\/1\.1 )/)
+        .find((response) => response.startsWith('HTTP/1.1 404'));
+      expect(denial).toMatch(/\r\ncontent-length: 0\r\n/i);
+      expect(denial?.split('\r\n\r\n')[1] ?? '').toBe('');
+    }
     async function pipelineAfterEvents(
       id: string,
       {
