@@ -190,7 +190,11 @@ def expand(path):
 def run(cmd, timeout=20, env=None, stdin=None):
     """(exit code, stdout, stderr); 124 on timeout, 127 when it cannot start."""
     full = dict(os.environ, PATH=SYS_PATH)
-    full.update(env or {})
+    for key, value in (env or {}).items():
+        if value is None:
+            full.pop(key, None)
+        else:
+            full[key] = value
     try:
         kw = {'input': stdin} if stdin is not None else {'stdin': subprocess.DEVNULL}
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=full, **kw)
@@ -479,7 +483,7 @@ def psql(cfg, sql, url=None, variables=None, timeout=30, readonly=True):
         cmd += ['-v', '%s=%s' % (k, v)]
     opts = '-c statement_timeout=15000' + (' -c default_transaction_read_only=on' if readonly else '')
     env.update(PGCONNECT_TIMEOUT='5', PGAPPNAME='allrice-monitor', PGOPTIONS=opts,
-               PGHOSTADDR='', PGSERVICE='', PGSERVICEFILE='')
+               PGHOSTADDR=None, PGSERVICE=None, PGSERVICEFILE=None)
     rc, out, err = run(cmd, timeout, env, sql)
     if rc:
         raise CheckError(short(err or 'psql exit %d' % rc))

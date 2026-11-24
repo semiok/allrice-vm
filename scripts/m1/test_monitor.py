@@ -239,6 +239,7 @@ class Delivery(unittest.TestCase):
         self.assertNotIn('s3cret', ' '.join(cmd))
         self.assertIn('postgres://snow@127.0.0.1:5432/allrice_dev', cmd)
         self.assertEqual(env['PGPASSWORD'], 's3cret')
+        self.assertTrue(all(env[key] is None for key in ('PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE')))
 
     def test_backlog_is_bounded(self):
         r = make_round()
