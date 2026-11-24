@@ -313,7 +313,13 @@ suite(
         await clientClosed;
         expect(settled).not.toHaveBeenCalled();
         releaseEnd();
-        expect(await outcome).toMatchObject({ code: '57P01' });
+        const error = await outcome;
+        expect(error).toBeInstanceOf(Error);
+        // The terminated backend may send its SQLSTATE or reset the socket
+        // before the driver receives the error response.
+        expect(['57P01', 'ECONNRESET']).toContain(
+          (error as NodeJS.ErrnoException).code,
+        );
         expect(
           await admin`select pid from pg_stat_activity where pid=${victim!.pid}`,
         ).toEqual([]);
