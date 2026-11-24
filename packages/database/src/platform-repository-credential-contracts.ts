@@ -6,6 +6,14 @@ export const platformRepository = Object.freeze({
   id: 1469490636,
   fullName: 'semiok/allrice-vm',
 } as const);
+export const PlatformRepositoryPullUrlSchema = z
+  .string()
+  .regex(
+    new RegExp(
+      `^https://github\\.com/${platformRepository.fullName}/pull/[1-9]\\d*$`,
+    ),
+  );
+
 export const PlatformRepositoryCredentialSchema = z
   .object({
     repositoryId: z.literal(platformRepository.id),

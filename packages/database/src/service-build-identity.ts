@@ -3,6 +3,7 @@ import { readFile, readdir, lstat, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
+import { platformRepository } from './platform-repository-credential-contracts.ts';
 
 const checksum = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -44,7 +45,8 @@ const manifestBodySchema = z
   .object({
     version: z.literal(1),
     environment: z.literal('dev'),
-    repository: z.literal('semiok/allrice-vm'),
+    repository: z.literal(platformRepository.fullName),
+    repositoryId: z.literal(platformRepository.id),
     sourceSha: sha,
     sourceTree: sha,
     webBuildId: z.string().min(1).max(200),
@@ -78,6 +80,7 @@ export interface ServiceBuildIdentity {
   version: 1;
   environment: 'dev';
   repository: ServiceBuildManifest['repository'];
+  repositoryId: ServiceBuildManifest['repositoryId'];
   service: ServiceBuildRole;
   mode: 'production';
   sourceSha: string;
@@ -411,7 +414,8 @@ export async function prepareServiceBuildManifest(input: {
   const body = manifestBodySchema.parse({
     version: 1,
     environment: 'dev',
-    repository: 'semiok/allrice-vm',
+    repository: platformRepository.fullName,
+    repositoryId: platformRepository.id,
     sourceSha: input.sourceSha,
     sourceTree: input.sourceTree,
     webBuildId: (await bytesAt(root, 'apps/web/.next/BUILD_ID', input.observe))
@@ -500,6 +504,7 @@ export async function verifyServiceBuildIdentity(input: {
       version: 1,
       environment: 'dev',
       repository: manifest.repository,
+      repositoryId: manifest.repositoryId,
       service: input.service,
       mode: 'production',
       sourceSha: manifest.sourceSha,

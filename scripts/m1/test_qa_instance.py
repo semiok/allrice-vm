@@ -81,6 +81,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         with open(self.script, 'w') as f:
             f.write(definitions + host_stubs + 'cmd_up "$@"\n')
         shutil.copyfile(os.path.join(HERE, 'lib.sh'), os.path.join(self.tmp, 'lib.sh'))
+        shutil.copyfile(os.path.join(HERE, 'service_target.py'), os.path.join(self.tmp, 'service_target.py'))
         shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(self.tmp, 'qa-lease.py'))
         Path(self.tmp, 'rice-standard.json').write_text('{"version":"installed-old","toolNames":["workspace.memory.search"]}')
         self.dispatch_script = os.path.join(self.tmp, 'qa-instance-cli')
@@ -95,7 +96,9 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             with open(os.path.join(agents, 'ai.bplabs.allrice40-dev-' + role + '.plist'), 'wb') as f:
                 plistlib.dump({
                     'Label': 'ai.bplabs.allrice40-dev-' + role,
-                    'ProgramArguments': [os.path.join(node_bin, 'node'), '--env-file=/unused', '/unused'],
+                    'ProgramArguments': [os.path.join(node_bin, 'node'),
+                                         '--env-file=' + os.path.join(dev, '.env'),
+                                         '/fake/apps/web/server.mjs' if role == 'web' else '/fake/apps/worker/dist/index.js'],
                     'EnvironmentVariables': {
                         'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev',
                         'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',

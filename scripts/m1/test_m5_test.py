@@ -32,6 +32,11 @@ case "$*" in
     [ ! -e hang ] || { echo "starting"; sleep 30; exit 0; }
     [ ! -e drop ] || { HOME=$PWD /bin/sh -c "$*" | grep -v '^m5-test: done on '; exit 255; }
     [ ! -e wrong-receipt ] || { HOME=$PWD /bin/sh -c "$*" | sed '/^m5-test: result repository /s/id 1469490636 /id 1323769790 /'; exit 0; }
+    [ ! -e before-guardian-drop ] || {
+      HOME=$PWD M5T_GUARDED=1 M5T_GUARD_RECEIPT_FD=3 /bin/sh -c "$*" 3>inner-receipt
+      [ -s inner-receipt ] || exit 88
+      exit 255
+    }
     [ ! -e late-drop ] || { HOME=$PWD /bin/sh -c "$*"; exit 255; }
     [ ! -e slept ] || { HOME=$PWD /bin/sh -c "$*"; echo "m5-test: M5 was asleep 40s during this run; it is no verdict"; exit 76; } ;;
 esac
@@ -788,6 +793,15 @@ class M5Test(unittest.TestCase):
                 p = self.run_m5(*args)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertEqual(self.calls(self.th) + self.calls(self.m1), [])
+
+    def test_disconnect_after_child_receipt_but_before_guardian_is_unknown(self):
+        write(os.path.join(self.m5, 'before-guardian-drop'), '')
+        p = self.run_m5('--on', 'm5', '--no-build', '--', 'receipt.test.ts')
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertIn('vitest says hello', p.stdout)
+        self.assertIn('done on M5', read(os.path.join(self.m5, 'inner-receipt')))
+        self.assertNotIn('finished on M5', p.stdout)
+        self.assertNotIn('m5-test: result repository', p.stdout)
 
     def test_exit_code_after_a_late_drop_comes_from_the_run(self):
         write(os.path.join(self.m5, 'late-drop'), '')  # the connection broke after the closing line

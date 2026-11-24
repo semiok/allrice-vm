@@ -1,8 +1,12 @@
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { resolveServiceBuildRoot } from './prepare-identity-root.mjs';
+import {
+  resolveServiceBuildRoot,
+  resolveServiceBuildSource,
+} from './prepare-identity-root.mjs';
 
 let directory: string;
 let home: string;
@@ -73,3 +77,50 @@ it.each(['task', 'release'])(
     );
   },
 );
+
+it('seals only a clean checkout of the canonical new repository', async () => {
+  const repo = join(home, 'allrice40-repo');
+  const foreign = join(home, 'allrice40-worktrees/foreign');
+  const allowed = join(home, 'allrice40-dev-releases/allowed');
+  const origin = 'https://github.com/semiok/allrice-vm.git';
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  await mkdir(repo);
+  git(repo, 'init', '-q');
+  git(
+    repo,
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    'commit',
+    '-qm',
+    'fixture',
+    '--allow-empty',
+  );
+  git(repo, 'remote', 'add', 'origin', origin);
+  const head = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'worktree', 'add', '-q', '--detach', allowed, head);
+  git(repo, 'clone', '-q', repo, foreign);
+  git(foreign, 'remote', 'set-url', 'origin', origin);
+  await expect(
+    resolveServiceBuildSource(allowed, head, home),
+  ).resolves.toMatchObject({
+    root: allowed,
+    sourceSha: head,
+    sourceTree: git(repo, 'rev-parse', 'HEAD^{tree}'),
+  });
+  await expect(resolveServiceBuildSource(foreign, head, home)).rejects.toThrow(
+    'DEV_BUILD_REPOSITORY_NOT_ALLOWED',
+  );
+  git(
+    repo,
+    'remote',
+    'set-url',
+    'origin',
+    'https://github.com/semiok/allrice.git',
+  );
+  await expect(resolveServiceBuildSource(allowed, head, home)).rejects.toThrow(
+    'DEV_BUILD_REPOSITORY_NOT_ALLOWED',
+  );
+});

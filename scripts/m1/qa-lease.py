@@ -231,7 +231,7 @@ def remind(path, waiter, owner, card, started):
             raise ValueError('expired occupant lacks owner/card; cannot address a reminder')
         marker = directory / (path.parent.name + '.json')
         previous = read(marker) if marker.exists() else {}
-        generation = data.get('createdAt')
+        generation = data.get(lease_fields(data)[0])
         now = time.time()
         if previous.get('generation') == generation and now - previous.get('attemptedAt', 0) < 1800:
             return

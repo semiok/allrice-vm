@@ -407,9 +407,16 @@ SH
     chmod 755 "$bin"
   done
 }
-finish() { # [why]: the closing line m5-test looks for
-  echo "m5-test: result repository $REPOSITORY id $REPOSITORY_ID commit $M5T_SHA host $HOST_NAME run $M5T_RUN exit $rc"
-  echo "m5-test: done on $HOST_NAME (${M5T_SHA:0:8}${slot:+, slot $slot}, $workers workers${times}${1:+; $1}), exit $rc"
+finish() { # M5 hands a private receipt to its guard; M1 has no sleep guard.
+  local receipt completed
+  receipt="m5-test: result repository $REPOSITORY id $REPOSITORY_ID commit $M5T_SHA host $HOST_NAME run $M5T_RUN exit $rc"
+  completed="m5-test: done on $HOST_NAME (${M5T_SHA:0:8}${slot:+, slot $slot}, $workers workers${times}${1:+; $1}), exit $rc"
+  if [ "$target" = m5 ]; then
+    [ -n "${M5T_GUARD_RECEIPT_FD:-}" ] || exit 88
+    printf '%s\n%s\n' "$receipt" "$completed" >&"$M5T_GUARD_RECEIPT_FD"
+  else
+    printf '%s\n%s\n' "$receipt" "$completed"
+  fi
   exit "$rc"
 }
 
@@ -554,16 +561,18 @@ esac
 #   (stopping one M1 still waited for only costs a rerun there);
 # - when the run ends normally, stops what is left of it all the same.
 if [ "$target" = m5 ] && [ -z "${M5T_GUARDED:-}" ] && [ -n "${BASH_EXECUTION_STRING:-}" ]; then
-  exec /usr/bin/python3 -c 'import os,select,signal,subprocess,sys,time
+  exec /usr/bin/python3 -c 'import os,select,signal,subprocess,sys,tempfile,time
 gap,log,rid,pgbin,argv=float(sys.argv[1]),sys.argv[2],sys.argv[3],sys.argv[4].rstrip("/")+"/",sys.argv[5:]
 clock=getattr(time,"CLOCK_BOOTTIME",time.CLOCK_MONOTONIC) # both count time asleep, neither clock changes
 now=lambda: time.clock_gettime(clock)
 tick,start=min(5,gap/4),now()
 r,w=os.pipe()
+receipt=tempfile.TemporaryFile()
+os.set_inheritable(receipt.fileno(),True)
 pid=os.fork()
 if pid==0:
     os.close(r); os.setsid(); os.write(w,b"."); os.close(w)
-    os.execve(argv[0],argv,dict(os.environ,M5T_GUARDED="1"))
+    os.execve(argv[0],argv,dict(os.environ,M5T_GUARDED="1",M5T_GUARD_RECEIPT_FD=str(receipt.fileno())))
 os.close(w); os.read(r,1); os.close(r) # the run has its own group before anything is watched
 gone=False
 if not hasattr(os,"waitid"): # macOS: told of the exit without reaping it
@@ -619,7 +628,7 @@ def stop(grace):
     for sig in (signal.SIGTERM,signal.SIGKILL):
         alive=look()
         left=[p for p,t in seen.items() if alive.get(p)==t and p!=pid]
-        if not left and gone: return
+        if not left and gone: return True
         for p in left:
             try: os.kill(p,sig)
             except OSError: pass
@@ -630,6 +639,8 @@ def stop(grace):
             alive=look()
             if not [p for p,t in seen.items() if alive.get(p)==t and p!=pid]: break
             time.sleep(0.2)
+    alive=look()
+    return not any(p!=pid and alive.get(p)==t for p,t in seen.items())
 look()
 slept,last=0,start
 while True: # the clock first: the run may have ended on waking, its output pipe gone
@@ -638,15 +649,30 @@ while True: # the clock first: the run may have ended on waking, its output pipe
     if t-last>tick+gap: slept=t-last; break
     if done: break
     look(); last=t
-stop(min(5,gap))
+cleanup_start=now()
+cleanup_grace=min(5,gap)
+clean=stop(cleanup_grace)
 status=os.waitpid(pid,0)[1]
+cleanup_elapsed=now()-cleanup_start
+if cleanup_elapsed>gap+2*cleanup_grace: slept=max(slept,cleanup_elapsed)
 if slept:
     with open(log,"a") as f:
         f.write("%s %s stopped after M5 was asleep %ds; m5-test on M1 reruns a run it loses\n"%(time.strftime("%Y-%m-%d %H:%M"),rid,slept))
     try: print("m5-test: M5 was asleep %ds during this run; it is no verdict"%slept,flush=True)
     except OSError: pass
     sys.exit(76)
-sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128+os.WTERMSIG(status))' \
+if not clean:
+    print("m5-test: could not finish cleaning up this run on M5",flush=True)
+    sys.exit(88)
+rc=os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128+os.WTERMSIG(status)
+receipt.seek(0)
+data=receipt.read(4096)
+if data and os.WIFEXITED(status):
+    # Only the outer guard can publish a terminal result after sleep checks,
+    # cleanup and reaping. A late SSH break can no longer promote child output.
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+sys.exit(rc)' \
     "${M5T_SLEEP_GAP:-30}" "$BASE/stopped.log" "${M5T_RUN:-?}" "$PG_BIN" /bin/bash -c "$BASH_EXECUTION_STRING" m5-run "$@"
 fi
 

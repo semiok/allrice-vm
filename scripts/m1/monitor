@@ -43,6 +43,8 @@ import urllib.request
 import uuid
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+from service_target import DEV_DATABASE, DEV_PORTS, database_matches, service_matches
 SYS_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 RANK = {'ok': 0, 'warning': 1, 'critical': 2}
 ICON = {'warning': '🟠', 'critical': '🔴', 'ok': '✅'}
@@ -287,12 +289,24 @@ def env_file(path):
     return out
 
 
-def derive_m1(cfg):
+def derive_m1(cfg, *, formal=True):
     """Fill what was left empty from the shared-Dev launchd files and .env."""
     web, worker = plist_of(cfg['webPlist']), plist_of(cfg['workerPlist'])
+    if formal:
+        for role, plist in (('web', web), ('worker', worker)):
+            label, port = 'ai.bplabs.allrice40-dev-' + role, DEV_PORTS[role]
+            port_key = 'ALLRICE_' + role.upper() + '_PORT'
+            valid = service_matches(plist, label, port_key, str(port), DEV_DATABASE, HERE)
+            cfg[role + 'Label'] = label if valid else None
+            cfg[role + 'Url'] = 'http://127.0.0.1:%s' % port if valid else None
+            if not valid:
+                if role == 'web':
+                    web = None
+                else:
+                    worker = None
     wenv = (web or {}).get('EnvironmentVariables', {})
     kenv = (worker or {}).get('EnvironmentVariables', {})
-    dotenv = env_file(cfg['envFile'])
+    dotenv = env_file('~/allrice40-dev/.env' if formal else cfg['envFile'])
     args = (worker or {}).get('ProgramArguments') or [None]
     if args[0] and os.path.basename(args[0]) == 'with-env': args = args[2:]
     fill = {
@@ -316,6 +330,14 @@ def derive_m1(cfg):
     for k, v in fill.items():
         if cfg.get(k) is None:
             cfg[k] = v
+    if formal:
+        # Use the verified Worker's actual launch DSN. A missing or foreign
+        # plist must not turn a fallback .env/monitor override into a write target.
+        cfg['databaseUrl'] = kenv.get('DATABASE_URL')
+        if not cfg['databaseUrl'] or (cfg.get('incidentDatabaseUrl') and not database_matches(cfg['incidentDatabaseUrl'])):
+            cfg['incidentDatabaseUrl'] = None
+            cfg['incidents'] = False
+            return cfg
     if cfg.get('incidentDatabaseUrl') is None:
         cfg['incidentDatabaseUrl'] = cfg['databaseUrl']
     return cfg
@@ -376,7 +398,8 @@ def psql(cfg, sql, url=None, variables=None, timeout=30, readonly=True):
     for k, v in (variables or {}).items():
         cmd += ['-v', '%s=%s' % (k, v)]
     opts = '-c statement_timeout=15000' + (' -c default_transaction_read_only=on' if readonly else '')
-    env.update(PGCONNECT_TIMEOUT='5', PGAPPNAME='allrice-monitor', PGOPTIONS=opts)
+    env.update(PGCONNECT_TIMEOUT='5', PGAPPNAME='allrice-monitor', PGOPTIONS=opts,
+               PGHOSTADDR='', PGSERVICE='', PGSERVICEFILE='')
     rc, out, err = run(cmd, timeout, env, sql)
     if rc:
         raise CheckError(short(err or 'psql exit %d' % rc))
@@ -1458,6 +1481,7 @@ def probe_public(r, url, key='public_entry', where='M1 本机', title='公网入
             answer = json.loads(body)
             identity = answer['identity']
             verified = (answer.get('status') == 'ready' and identity.get('repository') == 'semiok/allrice-vm'
+                        and identity.get('repositoryId') == 1469490636
                         and identity.get('environment') == 'dev' and identity.get('service') == 'web'
                         and identity.get('mode') == 'production')
         except (ValueError, KeyError, TypeError, AttributeError):
@@ -2633,10 +2657,12 @@ def main(argv):
     p.add_argument('--json', action='store_true', help='failures/online-waits: the snapshot as JSON')
     a = p.parse_args(argv)
     peer = a.command == 'peer' or a.peer
+    if a.command == 'ingest-incidents' and (peer or a.dry_run):
+        p.error('ingest-incidents requires the verified local 4.0 target')
     cfg = load_config(a.config, peer)
     os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     if not peer:
-        derive_m1(cfg)
+        derive_m1(cfg, formal=not (a.dry_run and a.command in ('run','daily')))
     if a.command in ('run', 'peer') and a.dry_run:
         r = Round(cfg, peer)
         findings, ran = run_checks(r, PEER_CHECKS if peer else M1_CHECKS)

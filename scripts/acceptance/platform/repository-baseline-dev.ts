@@ -23,6 +23,7 @@ export async function readDevReleaseSha(
           identity?.environment !== 'dev' ||
           identity?.service !== service ||
           identity?.repository !== platformRepository.fullName ||
+          identity?.repositoryId !== platformRepository.id ||
           identity?.mode !== 'production' ||
           !/^[a-f0-9]{40}$/.test(identity.sourceSha) ||
           !/^[a-f0-9]{40}$/.test(identity.sourceTree) ||

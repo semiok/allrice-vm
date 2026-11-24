@@ -1,3 +1,4 @@
+import { PlatformRepositoryPullUrlSchema } from './platform-repository-credential-contracts.ts';
 import { z } from 'zod';
 import {
   ChecksumSchema,
@@ -165,10 +166,7 @@ export const MaintenanceGrantSchema = z
     publication: z
       .object({
         id: UuidSchema,
-        url: z
-          .string()
-          .regex(/^https:\/\/github\.com\/semiok\/allrice\/pull\/[1-9]\d*$/)
-          .nullable(),
+        url: PlatformRepositoryPullUrlSchema.nullable(),
         number: z.number().int().positive().nullable(),
         ci: RepositoryPublicationCiSchema,
         sourceCompanySlug: z.string(),

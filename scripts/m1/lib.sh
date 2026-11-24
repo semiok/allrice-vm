@@ -3,6 +3,7 @@
 M1_LAUNCHCTL=/bin/launchctl
 M1_PY=/usr/bin/python3
 M1_UID=$(/usr/bin/id -u)
+M1_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
 
 # QA allocation remains shared with 3.x. Select an instance by explicit repository
@@ -26,34 +27,7 @@ dev_plist() { # web|worker -> active plist, or the parked configuration
 # starts a service, stops one, or uses the database. Query parameters can
 # override libpq's host, port or database and are excluded from these URLs.
 service_plist_config() { # path label port-key port database [exports]
-  "$M1_PY" - "$@" <<'PYCODE'
-import os, plistlib, shlex, sys
-from urllib.parse import urlsplit
-
-path, label, port_key, port, database, *mode = sys.argv[1:]
-try:
-    with open(path, 'rb') as f:
-        plist = plistlib.load(f)
-    env = plist['EnvironmentVariables']
-    dsn = urlsplit(env['DATABASE_URL'])
-    valid = (
-        plist['Label'] == label and env[port_key] == port
-        and dsn.scheme in ('postgres', 'postgresql')
-        and dsn.hostname == '127.0.0.1' and dsn.port == 5434
-        and dsn.path == '/' + database and not dsn.query and not dsn.fragment
-    )
-except (OSError, plistlib.InvalidFileException, KeyError, ValueError, TypeError, AttributeError):
-    valid = False
-if not valid:
-    sys.exit(f'{path}: expected {label}, {port_key}={port}, PostgreSQL 127.0.0.1:5434/{database}')
-if mode == ['exports']:
-    for key in set(os.environ) | set(env):
-        if key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_')):
-            print(f'unset {shlex.quote(key)}')
-            env.pop(key, None)
-    for key, value in env.items():
-        print(f'export {key}={shlex.quote(str(value))}')
-PYCODE
+  "$M1_PY" "$M1_TOOLS/service_target.py" "$@"
 }
 
 dev_plist_config() { # web|worker [plist path] [exports]

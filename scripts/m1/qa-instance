@@ -11,6 +11,7 @@
 # After `up`: open http://localhost:<webPort> on M1 and log in with the account in
 # ~/allrice-qa/<task>/creds.json (also used by: smoke-test --instance <task>).
 set -euo pipefail
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
 QA="$HOME/allrice-qa"; REPO="$HOME/allrice40-repo"
 NODE_BIN="$HOME/.local/opt/node-22.23.2/bin"

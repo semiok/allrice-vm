@@ -75,7 +75,8 @@ class DeployDevMigrations(unittest.TestCase):
                         'ALLRICE_DSH_RETAINED_ARTIFACT_ID': 'old', 'ALLRICE_DSH_RETAINED_ROOT_2': '/old',
                         'ALLRICE_DSH_ORIGIN_READER_ROOT': '/old-reader'})
         return {'Label': 'ai.bplabs.allrice40-dev-' + role, 'WorkingDirectory': release, 'KeepAlive': True,
-                'ProgramArguments': [NODE, '--env-file=' + self.home + '/allrice40-dev/.env', '/old/script'],
+                'ProgramArguments': [NODE, '--env-file=' + self.home + '/allrice40-dev/.env',
+                                     release + ('/apps/web/server.mjs' if role == 'web' else '/apps/worker/dist/index.js')],
                 'EnvironmentVariables': env}
 
     def live_plist(self, role):
@@ -519,7 +520,9 @@ class DeployDevMigrations(unittest.TestCase):
         monitor = runpy.run_path(os.path.join(HERE, 'monitor'))
         cfg = dict(monitor['M1'], webPlist=self.live_plist('web'),
                    workerPlist=self.live_plist('worker'), envFile=env_file)
-        self.assertEqual(monitor['derive_m1'](cfg)['node'], NODE)
+        from unittest.mock import patch
+        with patch.dict(os.environ, HOME=self.home):
+            self.assertEqual(monitor['derive_m1'](cfg)['node'], NODE)
 
     def write_qa_plists(self):
         with open(os.path.join(HERE, 'qa-instance')) as f:
@@ -640,6 +643,7 @@ class DeployDevMigrations(unittest.TestCase):
         write(os.path.join(smoke, 'smoke-test'), '#!/bin/sh\necho "SMOKE:$*"\n', 0o755)
         os.symlink(os.path.join(HERE, 'with-env'), os.path.join(smoke, 'with-env'))
         os.symlink(os.path.join(HERE, 'lib.sh'), os.path.join(smoke, 'lib.sh'))
+        os.symlink(os.path.join(HERE, 'service_target.py'), os.path.join(smoke, 'service_target.py'))
         stubs = (
             'df() { printf "h\\nx x x 100\\n"; }; resolve_ref() { echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }; '
             'git() { [ "$3 $4" != "worktree add" ] || { mkdir -p "$(dirname "$7")" && cp -R "$CANDIDATE" "$7"; }; }; pnpm() { :; }; '
@@ -914,6 +918,34 @@ class DeployDevMigrations(unittest.TestCase):
                             with open(path, 'wb') as f:
                                 plistlib.dump(valid, f)
 
+    def test_startup_arguments_refuse_legacy_overrides_but_allow_versioned_4_0_loader(self):
+        self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+        parked = os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')
+        for role, old in (
+            ('web', [NODE, '/r/apps/web/server.mjs', '--port', '3011']),
+            ('worker', [os.path.join(self.home, 'allrice-dev/bin/with-env'), 'worker', NODE, '/r/apps/worker/dist/index.js']),
+            ('worker', [NODE, '--env-file=' + os.path.join(self.home, 'allrice-dev/.env'), '/r/apps/worker/dist/index.js']),
+        ):
+            with self.subTest(role=role, argv=old):
+                path = os.path.join(parked, role + '.plist')
+                invalid = self.plist(role)
+                invalid['ProgramArguments'] = old
+                with open(path, 'wb') as f:
+                    plistlib.dump(invalid, f)
+                self.assertEqual(self.run_dd('deploy', []).returncode, 2)
+                self.assertFalse(os.path.isdir(self.snapshots))
+                with open(path, 'wb') as f:
+                    plistlib.dump(self.plist(role), f)
+        path = os.path.join(parked, 'web.plist')
+        valid = self.plist('web')
+        historical_loader = os.path.join(self.home, 'allrice40-dev/tools', 'd' * 40, 'with-env')
+        write(historical_loader, '#!/bin/sh\nexit 99\n', 0o755)
+        valid['ProgramArguments'] = [historical_loader, 'web', NODE, '/r/apps/web/server.mjs', '--port', '3311']
+        with open(path, 'wb') as f:
+            plistlib.dump(valid, f)
+        p = self.run_dd('dev_plist_pair', [])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
     def test_smoke_and_recovery_share_allocator_lock_before_reading_instance(self):
         from concurrent.futures import ThreadPoolExecutor
         import fcntl
@@ -956,6 +988,7 @@ class DeployDevMigrations(unittest.TestCase):
                   'start_job() { echo UNEXPECTED_START >&2; return 90; };\n'
                   'M1_LAUNCHCTL="$TEST_STUBS/launchctl"\n')
         shutil.copyfile(os.path.join(HERE, 'with-env'), os.path.join(directory, 'with-env'))
+        shutil.copyfile(os.path.join(HERE, 'service_target.py'), os.path.join(directory, 'service_target.py'))
         os.chmod(os.path.join(directory, 'with-env'), 0o755)
         with open(os.path.join(HERE, name)) as f:
             script = re.sub(r'^export PATH=.*$', 'export PATH="$TEST_PATH"', f.read(), flags=re.M)
@@ -1053,6 +1086,7 @@ class DeployDevMigrations(unittest.TestCase):
         }))
         qa_worker = self.plist('worker')
         qa_worker['Label'] = 'ai.bplabs.allrice-qa-recover-test-worker'
+        qa_worker['ProgramArguments'][1] = '--env-file=' + instance + '/.env'
         qa_worker['EnvironmentVariables'].update(
             DATABASE_URL='postgres://tester@127.0.0.1:5434/allrice40_qa_recover_test',
             ALLRICE_WORKER_PORT='3201',

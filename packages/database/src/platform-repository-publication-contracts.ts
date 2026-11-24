@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { ChecksumSchema, UuidSchema } from '@allrice/contracts';
-import { platformRepository } from './platform-repository-credential-contracts.ts';
+import {
+  platformRepository,
+  PlatformRepositoryPullUrlSchema,
+} from './platform-repository-credential-contracts.ts';
 
 export const repositoryPublicationJobType =
   'allrice.platform.repository' as const;
@@ -109,9 +112,7 @@ export const RepositoryPublicationRemoteSchema = z
     repository: z.literal(platformRepository.fullName),
     branch: z.string().regex(/^allrice\/repairs\/[a-f0-9-]{36}$/),
     number: z.number().int().positive(),
-    url: z
-      .string()
-      .regex(/^https:\/\/github\.com\/semiok\/allrice-vm\/pull\/[1-9]\d*$/),
+    url: PlatformRepositoryPullUrlSchema,
     headSha: RepositoryGitShaSchema,
     tree: RepositoryGitShaSchema,
     baseSha: RepositoryGitShaSchema,

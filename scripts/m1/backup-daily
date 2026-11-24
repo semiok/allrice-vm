@@ -5,6 +5,7 @@
 # other while Dev runs, so they are not one consistent point in time; after a restore
 # the database is the reference (a dev-stage trade-off, not a production backup).
 set -euo pipefail
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
 export PATH=/opt/homebrew/bin:/usr/bin:/bin
 umask 077

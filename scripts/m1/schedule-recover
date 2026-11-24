@@ -22,6 +22,7 @@
 # Exit: 0 done or nothing to do, 1 failed, 2 usage, 3 lock busy, 4 a lease is still live:
 # rerun after it, 6 --dev --execute without --release-manager.
 set -euo pipefail
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 umask 077
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
 PG=/opt/homebrew/opt/postgresql@17/bin

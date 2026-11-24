@@ -119,6 +119,26 @@ class LeaseSafety(unittest.TestCase):
             lease.remind(self.path, 'later', '等待线', 'MET-249', time.time())
             self.assertEqual(len(calls), 4)
 
+    def test_new_repository_reminders_track_recreated_task_generation(self):
+        data = dict(self.data, repository='semiok/allrice-vm', repositoryId=1469490636)
+        data['repositoryCreatedAt'] = data.pop('createdAt')
+        data['repositoryExpiresAt'] = data.pop('expiresAt')
+        lease.write(self.path, data)
+        calls = []
+        def graphql(query, variables):
+            calls.append(variables)
+            return {'issue': {'id': 'issue-uuid'}} if 'query' in query else {'commentCreate': {'success': True}}
+        with patch.object(lease, 'process_state', return_value='running'), patch.object(lease, 'graphql', side_effect=graphql):
+            for _ in range(2):
+                lease.remind(self.path, 'waiter', '等待线', 'MET-249', time.time())
+            self.assertEqual(len(calls), 2)
+            data.update(repositoryCreatedAt=lease.stamp(time.time()-60), owner='接手线', card='MET-250')
+            lease.write(self.path,data)
+            lease.remind(self.path, 'waiter', '等待线', 'MET-249', time.time())
+        self.assertEqual(len(calls),4)
+        self.assertEqual(calls[2],{'id':'MET-250'})
+        self.assertIn('接手线（MET-250）', calls[3]['input']['body'])
+
     def test_failed_notification_is_visible_and_not_retried_each_poll(self):
         with patch.object(lease, 'process_state', return_value='running'), patch.object(lease, 'graphql', side_effect=RuntimeError('SECRET')) as request:
             lease.remind(self.path, 'waiter', '等待线', 'MET-249', time.time())

@@ -44,6 +44,7 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
     url: string | URL | Request,
     differentWorker: boolean,
     repository = 'semiok/allrice-vm',
+    repositoryId = 1469490636,
   ) => {
     const service = replies.get(String(url));
     return Response.json({
@@ -55,6 +56,7 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
         mode: 'production',
         environment: 'dev',
         repository,
+        repositoryId,
         manifestDigest:
           'sha256:' +
           (differentWorker && service === 'worker' ? 'd' : 'c').repeat(64),
@@ -69,6 +71,11 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
   );
   await expect(
     readDevReleaseSha((url) => reply(url, false, 'semiok/allrice')),
+  ).rejects.toThrow('REPOSITORY_DEV_IDENTITY_UNAVAILABLE');
+  await expect(
+    readDevReleaseSha((url) =>
+      reply(url, false, 'semiok/allrice-vm', 1323769790),
+    ),
   ).rejects.toThrow('REPOSITORY_DEV_IDENTITY_UNAVAILABLE');
   await expect(
     readDevReleaseSha(async () => Response.json({ status: 'ready' })),

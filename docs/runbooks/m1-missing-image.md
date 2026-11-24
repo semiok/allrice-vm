@@ -2,6 +2,8 @@
 
 对应告警：`images`（钉死的镜像缺失）。总览见 [m1-monitor.md](m1-monitor.md)。
 
+> 操作前从已批准的 4.0 部署记录核对独立 Colima profile，并将其赋给 `ALLRICE40_CLOUD_PROFILE`。以下命令按此变量定向。
+
 ## 影响
 
 Worker 只用 `packages/contracts/src/runtime-v2/cloud-platform.ts` 里按 ID 钉死的镜像（Node、Python 图表、Office、静态浏览器）。少一个，对应的云端功能直接失败（10-21 Office 和 Python 镜像丢失，两天后才被人发现，就是这一类）。告警里列出缺的是哪个。
@@ -9,14 +11,14 @@ Worker 只用 `packages/contracts/src/runtime-v2/cloud-platform.ts` 里按 ID �
 ## 第一步
 
 ```bash
-export DOCKER_HOST=unix://$HOME/.colima/allrice-cloud-arm/docker.sock PATH=/opt/homebrew/bin:$PATH
+export DOCKER_HOST=unix://$HOME/.colima/${ALLRICE40_CLOUD_PROFILE:?}/docker.sock PATH=/opt/homebrew/bin:$PATH
 docker images --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}'
 ```
 
 和运行中版本要求的 ID 对比（监控就是这样取的）：
 
 ```bash
-REL=$(/usr/bin/python3 -c 'import plistlib,os;print(plistlib.load(open(os.path.expanduser("~/Library/LaunchAgents/ai.bplabs.allrice-dev-worker.plist"),"rb"))["WorkingDirectory"])')
+REL=$(/usr/bin/python3 -c 'import plistlib,os;print(plistlib.load(open(os.path.expanduser("~/Library/LaunchAgents/ai.bplabs.allrice40-dev-worker.plist"),"rb"))["WorkingDirectory"])')
 ~/.local/opt/node-22.23.2/bin/node -e 'import(require("url").pathToFileURL(process.argv[1]).href).then(m=>console.log(m.cloudPlatform.images))' "$REL/packages/contracts/dist/runtime-v2/cloud-platform.js"
 ```
 
@@ -31,8 +33,8 @@ REL=$(/usr/bin/python3 -c 'import plistlib,os;print(plistlib.load(open(os.path.e
 ## 确认恢复
 
 ```bash
-~/allrice-dev/bin/monitor run --dry-run | grep images
-~/allrice-dev/bin/smoke-test --dev --only office,csv,browser
+~/allrice40-dev/bin/monitor run --dry-run | grep images
+~/allrice40-dev/bin/smoke-test --dev --only office,csv,browser
 ```
 
 ## 后续

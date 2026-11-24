@@ -23,7 +23,7 @@ monitor = importlib.util.module_from_spec(_spec)
 _loader.exec_module(monitor)
 
 
-READY = json.dumps({'status': 'ready', 'identity': {'repository': 'semiok/allrice-vm',
+READY = json.dumps({'status': 'ready', 'identity': {'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636,
                    'environment': 'dev', 'service': 'web', 'mode': 'production'}}).encode()
 
 
@@ -883,6 +883,33 @@ class Peer(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_formal_monitor_never_uses_foreign_plists_or_incident_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg=monitor.load_config(None,False)
+            cfg.update(stateDir=tmp, webPlist=os.path.join(tmp,'web'), workerPlist=os.path.join(tmp,'worker'),
+                       databaseUrl='postgres://tester@127.0.0.1:5432/allrice_dev',
+                       incidentDatabaseUrl='postgres://tester@127.0.0.1:5432/allrice_dev',
+                       workerLabel='ai.bplabs.allrice-dev-worker', workerUrl='http://127.0.0.1:3012')
+            old = {'Label':'ai.bplabs.allrice-dev-worker', 'EnvironmentVariables': {
+                   'DATABASE_URL':cfg['databaseUrl'], 'ALLRICE_WORKER_PORT':'3012'},
+                   'ProgramArguments':['/some/node','/r/apps/worker/dist/index.js']}
+            with open(cfg['workerPlist'],'wb') as f:
+                monitor.plistlib.dump(old,f)
+            with mock.patch.dict(os.environ, HOME=tmp):
+                allowed_dry=monitor.derive_m1(dict(cfg),formal=False)
+                self.assertEqual(allowed_dry['workerUrl'],'http://127.0.0.1:3012')
+                monitor.derive_m1(cfg)
+            self.assertIsNone(cfg['workerUrl'])
+            self.assertIsNone(cfg['workerLabel'])
+            self.assertIsNone(cfg['databaseUrl'])
+            self.assertIsNone(cfg['incidentDatabaseUrl'])
+            self.assertFalse(cfg['incidents'])
+            r=monitor.Round(cfg)
+            r.state['incidentOutbox']=[{'kind':'test'}]
+            with mock.patch.object(monitor,'run') as run:
+                monitor.flush_incidents(r)
+                run.assert_not_called()
+
     def test_merge(self):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, 'c.json')

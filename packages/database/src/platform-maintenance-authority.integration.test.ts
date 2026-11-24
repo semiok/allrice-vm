@@ -5,6 +5,7 @@ import {
   readAcceptedRepositorySource,
 } from './platform-repository-publication-authority.ts';
 import { readRepositoryAction } from './platform-repository-publication-ledger.ts';
+import { RepositoryPublicationRemoteSchema } from './platform-repository-publication-contracts.ts';
 import { repositoryCandidate } from './platform-repository-source.ts';
 import {
   maintenanceCompiledProfileId,
@@ -1431,8 +1432,24 @@ suite('immutable report-bound maintenance authority', () => {
     expect((await repositoryRequestGate(lease, 'POST')).token).toMatch(
       /^github_pat_/,
     );
+    const publicationUrl = 'https://github.com/semiok/allrice-vm/pull/312';
+    const published = RepositoryPublicationRemoteSchema.parse({
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
+      branch: 'allrice/repairs/' + p.publicationId,
+      number: 312,
+      url: publicationUrl,
+      headSha: 'd'.repeat(40),
+      tree: 'e'.repeat(40),
+      baseSha: 'a'.repeat(40),
+    });
+    await fixture.db`update allrice_platform_repository_publications
+      set remote=${fixture.db.json(published)} where id=${p.publicationId}`;
     const shown = await getMaintenanceReportAuthority(admin, receipt.reportId);
-    expect(shown.grants[0]!.publication?.id).toBe(p.publicationId);
+    expect(shown.grants[0]!.publication).toMatchObject({
+      id: p.publicationId,
+      url: publicationUrl,
+    });
     await revokeMaintenanceGrant(admin, grant.id);
     await expect(repositoryRequestGate(lease, 'POST')).rejects.toThrow();
     expect((await repositoryRequestGate(lease, 'GET')).token).toMatch(
