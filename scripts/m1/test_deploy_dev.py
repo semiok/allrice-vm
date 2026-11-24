@@ -540,8 +540,7 @@ class DeployDevMigrations(unittest.TestCase):
         qa = self.write_qa_plists()
         for role in ('web', 'worker'):
             launch = self.read_plist(os.path.join(qa, role + '.plist'))
-            write(os.path.join(qa, 'release/apps/web/server.mjs' if role == 'web'
-                               else 'release/apps/worker/dist/index.js'), probe)
+            write(launch['ProgramArguments'][2], probe)
             started = subprocess.run(launch['ProgramArguments'], cwd=launch['WorkingDirectory'],
                                      env=dict(base_env, **launch['EnvironmentVariables']),
                                      capture_output=True, text=True, timeout=10)
@@ -564,11 +563,17 @@ class DeployDevMigrations(unittest.TestCase):
         with open(os.path.join(HERE, 'qa-instance')) as f:
             marker = '  /usr/bin/python3 - "$task" "$dir"'
             script = marker + f.read().split(marker, 1)[1].split('\nPY\n', 1)[0] + '\nPY\n'
-        directory = os.path.join(self.home, 'allrice-qa', task)
-        self.seed_identity(os.path.join(directory, 'release'), 'b' * 40)
-        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; db=allrice40_qa_${task//-/_}; web=3200; worker=3201; '
+        directory = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
+        release = os.path.join(self.home, 'allrice40-worktrees', '.qa-' + task + '.Fixture1')
+        self.seed_identity(release, 'b' * 40)
+        entry = os.stat(release)
+        write(os.path.join(directory, 'instance.json'), json.dumps(dict(
+            task=task, repository='semiok/allrice-vm', repositoryId=1469490636,
+            webPort=3200, workerPort=3201, nativeArtifactId='new-art',
+            worktree=dict(name=os.path.basename(release), device=entry.st_dev, inode=entry.st_ino))))
+        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=allrice40_qa_${task//-/_}; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
-                        QA_TASK=task, QA_DIR=directory, SHA='b' * 40, USER='tester')
+                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
         return directory
 
@@ -1092,10 +1097,8 @@ class DeployDevMigrations(unittest.TestCase):
     def test_qa_smoke_refuses_a_web_route_to_a_different_worker(self):
         task = 'tool-test'
         qa = self.write_qa_plists(task)
-        write(os.path.join(qa, 'instance.json'), json.dumps(dict(repository='semiok/allrice-vm',
-            repositoryId=1469490636, webPort=3200, workerPort=3201, nativeArtifactId='new-art')))
         for role in ('web', 'worker'):
-            live = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-%s-%s.plist' % (task, role))
+            live = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-qa-%s-%s.plist' % (task, role))
             plist = self.read_plist(os.path.join(qa, role + '.plist'))
             if role == 'web':
                 plist['EnvironmentVariables'].update(ALLRICE_WORKER_PORT='3211', ALLRICE_WORKER_INTERNAL_URL='http://127.0.0.1:3211')
@@ -1103,19 +1106,42 @@ class DeployDevMigrations(unittest.TestCase):
                 plistlib.dump(plist, f)
         p = self.run_config_tool('smoke-test', '--instance', task)
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn('expected ai.bplabs.allrice-qa-tool-test-web', p.stderr)
+        self.assertIn('expected ai.bplabs.allrice40-qa-tool-test-web', p.stderr)
         self.assertFalse(os.path.exists(os.path.join(qa, 'smoke')))
+
+    def test_qa_smoke_selects_4_0_when_3_x_has_the_same_task(self):
+        task = 'tool-test'
+        qa = self.write_qa_plists(task)
+        write(os.path.join(self.home, 'allrice-qa', task, 'instance.json'), '{"webPort":3210,"workerPort":3211}')
+        for role in ('web', 'worker'):
+            agents = os.path.join(self.home, 'Library/LaunchAgents')
+            write(os.path.join(agents, 'ai.bplabs.allrice-qa-%s-%s.plist' % (task, role)), 'old 3.x plist fixture')
+            shutil.copyfile(os.path.join(qa, role + '.plist'),
+                            os.path.join(agents, 'ai.bplabs.allrice40-qa-%s-%s.plist' % (task, role)))
+        probe = os.path.join(self.tmp, 'smoke-args.json')
+        write(os.path.join(self.home, '.local/opt/node-22.23.2/bin/node'), '#!' + sys.executable + '\n'
+              'import json,os,sys\nargs=sys.argv[2:]; out=args[args.index("--out")+1]\n'
+              'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
+              'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
+        p = self.run_config_tool('smoke-test', '--instance', task, '--only', 'chat', PROBE=probe)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(probe) as f:
+            args = json.load(f)
+        self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:3200')
+        self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:3201')
+        self.assertEqual(args[args.index('--creds') + 1], os.path.join(qa, 'creds.json'))
+        self.assertEqual(os.path.dirname(args[args.index('--out') + 1]), os.path.join(qa, 'smoke'))
 
     def test_smoke_and_recovery_share_allocator_lock_before_reading_instance(self):
         from concurrent.futures import ThreadPoolExecutor
         import fcntl
-        instance = os.path.join(self.home, 'allrice-qa', 'switch')
+        instance = os.path.join(self.home, 'allrice-qa', '_allrice40-switch')
         os.makedirs(instance)
         metadata = os.path.join(instance, 'instance.json')
         tools = ('smoke-test', 'schedule-recover')
         for name in tools:
             with self.subTest(tool=name):
-                write(metadata, json.dumps({'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636}))
+                write(metadata, json.dumps({'task': 'switch', 'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636}))
                 with ThreadPoolExecutor(max_workers=1) as worker:
                     with open(os.path.join(self.home, 'allrice-qa', '.alloc.lock'), 'a') as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1126,7 +1152,7 @@ class DeployDevMigrations(unittest.TestCase):
                     p = pending.result(timeout=5)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn('repository', p.stderr)
-                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice-qa', '.task-switch.lock')))
+                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice-qa', '.task40-switch.lock')))
 
     def test_qa_generation_reads_parked_configuration_without_restoring_dev(self):
         p = self.run_dd('park_plists', [])
@@ -1309,16 +1335,13 @@ class DeployDevMigrations(unittest.TestCase):
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
               'print(json.dumps(rows))\n', 0o755)
         instance = self.write_qa_plists('recover-test')
-        write(os.path.join(instance, 'instance.json'), json.dumps({
-            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'workerPort': 3201,
-        }))
         shutil.copyfile(os.path.join(instance, 'worker.plist'),
-                        os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-recover-test-worker.plist'))
+                        os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-qa-recover-test-worker.plist'))
         for mode in ('dev', 'instance'):
             args = ('--dev', '--release-manager') if mode == 'dev' else ('--instance', 'recover-test')
             if mode == 'instance':
                 import fcntl
-                task_lock = os.path.join(self.home, 'allrice-qa/.task-recover-test.lock')
+                task_lock = os.path.join(self.home, 'allrice-qa/.task40-recover-test.lock')
                 with open(task_lock, 'a') as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     refused = self.run_config_tool('schedule-recover', *args, '--execute',

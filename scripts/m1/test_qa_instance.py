@@ -25,10 +25,16 @@ if command == 'git':
     if 'rev-parse' in args:
         print('a' * 40)
     elif 'worktree' in args and 'add' in args:
+        if os.environ.get('QA_TEST_GIT_ADD_FAIL'):
+            sys.exit(44)
         release = Path(args[-2])
         (release / 'scripts/m1').mkdir(parents=True)
         if not os.environ.get('QA_TEST_MISSING_RICE'):
             (release / 'scripts/m1/rice-standard.json').write_text('{"version":"ref","toolNames":["memory.search"]}')
+    elif 'worktree' in args and 'remove' in args:
+        if os.environ.get('QA_TEST_GIT_REMOVE_FAIL'):
+            sys.exit(45)
+        shutil.rmtree(args[-1])
 elif command == 'node':
     if args[0].endswith('/prepare-native-artifact.mjs'):
         print(json.dumps({'artifactId': 'sha256:' + 'b' * 64}))
@@ -72,8 +78,12 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='qa-instance-test-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, 'home')
-        self.release = os.path.join(self.home, 'allrice-qa/met-218-test/release')
+        self.instance = Path(self.home, 'allrice-qa/_allrice40-met-218-test')
+        self.worktrees = Path(self.home, 'allrice40-worktrees')
         self.events = os.path.join(self.tmp, 'events.jsonl')
+        Path(self.tmp, 'sitecustomize.py').write_text(
+            'import socket\ndef no_listener(*args, **kwargs): raise ConnectionRefusedError\n'
+            'socket.create_connection = no_listener\n')
         node_bin = os.path.join(self.home, '.local/opt/node-22.23.2/bin')
         os.makedirs(node_bin)
         for name in ('git', 'pnpm', 'node', 'psql', 'dropdb', 'createdb', 'launchctl', 'curl', 'lsof', 'ps', 'sleep'):
@@ -81,15 +91,12 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             with open(path, 'w') as f:
                 f.write(COMMAND_STUB)
             os.chmod(path, 0o755)
-        # Keep cmd_up unchanged, replacing only the host port probe. Its actual
-        # allocation lock, file writes, plist generation and error exits run.
+        # Keep the actual dispatch, locks, writes and plist generation. The
+        # socket probe and launchctl are confined to host stubs.
         with open(os.path.join(HERE, 'qa-instance')) as f:
             definitions, marker, dispatch = f.read().partition('\ncase "${1:-}" in')
         self.assertTrue(marker, 'qa-instance command dispatch marker changed')
-        self.script = os.path.join(self.tmp, 'qa-instance')
-        host_stubs = '\nport_busy() { return 1; }\nM1_LAUNCHCTL="$NODE_BIN/launchctl"\n'
-        with open(self.script, 'w') as f:
-            f.write(definitions + host_stubs + 'cmd_up "$@"\n')
+        host_stubs = '\nM1_LAUNCHCTL="$NODE_BIN/launchctl"\n'
         shutil.copyfile(os.path.join(HERE, 'lib.sh'), os.path.join(self.tmp, 'lib.sh'))
         shutil.copyfile(os.path.join(HERE, 'service_target.py'), os.path.join(self.tmp, 'service_target.py'))
         shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(self.tmp, 'qa-lease.py'))
@@ -138,11 +145,9 @@ class QaInstanceBuildIdentity(unittest.TestCase):
                 }, f)
 
     def up(self, identity_fail=False):
-        env = dict(os.environ, HOME=self.home, USER='tester', QA_TEST_EVENTS=self.events,
-                   # A caller's SHA cannot replace resolve_ref's Git result.
-                   ALLRICE_RELEASE_SHA='c' * 40, QA_TEST_IDENTITY_FAIL='1' if identity_fail else '')
-        result = subprocess.run(['/bin/bash', self.script, 'met-218-test', '--owner', 'test-line', '--card', 'MET-218', '--ref', SOURCE_SHA],
-                                env=env, capture_output=True, text=True, timeout=20)
+        # A caller's SHA cannot replace resolve_ref's Git result.
+        result = self.cli('up', 'met-218-test', '--owner', 'test-line', '--card', 'MET-218', '--ref', SOURCE_SHA,
+                          ALLRICE_RELEASE_SHA='c' * 40, QA_TEST_IDENTITY_FAIL='1' if identity_fail else '')
         with open(self.events) as f:
             return result, [json.loads(line) for line in f]
 
@@ -158,15 +163,19 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertLess(native, identity)
         self.assertLess(identity, database)
         self.assertLess(database, start)
-        self.assertEqual(events[identity]['cwd'], self.release)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        release = str(self.worktrees / data['worktree']['name'])
+        self.assertEqual(events[identity]['cwd'], release)
         self.assertEqual(events[identity]['args'], [
-            'scripts/dev-release/prepare-identity.mjs', '--root=' + self.release,
+            'scripts/dev-release/prepare-identity.mjs', '--root=' + release,
             '--release-sha=' + SOURCE_SHA,
         ])
         envs = {}
         for role in ('web', 'worker'):
-            with open(os.path.join(os.path.dirname(self.release), role + '.plist'), 'rb') as f:
-                env = plistlib.load(f)['EnvironmentVariables']
+            with (self.instance / (role + '.plist')).open('rb') as f:
+                plist = plistlib.load(f)
+            self.assertEqual(plist['Label'], 'ai.bplabs.allrice40-qa-met-218-test-' + role)
+            env = plist['EnvironmentVariables']
             envs[role] = env
             self.assertEqual(env['ALLRICE_DEV_MAINTENANCE_ENABLED'], '0')
             self.assertEqual(env['ALLRICE_CLOUD_RUNNER_ENABLED'], '0')
@@ -174,25 +183,23 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             self.assertEqual(env['ALLRICE_RELEASE_SHA'], SOURCE_SHA)
             self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], ARTIFACT_ID)
             self.assertEqual(env['UNRELATED_SETTING'], 'keep')
-        with open(os.path.join(os.path.dirname(self.release), 'instance.json')) as f:
-            data = json.load(f)
-            self.assertEqual(data['setup'], 'ready')
-            self.assertEqual(data['owner'], 'test-line')
-            self.assertEqual(data['card'], 'MET-218')
-            self.assertIn('repositoryExpiresAt', data)
-            self.assertNotIn('expiresAt', data, 'old allocator must treat the new instance as legacy')
-            self.assertEqual(data['repository'], 'semiok/allrice-vm')
-            self.assertEqual(data['repositoryId'], 1469490636)
-            self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
+        self.assertEqual(data['setup'], 'ready')
+        self.assertEqual(data['owner'], 'test-line')
+        self.assertEqual(data['card'], 'MET-218')
+        self.assertIn('repositoryExpiresAt', data)
+        self.assertNotIn('expiresAt', data, 'old allocator must treat the new instance as legacy')
+        self.assertEqual(data['repository'], 'semiok/allrice-vm')
+        self.assertEqual(data['repositoryId'], 1469490636)
+        self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
         worker = str(data['workerPort'])
         self.assertEqual(envs['web']['ALLRICE_WORKER_PORT'], worker)
         self.assertEqual(envs['worker']['ALLRICE_WORKER_PORT'], worker)
         self.assertEqual(envs['web']['ALLRICE_WORKER_INTERNAL_URL'], f'http://127.0.0.1:{worker}')
-        dotenv = Path(self.release).parent.joinpath('.env').read_text()
+        dotenv = (self.instance / '.env').read_text()
         self.assertIn(f'ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:{worker}\n', dotenv)
         self.assertNotIn('ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012', dotenv)
         bootstrap = next(e for e in events if e['command'] == 'node' and e['args'][0].endswith('/qa-bootstrap.mjs'))
-        self.assertEqual(bootstrap['args'][bootstrap['args'].index('--rice') + 1], self.release + '/scripts/m1/rice-standard.json')
+        self.assertEqual(bootstrap['args'][bootstrap['args'].index('--rice') + 1], release + '/scripts/m1/rice-standard.json')
 
     def test_identity_failure_stops_before_database_creation_or_services(self):
         result, events = self.up(identity_fail=True)
@@ -202,18 +209,75 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertEqual(events[-1]['args'][0], 'scripts/dev-release/prepare-identity.mjs')
         self.assertFalse(any(e['command'] in ('psql', 'createdb', 'launchctl', 'curl') for e in events))
         self.assertFalse(any(e['command'] == 'pnpm' and 'db:prepare' in e['args'] for e in events))
-        with open(os.path.join(os.path.dirname(self.release), 'instance.json')) as f:
+        with (self.instance / 'instance.json').open() as f:
             self.assertEqual(json.load(f)['setup'], 'building')
-        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.release), 'worker.plist')))
+        self.assertFalse((self.instance / 'worker.plist').exists())
 
+    def test_down_only_removes_the_reserved_worktree_after_failed_add(self):
+        foreign = self.worktrees / '.qa-met-218-test'
+        foreign.mkdir(parents=True)
+        (foreign / 'keep').write_text('unrelated worktree')
+        link = self.worktrees / '.qa-met-218-test.Existing'
+        link.symlink_to(foreign)
+        result = self.cli('up', 'met-218-test', '--owner', 'test-line', '--card', 'MET-218', QA_TEST_GIT_ADD_FAIL='1')
+        self.assertEqual(result.returncode, 44, result.stdout + result.stderr)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        reserved = self.worktrees / data['worktree']['name']
+        self.assertTrue(reserved.is_dir())
+        result = self.cli('down', 'met-218-test', QA_TEST_GIT_REMOVE_FAIL='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.instance.exists())
+        self.assertFalse(reserved.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((foreign / 'keep').read_text(), 'unrelated worktree')
+
+    def test_down_refuses_a_replaced_worktree_before_mutations(self):
+        result, _ = self.up()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        reserved = self.worktrees / data['worktree']['name']
+        original = reserved.rename(self.worktrees / 'original')
+        for symlink in (True, False):
+            with self.subTest(symlink=symlink):
+                if symlink:
+                    reserved.symlink_to(original)
+                else:
+                    reserved.mkdir()
+                before = Path(self.events).read_bytes()
+                result = self.cli('down', 'met-218-test')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('cannot verify the reserved worktree', result.stderr)
+                self.assertEqual(Path(self.events).read_bytes(), before)
+                self.assertTrue(self.instance.is_dir())
+                self.assertTrue(reserved.is_dir())
+                if symlink:
+                    reserved.unlink()
+                else:
+                    reserved.rmdir()
+
+    def test_instance_commands_refuse_a_preexisting_symlink(self):
+        foreign = Path(self.home, 'foreign')
+        foreign.mkdir()
+        self.instance.parent.mkdir()
+        self.instance.symlink_to(foreign)
+        metadata = foreign / 'instance.json'
+        original = '{"repository":"semiok/allrice-vm","repositoryId":1469490636,"task":"met-218-test"}'
+        metadata.write_text(original)
+        for args in (('up', 'met-218-test', '--owner', 'test-line', '--card', 'MET-218'), ('down', 'met-218-test')):
+            result = self.cli(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(metadata.read_text(), original)
+            self.assertTrue(self.instance.is_symlink())
+            self.assertFalse(Path(self.events).exists())
 
     def cli(self, *args, **extra):
         return subprocess.run(['/bin/bash', self.dispatch_script, *args],
-                              env=dict(os.environ, HOME=self.home, USER='tester', QA_TEST_EVENTS=self.events, **extra),
+                              env=dict(os.environ, HOME=self.home, USER='tester', QA_TEST_EVENTS=self.events,
+                                       PYTHONPATH=self.tmp, **extra),
                               capture_output=True, text=True, timeout=20)
 
-    def seed(self, task, expired=True):
-        directory = Path(self.home, 'allrice-qa', task)
+    def seed(self, task, expired=True, old_version=False):
+        directory = Path(self.home, 'allrice-qa', task if old_version else '_allrice40-' + task)
         (directory / 'logs').mkdir(parents=True)
         now = time.time()
         from datetime import datetime, timezone
@@ -222,6 +286,12 @@ class QaInstanceBuildIdentity(unittest.TestCase):
                 'ref': SOURCE_SHA, 'database': 'allrice40_qa_' + task.replace('-', '_'),
                 'owner': 'owner-' + task, 'card': 'MET-220', 'repositoryCreatedAt': stamp(now - 86400),
                 'repositoryExpiresAt': stamp(now - 60 if expired else now + 600)}
+        if old_version:
+            data.pop('repository')
+            data.pop('repositoryId')
+            data['createdAt'] = data.pop('repositoryCreatedAt')
+            data['expiresAt'] = data.pop('repositoryExpiresAt')
+            data['database'] = 'allrice_qa_' + task.replace('-', '_')
         (directory / 'instance.json').write_text(json.dumps(data))
         (directory / 'creds.json').write_text('SECRET-CREDS')
         (directory / '.env').write_text('SECRET-ENV')
@@ -244,7 +314,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         files = sorted(str(p.relative_to(archives[0])) for p in archives[0].rglob('*') if p.is_file())
         self.assertEqual(files, ['instance.json', 'logs/build.log'])
         self.assertNotIn('SECRET', ''.join(p.read_text() for p in archives[0].rglob('*') if p.is_file()))
-        self.assertFalse(Path(self.home, 'allrice-qa/.task-met-218-test.lock').exists())
+        self.assertFalse(Path(self.home, 'allrice-qa/.task40-met-218-test.lock').exists())
 
     def test_full_capacity_keeps_running_and_prints_occupants(self):
         for task in ['one', 'two', 'three']:
@@ -272,14 +342,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
 
     def test_old_repository_instances_count_toward_capacity_but_cannot_be_reclaimed_or_changed(self):
         for task in ['old-one', 'old-two', 'old-three']:
-            directory = self.seed(task)
-            path = directory / 'instance.json'
-            data = json.loads(path.read_text())
-            data.pop('repository')
-            data.pop('repositoryId')
-            data['createdAt'] = data.pop('repositoryCreatedAt')
-            data['expiresAt'] = data.pop('repositoryExpiresAt')
-            path.write_text(json.dumps(data))
+            self.seed(task, old_version=True)
         result = self.cli('up', 'met-218-test', '--owner', 'tester', '--card', 'MET-218')
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         for operation in ['renew', 'down']:
@@ -294,20 +357,20 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         for task in ['one', 'two', 'three']:
             self.seed(task, expired=False)
         result = self.cli('up', 'met-218-test', '--owner', 'tester', '--card', 'MET-218', '--wait',
-                          LINEAR_API_KEY='test-only', QA_TEST_RELEASE='one')
+                          LINEAR_API_KEY='test-only', QA_TEST_RELEASE='_allrice40-one')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(Path(self.home, 'allrice-qa/met-218-test/instance.json').exists())
-        self.assertFalse(Path(self.home, 'allrice-qa/one').exists())
+        self.assertTrue((self.instance / 'instance.json').exists())
+        self.assertFalse(Path(self.home, 'allrice-qa/_allrice40-one').exists())
 
     def test_task_lock_prevents_reclaim_during_other_operation(self):
         import fcntl
         for task in ['one', 'two', 'three']:
             self.seed(task, expired=task == 'one')
-        with Path(self.home, 'allrice-qa/.task-one.lock').open('w') as lock:
+        with Path(self.home, 'allrice-qa/.task40-one.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.cli('up', 'met-218-test', '--owner', 'tester', '--card', 'MET-218')
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-        self.assertTrue(Path(self.home, 'allrice-qa/one/instance.json').exists())
+        self.assertTrue(Path(self.home, 'allrice-qa/_allrice40-one/instance.json').exists())
 
     def test_missing_owner_card_or_ref_template_refuses_before_build(self):
         for args in [[], ['--owner', 'test'], ['--card', 'MET-220']]:

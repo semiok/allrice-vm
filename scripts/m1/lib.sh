@@ -6,14 +6,17 @@ M1_UID=$(/usr/bin/id -u)
 M1_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
 M1_DEV_BACKUP_DIRS="storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform"
+M1_QA="$HOME/allrice-qa"
+# The 3.x glob counts these directories, but its task-name grammar rejects them.
+M1_QA_PREFIX=_allrice40-
 
-# QA allocation remains shared with 3.x. Select an instance by explicit repository
-# identity before reading its credentials, stopping jobs or changing its database.
+qa_instance_dir() { printf '%s/%s%s\n' "$M1_QA" "$M1_QA_PREFIX" "$1"; }
+qa_lock_file() { printf '%s/.task40-%s.lock\n' "$M1_QA" "$1"; }
+qa_label() { printf 'ai.bplabs.allrice40-qa-%s-%s\n' "$1" "$2"; }
+
+# Require the 4.0 namespace and repository identity for instance operations.
 qa_owned() {
-  "$M1_PY" -c 'import json,sys
-try: d=json.load(open(sys.argv[1]))
-except (OSError,ValueError): sys.exit(1)
-sys.exit(0 if isinstance(d,dict) and d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
+  "$M1_PY" "$M1_TOOLS/service_target.py" qa-owned "$1"
 }
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
@@ -63,7 +66,7 @@ while True:
 # Never wait on a task lock while holding the allocator (the owner needs it to
 # release). Fixed fd 8 belongs to this operation; fd 7 is only held briefly.
 qa_task_lock() {
-  exec 7>>"$HOME/allrice-qa/.alloc.lock"
+  exec 7>>"$M1_QA/.alloc.lock"
   flock_fd 7 30 || { exec 7>&-; return 1; }
   exec 8>>"$1"
   if ! flock_fd 8 0; then exec 8>&- 7>&-; return 1; fi
@@ -71,7 +74,7 @@ qa_task_lock() {
 }
 
 qa_task_unlock() {
-  exec 7>>"$HOME/allrice-qa/.alloc.lock"
+  exec 7>>"$M1_QA/.alloc.lock"
   if flock_fd 7 30; then rm -f -- "$1"; fi
   exec 8>&- 7>&-
 }

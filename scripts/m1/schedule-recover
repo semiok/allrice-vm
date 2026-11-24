@@ -62,15 +62,16 @@ case "$mode" in
     fi
     DBNAME=allrice40_dev ;;
   instance)
-    [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -d "$HOME/allrice-qa" ] || die "no QA instance: $task" 2
-    LABEL=ai.bplabs.allrice-qa-$task-worker; LOCK="$HOME/allrice-qa/.task-$task.lock"
+    [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -d "$M1_QA" ] || die "no QA instance: $task" 2
+    LABEL=$(qa_label "$task" worker); LOCK=$(qa_lock_file "$task")
     qa_task_lock "$LOCK" || die "$LOCK or the QA allocator is held; try later" 3
     TASK_LOCKED=1
-    INSTANCE="$HOME/allrice-qa/$task/instance.json"
+    dir=$(qa_instance_dir "$task")
+    INSTANCE="$dir/instance.json"
     qa_owned "$INSTANCE" || die "no QA instance in this repository: $task" 2
     DBNAME=allrice40_qa_${task//-/_}
-    ROOTS="$HOME/allrice-qa/$task/"; ENVFILE="$HOME/allrice-qa/$task/.env"
-    OUT="$HOME/allrice-qa/$task/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;
+    ROOTS="$dir/"; ENVFILE="$dir/.env"
+    OUT="$dir/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;
   *) usage ;;
 esac
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"

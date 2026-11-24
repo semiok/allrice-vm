@@ -9,11 +9,11 @@
 #   qa-instance renew <task> [--ttl 6h]           lease from now, at most 24 hours
 #
 # After `up`: open http://localhost:<webPort> on M1 and log in with the account in
-# ~/allrice-qa/<task>/creds.json (also used by: smoke-test --instance <task>).
+# ~/allrice-qa/_allrice40-<task>/creds.json (also used by: smoke-test --instance <task>).
 set -euo pipefail
 unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
-QA="$HOME/allrice-qa"; REPO="$HOME/allrice40-repo"
+REPO="$HOME/allrice40-repo"
 NODE_BIN="$HOME/.local/opt/node-22.23.2/bin"
 export PATH="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PGPORT=5434
@@ -21,50 +21,62 @@ MAX_INSTANCES=3
 UID_=$(id -u)
 LEASE="$BIN/qa-lease.py"
 ALLOCATED_TASK=""
+PENDING_WORKTREE=""
 
 die() { echo "qa-instance: $*" >&2; exit 1; }
 say() { echo "[qa-instance] $*"; }
 valid_task() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "task name must match [a-z0-9-], max 31 chars: $1"; }
 db_name() { echo "allrice40_qa_${1//-/_}"; }
-label() { echo "ai.bplabs.allrice-qa-$1-$2"; }
-instances() { ls -1d "$QA"/*/instance.json 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null || true; }
+instances() { ls -1d "$M1_QA"/*/instance.json 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null || true; }
 port_busy() { port_open "$1"; }
 json_get() { /usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
 
 write_instance() {  # uses the caller's allocation/build variables
-  /usr/bin/python3 - "$LEASE" "$dir/instance.json" "$task" "$ref" "$sha" "$web" "$worker" "$db" "${artifact:-}" "$1" "$owner" "$card" "$ttl" <<'PY'
+  /usr/bin/python3 - "$LEASE" "$dir/instance.json" "$task" "$ref" "$sha" "$web" "$worker" "$db" "${artifact:-}" "$1" "$owner" "$card" "$ttl" "${release:-}" <<'PY'
 import json, sys, time, runpy, os
-helper, p, task, ref, sha, web, worker, db, art, state, owner, card, ttl = sys.argv[1:]
+helper, p, task, ref, sha, web, worker, db, art, state, owner, card, ttl, release = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(helper))
 lease = runpy.run_path(helper)
 now = time.time()
 old = json.load(open(p)) if os.path.exists(p) else {}
-lease['write'](p, {'task': task, 'ref': ref, 'sha': sha, 'webPort': int(web), 'workerPort': int(worker), 'database': db,
+instance = {'task': task, 'ref': ref, 'sha': sha, 'webPort': int(web), 'workerPort': int(worker), 'database': db,
            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636,
            'nativeArtifactId': art or None, 'cloudExecution': False, 'setup': state,
            'owner': owner, 'card': card,
-           # The old allocator requires createdAt to renew, and expiresAt to reclaim.
+           # 3.x counts the slot but sees a legacy lease and never reclaims it.
            'repositoryCreatedAt': old.get('repositoryCreatedAt', lease['stamp'](now)),
-           'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)})
+           'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)}
+if 'worktree' in old:
+    instance['worktree'] = old['worktree']
+elif release:
+    directory = os.stat(release, follow_symlinks=False)
+    instance['worktree'] = {'name': os.path.basename(release), 'device': directory.st_dev, 'inode': directory.st_ino}
+lease['write'](p, instance)
 PY
 }
 
 stop_services() { # task -> 0 once both jobs are gone, their processes exited and ports closed
-  local task=$1 f="$QA/$1/instance.json" wp="" kp="" role
+  local task=$1 f=$2 wp="" kp="" role
   if [ -f "$f" ]; then wp=$(json_get "$f" webPort 2>/dev/null || true); kp=$(json_get "$f" workerPort 2>/dev/null || true); fi
-  stop_job "$(label "$task" web)" "$wp" && stop_job "$(label "$task" worker)" "$kp" || return 1
-  for role in web worker; do rm -f "$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"; done
+  stop_job "$(qa_label "$task" web)" "$wp" && stop_job "$(qa_label "$task" worker)" "$kp" || return 1
+  for role in web worker; do rm -f "$HOME/Library/LaunchAgents/$(qa_label "$task" "$role").plist"; done
 }
 
 cmd_list() {
-  /usr/bin/python3 "$LEASE" list "$QA"
-  local any=0
+  /usr/bin/python3 "$LEASE" list "$M1_QA"
+  local any=0 name task job
   printf '%-20s %-6s %-6s %-9s %-10s %-26s %s\n' TASK WEB WORKER SHA STATE DATABASE REF
-  for task in $(instances); do
+  for name in $(instances); do
     any=1
-    local f="$QA/$task/instance.json" web worker sha ref db state
+    local f="$M1_QA/$name/instance.json" web worker sha ref db state
+    if [[ "$name" == "$M1_QA_PREFIX"* ]]; then
+      task=${name#"$M1_QA_PREFIX"}; job=$(qa_label "$task" web)
+    else
+      task=$name; job="ai.bplabs.allrice-qa-$task-web"
+    fi
     web=$(json_get "$f" webPort); worker=$(json_get "$f" workerPort); sha=$(json_get "$f" sha); ref=$(json_get "$f" ref); db=$(json_get "$f" database)
     if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:$web/api/health/ready" 2>/dev/null && curl -fsS -m 3 -o /dev/null "http://127.0.0.1:$worker/health/ready" 2>/dev/null; then state=ready
-    elif launchctl print "gui/$UID_/$(label "$task" web)" >/dev/null 2>&1; then state=starting
+    elif launchctl print "gui/$UID_/$job" >/dev/null 2>&1; then state=starting
     else state=stopped; fi
     printf '%-20s %-6s %-6s %-9s %-10s %-26s %s\n' "$task" "$web" "$worker" "${sha:0:8}" "$state" "$db" "$ref"
   done
@@ -72,34 +84,37 @@ cmd_list() {
 }
 
 cmd_renew() {
-  local task=$1 ttl=6h; shift
-  qa_owned "$QA/$task/instance.json" || die "instance $task does not belong to semiok/allrice-vm"
+  local task=$1 ttl=6h f; shift
+  f="$(qa_instance_dir "$task")/instance.json"
+  qa_owned "$f" || die "instance $task does not belong to semiok/allrice-vm"
   if [ $# -gt 0 ]; then
     [ $# -eq 2 ] && [ "$1" = --ttl ] || die 'usage: qa-instance renew <task> [--ttl 6h]'
     ttl=$2
   fi
-  /usr/bin/python3 "$LEASE" renew "$QA/$task/instance.json" "$ttl"
+  /usr/bin/python3 "$LEASE" renew "$f" "$ttl"
 }
 
 # Allocation lock is held. Never block on another task lock: that task may be
 # waiting for the allocation lock itself. Recheck after acquiring its lock.
 reclaim_one() {
-  local candidate
+  local candidate task f lock
   for candidate in $(instances); do
-    qa_owned "$QA/$candidate/instance.json" || continue
-    /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || continue
+    f="$M1_QA/$candidate/instance.json"
+    qa_owned "$f" || continue
+    /usr/bin/python3 "$LEASE" reclaimable "$f" || continue
+    task=${candidate#"$M1_QA_PREFIX"}; lock=$(qa_lock_file "$task")
     if (
-      exec 9>>"$QA/.task-$candidate.lock"
+      exec 9>>"$lock"
       flock_fd 9 0 || exit 1
-      qa_owned "$QA/$candidate/instance.json" || exit 1
-      /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || exit 1
+      qa_owned "$f" || exit 1
+      /usr/bin/python3 "$LEASE" reclaimable "$f" || exit 1
       local archived
-      archived=$(/usr/bin/python3 "$LEASE" archive "$QA/$candidate/instance.json" "$HOME/allrice40-dev/qa/codex/qa-reclaimed") || exit 2
+      archived=$(/usr/bin/python3 "$LEASE" archive "$f" "$HOME/allrice40-dev/qa/codex/qa-reclaimed") || exit 2
       # A process may have appeared while logs were being archived.
-      /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || exit 1
-      say "reclaiming $candidate; archive=$archived" >&2
-      cmd_down "$candidate" >&2 || exit 2
-      rm -f -- "$QA/.task-$candidate.lock"
+      /usr/bin/python3 "$LEASE" reclaimable "$f" || exit 1
+      say "reclaiming $task; archive=$archived" >&2
+      cmd_down "$task" >&2 || exit 2
+      rm -f -- "$lock"
     ); then return 0; fi
   done
   return 1
@@ -107,21 +122,23 @@ reclaim_one() {
 
 cmd_down() {
   local task=$1; valid_task "$task"
-  qa_owned "$QA/$task/instance.json" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
-  local dir="$QA/$task" db; db=$(db_name "$task")
-  [ -d "$dir" ] || say "no instance directory for $task (cleaning leftovers anyway)"
-  stop_services "$task" || die "services of $task did not stop within 90s; database and files left in place"
+  local dir db release; dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
+  qa_owned "$dir/instance.json" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
+  release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$dir/instance.json") \
+    || die "cannot verify the reserved worktree of $task; instance left in place"
+  stop_services "$task" "$dir/instance.json" || die "services of $task did not stop within 90s; database and files left in place"
   local exists
   exists=$(psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'") || die "cannot inspect database $db; files left in place"
   if [[ "$exists" = *1* ]]; then
     dropdb -h 127.0.0.1 --force "$db" || die "cannot drop database $db; files left in place"
     say "dropped database $db"
   fi
-  if [ -d "$dir/release" ]; then
-    git -C "$REPO" worktree remove --force "$dir/release" 2>/dev/null || rm -rf -- "$dir/release"
-    git -C "$REPO" worktree prune
+  if [ -n "$release" ]; then
+    # A failed worktree add can leave the reserved directory empty and unregistered.
+    git -C "$REPO" worktree remove --force "$release" 2>/dev/null || rmdir "$release" \
+      || die "cannot remove reserved worktree $release; instance files left in place"
   fi
-  case "$dir" in "$QA"/?*) rm -rf -- "$dir" ;; esac
+  rm -rf -- "$dir" || die "cannot remove instance directory $dir"
   say "instance $task removed"
 }
 
@@ -129,19 +146,20 @@ cmd_down() {
 # free port pair 3200+2n / 3201+2n, writes instance.json (setup=building), prints "web worker".
 cmd_alloc() {
   local task=$1 ref=$2 sha=$3
-  local dir="$QA/$task" db n web worker found=0 claimed=" " t p artifact=""; db=$(db_name "$task")
-  [ ! -e "$dir/instance.json" ] || die "instance $task already exists (qa-instance down $task first)"
+  local dir db n web worker found=0 claimed=" " t p artifact="" release=""
+  dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
+  [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "instance path already exists: $dir (qa-instance down $task first)"
   if [ "$(instances | wc -l | tr -d ' ')" -ge "$MAX_INSTANCES" ]; then
     reclaim_one || true
     if [ "$(instances | wc -l | tr -d ' ')" -ge "$MAX_INSTANCES" ]; then
       echo "qa-instance: all $MAX_INSTANCES slots occupied:" >&2
-      /usr/bin/python3 "$LEASE" list "$QA" >&2
+      /usr/bin/python3 "$LEASE" list "$M1_QA" >&2
       return 75
     fi
   fi
   for t in $(instances); do
     # A concurrent `down` may have just removed this one.
-    p=$(json_get "$QA/$t/instance.json" webPort 2>/dev/null) || continue
+    p=$(json_get "$M1_QA/$t/instance.json" webPort 2>/dev/null) || continue
     claimed+="$p $((p + 1)) "
   done
   for n in $(seq 0 49); do
@@ -150,9 +168,11 @@ cmd_alloc() {
     if ! port_busy "$web" && ! port_busy "$worker"; then found=1; break; fi
   done
   [ $found = 1 ] || die "no free port pair in 3200-3299"
-  mkdir -p "$dir/.local" "$dir/logs" || return 2
-  chmod 700 "$dir" "$dir/.local" || return 2
-  write_instance building || return 2
+  mkdir -m 700 "$dir" || return 2
+  if ! mkdir -m 700 "$dir/.local" "$dir/logs" || ! write_instance building; then
+    rmdir "$dir/.local" "$dir/logs" "$dir" 2>/dev/null || true
+    return 2
+  fi
   echo "$web $worker"
 }
 
@@ -185,8 +205,8 @@ cmd_up() {
   [[ "$card" =~ ^[A-Z][A-Z0-9]*-[1-9][0-9]*$ ]] || die '--card (e.g. MET-220) is required'
   ttl=$(/usr/bin/python3 "$LEASE" ttl "$ttl") || exit 2
   local waited_since; waited_since=$(date +%s)
-  local dir="$QA/$task" db; db=$(db_name "$task")
-  [ ! -e "$dir/instance.json" ] || die "instance $task already exists (qa-instance down $task first)"
+  local dir db; dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
+  [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "instance path already exists: $dir (qa-instance down $task first)"
 
   dev_plist_pair || die "refusing a mismatched Dev configuration"
   # Other sessions may fetch at the same moment; a ref-lock collision just needs a retry.
@@ -196,16 +216,15 @@ cmd_up() {
 
   # Claim the slot and ports under a kernel lock (see lib.sh flock_fd), so sessions
   # starting instances together cannot take the same ports or exceed MAX_INSTANCES.
-  mkdir -p "$QA"
-  local web worker artifact="" ports
+  local web worker artifact="" ports release=""
   while :; do
-    exec 7>>"$QA/.alloc.lock"
+    exec 7>>"$M1_QA/.alloc.lock"
     flock_fd 7 30 || die "another qa-instance up is still allocating; try again shortly"
     if ports=$(cmd_alloc "$task" "$ref" "$sha"); then exec 7>&-; break; else rc=$?; fi
     exec 7>&-
     [ "$rc" -eq 75 ] && [ "$wait" -eq 1 ] || return "$rc"
     [ -n "${LINEAR_API_KEY:-}" ] || die 'up --wait requires LINEAR_API_KEY for owner-card reminders; do not read Dev credentials'
-    /usr/bin/python3 "$LEASE" remind "$QA" "$task" "$owner" "$card" "$waited_since" || echo 'qa-instance: reminder check failed; still waiting' >&2
+    /usr/bin/python3 "$LEASE" remind "$M1_QA" "$task" "$owner" "$card" "$waited_since" || echo 'qa-instance: reminder check failed; still waiting' >&2
     [ $((SECONDS - started)) -lt 86400 ] || die 'wait exceeded 24h; no slot allocated'
     sleep 15
   done
@@ -213,25 +232,34 @@ cmd_up() {
   ALLOCATED_TASK=$task
   say "task=$task ref=$ref sha=${sha:0:8} web=$web worker=$worker db=$db"
 
-  git -C "$REPO" worktree add -q --detach "$dir/release" "$sha"
-  [ -f "$dir/release/scripts/m1/rice-standard.json" ] || die 'ref has no Rice template; refusing the installed tools template'
+  # The build identity preparer accepts direct worktrees under this root. Record
+  # the private reservation before Git runs so down can also clean a partial up.
+  local worktrees="$HOME/allrice40-worktrees"
+  [ ! -L "$worktrees" ] || die "refusing a symlinked worktree root: $worktrees"
+  mkdir -p "$worktrees"
+  PENDING_WORKTREE=$(mktemp -d "$worktrees/.qa-$task.XXXXXXXX")
+  release=$PENDING_WORKTREE
+  write_instance building || die "cannot record the reserved worktree of $task"
+  PENDING_WORKTREE=""
+  git -C "$REPO" worktree add -q --detach "$release" "$sha"
+  [ -f "$release/scripts/m1/rice-standard.json" ] || die 'ref has no Rice template; refusing the installed tools template'
 
   say "installing and building (log: $dir/logs/build.log)"
-  ( cd "$dir/release" && pnpm install --frozen-lockfile && \
+  ( cd "$release" && pnpm install --frozen-lockfile && \
     pnpm -r --workspace-concurrency=1 --filter '@allrice/worker...' --filter '@allrice/web...' --if-present run build ) \
     > "$dir/logs/build.log" 2>&1 || die "build failed, see $dir/logs/build.log"
-  artifact=$(cd "$dir/release" && node apps/worker/scripts/prepare-native-artifact.mjs --root="$PWD" 2>>"$dir/logs/build.log" | tail -1 | /usr/bin/python3 -c 'import json,sys;print(json.load(sys.stdin)["artifactId"])') \
+  artifact=$(cd "$release" && node apps/worker/scripts/prepare-native-artifact.mjs --root="$PWD" 2>>"$dir/logs/build.log" | tail -1 | /usr/bin/python3 -c 'import json,sys;print(json.load(sys.stdin)["artifactId"])') \
     || die "native artifact preparation failed, see $dir/logs/build.log"
   say "native artifact ${artifact:7:12}…"
-  ( cd "$dir/release" && node scripts/dev-release/prepare-identity.mjs --root="$dir/release" --release-sha="$sha" ) \
+  ( cd "$release" && node scripts/dev-release/prepare-identity.mjs --root="$release" --release-sha="$sha" ) \
     >> "$dir/logs/build.log" 2>&1 || die "build identity preparation failed, see $dir/logs/build.log"
 
-  /usr/bin/python3 - "$task" "$dir" "$db" "$web" "$worker" "$sha" "$artifact" "$(dev_plist web)" "$(dev_plist worker)" <<'PY'
+  /usr/bin/python3 - "$task" "$dir" "$release" "$db" "$web" "$worker" "$sha" "$artifact" "$(dev_plist web)" "$(dev_plist worker)" "$(qa_label "$task" web)" "$(qa_label "$task" worker)" <<'PY'
 import json, os, plistlib, re, shlex, sys, uuid
-task, d, db, web, worker, sha, art, web_src, worker_src = sys.argv[1:]
+task, d, rel, db, web, worker, sha, art, web_src, worker_src, web_label, worker_label = sys.argv[1:]
 def retired_setting(key):
     return key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_'))
-home = os.path.expanduser('~'); rel = f'{d}/release'; L = f'{d}/.local'
+home = os.path.expanduser('~'); L = f'{d}/.local'
 for sub in ('storage', 'executions', 'dsh-runtime', 'native-once-control', 'native-recurring-control', 'project-preview'):
     os.makedirs(f'{L}/{sub}', mode=0o700, exist_ok=True); os.chmod(f'{L}/{sub}', 0o700)
 dburl = f'postgres://{os.environ.get("USER","snow")}@127.0.0.1:5434/{db}'
@@ -268,7 +296,7 @@ common = {
     # Version identity is sealed above; QA still cannot run Dev maintenance.
     'ALLRICE_DEV_MAINTENANCE_ENABLED': '0',
 }
-for role, source in (('web', web_src), ('worker', worker_src)):
+for role, source, label in (('web', web_src, web_label), ('worker', worker_src, worker_label)):
     src = plistlib.load(open(source, 'rb'))
     env = dict(src['EnvironmentVariables']); env.pop('ALLRICE_LOCAL_PORTAL', None)
     for key in list(env):
@@ -279,21 +307,20 @@ for role, source in (('web', web_src), ('worker', worker_src)):
     args = src['ProgramArguments']
     node = args[2] if os.path.basename(args[0]) == 'with-env' else args[0]
     script = f'{rel}/apps/web/server.mjs' if role == 'web' else f'{rel}/apps/worker/dist/index.js'
-    label = f'ai.bplabs.allrice-qa-{task}-{role}'
     plist = {'Label': label, 'ProgramArguments': [node, f'--env-file={d}/.env', script] + (['--hostname', '127.0.0.1', '--port', web] if role == 'web' else []),
              'EnvironmentVariables': env, 'KeepAlive': True, 'RunAtLoad': False, 'ExitTimeOut': 60,
              'WorkingDirectory': f'{rel}/apps/web' if role == 'web' else rel,
              'StandardOutPath': f'{d}/logs/{role}.log', 'StandardErrorPath': f'{d}/logs/{role}.err.log'}
     plistlib.dump(plist, open(f'{d}/{role}.plist', 'wb')); os.chmod(f'{d}/{role}.plist', 0o600)
 PY
-  service_plist_config "$dir/web.plist" "$(label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" "worker-port=$worker" || die 'invalid QA Web configuration'
-  service_plist_config "$dir/worker.plist" "$(label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
+  service_plist_config "$dir/web.plist" "$(qa_label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" "worker-port=$worker" || die 'invalid QA Web configuration'
+  service_plist_config "$dir/worker.plist" "$(qa_label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
 
   psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
   createdb -h 127.0.0.1 "$db"
 
   say "preparing database"
-  ( cd "$dir/release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
+  ( cd "$release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
     > "$dir/logs/db-prepare.log" 2>&1 || die "db:prepare failed, see $dir/logs/db-prepare.log"
   # Same Codex subscription slot as the shared Dev (one row may be enabled at a time).
   local slot; slot=$(psql -h 127.0.0.1 -d allrice40_dev -Atc "select slot from allrice_codex_subscriptions where enabled limit 1")
@@ -301,10 +328,10 @@ PY
 
   say "starting services"
   for role in worker web; do
-    local launch_plist="$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"
+    local launch_plist="$HOME/Library/LaunchAgents/$(qa_label "$task" "$role").plist"
     cp -p "$dir/$role.plist" "$launch_plist"
     launchctl bootstrap "gui/$UID_" "$launch_plist"
-    launchctl kickstart "gui/$UID_/$(label "$task" "$role")"
+    launchctl kickstart "gui/$UID_/$(qa_label "$task" "$role")"
   done
   local ok=0
   for _ in $(seq 1 60); do
@@ -317,7 +344,7 @@ PY
   write_instance started
   local drop
   drop=$(psql -h 127.0.0.1 -d "$db" -Atc "select string_agg(id::text, ',') from allrice_platform_dsh_skills where required_tool_refs ?| array['cloud.process.execute','cloud.mcp.call','python.execute','workspace.reconciliation.export']")
-  node "$BIN/qa-bootstrap.mjs" --rice "$dir/release/scripts/m1/rice-standard.json" --port "$web" --company "QA-$task" --username "qa-$task" --creds "$dir/creds.json" --no-cloud --drop-skills "$drop" > "$dir/logs/bootstrap.log" 2>&1 \
+  node "$BIN/qa-bootstrap.mjs" --rice "$release/scripts/m1/rice-standard.json" --port "$web" --company "QA-$task" --username "qa-$task" --creds "$dir/creds.json" --no-cloud --drop-skills "$drop" > "$dir/logs/bootstrap.log" 2>&1 \
     || die "tenant bootstrap failed, see $dir/logs/bootstrap.log"
 
   write_instance ready
@@ -328,12 +355,13 @@ PY
 cleanup_task_lock() {
   local rc=$?
   trap - EXIT
+  [ -z "$PENDING_WORKTREE" ] || rmdir "$PENDING_WORKTREE" 2>/dev/null || true
   if [ "$rc" -ne 0 ] && [ -n "$ALLOCATED_TASK" ]; then
     echo "qa-instance: up $ALLOCATED_TASK failed; slot retained. Clean up: qa-instance down $ALLOCATED_TASK" >&2
   fi
   # All new callers open/try task locks under .alloc.lock, so none can retain an
   # old inode while we unlink. Keep the shared allocation lock permanently.
-  qa_task_unlock "$QA/.task-$LOCKED_TASK.lock"
+  qa_task_unlock "$TASK_LOCK"
   exit "$rc"
 }
 
@@ -342,9 +370,11 @@ case "${1:-}" in
     op=$1; shift
     [ $# -ge 1 ] || die 'usage: qa-instance up|down|renew <task> (up requires --owner and --card)'
     [ "$op" != down ] || [ $# -eq 1 ] || die "usage: qa-instance down <task>"
-    valid_task "$1"; mkdir -p "$QA"
-    qa_task_lock "$QA/.task-$1.lock" || die "another allocation or operation of $1 is running"
-    LOCKED_TASK=$1
+    valid_task "$1"
+    [ ! -L "$M1_QA" ] || die "refusing a symlinked QA root: $M1_QA"
+    mkdir -p "$M1_QA"
+    TASK_LOCK=$(qa_lock_file "$1")
+    qa_task_lock "$TASK_LOCK" || die "another allocation or operation of $1 is running"
     trap cleanup_task_lock EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP

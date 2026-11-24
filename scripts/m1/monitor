@@ -28,6 +28,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -2759,6 +2760,14 @@ PEER_CHECKS = [
 # ---------- launchd ----------
 
 
+def checkpoint_timestamp(value):
+    # Both the round and the daily report subtract this from a float clock.
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def launchd(cfg, action, peer):
     if action == 'install':
         path = os.path.join(cfg['stateDir'], 'state.json')
@@ -2780,6 +2789,13 @@ def launchd(cfg, action, peer):
                 raise CheckError('monitor state has an invalid alert')
             if state.get('lastRound') is not None and not isinstance(state['lastRound'], dict):
                 raise CheckError('monitor state has an invalid lastRound')
+            for index, entry in enumerate(state.get('history', [])):
+                if (not isinstance(entry, dict) or not checkpoint_timestamp(entry.get('at'))
+                        or entry.get('event') not in ('opened', 'recovered')):
+                    raise CheckError('monitor state has an invalid history[%d]' % index)
+            for index, at in enumerate(state.get('rounds', [])):
+                if not checkpoint_timestamp(at):
+                    raise CheckError('monitor state has an invalid rounds[%d]' % index)
         except (OSError, ValueError, CheckError) as err:
             sys.exit('monitor: cannot use checkpoint %s: %s' % (path, err))
         os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
