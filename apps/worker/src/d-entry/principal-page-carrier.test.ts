@@ -57,6 +57,12 @@ function observeProfileRequest(
   return ready.promise;
 }
 
+function rejectBeforeSharedWait(response: Response): never {
+  throw Error(
+    `Profile returned HTTP ${response.status} before the shared proof wait`,
+  );
+}
+
 // These loopback responses use either a fixed body length or Node's chunked
 // encoding. The TCP packets can split any of those framing boundaries.
 function observeProfileWire(source: Readable) {
@@ -779,7 +785,6 @@ it(
     const release = await buildProfileFixture();
     const shared = deferred<AbortSignal>();
     const finish = deferred();
-    closes.push(async () => finish.resolve());
     let reads = 0;
     release.beforeGraphRead = async (signal) => {
       if (++reads !== 1) return;
@@ -787,6 +792,8 @@ it(
       await finish.promise;
     };
     const f = await fixture(release);
+    // Unblock the real proof before the fixture's reverse-order close joins it.
+    closes.push(async () => finish.resolve());
     const page = await open(f);
     const bothSubscribed = deferred();
     const wait = PendingPublication.prototype.wait;
@@ -817,7 +824,11 @@ it(
     const other = f.publish('bootstrap', page.scopeId, {}, 'document');
     void other.catch(() => {});
     try {
-      await bothSubscribed.promise;
+      await Promise.race([
+        bothSubscribed.promise,
+        first.then(rejectBeforeSharedWait),
+        other.then(rejectBeforeSharedWait),
+      ]);
       expect(f.profileBorrows.mock.calls).toHaveLength(2);
       const [one, two] = f.profileBorrows.mock.calls.map(([signal]) => signal);
       expect(getEventListeners(one!, 'abort')).toHaveLength(1);
@@ -827,12 +838,14 @@ it(
       const [firstWaiter, secondWaiter] = [...proof['waiters']];
       expect(firstWaiter).toBeTypeOf('function');
       expect(secondWaiter).toBeTypeOf('function');
+      const firstAbortedInWorker = once(one!, 'abort');
       cancel.abort(Error('the first wire left'));
       await expect(first).rejects.toThrow('the first wire left');
-      await firstDone.promise;
+      await firstAbortedInWorker;
       expect(getEventListeners(one!, 'abort')).toHaveLength(0);
       expect(getEventListeners(two!, 'abort')).toHaveLength(1);
       expect([...proof['waiters']]).toEqual([secondWaiter]);
+      await firstDone.promise;
       expect(sharedSignal.aborted).toBe(false);
       expect(reads).toBe(1);
     } finally {
@@ -1304,7 +1317,6 @@ it(
 
     const firstProof = deferred<AbortSignal>();
     const finishFirstProof = deferred();
-    closes.push(async () => finishFirstProof.resolve());
     const sharedProof: ProfileProof = {
       directory,
       graph,
@@ -1316,6 +1328,7 @@ it(
       },
     };
     const shared = await fixture(sharedProof);
+    closes.push(async () => finishFirstProof.resolve());
     const sharedPage = await open(shared);
     const caller = new AbortController();
     const firstResponseOnWire = observeProfileRequest(
@@ -1329,6 +1342,7 @@ it(
       'document',
       caller.signal,
     );
+    void canceledRequest.catch(() => {});
     const firstHandler = shared.profileCompletion(await firstResponseOnWire);
     const sharedSignal = await firstProof.promise;
     const secondBorrow = deferred();
@@ -1341,13 +1355,22 @@ it(
       {},
       'document',
     );
-    await secondBorrow.promise;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    caller.abort();
-    await expect(canceledRequest).rejects.toMatchObject({ name: 'AbortError' });
-    await firstHandler.promise;
-    expect(sharedSignal.aborted).toBe(false);
-    finishFirstProof.resolve();
+    try {
+      await Promise.race([
+        secondBorrow.promise,
+        canceledRequest.then(rejectBeforeSharedWait),
+        secondRequest.then(rejectBeforeSharedWait),
+      ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      caller.abort();
+      await expect(canceledRequest).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+      await firstHandler.promise;
+      expect(sharedSignal.aborted).toBe(false);
+    } finally {
+      finishFirstProof.resolve();
+    }
     const responseWithSharedProof = await secondRequest;
     expect(responseWithSharedProof.status).toBe(200);
     await responseWithSharedProof.json();
