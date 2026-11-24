@@ -138,10 +138,15 @@ describe('real official generator and same-release artifact closure', () => {
           .sort();
         expect(contractSources).toContain('index.ts');
         expect(contractSources).toContain('d-entry.ts');
-        for (const name of contractSources)
-          expect(
-            await readFile(join(scratch, 'packages/contracts/src', name)),
-          ).toEqual(await readFile(join(contracts, 'src', name)));
+        await Promise.all(
+          contractSources.map(async (name) => {
+            const [staged, original] = await Promise.all([
+              readFile(join(scratch, 'packages/contracts/src', name)),
+              readFile(join(contracts, 'src', name)),
+            ]);
+            expect(staged.equals(original), name).toBe(true);
+          }),
+        );
         const analysis = new WorkspaceAnalyzer(options).analyze();
         const face = analysis.faces.find((value) => value.face === 'host');
         if (!face) throw Error('actual Host model missing');

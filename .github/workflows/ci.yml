@@ -244,6 +244,8 @@ jobs:
           BASE: ${{ steps.audit-base.outputs.base }}
         run: node --import tsx scripts/dsh-convergence-gate.ts --base "$BASE"
       - name: Unit-test the M1 monitor (standard-library Python, no services)
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
         run: python3 -m unittest discover -s scripts/m1 -p 'test_*.py'
       # Native child processes and fsync journals need bounded contention.
       - name: Capture versioned deterministic regression source

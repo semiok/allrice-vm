@@ -39,8 +39,9 @@ export function installEmployeeProductOwner(ctx: Context) {
     __ALLRICE_D_ENTRY_LIFETIME__?: AbortSignal;
   };
   const signal = scope.__ALLRICE_D_ENTRY_LIFETIME__;
+  if (!signal) return;
   const data = document.getElementById('app')?.dataset;
-  if (!signal || !data) return;
+  if (!data) return;
   const { scopeId, selection, viewerId, organizationId, nativeSessionId } =
     readEmployeeDocument(data);
   if (!nativeSessionId || !selection.threadId)

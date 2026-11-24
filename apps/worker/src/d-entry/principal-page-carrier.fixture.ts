@@ -62,6 +62,8 @@ export async function buildProfileFixture(): Promise<ProfileProof> {
   const raw = JSON.parse(
     await readFile(join(directory, 'artifact.json'), 'utf8'),
   );
+  if (raw.source?.dirty !== false)
+    throw Error('Profile fixture requires a clean release source checkout');
   return {
     directory,
     graph: DEntryProfileGraphSchema.parse(raw.profile.graph),
