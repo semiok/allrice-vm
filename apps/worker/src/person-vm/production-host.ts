@@ -22,6 +22,10 @@ import {
 } from '@allrice/person-vm';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
+  readReleasedGuestProfile,
+  readWorkerEmployeeWebSeal,
+} from '../d-entry/released-profile.js';
+import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from '../native-web/composition.js';
@@ -312,9 +316,22 @@ export function createProductionPersonVmHost(input: {
         egress,
         ...providers.configuration.lifecycle,
       });
+      const { native, web } = providers.configuration;
       startup = createAssignedNativeWebStartup({
         vm,
         memoryGuestPlan: providers.memoryGuestPlan,
+        async readEmployeeProfile(active) {
+          if (
+            !web.cliPath.startsWith(
+              native.readonlyDshDirectory.guestDirectory + '/',
+            )
+          )
+            throw new PersonVmError('PROVIDER_FAILED');
+          return readReleasedGuestProfile(
+            await readWorkerEmployeeWebSeal(active),
+            active,
+          );
+        },
         configuration: {
           ...providers.configuration.web,
           publicUrl: sources.publicUrl,

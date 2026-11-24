@@ -80,6 +80,9 @@ function fixture() {
   const service = createAssignedNativeWebStartup({
     vm: { assertCurrentBinding: vi.fn() },
     memoryGuestPlan,
+    readEmployeeProfile: async () => [
+      { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+    ],
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
     configuration: {
@@ -151,7 +154,7 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   );
   expect(plan.initialize).toBe(f.memory.initialize);
   expect(plan.launcher).toBe(f.memory.launcher);
-  expect(plan.files).toHaveLength(1 + 3 * f.web.receipt.endpoints.length);
+  expect(plan.files).toHaveLength(1 + 4 * f.web.receipt.endpoints.length);
   await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
   expect(f.memoryGuestPlan).toHaveBeenCalledTimes(1);
   expect(open).toHaveBeenCalledTimes(2);
@@ -166,6 +169,15 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     expect(input.launch.command.env).toEqual({
       DSH_HOME: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh`,
       DSH_AGENTS_HOME: `/work/.allrice/employees/${endpoint.employeeInstanceId}/agents`,
+    });
+    expect(input.launch.command.args.slice(1, 3)).toEqual([
+      '--profile',
+      'allrice-web',
+    ]);
+    expect(plan.files).toContainEqual({
+      path: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh/profiles/allrice-web/package.json`,
+      contents: '{"name":"fixture-profile"}',
+      mode: 0o600,
     });
     const patch = input.launch.files.find((file: { path: string }) =>
       file.path.endsWith('/owner.patch.json'),

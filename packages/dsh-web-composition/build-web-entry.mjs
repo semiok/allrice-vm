@@ -283,6 +283,19 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     files.push({ path: output, bytes: bytes.length, sha256: sha256(bytes) });
   }
   await emit('allrice/client.js', compiled);
+  for (const pathname of [
+    'profiles/allrice-web/package.json',
+    'package.json',
+    'cordis.patch.yml',
+    'index.mjs',
+    'host/settings-models.mjs',
+    'host/settings-account.mjs',
+    'host/plugin-manager.mjs',
+  ])
+    await emit(
+      'guest/' + pathname,
+      await readFile(join(packageRoot, pathname)),
+    );
   for (const file of native.files)
     await emit(file.output, await readFile(file.path));
   const managedDirectory = join(outputDirectory, 'managed');
@@ -401,6 +414,32 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     JSON.stringify(manifest, null, 2) + '\n',
   );
   return manifest;
+}
+
+/** The Worker release seal inventories real files under dist. A sealed
+ * release directory must never be overwritten after it is available. */
+export async function prepareEmployeeWebServiceArtifact(directory, head) {
+  try {
+    const existing = JSON.parse(
+      await readFile(join(directory, 'artifact.json'), 'utf8'),
+    );
+    if (existing.source?.head !== head || existing.source.dirty)
+      throw Error('Employee Web artifact belongs to another source');
+    return existing;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const stage = await mkdtemp(join(dirname(directory), '.employee-web-'));
+  try {
+    const built = join(stage, 'contents');
+    const manifest = await buildEmployeeWebArtifact(built);
+    if (manifest.source.head !== head || manifest.source.dirty)
+      throw Error('Employee Web artifact requires the fixed service source');
+    await rename(built, directory);
+    return manifest;
+  } finally {
+    await rm(stage, { recursive: true, force: true });
+  }
 }
 
 /** The default destination is an atomic reference to a complete immutable

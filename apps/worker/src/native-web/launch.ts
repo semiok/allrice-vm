@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DEntryIdentity } from '@allrice/contracts';
 import { readDEntryPrincipalHostArtifact } from '../d-entry/principal-artifact.js';
+import type { readReleasedGuestProfile } from '../d-entry/released-profile.js';
 import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { posix } from 'node:path';
@@ -39,10 +40,14 @@ export type NativeWebLaunch = Readonly<{
   files: PersonVmMemoryGuestPlan['files'];
   command: PersonVmGuestCommand;
 }>;
+export type NativeWebGuestProfile = Awaited<
+  ReturnType<typeof readReleasedGuestProfile>
+>;
 
 export async function prepareNativeWebLaunch(
   config: NativeWebConfiguration,
   binding: PersonVmBinding,
+  profile: NativeWebGuestProfile,
 ): Promise<NativeWebLaunch> {
   let origin: URL, publicUrl: URL;
   try {
@@ -78,6 +83,17 @@ export async function prepareNativeWebLaunch(
   )
     throw new PersonVmError('PROVIDER_FAILED');
   const directory = `${config.dshHome}/native-web`;
+  const profileDirectory = `${config.dshHome}/profiles/allrice-web`;
+  if (
+    !profile.some(({ path }) => path === 'package.json') ||
+    profile.some(
+      ({ path }) =>
+        posix.isAbsolute(path) ||
+        posix.normalize(path) !== path ||
+        /(?:^|\/)\.\.(?:\/|$)|\0/.test(path),
+    )
+  )
+    throw new PersonVmError('PROVIDER_FAILED');
   const principalPlugin = `${directory}/current-principal.mjs`;
   const principalSource = await readDEntryPrincipalHostArtifact();
   const plugin = `${directory}/owner.mjs`,
@@ -130,13 +146,18 @@ export async function prepareNativeWebLaunch(
         ]),
         mode: 0o600,
       },
+      ...profile.map(({ path, contents }) => ({
+        path: `${profileDirectory}/${path}`,
+        contents,
+        mode: 0o600,
+      })),
     ]),
     command: Object.freeze({
       executable: 'node',
       args: Object.freeze([
         config.cliPath,
         '--profile',
-        'web',
+        'allrice-web',
         '--patch',
         patch,
         '--no-open',

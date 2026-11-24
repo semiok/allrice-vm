@@ -9,7 +9,11 @@ import {
   DEntryProfileGraphSchema,
   DEntryProfileInjectionSchema,
 } from '@allrice/contracts';
-import { DataAccessError } from '@allrice/database';
+import {
+  DataAccessError,
+  readServiceBuildIdentity,
+  ServiceBuildManifestSchema,
+} from '@allrice/database';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
 /** Trusted same-Host reader. Its implementation must read the actual current
@@ -25,6 +29,49 @@ export interface DEntryFixedProfileSource {
 }
 const hash = (value: Buffer) =>
   createHash('sha256').update(value).digest('hex');
+const workerReleasePath = 'apps/worker/dist/d-entry-web';
+export type EmployeeWebReleaseSeal = Readonly<{
+  directory: string;
+  manifestSha256: string;
+}>;
+
+/** Only the actual production Worker installation can select this artifact. */
+export async function readWorkerEmployeeWebSeal(signal: AbortSignal) {
+  signal.throwIfAborted();
+  const identity = await readServiceBuildIdentity('worker');
+  const entrypoint = process.argv[1];
+  if (identity?.mode !== 'production' || !entrypoint)
+    throw new DEntryNativeUnavailable();
+  const installed = await realpath(entrypoint);
+  const suffix = '/apps/worker/dist/index.js';
+  if (!installed.endsWith(suffix)) throw new DEntryNativeUnavailable();
+  const root = installed.slice(0, -suffix.length);
+  const releaseManifest = ServiceBuildManifestSchema.parse(
+    JSON.parse(
+      await readFile(join(root, '.local/dev-build-identity.json'), {
+        encoding: 'utf8',
+        signal,
+      }),
+    ),
+  );
+  const { manifestDigest, ...body } = releaseManifest;
+  if (
+    manifestDigest !== identity.manifestDigest ||
+    'sha256:' + hash(Buffer.from(JSON.stringify(body))) !== manifestDigest
+  )
+    throw new DEntryNativeUnavailable();
+  const artifact = releaseManifest.files.find(
+    (file) =>
+      file.scope === 'worker' &&
+      file.path === workerReleasePath + '/artifact.json',
+  );
+  if (!artifact) throw new DEntryNativeUnavailable();
+  signal.throwIfAborted();
+  return Object.freeze({
+    directory: join(root, workerReleasePath),
+    manifestSha256: artifact.checksum.slice('sha256:'.length),
+  }) satisfies EmployeeWebReleaseSeal;
+}
 const bytesEntry = z.object({
   path: DEntryProfileFilePathSchema,
   bytes: z.number().int().min(1),
@@ -124,18 +171,97 @@ function replaceMapTrailer(data: Buffer, before: string, after: string) {
   ]);
 }
 
-export async function holdReleasedProfile(
+async function readManifest(
   directory: string,
-  source: DEntryFixedProfileSource,
-  signal: AbortSignal,
+  active: AbortSignal,
+  manifestSha256?: string,
 ) {
-  const active = AbortSignal.any([signal, source.revoked]);
   active.throwIfAborted();
   const frozenRoot = await realpath(directory);
   const raw = await readFile(join(frozenRoot, 'artifact.json'), {
     signal: active,
   });
-  const manifest = manifestSchema.parse(JSON.parse(raw.toString('utf8')));
+  if (manifestSha256 && hash(raw) !== manifestSha256)
+    throw new DEntryNativeUnavailable();
+  return {
+    frozenRoot,
+    raw,
+    manifest: manifestSchema.parse(JSON.parse(raw.toString('utf8'))),
+  };
+}
+
+const guestFiles = [
+  ['guest/profiles/allrice-web/package.json', 'package.json'],
+  [
+    'guest/package.json',
+    'node_modules/@allrice/dsh-web-composition/package.json',
+  ],
+  [
+    'guest/cordis.patch.yml',
+    'node_modules/@allrice/dsh-web-composition/cordis.patch.yml',
+  ],
+  ['guest/index.mjs', 'node_modules/@allrice/dsh-web-composition/index.mjs'],
+  [
+    'guest/host/settings-models.mjs',
+    'node_modules/@allrice/dsh-web-composition/host/settings-models.mjs',
+  ],
+  [
+    'guest/host/settings-account.mjs',
+    'node_modules/@allrice/dsh-web-composition/host/settings-account.mjs',
+  ],
+  [
+    'guest/host/plugin-manager.mjs',
+    'node_modules/@allrice/dsh-web-composition/host/plugin-manager.mjs',
+  ],
+  [
+    'allrice/client.js',
+    'node_modules/@allrice/dsh-web-composition/dist/client.js',
+  ],
+] as const;
+
+/** Material for the exact employee profile under the existing guest bootstrap.
+ * In-box bundles continue to resolve from the sealed rc.2 CLI installation. */
+export async function readReleasedGuestProfile(
+  seal: EmployeeWebReleaseSeal,
+  signal: AbortSignal,
+) {
+  const { frozenRoot, manifest } = await readManifest(
+    seal.directory,
+    signal,
+    seal.manifestSha256,
+  );
+  const inventory = verified(manifest.files, (entry) => entry.path);
+  const staged = [];
+  for (const [path, destination] of guestFiles) {
+    const proof = inventory.get(path);
+    const absolute = join(frozenRoot, path);
+    if (!proof || (await realpath(absolute)) !== absolute)
+      throw new DEntryNativeUnavailable();
+    const bytes = await readFile(absolute, { signal });
+    if (bytes.length !== proof.bytes || hash(bytes) !== proof.sha256)
+      throw new DEntryNativeUnavailable();
+    const contents = new TextDecoder('utf-8', {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(bytes);
+    staged.push(Object.freeze({ path: destination, contents }));
+  }
+  signal.throwIfAborted();
+  return Object.freeze(staged);
+}
+
+export async function holdReleasedProfile(
+  directory: string,
+  source: DEntryFixedProfileSource,
+  signal: AbortSignal,
+  manifestSha256?: string,
+) {
+  const active = AbortSignal.any([signal, source.revoked]);
+  const { frozenRoot, raw, manifest } = await readManifest(
+    directory,
+    active,
+    manifestSha256,
+  );
   const { graph: sealedGraph, bootInjections } = manifest.profile;
   const graph = DEntryProfileGraphSchema.parse(
     await source.readImmutableGraph(active),

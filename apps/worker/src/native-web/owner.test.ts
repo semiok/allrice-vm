@@ -59,7 +59,10 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
       employeeVersionId: randomUUID(),
     },
   };
-  const a = await prepareNativeWebLaunch(config, binding),
+  const profile = [
+    { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+  ];
+  const a = await prepareNativeWebLaunch(config, binding, profile),
     b = await prepareNativeWebLaunch(
       {
         ...config,
@@ -71,8 +74,9 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
         },
       },
       binding,
+      profile,
     );
-  expect(a.command.args).toContain('--profile');
+  expect(a.command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
   expect(a.command.args).toContain('--no-open');
   expect(a.command.args.indexOf('--patch')).toBeLessThan(
     a.command.args.indexOf('--no-open'),
@@ -145,7 +149,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   expect(JSON.stringify(a)).not.toContain('?token=');
   for (const guestAddress of ['0.0.0.0', '::', 'guest.example.test'])
     await expect(
-      prepareNativeWebLaunch({ ...config, guestAddress }, binding),
+      prepareNativeWebLaunch({ ...config, guestAddress }, binding, profile),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
 

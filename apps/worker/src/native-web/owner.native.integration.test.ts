@@ -1,7 +1,15 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
@@ -13,6 +21,10 @@ import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
+import {
+  holdReleasedProfile,
+  readReleasedGuestProfile,
+} from '../d-entry/released-profile.js';
 import {
   PersonVmError,
   nativeWebAuthArtifact,
@@ -60,14 +72,16 @@ async function setup(
     scope: PersonVmBootstrapScope,
     lifetime: AbortController,
   ) => void,
+  installedCli = cli,
 ) {
+  if (!installedCli) throw Error('The exact rc.2 CLI is required');
   expect(
     createHash('sha256')
-      .update(await readFile(cli!))
+      .update(await readFile(installedCli))
       .digest('hex'),
   ).toBe('80112efe368efb1a39720c7ada0af00442e5131fb2744edaaff8a3e8bb499e6f');
   const pkg = JSON.parse(
-    await readFile(resolve(dirname(cli!), '../package.json'), 'utf8'),
+    await readFile(resolve(dirname(installedCli), '../package.json'), 'utf8'),
   );
   expect(pkg).toMatchObject({
     name: '@deepseek-ai/dsh',
@@ -75,6 +89,26 @@ async function setup(
   });
   const root = await mkdtemp('/tmp/ar-native-web-');
   roots.push(root);
+  const release = join(root, 'sealed-worker-profile');
+  const producer = await import(
+    new URL(
+      '../../../../packages/dsh-web-composition/build-web-entry.mjs',
+      import.meta.url,
+    ).href
+  );
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+    encoding: 'utf8',
+  }).trim();
+  await producer.prepareEmployeeWebServiceArtifact(release, head);
+  const artifact = await readFile(join(release, 'artifact.json'));
+  const seal = Object.freeze({
+    directory: release,
+    manifestSha256: createHash('sha256').update(artifact).digest('hex'),
+  });
+  const releaseSignal = new AbortController().signal;
+  const profile = await readReleasedGuestProfile(seal, releaseSignal);
+  const dshHome = join(root, 'dsh');
+  await expect(access(dshHome)).rejects.toMatchObject({ code: 'ENOENT' });
   const server = createServer();
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -100,14 +134,15 @@ async function setup(
       publicUrl: `http://127.0.0.1:${port}/`,
       guestAddress: '127.0.0.1',
       guestPort: port,
-      dshHome: join(root, 'dsh'),
+      dshHome,
       agentsHome: join(root, 'agents'),
       workdir: root,
-      cliPath: cli!,
+      cliPath: installedCli,
       startupTimeoutMs: 10000,
       principalProfile,
     },
     binding,
+    profile,
   );
   for (const file of launch.files) {
     await mkdir(dirname(file.path), { recursive: true });
@@ -218,6 +253,8 @@ async function setup(
   });
   return {
     owner,
+    seal,
+    launch,
     expectCloseFailure(error: unknown) {
       expectedCloseFailure = error;
     },
@@ -233,6 +270,68 @@ async function setup(
     kills: () => kills,
   };
 }
+
+it(
+  'boots the Worker-sealed AllRice web profile in an initially absent employee DSH_HOME',
+  {
+    timeout: 30_000,
+  },
+  async () => {
+    const install = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const installed = dirname(install.resolve('@deepseek-ai/dsh/package.json'));
+    const f = await setup(undefined, join(installed, 'lib/bin.js'));
+    const active = new AbortController().signal;
+    expect(f.launch.command.args.slice(1, 3)).toEqual([
+      '--profile',
+      'allrice-web',
+    ]);
+    expect(f.owner.controlReady()).toBe(true);
+    const proof = await holdReleasedProfile(
+      f.seal.directory,
+      {
+        revoked: f.owner.revoked,
+        readImmutableGraph: (signal) =>
+          f.owner.readImmutableGraphFor(f.context, signal),
+        readImmutableBundle: (reference, bytes, signal) =>
+          f.owner.readImmutableBundleFor(f.context, reference, bytes, signal),
+      },
+      active,
+      f.seal.manifestSha256,
+    );
+    expect(
+      proof.graph.entries.some(
+        ({ id }) => id === '@allrice/dsh-web-composition',
+      ),
+    ).toBe(true);
+    expect(
+      proof.graph.entries.some(
+        ({ id }) => id === '@deepseek-ai/dsh-client-hmr',
+      ),
+    ).toBe(false);
+    const guestManifest = f.launch.files.find(({ path }) =>
+      path.endsWith('/profiles/allrice-web/package.json'),
+    );
+    expect(JSON.parse(guestManifest!.contents).dsh.profile.bundles).toEqual([
+      '@deepseek-ai/dsh-base',
+      '@deepseek-ai/dsh-web-app',
+      '@allrice/dsh-web-composition',
+    ]);
+    await writeFile(
+      join(f.seal.directory, 'guest/cordis.patch.yml'),
+      '#tampered\n',
+    );
+    await expect(readReleasedGuestProfile(f.seal, active)).rejects.toThrow(
+      'D entry native owner is not bound',
+    );
+    await f.owner.close();
+    expect(f.kills()).toBe(1);
+  },
+);
 
 it.skipIf(!cli)(
   '真实rc.2产物交换API Cookie→认证list/control baseline；scope结束不杀长期job，close实际join',

@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { fileURLToPath } from 'node:url';
 import {
   DEntryPageBorrowSchema,
   DEntryProfileAddressSchema,
@@ -17,14 +16,10 @@ import type {
   createDEntryPageRequests,
   DEntryPageHandle,
 } from './principal-requests.js';
-import { holdReleasedProfile } from './released-profile.js';
-
-const directory = fileURLToPath(
-  new URL(
-    '../../../../packages/dsh-web-composition/dist/web-entry',
-    import.meta.url,
-  ),
-);
+import {
+  holdReleasedProfile,
+  readWorkerEmployeeWebSeal,
+} from './released-profile.js';
 const bootstrapQuery = DEntryPageBorrowSchema.extend({
   organizationId: UuidSchema,
 });
@@ -48,7 +43,7 @@ type Publication = {
 export function createDEntryProfile(
   pages: ReturnType<typeof createDEntryPageRequests>,
   serviceSignal: AbortSignal,
-  trustedReleaseDirectory = directory,
+  trustedReleaseDirectory?: string,
 ) {
   const publications = new WeakMap<DEntryPageHandle, Promise<Publication>>();
   const connections = new WeakMap<IncomingMessage['socket'], AbortSignal>();
@@ -92,9 +87,17 @@ export function createDEntryProfile(
       // The first finite preflight can finish before bootstrap/assets requests.
       // This verified release stays bound to the current page/source lifetime.
       held = page
-        .use(serviceLifetime, (active) =>
-          holdReleasedProfile(trustedReleaseDirectory, source, active),
-        )
+        .use(serviceLifetime, async (active) => {
+          if (trustedReleaseDirectory)
+            return holdReleasedProfile(trustedReleaseDirectory, source, active);
+          const seal = await readWorkerEmployeeWebSeal(active);
+          return holdReleasedProfile(
+            seal.directory,
+            source,
+            active,
+            seal.manifestSha256,
+          );
+        })
         .then((release) => ({
           release,
           bootstrap: 'available',
