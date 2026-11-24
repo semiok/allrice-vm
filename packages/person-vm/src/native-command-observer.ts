@@ -191,9 +191,18 @@ function prepareDshCommandMemoryReceipt(roots, executionRef) {
     if (currentBoot(cfg.procRoot) !== boot || now.device !== commands.device || now.inode !== commands.inode || !canonical(cfg.receiptDirectory) || !stateNow.isDirectory() || stateNow.dev !== state.dev || stateNow.ino !== state.ino) fail('command-memory-owner-changed');
   };
   let claimedReceipt, removedChild;
+  let originalProcessGone = false;
   const confirmReceipt = (receipt, fingerprint) => {
     if (claimedReceipt && claimedReceipt !== fingerprint) fail('owned-receipt-changed');
     if (receipt?.stage === 'admitted') claimedReceipt = fingerprint;
+  };
+  // The joined owner records absence only after this boot and the admitted
+  // receipt have been verified. A later process with the number must have
+  // started after the original; the same birth or an unknown one still fails.
+  const confirmOriginalProcessGone = (present, startTicks, readBirth) => {
+    if (!present) originalProcessGone = true;
+    else if (!originalProcessGone || BigInt(readBirth()) <= BigInt(startTicks))
+      fail('command-process-not-gone');
   };
   const retireReceipt = () => {
     if (atPath(childPath)) fail('owned-child-changed');
@@ -201,10 +210,10 @@ function prepareDshCommandMemoryReceipt(roots, executionRef) {
     fs.unlinkSync(receiptPath);
     return { released: true, evidence: { ...removedChild, childReleased: true } };
   };
-  const check = () => {
+  const check = owner => {
     assertCurrent();
     if (removedChild) return retireReceipt();
-    const evidence = verifyCommandMemoryReceipt(cfg, 'complete', true, confirmReceipt);
+    const evidence = verifyCommandMemoryReceipt(cfg, 'complete', true, owner);
     if (evidence?.populated) return null;
     if (evidence?.childJoined) {
       assertCurrent();
@@ -233,17 +242,23 @@ function prepareDshCommandMemoryReceipt(roots, executionRef) {
   return {
     observe() {
       assertCurrent();
-      return verifyCommandMemoryReceipt(cfg, 'observe', true, confirmReceipt);
+      return verifyCommandMemoryReceipt(cfg, 'observe', true, { confirmReceipt });
     },
-    async release(signal) {
-      return check() ?? waitForUnpopulated(path.join(childPath, 'cgroup.events'), check, signal);
+    async release(signal, nativeJoined) {
+      const owner = {
+        confirmReceipt,
+        confirmOriginalProcessGone: nativeJoined === true ? confirmOriginalProcessGone : undefined,
+      };
+      const verify = () => check(owner);
+      return verify() ?? waitForUnpopulated(path.join(childPath, 'cgroup.events'), verify, signal);
     },
   };
 }
 
-function verifyCommandMemoryReceipt(cfg, phase, readAdmittedPid = false, confirmReceipt) {
+function verifyCommandMemoryReceipt(cfg, phase, readAdmittedPid = false, owner) {
 let stage = 'read';
 try {
+  const { confirmReceipt, confirmOriginalProcessGone } = owner ?? {};
   const validPid = pid => Number.isSafeInteger(pid) && pid > 0;
   const owned = readAdmittedPid && cfg.dshDispatch === true && typeof confirmReceipt === 'function';
   const observe = owned && phase === 'observe';
@@ -300,8 +315,16 @@ try {
         if (identity.device !== child.device || identity.inode !== child.inode) fail('observation-changed');
         return { receipt, after };
       }
-      try { fs.statSync(path.join(cfg.procRoot, String(pid))); fail('command-process-not-gone'); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      let present = true;
+      try { fs.statSync(path.join(cfg.procRoot, String(pid))); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        present = false;
+      }
+      if (ownedCompletion) {
+        if (!confirmOriginalProcessGone) fail('native-subprocess-not-joined');
+        confirmOriginalProcessGone(present, receipt.startTicks, birth);
+      } else if (present) fail('command-process-not-gone');
       const active = populated(childPath, child.device), processes = members(childPath, child.device);
       if (active || processes.length) {
         if (active === 1 && ownedCompletion) {

@@ -182,6 +182,7 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
       signal?.throwIfAborted();
       ({ released, evidence } = await attempt.owner.release(
         cgroupObservation.signal,
+        attempt.joined === true,
       ));
     } catch {
       evidence = { error: 'command-memory-cleanup-unconfirmed' };

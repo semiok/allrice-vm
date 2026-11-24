@@ -107,7 +107,12 @@ it('shares memcg observation after native join with disposal and releases it onc
   await vi.waitFor(() => expect(f.native.waitForExit).toHaveBeenCalledOnce());
   expect(f.owner.release).not.toHaveBeenCalled();
   f.quiescent.resolve(true);
-  await vi.waitFor(() => expect(f.owner.release).toHaveBeenCalledOnce());
+  await vi.waitFor(() =>
+    expect(f.owner.release).toHaveBeenCalledExactlyOnceWith(
+      expect.any(AbortSignal),
+      true,
+    ),
+  );
   const closing = f.cleanup.close();
   await Promise.resolve();
   expect(f.native.terminate).not.toHaveBeenCalled();
@@ -119,6 +124,22 @@ it('shares memcg observation after native join with disposal and releases it onc
   );
   expect(f.native.waitForExit).toHaveBeenCalledOnce();
   expect(f.owner.release).toHaveBeenCalledOnce();
+});
+
+it('releases a reservation without certifying join when no native handle was created', async () => {
+  const reported = Promise.withResolvers();
+  const cleanup = createCommandMemoryCleanup(500, reported.resolve);
+  const release = vi.fn(() => ({ released: true }));
+  cleanup.track({ owner: { release }, ref: 'reservation' }, vi.fn());
+  expect(await reported.promise).toMatchObject({
+    outcome: null,
+    released: true,
+  });
+  expect(release).toHaveBeenCalledExactlyOnceWith(
+    expect.any(AbortSignal),
+    false,
+  );
+  await cleanup.close();
 });
 
 it('closes a pending memcg observation at the disposal deadline without certifying release', async () => {

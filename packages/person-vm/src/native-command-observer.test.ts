@@ -98,6 +98,9 @@ function guest() {
     };
   };
   const events = new EventEmitter();
+  const signalProcess = vi.fn(() => {
+    throw new Error('the observer must not signal a process');
+  });
   const watcher = Object.assign(events, {
     close: vi.fn(() => events.emit('close')),
   });
@@ -231,7 +234,7 @@ function guest() {
         cfg,
         ref,
         Buffer,
-        process,
+        process: { pid: 99, kill: signalProcess },
         require: (name: string) =>
           name === 'node:fs'
             ? fs
@@ -242,6 +245,7 @@ function guest() {
     ) as {
       release(
         signal: AbortSignal,
+        nativeJoined: boolean,
       ): Promise<{ released: boolean; evidence: unknown }>;
     };
   const makeChild = (ref: string, pid?: number) => {
@@ -277,6 +281,7 @@ function guest() {
     finish,
     watch,
     watcher,
+    signalProcess,
     notify: (event = 'change') => onChange?.(event),
     onWatch: (callback: () => void) => {
       watchStarted = callback;
@@ -303,7 +308,7 @@ function admittedDshGroup() {
   const receipt = `${cfg.receiptDirectory}/${nonce}.json`;
   const request = { ...cfg, executionRef: nonce, dshDispatch: true };
   const memoryEvents = `${child}/memory.events`;
-  g.files.set(memoryEvents, 'oom 0\noom_kill 0');
+  g.files.set(memoryEvents, 'oom 2\noom_kill 1');
   expect(g.run('baseline', false, request).exitCode).toBe(0);
   g.files.set(
     `${cfg.procRoot}/${cfg.pid}/cgroup`,
@@ -311,9 +316,18 @@ function admittedDshGroup() {
   );
   g.makeChild(nonce, cfg.pid);
   expect(g.run('admitted', false, request).exitCode).toBe(0);
-  g.directories.delete(`${cfg.procRoot}/${cfg.pid}`);
+  const processPath = `${cfg.procRoot}/${cfg.pid}`;
+  g.directories.delete(processPath);
   g.makeChild(nonce, 77);
-  return { g, owner, child, receipt };
+  const reusePid = (startTicks = '4567') => {
+    g.directories.add(processPath);
+    g.files.set(
+      `${processPath}/stat`,
+      `${cfg.pid} (unrelated process) ${['S', ...Array<string>(18).fill('0'), startTicks].join(' ')}`,
+    );
+    g.files.set(`${processPath}/cgroup`, '0::/unrelated');
+  };
+  return { g, owner, child, receipt, processPath, reusePid };
 }
 
 function fixture(signalValue: number | null | undefined = 9) {
@@ -392,14 +406,14 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
     const child = g.makeChild(nonce, 77);
     const partial = `${cfg.receiptDirectory}/${nonce}.json`;
     g.files.set(partial, '{"version":1');
-    await expect(owner.release(signal)).rejects.toThrow(
+    await expect(owner.release(signal, false)).rejects.toThrow(
       'owned-child-not-empty',
     );
     expect(g.watch).not.toHaveBeenCalled();
     expect(g.directories.has(child)).toBe(true);
     expect(g.files.has(partial)).toBe(true);
     g.makeChild(nonce);
-    expect(await owner.release(signal)).toMatchObject({
+    expect(await owner.release(signal, false)).toMatchObject({
       released: true,
       evidence: { error: 'command-memory-admission-unconfirmed' },
     });
@@ -412,7 +426,7 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
     const { g, owner, child, receipt } = admittedDshGroup();
     const released = vi.fn();
     g.onCleanup(released);
-    const pending = owner.release(new AbortController().signal);
+    const pending = owner.release(new AbortController().signal, true);
     expect(g.watch).toHaveBeenCalledExactlyOnceWith(
       `${child}/cgroup.events`,
       { persistent: false },
@@ -434,27 +448,115 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
     expect(g.files.has(receipt)).toBe(false);
   });
 
+  it('releases the empty admitted group after its vanished PID is reused by an unrelated process', async () => {
+    const { g, owner, child, receipt, processPath, reusePid } =
+      admittedDshGroup();
+    const released = vi.fn();
+    g.onCleanup(released);
+    const pending = owner.release(new AbortController().signal, true);
+    expect(g.directories.has(processPath)).toBe(false);
+    expect(g.watch).toHaveBeenCalledOnce();
+    reusePid();
+    g.notify();
+    expect(g.watcher.close).not.toHaveBeenCalled();
+    g.makeChild(nonce);
+    g.notify();
+    await expect(pending).resolves.toMatchObject({
+      released: true,
+      evidence: { childJoined: true, childReleased: true },
+    });
+    g.notify();
+    expect(g.directories.has(processPath)).toBe(true);
+    expect(g.files.get(`${processPath}/cgroup`)).toBe('0::/unrelated');
+    expect(g.signalProcess).not.toHaveBeenCalled();
+    expect(g.directories.has(child)).toBe(false);
+    expect(g.files.has(receipt)).toBe(false);
+    expect(g.watcher.close).toHaveBeenCalledOnce();
+    expect(released.mock.calls).toEqual([['before-rmdir'], ['before-unlink']]);
+  });
+
+  it('requires an initial absence proof even if the PID already has a different birth', async () => {
+    const { g, owner, child, receipt, reusePid } = admittedDshGroup();
+    reusePid();
+    await expect(
+      owner.release(new AbortController().signal, true),
+    ).resolves.toMatchObject({
+      released: false,
+      evidence: { error: 'command-process-not-gone' },
+    });
+    expect(g.watch).not.toHaveBeenCalled();
+    expect(g.directories.has(child)).toBe(true);
+    expect(g.files.has(receipt)).toBe(true);
+  });
+
+  it('does not establish a PID absence proof or watch before the native join', async () => {
+    const { g, owner, child, receipt, reusePid } = admittedDshGroup();
+    const { signal } = new AbortController();
+    await expect(owner.release(signal, false)).resolves.toMatchObject({
+      released: false,
+      evidence: { error: 'native-subprocess-not-joined' },
+    });
+    reusePid();
+    await expect(owner.release(signal, true)).resolves.toMatchObject({
+      released: false,
+      evidence: { error: 'command-process-not-gone' },
+    });
+    expect(g.watch).not.toHaveBeenCalled();
+    expect(g.directories.has(child)).toBe(true);
+    expect(g.files.has(receipt)).toBe(true);
+  });
+
+  it.each([
+    ['same birth', '1234', 'command-process-not-gone'],
+    ['an earlier birth', '1000', 'command-process-not-gone'],
+    ['unreadable birth', '?', 'invalid-process-birth'],
+  ])(
+    'preserves the group when a returned PID has %s',
+    async (_case, birth, error) => {
+      const { g, owner, child, receipt, processPath, reusePid } =
+        admittedDshGroup();
+      const pending = owner.release(new AbortController().signal, true);
+      expect(g.watch).toHaveBeenCalledOnce();
+      reusePid(birth);
+      g.makeChild(nonce);
+      g.notify();
+      await expect(pending).resolves.toMatchObject({
+        released: false,
+        evidence: { error },
+      });
+      expect(g.watcher.close).toHaveBeenCalledOnce();
+      expect(g.directories.has(processPath)).toBe(true);
+      expect(g.signalProcess).not.toHaveBeenCalled();
+      expect(g.directories.has(child)).toBe(true);
+      expect(g.files.has(receipt)).toBe(true);
+    },
+  );
+
   it('rechecks after arming a watch when the last member exited during setup', async () => {
     const { g, owner } = admittedDshGroup();
     g.onWatch(() => g.makeChild(nonce));
-    expect(await owner.release(new AbortController().signal)).toMatchObject({
+    expect(
+      await owner.release(new AbortController().signal, true),
+    ).toMatchObject({
       released: true,
     });
     expect(g.watcher.close).toHaveBeenCalledOnce();
   });
 
   it.each([
-    'child-inode',
-    'receipt-inode',
-    'receipt-birth',
-    'boot',
-    'remaining-member',
+    ['child-inode', 'receipt-identity-mismatch'],
+    ['receipt-inode', 'owned-receipt-changed'],
+    ['receipt-birth', 'owned-receipt-changed'],
+    ['boot', 'command-memory-owner-changed'],
+    ['remaining-member', 'child-not-joined'],
+    ['counter-reset', 'counter-reset'],
   ] as const)(
     'does not release a group or receipt after %s changed during observation',
-    async (change) => {
-      const { g, owner, child, receipt } = admittedDshGroup();
+    async (change, error) => {
+      const { g, owner, child, receipt, reusePid } = admittedDshGroup();
       const { signal } = new AbortController();
-      const pending = owner.release(signal);
+      const pending = owner.release(signal, true);
+      reusePid();
       g.makeChild(nonce);
       if (change === 'child-inode') g.replaceChild(child);
       if (change === 'receipt-inode') g.replaceChild(receipt);
@@ -473,19 +575,24 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
         );
       if (change === 'remaining-member')
         g.files.set(`${child}/cgroup.procs`, '77');
+      if (change === 'counter-reset')
+        g.files.set(`${child}/memory.events`, 'oom 1\noom_kill 0');
       g.notify();
-      if (change === 'boot')
-        await expect(pending).rejects.toThrow('command-memory-owner-changed');
-      else await expect(pending).resolves.toMatchObject({ released: false });
+      if (change === 'boot') await expect(pending).rejects.toThrow(error);
+      else
+        await expect(pending).resolves.toMatchObject({
+          released: false,
+          evidence: { error },
+        });
       expect(g.watcher.close).toHaveBeenCalledOnce();
       expect(g.directories.has(child)).toBe(true);
       expect(g.files.has(receipt)).toBe(true);
       if (change === 'boot')
-        await expect(owner.release(signal)).rejects.toThrow(
+        await expect(owner.release(signal, true)).rejects.toThrow(
           'command-memory-owner-changed',
         );
       else
-        await expect(owner.release(signal)).resolves.toMatchObject({
+        await expect(owner.release(signal, true)).resolves.toMatchObject({
           released: false,
         });
       expect(g.watch).toHaveBeenCalledOnce();
@@ -497,7 +604,7 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
     async (stop) => {
       const { g, owner, child, receipt } = admittedDshGroup();
       const abort = new AbortController();
-      const pending = owner.release(abort.signal);
+      const pending = owner.release(abort.signal, true);
       if (stop === 'abort') abort.abort(new Error('cleanup deadline'));
       if (stop === 'error') g.watcher.emit('error', new Error('watch failed'));
       if (stop === 'rename') g.notify('rename');
@@ -512,14 +619,14 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
 
   it('does not arm a watch after disposal cancelled further observations', async () => {
     const { g, owner } = admittedDshGroup();
-    await expect(owner.release(AbortSignal.abort())).rejects.toThrow();
+    await expect(owner.release(AbortSignal.abort(), true)).rejects.toThrow();
     expect(g.watch).not.toHaveBeenCalled();
   });
 
   it('retries unlink for the same admitted receipt after certifying group removal', async () => {
     const { g, owner, child, receipt } = admittedDshGroup();
     const { signal } = new AbortController();
-    const pending = owner.release(signal);
+    const pending = owner.release(signal, true);
     const steps = vi.fn();
     g.onCleanup((step) => {
       steps(step);
@@ -532,7 +639,7 @@ describe('command memory observer (synthetic kernel/native sources; not DSH/VM a
     expect(g.watcher.close).toHaveBeenCalledOnce();
     expect(g.directories.has(child)).toBe(false);
     expect(g.files.has(receipt)).toBe(true);
-    expect(await owner.release(signal)).toMatchObject({
+    expect(await owner.release(signal, true)).toMatchObject({
       released: true,
       evidence: { childJoined: true, childReleased: true },
     });
