@@ -96,9 +96,10 @@ export function EmployeeNativePage({ query }: { query: string }) {
         send(pageRevoked);
         if (!lifetime.signal.aborted) setFailed(true);
       });
-      scopeId = (await carrier.ready).scopeReference.scopeId;
+      const issued = (await carrier.ready).scopeReference;
+      scopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
-      params.set('scopeId', scopeId);
+      params.set('scopeId', issued.scopeId);
       setSource('/chatflow/4.0/document?' + params);
     };
     void setup().catch(() => {

@@ -10,6 +10,7 @@ import {
   pageClosing,
   pageCompletion,
   pageRevoked,
+  pendingPageResult,
 } from './page-carrier';
 
 const sender = z.strictObject({
@@ -48,7 +49,7 @@ export function nativeProfileDocument(
   const lifetime = new AbortController();
   const pending = new Set<Promise<unknown>>();
   const channels = new Map<WebSocket, Promise<void>>();
-  const done = Promise.withResolvers<void>();
+  const done = pendingPageResult<void>();
   const owned = <T>(task: Promise<T>) => {
     pending.add(task);
     void task.then(

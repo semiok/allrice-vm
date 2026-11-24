@@ -13,6 +13,16 @@ export {
   pageRevoked,
 } from './page-messages';
 
+export function pendingPageResult<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((fulfilled, rejected) => {
+    resolve = fulfilled;
+    reject = rejected;
+  });
+  return { promise, resolve, reject };
+}
+
 export function nativeMuxUrl(
   origin: string,
   organizationId: string,
@@ -38,8 +48,8 @@ export function openNativePageCarrier(
   onRevoked: () => void,
 ) {
   const ready =
-    Promise.withResolvers<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
-  const joined = Promise.withResolvers<void>();
+    pendingPageResult<ReturnType<typeof DEntryPageOpenedSchema.parse>>();
+  const joined = pendingPageResult<void>();
   // The owner can close before the first native acknowledgement.
   void ready.promise.catch(() => {});
   void joined.promise.catch(() => {});
