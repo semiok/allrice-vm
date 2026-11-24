@@ -491,7 +491,11 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
     );
     const artifactPath = join(root, 'guest-auth.json');
-    local.host.provide('clientModules', two.registry);
+    local.host.provide('clientModules', {
+      graph: () => two.registry.graph(),
+      onGraphChanged: (listener: () => void) =>
+        two.registry.onGraphChanged(listener),
+    });
     const installOwner = (started?: () => void) =>
       local.host.plugin({
         inject: ['allricePrincipal', 'connection', 'clientModules'],

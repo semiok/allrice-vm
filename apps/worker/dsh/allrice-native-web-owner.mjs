@@ -16,7 +16,7 @@ const original = (value) => value?.[cordisOriginal] ?? value;
 
 /** An explicit local unloader also receives the actual profile retirement. */
 export async function unloadNativeWebOwner(fiber) {
-  const retire = activeOwners.get(fiber);
+  const retire = activeOwners.get(fiber.dispose);
   if (!retire) throw Error('Native web owner retirement is unavailable');
   const results = await Promise.allSettled([retire(), fiber.dispose()]);
   const failures = results.flatMap((result) =>
@@ -60,7 +60,8 @@ export async function apply(ctx, config) {
     retiring = true;
     return observed.close();
   };
-  activeOwners.set(fiber, retire);
+  // Cordis exposes an awaitable facade over the same actual disposer.
+  activeOwners.set(fiber.dispose, retire);
   const retireMissingOwner = () => {
     if (!current()) void retire().catch(() => {});
   };
