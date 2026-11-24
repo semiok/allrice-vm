@@ -108,6 +108,15 @@
   margin-bottom: 6px;
   font-size: 15px;
 }
+.deliveryDownload {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-link);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
 .referenceLine {
   display: flex;
   align-items: center;

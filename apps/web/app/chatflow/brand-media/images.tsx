@@ -195,7 +195,7 @@ export function Images({
   const download = (images: Picture[]) =>
     work(async () => {
       for (const image of images)
-        await client.downloadImage(image.file.objectId);
+        await client.download(image.file.objectId, 'image');
     });
   return (
     <section className={layout.imageSection} aria-label="文章配图">

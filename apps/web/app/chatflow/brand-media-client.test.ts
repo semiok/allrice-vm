@@ -182,6 +182,56 @@ describe('brand-media scoped access', () => {
     },
   );
 
+  it('ignores an older in-flight enabled catalog after a later write refusal', async () => {
+    const old = deferred<Response>();
+    const fresh = deferred<Response>();
+    const oldStarted = deferred<void>();
+    const writeHidden = deferred<void>();
+    let checks = 0;
+    const fetch = vi.fn((url: string, options?: RequestInit) => {
+      if (!url.includes('/modules'))
+        return Promise.resolve(
+          options?.method === 'POST'
+            ? denied(409, 'VERSION_CONFLICT')
+            : denied(),
+        );
+      if (++checks !== 1) return fresh.promise;
+      oldStarted.resolve();
+      return old.promise;
+    });
+    vi.stubGlobal('fetch', fetch);
+    const { client, hide, reveal, revoke } = panelClient();
+    hide.mockImplementation(() => {
+      if (hide.mock.calls.length === 2) writeHidden.resolve();
+    });
+    const reading = expect(client.read({ view: 'topics' })).rejects.toThrow(
+      '当前品牌请求被拒绝',
+    );
+    await oldStarted.promise;
+    const writing = expect(
+      client.command({
+        operation: 'article.publication',
+        articleId: id(20),
+        requestId: id(21),
+        expectedRevision: 1,
+        change: { action: 'unschedule' },
+      }),
+    ).rejects.toThrow('当前品牌请求被拒绝');
+    await writeHidden.promise;
+    old.resolve(catalog(true));
+    await reading;
+    try {
+      expect(checks).toBe(2);
+      expect(reveal).not.toHaveBeenCalled();
+    } finally {
+      fresh.resolve(
+        Response.json({ message: '最新目录暂不可用' }, { status: 503 }),
+      );
+      await writing;
+    }
+    expect(revoke).not.toHaveBeenCalled();
+  });
+
   it('keeps direct reference refusals and an offline brand read local to each operation', async () => {
     const fetch = vi.fn((url: string) =>
       url.includes('/references/')

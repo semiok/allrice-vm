@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from 'react';
 import { z } from 'zod';
@@ -174,6 +175,7 @@ function mayBeScopeDenial(cause: unknown): cause is BrandMediaRequestError {
 }
 
 type OnBrandReadDenied = (cause: Error) => void;
+const isFileDenied = (status: number) => [401, 403, 404].includes(status);
 
 function recordReadDenied(cause: unknown): cause is BrandMediaRequestError {
   return (
@@ -275,10 +277,29 @@ function brandMediaOperations(
     }
   }
   let pendingCheck: Promise<BrandMediaScopeCheck> | undefined;
-  const checkScope = () =>
-    (pendingCheck ??= readAccess().finally(() => {
-      pendingCheck = undefined;
-    }));
+  let latestCheck: Promise<BrandMediaScopeCheck> | undefined;
+  const checkScope = (afterWrite: boolean) => {
+    if (pendingCheck && !afterWrite) return pendingCheck;
+    const check = readAccess().finally(() => {
+      if (pendingCheck === check) pendingCheck = undefined;
+    });
+    latestCheck = pendingCheck = check;
+    return check;
+  };
+  const imageDenials = new Map<string, Error>();
+  const imageListeners = new Set<() => void>();
+  const denyImage = (objectId: string, cause: Error) => {
+    imageDenials.set(objectId, cause);
+    for (const changed of imageListeners) changed();
+  };
+  const imageAccess = {
+    subscribe(changed: () => void) {
+      imageListeners.add(changed);
+      return () => void imageListeners.delete(changed);
+    },
+    denial: (objectId: string | undefined) =>
+      objectId ? imageDenials.get(objectId) : undefined,
+  };
   async function readOrWriteModule(
     query: string,
     options?: RequestInit,
@@ -307,8 +328,9 @@ function brandMediaOperations(
         } else {
           // Both reads and writes can report a lost module binding this way.
           access.hide(cause);
-          const outcome = await checkScope();
-          if (!access.signal.aborted) {
+          const check = checkScope(options?.method === 'POST');
+          const outcome = await check;
+          if (!access.signal.aborted && latestCheck === check) {
             if (outcome === 'unavailable') access.revoke(cause);
             if (outcome === 'enabled') access.reveal(cause);
           }
@@ -418,7 +440,7 @@ function brandMediaOperations(
       current?.throwIfAborted();
       if (!response.ok) {
         const cause = Error('正文文件暂时不可读，请重新核对权限。');
-        if ([401, 403, 404].includes(response.status)) onDenied?.(cause);
+        if (isFileDenied(response.status)) onDenied?.(cause);
         throw cause;
       }
       const text = await response.text();
@@ -541,36 +563,63 @@ function brandMediaOperations(
         throw Error('文件已保存，暂时无法读取上传回执，请重试同一上传。');
       return file;
     },
+    imageAccess,
     previewImage: async (objectId: string, signal?: AbortSignal) => {
+      const raw = await request(
+        `/api/v1/workbench/files/${objectId}/preview${q}`,
+        { signal },
+      ).catch((cause) => {
+        if (
+          !access?.signal.aborted &&
+          !signal?.aborted &&
+          cause instanceof BrandMediaRequestError &&
+          isFileDenied(cause.status)
+        )
+          denyImage(objectId, cause);
+        throw cause;
+      });
       const preview = z
         .object({
           kind: z.literal('image'),
           mediaType: z.enum(['image/png', 'image/jpeg', 'image/webp']),
           base64: z.string(),
         })
-        .parse(
-          await request(`/api/v1/workbench/files/${objectId}/preview${q}`, {
-            signal,
-          }),
-        );
+        .parse(raw);
       return `data:${preview.mediaType};base64,${preview.base64}`;
     },
-    downloadImage: async (objectId: string) => {
+    download: async (objectId: string, kind: 'image' | 'delivery') => {
       const signal = scopedSignal();
+      const image = kind === 'image';
+      const observed = imageAccess.denial(objectId);
       signal?.throwIfAborted();
       const response = await fetch(
-        `/api/v1/workbench/files/${objectId}/download${q}`,
+        `/api/v1/${image ? 'workbench/files' : 'files'}/${objectId}/download${q}`,
         { headers: scope.headers, signal, cache: 'no-store' },
       );
-      if (!response.ok) throw Error('原图暂时不可下载，请核对权限后重试。');
+      signal?.throwIfAborted();
+      if (!response.ok) {
+        const cause = Error(
+          image
+            ? '原图暂时不可下载，请核对权限后重试。'
+            : '正文文件暂时不可读，请重新核对权限。',
+        );
+        if (image && isFileDenied(response.status)) denyImage(objectId, cause);
+        throw cause;
+      }
       const disposition = response.headers.get('Content-Disposition') ?? '';
       const name = disposition.split("filename*=UTF-8''")[1];
       const bytes = await response.blob();
       signal?.throwIfAborted();
+      const denied = imageAccess.denial(objectId);
+      if (image && denied && denied !== observed) throw denied;
       const url = URL.createObjectURL(bytes);
       const link = document.createElement('a');
       link.href = url;
-      link.download = name ? decodeURIComponent(name) : '配图.png';
+      link.download = name
+        ? decodeURIComponent(name)
+        : image
+          ? '配图.png'
+          : 'allrice-export';
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     },
@@ -650,23 +699,43 @@ export function Image({
   label: string;
   active: boolean;
 }) {
-  const [source, setSource] = useState(''),
-    [error, setError] = useState('');
+  const denied = useSyncExternalStore(
+    client.imageAccess.subscribe,
+    () => client.imageAccess.denial(objectId),
+    () => undefined,
+  );
+  const [result, setResult] = useState<{
+    client: BrandMediaClient;
+    objectId?: string;
+    localFile?: File | null;
+    denied?: Error;
+    source?: string;
+    error?: string;
+  } | null>(null);
+  useEffect(() => {
+    if (denied)
+      setResult((old) =>
+        old?.objectId === objectId && old?.denied !== denied ? null : old,
+      );
+  }, [denied, objectId]);
   useEffect(() => {
     const abort = new AbortController();
-    setSource('');
-    setError('');
+    const observed = client.imageAccess.denial(objectId);
+    const identity = { client, objectId, localFile, denied: observed };
+    const current = () =>
+      !abort.signal.aborted && client.imageAccess.denial(objectId) === observed;
+    setResult(null);
     const local = localFile ? URL.createObjectURL(localFile) : '';
     if (active) {
-      if (local) setSource(local);
+      if (local) setResult({ ...identity, source: local });
       else if (objectId)
         void client
           .previewImage(objectId, abort.signal)
           .then((value) => {
-            if (!abort.signal.aborted) setSource(value);
+            if (current()) setResult({ ...identity, source: value });
           })
           .catch((cause) => {
-            if (!abort.signal.aborted) setError(cause.message);
+            if (current()) setResult({ ...identity, error: cause.message });
           });
     }
     return () => {
@@ -674,6 +743,15 @@ export function Image({
       if (local) URL.revokeObjectURL(local);
     };
   }, [client, objectId, localFile, active]);
+  const displayed =
+    result?.client === client &&
+    result.objectId === objectId &&
+    result.localFile === localFile &&
+    result.denied === denied
+      ? result
+      : null;
+  const source = displayed?.source;
+  const error = displayed ? displayed.error : denied?.message;
   const key = 'brand-media-image.png';
   const resolve = useCallback(
     (path: string) => (path === key && source ? source : undefined),
@@ -721,13 +799,15 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     async (signal?: AbortSignal) => {
       if (!client) return;
       const version = ++directoryRead.current;
-      const result = await client.catalog(signal);
-      if (
-        current.current !== key ||
-        directoryRead.current !== version ||
-        signal?.aborted
-      )
-        return;
+      const latest = () =>
+        current.current === key &&
+        directoryRead.current === version &&
+        !signal?.aborted;
+      const result = await client.catalog(signal).catch((cause) => {
+        if (latest()) throw cause;
+        return null;
+      });
+      if (!result || !latest()) return;
       const entry = result.modules.find(
         (module) => module.descriptor.id === brandMediaModule.id,
       );
@@ -752,6 +832,17 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     });
     return () => controller.abort();
   }, [reload, key]);
+  const openPicker = () => {
+    setPicker(true);
+    setChecked(false);
+    setError('');
+    setDirectory((old) =>
+      old?.key === key ? { ...old, available: false } : old,
+    );
+    void reload().catch((cause) => {
+      if (current.current === key) setError(cause.message);
+    });
+  };
   const available = directory?.key === key && directory.available;
   const add = async () => {
     if (!client || busy || !checked || !available) return;
@@ -797,6 +888,7 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     client,
     picker,
     setPicker,
+    openPicker,
     checked,
     setChecked,
     busy,
@@ -833,7 +925,7 @@ export function BrandMediaPluginSection({
               ]
             : []
         }
-        onAdd={() => controller.setPicker(true)}
+        onAdd={controller.openPicker}
       />
       {controller.error && <p role="alert">{controller.error}</p>}
     </>
