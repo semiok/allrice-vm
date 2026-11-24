@@ -5,6 +5,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,9 @@ DEV_DATABASE = 'allrice40_dev'
 DEV_PORTS = {'web': 3311, 'worker': 3312}
 REPOSITORY = 'semiok/allrice-vm'
 REPOSITORY_ID = 1469490636
+QA_DIRECTORY_PREFIX = '_allrice40-'
+QA_LABEL_PREFIX = 'ai.bplabs.allrice40-qa-'
+QA_TASK_PATTERN = r'[a-z0-9][a-z0-9-]{0,30}'
 ENTRIES = {'web': 'apps/web/server.mjs', 'worker': 'apps/worker/dist/index.js'}
 SHA = re.compile(r'[a-f0-9]{40}')
 DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
@@ -35,12 +39,59 @@ def canonical(path):
     return path.is_absolute() and path.resolve() == path
 
 
+def qa_instance_dir(task):
+    return Path.home().resolve() / 'allrice-qa' / (QA_DIRECTORY_PREFIX + task)
+
+
+def qa_instance_data(path):
+    if not canonical(path):
+        raise ValueError('QA instance path is not canonical')
+    data = json.loads(path.read_text())
+    task = data.get('task') if isinstance(data, dict) else None
+    if (not isinstance(task, str) or not re.fullmatch(QA_TASK_PATTERN, task)
+            or path != qa_instance_dir(task) / 'instance.json'
+            or data.get('repository') != REPOSITORY or data.get('repositoryId') != REPOSITORY_ID):
+        raise ValueError('expected a 4.0 QA instance')
+    return data
+
+
+def qa_instance_database(data):
+    name = data.get('database')
+    expected = 'allrice40_qa_' + data['task'].replace('-', '_')
+    if name != expected:
+        raise ValueError('invalid 4.0 QA database name')
+    return name
+
+
+def qa_worktree(data):
+    """Resolve the directory reserved by this instance before git worktree add."""
+    if 'worktree' not in data:
+        return None
+    record = data['worktree']
+    task = data.get('task')
+    name = record.get('name') if isinstance(record, dict) else None
+    if (not isinstance(task, str) or not re.fullmatch(QA_TASK_PATTERN, task) or not isinstance(name, str)
+            or not re.fullmatch(r'\.qa-' + re.escape(task) + r'\.[a-zA-Z0-9]{8}', name)):
+        raise ValueError('invalid QA worktree record')
+    release = Path.home().resolve() / 'allrice40-worktrees' / name
+    if not canonical(release.parent):
+        raise ValueError('QA worktree root is not canonical')
+    try:
+        entry = release.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISDIR(entry.st_mode) or record.get('device') != entry.st_dev
+            or record.get('inode') != entry.st_ino):
+        raise ValueError('QA worktree does not match the reserved directory')
+    return release
+
+
 def release_identity(release, task=None):
     """Read the build identity from the selected 4.0 release directory."""
     home = Path.home().resolve()
     manifest = release / '.local/dev-build-identity.json'
     try:
-        in_scope = (release == home / 'allrice-qa' / task / 'release' if task else
+        in_scope = (release == qa_worktree(qa_instance_data(qa_instance_dir(task) / 'instance.json')) if task else
                     release.parent == home / 'allrice40-dev-releases')
         if not in_scope or not canonical(release) or not canonical(manifest):
             return None
@@ -68,25 +119,30 @@ def ready_identity(doc, role, expected=None):
                 identity.get(key) == expected[key] for key in ('sourceSha', 'sourceTree', 'manifestDigest'))))
 
 
+def dotenv_environment(contents, node, keys=()):
+    """Read declarative Node dotenv values without using them to start Node."""
+    result = subprocess.run([node, '-e', '''
+const { readFileSync } = require('node:fs');
+const { parseEnv } = require('node:util');
+const env = parseEnv(readFileSync(0, 'utf8'));
+const keys = process.argv.slice(1);
+process.stdout.write(JSON.stringify(keys.length ? Object.fromEntries(keys.map(key => [key, env[key]])) : env));
+''', *keys], input=contents, capture_output=True, check=True, timeout=5, env={})
+    return json.loads(result.stdout)
+
+
 def controller_settings(env, loaded_env_file):
     """Read the same declarative values Node's --env-file supplies, without sourcing the file."""
     missing = [key for key in CONTROLLER_KEYS if key not in env]
     defaults = {}
     if loaded_env_file and missing:
-        dotenv = loaded_env_file.read_text()
-        if any(key in dotenv for key in missing):
+        dotenv = loaded_env_file.read_bytes()
+        if any(key.encode() in dotenv for key in missing):
             pinned = Path.home() / '.local/opt/node-22.23.2/bin/node'
             node = shutil.which(str(pinned)) or shutil.which('node') or shutil.which('node', path='/opt/homebrew/bin:/usr/local/bin')
             if not node:
                 raise ValueError('Node is required to read the controller environment')
-            result = subprocess.run([node, '-e', '''
-const { readFileSync } = require('node:fs');
-const { parseEnv } = require('node:util');
-const env = parseEnv(readFileSync(0, 'utf8'));
-const keys = process.argv.slice(1);
-process.stdout.write(JSON.stringify(Object.fromEntries(keys.map(key => [key, env[key]]))));
-''', *missing], input=dotenv, text=True, capture_output=True, check=True, timeout=5, env={})
-            defaults = json.loads(result.stdout)
+            defaults = dotenv_environment(dotenv, node, missing)
     return {key: env.get(key, defaults.get(key, '')) for key in CONTROLLER_KEYS}
 
 
@@ -94,7 +150,7 @@ def state_matches(env, controllers, role, task):
     """The launchd values win over .env and name the roots covered by backup."""
     home = Path.home().resolve()
     dev = home / 'allrice40-dev/.local'
-    state = home / 'allrice-qa' / task / '.local' if task else dev
+    state = qa_instance_dir(task) / '.local' if task else dev
     roots = {
         'ALLRICE_STORAGE_ROOT': state / 'storage',
         'ALLRICE_EXECUTION_ROOT': state / 'executions',
@@ -135,11 +191,12 @@ def _service_config(plist, label, port_key, port, database, tools, worker_port):
     env = plist.get('EnvironmentVariables')
     task = None
     if database != DEV_DATABASE:
-        match = re.fullmatch(r'ai\.bplabs\.allrice-qa-([a-z0-9][a-z0-9-]{0,30})-' + role, label)
-        if (not match or database != 'allrice40_qa_' + match[1].replace('-', '_')
-                or not 3200 <= int(port) <= 3299):
+        match = re.fullmatch(re.escape(QA_LABEL_PREFIX) + '(' + QA_TASK_PATTERN + ')-' + role, label)
+        if not match or not 3200 <= int(port) <= 3299:
             return None
         task = match[1]
+        if database != qa_instance_database(qa_instance_data(qa_instance_dir(task) / 'instance.json')):
+            return None
     if (plist.get('Label') != label or not isinstance(env, dict)
             or not all(isinstance(value, str) for value in env.values())
             or env.get('HOME', str(home)) != str(home)
@@ -163,7 +220,7 @@ def _service_config(plist, label, port_key, port, database, tools, worker_port):
     if cwd != expected_cwd or not identity or env.get('ALLRICE_RELEASE_SHA') != identity['sourceSha']:
         return None
 
-    env_path = home / 'allrice-qa' / task / '.env' if task else home / 'allrice40-dev/.env'
+    env_path = qa_instance_dir(task) / '.env' if task else home / 'allrice40-dev/.env'
     if not canonical(env_path) or not env_path.is_file():
         return None
     loaded = Path(args[0])
@@ -208,6 +265,18 @@ def _service_config(plist, label, port_key, port, database, tools, worker_port):
 
 
 def main():
+    if sys.argv[1] in ('qa-owned', 'qa-worktree', 'qa-database'):
+        try:
+            data = qa_instance_data(Path(sys.argv[2]))
+            if sys.argv[1] == 'qa-worktree':
+                release = qa_worktree(data)
+                if release:
+                    print(release)
+            elif sys.argv[1] == 'qa-database':
+                print(qa_instance_database(data))
+        except (OSError, RuntimeError, ValueError):
+            sys.exit(1)
+        return
     if sys.argv[1] == 'release':
         path, *sha = sys.argv[2:]
         identity = release_identity(Path(path))

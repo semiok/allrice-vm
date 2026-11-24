@@ -647,4 +647,13 @@ export const baseline: readonly BaselineEntry[] = [
     approvedBy:
       '2026-11-22 UTC 登记：用户原话“批准最小方案，按正式接口继续实施”（批准原答复时间未核）；见~/allrice-dev/qa/codex/met283-memory-business-20261122/CARRIER-APPROVAL.md，问题call_d0935e72e3c14c94a8157f07d22f5451。',
   },
+  {
+    kind: 'table',
+    id: 'allrice_native_schedule_observation_receipts',
+    category: '账本',
+    basis:
+      'MET-285 / 0257：DSH Schedule 独占任务规则、目标和投递。原生 catalog 不提供跨宿主的 SaaS 归属、观察和显式失效审计。该表仅追加完整观察及失效收据，按原输入核对提交，保持原生调度权威。',
+    approvedBy:
+      '2026-11-23 用户在 MET-285 n5 任务指令批准移植七个来源分支，包含原生定时观察收据，并指定将原 0254 重编号为 0257；见 MET-285 外部叫醒投影范围及本轮 n5 授权。',
+  },
 ];

@@ -68,6 +68,24 @@ class LeaseSafety(unittest.TestCase):
                 with patch.object(lease.subprocess, 'run', side_effect=run), patch.object(lease.socket, 'create_connection', side_effect=ConnectionRefusedError), patch.object(lease.os, 'kill'):
                     self.assertEqual(lease.process_state(self.path, self.data), expected)
 
+    def test_4_0_launchd_jobs_and_the_detached_worktree_prevent_reclaim(self):
+        path = self.root / 'allrice-qa/_allrice40-occupant/instance.json'
+        release = self.root / 'allrice40-worktrees/.qa-occupant.Fixture1'
+        release.mkdir(parents=True)
+        entry = release.stat()
+        data = dict(self.data, task='occupant', worktree=dict(name=release.name, device=entry.st_dev, inode=entry.st_ino))
+        with patch.dict(os.environ, HOME=str(self.root)):
+            loaded = subprocess.CompletedProcess([], 0, 'state = waiting', '')
+            with patch.object(lease.subprocess, 'run', return_value=loaded) as run:
+                self.assertEqual(lease.process_state(path, data), 'loaded')
+            self.assertTrue(run.call_args.args[0][-1].endswith('/ai.bplabs.allrice40-qa-occupant-web'))
+            absent = subprocess.CompletedProcess([], 113, '', '')
+            process = subprocess.CompletedProcess([], 0, '999999 1 node scripts/probe.mjs', '')
+            files = subprocess.CompletedProcess([], 0, 'p999999\nfcwd\nn' + str(release), '')
+            with patch.object(lease.subprocess, 'run', side_effect=[absent, absent, process, files]), \
+                    patch.object(lease.socket, 'create_connection', side_effect=ConnectionRefusedError):
+                self.assertEqual(lease.process_state(path, data), 'running')
+
     def test_log_enumeration_failure_preserves_source_and_rejects_archive(self):
         logs = self.path.parent / 'logs'
         logs.mkdir()

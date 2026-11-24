@@ -33,20 +33,21 @@ case "${1:-}" in
   --instance)
     task=${2:?task}; shift 2
     [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || exit 2
-    [ -d "$HOME/allrice-qa" ] || exit 2
-    task_lock="$HOME/allrice-qa/.task-$task.lock"
+    [ -d "$M1_QA" ] || exit 2
+    task_lock=$(qa_lock_file "$task")
     qa_task_lock "$task_lock" || { echo "QA instance is being changed: $task" >&2; exit 3; }
     trap 'qa_task_unlock "$task_lock"' EXIT
-    f="$HOME/allrice-qa/$task/instance.json"; [ -f "$f" ] || { echo "no QA instance: $task" >&2; exit 2; }
+    dir=$(qa_instance_dir "$task")
+    f="$dir/instance.json"; [ -f "$f" ] || { echo "no QA instance: $task" >&2; exit 2; }
     qa_owned "$f" || { echo "QA instance belongs to another repository: $task" >&2; exit 2; }
     web=$(json "$f" webPort); worker=$(json "$f" workerPort)
-    creds="$HOME/allrice-qa/$task/creds.json"; out="$HOME/allrice-qa/$task/smoke/$ts"
-    qa_label="ai.bplabs.allrice-qa-$task"
-    qa_db=allrice40_qa_${task//-/_}
-    qa_web="$HOME/Library/LaunchAgents/$qa_label-web.plist"
-    qa_worker="$HOME/Library/LaunchAgents/$qa_label-worker.plist"
-    service_plist_config "$qa_web" "$qa_label-web" ALLRICE_WEB_PORT "$web" "$qa_db" "worker-port=$worker" || exit 2
-    service_plist_config "$qa_worker" "$qa_label-worker" ALLRICE_WORKER_PORT "$worker" "$qa_db" || exit 2
+    creds="$dir/creds.json"; out="$dir/smoke/$ts"
+    qa_db=$(qa_database "$f") || exit 2
+    web_label=$(qa_label "$task" web); worker_label=$(qa_label "$task" worker)
+    qa_web="$HOME/Library/LaunchAgents/$web_label.plist"
+    qa_worker="$HOME/Library/LaunchAgents/$worker_label.plist"
+    service_plist_config "$qa_web" "$web_label" ALLRICE_WEB_PORT "$web" "$qa_db" "worker-port=$worker" || exit 2
+    service_plist_config "$qa_worker" "$worker_label" ALLRICE_WORKER_PORT "$worker" "$qa_db" || exit 2
     dbenv=$(printf '%s\n%s' "$(penv "$qa_worker" DATABASE_URL)" "$(json "$f" nativeArtifactId)")
     extra=(); [[ " $* " == *" --only "* ]] || extra=(--only chat,continue,browser,reminder) ;;
   *) sed -n 2,17p "$0"; exit 2 ;;

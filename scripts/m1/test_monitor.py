@@ -919,8 +919,10 @@ class Config(unittest.TestCase):
             checkpoint = state / 'state.json'
             agents = home / 'Library/LaunchAgents'
             agents.mkdir(parents=True)
-            for label in ('ai.bplabs.allrice40-dev-monitor', 'ai.bplabs.allrice40-dev-monitor-peer'):
-                (agents / (label + '.plist')).write_bytes(b'existing timer')
+            timers = {'ai.bplabs.allrice40-dev-monitor.plist': b'existing M1 timer',
+                      'ai.bplabs.allrice40-dev-monitor-peer.plist': b'existing peer timer'}
+            for name, contents in timers.items():
+                (agents / name).write_bytes(contents)
             cases = (
                 ('other target', b'{"drillTarget": {"tag": "outage", "role": "peer"}}', 'different target'),
                 ('unreadable', b'{}', 'fixture unreadable'),
@@ -928,7 +930,18 @@ class Config(unittest.TestCase):
                 ('invalid checkpoint', b'[]', 'state is not an object'),
                 ('invalid field', b'{"alerts": []}', 'invalid alerts'),
                 ('invalid alert', b'{"alerts": {"disk": 1}}', 'invalid alert'),
+                ('history container', b'{"history": {}}', 'invalid history'),
+                ('rounds container', b'{"rounds": null}', 'invalid rounds'),
             )
+            for value in (None, True, '1700000000', [], {}, float('nan'), float('inf'), float('-inf'), 10**400,
+                          -1, 1795478400000, 1e300, time.time() + 7 * 86400):
+                cases += (
+                    ('history timestamp', json.dumps({'history': [{'at': value, 'event': 'opened'}]}).encode(), 'invalid history'),
+                    ('round timestamp', json.dumps({'rounds': [1, value]}).encode(), 'invalid rounds'),
+                )
+            for entry in (None, [], 'opened', {'event': 'opened'}, {'at': 1}, {'at': 1, 'event': []},
+                          {'at': 1, 'event': 'other'}):
+                cases += (('history entry', json.dumps({'history': [entry]}).encode(), 'invalid history'),)
             real_open = open
             for peer_flag in ([], ['--peer']):
                 for condition, original, message in cases:
@@ -941,11 +954,35 @@ class Config(unittest.TestCase):
                             return real_open(path, *args, **kwargs)
 
                         with self.assertRaisesRegex(SystemExit, message), mock.patch('builtins.open', side_effect=open_file), \
-                                mock.patch.object(monitor, 'run') as run:
+                                mock.patch.object(monitor, 'run', side_effect=AssertionError('launchctl was reached')) as run:
                             monitor.main(['launchd', 'install', *peer_flag, '--config', str(config)])
                         run.assert_not_called()
                         self.assertEqual(checkpoint.read_bytes(), original)
-                        self.assertEqual(sorted(p.read_bytes() for p in agents.iterdir()), [b'existing timer'] * 2)
+                        self.assertEqual({p.name: p.read_bytes() for p in agents.iterdir()}, timers)
+
+    def test_formal_install_preserves_valid_checkpoint_history(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / 'restored-monitor-state'
+            state.mkdir()
+            config = home / 'config.json'
+            config.write_text(json.dumps({'stateDir': str(state)}))
+            (home / 'Library/LaunchAgents').mkdir(parents=True)
+            checkpoint = state / 'state.json'
+            clock = 1795478400
+            skewed = clock + 600.5
+            original = (json.dumps({'history': [{'at': clock, 'event': 'opened', 'key': 'disk', 'severity': 'warning'},
+                                               {'at': skewed, 'event': 'recovered'}],
+                                    'rounds': [clock, skewed]}) + '\n').encode()
+            checkpoint.write_bytes(original)
+            for peer in (False, True):
+                with self.subTest(peer=peer):
+                    calls = [(0, '', ''), (113, '', ''), (0, '', '')]
+                    with mock.patch.object(monitor, 'run', side_effect=calls) as run, mock.patch('builtins.print'), \
+                            mock.patch.object(monitor.time, 'time', return_value=clock):
+                        monitor.main(['launchd', 'install', '--config', str(config), *(['--peer'] if peer else [])])
+                    self.assertEqual([call.args[0][1] for call in run.call_args_list], ['bootout', 'print', 'bootstrap'])
+                    self.assertEqual(checkpoint.read_bytes(), original)
 
     def test_first_formal_install_can_start_without_a_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
