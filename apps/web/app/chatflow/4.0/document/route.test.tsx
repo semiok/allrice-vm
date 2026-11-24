@@ -1,11 +1,27 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { GET } from './route';
+import {
+  GET as documentAsset,
+  POST as documentUpload,
+} from './[...publicationPath]/route';
 import EntryPage from '../page';
 import { DataAccessError } from '@allrice/database';
 
 const authenticated = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
+const profileRequest = vi.hoisted(() => vi.fn());
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    get: () => ({ value: 'unit-test-original-session-cookie' }),
+  }),
+}));
+vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('../../../../lib/d-entry/native-worker')
+  >()),
+  requestDEntryProfile: profileRequest,
+}));
 vi.mock('../../../../lib/identity/session', () => ({
   requireRequestContext: authenticated,
 }));
@@ -30,6 +46,7 @@ const request = (suffix = query) =>
 beforeEach(() => {
   authenticated.mockReset();
   historyIdentity.mockReset();
+  profileRequest.mockReset();
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
@@ -118,4 +135,57 @@ it('preserves invalid empty/duplicate values on the page for the document parser
   expect(html).toContain('principal=');
   expect(html).toContain('threadId=a');
   expect(html).toContain('threadId=b');
+});
+
+it('requires the issued scope in the document address and leaves the two exact native HTTP routes denied', async () => {
+  const scopeId = '00000000-0000-4000-8000-000000000003';
+  const claims = {
+    bindingRef: 'leased-profile',
+    graphRev: 'verified-graph',
+    manifestSha256: '1'.repeat(64),
+  };
+  profileRequest.mockImplementation(async () =>
+    Response.json({ ...claims, nativeSessionId: 'real-native-root' }),
+  );
+  const entry = await GET(request(query + '&scopeId=' + scopeId));
+  expect(entry.status).toBe(307);
+  const location = entry.headers.get('location')!;
+  const parts = location.split('/').slice(4);
+  expect(parts).toEqual([
+    scopeId,
+    selection.workspaceId,
+    selection.employeeInstanceId,
+    '_',
+    claims.bindingRef,
+    claims.graphRev,
+    claims.manifestSha256,
+    'native',
+    'index.html',
+  ]);
+  const call = (path: string, method = 'GET') => {
+    const target = new URL(location, 'https://allrice.test');
+    target.pathname = target.pathname.replace(
+      'index.html',
+      path.split('?')[0]!,
+    );
+    target.search = path.includes('?') ? path.split('?')[1]! : '';
+    const publicationPath = target.pathname.split('/').slice(4);
+    return (method === 'POST' ? documentUpload : documentAsset)(
+      new Request(target, { method }),
+      { params: Promise.resolve({ publicationPath }) },
+    );
+  };
+  const doc = await call('index.html');
+  expect(doc.status).toBe(200);
+  const html = await doc.text();
+  expect(html).toContain('data-native-session-id="real-native-root"');
+  expect(html).toContain('/managed/employee-web-entry.js');
+  expect((await call('api/file?path=%2Ftest')).status).toBe(403);
+  expect((await call('api/session/uploadFileBinary', 'POST')).status).toBe(403);
+  expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
+    ['bootstrap', { scopeId }, 'document'],
+    ['bootstrap', { scopeId }, 'document'],
+    ['bootstrap', { scopeId }, 'document'],
+    ['bootstrap', { scopeId }, 'document'],
+  ]);
 });
