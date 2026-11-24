@@ -92,10 +92,18 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     if (this.joined) return this.joined;
     this.joined = Promise.resolve().then(async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
+      const deliveryErrors: unknown[] = [];
       try {
         if (!this.ended && !this.closed) {
-          this.handle.send('close');
-          this.handle.end();
+          try {
+            this.handle.send('close');
+            this.handle.end();
+          } catch (error) {
+            // The native carrier may already have delivered closed/end while
+            // our relay still owns a buffered item. Only the downlink can
+            // establish the remote terminal outcome.
+            deliveryErrors.push(error);
+          }
         }
         await Promise.race([
           this.done,
@@ -108,9 +116,12 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
         const local = await Promise.allSettled([
           Promise.resolve().then(() => this.local()),
         ]);
-        const failures = local.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        );
+        const failures = [
+          ...deliveryErrors,
+          ...local.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          ),
+        ];
         throw unknown(
           failures.length
             ? new AggregateError(
