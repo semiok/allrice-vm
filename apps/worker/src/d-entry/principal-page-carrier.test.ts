@@ -7,6 +7,8 @@ import { promisify } from 'node:util';
 import { on, once } from 'node:events';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { createRequire } from 'node:module';
+import { chromium } from 'playwright-core';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import {
@@ -203,7 +205,17 @@ async function fixture(release?: { directory: string; graph: unknown }) {
       },
     });
   }
-  return { ...f, host, connect, invoke, probe, publish, profileSource };
+  return {
+    ...f,
+    host,
+    connect,
+    invoke,
+    probe,
+    publish,
+    profileSource,
+    web,
+    origin,
+  };
 }
 
 async function listen(server: ReturnType<typeof createServer>) {
@@ -468,5 +480,75 @@ it(
     await expect(pending).rejects.toThrow();
     expect((await f.invoke(scopeId)).status).toBe(404);
     peer.terminate();
+  },
+);
+
+it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
+  'joins the native page carrier in Chromium with the original browser Cookie',
+  { timeout: 25_000 },
+  async () => {
+    const f = await fixture();
+    f.web.on('request', (_, outgoing) => {
+      outgoing.writeHead(200, { 'content-type': 'text/html' });
+      outgoing.end('<!doctype html><title>Owned native carrier test</title>');
+    });
+    const require = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const result: { outputFiles: { text: string }[] } =
+      await require('esbuild').build({
+        entryPoints: ['apps/web/lib/d-entry/page-carrier.ts'],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        globalName: 'DEntryCarrier',
+        write: false,
+      });
+    const browser = await chromium.launch({
+      executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
+    });
+    closes.push(() => browser.close());
+    const context = await browser.newContext();
+    await context.addCookies([
+      { name: 'allrice_session', value: sessionToken, url: f.origin },
+    ]);
+    const page = await context.newPage();
+    await page.goto(f.origin);
+    await page.addScriptTag({ content: result.outputFiles[0]!.text });
+    const receipt = await page.evaluate(
+      async ({ identity, selection }) => {
+        const { openNativePageCarrier } = (
+          window as unknown as {
+            DEntryCarrier: typeof import('../../../web/lib/d-entry/page-carrier');
+          }
+        ).DEntryCarrier;
+        let revoked = false;
+        const carrier = openNativePageCarrier(identity, selection, () => {
+          revoked = true;
+        });
+        const opened = await carrier.ready;
+        await carrier.close();
+        return { opened, revoked };
+      },
+      { identity: f.identity, selection: f.selection },
+    );
+    expect(receipt).toMatchObject({
+      opened: {
+        type: 'opened',
+        scopeReference: { scopeId: expect.any(String) },
+        bindingRef: f.owner.bindingRef,
+      },
+      revoked: false,
+    });
+    expect(
+      await f
+        .invoke(receipt.opened.scopeReference.scopeId)
+        .then((value) => value.status),
+    ).toBe(404);
+    expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+    await context.close();
   },
 );
