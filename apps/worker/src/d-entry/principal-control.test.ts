@@ -488,20 +488,23 @@ describe('Node control uses the real generated issuer over the same native Peer 
         endControl.resolve();
       }
       if (terminal === 'guest withdrawal') {
+        let reading: Promise<IteratorResult<unknown>> | undefined;
         try {
           await Promise.all([revoked.promise, cleanupEntered.promise]);
           const closing = first.close();
           const done = vi.fn();
+          const delivered = vi.fn();
           void closing.then(done, done);
-          await expect(stream[Symbol.asyncIterator]().next()).rejects.toThrow(
-            'PRINCIPAL_SCOPE_REVOKED',
-          );
+          reading = stream[Symbol.asyncIterator]().next();
+          void reading.then(delivered, () => {});
           await new Promise<void>((resolve) => setImmediate(resolve));
           expect(done).not.toHaveBeenCalled();
+          expect(delivered).not.toHaveBeenCalled();
           expect(second.revoked.aborted).toBe(false);
         } finally {
           cleanupRelease.resolve();
         }
+        await expect(reading).rejects.toThrow('PRINCIPAL_SCOPE_REVOKED');
         await expect(first.close()).resolves.toBeUndefined();
       } else {
         await revoked.promise;
