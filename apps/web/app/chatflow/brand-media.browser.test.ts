@@ -3512,9 +3512,12 @@ suite('MET-224 main-area brand media text workflow', () => {
             await page.locator('body').getAttribute('data-delivery-save'),
           ).toBeNull();
         }
-        expect(await deliveries.count()).toBe(1);
+        await expect
+          .poll(() => deliveries.count())
+          .toBe(outcome === 'unavailable' ? 0 : 1);
         releaseLatest.resolve();
         await latestStatus.waitFor();
+        expect(await deliveries.count()).toBe(1);
       } finally {
         releaseOlder.resolve();
         releaseLatest.resolve();
@@ -3601,6 +3604,176 @@ suite('MET-224 main-area brand media text workflow', () => {
       } finally {
         releaseOlder.resolve();
         await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['pending', '503', 'one pin'] as const)(
+    'does not request a withdrawn delivery before fresh Run authorization (%s)',
+    async (outcome) => {
+      const run = recovery('article');
+      const target = { ...file, objectId: id(82), versionId: id(83) };
+      const sibling = { ...file, objectId: id(85), versionId: id(86) };
+      const output = run.deliveries[0]!;
+      run.deliveries = [
+        { ...output, file: target },
+        { ...output, file: sibling },
+      ];
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const staleAction = page.locator('[data-fixture-withdrawn-delivery]');
+      const path = `/api/v1/files/${target.objectId}/download`;
+      const fileRequests = () =>
+        page
+          .locator('body')
+          .getAttribute('data-fixture-target-gets')
+          .then(Number);
+      const positiveStarted = gate();
+      const releasePositive = gate();
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const latestStarted = gate();
+      const releaseLatest = gate();
+      const refresh = () =>
+        page.evaluate(() => window.dispatchEvent(new Event('online')));
+      let holdOlderPositive = outcome === 'pending';
+      let reads = 0;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await deliveries
+          .first()
+          .evaluate((button) =>
+            button.setAttribute('data-fixture-withdrawn-delivery', ''),
+          );
+        await observeLateRunRead(page);
+        await page.evaluate((path) => {
+          const fetch = window.fetch.bind(window);
+          document.body.dataset.fixtureTargetGets = '0';
+          window.fetch = (input, options) => {
+            if (
+              typeof input === 'string' &&
+              new URL(input, location.href).pathname === path
+            ) {
+              const body = document.body;
+              body.dataset.fixtureTargetGets = String(
+                Number(body.dataset.fixtureTargetGets) + 1,
+              );
+            }
+            return fetch(input, options);
+          };
+        }, path);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (holdOlderPositive) {
+              holdOlderPositive = false;
+              positiveStarted.resolve();
+              await releasePositive.promise;
+              return route.fulfill({
+                status: 200,
+                headers: { 'x-fixture-late-run-read': 'yes' },
+                json: { runs: [run] },
+              });
+            }
+            if (++reads === 1) {
+              olderStarted.resolve();
+              await releaseOlder.promise;
+              const row =
+                outcome === 'one pin'
+                  ? { ...run, deliveries: [run.deliveries[1]!] }
+                  : { ...run, unavailable: true, deliveries: [] };
+              return route.fulfill({
+                status: 200,
+                headers: { 'x-fixture-late-run-read': 'yes' },
+                json: { runs: [row] },
+              });
+            }
+            if (reads === 2) {
+              latestStarted.resolve();
+              await releaseLatest.promise;
+              if (outcome === '503')
+                return route.fulfill({
+                  status: 503,
+                  json: { message: '成果读取暂时不可用' },
+                });
+            }
+            return route.fallback();
+          },
+        );
+
+        if (outcome === 'pending') {
+          await refresh();
+          await positiveStarted.promise;
+        }
+        await refresh();
+        await olderStarted.promise;
+        await refresh();
+        await latestStarted.promise;
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        if (outcome === 'pending') {
+          await page.evaluate(() => {
+            delete document.body.dataset.lateRunRead;
+          });
+          releasePositive.resolve();
+          await page.locator('body[data-late-run-read="settled"]').waitFor();
+        }
+        if (outcome === '503') {
+          releaseLatest.resolve();
+          await panel(page)
+            .getByRole('alert')
+            .filter({ hasText: '成果读取暂时不可用' })
+            .waitFor();
+        }
+        expect(await fileRequests()).toBe(0);
+        if (await staleAction.isVisible()) {
+          const requested = page
+            .waitForRequest(
+              (request) => new URL(request.url()).pathname === path,
+            )
+            .catch(() => null);
+          await staleAction.press('Enter');
+          if (await fileRequests())
+            expect((await requested)?.method()).toBe('GET');
+        }
+        expect(await fileRequests()).toBe(0);
+        expect(await deliveries.count()).toBe(outcome === 'one pin' ? 1 : 0);
+
+        if (outcome === 'one pin') {
+          const requested = page.waitForRequest(
+            (request) =>
+              new URL(request.url()).pathname ===
+              `/api/v1/files/${sibling.objectId}/download`,
+          );
+          const saved = page.waitForEvent('download');
+          await deliveries.press('Enter');
+          expect((await requested).method()).toBe('GET');
+          expect((await saved).suggestedFilename()).toBe('allrice-export');
+          expect(await fileRequests()).toBe(0);
+        }
+
+        if (outcome === '503') await refresh();
+        else releaseLatest.resolve();
+        await expect.poll(() => deliveries.count()).toBe(2);
+        const saved = page.waitForEvent('download');
+        await deliveries.first().press('Enter');
+        const download = await saved;
+        expect(await fileRequests()).toBe(1);
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(
+          '不可直接改写的正文\n第二段',
+        );
+      } finally {
+        releasePositive.resolve();
+        releaseOlder.resolve();
+        releaseLatest.resolve();
         await f.close();
       }
     },

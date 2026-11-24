@@ -54,6 +54,19 @@ function findArticleRun(runs: BrandMediaRun[], articleId: string | null) {
 type BodyPin = NonNullable<BrandMediaArticle['body']>;
 const articleBodyKey = (id: string, body: BodyPin) =>
   [id, body.objectId, body.versionId, body.checksum].join('/');
+function hasArticleDelivery(
+  runs: BrandMediaRun[],
+  articleId: string,
+  runId: string,
+  key: string,
+) {
+  const run = findArticleRun(runs, articleId);
+  return (
+    run?.run.id === runId &&
+    !run.unavailable &&
+    run.deliveries.some(({ file }) => articleBodyKey(articleId, file) === key)
+  );
+}
 function filterDeliveries(
   row: BrandMediaRun,
   keep: (file: BodyPin) => boolean,
@@ -287,6 +300,30 @@ function BrandMediaPanelContent({
       setRenderedRuns(next);
     },
     [invalidateSaves],
+  );
+  const withdrawRunDeliveries = useCallback(
+    (allowed: BrandMediaRun[], readVersion: number) => {
+      if (projectedRuns.current.readVersion > readVersion) {
+        invalidateSaves(allowed, readVersion);
+        return;
+      }
+      // A superseded read can withdraw deliveries from the displayed snapshot.
+      publishRuns((rows) =>
+        rows.map((row) => {
+          const { intent } = row.invocation;
+          if (intent.operation !== 'article') return row;
+          return filterDeliveries(row, (file) =>
+            hasArticleDelivery(
+              allowed,
+              intent.articleId,
+              row.run.id,
+              articleBodyKey(intent.articleId, file),
+            ),
+          );
+        }),
+      );
+    },
+    [invalidateSaves, publishRuns],
   );
   const [help, setHelp] = useState<string | null>(null),
     [body, setBody] = useState<{
@@ -543,7 +580,7 @@ function BrandMediaPanelContent({
     };
     const denyRunRead = (cause: Error) => {
       if (latest()) discardRead('runs', cause);
-      else invalidateSaves([], version);
+      else withdrawRunDeliveries([], version);
     };
     try {
       const [topicPage, articlePage, schedule, recovery] =
@@ -561,8 +598,7 @@ function BrandMediaPanelContent({
           ),
           client.runs(undefined, denyRunRead).then(({ runs }) => {
             if (!current('runs')) {
-              // A superseded read may still revoke a save from its generation.
-              invalidateSaves(runs, version);
+              withdrawRunDeliveries(runs, version);
               return;
             }
             publishRuns(
@@ -638,7 +674,7 @@ function BrandMediaPanelContent({
     discardRead,
     articleAllowedSince,
     pinAllowedSince,
-    invalidateSaves,
+    withdrawRunDeliveries,
     publishRuns,
     clearReadFailure,
     setError,
@@ -872,16 +908,8 @@ function BrandMediaPanelContent({
   ) => {
     const key = articleBodyKey(articleId, file);
     const observed = readDenials.current.version;
-    const allowedIn = (runs: BrandMediaRun[]) => {
-      const run = findArticleRun(runs, articleId);
-      return (
-        run?.run.id === runId &&
-        !run.unavailable &&
-        run.deliveries.some(
-          ({ file }) => articleBodyKey(articleId, file) === key,
-        )
-      );
-    };
+    const allowedIn = (runs: BrandMediaRun[]) =>
+      hasArticleDelivery(runs, articleId, runId, key);
     const { rows, readVersion } = projectedRuns.current;
     if (!allowedIn(rows)) return;
     const saves = pendingSaves.current;
