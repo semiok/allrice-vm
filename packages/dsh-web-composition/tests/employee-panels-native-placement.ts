@@ -95,9 +95,10 @@ export function placementWrapperIdentity(
     wrapper.parentIdentity !== oldApp.parentIdentity ||
     wrapper.tag !== 'DIV' ||
     wrapper.className !== null ||
-    wrapper.styles.position !== 'relative' ||
-    wrapper.styles.transform !== 'matrix(1, 0, 0, 1, 0, 0)' ||
-    !same(wrapper.rect, oldApp.rect)
+    wrapper.styles.display !== 'contents' ||
+    wrapper.styles.position !== 'static' ||
+    wrapper.styles.transform !== 'none' ||
+    !same(wrapper.rect, { x: 0, y: 0, width: 0, height: 0 })
   )
     fail('host is not the planned identity wrapper around the same app');
   const normalized = attached.ancestors

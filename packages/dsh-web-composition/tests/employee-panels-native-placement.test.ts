@@ -94,6 +94,16 @@ const snapshot = (ancestors: unknown[]) =>
   ({ ancestors }) as PanelsCausalSnapshot;
 const before = () => snapshot([node(1, 3), { ...node(3, null), tag: 'BODY' }]);
 const attached = () =>
+  snapshot([
+    node(1, 2),
+    {
+      ...node(2, 3),
+      rect: { x: 0, y: 0, width: 0, height: 0 },
+      styles: { display: 'contents', position: 'static', transform: 'none' },
+    },
+    { ...node(3, null), tag: 'BODY' },
+  ]);
+const placed = () =>
   snapshot([node(1, 2), node(2, 3), { ...node(3, null), tag: 'BODY' }]);
 const offset = { x: -793, y: -38 };
 describe('D actual ancestor controls', () => {
@@ -107,26 +117,26 @@ describe('D actual ancestor controls', () => {
     replacement.ancestors[0]!.identity = 7;
     extra.ancestors.push(node(9, null) as never);
     deformed.ancestors[0]!.rect.width++;
-    for (const value of [replacement, extra, deformed])
+    for (const value of [replacement, extra, deformed, placed()])
       expect(() => placementWrapperIdentity(before(), value)).toThrow(
         'Invalid native placement',
       );
   });
   it('permits only the measured host matrix at fixed boxes', () => {
-    const a = attached(),
-      b = attached();
+    const a = placed(),
+      b = placed();
     a.ancestors[1]!.styles.transform = 'matrix(1, 0, 0, 1, -793, -38)';
     expect(() => assertPlacementAncestors(a, b, 2, offset)).not.toThrow();
   });
   it('rejects clipping, geometry, unknown matrix and ownership changes', () => {
-    const changes = [attached(), attached(), attached(), attached()];
+    const changes = [placed(), placed(), placed(), placed()];
     changes[0]!.ancestors[0]!.styles['overflow-x'] = 'hidden';
     changes[1]!.ancestors[0]!.rect.x = 1;
     changes[2]!.ancestors[1]!.styles.transform = 'matrix(2, 0, 0, 1, 0, 0)';
     changes[3]!.ancestors[1]!.identity = 8;
     for (const value of changes)
       expect(() =>
-        assertPlacementAncestors(attached(), value, 2, offset),
+        assertPlacementAncestors(placed(), value, 2, offset),
       ).toThrow('Invalid native placement');
   });
 });

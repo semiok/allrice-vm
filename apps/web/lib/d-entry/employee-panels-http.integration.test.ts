@@ -94,6 +94,7 @@ suite(
           beforeReply?(): Promise<void>;
         }
       | undefined;
+    let unavailableOriginalReceipt: string | undefined;
     let dropPublishReply = false;
     let incompleteReply: ServerResponse | undefined;
     const publishWrites: string[] = [];
@@ -229,6 +230,15 @@ suite(
               if (part === ':objectId') params.objectId = pieces[index];
               if (part === ':requestId') params.requestId = pieces[index];
             });
+            if (
+              name === 'readWriteReceipt' &&
+              unavailableOriginalReceipt &&
+              params.requestId === unavailableOriginalReceipt
+            ) {
+              unavailableOriginalReceipt = undefined;
+              outgoing.writeHead(503, { 'Cache-Control': 'no-store' }).end();
+              return;
+            }
             const gate =
               name === 'readWriteReceipt' &&
               receiptGate?.requestId === params.requestId
@@ -505,6 +515,47 @@ suite(
             { name: 'allrice_session', value: p.login.token, url: base },
           ]);
           const page = await context.newPage();
+          const receiptPath = (requestId: string) =>
+            '/write-receipts/' + requestId;
+          const receiptRoute = (requestId: string) =>
+            '**' + receiptPath(requestId) + '?*';
+          const receiptResponse =
+            (requestId: string) => (response: BrowserResponse) =>
+              response.request().method() === 'GET' &&
+              new URL(response.url()).pathname.endsWith(receiptPath(requestId));
+          function holdReceipt(
+            requestId: string,
+            phase: 'beforeRead' | 'beforeReply',
+          ) {
+            let releaseRequest!: () => void;
+            let admitted = 0;
+            let resumed = 0;
+            const held = new Promise<void>((resolve) => {
+              releaseRequest = resolve;
+            });
+            receiptGate = {
+              requestId,
+              async [phase]() {
+                admitted++;
+                await held;
+                resumed++;
+              },
+            };
+            return {
+              arrived: () =>
+                expect.poll(() => admitted, { timeout: 5000 }).toBe(1),
+              release: releaseRequest,
+              async assertFinished(response: BrowserResponse) {
+                expect(admitted).toBe(1);
+                expect(resumed).toBe(1);
+                expect(await response.finished()).toBeNull();
+              },
+              close() {
+                receiptGate = undefined;
+                releaseRequest();
+              },
+            };
+          }
           await page.goto(base + '/fixture/panels');
           const files = page.getByRole('region', { name: '交付成果' });
           await files
@@ -716,13 +767,84 @@ suite(
             };
           }, sourceId);
           const previousReceipts = receiptReads.length;
+          unavailableOriginalReceipt = withdrawnId;
           await page.reload();
-          await materials();
+          const [unavailableReceipt] = await Promise.all([
+            page.waitForResponse(receiptResponse(withdrawnId), {
+              timeout: 5000,
+            }),
+            materials(),
+          ]);
+          expect(unavailableReceipt.status()).toBe(503);
+          expect(await unavailableReceipt.finished()).toBeNull();
+          expect(receiptReads.slice(previousReceipts)).toEqual([]);
+          expect(await retained.isVisible()).toBe(false);
+          const retry = page.getByRole('button', {
+            name: '重试核对',
+            exact: true,
+          });
+          await retry.waitFor();
+          const retryNode = await retry.elementHandle();
+          await retry.focus();
+          const readBack = holdReceipt(withdrawnId, 'beforeReply');
+          try {
+            const [confirmed] = await Promise.all([
+              page.waitForResponse(receiptResponse(withdrawnId), {
+                timeout: 5000,
+              }),
+              (async () => {
+                try {
+                  await page.keyboard.press('Enter');
+                  await readBack.arrived();
+                  await expect
+                    .poll(() =>
+                      retryNode?.evaluate((node) => ({
+                        focused: document.activeElement === node,
+                        busy: node.getAttribute('aria-busy'),
+                        disabled: node.getAttribute('aria-disabled'),
+                        label: node.textContent?.trim(),
+                      })),
+                    )
+                    .toEqual({
+                      focused: true,
+                      busy: 'true',
+                      disabled: 'true',
+                      label: '正在核对…',
+                    });
+                  await page.keyboard.press('Enter');
+                  expect(await retained.isVisible()).toBe(false);
+                } finally {
+                  readBack.release();
+                }
+              })(),
+            ]);
+            await readBack.assertFinished(confirmed);
+            expect(confirmed.status()).toBe(200);
+            expect(await confirmed.json()).toMatchObject({
+              requestId: withdrawnId,
+              status: 'recorded',
+              ready: true,
+            });
+          } finally {
+            readBack.close();
+          }
           await sourceMenu.waitFor({ state: 'detached' });
           await page
             .getByRole('status')
             .filter({ hasText: '原撤销已完成。 ' + sourceId })
             .waitFor();
+          const retryEnded = page.getByRole('button', {
+            name: '核对结束',
+            exact: true,
+          });
+          await retryEnded.waitFor();
+          expect(
+            await retryNode?.evaluate(
+              (node) => document.activeElement === node,
+            ),
+          ).toBe(true);
+          await page.keyboard.press('Tab');
+          await retryEnded.waitFor({ state: 'detached' });
           expect(receiptReads.slice(previousReceipts)).toEqual([withdrawnId]);
           expect(publicationActions).toEqual([withdrawnId]);
           expect(await retained.isVisible()).toBe(false);
@@ -816,14 +938,6 @@ suite(
           expect(storedA).toMatchObject({ status: 'recorded', ready: false });
           expect(referenceWrites).toBe(0);
 
-          const receiptPath = (requestId: string) =>
-            '/write-receipts/' + requestId;
-          const receiptRoute = (requestId: string) =>
-            '**' + receiptPath(requestId) + '?*';
-          const receiptResponse =
-            (requestId: string) => (response: BrowserResponse) =>
-              response.request().method() === 'GET' &&
-              new URL(response.url()).pathname.endsWith(receiptPath(requestId));
           const receiptFailure = (requestId: string) =>
             page.waitForEvent('requestfailed', {
               predicate: (request) =>
@@ -1022,39 +1136,6 @@ suite(
             ]);
             return response;
           }
-          function holdReceipt(
-            requestId: string,
-            phase: 'beforeRead' | 'beforeReply',
-          ) {
-            let releaseRequest!: () => void;
-            let admitted = 0;
-            let resumed = 0;
-            const held = new Promise<void>((resolve) => {
-              releaseRequest = resolve;
-            });
-            receiptGate = {
-              requestId,
-              async [phase]() {
-                admitted++;
-                await held;
-                resumed++;
-              },
-            };
-            return {
-              arrived: () =>
-                expect.poll(() => admitted, { timeout: 5000 }).toBe(1),
-              release: releaseRequest,
-              async assertFinished(response: BrowserResponse) {
-                expect(admitted).toBe(1);
-                expect(resumed).toBe(1);
-                expect(await response.finished()).toBeNull();
-              },
-              close() {
-                receiptGate = undefined;
-                releaseRequest();
-              },
-            };
-          }
           async function enterWithAOnHold(
             enter: () => Promise<void>,
             whileHeld: () => Promise<void>,
@@ -1131,7 +1212,7 @@ suite(
           await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
           expect(await readCache(marker)).toBeNull();
           const sidebarRetry = page.getByRole('button', {
-            name: '核对结果',
+            name: '重试核对',
             exact: true,
           });
           await page.route(
@@ -1361,10 +1442,11 @@ suite(
           expect(dialogD.status()).toBe(200);
           expect(await dialogD.finished()).toBeNull();
           const modalRetry = material.getByRole('button', {
-            name: '核对结果',
+            name: '重试核对',
             exact: true,
           });
           await modalRetry.waitFor();
+          await checkAction(currentFormId).waitFor();
           expect(
             await material.getByText(independentId.slice(0, 8)).count(),
           ).toBe(0);

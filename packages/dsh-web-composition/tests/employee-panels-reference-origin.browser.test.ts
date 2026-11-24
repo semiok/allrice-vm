@@ -61,6 +61,23 @@ const settle = (page: Page) =>
 const sha = (bytes: string | Buffer) =>
   createHash('sha256').update(bytes).digest('hex');
 
+const referenceDocumentGeometry = (page: Page) =>
+  page.evaluate(() => {
+    const html = document.documentElement;
+    const style = getComputedStyle(html);
+    const { x, width } = html.getBoundingClientRect();
+    return {
+      x,
+      width,
+      viewportWidth: innerWidth,
+      viewportHeight: innerHeight,
+      scrollHeight: html.scrollHeight,
+      scrollPosition: { x: scrollX, y: scrollY },
+      gutter: style.scrollbarGutter,
+      overflowY: style.overflowY,
+    };
+  });
+
 // This handle owns only a new reference host. Product nodes/styles are never edited.
 // Keep translate(...) present in all three formal phases, then remove this host.
 async function referenceHost(page: Page, width: number, height: number) {
@@ -235,6 +252,7 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
     let context: Awaited<ReturnType<Browser['newContext']>> | undefined;
     let native: Page | undefined, reference: Page | undefined;
     let owner: Awaited<ReturnType<typeof referenceHost>> | undefined;
+    let viewportControl: Awaited<ReturnType<Page['addStyleTag']>> | undefined;
     let start: Awaited<ReturnType<typeof capture>> | undefined,
       original: Awaited<ReturnType<typeof capture>> | undefined;
     let zero: Awaited<ReturnType<typeof capture>> | undefined,
@@ -271,7 +289,12 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
     };
     async function capture(page: Page, label: (typeof labels)[number]) {
       const value = await snapshot(page);
-      assertCausalSampling(value);
+      try {
+        assertCausalSampling(value);
+      } catch (error) {
+        await save(label + '-sampling-rejected.json', value);
+        throw error;
+      }
       // Save the actual full frame before any element screenshot. The ROI below
       // is decoded from these bytes, not a second clip/element capture.
       const frame = await page.screenshot({
@@ -466,7 +489,58 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
         await document.fonts.ready;
       });
       await settle(reference);
+      const archived = await snapshot(reference);
+      assertCausalSampling(archived);
+      const documentBefore = await referenceDocumentGeometry(reference);
+      const viewportEvidence = join(out, 'reference-viewport-control');
+      await mkdir(viewportEvidence);
+      const archivedFrame = await reference.screenshot({
+        path: join(viewportEvidence, 'archived-origin-frame.png'),
+        fullPage: true,
+      });
+      // The archived document reserves room for a classic scrollbar even
+      // when headless Chrome does not paint one. The reference experiment
+      // needs the native slot's exact viewport coordinates and all five hits.
+      if (documentBefore.width !== documentBefore.viewportWidth) {
+        expect(documentBefore).toMatchObject({
+          x: 0,
+          gutter: 'stable',
+          overflowY: 'scroll',
+          scrollHeight: documentBefore.viewportHeight,
+          scrollPosition: { x: 0, y: 0 },
+        });
+        viewportControl = await reference.addStyleTag({
+          content: 'html { scrollbar-gutter: auto }',
+        });
+        await settle(reference);
+      }
+      const documentAfter = await referenceDocumentGeometry(reference);
+      expect(documentAfter).toEqual({
+        ...documentBefore,
+        width: documentBefore.viewportWidth,
+        gutter: viewportControl ? 'auto' : documentBefore.gutter,
+      });
       original = await capture(reference, 'reference-original');
+      assertCausalInvariant(archived, original.value);
+      const viewportPixels = compareSidebarPixels(
+        archivedFrame,
+        original.frame,
+      );
+      const viewportBytesMatch = sha(archivedFrame) === sha(original.frame);
+      await save('reference-viewport-control.json', {
+        archivedHtmlSha256: sha(html),
+        documentBefore,
+        documentAfter,
+        viewportPixels,
+        viewportBytesMatch,
+      });
+      expect(
+        viewportPixels.changedPixels,
+        'reference original full frame',
+      ).toBe(0);
+      expect(viewportBytesMatch, 'reference original exact PNG bytes').toBe(
+        true,
+      );
       expect(original.value.root).toEqual({ ...start.value.root, x: 0, y: 0 });
       owner = await referenceHost(
         reference,
@@ -558,15 +632,25 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
       try {
         if (owner) {
           cleanup.push(await owner.evaluate((value) => value.restore()));
-          if (reference && original) {
-            await settle(reference);
-            const restored = await capture(reference, 'reference-restored');
-            assertCausalInvariant(original.value, restored.value);
-            await save(
-              'reference-restored-control.json',
-              unchanged(original, restored, 'reference exact detach'),
-            );
-          }
+        }
+      } catch (error) {
+        valid = false;
+        failures.push(error);
+        cleanup.push({ restorationError: String(error) });
+      }
+      try {
+        if (viewportControl) {
+          await viewportControl.evaluate((style) => style.remove());
+          await viewportControl.dispose();
+        }
+        if (owner && reference && original) {
+          await settle(reference);
+          const restored = await capture(reference, 'reference-restored');
+          assertCausalInvariant(original.value, restored.value);
+          await save(
+            'reference-restored-control.json',
+            unchanged(original, restored, 'reference exact detach'),
+          );
         }
       } catch (error) {
         valid = false;

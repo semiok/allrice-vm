@@ -210,6 +210,42 @@ class ReceiptStorageUnavailable extends Error {}
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
 const unavailableReceipt = '当前无法核对原发布请求。';
 
+function usePublicationReceiptRetry(
+  available: boolean,
+  recheck: () => Promise<unknown>,
+) {
+  const [checking, setChecking] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const inFlight = useRef(false);
+  // Keep keyboard focus until the next navigation even when the result
+  // settles the last receipt that could be checked here.
+  if (!available && !checking && !focused) return null;
+  const retry = async () => {
+    if (inFlight.current || !available) return;
+    inFlight.current = true;
+    setChecking(true);
+    try {
+      await recheck();
+    } finally {
+      inFlight.current = false;
+      setChecking(false);
+    }
+  };
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      aria-busy={checking || undefined}
+      aria-disabled={checking || !available || undefined}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      onClick={() => void retry()}
+    >
+      {checking ? '正在核对…' : available ? '重试核对' : '核对结束'}
+    </Button>
+  );
+}
+
 function receiptAccessDenied(error: unknown) {
   return (
     error instanceof EmployeePanelsHttpError &&
@@ -447,8 +483,14 @@ export function ReferencePublicationPending({
       !settledPublications.has(id) &&
       readPublicationReceiptAccess(key, receipt) === undefined,
   );
-  if (!visibleRecords.length && !visibleNotes.length && !retries.length)
-    return null;
+  const retry = usePublicationReceiptRetry(retries.length > 0, async () => {
+    const current = entrySignal.current;
+    if (current)
+      await Promise.allSettled(
+        retries.map((record) => reconcile(record, current)),
+      );
+  });
+  if (!visibleRecords.length && !visibleNotes.length && !retry) return null;
   return (
     <div hidden={dialogOpen} className={css.recovery}>
       {visibleRecords.map((record) => {
@@ -468,19 +510,7 @@ export function ReferencePublicationPending({
           </Button>
         );
       })}
-      {retries.length > 0 && (
-        <Button
-          type="button"
-          variant="ghost"
-          onClick={() => {
-            const current = entrySignal.current;
-            if (!current) return;
-            for (const record of retries) void reconcile(record, current);
-          }}
-        >
-          核对结果
-        </Button>
-      )}
+      {retry}
       {visibleNotes.map(([id, note]) => (
         <p key={id} role="status">
           {note.message}
@@ -884,6 +914,9 @@ function PublicationForm({
       receiptNotes[receipt.requestId]?.stage === 'waiting' &&
       readPublicationReceiptAccess(receiptKey, receipt) === undefined,
   );
+  const retry = usePublicationReceiptRetry(retries.length > 0, () =>
+    Promise.allSettled(retries.map(reconcile)),
+  );
   return (
     <DshDialog
       title={title}
@@ -1111,7 +1144,7 @@ function PublicationForm({
             variant="ghost"
             disabled={receiptNotes[receipt.requestId]?.stage === 'checking'}
             aria-label={
-              visibleReceipts.length === 1 && !retries.length
+              visibleReceipts.length === 1 && !retry
                 ? '核对结果'
                 : '核对结果 ' + receipt.requestId.slice(0, 8)
             }
@@ -1120,17 +1153,7 @@ function PublicationForm({
             核对结果
           </Button>
         ))}
-        {retries.length > 0 && (
-          <Button
-            type="button"
-            variant="ghost"
-            onClick={() => {
-              for (const receipt of retries) void reconcile(receipt);
-            }}
-          >
-            核对结果
-          </Button>
-        )}
+        {retry}
         <Button
           type="button"
           variant="primary"

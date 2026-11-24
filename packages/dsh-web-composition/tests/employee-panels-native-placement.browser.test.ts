@@ -39,6 +39,7 @@ const suite =
 const labels = [
   'native-original',
   'reference-start',
+  'native-original-repeat',
   'native-attached',
   'native-transform',
   'native-layout',
@@ -152,10 +153,17 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
       };
       const wrapper = document.createElement('div');
       wrapper.dataset.nativePlacementOwner = nonce;
-      wrapper.style.cssText =
-        'width:100%;height:100%;min-height:0;position:relative;left:0;top:0;transform:translate(0px,0px)';
+      wrapper.style.display = 'contents';
       let expectedStyle = wrapper.getAttribute('style');
       let mode: 'identity' | 'transform' | 'layout' = 'identity';
+      const moveBefore = (destination: Element, before: Element | null) => {
+        const move: unknown = Reflect.get(destination, 'moveBefore');
+        if (typeof move !== 'function')
+          throw Error(
+            'Expected the locked browser to support state-preserving DOM moves',
+          );
+        Reflect.apply(move, destination, [app, before]);
+      };
       const sameNodes = () => {
         if (
           panel.parentElement !== surface ||
@@ -234,20 +242,35 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
         wrapped();
         const style = getComputedStyle(wrapper);
         const placement = {
+          display: style.display,
           position: style.position,
           left: style.left,
           top: style.top,
           transform: style.transform,
         };
-        const x = mode === 'layout' ? offset.x : 0,
-          y = mode === 'layout' ? offset.y : 0;
-        const tx = mode === 'transform' ? offset.x : 0,
-          ty = mode === 'transform' ? offset.y : 0;
+        const x = mode === 'layout' ? offset.x : 0;
+        const y = mode === 'layout' ? offset.y : 0;
+        const tx = mode === 'transform' ? offset.x : 0;
+        const ty = mode === 'transform' ? offset.y : 0;
+        const expected =
+          mode === 'identity'
+            ? {
+                display: 'contents',
+                position: 'static',
+                left: 'auto',
+                top: 'auto',
+                transform: 'none',
+              }
+            : {
+                display: 'block',
+                position: 'relative',
+                left: `${x}px`,
+                top: `${y}px`,
+                transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
+              };
         if (
-          placement.position !== 'relative' ||
-          placement.left !== `${x}px` ||
-          placement.top !== `${y}px` ||
-          placement.transform !== `matrix(1, 0, 0, 1, ${tx}, ${ty})`
+          JSON.stringify(placement) !== JSON.stringify(expected) ||
+          (mode === 'identity' && wrapper.getClientRects().length !== 0)
         )
           throw Error('Owned placement does not equal the declared mechanism');
         return {
@@ -269,11 +292,13 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
           )
             throw Error('Native order changed before attachment');
           parent.insertBefore(wrapper, app);
-          wrapper.append(app);
+          moveBefore(wrapper, null);
           return inspect();
         },
         place(value: 'transform' | 'layout') {
           wrapped();
+          wrapper.style.cssText =
+            'display:block;width:100%;height:100%;min-height:0;position:relative';
           wrapper.style.left = `${value === 'layout' ? offset.x : 0}px`;
           wrapper.style.top = `${value === 'layout' ? offset.y : 0}px`;
           wrapper.style.transform = `translate(${value === 'transform' ? offset.x : 0}px,${value === 'transform' ? offset.y : 0}px)`;
@@ -286,7 +311,7 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
           sameNodes();
           if (app.parentNode === wrapper) {
             wrapped();
-            parent.insertBefore(app, wrapper);
+            moveBefore(parent, wrapper);
             wrapper.remove();
           } else if (
             wrapper.parentNode ||
@@ -432,6 +457,10 @@ suite(
       ) {
         // A stationary cursor is not a fresh hover control after public placement.
         // Re-issue the same real input for every capture, including return controls.
+        await page.bringToFront();
+        await page.waitForFunction(
+          () => document.visibilityState === 'visible',
+        );
         await page.mouse.move(pointerControl.x, pointerControl.y);
         await settle(page);
         journal.record(
@@ -698,6 +727,20 @@ suite(
         original = await capture(native, 'native-original');
         refStart = await capture(reference, 'reference-start');
         expect(refStart.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
+        const repeated = await capture(native, 'native-original-repeat');
+        assertCausalInvariant(original.value, repeated.value);
+        expect(repeated.value.ancestors).toEqual(original.value.ancestors);
+        await save(
+          'native-original-repeat-control.json',
+          unchanged(original, repeated, 'unmodified native repeat'),
+        );
+        const unreadDeliveryBadge = native
+          .getByRole('button', {
+            name: '交付成果，5 项新增',
+            exact: true,
+          })
+          .getByText('5', { exact: true });
+        expect(await unreadDeliveryBadge.isVisible()).toBe(true);
         const offset = { x: -nativeRoot.x, y: -nativeRoot.y };
         owner = await nativeHost(native, offset);
         await save(
