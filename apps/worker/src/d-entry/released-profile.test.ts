@@ -295,7 +295,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
             lifetime,
           )
         ).value,
-      ).toMatchObject({ ok: true });
+      ).toEqual({ records: [], hasMore: false });
     } finally {
       release.resolve();
       detach();
