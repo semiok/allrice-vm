@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
-import { mkdir, readFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   ApiErrorSchema,
@@ -285,6 +285,75 @@ type State = {
   bodyGate?: Promise<void>;
 };
 
+async function compareComposerProbes(
+  page: Page,
+  cyan: Buffer,
+  magenta: Buffer,
+) {
+  return page.evaluate(
+    async ([cyan, magenta]) => {
+      const decode = async (data: string) => {
+        const response = await fetch(`data:image/png;base64,${data}`);
+        const image = await createImageBitmap(await response.blob(), {
+          colorSpaceConversion: 'none',
+        });
+        try {
+          const { width, height } = image;
+          const context = new OffscreenCanvas(width, height).getContext('2d');
+          if (!context) throw Error('Cannot read composer probe pixels');
+          context.drawImage(image, 0, 0);
+          return context.getImageData(0, 0, width, height);
+        } finally {
+          image.close();
+        }
+      };
+      const [first, second] = await Promise.all([
+        decode(cyan),
+        decode(magenta),
+      ]);
+      const { width, height, data: before } = first;
+      if (width !== second.width || height !== second.height)
+        throw Error('Composer probe screenshot dimensions changed');
+      const after = second.data;
+      let changedPixels = 0,
+        neutralPixels = 0,
+        probePixels = 0;
+      let firstDifference;
+      const gray = (pixels: Uint8ClampedArray, offset: number) =>
+        pixels[offset] === pixels[offset + 1] &&
+        pixels[offset + 1] === pixels[offset + 2];
+      for (let offset = 0; offset < before.length; offset += 4) {
+        const red = after[offset]! - before[offset]!,
+          green = after[offset + 1]! - before[offset + 1]!,
+          blue = after[offset + 2]! - before[offset + 2]!,
+          alpha = after[offset + 3]! - before[offset + 3]!;
+        if (red === 0 && green === 0 && blue === 0 && alpha === 0) continue;
+        changedPixels++;
+        firstDifference ??= {
+          x: (offset / 4) % width,
+          y: Math.floor(offset / 4 / width),
+          cyan: Array.from(before.subarray(offset, offset + 4)),
+          magenta: Array.from(after.subarray(offset, offset + 4)),
+        };
+        // Gray foreground redraws change luminance only. An exposed cyan to
+        // magenta switch increases red and decreases green, even under a scrim.
+        if (alpha === 0 && gray(before, offset) && gray(after, offset))
+          neutralPixels++;
+        if (red > 0 && green < 0 && blue === 0 && alpha === 0) probePixels++;
+      }
+      return {
+        width,
+        height,
+        changedPixels,
+        neutralPixels,
+        probePixels,
+        firstDifference,
+      };
+    },
+    [cyan.toString('base64'), magenta.toString('base64')] as const,
+  );
+}
+
 suite('MET-224 main-area brand media text workflow', () => {
   let browser: Browser, server: Server, origin: string;
   const evidence = resolve('.local/met224-brand-media-p3');
@@ -399,10 +468,9 @@ suite('MET-224 main-area brand media text workflow', () => {
     );
     browser = await chromium.launch({
       headless: true,
-      // Use Chromium's software compositor for the exact paint oracle below.
+      // Use Chromium's software compositor for repeatable probe captures.
       // macOS GPU rasterization changes rounded-edge gray values between
       // screenshots even when an opaque layer fully covers the changed seat.
-      // This keeps zero pixel tolerance; the missing-isolation control stays.
       args: ['--disable-gpu'],
       executablePath:
         process.env.ALLRICE_TEST_CHROME_EXECUTABLE ??
@@ -1636,18 +1704,17 @@ suite('MET-224 main-area brand media text workflow', () => {
           });
         for (const inset of insets)
           expect(Math.abs(inset - 12)).toBeLessThanOrEqual(0.5);
-        const assertCovered = async (name: string) => {
-          const prefix = resolve(
-            evidence,
-            `native-composer-${surface.width}-${surface.colorScheme}-${name}`,
-          );
+        const assertComposerPaint = async (name: string, covered = true) => {
+          const label = `native-composer-${surface.width}-${surface.colorScheme}-${name}`;
+          const prefix = resolve(evidence, label);
           // inert does not stop painting. Keep the native seat and all layers
           // mounted in both probes. Only the same paint variable changes;
           // adding/removing layers can rerasterize unrelated alpha edges.
-          await page.screenshot({
-            path: prefix + '-mounted.png',
-            animations: 'disabled',
-          });
+          if (covered)
+            await page.screenshot({
+              path: prefix + '-mounted.png',
+              animations: 'disabled',
+            });
           await seat.evaluate((el) =>
             el.style.setProperty('--met224-probe-color', 'cyan'),
           );
@@ -1684,8 +1751,59 @@ suite('MET-224 main-area brand media text workflow', () => {
               caret: 'initial',
               clip: composerClip,
             });
-            // Every pixel in the native seat/viewport intersection is exact.
-            expect(cyan.equals(magenta)).toBe(true);
+            const equalPng = cyan.equals(magenta);
+            if (covered && equalPng) return;
+            const preserve = async (comparison: object) => {
+              const batch = process.env.ALLRICE_CI_COLLECTION_BATCH;
+              const directory = batch
+                ? resolve(dirname(resolve(batch)), 'brand-media-composer')
+                : evidence;
+              await mkdir(directory, { recursive: true });
+              const files = ['composer-cyan', 'composer-magenta'];
+              if (covered) files.push('mounted');
+              await Promise.all([
+                writeFile(
+                  resolve(directory, label + '-comparison.json'),
+                  JSON.stringify(
+                    {
+                      name,
+                      surface,
+                      composerClip,
+                      covered,
+                      equalPng,
+                      browserVersion: browser.version(),
+                      comparison,
+                    },
+                    null,
+                    2,
+                  ),
+                ),
+                ...(batch
+                  ? files.map((file) =>
+                      copyFile(
+                        `${prefix}-${file}.png`,
+                        resolve(directory, `${label}-${file}.png`),
+                      ),
+                    )
+                  : []),
+              ]);
+            };
+            const pixels = await compareComposerProbes(
+              page,
+              cyan,
+              magenta,
+            ).catch(async (error: unknown) => {
+              await preserve({ error: String(error) });
+              throw error;
+            });
+            if (covered || pixels.probePixels === 0) await preserve(pixels);
+            if (covered) {
+              expect(pixels.changedPixels - pixels.neutralPixels, label).toBe(
+                0,
+              );
+            } else {
+              expect(pixels.probePixels, label).toBeGreaterThan(0);
+            }
           } finally {
             await probe.evaluate((el) => (el as HTMLStyleElement).remove());
             await seat.evaluate((el) =>
@@ -1700,32 +1818,17 @@ suite('MET-224 main-area brand media text workflow', () => {
               .poll(() => page.getByLabel('文章正文').textContent())
               .toContain('不可直接改写的正文');
           await page.evaluate(() => document.fonts.ready);
-          await assertCovered(tab);
+          await assertComposerPaint(tab);
         }
         await page.getByRole('button', { name: 'ⓘ 使用说明' }).click();
         await page.getByRole('dialog', { name: '使用说明' }).waitFor();
-        await assertCovered('help');
-        const covered = await page.screenshot({
-          animations: 'disabled',
-          clip: composerClip,
-        });
+        await assertComposerPaint('help');
         const conversation = seat.locator('xpath=ancestor::*[@aria-hidden][1]');
         await conversation.evaluate((el) => {
           (el as HTMLElement).style.isolation = 'auto';
         });
         try {
-          expect(
-            covered.equals(
-              await page.screenshot({
-                path: resolve(
-                  evidence,
-                  `native-composer-${surface.width}-${surface.colorScheme}-without-isolation.png`,
-                ),
-                animations: 'disabled',
-                clip: composerClip,
-              }),
-            ),
-          ).toBe(false);
+          await assertComposerPaint('without-isolation', false);
         } finally {
           await conversation.evaluate((el) =>
             (el as HTMLElement).style.removeProperty('isolation'),
