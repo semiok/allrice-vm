@@ -4,9 +4,9 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { getEventListeners, once } from 'node:events';
-import { get, type ServerResponse } from 'node:http';
-import { createConnection, type AddressInfo } from 'node:net';
+import { getEventListeners, on, once } from 'node:events';
+import { get, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createConnection, type AddressInfo, type Socket } from 'node:net';
 import { expect, it, vi } from 'vitest';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -34,6 +34,76 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+// These loopback responses use either a fixed body length or Node's chunked
+// encoding. The TCP packets can split any of those framing boundaries.
+function observeProfileWire(socket: Socket) {
+  const chunks = on(socket, 'data', { close: ['end', 'close'] });
+  let pending = Buffer.alloc(0);
+
+  async function receive(boundary: string) {
+    const next = await chunks.next();
+    if (next.done) throw Error(`Profile socket closed before ${boundary}`);
+    pending = Buffer.concat([pending, next.value[0] as Buffer]);
+  }
+  function take(length: number) {
+    const value = pending.subarray(0, length);
+    pending = pending.subarray(length);
+    return value;
+  }
+  async function bytes(length: number, boundary: string) {
+    while (pending.length < length) await receive(boundary);
+    return take(length);
+  }
+  async function through(delimiter: string, boundary: string) {
+    let end = pending.indexOf(delimiter);
+    while (end === -1) {
+      await receive(boundary);
+      end = pending.indexOf(delimiter);
+    }
+    return take(end + delimiter.length).subarray(0, end);
+  }
+  async function head(status: 200 | 404) {
+    const [line, ...fields] = (
+      await through('\r\n\r\n', 'complete response headers')
+    )
+      .toString('latin1')
+      .split('\r\n');
+    expect(line).toBe(
+      status === 200 ? 'HTTP/1.1 200 OK' : 'HTTP/1.1 404 Not Found',
+    );
+    const headers = new Headers();
+    for (const field of fields) {
+      const colon = field.indexOf(':');
+      expect(colon).toBeGreaterThan(0);
+      headers.append(field.slice(0, colon), field.slice(colon + 1));
+    }
+    return headers;
+  }
+  async function chunk() {
+    const size = (await through('\r\n', 'HTTP chunk size')).toString('ascii');
+    expect(size).toMatch(/^[0-9a-f]+$/i);
+    const length = Number.parseInt(size, 16);
+    expect(Number.isSafeInteger(length)).toBe(true);
+    const data = await bytes(length, 'HTTP chunk bytes');
+    expect((await bytes(2, 'HTTP chunk boundary')).toString()).toBe('\r\n');
+    return length ? data : null;
+  }
+  async function body(headers: Headers) {
+    if (headers.get('transfer-encoding') === 'chunked') {
+      expect(headers.has('content-length')).toBe(false);
+      const parts: Buffer[] = [];
+      for (let part = await chunk(); part; part = await chunk())
+        parts.push(part);
+      return Buffer.concat(parts);
+    }
+    const length = headers.get('content-length');
+    expect(length).toMatch(/^\d+$/);
+    expect(Number.isSafeInteger(Number(length))).toBe(true);
+    return bytes(Number(length), 'fixed-length response body');
+  }
+  return { head, chunk, body, dispose: () => chunks.return?.() };
+}
 
 it('issues only once, borrows the same actual native Peer for unary and stream and joins before closed/end', async () => {
   const f = await fixture();
@@ -711,9 +781,31 @@ it(
     );
     const foreground = await open(f);
     const waiting = await open(f);
-    const pipeline = await pipelineAfterEvents(foreground.scopeId, {
+    const checkingGraph = deferred();
+    const finishGraph = deferred();
+    closes.push(async () => finishGraph.resolve());
+    ownerProof.beforeGraphRead = async () => {
+      ownerProof.beforeGraphRead = undefined;
+      checkingGraph.resolve();
+      await finishGraph.promise;
+    };
+    let sentQueued = false;
+    const starting = pipelineAfterEvents(foreground.scopeId, {
       awaitingId: waiting.scopeId,
+      beforeQueued: () => (sentQueued = true),
     });
+    try {
+      await Promise.race([
+        checkingGraph.promise,
+        starting.then(() => {
+          throw Error('Pipeline completed before reading the published graph');
+        }),
+      ]);
+      expect(sentQueued).toBe(false);
+    } finally {
+      finishGraph.resolve();
+    }
+    const pipeline = await starting;
     const [active, queuedAsset, queuedDenial, next] = pipeline.responses;
     for (const item of [queuedAsset!, queuedDenial!, next!]) {
       expect(item.socket).toBeNull();
@@ -733,21 +825,9 @@ it(
     expect(queuedDenial!.statusCode).toBe(404);
     expect(next!.headersSent).toBe(false);
     active!.end();
-    await expect
-      .poll(() => pipeline.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual([
-        'HTTP/1.1 200',
-        'HTTP/1.1 404',
-        'HTTP/1.1 404',
-        'HTTP/1.1 200',
-      ]);
-    await expect
-      .poll(() => pipeline.raw().includes(target.manifestSha256))
-      .toBe(true);
-    expect(pipeline.raw()).not.toContain(
-      'content-length: ' + largeBytes.length,
-    );
-    pipeline.client.destroy();
+    const [, , document] = await pipeline.remaining(404, 404, 200);
+    expect(JSON.parse(document!.toString())).toEqual(target);
+    await pipeline.disconnect();
 
     const noNotification = await open(f);
     const afterRoleChange = await pipelineAfterEvents(foreground.scopeId, {
@@ -762,14 +842,11 @@ it(
       new DataAccessError('authorization_denied'),
     );
     roleHead!.end();
-    await expect
-      .poll(() => afterRoleChange.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expectEmptyDenial(afterRoleChange.raw());
+    await afterRoleChange.remaining(404, 200);
     expect(roleNext!.writableFinished).toBe(true);
     expect((await f.invoke(noNotification.scopeId)).status).toBe(404);
     expect((await f.invoke(foreground.scopeId)).status).toBe(200);
-    afterRoleChange.client.destroy();
+    await afterRoleChange.disconnect();
 
     const beforeHeaders = await open(f);
     const assigned = await pipelineAfterEvents(foreground.scopeId, {
@@ -797,12 +874,9 @@ it(
     expect(assignedNext!.headersSent).toBe(false);
     finishCheck.resolve();
     expect(await rejected).toMatchObject({ value: { type: 'closed' } });
-    await expect
-      .poll(() => assigned.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expectEmptyDenial(assigned.raw());
+    await assigned.remaining(404, 200);
     expect(assignedNext!.writableFinished).toBe(true);
-    assigned.client.destroy();
+    await assigned.disconnect();
 
     const reading = await open(f);
     const readingGraph = deferred();
@@ -836,11 +910,8 @@ it(
     expect(readHead!.writableEnded).toBe(false);
     expect(preReadNext!.headersSent).toBe(false);
     readHead!.end();
-    await expect
-      .poll(() => preRead.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expectEmptyDenial(preRead.raw());
-    preRead.client.destroy();
+    await preRead.remaining(404, 200);
+    await preRead.disconnect();
 
     const borrowing = await open(f);
     const authorizing = deferred();
@@ -876,11 +947,8 @@ it(
     });
     expect(earlyHead!.writableEnded).toBe(false);
     earlyHead!.end();
-    await expect
-      .poll(() => early.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
-    expectEmptyDenial(early.raw());
-    early.client.destroy();
+    await early.remaining(404, 200);
+    await early.disconnect();
 
     const warm = await open(f);
     const warming = await f.publish('bootstrap', warm.scopeId, {}, 'document');
@@ -911,7 +979,7 @@ it(
     });
     const disconnectedAsset = disconnected.responses[1]!;
     expect(disconnectedAsset.socket).toBeNull();
-    disconnected.client.destroy();
+    await disconnected.disconnect();
     await expect
       .poll(() => f.completedProfiles.has(disconnectedAsset))
       .toBe(true);
@@ -933,15 +1001,18 @@ it(
         (row) => row.sessionId !== 'child',
       );
       grantHead!.end();
-      await expect
-        .poll(() => grantPipeline.raw())
-        .toContain('__DSH_REMOTE_ACCESS__');
-      expect(grantPipeline.raw()).toContain('"id":"root"');
-      expect(grantPipeline.raw()).not.toContain('"id":"child"');
+      const [grants] = await grantPipeline.remaining(200, 200);
+      const published = DEntryProfileBootstrapSchema.parse(
+        JSON.parse(grants!.toString()),
+      );
+      const access = published.injections.at(-1);
+      expect(access).toMatchObject({ name: '__DSH_REMOTE_ACCESS__' });
+      expect(JSON.stringify(access)).toContain('"id":"root"');
+      expect(JSON.stringify(access)).not.toContain('"id":"child"');
       expect((await f.invoke(waitingGrants.scopeId)).status).toBe(200);
     } finally {
       f.host.catalog.items = oldCatalog;
-      grantPipeline.client.destroy();
+      await grantPipeline.disconnect();
     }
 
     const draining = await pipelineAfterEvents(foreground.scopeId);
@@ -1009,11 +1080,8 @@ it(
     unrelatedHead!.end();
     await unrelatedFinish;
     await stoppingWire;
-    expect(unrelated.raw()).toContain('unrelated handler still running');
-    await expect
-      .poll(() => unrelated.raw().match(/HTTP\/1\.1 (200|404)/g))
-      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404']);
-    unrelated.client.destroy();
+    await unrelated.remaining(404);
+    await unrelated.disconnect();
     closePage(peer);
     expect(await receive()).toMatchObject({ value: { type: 'closed' } });
     closePage(second.peer);
@@ -1121,13 +1189,6 @@ it(
     expect(await withdrew).toBe(true);
     expect((await withdrawn.invoke(live.scopeId)).status).toBe(404);
 
-    function expectEmptyDenial(output: string) {
-      const denial = output
-        .split(/\r\n(?=HTTP\/1\.1 )/)
-        .find((response) => response.startsWith('HTTP/1.1 404'));
-      expect(denial).toMatch(/\r\ncontent-length: 0\r\n/i);
-      expect(denial?.split('\r\n\r\n')[1] ?? '').toBe('');
-    }
     async function pipelineAfterEvents(
       id: string,
       {
@@ -1151,43 +1212,87 @@ it(
     ) {
       const worker = subject.worker.address() as AddressInfo;
       const client = createConnection({ host: '127.0.0.1', port: worker.port });
-      client.on('error', () => {});
-      closes.push(async () => client.destroy());
-      await once(client, 'connect', { signal: AbortSignal.timeout(5000) });
-      const responses: ServerResponse[] = [];
-      const observed = (_request: unknown, response: ServerResponse) =>
-        responses.push(response);
-      subject.worker.on('request', observed);
-      let body = '';
-      client.on('data', (data) => {
-        body += data.toString();
+      const wire = observeProfileWire(client);
+      const terminal = deferred<Error>();
+      client.once('error', terminal.resolve);
+      client.once('end', () => terminal.resolve(Error('Profile socket ended')));
+      const closed = new Promise<void>((resolve) => {
+        client.once('close', () => {
+          terminal.resolve(Error('Profile socket closed'));
+          resolve();
+        });
       });
+      function whileConnected<T>(work: Promise<T>) {
+        return Promise.race([
+          work,
+          terminal.promise.then((error) => {
+            throw error;
+          }),
+        ]);
+      }
+      async function disconnect() {
+        client.destroy();
+        await closed;
+        await wire.dispose();
+      }
+      closes.push(disconnect);
+      await once(client, 'connect', { signal: AbortSignal.timeout(5000) });
+
+      const expected = unrelated
+        ? 2
+        : errors
+          ? 3
+          : awaitingId
+            ? onlyAsset || bootstrap
+              ? 3
+              : 4
+            : 1;
+      const arrived = deferred();
+      const responses: ServerResponse[] = [];
+      const waiters: Array<{ waiting: Promise<void>; dispose: () => void }> =
+        [];
+      const observed = (request: IncomingMessage, response: ServerResponse) => {
+        if (request.socket.remotePort !== client.localPort) return;
+        const ready = deferred();
+        const added = (name: string | symbol) => {
+          if (name === 'socket') ready.resolve();
+        };
+        response.on('newListener', added);
+        waiters.push({
+          waiting: ready.promise,
+          dispose: () => response.off('newListener', added),
+        });
+        responses.push(response);
+        if (responses.length === expected) arrived.resolve();
+      };
+      subject.worker.prependListener('request', observed);
       const bindingRef = subject.owner.bindingRef;
       const events = subject.profileUrl('events', id, { bindingRef });
       const serialize = (url: URL, headers = '') =>
         `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
+      let firstHeaders: Headers;
       try {
         const head = unrelated
           ? new URL('/fixture-before-profile', events)
           : events;
         client.write(serialize(head));
-        await expect.poll(() => body.split('\r\n')[0]).toBe('HTTP/1.1 200 OK');
-        await expect
-          .poll(() =>
-            body.includes(
-              unrelated
-                ? 'unrelated handler still running'
-                : 'text/event-stream',
-            ),
-          )
-          .toBe(true);
+        firstHeaders = await wire.head(200);
+        expect(firstHeaders.get('transfer-encoding')).toBe('chunked');
+        expect(firstHeaders.get('content-type')).toBe(
+          unrelated ? 'text/plain' : 'text/event-stream; charset=utf-8',
+        );
+        const firstBody = await wire.chunk();
+        expect(firstBody?.toString()).toBe(
+          unrelated
+            ? 'unrelated handler still running'
+            : `data: ${JSON.stringify({ type: 'graph', graph })}\n\n`,
+        );
         if (unrelated || errors) {
           const invalid = new URL(events);
           invalid.searchParams.append('scopeId', id);
           client.write(
             (unrelated ? '' : serialize(events)) + serialize(invalid),
           );
-          await expect.poll(() => responses.length).toBe(unrelated ? 2 : 3);
         } else if (awaitingId) {
           const asset = subject.profileUrl('assets', awaitingId, {
             bindingRef,
@@ -1207,20 +1312,38 @@ it(
                 ? ''
                 : serialize(invalid, 'x-allrice-profile-request: static\r\n')),
           );
-          await beforeNext?.();
+          if (beforeNext) await whileConnected(beforeNext());
           client.write(
             serialize(document, 'x-allrice-profile-request: document\r\n'),
           );
-          await expect
-            .poll(() => responses.length)
-            .toBe(onlyAsset || bootstrap ? 3 : 4);
         }
-        for (const queued of responses.slice(beforeNext ? 2 : 1))
-          await expect.poll(() => queued.listenerCount('socket')).toBe(1);
+        await whileConnected(arrived.promise);
+        expect(responses).toHaveLength(expected);
+        for (const [index, queued] of responses.entries()) {
+          if (index < (beforeNext ? 2 : 1)) continue;
+          await whileConnected(waiters[index]!.waiting);
+          expect(queued.listenerCount('socket')).toBe(1);
+        }
       } finally {
         subject.worker.off('request', observed);
+        for (const waiter of waiters) waiter.dispose();
       }
-      return { responses, client, raw: () => body };
+      async function remaining(...statuses: (200 | 404)[]) {
+        expect(await wire.body(firstHeaders)).toHaveLength(0);
+        const bodies = [];
+        for (const status of statuses) {
+          const headers = await wire.head(status);
+          expect(headers.get('content-length')).not.toBe(
+            String(largeBytes.length),
+          );
+          if (status === 404) expect(headers.get('content-length')).toBe('0');
+          const data = await wire.body(headers);
+          if (status === 404) expect(data).toHaveLength(0);
+          bodies.push(data);
+        }
+        return bodies;
+      }
+      return { responses, remaining, disconnect };
     }
     function holdSocket(response: ServerResponse) {
       const socket = response.socket!;
