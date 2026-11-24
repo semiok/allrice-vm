@@ -6,7 +6,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Browser, Page } from 'playwright-core';
-import type { PanelDataState } from '../../test/employee-panel-data-page';
+import type { PanelDataState } from '../../../../packages/dsh-web-composition/tests/fixtures/employee-panels/employee-panel-data-types';
 
 // Business data is an explicit in-browser contract substitute. Product panels,
 // hooks, forms, actions and native document components are the actual code.

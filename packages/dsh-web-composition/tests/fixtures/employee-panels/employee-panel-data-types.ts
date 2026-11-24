@@ -1,0 +1,31 @@
+import type { WorkbenchDeliverable } from '../../../../contracts/src/index';
+import type { EmployeePanelDataMethod } from '../../../../../apps/web/lib/chatflow/employee-panel-data';
+
+export type PanelDataState =
+  'list' | 'empty' | 'loading' | 'error' | 'denied' | 'unbound' | 'longname';
+export type PanelDataCall = {
+  method: EmployeePanelDataMethod;
+  input: unknown;
+  aborted: boolean;
+};
+
+export interface PanelDataFixture {
+  setState(value: PanelDataState): void;
+  setKind(value: 'files' | 'materials'): void;
+  mutateOriginal(): void;
+  refusePreview(status: number): void;
+  losePublicationReply(): void;
+  finishReceipt(): void;
+  evidence(): {
+    calls: PanelDataCall[];
+    used: unknown[];
+    files: WorkbenchDeliverable[];
+    copies: [string, string][];
+    writes: [string, { sourceId: string; revisionId: string }][];
+  };
+}
+declare global {
+  interface Window {
+    __panelDataFixture: PanelDataFixture;
+  }
+}

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
-import type { Browser } from '../../../worker/node_modules/playwright-core/index.js';
+import type { Browser } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
@@ -73,6 +73,7 @@ suite(
     const publishWrites: string[] = [];
     const receiptReads: string[] = [];
     let referenceWrites = 0;
+    const publicationStatuses: number[] = [];
 
     const routeNames: Record<
       string,
@@ -222,6 +223,7 @@ suite(
                 Buffer.concat(chunks).toString('utf8'),
               );
               publishWrites.push(requestId);
+              publicationStatuses.push(response.status);
               if (dropPublishReply && response.ok) {
                 dropPublishReply = false;
                 await response.body?.cancel();
@@ -431,12 +433,9 @@ suite(
         fixtureDocument = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture/assets/employee-panel-live-page.css"><div id="app" data-organization-id="${p.context.organizationId}" data-viewer-id="${p.context.actor.id}" data-workspace-id="${p.selection.workspaceId}" data-employee-instance-id="${p.selection.employeeInstanceId}" data-thread-id="${session.id}" data-scope-id="${randomUUID()}" data-native-session-id="test-dock"></div><script type="module" src="/fixture/assets/employee-panel-live-page.js"></script>`;
         let browser: Browser | undefined;
         try {
-          browser =
-            await require('../../../worker/node_modules/playwright-core').chromium.launch(
-              {
-                executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
-              },
-            );
+          browser = await require('playwright-core').chromium.launch({
+            executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
+          });
           const context = await browser!.newContext({
             reducedMotion: 'reduce',
           });
@@ -507,9 +506,16 @@ suite(
           await dialog
             .getByRole('button', { name: '确认', exact: true })
             .click();
+          await expect
+            .poll(async () => ({
+              statuses: publicationStatuses,
+              dropped: !dropPublishReply,
+              message: await dialog.getByRole('alert').allTextContents(),
+            }))
+            .toMatchObject({ statuses: [200], dropped: true });
           await dialog
             .getByText('发布结果待核，请按原请求核对。', { exact: true })
-            .waitFor();
+            .waitFor({ timeout: 5000 });
           await dialog
             .getByRole('button', { name: '取消', exact: true })
             .click();
@@ -1497,7 +1503,9 @@ suite(
         );
         const input = uploadInput(p, '受管资格.txt');
         const audience = { scope: 'personal' as const, departmentIds: [] };
-        const operation =
+        const operation: Parameters<
+          typeof p.client.readWriteReceipt
+        >[0]['operation'] =
           scenario === 'fresh capture'
             ? 'capture'
             : scenario === 'fresh publish-upload'

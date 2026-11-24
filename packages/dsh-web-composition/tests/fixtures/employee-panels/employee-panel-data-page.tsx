@@ -14,10 +14,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { bindEmployeePanels } from '../../../src/employee-panels';
 import type { EmployeePanelsPort } from '../../../src/employee-panels-port';
 import { syntheticPanelSnapshot } from './presentation';
-import type {
-  ReferenceRevision,
-  WorkbenchDeliverable,
-} from '../../../../contracts/src/index';
+import type { ReferenceRevision } from '../../../../contracts/src/index';
 import {
   createEmployeePanelDataClient,
   type EmployeePanelDataMethod,
@@ -40,8 +37,11 @@ import {
   uid,
 } from './data';
 
-export type PanelDataState =
-  'list' | 'empty' | 'loading' | 'error' | 'denied' | 'unbound' | 'longname';
+import type {
+  PanelDataCall,
+  PanelDataState,
+} from './employee-panel-data-types';
+
 const sample = createSyntheticPanelsData();
 let files = structuredClone(sample.files.files);
 const otherEmployee = uid(8);
@@ -54,11 +54,7 @@ let metadataStatus: number | undefined;
 let publicationReplyLost = false;
 let receiptReady = false;
 let serial = 850;
-const calls: {
-  method: EmployeePanelDataMethod;
-  input: unknown;
-  aborted: boolean;
-}[] = [];
+const calls: PanelDataCall[] = [];
 const used: unknown[] = [];
 const writes = new Map<string, { sourceId: string; revisionId: string }>();
 const uploads = new Map<string, { objectId: string }>();
@@ -324,27 +320,6 @@ function textPage(offset = 1) {
     lines: 2,
     eof: offset > 1,
   } as const;
-}
-
-export interface PanelDataFixture {
-  setState(value: PanelDataState): void;
-  setKind(value: 'files' | 'materials'): void;
-  mutateOriginal(): void;
-  refusePreview(status: number): void;
-  losePublicationReply(): void;
-  finishReceipt(): void;
-  evidence(): {
-    calls: typeof calls;
-    used: unknown[];
-    files: WorkbenchDeliverable[];
-    copies: [string, string][];
-    writes: [string, { sourceId: string; revisionId: string }][];
-  };
-}
-declare global {
-  interface Window {
-    __panelDataFixture: PanelDataFixture;
-  }
 }
 
 function Fixture() {
