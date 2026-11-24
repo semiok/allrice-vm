@@ -199,6 +199,17 @@ it('requires the issued scope in the document address and leaves the two exact n
   const html = await doc.text();
   expect(html).toContain('data-native-session-id="real-native-root"');
   expect(html).toContain('/managed/employee-web-entry.js');
+  const lifecycle = html.indexOf('__ALLRICE_EMPLOYEE_DOCUMENT__');
+  const stylesheetTags = [
+    ...html.matchAll(/data-allrice-document-asset="style"/g),
+  ];
+  expect(lifecycle).toBeGreaterThan(0);
+  expect(stylesheetTags).toHaveLength(3);
+  for (const stylesheet of stylesheetTags)
+    expect(stylesheet.index).toBeGreaterThan(lifecycle);
+  expect(html.indexOf('data-allrice-document-asset="entry"')).toBeGreaterThan(
+    lifecycle,
+  );
   expect(html).toContain(
     'id="allrice-employee-directory" type="application/json"',
   );

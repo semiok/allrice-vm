@@ -9,8 +9,10 @@ import {
   openNativePageCarrier,
   pageClosing,
   pageCompletion,
+  pageDocumentReady,
   pageNavigate,
   pageRevoked,
+  pageStartupFailed,
   pendingPageResult,
 } from '../../../lib/d-entry/page-carrier';
 
@@ -18,12 +20,19 @@ export function EmployeeNativePage({ query }: { query: string }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
+  const [activeQuery, setActiveQuery] = useState(query);
+  const replace = useRef<(() => void) | undefined>(undefined);
+  const nextQuery = useRef(query);
+  nextQuery.current = query;
 
   useEffect(() => {
     const lifetime = new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
     let navigating = false;
+    let mounted = false;
+    let replacing: Promise<boolean> | undefined;
+    let setting: Promise<void> | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
     setFailed(false);
@@ -46,6 +55,30 @@ export function EmployeeNativePage({ query }: { query: string }) {
         },
       );
     }
+    function retire() {
+      return (replacing ??= (async () => {
+        // A render change keeps the old iframe and its authenticated sender
+        // attached until both halves have settled.
+        if (!mounted || !frame.current) {
+          lifetime.abort();
+          const [remote] = await Promise.all([close(), setting]);
+          return remote !== 'unknown';
+        }
+        send(pageRevoked);
+        const [remote, entry] = await Promise.all([close(), local.promise]);
+        return remote === 'closed' && entry === 'closed';
+      })());
+    }
+    const applyQuery = () => {
+      if (navigating) return;
+      navigating = true;
+      void retire().then((closed) => {
+        if (replace.current !== applyQuery) return;
+        if (closed) setActiveQuery(nextQuery.current);
+        else setFailed(true);
+      });
+    };
+    replace.current = applyQuery;
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -55,6 +88,8 @@ export function EmployeeNativePage({ query }: { query: string }) {
       )
         return;
       if (event.data.type === pageClosing) void close();
+      if (event.data.type === pageStartupFailed) setFailed(true);
+      if (event.data.type === pageDocumentReady && replacing) send(pageRevoked);
       if (
         event.data.type === pageCompletion &&
         ['closed', 'unknown'].includes(event.data.state)
@@ -72,19 +107,20 @@ export function EmployeeNativePage({ query }: { query: string }) {
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
         // work independently and keep the frame until both report back.
-        send(pageRevoked);
-        void Promise.all([close(), local.promise]).then(([remote, entry]) => {
-          if (lifetime.signal.aborted) return;
-          if (remote === 'closed' && entry === 'closed')
-            location.assign('/chatflow/4.0?' + params);
-          else setFailed(true);
+        void retire().then((closed) => {
+          if (replace.current !== applyQuery) return;
+          if (closed) {
+            if (nextQuery.current !== activeQuery)
+              setActiveQuery(nextQuery.current);
+            else location.assign('/chatflow/4.0?' + params);
+          } else setFailed(true);
         });
       }
     };
     window.addEventListener('message', receive);
     window.addEventListener('pagehide', close);
     const setup = async () => {
-      const params = new URLSearchParams(query);
+      const params = new URLSearchParams(activeQuery);
       if ([...params.keys()].some((key) => params.getAll(key).length !== 1))
         throw Error('Invalid employee selection');
       const selection = DEntrySelectionInputSchema.parse(
@@ -114,21 +150,27 @@ export function EmployeeNativePage({ query }: { query: string }) {
       scopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
       params.set('scopeId', issued.scopeId);
+      mounted = true;
       setSource('/chatflow/4.0/document?' + params);
     };
-    void setup().catch(() => {
+    setting = setup().catch(() => {
       if (!lifetime.signal.aborted) setFailed(true);
     });
     return () => {
       lifetime.abort();
       close();
+      if (replace.current === applyQuery) replace.current = undefined;
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', close);
     };
-  }, [query]);
+  }, [activeQuery]);
+
+  useEffect(() => {
+    if (nextQuery.current !== activeQuery) replace.current?.();
+  }, [query, activeQuery]);
 
   return (
-    <main data-employee-selection={query}>
+    <main data-employee-selection={activeQuery}>
       {source && (
         <iframe
           ref={frame}

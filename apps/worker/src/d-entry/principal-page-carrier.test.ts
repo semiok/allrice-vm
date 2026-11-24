@@ -18,6 +18,7 @@ import {
   deferred,
 } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { createDEntryNativeGateway } from '../../../web/server/d-entry-native.mjs';
+import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
 import { nativeEntryFixture } from './native-entry.fixture.js';
 import { createDEntryPrincipalControl } from './principal-control.js';
 import { createDEntryPageRpc } from './principal-page-rpc.js';
@@ -1220,7 +1221,9 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
         `
         import { createRoot } from 'react-dom/client';
         import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
-        createRoot(document.getElementById('root')).render(<EmployeeNativePage query={location.search.slice(1)} />);
+        const root = createRoot(document.getElementById('root'));
+        window.updateEmployeeQuery = (query) => root.render(<EmployeeNativePage query={query} />);
+        window.updateEmployeeQuery(location.search.slice(1));
       `,
       ),
       bundle(
@@ -1242,6 +1245,9 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
     ]);
     let transfer = deferred<ServerResponse>();
     let cancelled = deferred<void>();
+    let firstScript = deferred<ServerResponse>();
+    let startup: 'style' | 'entry' | undefined;
+    const directoryQueries: string[] = [];
     const graph = DEntryProfileGraphSchema.parse({
       rev: 'test-graph',
       release: { version: '0.2.1-rc.2' },
@@ -1263,11 +1269,21 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
         return send('application/javascript', outer);
       if (url.pathname === '/child.js')
         return send('application/javascript', child);
-      if (url.pathname === '/api/v1/d-entry/identity')
+      if (url.pathname === '/first.js') {
+        if (startup === 'entry') return response.writeHead(503).end();
+        response.writeHead(200, { 'content-type': 'application/javascript' });
+        response.write('/* the managed module has not loaded */\n');
+        firstScript.resolve(response);
+        return;
+      }
+      if (url.pathname === '/first.css') return response.writeHead(503).end();
+      if (url.pathname === '/api/v1/d-entry/identity') {
+        directoryQueries.push(url.searchParams.get('threadId')!);
         return send(
           'application/json',
           JSON.stringify({ identity: f.identity }),
         );
+      }
       if (url.pathname === '/chatflow/4.0/document') {
         const fields = {
           'scope-id': url.searchParams.get('scopeId'),
@@ -1283,7 +1299,7 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
           .join(' ');
         return send(
           'text/html',
-          `<!doctype html><div id="app" ${attributes}></div><script type="module" src="/child.js"></script>`,
+          `<!doctype html><head><script data-scope-id="${fields['scope-id']}">${initialDocumentLifecycle}</script>${startup === 'style' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body><div id="app" ${attributes}></div><script type="module" data-allrice-document-asset="entry" src="/${startup ? 'first' : 'child'}.js"></script></body>`,
         );
       }
       if (url.pathname === '/api/v1/d-entry/profile/bootstrap')
@@ -1329,7 +1345,13 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const start = f.origin + '/old?' + new URLSearchParams(f.selection);
-    for (const scenario of ['navigate', 'unknown', 'child-hides'] as const) {
+    for (const scenario of [
+      'navigate',
+      'unknown',
+      'child-hides',
+      'query',
+      'query-unknown',
+    ] as const) {
       transfer = deferred<ServerResponse>();
       cancelled = deferred<void>();
       const page = await context.newPage();
@@ -1345,24 +1367,40 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
         const scopeId = new URL(frame.url()).searchParams.get('scopeId')!;
         expect((await f.invoke(scopeId)).status).toBe(200);
         const next = { ...f.selection, threadId: randomUUID() };
-        await frame.evaluate(
-          ({ scenario, scopeId, next }) => {
-            if (scenario === 'child-hides')
-              window.dispatchEvent(new Event('pagehide'));
-            else
-              parent.postMessage(
-                { type: 'allrice:d-entry:navigate', scopeId, selection: next },
-                location.origin,
-              );
-          },
-          { scenario, scopeId, next },
-        );
+        if (scenario === 'query' || scenario === 'query-unknown') {
+          await page.evaluate(
+            (nextSelection) =>
+              (
+                window as unknown as {
+                  updateEmployeeQuery(value: string): void;
+                }
+              ).updateEmployeeQuery(nextSelection),
+            new URLSearchParams(next).toString(),
+          );
+        } else
+          await frame.evaluate(
+            ({ scenario, scopeId, next }) => {
+              if (scenario === 'child-hides')
+                window.dispatchEvent(new Event('pagehide'));
+              else
+                parent.postMessage(
+                  {
+                    type: 'allrice:d-entry:navigate',
+                    scopeId,
+                    selection: next,
+                  },
+                  location.origin,
+                );
+            },
+            { scenario, scopeId, next },
+          );
         await cancelled.promise;
         expect(blocked.destroyed).toBe(true);
         expect(blocked.writableFinished).toBe(false);
         await frame.locator('body[data-dispose=waiting]').waitFor();
         expect((await f.invoke(scopeId)).status).toBe(404);
         expect(page.url()).toBe(start);
+        expect(directoryQueries).not.toContain(next.threadId);
         expect(
           await frame.evaluate(() =>
             Object.hasOwn(window, 'nativeLateRegistration'),
@@ -1373,13 +1411,49 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
             (
               window as unknown as { releaseDispose(fail: boolean): void }
             ).releaseDispose(fail),
-          scenario === 'unknown',
+          scenario === 'unknown' || scenario === 'query-unknown',
         );
         if (scenario === 'navigate')
           await page.waitForURL('**/chatflow/4.0?**');
-        else if (scenario === 'unknown') {
+        else if (scenario === 'query') {
+          await expect.poll(() => directoryQueries).toContain(next.threadId);
+        } else if (scenario === 'unknown' || scenario === 'query-unknown') {
           await page.getByRole('alert').waitFor();
           expect(page.url()).toBe(start);
+          expect(directoryQueries).not.toContain(next.threadId);
+        }
+      } finally {
+        await page.close();
+      }
+    }
+    for (const phase of ['style', 'entry'] as const) {
+      startup = phase;
+      firstScript = deferred<ServerResponse>();
+      const page = await context.newPage();
+      try {
+        await page.goto(start, { waitUntil: 'domcontentloaded' });
+        await page.getByRole('alert').waitFor();
+        const frame = page
+          .frames()
+          .find((view) => view.url().includes('/chatflow/4.0/document'))!;
+        const scopeId = new URL(frame.url()).searchParams.get('scopeId')!;
+        expect((await f.invoke(scopeId)).status).toBe(404);
+        const next = { ...f.selection, threadId: randomUUID() };
+        if (phase === 'style') {
+          const script = await firstScript.promise;
+          expect(script.writableFinished).toBe(false);
+          await page.evaluate(
+            (query) =>
+              (
+                window as unknown as {
+                  updateEmployeeQuery(value: string): void;
+                }
+              ).updateEmployeeQuery(query),
+            new URLSearchParams(next).toString(),
+          );
+          expect(directoryQueries).not.toContain(next.threadId);
+          script.end(child);
+          await expect.poll(() => directoryQueries).toContain(next.threadId);
         }
       } finally {
         await page.close();
