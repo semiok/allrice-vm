@@ -12,6 +12,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
+import { SessionId } from '@deepseek-ai/dsh-session';
+import {
+  deferred,
+  hostFixture,
+  issue,
+} from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { createDEntryPrincipalControl } from './principal-control.js';
 import { DEntryProfileGraphSchema } from '@allrice/contracts';
 import { expect, it } from 'vitest';
 import { holdReleasedProfile } from './released-profile.js';
@@ -34,6 +41,8 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
   type Registry = {
     graph(): ReturnType<typeof DEntryProfileGraphSchema.parse>;
     fetchBundle(request: Request): Promise<Response>;
+    onGraphChanged(listener: () => void): () => void;
+    rebuilt(id: string): string | undefined;
   };
   const contexts: Context[] = [];
   async function installed(name: string, mtime: number) {
@@ -220,6 +229,79 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
         lifetime,
       ),
     ).rejects.toThrow('D entry native owner is not bound');
+
+    const local = await hostFixture(issue('execute'));
+    const neighbor = await hostFixture(issue('execute'));
+    const control = createDEntryPrincipalControl(local.node, {
+      carrier: lifetime,
+      cleanupTimeoutMs: 3000,
+    });
+    const otherControl = createDEntryPrincipalControl(neighbor.node, {
+      carrier: lifetime,
+      cleanupTimeoutMs: 3000,
+    });
+    const detach = local.host.allricePrincipal.observeProfileGraph(
+      two.registry,
+    );
+    const release = deferred();
+    try {
+      const original = control.acquire(local.selected, lifetime);
+      const page = await original.run(lifetime);
+      const other = await otherControl
+        .acquire(neighbor.selected, lifetime)
+        .run(lifetime);
+      const held = deferred();
+      local.catalog.beforeList = async () => {
+        held.resolve();
+        await release.promise;
+      };
+      const call = {
+        scopeId: local.selected.scopeId,
+        endpoint: 'session/page' as const,
+        args: {
+          request: {
+            address: { kind: 'session' as const, sessionId: SessionId('root') },
+            throughSeq: 0,
+          },
+        },
+      };
+      const reading = page.invoke(call, lifetime).then(
+        () => false,
+        () => true,
+      );
+      await held.promise;
+      await writeFile(
+        nativeFile(two.directory),
+        '/* a different native source generation */',
+      );
+      two.registry.rebuilt(names[0]!);
+      expect(two.registry.graph().rev).not.toBe(native.rev);
+      await expect.poll(() => page.revoked.aborted).toBe(true);
+      let joined = false;
+      const closed = original.close().then(() => {
+        joined = true;
+      });
+      expect(other.revoked.aborted).toBe(false);
+      expect(local.catalog.pages).toHaveLength(0);
+      expect(joined).toBe(false);
+      release.resolve();
+      expect(await reading).toBe(true);
+      await closed;
+      expect(joined).toBe(true);
+      expect(
+        (
+          await other.invoke(
+            { ...call, scopeId: neighbor.selected.scopeId },
+            lifetime,
+          )
+        ).value,
+      ).toMatchObject({ ok: true });
+    } finally {
+      release.resolve();
+      detach();
+      await Promise.all([control.close(), otherControl.close()]);
+      await Promise.all([local.close(), neighbor.close()]);
+    }
   } finally {
     for (const context of contexts.reverse()) await context.fiber.dispose();
     await rm(root, { recursive: true, force: true });
