@@ -30,13 +30,13 @@ const signal = () => new AbortController().signal;
 afterEach(() => vi.unstubAllGlobals());
 
 describe('explicit browser panel client, without BFF identity or business writes', () => {
-  it('rejects all sixteen missing methods without making a legacy request or returning empty success', async () => {
+  it('rejects all missing methods without making a legacy request or returning empty success', async () => {
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);
     const names = Object.keys(
       unboundEmployeePanelDataClient,
     ) as EmployeePanelDataMethod[];
-    expect(names).toHaveLength(16);
+    expect(names).toHaveLength(17);
     for (const name of names) {
       const call = unboundEmployeePanelDataClient[name] as (
         input: unknown,

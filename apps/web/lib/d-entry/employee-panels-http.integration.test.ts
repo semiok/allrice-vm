@@ -3,7 +3,12 @@ import { createServer } from 'node:http';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
-import { DataAccessError, type BuiltinModuleId } from '@allrice/database';
+import {
+  DataAccessError,
+  updateDEntryReleasePolicy,
+  type BuiltinModuleId,
+} from '@allrice/database';
+import { authorizeFixturePlatformAdministrator } from '../../../../packages/database/src/platform-authority.fixture.ts';
 import * as database from '../../../../packages/database/src/core/client.ts';
 import {
   createRuntimeFixtureDatabase,
@@ -1180,6 +1185,96 @@ suite(
         await response.text();
       } finally {
         read.mockRestore();
+      }
+    });
+    it('leaves the exact upload reservation pending when 4.0 eligibility is removed during the storage put', async () => {
+      const p = await person();
+      await release(p);
+      await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+      const storage = runtimeFixtureStorage(f.db);
+      const put = storage.put.bind(storage);
+      const input = uploadInput(p, 'revoked-during-upload.txt');
+      const writing = vi
+        .spyOn(storage, 'put')
+        .mockImplementationOnce(async (object, bytes) => {
+          await put(object, bytes);
+          await updateDEntryReleasePolicy(p.context, {
+            revision: 'fixture-withdraw',
+            defaultGeneration: '3.x',
+            selections: [],
+          });
+        });
+      try {
+        await expect(
+          p.client.uploadDeliverable(input, signal()),
+        ).rejects.toMatchObject({
+          requestId: input.requestId,
+          cause: { status: 403 },
+        });
+        expect(
+          await f.db`select o.state
+          from allrice_workbench_file_policies p
+          join allrice_storage_objects o on o.id=p.object_id
+          where p.upload_request_id=${input.requestId}`,
+        ).toEqual([{ state: 'pending' }]);
+        await release(p);
+        const receipt = await p.client.readWriteReceipt(
+          {
+            workspaceId: p.selection.workspaceId,
+            requestId: input.requestId,
+            operation: 'upload',
+          },
+          signal(),
+        );
+        expect(receipt).toMatchObject({ status: 'recorded', ready: false });
+      } finally {
+        writing.mockRestore();
+      }
+    });
+    it('replays the same material reservation from verified copy bytes after the original is withdrawn', async () => {
+      const p = await person();
+      await release(p);
+      const original = await p.client.uploadDeliverable(
+        uploadInput(p),
+        signal(),
+      );
+      const input = {
+        origin: 'file' as const,
+        workspaceId: p.selection.workspaceId,
+        requestId: randomUUID(),
+        objectId: original.objectId,
+        purpose: 'fixed copy',
+        audience: { scope: 'personal' as const, departmentIds: [] },
+      };
+      const storage = runtimeFixtureStorage(f.db);
+      const put = storage.put.bind(storage);
+      const writing = vi
+        .spyOn(storage, 'put')
+        .mockImplementationOnce(async (object, bytes) => {
+          await put(object, bytes);
+          throw Error('copy acknowledgement lost');
+        });
+      try {
+        await expect(
+          p.client.publishFile(input, signal()),
+        ).rejects.toBeInstanceOf(EmployeePanelsWriteUnknownError);
+        const check = {
+          workspaceId: input.workspaceId,
+          requestId: input.requestId,
+          operation: 'publish-file' as const,
+        };
+        const pending = await p.client.readWriteReceipt(check, signal());
+        expect(pending).toMatchObject({ status: 'recorded', ready: false });
+        await f.db`update allrice_storage_objects set deleted_at=clock_timestamp() where id=${original.objectId}`;
+        const replay = await p.client.publishFile(input, signal());
+        expect(replay).toEqual(pending.result);
+        expect(await p.client.readWriteReceipt(check, signal())).toMatchObject({
+          status: 'recorded',
+          ready: true,
+        });
+        expect(writing).toHaveBeenCalledOnce();
+      } finally {
+        writing.mockRestore();
       }
     });
   },

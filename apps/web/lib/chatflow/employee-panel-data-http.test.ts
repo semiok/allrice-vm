@@ -325,6 +325,16 @@ describe('sixteen fixed n4 browser methods', () => {
     expect(init?.method).toBeUndefined();
     expect(init?.body).toBeUndefined();
   });
+  it.each([401, 403, 404])(
+    'preserves the HTTP status on a refused file read (%i)',
+    async (status) => {
+      const f = fixture();
+      f.fetcher.mockResolvedValueOnce(new Response(null, { status }));
+      await expect(
+        f.client.listDeliverables({ workspaceId: f.workspaceId }, f.signal),
+      ).rejects.toMatchObject({ status });
+    },
+  );
   it('does not reconcile a receipt for another request or operation', async () => {
     const f = fixture();
     f.fetcher.mockResolvedValueOnce(

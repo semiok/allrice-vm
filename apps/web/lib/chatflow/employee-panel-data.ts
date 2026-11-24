@@ -9,6 +9,8 @@ import {
   ReferencePublishInputSchema,
   ReferenceRevisionSchema,
   ReferenceSaveResultSchema,
+  PanelWriteReceiptQuerySchema,
+  PanelWriteReceiptSchema,
   UuidSchema,
   WorkbenchDeliverablesFilterSchema,
   WorkbenchFileFavoriteSchema,
@@ -71,6 +73,10 @@ const methods = {
   publishUpload: method(
     ReferencePublishInputSchema.options[1]!,
     ReferenceSaveResultSchema.parse,
+  ),
+  readWriteReceipt: method(
+    PanelWriteReceiptQuerySchema,
+    PanelWriteReceiptSchema.parse,
   ),
   changePublication: method(
     z

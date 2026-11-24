@@ -177,6 +177,95 @@ suite(
       if (server) await new Promise<void>((done) => server.close(() => done()));
     });
 
+    it('removes open file contents and actions after the current metadata read returns 403', async () => {
+      const page = await browser.newPage();
+      try {
+        await page.goto(origin);
+        await root(page).getByText(firstFile, { exact: true }).click();
+        await root(page)
+          .getByText('这是固定文件第一页。', { exact: false })
+          .waitFor();
+        await page.evaluate(() => window.__panelDataFixture.refusePreview(403));
+        await root(page).getByText('无权访问', { exact: true }).waitFor();
+        expect(
+          await root(page)
+            .getByText('这是固定文件第一页。', { exact: false })
+            .count(),
+        ).toBe(0);
+        expect(
+          await root(page).locator('header[aria-label="文件操作"]').count(),
+        ).toBe(0);
+        expect(
+          (await evidence(page)).calls.filter(
+            (call) =>
+              call.method === 'listDeliverables' &&
+              (call.input as { objectId?: string }).objectId,
+          ),
+        ).toHaveLength(2);
+      } finally {
+        await page.close();
+      }
+    });
+
+    it('reopens an ambiguous publication on its original receipt and never submits a second upload', async () => {
+      const page = await browser.newPage();
+      try {
+        await page.goto(origin);
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+        await page.evaluate(() =>
+          window.__panelDataFixture.losePublicationReply(),
+        );
+        const open = () =>
+          root(page).getByRole('button', { name: '上传', exact: true }).click();
+        const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+        await open();
+        await dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+          name: '待核.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('same canonical write'),
+        });
+        await dialog.getByRole('button', { name: '发布', exact: true }).click();
+        await dialog
+          .getByText('发布结果待核，请按原请求核对。', { exact: true })
+          .waitFor();
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        await open();
+        await dialog
+          .getByRole('button', { name: '核对结果', exact: true })
+          .waitFor();
+        await expect
+          .poll(
+            async () =>
+              (await evidence(page)).calls.filter(
+                (call) => call.method === 'readWriteReceipt',
+              ).length,
+          )
+          .toBe(1);
+        await page.evaluate(() => window.__panelDataFixture.finishReceipt());
+        await dialog
+          .getByRole('button', { name: '核对结果', exact: true })
+          .click();
+        await dialog.waitFor({ state: 'hidden' });
+        const calls = (await evidence(page)).calls;
+        const uploads = calls.filter((call) => call.method === 'publishUpload');
+        expect(uploads).toHaveLength(1);
+        const requestId = (uploads[0]!.input as { requestId: string })
+          .requestId;
+        expect(
+          calls
+            .filter((call) => call.method === 'readWriteReceipt')
+            .map(({ input }) => input),
+        ).toEqual([
+          expect.objectContaining({ requestId, operation: 'publish-upload' }),
+          expect.objectContaining({ requestId, operation: 'publish-upload' }),
+        ]);
+      } finally {
+        await page.close();
+      }
+    });
+
     for (const env of environments)
       it(`${env.width}/${env.theme}: search, cross-employee favorites, exact quote, preview, download, fixed copy, upload and failure states`, async () => {
         const context = await browser.newContext({

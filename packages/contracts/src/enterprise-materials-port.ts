@@ -145,7 +145,9 @@ export interface EnterpriseMaterialsPort {
   publishFile(
     context: RequestContext,
     input: z.input<typeof MaterialsFilePublicationInputProjectionSchema>,
-    source: AuthorizedDeliverableResource,
+    source:
+      | AuthorizedDeliverableResource
+      | ((signal: AbortSignal) => Promise<AuthorizedDeliverableResource>),
     signal: AbortSignal,
   ): Promise<z.infer<typeof ReferenceSaveResultSchema>>;
   readWriteReceipt(

@@ -1,3 +1,4 @@
+import type { TransactionSql } from 'postgres';
 import { createAuthorizedFileResource } from './authorized-file-resource.ts';
 import {
   ArtifactSourceFileSchema,
@@ -44,6 +45,7 @@ export interface DeliverablesPortOptions {
   requireCurrentAccess?: (
     context: RequestContext,
     signal: AbortSignal,
+    transaction?: TransactionSql,
   ) => Promise<void>;
 }
 
@@ -58,10 +60,12 @@ export class DeliverableReadError extends Error {
   }
 }
 
-export function createDeliverablesPort(
-  options: DeliverablesPortOptions,
-): DeliverablesPort {
-  async function current(contextInput: RequestContext, signal: AbortSignal) {
+export function createDeliverablesPort(options: DeliverablesPortOptions) {
+  async function current(
+    contextInput: RequestContext,
+    signal: AbortSignal,
+    transaction?: TransactionSql,
+  ) {
     signal.throwIfAborted();
     const context = RequestContextSchema.parse(contextInput);
     if (
@@ -70,7 +74,7 @@ export function createDeliverablesPort(
       !options.requireCurrentAccess
     )
       throw new DataAccessError('authorization_denied');
-    await options.requireCurrentAccess(context, signal);
+    await options.requireCurrentAccess(context, signal, transaction);
     signal.throwIfAborted();
     return context;
   }
@@ -83,7 +87,7 @@ export function createDeliverablesPort(
     objectId: string,
     signal: AbortSignal,
   ) {
-    await current(context, signal);
+    signal.throwIfAborted();
     // Candidate eligibility is the same owner-only business directory used for
     // favorites. Reference copies and arbitrary storage objects are excluded.
     const file = await readPersonalWorkbenchFile(context, objectId);
@@ -101,7 +105,11 @@ export function createDeliverablesPort(
     objectId: string,
     checksum: string | undefined,
     signal: AbortSignal,
-  ): Promise<AuthorizedDeliverableResource> {
+  ): Promise<
+    AuthorizedDeliverableResource & {
+      reauthorize(signal: AbortSignal): Promise<void>;
+    }
+  > {
     const original = await ownedFile(context, objectId, signal);
     if (checksum !== undefined && original.object.checksum !== checksum)
       throw new DataAccessError('not_found');
@@ -113,7 +121,9 @@ export function createDeliverablesPort(
       const file = await ownedFile(context, objectId, transferSignal);
       if (
         file.object.checksum !== source.checksum ||
-        file.object.sizeBytes !== original.object.sizeBytes
+        file.object.sizeBytes !== original.object.sizeBytes ||
+        file.row.file_name !== original.row.file_name ||
+        file.object.mediaType !== original.object.mediaType
       )
         throw new DataAccessError('not_found');
       return file;
@@ -123,14 +133,16 @@ export function createDeliverablesPort(
       fileName: original.row.file_name,
       mediaType: original.object.mediaType,
       sizeBytes: original.object.sizeBytes,
+      async reauthorize(signal) {
+        await recheck(signal);
+      },
       async open(openSignal) {
         return createAuthorizedFileResource({
           signal,
           checksum: source.checksum,
           sizeBytes: original.object.sizeBytes,
           recheck,
-          async openSource(transferSignal) {
-            const file = await recheck(transferSignal);
+          openSource(_transferSignal, file) {
             return options.storage.get(file.object);
           },
           changed: () =>
@@ -193,7 +205,17 @@ export function createDeliverablesPort(
       const context = await current(contextInput, signal);
       const value = WorkbenchFileUploadSchema.parse(input);
       workspace(context, value.workspaceId);
-      const result = await uploadWorkbenchFile(context, value, options.storage);
+      const result = await uploadWorkbenchFile(
+        context,
+        value,
+        options.storage,
+        {
+          signal,
+          async current(transaction) {
+            await current(context, signal, transaction);
+          },
+        },
+      );
       // Join the owner's real I/O/transaction; cancellation is not rollback.
       await current(context, signal);
       return DeliverableUploadResultProjectionSchema.parse(result);
@@ -293,5 +315,5 @@ export function createDeliverablesPort(
             : null,
       });
     },
-  };
+  } satisfies DeliverablesPort;
 }

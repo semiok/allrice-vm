@@ -5,16 +5,12 @@ import EntryPage from '../page';
 import { DataAccessError } from '@allrice/database';
 
 const authenticated = vi.hoisted(() => vi.fn());
+const historyIdentity = vi.hoisted(() => vi.fn());
 vi.mock('../../../../lib/identity/session', () => ({
   requireRequestContext: authenticated,
 }));
-vi.mock('@allrice/database', () => ({
-  DataAccessError: class extends Error {
-    constructor(public code: string) {
-      super(code);
-    }
-  },
-  CodexSubscriptionError: class extends Error {},
+vi.mock('../../../../lib/d-entry/identity', () => ({
+  resolveDEntryIdentity: historyIdentity,
 }));
 
 const selection = {
@@ -33,6 +29,7 @@ const request = (suffix = query) =>
   });
 beforeEach(() => {
   authenticated.mockReset();
+  historyIdentity.mockReset();
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
@@ -45,6 +42,11 @@ it('the Next product page targets only the fixed same-origin document, preservin
   expect(html).not.toContain('<script');
   const response = await GET(request());
   expect(response.status).toBe(503);
+  expect(historyIdentity).toHaveBeenCalledExactlyOnceWith(
+    { actor: { type: 'user', id: 'actor' } },
+    selection,
+    'history',
+  );
 });
 
 it('checks the original Request/Cookie before accepting even invalid selectors', async () => {
@@ -56,6 +58,7 @@ it('checks the original Request/Cookie before accepting even invalid selectors',
   expect(authenticated).toHaveBeenCalledExactlyOnceWith(original);
   expect(response.status).toBe(401);
   expect((await response.json()).error.code).toBe('AUTHENTICATION_REQUIRED');
+  expect(historyIdentity).not.toHaveBeenCalled();
 });
 
 it.each([
@@ -70,6 +73,20 @@ it.each([
     const response = await GET(request(suffix));
     expect(response.status).toBe(400);
     expect((await response.json()).error.code).toBe('VALIDATION_FAILED');
+    expect(historyIdentity).not.toHaveBeenCalled();
+  },
+);
+
+it.each([
+  ['not_found', 404, 'RESOURCE_NOT_FOUND'],
+  ['authorization_denied', 403, 'AUTHORIZATION_DENIED'],
+] as const)(
+  'returns the existing history owner refusal for %s',
+  async (reason, status, code) => {
+    historyIdentity.mockRejectedValueOnce(new DataAccessError(reason));
+    const response = await GET(request());
+    expect(response.status).toBe(status);
+    expect((await response.json()).error.code).toBe(code);
   },
 );
 

@@ -23,6 +23,7 @@ import {
   type EmployeePanelDataMethod,
 } from '../lib/chatflow/employee-panel-data';
 import { uploadPersonalDeliverable } from '../lib/chatflow/employee-panel-upload';
+import { EmployeePanelsWriteUnknownError } from '../lib/chatflow/employee-panel-data-http';
 import { EnterpriseMaterialsPanel } from '../app/chatflow/enterprise-materials-panel';
 import { WorkbenchFilesPanel } from '../app/chatflow/workbench-files-panel';
 import { WorkbenchDeliverablePreview } from '../app/chatflow/workspace-file-preview';
@@ -49,6 +50,9 @@ files[2]!.sources[0]!.employeeName = 'Mika';
 files[2]!.favorite = true;
 let references = structuredClone(sample.references);
 let state: PanelDataState = 'list';
+let metadataStatus: number | undefined;
+let publicationReplyLost = false;
+let receiptReady = false;
 let serial = 850;
 const calls: {
   method: EmployeePanelDataMethod;
@@ -133,6 +137,10 @@ const bound = createEmployeePanelDataClient({
   },
   async listDeliverables(input, signal) {
     await call('listDeliverables', input, signal);
+    if (input.objectId && metadataStatus)
+      throw Object.assign(Error('文件服务拒绝读取'), {
+        status: metadataStatus,
+      });
     const visible =
       state === 'empty'
         ? []
@@ -242,7 +250,30 @@ const bound = createEmployeePanelDataClient({
         origin: 'upload',
       },
     });
+    if (publicationReplyLost) {
+      writes.set(input.requestId, saved);
+      throw new EmployeePanelsWriteUnknownError(
+        'publish-upload',
+        input.requestId,
+        input,
+        {
+          cause: Error('fixture: publication reply lost'),
+        },
+      );
+    }
     return saved;
+  },
+  async readWriteReceipt(input, signal) {
+    await call('readWriteReceipt', input, signal);
+    const result = writes.get(input.requestId) ?? null;
+    return {
+      requestId: input.requestId,
+      operation: input.operation,
+      status: result ? 'recorded' : 'unknown',
+      inputDigest: result ? 'sha256:' + '0'.repeat(64) : null,
+      result,
+      ready: result ? receiptReady : null,
+    };
   },
   async changePublication(input, signal) {
     await call('changePublication', input, signal);
@@ -299,6 +330,9 @@ export interface PanelDataFixture {
   setState(value: PanelDataState): void;
   setKind(value: 'files' | 'materials'): void;
   mutateOriginal(): void;
+  refusePreview(status: number): void;
+  losePublicationReply(): void;
+  finishReceipt(): void;
   evidence(): {
     calls: typeof calls;
     used: unknown[];
@@ -352,6 +386,16 @@ function Fixture() {
       },
       mutateOriginal() {
         bytes.set(uid(300), '后续另存的内容');
+      },
+      refusePreview(status) {
+        metadataStatus = status;
+        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+      },
+      losePublicationReply() {
+        publicationReplyLost = true;
+      },
+      finishReceipt() {
+        receiptReady = true;
       },
       evidence: () => ({
         calls,

@@ -224,6 +224,10 @@ export async function uploadWorkbenchFile(
   contextInput: RequestContext,
   input: unknown,
   storage: StoragePort,
+  qualification?: {
+    signal: AbortSignal;
+    current(transaction?: postgres.TransactionSql): Promise<void>;
+  },
 ) {
   const value = WorkbenchFileUploadSchema.parse(input),
     context = scoped(contextInput, value.workspaceId);
@@ -249,6 +253,7 @@ export async function uploadWorkbenchFile(
     );
     if (!(await readContentPrincipal(context, tx, true))?.writable)
       throw new DataAccessError('authorization_denied');
+    await qualification?.current(tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${context.organizationId + '/' + context.actor.id + '/' + value.requestId},0))`;
     const [existing] = await tx<
       { object_id: string; upload_digest: string; state: string }[]
@@ -315,11 +320,15 @@ export async function uploadWorkbenchFile(
         'invalid_file',
         '该上传已不可继续，请重新发起。',
       );
+    await qualification?.current();
+    qualification?.signal.throwIfAborted();
     await storage.put(
       object(pending),
       new Blob([new Uint8Array(bytes)]).stream(),
     );
+    qualification?.signal.throwIfAborted();
     await db.begin(async (tx) => {
+      await qualification?.current(tx);
       const access = await workbenchFileAccess(
         context,
         prepared.objectId,
@@ -330,6 +339,7 @@ export async function uploadWorkbenchFile(
         throw new DataAccessError('authorization_denied');
       const [current] =
         await tx`select state from allrice_storage_objects where id=${prepared.objectId} for update`;
+      qualification?.signal.throwIfAborted();
       if (current?.state === 'pending')
         await markStorageReady(context, prepared.objectId, tx);
       else if (current?.state !== 'ready')

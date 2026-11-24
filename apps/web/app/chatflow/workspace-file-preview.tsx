@@ -38,6 +38,11 @@ import { useWorkbenchFileFavorite } from './use-workbench-file-favorite';
 import { WorkbenchIcon } from './workbench-modules';
 import { useReferencePublicationOptions } from './use-reference-publication-options';
 
+const accessDenied = (error: unknown) =>
+  error instanceof Error &&
+  'status' in error &&
+  [401, 403, 404].some((status) => status === error.status);
+
 /** Used by business file cards as well as the owner directory. Resolve metadata
  * before the toolbar mounts, including when an old card points at a denied file. */
 export function WorkbenchDeliverablePreview(props: {
@@ -80,6 +85,11 @@ export function WorkbenchDeliverablePreview(props: {
     attempt: number;
     client: EmployeePanelDataClient;
   } | null>(null);
+  const forgetPreview = useCallback(() => {
+    loaded.current = null;
+    setSnapshot(null);
+    setFailure({ key, denied: true });
+  }, [key]);
   useEffect(() => {
     const changed = () => setAttempt((n) => n + 1);
     window.addEventListener('allrice:workbench-files-changed', changed);
@@ -125,18 +135,12 @@ export function WorkbenchDeliverablePreview(props: {
             quotable: catalog.quotableFileIds.includes(file.objectId),
             publicationViewerId: catalog.viewerId,
           });
-        } else {
-          setSnapshot(null);
-          setFailure({ key, denied: true });
-        }
+        } else forgetPreview();
       })
       .catch((error) => {
         if (abort.signal.aborted) return;
-        const denied = [401, 403, 404].includes(
-          (error as { status?: number }).status ?? 0,
-        );
-        if (denied) setSnapshot(null);
-        setFailure({ key, denied });
+        if (accessDenied(error)) forgetPreview();
+        else setFailure({ key, denied: false });
       });
     return () => abort.abort();
   }, [
@@ -147,6 +151,7 @@ export function WorkbenchDeliverablePreview(props: {
     props.active,
     attempt,
     data,
+    forgetPreview,
   ]);
   if (
     failure?.key === key &&
@@ -184,6 +189,7 @@ export function WorkbenchDeliverablePreview(props: {
         quotable={snapshot.quotable}
         metadataError={failure?.key === key}
         onReloadMetadata={() => setAttempt((n) => n + 1)}
+        onAccessDenied={forgetPreview}
       />
     </div>
   );
@@ -204,6 +210,7 @@ export function WorkspaceFilePreview(props: {
   quotable?: boolean;
   metadataError?: boolean;
   onReloadMetadata?: () => void;
+  onAccessDenied?: () => void;
   onBack?: () => void;
   onSource?: (sessionId: string) => void;
   onPublish?: (file: WorkbenchDeliverable) => void;
@@ -222,26 +229,48 @@ export function WorkspaceFilePreview(props: {
     `${props.ownerKey}/${props.workspaceId}/${props.objectId}`,
     props.active ?? true,
   );
+  const [denied, setDenied] = useState(false);
+  const onAccessDenied = props.onAccessDenied;
+  const rejectPreview = useCallback(
+    (error: unknown, signal: AbortSignal) => {
+      if (!signal.aborted && accessDenied(error)) {
+        setPreview(null);
+        setDenied(true);
+        onAccessDenied?.();
+      }
+    },
+    [onAccessDenied],
+  );
   const readPage = useCallback(
     (page: { source: true; offset?: number }, signal: AbortSignal) =>
-      data.previewDeliverable(
-        {
-          workspaceId: props.workspaceId,
-          objectId: props.objectId,
-          fileName: props.title,
-          ...page,
-        },
-        signal,
-      ),
-    [data, props.workspaceId, props.objectId, props.title],
+      data
+        .previewDeliverable(
+          {
+            workspaceId: props.workspaceId,
+            objectId: props.objectId,
+            fileName: props.title,
+            ...page,
+          },
+          signal,
+        )
+        .catch((error) => {
+          rejectPreview(error, signal);
+          throw error;
+        }),
+    [data, props.workspaceId, props.objectId, props.title, rejectPreview],
   );
   const downloadFile = () =>
     void download.download(
       (signal) =>
-        data.downloadDeliverable(
-          { workspaceId: props.workspaceId, objectId: props.objectId },
-          signal,
-        ),
+        data
+          .downloadDeliverable(
+            { workspaceId: props.workspaceId, objectId: props.objectId },
+            signal,
+          )
+          .catch((error) => {
+            rejectPreview(error, signal);
+            throw error;
+          }),
       props.title,
     );
   const [preview, setPreview] = useState<ArtifactPreview | null>(null);
@@ -315,6 +344,7 @@ export function WorkspaceFilePreview(props: {
     if (props.dataClient && props.active === false) return;
     const controller = new AbortController();
     setError('');
+    setDenied(false);
     setPreview(null);
     setSource(false);
     setInteractive(false);
@@ -336,6 +366,7 @@ export function WorkspaceFilePreview(props: {
         if (!controller.signal.aborted) setPreview(parseArtifactPreview(value));
       })
       .catch((error) => {
+        rejectPreview(error, controller.signal);
         if (!controller.signal.aborted)
           setError(
             error instanceof Error
@@ -355,7 +386,9 @@ export function WorkspaceFilePreview(props: {
     props.workspaceId,
     props.objectId,
     props.title,
+    rejectPreview,
   ]);
+  if (denied) return <p className={detail.empty}>无权访问</p>;
   const footer = props.deliverable ? (
     <footer className={detail.detailFooter}>
       <dl className={detail.metadata}>

@@ -52,7 +52,20 @@ describe('complete authorized panel download', () => {
       Buffer.from('完整\ufeffbytes\r\n'),
     );
     expect(f.open).toHaveBeenCalledTimes(1);
-    expect(f.authorize.mock.calls.length).toBeGreaterThan(3);
+    expect(f.authorize).toHaveBeenCalledTimes(6);
+  });
+  it('authorizes each delivered chunk at the disclosure boundary without doubling the read', async () => {
+    const bytes = Buffer.alloc(3 * 64 * 1024 + 9, 3);
+    const f = fixture(bytes);
+    const response = await preparePanelDownload(
+      f.resource,
+      f.checksum,
+      f.signal.signal,
+      f.authorize,
+    );
+    const beforeBody = f.authorize.mock.calls.length;
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+    expect(f.authorize.mock.calls.length - beforeBody).toBe(5);
   });
   it.each(['short', 'long', 'checksum'] as const)(
     'does not construct success for %s source corruption',

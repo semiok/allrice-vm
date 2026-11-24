@@ -153,7 +153,6 @@ export async function preparePanelDownload(
     let size = 0;
     const hash = createHash('sha256');
     for (;;) {
-      await current();
       const chunk = await reader.read();
       await current();
       if (chunk.done) break;
@@ -162,7 +161,7 @@ export async function preparePanelDownload(
       hash.update(chunk.value);
       let written = 0;
       while (written < chunk.value.byteLength) {
-        await current();
+        active.throwIfAborted();
         const result = await file.write(
           chunk.value,
           written,
@@ -220,8 +219,11 @@ export async function preparePanelDownload(
         },
         pull() {
           const work = Promise.resolve().then(async () => {
-            await current();
-            if (offset === resource.sizeBytes) return true;
+            active.throwIfAborted();
+            if (offset === resource.sizeBytes) {
+              await current();
+              return true;
+            }
             const chunk = Buffer.alloc(
               Math.min(64 * 1024, resource.sizeBytes - offset),
             );

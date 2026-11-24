@@ -49,7 +49,7 @@ export interface EnterpriseMaterialsPortOptions {
 
 export function createEnterpriseMaterialsPort(
   options: EnterpriseMaterialsPortOptions,
-): EnterpriseMaterialsPort {
+) {
   async function current(
     contextInput: RequestContext,
     workspaceId: string,
@@ -86,7 +86,7 @@ export function createEnterpriseMaterialsPort(
         checksum: original.object.checksum,
       };
       const recheck = async (reading: AbortSignal) => {
-        await current(context, value.workspaceId, reading);
+        reading.throwIfAborted();
         const file = await getAuthorizedReferenceFile(
           context,
           value.workspaceId,
@@ -97,6 +97,8 @@ export function createEnterpriseMaterialsPort(
           file.object.id !== original.object.id ||
           file.object.checksum !== pin.checksum ||
           file.object.sizeBytes !== original.object.sizeBytes ||
+          file.object.mediaType !== original.object.mediaType ||
+          file.fileName !== original.fileName ||
           file.reference.revision !== pin.revision ||
           (file.reference.manifestDigest ?? file.reference.checksum) !==
             pin.digest
@@ -105,20 +107,22 @@ export function createEnterpriseMaterialsPort(
         await current(context, value.workspaceId, reading);
         return file;
       };
-      await recheck(signal);
+      await current(context, value.workspaceId, signal);
       return {
         pin,
         objectId: original.object.id,
         fileName: original.fileName,
         mediaType: original.object.mediaType,
         sizeBytes: original.object.sizeBytes,
+        async reauthorize(signal: AbortSignal) {
+          await recheck(signal);
+        },
         open: createAuthorizedFileResource({
           signal,
           checksum: pin.checksum,
           sizeBytes: original.object.sizeBytes,
           recheck,
-          openSource: async (reading) =>
-            options.storage.get((await recheck(reading)).object),
+          openSource: (_reading, file) => options.storage.get(file.object),
           changed: () => new DataAccessError('not_found'),
         }),
       };
@@ -140,8 +144,6 @@ export function createEnterpriseMaterialsPort(
     async publishFile(contextInput, input, source, signal) {
       const value = MaterialsFilePublicationInputProjectionSchema.parse(input);
       const context = await current(contextInput, value.workspaceId, signal);
-      if (source.source.objectId !== value.objectId)
-        throw new DataAccessError('not_found');
       const result = await publishReference(context, value, options.storage, {
         namePolicy: 'independent-material',
         source,
@@ -290,5 +292,5 @@ export function createEnterpriseMaterialsPort(
       await current(context, value.body.workspaceId, signal);
       return MaterialsActionResultProjectionSchema.parse(result);
     },
-  };
+  } satisfies EnterpriseMaterialsPort;
 }

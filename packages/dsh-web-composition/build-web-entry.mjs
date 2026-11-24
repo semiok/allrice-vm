@@ -4,9 +4,11 @@ import { execFile } from 'node:child_process';
 import {
   mkdir,
   mkdtemp,
+  lstat,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -398,6 +400,53 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
   return manifest;
 }
 
+/** The default destination is an atomic reference to a complete immutable
+ * build. Explicitly named outputs still use the original one-write contract. */
+export async function publishEmployeeWebArtifact(
+  outputDirectory,
+  buildArtifact = buildEmployeeWebArtifact,
+) {
+  const destination = resolve(outputDirectory);
+  const parent = dirname(destination);
+  await mkdir(parent, { recursive: true });
+  const stage = await mkdtemp(join(parent, '.web-entry-'));
+  const artifact = join(stage, 'artifact');
+  const pointer = join(stage, 'next');
+  const backup = join(stage, 'previous');
+  let keep = false;
+  try {
+    const manifest = await buildArtifact(artifact);
+    await symlink(relative(parent, artifact), pointer, 'dir');
+    const previous = await lstat(destination).catch((error) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    if (previous && !previous.isDirectory() && !previous.isSymbolicLink())
+      throw new Error('Web entry destination is not a release directory');
+    // Migrate an older default build that published a directory directly.
+    if (previous?.isDirectory()) await rename(destination, backup);
+    try {
+      await rename(pointer, destination);
+    } catch (error) {
+      if (previous?.isDirectory()) {
+        try {
+          await rename(backup, destination);
+        } catch (cleanup) {
+          keep = true;
+          throw new AggregateError(
+            [error, cleanup],
+            'Web entry publication rollback failed',
+          );
+        }
+      }
+      throw error;
+    }
+    keep = true;
+    return manifest;
+  } finally {
+    if (!keep) await rm(stage, { recursive: true, force: true });
+  }
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href
@@ -406,7 +455,9 @@ if (
     await collectProfileArtifacts(process.argv[3]);
   } else {
     const directory = process.argv[2] ?? join(packageRoot, 'dist/web-entry');
-    const manifest = await buildEmployeeWebArtifact(directory);
+    const manifest = await (process.argv[2]
+      ? buildEmployeeWebArtifact(directory)
+      : publishEmployeeWebArtifact(directory));
     process.stdout.write(
       JSON.stringify({
         status: manifest.status,

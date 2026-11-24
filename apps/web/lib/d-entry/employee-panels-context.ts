@@ -89,9 +89,12 @@ export async function requireEmployeePanelsContext(
     candidate: RequestContext,
     signal: AbortSignal,
   ) {
-    const fresh = await current(candidate, signal);
-    await dependencies.builtinModules.require({ moduleId, ...fresh }, signal);
-    // A pending policy/build read never freezes Cookie or membership authority.
+    signal.throwIfAborted();
+    await dependencies.builtinModules.require(
+      { moduleId, context, identity },
+      signal,
+    );
+    // Re-read the request authority after the asynchronous build policy check.
     await current(candidate, signal);
   }
   await current(context, request.signal);
@@ -114,8 +117,18 @@ export async function requireEmployeePanelsContext(
     }),
     deliverables: createDeliverablesPort({
       storage,
-      requireCurrentAccess: (candidate, signal) =>
-        currentModule('deliverables', candidate, signal),
+      async requireCurrentAccess(candidate, signal, transaction) {
+        if (!transaction)
+          return currentModule('deliverables', candidate, signal);
+        const next = await dependencies.authorize(
+          candidate,
+          selection,
+          transaction,
+        );
+        if (!sameDEntryIdentity(identity, next))
+          throw new DataAccessError('authorization_denied');
+        signal.throwIfAborted();
+      },
     }),
   };
 }

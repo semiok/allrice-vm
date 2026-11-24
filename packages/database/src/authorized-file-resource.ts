@@ -2,12 +2,15 @@ import { createHash } from 'node:crypto';
 
 /** Shared owner stream. The caller supplies the exact immutable pin and live
  * ACL recheck; this helper does not establish identity or issue a grant. */
-export function createAuthorizedFileResource(options: {
+export function createAuthorizedFileResource<T>(options: {
   checksum: string;
   sizeBytes: number;
   signal: AbortSignal;
-  recheck(signal: AbortSignal): Promise<unknown>;
-  openSource(signal: AbortSignal): Promise<ReadableStream<Uint8Array>>;
+  recheck(signal: AbortSignal): Promise<T>;
+  openSource(
+    signal: AbortSignal,
+    source: T,
+  ): Promise<ReadableStream<Uint8Array>>;
   changed(): Error;
 }) {
   const signal = options.signal;
@@ -18,8 +21,8 @@ export function createAuthorizedFileResource(options: {
       openSignal,
       stopped.signal,
     ]);
-    await options.recheck(transferSignal);
-    const stream = await options.openSource(transferSignal);
+    const source = await options.recheck(transferSignal);
+    const stream = await options.openSource(transferSignal, source);
     try {
       await options.recheck(transferSignal);
     } catch (error) {

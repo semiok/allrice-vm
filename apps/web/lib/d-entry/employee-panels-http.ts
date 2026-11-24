@@ -98,38 +98,22 @@ export function createEmployeePanelsHandlers(
     request: Request,
     kind: 'material' | 'file',
   ) {
-    const get = () =>
-      kind === 'material'
-        ? scope.materials.authorizedRevisionResource(
-            scope.context,
-            materialInput(scope, params),
-            request.signal,
-          )
-        : scope.deliverables.download(
-            scope.context,
-            fileInput(params),
-            request.signal,
-          );
-    const original = await get();
+    const original = await (kind === 'material'
+      ? scope.materials.authorizedRevisionResource(
+          scope.context,
+          materialInput(scope, params),
+          request.signal,
+        )
+      : scope.deliverables.download(
+          scope.context,
+          fileInput(params),
+          request.signal,
+        ));
     const checksum =
       'pin' in original ? original.pin.checksum : original.source.checksum;
     const objectId =
       'pin' in original ? original.objectId : original.source.objectId;
-    const pin =
-      'pin' in original
-        ? JSON.stringify(original.pin)
-        : JSON.stringify(original.source);
-    const authorize = async () => {
-      const fresh = await get();
-      if (
-        JSON.stringify('pin' in fresh ? fresh.pin : fresh.source) !== pin ||
-        fresh.sizeBytes !== original.sizeBytes ||
-        fresh.fileName !== original.fileName ||
-        fresh.mediaType !== original.mediaType
-      )
-        throw new DataAccessError('not_found');
-      await scope.current();
-    };
+    const authorize = (signal: AbortSignal) => original.reauthorize(signal);
     return { original, checksum, objectId, authorize };
   }
   const preview = (kind: 'material' | 'file') =>
@@ -236,15 +220,15 @@ export function createEmployeePanelsHandlers(
           value,
           request.signal,
         );
-      const source = await scope.deliverables.download(
-        scope.context,
-        { objectId: value.objectId },
-        request.signal,
-      );
       return scope.materials.publishFile(
         scope.context,
         value,
-        source,
+        (signal) =>
+          scope.deliverables.download(
+            scope.context,
+            { objectId: value.objectId },
+            signal,
+          ),
         request.signal,
       );
     }),

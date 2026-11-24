@@ -530,12 +530,17 @@ export async function readReferenceWriteReceipt(
     )
       row = undefined;
     if (row && value.operation === 'change-source') {
-      // Reuse retry's current maintenance boundary and lock order, without
-      // replaying the action or changing its actor/request ledger.
-      const sourceId = row.source_id;
-      await db.begin(async (tx) => {
-        await referenceSourceAccess(context, sourceId, tx, true, false, true);
-      });
+      // The receipt is a read. Check the same current maintenance decision
+      // without running the mutation's locking path.
+      const { access } = await referenceSourceAccess(
+        context,
+        row.source_id,
+        db,
+        false,
+        false,
+        true,
+      );
+      if (!access.canMaintain) throw new DataAccessError('not_found');
     }
   } else if (
     ['publish-file', 'publish-upload', 'capture'].includes(value.operation)
@@ -1218,7 +1223,9 @@ export async function publishReference(
   storage: StoragePort,
   options?: {
     namePolicy: 'independent-material';
-    source?: AuthorizedDeliverableResource;
+    source?:
+      | AuthorizedDeliverableResource
+      | ((signal: AbortSignal) => Promise<AuthorizedDeliverableResource>);
     signal?: AbortSignal;
     requireCurrentAccess?: () => Promise<void>;
   },
@@ -1469,17 +1476,19 @@ export async function publishReference(
           return requirePublicationFile(context, v.objectId, tx);
         }));
       if (options?.source && options.signal) {
+        const source =
+          typeof options.source === 'function'
+            ? await options.source(options.signal)
+            : options.source;
         if (
-          options.source.source.objectId !== original.object.id ||
-          options.source.source.checksum !== original.object.checksum ||
-          options.source.sizeBytes !== original.object.sizeBytes ||
+          source.source.objectId !== original.object.id ||
+          source.source.checksum !== original.object.checksum ||
+          source.sizeBytes !== original.object.sizeBytes ||
           original.object.sizeBytes > 50 * 1024 * 1024
         )
           throw new ReferenceLibraryError('source_unavailable');
         bytes = Buffer.from(
-          await new Response(
-            await options.source.open(options.signal),
-          ).arrayBuffer(),
+          await new Response(await source.open(options.signal)).arrayBuffer(),
         );
       } else
         bytes = await readArtifactBytes(

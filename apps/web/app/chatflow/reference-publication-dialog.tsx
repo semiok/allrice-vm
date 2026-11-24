@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   ReferenceAudienceSchema,
   ReferencePublicationActionSchema,
@@ -48,6 +48,16 @@ type Props = {
   onSaved: (result: { sourceId: string; revisionId?: string }) => void;
 };
 
+type PublicationReceipt = {
+  operation: 'publish-file' | 'publish-upload' | 'change-publication';
+  requestId: string;
+  sourceId?: string;
+};
+// The dialog may unmount after a write has entered the transport. Keep only
+// its original receipt selector for the same editor and target.
+const unresolvedPublications = new Map<string, PublicationReceipt>();
+const waitingForReceipt = '发布结果待核，请按原请求核对。';
+
 // Replacing the account, workspace or precise target discards local form state
 // and aborts its transport; expected-viewer is a write precondition, not owner.
 export function ReferencePublicationDialog(props: Props) {
@@ -93,6 +103,12 @@ function PublicationForm({
   });
   const options = available.options;
   const reference = 'reference' in target ? target.reference : null;
+  const receiptKey = JSON.stringify([
+    workspaceId,
+    viewerId,
+    target.kind,
+    target.kind === 'file' ? target.file.objectId : reference?.sourceId,
+  ]);
   const publication = reference?.publication;
   const destructive = target.kind === 'revoke' || target.kind === 'delete';
   const [scope, setScope] = useState(publication?.audience.scope ?? 'personal');
@@ -108,6 +124,12 @@ function PublicationForm({
   const transport = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
+  const [initialReceipt] = useState(() =>
+    dataClient ? unresolvedPublications.get(receiptKey) : undefined,
+  );
+  const [receipt, setReceipt] = useState(initialReceipt);
+  const savedResult = useRef(onSaved);
+  savedResult.current = onSaved;
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -115,6 +137,47 @@ function PublicationForm({
       transport.current?.abort();
     };
   }, []);
+
+  const reconcile = useCallback(
+    async (value: PublicationReceipt) => {
+      if (pending.current) return;
+      pending.current = true;
+      setBusy(true);
+      setError(waitingForReceipt);
+      const controller = new AbortController();
+      transport.current = controller;
+      try {
+        const result = await data.readWriteReceipt(
+          { workspaceId, ...value },
+          controller.signal,
+        );
+        if (!alive.current || controller.signal.aborted) return;
+        if (
+          result.status === 'recorded' &&
+          result.ready !== false &&
+          result.result &&
+          'sourceId' in result.result
+        ) {
+          if (unresolvedPublications.get(receiptKey) !== value) return;
+          unresolvedPublications.delete(receiptKey);
+          setReceipt(undefined);
+          setError('');
+          savedResult.current(result.result);
+        }
+      } catch {
+        // A refused or interrupted receipt read still leaves the write unknown.
+      } finally {
+        if (alive.current && !controller.signal.aborted) {
+          pending.current = false;
+          setBusy(false);
+        }
+      }
+    },
+    [data, receiptKey, workspaceId],
+  );
+  useEffect(() => {
+    if (initialReceipt) void reconcile(initialReceipt);
+  }, [initialReceipt, reconcile]);
 
   const title = {
     file: '添加为企业资料',
@@ -153,6 +216,13 @@ function PublicationForm({
             (target.kind === 'delete' && publication.origin === 'upload')));
 
   async function save() {
+    const existing =
+      receipt ?? (dataClient && unresolvedPublications.get(receiptKey));
+    if (existing) {
+      setReceipt(existing);
+      await reconcile(existing);
+      return;
+    }
     if (
       !permitted ||
       pending.current ||
@@ -165,6 +235,7 @@ function PublicationForm({
     setError('');
     const controller = new AbortController();
     transport.current = controller;
+    let issued: PublicationReceipt | undefined;
     try {
       const audience = ReferenceAudienceSchema.parse({
         scope,
@@ -217,6 +288,24 @@ function PublicationForm({
       ).join('');
       const requestId = requestIds.current.get(key) ?? proposed;
       requestIds.current.set(key, requestId);
+      if (dataClient) {
+        const prior = unresolvedPublications.get(receiptKey);
+        if (prior) {
+          setReceipt(prior);
+          setError(waitingForReceipt);
+          return;
+        }
+        issued = {
+          requestId,
+          operation: reference
+            ? 'change-publication'
+            : target.kind === 'file'
+              ? 'publish-file'
+              : 'publish-upload',
+          ...(reference ? { sourceId: reference.sourceId } : {}),
+        };
+        unresolvedPublications.set(receiptKey, issued);
+      }
       const saved = reference
         ? await data.changePublication(
             {
@@ -237,8 +326,19 @@ function PublicationForm({
               ? data.publishFile(body, controller.signal)
               : data.publishUpload(body, controller.signal);
           })();
+      if (issued && unresolvedPublications.get(receiptKey) === issued)
+        unresolvedPublications.delete(receiptKey);
       if (alive.current && !controller.signal.aborted) onSaved(saved);
     } catch (caught) {
+      if (issued && !(caught instanceof EmployeePanelDataUnavailableError)) {
+        if (alive.current && !controller.signal.aborted) {
+          setReceipt(issued);
+          setError(waitingForReceipt);
+        }
+        return;
+      }
+      if (issued && unresolvedPublications.get(receiptKey) === issued)
+        unresolvedPublications.delete(receiptKey);
       if (alive.current && !controller.signal.aborted) {
         setError(
           caught instanceof EmployeePanelDataUnavailableError ||
@@ -461,15 +561,16 @@ function PublicationForm({
           className={destructive ? css.danger : undefined}
           disabled={
             busy ||
-            !permitted ||
-            (!destructive &&
-              scope === 'departments' &&
-              !departmentIds.length) ||
-            (target.kind === 'upload' && !upload)
+            (!receipt &&
+              (!permitted ||
+                (!destructive &&
+                  scope === 'departments' &&
+                  !departmentIds.length) ||
+                (target.kind === 'upload' && !upload)))
           }
           onClick={() => void save()}
         >
-          {confirmation}
+          {receipt ? '核对结果' : confirmation}
         </Button>
       </footer>
     </DshDialog>

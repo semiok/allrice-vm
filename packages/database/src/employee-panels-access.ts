@@ -1,3 +1,4 @@
+import type { TransactionSql } from 'postgres';
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
@@ -6,7 +7,10 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import { DataAccessError } from './data.ts';
-import { getEmployeeInstance } from './employees/employee-instances.ts';
+import {
+  getEmployeeInstance,
+  resolveEmployeeSessionInstance,
+} from './employees/employee-instances.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import {
   authorizeSessionHistoryOwner,
@@ -19,6 +23,7 @@ import {
 export async function requireEmployeePanelsAccess(
   contextInput: RequestContext,
   input: unknown,
+  transaction?: TransactionSql,
 ) {
   const context = RequestContextSchema.parse(contextInput);
   const selection = DEntrySelectionInputSchema.parse(input);
@@ -27,10 +32,18 @@ export async function requireEmployeePanelsAccess(
     context.workspaceId !== selection.workspaceId
   )
     throw new DataAccessError('authorization_denied');
-  const employee = await getEmployeeInstance(
+  let employee = await getEmployeeInstance(
     context,
     selection.employeeInstanceId,
+    transaction,
   );
+  if (transaction)
+    employee = await resolveEmployeeSessionInstance(
+      context,
+      employee.assignmentId,
+      employee.id,
+      transaction,
+    );
   if (
     employee.ownerId !== context.actor.id ||
     employee.organizationId !== context.organizationId ||
@@ -38,21 +51,30 @@ export async function requireEmployeePanelsAccess(
   )
     throw new DataAccessError('authorization_denied');
   if (selection.threadId) {
-    const thread = await authorizeSessionHistoryOwner(
-      context,
-      selection.workspaceId,
-      selection.threadId,
-    );
-    if (
-      (thread.employeeInstanceId ?? thread.employeeAssignmentId) !==
-        employee.id ||
-      (await getSessionExecutionGeneration(
+    if (transaction) {
+      const [thread] = await transaction`select id from allrice_chat_sessions
+        where id=${selection.threadId} and organization_id=${context.organizationId}
+          and workspace_id=${selection.workspaceId} and owner_id=${context.actor.id}
+          and coalesce(employee_instance_id,employee_assignment_id)=${employee.id}
+          and execution_generation='4.0' for share`;
+      if (!thread) throw new DataAccessError('authorization_denied');
+    } else {
+      const thread = await authorizeSessionHistoryOwner(
         context,
         selection.workspaceId,
         selection.threadId,
-      )) !== '4.0'
-    )
-      throw new DataAccessError('authorization_denied');
+      );
+      if (
+        (thread.employeeInstanceId ?? thread.employeeAssignmentId) !==
+          employee.id ||
+        (await getSessionExecutionGeneration(
+          context,
+          selection.workspaceId,
+          selection.threadId,
+        )) !== '4.0'
+      )
+        throw new DataAccessError('authorization_denied');
+    }
   }
   const identity = DEntryIdentitySchema.parse({
     organizationId: context.organizationId,
@@ -64,7 +86,10 @@ export async function requireEmployeePanelsAccess(
     threadId: selection.threadId ?? null,
   });
   if (
-    selectDEntryGeneration(await readDEntryReleasePolicy(), identity) !== '4.0'
+    selectDEntryGeneration(
+      await readDEntryReleasePolicy(transaction, transaction !== undefined),
+      identity,
+    ) !== '4.0'
   )
     throw new DataAccessError('authorization_denied');
   return identity;

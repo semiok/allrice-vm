@@ -111,7 +111,10 @@ export function createEmployeePanelsHttpClient(
           : { body: JSON.stringify(config.body) }),
       });
       await checkReferenceSelectionFailure(response, config.revisions ?? []);
-      if (!response.ok) throw Error(`文件服务请求失败 (${response.status})。`);
+      if (!response.ok)
+        throw Object.assign(Error(`文件服务请求失败 (${response.status})。`), {
+          status: response.status,
+        });
       const result: unknown = config.blob
         ? await response.blob()
         : await response.json();
@@ -237,6 +240,12 @@ export function createEmployeePanelsHttpClient(
           requestId: value.requestId,
         }),
       );
+    },
+    readWriteReceipt(
+      input: z.input<typeof PanelWriteReceiptQuerySchema>,
+      signal: AbortSignal,
+    ) {
+      return readEmployeePanelsWriteReceipt(selection, input, signal, options);
     },
     async changePublication(
       input: {
