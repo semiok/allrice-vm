@@ -60,7 +60,6 @@ case "$mode" in
       exec 9>>"$LOCK"
       flock_fd 9 0 || die "$LOCK is held (a deploy or a restart); try later" 3
     fi
-    dev_plist_config worker || exit 2
     DBNAME=allrice40_dev ;;
   instance)
     [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -d "$HOME/allrice-qa" ] || die "no QA instance: $task" 2
@@ -77,11 +76,13 @@ esac
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 # Parked plists supply configuration only; restart paths still require a live LaunchAgent.
 CONFIG_PLIST=$PLIST; [ "$mode" != dev ] || CONFIG_PLIST=$(dev_plist worker)
-[ -f "$CONFIG_PLIST" ] || die "missing $CONFIG_PLIST" 2
 if [ "$mode" = instance ]; then
   expected_port=$("$M1_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["workerPort"])' "$INSTANCE") || exit 2
-  service_plist_config "$CONFIG_PLIST" "$LABEL" ALLRICE_WORKER_PORT "$expected_port" "$DBNAME" || exit 2
+else
+  expected_port=3312
 fi
+verify_worker() { service_plist_config "$1" "$LABEL" ALLRICE_WORKER_PORT "$expected_port" "$DBNAME"; }
+verify_worker "$CONFIG_PLIST" || exit 2
 DB=$(penv "$CONFIG_PLIST" DATABASE_URL); PORT=$(penv "$CONFIG_PLIST" ALLRICE_WORKER_PORT)
 
 sql() { PGCONNECT_TIMEOUT=5 PGOPTIONS="-c statement_timeout=15000 ${RO:+-c default_transaction_read_only=on}" \
@@ -179,6 +180,7 @@ print(time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(s)))'; }
 
 read -r status once recurring worker_id <<<"$(worker_ready)"
 was=$(job_state "$LABEL") || die "cannot read the launchd state of $LABEL"
+if [ -n "$execute" ] && [ "$was" != gone ]; then verify_worker "$PLIST" || exit 2; fi
 say "target $mode${task:+ $task}: Worker $LABEL ${was%% *} and $status, controllers once=$once recurring=$recurring, worker $worker_id; host booted $(boot_at)"
 OUT_ORPHANS=$(mktemp); OUT_OTHERS=$(mktemp)
 before=$(partitions) || die "cannot read the partitions"
@@ -206,7 +208,7 @@ restore() { # however the run ends after the stop, a Worker that was loaded runs
   if [ -n "$STOPPED" ]; then # an interrupted stop may still be unloading it
     for i in $(seq 1 90); do state=$(job_state "$LABEL" 2>/dev/null) && [ "$state" = gone ] && break; sleep 1; done
     if [ "$state" = gone ]; then
-      start_job "$LABEL" "$PLIST" 2>/dev/null || echo "schedule-recover: could not start $LABEL: start it by hand" >&2
+      { verify_worker "$PLIST" && start_job "$LABEL" "$PLIST"; } 2>/dev/null || echo "schedule-recover: could not start $LABEL: check its configuration" >&2
     else
       echo "schedule-recover: $LABEL is '${state:-unknown}', not started again: check it by hand" >&2
     fi
@@ -246,7 +248,7 @@ show "$(cat "$OUT/partitions-after.json")" "-"
 if [ "$was" = gone ]; then
   say "the Worker was not loaded when this started: left stopped. Start it, wait for both controllers active, then: $SMOKE"; exit 0
 fi
-start_job "$LABEL" "$PLIST" || die "could not start $LABEL; the proofs are in place"
+verify_worker "$PLIST" && start_job "$LABEL" "$PLIST" || die "could not start $LABEL; the proofs are in place"
 STOPPED=""
 active() { read -r status once recurring worker_id <<<"$(worker_ready)"
   [ "$status" = ready ] && [[ "$once" =~ ^(active|disabled)$ ]] && [[ "$recurring" =~ ^(active|disabled)$ ]]; }

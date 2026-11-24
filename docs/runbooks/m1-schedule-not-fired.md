@@ -33,7 +33,7 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice40-dev-worker.err.log |
 3. **控制器正常，个别任务没触发**：业务巡检告警里给了任务 ID。查任务状态和最近一次运行：
 
    ```bash
-   /opt/homebrew/bin/psql -h 127.0.0.1 -At allrice_dev -c "
+   /opt/homebrew/bin/psql -h 127.0.0.1 -p 5434 -d allrice40_dev -At -c "
      select id, status, clock_owner, schedule, next_run_at, last_run_at, deleted_at
      from allrice_automations where id = '<任务 ID>'"
    ```
@@ -63,7 +63,7 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice40-dev-worker.err.log |
    ```
 
    它自己持部署锁（不要再套 `deploy-lock run`，也不能在持锁的 shell 里跑），依次：
-   - 整库备份到 `~/allrice-backups/schedule-recover-<时间>/`（不自动清理，确认恢复后移到废纸篓）；
+   - 整库备份到 `~/allrice40-backups/schedule-recover-<时间>/`，确认恢复后只归档本次命令打印的备份目录；
    - 停 Worker，确认没有留下可能持有分区的进程：环境里 `DATABASE_URL` 指向这个库的（Worker、DSH 子进程、用 `with-env` 手工起的）、从发布目录或 `.env` 起的 node 进程，库里也没有 Worker 的连接，也就是旧 owner 确实已经退出。还有这样的进程就列出来、拒绝写入：先查清那是什么（部署的构建和检查也会被列出来，等它结束再跑）；
    - 再读一次分区，在一个事务里给每个卡住的分区登记 `verified_process_exit` 关闭证明。owner、epoch、token、仍未关闭、租约已过期、还没有证明，任何一项和读到的对不上就整笔回滚，不写任何东西；任务账本不动；
    - 开始时 Worker 在跑，就重新启动它，等两个控制器变成 `active`，中途失败或被中断也会把它拉起来（被 `kill -9` 时不会：看 `deploy-dev --status`，手工启动）；开始时 Worker 本来就停着（比如手册 5 的停库流程里），就让它继续停着。

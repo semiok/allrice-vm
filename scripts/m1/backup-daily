@@ -16,7 +16,7 @@ pg_dump -h 127.0.0.1 -p 5434 -Fp --no-owner --no-privileges allrice40_dev | gzip
 mv "$B/db/allrice40_dev-$D.sql.gz.tmp" "$B/db/allrice40_dev-$D.sql.gz"
 prev=$(ls -1d "$B/files/"2* 2>/dev/null | grep -v "/$D\$" | tail -1 || true)
 mkdir -p "$B/files/$D"
-for d in storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform; do
+for d in $M1_DEV_BACKUP_DIRS; do
   [ -e "$L/$d" ] || continue
   rsync -a --delete ${prev:+--link-dest="$prev/$d"} "$L/$d/" "$B/files/$D/$d/"
 done

@@ -45,13 +45,16 @@ class DeployDevMigrations(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix='deploy-dev-test-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, 'home')
+        self.releases = os.path.join(self.home, 'allrice40-dev-releases')
+        self.initial_release = self.release()
+        local = os.path.join(self.home, 'allrice40-dev/.local')
+        self.once_reference = json.dumps({'artifactId': 'provenance', 'stateRoot': local + '/native-once-control-m1'})
         for role in ('web', 'worker'):
             path = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-dev-%s.plist' % role)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, 'wb') as f:
                 plistlib.dump(self.plist(role), f)
         write(os.path.join(self.home, 'allrice40-dev/.env'), 'ALLRICE_TEST=1\n', 0o600)
-        local = os.path.join(self.home, 'allrice40-dev/.local')
         write(os.path.join(local, 'storage/org/file.txt'), 'stored')
         write(os.path.join(local, 'dsh-runtime-m1/rt/journal.jsonl'), '{"v":1}\n')
         write(os.path.join(local, 'bridge/big.bin'), 'not snapshotted')
@@ -61,20 +64,26 @@ class DeployDevMigrations(unittest.TestCase):
         write(os.path.join(self.stubs, 'psql'), '#!/bin/sh\n[ -z "$PSQL_FAIL" ] || exit 2\nfor a; do q=$a; done\n'
               'case "$q" in *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
+        write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
 
-    def plist(self, role, release='/nowhere', legacy=False):
+    def plist(self, role, release=None, legacy=False):
+        release = release or self.initial_release
+        local = os.path.join(self.home, 'allrice40-dev/.local')
         env = {'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev', 'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',
                'ALLRICE_RELEASE_SHA': 'a' * 40, 'ALLRICE_DSH_NATIVE_ARTIFACT_ID': 'sha256:' + 'a' * 64,
-               'ALLRICE_NATIVE_ONCE_REFERENCE': '{"artifactId":"provenance"}', 'UNRELATED_SETTING': 'keep'}
+               'ALLRICE_NATIVE_ONCE_REFERENCE': self.once_reference, 'UNRELATED_SETTING': 'keep',
+               'ALLRICE_STORAGE_ROOT': local + '/storage', 'ALLRICE_EXECUTION_ROOT': local + '/executions',
+               'ALLRICE_DSH_RUNTIME_ROOT': local + '/dsh-runtime-m1', 'ALLRICE_DSH_PLATFORM_HOME': local + '/dsh-platform'}
         if legacy:
             env.update({'ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID': 'old-root',
                         'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS': 'obsolete-not-json',
                         'ALLRICE_DSH_RETAINED_ARTIFACT_ID': 'old', 'ALLRICE_DSH_RETAINED_ROOT_2': '/old',
                         'ALLRICE_DSH_ORIGIN_READER_ROOT': '/old-reader'})
-        return {'Label': 'ai.bplabs.allrice40-dev-' + role, 'WorkingDirectory': release, 'KeepAlive': True,
+        return {'Label': 'ai.bplabs.allrice40-dev-' + role,
+                'WorkingDirectory': release + ('/apps/web' if role == 'web' else ''), 'KeepAlive': True,
                 'ProgramArguments': [NODE, '--env-file=' + self.home + '/allrice40-dev/.env',
                                      release + ('/apps/web/server.mjs' if role == 'web' else '/apps/worker/dist/index.js')],
                 'EnvironmentVariables': env}
@@ -97,8 +106,18 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertFalse(any(key.startswith('ALLRICE_DSH_RETAINED_') for key in env))
         self.assertFalse(any(key.startswith('ALLRICE_DSH_ORIGIN_READER_') for key in env))
 
-    def release(self, files=FILES, archived=ARCHIVED, module=None, store=True):
-        rel = tempfile.mkdtemp(prefix='rel-', dir=self.tmp)
+    def seed_identity(self, rel, sha):
+        for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js'):
+            write(os.path.join(rel, entry), '')
+        write(os.path.join(rel, '.local/dev-build-identity.json'), json.dumps({
+            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'environment': 'dev',
+            'sourceSha': sha, 'sourceTree': 'd' * 40, 'manifestDigest': 'sha256:' + 'e' * 64,
+        }))
+
+    def release(self, files=FILES, archived=ARCHIVED, module=None, store=True, sha='a' * 40):
+        os.makedirs(self.releases, exist_ok=True)
+        rel = tempfile.mkdtemp(prefix='rel-', dir=self.releases)
+        self.seed_identity(rel, sha)
         db = os.path.join(rel, 'packages/database')
         for name in files:
             write(os.path.join(db, 'migrations', name), '-- %s\n' % name)
@@ -113,6 +132,11 @@ class DeployDevMigrations(unittest.TestCase):
         if store:  # releases from MET-221 PR2b-1 on know the journal contract high water
             write(os.path.join(db, 'dist/native-journal-contract-store.js'), 'export {};\n')
         return rel
+
+    def remove_deploy_build(self):
+        for entry in os.listdir(self.releases):
+            if re.fullmatch(r'20[0-9]{6}-[0-9]{4}-[a-f0-9]{8}', entry):
+                shutil.rmtree(os.path.join(self.releases, entry))
 
     def run_dd(self, script, applied, CONTRACT='', **env):
         write(self.applied, ''.join(n + '\n' for n in applied))
@@ -263,7 +287,7 @@ class DeployDevMigrations(unittest.TestCase):
 
     def test_status_shows_whether_a_rollback_would_pass(self):
         old = self.release(store=False)
-        write(os.path.join(self.home, 'allrice40-dev/qa/.previous-release'), old + '\n/nowhere\n')
+        write(os.path.join(self.home, 'allrice40-dev/qa/.previous-release'), old + '\n' + self.initial_release + '\n')
         for high_water, expected in (('1', 'it predates the journal contract, fine while the journals are at contract 1'),
                                      ('2', 'would be REFUSED: the journals reach contract 2')):
             with self.subTest(high_water=high_water):
@@ -301,7 +325,7 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertIn('STOPPED', run(CONTRACT='row:1').stdout)
 
     def test_deploy_refuses_an_old_candidate_before_stopping(self):
-        old = self.release(store=False)
+        old = self.release(store=False, sha='b' * 40)
         stubs = self.FLOW_STUBS + (
             'df() { printf "h\\nx x x 100\\n"; }; resolve_ref() { echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }; '
             'git() { [ "$3 $4" != "worktree add" ] || { mkdir -p "$(dirname "$7")" && cp -R "$OLD" "$7"; }; }; pnpm() { :; }; '
@@ -320,7 +344,7 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertTrue(os.path.isfile(self.live_plist('worker')))
                     with open(os.path.join(self.home, 'allrice40-dev/qa/deploys.jsonl')) as f:
                         self.assertIn('"phase": "contract"', f.read())
-                shutil.rmtree(os.path.join(self.home, 'allrice40-dev-releases'), True)
+                self.remove_deploy_build()
 
     def saved_release(self, old):
         inflight = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
@@ -413,11 +437,12 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')))
 
     def test_point_plists_cleans_both_roles_even_when_artifact_is_unchanged(self):
-        rel = self.release()
+        rel = self.release(sha='b' * 40)
         for art in ('sha256:' + 'a' * 64, 'sha256:' + 'c' * 64):
             with self.subTest(art=art):
                 self.seed_legacy_plists()
-                p = self.run_dd('point_plists "$REL" "$SHA" "$ART"', [], REL=rel, SHA='b' * 40, ART=art)
+                p = self.run_dd('mkdir -p "$STATE"; stage_plists "$REL" "$SHA" "$ART" && activate_plists', [],
+                                REL=rel, SHA='b' * 40, ART=art)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 for role in ('web', 'worker'):
                     path = self.live_plist(role)
@@ -426,7 +451,7 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assert_no_legacy_settings(env)
                     self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], art)
                     self.assertEqual(env['ALLRICE_RELEASE_SHA'], 'b' * 40)
-                    self.assertEqual(env['ALLRICE_NATIVE_ONCE_REFERENCE'], '{"artifactId":"provenance"}')
+                    self.assertEqual(env['ALLRICE_NATIVE_ONCE_REFERENCE'], self.once_reference)
                     self.assertEqual(env['UNRELATED_SETTING'], 'keep')
                     self.assertEqual(env['ALLRICE_DSH_CORDIS_CONFIG'], rel + '/apps/worker/dsh/allrice-restricted.cordis.yml')
                     self.assertEqual(value['WorkingDirectory'], rel + '/apps/web' if role == 'web' else rel)
@@ -457,7 +482,9 @@ class DeployDevMigrations(unittest.TestCase):
                     'export ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID=old-env-root\n'
                     'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS=old-env-delivery\n'
                     'ALLRICE_DSH_ORIGIN_READER_ENV_ROOT=/old-reader\n'
-                    'ALLRICE_DSH_RETAINEDNESS=keep-similar-key\n')
+                    'ALLRICE_DSH_RETAINEDNESS=keep-similar-key\n'
+                    'ALLRICE_STORAGE_ROOT=' + self.home + '/allrice-dev/.local/storage\n'
+                    'ALLRICE_DSH_PLATFORM_HOME=' + self.home + '/allrice-dev/.local/dsh-platform\n')
         write(env_file, contents, 0o600)
         base_env = dict(HOME=self.home, PATH=os.path.dirname(NODE) + ':/usr/bin:/bin')
         # Use the real Node parser, not an env-file stub: these bytes do reintroduce
@@ -480,7 +507,7 @@ class DeployDevMigrations(unittest.TestCase):
             with self.subTest(retry=retry):
                 write(log, '')
                 p = self.run_dd('precheck "$REL" "$SHA" "$ART" "$PLOG"; '
-                                'point_plists "$REL" "$SHA" "$ART"', [],
+                                'mkdir -p "$STATE"; stage_plists "$REL" "$SHA" "$ART" && activate_plists', [],
                                 REL=rel, SHA='a' * 40, ART='sha256:' + 'c' * 64, PLOG=log)
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 with open(log) as f:
@@ -498,7 +525,9 @@ class DeployDevMigrations(unittest.TestCase):
                         self.assertEqual(env['UNRELATED_ENV'], "space and 'quote'")
                         self.assertEqual(env['ALLRICE_DSH_RETAINEDNESS'], 'keep-similar-key')
                         self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_dev')
-                        self.assertEqual(env['ALLRICE_NATIVE_ONCE_REFERENCE'], '{"artifactId":"provenance"}')
+                        self.assertEqual(env['ALLRICE_NATIVE_ONCE_REFERENCE'], self.once_reference)
+                        self.assertEqual(env['ALLRICE_STORAGE_ROOT'], self.home + '/allrice40-dev/.local/storage')
+                        self.assertEqual(env['ALLRICE_DSH_PLATFORM_HOME'], self.home + '/allrice40-dev/.local/dsh-platform')
                 with open(env_file) as f:
                     self.assertEqual(f.read(), contents)
                 self.assertEqual(os.stat(env_file).st_mode & 0o777, 0o600)
@@ -516,6 +545,8 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(started.returncode, 0, started.stderr)
             actual = json.loads(started.stdout)
             self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(actual['ALLRICE_STORAGE_ROOT'], qa + '/.local/storage')
+            self.assertEqual(actual['ALLRICE_DSH_PLATFORM_HOME'], self.home + '/allrice40-dev/.local/dsh-platform')
             self.assert_no_legacy_settings(actual)
         monitor = runpy.run_path(os.path.join(HERE, 'monitor'))
         cfg = dict(monitor['M1'], webPlist=self.live_plist('web'),
@@ -524,14 +555,15 @@ class DeployDevMigrations(unittest.TestCase):
         with patch.dict(os.environ, HOME=self.home):
             self.assertEqual(monitor['derive_m1'](cfg)['node'], NODE)
 
-    def write_qa_plists(self):
+    def write_qa_plists(self, task='tool-test'):
         with open(os.path.join(HERE, 'qa-instance')) as f:
             marker = '  /usr/bin/python3 - "$task" "$dir"'
             script = marker + f.read().split(marker, 1)[1].split('\nPY\n', 1)[0] + '\nPY\n'
-        directory = os.path.join(self.tmp, 'qa')
-        p = self.run_dd('task=tool-test; dir=$QA_DIR; db=allrice40_qa_tool_test; web=3200; worker=3201; '
+        directory = os.path.join(self.home, 'allrice-qa', task)
+        self.seed_identity(os.path.join(directory, 'release'), 'b' * 40)
+        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; db=allrice40_qa_${task//-/_}; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
-                        QA_DIR=directory, SHA='b' * 40, USER='tester')
+                        QA_TASK=task, QA_DIR=directory, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
         return directory
 
@@ -540,8 +572,12 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         for role in ('web', 'worker'):
             value = self.read_plist(os.path.join(directory, role + '.plist'))
-            live = self.read_plist(os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-tool-test-%s.plist' % role))
-            self.assertEqual(live, value)
+            env = value['EnvironmentVariables']
+            self.assertEqual(env['ALLRICE_DSH_PLATFORM_HOME'], os.path.join(self.home, 'allrice40-dev/.local/dsh-platform'))
+            p = self.run_dd('service_plist_config "$PLIST" "$LABEL" "$PORT_KEY" "$PORT" allrice40_qa_tool_test', [],
+                            PLIST=os.path.join(directory, role + '.plist'), LABEL=value['Label'],
+                            PORT_KEY='ALLRICE_' + role.upper() + '_PORT', PORT=env['ALLRICE_' + role.upper() + '_PORT'])
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assert_no_legacy_settings(value['EnvironmentVariables'])
             self.assertEqual(value['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
             self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
@@ -658,7 +694,7 @@ class DeployDevMigrations(unittest.TestCase):
         stubs += 'deploy'
         for forward in (False, True):
             with self.subTest(forward=forward):
-                candidate = self.release(files=FILES + (['0219_tool_fixture.sql'] if forward else []))
+                candidate = self.release(files=FILES + (['0219_tool_fixture.sql'] if forward else []), sha='b' * 40)
                 self.seed_legacy_plists()
                 if forward:
                     self.saved_release(self.release(files=FILES[:-1]))
@@ -692,7 +728,7 @@ class DeployDevMigrations(unittest.TestCase):
                 log_path = os.path.join(self.home, 'allrice40-dev/qa/deploy-logs')
                 with open(os.path.join(log_path, os.listdir(log_path)[0])) as f:
                     self.assertIn('DB_PREPARE:db:prepare', f.read())
-                shutil.rmtree(os.path.join(self.home, 'allrice40-dev-releases'))
+                self.remove_deploy_build()
 
     def test_with_env_does_not_pass_retired_settings_from_any_source(self):
         # Exercise the actual executable, including .env and inherited exports,
@@ -733,7 +769,7 @@ class DeployDevMigrations(unittest.TestCase):
                     p = self.run_dd('park_plists', [])
                     self.assertEqual(p.returncode, 0, p.stderr)
                 p = self.run_dd(stubs + 'deploy', FILES + ARCHIVED, CONTRACT='row:1',
-                                CANDIDATE=self.release(), ART='sha256:' + 'c' * 64, SMOKE=smoke)
+                                CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'c' * 64, SMOKE=smoke)
                 self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
                 self.assertIn('smoke test failed on bbbbbbbb', p.stderr)
                 default = self.run_dd('previous_release', [])
@@ -748,7 +784,7 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertNotIn('<release-dir>', p.stderr)
                 with open(os.path.join(self.home, 'allrice40-dev/qa/deploys.jsonl')) as f:
                     self.assertEqual(json.loads(f.readlines()[-1])['result'], 'failed')
-                shutil.rmtree(os.path.join(self.home, 'allrice40-dev-releases'))
+                self.remove_deploy_build()
 
     def test_deploy_with_parked_plists_and_inflight_state_refuses_before_build(self):
         self.saved_release(self.release(files=FILES[:-1]))
@@ -769,9 +805,9 @@ class DeployDevMigrations(unittest.TestCase):
         stubs, smoke = self.successful_deploy_stubs()
         for force in (False, True):
             with self.subTest(force=force):
-                candidate = self.release()
+                candidate = self.release(sha='b' * 40)
                 self.saved_release(self.release(files=FILES[:-1]))
-                p = self.run_dd('point_plists "$CANDIDATE" "$SHA" "$ART"; '
+                p = self.run_dd('mkdir -p "$STATE"; stage_plists "$CANDIDATE" "$SHA" "$ART" && activate_plists; '
                                 'stop_job() { :; }; if restore; then exit 9; fi',
                                 FILES + ARCHIVED, CONTRACT='row:1', CANDIDATE=candidate,
                                 SHA='b' * 40, ART='sha256:' + 'c' * 64)
@@ -791,11 +827,12 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')))
                 self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')))
                 self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/.previous-release')))
-                shutil.rmtree(os.path.join(self.home, 'allrice40-dev-releases'))
+                self.remove_deploy_build()
+                self.seed_legacy_plists()
 
     def test_same_sha_is_skipped_only_with_both_active_plists(self):
         stubs, smoke = self.successful_deploy_stubs()
-        candidate = self.release()
+        candidate = self.release(sha='a' * 40)
         stubs += 'resolve_ref() { echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }; deploy'
         for parked in (False, True):
             with self.subTest(partial_park=parked):
@@ -853,24 +890,24 @@ class DeployDevMigrations(unittest.TestCase):
 
     def test_forward_fix_after_partial_plist_write_replaces_both_seals(self):
         stubs, smoke = self.successful_deploy_stubs()
-        candidate = self.release()
+        candidate = self.release(sha='c' * 40)
         self.saved_release(self.release(files=FILES[:-1]))
-        # Web is written, then opening the Worker's temporary file fails.
-        os.mkdir(self.live_plist('worker') + '.tmp')
-        p = self.run_dd('if point_plists "$CANDIDATE" "$SHA" "$ART"; then exit 9; fi; '
+        # Web is activated, then publishing the staged Worker file fails.
+        p = self.run_dd('stage_plists "$CANDIDATE" "$SHA" "$ART"; '
+                        'mv() { if [ "$3" = "$WORKER_PLIST" ]; then echo WORKER_REPLACE_FAILED >&2; return 1; fi; command mv "$@"; }; '
+                        'if activate_plists; then exit 9; fi; unset -f mv; '
                         'stop_job() { :; }; if restore; then exit 9; fi',
                         FILES + ARCHIVED, CONTRACT='row:1', CANDIDATE=candidate,
                         SHA='c' * 40, ART='sha256:' + 'c' * 64)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn('IsADirectoryError', p.stderr)
+        self.assertIn('WORKER_REPLACE_FAILED', p.stderr)
         parked = os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')
         for role, letter in (('web', 'c'), ('worker', 'a')):
             self.assertEqual(self.read_plist(os.path.join(parked, role + '.plist'))['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'sha256:' + letter * 64)
-        os.rmdir(self.live_plist('worker') + '.tmp')
         shutil.move(os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight'), os.path.join(self.tmp, 'failed-deploy'))
         # The repair reuses the Worker's original artifact. Both plists must converge.
         p = self.run_dd(stubs + 'deploy', FILES + ARCHIVED, CONTRACT='row:1',
-                        CANDIDATE=candidate, ART='sha256:' + 'a' * 64, SMOKE=smoke)
+                        CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'a' * 64, SMOKE=smoke)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         for role in ('web', 'worker'):
             env = self.read_plist(self.live_plist(role))['EnvironmentVariables']
@@ -887,6 +924,9 @@ class DeployDevMigrations(unittest.TestCase):
             ('web', 'ALLRICE_WEB_PORT', '3011'),
             ('worker', 'ALLRICE_WORKER_PORT', '3012'),
             ('worker', 'Label', 'ai.bplabs.allrice-dev-worker'),
+            ('web', 'ALLRICE_STORAGE_ROOT', self.home + '/allrice-dev/.local/storage'),
+            ('worker', 'ALLRICE_EXECUTION_ROOT', '.local/executions'),
+            ('worker', 'ALLRICE_DSH_PLATFORM_HOME', self.home + '/allrice-dev/.local/dsh-platform'),
         ]
         with tempfile.TemporaryDirectory(dir=self.tmp) as output:
             touched = os.path.join(output, 'started')
@@ -922,9 +962,10 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
         parked = os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled')
         for role, old in (
-            ('web', [NODE, '/r/apps/web/server.mjs', '--port', '3011']),
-            ('worker', [os.path.join(self.home, 'allrice-dev/bin/with-env'), 'worker', NODE, '/r/apps/worker/dist/index.js']),
-            ('worker', [NODE, '--env-file=' + os.path.join(self.home, 'allrice-dev/.env'), '/r/apps/worker/dist/index.js']),
+            ('web', [NODE, self.initial_release + '/apps/web/server.mjs', '--port', '3011']),
+            ('worker', [os.path.join(self.home, 'allrice-dev/bin/with-env'), 'worker', NODE, self.initial_release + '/apps/worker/dist/index.js']),
+            ('worker', [NODE, '--env-file=' + os.path.join(self.home, 'allrice-dev/.env'), self.initial_release + '/apps/worker/dist/index.js']),
+            ('worker', [NODE, self.release() + '/apps/worker/dist/index.js']),
         ):
             with self.subTest(role=role, argv=old):
                 path = os.path.join(parked, role + '.plist')
@@ -940,7 +981,7 @@ class DeployDevMigrations(unittest.TestCase):
         valid = self.plist('web')
         historical_loader = os.path.join(self.home, 'allrice40-dev/tools', 'd' * 40, 'with-env')
         write(historical_loader, '#!/bin/sh\nexit 99\n', 0o755)
-        valid['ProgramArguments'] = [historical_loader, 'web', NODE, '/r/apps/web/server.mjs', '--port', '3311']
+        valid['ProgramArguments'] = [historical_loader, 'web', NODE, self.initial_release + '/apps/web/server.mjs', '--port', '3311']
         with open(path, 'wb') as f:
             plistlib.dump(valid, f)
         p = self.run_dd('dev_plist_pair', [])
@@ -978,7 +1019,7 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
         self.assert_parked()
 
-    def run_config_tool(self, name, *args, **env):
+    def run_config_tool(self, name, *args, deploy_stubs='', **env):
         # Run the real entrypoint in a fake HOME. Only external services are replaced;
         # configuration selection and writes still use the source scripts and lib.sh.
         directory = os.path.join(self.tmp, 'config-tools')
@@ -998,11 +1039,80 @@ class DeployDevMigrations(unittest.TestCase):
             script = start + 'worker_procs() { :; };\nworker_sessions() {' + rest.split('worker_sessions() {', 1)[1]
             start, rest = script.split('boot_at() {', 1)
             script = start + 'boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
+        if name == 'deploy-dev':
+            shutil.copyfile(os.path.join(HERE, 'deploy-result.py'), os.path.join(directory, 'deploy-result.py'))
+            marker = '# --release-manager is a deliberate speed bump'
+            script = script.replace(marker, deploy_stubs + '\n' + marker)
         path = os.path.join(directory, name)
         write(path, script, 0o755)
-        path_env = self.stubs + ':/usr/bin:/bin:/usr/sbin:/sbin'
+        path_env = ':'.join([self.stubs, os.path.dirname(NODE), '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
         env = dict(HOME=self.home, PATH=path_env, TEST_STUBS=self.stubs, TEST_PATH=path_env, **env)
         return subprocess.run(['/bin/bash', path, *args], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_cli_deploy_and_recover_preserve_explicit_launchd_programs(self):
+        stubs, _ = self.successful_deploy_stubs()
+        candidate = self.release(sha='b' * 40)
+        contract = os.path.join(self.tmp, 'contract-cli.txt')
+        write(contract, 'row:1')
+        write(self.applied, '\n'.join(FILES + ARCHIVED) + '\n')
+        states = dict(deploy_stubs=stubs.replace('BIN=$SMOKE; ', ''), APPLIED=self.applied,
+                      CONTRACT_FILE=contract, CANDIDATE=candidate, ART='sha256:' + 'b' * 64)
+        historical = os.path.join(self.home, 'allrice40-dev/tools', 'f' * 40, 'with-env')
+        write(historical, '#!/bin/sh\nexit 99\n', 0o755)
+        originals = {}
+        for role in ('web', 'worker'):
+            original = self.plist(role)
+            if role == 'worker':
+                original['ProgramArguments'] = [historical, role, NODE, original['ProgramArguments'][-1]]
+            original['Program'] = original['ProgramArguments'][0]
+            originals[role] = original
+            with open(self.live_plist(role), 'wb') as f:
+                plistlib.dump(original, f)
+        p = self.run_config_tool('deploy-dev', '--release-manager', '--skip-smoke', **states)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('STOPPED:3311', p.stdout)
+        self.assertIn('READY:' + 'b' * 40, p.stdout)
+        inflight = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
+        write(os.path.join(inflight, 'state'), 'switching\n' + 'a' * 40 + '\n')
+        for role, original in originals.items():
+            active = self.read_plist(self.live_plist(role))
+            self.assertEqual(active['Program'], active['ProgramArguments'][0])
+            self.assertTrue(active['Program'].endswith('/with-env'))
+            self.assertEqual(active['EnvironmentVariables']['ALLRICE_RELEASE_SHA'], 'b' * 40)
+            with open(os.path.join(inflight, role + '.plist'), 'wb') as f:
+                plistlib.dump(original, f)
+        p = self.run_config_tool('deploy-dev', '--release-manager', '--recover', **states)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('READY:' + 'a' * 40, p.stdout)
+        self.assertFalse(os.path.exists(inflight))
+        for role, original in originals.items():
+            self.assertEqual(self.read_plist(self.live_plist(role)), original)
+
+    def test_cli_refuses_uncovered_storage_and_mixed_saved_entry_before_stopping(self):
+        stubs, _ = self.successful_deploy_stubs()
+        stubs = stubs.replace('BIN=$SMOKE; ', '')
+        self.saved_release(self.initial_release)
+        saved = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight/worker.plist')
+        old = self.home + '/allrice-dev-releases/old/apps/worker/dist/index.js'
+        write(old, '')
+        wrong = self.read_plist(saved)
+        wrong['ProgramArguments'][-1] = old
+        with open(saved, 'wb') as f:
+            plistlib.dump(wrong, f)
+        p = self.run_config_tool('deploy-dev', '--release-manager', '--recover', deploy_stubs=stubs)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn('STOPPED:', p.stdout)
+        self.assertEqual(self.read_plist(saved), wrong)
+        shutil.rmtree(os.path.dirname(saved))
+        storage = os.path.join(self.home, 'allrice40-dev/.local/storage')
+        shutil.move(storage, os.path.join(self.tmp, 'state-storage'))
+        os.symlink(os.path.join(self.tmp, 'state-storage'), storage)
+        p = self.run_config_tool('deploy-dev', '--release-manager', '--skip-smoke', deploy_stubs=stubs)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertNotIn('STOPPED:', p.stdout)
+        p = self.run_config_tool('backup-daily')
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-backups')))
 
     def test_backup_copies_parked_plists_and_finishes(self):
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
@@ -1079,20 +1189,12 @@ class DeployDevMigrations(unittest.TestCase):
               'rows=json.loads(os.environ["ROWS"])\n'
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
               'print(json.dumps(rows))\n', 0o755)
-        instance = os.path.join(self.home, 'allrice-qa/recover-test')
-        os.makedirs(instance)
+        instance = self.write_qa_plists('recover-test')
         write(os.path.join(instance, 'instance.json'), json.dumps({
             'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'workerPort': 3201,
         }))
-        qa_worker = self.plist('worker')
-        qa_worker['Label'] = 'ai.bplabs.allrice-qa-recover-test-worker'
-        qa_worker['ProgramArguments'][1] = '--env-file=' + instance + '/.env'
-        qa_worker['EnvironmentVariables'].update(
-            DATABASE_URL='postgres://tester@127.0.0.1:5434/allrice40_qa_recover_test',
-            ALLRICE_WORKER_PORT='3201',
-        )
-        with open(os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-recover-test-worker.plist'), 'wb') as f:
-            plistlib.dump(qa_worker, f)
+        shutil.copyfile(os.path.join(instance, 'worker.plist'),
+                        os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-recover-test-worker.plist'))
         for mode in ('dev', 'instance'):
             args = ('--dev', '--release-manager') if mode == 'dev' else ('--instance', 'recover-test')
             if mode == 'instance':
@@ -1141,9 +1243,9 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertEqual(record['restored'], 'no')
 
     def test_rollback_after_parking_checks_gates_then_rewrites_and_cleans_up(self):
-        current, target = self.release(), self.release()
+        current, target = self.release(sha='b' * 40), self.release(sha='c' * 40)
         self.saved_release(self.release(files=FILES[:-1]))
-        p = self.run_dd('point_plists "$CURRENT" "$SHA" "$ART"; '
+        p = self.run_dd('stage_plists "$CURRENT" "$SHA" "$ART" && activate_plists; '
                         'stop_job() { :; }; if restore; then exit 9; fi',
                         FILES + ARCHIVED, CONTRACT='row:1', CURRENT=current,
                         SHA='b' * 40, ART='sha256:' + 'b' * 64)

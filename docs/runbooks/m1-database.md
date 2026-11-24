@@ -114,7 +114,7 @@ df -h ~                       # 磁盘满是最常见的原因之一
       psql -h 127.0.0.1 -p 5434 -X postgres -c "alter database allrice40_dev_restore_$T rename to allrice40_dev"
       ```
 
-   4. 状态目录：`~/allrice40-dev/.local/` 里和 `$S` 同名的目录先改名保留（`mv storage storage.failed-$T`），再从 `$S` 拷回（快照用 `cp -c -pR`，每日备份用 `rsync -a`）。**`dsh-platform` 默认不拷回**：它是模型订阅凭证，验收实例也在用，Dev 停着时它们可能刷新过 token，拷回旧的会让订阅失效；只有凭证本身坏了才恢复它。`bridge`、`project-preview`、`quality-evidence`、`repository-baselines` 不在快照和备份里，不动（它们会比恢复后的数据库新）。`env` 只在 `.env` 被改过时才拷回。
+   4. 状态目录：`~/allrice40-dev/.local/` 里和 `$S` 同名的目录先改名保留（`mv storage storage.failed-$T`），再从 `$S` 拷回（快照用 `cp -c -pR`，每日备份用 `rsync -a`）。Web 和 Worker 的 launchd 环境都须把 `ALLRICE_STORAGE_ROOT` 指向这个根下的 `storage`。Worker 的 `ALLRICE_EXECUTION_ROOT`、`ALLRICE_DSH_RUNTIME_ROOT`、`ALLRICE_DSH_PLATFORM_HOME` 分别指向同根下的 `executions`、`dsh-runtime-m1`、`dsh-platform`。这些路径须以绝对路径写在 plist 内。**`dsh-platform` 默认不拷回**：它是模型订阅凭证，4.0 验收实例也在用，Dev 停着时它们可能刷新过 token，拷回旧的会让订阅失效；只有凭证本身坏了才恢复它。`bridge`、`project-preview`、`quality-evidence`、`repository-baselines` 不在快照和备份里，不动（它们会比恢复后的数据库新）。`env` 只在 `.env` 被改过时才拷回。
    5. 起服务：`~/allrice40-dev/qa/deploy-inflight/` 还在（部署没走完）时，退出这个 shell，运行 `deploy-dev --release-manager --recover`，它会放回保存的 launchd 文件、起旧版本并核对。否则把 `$S` 里的 `web.plist`、`worker.plist` 拷回 `~/Library/LaunchAgents/`（文件名 `ai.bplabs.allrice40-dev-web.plist`、`-worker.plist`），先起 Worker 再起 Web（`launchctl bootstrap gui/$(id -u) <plist>`），等两个就绪接口都报 ready。快照按新版本命名，里面的 plist 却指向部署之前的发布目录：拷回前先确认 plist 里的 `WorkingDirectory` 还在（可能已被清理），不在就用 `deploy-dev` 重新部署那个版本，不要手工拼目录。
 
 3. `deploy-dev --status` 看两个服务的版本，跑 `~/allrice40-dev/bin/smoke-test --dev`；在 MET 卡上记下恢复到了哪个时刻、丢了哪段时间的数据。手工恢复后 `~/allrice40-dev/qa/.previous-release` 和 `deploys.jsonl` 不会自动更新：下一次回滚要用 `--rollback <发布目录>` 指定目标。

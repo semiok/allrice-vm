@@ -12,9 +12,13 @@ shift; [ $# -ge 1 ] || die "no command given"
 plist=$(dev_plist "$role")
 [ -f "$plist" ] || die "missing $plist"
 [ -f "$HOME/allrice40-dev/.env" ] || die "missing ~/allrice40-dev/.env"
-set -a; source "$HOME/allrice40-dev/.env"; set +a
 exports=$(dev_plist_config "$role" "$plist" exports) || die "cannot read the environment from $plist"
 [ -n "$exports" ] || die "empty environment from $plist"
+set -a; source "$HOME/allrice40-dev/.env"; set +a
+# The loader's .env may still contain retired settings even though the launchd
+# target is valid. Never pass those settings or libpq target overrides through.
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS
+for key in "${!ALLRICE_DSH_RETAINED_@}" "${!ALLRICE_DSH_ORIGIN_READER_@}"; do unset "$key"; done
 eval "$exports"
 [ -n "${DATABASE_URL:-}" ] || die "DATABASE_URL is empty"
 exec "$@"

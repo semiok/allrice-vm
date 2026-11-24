@@ -147,7 +147,7 @@ scp m1:allrice40-dev/bin/monitor m1:allrice40-dev/bin/service_target.py m1:allri
 
 huihuimac 的告警通过 `ssh m1 allrice40-dev/bin/monitor ingest-incidents` 写进 M1 的事件表，所以 M1 上要先装好 `monitor`。
 
-事件表要先有迁移 `0220`（随 Dev 部署执行），否则写入会被 `kind` 约束拒绝，30 分钟后报 `monitor`；监控本身照常检查和发 Telegram。`scripts/m1/install` 装之前会用 `/usr/bin/python3`（3.9）跑一遍 `scripts/m1/test_monitor.py`。
+事件表要先有迁移 `0220`（随 Dev 部署执行）。每轮把告警状态和事件待发队列一同存盘。Worker 配置暂不可用、写库地址校验失败或事件表拒绝写入时，队列保留，连续 30 分钟后报 `monitor`。可信的 4.0 连接目标恢复后补写。`scripts/m1/install` 安装前会用 `/usr/bin/python3`（3.9）跑 `scripts/m1/test_monitor.py`。
 
 ## 日常命令
 
@@ -181,11 +181,13 @@ tail -50 ~/allrice40-dev/monitor/monitor.log
 
 ## 演练
 
-告警链路至少按下面四种演练过一遍（MET-222 记录）。演练用独立的状态目录、标签“演练”和独立的事件库，不碰共享 Dev 的服务、沙箱 VM 和库：
+告警链路的历史演练见 MET-222。4.0 演练使用 `--drill --config <文件>`。M1 的 `stateDir` 为 `~/allrice40-dev/monitor-drills/<代号>`，看门端为 `~/.local/state/allrice40-monitor-peer-drills/<代号>`。两端用相同代号（小写字母开头，可含数字和短横线），配置文件放在各自目录内，命名为 `config.json`。将演练 Telegram 配置放在该状态目录内。
+
+M1 配置的 `incidentDatabaseUrl` 指向独立测试 PostgreSQL，例如 `postgres://test@127.0.0.1:5544/allrice40_monitor_drill_outage`（代号 `outage`）。库名后缀用下划线替换代号中的短横线，事件表须包含 `0220` 的事件类型。看门端将事件送到 M1 同代号的 `ingest-incidents --drill`。可先执行 `monitor run --drill --config <文件>`、`monitor peer --drill --config <文件>`，验证两端状态和事件表，再用相同参数安装演练定时任务。看门端的安装命令另加 `--peer`。告警已带“演练”标签，触发前只配置独立测试 VM、镜像或磁盘。
 
 | 故障         | 做法                                                                                           |
 | ------------ | ---------------------------------------------------------------------------------------------- |
 | 沙箱 VM 停了 | 另建一个最小的 colima 测试实例，加进 `extraColimaProfiles`，`colima stop` 它                   |
-| 镜像丢失     | 在 VM 里构建一个测试镜像，把它的 ID 加进 `extraImages`，再 `docker rmi` 删掉                   |
+| 镜像丢失     | 将测试 VM 设为 `colimaProfile`，把测试镜像的 ID 加进 `extraImages`，再在该 VM 里删除测试镜像   |
 | 磁盘快满     | `hdiutil` 建一个小磁盘映像挂载，加进 `disks`，用 `dd` 填满（`mkfile -n` 是稀疏文件，不占空间） |
 | 监控停了     | 停掉演练用的 M1 监控定时任务，等 huihuimac 报 `m1_heartbeat`                                   |

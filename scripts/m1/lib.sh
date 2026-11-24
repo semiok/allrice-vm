@@ -5,6 +5,7 @@ M1_PY=/usr/bin/python3
 M1_UID=$(/usr/bin/id -u)
 M1_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
+M1_DEV_BACKUP_DIRS="storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform"
 
 # QA allocation remains shared with 3.x. Select an instance by explicit repository
 # identity before reading its credentials, stopping jobs or changing its database.
@@ -41,6 +42,8 @@ dev_plist_config() { # web|worker [plist path] [exports]
 }
 
 dev_plist_pair() { dev_plist_config web && dev_plist_config worker; }
+
+dev_release_config() { "$M1_PY" "$M1_TOOLS/service_target.py" release "$@"; }
 
 # flock_fd <fd> [seconds]: take an exclusive kernel lock on the file open at <fd>, waiting
 # up to [seconds] (default 0). Exit 0 = held, 1 = still busy. The lock belongs to the open

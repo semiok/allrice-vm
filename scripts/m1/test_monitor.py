@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +15,8 @@ import threading
 import time
 import unittest
 import urllib.parse
+import uuid
+from pathlib import Path
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -731,6 +734,22 @@ print(len(monitor.check_public_entry(monitor.Round(cfg))))
 
 
 class Worker(unittest.TestCase):
+    def test_formal_readiness_matches_the_configured_build(self):
+        r = make_round()
+        sealed = dict(sourceSha='a' * 40, sourceTree='b' * 40, manifestDigest='sha256:' + 'c' * 64)
+        r.cfg['workerIdentity'] = sealed
+        identity = dict(sealed, repository='semiok/allrice-vm', repositoryId=1469490636,
+                        environment='dev', service='worker', mode='production')
+        with mock.patch.object(monitor, 'deploying', return_value=False), \
+                mock.patch.object(monitor, 'job_info', return_value=('running', 1, None)), \
+                mock.patch.object(monitor, 'http_get') as request:
+            for wrong in ({'repository': 'semiok/allrice', 'repositoryId': 1104914723},
+                          {'manifestDigest': 'sha256:' + 'd' * 64}, {}):
+                with self.subTest(wrong=wrong):
+                    request.return_value = (200, json.dumps(dict(status='ready', identity=dict(identity, **wrong))))
+                    finding = monitor.check_worker(r)[0]
+                    self.assertEqual(finding['severity'], 'critical' if wrong else 'ok')
+
     def test_blocked_schedule_controller_asks_for_a_restart(self):
         r = make_round()
         body = json.dumps({'status': 'not_ready', 'detail': 'native_once_blocked',
@@ -903,12 +922,123 @@ class Config(unittest.TestCase):
             self.assertIsNone(cfg['workerLabel'])
             self.assertIsNone(cfg['databaseUrl'])
             self.assertIsNone(cfg['incidentDatabaseUrl'])
-            self.assertFalse(cfg['incidents'])
+            self.assertTrue(cfg['incidents'])
             r=monitor.Round(cfg)
             r.state['incidentOutbox']=[{'kind':'test'}]
             with mock.patch.object(monitor,'run') as run:
                 monitor.flush_incidents(r)
                 run.assert_not_called()
+            self.assertEqual(r.state['incidentOutbox'], [{'kind':'test'}])
+            self.assertIn('incidentFailingSince', r.state)
+
+    def test_formal_run_flushes_the_original_outage_after_the_dsn_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / 'allrice40-dev/monitor'
+            state.mkdir(parents=True)
+            config = state / 'config.json'
+            worker = state / 'worker.plist'
+            config.write_text(json.dumps({'stateDir': str(state), 'workerPlist': str(worker)}))
+            command = ['run', '--config', str(config)]
+            with mock.patch.object(monitor, 'run_checks', return_value=([bad('disk')], {'disk'})), \
+                    mock.patch.object(monitor, 'daily_due', return_value=False), \
+                    mock.patch.object(monitor, 'send_telegram'), \
+                    mock.patch.object(monitor, 'run', return_value=(0, '', '')) as run:
+                monitor.main(command)
+                run.assert_not_called()
+                first = json.loads((state / 'state.json').read_text())
+                self.assertEqual(len(first['incidentOutbox']), 1)
+                self.assertIn('incidentFailingSince', first)
+                release = home / 'allrice40-dev-releases/previous'
+                for entry in ('apps/worker/dist/index.js', 'apps/web/server.mjs'):
+                    script = release / entry
+                    script.parent.mkdir(parents=True)
+                    script.touch()
+                (release / '.local').mkdir()
+                (release / '.local/dev-build-identity.json').write_text(json.dumps(dict(
+                    repository='semiok/allrice-vm', repositoryId=1469490636, environment='dev',
+                    sourceSha='a' * 40, sourceTree='b' * 40, manifestDigest='sha256:' + 'c' * 64)))
+                local = home / 'allrice40-dev/.local'
+                (local.parent / '.env').touch()
+                dsn = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
+                worker.write_bytes(monitor.plistlib.dumps({
+                    'Label': 'ai.bplabs.allrice40-dev-worker', 'WorkingDirectory': str(release),
+                    'ProgramArguments': ['/opt/bin/node', str(release / 'apps/worker/dist/index.js')],
+                    'EnvironmentVariables': dict(ALLRICE_WORKER_PORT='3312', DATABASE_URL=dsn,
+                       ALLRICE_RELEASE_SHA='a' * 40, ALLRICE_STORAGE_ROOT=str(local / 'storage'),
+                       ALLRICE_EXECUTION_ROOT=str(local / 'executions'), ALLRICE_DSH_PLATFORM_HOME=str(local / 'dsh-platform'),
+                       ALLRICE_DSH_RUNTIME_ROOT=str(local / 'dsh-runtime-m1')),
+                }))
+                monitor.main(command)
+                run.assert_called_once()
+                invocation = run.call_args.args[0]
+                self.assertEqual(invocation[1], dsn)
+                rows = next(value[5:] for value in invocation if value.startswith('rows='))
+                self.assertEqual(json.loads(rows), first['incidentOutbox'])
+                last = json.loads((state / 'state.json').read_text())
+                self.assertEqual(last['incidentOutbox'], [])
+                self.assertNotIn('incidentFailingSince', last)
+
+    def test_drill_rejects_dev_database_and_state_before_starting(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            config = home / 'drill.json'
+            for state in ('allrice40-dev/monitor', 'allrice40-dev/monitor-drills/example'):
+                with self.subTest(state=state):
+                    config.write_text(json.dumps({'stateDir': str(home / state),
+                        'incidentDatabaseUrl': 'postgres://tester@127.0.0.1:5434/allrice40_dev'}))
+                    with self.assertRaises(SystemExit), mock.patch.object(monitor, 'run') as run:
+                        monitor.main(['run', '--drill', '--config', str(config)])
+                    run.assert_not_called()
+                    self.assertFalse((home / state).exists())
+
+    def test_drill_run_and_peer_ingest_in_an_isolated_test_database(self):
+        test_url = os.environ.get('ALLRICE_TEST_DATABASE_URL')
+        target = urllib.parse.urlsplit(test_url or '')
+        psql = shutil.which('psql')
+        if not psql or target.hostname != '127.0.0.1' or target.port != 54329 or target.path != '/allrice':
+            self.skipTest('requires the isolated M5 test PostgreSQL')
+        tag = 'm5-' + uuid.uuid4().hex[:12]
+        database = 'allrice40_monitor_drill_' + tag.replace('-', '_')
+        drill_url = urllib.parse.urlunsplit(target._replace(path='/' + database, query='', fragment=''))
+
+        def sql(url, statement):
+            # Use the same client wrapper as the real test delivery so the fixture password stays off argv.
+            return monitor.psql({'psql': psql}, statement, url, readonly=False)
+
+        sql(test_url, 'create database ' + database)
+        self.addCleanup(sql, test_url, 'drop database ' + database)
+        sql(drill_url, 'create table allrice_operational_incidents (id uuid primary key, kind text, '
+            'severity text, detail_code text, metadata jsonb, created_at timestamptz)')
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            state = home / 'allrice40-dev/monitor-drills' / tag
+            peer = home / '.local/state/allrice40-monitor-peer-drills' / tag
+            state.mkdir(parents=True)
+            peer.mkdir(parents=True)
+            config, peer_config = state / 'config.json', peer / 'config.json'
+            config.write_text(json.dumps({'stateDir': str(state), 'incidentDatabaseUrl': drill_url, 'psql': psql}))
+            peer_config.write_text(json.dumps({'stateDir': str(peer)}))
+            run_real = monitor.run
+
+            def run(cmd, timeout, env=None, stdin=None):
+                if cmd[0] != '/usr/bin/ssh':
+                    return run_real(cmd, timeout, env, stdin)
+                self.assertEqual(monitor.shlex.split(cmd[-1])[-4:],
+                    ['ingest-incidents', '--config', 'allrice40-dev/monitor-drills/' + tag + '/config.json', '--drill'])
+                with mock.patch.object(monitor.sys, 'stdin', io.StringIO(stdin)), mock.patch('builtins.print'):
+                    monitor.main(['ingest-incidents', '--drill', '--config', str(config)])
+                return 0, '', ''
+
+            with mock.patch.object(monitor, 'run_checks', side_effect=[([bad('disk')], {'disk'}),
+                    ([bad('m1_heartbeat')], {'m1'})]), mock.patch.object(monitor, 'send_telegram'), \
+                    mock.patch.object(monitor, 'run', side_effect=run):
+                monitor.main(['run', '--drill', '--config', str(config)])
+                monitor.main(['peer', '--drill', '--config', str(peer_config)])
+            self.assertEqual(sql(drill_url, 'select detail_code from allrice_operational_incidents order by detail_code').splitlines(),
+                             ['monitor.disk', 'monitor.m1_heartbeat'])
+            for directory in (state, peer):
+                self.assertEqual(json.loads((directory / 'state.json').read_text())['incidentOutbox'], [])
 
     def test_merge(self):
         tmp = tempfile.mkdtemp()

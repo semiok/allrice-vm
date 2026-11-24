@@ -31,7 +31,7 @@ colima ssh -p "${ALLRICE40_CLOUD_PROFILE:?}" -- sudo /usr/local/lib/allrice-clou
 
 ## 自动拉起与登录
 
-- #557 起有登录项 `ai.bplabs.allrice-cloud-autostart`：用户登录后拉起 VM，失败每分钟重试一次；看门狗服务也加了 `WantedBy=docker.service`，docker 起来它就起来。
+- 登录项 `ai.bplabs.allrice40-dev-cloud-autostart` 在用户登录后拉起 4.0 VM，失败每分钟重试一次。看门狗随该 VM 的 Docker 启动。
 - M1 开着 FileVault：**无人值守重启后，要有人到机器前登录**，登录项和所有 launchd 服务才会起来。这段时间 huihuimac 的看门会报 `m1_reachable` 或 `m1_heartbeat`。
 - 在 `deploy-lock run` 里启动 colima 时，`limactl` 会继承部署锁的文件描述符，一直占着锁：要么在锁外启动，要么启动命令带 `9>&-` 关掉它。
 
@@ -41,7 +41,8 @@ colima ssh -p "${ALLRICE40_CLOUD_PROFILE:?}" -- sudo /usr/local/lib/allrice-clou
 export DOCKER_HOST=unix://$HOME/.colima/${ALLRICE40_CLOUD_PROFILE:?}/docker.sock PATH=/opt/homebrew/bin:$PATH
 docker ps -a --filter name=allrice-office-renderer
 docker logs --tail 50 allrice-office-renderer
-curl -s http://127.0.0.1:3112/health
+RENDERER_URL=$(~/allrice40-dev/bin/with-env worker printenv ALLRICE_OFFICE_RENDERER_URL) &&
+curl --fail --silent --show-error "${RENDERER_URL%/}/health"
 ```
 
 容器的重启策略是 `unless-stopped`，VM 和 docker 恢复后会自己起来。容器被删了或一直不健康：`docker start allrice-office-renderer`；仍不行，记下 `docker inspect` 和日志，交给发布负责人重建（镜像 `allrice-office-renderer:arm64-v1`，`infra/docker/Dockerfile.office-renderer`）。

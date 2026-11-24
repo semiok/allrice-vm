@@ -226,9 +226,6 @@ cmd_up() {
   ( cd "$dir/release" && node scripts/dev-release/prepare-identity.mjs --root="$dir/release" --release-sha="$sha" ) \
     >> "$dir/logs/build.log" 2>&1 || die "build identity preparation failed, see $dir/logs/build.log"
 
-  psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
-  createdb -h 127.0.0.1 "$db"
-
   /usr/bin/python3 - "$task" "$dir" "$db" "$web" "$worker" "$sha" "$artifact" "$(dev_plist web)" "$(dev_plist worker)" <<'PY'
 import json, os, plistlib, re, sys, uuid
 task, d, db, web, worker, sha, art, web_src, worker_src = sys.argv[1:]
@@ -259,6 +256,8 @@ common = {
     'ALLRICE_NATIVE_RECURRING_REFERENCE': json.dumps(rec, separators=(',', ':')),
     'ALLRICE_DSH_CORDIS_CONFIG': f'{rel}/apps/worker/dsh/allrice-restricted.cordis.yml',
     'ALLRICE_DSH_RUNTIME_ROOT': f'{L}/dsh-runtime', 'ALLRICE_STORAGE_ROOT': f'{L}/storage',
+    'ALLRICE_EXECUTION_ROOT': f'{L}/executions',
+    'ALLRICE_DSH_PLATFORM_HOME': f'{home}/allrice40-dev/.local/dsh-platform',
     'ALLRICE_CLOUD_PREVIEW_SOCKET': f'{L}/project-preview/p.sock',
     'ALLRICE_TECHNICAL_WEB_HEALTH_URL': f'http://127.0.0.1:{web}/api/health/ready',
     'ALLRICE_TECHNICAL_WORKER_HEALTH_URL': f'http://127.0.0.1:{worker}/health/ready',
@@ -276,7 +275,7 @@ for role, source in (('web', web_src), ('worker', worker_src)):
     env.update(common)
     if role == 'web': env['ALLRICE_WEB_PORT'] = web
     else:
-        env.update({'ALLRICE_WORKER_PORT': worker, 'ALLRICE_EXECUTION_ROOT': f'{L}/executions', 'ALLRICE_WORKER_CONCURRENCY': '2'})
+        env.update({'ALLRICE_WORKER_PORT': worker, 'ALLRICE_WORKER_CONCURRENCY': '2'})
     args = src['ProgramArguments']
     node = args[2] if os.path.basename(args[0]) == 'with-env' else args[0]
     script = f'{rel}/apps/web/server.mjs' if role == 'web' else f'{rel}/apps/worker/dist/index.js'
@@ -285,10 +284,13 @@ for role, source in (('web', web_src), ('worker', worker_src)):
              'EnvironmentVariables': env, 'KeepAlive': True, 'RunAtLoad': False, 'ExitTimeOut': 60,
              'WorkingDirectory': f'{rel}/apps/web' if role == 'web' else rel,
              'StandardOutPath': f'{d}/logs/{role}.log', 'StandardErrorPath': f'{d}/logs/{role}.err.log'}
-    p = f'{home}/Library/LaunchAgents/{label}.plist'
-    plistlib.dump(plist, open(p, 'wb')); os.chmod(p, 0o600)
     plistlib.dump(plist, open(f'{d}/{role}.plist', 'wb')); os.chmod(f'{d}/{role}.plist', 0o600)
 PY
+  service_plist_config "$dir/web.plist" "$(label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" || die 'invalid QA Web configuration'
+  service_plist_config "$dir/worker.plist" "$(label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
+
+  psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
+  createdb -h 127.0.0.1 "$db"
 
   say "preparing database"
   ( cd "$dir/release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
@@ -299,7 +301,9 @@ PY
 
   say "starting services"
   for role in worker web; do
-    launchctl bootstrap "gui/$UID_" "$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"
+    local launch_plist="$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"
+    cp -p "$dir/$role.plist" "$launch_plist"
+    launchctl bootstrap "gui/$UID_" "$launch_plist"
     launchctl kickstart "gui/$UID_/$(label "$task" "$role")"
   done
   local ok=0
