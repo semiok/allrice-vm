@@ -297,7 +297,11 @@ class PrincipalService extends TypertRemoteService {
   readonly scopes = new Map<string, Scope>();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
-  private graphObserver?: { ready: boolean; close(): Promise<void> };
+  private graphObserver?: {
+    ready: boolean;
+    current(): boolean;
+    close(): Promise<void>;
+  };
   private graphRetirement = Promise.resolve();
   constructor(
     private readonly hostContext: Context,
@@ -448,9 +452,9 @@ class PrincipalService extends TypertRemoteService {
     )
       throw Error('PRINCIPAL_ISSUE_INVALID');
     const observer = this.graphObserver;
-    if (!observer?.ready || !observer.current()) {
-      if (observer && !observer.current())
-        void observer.close().catch(() => {});
+    const observerCurrent = observer?.current();
+    if (!observer?.ready || !observerCurrent) {
+      if (observer && !observerCurrent) void observer.close().catch(() => {});
       // The authenticated issue has not created a scope or opened a native
       // reader. Close its private stream with the ordinary pre-open terminal.
       yield { type: 'closed', scopeId: issue.scopeId };
