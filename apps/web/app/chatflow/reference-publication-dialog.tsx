@@ -303,7 +303,7 @@ export function ReferencePublicationPending({
         stage: 'waiting',
         message: waitingForReceipt,
       };
-      if (canShowPublicationReceipt(key, receipt))
+      if (readPublicationReceiptAccess(key, receipt) !== 'denied')
         note({
           stage: 'checking',
           message: '正在核对' + action + '…',
@@ -341,7 +341,7 @@ export function ReferencePublicationPending({
             delete next[id];
             return next;
           });
-        } else if (canShowPublicationReceipt(key, receipt)) {
+        } else if (readPublicationReceiptAccess(key, receipt) !== 'denied') {
           note(waiting);
         }
       } finally {
@@ -438,12 +438,21 @@ export function ReferencePublicationPending({
       (note.stage !== 'checking' || !note.reading.aborted) &&
       (note.stage === 'settled' || !settledPublications.has(id)),
   );
-  if (records.length === hidden.size && !visibleNotes.length) return null;
+  const visibleRecords = records.filter(
+    ({ id }) => !hidden.has(id) && !settledPublications.has(id),
+  );
+  const retries = records.filter(
+    ({ id, key, receipt }) =>
+      notes[id]?.stage === 'waiting' &&
+      !settledPublications.has(id) &&
+      readPublicationReceiptAccess(key, receipt) === undefined,
+  );
+  if (!visibleRecords.length && !visibleNotes.length && !retries.length)
+    return null;
   return (
     <div hidden={dialogOpen} className={css.recovery}>
-      {records.map((record) => {
+      {visibleRecords.map((record) => {
         const { id } = record;
-        if (hidden.has(id)) return null;
         return (
           <Button
             key={id}
@@ -459,6 +468,19 @@ export function ReferencePublicationPending({
           </Button>
         );
       })}
+      {retries.length > 0 && (
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={() => {
+            const current = entrySignal.current;
+            if (!current) return;
+            for (const record of retries) void reconcile(record, current);
+          }}
+        >
+          核对结果
+        </Button>
+      )}
       {visibleNotes.map(([id, note]) => (
         <p key={id} role="status">
           {note.message}
@@ -857,6 +879,11 @@ function PublicationForm({
   const visibleReceipts = receipts.filter((receipt) =>
     canShowPublicationReceipt(receiptKey, receipt),
   );
+  const retries = receipts.filter(
+    (receipt) =>
+      receiptNotes[receipt.requestId]?.stage === 'waiting' &&
+      readPublicationReceiptAccess(receiptKey, receipt) === undefined,
+  );
   return (
     <DshDialog
       title={title}
@@ -1084,7 +1111,7 @@ function PublicationForm({
             variant="ghost"
             disabled={receiptNotes[receipt.requestId]?.stage === 'checking'}
             aria-label={
-              visibleReceipts.length === 1
+              visibleReceipts.length === 1 && !retries.length
                 ? '核对结果'
                 : '核对结果 ' + receipt.requestId.slice(0, 8)
             }
@@ -1093,6 +1120,17 @@ function PublicationForm({
             核对结果
           </Button>
         ))}
+        {retries.length > 0 && (
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => {
+              for (const receipt of retries) void reconcile(receipt);
+            }}
+          >
+            核对结果
+          </Button>
+        )}
         <Button
           type="button"
           variant="primary"

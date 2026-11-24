@@ -824,6 +824,15 @@ suite(
             (requestId: string) => (response: BrowserResponse) =>
               response.request().method() === 'GET' &&
               new URL(response.url()).pathname.endsWith(receiptPath(requestId));
+          const receiptFailure = (requestId: string) =>
+            page.waitForEvent('requestfailed', {
+              predicate: (request) =>
+                request.method() === 'GET' &&
+                new URL(request.url()).pathname.endsWith(
+                  receiptPath(requestId),
+                ),
+              timeout: 5000,
+            });
           async function checkReceipt(button: Locator, requestId: string) {
             const [response] = await Promise.all([
               page.waitForResponse(receiptResponse(requestId)),
@@ -1078,14 +1087,7 @@ suite(
                 { times: 1 },
               );
               const [failure] = await Promise.all([
-                page.waitForEvent('requestfailed', {
-                  predicate: (request) =>
-                    request.method() === 'GET' &&
-                    new URL(request.url()).pathname.endsWith(
-                      receiptPath(independentId),
-                    ),
-                  timeout: 5000,
-                }),
+                receiptFailure(independentId),
                 independentPublication.click(),
               ]);
               expect(failure.failure()).not.toBeNull();
@@ -1128,16 +1130,39 @@ suite(
           await page.reload();
           await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
           expect(await readCache(marker)).toBeNull();
-          const [freshC, deniedAfterReload] = await Promise.all([
-            page.waitForResponse(receiptResponse(independentId), {
-              timeout: 5000,
-            }),
-            enterWithAOnHold(materials, async () => {
-              await onlyIndependentVisible();
-              await withdraw('fixture-receipt-fresh-heap-withdrawal');
-              await onlyIndependentVisible();
-            }),
-          ]);
+          const sidebarRetry = page.getByRole('button', {
+            name: '核对结果',
+            exact: true,
+          });
+          await page.route(
+            receiptRoute(independentId),
+            (route) => route.abort('failed'),
+            {
+              times: 1,
+            },
+          );
+          const beforeFreshRead = receiptReads.length;
+          const [freshC, deniedAfterReload, failedFreshRead] =
+            await Promise.all([
+              page.waitForResponse(receiptResponse(independentId), {
+                timeout: 5000,
+              }),
+              enterWithAOnHold(materials, async () => {
+                await sidebarRetry.waitFor();
+                expect(await pendingPublication.count()).toBe(0);
+                expect(await independentPublication.count()).toBe(0);
+                expect(receiptReads.slice(beforeFreshRead)).toEqual([]);
+                await sidebarRetry.click();
+                await onlyIndependentVisible();
+                expect(receiptReads.slice(beforeFreshRead)).toEqual([
+                  independentId,
+                ]);
+                await withdraw('fixture-receipt-fresh-heap-withdrawal');
+                await onlyIndependentVisible();
+              }),
+              receiptFailure(independentId),
+            ]);
+          expect(failedFreshRead.failure()).not.toBeNull();
           expect(freshC.status()).toBe(200);
           expect(await freshC.json()).toMatchObject({
             requestId: independentId,
@@ -1146,6 +1171,7 @@ suite(
           expect(deniedAfterReload.status()).toBe(403);
           await expect.poll(() => readCache(marker)).toBe('1');
           await onlyIndependentVisible();
+          expect(await sidebarRetry.count()).toBe(0);
 
           const deniedAfterSwitch = await enterWithA(returnToMaterials);
           expect(deniedAfterSwitch.status()).toBe(403);
@@ -1299,6 +1325,46 @@ suite(
           await onlyIndependentVisible();
           expect(await sideReceipt(currentFormId).count()).toBe(0);
           expect(await sideWaiting.count()).toBe(1);
+
+          // A fresh unverified C can be retried in the original dialog too.
+          await restore('fixture-modal-unverified-retry');
+          await page.reload();
+          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
+          await page.route(
+            receiptRoute(independentId),
+            (route) => route.abort('failed'),
+            {
+              times: 2,
+            },
+          );
+          await Promise.all([receiptFailure(independentId), materials()]);
+          await sidebarRetry.waitFor();
+          await Promise.all([
+            receiptFailure(independentId),
+            page.waitForResponse(receiptResponse(currentFormId), {
+              timeout: 5000,
+            }),
+            openUpload(),
+          ]);
+          const modalRetry = material.getByRole('button', {
+            name: '核对结果',
+            exact: true,
+          });
+          await modalRetry.waitFor();
+          expect(
+            await material.getByText(independentId.slice(0, 8)).count(),
+          ).toBe(0);
+          const beforeModalRetry = receiptReads.length;
+          const modalRetryResult = await checkReceipt(
+            modalRetry,
+            independentId,
+          );
+          expect(modalRetryResult.status()).toBe(200);
+          expect(await modalRetryResult.json()).toMatchObject({
+            requestId: independentId,
+            status: 'unknown',
+          });
+          expect(receiptReads.slice(beforeModalRetry)).toEqual([independentId]);
           expect(observedPosts).toEqual([currentFormId]);
           expect(publishWrites).toHaveLength(3);
           await page.unrouteAll({ behavior: 'wait' });
@@ -1312,6 +1378,10 @@ suite(
             },
             heldOriginalReadsFinished: 3,
             delayedReply: { A: 403, C: 200 },
+            unverifiedRetries: {
+              sidebar: freshC.status(),
+              dialog: modalRetryResult.status(),
+            },
             originalRequestsRepeated: 0,
             serverPublicationWrites: publishWrites.length,
           });
