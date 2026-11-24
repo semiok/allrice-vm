@@ -23,7 +23,7 @@ import { DEntryProfileGraphSchema } from '@allrice/contracts';
 import { expect, it } from 'vitest';
 import { holdReleasedProfile } from './released-profile.js';
 
-it('attests each exact graph resource from independently installed rc.2 bytes and fails closed on a modified bundle, map or URL', async () => {
+it('attests each exact resource in independent rc.2 graph orders and rejects a modified bundle, map or URL', async () => {
   const root = await mkdtemp(join(tmpdir(), 'allrice-native-profile-copies-'));
   const install = createRequire(
     new URL(
@@ -37,6 +37,8 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
   const names = [
     '@deepseek-ai/dsh-client-modules',
     '@allrice/dsh-web-composition',
+    '@allrice/independent-profile-module',
+    '@allrice/dependent-profile-module',
   ];
   type Registry = {
     graph(): ReturnType<typeof DEntryProfileGraphSchema.parse>;
@@ -45,7 +47,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
     rebuilt(id: string): string | undefined;
   };
   const contexts: Context[] = [];
-  async function installed(name: string, mtime: number) {
+  async function installed(name: string, mtime: number, reverse = false) {
     const directory = join(root, name);
     const entries = await Promise.all(
       names.map(async (name, index) => {
@@ -55,7 +57,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
         await writeFile(entry, 'export function apply() {}\n');
         await writeFile(
           join(pkg, 'client.js'),
-          'globalThis.nativeTestBundle = ' + index + ';\n',
+          ('globalThis.nativeTestBundle = ' + index + ';\n').repeat(index + 1),
         );
         const { utimes } = await import('node:fs/promises');
         await utimes(join(pkg, 'client.js'), mtime, mtime);
@@ -65,7 +67,13 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
             name,
             type: 'module',
             exports: { '.': './host.js', './client': './client.js' },
-            dsh: { client: { platform: 'web', immediately: index === 0 } },
+            dsh: {
+              client: {
+                platform: 'web',
+                immediately: index === 0,
+                ...(index === 3 && { external: [names[1]] }),
+              },
+            },
           }),
         );
         return {
@@ -79,7 +87,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
     const context = new Context();
     contexts.push(context);
     context.provide('loader', {
-      entries: () => entries,
+      entries: () => (reverse ? [...entries].reverse() : entries),
     } as unknown as Context['loader']);
     await context.plugin(api.ClientModuleRegistry);
     const registry = context.get('clientModules') as Registry;
@@ -95,7 +103,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
   const lifetime = new AbortController().signal;
   try {
     const one = await installed('authoritative-release', 1_000_000);
-    const two = await installed('native-guest-install', 2_000_000);
+    const two = await installed('native-guest-install', 2_000_000, true);
     const nativeFile = (directory: string) =>
       join(directory, names[0]!, 'client.js');
     const a = await stat(nativeFile(one.directory));
@@ -108,6 +116,10 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
     const graph = DEntryProfileGraphSchema.parse(one.registry.graph());
     const native = DEntryProfileGraphSchema.parse(two.registry.graph());
     expect(native.rev).not.toBe(graph.rev);
+    expect(native.entries.map(({ id }) => id)).not.toEqual(
+      graph.entries.map(({ id }) => id),
+    );
+    expect(native.batches[1]!.entries).not.toEqual(graph.batches[1]!.entries);
     const directory = join(root, 'sealed');
     const files: Array<{ path: string; bytes: number; sha256: string }> = [];
     async function seal(path: string, data: Buffer) {

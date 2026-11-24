@@ -128,18 +128,15 @@ function verified<T>(values: readonly T[], key: (value: T) => string) {
 
 type Graph = z.infer<typeof DEntryProfileGraphSchema>;
 type Resource = { url: string; rev: string };
+const parserModule = '@deepseek-ai/dsh-client-modules';
 
-function topology(graph: Graph) {
-  return {
-    release: graph.release,
-    entries: graph.entries.map(({ id, inject, immediately, external }) => ({
-      id,
-      inject,
-      immediately,
-      external,
-    })),
-    batches: graph.batches.map(({ phase, entries }) => ({ phase, entries })),
-  };
+function topology({
+  id,
+  inject,
+  immediately,
+  external,
+}: Graph['entries'][number]) {
+  return { id, inject, immediately, external };
 }
 
 function rc2Resource(ids: readonly string[], rev: string, map: boolean) {
@@ -157,18 +154,88 @@ function rc2Resource(ids: readonly string[], rev: string, map: boolean) {
   );
 }
 
-function replaceMapTrailer(data: Buffer, before: string, after: string) {
-  const trailer = (reference: string) =>
-    Buffer.from(
-      '//# sourceMappingURL=' + reference.slice('plugins/'.length) + '\n',
-    );
-  const original = trailer(before);
+function mapTrailer(reference: string) {
+  return Buffer.from(
+    '//# sourceMappingURL=' + reference.slice('plugins/'.length) + '\n',
+  );
+}
+function withoutMapTrailer(data: Buffer, reference: string) {
+  const original = mapTrailer(reference);
   if (!data.subarray(-original.byteLength).equals(original))
     throw new DEntryNativeUnavailable();
-  return Buffer.concat([
-    data.subarray(0, -original.byteLength),
-    trailer(after),
-  ]);
+  return data.subarray(0, -original.byteLength);
+}
+
+/** In rc.2, native scan order breaks ties between independent modules. The
+ * dependency edges, parser module, URL limits and combo identity remain exact. */
+function assertNativeGraph(graph: Graph, sealed: Graph) {
+  if (!isDeepStrictEqual(graph.release, sealed.release))
+    throw new DEntryNativeUnavailable();
+  const nodes = verified(graph.entries, ({ id }) => id);
+  const sealedNodes = verified(sealed.entries, ({ id }) => id);
+  if (nodes.size !== sealedNodes.size) throw new DEntryNativeUnavailable();
+  const started = new Set<string>();
+  for (const entry of graph.entries) {
+    const original = sealedNodes.get(entry.id);
+    if (
+      !original ||
+      entry.url !== rc2Resource([entry.id], entry.rev, false) ||
+      !/^[a-f0-9]{12}$/.test(entry.rev) ||
+      !isDeepStrictEqual(topology(entry), topology(original))
+    )
+      throw new DEntryNativeUnavailable();
+    for (const external of entry.external ?? []) {
+      const name = nodes.has(external)
+        ? external
+        : external.replace(/\/client$/, '');
+      if (
+        nodes.has(name) &&
+        (!started.has(name) ||
+          (entry.id === parserModule && name !== parserModule))
+      )
+        throw new DEntryNativeUnavailable();
+    }
+    started.add(entry.id);
+  }
+  const batches: Graph['batches'] = [];
+  function append(phase: Graph['batches'][number]['phase'], entries: string[]) {
+    const digest = createHash('sha1').update('combo\0');
+    for (const id of entries) {
+      const revision = nodes.get(id)!.rev;
+      for (const part of [id, revision])
+        digest.update(String(Buffer.byteLength(part)) + ':').update(part);
+    }
+    const rev = digest.digest('hex').slice(0, 12);
+    batches.push({
+      phase,
+      rev,
+      entries,
+      url: rc2Resource(entries, rev, false),
+    });
+  }
+  if (!nodes.has(parserModule)) throw new DEntryNativeUnavailable();
+  append('bootstrap', [parserModule]);
+  let group: string[] = [];
+  for (const { id } of graph.entries) {
+    if (id === parserModule) continue;
+    const candidate = [...group, id];
+    if (
+      Buffer.byteLength(rc2Resource(candidate, '0'.repeat(12), true)) >
+      3 * 1024
+    ) {
+      if (!group.length) throw new DEntryNativeUnavailable();
+      append('application', group);
+      group = [id];
+    } else group = candidate;
+  }
+  if (group.length) append('application', group);
+  if (!isDeepStrictEqual(graph.batches, batches))
+    throw new DEntryNativeUnavailable();
+  const revision = createHash('sha1')
+    .update(JSON.stringify({ entries: graph.entries, batches: graph.batches }))
+    .digest('hex')
+    .slice(0, 12);
+  if (graph.rev !== revision) throw new DEntryNativeUnavailable();
 }
 
 async function readManifest(
@@ -267,8 +334,8 @@ export async function holdReleasedProfile(
     await source.readImmutableGraph(active),
   );
   active.throwIfAborted();
-  if (!isDeepStrictEqual(topology(graph), topology(sealedGraph)))
-    throw new DEntryNativeUnavailable();
+  assertNativeGraph(sealedGraph, sealedGraph);
+  assertNativeGraph(graph, sealedGraph);
   const files = verified(manifest.files, (entry) => entry.path);
   const refs = verified(
     [...sealedGraph.entries, ...sealedGraph.batches],
@@ -280,7 +347,7 @@ export async function holdReleasedProfile(
   if (
     modules.has('@deepseek-ai/dsh-client-hmr') ||
     !modules.has('@allrice/dsh-web-composition') ||
-    !modules.has('@deepseek-ai/dsh-client-modules') ||
+    !modules.has(parserModule) ||
     partition.length !== modules.size ||
     new Set(partition).size !== modules.size ||
     partition.some((id) => !modules.has(id))
@@ -377,39 +444,92 @@ export async function holdReleasedProfile(
       read(signal: AbortSignal): ReturnType<typeof readBytes>;
     }
   >();
-  const relocated = new Map<string, string>();
-  async function attest(
-    ids: readonly string[],
-    sealed: Resource,
-    current: Resource,
-  ) {
+  function proof(reference: string) {
+    const row = bundles.get(reference);
     if (
-      sealed.url !== rc2Resource(ids, sealed.rev, false) ||
-      current.url !== rc2Resource(ids, current.rev, false)
+      !row ||
+      !row.path.startsWith('plugins/') ||
+      !isDeepStrictEqual(files.get(row.path), {
+        path: row.path,
+        bytes: row.bytes,
+        sha256: row.sha256,
+      })
     )
       throw new DEntryNativeUnavailable();
-    const oldMap = rc2Resource(ids, sealed.rev, true);
-    const newMap = rc2Resource(ids, current.rev, true);
-    const proof = (reference: string) => {
-      const row = bundles.get(reference);
-      if (
-        !row ||
-        !row.path.startsWith('plugins/') ||
-        !isDeepStrictEqual(files.get(row.path), {
-          path: row.path,
-          bytes: row.bytes,
-          sha256: row.sha256,
-        })
-      )
-        throw new DEntryNativeUnavailable();
-      return row;
+    return row;
+  }
+  async function readEntry(id: string, signal: AbortSignal) {
+    const sealed = modules.get(id);
+    if (!sealed) throw new DEntryNativeUnavailable();
+    const map = rc2Resource([id], sealed.rev, true);
+    const { data, media } = await readBytes(proof(sealed.url), signal);
+    return { data: withoutMapTrailer(data, map), media, map };
+  }
+  async function readCombo(
+    ids: readonly string[],
+    map: string,
+    current: AbortSignal,
+  ) {
+    const scripts = [];
+    const offsets = [];
+    const nativeMaps = [];
+    let line = 0;
+    for (const id of ids) {
+      const entry = await readEntry(id, current);
+      scripts.push(entry.data);
+      offsets.push(line);
+      nativeMaps.push(entry.map);
+      for (const byte of entry.data) if (byte === 10) line++;
+    }
+    return {
+      data: Buffer.concat([...scripts, mapTrailer(map)]),
+      media: 'text/javascript; charset=utf-8',
+      async sourceMap(signal: AbortSignal) {
+        const sections = [];
+        for (const [index, reference] of nativeMaps.entries()) {
+          const { data } = await readBytes(proof(reference), signal);
+          const singleton = z
+            .strictObject({
+              version: z.literal(3),
+              file: z.literal('client.js'),
+              sections: z.tuple([
+                z.strictObject({
+                  offset: z.strictObject({
+                    line: z.literal(0),
+                    column: z.literal(0),
+                  }),
+                  map: z.json(),
+                }),
+              ]),
+            })
+            .parse(JSON.parse(data.toString('utf8')));
+          sections.push({
+            offset: { line: offsets[index]!, column: 0 },
+            map: singleton.sections[0].map,
+          });
+        }
+        return Buffer.from(
+          JSON.stringify({ version: 3, file: 'client.js', sections }) + '\n',
+        );
+      },
     };
-    const script = proof(sealed.url);
-    const sourceMap = proof(oldMap);
-    const read = async (signal: AbortSignal) => {
-      const { data, media } = await readBytes(script, signal);
-      return { data: replaceMapTrailer(data, oldMap, newMap), media };
-    };
+  }
+
+  // Check the sealer's native combos as well as the guest's exact orders.
+  for (const batch of sealedGraph.batches) {
+    const map = rc2Resource(batch.entries, batch.rev, true);
+    const expected = await readCombo(batch.entries, map, active);
+    const original = await readBytes(proof(batch.url), active);
+    const originalMap = await readBytes(proof(map), active);
+    if (
+      !original.data.equals(expected.data) ||
+      !originalMap.data.equals(await expected.sourceMap(active))
+    )
+      throw new DEntryNativeUnavailable();
+  }
+  async function attest(ids: readonly string[], current: Resource) {
+    const map = rc2Resource(ids, current.rev, true);
+    const read = (signal: AbortSignal) => readCombo(ids, map, signal);
     const expected = await read(active);
     const native = await source.readImmutableBundle(
       current.url,
@@ -418,36 +538,47 @@ export async function holdReleasedProfile(
     );
     active.throwIfAborted();
     if (!expected.data.equals(native)) throw new DEntryNativeUnavailable();
-    const expectedMap = await readBytes(sourceMap, active);
+    const expectedMap = await expected.sourceMap(active);
     const nativeMap = await source.readImmutableBundle(
-      newMap,
-      expectedMap.data.byteLength,
+      map,
+      expectedMap.byteLength,
       active,
     );
     active.throwIfAborted();
-    if (!expectedMap.data.equals(nativeMap))
-      throw new DEntryNativeUnavailable();
-    if (checked.has(current.url) || relocated.has(sealed.url))
-      throw new DEntryNativeUnavailable();
-    checked.set(current.url, { revision: current.rev, read });
-    relocated.set(sealed.url, current.url);
+    if (!expectedMap.equals(nativeMap)) throw new DEntryNativeUnavailable();
+    if (checked.has(current.url)) throw new DEntryNativeUnavailable();
+    checked.set(current.url, {
+      revision: current.rev,
+      async read(signal) {
+        const { data, media } = await read(signal);
+        return { data, media };
+      },
+    });
   }
 
-  for (const [index, entry] of sealedGraph.entries.entries())
-    await attest([entry.id], entry, graph.entries[index]!);
-  for (const [index, batch] of sealedGraph.batches.entries())
-    await attest(batch.entries, batch, graph.batches[index]!);
+  for (const entry of graph.entries) await attest([entry.id], entry);
+  for (const batch of graph.batches) await attest(batch.entries, batch);
   for (const file of files.values()) {
     if (isStatic(file.path)) await readBytes(file, active);
   }
   await assertCurrent(active);
-  const injections = bootInjections.map((row) => {
-    if (row.kind === 'global') return { ...row, value: graph };
-    if (row.kind === 'script') return row;
-    const src = relocated.get(row.src);
-    if (!src) throw new DEntryNativeUnavailable();
-    return { ...row, src };
-  });
+  const injections = [
+    bootInjections[0],
+    ...graph.batches
+      .filter((part) => part.phase === 'application')
+      .map(({ url }) => ({
+        kind: 'script-preload',
+        src: url,
+      })),
+    ...graph.batches
+      .filter((part) => part.phase === 'bootstrap')
+      .map(({ url }) => ({
+        kind: 'script-src',
+        placement: 'head',
+        src: url,
+      })),
+    { kind: 'global', name: '__DSH_BOOT__', value: graph },
+  ].map((row) => DEntryProfileInjectionSchema.parse(row));
   return {
     manifestSha256: hash(raw),
     graph,

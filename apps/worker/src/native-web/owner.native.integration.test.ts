@@ -308,11 +308,6 @@ it(
       extra: ids.filter((id) => !sealedIds.includes(id)),
       release: native.release,
     }).toEqual({ missing: [], extra: [], release: expected.release });
-    const offset = ids.findIndex((id, index) => id !== sealedIds[index]);
-    expect(
-      offset < 0 ? [] : [offset, ids[offset], sealedIds[offset]],
-      'first difference in the native module order',
-    ).toEqual([]);
     const proof = await holdReleasedProfile(
       f.seal.directory,
       {
@@ -335,6 +330,7 @@ it(
         ({ id }) => id === '@deepseek-ai/dsh-client-hmr',
       ),
     ).toBe(false);
+    expect(proof.graph).toEqual(native);
     const guestManifest = f.launch.files.find(({ path }) =>
       path.endsWith('/profiles/allrice-web/package.json'),
     );
