@@ -15,12 +15,9 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import {
-  WorkspaceAnalyzer,
-  FaceModelEmitter,
-  type WorkspaceAnalyzerOptions,
-} from '@deepseek-ai/dsh-typert-generator';
+import type { WorkspaceAnalyzerOptions } from '@deepseek-ai/dsh-typert-generator';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
+import { TYPERT } from '@allrice/d-entry-principal/typert';
 import { withPrincipalGeneratorInput } from '../build.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -33,13 +30,13 @@ const values = dirname(
 );
 const digest = (bytes: Uint8Array) =>
   createHash('sha256').update(bytes).digest('hex');
-describe('real official generator and same-release artifact closure', () => {
-  it('derives all three methods, original native result codecs and duplex uplinks from the current source', async () => {
+describe('official generator inputs and same-release artifact closure', () => {
+  it('stages current declarations, contracts and compiler options for the official generator', async () => {
     const originalContractManifest = await readFile(
       resolve(root, '../contracts/package.json'),
     );
     let scratch = '';
-    const emitted = await withPrincipalGeneratorInput(
+    await withPrincipalGeneratorInput(
       async (options: WorkspaceAnalyzerOptions) => {
         scratch = options.root;
         expect(options).toMatchObject({
@@ -147,35 +144,30 @@ describe('real official generator and same-release artifact closure', () => {
             expect(staged.equals(original), name).toBe(true);
           }),
         );
-        const analysis = new WorkspaceAnalyzer(options).analyze();
-        const face = analysis.faces.find((value) => value.face === 'host');
-        if (!face) throw Error('actual Host model missing');
-        const artifact = new FaceModelEmitter(face).emit(
-          '@allrice/d-entry-principal',
-        );
-        if (!artifact.remote) throw Error('actual Remote model missing');
-        return artifact;
       },
     );
     await expect(stat(scratch)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(resolve(root, '../contracts/package.json'))).toEqual(
       originalContractManifest,
     );
-    expect(await readFile(resolve(root, 'lib/typert.host.js'), 'utf8')).toBe(
-      emitted.js,
-    );
-    expect(
-      await readFile(resolve(root, 'lib/typert.remote-client.js'), 'utf8'),
-    ).toBe(emitted.remote?.js);
-    expect(Object.keys(TYPERT_REMOTE.methods).sort()).toEqual([
+  });
+  it('checks the built Host and Remote methods and strict duplex uplinks', () => {
+    // build:test-sources generates these exports and seals their bytes before Vitest.
+    const methods = [
       'allricePrincipal/invokeScoped',
       'allricePrincipal/openScope',
       'allricePrincipal/streamScoped',
-    ]);
-    for (const endpoint of [
-      'allricePrincipal/openScope',
-      'allricePrincipal/streamScoped',
-    ] as const) {
+    ] as const;
+    expect(Object.keys(TYPERT_REMOTE.methods).sort()).toEqual(methods);
+    expect(TYPERT).toMatchObject({
+      package: '@allrice/d-entry-principal',
+      face: 'host',
+      invocations: methods.map((endpoint) => ({
+        id: `@allrice/d-entry-principal#${endpoint}`,
+        result: { create: expect.any(Function) },
+      })),
+    });
+    for (const endpoint of [methods[1], methods[2]]) {
       const uplink = TYPERT_REMOTE.methods[endpoint].uplink;
       if (!uplink || uplink.codec.mode !== 'strict')
         throw Error('actual typed duplex codec missing');
@@ -215,7 +207,10 @@ describe('real official generator and same-release artifact closure', () => {
       expect.arrayContaining([
         'host.js',
         'typert.host.js',
+        'typert.host.d.ts',
         'typert.remote-client.js',
+        'typert.remote-client.d.ts',
+        'typert.remote-client.d.ts.map',
         'types/types.d.ts',
       ]),
     );
