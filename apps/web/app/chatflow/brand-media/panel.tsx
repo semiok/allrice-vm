@@ -40,7 +40,7 @@ import { Images } from './images';
 import layout from './panel.module.css';
 type Tab = 'calendar' | 'topics' | 'articles';
 type ReadProjection = Tab | 'runs';
-type Feedback = string | { message: string; target: string; version: number };
+type ReadFailure = { message: string; target: string; version: number };
 const relatedArticle = ({ invocation: { intent } }: BrandMediaRun) =>
   intent.operation === 'candidates' ? undefined : intent.articleId;
 type BodyPin = NonNullable<BrandMediaArticle['body']>;
@@ -243,7 +243,9 @@ function BrandMediaPanelContent({
     >('all'),
     [selectedId, setSelectedId] = useState<string | null>(null);
   const [runs, setRuns] = useState<BrandMediaRun[]>([]),
-    [feedback, setFeedback] = useState<Feedback>(''),
+    [readFailures, setReadFailures] = useState<ReadFailure[]>([]),
+    [error, setError] = useState(''),
+    [actionError, setActionError] = useState(''),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
   const [help, setHelp] = useState<string | null>(null),
@@ -292,19 +294,25 @@ function BrandMediaPanelContent({
     byId: new Map<string, number>(),
     byBody: new Map<string, number>(),
   });
-  const error = typeof feedback === 'string' ? feedback : feedback.message;
-  const setError = useCallback((message: string) => {
-    setFeedback((previous) =>
-      typeof previous === 'string' ? message : previous,
-    );
+  const actionGeneration = useRef(0);
+  const beginAction = () => {
+    const version = ++actionGeneration.current;
+    setActionError('');
+    return (message: string) => {
+      if (version === actionGeneration.current) setActionError(message);
+    };
+  };
+  const recordReadFailure = useCallback((failure: ReadFailure) => {
+    setReadFailures((previous) => [
+      ...previous.filter(({ target }) => target !== failure.target),
+      failure,
+    ]);
   }, []);
   const clearReadFailure = useCallback((target: string, started: number) => {
-    setFeedback((previous) =>
-      typeof previous !== 'string' &&
-      previous.target === target &&
-      previous.version <= started
-        ? ''
-        : previous,
+    setReadFailures((previous) =>
+      previous.filter(
+        (failure) => failure.target !== target || failure.version > started,
+      ),
     );
   }, []);
   const articleAllowedSince = useCallback(
@@ -333,7 +341,7 @@ function BrandMediaPanelContent({
   const discardRead = useCallback(
     (projection: ReadProjection, cause: Error) => {
       readEpoch.current[projection]++;
-      setFeedback({
+      recordReadFailure({
         message: cause.message,
         target: projection,
         version: ++readDenials.current.version,
@@ -355,7 +363,7 @@ function BrandMediaPanelContent({
           setRuns([]);
       }
     },
-    [],
+    [recordReadFailure],
   );
   const discardArticle = useCallback(
     (id: string, cause: Error, body?: BodyPin) => {
@@ -367,7 +375,7 @@ function BrandMediaPanelContent({
       const matches = (row: BrandMediaArticle) =>
         row.id === id &&
         (!key || (!!row.body && articleBodyKey(id, row.body) === key));
-      setFeedback({ message: cause.message, target: key ?? id, version });
+      recordReadFailure({ message: cause.message, target: key ?? id, version });
       setArticles((old) => old?.filter((item) => !matches(item)) ?? null);
       setCalendar((old) => old.filter((item) => !matches(item)));
       setRuns((old) =>
@@ -396,7 +404,7 @@ function BrandMediaPanelContent({
         setSelectedId(null);
       }
     },
-    [],
+    [recordReadFailure],
   );
   const listed = articles?.find((article) => article.id === selectedId);
   const selected =
@@ -501,10 +509,21 @@ function BrandMediaPanelContent({
             undefined,
             deny('calendar'),
           ),
-          client.runs(undefined, deny('runs')),
+          client.runs(undefined, deny('runs')).then(({ runs }) => {
+            if (!current('runs')) return;
+            setRuns(
+              runs
+                .filter((row) => allowed(relatedArticle(row)))
+                .map((row) =>
+                  filterDeliveries(row, (file) =>
+                    allowed(relatedArticle(row), file),
+                  ),
+                ),
+            );
+            clearReadFailure('runs', observedDenial);
+          }),
         ]);
       if (!latest()) return;
-      const accepted = new Set<string>();
       if (
         current('topics') &&
         topicPage.status === 'fulfilled' &&
@@ -512,7 +531,7 @@ function BrandMediaPanelContent({
       ) {
         setTopics(topicPage.value.items);
         setTopicCursor(topicPage.value.nextCursor);
-        accepted.add('topics');
+        clearReadFailure('topics', observedDenial);
       }
       if (
         current('articles') &&
@@ -524,7 +543,7 @@ function BrandMediaPanelContent({
         setArticles(items);
         setArticleCursor(page.nextCursor);
         setSelectedId((old) => old ?? items[0]?.id ?? null);
-        accepted.add('articles');
+        clearReadFailure('articles', observedDenial);
       }
       if (
         current('calendar') &&
@@ -534,31 +553,21 @@ function BrandMediaPanelContent({
         setCalendar(
           schedule.value.items.filter((item) => allowed(item.id, item.body)),
         );
-        accepted.add('calendar');
+        clearReadFailure('calendar', observedDenial);
       }
-      if (current('runs') && recovery.status === 'fulfilled') {
-        setRuns(
-          recovery.value.runs
-            .filter((row) => allowed(relatedArticle(row)))
-            .map((row) =>
-              filterDeliveries(row, (file) =>
-                allowed(relatedArticle(row), file),
-              ),
-            ),
-        );
-        accepted.add('runs');
-      }
-      const failed = [topicPage, articlePage, schedule, recovery].find(
-        (value) => value.status === 'rejected',
+      const failed = (
+        [
+          ['topics', topicPage],
+          ['articles', articlePage],
+          ['calendar', schedule],
+          ['runs', recovery],
+        ] as const
+      ).find(
+        ([projection, result]) =>
+          current(projection) && result.status === 'rejected',
       );
-      const message =
-        failed?.status === 'rejected' ? failed.reason.message : '';
-      setFeedback((previous) =>
-        typeof previous === 'string' ||
-        (previous.version <= observedDenial && accepted.has(previous.target))
-          ? message
-          : previous,
-      );
+      const result = failed?.[1];
+      setError(result?.status === 'rejected' ? result.reason.message : '');
       const currentId = selectedIdRef.current;
       if (currentId) await readDetail(currentId);
     } catch (cause) {
@@ -575,6 +584,7 @@ function BrandMediaPanelContent({
     readDetail,
     discardRead,
     articleAllowedSince,
+    clearReadFailure,
     setError,
   ]);
   useEffect(() => {
@@ -633,6 +643,7 @@ function BrandMediaPanelContent({
     input: NoRequest<Scoped<BrandMediaUserCommand>>,
     key: string,
   ) => {
+    const fail = beginAction();
     const observedArticle = readDenials.current.version;
     const previous = pendingCommands.current.get(key);
     const request =
@@ -664,7 +675,6 @@ function BrandMediaPanelContent({
     } as Scoped<BrandMediaUserCommand>;
     pendingCommands.current.set(key, request);
     setBusy(true);
-    setError('');
     try {
       const result = await client.command(request.input);
       if (result.kind === 'article') {
@@ -688,9 +698,7 @@ function BrandMediaPanelContent({
       await reload();
       return result;
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : '保存失败，请重试原操作。',
-      );
+      fail(cause instanceof Error ? cause.message : '保存失败，请重试原操作。');
       throw cause;
     } finally {
       setBusy(false);
@@ -703,13 +711,11 @@ function BrandMediaPanelContent({
     (row) =>
       !row.unavailable && row.invocation.intent.operation === 'candidates',
   );
-  const articleRun =
-    selected &&
-    runs.find(
-      (row) =>
-        row.invocation.intent.operation === 'article' &&
-        row.invocation.intent.articleId === selected.id,
-    );
+  const articleRun = runs.find(
+    (row) =>
+      row.invocation.intent.operation === 'article' &&
+      row.invocation.intent.articleId === selectedId,
+  );
   const candidateDeliveries =
     candidatesRun?.deliveries
       .filter((delivery) => delivery.format === 'json')
@@ -752,6 +758,7 @@ function BrandMediaPanelContent({
   };
   const retry = (row: BrandMediaRun) => {
     if (busy || row.unavailable || runActive(row)) return;
+    const fail = beginAction();
     setBusy(true);
     const {
       workspaceId: _workspace,
@@ -765,7 +772,7 @@ function BrandMediaPanelContent({
       .then((requestId) =>
         generate({ ...intent, requestId, sessionId: row.sessionId }),
       )
-      .catch((cause) => setError(cause.message))
+      .catch((cause) => fail(cause.message))
       .finally(() => setBusy(false));
   };
   const openArticle = (article: BrandMediaArticle) => {
@@ -782,6 +789,7 @@ function BrandMediaPanelContent({
   };
   const copyBody = async () => {
     if (!selected?.body || !active) return;
+    const fail = beginAction();
     const owner = copyLifetime.current,
       revision = owner.revision,
       articleVersion = readDenials.current.version;
@@ -801,28 +809,49 @@ function BrandMediaPanelContent({
       if (!(await writeClipboard(text))) throw Error('未能复制正文，请重试。');
       if (current()) setNotice('正文已复制');
     } catch (cause) {
-      if (current())
-        setError(cause instanceof Error ? cause.message : '复制失败');
+      if (current()) fail(cause instanceof Error ? cause.message : '复制失败');
     }
   };
   const downloadDelivery = async (articleId: string, file: BodyPin) => {
+    const fail = beginAction();
     const observed = readDenials.current.version;
+    const current = () => articleAllowedSince(articleId, observed, file);
     try {
-      await client.download(file.objectId, 'delivery', (cause) =>
-        discardArticle(articleId, cause, file),
-      );
-      clearReadFailure(articleBodyKey(articleId, file), observed);
+      await client.download(file.objectId, 'delivery', {
+        current,
+        onDenied: (cause) => discardArticle(articleId, cause, file),
+      });
+      if (current())
+        clearReadFailure(articleBodyKey(articleId, file), observed);
     } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : '正文文件暂时不可读，请重新核对权限。',
-      );
+      if (current())
+        fail(
+          cause instanceof Error
+            ? cause.message
+            : '正文文件暂时不可读，请重新核对权限。',
+        );
     }
   };
+  // The Run read authorizes its own deliveries when the article body is gone.
+  const deliveries =
+    selectedId &&
+    articleRun &&
+    !articleRun.unavailable &&
+    articleRun.deliveries.map(({ file }) => (
+      <p key={file.versionId}>
+        <button
+          type="button"
+          className={layout.deliveryDownload}
+          onClick={() => void downloadDelivery(selectedId, file)}
+        >
+          查看本次正文成果
+        </button>
+      </p>
+    ));
   const pageMore = async (view: 'topics' | 'articles') => {
     const cursor = view === 'topics' ? topicCursor : articleCursor;
     if (!cursor || busy) return;
+    const fail = beginAction();
     const version = generation.current;
     const observed = readEpoch.current[view];
     const observedArticle = readDenials.current.version;
@@ -864,8 +893,7 @@ function BrandMediaPanelContent({
         setArticleCursor(result.nextCursor);
       }
     } catch (cause) {
-      if (current())
-        setError(cause instanceof Error ? cause.message : '读取失败');
+      if (current()) fail(cause instanceof Error ? cause.message : '读取失败');
     } finally {
       setBusy(false);
     }
@@ -925,6 +953,11 @@ function BrandMediaPanelContent({
     return (
       <BrandMediaAccessFeedback message={accessWarning} onReturn={onReturn} />
     );
+  const errors = new Set(
+    [...readFailures.map(({ message }) => message), error, actionError].filter(
+      Boolean,
+    ),
+  );
   return (
     <section className={ui.page} aria-label="品牌自媒体">
       {!(tab === 'topics' && form?.kind === 'candidates') && (
@@ -964,10 +997,11 @@ function BrandMediaPanelContent({
           <Button
             className={ui.helpAction}
             onClick={() => {
+              const fail = beginAction();
               void client
                 .help()
                 .then((value) => setHelp(value.content))
-                .catch((cause) => setError(cause.message));
+                .catch((cause) => fail(cause.message));
             }}
           >
             ⓘ 使用说明
@@ -975,9 +1009,10 @@ function BrandMediaPanelContent({
         </header>
       )}
       <div className={`${ui.content} ${layout.content}`}>
-        {error && (
+        {errors.size > 0 && (
           <p role="alert" className={layout.feedback}>
-            {error} <Button onClick={() => void reload()}>刷新</Button>
+            {[...errors].join(' ')}{' '}
+            <Button onClick={() => void reload()}>刷新</Button>
           </p>
         )}
         {runs
@@ -1482,19 +1517,7 @@ function BrandMediaPanelContent({
                       generate={generate}
                       command={command}
                     />
-                    {articleRun?.deliveries.map((delivery) => (
-                      <p key={delivery.file.versionId}>
-                        <button
-                          type="button"
-                          className={layout.deliveryDownload}
-                          onClick={() =>
-                            void downloadDelivery(selected.id, delivery.file)
-                          }
-                        >
-                          查看本次正文成果
-                        </button>
-                      </p>
-                    ))}
+                    {deliveries}
                     <div className={layout.referenceLine}>
                       <span className={layout.meta}>参考资料：</span>
                       <ReferenceChips
@@ -1539,6 +1562,7 @@ function BrandMediaPanelContent({
                     )}
                   </>
                 )}
+                {!selected && deliveries}
               </article>
             </div>
           </section>

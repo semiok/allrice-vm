@@ -81,6 +81,7 @@ describe('brand-media scoped access', () => {
       hide,
       reveal,
       revoke,
+      lifetime,
     };
   }
 
@@ -139,6 +140,55 @@ describe('brand-media scoped access', () => {
     expect(hide).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledOnce();
   });
+
+  it.each(['live', 'retired'] as const)(
+    'recognizes JSON authentication loss at headers for a %s visit',
+    async (visit) => {
+      const headers = deferred<Response>();
+      const decode = deferred<void>();
+      const reader = new AbortController();
+      const response = new Response(null, { status: 401 });
+      const json = vi.spyOn(response, 'json').mockImplementation(async () => {
+        await decode.promise;
+        reader.signal.throwIfAborted();
+        return { error: { code: 'AUTHENTICATION_REQUIRED' } };
+      });
+      const fetch = vi
+        .fn()
+        .mockImplementationOnce(() => headers.promise)
+        .mockResolvedValueOnce(
+          Response.json({
+            kind: 'image',
+            mediaType: 'image/png',
+            base64: 'AA==',
+          }),
+        );
+      vi.stubGlobal('fetch', fetch);
+      const { client, hide, revoke, lifetime } = panelClient();
+      const replacement = panelClient();
+      const read = expect(
+        client.previewImage(id(7), reader.signal),
+      ).rejects.toThrow(
+        visit === 'live'
+          ? '登录已过期，请重新登录'
+          : 'This operation was aborted',
+      );
+      if (visit === 'retired') lifetime.abort();
+      headers.resolve(response);
+      await headers.promise;
+      reader.abort();
+      decode.resolve();
+      await read;
+      expect(json).not.toHaveBeenCalled();
+      expect(revoke).toHaveBeenCalledTimes(visit === 'live' ? 1 : 0);
+      expect(hide).not.toHaveBeenCalled();
+      expect(client.imageAccess.denial(id(7))).toBeUndefined();
+      await expect(replacement.client.previewImage(id(7))).resolves.toBe(
+        'data:image/png;base64,AA==',
+      );
+      expect(replacement.revoke).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['disabled', 'enabled', 'unknown'] as const)(
     'joins one scoped catalog check for concurrent branded record denials (%s)',

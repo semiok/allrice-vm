@@ -189,20 +189,7 @@ function recordReadDenied(cause: unknown): cause is BrandMediaRequestError {
   );
 }
 
-async function json(
-  url: string,
-  headers: Record<string, string>,
-  options?: RequestInit,
-): Promise<unknown> {
-  const response = await fetch(url, {
-    cache: 'no-store',
-    ...options,
-    headers: {
-      ...headers,
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
+async function json(response: Response): Promise<unknown> {
   const body = await response.json();
   if (!response.ok)
     throw new BrandMediaRequestError(
@@ -249,18 +236,19 @@ function brandMediaOperations(
   const request = async (url: string, options?: RequestInit) => {
     const signal = scopedSignal(options?.signal);
     signal?.throwIfAborted();
-    const raw = await json(
-      url,
-      scope.headers,
-      signal ? { ...options, signal } : options,
-    ).catch((cause) => {
-      if (
-        cause instanceof BrandMediaRequestError &&
-        cause.code === 'AUTHENTICATION_REQUIRED'
-      )
-        revokeAuthentication(cause.status);
-      throw cause;
+    const response = await fetch(url, {
+      cache: 'no-store',
+      ...options,
+      signal,
+      headers: {
+        ...scope.headers,
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
     });
+    // An HTTP 401 belongs to this visit even if its local reader was canceled.
+    revokeAuthentication(response.status);
+    const raw = await json(response);
     signal?.throwIfAborted();
     return raw;
   };
@@ -638,14 +626,14 @@ function brandMediaOperations(
     download: async (
       objectId: string,
       kind: 'image' | 'delivery',
-      onDenied?: OnBrandReadDenied,
+      delivery?: { onDenied: OnBrandReadDenied; current: () => boolean },
     ) => {
       const image = kind === 'image';
       const observed = imageAccess.denial(objectId);
       const { response, signal } = await downloadResponse(
         objectId,
         kind,
-        image ? (cause) => denyImage(objectId, cause) : onDenied,
+        image ? (cause) => denyImage(objectId, cause) : delivery?.onDenied,
       );
       const disposition = response.headers.get('Content-Disposition') ?? '';
       const name = disposition.split("filename*=UTF-8''")[1];
@@ -653,6 +641,7 @@ function brandMediaOperations(
       signal?.throwIfAborted();
       const denied = imageAccess.denial(objectId);
       if (image && denied && denied !== observed) throw denied;
+      if (delivery && !delivery.current()) return;
       // The HTTP attachment supplies the exact name. Save body bytes as an
       // opaque blob so Chromium does not infer a suffix from their media type.
       const url = URL.createObjectURL(

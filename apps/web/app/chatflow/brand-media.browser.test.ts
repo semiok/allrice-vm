@@ -55,6 +55,7 @@ const accessProblem = (
   code:
     | 'AUTHENTICATION_REQUIRED'
     | 'AUTHORIZATION_DENIED'
+    | 'REFERENCE_SELECTION_UNAVAILABLE'
     | 'VERSION_CONFLICT'
     | 'RESOURCE_NOT_FOUND' = 'AUTHORIZATION_DENIED',
 ) =>
@@ -3062,6 +3063,273 @@ suite('MET-224 main-area brand media text workflow', () => {
       }
     },
   );
+
+  it('fences a pending download after a later refusal for the same body pin', async () => {
+    const f = await fixture({ runs: [recovery('article')] });
+    const { page } = f;
+    const path = `/api/v1/files/${file.objectId}/download`;
+    const contents = page.getByLabel('文章正文');
+    const deliveries = panel(page).getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    const expected = '不可直接改写的正文\n第二段';
+    let fileRequests = 0;
+    let deny = true;
+    try {
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect.poll(() => contents.textContent()).toBe(expected);
+      await page.evaluate((path) => {
+        const fetch = window.fetch.bind(window);
+        const click = HTMLAnchorElement.prototype.click;
+        const release = new Promise<void>((done) => {
+          window.addEventListener('finish-body-delivery', () => done(), {
+            once: true,
+          });
+        });
+        let first = true;
+        window.fetch = async (input, options) => {
+          const response = await fetch(input, options);
+          if (
+            first &&
+            typeof input === 'string' &&
+            new URL(input, location.href).pathname === path
+          ) {
+            first = false;
+            const blob = response.blob.bind(response);
+            response.blob = async () => {
+              document.body.dataset.deliveryHeaders = String(response.status);
+              await release;
+              const bytes = await blob();
+              setTimeout(() => {
+                document.body.dataset.deliveryBytes = String(bytes.size);
+              }, 0);
+              return bytes;
+            };
+          }
+          return response;
+        };
+        HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+          if (this.hasAttribute('download'))
+            document.body.dataset.deliverySave = this.download;
+          click.call(this);
+        };
+      }, path);
+      await page.route(
+        (url) => url.pathname === path,
+        async (route) => {
+          if (++fileRequests === 1 || !deny) return route.fallback();
+          return route.fulfill({
+            status: 403,
+            json: accessProblem('该文件已撤销当前读取授权'),
+          });
+        },
+      );
+      await deliveries.press('Enter');
+      await page.locator('body[data-delivery-headers="200"]').waitFor();
+      await panel(page).getByRole('button', { name: '复制正文' }).click();
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: '正文文件暂时不可读' })
+        .waitFor();
+      expect(await deliveries.count()).toBe(0);
+      expect(await contents.count()).toBe(0);
+      expect(fileRequests).toBe(2);
+
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      await page
+        .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+        .waitFor();
+      expect(
+        await page.locator('body').getAttribute('data-delivery-save'),
+      ).toBeNull();
+
+      deny = false;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await expect.poll(() => contents.textContent()).toBe(expected);
+      const saved = page.waitForEvent('download');
+      await deliveries.press('Enter');
+      const download = await saved;
+      expect(download.suggestedFilename()).toBe('allrice-export');
+      expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+    } finally {
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      await f.close();
+    }
+  });
+
+  it.each(['unavailable', 'empty'] as const)(
+    'keeps independent delivery buttons after the current pin is refused and honors a fresh %s Run read',
+    async (outcome) => {
+      const run = recovery('article');
+      const sibling = { ...file, objectId: id(82), versionId: id(83) };
+      run.deliveries.push({ ...run.deliveries[0]!, file: sibling });
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const topicsStarted = gate();
+      const finishTopics = gate();
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const contents = page.getByLabel('文章正文');
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => contents.textContent())
+          .toContain('不可直接改写的正文');
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await page.route(
+          (url) => url.pathname === `/api/v1/files/${file.objectId}/download`,
+          (route) => route.fulfill({ status: 404, body: '' }),
+        );
+        await deliveries.first().press('Enter');
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: '正文文件暂时不可读' })
+          .waitFor();
+        expect(await contents.count()).toBe(0);
+        expect(
+          await panel(page).getByText('文章 20', { exact: true }).count(),
+        ).toBe(0);
+        expect(await deliveries.count()).toBe(1);
+        const request = page.waitForRequest(
+          (req) =>
+            new URL(req.url()).pathname ===
+            `/api/v1/files/${sibling.objectId}/download`,
+        );
+        const saved = page.waitForEvent('download');
+        await deliveries.press('Enter');
+        expect((await request).method()).toBe('GET');
+        expect((await saved).suggestedFilename()).toBe('allrice-export');
+
+        f.state.articles[0] = { ...article(), revision: 2, body: null };
+        f.state.runs =
+          outcome === 'empty'
+            ? []
+            : [{ ...run, unavailable: true, deliveries: [] }];
+        await page.route(
+          (url) => brandView(url, 'topics'),
+          async (route) => {
+            topicsStarted.resolve();
+            await finishTopics.promise;
+            return route.fallback();
+          },
+        );
+        const reread = page.waitForResponse((response) =>
+          brandView(new URL(response.url()), 'runs'),
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await topicsStarted.promise;
+        expect(await (await reread).json()).toEqual({ runs: f.state.runs });
+        await expect.poll(() => deliveries.count()).toBe(0);
+        finishTopics.resolve();
+        await expect.poll(() => contents.textContent()).toBe('正文还未生成');
+        expect(await deliveries.count()).toBe(0);
+      } finally {
+        finishTopics.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it('keeps separate read refusals and a failed clipboard action through independent recovery', async () => {
+    const other = {
+      ...article(21),
+      body: { ...file, objectId: id(82), versionId: id(83) },
+    };
+    const f = await fixture({ articles: [article(), other] });
+    const { page } = f;
+    const started = gate();
+    const release = gate();
+    const alerts = panel(page).getByRole('alert');
+    const bodyFailure = alerts.filter({ hasText: '正文文件暂时不可读' });
+    const topicMessage = '这次选题读取的参考资料已不可用';
+    const topicFailure = alerts.filter({ hasText: topicMessage });
+    const copyFailure = alerts.filter({ hasText: '未能复制正文' });
+    const copy = panel(page).getByRole('button', {
+      name: '复制正文',
+      exact: true,
+    });
+    let denyTopics = true;
+    try {
+      await page
+        .context()
+        .grantPermissions(['clipboard-read', 'clipboard-write']);
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect.poll(() => copy.isEnabled()).toBe(true);
+      await page.route(
+        (url) => url.pathname === `/api/v1/files/${file.objectId}/download`,
+        (route) => route.fulfill({ status: 403, body: '' }),
+      );
+      await page.route(
+        (url) => brandView(url, 'topics'),
+        async (route) => {
+          if (!denyTopics) return route.fallback();
+          started.resolve();
+          await release.promise;
+          return route.fulfill({
+            status: 409,
+            json: accessProblem(
+              topicMessage,
+              'REFERENCE_SELECTION_UNAVAILABLE',
+            ),
+          });
+        },
+      );
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await started.promise;
+      await copy.click();
+      await bodyFailure.waitFor();
+      await panel(page)
+        .getByRole('button', { name: other.title, exact: true })
+        .click();
+      await expect.poll(() => copy.isEnabled()).toBe(true);
+      release.resolve();
+      await topicFailure.waitFor();
+      expect(await bodyFailure.isVisible()).toBe(true);
+
+      await page.evaluate(() => {
+        Object.defineProperty(navigator.clipboard, 'writeText', {
+          configurable: true,
+          value: async () => {
+            throw new Error('Synthetic clipboard rejection');
+          },
+        });
+      });
+      await copy.click();
+      await copyFailure.waitFor();
+      expect(await bodyFailure.isVisible()).toBe(true);
+      expect(await topicFailure.isVisible()).toBe(true);
+
+      denyTopics = false;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await topicFailure.waitFor({ state: 'hidden' });
+      expect(await bodyFailure.isVisible()).toBe(true);
+      expect(await copyFailure.isVisible()).toBe(true);
+
+      await page.evaluate(() =>
+        Reflect.deleteProperty(navigator.clipboard, 'writeText'),
+      );
+      await copy.click();
+      await page.getByText('正文已复制', { exact: true }).waitFor();
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+        '不可直接改写的正文\n第二段',
+      );
+      expect(await copyFailure.isVisible()).toBe(false);
+      expect(await bodyFailure.isVisible()).toBe(true);
+    } finally {
+      release.resolve();
+      await f.close();
+    }
+  });
 
   async function imagesPage(f: Awaited<ReturnType<typeof fixture>>) {
     await f.open();
