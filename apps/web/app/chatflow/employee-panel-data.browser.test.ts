@@ -509,6 +509,58 @@ suite(
       }
     });
 
+    it('allows the same intent after a definitive rejection even when removing its local receipt fails', async () => {
+      const page = await browser.newPage();
+      const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+      const publish = dialog.getByRole('button', { name: '发布', exact: true });
+      try {
+        await page.goto(origin);
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+        await root(page)
+          .getByRole('button', { name: '上传', exact: true })
+          .click();
+        await dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+          name: '真实拒绝后重新提交.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('相同的发布意图'),
+        });
+        await page.evaluate(() => {
+          window.__panelDataFixture.rejectNextPublication();
+          const remove = Storage.prototype.removeItem;
+          Storage.prototype.removeItem = function (key) {
+            if (key.startsWith('allrice:publication-receipts:v2:'))
+              throw new DOMException(
+                'Cannot remove old receipt',
+                'QuotaExceededError',
+              );
+            remove.call(this, key);
+          };
+        });
+        await publish.click();
+        await dialog.getByText('发布被明确拒绝。', { exact: true }).waitFor();
+        expect(
+          await dialog
+            .getByRole('button', { name: '核对结果', exact: true })
+            .count(),
+        ).toBe(0);
+        await publish.click();
+        await dialog.waitFor({ state: 'hidden' });
+        const calls = (await evidence(page)).calls;
+        const ids = calls
+          .filter(({ method }) => method === 'publishUpload')
+          .map(({ input }) => (input as { requestId: string }).requestId);
+        expect(ids).toHaveLength(2);
+        expect(ids[0]).not.toBe(ids[1]);
+        expect(
+          calls.filter(({ method }) => method === 'readWriteReceipt'),
+        ).toEqual([]);
+      } finally {
+        await page.close();
+      }
+    });
+
     for (const env of environments)
       it(`${env.width}/${env.theme}: search, cross-employee favorites, exact quote, preview, download, fixed copy, upload and failure states`, async () => {
         const context = await browser.newContext({

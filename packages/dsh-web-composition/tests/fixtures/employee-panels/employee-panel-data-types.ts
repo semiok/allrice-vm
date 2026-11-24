@@ -15,6 +15,7 @@ export interface PanelDataFixture {
   mutateOriginal(): void;
   refusePreview(status: number, code?: string): void;
   losePublicationReply(): void;
+  rejectNextPublication(): void;
   finishReceipt(): void;
   holdReceipt(): void;
   selectReceiptScope(employee: string, thread: string): void;

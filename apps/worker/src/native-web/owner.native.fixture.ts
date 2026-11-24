@@ -59,6 +59,40 @@ async function isolatedCli(root: string, installedCli: string) {
       );
     }
   }
+  // The guest principal imports only the public packages named by its sealed
+  // build receipt. In the locked pnpm tree some live in the native hoist.
+  const original = createRequire(installedCli);
+  const principal = JSON.parse(
+    await readFile(
+      createRequire(import.meta.url).resolve(
+        '@allrice/d-entry-principal/artifact',
+      ),
+      'utf8',
+    ),
+  ) as { modules: { specifier: string }[] };
+  const dependencies = new Set(
+    principal.modules.map(({ specifier }) =>
+      specifier.split('/').slice(0, 2).join('/'),
+    ),
+  );
+  for (const dependency of dependencies) {
+    expect(dependency).toMatch(/^@deepseek-ai\/[a-z0-9-]+$/);
+    const destination = join(modules, dependency);
+    try {
+      await access(destination);
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !('code' in error) ||
+        error.code !== 'ENOENT'
+      )
+        throw error;
+      await symlink(
+        dirname(original.resolve(dependency + '/package.json')),
+        destination,
+      );
+    }
+  }
   const pkg = join(modules, '@deepseek-ai/dsh');
   await cp(originalPackage, pkg, { recursive: true });
   return join(pkg, 'lib/bin.js');

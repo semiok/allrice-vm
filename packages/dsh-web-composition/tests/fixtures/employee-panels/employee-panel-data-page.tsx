@@ -20,7 +20,10 @@ import {
   type EmployeePanelDataMethod,
 } from '../../../../../apps/web/lib/chatflow/employee-panel-data';
 import { uploadPersonalDeliverable } from '../../../../../apps/web/lib/chatflow/employee-panel-upload';
-import { EmployeePanelsWriteUnknownError } from '../../../../../apps/web/lib/chatflow/employee-panel-data-http';
+import {
+  EmployeePanelsWriteRejectedError,
+  EmployeePanelsWriteUnknownError,
+} from '../../../../../apps/web/lib/chatflow/employee-panel-data-http';
 import { EnterpriseMaterialsPanel } from '../../../../../apps/web/app/chatflow/enterprise-materials-panel';
 import { WorkbenchFilesPanel } from '../../../../../apps/web/app/chatflow/workbench-files-panel';
 import { WorkbenchDeliverablePreview } from '../../../../../apps/web/app/chatflow/workspace-file-preview';
@@ -53,6 +56,7 @@ let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
 let publicationReplyLost = false;
+let publicationRejected = false;
 let receiptReady = false;
 let receiptGate: PromiseWithResolvers<void> | undefined;
 let serial = 850;
@@ -237,6 +241,10 @@ const bound = createEmployeePanelDataClient({
   },
   async publishUpload(input, signal) {
     await call('publishUpload', input, signal);
+    if (publicationRejected) {
+      publicationRejected = false;
+      throw new EmployeePanelsWriteRejectedError(409, '发布被明确拒绝。');
+    }
     const saved = { sourceId: uid(serial++), revisionId: uid(serial++) };
     references.push({
       ...sample.references[0]!,
@@ -380,6 +388,9 @@ function Fixture() {
       },
       losePublicationReply() {
         publicationReplyLost = true;
+      },
+      rejectNextPublication() {
+        publicationRejected = true;
       },
       finishReceipt() {
         receiptReady = true;
