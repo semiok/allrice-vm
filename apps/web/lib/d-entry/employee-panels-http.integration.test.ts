@@ -439,6 +439,7 @@ suite(
           );
         fixtureDocument = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture/assets/employee-panel-live-page.css"><div id="app" data-organization-id="${p.context.organizationId}" data-viewer-id="${p.context.actor.id}" data-workspace-id="${p.selection.workspaceId}" data-employee-instance-id="${p.selection.employeeInstanceId}" data-thread-id="${session.id}" data-scope-id="${randomUUID()}" data-native-session-id="test-dock"></div><script type="module" src="/fixture/assets/employee-panel-live-page.js"></script>`;
         let browser: Browser | undefined;
+        let restoreStoragePut: (() => void) | undefined;
         try {
           browser = await require('playwright-core').chromium.launch({
             executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
@@ -591,13 +592,11 @@ suite(
             page.getByRole('button', { name: '上传', exact: true }).click();
           const material = page.getByRole('dialog', { name: '上传企业资料' });
           async function selectFile(name: string, text: string) {
-            await material
-              .locator('input[type=file]')
-              .setInputFiles({
-                name,
-                mimeType: 'text/plain',
-                buffer: Buffer.from(text),
-              });
+            await material.locator('input[type=file]').setInputFiles({
+              name,
+              mimeType: 'text/plain',
+              buffer: Buffer.from(text),
+            });
           }
           async function publishMaterial() {
             await material
@@ -607,12 +606,13 @@ suite(
 
           const storage = runtimeFixtureStorage(f.db);
           const put = storage.put.bind(storage);
-          vi.spyOn(storage, 'put').mockImplementationOnce(
-            async (object, bytes) => {
+          const failUploadA = vi
+            .spyOn(storage, 'put')
+            .mockImplementationOnce(async (object, bytes) => {
               await put(object, bytes);
               throw Error('Upload A acknowledgement lost');
-            },
-          );
+            });
+          restoreStoragePut = () => failUploadA.mockRestore();
           handlers = createEmployeePanelsHandlers({
             ...employeePanelsDependencies,
             storage: () => storage,
@@ -654,6 +654,9 @@ suite(
             status: 'recorded',
             ready: true,
           });
+          await page
+            .getByRole('button', { name: '‹ 企业资料', exact: true })
+            .click();
           await openUpload();
           await material
             .getByRole('button', { name: '核对结果', exact: true })
@@ -674,6 +677,7 @@ suite(
           await context.close();
         } finally {
           await browser?.close();
+          restoreStoragePut?.();
           incompleteReply?.destroy();
           incompleteReply = undefined;
           handlers = createEmployeePanelsHandlers({
