@@ -139,7 +139,9 @@ class Scope implements Projection {
   private closing?: Promise<void>;
   private detach = () => {};
   private unregister?: TypertDisposer;
+  private catalogQueue = Promise.resolve();
   private refreshQueue = Promise.resolve();
+  private refreshGeneration = 0;
   constructor(
     readonly host: PrincipalService,
     private readonly ctx: Context,
@@ -208,30 +210,41 @@ class Scope implements Projection {
     if (!peer || this.abort.signal.aborted) throw closed();
     return peer;
   }
-  refresh() {
-    this.active = false;
-    this.bindings = [];
-    this.ctx.remoteAccess.invalidate();
-    const task = this.refreshQueue
-      .catch(() => undefined)
-      .then(async () => {
-        this.abort.signal.throwIfAborted();
-        const catalog = await this.ctx.sessionController.list(
-          {},
-          this.abort.signal,
-        );
-        this.abort.signal.throwIfAborted();
+  refresh(signal = this.abort.signal) {
+    const pageRefresh = signal === this.abort.signal;
+    if (pageRefresh) {
+      this.refreshGeneration++;
+      this.publish([]);
+    }
+    const generation = this.refreshGeneration;
+    const task = this.catalogQueue.then(async () => {
+      signal.throwIfAborted();
+      try {
+        const catalog = await this.ctx.sessionController.list({}, signal);
+        signal.throwIfAborted();
         const bindings = projectSessions(this.issue, catalog.items);
-        // A later hint/read already fenced this projection. Only the last
-        // actual read in the queue may publish it again.
-        if (this.refreshQueue === task) {
-          this.bindings = bindings;
-          this.active = true;
-          this.ctx.remoteAccess.invalidate();
+        // A newer page-level read or hint owns the projection once it fences
+        // this generation. A cancelled follower owns only its catalog read.
+        if (generation === this.refreshGeneration) {
+          this.refreshQueue = task;
+          this.publish(bindings);
         }
-      });
-    this.refreshQueue = this.track(task);
-    return task;
+      } catch (error) {
+        if (!signal.aborted && generation === this.refreshGeneration) {
+          this.refreshQueue = task;
+          this.publish([]);
+        }
+        throw error;
+      }
+    });
+    this.catalogQueue = task.catch(() => undefined);
+    if (pageRefresh) this.refreshQueue = task;
+    return this.track(task);
+  }
+  private publish(bindings: Projection['bindings']) {
+    this.bindings = bindings;
+    this.active = bindings.length > 0;
+    this.ctx.remoteAccess.invalidate();
   }
   async current<T>(dispatch: () => Promise<T>): Promise<T> {
     await this.ready;
@@ -681,7 +694,7 @@ class PrincipalService extends TypertRemoteService {
       if (endpoint === 'remoteAccess/follow') {
         // The new stream's baseline is a current catalog read even when the
         // native change hint for a withdrawn child has not arrived yet.
-        await scope.refresh();
+        await scope.refresh(active);
       }
       const payload = events ? REMOTE_EVENT_STREAM_PAYLOAD : { args: raw.args };
       const open = () => {

@@ -398,7 +398,33 @@ export function createDEntryProfile(
                 await busy(active);
                 return;
               }
+              const followAccess = () =>
+                page.scope
+                  .stream(
+                    {
+                      scopeId,
+                      endpoint: 'remoteAccess/follow',
+                      args: {},
+                    },
+                    active,
+                  )
+                  [Symbol.asyncIterator]();
+              async function readBaseline(
+                iterator: ReturnType<typeof followAccess>,
+              ) {
+                const first = await iterator.next();
+                if (
+                  first.done ||
+                  first.value.scopeId !== scopeId ||
+                  first.value.value.type !== 'baseline' ||
+                  !('owner' in first.value.value) ||
+                  first.value.value.owner !== false
+                )
+                  throw new DEntryNativeUnavailable();
+                return first.value.value;
+              }
               held.bootstrap = 'sending';
+              let latestAccess: ReturnType<typeof followAccess> | undefined;
               try {
                 let body: string;
                 const sent = await send(
@@ -408,26 +434,17 @@ export function createDEntryProfile(
                   200,
                   async () => {
                     await verify();
-                    const access = page.scope.stream(
-                      {
-                        scopeId,
-                        endpoint: 'remoteAccess/follow',
-                        args: {},
-                      },
-                      active,
-                    );
-                    const iterator = access[Symbol.asyncIterator]();
-                    const first = await iterator
-                      .next()
-                      .finally(() => iterator.return?.());
-                    if (
-                      first.done ||
-                      first.value.scopeId !== scopeId ||
-                      first.value.value.type !== 'baseline' ||
-                      !('owner' in first.value.value) ||
-                      first.value.value.owner !== false
-                    )
-                      throw new DEntryNativeUnavailable();
+                    const initialAccess = followAccess();
+                    await readBaseline(initialAccess).catch(async (error) => {
+                      await initialAccess.return?.().catch(() => {});
+                      throw error;
+                    });
+                    await initialAccess.return?.();
+                    // Closing the initial native reader can block while its
+                    // grants change. Read from the same Peer after that join.
+                    // Keep this reader owned through the actual response.
+                    latestAccess = followAccess();
+                    const baseline = await readBaseline(latestAccess);
                     await verify();
                     body = JSON.stringify(
                       DEntryProfileBootstrapSchema.parse({
@@ -440,7 +457,7 @@ export function createDEntryProfile(
                           {
                             kind: 'global',
                             name: '__DSH_REMOTE_ACCESS__',
-                            value: first.value.value,
+                            value: baseline,
                           },
                         ],
                       }),
@@ -449,6 +466,11 @@ export function createDEntryProfile(
                 );
                 if (sent) held.bootstrap = 'sent';
               } finally {
+                try {
+                  await latestAccess?.return?.();
+                } catch (error) {
+                  page.invalidate(error);
+                }
                 if (held.bootstrap === 'sending') held.bootstrap = 'available';
               }
               return;

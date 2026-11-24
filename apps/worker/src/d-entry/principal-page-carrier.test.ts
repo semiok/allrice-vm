@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { on, once } from 'node:events';
+import { getEventListeners, on, once } from 'node:events';
 import { createServer, get, type ServerResponse } from 'node:http';
 import { createConnection, type AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
@@ -47,6 +47,30 @@ type ProfileProof = {
   read(reference: string, signal: AbortSignal): Promise<Uint8Array>;
   beforeGraphRead?: (signal: AbortSignal) => Promise<void>;
 };
+
+async function buildProfileFixture(): Promise<ProfileProof> {
+  const directory = await mkdtemp(join(tmpdir(), 'allrice-profile-finite-'));
+  closes.push(() => rm(directory, { recursive: true, force: true }));
+  await promisify(execFile)(
+    process.execPath,
+    ['packages/dsh-web-composition/build-web-entry.mjs', directory],
+    { timeout: 20_000 },
+  );
+  const raw = JSON.parse(
+    await readFile(join(directory, 'artifact.json'), 'utf8'),
+  );
+  return {
+    directory,
+    graph: DEntryProfileGraphSchema.parse(raw.profile.graph),
+    read(reference, signal) {
+      const file = raw.profile.files.find(
+        (row: { reference: string }) => row.reference === reference,
+      );
+      if (!file) throw Error('Named release proof missing');
+      return readFile(join(directory, file.path), { signal });
+    },
+  };
+}
 
 async function fixture(release?: ProfileProof) {
   const selected = issue('execute');
@@ -113,8 +137,25 @@ async function fixture(release?: ProfileProof) {
   });
   const mux = createDEntryPageMux(pages, service.signal);
   const rpc = createDEntryPageRpc(pages, authenticate, service.signal);
+  const profileBorrows = vi.fn<(active: AbortSignal) => void>();
+  const profilePages: typeof pages = {
+    ...pages,
+    borrow(token, selection, scopeId, caller, operation, failed) {
+      return pages.borrow(
+        token,
+        selection,
+        scopeId,
+        caller,
+        (page, active) => {
+          profileBorrows(active);
+          return operation(page, active);
+        },
+        failed,
+      );
+    },
+  };
   const profile = createDEntryProfile(
-    pages,
+    profilePages,
     service.signal,
     release?.directory,
   );
@@ -248,6 +289,7 @@ async function fixture(release?: ProfileProof) {
     invoke,
     probe,
     publish,
+    profileBorrows,
     profileSource,
     profileUrl,
     historyIdentity,
@@ -418,6 +460,207 @@ it('refuses duplicate selectors, unauthorized login and cross-session borrow wit
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
   expect(await life.receive()).toEqual({ type: 'end', streamId: 'life' });
 });
+
+it.each(['child grant', 'D qualification'] as const)(
+  'checks %s after a real bootstrap baseline and a blocked native close',
+  { timeout: 30_000 },
+  async (change) => {
+    const f = await fixture(await buildProfileFixture());
+    const page = await open(f);
+    const observed = deferred<unknown>();
+    const joining = deferred();
+    const allowJoin = deferred();
+    closes.push(async () => allowJoin.resolve());
+    const gateway = f.host.host.typertGateway.wireStream;
+    const nativeOpen = gateway.open.bind(gateway);
+    const peerIds: string[] = [];
+    vi.spyOn(gateway, 'open').mockImplementation(async (...args) => {
+      const source = await nativeOpen(...args);
+      if (args[0] !== 'remoteAccess/follow') return source;
+      const principal = args[3]?.principal;
+      if (principal?.kind !== 'allrice-d-entry') return source;
+      peerIds.push(principal.scopeId);
+      if (peerIds.length !== 1) return source;
+      return {
+        [Symbol.asyncIterator]() {
+          const underlying = source[Symbol.asyncIterator]();
+          return {
+            async next() {
+              const item = await underlying.next();
+              if (!item.done) observed.resolve(item.value);
+              return item;
+            },
+            async return() {
+              joining.resolve();
+              await allowJoin.promise;
+              return (
+                (await underlying.return?.()) ?? {
+                  done: true,
+                  value: undefined,
+                }
+              );
+            },
+          };
+        },
+      };
+    });
+    const pendingResponse = deferred<ServerResponse>();
+    f.worker.once('request', (_request, response) =>
+      pendingResponse.resolve(response),
+    );
+    const result = f.publish('bootstrap', page.scopeId);
+    void result.catch(() => {});
+    try {
+      const first = await observed.promise;
+      expect(first).toMatchObject({ type: 'baseline', owner: false });
+      expect(JSON.stringify(first)).toContain('"id":"child"');
+      await joining.promise;
+      expect((await pendingResponse.promise).headersSent).toBe(false);
+      // No change hint has reached the guest and no SQL watcher has fired.
+      if (change === 'child grant') {
+        f.host.catalog.items = f.host.catalog.items.filter(
+          (row) => String(row.sessionId) !== 'child',
+        );
+      } else {
+        vi.mocked(f.owner.assertCurrent).mockRejectedValueOnce(
+          new DataAccessError('authorization_denied'),
+        );
+      }
+    } finally {
+      allowJoin.resolve();
+    }
+    const response = await result;
+    if (change === 'child grant') {
+      expect(response.status).toBe(200);
+      const bootstrap = DEntryProfileBootstrapSchema.parse(
+        await response.json(),
+      );
+      const baseline = bootstrap.injections.at(-1);
+      expect(JSON.stringify(baseline)).toContain('"id":"root"');
+      expect(JSON.stringify(baseline)).not.toContain('"id":"child"');
+      expect(peerIds).toEqual([page.scopeId, page.scopeId]);
+    } else {
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('');
+    }
+  },
+);
+
+it.each(['HTTP disconnect', 'profile shutdown'] as const)(
+  'cancels and joins the actual guest list on %s without revoking the page or its neighbor',
+  { timeout: 30_000 },
+  async (change) => {
+    const f = await fixture(await buildProfileFixture());
+    const page = await open(f);
+    const neighbor = await open(f);
+    const entered = deferred<AbortSignal>();
+    const sawAbort = deferred();
+    const joined = deferred();
+    const allowJoin = deferred();
+    closes.push(async () => allowJoin.resolve());
+    let reads = 0;
+    f.host.catalog.beforeList = async (signal) => {
+      if (++reads !== 1) return;
+      entered.resolve(signal);
+      if (!signal.aborted) await once(signal, 'abort');
+      sawAbort.resolve();
+      await allowJoin.promise;
+      joined.resolve();
+      signal.throwIfAborted();
+    };
+    const pendingResponse = deferred<ServerResponse>();
+    f.worker.once('request', (_request, response) =>
+      pendingResponse.resolve(response),
+    );
+    const client = get(f.profileUrl('bootstrap', page.scopeId), {
+      headers: { authorization: 'Bearer ' + sessionToken },
+    });
+    client.on('error', () => {});
+    client.on('response', (response) => response.resume());
+    closes.push(async () => client.destroy());
+    let shutdown: Promise<void> | undefined;
+    let stopped = false;
+    try {
+      const actualCatalogSignal = await entered.promise;
+      expect(actualCatalogSignal.aborted).toBe(false);
+      if (change === 'HTTP disconnect') client.destroy();
+      else
+        shutdown = f.closeProfile().then(() => {
+          stopped = true;
+        });
+      await sawAbort.promise;
+      expect(actualCatalogSignal.aborted).toBe(true);
+      const response = await pendingResponse.promise;
+      expect(f.completedProfiles.has(response)).toBe(false);
+      expect(stopped).toBe(false);
+      expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+      expect(f.completedProfiles.has(response)).toBe(false);
+    } finally {
+      allowJoin.resolve();
+    }
+    await joined.promise;
+    await shutdown;
+    const response = await pendingResponse.promise;
+    await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
+    expect((await f.invoke(page.scopeId)).status).toBe(200);
+    if (change === 'HTTP disconnect') {
+      const retry = await f.publish('bootstrap', page.scopeId);
+      expect(retry.status).toBe(200);
+      await retry.arrayBuffer();
+    }
+  },
+);
+
+it(
+  'unregisters one of two actual waiters while keeping their shared page proof alive',
+  { timeout: 30_000 },
+  async () => {
+    const release = await buildProfileFixture();
+    const shared = deferred<AbortSignal>();
+    const finish = deferred();
+    closes.push(async () => finish.resolve());
+    let reads = 0;
+    release.beforeGraphRead = async (signal) => {
+      if (++reads !== 1) return;
+      shared.resolve(signal);
+      await finish.promise;
+    };
+    const f = await fixture(release);
+    const page = await open(f);
+    const cancel = new AbortController();
+    const first = f.publish(
+      'bootstrap',
+      page.scopeId,
+      {},
+      'document',
+      cancel.signal,
+    );
+    void first.catch(() => {});
+    const sharedSignal = await shared.promise;
+    const other = f.publish('bootstrap', page.scopeId, {}, 'document');
+    void other.catch(() => {});
+    try {
+      await expect.poll(() => f.profileBorrows.mock.calls.length).toBe(2);
+      const [one, two] = f.profileBorrows.mock.calls.map(([signal]) => signal);
+      await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(1);
+      await expect.poll(() => getEventListeners(two!, 'abort').length).toBe(1);
+      cancel.abort(Error('the first wire left'));
+      await expect(first).rejects.toThrow('the first wire left');
+      await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(0);
+      expect(getEventListeners(two!, 'abort')).toHaveLength(1);
+      expect(sharedSignal.aborted).toBe(false);
+      expect(reads).toBe(1);
+    } finally {
+      finish.resolve();
+    }
+    const result = await other;
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ nativeSessionId: 'root' });
+    expect(
+      getEventListeners(f.profileBorrows.mock.calls[1]![0], 'abort'),
+    ).toHaveLength(0);
+  },
+);
 
 it(
   'publishes the released graph and bytes, and waits for all queued HTTP writers to settle',
