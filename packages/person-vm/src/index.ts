@@ -67,6 +67,13 @@ export type {
   PersonVmNativeCommandExecution,
   PersonVmCommandMemoryCompletion,
 } from './native-command-observer.ts';
+export {
+  COMMAND_MEMORY_CONTROL_FILES,
+  COMMAND_MEMORY_STATE_ROOT,
+  checkedReadonlyCommandMemoryDirectory,
+  hashCommandMemoryControlFiles,
+  type ReadonlyCommandMemoryDirectory,
+} from './readonly-artifact.ts';
 
 export {
   createPersonVmGuestMemoryReader,

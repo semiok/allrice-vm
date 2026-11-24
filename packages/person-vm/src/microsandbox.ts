@@ -19,9 +19,12 @@ import {
 import { createPersonVmGuestMemoryReader } from './native-resource.ts';
 import {
   assertReadonlyArtifactInspection,
+  checkedReadonlyCommandMemoryDirectory,
   checkedReadonlyDshDirectory,
   readonlyArtifactReference,
+  verifyReadonlyCommandMemoryDirectory,
   verifyReadonlyDshDirectory,
+  type ReadonlyCommandMemoryDirectory,
   type ReadonlyDshDirectory,
 } from './readonly-artifact.ts';
 import type {
@@ -115,6 +118,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       agentd: string;
       image: string;
       readonlyDshDirectory?: ReadonlyDshDirectory;
+      readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
       rootDiskGiB: number;
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
@@ -132,6 +136,14 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
             ),
           }
         : {}),
+      ...(options.readonlyCommandMemoryDirectory
+        ? {
+            readonlyCommandMemoryDirectory:
+              checkedReadonlyCommandMemoryDirectory(
+                options.readonlyCommandMemoryDirectory,
+              ),
+          }
+        : {}),
     };
     this.run = options.runner ?? runCommand;
     this.memoryMiB =
@@ -146,6 +158,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         options.socketRoot,
       ].every(isAbsolute) ||
       !/^.+@sha256:[a-f0-9]{64}$/.test(options.image) ||
+      (options.readonlyCommandMemoryDirectory &&
+        !options.readonlyDshDirectory) ||
       !Number.isSafeInteger(this.memoryMiB) ||
       this.memoryMiB <= 0 ||
       !Number.isSafeInteger(this.memoryMiB * 1024 ** 2) ||
@@ -284,6 +298,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       this.options.image,
       signal,
     );
+    const controls = this.options.readonlyCommandMemoryDirectory;
+    if (controls) await verifyReadonlyCommandMemoryDirectory(controls, signal);
     const paths = this.homes.get(binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     await readonlyArtifactReference(
@@ -293,6 +309,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       create,
       signal,
       descriptorSha256,
+      controls,
     );
   }
   private async assertArtifact(
@@ -314,6 +331,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       this.name(binding),
       c,
       running,
+      this.options.readonlyCommandMemoryDirectory,
     );
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
@@ -456,6 +474,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         '--mount-dir',
         `${this.options.readonlyDshDirectory.hostDirectory}:${this.options.readonlyDshDirectory.guestDirectory}:ro`,
       );
+    const controls = this.options.readonlyCommandMemoryDirectory;
+    if (controls)
+      args.push(
+        '--mount-dir',
+        `${controls.hostDirectory}:${controls.guestDirectory}:ro`,
+      );
     for (const port of receipt.gatewayPorts)
       args.push('--net-rule', `allow:egress@host:tcp:${port}`);
     if (web) {
@@ -520,6 +544,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         this.name(receipt.binding),
         this.options.readonlyDshDirectory,
         true,
+        this.options.readonlyCommandMemoryDirectory,
       );
     assertWebEndpointInspection(
       inspection.value,
@@ -548,11 +573,15 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   async bootstrap(scope: PersonVmStartingScope, plan: PersonVmMemoryGuestPlan) {
     const paths = this.homes.get(scope.binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
+    if (this.options.readonlyCommandMemoryDirectory)
+      await this.assertArtifact(scope.binding, scope.signal);
     return bootstrapMicrosandbox({
       scope,
       plan,
       name: this.name(scope.binding),
       stagingRoot: paths.userHome,
+      readonlyCommandMemoryDirectory:
+        this.options.readonlyCommandMemoryDirectory?.guestDirectory,
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,
       command: (args, signal, readNonzeroExit) =>
         this.command(scope.binding, args, signal, readNonzeroExit),

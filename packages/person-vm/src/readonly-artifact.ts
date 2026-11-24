@@ -1,5 +1,5 @@
 import { constants, type BigIntStats } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { PersonVmError, type PersonVmBinding } from './contract.ts';
@@ -14,6 +14,20 @@ export type ReadonlyDshDirectory = Readonly<{
   sealedManifestSha256: string;
   treeSha256: string;
 }>;
+export type ReadonlyCommandMemoryDirectory = Readonly<{
+  hostDirectory: string;
+  guestDirectory: string;
+  sha256: string;
+}>;
+export const COMMAND_MEMORY_CONTROL_FILES = Object.freeze([
+  'bash-env.sh',
+  'command-observer.cjs',
+  'dsh-command-memory.mjs',
+  'initialize.cjs',
+  'launch-dsh.sh',
+  'sample.cjs',
+] as const);
+export const COMMAND_MEMORY_STATE_ROOT = '/run/allrice-command-memory';
 const BASE =
   'docker.io/library/node@sha256:af0bb4bf5b7318e3269417a7684a9e116c3c22eaf05382578b0d0d33de597ad2';
 const MANIFEST_BYTES = 16832328;
@@ -73,6 +87,40 @@ export function checkedReadonlyDshDirectory(
     treeSha256: value.treeSha256,
   });
 }
+export function checkedReadonlyCommandMemoryDirectory(
+  value: ReadonlyCommandMemoryDirectory,
+): ReadonlyCommandMemoryDirectory {
+  if (
+    !value ||
+    !digest(value.sha256) ||
+    typeof value.hostDirectory !== 'string' ||
+    !isAbsolute(value.hostDirectory) ||
+    resolve(value.hostDirectory) !== value.hostDirectory ||
+    /[:\0]/.test(value.hostDirectory) ||
+    basename(value.hostDirectory) !== value.sha256 ||
+    value.guestDirectory !== `/opt/allrice/command-memory/${value.sha256}`
+  )
+    invalid();
+  return Object.freeze({
+    hostDirectory: value.hostDirectory,
+    guestDirectory: value.guestDirectory,
+    sha256: value.sha256,
+  });
+}
+export function hashCommandMemoryControlFiles(
+  files: ReadonlyMap<(typeof COMMAND_MEMORY_CONTROL_FILES)[number], Uint8Array>,
+) {
+  return hash(
+    Buffer.from(
+      JSON.stringify(
+        COMMAND_MEMORY_CONTROL_FILES.map((file) => [
+          file,
+          hash(files.get(file) ?? invalid()),
+        ]),
+      ),
+    ),
+  );
+}
 async function publishedDirectory(path: string) {
   const s = await lstat(path, { bigint: true });
   owned(s);
@@ -103,6 +151,37 @@ async function metadataFile(
     return bytes;
   } finally {
     await fd.close();
+  }
+}
+
+export async function verifyReadonlyCommandMemoryDirectory(
+  value: ReadonlyCommandMemoryDirectory,
+  signal: AbortSignal,
+) {
+  const c = checkedReadonlyCommandMemoryDirectory(value);
+  try {
+    await publishedDirectory(dirname(c.hostDirectory));
+    await publishedDirectory(c.hostDirectory);
+    const names = (await readdir(c.hostDirectory)).sort();
+    if (names.join('\0') !== COMMAND_MEMORY_CONTROL_FILES.join('\0')) invalid();
+    const files = new Map<
+      (typeof COMMAND_MEMORY_CONTROL_FILES)[number],
+      Uint8Array
+    >();
+    for (const name of COMMAND_MEMORY_CONTROL_FILES)
+      files.set(
+        name,
+        await metadataFile(
+          join(c.hostDirectory, name),
+          MANIFEST_BYTES,
+          signal,
+          name === 'launch-dsh.sh' ? 0o555 : 0o444,
+        ),
+      );
+    if (hashCommandMemoryControlFiles(files) !== c.sha256) invalid();
+    signal.throwIfAborted();
+  } catch {
+    invalid();
   }
 }
 
@@ -156,6 +235,7 @@ export async function readonlyArtifactReference(
   create: boolean,
   signal: AbortSignal,
   descriptorSha256: string,
+  controls?: ReadonlyCommandMemoryDirectory,
 ) {
   signal.throwIfAborted();
   if (!digest(descriptorSha256)) invalid();
@@ -166,6 +246,7 @@ export async function readonlyArtifactReference(
     personId: binding.personId,
     ...c,
     descriptorSha256,
+    ...(controls ? { commandMemorySha256: controls.sha256 } : {}),
   };
   if (create) {
     let fd;
@@ -216,6 +297,7 @@ export function assertReadonlyArtifactInspection(
   name: string,
   c: ReadonlyDshDirectory,
   running: boolean,
+  controls?: ReadonlyCommandMemoryDirectory,
 ) {
   const inspection = object(value);
   if (
@@ -231,34 +313,39 @@ export function assertReadonlyArtifactInspection(
     invalid();
   function config(value: unknown) {
     const v = object(value);
-    if (!Array.isArray(v.mounts) || v.mounts.length !== 1) invalid();
-    const m = object(v.mounts[0]),
-      options = object(m.options);
-    keys(m, [
-      'type',
-      'host',
-      'guest',
-      'options',
-      'stat_virtualization',
-      'host_permissions',
-      'follow_root_symlinks',
-      'quota_mib',
-    ]);
-    keys(options, ['readonly', 'noexec', 'nosuid', 'nodev']);
-    if (
-      m.type !== 'Bind' ||
-      m.host !== c.hostDirectory ||
-      m.guest !== c.guestDirectory ||
-      m.stat_virtualization !== 'strict' ||
-      m.host_permissions !== 'private' ||
-      m.follow_root_symlinks !== false ||
-      m.quota_mib !== null ||
-      options.readonly !== true ||
-      options.noexec !== false ||
-      options.nosuid !== false ||
-      options.nodev !== false
-    )
+    if (!Array.isArray(v.mounts) || v.mounts.length !== (controls ? 2 : 1))
       invalid();
+    const mounts = v.mounts.map(object);
+    for (const expected of controls ? [c, controls] : [c]) {
+      const m = object(
+          mounts.find((mount) => mount.guest === expected.guestDirectory),
+        ),
+        options = object(m.options);
+      keys(m, [
+        'type',
+        'host',
+        'guest',
+        'options',
+        'stat_virtualization',
+        'host_permissions',
+        'follow_root_symlinks',
+        'quota_mib',
+      ]);
+      keys(options, ['readonly', 'noexec', 'nosuid', 'nodev']);
+      if (
+        m.type !== 'Bind' ||
+        m.host !== expected.hostDirectory ||
+        m.stat_virtualization !== 'strict' ||
+        m.host_permissions !== 'private' ||
+        m.follow_root_symlinks !== false ||
+        m.quota_mib !== null ||
+        options.readonly !== true ||
+        options.noexec !== false ||
+        options.nosuid !== false ||
+        options.nodev !== false
+      )
+        invalid();
+    }
   }
   config(inspection.config);
   if (running || inspection.active_config !== null)

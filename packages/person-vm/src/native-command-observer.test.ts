@@ -71,6 +71,7 @@ function guest() {
     [`${cfg.commandsGroup}/memory.events`, 'oom 999\noom_kill 999'],
   ]);
   const reads: string[] = [];
+  const commandChildren = new Set([childPath]);
   const descriptors = new Map<number, string>();
   const aliases = new Map<string, string>();
   let next = 10;
@@ -106,6 +107,7 @@ function guest() {
       return aliases.get(p) ?? p;
     },
     statSync: stat,
+    lstatSync: (p: string) => ({ ...stat(p), nlink: 1, mode: 0o600 }),
     statfsSync: (p: string) => ({
       type: p === cfg.procRoot ? 0x9fa0n : cgroupType,
     }),
@@ -142,7 +144,7 @@ function guest() {
       cleanupStep?.('before-rmdir');
       if (
         cleanupFails ||
-        p !== childPath ||
+        !commandChildren.has(p) ||
         files.get(`${p}/cgroup.procs`) ||
         files.get(`${p}/cgroup.events`) !== 'populated 0\nfrozen 0'
       )
@@ -153,7 +155,8 @@ function guest() {
     },
     unlinkSync: (p: string) => {
       cleanupStep?.('before-unlink');
-      if (p !== receiptPath || !files.delete(p)) throw missing();
+      if (!p.startsWith(cfg.receiptDirectory + '/') || !files.delete(p))
+        throw missing();
     },
   };
   const run = (
@@ -199,6 +202,30 @@ function guest() {
     };
   };
   const baseline = () => run('baseline');
+  const prepareOwner = (ref: string) =>
+    runInNewContext(
+      `${PERSON_VM_COMMAND_MEMORY_VERIFIER}\nprepareDshCommandMemoryReceipt(cfg, ref)`,
+      {
+        cfg,
+        ref,
+        Buffer,
+        process,
+        require: (name: string) =>
+          name === 'node:fs'
+            ? fs
+            : name === 'node:path'
+              ? { posix }
+              : undefined,
+      },
+    ) as { release(): { released: boolean; evidence: unknown } };
+  const makeChild = (ref: string, pid?: number) => {
+    const child = `${cfg.commandsGroup}/command-${ref}`;
+    directories.add(child);
+    commandChildren.add(child);
+    files.set(`${child}/cgroup.procs`, pid ? String(pid) : '');
+    files.set(`${child}/cgroup.events`, `populated ${pid ? 1 : 0}\nfrozen 0`);
+    return child;
+  };
   const admit = () => {
     files.set(`${cfg.procRoot}/${cfg.pid}/cgroup`, '0::/commands/command-41');
     files.set(`${childPath}/cgroup.procs`, `${cfg.pid}\n99`);
@@ -217,6 +244,8 @@ function guest() {
     aliases,
     reads,
     run,
+    prepareOwner,
+    makeChild,
     baseline,
     admit,
     finish,
@@ -304,6 +333,26 @@ function fixture(signalValue: number | null | undefined = 9) {
 }
 
 describe('command memory observer (synthetic kernel/native sources; not DSH/VM acceptance)', () => {
+  it('retains a pending native nonce until its exact group is empty, then reaps early or partial setup without manufacturing evidence', () => {
+    const g = guest();
+    const nonce = 'b33762b1-1180-4a35-a2d6-7c7db01c3d08';
+    const owner = g.prepareOwner(nonce);
+    const child = g.makeChild(nonce, 77);
+    const partial = `${cfg.receiptDirectory}/${nonce}.json`;
+    g.files.set(partial, '{"version":1');
+    expect(() => owner.release()).toThrow('owned-child-not-empty');
+    expect(g.directories.has(child)).toBe(true);
+    expect(g.files.has(partial)).toBe(true);
+    g.makeChild(nonce);
+    expect(owner.release()).toMatchObject({
+      released: true,
+      evidence: { error: 'command-memory-admission-unconfirmed' },
+    });
+    expect(g.directories.has(child)).toBe(false);
+    expect(g.files.has(partial)).toBe(false);
+    expect(g.directories.has(childPath)).toBe(true);
+  });
+
   it('only consumes the admitted PID of its own bounded receipt after the child is empty', () => {
     const g = guest();
     expect(g.baseline().exitCode).toBe(0);

@@ -122,11 +122,66 @@ const readReceipt = p => {
     return JSON.parse(buffer.toString('utf8', 0, bytes));
   } finally { fs.closeSync(fd); }
 };
+const currentBoot = procRoot => {
+  const id = read(path.join(procRoot, 'sys/kernel/random/boot_id'));
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) fail('invalid-boot-id');
+  return id;
+};
+const commandGroup = (cfg, pid) => path.join(cfg.commandsGroup, 'command-' + (cfg.dshDispatch ? cfg.executionRef : pid));
+const dshNonce = ref => typeof ref === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(ref);
+const atPath = p => {
+  try { return fs.lstatSync(p); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+};
+
+// The in-guest owner reserves a previously absent nonce namespace before the
+// native spawn. Cleanup may retire that exact namespace even if the starter
+// never reached baseline/admitted; this never produces observed OOM evidence.
+function prepareDshCommandMemoryReceipt(roots, executionRef) {
+  const cfg = { ...roots, executionRef, dshDispatch: true };
+  if (!dshNonce(executionRef) || !canonical(cfg.receiptDirectory) || !canonical(cfg.procRoot)) fail('invalid-source-root');
+  const childPath = commandGroup(cfg), receiptPath = path.join(cfg.receiptDirectory, executionRef + '.json');
+  const commands = directory(cfg.commandsGroup), boot = currentBoot(cfg.procRoot);
+  const state = fs.statSync(cfg.receiptDirectory, { bigint: true });
+  if (!state.isDirectory()) fail('invalid-source-root');
+  if (atPath(childPath) || atPath(receiptPath)) fail('command-memory-namespace-already-exists');
+  const assertCurrent = () => {
+    const now = directory(cfg.commandsGroup);
+    const stateNow = fs.statSync(cfg.receiptDirectory, { bigint: true });
+    if (currentBoot(cfg.procRoot) !== boot || now.device !== commands.device || now.inode !== commands.inode || !canonical(cfg.receiptDirectory) || !stateNow.isDirectory() || stateNow.dev !== state.dev || stateNow.ino !== state.ino) fail('command-memory-owner-changed');
+  };
+  return {
+    observe() {
+      assertCurrent();
+      return verifyCommandMemoryReceipt(cfg, 'observe', true);
+    },
+    release() {
+      assertCurrent();
+      const evidence = verifyCommandMemoryReceipt(cfg, 'complete-and-release', true);
+      if (evidence?.childReleased) return { released: true, evidence };
+      if (atPath(childPath)) {
+        const identity = directory(childPath);
+        if (identity.device !== commands.device || members(childPath, identity.device).length || populated(childPath, identity.device) !== 0) fail('owned-child-not-empty');
+        const confirmed = directory(childPath);
+        if (confirmed.device !== identity.device || confirmed.inode !== identity.inode) fail('owned-child-changed');
+        fs.rmdirSync(childPath);
+      }
+      const receipt = atPath(receiptPath);
+      if (receipt) {
+        if (!receipt.isFile() || receipt.nlink !== 1 || (receipt.mode & 0o777) !== 0o600) fail('owned-receipt-unconfirmed');
+        fs.unlinkSync(receiptPath);
+      }
+      return { released: true, evidence: { error: 'command-memory-admission-unconfirmed', stage: evidence?.stage } };
+    },
+  };
+}
+
 function verifyCommandMemoryReceipt(cfg, phase, readAdmittedPid = false) {
 let stage = 'read';
 try {
   const validPid = pid => Number.isSafeInteger(pid) && pid > 0;
-  if (!['baseline', 'admitted', 'complete', 'complete-and-release'].includes(phase) || typeof cfg.executionRef !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cfg.executionRef) || (readAdmittedPid ? phase !== 'complete-and-release' : !validPid(cfg.pid))) fail('invalid-request');
+  const observe = readAdmittedPid && cfg.dshDispatch === true && phase === 'observe';
+  if ((!observe && !['baseline', 'admitted', 'complete', 'complete-and-release'].includes(phase)) || typeof cfg.executionRef !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cfg.executionRef) || (cfg.dshDispatch && !dshNonce(cfg.executionRef)) || (readAdmittedPid ? !observe && phase !== 'complete-and-release' : !validPid(cfg.pid))) fail('invalid-request');
   const root = directory(cfg.cgroupRoot), commands = directory(cfg.commandsGroup), dsh = directory(cfg.dshGroup);
   if (![cfg.commandsGroup, cfg.dshGroup].every(p => p.startsWith(cfg.cgroupRoot + '/')) || commands.device !== root.device || dsh.device !== root.device) fail('invalid-group-root');
   if (!canonical(cfg.receiptDirectory) || !fs.statSync(cfg.receiptDirectory).isDirectory() || !canonical(cfg.procRoot) || fs.statfsSync(cfg.procRoot, { bigint: true }).type !== 0x9fa0n) fail('invalid-source-root');
@@ -134,11 +189,10 @@ try {
   let receipt = phase === 'baseline' ? undefined : readReceipt(receiptPath);
   const pid = readAdmittedPid ? receipt?.pid : cfg.pid;
   if (!validPid(pid)) fail('invalid-request');
-  const childPath = path.join(cfg.commandsGroup, 'command-' + pid);
+  const childPath = commandGroup(cfg, pid);
   const child = directory(childPath);
   if (child.device !== root.device) fail('different-cgroup-device');
-  const bootId = read(path.join(cfg.procRoot, 'sys/kernel/random/boot_id'));
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(bootId)) fail('invalid-boot-id');
+  const bootId = currentBoot(cfg.procRoot);
   const birth = () => {
     const stat = read(path.join(cfg.procRoot, String(pid), 'stat'));
     if (!stat.startsWith(pid + ' (') || !stat.includes(') ')) fail('invalid-process-stat');
@@ -172,6 +226,13 @@ try {
       }
     } else {
       if (receipt.stage !== 'admitted' || receipt.admittedMembership !== childPath.slice(cfg.cgroupRoot.length)) fail('dispatch-not-witnessed');
+      if (observe) {
+        const after = events(childPath, child.device);
+        if (BigInt(after.oom) < BigInt(receipt.baseline.oom) || BigInt(after.oomKill) < BigInt(receipt.baseline.oomKill)) fail('counter-reset');
+        const identity = directory(childPath);
+        if (identity.device !== child.device || identity.inode !== child.inode) fail('observation-changed');
+        return { receipt, after };
+      }
       try { fs.statSync(path.join(cfg.procRoot, String(pid))); fail('command-process-not-gone'); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (members(childPath, child.device).length || populated(childPath, child.device) !== 0) fail('child-not-joined');

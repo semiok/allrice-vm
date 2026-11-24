@@ -53,6 +53,11 @@ function initialize(config, io = fs, run = cp.execFileSync) {
       .slice(1)
       .some((line) => line.split(/\s+/)[0] === swapFile);
   io.mkdirSync(path.dirname(swapFile), { recursive: true, mode: 0o700 });
+  if (
+    config.protectedCommandMemory === true &&
+    io.realpathSync(path.dirname(swapFile)) !== path.dirname(swapFile)
+  )
+    throw Error('invalid_memory_swap_directory');
   let stat;
   try {
     stat = io.lstatSync(swapFile);

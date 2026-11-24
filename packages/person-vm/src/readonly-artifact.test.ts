@@ -17,8 +17,11 @@ import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import {
   assertReadonlyArtifactInspection,
+  COMMAND_MEMORY_CONTROL_FILES,
   checkedReadonlyDshDirectory,
+  hashCommandMemoryControlFiles,
   readonlyArtifactReference,
+  verifyReadonlyCommandMemoryDirectory,
   verifyReadonlyDshDirectory,
   type ReadonlyDshDirectory,
 } from './readonly-artifact.ts';
@@ -127,6 +130,67 @@ function inspection(c: ReadonlyDshDirectory) {
     pending_changes: [] as unknown[],
   };
 }
+
+it('requires the independently sealed control bytes and an exact active read-only mount beside DSH', async () => {
+  const f = await fixture();
+  const files = new Map(
+    COMMAND_MEMORY_CONTROL_FILES.map((name) => [name, Buffer.from(name)]),
+  );
+  const sha256 = hashCommandMemoryControlFiles(files);
+  const controls = {
+    sha256,
+    hostDirectory: join(f.root, sha256),
+    guestDirectory: `/opt/allrice/command-memory/${sha256}`,
+  };
+  await mkdir(controls.hostDirectory, { mode: 0o700 });
+  for (const name of COMMAND_MEMORY_CONTROL_FILES) {
+    const path = join(controls.hostDirectory, name);
+    await writeFile(path, files.get(name)!);
+    await chmod(path, name === 'launch-dsh.sh' ? 0o555 : 0o444);
+  }
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).resolves.toBeUndefined();
+  const snapshot = inspection(f.c);
+  for (const settings of [snapshot.config, snapshot.active_config])
+    settings.mounts.push({
+      ...settings.mounts[0]!,
+      host: controls.hostDirectory,
+      guest: controls.guestDirectory,
+    });
+  expect(() =>
+    assertReadonlyArtifactInspection(
+      snapshot,
+      snapshot.name,
+      f.c,
+      true,
+      controls,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    assertReadonlyArtifactInspection(snapshot, snapshot.name, f.c, true),
+  ).toThrow('PROVIDER_FAILED');
+  snapshot.active_config.mounts[1]!.options = {
+    ...snapshot.active_config.mounts[1]!.options,
+    readonly: false,
+  };
+  expect(() =>
+    assertReadonlyArtifactInspection(
+      snapshot,
+      snapshot.name,
+      f.c,
+      true,
+      controls,
+    ),
+  ).toThrow('PROVIDER_FAILED');
+  const guard = join(controls.hostDirectory, 'bash-env.sh');
+  await chmod(guard, 0o600);
+  await writeFile(guard, 'changed');
+  await chmod(guard, 0o444);
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
 
 it('trusted release pins sealed bytes and tree version; config is frozen and all16 links stay public', async () => {
   const { c } = await fixture(),

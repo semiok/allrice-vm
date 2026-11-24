@@ -16,6 +16,27 @@ import {
   parseNativeWebAuth,
   type PersonVmNativeWebAuthRequest,
 } from './native-web-auth.ts';
+import { COMMAND_MEMORY_STATE_ROOT } from './readonly-artifact.ts';
+
+const prepareCommandMemoryState = String.raw`
+const fs = require('node:fs');
+const state = process.argv[1];
+function directory(path, mode) {
+  const stat = fs.lstatSync(path);
+  if (!stat.isDirectory() || stat.uid !== 0 || fs.realpathSync(path) !== path ||
+      (mode === undefined ? (stat.mode & 0o022) !== 0 : (stat.mode & 0o777) !== mode))
+    throw new Error('untrusted-command-memory-state');
+}
+directory('/run');
+try { fs.mkdirSync(state, { mode: 0o700 }); }
+catch (error) { if (error.code !== 'EEXIST') throw error; }
+directory(state, 0o700);
+try {
+  const file = fs.lstatSync(state + '/config.json');
+  if (!file.isFile() || file.uid !== 0 || (file.mode & 0o777) !== 0o600 || file.nlink !== 1)
+    throw new Error('untrusted-command-memory-config');
+} catch (error) { if (error.code !== 'ENOENT') throw error; }
+`;
 
 type NativeCommand = (
   args: string[],
@@ -222,6 +243,7 @@ export async function bootstrapMicrosandbox(input: {
   stagingRoot: string;
   name: string;
   cleanupTimeoutMs: number;
+  readonlyCommandMemoryDirectory?: string;
   command: NativeCommand;
 }): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>> {
   const { scope, name, command } = input;
@@ -240,12 +262,39 @@ export async function bootstrapMicrosandbox(input: {
   guestPath(plan.launcher);
   commandInput(plan.initialize);
   commandInput({ executable: plan.launcher, args: [], env: plan.env });
+  const controls = input.readonlyCommandMemoryDirectory;
   if (
     plan.initialize.executable !== 'node' ||
-    !paths.has(plan.initialize.args[0]!) ||
-    !plan.files.some(
-      (file) => file.path === plan.launcher && file.mode === 0o700,
-    )
+    (controls
+      ? plan.initialize.args.length !== 2 ||
+        plan.initialize.args[0] !== posix.join(controls, 'initialize.cjs') ||
+        plan.initialize.args[1] !==
+          posix.join(COMMAND_MEMORY_STATE_ROOT, 'config.json') ||
+        plan.launcher !== posix.join(controls, 'launch-dsh.sh') ||
+        plan.env.BASH_ENV !== posix.join(controls, 'bash-env.sh') ||
+        plan.env.ALLRICE_MEMORY_RECEIPT_WRITER !==
+          posix.join(controls, 'command-observer.cjs') ||
+        plan.env.ALLRICE_MEMORY_RECEIPT_DIRECTORY !==
+          posix.join(COMMAND_MEMORY_STATE_ROOT, 'receipts') ||
+        plan.env.ALLRICE_MEMORY_RECEIPT_NODE !== '/usr/local/bin/node' ||
+        !plan.files.some(
+          (file) =>
+            file.path === plan.initialize.args[1] && file.mode === 0o600,
+        ) ||
+        plan.files.some(
+          (file) =>
+            file.path === controls || file.path.startsWith(controls + '/'),
+        ) ||
+        plan.files.some(
+          (file) =>
+            file.path === COMMAND_MEMORY_STATE_ROOT ||
+            (file.path.startsWith(COMMAND_MEMORY_STATE_ROOT + '/') &&
+              file.path !== plan.initialize.args[1]),
+        )
+      : !paths.has(plan.initialize.args[0]!) ||
+        !plan.files.some(
+          (file) => file.path === plan.launcher && file.mode === 0o700,
+        ))
   )
     throw new PersonVmError('PROVIDER_FAILED');
 
@@ -280,6 +329,11 @@ export async function bootstrapMicrosandbox(input: {
   await scope.assertCurrent();
   const stage = await mkdtemp(join(input.stagingRoot, 'bootstrap-'));
   try {
+    if (controls)
+      await run({
+        executable: '/usr/local/bin/node',
+        args: ['-e', prepareCommandMemoryState, COMMAND_MEMORY_STATE_ROOT],
+      });
     // cp preserves Unix permissions but doesn't create missing file parents.
     await run({
       executable: '/bin/mkdir',
@@ -299,7 +353,11 @@ export async function bootstrapMicrosandbox(input: {
       );
       await scope.assertCurrent();
     }
-    await run(plan.initialize);
+    await run(
+      controls
+        ? { ...plan.initialize, executable: '/usr/local/bin/node' }
+        : plan.initialize,
+    );
   } finally {
     await rm(stage, { recursive: true, force: true });
   }
