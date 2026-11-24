@@ -470,15 +470,13 @@ export async function holdReleasedProfile(
     map: string,
     current: AbortSignal,
   ) {
-    const scripts = [];
-    const offsets = [];
-    const nativeMaps = [];
+    const scripts: Buffer[] = [];
+    const nativeMaps: { reference: string; line: number }[] = [];
     let line = 0;
     for (const id of ids) {
       const entry = await readEntry(id, current);
       scripts.push(entry.data);
-      offsets.push(line);
-      nativeMaps.push(entry.map);
+      nativeMaps.push({ reference: entry.map, line });
       for (const byte of entry.data) if (byte === 10) line++;
     }
     return {
@@ -486,7 +484,7 @@ export async function holdReleasedProfile(
       media: 'text/javascript; charset=utf-8',
       async sourceMap(signal: AbortSignal) {
         const sections = [];
-        for (const [index, reference] of nativeMaps.entries()) {
+        for (const { reference, line } of nativeMaps) {
           const { data } = await readBytes(proof(reference), signal);
           const singleton = z
             .strictObject({
@@ -504,7 +502,7 @@ export async function holdReleasedProfile(
             })
             .parse(JSON.parse(data.toString('utf8')));
           sections.push({
-            offset: { line: offsets[index]!, column: 0 },
+            offset: { line, column: 0 },
             map: singleton.sections[0].map,
           });
         }
