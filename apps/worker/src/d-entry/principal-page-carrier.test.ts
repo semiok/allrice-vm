@@ -471,13 +471,13 @@ it(
     });
     expect(clash.status).toBe(409);
     await clash.body?.cancel();
-    const pending = reader.read();
+    const pending = expect(reader.read()).rejects.toThrow();
     f.profileSource.abort(Error('The native profile source was retired'));
     expect(await receive()).toMatchObject({
       type: 'error',
       streamId: 'life',
     });
-    await expect(pending).rejects.toThrow();
+    await pending;
     expect((await f.invoke(scopeId)).status).toBe(404);
     peer.terminate();
   },
