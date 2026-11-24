@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type SetStateAction,
 } from 'react';
 import {
   BrandMediaCandidatesSchema,
@@ -41,8 +42,15 @@ import layout from './panel.module.css';
 type Tab = 'calendar' | 'topics' | 'articles';
 type ReadProjection = Tab | 'runs';
 type ReadFailure = { message: string; target: string; version: number };
+type ActionSource = 'copy' | 'help' | 'panel';
 const relatedArticle = ({ invocation: { intent } }: BrandMediaRun) =>
   intent.operation === 'candidates' ? undefined : intent.articleId;
+function findArticleRun(runs: BrandMediaRun[], articleId: string | null) {
+  return runs.find(
+    ({ invocation: { intent } }) =>
+      intent.operation === 'article' && intent.articleId === articleId,
+  );
+}
 type BodyPin = NonNullable<BrandMediaArticle['body']>;
 const articleBodyKey = (id: string, body: BodyPin) =>
   [id, body.objectId, body.versionId, body.checksum].join('/');
@@ -242,12 +250,22 @@ function BrandMediaPanelContent({
       'all' | BrandMediaArticle['publication']['state']
     >('all'),
     [selectedId, setSelectedId] = useState<string | null>(null);
-  const [runs, setRuns] = useState<BrandMediaRun[]>([]),
+  const [runs, setRenderedRuns] = useState<BrandMediaRun[]>([]),
     [readFailures, setReadFailures] = useState<ReadFailure[]>([]),
     [error, setError] = useState(''),
-    [actionError, setActionError] = useState(''),
+    [actionErrors, setActionErrors] = useState<
+      Partial<Record<ActionSource, string>>
+    >({}),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
+  const projectedRuns = useRef(runs);
+  const publishRuns = useCallback((update: SetStateAction<BrandMediaRun[]>) => {
+    const next =
+      typeof update === 'function' ? update(projectedRuns.current) : update;
+    // A pending file save can finish before React renders this same snapshot.
+    projectedRuns.current = next;
+    setRenderedRuns(next);
+  }, []);
   const [help, setHelp] = useState<string | null>(null),
     [body, setBody] = useState<{
       articleId: string;
@@ -294,13 +312,15 @@ function BrandMediaPanelContent({
     byId: new Map<string, number>(),
     byBody: new Map<string, number>(),
   });
-  const actionGeneration = useRef(0);
-  const beginAction = () => {
-    const version = ++actionGeneration.current;
-    setActionError('');
-    return (message: string) => {
-      if (version === actionGeneration.current) setActionError(message);
+  const actionGeneration = useRef({ copy: 0, help: 0, panel: 0 });
+  const beginAction = (source: ActionSource = 'panel') => {
+    const version = ++actionGeneration.current[source];
+    const report = (message: string) => {
+      if (version === actionGeneration.current[source])
+        setActionErrors((previous) => ({ ...previous, [source]: message }));
     };
+    report('');
+    return report;
   };
   const recordReadFailure = useCallback((failure: ReadFailure) => {
     setReadFailures((previous) => [
@@ -315,6 +335,12 @@ function BrandMediaPanelContent({
       ),
     );
   }, []);
+  const pinAllowedSince = useCallback(
+    (id: string | undefined, version: number, pin: BodyPin) =>
+      !id ||
+      (readDenials.current.byBody.get(articleBodyKey(id, pin)) ?? 0) <= version,
+    [],
+  );
   const articleAllowedSince = useCallback(
     (
       id: string | undefined,
@@ -322,13 +348,12 @@ function BrandMediaPanelContent({
       body?: BrandMediaArticle['body'],
     ) => {
       if (!id) return true;
-      const { byId, byBody } = readDenials.current;
       return (
-        (byId.get(id) ?? 0) <= version &&
-        (!body || (byBody.get(articleBodyKey(id, body)) ?? 0) <= version)
+        (readDenials.current.byId.get(id) ?? 0) <= version &&
+        (!body || pinAllowedSince(id, version, body))
       );
     },
-    [],
+    [pinAllowedSince],
   );
   const acceptDetail = useCallback((article: BrandMediaArticle) => {
     detailGeneration.current++;
@@ -360,10 +385,10 @@ function BrandMediaPanelContent({
           setCalendar([]);
           break;
         case 'runs':
-          setRuns([]);
+          publishRuns([]);
       }
     },
-    [recordReadFailure],
+    [publishRuns, recordReadFailure],
   );
   const discardArticle = useCallback(
     (id: string, cause: Error, body?: BodyPin) => {
@@ -378,18 +403,17 @@ function BrandMediaPanelContent({
       recordReadFailure({ message: cause.message, target: key ?? id, version });
       setArticles((old) => old?.filter((item) => !matches(item)) ?? null);
       setCalendar((old) => old.filter((item) => !matches(item)));
-      setRuns((old) =>
-        key
-          ? old.map((row) =>
-              relatedArticle(row) === id
-                ? filterDeliveries(
-                    row,
-                    (file) => articleBodyKey(id, file) !== key,
-                  )
-                : row,
-            )
-          : old.filter((row) => relatedArticle(row) !== id),
-      );
+      if (key)
+        publishRuns((old) =>
+          old.map((row) =>
+            relatedArticle(row) === id
+              ? filterDeliveries(
+                  row,
+                  (file) => articleBodyKey(id, file) !== key,
+                )
+              : row,
+          ),
+        );
       setForm((old) =>
         old?.kind === 'article' && matches(old.article) ? null : old,
       );
@@ -399,18 +423,18 @@ function BrandMediaPanelContent({
       setBody((old) =>
         old?.articleId === id && (!key || old.key === key) ? null : old,
       );
-      if (!key && selectedIdRef.current === id) {
-        selectedIdRef.current = null;
-        setSelectedId(null);
-      }
     },
-    [recordReadFailure],
+    [publishRuns, recordReadFailure],
   );
   const listed = articles?.find((article) => article.id === selectedId);
-  const selected =
+  const availableDetail =
     detail?.id === selectedId && (!listed || detail.revision >= listed.revision)
       ? detail
       : listed;
+  // A fresh list can authorize its rows while the detail read is pending.
+  const selected = readFailures.some(({ target }) => target === selectedId)
+    ? undefined
+    : availableDetail;
   const bodyKey = selected?.body
     ? articleBodyKey(selected.id, selected.body)
     : '';
@@ -511,14 +535,12 @@ function BrandMediaPanelContent({
           ),
           client.runs(undefined, deny('runs')).then(({ runs }) => {
             if (!current('runs')) return;
-            setRuns(
-              runs
-                .filter((row) => allowed(relatedArticle(row)))
-                .map((row) =>
-                  filterDeliveries(row, (file) =>
-                    allowed(relatedArticle(row), file),
-                  ),
+            publishRuns(
+              runs.map((row) =>
+                filterDeliveries(row, (file) =>
+                  pinAllowedSince(relatedArticle(row), observedDenial, file),
                 ),
+              ),
             );
             clearReadFailure('runs', observedDenial);
           }),
@@ -584,6 +606,8 @@ function BrandMediaPanelContent({
     readDetail,
     discardRead,
     articleAllowedSince,
+    pinAllowedSince,
+    publishRuns,
     clearReadFailure,
     setError,
   ]);
@@ -711,11 +735,7 @@ function BrandMediaPanelContent({
     (row) =>
       !row.unavailable && row.invocation.intent.operation === 'candidates',
   );
-  const articleRun = runs.find(
-    (row) =>
-      row.invocation.intent.operation === 'article' &&
-      row.invocation.intent.articleId === selectedId,
-  );
+  const articleRun = findArticleRun(runs, selectedId);
   const candidateDeliveries =
     candidatesRun?.deliveries
       .filter((delivery) => delivery.format === 'json')
@@ -740,7 +760,7 @@ function BrandMediaPanelContent({
         observedArticle,
       )
     )
-      setRuns((old) => [
+      publishRuns((old) => [
         {
           run: result.run,
           sessionId: result.userMessage.sessionId,
@@ -789,7 +809,7 @@ function BrandMediaPanelContent({
   };
   const copyBody = async () => {
     if (!selected?.body || !active) return;
-    const fail = beginAction();
+    const fail = beginAction('copy');
     const owner = copyLifetime.current,
       revision = owner.revision,
       articleVersion = readDenials.current.version;
@@ -812,17 +832,32 @@ function BrandMediaPanelContent({
       if (current()) fail(cause instanceof Error ? cause.message : '复制失败');
     }
   };
-  const downloadDelivery = async (articleId: string, file: BodyPin) => {
-    const fail = beginAction();
+  const downloadDelivery = async (
+    articleId: string,
+    runId: string,
+    file: BodyPin,
+  ) => {
+    const key = articleBodyKey(articleId, file);
     const observed = readDenials.current.version;
-    const current = () => articleAllowedSince(articleId, observed, file);
+    const current = () => {
+      const run = findArticleRun(projectedRuns.current, articleId);
+      return (
+        run?.run.id === runId &&
+        !run.unavailable &&
+        pinAllowedSince(articleId, observed, file) &&
+        run.deliveries.some(
+          ({ file }) => articleBodyKey(articleId, file) === key,
+        )
+      );
+    };
+    if (!current()) return;
+    const fail = beginAction();
     try {
       await client.download(file.objectId, 'delivery', {
         current,
         onDenied: (cause) => discardArticle(articleId, cause, file),
       });
-      if (current())
-        clearReadFailure(articleBodyKey(articleId, file), observed);
+      if (current()) clearReadFailure(key, observed);
     } catch (cause) {
       if (current())
         fail(
@@ -842,7 +877,9 @@ function BrandMediaPanelContent({
         <button
           type="button"
           className={layout.deliveryDownload}
-          onClick={() => void downloadDelivery(selectedId, file)}
+          onClick={() =>
+            void downloadDelivery(selectedId, articleRun.run.id, file)
+          }
         >
           查看本次正文成果
         </button>
@@ -954,9 +991,11 @@ function BrandMediaPanelContent({
       <BrandMediaAccessFeedback message={accessWarning} onReturn={onReturn} />
     );
   const errors = new Set(
-    [...readFailures.map(({ message }) => message), error, actionError].filter(
-      Boolean,
-    ),
+    [
+      ...readFailures.map(({ message }) => message),
+      error,
+      ...Object.values(actionErrors),
+    ].filter(Boolean),
   );
   return (
     <section className={ui.page} aria-label="品牌自媒体">
@@ -997,7 +1036,7 @@ function BrandMediaPanelContent({
           <Button
             className={ui.helpAction}
             onClick={() => {
-              const fail = beginAction();
+              const fail = beginAction('help');
               void client
                 .help()
                 .then((value) => setHelp(value.content))
