@@ -411,6 +411,7 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
     browser = await chromium.launch({
       headless: true,
+      args: ['--disable-lcd-text'],
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
         : {}),

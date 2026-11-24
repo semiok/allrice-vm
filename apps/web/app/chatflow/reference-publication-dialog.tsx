@@ -2,7 +2,10 @@
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { z } from 'zod';
-import { EmployeePanelsWriteRejectedError } from '../../lib/chatflow/employee-panel-data-http';
+import {
+  EmployeePanelsHttpError,
+  EmployeePanelsWriteRejectedError,
+} from '../../lib/chatflow/employee-panel-data-http';
 import {
   ReferenceAudienceSchema,
   ReferencePublicationActionSchema,
@@ -71,6 +74,23 @@ const receiptList = z.array(receiptSchema);
 type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
 const settledPublications = new Map<string, ReceiptOutcome>();
 const settledKey = (key: string, requestId: string) => key + '/' + requestId;
+const receiptPrefix = 'allrice:publication-receipts:v2:';
+const receiptAddress = z.tuple([
+  UuidSchema,
+  UuidSchema,
+  UuidSchema,
+  UuidSchema,
+  UuidSchema.nullable(),
+  z.enum(['file', 'upload', 'audience', 'revoke', 'delete']),
+  UuidSchema.nullable(),
+]);
+const receiptActions = {
+  file: '原添加为企业资料',
+  upload: '原发布',
+  audience: '原资料编辑',
+  revoke: '原撤销',
+  delete: '原删除',
+};
 
 // Only the full intent fingerprint and original scoped receipt selectors
 // survive reload. File bytes and display metadata stay in the active form.
@@ -140,6 +160,191 @@ class ReceiptStorageUnavailable extends Error {}
 
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
 
+async function checkPublication(
+  data: EmployeePanelDataClient,
+  workspaceId: string,
+  key: string,
+  receipt: PublicationReceipt,
+  signal: AbortSignal,
+): Promise<ReceiptOutcome | undefined> {
+  const known = settledPublications.get(settledKey(key, receipt.requestId));
+  if (known) return known;
+  const result = await data.readWriteReceipt(
+    {
+      workspaceId,
+      operation: receipt.operation,
+      requestId: receipt.requestId,
+      sourceId: receipt.sourceId,
+    },
+    signal,
+  );
+  signal.throwIfAborted();
+  if (result.status !== 'recorded' || result.ready === false || !result.result)
+    return;
+  settlePublication(key, receipt, 'recorded');
+  return 'recorded';
+}
+
+type PendingPublication = {
+  key: string;
+  receipt: PublicationReceipt;
+  action: string;
+  targetId: string;
+};
+
+/** Recover the original request even when the completed write removed its row. */
+export function ReferencePublicationPending({
+  workspaceId,
+  viewerId,
+  receiptScope,
+  dataClient,
+  panel,
+  dialogOpen,
+  signal,
+}: {
+  workspaceId: string;
+  viewerId: string;
+  receiptScope: ReferencePublicationScope;
+  dataClient: EmployeePanelDataClient;
+  panel: 'files' | 'materials';
+  dialogOpen: boolean;
+  signal: AbortSignal;
+}) {
+  const { organizationId, employeeInstanceId, threadId } = receiptScope;
+  const [records, setRecords] = useState<PendingPublication[]>([]);
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const checking = useRef(new Set<string>()).current;
+  useEffect(() => {
+    if (dialogOpen || signal.aborted) return;
+    const found: PendingPublication[] = [];
+    try {
+      for (let index = 0; index < sessionStorage.length; index++) {
+        const key = sessionStorage.key(index);
+        if (!key?.startsWith(receiptPrefix)) continue;
+        try {
+          const address = receiptAddress.parse(
+            JSON.parse(key.slice(receiptPrefix.length)),
+          );
+          const [org, viewer, workspace, employee, thread, action, target] =
+            address;
+          if (
+            org !== organizationId ||
+            viewer !== viewerId ||
+            workspace !== workspaceId ||
+            employee !== employeeInstanceId ||
+            thread !== threadId ||
+            (action === 'file') !== (panel === 'files')
+          )
+            continue;
+          for (const receipt of pendingPublications(key)) {
+            const matches =
+              action === 'file'
+                ? target &&
+                  receipt.operation === 'publish-file' &&
+                  !receipt.sourceId
+                : action === 'upload'
+                  ? target === null &&
+                    receipt.operation === 'publish-upload' &&
+                    !receipt.sourceId
+                  : target &&
+                    receipt.sourceId === target &&
+                    receipt.operation === 'change-publication';
+            if (matches)
+              found.push({
+                key,
+                receipt,
+                action: receiptActions[action],
+                targetId: target ?? receipt.requestId,
+              });
+          }
+        } catch {
+          // Ignore an unidentified entry while recovering independently scoped requests.
+        }
+      }
+    } catch {
+      return;
+    }
+    setRecords(found);
+  }, [
+    dialogOpen,
+    employeeInstanceId,
+    organizationId,
+    panel,
+    signal,
+    threadId,
+    viewerId,
+    workspaceId,
+  ]);
+
+  async function reconcile(record: PendingPublication) {
+    const { key, receipt, action, targetId } = record;
+    const id = receipt.requestId;
+    if (signal.aborted || checking.has(id)) return;
+    checking.add(id);
+    const note = (value: string) =>
+      setNotes((previous) => ({ ...previous, [id]: value }));
+    note('正在核对' + action + '…');
+    try {
+      const outcome = await checkPublication(
+        dataClient,
+        workspaceId,
+        key,
+        receipt,
+        signal,
+      );
+      if (signal.aborted) return;
+      if (!outcome) {
+        note(waitingForReceipt);
+        return;
+      }
+      setRecords((previous) =>
+        previous.filter(({ receipt }) => receipt.requestId !== id),
+      );
+      note(
+        action +
+          (outcome === 'recorded' ? '已完成。' : '已拒绝。') +
+          ' ' +
+          targetId,
+      );
+      if (outcome === 'recorded')
+        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+    } catch (error) {
+      if (signal.aborted) return;
+      if (
+        error instanceof EmployeePanelsHttpError &&
+        [401, 403, 404].includes(error.status)
+      ) {
+        setRecords([]);
+        setNotes({});
+      } else note(waitingForReceipt);
+    } finally {
+      checking.delete(id);
+    }
+  }
+
+  if (!records.length && !Object.keys(notes).length) return null;
+  return (
+    <div hidden={dialogOpen} className={css.recovery}>
+      {records.map((record) => (
+        <Button
+          key={record.receipt.requestId}
+          type="button"
+          variant="ghost"
+          disabled={checking.has(record.receipt.requestId)}
+          onClick={() => void reconcile(record)}
+        >
+          核对{record.action} {record.targetId}
+        </Button>
+      ))}
+      {Object.entries(notes).map(([id, note]) => (
+        <p key={id} role="status">
+          {note}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 // Replacing the account, workspace or precise target discards local form state
 // and aborts its transport; expected-viewer is a write precondition, not owner.
 export function ReferencePublicationDialog(props: Props) {
@@ -196,7 +401,7 @@ function PublicationForm({
   const parsedScope = receiptScopeSchema.safeParse(receiptScope);
   const receiptKey =
     dataClient && parsedScope.success
-      ? 'allrice:publication-receipts:v2:' +
+      ? receiptPrefix +
         JSON.stringify([
           parsedScope.data.organizationId,
           viewerId,
@@ -228,13 +433,7 @@ function PublicationForm({
   const [initialReceipts] = useState(() => restorePublications(receiptKey));
   const [receipts, setReceipts] = useState(initialReceipts);
   const [receiptNotes, setReceiptNotes] = useState<Record<string, string>>({});
-  const completion = {
-    file: '原添加为企业资料已完成。',
-    upload: '原发布已完成。',
-    audience: '原资料编辑已完成。',
-    revoke: '原撤销已完成。',
-    delete: '原删除已完成。',
-  }[target.kind];
+  const completion = receiptActions[target.kind] + '已完成。';
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -251,35 +450,21 @@ function PublicationForm({
       const controller = new AbortController();
       const note = (message: string) =>
         setReceiptNotes((prior) => ({ ...prior, [value.requestId]: message }));
-      const existing = settledPublications.get(
-        settledKey(receiptKey, value.requestId),
-      );
-      if (existing) {
-        if (existing === 'recorded') note(completion);
-        return;
-      }
       checks.set(value.requestId, controller);
       note('正在核对原发布结果…');
       try {
-        const result = await data.readWriteReceipt(
-          {
-            workspaceId,
-            operation: value.operation,
-            requestId: value.requestId,
-            sourceId: value.sourceId,
-          },
+        const outcome = await checkPublication(
+          data,
+          workspaceId,
+          receiptKey,
+          value,
           controller.signal,
         );
         if (!alive.current || controller.signal.aborted) return;
-        if (
-          result.status !== 'recorded' ||
-          result.ready === false ||
-          !result.result
-        ) {
+        if (!outcome) {
           note(waitingForReceipt);
           return;
         }
-        settlePublication(receiptKey, value, 'recorded');
         setReceipts((prior) =>
           prior.filter((pending) => pending.requestId !== value.requestId),
         );
@@ -287,8 +472,14 @@ function PublicationForm({
           waitingFor.current = undefined;
           setError((current) => (current === waitingForReceipt ? '' : current));
         }
-        note(completion);
-        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+        note(
+          outcome === 'recorded'
+            ? completion
+            : receiptActions[target.kind] + '已拒绝。',
+        );
+        if (outcome === 'recorded') {
+          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+        }
       } catch {
         if (alive.current && !controller.signal.aborted)
           note(waitingForReceipt);
@@ -297,7 +488,7 @@ function PublicationForm({
           checks.delete(value.requestId);
       }
     },
-    [data, checks, receiptKey, workspaceId, completion],
+    [data, checks, receiptKey, workspaceId, completion, target.kind],
   );
   useEffect(() => {
     for (const prior of initialReceipts) void reconcile(prior);

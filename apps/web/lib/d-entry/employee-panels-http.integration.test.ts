@@ -83,6 +83,7 @@ suite(
     let dropPublishReply = false;
     let incompleteReply: ServerResponse | undefined;
     const publishWrites: string[] = [];
+    const publicationActions: string[] = [];
     const receiptReads: string[] = [];
     let referenceWrites = 0;
     const publicationStatuses: number[] = [];
@@ -221,12 +222,17 @@ suite(
               referenceWrites++;
             if (fixtureDocument && name === 'readWriteReceipt')
               receiptReads.push(params.requestId!);
-            if (fixtureDocument && name === 'publish') {
+            if (
+              fixtureDocument &&
+              (name === 'publish' || name === 'changePublication')
+            ) {
               const { requestId } = JSON.parse(
                 Buffer.concat(chunks).toString('utf8'),
               );
-              publishWrites.push(requestId);
-              publicationStatuses.push(response.status);
+              if (name === 'publish') {
+                publishWrites.push(requestId);
+                publicationStatuses.push(response.status);
+              } else publicationActions.push(requestId);
               if (dropPublishReply && response.ok) {
                 dropPublishReply = false;
                 await response.body?.cancel();
@@ -632,6 +638,92 @@ suite(
               .click();
           }
 
+          if (!recorded.result || !('sourceId' in recorded.result))
+            throw Error('The file publication receipt has no original source');
+          const sourceId = recorded.result.sourceId;
+          await materials();
+          const sourceMenu = page.getByRole('button', {
+            name: '资料选项 ' + input.fileName,
+          });
+          await sourceMenu.click();
+          await page
+            .getByRole('menuitem', { name: '撤销资料', exact: true })
+            .click();
+          const revoke = page.getByRole('dialog', {
+            name: '撤销这份企业资料？',
+          });
+          dropPublishReply = true;
+          await Promise.all([
+            page.waitForResponse(
+              (response) =>
+                response.request().method() === 'POST' &&
+                response
+                  .url()
+                  .includes('/materials/publications/' + sourceId + '?'),
+              { timeout: 5000 },
+            ),
+            revoke
+              .getByRole('button', { name: '撤销资料', exact: true })
+              .click(),
+          ]);
+          expect(incompleteReply?.writableFinished).toBe(false);
+          incompleteReply?.destroy();
+          await revoke
+            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .waitFor();
+          expect(publicationActions).toHaveLength(1);
+          const withdrawnId = publicationActions[0]!;
+          expect(
+            await f.db`select status from allrice_knowledge_sources where id=${sourceId}`,
+          ).toEqual([{ status: 'archived' }]);
+          await page.reload();
+          await materials();
+          await sourceMenu.waitFor({ state: 'detached' });
+          const retained = page.getByRole('button', {
+            name: '核对原撤销 ' + sourceId,
+          });
+          await retained.waitFor();
+          await page.evaluate(() => {
+            const remove = Storage.prototype.removeItem;
+            Storage.prototype.removeItem = function (key) {
+              if (key.startsWith('allrice:publication-receipts:v2:'))
+                throw new DOMException(
+                  'Storage cleanup is unavailable',
+                  'QuotaExceededError',
+                );
+              remove.call(this, key);
+            };
+          });
+          const previousReceipts = receiptReads.length;
+          await retained.click();
+          await page
+            .getByRole('status')
+            .filter({ hasText: '原撤销已完成。 ' + sourceId })
+            .waitFor();
+          expect(receiptReads.slice(previousReceipts)).toEqual([withdrawnId]);
+          expect(publicationActions).toEqual([withdrawnId]);
+          expect(await retained.isVisible()).toBe(false);
+          expect(
+            await page.evaluate(
+              (requestId) =>
+                Object.keys(sessionStorage).some(
+                  (key) =>
+                    key.startsWith('allrice:publication-receipts:v2:') &&
+                    (
+                      JSON.parse(sessionStorage.getItem(key)!) as {
+                        requestId: string;
+                        outcome: string;
+                      }[]
+                    ).some(
+                      (entry) =>
+                        entry.requestId === requestId &&
+                        entry.outcome === 'recorded',
+                    ),
+                ),
+              withdrawnId,
+            ),
+          ).toBe(true);
+
           const storage = runtimeFixtureStorage(f.db);
           const put = storage.put.bind(storage);
           const failUploadA = vi
@@ -645,7 +737,6 @@ suite(
             ...employeePanelsDependencies,
             storage: () => storage,
           });
-          await materials();
           await openUpload();
           await selectFile('浏览器企业资料A.txt', '资料 A 的已写字节。');
           await publishMaterial();

@@ -209,6 +209,8 @@ export async function setupNativeWebFixture(
   }
   const startup = new AbortController(),
     lifetime = new AbortController();
+  const diagnostics = new Set<string>();
+  let authRead = false;
   let kills = 0,
     waitSignal: AbortSignal | undefined,
     job!: PersonVmManagedJob,
@@ -233,9 +235,18 @@ export async function setupNativeWebFixture(
             DO_NOT_TRACK: '1',
             NPM_CONFIG_OFFLINE: 'true',
           },
-          stdio: 'ignore',
+          stdio: isolateProfile ? ['ignore', 'ignore', 'pipe'] : 'ignore',
         },
       );
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', (text: string) => {
+        for (const code of text.matchAll(/\bERR_[A-Z_]+\b/g))
+          diagnostics.add(code[0]);
+        for (const missing of text.matchAll(
+          /Cannot find (?:package|module) ['"]([@\w./-]+)['"]/g,
+        ))
+          diagnostics.add('missing ' + missing[1]);
+      });
       exited = new Promise<{ exitCode: number; timedOut: boolean }>(
         (done, reject) => {
           child.once('error', reject);
@@ -287,7 +298,9 @@ export async function setupNativeWebFixture(
           AbortSignal.timeout(request.timeoutMs),
         ]),
       });
-      return parseNativeWebAuth(text, request);
+      const auth = parseNativeWebAuth(text, request);
+      authRead = true;
+      return auth;
     },
   };
   const context: RequestContext = {
@@ -308,6 +321,16 @@ export async function setupNativeWebFixture(
     vm: { assertCurrentBinding: current },
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
+  }).catch(async (error: unknown) => {
+    if (!isolateProfile) throw error;
+    const patchRead = await access(tracePath).then(
+      () => true,
+      () => false,
+    );
+    throw new Error(
+      `Isolated CLI startup failed (auth: ${authRead}, patch: ${patchRead}, exit: ${child?.exitCode}, signals: ${[...diagnostics].join(', ')})`,
+      { cause: error },
+    );
   });
   let expectedCloseFailure: unknown;
   cleanup.push(async () => {

@@ -61,6 +61,13 @@ const ReferencePublicationDialog = lazy(() =>
     }),
   ),
 );
+const ReferencePublicationPending = lazy(() =>
+  import('../../../apps/web/app/chatflow/reference-publication-dialog').then(
+    ({ ReferencePublicationPending }) => ({
+      default: ReferencePublicationPending,
+    }),
+  ),
+);
 const publicationNotices = {
   file: '已添加为企业资料',
   upload: '已发布',
@@ -107,6 +114,11 @@ export function EmployeePanelContent(props: EmployeePanelContentProps) {
     if (snapshot.publicationManagement && data.viewerId && data.dataClient)
       return (
         <EmployeePublicationPanel
+          key={JSON.stringify([
+            snapshot.scopeKey,
+            data.viewerId,
+            snapshot.publicationManagement,
+          ])}
           {...props}
           kind={kind}
           viewerId={data.viewerId}
@@ -136,6 +148,19 @@ function EmployeePublicationPanel({
   }>();
   return (
     <>
+      {dataClient && snapshot.publicationManagement && (
+        <Suspense fallback={null}>
+          <ReferencePublicationPending
+            workspaceId={workspaceId}
+            viewerId={viewerId}
+            receiptScope={snapshot.publicationManagement}
+            dataClient={dataClient}
+            panel={kind}
+            dialogOpen={publication !== null}
+            signal={signal}
+          />
+        </Suspense>
+      )}
       {employeePanelView(props, {
         createdMaterial,
         edit(target, options) {

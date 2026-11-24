@@ -573,8 +573,29 @@ suite(
     );
     it('serializes favorites with the real soft delete on the original personal object', async () => {
       const { a: context } = await setup();
-      const makeFile = () =>
-        uploadWorkbenchFile(context, uploadInput(context), storage());
+      async function makeFile() {
+        // The ordinary soft-delete path applies to mutable legacy uploads.
+        // The current upload producer deliberately creates immutable files.
+        const objectId = randomUUID();
+        const input = uploadInput(context);
+        const checksum = `sha256:${'a'.repeat(64)}`;
+        await createStorageMetadata(context, {
+          id: objectId,
+          workspaceId: input.workspaceId,
+          category: 'uploads',
+          mediaType: input.mediaType,
+          sizeBytes: 1,
+          checksum,
+          visibility: 'private',
+          immutable: false,
+          retentionUntil: null,
+        });
+        await fixture.db`insert into allrice_workbench_file_policies
+          (object_id,organization_id,workspace_id,owner_id,file_name,scope,upload_request_id,upload_digest)
+          values(${objectId},${context.organizationId},${input.workspaceId},${context.actor.id},${input.fileName},'personal',${input.requestId},${checksum})`;
+        await markStorageReady(context, objectId);
+        return { objectId };
+      }
       const first = await makeFile();
       const deletedFirst = await makeFile();
       await completeStorageDelete(context, deletedFirst.objectId);

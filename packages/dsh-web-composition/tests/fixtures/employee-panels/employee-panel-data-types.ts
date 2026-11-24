@@ -18,6 +18,7 @@ export interface PanelDataFixture {
   finishReceipt(): void;
   holdReceipt(): void;
   selectReceiptScope(employee: string, thread: string): void;
+  selectReceiptViewer(viewer: string): void;
   evidence(): {
     calls: PanelDataCall[];
     used: unknown[];

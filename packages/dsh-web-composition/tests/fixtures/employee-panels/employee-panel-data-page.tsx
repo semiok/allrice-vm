@@ -338,6 +338,7 @@ function Fixture() {
     employeeInstanceId: panelsEmployee,
     threadId: uid(7),
   });
+  const [receiptViewer, setReceiptViewer] = useState(panelsViewer);
   const [error, setError] = useState('');
   const uploadInput = useRef<HTMLInputElement>(null);
   const client = state === 'unbound' ? unbound : bound;
@@ -391,6 +392,7 @@ function Fixture() {
       selectReceiptScope(employeeInstanceId, threadId) {
         setScope({ employeeInstanceId, threadId });
       },
+      selectReceiptViewer: setReceiptViewer,
       evidence: () => ({
         calls,
         used,
@@ -489,7 +491,7 @@ function Fixture() {
       {publication && (
         <ReferencePublicationDialog
           workspaceId={panelsWorkspace}
-          viewerId={panelsViewer}
+          viewerId={receiptViewer}
           headers={headers}
           dataClient={client}
           receiptScope={{ organizationId: uid(1), ...scope }}

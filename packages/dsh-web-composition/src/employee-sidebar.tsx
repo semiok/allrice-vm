@@ -1,4 +1,5 @@
 import { useSyncExternalStore, type ComponentProps } from 'react';
+import { flushSync } from 'react-dom';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
@@ -116,18 +117,34 @@ export function EmployeeSidebar({
 /** Registers only after the real owner port and native layout are available. */
 export function apply(ctx: Context) {
   ctx.inject(['allriceEmployeeSidebar', 'layout'], (scope) => {
-    scope.slots.inject('sidebar', () =>
-      scope.slots.register(
+    scope.slots.inject('sidebar', () => {
+      const lifetime = new AbortController();
+      const current = () => !lifetime.signal.aborted;
+      const subscribe = (changed: () => void) => {
+        lifetime.signal.addEventListener('abort', changed, { once: true });
+        return () => lifetime.signal.removeEventListener('abort', changed);
+      };
+      function RegisteredSidebar(
+        props: SidebarOwnerProps & PropsRenderSlots<'sidebar.settings'>,
+      ) {
+        const mounted = useSyncExternalStore(subscribe, current);
+        return mounted ? <EmployeeSidebar {...props} ctx={scope} /> : null;
+      }
+      const remove = scope.slots.register(
         {
           name: 'sidebar',
           priority: -100,
           children: { 'sidebar.settings': { kind: 'single', scope: 'root' } },
         },
-        (props: SidebarOwnerProps & PropsRenderSlots<'sidebar.settings'>) => (
-          <EmployeeSidebar {...props} ctx={scope} />
-        ),
-      ),
-    );
+        RegisteredSidebar,
+      );
+      return () => {
+        // The native SettingsRoot and its modal must leave React before the
+        // renderer revokes the parent registration and its renderSlot closures.
+        flushSync(() => lifetime.abort());
+        remove();
+      };
+    });
   });
 }
 

@@ -366,22 +366,16 @@ suite(
         await open();
         await expect.poll(inquiries).toEqual([b!.requestId, a!.requestId]);
         expect(await writes()).toEqual([]);
-        // Employee and thread are both required to restore a saved request.
+        // Change one identity field from the saved request at a time.
         for (const scope of [
-          {
-            employee: '00000000-0000-4000-8000-000000000099',
-            thread: '00000000-0000-4000-8000-000000000007',
-          },
-          {
-            employee: '00000000-0000-4000-8000-000000000099',
-            thread: '00000000-0000-4000-8000-000000000098',
-          },
+          { employee: uid(99), thread: uid(7), viewer: uid(1) },
+          { employee: uid(3), thread: uid(98), viewer: uid(1) },
+          { employee: uid(3), thread: uid(7), viewer: uid(97) },
         ]) {
-          await page.evaluate(
-            ({ employee, thread }) =>
-              window.__panelDataFixture.selectReceiptScope(employee, thread),
-            scope,
-          );
+          await page.evaluate(({ employee, thread, viewer }) => {
+            window.__panelDataFixture.selectReceiptScope(employee, thread);
+            window.__panelDataFixture.selectReceiptViewer(viewer);
+          }, scope);
           await expect
             .poll(() =>
               dialog.getByRole('button', { name: /核对结果/ }).count(),
