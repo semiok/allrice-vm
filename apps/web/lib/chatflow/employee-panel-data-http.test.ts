@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createEmployeePanelsHttpClient,
   createEmployeePanelsHttpResolver,
+  EmployeePanelsHttpError,
   readEmployeePanelsWriteReceipt,
   EmployeePanelsWriteUnknownError,
 } from './employee-panel-data-http';
@@ -333,6 +334,34 @@ describe('sixteen fixed n4 browser methods', () => {
       await expect(
         f.client.listDeliverables({ workspaceId: f.workspaceId }, f.signal),
       ).rejects.toMatchObject({ status });
+    },
+  );
+  it.each([401, 403, 404])(
+    'preserves access denial for the selected panel receipt (%i)',
+    async (status) => {
+      const f = fixture();
+      const resolve = createEmployeePanelsHttpResolver(
+        () => ({ selection: f.selection, viewerId: f.viewerId }),
+        f.signal,
+        { fetch: f.fetcher },
+      );
+      const selected = resolve('native-session', null);
+      expect(selected).not.toBeNull();
+      f.fetcher.mockResolvedValueOnce(new Response(null, { status }));
+      const receipt = selected!.readWriteReceipt(
+        {
+          workspaceId: f.workspaceId,
+          requestId: f.upload.requestId,
+          operation: 'upload',
+        },
+        f.signal,
+      );
+      await expect(receipt).rejects.toBeInstanceOf(EmployeePanelsHttpError);
+      await expect(receipt).rejects.toMatchObject({ status });
+      expect(f.fetcher).toHaveBeenCalledOnce();
+      expect(f.fetcher.mock.calls[0]?.[1]).toMatchObject({
+        headers: { 'x-allrice-expected-viewer-id': f.viewerId },
+      });
     },
   );
   it('does not reconcile a receipt for another request or operation', async () => {

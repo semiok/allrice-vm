@@ -469,7 +469,11 @@ export async function readEmployeePanelsWriteReceipt(
         : {},
     },
   );
-  if (!response.ok) throw Error(`文件请求对账失败 (${response.status})。`);
+  if (!response.ok) {
+    const error = await panelError(response);
+    active.throwIfAborted();
+    throw error;
+  }
   const result = PanelWriteReceiptSchema.parse(await response.json());
   active.throwIfAborted();
   if (

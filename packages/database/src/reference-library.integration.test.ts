@@ -974,6 +974,64 @@ suite(
         result: { sourceId: source.sourceId },
       });
     });
+    it('reconciles an unchanged legacy action recorded with an uppercase workspace UUID', async () => {
+      const { owner } = await setup();
+      const workspaceId = owner.workspaceId!;
+      const source = await upload(owner);
+      const original = {
+        workspaceId: workspaceId.toUpperCase(),
+        requestId: randomUUID(),
+        expectedRevision: 1,
+        action: 'retry' as const,
+      };
+      // The old route accepts an organization-wide session and stores its
+      // validated request spelling along with the action.
+      expect(original.workspaceId).not.toBe(workspaceId);
+      await changeReference(
+        { ...owner, workspaceId: null },
+        source.sourceId,
+        original,
+      );
+      const [other] =
+        await f.db`insert into allrice_workspaces(organization_id,slug,name)
+        values(${owner.organizationId},'receipt-other','Other receipt workspace') returning id`;
+      const rejected = ['invalid-workspace', null, other!.id as string];
+      const rejectedIds = [];
+      for (const invalidWorkspaceId of rejected) {
+        const requestId = randomUUID();
+        rejectedIds.push(requestId);
+        const input = {
+          ...original,
+          workspaceId: invalidWorkspaceId,
+          requestId,
+        };
+        await f.db`insert into allrice_knowledge_reference_actions(source_id,actor_id,request_id,input)
+          values(${source.sourceId},${owner.actor.id},${requestId},${f.db.json(input)})`;
+      }
+      const rows = () =>
+        f.db`select request_id,input from allrice_knowledge_reference_actions
+          where source_id=${source.sourceId} order by request_id`;
+      const before = await rows();
+      expect(before).toContainEqual({
+        request_id: original.requestId,
+        input: original,
+      });
+      const query = {
+        workspaceId,
+        requestId: original.requestId,
+        sourceId: source.sourceId,
+        operation: 'change-source',
+      };
+      expect(await readReferenceWriteReceipt(owner, query)).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
+      for (const requestId of rejectedIds)
+        expect(
+          await readReferenceWriteReceipt(owner, { ...query, requestId }),
+        ).toMatchObject({ status: 'unknown', result: null });
+      expect(await rows()).toEqual(before);
+    });
     it('reconciles only the current maintainer own retry key on another publisher source without replay or writes', async () => {
       for (const scope of ['department', 'company'] as const) {
         const a = await setup();
