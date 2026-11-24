@@ -538,12 +538,12 @@ suite('installed native employee panels with synthetic business owner', () => {
     });
     browser = await chromium.launch({
       headless: true,
+      args: ['--disable-lcd-text', '--disable-gpu'],
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
         : {}),
     });
-    // Read-only browser diagnostics for exact edge rasterization failures.
-    // Launch flags, capture modes and every visual assertion remain unchanged.
+    // Record the rasterization environment used by both independent hosts.
     const rendering = await readPanelsRenderingDiagnostics(
       await browser.newBrowserCDPSession(),
     );

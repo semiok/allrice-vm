@@ -179,6 +179,7 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
     );
     browser = await chromium.launch({
       headless: true,
+      args: ['--disable-lcd-text', '--disable-gpu'],
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
         : {}),
