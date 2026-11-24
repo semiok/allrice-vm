@@ -10,6 +10,7 @@ import stat
 import struct
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -23,6 +24,8 @@ VALUE_OPTIONS = {
     '--max-old-space-size': r'[0-9]+',
 }
 BOOLEAN_OPTIONS = {'--enable-source-maps', '--no-warnings', '--trace-warnings', '--trace-deprecation', '--trace-uncaught'}
+BUILTIN_ACCESS_OPTION = '--expose-internals'
+HTTP_PROXY_SETTING = 'NODE_USE_ENV_PROXY'
 ENV_FILE_OPTIONS = {'--env-file', '--env-file-if-exists'}
 WEB_OPTIONS = {'--hostname': r'127\.0\.0\.1|0\.0\.0\.0|localhost|::1?', '--port': r'[0-9]+'}
 BSD_INFO = struct.Struct('=12I16s32s6IQQ')  # Darwin proc_bsdinfo, including start time
@@ -107,7 +110,7 @@ def observe_process(pid):
     return os.fsdecode(executable), list(map(os.fsdecode, fields[:argc])), environment, start
 
 
-def plain_node_options(args, allow_env_files):
+def plain_node_options(args, allow_env_files, *, recognize_builtin_access=False):
     files = []
     i = 0
     while i < len(args) and args[i].startswith('-'):
@@ -115,10 +118,12 @@ def plain_node_options(args, allow_env_files):
             return i + 1, files
         key, eq, value = args[i].partition('=')
         i += 1
-        if key in BOOLEAN_OPTIONS and not eq:
+        if not eq and (key in BOOLEAN_OPTIONS or (recognize_builtin_access and key == BUILTIN_ACCESS_OPTION)):
             continue
         is_env_file = key in ENV_FILE_OPTIONS and allow_env_files
         if key not in VALUE_OPTIONS and not is_env_file:
+            if key in ('-r', '--require', '--import'):
+                raise UnverifiedStartup(f'Node 入口前的 {key} 会预加载模块。请按 PID 核查加载来源。')
             kind = 'long' if key.startswith('--') else 'short'
             raise ValueError(f'unrecognized {kind} startup option')
         if not eq:
@@ -145,6 +150,51 @@ def launch_file(st, start):
     return stat.S_ISREG(st.st_mode) and max(st.st_ctime_ns, st.st_mtime_ns) <= start
 
 
+def ordinary_node_entry(script, start, scope):
+    """Verify a disjoint file entry, including an unchanged launcher symlink."""
+    resolved = script.resolve(strict=True)
+    if resolved.suffix not in ('.js', '.mjs', '.cjs') or any(
+            path.is_relative_to(root) for path in (script, resolved) for root in scope):
+        return None
+    target = resolved.stat()
+    if resolved == script:
+        return 'direct file' if stat.S_ISREG(target.st_mode) else None
+    if '..' in script.parts or not launch_file(target, start):
+        return None
+
+    # A launcher alias retargeted after exec says nothing about its original entry.
+    def identity(st):
+        return st.st_dev, st.st_ino, st.st_ctime_ns
+
+    parent = Path(script.anchor)
+    parts = deque(script.parts[1:])
+    links = {}
+    while parts:
+        component = parts.popleft()
+        if component == '..':
+            parent = parent.parent
+            continue
+        path = parent / component
+        if any(path.is_relative_to(root) for root in scope):
+            return None
+        info = path.lstat()
+        if not stat.S_ISLNK(info.st_mode):
+            parent = path
+            continue
+        if info.st_ctime_ns > start or path in links or len(links) >= 40:
+            return None
+        links[path] = identity(info)
+        destination = path.readlink()
+        if destination.is_absolute():
+            parent = Path(destination.anchor)
+        parts.extendleft(reversed(destination.parts[1:] if destination.is_absolute() else destination.parts))
+    if (links and parent == resolved and script.resolve(strict=True) == resolved
+            and all(identity(path.lstat()) == saved for path, saved in links.items())
+            and identity(resolved.stat()) == identity(target)):
+        return 'symlink verified at startup'
+    return None
+
+
 def node_options_kind(raw_options):
     if not raw_options:
         return 'empty'
@@ -161,8 +211,9 @@ def node_options_kind(raw_options):
     return 'unverified'
 
 
-def loader_categories(environment):
-    categories = {prefix for key, value in environment.items() if value and key not in ('NODE_ENV', 'NODE_OPTIONS')
+def loader_categories(environment, *, neutral_settings=()):
+    categories = {prefix for key, value in environment.items()
+                  if value and key not in ('NODE_ENV', 'NODE_OPTIONS') and key not in neutral_settings
                   for prefix in LOADER_PREFIXES if key.startswith(prefix)}
     if any(environment.get(key) for key in LOADER_SETTINGS):
         categories.add('OpenSSL')
@@ -554,20 +605,28 @@ def scan_processes(db, roots, known_tree, *web_settings):
         source_keys = {arg.partition('=')[0].replace('_', '-') for arg in args[1:]}
         source_option = bool(source_keys & EARLY_SOURCE_OPTIONS) or any(
             arg.startswith(('-r', '-e', '-p')) and not arg.startswith('--') for arg in args[1:])
+        # This setting selects HTTP(S) proxy behavior without selecting startup code.
+        neutral_settings = (HTTP_PROXY_SETTING,) if inherited.get(HTTP_PROXY_SETTING) in ('0', '1') else ()
         facts.update(targetDatabaseMarker=any(db in value for value in values),
                      targetPortMarker=any(PG_PORT in value for value in values),
                      targetPathMarker=any(str(root) in value for value in values for root in scope),
                      envFileFlag=bool(source_keys & ENV_FILE_OPTIONS), extraCodeSourceFlag=source_option,
                      nodeOptions=node_options_kind(inherited.get('NODE_OPTIONS', '')),
-                     loaderEnvironment=loader_categories(inherited))
+                     loaderEnvironment=loader_categories(inherited, neutral_settings=neutral_settings))
+        if neutral_settings:
+            facts['recognizedSettings'] = {HTTP_PROXY_SETTING: 'configures HTTP(S) proxy behavior'}
+        if inherited.get('NODE_PATH'):
+            facts['recognizedLoadingControls'] = {'NODE_PATH': 'adds module search directories'}
         if here is None or not canonical(here) or not here.is_dir():
             return False, 'Node 工作目录无法核实。请按 PID 核查 cwd。'
         facts['cwdOutsideTarget'] = not scoped(here)
         if not args or (args[0] != 'node' and not Path(args[0]).is_absolute()):
             return False, 'Node 的启动入口无法核实。请按 PID 核查启动命令。'
         try:
-            index, env_files = plain_node_options(args[1:], allow_env_files=True)
+            index, env_files = plain_node_options(args[1:], allow_env_files=True, recognize_builtin_access=True)
             script = Path(args[index + 1])
+        except UnverifiedStartup:
+            raise
         except ValueError as error:
             facts['startupOptions'] = str(error)
             return False, 'Node 启动参数无法确认为普通文件启动，入口前的选项可能改变代码来源。请按 PID 核查。'
@@ -575,19 +634,28 @@ def scan_processes(db, roots, known_tree, *web_settings):
             facts['startupOptions'] = 'entry missing'
             return False, 'Node 缺少可核实的普通文件入口。请按 PID 核查。'
         facts['startupOptions'] = 'recognized'
+        builtin_access = BUILTIN_ACCESS_OPTION in args[1:index + 1]
+        if builtin_access:
+            facts['recognizedOptions'] = {BUILTIN_ACCESS_OPTION: 'allows the entry to require built-in internal modules'}
         facts['entryForm'] = 'absolute' if script.is_absolute() else 'relative'
         if not script.is_absolute():
             script = here / script
         facts['entryOutsideTarget'] = not scoped(script)
+        if 'recognizedLoadingControls' in facts:
+            return False, 'Node 启动环境的 NODE_PATH 增加模块搜索目录。请按 PID 核查加载来源。'
         # Node can read env/config options even after an apparent script entry.
         if (not env_files and not source_option and facts['cwdOutsideTarget'] and facts['entryOutsideTarget']
-                and script.suffix in ('.js', '.mjs', '.cjs') and canonical(script) and script.is_file()
                 and not any(scoped_argument(arg, here) for arg in args[1:])
                 and not any(facts[key] for key in ('targetDatabaseMarker', 'targetPortMarker', 'targetPathMarker'))):
             if not targets_database(inherited.get('DATABASE_URL', ''), db):
+                entry = ordinary_node_entry(script, start, scope)
                 if facts['nodeOptions'] == 'unverified' or facts['loaderEnvironment']:
                     return False, 'Node 启动环境含无法核实作用的加载设置。请按 PID 核查运行时的启动环境。'
-                return True, '可读的普通 Node 启动未见目标库、5434、目标路径或额外代码来源。'
+                if entry:
+                    facts['ordinaryEntry'] = entry
+                    return True, '可读的普通 Node 启动未见目标库、5434、目标路径或额外代码来源。'
+        if builtin_access:
+            return False, 'Node 启用了内置模块访问，尚未核实其启动范围与恢复目标分离。'
         if Path(observed).resolve() != PINNED_NODE.resolve():
             return False, 'Node 使用其他运行时且无法凭可读的启动证据排除归属。请按 PID 核查。'
         if (script.suffix not in ('.js', '.mjs', '.cjs') or not canonical(script)

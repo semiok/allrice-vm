@@ -1686,6 +1686,71 @@ def observe_unix_socket(pid, file):
         self.check_recovery_scan(task, rows, 'Node with opaque loader environment', [runtime, script], self.home, False,
                                  executable=runtime, environment={'NODE_FIXTURE_SETTINGS': 'opaque'},
                                  reason='启动环境含无法核实作用的加载设置')
+        builtins = self.check_recovery_scan(task, rows, 'outside Node exposing built-in internals',
+                                            [runtime, '--expose-internals', script], self.home, True,
+                                            executable=runtime)
+        proxy = self.check_recovery_scan(task, rows, 'outside Node using the HTTP proxy switch',
+                                         [runtime, script], self.home, True, executable=runtime,
+                                         environment={'NODE_USE_ENV_PROXY': '1'})
+        self.assertIn('--expose-internals', builtins['evidence']['startup']['recognizedOptions'])
+        self.assertIn('NODE_USE_ENV_PROXY', proxy['evidence']['startup']['recognizedSettings'])
+
+        alias_directory = os.path.join(self.home, 'installed-launcher')
+        command_directory = os.path.join(os.path.dirname(script), 'commands')
+        os.mkdir(command_directory)
+        launcher = os.path.join(command_directory, 'fixture-cli')
+        os.symlink(os.path.dirname(script), alias_directory)
+        os.symlink('../ordinary.mjs', launcher)
+        for name, args in (
+            ('installed launcher directory', [runtime, '--expose-internals', os.path.join(alias_directory, 'ordinary.mjs')]),
+            ('extensionless command symlink', [runtime, launcher]),
+        ):
+            with self.subTest(name=name):
+                observed_launch = self.check_recovery_scan(task, rows, name, args, self.home, True, executable=runtime)
+                self.assertEqual(observed_launch['evidence']['startup']['ordinaryEntry'], 'symlink verified at startup')
+
+        target_entry = os.path.join(instance, 'target.mjs')
+        write(target_entry, '// inert target fixture\n')
+        target_link = os.path.join(command_directory, 'target-cli')
+        inside_target_link = os.path.join(instance, 'link-to-outside')
+        crossing_link = os.path.join(command_directory, 'crossing-cli')
+        os.symlink(target_entry, target_link)
+        os.symlink(script, inside_target_link)
+        os.symlink(inside_target_link, crossing_link)
+        for name, path, started in (
+            ('outside launcher resolves into the target', target_link, None),
+            ('outside launcher traverses the target', crossing_link, None),
+            ('outside launcher changed after exec', launcher, os.lstat(launcher).st_ctime_ns - 1),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, [runtime, path], self.home, False,
+                                         executable=runtime, started=started)
+
+        preload = self.check_recovery_scan(task, rows, 'entry uses an explicit preload',
+                                          [runtime, '--expose-internals', '--require', script, script], self.home,
+                                          False, executable=runtime, reason='入口前的 --require 会预加载模块', secret=script)
+        self.assertTrue(preload['evidence']['startup']['extraCodeSourceFlag'])
+        search_path = os.path.join(self.home, 'fixture-unreported-search-path')
+        module_path = self.check_recovery_scan(task, rows, 'proxy switch with a module search path', [runtime, script],
+                                              self.home, False, executable=runtime, reason='NODE_PATH 增加模块搜索目录',
+                                              environment={'NODE_USE_ENV_PROXY': '1', 'NODE_PATH': search_path}, secret=search_path)
+        self.assertIn('NODE_PATH', module_path['evidence']['startup']['recognizedLoadingControls'])
+        for name, args, cwd, env in (
+            ('built-in access with target PG port', [runtime, '--expose-internals', script], self.home, {'PGPORT': '5434'}),
+            ('built-in access from target cwd', [runtime, '--expose-internals', script], instance, {}),
+            ('built-in access with an env file', [runtime, '--expose-internals', '--env-file=' + env_file, script],
+             self.home, {}),
+            ('built-in access in opaque inherited options', [runtime, script], self.home,
+             {'NODE_OPTIONS': '--expose-internals'}),
+            ('proxy switch in an unverified form', [runtime, script], self.home,
+             {'NODE_USE_ENV_PROXY': 'fixture-unsupported-proxy-setting'}),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, False, executable=runtime, environment=env,
+                                         secret='fixture-unsupported-proxy-setting')
+        self.check_recovery_scan(task, rows, 'startup data unavailable for a Node candidate',
+                                 [runtime, '--expose-internals', script], self.home, False,
+                                 executable=runtime, observed=False, reason='无法读取进程启动环境')
 
     def test_schedule_recover_refuses_a_visible_worker_database_session(self):
         task = 'recover-worker-session'
@@ -1759,6 +1824,7 @@ def observe_unix_socket(pid, file):
         if secret:
             self.assertNotIn(secret, p.stdout + p.stderr)
             self.assertNotIn(secret, json.dumps(report))
+        return observed if report['status'] == 'complete' else None
 
     def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
         worker = self.plist('worker')
