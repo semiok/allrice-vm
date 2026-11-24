@@ -16,6 +16,7 @@ import {
   hostFixture,
   issue,
   deferred,
+  summary,
 } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import { createDEntryNativeGateway } from '../../../web/server/d-entry-native.mjs';
 import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
@@ -24,7 +25,7 @@ import { createDEntryPrincipalControl } from './principal-control.js';
 import { createDEntryPageRpc } from './principal-page-rpc.js';
 import { createDEntryPageMux } from './principal-profile-mux.js';
 import { createDEntryPageRequests } from './principal-requests.js';
-import { createDEntryProfile } from './profile.js';
+import { createDEntryProfile, PendingPublication } from './profile.js';
 import { holdReleasedProfile } from './released-profile.js';
 import {
   type DEntryPageOpenedSchema,
@@ -35,8 +36,17 @@ import {
 
 const closes: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
-  for (const close of closes.splice(0).reverse()) await close();
+  const failures: unknown[] = [];
+  for (const close of closes.splice(0).reverse()) {
+    try {
+      await close();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
   vi.unstubAllEnvs();
+  if (failures.length)
+    throw new AggregateError(failures, 'Fixture close failed');
 });
 const sessionToken = 'original_session_token_for_page';
 const otherToken = 'different_session_of_same_person';
@@ -86,7 +96,10 @@ async function fixture(release?: ProfileProof) {
     carrier: service.signal,
     cleanupTimeoutMs: 3000,
   });
-  closes.push(() => control.close());
+  let controlCloseChecked = false;
+  closes.push(() =>
+    controlCloseChecked ? control.drainLocal() : control.close(),
+  );
   vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) =>
     control.acquire(input, active),
   );
@@ -296,6 +309,10 @@ async function fixture(release?: ProfileProof) {
     historyIdentity,
     completedProfiles,
     closeProfile: profile.close,
+    async checkUnknownControlClose() {
+      controlCloseChecked = true;
+      await expect(control.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');
+    },
     worker,
     web,
     origin,
@@ -613,6 +630,174 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
 );
 
 it(
+  'rejects the second baseline when a native grant update reaches the relay during final verification',
+  { timeout: 30_000 },
+  async () => {
+    const release = await buildProfileFixture();
+    const f = await fixture(release);
+    const page = await open(f);
+    const terminal = deferred<ServerResponse>();
+    const checking = deferred();
+    const allowCheck = deferred();
+    const updated = deferred();
+    closes.push(async () => allowCheck.resolve());
+    const wire = f.host.host.typertGateway.wireStream;
+    const openNative = wire.open.bind(wire);
+    let access = 0;
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await openNative(...args);
+      if (args[0] !== 'remoteAccess/follow' || ++access !== 2) return source;
+      return {
+        async *[Symbol.asyncIterator]() {
+          let first = true;
+          for await (const item of source) {
+            if (first) {
+              expect(item).toMatchObject({ type: 'baseline', owner: false });
+              expect(JSON.stringify(item)).toContain('"id":"child"');
+              release.beforeGraphRead = async () => {
+                release.beforeGraphRead = undefined;
+                checking.resolve();
+                await allowCheck.promise;
+              };
+              first = false;
+            } else updated.resolve();
+            yield item;
+          }
+        },
+      };
+    });
+    f.worker.once('request', (_request, response) =>
+      terminal.resolve(response),
+    );
+    const result = f.publish('bootstrap', page.scopeId);
+    void result.catch(() => {});
+    try {
+      await checking.promise;
+      const nativeChild = summary('child', 'root');
+      f.host.catalog.items = f.host.catalog.items.filter(
+        (row) => row.sessionId !== nativeChild.sessionId,
+      );
+      f.host.host.emit('api-session/removed', nativeChild);
+      await updated.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect((await terminal.promise).headersSent).toBe(false);
+      expect(access).toBe(2);
+    } finally {
+      allowCheck.resolve();
+    }
+    const refused = await result;
+    expect(refused.status).toBe(404);
+    expect(await refused.text()).not.toContain('"id":"child"');
+    const retry = await f.publish('bootstrap', page.scopeId);
+    expect(retry.status).toBe(200);
+    expect(await retry.text()).not.toContain('"id":"child"');
+  },
+);
+
+it.each(['waiting to read', 'waiting for a newer projection'] as const)(
+  'joins the finite request while it is %s and unrelated catalog I/O remains held',
+  { timeout: 30_000 },
+  async (mode) => {
+    const f = await fixture(await buildProfileFixture());
+    const page = await open(f);
+    const reading = deferred<AbortSignal>();
+    const finish = deferred();
+    closes.push(async () => finish.resolve());
+    let calls = 0;
+    f.host.catalog.beforeList = async (signal) => {
+      const call = ++calls;
+      if (mode === 'waiting for a newer projection' && call === 1) {
+        // Fence this follower with a newer page-owned refresh while its own
+        // read is still the only one in progress.
+        f.host.host.emit('api-session/added', summary('child', 'root'));
+      }
+      if (call !== (mode === 'waiting to read' ? 1 : 2)) return;
+      reading.resolve(signal);
+      await finish.promise;
+    };
+    const predecessor =
+      mode === 'waiting to read' ? f.invoke(page.scopeId) : undefined;
+    void predecessor?.catch(() => {});
+    if (predecessor) await reading.promise;
+    const responseReady = deferred<ServerResponse>();
+    f.worker.once('request', (_request, response) =>
+      responseReady.resolve(response),
+    );
+    const client = get(f.profileUrl('bootstrap', page.scopeId), {
+      headers: { authorization: 'Bearer ' + sessionToken },
+    });
+    client.on('error', () => {});
+    closes.push(async () => client.destroy());
+    try {
+      const nativeSignal = await reading.promise;
+      const scope = f.host.host.allricePrincipal.scopes.get(page.scopeId);
+      await expect.poll(() => scope?.children.size).toBe(1);
+      const callsBeforeCancel = calls;
+      client.destroy();
+      const response = await responseReady.promise;
+      await expect.poll(() => f.completedProfiles.has(response)).toBe(true);
+      expect(nativeSignal.aborted).toBe(false);
+      expect(calls).toBe(callsBeforeCancel);
+      expect(scope?.children.size).toBe(0);
+    } finally {
+      finish.resolve();
+    }
+    if (predecessor) expect((await predecessor).status).toBe(200);
+    const retry = await f.publish('bootstrap', page.scopeId);
+    expect(retry.status).toBe(200);
+    await retry.arrayBuffer();
+  },
+);
+
+it(
+  'fences bootstrap and later borrows when the initial native follow cannot confirm its close',
+  { timeout: 30_000 },
+  async () => {
+    const f = await fixture(await buildProfileFixture());
+    const page = await open(f);
+    const neighbor = await open(f);
+    const initial = deferred();
+    const failed = deferred<unknown>();
+    const failure = Error('initial native follow return failed');
+    const wire = f.host.host.typertGateway.wireStream;
+    const openNative = wire.open.bind(wire);
+    let access = 0;
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await openNative(...args);
+      if (args[0] !== 'remoteAccess/follow' || ++access !== 1) return source;
+      return {
+        [Symbol.asyncIterator]() {
+          const underlying = source[Symbol.asyncIterator]();
+          return {
+            async next() {
+              const item = await underlying.next();
+              if (!item.done) initial.resolve();
+              return item;
+            },
+            async return() {
+              await underlying.return?.();
+              failed.resolve(failure);
+              throw failure;
+            },
+          };
+        },
+      };
+    });
+    const result = f.publish('bootstrap', page.scopeId);
+    await initial.promise;
+    expect(await failed.promise).toBe(failure);
+    const denied = await result;
+    expect(denied.status).toBe(404);
+    expect(await denied.text()).toBe('');
+    expect((await f.publish('bootstrap', page.scopeId)).status).toBe(404);
+    expect((await f.invoke(page.scopeId)).status).toBe(404);
+    expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+    expect(access).toBe(1);
+    await f.checkUnknownControlClose();
+  },
+);
+
+it(
   'unregisters one of two actual waiters while keeping their shared page proof alive',
   { timeout: 30_000 },
   async () => {
@@ -628,6 +813,7 @@ it(
     };
     const f = await fixture(release);
     const page = await open(f);
+    const pendingPublications = vi.spyOn(PendingPublication.prototype, 'wait');
     const cancel = new AbortController();
     const first = f.publish(
       'bootstrap',
@@ -645,14 +831,21 @@ it(
       const [one, two] = f.profileBorrows.mock.calls.map(([signal]) => signal);
       await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(1);
       await expect.poll(() => getEventListeners(two!, 'abort').length).toBe(1);
+      const proof = pendingPublications.mock.contexts[0] as PendingPublication;
+      expect(pendingPublications.mock.contexts).toEqual([proof, proof]);
+      const [firstWaiter, secondWaiter] = [...proof['waiters']];
+      expect(firstWaiter).toBeTypeOf('function');
+      expect(secondWaiter).toBeTypeOf('function');
       cancel.abort(Error('the first wire left'));
       await expect(first).rejects.toThrow('the first wire left');
       await expect.poll(() => getEventListeners(one!, 'abort').length).toBe(0);
       expect(getEventListeners(two!, 'abort')).toHaveLength(1);
+      expect([...proof['waiters']]).toEqual([secondWaiter]);
       expect(sharedSignal.aborted).toBe(false);
       expect(reads).toBe(1);
     } finally {
       finish.resolve();
+      pendingPublications.mockRestore();
     }
     const result = await other;
     expect(result.status).toBe(200);

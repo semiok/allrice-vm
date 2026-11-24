@@ -284,7 +284,7 @@ export function createDEntryPrincipalControl(
                 );
                 return task;
               },
-              stream(call, active) {
+              stream(call, active, observed) {
                 business.throwIfAborted();
                 active.throwIfAborted();
                 if (call.scopeId !== issue.scopeId)
@@ -292,6 +292,7 @@ export function createDEntryPrincipalControl(
                 const handle = TYPERT_REMOTE.methods[
                   'allricePrincipal/streamScoped'
                 ].invoke(root.remote, { call }, input.carrier);
+                const current = AbortSignal.any([business, active]);
                 const child = new Relay(
                   handle,
                   issue.scopeId,
@@ -299,13 +300,16 @@ export function createDEntryPrincipalControl(
                   TYPERT_REMOTE.methods[
                     'allricePrincipal/streamScoped'
                   ].result.create(),
-                  () => true,
+                  (frame) => {
+                    if (!current.aborted && frame.type === 'item')
+                      observed?.(frame);
+                    return true;
+                  },
                 );
                 children.add(child);
                 const cancelled = () => {
                   void child.close().catch(() => {});
                 };
-                const current = AbortSignal.any([business, active]);
                 current.addEventListener('abort', cancelled, { once: true });
                 void child.done.then(
                   () => {

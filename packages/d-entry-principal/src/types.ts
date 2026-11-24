@@ -118,6 +118,9 @@ export interface DEntryPrincipalControlScope {
   stream(
     call: DEntryScopedStreamCall,
     signal: AbortSignal,
+    observed?: (
+      frame: Extract<DEntryScopedStreamFrame, { type: 'item' }>,
+    ) => void,
   ): AsyncIterable<DEntryScopedStreamFrame & { type: 'item' }>;
   close(): Promise<void>;
 }

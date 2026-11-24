@@ -40,17 +40,44 @@ type Publication = {
   events: boolean;
 };
 type PublicationResult = { value: Publication } | { error: unknown };
-type PublicationWait = {
-  result?: PublicationResult;
-  waiters: Set<(result: PublicationResult) => void>;
-};
+export class PendingPublication {
+  private result?: PublicationResult;
+  private readonly waiters = new Set<(result: PublicationResult) => void>();
+
+  finish(result: PublicationResult) {
+    this.result = result;
+    for (const receive of this.waiters) receive(result);
+    this.waiters.clear();
+  }
+
+  async wait(caller: AbortSignal) {
+    caller.throwIfAborted();
+    return (
+      this.result ??
+      new Promise<PublicationResult>((resolve, reject) => {
+        const receive = (value: PublicationResult) => {
+          caller.removeEventListener('abort', stop);
+          resolve(value);
+        };
+        const stop = () => {
+          caller.removeEventListener('abort', stop);
+          this.waiters.delete(receive);
+          reject(caller.reason);
+        };
+        this.waiters.add(receive);
+        caller.addEventListener('abort', stop, { once: true });
+        if (caller.aborted) stop();
+      })
+    );
+  }
+}
 
 export function createDEntryProfile(
   pages: ReturnType<typeof createDEntryPageRequests>,
   serviceSignal: AbortSignal,
   trustedReleaseDirectory?: string,
 ) {
-  const publications = new WeakMap<DEntryPageHandle, PublicationWait>();
+  const publications = new WeakMap<DEntryPageHandle, PendingPublication>();
   const connections = new WeakMap<IncomingMessage['socket'], AbortSignal>();
   const pending = new Set<Promise<unknown>>();
   function track(work: Promise<unknown>) {
@@ -79,7 +106,7 @@ export function createDEntryProfile(
     if (!page.fixedProfile) throw new DEntryNativeUnavailable();
     let held = publications.get(page);
     if (!held) {
-      const opening: PublicationWait = { waiters: new Set() };
+      const opening = new PendingPublication();
       const source = page.fixedProfile;
       const revoked = () => page.invalidate(source.revoked.reason);
       const shared = AbortSignal.any([page.signal, serviceLifetime]);
@@ -109,41 +136,20 @@ export function createDEntryProfile(
       });
       publications.set(page, opening);
       track(proof);
-      const finish = (result: PublicationResult) => {
-        opening.result = result;
-        for (const receive of opening.waiters) receive(result);
-        opening.waiters.clear();
-      };
       void proof.then(
         (release) =>
-          finish({
+          opening.finish({
             value: { release, bootstrap: 'available', events: false },
           }),
         (error) => {
           publications.delete(page);
           if (!shared.aborted) page.invalidate(error);
-          finish({ error });
+          opening.finish({ error });
         },
       );
       held = opening;
     }
-    const wait = held;
-    const result =
-      wait.result ??
-      (await new Promise<PublicationResult>((resolve, reject) => {
-        const receive = (value: PublicationResult) => {
-          caller.removeEventListener('abort', stop);
-          resolve(value);
-        };
-        const stop = () => {
-          caller.removeEventListener('abort', stop);
-          wait.waiters.delete(receive);
-          reject(caller.reason);
-        };
-        wait.waiters.add(receive);
-        caller.addEventListener('abort', stop, { once: true });
-        if (caller.aborted) stop();
-      }));
+    const result = await held.wait(caller);
     caller.throwIfAborted();
     if ('error' in result) throw result.error;
     return result.value;
@@ -260,8 +266,10 @@ export function createDEntryProfile(
           else write();
           return await wire;
         } catch (error) {
-          abort();
-          await wire;
+          if (response.headersSent) {
+            abort();
+            await wire;
+          } else closed();
           throw error;
         } finally {
           active.removeEventListener('abort', abort);
@@ -273,10 +281,12 @@ export function createDEntryProfile(
         write: () => void,
         status = 200,
         verify?: () => Promise<void>,
+        beforeHead?: () => void,
       ) {
         return writeOwned(
           active,
           () => {
+            beforeHead?.();
             response.writeHead(status, {
               'cache-control': 'private, no-store',
               ...headers,
@@ -398,7 +408,9 @@ export function createDEntryProfile(
                 await busy(active);
                 return;
               }
-              const followAccess = () =>
+              const followAccess = (
+                observed?: Parameters<DEntryPageHandle['scope']['stream']>[2],
+              ) =>
                 page.scope
                   .stream(
                     {
@@ -407,6 +419,7 @@ export function createDEntryProfile(
                       args: {},
                     },
                     active,
+                    observed,
                   )
                   [Symbol.asyncIterator]();
               async function readBaseline(
@@ -427,6 +440,8 @@ export function createDEntryProfile(
               let latestAccess: ReturnType<typeof followAccess> | undefined;
               try {
                 let body: string;
+                let firstItem = true;
+                let superseded = false;
                 const sent = await send(
                   active,
                   { 'content-type': 'application/json' },
@@ -439,11 +454,17 @@ export function createDEntryProfile(
                       await initialAccess.return?.().catch(() => {});
                       throw error;
                     });
-                    await initialAccess.return?.();
+                    await initialAccess.return?.().catch((error) => {
+                      page.invalidate(error);
+                      throw error;
+                    });
                     // Closing the initial native reader can block while its
                     // grants change. Read from the same Peer after that join.
                     // Keep this reader owned through the actual response.
-                    latestAccess = followAccess();
+                    latestAccess = followAccess(() => {
+                      if (firstItem) firstItem = false;
+                      else superseded = true;
+                    });
                     const baseline = await readBaseline(latestAccess);
                     await verify();
                     body = JSON.stringify(
@@ -462,6 +483,9 @@ export function createDEntryProfile(
                         ],
                       }),
                     );
+                  },
+                  () => {
+                    if (superseded) throw new DataAccessError('not_found');
                   },
                 );
                 if (sent) held.bootstrap = 'sent';

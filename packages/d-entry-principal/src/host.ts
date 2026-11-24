@@ -103,6 +103,49 @@ async function commands(input: AsyncIterator<CloseCommand>, stop: () => void) {
     throw Error('PRINCIPAL_CLOSE_INVALID');
   stop();
 }
+type ReadCompletion = { ok: true } | { ok: false; error: unknown };
+type ReadWait = {
+  outcome?: ReadCompletion;
+  waiters: Set<(outcome: ReadCompletion) => void>;
+};
+const sharedReads = new WeakMap<Promise<void>, ReadWait>();
+async function waitForRead(task: Promise<void>, signal: AbortSignal) {
+  signal.throwIfAborted();
+  let state = sharedReads.get(task);
+  if (!state) {
+    const next: ReadWait = { waiters: new Set() };
+    sharedReads.set(task, next);
+    const finish = (outcome: ReadCompletion) => {
+      next.outcome = outcome;
+      for (const listener of next.waiters) listener(outcome);
+      next.waiters.clear();
+    };
+    void task.then(
+      () => finish({ ok: true }),
+      (error) => finish({ ok: false, error }),
+    );
+    state = next;
+  }
+  const holding = state;
+  const outcome =
+    holding.outcome ??
+    (await new Promise<ReadCompletion>((resolve, reject) => {
+      const receive = (result: ReadCompletion) => {
+        signal.removeEventListener('abort', cancel);
+        resolve(result);
+      };
+      const cancel = () => {
+        holding.waiters.delete(receive);
+        signal.removeEventListener('abort', cancel);
+        reject(signal.reason);
+      };
+      holding.waiters.add(receive);
+      signal.addEventListener('abort', cancel, { once: true });
+      if (signal.aborted) cancel();
+    }));
+  if (!outcome.ok) throw outcome.error;
+  signal.throwIfAborted();
+}
 function assertContribution(
   value: unknown,
 ): asserts value is TypertContribution {
@@ -139,7 +182,8 @@ class Scope implements Projection {
   private closing?: Promise<void>;
   private detach = () => {};
   private unregister?: TypertDisposer;
-  private catalogQueue = Promise.resolve();
+  private readonly catalogQueue = new Set<() => void>();
+  private catalogRunning = false;
   private refreshQueue = Promise.resolve();
   private refreshGeneration = 0;
   constructor(
@@ -210,6 +254,32 @@ class Scope implements Projection {
     if (!peer || this.abort.signal.aborted) throw closed();
     return peer;
   }
+  private readInOrder(signal: AbortSignal, read: () => Promise<void>) {
+    return new Promise<void>((resolve, reject) => {
+      signal.throwIfAborted();
+      const cancel = () => {
+        signal.removeEventListener('abort', cancel);
+        this.catalogQueue.delete(start);
+        reject(signal.reason);
+      };
+      const start = () => {
+        this.catalogQueue.delete(start);
+        signal.removeEventListener('abort', cancel);
+        this.catalogRunning = true;
+        void Promise.resolve()
+          .then(read)
+          .then(resolve, reject)
+          .finally(() => {
+            this.catalogRunning = false;
+            this.catalogQueue.values().next().value?.();
+          });
+      };
+      if (this.catalogRunning) {
+        this.catalogQueue.add(start);
+        signal.addEventListener('abort', cancel, { once: true });
+      } else start();
+    });
+  }
   refresh(signal = this.abort.signal) {
     const pageRefresh = signal === this.abort.signal;
     if (pageRefresh) {
@@ -217,7 +287,7 @@ class Scope implements Projection {
       this.publish([]);
     }
     const generation = this.refreshGeneration;
-    const task = this.catalogQueue.then(async () => {
+    const task = this.readInOrder(signal, async () => {
       signal.throwIfAborted();
       try {
         const catalog = await this.ctx.sessionController.list({}, signal);
@@ -237,7 +307,6 @@ class Scope implements Projection {
         throw error;
       }
     });
-    this.catalogQueue = task.catch(() => undefined);
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
   }
@@ -246,12 +315,14 @@ class Scope implements Projection {
     this.active = bindings.length > 0;
     this.ctx.remoteAccess.invalidate();
   }
-  async current<T>(dispatch: () => Promise<T>): Promise<T> {
-    await this.ready;
+  async current<T>(
+    dispatch: () => Promise<T>,
+    signal = this.abort.signal,
+  ): Promise<T> {
+    await waitForRead(this.ready, signal);
     while (true) {
       const pending = this.refreshQueue;
-      await pending;
-      this.abort.signal.throwIfAborted();
+      await waitForRead(pending, signal);
       if (pending !== this.refreshQueue) continue;
       if (!this.active) throw closed();
       // No await between the stable projection and the native guard/dispatch.
@@ -576,8 +647,9 @@ class PrincipalService extends TypertRemoteService {
     endpoint: string,
     args: Record<string, unknown>,
     dispatch: () => Promise<T>,
+    signal = scope.abort.signal,
   ) {
-    await scope.refresh();
+    await scope.refresh(signal);
     const request = object.parse(args.request);
     const address =
       request.address === undefined ? undefined : object.parse(request.address);
@@ -591,10 +663,7 @@ class PrincipalService extends TypertRemoteService {
             : address.childSessionId
           : request.sessionId,
       );
-    const catalog = await this.ctx.sessionController.list(
-      {},
-      scope.abort.signal,
-    );
+    const catalog = await this.ctx.sessionController.list({}, signal);
     return scope.current(() => {
       const item = catalog.items.find(
         (row) => String(row.sessionId) === sessionId,
@@ -621,7 +690,7 @@ class PrincipalService extends TypertRemoteService {
       )
         throw Error('PRINCIPAL_WRITE_DENIED');
       return dispatch();
-    });
+    }, signal);
   }
   @Remote
   async invokeScoped(
@@ -770,8 +839,8 @@ class PrincipalService extends TypertRemoteService {
         );
       };
       const values = nativeArgs
-        ? await this.native(scope, 'session/follow', nativeArgs, open)
-        : await scope.current(open);
+        ? await this.native(scope, 'session/follow', nativeArgs, open, active)
+        : await scope.current(open, active);
       iterator = values[Symbol.asyncIterator]();
     });
     const child = {
