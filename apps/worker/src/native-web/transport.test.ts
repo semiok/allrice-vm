@@ -1,4 +1,4 @@
-import { Agent, ClientRequest, createServer } from 'node:http';
+import { Agent, ClientRequest, createServer, IncomingMessage } from 'node:http';
 import type { ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import type { Duplex } from 'node:stream';
@@ -14,6 +14,40 @@ function latch<T = void>() {
     resolve = done;
   });
   return { promise, resolve };
+}
+function watchClient(
+  inspect: (
+    request: ClientRequest,
+    event: string | symbol,
+    args: unknown[],
+  ) => void,
+) {
+  const emit = ClientRequest.prototype.emit;
+  vi.spyOn(ClientRequest.prototype, 'emit').mockImplementation(function (
+    this: ClientRequest,
+    event: string | symbol,
+    ...args: unknown[]
+  ) {
+    inspect(this, event, args);
+    return Reflect.apply(emit, this, [event, ...args]) as boolean;
+  });
+}
+function parsedPrefix(size: number) {
+  const parsed = latch<number>();
+  return {
+    observe(response: IncomingMessage) {
+      let bytes = 0;
+      const account = (chunk: Buffer) => {
+        bytes += chunk.byteLength;
+        if (bytes >= size) {
+          response.off('data', account);
+          parsed.resolve(bytes);
+        }
+      };
+      response.on('data', account);
+    },
+    promise: parsed.promise,
+  };
 }
 afterEach(async () => {
   const results = await Promise.allSettled(
@@ -87,6 +121,11 @@ it('bounds actual streamed profile bytes and joins the socket of an oversized re
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const assigned = latch<Duplex>();
+  const prefix = parsedPrefix(3);
+  watchClient((_call, event, [response]) => {
+    if (event === 'response' && response instanceof IncomingMessage)
+      prefix.observe(response);
+  });
   const create = Agent.prototype.createConnection;
   vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
     this: Agent,
@@ -120,26 +159,24 @@ it('bounds actual streamed profile bytes and joins the socket of an oversized re
   );
   const socket = await assigned.promise;
   const cancelling = latch();
+  let destroyStarted = false;
   const close = socket.destroy.bind(socket);
   vi.spyOn(socket, 'destroy').mockImplementation((error) => {
+    destroyStarted = true;
     cancelling.resolve();
     void release.promise.then(() => close(error));
     return socket;
   });
   const closed = once(socket, 'close');
   const response = await reply.promise;
-  const firstChunk = latch();
-  const sawFirst = (raw: Buffer) => {
-    if (raw.toString().includes('abc')) firstChunk.resolve();
-  };
-  socket.on('data', sawFirst);
   response.write('abc');
-  await firstChunk.promise;
-  socket.off('data', sawFirst);
+  expect(await prefix.promise).toBe(3);
+  expect(destroyStarted).toBe(false);
   expect(settled).toBe(false);
   expect(socket.closed).toBe(false);
   response.write('d');
   await cancelling.promise;
+  expect(destroyStarted).toBe(true);
   expect(response.writableEnded).toBe(false);
   expect(settled).toBe(false);
   expect(socket.closed).toBe(false);
@@ -173,81 +210,106 @@ it('rejects contradictory profile length headers without waiting for body bytes'
   expect(response.writableEnded).toBe(false);
 });
 
-it('joins its own created socket when canceled before ClientRequest assigns it', async () => {
-  const server = createServer((_request, response) => response.end('abc'));
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-  const caller = new AbortController();
-  const transport = nativeWebTransport(
-    origin,
-    new AbortController().signal,
-    () => {},
-  );
-  const cancelling = latch();
-  const release = latch();
-  const physicallyClosed = latch();
-  cleanup.push(async () => {
+for (const otherStarted of [false, true])
+  it(`joins its own created socket before assignment, with the other reader ${otherStarted ? 'already pending' : 'starting later'}`, async () => {
+    const otherResponse = latch<ServerResponse>();
+    const server = createServer((request, response) => {
+      if (otherStarted && request.url === '/other') {
+        response.write('a');
+        otherResponse.resolve(response);
+      } else response.end('abc');
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const caller = new AbortController();
+    const transport = nativeWebTransport(
+      origin,
+      new AbortController().signal,
+      () => {},
+    );
+    const cancelling = latch();
+    const release = latch();
+    const physicallyClosed = latch();
+    cleanup.push(async () => {
+      release.resolve();
+      await transport.close();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    });
+    let assigned = false;
+    const prefix = parsedPrefix(1);
+    watchClient((call, event, [response]) => {
+      if (call.path === '/before-assignment' && event === 'socket')
+        assigned = true;
+      if (
+        call.path === '/other' &&
+        event === 'response' &&
+        response instanceof IncomingMessage
+      )
+        prefix.observe(response);
+    });
+    let arm = false;
+    const reason = Error('stopped after physical creation, before assignment');
+    const create = Agent.prototype.createConnection;
+    vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
+      this: Agent,
+      ...args: Parameters<Agent['createConnection']>
+    ) {
+      const socket = create.apply(this, args);
+      if (socket && arm) {
+        arm = false;
+        const destroy = socket.destroy.bind(socket);
+        socket.once('close', () => physicallyClosed.resolve());
+        vi.spyOn(socket, 'destroy').mockImplementation((error) => {
+          cancelling.resolve();
+          void release.promise.then(() => destroy(error));
+          return socket;
+        });
+        caller.abort(reason);
+      }
+      return socket;
+    });
+    const readOther = () =>
+      transport.readExact(
+        new URL('/other', origin),
+        3,
+        new AbortController().signal,
+      );
+    const earlier = otherStarted ? readOther() : undefined;
+    let earlierSettled = false;
+    void earlier?.then(
+      () => (earlierSettled = true),
+      () => (earlierSettled = true),
+    );
+    if (earlier) expect(await prefix.promise).toBe(1);
+    arm = true;
+    const cancelled = transport.readExact(
+      new URL('/before-assignment', origin),
+      3,
+      caller.signal,
+    );
+    let settled = false;
+    void cancelled.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    await cancelling.promise;
+    expect(assigned).toBe(false);
+    if (!earlier) expect(Buffer.from(await readOther()).toString()).toBe('abc');
+    expect(settled).toBe(false);
     release.resolve();
-    await transport.close();
-    server.closeAllConnections();
-    await new Promise<void>((done) => server.close(() => done()));
-  });
-  let assigned = false;
-  const emit = ClientRequest.prototype.emit;
-  vi.spyOn(ClientRequest.prototype, 'emit').mockImplementation(function (
-    this: ClientRequest,
-    event: string | symbol,
-    ...args: unknown[]
-  ) {
-    if (this.path === '/before-assignment' && event === 'socket')
-      assigned = true;
-    return Reflect.apply(emit, this, [event, ...args]) as boolean;
-  });
-  let first = true;
-  const reason = Error('stopped after physical creation, before assignment');
-  const create = Agent.prototype.createConnection;
-  vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
-    this: Agent,
-    ...args: Parameters<Agent['createConnection']>
-  ) {
-    const socket = create.apply(this, args);
-    if (socket && first) {
-      first = false;
-      const destroy = socket.destroy.bind(socket);
-      socket.once('close', () => physicallyClosed.resolve());
-      vi.spyOn(socket, 'destroy').mockImplementation((error) => {
-        cancelling.resolve();
-        void release.promise.then(() => destroy(error));
-        return socket;
-      });
-      caller.abort(reason);
+    await physicallyClosed.promise;
+    await expect(cancelled).rejects.toBe(reason);
+    if (earlier) {
+      const response = await otherResponse.promise;
+      expect(earlierSettled).toBe(false);
+      expect(response.writableEnded).toBe(false);
+      expect(response.destroyed).toBe(false);
+      response.end('bc');
+      expect(Buffer.from(await earlier).toString()).toBe('abc');
     }
-    return socket;
   });
-  const cancelled = transport.readExact(
-    new URL('/before-assignment', origin),
-    3,
-    caller.signal,
-  );
-  let settled = false;
-  void cancelled.then(
-    () => (settled = true),
-    () => (settled = true),
-  );
-  await cancelling.promise;
-  expect(assigned).toBe(false);
-  const independent = await transport.readExact(
-    new URL('/other', origin),
-    3,
-    new AbortController().signal,
-  );
-  expect(Buffer.from(independent).toString()).toBe('abc');
-  expect(settled).toBe(false);
-  release.resolve();
-  await physicallyClosed.promise;
-  await expect(cancelled).rejects.toBe(reason);
-});
 
 it('rejects an actual short body and joins a caller-canceled bounded reader with its original reason', async () => {
   const waiting = latch();
