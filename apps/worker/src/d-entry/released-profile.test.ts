@@ -252,6 +252,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
     const artifactPath = join(root, 'guest-auth.json');
     const installOwner = (started?: () => void) =>
       local.host.plugin({
+        inject: ['allricePrincipal', 'connection'],
         apply(ctx: Context) {
           const loading = owner.apply(
             {
