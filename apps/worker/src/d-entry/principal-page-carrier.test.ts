@@ -1,4 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { on, once } from 'node:events';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -15,6 +20,11 @@ import { createDEntryPrincipalControl } from './principal-control.js';
 import { createDEntryPageRpc } from './principal-page-rpc.js';
 import { createDEntryPageMux } from './principal-profile-mux.js';
 import { createDEntryPageRequests } from './principal-requests.js';
+import { createDEntryProfile } from './profile.js';
+import {
+  DEntryProfileBootstrapSchema,
+  DEntryProfileGraphSchema,
+} from '@allrice/contracts';
 
 const closes: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
@@ -24,7 +34,7 @@ afterEach(async () => {
 const sessionToken = 'original_session_token_for_page';
 const otherToken = 'different_session_of_same_person';
 
-async function fixture() {
+async function fixture(release?: { directory: string; graph: unknown }) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
   const host = await hostFixture({
@@ -52,6 +62,18 @@ async function fixture() {
     rootBindingRef: selected.root.rootBindingRef,
     vmId: f.binding.vmId,
   }));
+  const profileSource = new AbortController();
+  if (release)
+    f.deps.owners.resolve.mockResolvedValue({
+      ...f.owner,
+      fixedProfile: {
+        revoked: profileSource.signal,
+        async readImmutableGraph(signal) {
+          signal.throwIfAborted();
+          return release.graph;
+        },
+      },
+    });
   const otherSession = { ...f.context, sessionId: randomUUID() };
   const authenticate = vi.fn(async (token: string) =>
     token === sessionToken
@@ -71,7 +93,13 @@ async function fixture() {
   });
   const mux = createDEntryPageMux(pages, service.signal);
   const rpc = createDEntryPageRpc(pages, authenticate, service.signal);
+  const profile = createDEntryProfile(
+    pages,
+    service.signal,
+    release?.directory,
+  );
   const worker = createServer(async (request, response) => {
+    if (await profile.handle(request, response)) return;
     if (!(await rpc.handle(request, response))) response.writeHead(404).end();
   });
   worker.on('upgrade', (request, socket, head) => {
@@ -81,7 +109,7 @@ async function fixture() {
   const workerOrigin = await listen(worker);
   vi.stubEnv('ALLRICE_WORKER_INTERNAL_URL', workerOrigin);
   closes.push(async () => {
-    await Promise.all([mux.close(), rpc.close()]);
+    await Promise.all([mux.close(), rpc.close(), profile.close()]);
     worker.closeAllConnections();
     await new Promise<void>((resolve) => worker.close(() => resolve()));
   });
@@ -152,7 +180,29 @@ async function fixture() {
         ...extra,
       }),
     });
-  return { ...f, host, connect, invoke, probe };
+  function publish(
+    kind: 'bootstrap' | 'assets' | 'events',
+    scopeId: string,
+    selectors: Record<string, string> = {},
+    mode?: 'document' | 'static',
+    signal?: AbortSignal,
+  ) {
+    const url = new URL('/internal/d-entry/profile/' + kind, workerOrigin);
+    url.search = new URLSearchParams({
+      ...f.selection,
+      organizationId: f.identity.organizationId,
+      scopeId,
+      ...selectors,
+    }).toString();
+    return fetch(url, {
+      signal,
+      headers: {
+        authorization: 'Bearer ' + sessionToken,
+        ...(mode && { 'x-allrice-profile-request': mode }),
+      },
+    });
+  }
+  return { ...f, host, connect, invoke, probe, publish, profileSource };
 }
 
 async function listen(server: ReturnType<typeof createServer>) {
@@ -312,3 +362,95 @@ it('refuses duplicate selectors, unauthorized login and cross-session borrow wit
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
   expect(await life.receive()).toEqual({ type: 'end', streamId: 'life' });
 });
+
+it(
+  'publishes the real released graph and exact bytes through the same live page and closes an active event reader on revocation',
+  { timeout: 30_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'allrice-profile-release-'));
+    closes.push(() => rm(root, { recursive: true, force: true }));
+    const directory = join(root, 'release');
+    await promisify(execFile)(
+      process.execPath,
+      ['packages/dsh-web-composition/build-web-entry.mjs', directory],
+      { timeout: 20_000 },
+    );
+    const raw = JSON.parse(
+      await readFile(join(directory, 'artifact.json'), 'utf8'),
+    );
+    const graph = DEntryProfileGraphSchema.parse(raw.profile.graph);
+    // This runs the released app profile builder and actual non-owner Cordis
+    // Peer. Only the VM receipt/current PostgreSQL lease is fixture-owned.
+    const f = await fixture({ directory, graph });
+    const { peer, receive, scopeId } = await open(f);
+    const address = await f.publish('bootstrap', scopeId, {}, 'document');
+    expect(address.status).toBe(200);
+    const target = await address.json();
+    expect(target).toMatchObject({
+      bindingRef: f.owner.bindingRef,
+      graphRev: graph.rev,
+      nativeSessionId: 'root',
+    });
+    const initial = await f.publish('bootstrap', scopeId);
+    expect(initial.status).toBe(200);
+    const boot = DEntryProfileBootstrapSchema.parse(await initial.json());
+    expect(boot.graph).toEqual(graph);
+    expect(boot.injections.at(-1)).toMatchObject({
+      kind: 'global',
+      name: '__DSH_REMOTE_ACCESS__',
+      value: { owner: false, grants: expect.any(Array) },
+    });
+    const duplicate = await f.publish('bootstrap', scopeId);
+    expect(duplicate.status).toBe(409);
+    await duplicate.body?.cancel();
+    const { url, rev } = graph.batches[0]!;
+    const asset = await f.publish('assets', scopeId, {
+      bindingRef: f.owner.bindingRef,
+      reference: url,
+      revision: rev,
+    });
+    expect(asset.status).toBe(200);
+    const proof = raw.profile.files.find(
+      (row: { reference: string }) => row.reference === url,
+    );
+    const data = Buffer.from(await asset.arrayBuffer());
+    expect(data).toEqual(await readFile(join(directory, proof.path)));
+    expect(asset.headers.get('content-length')).toBe(String(data.byteLength));
+    const bad = await f.publish('assets', scopeId, {
+      bindingRef: f.owner.bindingRef,
+      reference: url,
+      revision: 'wrong',
+    });
+    expect(bad.status).toBe(404);
+    await bad.body?.cancel();
+
+    const keep = new AbortController();
+    closes.push(async () => keep.abort());
+    const events = await f.publish(
+      'events',
+      scopeId,
+      { bindingRef: f.owner.bindingRef },
+      undefined,
+      keep.signal,
+    );
+    const reader = events.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toBe(
+      `data: ${JSON.stringify({ type: 'graph', graph })}\n\n`,
+    );
+    const clash = await f.publish('events', scopeId, {
+      bindingRef: f.owner.bindingRef,
+    });
+    expect(clash.status).toBe(409);
+    await clash.body?.cancel();
+    const pending = reader.read();
+    f.profileSource.abort(Error('The native profile source was retired'));
+    expect(await receive()).toMatchObject({
+      type: 'error',
+      streamId: 'life',
+    });
+    await expect(pending).rejects.toThrow();
+    expect((await f.invoke(scopeId)).status).toBe(404);
+    peer.terminate();
+  },
+);
