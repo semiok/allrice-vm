@@ -27,6 +27,7 @@ export async function requestDEntryWorker(
     | 'native-owner'
     | 'native-resource'
     | 'native-rpc'
+    | 'native-rpc?carrier=page'
     | 'native-root'
     | 'native-prewarm',
   fields: Record<string, unknown> = {},

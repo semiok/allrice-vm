@@ -128,6 +128,45 @@ export const DEntryNativeOwnerRequestSchema = z
     selection: DEntrySelectionInputSchema,
   })
   .strict();
+// Page locators carry no authority. Borrowers must present the original login.
+export const DEntryPageScopeReferenceSchema = z
+  .object({ scopeId: UuidSchema })
+  .strict();
+export const DEntryPageOpenedSchema = z
+  .object({
+    type: z.literal('opened'),
+    scopeReference: DEntryPageScopeReferenceSchema,
+    bindingRef: z.string().min(1),
+  })
+  .strict();
+export const DEntryPageClosedSchema = z
+  .object({ type: z.literal('closed'), scopeId: UuidSchema })
+  .strict();
+export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
+  carrier: z.literal('page'),
+  organizationId: UuidSchema,
+  scopeId: UuidSchema.optional(),
+});
+export const DEntryPageUnarySchema = z.enum([
+  'session/attachment',
+  'session/page',
+  'session/projections',
+  'skills/list',
+  'session/prompt',
+  'session/updateQueue',
+  'session/cancel',
+  'session/rename',
+  'session/selectModel',
+]);
+export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
+  {
+    selection: DEntrySelectionInputSchema,
+    rpcId: z.string(),
+    endpoint: DEntryPageUnarySchema,
+    payload: z.object({ args: z.record(z.string(), z.unknown()) }).strict(),
+  },
+);
+
 export const DEntryNativePrewarmTriggerSchema = z.enum(['page', 'input']);
 export const DEntryNativePrewarmInputSchema = z
   .object({

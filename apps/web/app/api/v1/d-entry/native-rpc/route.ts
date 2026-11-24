@@ -1,4 +1,8 @@
-import { DEntryNativeRpcRequestSchema } from '@allrice/contracts';
+import {
+  DEntryNativeRpcRequestSchema,
+  DEntryPageRpcRequestSchema,
+} from '@allrice/contracts';
+import { apiProblem } from '../../../../../lib/api-error-response';
 import {
   authenticateNativeRequest,
   currentNativeRequest,
@@ -11,14 +15,31 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: Request) {
   try {
     const context = await authenticateNativeRequest(request);
-    const { selection, endpoint, payload } = DEntryNativeRpcRequestSchema.parse(
-      await request.json(),
+    const { searchParams } = new URL(request.url);
+    const page = searchParams.has('carrier');
+    if (
+      page &&
+      (searchParams.size !== 1 || searchParams.get('carrier') !== 'page')
+    )
+      return apiProblem({
+        status: 400,
+        code: 'VALIDATION_FAILED',
+        message: 'Invalid page carrier',
+      });
+    const { selection, ...fields } = (
+      page ? DEntryPageRpcRequestSchema : DEntryNativeRpcRequestSchema
+    ).parse(await request.json());
+    const input = await currentNativeRequest(
+      request,
+      selection,
+      context,
+      page ? 'history' : 'execute',
     );
-    const input = await currentNativeRequest(request, selection, context);
-    const response = await requestDEntryWorker(input, 'native-rpc', {
-      endpoint,
-      payload,
-    });
+    const response = await requestDEntryWorker(
+      input,
+      page ? 'native-rpc?carrier=page' : 'native-rpc',
+      fields,
+    );
     return new Response(response.body, {
       status: response.status,
       headers: {
