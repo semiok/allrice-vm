@@ -77,6 +77,7 @@ export type ServiceBuildManifest = z.infer<typeof ServiceBuildManifestSchema>;
 export interface ServiceBuildIdentity {
   version: 1;
   environment: 'dev';
+  repository: ServiceBuildManifest['repository'];
   service: ServiceBuildRole;
   mode: 'production';
   sourceSha: string;
@@ -498,6 +499,7 @@ export async function verifyServiceBuildIdentity(input: {
     return {
       version: 1,
       environment: 'dev',
+      repository: manifest.repository,
       service: input.service,
       mode: 'production',
       sourceSha: manifest.sourceSha,

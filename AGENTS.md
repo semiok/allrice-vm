@@ -13,7 +13,7 @@
 
 **共享调度例外，不能按仓加预算**：M5 两仓继续共用 `~/allrice-test/repo.git`、`slots/`、`locks/`、`limits`、测试 PG 和 worker/内存预算；结果 `results/allrice-vm/` 及 M1 日志 `~/allrice40-dev/qa/m5-test/` 区分来源。唯一 M1→M5 活租约仍在 `~/allrice-dev/qa/m5-test/leases/`，新旧工具必须双向看到同一 lease，不能改成两套后误杀另一仓运行。M1 fallback 新 checkout/results 在 `~/allrice40-worktrees/.m5-test-m1/`，仅运行锁沿用旧 `~/allrice-worktrees/.m5-test-m1/locks/`，两仓合计最多 2 批；不在旧 checkout 写入新仓代码。
 
-QA 仍共用 `~/allrice-qa`、同一 `.alloc.lock`、三席和 3200–3299；实例必须记录 repo name/ID。新工具只操作本仓实例，4.0 租期使用 `repositoryExpiresAt`，旧 allocator 视为 legacy 而不自动回收。不能用旧工具对新实例显式 down；启用前由发布负责人协调共享 allocator 的使用窗口，不能另建一套三席绕预算。4.0 QA 数据库为 `127.0.0.1:5434/allrice40_qa_<任务名>`，不连 3.x Dev 库。
+QA 仍共用 `~/allrice-qa`、同一 `.alloc.lock`、三席和 3200–3299；实例必须记录 repo name/ID。新工具只操作本仓实例，4.0 租期使用 `repositoryCreatedAt` 和 `repositoryExpiresAt`，旧 allocator 视为 legacy，拒绝续租并略过自动回收。不能用旧工具对新实例显式 down；启用前由发布负责人协调共享 allocator 的使用窗口，不能另建一套三席绕预算。4.0 QA 数据库为 `127.0.0.1:5434/allrice40_qa_<任务名>`，不连 3.x Dev 库。
 
 M1 只保留一套七线 wake/dog 调度；新源码默认状态根 `~/allrice40-dev`，dog 继续使用唯一 label `ai.bplabs.allrice-m1-dog`。先收齐旧路径在途 wait，再由发布负责人迁移同一调度；本次不安装、不启动第二 dog、不改 M5 `allrice-watch`。迁移前可沿旧已安装 wake 等新仓 CI，但必须在 `gh run watch` 命令内明确 `--repo semiok/allrice-vm --interval 60`；新候选也支持同义顶层参数，并拒绝与 gh 参数冲突。
 

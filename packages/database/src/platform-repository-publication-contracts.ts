@@ -111,7 +111,7 @@ export const RepositoryPublicationRemoteSchema = z
     number: z.number().int().positive(),
     url: z
       .string()
-      .regex(/^https:\/\/github\.com\/semiok\/allrice\/pull\/[1-9]\d*$/),
+      .regex(/^https:\/\/github\.com\/semiok\/allrice-vm\/pull\/[1-9]\d*$/),
     headSha: RepositoryGitShaSchema,
     tree: RepositoryGitShaSchema,
     baseSha: RepositoryGitShaSchema,

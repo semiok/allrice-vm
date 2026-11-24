@@ -92,13 +92,13 @@ M1 = dict(
     incidentDatabaseUrl=None,
     webUrl=None,
     workerUrl=None,
-    publicUrl=None,
+    publicUrl='https://allrice.bplabs.xyz',
     # component checks
     tunnelLabel='ai.bplabs.allrice40-dev-tunnel',
-    tunnelMetrics=['http://127.0.0.1:%d/ready' % p for p in range(20241, 20246)],
+    tunnelMetrics=['http://127.0.0.1:20246/ready'],
     # Approved 4.0 hostnames. Routing and the isolated tunnel are configured only
     # after deployment authorization; do not reuse the 3.x Bridge hostname.
-    extraPublicUrls=['https://allrice.bplabs.xyz', 'https://allrice-admin.bplabs.xyz'],
+    extraPublicUrls=['https://allrice-admin.bplabs.xyz'],
     docker='/opt/homebrew/bin/docker',
     officeContainer='allrice-office-renderer',
     vmWatchdog='allrice-cloud-watchdog',
@@ -194,11 +194,17 @@ def run(cmd, timeout=20, env=None, stdin=None):
         return 127, '', str(err)
 
 
-def opener(proxy):
-    """None: urllib's own choice (macOS system proxy settings); "": direct; else that proxy."""
-    if proxy is None:
-        return urllib.request.build_opener()
-    return urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {}))
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def opener(proxy, *, redirects=True):
+    """None uses the system proxy; an empty string is direct."""
+    handlers = [] if redirects else [NoRedirect()]
+    if proxy is not None:
+        handlers.append(urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {}))
+    return urllib.request.build_opener(*handlers)
 
 
 LOCAL = opener('')
@@ -1442,12 +1448,26 @@ PUBLIC_PROBE_SECONDS = 15
 def probe_public(r, url, key='public_entry', where='M1 本机', title='公网入口不可达'):
     if not url:
         return [finding(key, 'warning', title + '（未配置地址）', '', 'm1-tunnel.md', '')]
+    ready_url = urllib.parse.urljoin(url, '/api/health/ready')
     start = time.time()
-    code, body = http_get(url, PUBLIC_PROBE_SECONDS, opener(r.cfg.get('publicProxy')))
+    code, body = http_get(ready_url, PUBLIC_PROBE_SECONDS, opener(r.cfg.get('publicProxy'), redirects=False))
     took = time.time() - start
-    ok = code == 200 and took < PUBLIC_PROBE_SECONDS
-    return [finding(key, 'ok' if ok else 'critical', title, '从%s访问 %s：%s（%.1f 秒）' % (where, url, code or short(body, 120), took),
-                    'm1-tunnel.md', 'curl -sS -o /dev/null -w "%%{http_code}\\n" %s' % url)]
+    verified = False
+    if code == 200:
+        try:
+            answer = json.loads(body)
+            identity = answer['identity']
+            verified = (answer.get('status') == 'ready' and identity.get('repository') == 'semiok/allrice-vm'
+                        and identity.get('environment') == 'dev' and identity.get('service') == 'web'
+                        and identity.get('mode') == 'production')
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+    ok = verified and took < PUBLIC_PROBE_SECONDS
+    outcome = code or short(body, 120)
+    if code == 200 and not verified:
+        outcome = '200，缺少 4.0 Web 的就绪身份'
+    return [finding(key, 'ok' if ok else 'critical', title, '从%s访问 %s：%s（%.1f 秒）' % (where, ready_url, outcome, took),
+                    'm1-tunnel.md', 'curl -sS %s' % ready_url)]
 
 
 def check_public_entry(r):

@@ -429,6 +429,35 @@ suite('immutable report-bound maintenance authority', () => {
       },
     };
   }
+  it('leaves old defect rows intact when the new repository constraint refuses them', async () => {
+    const migration = await readFile(
+      new URL(
+        '../migrations/0255_platform_maintenance_repository_identity.sql',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    await fixture.db.begin(async (tx) => {
+      await tx`create temporary table allrice_platform_maintenance_defects (
+        repository_id bigint not null check (repository_id = 1323769790)
+      ) on commit drop`;
+      await tx`set local search_path to pg_temp`;
+      await tx`insert into allrice_platform_maintenance_defects (repository_id) values (1323769790)`;
+      await expect(
+        tx.savepoint(async (ddl) => {
+          await ddl.unsafe(migration);
+        }),
+      ).rejects.toMatchObject({ code: '23514' });
+      const [row] =
+        await tx`select count(*)::int as count from allrice_platform_maintenance_defects where repository_id=1323769790`;
+      expect(row?.count).toBe(1);
+      await expect(
+        tx.savepoint(async (write) => {
+          await write`insert into allrice_platform_maintenance_defects (repository_id) values (1469490636)`;
+        }),
+      ).rejects.toMatchObject({ code: '23514' });
+    });
+  });
   it('binds current central source independently of installed SHA; rejects forged mappings/oracles and incomplete probes', async () => {
     const i = await install(),
       r = await report(i);

@@ -23,7 +23,7 @@ import {
   loadRepositoryBaseline,
 } from '../../../packages/database/src/platform-repository-source.ts';
 import { platformRepository } from '../../../packages/database/src/platform-repository-credential-contracts.ts';
-import { readDevReleaseSha } from './repository-baseline-dev.mjs';
+import { readDevReleaseSha } from './repository-baseline-dev.ts';
 import { prepareRepositoryCompiledDependencies } from './repository-compiled-dependencies.ts';
 
 // Operator CLI, not a model or HTTP tool. It cannot change refs or the worktree.

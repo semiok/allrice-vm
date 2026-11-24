@@ -105,6 +105,7 @@ report_after_stop() { # boot of the stopped Worker, or ""
 SNAPSHOT_DIRS="storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform"
 snapshot() ( # name -> 0 when $SNAPSHOTS/<name> is complete
   umask 077
+  dev_plist_pair || exit 1
   dir="$SNAPSHOTS/$1" L="$HOME/allrice40-dev/.local"
   [ ! -e "$dir" ] || { echo "$dir already exists" >&2; exit 1; }
   trap 'rm -rf -- "$dir.tmp"' EXIT # a partial snapshot is never left behind
@@ -120,6 +121,7 @@ snapshot() ( # name -> 0 when $SNAPSHOTS/<name> is complete
   exit 0
 )
 start_both_on() { # sha -> start Worker then Web, both must report sha
+  dev_plist_pair || return 1
   start_job "$WORKER_LABEL" "$WORKER_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 180 || { say "worker did not become ready on ${1:0:8}"; return 1; }
   start_job "$WEB_LABEL" "$WEB_PLIST" || return 1
@@ -164,6 +166,7 @@ os.replace(sys.argv[1]+".tmp",sys.argv[1])' "$LOCK.owner" $$ "${MODE:-}"
 }
 release_lock() { if [ -n "$LOCKED" ]; then exec 9>&-; LOCKED=""; fi; return 0; }
 inflight_begin() { # prev_sha
+  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish (qa/deploy-inflight exists); run deploy-dev --release-manager --recover"
   mkdir -p "$INFLIGHT.tmp"
   cp -p "$(dev_plist web)" "$INFLIGHT.tmp/web.plist" && cp -p "$(dev_plist worker)" "$INFLIGHT.tmp/worker.plist" || die "could not save the launchd files"
@@ -199,6 +202,9 @@ refuse_restore() { # phase previous_sha reason
 # previous SHA. Every step is checked: on any failure the saved files stay for a person.
 restore() {
   local prev; prev=$(sed -n 2p "$INFLIGHT/state" 2>/dev/null) && [ -n "$prev" ] || { say "no saved previous version to restore"; return 1; }
+  dev_plist_config web "$INFLIGHT/web.plist" &&
+    dev_plist_config worker "$INFLIGHT/worker.plist" &&
+    dev_plist_pair || return 1
   say "restoring the previous version ${prev:0:8}"
   stop_both || { say "could not stop the services to restore them"; return 1; }
   local why rel; rel=$(release_of "$INFLIGHT/worker.plist") || return 1
@@ -401,6 +407,7 @@ rollback_gate() { # target sha -> dies, before anything stops, when the target c
 }
 
 rollback() { # [release-dir]
+  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
   local cur_rel cur_sha cur_art target="${1:-}"
   cur_rel=$(release_of); cur_sha=$(penv "$(dev_plist worker)" ALLRICE_RELEASE_SHA); cur_art=$(penv "$(dev_plist worker)" ALLRICE_DSH_NATIVE_ARTIFACT_ID)
   if [ -z "$target" ]; then
@@ -416,6 +423,7 @@ rollback() { # [release-dir]
   say "checking that ${sha:0:8} covers the current native references"
   local why; why=$(precheck "$target" "$sha" "$art" "$BLOG") || die "$why. Dev untouched."
   take_lock || die "deploy lock is held; $("$BIN/deploy-lock" status)" 3
+  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
   [ "$(release_of)" = "$cur_rel" ] || die "the current release changed while checking; start again"
   rollback_gate "$target" "$sha" # a deploy that ended meanwhile may have raised either
   say "rolling back to $(basename "$target") (${sha:0:8}); database migrations are not reverted"
@@ -440,6 +448,7 @@ deploy() {
   local t0; t0=$(date +%s)
   ! lock_held "$LOCK" || die "a deploy is in progress ($("$BIN/deploy-lock" status)); stop and retry later" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run deploy-dev --release-manager --recover first"
+  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
   local avail; avail=$(df -g "$HOME" | awk 'NR==2{print $4}')
   [ "$avail" -ge 20 ] || die "only ${avail}G free; clean up before building"
 
@@ -475,6 +484,7 @@ deploy() {
   take_lock || die "another deploy started meanwhile; build kept at $rel (rerun deploy-dev later)" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; build kept at $rel. Run deploy-dev --release-manager --recover first"
   [ "$(release_of)" = "$cur_rel" ] || die "Dev changed while this version was building; build kept at $rel, start again"
+  dev_plist_pair || die "refusing a mismatched Dev configuration" 2
   local pending; pending=$(check_migrations_known "$rel") || {
     log_deploy kind failed phase migrations sha "$sha" reason "$pending" log "$BLOG"
     die "not starting ${sha:0:8}: $pending; build kept at $rel (Dev untouched)."; }

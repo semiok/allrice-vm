@@ -408,7 +408,7 @@ SH
   done
 }
 finish() { # [why]: the closing line m5-test looks for
-  echo "m5-test: repository $REPOSITORY id $REPOSITORY_ID commit $M5T_SHA"
+  echo "m5-test: result repository $REPOSITORY id $REPOSITORY_ID commit $M5T_SHA host $HOST_NAME run $M5T_RUN exit $rc"
   echo "m5-test: done on $HOST_NAME (${M5T_SHA:0:8}${slot:+, slot $slot}, $workers workers${times}${1:+; $1}), exit $rc"
   exit "$rc"
 }

@@ -1,15 +1,15 @@
 # 后台等待与本线唤醒
 
-等 CI 请加 `--interval 60`；新版会自动补 60 秒，显式间隔不得小于 30 秒。正在运行的旧等待不会被安装自动改写。
+等 CI 请加 `--interval 60`；新版会自动补 60 秒，显式间隔不得小于 30 秒。正在运行的 3.x 等待由已经安装的 3.x 工具收尾。4.0 工具尚未获准安装时，可用现有 `~/allrice-dev/bin/wake-when` 等新仓 CI，须在 `gh run watch` 内明传 `--repo semiok/allrice-vm --interval 60`。迁移 dog 前收齐旧等待并核对七线 live 白名单，再切换现有单一 launchd job。
 
 仓库 Skill 在 [`.agents/skills/wait-and-wake/SKILL.md`](../../.agents/skills/wait-and-wake/SKILL.md)，在任务 worktree 中可用 `$wait-and-wake`。从仓库外启动的旧会话需显式读取这份文件；不安装到 `~/.codex/skills`，不修改 Codex 配置。
 
 在 M1 运行，等待过程中不占 Codex 回合，也不依赖 M5。工具通过 `~/.local/bin/codex queue` 给指定本线发一次回执，区分任务真实结论与等待命令退出码；等待失败／任务失败附最后 30 行诊断日志（长行截断）。回执不是新增业务、合并或部署授权。
 
 ```bash
-~/allrice-dev/bin/wake-when \
+~/allrice40-dev/bin/wake-when \
   --thread <本线会话UUID> --label '#884 CI' --timeout 3h -- \
-  /opt/homebrew/bin/gh run watch <run-id> --repo semiok/allrice --exit-status --interval 60
+  /opt/homebrew/bin/gh run watch <run-id> --repo semiok/allrice-vm --exit-status --interval 60
 ```
 
 启动成功后立刻结束本回合；收到回执再继续，不让模型轮询、sleep 或发等待进度。默认最多等待 3 小时，`--timeout` 可写秒数或 `30m`、`3h`。工具自身全部在 M1 运行，执行权限仍取决于原任务授权。
@@ -27,15 +27,15 @@ EOF、5xx、超时等导致 watch／查询不能确认终态时，按 5、15、3
 完整 M5 常用 2–3 小时，建议显式设 **`--timeout 6h`**，给排队、依赖安装、构建和收尾留余量。默认仍为 3 小时；`--timeout` 没有额外的 3 小时上限，6 小时就是 21600 秒。等待从命令启动时开始计算，包含整个 m5-test 流程；实例／名额仍按既有租约要求管理，不因等待参数延长而续租。
 
 ```bash
-~/allrice-dev/bin/wake-when \
+~/allrice40-dev/bin/wake-when \
   --thread "$CODEX_THREAD_ID" --label 'MET-xxx 完整 M5 固定SHA' --timeout 6h -- \
-  ~/allrice-dev/bin/m5-test <固定SHA> --wait 0 --db --browser \
+  ~/allrice40-dev/bin/m5-test <固定SHA> --wait 0 --db --browser \
   --build '<本轮已授权的完整构建与测试命令>' -- --help
 ```
 
 将示例占位符换成原批次参数；`--build` 内真实的 CI 调用保留对应步骤的 `--maxWorkers=1 --testTimeout=30000` 及开关，不改断言、重试和时限。新批启动前照常检查 M5 负载和名额。直接把 m5-test 作为被等待命令，不再另外启动同一批次，也不包一层 shell。收到 started 就结束回合，m5-test 的启动和完整等待均在后台进行。
 
-工具只执行一次 m5-test。它退出后，wake-when 从输出中的 `finished on M5/M1, exit N; log ...` 找到本次结果日志，再读取该文件核对最终收尾行；文件须绑定本次 m5-test 的 PID、日志目录和启动时间。中途 `done on`、旧任务日志或单独进程退出码都不能替代终态。叫醒消息写真实执行机器、最终 exit code 和结果文件路径，`result.json` 的 `task` 同样留存。M5 中途掉线按原工具规则回到 M1 时，回执明确写 M1；wake-when 自身不另重跑。没有可靠收尾行就报任务状态未知。
+工具只执行一次 m5-test。它退出后，wake-when 从输出中的 `finished on M5/M1, exit N; log ...` 找到本次结果日志，再读取该文件核对最终收尾行；文件须绑定本次 m5-test 的 PID、日志目录和启动时间，执行机的收尾也须匹配仓库、数值 ID、完整提交、机器与本次运行 ID。中途 `done on`、旧任务日志或单独进程退出码都不能替代终态。叫醒消息写真实执行机器、最终 exit code 和结果文件路径，`result.json` 的 `task` 同样留存。M5 中途掉线按原工具规则回到 M1 时，回执明确写 M1；wake-when 自身不另重跑。没有可靠收尾行就报任务状态未知。
 
 ## 其他外部等待的终态文件
 
@@ -45,19 +45,19 @@ EOF、5xx、超时等导致 watch／查询不能确认终态时，按 5、15、3
 { "id": "本次任务ID", "status": "completed", "exitCode": 0 }
 ```
 
-直接包住 `~/allrice-dev/bin/deploy-dev <原授权参数>` 时，wake-when 自动设置专用文件及 ID。deploy-dev 在实际退出清理之后写 completed，覆盖参数/权限拒绝、构建失败、回滚收尾、冒烟失败和正常完成；清理函数返回非零或收到中断也写终态，`initialExitCode` 保留进入清理前的退出码，`exitCode` 是最终实际退出码；SIGKILL/断电会留下 running，不能误报完成。部署工具单独使用时，也在 `qa/deploy-results/<UUID>.json` 留终态。`--status`/帮助只读，不生成部署终态；不要把它们当成部署调用。此接入不改变发布负责人和部署授权门禁。其他工具仍用上面的可选合同，不能把 SSH／等待命令退出码直接包装成终态文件。文件必须是启动等待时尚不存在的本次专用路径，ID、终态、整数退出码都要匹配；命令退出后按上述退避读取，仍无终态就报“等待失败，任务状态未知”。未提供终态文件的普通命令异常退出时，直接报告等待失败和原退出码，任务结论保持未知。需要 shell 组合语法时显式传 `bash -lc '...'`，工具不解释 shell；CI／M5 仍必须用各自直接命令形式，不能用外部 JSON 覆盖原生核验。
+直接包住 `~/allrice40-dev/bin/deploy-dev <原授权参数>` 时，wake-when 自动设置专用文件及 ID。deploy-dev 在实际退出清理之后写 completed，覆盖参数/权限拒绝、构建失败、回滚收尾、冒烟失败和正常完成；清理函数返回非零或收到中断也写终态，`initialExitCode` 保留进入清理前的退出码，`exitCode` 是最终实际退出码；SIGKILL/断电会留下 running，不能误报完成。部署工具单独使用时，也在 `qa/deploy-results/<UUID>.json` 留终态。`--status`/帮助只读，不生成部署终态；不要把它们当成部署调用。此接入不改变发布负责人和部署授权门禁。其他工具仍用上面的可选合同，不能把 SSH／等待命令退出码直接包装成终态文件。文件必须是启动等待时尚不存在的本次专用路径，ID、终态、整数退出码都要匹配；命令退出后按上述退避读取，仍无终态就报“等待失败，任务状态未知”。未提供终态文件的普通命令异常退出时，直接报告等待失败和原退出码，任务结论保持未知。需要 shell 组合语法时显式传 `bash -lc '...'`，工具不解释 shell；CI／M5 仍必须用各自直接命令形式，不能用外部 JSON 覆盖原生核验。
 
 命令必须在前台阻塞直到工作完成，不要在命令里自行 `nohup`、`setsid` 或启动常驻服务。超时退出码为 124；结束时会清理该命令进程组，包括仍运行的子进程。TERM 后留 10 秒清理宽限，覆盖现有 `m5-test relay()` 对其独立子进程组的 5 秒清理流程，再对残留进程组发 KILL；因此回执可比命令时限稍晚。不要传入读取凭据、打印敏感内容的命令：命令输出会进入本机日志，失败尾部会发到本线。
 
 ## 白名单与升级
 
-工具只读 `~/allrice-dev/wake-when.threads`，每行 `线名 UUID`，恰好 7 条且 UUID 不重复。首次安装从仓库模板初始化，以后安装保留现有文件。哪条线更换会话，只改这一个文件中对应的 UUID；不需要改工具、重建或重启。名单是通知接收方限制，不是凭据。
+工具只读 `~/allrice40-dev/wake-when.threads`，每行 `线名 UUID`，恰好 7 条且 UUID 不重复。首次安装从仓库模板初始化，以后安装保留现有文件。哪条线更换会话，只改这一个文件中对应的 UUID；不需要改工具、重建或重启。名单是通知接收方限制，不是凭据。
 
 同一 label 在 7 条线之间全局去重：等待尚未结束时再次启动会报错，不启动第二个命令。不同任务请使用不同 label；旧等待结束并通知后可复用原 label。
 
 ## 日志、失败与资源
 
-启动回执给出后台 PID、日志与结果路径。文件均在 `~/allrice-dev/qa/wake-when/<时间-随机ID>/`，目录 700、文件 600。`command.log` 是命令原始输出，`notification.log` 是 queue 回执，`result.json` 中 `task` 是已核实结论或 `unknown`，`commandExitCode` 是等待命令退出码；还记录核验次数、超时与通知结果。记录工作目录、固定 CI 仓库/run 或终态文件路径，不另存完整 argv 或读取凭据。
+启动回执给出后台 PID、日志与结果路径。文件均在 `~/allrice40-dev/qa/wake-when/<时间-随机ID>/`，目录 700、文件 600。`command.log` 是命令原始输出，`notification.log` 是 queue 回执，`result.json` 中 `task` 是已核实结论或 `unknown`，`commandExitCode` 是等待命令退出码；还记录核验次数、超时与通知结果。记录工作目录、固定 CI 仓库/run 或终态文件路径，不另存完整 argv 或读取凭据。
 
 `notification=sent` 只说明 queue 已接收，不等于本线已执行后续。queue 每次最多30秒；失败按1/2/4秒退避再试，累计最多4次，不重跑原命令。delivery.json 记录投递过程；线程不存在/归档/不在白名单立即升级TG，其他失败耗尽后升级TG。TG失败有持久化退避，交看门狗续送。正常结束／超时／TERM 会退出后台进程并删除任务锁。M1 重启或 supervisor 被 SIGKILL 时不自动恢复任务；看门狗启动补扫并通知核对，清理内核已解锁的任务锁。日志作为证据保留，不占实例名额。
 
@@ -70,10 +70,10 @@ EOF、5xx、超时等导致 watch／查询不能确认终态时，按 5、15、3
 `m1-dog launchd install` 安装用户 LaunchAgent `ai.bplabs.allrice-m1-dog`，RunAtLoad/KeepAlive，崩溃由 launchd 拉起（60秒节流）。开机后用户登录时启动，不安装 root LaunchDaemon。安装先把原 plist/launchctl 状态存到 `qa/wake-when/dog/launchd-backups/<UTC>/`，验证新 plist；停旧 dog 时轮询 launchctl 和旧 PID，最长30秒，再启新版本。安装失败恢复原 plist/加载状态。只操作自己的 label。
 
 ```bash
-~/allrice-dev/bin/m1-dog status
+~/allrice40-dev/bin/m1-dog status
 launchctl print gui/$(id -u)/ai.bplabs.allrice-m1-dog
 # 已获维护授权后，升级/重装（不停止任何 CI/M5/部署）：
-~/allrice-dev/bin/m1-dog launchd install
+~/allrice40-dev/bin/m1-dog launchd install
 ```
 
 心跳 `dog/heartbeat.json` 有 startedAt/completedAt；`dog.log` 为每轮日志，`dog/state.json` 为活动等待/叫醒计数/告警数。每个 supervisor 在阻塞命令期间最多30秒更新 heartbeat，记录本次开机身份和进程启动时间，防止 PID 重用。心跳停更超过3分钟或超过任务总时限+5分钟收尾宽限，下一轮发“等待中断，请自行核对”；不据此杀任务。旧#885等待没有心跳，兼容其进程/截止时间直到自然收尾。

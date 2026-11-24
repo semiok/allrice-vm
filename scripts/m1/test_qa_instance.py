@@ -94,8 +94,11 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         for role in ('web', 'worker'):
             with open(os.path.join(agents, 'ai.bplabs.allrice40-dev-' + role + '.plist'), 'wb') as f:
                 plistlib.dump({
+                    'Label': 'ai.bplabs.allrice40-dev-' + role,
                     'ProgramArguments': [os.path.join(node_bin, 'node'), '--env-file=/unused', '/unused'],
                     'EnvironmentVariables': {
+                        'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev',
+                        'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',
                         'ALLRICE_DEV_MAINTENANCE_ENABLED': '1',
                         'ALLRICE_CLOUD_RUNNER_ENABLED': '1',
                         'ALLRICE_CLOUD_MCP_ENABLED': '1',
@@ -177,7 +180,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         stamp = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
         data = {'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'task': task, 'webPort': 3298, 'workerPort': 3299, 'sha': SOURCE_SHA,
                 'ref': SOURCE_SHA, 'database': 'allrice40_qa_' + task.replace('-', '_'),
-                'owner': 'owner-' + task, 'card': 'MET-220', 'createdAt': stamp(now - 86400),
+                'owner': 'owner-' + task, 'card': 'MET-220', 'repositoryCreatedAt': stamp(now - 86400),
                 'repositoryExpiresAt': stamp(now - 60 if expired else now + 600)}
         (directory / 'instance.json').write_text(json.dumps(data))
         (directory / 'creds.json').write_text('SECRET-CREDS')
@@ -219,7 +222,9 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         result = self.cli('renew', 'renew-me', '--ttl', '24h')
         self.assertEqual(result.returncode, 0, result.stderr)
         after = json.loads((directory / 'instance.json').read_text())
-        self.assertEqual(before['createdAt'], after['createdAt'])
+        self.assertEqual(before['repositoryCreatedAt'], after['repositoryCreatedAt'])
+        self.assertNotIn('createdAt', after)
+        self.assertNotIn('expiresAt', after)
         self.assertNotEqual(before['repositoryExpiresAt'], after['repositoryExpiresAt'])
         refused = self.cli('renew', 'renew-me', '--ttl', '25h')
         self.assertNotEqual(refused.returncode, 0)
@@ -232,6 +237,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             data = json.loads(path.read_text())
             data.pop('repository')
             data.pop('repositoryId')
+            data['createdAt'] = data.pop('repositoryCreatedAt')
             data['expiresAt'] = data.pop('repositoryExpiresAt')
             path.write_text(json.dumps(data))
         result = self.cli('up', 'met-218-test', '--owner', 'tester', '--card', 'MET-218')

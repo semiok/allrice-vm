@@ -32,7 +32,7 @@ import {
   repositoryGitMaterialLimits,
 } from './repository-git-material.mjs';
 
-import { readDevReleaseSha } from './repository-baseline-dev.mjs';
+import { readDevReleaseSha } from './repository-baseline-dev.ts';
 
 it('registers a baseline against the matching 4.0 Web and Worker release', async () => {
   const sourceSha = 'a'.repeat(40);
@@ -43,6 +43,7 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
   const reply = async (
     url: string | URL | Request,
     differentWorker: boolean,
+    repository = 'semiok/allrice-vm',
   ) => {
     const service = replies.get(String(url));
     return Response.json({
@@ -53,6 +54,7 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
         service,
         mode: 'production',
         environment: 'dev',
+        repository,
         manifestDigest:
           'sha256:' +
           (differentWorker && service === 'worker' ? 'd' : 'c').repeat(64),
@@ -65,6 +67,9 @@ it('registers a baseline against the matching 4.0 Web and Worker release', async
   await expect(readDevReleaseSha((url) => reply(url, true))).rejects.toThrow(
     'REPOSITORY_DEV_IDENTITY_MISMATCH',
   );
+  await expect(
+    readDevReleaseSha((url) => reply(url, false, 'semiok/allrice')),
+  ).rejects.toThrow('REPOSITORY_DEV_IDENTITY_UNAVAILABLE');
   await expect(
     readDevReleaseSha(async () => Response.json({ status: 'ready' })),
   ).rejects.toThrow('REPOSITORY_DEV_IDENTITY_UNAVAILABLE');

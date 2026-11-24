@@ -215,13 +215,17 @@ attempt() {
     # The lease, locked while this side is attached to the run (locked before it gets its name,
     # so leftovers never takes it for a stale one). A later run on M5 stops this one if it is
     # still going once the lease is gone: M5 slept, M1 gave up, then M5 woke.
-    exec 8>"$LEASES/$run.new"
-    flock_fd 8 && mv "$LEASES/$run.new" "$LEASES/$run.lease"
-    relay "$idle" "$log" "${SSH[@]}" "$HOST" "$(quote env M5T_TARGET=m5 "${settings[@]}" M5T_STOP="$(leftovers)" \
-      /bin/bash -c "$(cat "$BIN/m5-run")" m5-run ${vargs[@]+"${vargs[@]}"})" <"${prompt:-/dev/null}"
-    rc=$?
-    exec 8>&-
-    rm -f "$LEASES/$run.lease"
+    if ! { exec 8>"$LEASES/$run.new"; } || ! flock_fd 8 || ! mv "$LEASES/$run.new" "$LEASES/$run.lease"; then
+      exec 8>&-
+      rm -f "$LEASES/$run.new"
+      rc=89
+    else
+      relay "$idle" "$log" "${SSH[@]}" "$HOST" "$(quote env M5T_TARGET=m5 "${settings[@]}" M5T_STOP="$(leftovers)" \
+        /bin/bash -c "$(cat "$BIN/m5-run")" m5-run ${vargs[@]+"${vargs[@]}"})" <"${prompt:-/dev/null}"
+      rc=$?
+      exec 8>&-
+      rm -f "$LEASES/$run.lease"
+    fi
   else
     relay "$idle" "$log" env M5T_TARGET=m1 M5T_REPO="$REPO" "${settings[@]}" /bin/bash "$BIN/m5-run" ${vargs[@]+"${vargs[@]}"} <"${prompt:-/dev/null}"
     rc=$?
@@ -230,11 +234,11 @@ attempt() {
   set -e
   [ "$rc" != "$STOPPED" ] || { echo "m5-test: stopped; log $log" >&2; exit 130; }
 }
-# finished <host>: the run there printed its closing line; rc becomes the exit code it reports
-# (the connection may still have broken after it).
+# Check the execution host's receipt even when SSH closed after it wrote it.
 finished() {
-  local code; code=$(tail -n 3 "$log" | sed -n "s/^m5-test: done on $1 .*, exit \([0-9]*\)\$/\1/p" | tail -1)
-  [ -n "$code" ] && rc=$code
+  local code
+  code=$("$M1_PY" "$BIN/m5_result.py" "$log" "$1" "$run" "$sha") || return 1
+  rc=$code
 }
 
 target=m1 dropped=""
@@ -256,6 +260,7 @@ if [ "$on" != m1 ]; then
         86) why="M5 的测试环境没配好或版本不符（在 M1 上跑 m5-test setup）" ;;
         87) why="M5 内存紧张" ;;
         76) why="M5 中断：运行中 M5 睡过（不算测试失败）" dropped=1 ;;
+        89) why="M5 活租约登记失败（未启动远端测试）" ;;
         88) why="M5 环境故障（$(grep -a '^m5-test: .* on M5$' "$log" | tail -1 | sed 's/^m5-test: //')）" ;;
         75) why="M5 中断：测试进程被结束（不算测试失败）" dropped=1 ;;
         124) why="M5 中断：${idle} 秒没有输出（不算测试失败）" dropped=1 ;;
@@ -268,7 +273,14 @@ if [ "$on" != m1 ]; then
     echo "m5-test: ${why}，改在 M1 ${dropped:+从头重}跑（--maxWorkers=2）" | tee -a "$log"
   fi
 fi
-[ "$target" = m5 ] || attempt m1
+if [ "$target" = m1 ]; then
+  attempt m1
+  if ! finished M1; then
+    [ "$rc" != 0 ] || rc=88
+    echo "m5-test: M1 ended without a verified result (exit $rc); log $log" | tee -a "$log" >&2
+    exit "$rc"
+  fi
+fi
 
 if [ "$cmd" = codex ]; then # fetch the report and the patch; failing that is not a pass
   patch=${out%.md}.patch fetched=1

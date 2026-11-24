@@ -6,10 +6,10 @@
 
 | 部分            | 位置                                                                                                            | 频率      |
 | --------------- | --------------------------------------------------------------------------------------------------------------- | --------- |
-| 组件健康        | M1 `~/allrice-dev/bin/monitor run`，launchd `ai.bplabs.allrice-dev-monitor`                                     | 每 4 分钟 |
+| 组件健康        | M1 `~/allrice40-dev/bin/monitor run`，launchd `ai.bplabs.allrice40-dev-monitor`                                 | 每 4 分钟 |
 | 业务巡检（SQL） | 同上，只读查询 `allrice_dev`                                                                                    | 每 4 分钟 |
 | 入口拨测        | 同上（从 M1 经 Cloudflare 访问）+ huihuimac 的 `monitor peer`（从 M1 之外访问）                                 | 每 4 分钟 |
-| 互相看门        | huihuimac `monitor peer`，launchd `ai.bplabs.allrice-monitor-peer`；M1 也检查它的心跳                           | 每 1 分钟 |
+| 互相看门        | huihuimac `monitor peer`，launchd `ai.bplabs.allrice40-dev-monitor-peer`；M1 也检查它的心跳                     | 每 1 分钟 |
 | 日报            | M1 每天 09:00 之后的第一轮发出                                                                                  | 每天      |
 | 告警出口        | Telegram（凭证只在两台机器的本地文件里）+ 表 `allrice_operational_incidents`（huihuimac 的经 SSH 写进 M1 的表） | 有变化时  |
 
@@ -34,7 +34,7 @@
 
 ## 检查项与阈值
 
-阈值都在 `scripts/m1/monitor` 顶部的默认配置里，可以在 `~/allrice-dev/monitor/config.json` 里覆盖（只写要改的键）。
+阈值都在 `scripts/m1/monitor` 顶部的默认配置里，可以在 `~/allrice40-dev/monitor/config.json` 里覆盖（只写要改的键）。
 
 | 键                                            | 查什么                                                                                          | 告警条件（初始值）                                                                                                                                                                                                                       | 手册                                                        |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
@@ -54,7 +54,7 @@
 | `tunnel`                                      | launchd 隧道进程 + cloudflared 指标端口 `/ready` 的就绪连接数                                   | 进程不在或就绪连接为 0：严重                                                                                                                                                                                                             | [隧道断开](m1-tunnel.md)                                    |
 | `public_entry` / `public_entry:<域名>`        | `ALLRICE_PUBLIC_URL` 和 `extraPublicUrls`（员工入口、管理后台、Bridge），跟随跳转应得 200       | 15 秒内拿不到 200：严重                                                                                                                                                                                                                  | [隧道断开](m1-tunnel.md)                                    |
 | `disk:<路径>`                                 | 可用空间                                                                                        | 低于 100 GiB：警告；低于 30 GiB：严重                                                                                                                                                                                                    | [磁盘快满](m1-disk-space.md)                                |
-| `backup`                                      | 每日备份日志里最后一次 `ok` + launchd `ai.bplabs.allrice-dev-backup` 上次的退出码               | 上次运行失败或超过 50 小时/没有记录：严重；超过 26 小时、定时任务没加载：警告                                                                                                                                                            | [数据库](m1-database.md#每日备份)                           |
+| `backup`                                      | 每日备份日志里最后一次 `ok` + launchd `ai.bplabs.allrice40-dev-backup` 上次的退出码             | 上次运行失败或超过 50 小时/没有记录：严重；超过 26 小时、定时任务没加载：警告                                                                                                                                                            | [数据库](m1-database.md#每日备份)                           |
 | `peer` / `peer_telegram`                      | huihuimac 看门的心跳（与 huihuimac 看 M1 的判断相同）                                           | 4 分钟没更新、4 分钟没有一轮跑完、连不上：警告；连续 3 分钟发不出 Telegram：警告                                                                                                                                                         | 本页“看门”                                                  |
 | `monitor` / `monitor_round` / `monitor_state` | 事件表写入积压、单轮超过 240 秒、状态文件损坏                                                   | 积压 30 分钟：警告；超时：严重；损坏：警告                                                                                                                                                                                               | 本页                                                        |
 | `business.*`                                  | 业务巡检                                                                                        | 见“业务巡检”                                                                                                                                                                                                                             | 见“业务巡检”                                                |
@@ -115,9 +115,9 @@ huihuimac 一侧（`monitor peer`）：
 
 ## 安装（发布负责人）
 
-M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice-dev/bin`。第一次另需两步：
+M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice40-dev/bin`。4.0 Dev 获准启用且已在新环境准备就绪后，由发布负责人完成以下两步。
 
-1. 告警凭证：`~/allrice-dev/monitor/telegram.env`（权限 600，不进仓库、不放 Dev 的 `.env`）：
+1. 告警凭证：`~/allrice40-dev/monitor/telegram.env`（权限 600，不进仓库、不放 Dev 的 `.env`）：
 
    ```bash
    TELEGRAM_BOT_TOKEN=<bot token>
@@ -129,53 +129,53 @@ M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice-dev/bin`。第�
 2. 安装定时任务并发一条测试消息：
 
    ```bash
-   ~/allrice-dev/bin/monitor test-alert
-   ~/allrice-dev/bin/monitor launchd install
+   ~/allrice40-dev/bin/monitor test-alert
+   ~/allrice40-dev/bin/monitor launchd install
    ```
 
-   plist 指向 `~/allrice-dev/bin/monitor`，以后 `scripts/m1/install` 换版本时自动用新版，不用重装 launchd。
+   plist 指向 `~/allrice40-dev/bin/monitor`，以后 `scripts/m1/install` 换版本时自动用新版，不用重装 launchd。
 
 huihuimac 上（没有 AllRice 仓库副本，直接复制 M1 已安装的版本）：
 
 ```bash
-mkdir -p ~/.local/share/allrice-monitor ~/.local/state/allrice-monitor-peer
-scp m1:allrice-dev/bin/monitor m1:allrice-dev/bin/TOOLS_VERSION ~/.local/share/allrice-monitor/
-# 凭证在 ~/.config/allrice-monitor/telegram.env（同上格式，权限 600，目录 700）
-/usr/bin/python3 ~/.local/share/allrice-monitor/monitor test-alert --peer
-/usr/bin/python3 ~/.local/share/allrice-monitor/monitor launchd install --peer
+mkdir -p ~/.local/share/allrice40-monitor ~/.local/state/allrice40-monitor-peer
+scp m1:allrice40-dev/bin/monitor m1:allrice40-dev/bin/TOOLS_VERSION ~/.local/share/allrice40-monitor/
+# 凭证在 ~/.config/allrice40-monitor/telegram.env（同上格式，权限 600，目录 700）
+/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor test-alert --peer
+/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor launchd install --peer
 ```
 
-huihuimac 的告警通过 `ssh m1 allrice-dev/bin/monitor ingest-incidents` 写进 M1 的事件表，所以 M1 上要先装好 `monitor`。
+huihuimac 的告警通过 `ssh m1 allrice40-dev/bin/monitor ingest-incidents` 写进 M1 的事件表，所以 M1 上要先装好 `monitor`。
 
 事件表要先有迁移 `0220`（随 Dev 部署执行），否则写入会被 `kind` 约束拒绝，30 分钟后报 `monitor`；监控本身照常检查和发 Telegram。`scripts/m1/install` 装之前会用 `/usr/bin/python3`（3.9）跑一遍 `scripts/m1/test_monitor.py`。
 
 ## 日常命令
 
 ```bash
-~/allrice-dev/bin/monitor status          # 未恢复的告警、上一轮、Telegram 和事件表积压
-~/allrice-dev/bin/monitor run --dry-run   # 现在跑一遍，只打印，不发不写
-~/allrice-dev/bin/monitor daily           # 立刻发日报
-~/allrice-dev/bin/monitor failures --json # 24 小时失败按错误码分组（新出现/变多/其余），给每日问题报告读
-~/allrice-dev/bin/monitor online-waits --json # 当前前台待答Run、实际占位/容量及来源；只读，可截图
-tail -50 ~/allrice-dev/monitor/monitor.log
+~/allrice40-dev/bin/monitor status          # 未恢复的告警、上一轮、Telegram 和事件表积压
+~/allrice40-dev/bin/monitor run --dry-run   # 现在跑一遍，只打印，不发不写
+~/allrice40-dev/bin/monitor daily           # 立刻发日报
+~/allrice40-dev/bin/monitor failures --json # 24 小时失败按错误码分组（新出现/变多/其余），给每日问题报告读
+~/allrice40-dev/bin/monitor online-waits --json # 当前前台待答Run、实际占位/容量及来源；只读，可截图
+tail -50 ~/allrice40-dev/monitor/monitor.log
 ```
 
-调阈值、关某项检查：在 `~/allrice-dev/monitor/config.json` 写覆盖值，例如 `{"skipChecks": ["peer"], "disks": [{"path": "~", "warnFreeGiB": 80, "criticalFreeGiB": 20}]}`。下一轮生效。
+调阈值、关某项检查：在 `~/allrice40-dev/monitor/config.json` 写覆盖值，例如 `{"skipChecks": ["peer"], "disks": [{"path": "~", "warnFreeGiB": 80, "criticalFreeGiB": 20}]}`。下一轮生效。
 
 ## 看门（监控自己挂了）
 
-- M1 每轮开始和结束都写 `~/allrice-dev/monitor/heartbeat.json`；huihuimac 每 1 分钟用 SSH 读它。M1 整机宕机约 1–2 分钟报 `m1_reachable`；监控停了最迟约 7.5 分钟（6 分钟阈值 + 1 分钟间隔 + 重查）报 `m1_heartbeat`；每轮开始又出错（心跳在刷新但没有一轮跑完）约 7.5 分钟报 `m1_heartbeat`。
-- huihuimac 每轮写 `~/.local/state/allrice-monitor-peer/heartbeat.json`，M1 每轮读它（`peer`、`peer_telegram`，判断和上面相同）。huihuimac 停了或发不出 Telegram，M1 报警告：此时 M1 整机故障将没人报警，尽快恢复。
-- 收到 `m1_heartbeat`：`ssh m1 '~/allrice-dev/bin/monitor status; launchctl print gui/$(id -u)/ai.bplabs.allrice-dev-monitor | head -20; tail -50 ~/allrice-dev/monitor/monitor.log'`。
+- M1 每轮开始和结束都写 `~/allrice40-dev/monitor/heartbeat.json`；huihuimac 每 1 分钟用 SSH 读它。M1 整机宕机约 1–2 分钟报 `m1_reachable`；监控停了最迟约 7.5 分钟（6 分钟阈值 + 1 分钟间隔 + 重查）报 `m1_heartbeat`；每轮开始又出错（心跳在刷新但没有一轮跑完）约 7.5 分钟报 `m1_heartbeat`。
+- huihuimac 每轮写 `~/.local/state/allrice40-monitor-peer/heartbeat.json`，M1 每轮读它（`peer`、`peer_telegram`，判断和上面相同）。huihuimac 停了或发不出 Telegram，M1 报警告：此时 M1 整机故障将没人报警，尽快恢复。
+- 收到 `m1_heartbeat`：`ssh m1 '~/allrice40-dev/bin/monitor status; launchctl print gui/$(id -u)/ai.bplabs.allrice40-dev-monitor | head -20; tail -50 ~/allrice40-dev/monitor/monitor.log'`。
 - 收到 `m1_reachable`：先确认 huihuimac 自己的网络和 Tailscale（`tailscale status`）；M1 在线但 SSH 不通，让用户到机器旁查看。M1 开着 FileVault，**无人值守重启后要有人到机器前登录**，服务才会起来。
 
 ## 诊断交给 Codex
 
-需要定位根因时，派 Codex Astra 做只读诊断（AGENTS.md 第 9 节“线上问题诊断”），结论回报用户：
+需要定位根因时，派 `gpt-6.2-sol` `max` 做只读诊断（AGENTS.md 第 9 节“线上问题诊断”），结论回报用户：
 
 ```bash
-~/.local/bin/codex exec -C ~/allrice-repo -m gpt-6-astra -c model_reasoning_effort=max -s read-only \
-  -o ~/allrice-dev/qa/codex/diagnose-$(date +%m%d-%H%M).md \
+~/.local/bin/codex exec -C ~/allrice40-repo -m gpt-6.2-sol -c model_reasoning_effort=max -s read-only \
+  -o ~/allrice40-dev/qa/codex/diagnose-$(date +%m%d-%H%M).md \
   "只读诊断 M1 Dev 告警：<粘贴告警原文>。查 deploy-dev --status、相关日志和只读 SQL，给出根因、证据和建议修法，不改代码、数据和配置。" </dev/null
 ```
 

@@ -106,6 +106,8 @@ it('measures actual service files and transitive compiled packages; roles share 
     web = await f.verify('web'),
     worker = await f.verify('worker');
   expect(f.manifest.repository).toBe('semiok/allrice-vm');
+  expect(web?.repository).toBe(f.manifest.repository);
+  expect(worker?.repository).toBe(f.manifest.repository);
   expect(web?.manifestDigest).toBe(f.manifest.manifestDigest);
   expect(worker?.manifestDigest).toBe(web?.manifestDigest);
   expect(worker?.runtimeGraphDigest).toBe(web?.runtimeGraphDigest);

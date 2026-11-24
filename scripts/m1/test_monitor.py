@@ -23,6 +23,10 @@ monitor = importlib.util.module_from_spec(_spec)
 _loader.exec_module(monitor)
 
 
+READY = json.dumps({'status': 'ready', 'identity': {'repository': 'semiok/allrice-vm',
+                   'environment': 'dev', 'service': 'web', 'mode': 'production'}}).encode()
+
+
 def make_round(peer=False, **overrides):
     tmp = tempfile.mkdtemp(prefix='monitor-test-')
     cfg = json.loads(json.dumps(monitor.PEER if peer else monitor.M1))
@@ -147,7 +151,7 @@ class Messages(unittest.TestCase):
         texts = monitor.compose(r, events)
         self.assertEqual(len(texts), 1)
         text = texts[0]
-        self.assertTrue(text.startswith('🟠 [演练] AllRice M1 Dev：1 项告警，1 项恢复'))
+        self.assertTrue(text.startswith('🟠 [演练] AllRice 4.0 M1 Dev：1 项告警，1 项恢复'))
         self.assertIn('[警告] 磁盘余量不足', text)
         self.assertIn('   第一步：step', text)
         self.assertIn('手册：https://github.com/semiok/allrice-vm/blob/main/docs/runbooks/x.md', text)
@@ -164,7 +168,7 @@ class Messages(unittest.TestCase):
         texts = monitor.compose(r, events)
         self.assertGreater(len(texts), 1)
         self.assertTrue(all(len(t) <= monitor.MESSAGE_LIMIT + 200 for t in texts))
-        self.assertTrue(texts[0].startswith('🔴 AllRice M1 Dev：12 项告警（1/%d）' % len(texts)))
+        self.assertTrue(texts[0].startswith('🔴 AllRice 4.0 M1 Dev：12 项告警（1/%d）' % len(texts)))
         joined = '\n'.join(texts)
         self.assertTrue(all('告警%d' % i in joined for i in range(12)))  # nothing cut off
 
@@ -489,7 +493,9 @@ class Checks(unittest.TestCase):
 
     def test_public_entry_probes_every_hostname(self):
         r = make_round(publicUrl='https://a.example', extraPublicUrls=['https://b.example', 'https://A.example/login', 'https://c.example'])
-        answers = {'https://a.example': (200, b'login'), 'https://b.example': (200, b'login'), 'https://c.example': (530, b'error 1033')}
+        answers = {'https://a.example/api/health/ready': (200, READY),
+                   'https://b.example/api/health/ready': (200, READY),
+                   'https://c.example/api/health/ready': (530, b'error 1033')}
 
         def probe():
             with mock.patch.object(monitor, 'lock_holders', return_value=[]), \
@@ -504,19 +510,30 @@ class Checks(unittest.TestCase):
         findings, ran = probe()
         self.assertEqual(step(r, findings, 300, ran), [('recovered', 'public_entry:c.example', False)])  # left the config
 
-    def test_m1_probes_every_entry_the_tunnel_serves(self):
-        r = make_round(publicUrl='https://a.bplabs.xyz')  # the shipped extraPublicUrls
+    def test_m1_probes_both_new_entries_and_refuses_an_old_service(self):
+        r = make_round()
         probed = []
 
         def get(url, *a):
             probed.append(url)
-            return 200, b'ok'
+            return 200, READY if 'allrice-admin' in url else READY.replace(b'allrice-vm', b'allrice')
         with mock.patch.object(monitor, 'lock_holders', return_value=[]), mock.patch.object(monitor, 'http_get', side_effect=get):
-            keys = [f['key'] for f in monitor.check_public_entry(r)]
-        self.assertEqual(keys, ['public_entry', 'public_entry:allrice.bplabs.xyz', 'public_entry:allrice-admin.bplabs.xyz',
-                                'public_entry:allrice-dsh.bplabs.xyz'])
-        # Rice Bridge pairs with allrice-dsh; its root redirects to allrice-admin, so it is probed on a path of its own
-        self.assertIn('https://allrice-dsh.bplabs.xyz/api/health/ready', probed)
+            findings = monitor.check_public_entry(r)
+        self.assertEqual([(f['key'], f['severity']) for f in findings],
+                         [('public_entry', 'critical'), ('public_entry:allrice-admin.bplabs.xyz', 'ok')])
+        self.assertCountEqual(probed, ['https://allrice.bplabs.xyz/api/health/ready',
+                                      'https://allrice-admin.bplabs.xyz/api/health/ready'])
+
+    def test_tunnel_does_not_borrow_ready_connections_from_the_legacy_port(self):
+        r = make_round()
+
+        def get(url, *a):
+            return (200, b'{"readyConnections": 4}') if ':20241/' in url else (503, b'{"readyConnections": 0}')
+        with mock.patch.object(monitor, 'job_info', return_value=('running', '123', '0')), \
+                mock.patch.object(monitor, 'plist_of', return_value={}), \
+                mock.patch.object(monitor, 'http_get', side_effect=get) as probe:
+            self.assertEqual(monitor.check_tunnel(r)[0]['severity'], 'critical')
+            probe.assert_called_once_with('http://127.0.0.1:20246/ready', 3)
 
     def test_public_entry_probes_hostnames_at_once(self):
         r = make_round(publicUrl='https://a.example', extraPublicUrls=['https://b.example', 'https://c.example'])
@@ -524,7 +541,7 @@ class Checks(unittest.TestCase):
 
         def get(url, *a):
             together.wait()
-            return 200, b'login'
+            return 200, READY
         with mock.patch.object(monitor, 'lock_holders', return_value=[]), mock.patch.object(monitor, 'http_get', side_effect=get):
             self.assertEqual([(f['key'], f['severity']) for f in monitor.check_public_entry(r)],
                              [('public_entry', 'ok'), ('public_entry:b.example', 'ok'), ('public_entry:c.example', 'ok')])
@@ -539,7 +556,7 @@ class Checks(unittest.TestCase):
                 code = replies[urllib.parse.urlsplit(url).hostname].pop(0)
             if code is None:
                 release.wait()
-            return code, b'reply'
+            return code, READY
         return mock.patch.object(monitor, 'http_get', side_effect=get)
 
     def round_limit(self, seconds):
@@ -847,7 +864,7 @@ class Peer(unittest.TestCase):
             self.assertIsNone(monitor.check_outside(r))  # down while M1 deploys: not judged
         with self.remote(fresh, holders=[]), mock.patch.object(monitor, 'http_get', return_value=(502, b'bad gateway')):
             self.assertEqual(monitor.check_outside(r)[0]['severity'], 'critical')
-        with self.remote(fresh, holders=['777']), mock.patch.object(monitor, 'http_get', return_value=(200, b'ok')):
+        with self.remote(fresh, holders=['777']), mock.patch.object(monitor, 'http_get', return_value=(200, READY)):
             self.assertEqual(monitor.check_outside(r)[0]['severity'], 'ok')  # up during a deploy is still up
 
     def test_m1_judges_the_peer_the_same_way(self):
@@ -876,7 +893,7 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg['telegramEnv'], os.path.join(tmp, 'telegram.env'))
         self.assertEqual(cfg['label'], '演练')
         peer = monitor.load_config(path, True)
-        self.assertEqual(peer['telegramEnv'], os.path.expanduser('~/.config/allrice-monitor/telegram.env'))
+        self.assertEqual(peer['telegramEnv'], os.path.expanduser('~/.config/allrice40-monitor/telegram.env'))
 
 
 class Business(unittest.TestCase):

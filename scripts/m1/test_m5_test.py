@@ -31,6 +31,7 @@ case "$*" in
   *M5T_ACTION=test*|*M5T_ACTION=codex*)
     [ ! -e hang ] || { echo "starting"; sleep 30; exit 0; }
     [ ! -e drop ] || { HOME=$PWD /bin/sh -c "$*" | grep -v '^m5-test: done on '; exit 255; }
+    [ ! -e wrong-receipt ] || { HOME=$PWD /bin/sh -c "$*" | sed '/^m5-test: result repository /s/id 1469490636 /id 1323769790 /'; exit 0; }
     [ ! -e late-drop ] || { HOME=$PWD /bin/sh -c "$*"; exit 255; }
     [ ! -e slept ] || { HOME=$PWD /bin/sh -c "$*"; echo "m5-test: M5 was asleep 40s during this run; it is no verdict"; exit 76; } ;;
 esac
@@ -343,6 +344,35 @@ class M5Test(unittest.TestCase):
         p = self.run_m5('--on', 'm1', '--wait', '0', '--no-build', '--', 'isolation.test.ts')
         self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
         self.assertIn('2 of 2 runs busy', p.stdout)
+
+    def test_unpublished_lease_never_starts_remote_test_process(self):
+        isolated = Path(self.tmp, 'tools')
+        isolated.mkdir()
+        for name in ('m5-test', 'm5-run', 'lib.sh', 'm5_result.py'):
+            shutil.copy2(Path(HERE, name), isolated / name)
+        lib = isolated / 'lib.sh'
+        original = lib.read_text()
+        fake_mv = Path(self.m1, '.local/opt/node-22.23.2/bin/mv')
+        for broken in ('lock', 'rename'):
+            with self.subTest(broken=broken):
+                lib.write_text(original + ('\nflock_fd() { return 1; }\n' if broken == 'lock' else ''))
+                if broken == 'rename':
+                    write(str(fake_mv), '#!/bin/sh\nexit 1\n', 0o755)
+                p = subprocess.run([str(isolated / 'm5-test'), '--on', 'm5', '--no-build', '--', 'must-not.test.ts'],
+                    cwd=self.repo, env=dict(os.environ, HOME=self.m1, M5_FAKE_HOME=self.m5,
+                    M5_TEST_SSH=self.ssh, **GIT_ENV), capture_output=True, text=True, timeout=20)
+                self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+                self.assertIn('未启动远端测试', p.stdout + p.stderr)
+                self.assertEqual(self.calls(self.th), [])
+                self.assertEqual(os.listdir(self.leases), [])
+
+    def test_wrong_remote_completion_is_unknown_to_caller(self):
+        write(os.path.join(self.m5, 'wrong-receipt'), '')
+        p = self.run_m5('--on', 'm5', '--no-build', '--', 'receipt.test.ts')
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertIn('vitest says hello', p.stdout)
+        self.assertIn('done on M5', p.stdout)
+        self.assertNotIn('finished on M5', p.stdout)
 
     def test_wrong_repository_origin_is_refused_before_push_or_lease(self):
         self.git('remote', 'set-url', 'origin', 'https://github.com/semiok/allrice.git')

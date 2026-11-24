@@ -35,6 +35,7 @@ config_missing() {
   echo "cloud-autostart: cannot read ALLRICE_CLOUD_PROFILE / ALLRICE_CLOUD_COLIMA / ALLRICE_OFFICE_RENDERER_URL from $WORKER_PLIST" >&2
   exit 2
 }
+dev_plist_config worker "$WORKER_PLIST" || exit 2
 PROFILE=$(worker_env ALLRICE_CLOUD_PROFILE 2>/dev/null) || config_missing
 COLIMA=$(worker_env ALLRICE_CLOUD_COLIMA 2>/dev/null) || config_missing
 RENDERER_URL=$(worker_env ALLRICE_OFFICE_RENDERER_URL 2>/dev/null) || config_missing

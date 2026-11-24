@@ -50,6 +50,7 @@ const pending = {
 const identity: ServiceBuildIdentity = {
   version: 1,
   environment: 'dev',
+  repository: 'semiok/allrice-vm',
   service: 'worker',
   mode: 'production',
   sourceSha: 'a'.repeat(40),

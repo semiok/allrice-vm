@@ -695,12 +695,26 @@ mode=os.environ['M5_RECEIPT']
 pid=os.getpid() if mode!='other-run' else 1
 path=root/('20261116-140000-12345678-%s.log'%pid)
 line='m5-test: finished on M5, exit 0; log %s'%path
-if mode!='missing': path.write_text(line+'\\n' if mode!='partial' else 'm5-test: done on M5 (batch), exit 0\\n')
+sha='12345678'+'a'*32
+identity_sha=sha if mode!='wrong-sha' else '12345678'+'b'*32
+repository='semiok/allrice-vm' if mode!='wrong-repo' else 'semiok/allrice'
+repository_id=1469490636 if mode!='wrong-id' else 1323769790
+host='M1' if mode=='wrong-host' else 'M5'
+run=path.stem if mode!='wrong-run' else path.stem+'0'
+header='m5-test: repository semiok/allrice-vm id 1469490636 commit '+sha
+receipt='m5-test: result repository %s id %s commit %s host %s run %s exit 0'%(repository,repository_id,identity_sha,host,run)
+closing='m5-test: done on M5 (12345678, 1 workers), exit 0'
+if mode!='missing':
+    lines=[header, receipt, closing, line]
+    if mode=='partial': lines.pop()
+    if mode=='header-only': lines.pop(1)
+    path.write_text('\\n'.join(lines)+'\\n')
 if mode=='old': os.utime(path,(1,1))
 print(line)
 ''')
         command.chmod(0o755)
-        for mode in ['other-run', 'missing', 'partial', 'old']:
+        for mode in ['other-run', 'missing', 'partial', 'old', 'header-only',
+                     'wrong-sha', 'wrong-repo', 'wrong-id', 'wrong-host', 'wrong-run']:
             with self.subTest(mode=mode):
                 item = self.start('', command=[str(command)], extra_env={'M5_RECEIPT': mode})
                 state = self.finished(item)

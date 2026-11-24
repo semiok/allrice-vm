@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import unittest
 
@@ -65,7 +66,7 @@ class DeployDevMigrations(unittest.TestCase):
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
 
     def plist(self, role, release='/nowhere', legacy=False):
-        env = {'DATABASE_URL': 'postgres://stub/allrice_dev', 'ALLRICE_WEB_PORT': '1', 'ALLRICE_WORKER_PORT': '2',
+        env = {'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev', 'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',
                'ALLRICE_RELEASE_SHA': 'a' * 40, 'ALLRICE_DSH_NATIVE_ARTIFACT_ID': 'sha256:' + 'a' * 64,
                'ALLRICE_NATIVE_ONCE_REFERENCE': '{"artifactId":"provenance"}', 'UNRELATED_SETTING': 'keep'}
         if legacy:
@@ -73,7 +74,7 @@ class DeployDevMigrations(unittest.TestCase):
                         'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS': 'obsolete-not-json',
                         'ALLRICE_DSH_RETAINED_ARTIFACT_ID': 'old', 'ALLRICE_DSH_RETAINED_ROOT_2': '/old',
                         'ALLRICE_DSH_ORIGIN_READER_ROOT': '/old-reader'})
-        return {'Label': role, 'WorkingDirectory': release, 'KeepAlive': True,
+        return {'Label': 'ai.bplabs.allrice40-dev-' + role, 'WorkingDirectory': release, 'KeepAlive': True,
                 'ProgramArguments': [NODE, '--env-file=' + self.home + '/allrice40-dev/.env', '/old/script'],
                 'EnvironmentVariables': env}
 
@@ -179,7 +180,7 @@ class DeployDevMigrations(unittest.TestCase):
         d = os.path.join(self.snapshots, name)
         self.assertEqual(sorted(os.listdir(d)), ['allrice40_dev.sql.gz', 'dsh-runtime-m1', 'env', 'storage', 'web.plist', 'worker.plist'])
         with gzip.open(os.path.join(d, 'allrice40_dev.sql.gz'), 'rt') as f:
-            self.assertEqual(f.read(), '-- dump of -Fp --no-owner --no-privileges postgres://stub/allrice_dev\n')
+            self.assertEqual(f.read(), '-- dump of -Fp --no-owner --no-privileges postgres://tester@127.0.0.1:5434/allrice40_dev\n')
         with open(os.path.join(d, 'storage/org/file.txt')) as f:
             self.assertEqual(f.read(), 'stored')
         self.assertEqual(os.stat(os.path.join(d, 'env')).st_mode & 0o777, 0o600)
@@ -495,7 +496,7 @@ class DeployDevMigrations(unittest.TestCase):
                         self.assert_no_legacy_settings(env)
                         self.assertEqual(env['UNRELATED_ENV'], "space and 'quote'")
                         self.assertEqual(env['ALLRICE_DSH_RETAINEDNESS'], 'keep-similar-key')
-                        self.assertEqual(env['DATABASE_URL'], 'postgres://stub/allrice_dev')
+                        self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_dev')
                         self.assertEqual(env['ALLRICE_NATIVE_ONCE_REFERENCE'], '{"artifactId":"provenance"}')
                 with open(env_file) as f:
                     self.assertEqual(f.read(), contents)
@@ -513,7 +514,7 @@ class DeployDevMigrations(unittest.TestCase):
                                      capture_output=True, text=True, timeout=10)
             self.assertEqual(started.returncode, 0, started.stderr)
             actual = json.loads(started.stdout)
-            self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5432/allrice_qa_tool_test')
+            self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
             self.assert_no_legacy_settings(actual)
         monitor = runpy.run_path(os.path.join(HERE, 'monitor'))
         cfg = dict(monitor['M1'], webPlist=self.live_plist('web'),
@@ -525,7 +526,7 @@ class DeployDevMigrations(unittest.TestCase):
             marker = '  /usr/bin/python3 - "$task" "$dir"'
             script = marker + f.read().split(marker, 1)[1].split('\nPY\n', 1)[0] + '\nPY\n'
         directory = os.path.join(self.tmp, 'qa')
-        p = self.run_dd('task=tool-test; dir=$QA_DIR; db=allrice_qa_tool_test; web=3200; worker=3201; '
+        p = self.run_dd('task=tool-test; dir=$QA_DIR; db=allrice40_qa_tool_test; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
                         QA_DIR=directory, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -540,14 +541,14 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(live, value)
             self.assert_no_legacy_settings(value['EnvironmentVariables'])
             self.assertEqual(value['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
-            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], 'postgres://tester@127.0.0.1:5432/allrice_qa_tool_test')
+            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
             self.assertEqual(value['EnvironmentVariables']['UNRELATED_SETTING'], 'keep')
 
     def test_qa_env_does_not_copy_retired_settings(self):
         # Both QA processes use --env-file; cleaning only the plist cannot
         # prevent a retained setting in the copied .env from reaching Node.
         write(os.path.join(self.home, 'allrice40-dev/.env'),
-              'DATABASE_URL=postgres://stub/allrice_dev\nUNRELATED_ENV=keep\n'
+              'DATABASE_URL=postgres://tester@127.0.0.1:5434/allrice40_dev\nUNRELATED_ENV=keep\n'
               'ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID=old-root\n'
               'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS=[]\n'
               'ALLRICE_DSH_RETAINED_1_ROOT=/old\n'
@@ -557,7 +558,7 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         with open(os.path.join(directory, '.env')) as f:
             env = dict(line.rstrip('\n').split('=', 1) for line in f)
-        self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5432/allrice_qa_tool_test')
+        self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
         self.assertEqual(env['UNRELATED_ENV'], 'keep')
         self.assert_no_legacy_settings(env)
 
@@ -572,7 +573,7 @@ class DeployDevMigrations(unittest.TestCase):
                     p = self.run_dd('take_lock() { :; }; stop_job() { echo STOPPED:$2; }; '
                                     'start_both_on() { echo STARTED; }; ' + entry, FILES + ARCHIVED, CONTRACT=row, **extra)
                     self.assertNotEqual(p.returncode, 0)
-                    self.assertIn('STOPPED:1\nSTOPPED:2', p.stdout)
+                    self.assertIn('STOPPED:3311\nSTOPPED:3312', p.stdout)
                     self.assertNotIn('STARTED', p.stdout)
                     self.assert_parked()
                     with open(log) as f:
@@ -599,7 +600,7 @@ class DeployDevMigrations(unittest.TestCase):
             self.assert_parked()
         p = self.run_dd(script, FILES[:-1] + ARCHIVED, CONTRACT='row:1')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('STOPPED:1\nSTOPPED:2', p.stdout)
+        self.assertIn('STOPPED:3311\nSTOPPED:3312', p.stdout)
         self.assertIn('READY:' + 'a' * 40, p.stdout)
         for role in ('web', 'worker'):
             self.assertEqual(self.read_plist(self.live_plist(role)), self.plist(role, old))
@@ -713,7 +714,7 @@ class DeployDevMigrations(unittest.TestCase):
                                     ALLRICE_DSH_ORIGIN_READER_PARENT_ROOT='/old-parent-reader')
                     self.assertEqual(p.returncode, 0, p.stderr)
                     env = json.loads(p.stdout)
-                    self.assertEqual(env['DATABASE_URL'], 'postgres://stub/allrice_dev')
+                    self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_dev')
                     self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'sha256:' + 'a' * 64)
                     self.assertEqual(env['UNRELATED_SETTING'], 'keep')
                     self.assert_no_legacy_settings(env)
@@ -875,13 +876,73 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertFalse(os.path.exists(parked))
         self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice40-dev/qa/.previous-release')))
 
+    def test_dev_operations_refuse_old_or_miswired_plists_before_effects(self):
+        rejected = [
+            ('worker', 'DATABASE_URL', 'postgres://tester@127.0.0.1:5432/allrice_dev'),
+            ('worker', 'DATABASE_URL', 'postgres://tester@127.0.0.1:5434/allrice40_dev?port=5432'),
+            ('web', 'ALLRICE_WEB_PORT', '3011'),
+            ('worker', 'ALLRICE_WORKER_PORT', '3012'),
+            ('worker', 'Label', 'ai.bplabs.allrice-dev-worker'),
+        ]
+        with tempfile.TemporaryDirectory(dir=self.tmp) as output:
+            touched = os.path.join(output, 'started')
+            for parked in (False, True):
+                if parked:
+                    self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+                for role, key, value in rejected:
+                    with self.subTest(parked=parked, key=key, value=value):
+                        path = (os.path.join(self.home, 'allrice40-dev/qa/deploy-disabled', role + '.plist')
+                                if parked else self.live_plist(role))
+                        valid = self.plist(role)
+                        bad = self.plist(role)
+                        (bad if key == 'Label' else bad['EnvironmentVariables'])[key] = value
+                        with open(path, 'wb') as f:
+                            plistlib.dump(bad, f)
+                        try:
+                            p = self.run_dd('deploy', [])
+                            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                            self.assertIn('refusing a mismatched Dev configuration', p.stderr)
+                            self.assertFalse(os.path.isdir(self.snapshots))
+                            p = self.run_config_tool('with-env', role, '/usr/bin/touch', touched)
+                            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                            self.assertFalse(os.path.exists(touched))
+                            if role == 'worker':
+                                p = self.run_config_tool('schedule-recover', '--dev', '--release-manager', '--execute')
+                                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                                self.assertIn('expected ai.bplabs.allrice40-dev-worker', p.stderr)
+                        finally:
+                            with open(path, 'wb') as f:
+                                plistlib.dump(valid, f)
+
+    def test_smoke_and_recovery_share_allocator_lock_before_reading_instance(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import fcntl
+        instance = os.path.join(self.home, 'allrice-qa', 'switch')
+        os.makedirs(instance)
+        metadata = os.path.join(instance, 'instance.json')
+        tools = ('smoke-test', 'schedule-recover')
+        for name in tools:
+            with self.subTest(tool=name):
+                write(metadata, json.dumps({'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636}))
+                with ThreadPoolExecutor(max_workers=1) as worker:
+                    with open(os.path.join(self.home, 'allrice-qa', '.alloc.lock'), 'a') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        pending = worker.submit(self.run_config_tool, name, '--instance', 'switch')
+                        time.sleep(.25)
+                        self.assertFalse(pending.done(), 'selection must wait for the common allocator')
+                        write(metadata, json.dumps({'repository': 'semiok/allrice', 'repositoryId': 1323769790}))
+                    p = pending.result(timeout=5)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn('repository', p.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice-qa', '.task-switch.lock')))
+
     def test_qa_generation_reads_parked_configuration_without_restoring_dev(self):
         p = self.run_dd('park_plists', [])
         self.assertEqual(p.returncode, 0, p.stderr)
         directory = self.write_qa_plists()
         for role in ('web', 'worker'):
             env = self.read_plist(os.path.join(directory, role + '.plist'))['EnvironmentVariables']
-            self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5432/allrice_qa_tool_test')
+            self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
             self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
         self.assert_parked()
 
@@ -912,14 +973,14 @@ class DeployDevMigrations(unittest.TestCase):
 
     def test_backup_copies_parked_plists_and_finishes(self):
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
-        os.makedirs(os.path.join(self.home, 'allrice-backups/db'))
+        os.makedirs(os.path.join(self.home, 'allrice40-backups/db'))
         # File copying is local to the fixture; no rsync installation is needed in CI.
         write(os.path.join(self.stubs, 'rsync'), '#!' + sys.executable + '\n'
               'import shutil,sys\nshutil.copytree(sys.argv[-2], sys.argv[-1], dirs_exist_ok=True)\n', 0o755)
         p = self.run_config_tool('backup-daily')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('ok db=', p.stdout)
-        files = os.path.join(self.home, 'allrice-backups/files')
+        files = os.path.join(self.home, 'allrice40-backups/files')
         day = os.path.join(files, os.listdir(files)[0])
         for role in ('web', 'worker'):
             self.assertEqual(self.read_plist(os.path.join(day, role + '.plist')), self.plist(role))
@@ -961,15 +1022,15 @@ class DeployDevMigrations(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(probe) as f:
             args = json.load(f)
-        self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:1')
-        self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:2')
+        self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:3311')
+        self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:3312')
         with open(os.path.join(out, 'result.json')) as f:
             self.assertEqual(json.load(f)['nativeArtifactId'], 'sha256:' + 'a' * 64)
         self.assert_parked()
 
     def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
         worker = self.plist('worker')
-        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5432/allrice_dev'
+        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(worker, f)
         self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
@@ -987,9 +1048,17 @@ class DeployDevMigrations(unittest.TestCase):
               'print(json.dumps(rows))\n', 0o755)
         instance = os.path.join(self.home, 'allrice-qa/recover-test')
         os.makedirs(instance)
-        write(os.path.join(instance, 'instance.json'), '{}')
+        write(os.path.join(instance, 'instance.json'), json.dumps({
+            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'workerPort': 3201,
+        }))
+        qa_worker = self.plist('worker')
+        qa_worker['Label'] = 'ai.bplabs.allrice-qa-recover-test-worker'
+        qa_worker['EnvironmentVariables'].update(
+            DATABASE_URL='postgres://tester@127.0.0.1:5434/allrice40_qa_recover_test',
+            ALLRICE_WORKER_PORT='3201',
+        )
         with open(os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-recover-test-worker.plist'), 'wb') as f:
-            plistlib.dump(worker, f)
+            plistlib.dump(qa_worker, f)
         for mode in ('dev', 'instance'):
             args = ('--dev', '--release-manager') if mode == 'dev' else ('--instance', 'recover-test')
             if mode == 'instance':

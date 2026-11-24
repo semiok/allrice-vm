@@ -40,8 +40,9 @@ old = json.load(open(p)) if os.path.exists(p) else {}
 lease['write'](p, {'task': task, 'ref': ref, 'sha': sha, 'webPort': int(web), 'workerPort': int(worker), 'database': db,
            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636,
            'nativeArtifactId': art or None, 'cloudExecution': False, 'setup': state,
-           'owner': owner, 'card': card, 'createdAt': old.get('createdAt', lease['stamp'](now)),
-           # The old allocator treats these as legacy and cannot auto-reclaim them.
+           'owner': owner, 'card': card,
+           # The old allocator requires createdAt to renew, and expiresAt to reclaim.
+           'repositoryCreatedAt': old.get('repositoryCreatedAt', lease['stamp'](now)),
            'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)})
 PY
 }
@@ -186,6 +187,7 @@ cmd_up() {
   local dir="$QA/$task" db; db=$(db_name "$task")
   [ ! -e "$dir/instance.json" ] || die "instance $task already exists (qa-instance down $task first)"
 
+  dev_plist_pair || die "refusing a mismatched Dev configuration"
   # Other sessions may fetch at the same moment; a ref-lock collision just needs a retry.
   git -C "$REPO" fetch -q origin 2>/dev/null || { sleep 2; git -C "$REPO" fetch -q origin; }
   local sha

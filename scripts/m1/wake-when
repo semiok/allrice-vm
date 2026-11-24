@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import m5_result
 import wake_runtime as runtime
 
 HEARTBEAT = None
@@ -384,15 +385,26 @@ def verify_m5(run, state):
         root = (runtime.base() / 'qa/m5-test').resolve()
         if (not path.is_absolute() or path.is_symlink() or path.resolve().parent != root
                 or not re.fullmatch(r'[0-9]{8}-[0-9]{6}-[0-9a-f]{8}-%s\.log' % state['commandPid'], path.name)
-                or path.stat().st_mtime < state['commandStartedEpoch']
-                or tail_text(path).splitlines()[-1] != closing):
+                or path.stat().st_mtime < state['commandStartedEpoch']):
+            return None
+        lines = m5_result.tail_lines(path)
+        if lines[-1] != closing or int(match[2]) != state['commandExitCode']:
             return None
         with path.open('rb') as stream:
             first = stream.read(256).decode('utf-8', errors='replace').splitlines()[0]
-        if not re.fullmatch(r'm5-test: repository semiok/allrice-vm id 1469490636 commit [a-f0-9]{40}', first):
+        header = m5_result.HEADER.fullmatch(first)
+        if not header or path.stem.split('-')[2] != header[1][:8]:
+            return None
+        runner_exit = m5_result.result_exit(lines[:-1], match[1], path.stem, header[1])
+        exit_code = int(match[2])
+        if runner_exit != exit_code and not (
+                runner_exit == 0 and exit_code == 5
+                and f"m5-test: could not fetch Codex's report and patch from {match[1].lower()}" in lines):
             return None
         return dict(status='completed', conclusion='%s exit %s' % (match[1], match[2]),
-                    exitCode=int(match[2]), host=match[1], resultFile=str(path))
+                    exitCode=exit_code, host=match[1], resultFile=str(path),
+                    repository=m5_result.REPOSITORY, repositoryId=m5_result.REPOSITORY_ID,
+                    commit=header[1], run=path.stem)
     except (OSError, IndexError, KeyError, ValueError):
         return None
 

@@ -10,15 +10,15 @@ M1 只有一个数据卷，Postgres、发布目录、备份、colima 的 VM 磁�
 
 ```bash
 df -h ~
-du -sh ~/allrice-dev-releases ~/allrice-worktrees ~/allrice-qa ~/allrice-backups ~/.colima ~/Library/Caches ~/Library/Logs 2>/dev/null | sort -h
-du -sh ~/allrice-worktrees/* ~/allrice-dev-releases/* 2>/dev/null | sort -h | tail -15
+du -sh ~/allrice40-dev-releases ~/allrice40-worktrees ~/allrice-qa ~/allrice40-backups ~/.colima ~/Library/Caches ~/Library/Logs 2>/dev/null | sort -h
+du -sh ~/allrice40-worktrees/* ~/allrice40-dev-releases/* 2>/dev/null | sort -h | tail -15
 ```
 
 ## 处理（按安全程度从高到低）
 
-1. **自己任务的临时验收实例**：`~/allrice-dev/bin/qa-instance down <任务>`。**不要停别人的实例**。
-2. **已合并任务的 worktree**：确认没有 `.KEEP`、没有未提交改动、没有进程在用（`lsof +D <目录> | head`）后 `git -C ~/allrice-repo worktree remove <目录>`。只处理自己任务的；别人的写到 MET 卡上让对方处理。
-3. **日志**：`~/Library/Logs/allrice-dev-*.log` 过大时截断（`: > 文件`），不要删除正在写的文件。
+1. **自己任务的临时验收实例**：`~/allrice40-dev/bin/qa-instance down <任务>`。**不要停别人的实例**。
+2. **已合并任务的 worktree**：确认没有 `.KEEP`、没有未提交改动、没有进程在用（`lsof +D <目录> | head`）后 `git -C ~/allrice40-repo worktree remove <目录>`。只处理自己任务的；别人的写到 MET 卡上让对方处理。
+3. **日志**：`~/Library/Logs/allrice40-dev-*.log` 过大时截断（`: > 文件`），不要删除正在写的文件。
 4. **旧发布目录**：只由 `deploy-dev` 清理（保留当前、上一个和最近 3 个），不要手删。
 5. **colima VM 磁盘**：VM 内 `docker system df` 看占用，可以删已停止的临时容器；**不要 prune 镜像**（见 [m1-missing-image.md](m1-missing-image.md)）。
 
@@ -28,7 +28,7 @@ du -sh ~/allrice-worktrees/* ~/allrice-dev-releases/* 2>/dev/null | sort -h | ta
 
 ```bash
 df -h ~
-~/allrice-dev/bin/monitor run --dry-run | grep disk
+~/allrice40-dev/bin/monitor run --dry-run | grep disk
 ```
 
 ## 谁来做

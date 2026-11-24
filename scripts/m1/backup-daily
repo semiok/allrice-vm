@@ -9,6 +9,7 @@ BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
 export PATH=/opt/homebrew/bin:/usr/bin:/bin
 umask 077
 B="$HOME/allrice40-backups"; D=$(date +%Y%m%d); L="$HOME/allrice40-dev/.local"
+dev_plist_pair || exit 2
 mkdir -p "$B/db"
 pg_dump -h 127.0.0.1 -p 5434 -Fp --no-owner --no-privileges allrice40_dev | gzip -6 > "$B/db/allrice40_dev-$D.sql.gz.tmp"
 mv "$B/db/allrice40_dev-$D.sql.gz.tmp" "$B/db/allrice40_dev-$D.sql.gz"

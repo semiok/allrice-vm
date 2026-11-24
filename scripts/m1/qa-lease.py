@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 
 FIELDS = ('task ref sha webPort workerPort database nativeArtifactId cloudExecution '
-          'setup updatedAt owner card createdAt expiresAt repository repositoryId repositoryExpiresAt').split()
+          'setup updatedAt owner card createdAt expiresAt repository repositoryId repositoryCreatedAt repositoryExpiresAt').split()
 
 
 def stamp(now=None):
@@ -65,14 +65,15 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
-def expiry_field(data):
-    # Old allocators see a 4.0 instance as legacy, never as auto-reclaimable.
-    return 'repositoryExpiresAt' if data.get('repository') == 'semiok/allrice-vm' else 'expiresAt'
+def lease_fields(data):
+    if data.get('repository') == 'semiok/allrice-vm' and data.get('repositoryId') == 1469490636:
+        return 'repositoryCreatedAt', 'repositoryExpiresAt'
+    return 'createdAt', 'expiresAt'
 
 
 def expired(data):
     # Legacy instances have no lease: never guess permission to delete them.
-    value = data.get(expiry_field(data))
+    value = data.get(lease_fields(data)[1])
     return bool(value) and epoch(value) <= time.time()
 
 
@@ -158,8 +159,9 @@ def process_state(path, data):
 def describe(path):
     data = read(path)
     state = process_state(path, data)
-    created = epoch(data['createdAt']) if data.get('createdAt') else path.stat().st_mtime
-    lease = 'expired' if expired(data) else ('leased' if data.get(expiry_field(data)) else 'legacy')
+    created_field, expiry_field = lease_fields(data)
+    created = epoch(data[created_field]) if data.get(created_field) else path.stat().st_mtime
+    lease = 'expired' if expired(data) else ('leased' if data.get(expiry_field) else 'legacy')
     return data, state, '%s owner=%s card=%s age=%s process=%s lease=%s' % (
         path.parent.name, data.get('owner', '?'), data.get('card', '?'), duration(created), state, lease)
 
@@ -273,9 +275,9 @@ def main(args):
         return
     data = read(path)
     if command == 'renew':
-        if not data.get('createdAt') or not data.get('owner') or not data.get('card'):
+        created_field, field = lease_fields(data)
+        if not data.get(created_field) or not data.get('owner') or not data.get('card'):
             raise ValueError('legacy instance: down then up with owner/card to adopt a lease')
-        field = expiry_field(data)
         data.update({field: stamp(time.time() + seconds(args[1])), 'updatedAt': stamp()})
         write(path, data)
         print('renewed %s until %s' % (path.parent.name, data[field]))

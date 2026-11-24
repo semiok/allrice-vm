@@ -173,6 +173,7 @@ async function seal(config: unknown = value(), include = true) {
   build = {
     version: 1,
     environment: 'dev',
+    repository: 'semiok/allrice-vm',
     service: 'worker',
     mode: 'production',
     sourceSha: body.sourceSha,

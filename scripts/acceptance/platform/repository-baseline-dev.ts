@@ -1,10 +1,14 @@
+import { platformRepository } from '../../../packages/database/src/platform-repository-credential-contracts.ts';
+
 const devReadiness = {
   web: 'http://127.0.0.1:3311/api/health/ready',
   worker: 'http://127.0.0.1:3312/health/ready',
 };
 
 // Baseline registration reads the same verified identity as deploy-dev.
-export async function readDevReleaseSha(read = fetch) {
+export async function readDevReleaseSha(
+  read: typeof fetch = fetch,
+): Promise<string> {
   const [web, worker] = await Promise.all(
     Object.entries(devReadiness).map(async ([service, url]) => {
       try {
@@ -18,6 +22,7 @@ export async function readDevReleaseSha(read = fetch) {
           status !== 'ready' ||
           identity?.environment !== 'dev' ||
           identity?.service !== service ||
+          identity?.repository !== platformRepository.fullName ||
           identity?.mode !== 'production' ||
           !/^[a-f0-9]{40}$/.test(identity.sourceSha) ||
           !/^[a-f0-9]{40}$/.test(identity.sourceTree) ||

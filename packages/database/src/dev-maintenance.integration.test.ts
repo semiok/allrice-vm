@@ -99,6 +99,7 @@ suite('Durable maintenance fence, without installed host authority', () => {
     new DevProducerLifecycle(true, 'worker', {
       version: 1,
       environment: 'dev',
+      repository: 'semiok/allrice-vm',
       service: 'worker',
       mode: 'production',
       sourceSha: 'a'.repeat(40),

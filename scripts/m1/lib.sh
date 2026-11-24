@@ -11,7 +11,7 @@ qa_owned() {
   "$M1_PY" -c 'import json,sys
 try: d=json.load(open(sys.argv[1]))
 except (OSError,ValueError): sys.exit(1)
-sys.exit(0 if d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
+sys.exit(0 if isinstance(d,dict) and d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
 }
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
@@ -21,6 +21,52 @@ dev_plist() { # web|worker -> active plist, or the parked configuration
   [ -f "$p" ] || p="$M1_DEV_DISABLED/$1.plist"
   printf '%s\n' "$p"
 }
+
+# Check the exact launchd target and parse the connection URL before a caller
+# starts a service, stops one, or uses the database. Query parameters can
+# override libpq's host, port or database and are excluded from these URLs.
+service_plist_config() { # path label port-key port database [exports]
+  "$M1_PY" - "$@" <<'PYCODE'
+import os, plistlib, shlex, sys
+from urllib.parse import urlsplit
+
+path, label, port_key, port, database, *mode = sys.argv[1:]
+try:
+    with open(path, 'rb') as f:
+        plist = plistlib.load(f)
+    env = plist['EnvironmentVariables']
+    dsn = urlsplit(env['DATABASE_URL'])
+    valid = (
+        plist['Label'] == label and env[port_key] == port
+        and dsn.scheme in ('postgres', 'postgresql')
+        and dsn.hostname == '127.0.0.1' and dsn.port == 5434
+        and dsn.path == '/' + database and not dsn.query and not dsn.fragment
+    )
+except (OSError, plistlib.InvalidFileException, KeyError, ValueError, TypeError, AttributeError):
+    valid = False
+if not valid:
+    sys.exit(f'{path}: expected {label}, {port_key}={port}, PostgreSQL 127.0.0.1:5434/{database}')
+if mode == ['exports']:
+    for key in set(os.environ) | set(env):
+        if key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_')):
+            print(f'unset {shlex.quote(key)}')
+            env.pop(key, None)
+    for key, value in env.items():
+        print(f'export {key}={shlex.quote(str(value))}')
+PYCODE
+}
+
+dev_plist_config() { # web|worker [plist path] [exports]
+  local role=$1 key port
+  case "$role" in
+    web) key=ALLRICE_WEB_PORT; port=3311 ;;
+    worker) key=ALLRICE_WORKER_PORT; port=3312 ;;
+    *) return 2 ;;
+  esac
+  service_plist_config "${2:-$(dev_plist "$role")}" "ai.bplabs.allrice40-dev-$role" "$key" "$port" allrice40_dev ${3:+"$3"}
+}
+
+dev_plist_pair() { dev_plist_config web && dev_plist_config worker; }
 
 # flock_fd <fd> [seconds]: take an exclusive kernel lock on the file open at <fd>, waiting
 # up to [seconds] (default 0). Exit 0 = held, 1 = still busy. The lock belongs to the open
