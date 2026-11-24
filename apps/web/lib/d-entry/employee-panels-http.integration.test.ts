@@ -1153,13 +1153,15 @@ suite(
             ).status(),
           ).toBe(200);
           await expect.poll(() => sideWaiting.count()).toBe(2);
-          expect(storedA.result?.revisionId).toBeDefined();
+          const originalReservation = storedA.result;
+          if (!originalReservation || !('revisionId' in originalReservation))
+            throw Error('Original upload reservation has no revision');
           // The original reservation's immutable bytes were written before its
           // provider acknowledgement was lost. Finish that reservation in PG.
           await completeReferenceUpload(
             p.context,
             p.selection.workspaceId,
-            storedA.result!.revisionId!,
+            originalReservation.revisionId,
           );
           await openUpload();
           await material
