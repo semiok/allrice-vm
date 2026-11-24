@@ -293,14 +293,6 @@ export async function setupNativeWebFixture(
   const owner = await openNativeWebOwner({
     scope,
     launch,
-    async observedProfilePatch() {
-      return {
-        expected: await realpath(profilePatch),
-        actual: [
-          ...new Set((await readFile(tracePath, 'utf8')).trim().split('\n')),
-        ],
-      };
-    },
     context,
     vm: { assertCurrentBinding: current },
     lifetime: lifetime.signal,
@@ -315,6 +307,14 @@ export async function setupNativeWebFixture(
     owner,
     seal,
     launch,
+    async observedProfilePatch() {
+      return {
+        expected: await realpath(profilePatch),
+        actual: [
+          ...new Set((await readFile(tracePath, 'utf8')).trim().split('\n')),
+        ],
+      };
+    },
     expectCloseFailure(error: unknown) {
       expectedCloseFailure = error;
     },
