@@ -837,10 +837,13 @@ suite(
             pendingPublication.click(),
           ]);
           expect(denied.status()).toBe(403);
-          await pendingPublication.waitFor({ state: 'detached', timeout: 5000 });
-          expect(await page.getByText(pendingId, { exact: false }).count()).toBe(
-            0,
-          );
+          await pendingPublication.waitFor({
+            state: 'detached',
+            timeout: 5000,
+          });
+          expect(
+            await page.getByText(pendingId, { exact: false }).count(),
+          ).toBe(0);
           expect(receiptReads.slice(readsBeforeDenial)).toEqual([pendingId]);
           expect(publishWrites).toHaveLength(3);
           await context.close();
