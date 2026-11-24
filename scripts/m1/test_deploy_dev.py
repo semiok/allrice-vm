@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY_DEV = os.path.join(HERE, 'deploy-dev')
 _pinned = os.path.expanduser('~/.local/opt/node-22.23.2/bin/node')
 NODE = _pinned if os.path.exists(_pinned) else shutil.which('node')
-QA_DATABASE = 'allrice40_qa_' + '4' * 32
+QA_DATABASE = 'allrice40_qa_tool_test'
 QA_DATABASE_URL = 'postgres://tester@127.0.0.1:5434/' + QA_DATABASE
 ARCHIVED = [
     '0073_gemini_model_provider.sql',
@@ -569,15 +569,16 @@ class DeployDevMigrations(unittest.TestCase):
             script = marker + f.read().split(marker, 1)[1].split('\nPY\n', 1)[0] + '\nPY\n'
         directory = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
         release = os.path.join(self.home, 'allrice40-worktrees', '.qa-' + task + '.Fixture1')
+        database = 'allrice40_qa_' + task.replace('-', '_')
         self.seed_identity(release, 'b' * 40)
         entry = os.stat(release)
         write(os.path.join(directory, 'instance.json'), json.dumps(dict(
             task=task, repository='semiok/allrice-vm', repositoryId=1469490636,
-            webPort=3200, workerPort=3201, nativeArtifactId='new-art', database=QA_DATABASE,
+            webPort=3200, workerPort=3201, nativeArtifactId='new-art', database=database,
             worktree=dict(name=os.path.basename(release), device=entry.st_dev, inode=entry.st_ino))))
         p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=$QA_DATABASE; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
-                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, QA_DATABASE=QA_DATABASE, SHA='b' * 40, USER='tester')
+                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, QA_DATABASE=database, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
         return directory
 
@@ -620,7 +621,7 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         path = os.path.join(directory, 'worker.plist')
         worker = self.read_plist(path)
-        other = 'allrice40_qa_' + '5' * 32
+        other = 'allrice40_qa_other_task'
         worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/' + other
         with open(path, 'wb') as f:
             plistlib.dump(worker, f)
@@ -1197,6 +1198,10 @@ class DeployDevMigrations(unittest.TestCase):
             script = re.sub(r'^export PATH=.*$', 'export PATH="$TEST_PATH"', f.read(), flags=re.M)
         if name == 'schedule-recover':
             script = script.replace('PG=/opt/homebrew/opt/postgresql@17/bin', 'PG="$TEST_STUBS"')
+            node = os.path.join(self.home, '.local/opt/node-22.23.2/bin/node')
+            os.makedirs(os.path.dirname(node), exist_ok=True)
+            if not os.path.exists(node):
+                os.symlink(NODE, node)
             for path in ('/bin/ps', '/usr/sbin/lsof'):
                 script = script.replace('"' + path + '"', f'os.environ["TEST_STUBS"] + "/{os.path.basename(path)}"')
             start, rest = script.split('boot_at() {', 1)
@@ -1355,8 +1360,10 @@ class DeployDevMigrations(unittest.TestCase):
         live = os.path.join(self.home, 'Library/LaunchAgents', worker['Label'] + '.plist')
         shutil.copyfile(os.path.join(instance, 'worker.plist'), live)
         release = worker['WorkingDirectory']
+        web_entry = os.path.join(release, 'apps/web/server.mjs')
         old = os.path.join(self.home, 'allrice-qa', task, 'release')
-        os.makedirs(old)
+        old_entry = os.path.join(old, 'apps/worker/dist/index.js')
+        write(old_entry, '')
         relative = os.path.relpath(os.path.join(release, 'apps/worker/dist/index.js'), self.home)
         rows = self.seed_recovery_partition()
         for name, script, cwd, allowed in (
@@ -1364,9 +1371,20 @@ class DeployDevMigrations(unittest.TestCase):
             ('absolute release script', os.path.join(release, 'apps/worker/dist/index.js'), self.home, False),
             ('relative release script', relative, self.home, False),
             ('script after end of options', '-- ' + relative, self.home, False),
+            ('separate unhandled rejection value', '--unhandled-rejections strict ' + relative, self.home, False),
+            ('separate numeric value before delimiter', '--max-http-header-size 16384 -- ' + relative, self.home, False),
             ('instance cwd', '/tmp/unrelated.mjs', instance, False),
-            ('3.x script after end of options', '-- ' + os.path.join(old, 'apps/worker/dist/index.js'), self.home, True),
-            ('same name 3.x release', os.path.join(old, 'apps/worker/dist/index.js'), old, True),
+            ('3.x script after end of options', '-- ' + old_entry, self.home, True),
+            ('same name 3.x with documented options', '--unhandled-rejections strict --max-http-header-size 16384 ' + old_entry, old, True),
+            ('same name 3.x release', old_entry, old, True),
+            ('unrecognized option with an apparent 3.x entry', '--unknown-runtime-option ' + old_entry, old, False),
+            ('unknown attached option', '--unknown-runtime-option=value ' + old_entry, old, False),
+            ('missing option value or entry', '--max-http-header-size --', old, False),
+            ('unrecognized args cannot use the Web exemption', '--unknown-runtime-option /elsewhere/apps/web/server.mjs', old, False),
+            ('inline execution with apparent 3.x entry', '--eval=process.exit() ' + old_entry, old, False),
+            ('ambiguous apparent Web entry with Worker argument', '--title demo ' + web_entry + ' ' + relative, self.home, False),
+            ('recognized Web entry', '--env-file=' + os.path.join(instance, '.env') + ' ' + web_entry
+             + ' --hostname 127.0.0.1 --port 3200', self.home, True),
         ):
             with self.subTest(name=name):
                 proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))

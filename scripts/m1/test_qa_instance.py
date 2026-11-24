@@ -362,7 +362,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertNotIn('expiresAt', data, 'old allocator must treat the new instance as legacy')
         self.assertEqual(data['repository'], 'semiok/allrice-vm')
         self.assertEqual(data['repositoryId'], 1469490636)
-        self.assertRegex(data['database'], r'^allrice40_qa_[a-f0-9]{32}$')
+        self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
         self.assertEqual((self.db_dir / data['database']).read_text(), data['databaseClaim'])
         worker = str(data['workerPort'])
         self.assertEqual(envs['web']['ALLRICE_WORKER_PORT'], worker)

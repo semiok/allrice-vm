@@ -57,8 +57,8 @@ def qa_instance_data(path):
 
 def qa_instance_database(data):
     name = data.get('database')
-    legacy = 'allrice40_qa_' + data['task'].replace('-', '_')
-    if not isinstance(name, str) or (name != legacy and not re.fullmatch(r'allrice40_qa_[a-f0-9]{32}', name)):
+    expected = 'allrice40_qa_' + data['task'].replace('-', '_')
+    if name != expected:
         raise ValueError('invalid 4.0 QA database name')
     return name
 

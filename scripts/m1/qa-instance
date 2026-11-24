@@ -83,12 +83,10 @@ SQL
 }
 
 create_database() {
-  local f=$1 db=$2 previous=$3 name current token oid marker expected
-  for name in "$previous" "$db"; do
-    current=$(database_identity "$name") || die "cannot inspect database $name"
-    [ -z "$current" ] || die "database $name already exists"
-  done
-  token=${db#allrice40_qa_}
+  local f=$1 db=$2 current token oid marker expected
+  current=$(database_identity "$db") || die "cannot inspect database $db"
+  [ -z "$current" ] || die "database $db already exists"
+  token=$("$M1_PY" -c 'import uuid; print(uuid.uuid4().hex)') || return 1
   # Use a normal-range PostgreSQL OID known before CREATE so a later catalog
   # lookup cannot accidentally adopt a replacement. OID collisions refuse CREATE.
   oid=$((16#${token:0:8} % 4294950912 + 16384))
@@ -324,8 +322,7 @@ cmd_up() {
   [[ "$card" =~ ^[A-Z][A-Z0-9]*-[1-9][0-9]*$ ]] || die '--card (e.g. MET-220) is required'
   ttl=$(/usr/bin/python3 "$LEASE" ttl "$ttl") || exit 2
   local waited_since; waited_since=$(date +%s)
-  local dir db; dir=$(qa_instance_dir "$task")
-  db=$("$M1_PY" -c 'import uuid; print("allrice40_qa_" + uuid.uuid4().hex)')
+  local dir db="allrice40_qa_${task//-/_}"; dir=$(qa_instance_dir "$task")
   [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "instance path already exists: $dir (qa-instance down $task first)"
 
   dev_plist_pair || die "refusing a mismatched Dev configuration"
@@ -441,7 +438,7 @@ PY
     label=$(qa_label "$task" "$role"); launch_plist=$(launch_plist_path "$label")
     require_launch_slot "$label" "$launch_plist"
   done
-  create_database "$dir/instance.json" "$db" "allrice40_qa_${task//-/_}"
+  create_database "$dir/instance.json" "$db"
 
   say "preparing database"
   ( cd "$release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
