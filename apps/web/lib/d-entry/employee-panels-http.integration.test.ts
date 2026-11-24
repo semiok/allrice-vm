@@ -657,23 +657,97 @@ suite(
           await dialog
             .getByText('发布结果待核，请按原请求核对。', { exact: true })
             .waitFor({ timeout: 5000 });
-          await dialog
-            .getByRole('button', { name: '取消', exact: true })
-            .click();
-          await openPublication();
-          await dialog
-            .getByText('原添加为企业资料已完成。', { exact: true })
-            .waitFor();
-          await dialog
-            .getByRole('button', { name: '取消', exact: true })
-            .click();
+          const publishedId = publishWrites[0]!;
+          expect(publishWrites).toEqual([publishedId]);
+          const publishedRecord = page.getByRole('button', {
+            name: '核对原添加为企业资料 ' + original.objectId,
+            exact: true,
+          });
+          unavailableOriginalReceipt = publishedId;
+          const [unavailableReceipt] = await Promise.all([
+            page.waitForResponse(receiptResponse(publishedId), {
+              timeout: 5000,
+            }),
+            dialog.getByRole('button', { name: '取消', exact: true }).click(),
+          ]);
           await dialog.waitFor({ state: 'hidden' });
-          expect(publishWrites).toHaveLength(1);
-          expect(receiptReads).toEqual([publishWrites[0]]);
+          expect(unavailableReceipt.status()).toBe(503);
+          expect(await unavailableReceipt.finished()).toBeNull();
+          expect(receiptReads).toEqual([]);
+          expect(await publishedRecord.isVisible()).toBe(false);
+          const retry = page.getByRole('button', {
+            name: '重试核对',
+            exact: true,
+          });
+          await retry.waitFor();
+          const retryNode = await retry.elementHandle();
+          await retry.focus();
+          const readBack = holdReceipt(publishedId, 'beforeReply');
+          try {
+            const [confirmed] = await Promise.all([
+              page.waitForResponse(receiptResponse(publishedId), {
+                timeout: 5000,
+              }),
+              (async () => {
+                try {
+                  await page.keyboard.press('Enter');
+                  await readBack.arrived();
+                  await expect
+                    .poll(() =>
+                      retryNode?.evaluate((node) => ({
+                        focused: document.activeElement === node,
+                        busy: node.getAttribute('aria-busy'),
+                        disabled: node.getAttribute('aria-disabled'),
+                        label: node.textContent?.trim(),
+                      })),
+                    )
+                    .toEqual({
+                      focused: true,
+                      busy: 'true',
+                      disabled: 'true',
+                      label: '正在核对…',
+                    });
+                  await page.keyboard.press('Enter');
+                  expect(await publishedRecord.isVisible()).toBe(false);
+                } finally {
+                  readBack.release();
+                }
+              })(),
+            ]);
+            await readBack.assertFinished(confirmed);
+            expect(confirmed.status()).toBe(200);
+            expect(await confirmed.json()).toMatchObject({
+              requestId: publishedId,
+              status: 'recorded',
+              ready: true,
+            });
+          } finally {
+            readBack.close();
+          }
+          await page
+            .getByRole('status')
+            .filter({
+              hasText: '原添加为企业资料已完成。 ' + original.objectId,
+            })
+            .waitFor();
+          const retryEnded = page.getByRole('button', {
+            name: '核对结束',
+            exact: true,
+          });
+          await retryEnded.waitFor();
+          expect(
+            await retryNode?.evaluate(
+              (node) => document.activeElement === node,
+            ),
+          ).toBe(true);
+          await page.keyboard.press('Tab');
+          await retryEnded.waitFor({ state: 'detached' });
+          expect(receiptReads).toEqual([publishedId]);
+          expect(publishWrites).toEqual([publishedId]);
           const recorded = await p.client.readWriteReceipt(
             {
               workspaceId: p.selection.workspaceId,
-              requestId: publishWrites[0]!,
+              requestId: publishedId,
               operation: 'publish-file',
             },
             signal(),
@@ -767,84 +841,13 @@ suite(
             };
           }, sourceId);
           const previousReceipts = receiptReads.length;
-          unavailableOriginalReceipt = withdrawnId;
           await page.reload();
-          const [unavailableReceipt] = await Promise.all([
-            page.waitForResponse(receiptResponse(withdrawnId), {
-              timeout: 5000,
-            }),
-            materials(),
-          ]);
-          expect(unavailableReceipt.status()).toBe(503);
-          expect(await unavailableReceipt.finished()).toBeNull();
-          expect(receiptReads.slice(previousReceipts)).toEqual([]);
-          expect(await retained.isVisible()).toBe(false);
-          const retry = page.getByRole('button', {
-            name: '重试核对',
-            exact: true,
-          });
-          await retry.waitFor();
-          const retryNode = await retry.elementHandle();
-          await retry.focus();
-          const readBack = holdReceipt(withdrawnId, 'beforeReply');
-          try {
-            const [confirmed] = await Promise.all([
-              page.waitForResponse(receiptResponse(withdrawnId), {
-                timeout: 5000,
-              }),
-              (async () => {
-                try {
-                  await page.keyboard.press('Enter');
-                  await readBack.arrived();
-                  await expect
-                    .poll(() =>
-                      retryNode?.evaluate((node) => ({
-                        focused: document.activeElement === node,
-                        busy: node.getAttribute('aria-busy'),
-                        disabled: node.getAttribute('aria-disabled'),
-                        label: node.textContent?.trim(),
-                      })),
-                    )
-                    .toEqual({
-                      focused: true,
-                      busy: 'true',
-                      disabled: 'true',
-                      label: '正在核对…',
-                    });
-                  await page.keyboard.press('Enter');
-                  expect(await retained.isVisible()).toBe(false);
-                } finally {
-                  readBack.release();
-                }
-              })(),
-            ]);
-            await readBack.assertFinished(confirmed);
-            expect(confirmed.status()).toBe(200);
-            expect(await confirmed.json()).toMatchObject({
-              requestId: withdrawnId,
-              status: 'recorded',
-              ready: true,
-            });
-          } finally {
-            readBack.close();
-          }
+          await materials();
           await sourceMenu.waitFor({ state: 'detached' });
           await page
             .getByRole('status')
             .filter({ hasText: '原撤销已完成。 ' + sourceId })
             .waitFor();
-          const retryEnded = page.getByRole('button', {
-            name: '核对结束',
-            exact: true,
-          });
-          await retryEnded.waitFor();
-          expect(
-            await retryNode?.evaluate(
-              (node) => document.activeElement === node,
-            ),
-          ).toBe(true);
-          await page.keyboard.press('Tab');
-          await retryEnded.waitFor({ state: 'detached' });
           expect(receiptReads.slice(previousReceipts)).toEqual([withdrawnId]);
           expect(publicationActions).toEqual([withdrawnId]);
           expect(await retained.isVisible()).toBe(false);
