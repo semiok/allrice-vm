@@ -22,7 +22,10 @@ vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
   >()),
   requestDEntryProfile: profileRequest,
 }));
-vi.mock('../../../../lib/identity/session', () => ({
+vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('../../../../lib/identity/session')
+  >()),
   requireRequestContext: authenticated,
 }));
 vi.mock('../../../../lib/d-entry/identity', () => ({
