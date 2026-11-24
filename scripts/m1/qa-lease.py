@@ -6,6 +6,7 @@ have a separate cross-waiter lock and never hold the allocation lock over HTTP.
 """
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ import tempfile
 import time
 import urllib.request
 import uuid
+
+from service_target import QA_DIRECTORY_PREFIX, QA_LABEL_PREFIX, canonical, qa_worktree
 
 FIELDS = ('task ref sha webPort workerPort database nativeArtifactId cloudExecution '
           'setup updatedAt owner card createdAt expiresAt repository repositoryId repositoryCreatedAt repositoryExpiresAt').split()
@@ -65,6 +68,40 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
+def valid_database_claim(claim):
+    return claim is None or (isinstance(claim, str) and (
+        claim == 'pending' or re.fullmatch(r'[1-9][0-9]*:allrice40-qa:[0-9a-f]{32}', claim)))
+
+
+def plist_identity(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('expected a regular LaunchAgent file')
+        return {'device': info.st_dev, 'inode': info.st_ino, 'sha256': hashlib.sha256(file.read()).hexdigest()}
+
+
+def plist_claim(data, role, destination):
+    claims = data.get('plistClaims')
+    if not isinstance(claims, dict):
+        raise ValueError('unknown LaunchAgent ownership')
+    if role not in claims:
+        return 'unpublished'
+    expected = claims[role]
+    if (not isinstance(expected, dict) or type(expected.get('device')) is not int
+            or type(expected.get('inode')) is not int or not isinstance(expected.get('sha256'), str)
+            or not re.fullmatch(r'[a-f0-9]{64}', expected['sha256'])):
+        raise ValueError('invalid LaunchAgent ownership record')
+    try:
+        current = plist_identity(destination)
+    except FileNotFoundError:
+        return 'absent'
+    if current != expected:
+        raise ValueError('LaunchAgent file does not match the one published by this instance')
+    return 'published'
+
+
 def lease_fields(data):
     if data.get('repository') == 'semiok/allrice-vm' and data.get('repositoryId') == 1469490636:
         return 'repositoryCreatedAt', 'repositoryExpiresAt'
@@ -83,8 +120,15 @@ def duration(start):
 
 def process_state(path, data):
     """Unknown/loaded jobs and orphan processes are not safe to reclaim."""
+    task = path.parent.name
+    label_prefix = 'ai.bplabs.allrice-qa-'
+    release = None
+    if task.startswith(QA_DIRECTORY_PREFIX):
+        task = task[len(QA_DIRECTORY_PREFIX):]
+        label_prefix = QA_LABEL_PREFIX
+        release = qa_worktree(data)
     for role in ('web', 'worker'):
-        job = 'gui/%s/ai.bplabs.allrice-qa-%s-%s' % (os.getuid(), path.parent.name, role)
+        job = 'gui/%s/%s%s-%s' % (os.getuid(), label_prefix, task, role)
         result = subprocess.run(['launchctl', 'print', job], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             return 'running' if re.search(r'^\s*pid = [1-9][0-9]*$', result.stdout, re.M) else 'loaded'
@@ -112,6 +156,8 @@ def process_state(path, data):
         ancestors.add(pid)
         pid = processes.get(pid, (0, ''))[0]
     prefixes = {str(path.parent.absolute()), str(path.parent.resolve())}
+    if release:
+        prefixes.add(str(release))
     def refers(value):
         return any(value == prefix or value.startswith(prefix + '/') for prefix in prefixes)
     if any(pid not in ancestors and any(prefix + '/' in command for prefix in prefixes)
@@ -162,8 +208,11 @@ def describe(path):
     created_field, expiry_field = lease_fields(data)
     created = epoch(data[created_field]) if data.get(created_field) else path.stat().st_mtime
     lease = 'expired' if expired(data) else ('leased' if data.get(expiry_field) else 'legacy')
+    name = path.parent.name
+    if name.startswith(QA_DIRECTORY_PREFIX):
+        name = name[len(QA_DIRECTORY_PREFIX):] + ' (4.0)'
     return data, state, '%s owner=%s card=%s age=%s process=%s lease=%s' % (
-        path.parent.name, data.get('owner', '?'), data.get('card', '?'), duration(created), state, lease)
+        name, data.get('owner', '?'), data.get('card', '?'), duration(created), state, lease)
 
 
 def archive(path, destination):
@@ -274,7 +323,37 @@ def main(args):
             remind(f, *args[1:])
         return
     data = read(path)
-    if command == 'renew':
+    if command == 'database-claim':
+        if 'databaseClaim' not in data and args[1:] == ['--allow-unrecorded']:
+            return
+        if 'databaseClaim' not in data or not valid_database_claim(data['databaseClaim']):
+            raise ValueError('unknown database ownership')
+        print(data['databaseClaim'] or '')
+    elif command == 'record-database':
+        claim = args[1]
+        if not valid_database_claim(claim):
+            raise ValueError('invalid database ownership record')
+        data['databaseClaim'] = claim
+        write(path, data)
+    elif command in ('publish-plist', 'plist-claim'):
+        role, destination = args[1:]
+        if role not in ('web', 'worker'):
+            raise ValueError('unknown LaunchAgent role')
+        if not canonical(Path(destination).parent):
+            raise ValueError('LaunchAgent directory is not canonical')
+        state = plist_claim(data, role, destination)
+        if command == 'publish-plist':
+            if state != 'unpublished':
+                raise ValueError('LaunchAgent publication already recorded')
+            source = path.parent / (role + '.plist')
+            data['plistClaims'][role] = plist_identity(source)
+            write(path, data)
+            # The destination must be absent. Publish the verified file without overwriting or exposing partial data.
+            os.link(source, destination, follow_symlinks=False)
+            plist_claim(data, role, destination)
+        else:
+            print(state)
+    elif command == 'renew':
         created_field, field = lease_fields(data)
         if not data.get(created_field) or not data.get('owner') or not data.get('card'):
             raise ValueError('legacy instance: down then up with owner/card to adopt a lease')

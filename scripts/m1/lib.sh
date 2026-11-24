@@ -6,14 +6,20 @@ M1_UID=$(/usr/bin/id -u)
 M1_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
 M1_DEV_BACKUP_DIRS="storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform"
+M1_QA="$HOME/allrice-qa"
+# The 3.x glob counts these directories, but its task-name grammar rejects them.
+M1_QA_PREFIX=_allrice40-
 
-# QA allocation remains shared with 3.x. Select an instance by explicit repository
-# identity before reading its credentials, stopping jobs or changing its database.
+qa_instance_dir() { printf '%s/%s%s\n' "$M1_QA" "$M1_QA_PREFIX" "$1"; }
+qa_lock_file() { printf '%s/.task40-%s.lock\n' "$M1_QA" "$1"; }
+qa_label() { printf 'ai.bplabs.allrice40-qa-%s-%s\n' "$1" "$2"; }
+
+# Require the 4.0 namespace and repository identity for instance operations.
 qa_owned() {
-  "$M1_PY" -c 'import json,sys
-try: d=json.load(open(sys.argv[1]))
-except (OSError,ValueError): sys.exit(1)
-sys.exit(0 if isinstance(d,dict) and d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
+  "$M1_PY" "$M1_TOOLS/service_target.py" qa-owned "$1"
+}
+qa_database() {
+  "$M1_PY" "$M1_TOOLS/service_target.py" qa-database "$1"
 }
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
@@ -63,7 +69,7 @@ while True:
 # Never wait on a task lock while holding the allocator (the owner needs it to
 # release). Fixed fd 8 belongs to this operation; fd 7 is only held briefly.
 qa_task_lock() {
-  exec 7>>"$HOME/allrice-qa/.alloc.lock"
+  exec 7>>"$M1_QA/.alloc.lock"
   flock_fd 7 30 || { exec 7>&-; return 1; }
   exec 8>>"$1"
   if ! flock_fd 8 0; then exec 8>&- 7>&-; return 1; fi
@@ -71,7 +77,7 @@ qa_task_lock() {
 }
 
 qa_task_unlock() {
-  exec 7>>"$HOME/allrice-qa/.alloc.lock"
+  exec 7>>"$M1_QA/.alloc.lock"
   if flock_fd 7 30; then rm -f -- "$1"; fi
   exec 8>&- 7>&-
 }
@@ -85,36 +91,54 @@ except BlockingIOError: sys.exit(0)
 sys.exit(1)' "$1"
 }
 
-# job_state <label>: prints "running <pid>", "loaded" or "gone". Exit 2 when launchctl
-# itself fails, so a failed query is never mistaken for a stopped service.
+# job_state <label> [plist cwd]: prints "running <pid>", "loaded" or "gone".
+# With a plist and cwd, require the loaded job to match both before accepting it.
 job_state() {
   local out rc=0
   out=$("$M1_LAUNCHCTL" print "gui/$M1_UID/$1" 2>&1) || rc=$?
   if [ "$rc" = 113 ]; then echo gone; return 0; fi # "Could not find service"
   [ "$rc" = 0 ] || { echo "launchctl print $1 failed (exit $rc)" >&2; return 2; }
+  if [ "$#" -eq 3 ] && ! "$M1_PY" -c 'import sys
+lines = [line.strip() for line in sys.stdin]
+for field, expected in zip(("path", "working directory"), sys.argv[1:]):
+    key = field + " = "
+    if [line[len(key):] for line in lines if line.startswith(key)] != [expected]:
+        sys.exit(1)' "$2" "$3" <<<"$out"; then
+    echo "loaded LaunchAgent $1 does not match its published plist and worktree" >&2
+    return 2
+  fi
   local pid; pid=$(printf '%s\n' "$out" | /usr/bin/awk '$1=="pid" && $2=="=" {print $3; exit}')
   if [ -n "$pid" ]; then echo "running $pid"; else echo loaded; fi
 }
 
-# port_open <port>: exit 0 when something accepts connections on 127.0.0.1:<port>.
+# port_open <port>: exit 0 for a listening port, 1 for a refused connection and 2 for an unknown result.
 port_open() {
   "$M1_PY" -c 'import socket,sys
-try: socket.create_connection(("127.0.0.1",int(sys.argv[1])),0.5).close()
-except OSError: sys.exit(1)' "$1"
+try:
+    port=int(sys.argv[1])
+    if not 1<=port<=65535: sys.exit(2)
+    socket.create_connection(("127.0.0.1",port),0.5).close()
+except ConnectionRefusedError: sys.exit(1)
+except (ValueError,OSError): sys.exit(2)' "$1"
 }
 
-# stop_job <label> [port]: boot the job out and wait (max 90s) until launchd no longer
+port_closed() { local rc=0; port_open "$1" || rc=$?; [ "$rc" -eq 1 ]; }
+
+# stop_job <label> [port [plist cwd]]: boot the job out and wait (max 90s) until launchd no longer
 # knows it, its last process has exited and the port is closed. launchd kills the job's
 # whole process group when the job ends (AbandonProcessGroup is not set), so children go
 # with it. Exit 1 on timeout or when the state cannot be read.
 stop_job() {
   local label=$1 port=${2:-} state pid="" i
-  state=$(job_state "$label") || return 1
+  shift; if [ "$#" -gt 0 ]; then shift; fi
+  state=$(job_state "$label" "$@") || return 1
   case "$state" in running*) pid=${state#running } ;; esac
-  "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$label" 2>/dev/null || true
+  if [ "$#" -eq 0 ] || [ "$state" != gone ]; then
+    "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$label" 2>/dev/null || true
+  fi
   for i in $(seq 1 90); do
-    state=$(job_state "$label") || return 1
-    if [ "$state" = gone ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } && { [ -z "$port" ] || ! port_open "$port"; }; then
+    state=$(job_state "$label" "$@") || return 1
+    if [ "$state" = gone ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } && { [ -z "$port" ] || port_closed "$port"; }; then
       return 0
     fi
     sleep 1

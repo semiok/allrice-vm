@@ -22,6 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY_DEV = os.path.join(HERE, 'deploy-dev')
 _pinned = os.path.expanduser('~/.local/opt/node-22.23.2/bin/node')
 NODE = _pinned if os.path.exists(_pinned) else shutil.which('node')
+QA_DATABASE = 'allrice40_qa_tool_test'
+QA_DATABASE_URL = 'postgres://tester@127.0.0.1:5434/' + QA_DATABASE
+QA_DATABASE_CLAIM = '49000:allrice40-qa:' + 'b' * 32
 ARCHIVED = [
     '0073_gemini_model_provider.sql',
     '0213_native_chat_executor_transitions.sql',
@@ -66,6 +69,16 @@ class DeployDevMigrations(unittest.TestCase):
               'case "$q" in *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
+        write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\nexit 113\n', 0o755)
+        write(os.path.join(self.stubs, 'ps'), '#!/bin/sh\n'
+              'if [ -z "$PROCESS_TREE_STOPPED" ] && [ -n "$PROCESS_ARGS_BEFORE" ]; then '
+              'printf "%s" "$PROCESS_ARGS_BEFORE"; else printf "%s" "$PROCESS_ARGS"; fi\n', 0o755)
+        write(os.path.join(self.stubs, 'lsof'), '#!' + sys.executable + '\n'
+              'import json,os,sys\n'
+              'for fields in json.loads(os.environ.get("PROCESS_LSOF", "[]")):\n'
+              '    sys.stdout.buffer.write(("\\0".join(fields) + "\\0\\n").encode())\n'
+              'print(os.environ.get("PROCESS_LSOF_WARNING", ""), end="", file=sys.stderr)\n'
+              'sys.exit(int(os.environ.get("PROCESS_LSOF_EXIT", "0")))\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
@@ -540,14 +553,13 @@ class DeployDevMigrations(unittest.TestCase):
         qa = self.write_qa_plists()
         for role in ('web', 'worker'):
             launch = self.read_plist(os.path.join(qa, role + '.plist'))
-            write(os.path.join(qa, 'release/apps/web/server.mjs' if role == 'web'
-                               else 'release/apps/worker/dist/index.js'), probe)
+            write(launch['ProgramArguments'][2], probe)
             started = subprocess.run(launch['ProgramArguments'], cwd=launch['WorkingDirectory'],
                                      env=dict(base_env, **launch['EnvironmentVariables']),
                                      capture_output=True, text=True, timeout=10)
             self.assertEqual(started.returncode, 0, started.stderr)
             actual = json.loads(started.stdout)
-            self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(actual['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(actual['ALLRICE_STORAGE_ROOT'], qa + '/.local/storage')
             self.assertEqual(actual['ALLRICE_DSH_PLATFORM_HOME'], self.home + '/allrice40-dev/.local/dsh-platform')
             self.assertEqual(actual['ALLRICE_WORKER_INTERNAL_URL'], 'http://127.0.0.1:3201')
@@ -564,11 +576,19 @@ class DeployDevMigrations(unittest.TestCase):
         with open(os.path.join(HERE, 'qa-instance')) as f:
             marker = '  /usr/bin/python3 - "$task" "$dir"'
             script = marker + f.read().split(marker, 1)[1].split('\nPY\n', 1)[0] + '\nPY\n'
-        directory = os.path.join(self.home, 'allrice-qa', task)
-        self.seed_identity(os.path.join(directory, 'release'), 'b' * 40)
-        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; db=allrice40_qa_${task//-/_}; web=3200; worker=3201; '
+        directory = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
+        release = os.path.join(self.home, 'allrice40-worktrees', '.qa-' + task + '.Fixture1')
+        database = 'allrice40_qa_' + task.replace('-', '_')
+        self.seed_identity(release, 'b' * 40)
+        entry = os.stat(release)
+        write(os.path.join(directory, 'instance.json'), json.dumps(dict(
+            task=task, repository='semiok/allrice-vm', repositoryId=1469490636,
+            webPort=3200, workerPort=3201, nativeArtifactId='new-art', database=database,
+            databaseClaim=QA_DATABASE_CLAIM, plistClaims={},
+            worktree=dict(name=os.path.basename(release), device=entry.st_dev, inode=entry.st_ino))))
+        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=$QA_DATABASE; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
-                        QA_TASK=task, QA_DIR=directory, SHA='b' * 40, USER='tester')
+                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, QA_DATABASE=database, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
         return directory
 
@@ -579,13 +599,14 @@ class DeployDevMigrations(unittest.TestCase):
             value = self.read_plist(os.path.join(directory, role + '.plist'))
             env = value['EnvironmentVariables']
             self.assertEqual(env['ALLRICE_DSH_PLATFORM_HOME'], os.path.join(self.home, 'allrice40-dev/.local/dsh-platform'))
-            p = self.run_dd('service_plist_config "$PLIST" "$LABEL" "$PORT_KEY" "$PORT" allrice40_qa_tool_test', [],
+            p = self.run_dd('service_plist_config "$PLIST" "$LABEL" "$PORT_KEY" "$PORT" "$QA_DATABASE"', [],
                             PLIST=os.path.join(directory, role + '.plist'), LABEL=value['Label'],
+                            QA_DATABASE=QA_DATABASE,
                             PORT_KEY='ALLRICE_' + role.upper() + '_PORT', PORT=env['ALLRICE_' + role.upper() + '_PORT'])
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assert_no_legacy_settings(value['EnvironmentVariables'])
             self.assertEqual(value['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
-            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(value['EnvironmentVariables']['UNRELATED_SETTING'], 'keep')
 
     def test_qa_env_does_not_copy_retired_settings(self):
@@ -602,9 +623,21 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         with open(os.path.join(directory, '.env')) as f:
             env = dict(line.rstrip('\n').split('=', 1) for line in f)
-        self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+        self.assertEqual(env['DATABASE_URL'], QA_DATABASE_URL)
         self.assertEqual(env['UNRELATED_ENV'], 'keep')
         self.assert_no_legacy_settings(env)
+
+    def test_qa_plist_cannot_select_another_instance_database(self):
+        directory = self.write_qa_plists()
+        path = os.path.join(directory, 'worker.plist')
+        worker = self.read_plist(path)
+        other = 'allrice40_qa_other_task'
+        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/' + other
+        with open(path, 'wb') as f:
+            plistlib.dump(worker, f)
+        p = self.run_dd('service_plist_config "$PLIST" "$LABEL" ALLRICE_WORKER_PORT 3201 "$DATABASE"', [],
+                        PLIST=path, LABEL=worker['Label'], DATABASE=other)
+        self.assertNotEqual(p.returncode, 0)
 
     def test_contract_refusal_is_recorded_for_automatic_restore_and_recover(self):
         old = self.release(store=False)
@@ -1092,10 +1125,8 @@ class DeployDevMigrations(unittest.TestCase):
     def test_qa_smoke_refuses_a_web_route_to_a_different_worker(self):
         task = 'tool-test'
         qa = self.write_qa_plists(task)
-        write(os.path.join(qa, 'instance.json'), json.dumps(dict(repository='semiok/allrice-vm',
-            repositoryId=1469490636, webPort=3200, workerPort=3201, nativeArtifactId='new-art')))
         for role in ('web', 'worker'):
-            live = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-%s-%s.plist' % (task, role))
+            live = os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-qa-%s-%s.plist' % (task, role))
             plist = self.read_plist(os.path.join(qa, role + '.plist'))
             if role == 'web':
                 plist['EnvironmentVariables'].update(ALLRICE_WORKER_PORT='3211', ALLRICE_WORKER_INTERNAL_URL='http://127.0.0.1:3211')
@@ -1103,19 +1134,42 @@ class DeployDevMigrations(unittest.TestCase):
                 plistlib.dump(plist, f)
         p = self.run_config_tool('smoke-test', '--instance', task)
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn('expected ai.bplabs.allrice-qa-tool-test-web', p.stderr)
+        self.assertIn('expected ai.bplabs.allrice40-qa-tool-test-web', p.stderr)
         self.assertFalse(os.path.exists(os.path.join(qa, 'smoke')))
+
+    def test_qa_smoke_selects_4_0_when_3_x_has_the_same_task(self):
+        task = 'tool-test'
+        qa = self.write_qa_plists(task)
+        write(os.path.join(self.home, 'allrice-qa', task, 'instance.json'), '{"webPort":3210,"workerPort":3211}')
+        for role in ('web', 'worker'):
+            agents = os.path.join(self.home, 'Library/LaunchAgents')
+            write(os.path.join(agents, 'ai.bplabs.allrice-qa-%s-%s.plist' % (task, role)), 'old 3.x plist fixture')
+            shutil.copyfile(os.path.join(qa, role + '.plist'),
+                            os.path.join(agents, 'ai.bplabs.allrice40-qa-%s-%s.plist' % (task, role)))
+        probe = os.path.join(self.tmp, 'smoke-args.json')
+        write(os.path.join(self.home, '.local/opt/node-22.23.2/bin/node'), '#!' + sys.executable + '\n'
+              'import json,os,sys\nargs=sys.argv[2:]; out=args[args.index("--out")+1]\n'
+              'json.dump(args,open(os.environ["PROBE"],"w")); os.makedirs(out,exist_ok=True)\n'
+              'json.dump({"results":[]},open(out+"/result.json","w"))\n', 0o755)
+        p = self.run_config_tool('smoke-test', '--instance', task, '--only', 'chat', PROBE=probe)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(probe) as f:
+            args = json.load(f)
+        self.assertEqual(args[args.index('--url') + 1], 'http://127.0.0.1:3200')
+        self.assertEqual(args[args.index('--worker-url') + 1], 'http://127.0.0.1:3201')
+        self.assertEqual(args[args.index('--creds') + 1], os.path.join(qa, 'creds.json'))
+        self.assertEqual(os.path.dirname(args[args.index('--out') + 1]), os.path.join(qa, 'smoke'))
 
     def test_smoke_and_recovery_share_allocator_lock_before_reading_instance(self):
         from concurrent.futures import ThreadPoolExecutor
         import fcntl
-        instance = os.path.join(self.home, 'allrice-qa', 'switch')
+        instance = os.path.join(self.home, 'allrice-qa', '_allrice40-switch')
         os.makedirs(instance)
         metadata = os.path.join(instance, 'instance.json')
         tools = ('smoke-test', 'schedule-recover')
         for name in tools:
             with self.subTest(tool=name):
-                write(metadata, json.dumps({'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636}))
+                write(metadata, json.dumps({'task': 'switch', 'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636}))
                 with ThreadPoolExecutor(max_workers=1) as worker:
                     with open(os.path.join(self.home, 'allrice-qa', '.alloc.lock'), 'a') as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1126,7 +1180,7 @@ class DeployDevMigrations(unittest.TestCase):
                     p = pending.result(timeout=5)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn('repository', p.stderr)
-                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice-qa', '.task-switch.lock')))
+                self.assertFalse(os.path.exists(os.path.join(self.home, 'allrice-qa', '.task40-switch.lock')))
 
     def test_qa_generation_reads_parked_configuration_without_restoring_dev(self):
         p = self.run_dd('park_plists', [])
@@ -1134,7 +1188,7 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         for role in ('web', 'worker'):
             env = self.read_plist(os.path.join(directory, role + '.plist'))['EnvironmentVariables']
-            self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(env['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
         self.assert_parked()
 
@@ -1143,8 +1197,9 @@ class DeployDevMigrations(unittest.TestCase):
         # configuration selection and writes still use the source scripts and lib.sh.
         directory = os.path.join(self.tmp, 'config-tools')
         with open(os.path.join(HERE, 'lib.sh')) as f:
-            write(os.path.join(directory, 'lib.sh'), f.read() + '\n'
-                  'job_state() { echo gone; }; stop_job() { :; };\n'
+            write(os.path.join(directory, 'lib.sh'), f.read() + '\n' +
+                  ('' if name == 'schedule-recover' else 'job_state() { echo gone; };\n') +
+                  'stop_job() { export PROCESS_TREE_STOPPED=1; };\n'
                   'start_job() { echo UNEXPECTED_START >&2; return 90; };\n'
                   'M1_LAUNCHCTL="$TEST_STUBS/launchctl"\n')
         shutil.copyfile(os.path.join(HERE, 'with-env'), os.path.join(directory, 'with-env'))
@@ -1154,10 +1209,43 @@ class DeployDevMigrations(unittest.TestCase):
             script = re.sub(r'^export PATH=.*$', 'export PATH="$TEST_PATH"', f.read(), flags=re.M)
         if name == 'schedule-recover':
             script = script.replace('PG=/opt/homebrew/opt/postgresql@17/bin', 'PG="$TEST_STUBS"')
-            start, rest = script.split('worker_procs() {', 1)
-            script = start + 'worker_procs() { :; };\nworker_sessions() {' + rest.split('worker_sessions() {', 1)[1]
+            shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(directory, 'qa-lease.py'))
+            node = os.path.join(self.home, '.local/opt/node-22.23.2/bin/node')
+            os.makedirs(os.path.dirname(node), exist_ok=True)
+            if not os.path.exists(node):
+                os.symlink(NODE, node)
+            with open(os.path.join(HERE, 'schedule-recover-processes.py')) as f:
+                source = f.read()
+            source = source.replace('def observe_process(pid):', 'def native_observe_process(pid):', 1)
+            source = source.replace('def process_started(pid):', 'def native_process_started(pid):', 1)
+            source = source.replace('def observe_unix_socket(pid, file):', 'def native_observe_unix_socket(pid, file):', 1)
+            marker = "if __name__ == '__main__':"
+            source = source.replace(marker, '''def process_started(pid):
+    if str(pid) == os.environ.get('PROCESS_WORKER_PID') and os.environ.get('PROCESS_TREE_STOPPED'):
+        raise OSError('fixture Worker exited')
+    return json.loads(os.environ.get('PROCESS_STARTS', '{}'))[str(pid)]
+
+def observe_process(pid):
+    row = json.loads(os.environ.get('PROCESS_SNAPSHOT', 'null'))
+    if row is None:
+        raise OSError('fixture process environment unavailable')
+    return row['executable'], row['args'], row['environment'], row['started']
+
+def observe_unix_socket(pid, file):
+    rows = json.loads(os.environ.get('PROCESS_UNIX_SOCKETS', '{}'))
+    if file.descriptor not in rows:
+        raise ValueError('Unix 套接字缺少可核实的 FD 或 PCB 标识')
+    row = rows[file.descriptor]
+    if 'errno' in row:
+        raise OSError(row['errno'], 'fixture socket read failure')
+    return row
+
+''' + marker)
+            for path in ('/bin/ps', '/usr/sbin/lsof'):
+                source = source.replace(repr(path), f'os.environ["TEST_STUBS"] + "/{os.path.basename(path)}"')
+            write(os.path.join(directory, 'schedule-recover-processes.py'), source)
             start, rest = script.split('boot_at() {', 1)
-            script = start + 'boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
+            script = start + 'sleep() { :; }; boot_at() { echo 2000-01-01; };\nread -r status' + rest.split('read -r status', 1)[1]
         if name == 'deploy-dev':
             shutil.copyfile(os.path.join(HERE, 'deploy-result.py'), os.path.join(directory, 'deploy-result.py'))
             marker = '# --release-manager is a deliberate speed bump'
@@ -1290,12 +1378,7 @@ class DeployDevMigrations(unittest.TestCase):
             self.assertEqual(json.load(f)['nativeArtifactId'], 'sha256:' + 'a' * 64)
         self.assert_parked()
 
-    def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
-        worker = self.plist('worker')
-        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
-        with open(self.live_plist('worker'), 'wb') as f:
-            plistlib.dump(worker, f)
-        self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+    def seed_recovery_partition(self):
         rows = [{'partitionId': 'once', 'ownerId': 'old-worker', 'epoch': 1, 'tokenDigest': 'token',
                  'expiresAt': '2000-01-01', 'closed': False, 'expired': True, 'proofNull': True, 'audit': None}]
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\necho \'{}\'\n', 0o755)
@@ -1303,22 +1386,461 @@ class DeployDevMigrations(unittest.TestCase):
               'import json,os,sys\n'
               'if "-f" in sys.argv:\n'
               '    if os.environ.get("SQL_FAIL"): sys.exit(1)\n'
-              '    open(os.environ["PROOF"],"w").write("committed"); sys.exit(0)\n'
-              'if "pg_stat_activity" in sys.argv[-1]: print(0); sys.exit(0)\n'
+              '    evidence=next(a.split("=",1)[1] for a in sys.argv if a.startswith("evidence="))\n'
+              '    assert json.loads(evidence)["processObservations"] == "process-observations.json"\n'
+              '    claim=next((a.split("=",1)[1] for a in sys.argv if a.startswith("database_claim=")), "")\n'
+              '    open(os.environ["PROOF"],"w").write(claim); sys.exit(0)\n'
+              'if "pg_stat_activity" in sys.argv[-1]: print(os.environ.get("WORKER_SESSIONS", "0")); sys.exit(0)\n'
               'rows=json.loads(os.environ["ROWS"])\n'
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
               'print(json.dumps(rows))\n', 0o755)
+        return rows
+
+    def recovery_scan_fixture(self, task):
+        instance = self.write_qa_plists(task)
+        worker = self.read_plist(os.path.join(instance, 'worker.plist'))
+        web = self.read_plist(os.path.join(instance, 'web.plist'))
+        agents = os.path.join(self.home, 'Library/LaunchAgents')
+        for role, plist in (('worker', worker), ('web', web)):
+            destination = os.path.join(agents, plist['Label'] + '.plist')
+            subprocess.run([sys.executable, os.path.join(HERE, 'qa-lease.py'), 'publish-plist',
+                            os.path.join(instance, 'instance.json'), role, destination],
+                           env=dict(HOME=self.home, PATH=os.defpath), capture_output=True, text=True, check=True)
+        self.recovery_web_plist = destination
+        self.recovery_web_cwd = web['WorkingDirectory']
+        self.recovery_worker_plist = os.path.join(agents, worker['Label'] + '.plist')
+        self.recovery_worker_cwd = worker['WorkingDirectory']
+        write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\n'
+              'case "$2" in\n'
+              '  *-web) set -- "$PROCESS_WEB_PLIST" "$PROCESS_WEB_CWD" "$PROCESS_WEB_PID" ;;\n'
+              '  *-worker) [ -z "$PROCESS_TREE_STOPPED" ] || exit 113; '
+              'set -- "$PROCESS_WORKER_PLIST" "$PROCESS_WORKER_CWD" "$PROCESS_WORKER_PID" ;;\n'
+              '  *) exit 113 ;;\n'
+              'esac\n[ -n "$3" ] || exit 113\n'
+              'printf "path = %s\\nworking directory = %s\\npid = %s\\n" "$@"\n', 0o755)
+        return instance, worker, web
+
+    def test_schedule_recover_checks_the_verified_worktree_and_instance_directory(self):
+        task = 'recover-scan'
+        instance, worker, web = self.recovery_scan_fixture(task)
+        release = worker['WorkingDirectory']
+        web_entry = web['ProgramArguments'][2]
+        old = os.path.join(self.home, 'allrice-qa', task, 'release')
+        old_entry = os.path.join(old, 'apps/worker/dist/index.js')
+        old_web_entry = os.path.join(old, 'apps/web/server.mjs')
+        write(old_entry, '')
+        write(old_web_entry, '')
+        relative = os.path.relpath(os.path.join(release, 'apps/worker/dist/index.js'), self.home)
+        rows = self.seed_recovery_partition()
+        for name, script, cwd, allowed in (
+            ('release cwd', old_entry, release, False),
+            ('absolute release script', os.path.join(release, 'apps/worker/dist/index.js'), self.home, False),
+            ('relative release script', relative, self.home, False),
+            ('script after end of options', '-- ' + relative, self.home, False),
+            ('separate unhandled rejection value', '--unhandled-rejections strict ' + relative, self.home, False),
+            ('separate numeric value before delimiter', '--max-http-header-size 16384 -- ' + relative, self.home, False),
+            ('instance cwd', old_entry, instance, False),
+            ('3.x script after end of options', '-- ' + old_entry, self.home, True),
+            ('same name 3.x with documented options', '--unhandled-rejections strict --max-http-header-size 16384 ' + old_entry, old, True),
+            ('same name 3.x release', old_entry, old, True),
+            ('unrecognized option with an apparent 3.x entry', '--unknown-runtime-option ' + old_entry, old, False),
+            ('unknown attached option', '--unknown-runtime-option=value ' + old_entry, old, False),
+            ('missing option value or entry', '--max-http-header-size --', old, False),
+            ('unrecognized args cannot use the Web exemption', '--unknown-runtime-option /elsewhere/apps/web/server.mjs', old, False),
+            ('inline execution with apparent 3.x entry', '--eval=process.exit() ' + old_entry, old, False),
+            ('ambiguous apparent Web entry with Worker argument', '--title demo ' + web_entry + ' ' + relative, self.home, False),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, ['node', *shlex.split(script)], cwd, allowed)
+
+        duplicate = os.path.join(instance, '.local/project/apps/web/server.mjs')
+        nested = os.path.join(release, 'nested/apps/web/server.mjs')
+        for path in (duplicate, nested):
+            write(path, '// inert fixture\n')
+        db_env = {'DATABASE_URL': worker['EnvironmentVariables']['DATABASE_URL']}
+        env_file = os.path.join(self.tmp, 'node-config.env')
+        clean_env = os.path.join(self.tmp, 'clean.env')
+        old_env = os.path.join(os.path.dirname(old), '.env')
+        write(env_file, 'export NODE_OPTIONS="--require /outside/unexecuted-fixture.js"\n')
+        write(clean_env, 'NODE_OPTIONS="--unhandled-rejections strict"\n')
+        write(old_env, 'DATABASE_URL=postgres://tester@127.0.0.1:5432/allrice_qa_recover_scan\n')
+        old_args = [NODE, old_entry]
+        web_args, web_cwd = web['ProgramArguments'], web['WorkingDirectory']
+        web_state = {'web_pid': '999999'}
+        for name, args, cwd, allowed, facts in (
+            ('verified Web with environment file', web_args, web_cwd, True, dict(web_state, environment=db_env)),
+            ('Web argv without confirmed service', web_args, web_cwd, False, dict(environment=db_env)),
+            ('Web argv with another service PID', web_args, web_cwd, False, dict(web_pid='999998', environment=db_env)),
+            ('Web argv under an unrelated loaded plist', web_args, web_cwd, False,
+             dict(web_state, environment=db_env, job_plist=self.recovery_web_plist + '.other')),
+            ('Web argv with wrong cwd', web_args, old, False, dict(web_state, environment=db_env)),
+            ('Web suffix in instance data', [NODE, duplicate], instance, False, dict(web_state, environment=db_env)),
+            ('Web suffix in nested release', [NODE, nested], release, False, dict(web_state, environment=db_env)),
+            ('Web with inherited preload', web_args, web_cwd, False,
+             dict(web_state, environment=dict(db_env, NODE_OPTIONS='--require /outside/unexecuted-fixture.js'))),
+            ('startup snapshot', [NODE, '--snapshot-blob', '/outside/unexecuted.blob', old_entry], old, False, {}),
+            ('snapshot builder', [NODE, '--build-snapshot-config=/outside/unexecuted.json', old_entry], old, False, {}),
+            ('inherited preload', old_args, old, False, dict(environment={'NODE_OPTIONS': '--import /outside/unexecuted.mjs'})),
+            ('file preload', [NODE, '--env-file', env_file, old_entry], old, False, {}),
+            ('env file after apparent script', [*old_args, '--env-file=' + env_file], old, False, {}),
+            ('config file after apparent script', [*old_args, '--experimental-config-file=/outside/unexecuted.json'], old, False, {}),
+            ('inherited native loader setting', old_args, old, False,
+             dict(environment={'DYLD_INSERT_LIBRARIES': '/outside/unexecuted.dylib'})),
+            ('inherited empty options override the file', [NODE, '--env-file=' + env_file, old_entry], old, True,
+             dict(environment={'NODE_OPTIONS': ''})),
+            ('ordinary env options', [NODE, '--env-file=' + clean_env, old_entry], old, True, {}),
+            ('ordinary 3.x Web', [NODE, '--env-file=' + old_env, old_web_entry, '--hostname', '127.0.0.1', '--port', '3200'],
+             os.path.dirname(old_web_entry), True, {}),
+            ('env file edited since launch', [NODE, '--env-file=' + clean_env, old_entry], old, False,
+             dict(started=os.stat(clean_env).st_ctime_ns - 1)),
+            ('unavailable optional env file', [NODE, '--env-file-if-exists=' + clean_env + '.missing', old_entry], old, False, {}),
+            ('unavailable process environment', old_args, old, False, dict(observed=False)),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, **facts)
+        os.unlink(self.recovery_web_plist)
+        shutil.copyfile(os.path.join(instance, 'web.plist'), self.recovery_web_plist)
+        self.check_recovery_scan(task, rows, 'Web plist has an unrelated inode', web_args, web_cwd, False,
+                                 environment=db_env, **web_state)
+
+    def test_schedule_recover_refuses_uncertain_launch_evidence(self):
+        task = 'recover-evidence'
+        instance, worker, web = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        entry = os.path.join(self.home, 'allrice-qa', task, 'release', 'ordinary.mjs')
+        write(entry, '// inert fixture\n')
+        outside = os.path.dirname(entry)
+        for name, contents, allowed in (
+            ('LF', b'FIXTURE_FIRST=one\nFIXTURE_SECOND=two\n', True),
+            ('CRLF', b'FIXTURE_FIRST=one\r\nFIXTURE_SECOND=two\r\n', True),
+            ('standalone CR between fields', b'FIXTURE_FIRST=one\rFIXTURE_SECOND=two\n', False),
+            ('standalone CR inside a key', b'FIXTURE_\rSECOND=two\n', False),
+        ):
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp, name + '.env')
+                with open(path, 'wb') as dotenv:
+                    dotenv.write(contents)
+                self.check_recovery_scan(task, rows, name, [NODE, '--env-file=' + path, entry], outside, allowed,
+                                         reason=None if allowed else '环境文件含独立回车')
+
+        secret = 'fictional-fixture-password'
+        dsn = 'postgres://tester:' + secret + '@127.0.0.1:5434'
+        target = '/allrice40_qa_recover_evidence'
+        review_host = '请把 DSN 改成标准本机地址，或确认这个进程不连目标库'
+        for name, value, extra, allowed, reason in (
+            ('full other database takes precedence', dsn + '/allrice_qa_recover_evidence',
+             {'PGDATABASE': target[1:]}, True, None),
+            ('full target database', dsn + target, {'PGDATABASE': 'other'}, False, None),
+            ('target at localhost', 'postgres://localhost' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target at IPv6 loopback', 'postgres://[::1]' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target via default socket', 'postgresql://' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target via explicit socket', 'postgres://%2Fprivate%2Ftmp' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target at abbreviated loopback', 'postgres://127.1' + target, {}, False, review_host),
+            ('target at nonstandard host', 'postgres://pg-fixture.invalid' + target, {}, False, review_host),
+            ('other database at nonstandard host', 'postgres://pg-fixture.invalid/other', {}, True, None),
+            ('empty path despite PGDATABASE', dsn, {'PGDATABASE': 'other'}, False, 'URL 路径缺少库名'),
+            ('slash path despite username', dsn + '/', {}, False, 'URL 路径缺少库名'),
+            ('unverified connection overrides', dsn + '/other?database=' + target[1:], {}, False, 'DATABASE_URL 无法核实'),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, [NODE, entry], outside, allowed,
+                                         environment=dict(extra, DATABASE_URL=value), reason=reason, secret=secret)
+        self.check_recovery_scan(task, rows, 'official Web with pathless DSN',
+                                 web['ProgramArguments'], web['WorkingDirectory'], False,
+                                 web_pid='999999', environment={'DATABASE_URL': dsn + '/', 'PGDATABASE': target[1:]},
+                                 reason='URL 路径缺少库名', secret=secret)
+
+        helper = '/bin/sh'
+        for name, args, cwd, allowed, facts in (
+            ('visible unrelated helper', [helper, entry], outside, True, {}),
+            ('helper environment hidden outside scope', [helper, entry], outside, True,
+             dict(env_visible=False, reason='套接字观测未见目标')),
+            ('helper native environment unavailable', [helper, entry], outside, True,
+             dict(observed=False, reason='套接字观测未见目标')),
+            ('helper environment hidden in target cwd', [helper, entry], instance, False,
+             dict(env_visible=False, reason='lsof 显示工作目录属于目标')),
+            ('helper with target cwd', [helper, entry], instance, False, {}),
+            ('helper with target launch path', [helper, os.path.join(instance, 'helper.sh')], outside, False, {}),
+            ('known Worker descendant reparented', [helper, entry], outside, False,
+             dict(worker_parent=True, env_visible=False, reason='停止前已核实为 Worker 或其子进程')),
+            ('known Worker descendant off current list', [helper, entry], outside, False,
+             dict(worker_parent=True, listed=False, reason='停止前已核实为 Worker 或其子进程')),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, executable=helper, **facts)
+
+    def test_schedule_recover_uses_lsof_for_helpers_with_hidden_environments(self):
+        task = 'recover-open-files'
+        _, worker, _ = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        safe = '套接字观测未见目标'
+        connection = '套接字观测命中本机 PostgreSQL 5434 端点'
+        unreadable = '无法核实 lsof'
+        secret = 'fixture-sensitive-file-name'
+        opened = os.path.join(worker['WorkingDirectory'], secret)
+        write(opened, '// synthetic fixture\n')
+        for name, allowed, reason, facts in (
+            ('open file in target', False, 'lsof 显示打开文件属于目标',
+             dict(file_sets=[['f3', 'tREG', 'n' + opened]])),
+            ('open file outside target', True, safe,
+             dict(file_sets=[['f3', 'tREG', 'n' + os.path.join(self.home, secret)]])),
+            ('confirmed unnamed system handles', True, safe,
+             dict(file_sets=[['f3', 'tNPOLICY', 'n'], ['f4', 'tNEXUS', 'n'], ['f5', 'tKQUEUE', 'n'], ['f6', 'tPIPE', 'n']])),
+            ('unnamed unknown descriptor', False, 'TYPE=unknown',
+             dict(file_sets=[['f3', 'tunknown', 'n']])),
+            ('unknown descriptor names a target file', False, '打开文件属于目标',
+             dict(file_sets=[['f3', 'tunknown', 'n' + opened]])),
+            ('known unnamed handle with explicit error', False, 'errno=13',
+             dict(file_sets=[['ferr', 'tNPOLICY', 'nFD info error: Permission denied errno=13']])),
+            ('loopback IPv4 PG connection', False, connection,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->127.0.0.1:5434']])),
+            ('loopback IPv6 PG connection', False, connection,
+             dict(file_sets=[['f4', 'tIPv6', 'PTCP', 'n[::1]:49600->[::1]:5434']])),
+            ('loopback UDP PG endpoint', False, connection,
+             dict(file_sets=[['f4', 'tIPv4', 'PUDP', 'n127.0.0.1:49600->127.0.0.1:5434']])),
+            ('incomplete IP peer', False, 'TCP/UDP 连接记录不完整（TYPE=IPv4）',
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->']])),
+            ('PG listener is not a TCP client', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:5434']])),
+            ('local TCP connection to another port', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->127.0.0.1:5432']])),
+            ('same port on nonlocal host', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->192.0.2.1:5434']])),
+            ('Unix PG socket by name', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'n/private/tmp/.s.PGSQL.5434']])),
+            ('Unix PG socket by peer', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n/private/tmp/.s.PGSQL.5434']])),
+            ('Unix peer for different PG port', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n/private/tmp/.s.PGSQL.5432']])),
+            ('identified unnamed Unix pair', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n->0xdef']])),
+            ('Unix endpoint name missing', False, 'Unix 套接字缺少可核实的 FD 或 PCB 标识（TYPE=unix）',
+             dict(file_sets=[['f4', 'tunix', 'n']])),
+            ('Unix peer not observed', False, 'Unix 套接字缺少可核实的 FD 或 PCB 标识（TYPE=unix）',
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc']])),
+            ('PG peer available via candidate FD alone', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=True, targetPg=True)})),
+            ('non-PG named peer available via candidate FD alone', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=True, targetPg=False)})),
+            ('kernel confirms connected endpoints both unnamed', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=False, targetPg=False)})),
+            ('kernel confirms unbound and unconnected', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->(none)']],
+                  unix_sockets={'4': dict(connected=False, localNamed=False, peerNamed=False, targetPg=False)})),
+            ('kernel socket read denied out of index', False, '本机 Unix FD 读取失败（TYPE=unix）。errno=13',
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']], unix_sockets={'4': {'errno': 13}})),
+            ('missing cwd preserves the FD errno', False, '本机 Unix FD 读取失败（TYPE=unix）。errno=13',
+             dict(cwd=None, file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']], unix_sockets={'4': {'errno': 13}})),
+            ('lsof has no record for a still present process', False, unreadable, dict(cwd=None)),
+            ('per PID lsof permission error', False, '系统未提供 errno',
+             dict(file_sets=[['ferr', 'tunknown', 'nFD info error: Operation not permitted']])),
+            ('lsof returned an error', False, unreadable, dict(lsof_exit=1)),
+            ('lsof stdout with a permission warning', False, unreadable,
+             dict(lsof_warning='lsof: Permission denied: ' + secret)),
+        ):
+            with self.subTest(name=name):
+                cwd = facts.pop('cwd', self.home)
+                self.check_recovery_scan(task, rows, name, ['/bin/sh'], cwd, allowed,
+                                         executable='/bin/sh', env_visible=False, reason=reason, secret=secret, **facts)
+
+    def test_schedule_recover_checks_disjoint_node_without_trusting_its_runtime(self):
+        task = 'recover-other-node'
+        instance, worker, _ = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        runtime = os.path.join(self.tmp, 'alternate-runtime', 'node')
+        script = os.path.join(self.home, 'outside', 'ordinary.mjs')
+        env_file = os.path.join(self.tmp, 'outside.env')
+        write(runtime, 'inert fixture')
+        write(script, '// inert fixture\n')
+        write(env_file, 'FIXTURE=ordinary\n')
+        for name, args, cwd, env, allowed in (
+            ('alternate Node outside target', [runtime, script, '--ordinary-app-argument'], self.home, {}, True),
+            ('alternate Node with relative entry and neutral options',
+             [runtime, '--enable-source-maps', './ordinary.mjs'], os.path.dirname(script),
+             {'NODE_OPTIONS': '--trace-warnings --max-old-space-size=1024'}, True),
+            ('alternate Node with 5434', [runtime, script], self.home, {'PGPORT': '5434'}, False),
+            ('alternate Node with target cwd', [runtime, script], instance, {}, False),
+            ('alternate Node with target path', [runtime, script, worker['WorkingDirectory']], self.home, {}, False),
+            ('alternate Node with target database', [runtime, script], self.home,
+             {'DATABASE_URL': 'postgres://localhost/allrice40_qa_recover_other_node'}, False),
+            ('alternate Node with env file', [runtime, '--env-file=' + env_file, script], self.home, {}, False),
+            ('early env file option after script', [runtime, script, '--env-file=' + env_file], self.home, {}, False),
+            ('alternate runtime with startup config after script', [runtime, script, '--experimental-config-file=' + env_file],
+             self.home, {}, False),
+            ('alternate Node with preloaded code', [runtime, script], self.home,
+             {'NODE_OPTIONS': '--import /unexecuted-fixture.mjs'}, False),
+            ('unknown Node launch mode', [runtime, '--unverified-launch-mode', script], self.home, {}, False),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, executable=runtime, environment=env,
+                                         reason='普通 Node 启动未见目标库' if allowed else None)
+        self.check_recovery_scan(task, rows, 'outside Node with a newer entry file', [runtime, script], self.home, True,
+                                 executable=runtime, started=os.stat(script).st_ctime_ns - 1,
+                                 reason='普通 Node 启动未见目标库')
+        self.check_recovery_scan(task, rows, 'Node with opaque loader environment', [runtime, script], self.home, False,
+                                 executable=runtime, environment={'NODE_FIXTURE_SETTINGS': 'opaque'},
+                                 reason='启动环境含无法核实作用的加载设置')
+        builtins = self.check_recovery_scan(task, rows, 'outside Node exposing built-in internals',
+                                            [runtime, '--expose-internals', script], self.home, True,
+                                            executable=runtime)
+        proxy = self.check_recovery_scan(task, rows, 'outside Node using the HTTP proxy switch',
+                                         [runtime, script], self.home, True, executable=runtime,
+                                         environment={'NODE_USE_ENV_PROXY': '1'})
+        self.assertIn('--expose-internals', builtins['evidence']['startup']['recognizedOptions'])
+        self.assertIn('NODE_USE_ENV_PROXY', proxy['evidence']['startup']['recognizedSettings'])
+
+        alias_directory = os.path.join(self.home, 'installed-launcher')
+        command_directory = os.path.join(os.path.dirname(script), 'commands')
+        os.mkdir(command_directory)
+        launcher = os.path.join(command_directory, 'fixture-cli')
+        os.symlink(os.path.dirname(script), alias_directory)
+        os.symlink('../ordinary.mjs', launcher)
+        for name, args in (
+            ('installed launcher directory', [runtime, '--expose-internals', os.path.join(alias_directory, 'ordinary.mjs')]),
+            ('extensionless command symlink', [runtime, launcher]),
+        ):
+            with self.subTest(name=name):
+                observed_launch = self.check_recovery_scan(task, rows, name, args, self.home, True, executable=runtime)
+                self.assertEqual(observed_launch['evidence']['startup']['ordinaryEntry'], 'symlink verified at startup')
+
+        target_entry = os.path.join(instance, 'target.mjs')
+        write(target_entry, '// inert target fixture\n')
+        target_link = os.path.join(command_directory, 'target-cli')
+        inside_target_link = os.path.join(instance, 'link-to-outside')
+        crossing_link = os.path.join(command_directory, 'crossing-cli')
+        os.symlink(target_entry, target_link)
+        os.symlink(script, inside_target_link)
+        os.symlink(inside_target_link, crossing_link)
+        for name, path, started in (
+            ('outside launcher resolves into the target', target_link, None),
+            ('outside launcher traverses the target', crossing_link, None),
+            ('outside launcher changed after exec', launcher, os.lstat(launcher).st_ctime_ns - 1),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, [runtime, path], self.home, False,
+                                         executable=runtime, started=started)
+
+        preload = self.check_recovery_scan(task, rows, 'entry uses an explicit preload',
+                                          [runtime, '--expose-internals', '--require', script, script], self.home,
+                                          False, executable=runtime, reason='入口前的 --require 会预加载模块', secret=script)
+        self.assertTrue(preload['evidence']['startup']['extraCodeSourceFlag'])
+        search_path = os.path.join(self.home, 'fixture-unreported-search-path')
+        module_path = self.check_recovery_scan(task, rows, 'proxy switch with a module search path', [runtime, script],
+                                              self.home, False, executable=runtime, reason='NODE_PATH 增加模块搜索目录',
+                                              environment={'NODE_USE_ENV_PROXY': '1', 'NODE_PATH': search_path}, secret=search_path)
+        self.assertIn('NODE_PATH', module_path['evidence']['startup']['recognizedLoadingControls'])
+        for name, args, cwd, env in (
+            ('built-in access with target PG port', [runtime, '--expose-internals', script], self.home, {'PGPORT': '5434'}),
+            ('built-in access from target cwd', [runtime, '--expose-internals', script], instance, {}),
+            ('built-in access with an env file', [runtime, '--expose-internals', '--env-file=' + env_file, script],
+             self.home, {}),
+            ('built-in access in opaque inherited options', [runtime, script], self.home,
+             {'NODE_OPTIONS': '--expose-internals'}),
+            ('proxy switch in an unverified form', [runtime, script], self.home,
+             {'NODE_USE_ENV_PROXY': 'fixture-unsupported-proxy-setting'}),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, False, executable=runtime, environment=env,
+                                         secret='fixture-unsupported-proxy-setting')
+        self.check_recovery_scan(task, rows, 'startup data unavailable for a Node candidate',
+                                 [runtime, '--expose-internals', script], self.home, False,
+                                 executable=runtime, observed=False, reason='无法读取进程启动环境')
+
+    def test_schedule_recover_refuses_a_visible_worker_database_session(self):
+        task = 'recover-worker-session'
+        self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        proof = os.path.join(self.tmp, 'worker-session-proof')
+        result = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
+                                      ROWS=json.dumps(rows), PROOF=proof, WORKER_SESSIONS='1')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('1 Worker session(s) still on the database', result.stderr)
+        self.assertFalse(os.path.exists(proof))
+
+    def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
+                            web_pid='', observed=True, job_plist=None, executable=NODE, env_visible=True,
+                            worker_parent=False, listed=True, reason=None, secret=None,
+                            file_sets=(), lsof_exit=0, lsof_warning='', unix_sockets=None):
+        proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
+        started = started or time.time_ns()
+        environment = dict(HOME=self.home, **(environment or {})) if env_visible else {}
+        snapshot = dict(executable=executable, args=args, environment=environment, started=started) if observed else None
+        command = os.path.basename(executable)
+        before = f'999998 1 node\n999999 999998 {command}\n' if worker_parent else ''
+        file_sets = ([['fcwd', 'tDIR', 'n' + cwd]] if cwd else []) + list(file_sets)
+        if file_sets:
+            file_sets.insert(0, ['p999999'])
+        p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
+                                 ROWS=json.dumps(rows), PROOF=proof, PROCESS_WEB_PID=web_pid,
+                                 PROCESS_WEB_PLIST=job_plist or self.recovery_web_plist, PROCESS_WEB_CWD=self.recovery_web_cwd,
+                                 PROCESS_WORKER_PID='999998' if worker_parent else '',
+                                 PROCESS_WORKER_PLIST=self.recovery_worker_plist, PROCESS_WORKER_CWD=self.recovery_worker_cwd,
+                                 PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=f'999999 1 {command}\n' if listed else '',
+                                 PROCESS_ARGS_BEFORE=before, PROCESS_STARTS=json.dumps({'999998': started - 1, '999999': started}),
+                                 PROCESS_LSOF=json.dumps(file_sets), PROCESS_LSOF_EXIT=str(lsof_exit),
+                                 PROCESS_LSOF_WARNING=lsof_warning, PROCESS_UNIX_SOCKETS=json.dumps(unix_sockets or {}))
+        self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
+        self.assertEqual(os.path.exists(proof), allowed)
+        instance = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
+        latest = sorted(name for name in os.listdir(instance) if name.startswith('schedule-recover-'))[-1]
+        with open(os.path.join(instance, latest, 'process-observations.json'), encoding='utf-8') as stream:
+            report = json.load(stream)
+        if lsof_exit or lsof_warning:
+            self.assertEqual(report['status'], 'error')
+            self.assertNotIn('processes', report)
+            self.assertIn('cannot verify process observations', p.stderr)
+        else:
+            self.assertEqual(report['status'], 'complete')
+            count = 1 + int(worker_parent)
+            self.assertEqual((report['total'], report['allowed'], report['blocked']),
+                             (count, int(allowed) + int(worker_parent), int(not allowed)))
+            self.assertEqual(len(report['processes']), count)
+            observed = report['processes'][-1]
+            self.assertEqual(set(observed) - {'evidence'}, {'pid', 'command', 'allowed', 'reason'})
+            self.assertEqual((observed['pid'], observed['command'], observed['allowed']), (999999, command, allowed))
+            if unix_sockets:
+                native = [item for item in observed['evidence']['unixSockets'] if item['source'] == 'proc_pidfdinfo']
+                self.assertEqual(len(native), len(unix_sockets))
+                for info, fixture in zip(native, unix_sockets.values()):
+                    self.assertEqual(info['type'], 'unix')
+                    self.assertEqual({key: info[key] for key in fixture}, fixture)
+                if cwd is None:
+                    self.assertIn('未看到此进程的可核实 cwd', observed['reason'])
+        if allowed:
+            with open(proof) as f:
+                self.assertEqual(f.read(), QA_DATABASE_CLAIM)
+        elif not (lsof_exit or lsof_warning):
+            self.assertIn('processes that could own the partitions are still running', p.stderr)
+        if reason:
+            self.assertIn(reason, report['reason'] if report['status'] == 'error' else observed['reason'])
+            if not allowed:
+                self.assertIn(reason, p.stderr)
+        if secret:
+            self.assertNotIn(secret, p.stdout + p.stderr)
+            self.assertNotIn(secret, json.dumps(report))
+        return observed if report['status'] == 'complete' else None
+
+    def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
+        worker = self.plist('worker')
+        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/allrice40_dev'
+        with open(self.live_plist('worker'), 'wb') as f:
+            plistlib.dump(worker, f)
+        self.assertEqual(self.run_dd('park_plists', []).returncode, 0)
+        rows = self.seed_recovery_partition()
         instance = self.write_qa_plists('recover-test')
-        write(os.path.join(instance, 'instance.json'), json.dumps({
-            'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'workerPort': 3201,
-        }))
         shutil.copyfile(os.path.join(instance, 'worker.plist'),
-                        os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice-qa-recover-test-worker.plist'))
+                        os.path.join(self.home, 'Library/LaunchAgents/ai.bplabs.allrice40-qa-recover-test-worker.plist'))
         for mode in ('dev', 'instance'):
             args = ('--dev', '--release-manager') if mode == 'dev' else ('--instance', 'recover-test')
             if mode == 'instance':
                 import fcntl
-                task_lock = os.path.join(self.home, 'allrice-qa/.task-recover-test.lock')
+                task_lock = os.path.join(self.home, 'allrice-qa/.task40-recover-test.lock')
                 with open(task_lock, 'a') as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     refused = self.run_config_tool('schedule-recover', *args, '--execute',
