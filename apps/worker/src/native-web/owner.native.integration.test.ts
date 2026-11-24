@@ -4,8 +4,15 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
+import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
+import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
+import { SessionId } from '@deepseek-ai/dsh-session';
+import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import * as PrincipalControl from '../d-entry/principal-control.js';
 import {
   PersonVmError,
   nativeWebAuthArtifact,
@@ -48,7 +55,12 @@ afterEach(async () => {
   const failure = joined.find((result) => result.status === 'rejected');
   if (failure?.status === 'rejected') throw failure.reason;
 });
-async function setup() {
+async function setup(
+  prepareScope?: (
+    scope: PersonVmBootstrapScope,
+    lifetime: AbortController,
+  ) => void,
+) {
   expect(
     createHash('sha256')
       .update(await readFile(cli!))
@@ -75,6 +87,13 @@ async function setup() {
     organizationId: randomUUID(),
     leaseEpoch: 1,
   };
+  // Test-owned endpoint facts; no production roster or authority is manufactured.
+  const principalProfile = {
+    workspaceId: randomUUID(),
+    employeeInstanceId: randomUUID(),
+    employeeRevision: 1,
+    employeeVersionId: randomUUID(),
+  };
   const launch = await prepareNativeWebLaunch(
     {
       origin: `http://127.0.0.1:${port}/`,
@@ -86,6 +105,7 @@ async function setup() {
       workdir: root,
       cliPath: cli!,
       startupTimeoutMs: 10000,
+      principalProfile,
     },
     binding,
   );
@@ -177,11 +197,12 @@ async function setup() {
     sessionId: randomUUID(),
     actor: { type: 'user', id: binding.personId },
     organizationId: binding.organizationId,
-    workspaceId: null,
+    workspaceId: principalProfile.workspaceId,
     memberships: [],
     authenticatedAt: new Date().toISOString(),
   };
   const current = vi.fn<PersonVmPort['assertCurrentBinding']>(async () => {});
+  prepareScope?.(scope, lifetime);
   const owner = await openNativeWebOwner({
     scope,
     launch,
@@ -190,9 +211,17 @@ async function setup() {
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
   });
-  cleanup.push(() => owner.close());
+  let expectedCloseFailure: unknown;
+  cleanup.push(async () => {
+    if (expectedCloseFailure === undefined) await owner.close();
+    else await expect(owner.close()).rejects.toBe(expectedCloseFailure);
+  });
   return {
     owner,
+    expectCloseFailure(error: unknown) {
+      expectedCloseFailure = error;
+    },
+    principalProfile,
     startup,
     lifetime,
     child,
@@ -452,7 +481,11 @@ it.skipIf(!cli)(
   },
 );
 
-for (const method of ['readSessions', 'readSessionsFor'] as const)
+for (const method of [
+  'readSessions',
+  'readSessionsFor',
+  'readModelCatalogFor',
+] as const)
   for (const check of [1, 2])
     it.skipIf(!cli)(
       `真实${method}第${check}次现权检查阻塞时close等待完整operation，禁止新读`,
@@ -484,7 +517,7 @@ for (const method of ['readSessions', 'readSessionsFor'] as const)
         const read = (signal: AbortSignal) =>
           method === 'readSessions'
             ? f.owner.readSessions(signal)
-            : f.owner.readSessionsFor(f.context, signal);
+            : f.owner[method](f.context, signal);
         cleanup.push(async () => {
           release.resolve();
         });
@@ -750,5 +783,468 @@ it.skipIf(!cli)(
     expect(f.kills()).toBe(0);
     await f.owner.close();
     expect(f.kills()).toBe(1);
+  },
+);
+
+it.skipIf(!cli)(
+  '真实running raw modelCatalog使用零业务参数和原生结果；不赋予startup/send就绪',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const f = await setup();
+    const result = await f.owner.readModelCatalogFor(
+      f.context,
+      new AbortController().signal,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw Error('actual native model catalog was unavailable');
+    expect(
+      NATIVE_REMOTE.methods['session/modelCatalog'].result
+        .create()
+        .parse(result.value),
+    ).toEqual(result.value);
+    expect(f.owner).not.toHaveProperty('editorReady');
+    expect(f.owner).not.toHaveProperty('canSend');
+    await f.owner.close();
+    await expect(
+      f.owner.readModelCatalogFor(f.context, new AbortController().signal),
+    ).rejects.toBeDefined();
+  },
+);
+
+it.skipIf(!cli).each([1, 2])(
+  '真实raw catalog第%s个current拒绝仅影响本请求，原错误保留且共享owner可继续',
+  { tags: [tag], timeout: 30000 },
+  async (check) => {
+    const fetches = observeFetches(),
+      f = await setup();
+    const denied = new PersonVmError('AUTHORIZATION_DENIED');
+    if (check === 2) f.current.mockResolvedValueOnce(undefined);
+    f.current.mockRejectedValueOnce(denied);
+    const before = fetches();
+    await expect(
+      f.owner.readModelCatalogFor(f.context, new AbortController().signal),
+    ).rejects.toBe(denied);
+    expect(fetches()).toBe(before + check - 1);
+    expect(f.owner.revoked.aborted).toBe(false);
+    expect(f.owner.controlReady()).toBe(true);
+    expect(f.kills()).toBe(0);
+    expect(
+      (
+        await f.owner.readModelCatalogFor(
+          { ...f.context, sessionId: randomUUID() },
+          new AbortController().signal,
+        )
+      ).ok,
+    ).toBe(true);
+  },
+);
+
+it.skipIf(!cli).each(['caller-cancel', 'owner-close'] as const)(
+  '真实raw零参Promise尚未返回时%s不代替join；只在原reply真实结清后拒绝结果',
+  { tags: [tag], timeout: 30000 },
+  async (mode) => {
+    const create = NativeTransport.nativeWebTransport,
+      entered = latch(),
+      release = latch();
+    let first = true;
+    let actual:
+      { body: unknown; signal: AbortSignal | null | undefined } | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        const transport = create(...args);
+        return {
+          ...transport,
+          async fetch(...request) {
+            const response = await transport.fetch(...request);
+            if (
+              first &&
+              new URL(request[0], args[0]).pathname ===
+                '/api/session/modelCatalog'
+            ) {
+              first = false;
+              if (typeof request[1].body !== 'string')
+                throw Error('actual native JSON request missing');
+              actual = {
+                body: JSON.parse(request[1].body),
+                signal: request[1].signal,
+              };
+              entered.resolve();
+              await release.promise; // Hold the original public carrier Promise, never replace its response.
+            }
+            return response;
+          },
+        };
+      },
+    );
+    const f = await setup(),
+      caller = new AbortController();
+    cleanup.push(async () => {
+      release.resolve();
+    });
+    let settled = false;
+    const reading = f.owner
+      .readModelCatalogFor(f.context, caller.signal)
+      .catch((error: unknown) => error)
+      .finally(() => {
+        settled = true;
+      });
+    await entered.promise;
+    if (!actual) throw Error('actual raw request was not observed');
+    expect(actual.body).toEqual({
+      type: 'client-request',
+      rpcId: expect.any(String),
+      method: 'session/modelCatalog',
+      payload: { args: {} },
+    });
+    const cancelled = Error('fixture-only single raw read cancelled');
+    const closing =
+      mode === 'owner-close' ? f.owner.close() : Promise.resolve();
+    void closing.catch(() => {});
+    if (mode === 'caller-cancel') caller.abort(cancelled);
+    await new Promise<void>((done) => setImmediate(done));
+    expect(settled).toBe(false);
+    // The zero-argument native descriptor has only its mount lifetime, no caller cancellation slot.
+    expect(actual.signal?.aborted).toBe(false);
+    if (mode === 'caller-cancel') {
+      expect(f.owner.revoked.aborted).toBe(false);
+      expect(f.owner.controlReady()).toBe(true);
+    } else expect(f.owner.revoked.aborted).toBe(true);
+    release.resolve();
+    const outcome = await reading;
+    if (mode === 'caller-cancel') expect(outcome).toBe(cancelled);
+    else expect(outcome).toBeInstanceOf(Error);
+    await closing;
+    if (mode === 'caller-cancel') {
+      expect(
+        (
+          await f.owner.readModelCatalogFor(
+            f.context,
+            new AbortController().signal,
+          )
+        ).ok,
+      ).toBe(true);
+      expect(f.kills()).toBe(0);
+    } else expect(f.kills()).toBe(1);
+  },
+);
+
+it.skipIf(!cli).each(['normal', 'lost-then-exact-stop'] as const)(
+  '真实guest封存principal安装、同API Peer两页及技术ready；%s按各自ACK/unknown/退役出口join',
+  { tags: [tag], timeout: 30000 },
+  async (mode) => {
+    const create = NativeTransport.nativeWebTransport;
+    let selected:
+      ReturnType<typeof NativeTransport.nativeWebTransport> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        selected = create(...args);
+        return selected;
+      },
+    );
+    const f = await setup(),
+      transport = selected;
+    if (!transport) throw Error('actual authenticated owner transport missing');
+    // Only this manual test creates a native Session through the original owner Peer.
+    // The pin strings below are explicitly test-owned provenance, not SQL or production authorization.
+    const args = NATIVE_REMOTE.methods['session/create']
+      .input({ strict: true })
+      .create()
+      .parse({ request: {} });
+    const response = await transport.fetch('api/session/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method: 'session/create',
+        payload: { args },
+      }),
+    });
+    const envelope = serverResponseSchema.parse(await response.json());
+    if (!envelope.result.ok)
+      throw Error('actual native session/create refused the manual fixture');
+    const created = NATIVE_REMOTE.methods['session/create'].result
+      .create()
+      .parse(envelope.result.value);
+    const issue: DEntryPrincipalIssue = {
+      scopeId: randomUUID(),
+      access: 'history',
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
+      },
+      root: {
+        nativeSessionId: created.sessionId,
+        rootOriginDigest: 'manual-test-native-create-only',
+        rootBindingRef: 'manual-test-no-sql-permit',
+      },
+    };
+    const first = f.owner.acquirePrincipal(issue, new AbortController().signal);
+    const secondIssue = { ...issue, scopeId: randomUUID() };
+    const second = f.owner.acquirePrincipal(
+      secondIssue,
+      new AbortController().signal,
+    );
+    const firstScope = await first.run(new AbortController().signal);
+    const secondScope = await second.run(new AbortController().signal);
+    expect(firstScope.opened.baseline.owner).toBe(false);
+    expect(firstScope.opened.principal.kind).toBe('allrice-d-entry');
+    expect(secondScope.opened.baseline.owner).toBe(false);
+    const eventsSource = firstScope.stream(
+      { kind: 'events', scopeId: issue.scopeId, payload: { args: {} } },
+      new AbortController().signal,
+    );
+    const events = eventsSource[Symbol.asyncIterator]();
+    expect(await events.next()).toMatchObject({
+      value: {
+        type: 'item',
+        value: { type: 'ready', clientId: expect.any(String) },
+      },
+    });
+    await first.close(); // Real close/closed/end and local join; it never cancels the shared job.
+    await events.return?.(); // Join this test's paused consumer too.
+    expect(firstScope.revoked.aborted).toBe(true);
+    expect(secondScope.revoked.aborted).toBe(false);
+    expect(f.kills()).toBe(0);
+    expect(
+      await secondScope.invoke(
+        {
+          scopeId: secondIssue.scopeId,
+          endpoint: 'session/page',
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: created.sessionId },
+              throughSeq: 0,
+            },
+          },
+        },
+        new AbortController().signal,
+      ),
+    ).toMatchObject({ endpoint: 'session/page' });
+    if (mode === 'normal') {
+      const entered = latch();
+      f.current.mockImplementationOnce(async (_context, _binding, checking) => {
+        entered.resolve();
+        await new Promise<void>((_resolve, reject) => {
+          const abort = () => reject(checking.reason);
+          checking.addEventListener('abort', abort, { once: true });
+          if (checking.aborted) {
+            checking.removeEventListener('abort', abort);
+            abort();
+          }
+        });
+      });
+      const reading = f.owner.readSessions(new AbortController().signal);
+      void reading.catch(() => {});
+      await entered.promise;
+      // Normal stale abort rejects a real in-flight binding guard. It must not
+      // enter lost and kill the carrier before the other page's close ACK.
+      const closing = f.owner.close();
+      await expect(reading).rejects.toBeDefined();
+      await closing;
+    } else {
+      f.child.kill('SIGKILL');
+      await f.exited;
+      await expect(f.owner.close()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      // Actual child exit is the fixture's trusted exact-stop fact; it is not an ACK.
+      await f.owner.retireAfterNativeStop(
+        f.owner.binding,
+        new AbortController().signal,
+      );
+      await f.owner.close();
+    }
+    expect(secondScope.revoked.aborted).toBe(true);
+    expect(f.kills()).toBe(1);
+  },
+);
+
+it.skipIf(!cli)(
+  'R3最后baseline后setup current实际悬挂时，normal close不能在真guard join前完成',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const entered = latch(),
+      release = latch();
+    let abort: (() => void) | undefined;
+    let cancel: MockInstance<PersonVmManagedJob['cancelAndWait']> | undefined;
+    let checks = 0,
+      settled = false;
+    const opening = setup((scope, lifetime) => {
+      abort = () => lifetime.abort();
+      const current = scope.assertCurrent.bind(scope),
+        launch = scope.launch.bind(scope);
+      vi.spyOn(scope, 'assertCurrent').mockImplementation(async () => {
+        await current();
+        if (++checks === 3) {
+          entered.resolve();
+          await release.promise;
+        }
+      });
+      vi.spyOn(scope, 'launch').mockImplementation(async (...args) => {
+        const job = await launch(...args);
+        cancel = vi.spyOn(job, 'cancelAndWait');
+        return job;
+      });
+    })
+      .then(
+        () => {
+          throw Error('a late successful owner must never be published');
+        },
+        (error: unknown) => error,
+      )
+      .finally(() => {
+        settled = true;
+      });
+    cleanup.push(async () => {
+      release.resolve();
+      await opening;
+    });
+    await entered.promise;
+    if (!abort || !cancel) throw Error('actual setup guard/job not reached');
+    abort();
+    await new Promise<void>((done) => setImmediate(done));
+    expect(checks).toBe(3);
+    expect(settled).toBe(false);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    const cancelled = cancel.mock.results[0];
+    if (!cancelled || cancelled.type !== 'return')
+      throw Error('actual native cancellation did not start');
+    await cancelled.value; // Actual Host/job has joined, but its last guard is still pending.
+    expect(settled).toBe(false);
+    release.resolve();
+    expect(await opening).toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.skipIf(!cli)(
+  'owner close保留真实control的native错误链及并存cleanup原因，等待实际job收尾并复用失败memo',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    // This boundary test routes the real control to the public S1 fixture so its
+    // native catalog can deterministically fail. Other manual cases cover the
+    // actual same-Host/Peer installation; the owner job and its cleanup stay real.
+    const native = await hostFixture(),
+      create = PrincipalControl.createDEntryPrincipalControl,
+      cancelEntered = latch(),
+      cancelRelease = latch(),
+      cleanupFailure = Error('actual joined job cleanup diagnostic');
+    vi.spyOn(
+      PrincipalControl,
+      'createDEntryPrincipalControl',
+    ).mockImplementation((_root, input) => create(native.node, input));
+    let cancel: MockInstance<PersonVmManagedJob['cancelAndWait']> | undefined;
+    const pendingCloses: Promise<unknown>[] = [];
+    let nativeClosed = false,
+      holdCancel = false;
+    cleanup.push(async () => {
+      cancelRelease.resolve();
+      await Promise.allSettled(pendingCloses);
+      if (!nativeClosed) await native.close();
+    });
+    const f = await setup((scope) => {
+      const launch = scope.launch.bind(scope);
+      vi.spyOn(scope, 'launch').mockImplementation(async (...args) => {
+        const job = await launch(...args),
+          actual = job.cancelAndWait.bind(job);
+        cancel = vi
+          .spyOn(job, 'cancelAndWait')
+          .mockImplementation(async (...request) => {
+            const result = await actual(...request);
+            if (!holdCancel) return result;
+            cancelEntered.resolve();
+            await cancelRelease.promise;
+            throw cleanupFailure;
+          });
+        return job;
+      });
+    });
+    cleanup.push(async () => {
+      cancelRelease.resolve();
+      await Promise.allSettled(pendingCloses);
+    });
+    const activity = f.owner.acquirePrincipal(
+      native.selected,
+      new AbortController().signal,
+    );
+    const scope = await activity.run(new AbortController().signal);
+    const failure = new RemoteError(
+      'subagent/catalog-diagnostic',
+      'owner boundary native setup failure',
+      {
+        parentSessionId: SessionId('root'),
+        childSessionId: SessionId('child'),
+        reason: 'unavailable',
+      },
+    );
+    native.catalog.beforeFollow = async () => {
+      throw failure;
+    };
+    const follow = scope.stream(
+      {
+        scopeId: native.selected.scopeId,
+        endpoint: 'session/follow',
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: SessionId('root') },
+          },
+        },
+      },
+      new AbortController().signal,
+    );
+    const stream = follow[Symbol.asyncIterator]();
+    await expect(stream.next()).rejects.toMatchObject({
+      code: failure.code,
+      message: failure.message,
+      details: failure.details,
+    });
+    let settled = false;
+    holdCancel = true;
+    const closing = f.owner
+      .close()
+      .catch((error: unknown) => error)
+      .finally(() => {
+        settled = true;
+      });
+    pendingCloses.push(closing);
+    try {
+      await cancelEntered.promise;
+      await f.exited;
+      await new Promise<void>((done) => setImmediate(done));
+      expect(settled).toBe(false);
+      expect(f.kills()).toBe(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      cancelRelease.resolve();
+    }
+    const outcome = await closing;
+    f.expectCloseFailure(outcome);
+    expect(outcome).toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+      cause: expect.any(AggregateError),
+    });
+    const reasons: unknown[] = [];
+    function collect(error: unknown) {
+      if (reasons.includes(error)) return;
+      reasons.push(error);
+      if (error instanceof AggregateError) error.errors.forEach(collect);
+      if (error instanceof Error && error.cause) collect(error.cause);
+    }
+    collect(outcome);
+    expect(reasons).toContainEqual(
+      expect.objectContaining({
+        code: failure.code,
+        message: failure.message,
+        details: failure.details,
+      }),
+    );
+    expect(reasons).toContain(cleanupFailure);
+    await expect(f.owner.close()).rejects.toBe(outcome);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    await native.close();
+    nativeClosed = true;
   },
 );

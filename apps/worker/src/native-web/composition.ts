@@ -134,6 +134,12 @@ export function createAssignedNativeWebStartup(input: {
             return prepareNativeWebLaunch(
               {
                 ...input.configuration,
+                principalProfile: {
+                  workspaceId: endpoint.workspaceId,
+                  employeeInstanceId: endpoint.employeeInstanceId,
+                  employeeRevision: endpoint.employeeRevision,
+                  employeeVersionId: endpoint.employeeVersionId,
+                },
                 origin: `http://127.0.0.1:${endpoint.hostPort}/`,
                 publicUrl: input.configuration.publicUrl(endpoint, binding),
                 guestPort: endpoint.guestPort,

@@ -17,6 +17,7 @@
     "@allrice/vm-memory": "workspace:*",
     "@allrice/person-vm": "workspace:*",
     "@allrice/database": "workspace:*",
+    "@allrice/d-entry-principal": "workspace:*",
     "@allrice/office-runtime": "workspace:*",
     "@allrice/storage": "workspace:*",
     "@deepseek-ai/cordis": "4.0.5",

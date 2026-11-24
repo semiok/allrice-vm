@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import type {
+  DEntryPrincipalIssue,
+  DEntryPrincipalActivity,
+} from '@allrice/d-entry-principal/types';
 import {
   DEntryNativeResourceFactsSchema,
   UuidSchema,
@@ -60,6 +64,13 @@ export type ResolvedDEntryNativeOwner = Readonly<{
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;
   readSessions(signal: AbortSignal): Promise<RemoteResult<SessionListValue>>;
+  /** Actual same-Host issuer. Acquisition does not start I/O; run opens the
+   * fixed generated control scope. No browser-provided principal or grants. */
+  acquirePrincipal(
+    context: RequestContext,
+    input: DEntryPrincipalIssue,
+    signal: AbortSignal,
+  ): DEntryPrincipalActivity;
 }>;
 export interface DEntryNativeOwnerPort {
   resolve(
