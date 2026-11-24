@@ -1,18 +1,131 @@
 import { renameSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { Agent, request } from 'node:http';
 import { dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
   'connection',
   'webServer',
+  'typertGateway',
+  'appReady',
+  'loader',
   'clientModules',
   'allricePrincipal',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
 const original = (value) => value?.[cordisOriginal] ?? value;
+
+async function waitWhileOwned(signal, subscribe) {
+  let stop, unsubscribe;
+  const release = () => {
+    const cancel = unsubscribe;
+    unsubscribe = undefined;
+    cancel?.();
+  };
+  try {
+    return await new Promise((resolve, reject) => {
+      stop = () => {
+        release();
+        resolve(false);
+      };
+      if (signal.aborted) return stop();
+      signal.addEventListener('abort', stop, { once: true });
+      unsubscribe = subscribe(() => resolve(true), reject);
+    });
+  } finally {
+    release();
+    signal.removeEventListener('abort', stop);
+  }
+}
+
+/** One credential-free Upgrade on this sealed listener. rc.2 destroys the
+ * socket for an absent route and emits this bounded reply from the real mux. */
+async function confirmGatewayMux(origin, baseUrl, signal) {
+  signal.throwIfAborted();
+  const expected = Buffer.from('unauthorized');
+  const bytes = Buffer.alloc(expected.length);
+  let physicalClose, failure;
+  let received = 0;
+  let complete = false;
+  const agent = new (class extends Agent {
+    createConnection(...args) {
+      const socket = super.createConnection(...args);
+      physicalClose = new Promise((resolve) => socket.once('close', resolve));
+      return socket;
+    }
+  })({ keepAlive: false });
+  const invalid = () =>
+    Error('Native gateway mux readiness response was invalid');
+  try {
+    await new Promise((resolve) => {
+      const call = request(
+        new URL('/api/remote.mux', origin),
+        {
+          agent,
+          signal,
+          headers: {
+            Host: new URL(baseUrl).host,
+            Connection: 'Upgrade',
+            Upgrade: 'websocket',
+            'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+            'Sec-WebSocket-Version': '13',
+          },
+        },
+        (response) => {
+          response.on('error', (error) => (failure ??= error));
+          if (
+            response.httpVersion !== '1.1' ||
+            response.statusCode !== 401 ||
+            response.statusMessage !== 'Unauthorized' ||
+            response.headers.connection !== 'close' ||
+            response.headers['content-type'] !== 'text/plain; charset=utf-8' ||
+            response.headers['content-length'] !== String(expected.length)
+          ) {
+            failure = invalid();
+            response.destroy();
+            return;
+          }
+          response.on('data', (chunk) => {
+            if (chunk.length > bytes.length - received) {
+              failure = invalid();
+              response.destroy();
+              return;
+            }
+            chunk.copy(bytes, received);
+            received += chunk.length;
+          });
+          response.once('end', () => {
+            complete = received === bytes.length && bytes.equals(expected);
+          });
+        },
+      );
+      call.on('error', (error) => (failure ??= error));
+      call.once('upgrade', (_response, socket) => {
+        failure = invalid();
+        socket.destroy();
+      });
+      call.once('close', resolve);
+      call.end();
+    });
+  } finally {
+    agent.destroy();
+    await physicalClose;
+  }
+  if (failure) {
+    if (
+      signal.aborted &&
+      failure.code === 'ABORT_ERR' &&
+      failure.cause === signal.reason
+    )
+      throw signal.reason;
+    throw failure;
+  }
+  signal.throwIfAborted();
+  if (!complete) throw invalid();
+}
 
 /** An explicit local unloader also receives the actual profile retirement. */
 export async function unloadNativeWebOwner(fiber) {
@@ -28,19 +141,24 @@ export async function unloadNativeWebOwner(fiber) {
 }
 
 /** Native local login only. This file never establishes an AllRice principal. */
-export async function apply(ctx, config) {
+export function apply(ctx, config) {
   const { artifactPath, nonce, baseUrl } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
   );
   const temporary = `${artifactPath}.${randomUUID()}.tmp`;
+  const lifetime = new AbortController();
+  const { signal } = lifetime;
+  const canceled = Error('Native auth publication canceled');
   let publishing;
-  let stagingFailure;
+  let publicationFailure;
   let published = false;
   let retiring = false;
-  let activated = false;
-  let restarting = false;
+  const stop = () => {
+    retiring = true;
+    lifetime.abort(canceled);
+  };
   const sameConfig = (value) =>
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
@@ -57,26 +175,30 @@ export async function apply(ctx, config) {
   const observed = ctx.allricePrincipal.observeProfileGraph(ctx.clientModules, {
     current,
     publish() {
-      return (publishing = publish());
+      return (publishing = publish().catch((error) => {
+        if (error === canceled) return;
+        publicationFailure = { error };
+        throw error;
+      }));
     },
     async retire() {
-      retiring = true;
+      stop();
       await publishing?.catch(() => {});
       try {
         if (published) await rm(artifactPath, { force: true });
       } catch (error) {
-        if (stagingFailure)
+        if (publicationFailure)
           throw new AggregateError(
-            [stagingFailure.error, error],
+            [publicationFailure.error, error],
             'Native auth cleanup failed',
           );
         throw error;
       }
-      if (stagingFailure) throw stagingFailure.error;
+      if (publicationFailure) throw publicationFailure.error;
     },
   });
   const retire = () => {
-    retiring = true;
+    stop();
     return observed.close();
   };
   // Cordis exposes an awaitable facade over the same actual disposer.
@@ -90,32 +212,32 @@ export async function apply(ctx, config) {
   ctx.on('internal/service', retireMissingOwner);
   ctx.on('loader/partial-dispose', (changed) => {
     if (!entry || changed !== entry || sameConfig(entry.options.config)) return;
-    const stopped = retire();
-    void stopped.catch(() => {});
-    if (activated || restarting) return;
-    restarting = true;
-    // rc.2 records a loading entry's new raw config before its old apply
-    // returns. Let that transition settle, then update the same live entry.
-    void stopped
-      .then(async () => {
-        await fiber.await();
-        if (fiber.uid !== null && fiber.entry === entry)
-          fiber.update(entry.options.config, true);
-      })
-      .catch(() => {});
+    void retire().catch(() => {});
   });
   ctx.effect(() => retire, 'allrice native profile and local auth lifetime');
-  try {
-    await observed.ready;
-    activated = true;
-  } catch (error) {
-    if (current()) {
-      await retire().catch(() => {});
-      throw error;
-    }
-  }
+  // Startup and this entry must settle before the launcher can call appReady.
+  // The observer owns publication outside the Loader's apply task.
+  void observed.ready.catch((error) => {
+    if (!current()) return;
+    publicationFailure ??= { error };
+    void retire().catch(() => {});
+  });
 
   async function publish() {
+    if (!(await waitWhileOwned(signal, (ready) => ctx.appReady.onReady(ready))))
+      return;
+    if (!current()) return;
+    // rc.2 dispatches ready listeners synchronously. This continuation runs
+    // after dispatch and lets the shared Loader settle its actual entries.
+    if (
+      !(await waitWhileOwned(signal, (settled, reject) => {
+        void ctx.loader.await().then(settled, reject);
+      }))
+    )
+      return;
+    if (!current()) return;
+    await confirmGatewayMux(ctx.webServer.getOrigin(), baseUrl, signal);
+    if (!current()) return;
     await mkdir(dirname(artifactPath), { recursive: true, mode: 0o700 });
     if (!current()) return;
     let primary;
@@ -141,15 +263,12 @@ export async function apply(ctx, config) {
     try {
       await rm(temporary, { force: true });
     } catch (error) {
-      stagingFailure = {
-        error: primary
-          ? new AggregateError(
-              [primary.error, error],
-              'Native auth staging failed',
-            )
-          : error,
-      };
-      throw stagingFailure.error;
+      if (primary)
+        throw new AggregateError(
+          [primary.error, error],
+          'Native auth staging failed',
+        );
+      throw error;
     }
     if (primary) throw primary.error;
   }

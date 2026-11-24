@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { DEntryProfileGraphSchema } from '@allrice/contracts';
+import { nativeWebAuthArtifact } from '@allrice/person-vm';
 import {
   holdReleasedProfile,
   readReleasedGuestProfile,
@@ -50,6 +51,7 @@ it(
       'allrice-web',
     ]);
     expect(f.owner.controlReady()).toBe(true);
+    expect((await f.owner.readSessions(active)).ok).toBe(true);
     const patch = await f.observedProfilePatch();
     expect(patch.actual).toEqual([patch.expected]);
     const built = JSON.parse(
@@ -109,6 +111,23 @@ it(
         built.source.head,
       );
     expect(await prepareAgain()).toEqual(built);
+    const firstNonce = nativeWebAuthArtifact(f.launch.auth).path;
+    await access(firstNonce);
+    await f.owner.close();
+    expect((await f.exited).timedOut).toBe(false);
+    await expect(access(firstNonce)).rejects.toMatchObject({ code: 'ENOENT' });
+    const second = await f.restartRetained();
+    expect(second.launch.auth.dshHome).toBe(f.launch.auth.dshHome);
+    expect(second.launch.auth.nonce).not.toBe(f.launch.auth.nonce);
+    expect(second.child.pid).not.toBe(f.child.pid);
+    expect(second.owner.controlReady()).toBe(true);
+    expect((await second.owner.readSessions(active)).ok).toBe(true);
+    const secondNonce = nativeWebAuthArtifact(second.launch.auth).path;
+    await access(secondNonce);
+    await second.owner.close();
+    expect((await second.exited).timedOut).toBe(false);
+    await expect(access(secondNonce)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.kills()).toBe(2);
     const patchFile = join(f.seal.directory, 'guest/cordis.patch.yml');
     const exactBytes = await readFile(patchFile);
     await rm(patchFile);
@@ -134,7 +153,5 @@ it(
     await expect(prepareAgain()).rejects.toThrow(
       'Missing Employee Web artifact file: guest/cordis.patch.yml',
     );
-    await f.owner.close();
-    expect(f.kills()).toBe(1);
   },
 );

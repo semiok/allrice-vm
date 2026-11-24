@@ -32,7 +32,7 @@ import {
   parseNativeWebAuth,
 } from '../../../../packages/person-vm/src/native-web-auth.ts';
 import { runCommand } from '../../../../packages/person-vm/src/process.ts';
-import { prepareNativeWebLaunch } from './launch.js';
+import { prepareNativeWebLaunch, type NativeWebLaunch } from './launch.js';
 import { openNativeWebOwner } from './owner.js';
 
 async function isolatedCli(root: string, installedCli: string) {
@@ -165,26 +165,26 @@ export async function setupNativeWebFixture(
     employeeRevision: 1,
     employeeVersionId: randomUUID(),
   };
-  const launch = await prepareNativeWebLaunch(
-    {
-      origin: `http://127.0.0.1:${port}/`,
-      publicUrl: `http://127.0.0.1:${port}/`,
-      guestAddress: '127.0.0.1',
-      guestPort: port,
-      dshHome,
-      agentsHome: join(root, 'agents'),
-      workdir: root,
-      cliPath,
-      startupTimeoutMs: 10000,
-      principalProfile,
-    },
-    binding,
-    profile,
-  );
-  for (const file of launch.files) {
-    await mkdir(dirname(file.path), { recursive: true });
-    await writeFile(file.path, file.contents, { mode: file.mode });
+  const configuration = {
+    origin: `http://127.0.0.1:${port}/`,
+    publicUrl: `http://127.0.0.1:${port}/`,
+    guestAddress: '127.0.0.1',
+    guestPort: port,
+    dshHome,
+    agentsHome: join(root, 'agents'),
+    workdir: root,
+    cliPath,
+    startupTimeoutMs: 10000,
+    principalProfile,
+  };
+  const launch = await prepareNativeWebLaunch(configuration, binding, profile);
+  async function stage(ownerLaunch: NativeWebLaunch) {
+    for (const file of ownerLaunch.files) {
+      await mkdir(dirname(file.path), { recursive: true });
+      await writeFile(file.path, file.contents, { mode: file.mode });
+    }
   }
+  await stage(launch);
   const tracePath = join(root, 'profile-patch-reads');
   const profileDirectory = join(dshHome, 'profiles/allrice-web');
   const profilePatch = join(
@@ -289,13 +289,15 @@ export async function setupNativeWebFixture(
           );
         },
       );
+      const processHandle = child,
+        processExit = exited;
       async function wait(signal: AbortSignal) {
         waitSignal ??= signal; // Observe the public managed wait's actual abort.
         signal.throwIfAborted();
         let abort!: () => void;
         try {
           return await Promise.race([
-            exited,
+            processExit,
             new Promise<never>((_, reject) => {
               abort = () => reject(signal.reason);
               signal.addEventListener('abort', abort, { once: true });
@@ -311,13 +313,13 @@ export async function setupNativeWebFixture(
         wait,
         cancelAndWait: async (signal) => {
           kills++;
-          child.kill('SIGKILL');
+          processHandle.kill(isolateProfile ? 'SIGTERM' : 'SIGKILL');
           return wait(signal);
         },
       };
       cleanup.push(async () => {
-        child.kill('SIGKILL');
-        await exited;
+        processHandle.kill('SIGKILL');
+        await processExit;
       });
       return job;
     },
@@ -390,6 +392,29 @@ export async function setupNativeWebFixture(
     startup,
     lifetime,
     child,
+    async restartRetained() {
+      if (
+        !isolateProfile ||
+        (child.exitCode === null && child.signalCode === null)
+      )
+        throw Error('The original isolated Host must stop before restart');
+      const next = await prepareNativeWebLaunch(
+        configuration,
+        binding,
+        profile,
+      );
+      await stage(next);
+      const restarted = await openNativeWebOwner({
+        scope,
+        launch: next,
+        context,
+        vm: { assertCurrentBinding: current },
+        lifetime: new AbortController().signal,
+        cleanupTimeoutMs: 5000,
+      });
+      cleanup.push(() => restarted.close());
+      return { owner: restarted, launch: next, child, exited };
+    },
     current,
     context,
     exited,

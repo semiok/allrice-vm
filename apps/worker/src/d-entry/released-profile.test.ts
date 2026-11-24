@@ -9,6 +9,8 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import type { IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -38,9 +40,57 @@ vi.mock('node:fs/promises', async (load) => {
   };
 });
 
+async function waitForAuthNonce(path: string, nonce: string) {
+  await expect
+    .poll(async () => {
+      const value = await readFile(path, 'utf8').catch(() => undefined);
+      return value === undefined ? undefined : JSON.parse(value).nonce;
+    })
+    .toBe(nonce);
+}
+
+async function installObserverWeb(
+  host: Context,
+  source: NodeRequire,
+  manual = false,
+) {
+  let committed = false;
+  const listeners = new Set<() => void>();
+  host.provide('appReady', {
+    onReady(listener: () => void) {
+      if (committed) listener();
+      else listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  });
+  const resolve = createRequire(source.resolve('@deepseek-ai/dsh-web-app'));
+  const { WebServer } = await import(
+    pathToFileURL(resolve.resolve('@deepseek-ai/dsh-host-webserver')).href
+  );
+  await host.plugin(WebServer, { host: '127.0.0.1', port: 0 });
+  function commit(reverse = false) {
+    committed = true;
+    const pending = [...listeners];
+    for (const listener of reverse ? pending.reverse() : pending) listener();
+    listeners.clear();
+  }
+  if (!manual) commit();
+  const server = host.webServer;
+  return {
+    commit,
+    pendingReady: () => listeners.size,
+    server,
+    baseUrl: server.getOrigin(),
+  };
+}
+
 async function observerFixture(options?: {
   loader?: boolean;
   graphEvents?: boolean;
+  manualReady?: boolean;
+  beforeLoader?: () => Promise<void>;
 }) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
   const local = await hostFixture(issue('execute'), true, null);
@@ -72,7 +122,18 @@ async function observerFixture(options?: {
     );
     await local.host.plugin(plugin.default);
     loader = local.host.get('loader');
-  } else local.host.provide('loader', { entries: () => [] });
+  } else
+    local.host.provide('loader', {
+      entries: () => [],
+      async await() {
+        await options?.beforeLoader?.();
+      },
+    });
+  const web = await installObserverWeb(
+    local.host,
+    install,
+    options?.manualReady,
+  );
   const callbacks = new Set<() => void>();
   if (options?.graphEvents) {
     local.host.provide('clientModules', {
@@ -87,12 +148,12 @@ async function observerFixture(options?: {
   } else await local.host.plugin(native.ClientModuleRegistry);
   const mount = (nonce: string, entered?: () => void) =>
     local.host.plugin({
-      inject: ['allricePrincipal', 'connection', 'clientModules'],
+      inject: owner.inject,
       apply(ctx: Context) {
         const applying = owner.apply(ctx, {
           artifactPath: artifacts,
           nonce,
-          baseUrl: 'http://127.0.0.1:18881/',
+          baseUrl: web.baseUrl,
         });
         entered?.();
         return applying;
@@ -105,6 +166,7 @@ async function observerFixture(options?: {
     artifacts,
     mount,
     loader,
+    web,
     graphChanged() {
       for (const callback of callbacks) callback();
     },
@@ -121,6 +183,134 @@ async function observerFixture(options?: {
   };
 }
 
+it('keeps the nonce private through appReady dispatch, loader settlement and actual mux registration', async () => {
+  const entered = deferred(),
+    settle = deferred();
+  const f = await observerFixture({
+    manualReady: true,
+    async beforeLoader() {
+      entered.resolve();
+      await settle.promise;
+    },
+  });
+  const register = vi.spyOn(f.web.server, 'registerUpgrade');
+  try {
+    const discarded = f.mount('stop-before-ready');
+    await discarded; // Cordis apply settles without boot's readiness callback.
+    await expect.poll(f.web.pendingReady).toBe(2);
+    await f.owner.unloadNativeWebOwner(discarded);
+    expect(f.web.pendingReady()).toBe(1);
+    expect(register).not.toHaveBeenCalled();
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const incumbent = f.mount('current-startup');
+    await incumbent;
+    await expect.poll(f.web.pendingReady).toBe(2);
+    f.web.commit(true); // Even if this owner's listener ran before the mux listener.
+    await entered.promise;
+    expect(register).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ path: '/api/remote.mux' }),
+    );
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(f.open()).rejects.toBeDefined();
+    settle.resolve();
+    await waitForAuthNonce(f.artifacts, 'current-startup');
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(incumbent);
+
+    const remounted = f.mount('already-committed-app');
+    await waitForAuthNonce(f.artifacts, 'already-committed-app');
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(remounted);
+    expect(register).toHaveBeenCalledTimes(1);
+  } finally {
+    settle.resolve();
+    register.mockRestore();
+    await f.close();
+  }
+});
+
+it('reports the real startup transport fault without publishing when the mux was not installed', async () => {
+  const f = await observerFixture({ manualReady: true });
+  const register = vi
+    .spyOn(f.web.server, 'registerUpgrade')
+    .mockReturnValue(() => {});
+  try {
+    const active = f.mount('unregistered-mux');
+    await active;
+    await expect.poll(f.web.pendingReady).toBe(2);
+    f.web.commit();
+    await expect
+      .poll(() => Reflect.get(f.local.host.allricePrincipal, 'graphObserver'))
+      .toBeUndefined();
+    expect(register).toHaveBeenCalledTimes(1);
+    await expect(f.owner.unloadNativeWebOwner(active)).rejects.toMatchObject({
+      code: 'ECONNRESET',
+    });
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(f.open()).rejects.toBeDefined();
+  } finally {
+    register.mockRestore();
+    await f.close();
+  }
+});
+
+it('joins the single anonymous Upgrade on retirement before permitting new publication', async () => {
+  const f = await observerFixture({ manualReady: true });
+  const arrived = deferred<IncomingMessage>();
+  const disconnected = deferred();
+  const registerUpgrade = f.web.server.registerUpgrade.bind(f.web.server);
+  let holdProbe = true;
+  const register = vi
+    .spyOn(f.web.server, 'registerUpgrade')
+    .mockImplementation((route: Parameters<typeof registerUpgrade>[0]) => {
+      return registerUpgrade({
+        ...route,
+        handler(req: IncomingMessage, socket: Duplex, head: Buffer) {
+          if (!holdProbe) return route.handler(req, socket, head);
+          holdProbe = false;
+          socket.once('close', () => disconnected.resolve());
+          arrived.resolve(req);
+          // Leave the actual accepted Upgrade in flight until the owner cancels.
+        },
+      });
+    });
+  try {
+    const active = f.mount('obsolete-probe');
+    await active;
+    f.web.commit();
+    const request = await arrived.promise;
+    expect(request.method).toBe('GET');
+    expect(request.url).toBe('/api/remote.mux');
+    expect(request.headers.upgrade).toBe('websocket');
+    expect(request.headers.cookie).toBeUndefined();
+    expect(request.headers.authorization).toBeUndefined();
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await f.owner.unloadNativeWebOwner(active);
+    await disconnected.promise;
+    await expect(readFile(f.artifacts)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const restored = f.mount('current-probe');
+    await waitForAuthNonce(f.artifacts, 'current-probe');
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    await f.owner.unloadNativeWebOwner(restored);
+    expect(register).toHaveBeenCalledTimes(1);
+  } finally {
+    register.mockRestore();
+    await f.close();
+  }
+});
+
 it('keeps the first graph withdrawal terminal failure after its scope leaves the Host', async () => {
   const f = await observerFixture({ graphEvents: true });
   const writingClosed = deferred();
@@ -128,7 +318,7 @@ it('keeps the first graph withdrawal terminal failure after its scope leaves the
   const broken = Error('old control downlink refused the terminal item');
   try {
     const previous = f.mount('graph-owner');
-    await previous;
+    await waitForAuthNonce(f.artifacts, 'graph-owner');
     const wire = f.local.host.typertGateway.wireStream;
     const open = wire.open.bind(wire);
     let first = true;
@@ -164,7 +354,10 @@ it('keeps the first graph withdrawal terminal failure after its scope leaves the
     expect(service['scopeControls'].size).toBe(0);
     await expect(f.owner.unloadNativeWebOwner(previous)).rejects.toBe(original);
     const successor = f.mount('cannot-overtake-failed-control');
-    await expect(successor.await()).rejects.toBe(original);
+    await successor;
+    await expect(f.owner.unloadNativeWebOwner(successor)).rejects.toBe(
+      original,
+    );
     await expect(f.open()).rejects.toBeDefined();
   } finally {
     finishWrite.resolve();
@@ -196,7 +389,8 @@ it('retains the real staging removal failure even when disposal canceled publica
       code: 'ENOENT',
     });
     const successor = f.mount('staged-owner-failure-successor');
-    await expect(successor.await()).rejects.toBe(error);
+    await successor;
+    await expect(f.owner.unloadNativeWebOwner(successor)).rejects.toBe(error);
     await expect(f.open()).rejects.toBeDefined();
   } finally {
     release.resolve();
@@ -220,7 +414,7 @@ it('replaces a real Cordis loader entry updated during auth staging without publ
     const other = await control.acquire(neighbor.selected, signal).run(signal);
     const loader = f.loader!;
     loader.builtins['observer-test-owner'] = {
-      inject: ['allricePrincipal', 'connection', 'clientModules'],
+      inject: f.owner.inject,
       apply: f.owner.apply,
     };
     authStage.afterWrite = async (filename) => {
@@ -228,7 +422,7 @@ it('replaces a real Cordis loader entry updated during auth staging without publ
       staging.resolve();
       await release.promise;
     };
-    const baseUrl = 'http://127.0.0.1:18881/';
+    const baseUrl = f.web.baseUrl;
     const id = await loader.create({
       name: 'cordis:observer-test-owner',
       config: { artifactPath: f.artifacts, nonce: 'old', baseUrl },
@@ -246,14 +440,7 @@ it('replaces a real Cordis loader entry updated during auth staging without publ
     });
     expect(other.revoked.aborted).toBe(false);
     release.resolve();
-    await expect
-      .poll(async () => {
-        const value = await readFile(newArtifact, 'utf8').catch(
-          () => undefined,
-        );
-        return value === undefined ? undefined : JSON.parse(value).nonce;
-      })
-      .toBe('new');
+    await waitForAuthNonce(newArtifact, 'new');
     await expect(readFile(f.artifacts)).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -283,7 +470,7 @@ it('retirement waits for the real old control downlink and a disposed waiter can
   const finishFinal = deferred();
   try {
     const previous = f.mount('first-owner');
-    await previous;
+    await waitForAuthNonce(f.artifacts, 'first-owner');
     const scopeId = randomUUID();
     const wire = f.local.host.typertGateway.wireStream;
     const open = wire.open.bind(wire);
@@ -333,12 +520,10 @@ it('retirement waits for the real old control downlink and a disposed waiter can
     const successor = f.mount('successor', ready.resolve);
     await ready.promise;
     let restarted = false;
-    void Promise.resolve(successor).then(
-      () => {
-        restarted = true;
-      },
-      () => {},
-    );
+    const published = waitForAuthNonce(f.artifacts, 'successor').then(() => {
+      restarted = true;
+    });
+    void published.catch(() => {});
     expect(restarted).toBe(false);
     expect(unaffected.revoked.aborted).toBe(false);
 
@@ -351,7 +536,7 @@ it('retirement waits for the real old control downlink and a disposed waiter can
     finishFinal.resolve();
     await stopping;
     await disposedWhileLoading;
-    await successor;
+    await published;
     expect(JSON.parse(await readFile(f.artifacts, 'utf8')).nonce).toBe(
       'successor',
     );
@@ -392,7 +577,7 @@ it('a Cordis owner disposed during actual local auth staging issues no scope and
     });
     await expect(f.open()).rejects.toBeDefined();
     const fresh = f.mount('next-owner');
-    await fresh;
+    await waitForAuthNonce(f.artifacts, 'next-owner');
     expect(JSON.parse(await readFile(f.artifacts, 'utf8')).nonce).toBe(
       'next-owner',
     );
@@ -409,7 +594,7 @@ it('returns the real local retirement failure to an explicit unloader and keeps 
   const f = await observerFixture();
   try {
     const previous = f.mount('owner-with-failing-cleanup');
-    await previous;
+    await waitForAuthNonce(f.artifacts, 'owner-with-failing-cleanup');
     await rm(f.artifacts);
     await mkdir(f.artifacts);
     await expect(f.owner.unloadNativeWebOwner(previous)).rejects.toMatchObject({
@@ -417,10 +602,13 @@ it('returns the real local retirement failure to an explicit unloader and keeps 
       path: f.artifacts,
     });
     const successor = f.mount('must-not-issue');
-    await expect(successor.await()).rejects.toMatchObject({
-      code: 'ERR_FS_EISDIR',
-      path: f.artifacts,
-    });
+    await successor;
+    await expect(f.owner.unloadNativeWebOwner(successor)).rejects.toMatchObject(
+      {
+        code: 'ERR_FS_EISDIR',
+        path: f.artifacts,
+      },
+    );
     await expect(f.open()).rejects.toBeDefined();
   } finally {
     await f.close();
@@ -684,29 +872,31 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
     );
     const artifactPath = join(root, 'guest-auth.json');
+    local.host.provide('loader', { entries: () => [], async await() {} });
+    const web = await installObserverWeb(local.host, install);
     local.host.provide('clientModules', {
       graph: () => two.registry.graph(),
       onGraphChanged: (listener: () => void) =>
         two.registry.onGraphChanged(listener),
     });
-    const installOwner = (started?: () => void) =>
+    const installOwner = (nonce: string, started?: () => void) =>
       local.host.plugin({
-        inject: ['allricePrincipal', 'connection', 'clientModules'],
+        inject: owner.inject,
         apply(ctx: Context) {
           const loading = owner.apply(ctx, {
             artifactPath,
-            nonce: randomUUID(),
-            baseUrl: 'http://127.0.0.1:18881/',
+            nonce,
+            baseUrl: web.baseUrl,
           });
           started?.();
           return loading;
         },
       });
-    const firstOwner = installOwner();
+    const firstOwner = installOwner('original-graph-owner');
     const release = deferred();
     let nextOwner: ReturnType<typeof installOwner> | undefined;
     try {
-      await firstOwner;
+      await waitForAuthNonce(artifactPath, 'original-graph-owner');
       const original = control.acquire(local.selected, lifetime);
       const page = await original.run(lifetime);
       const other = await otherControl
@@ -749,15 +939,16 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       two.registry.rebuilt(names[0]!);
       expect(two.registry.graph().rev).not.toBe(native.rev);
       const replacing = deferred();
-      nextOwner = installOwner(replacing.resolve);
+      nextOwner = installOwner('replacement-graph-owner', replacing.resolve);
       await replacing.promise;
       let replacementReady = false;
-      void Promise.resolve(nextOwner).then(
-        () => {
-          replacementReady = true;
-        },
-        () => {},
-      );
+      const published = waitForAuthNonce(
+        artifactPath,
+        'replacement-graph-owner',
+      ).then(() => {
+        replacementReady = true;
+      });
+      void published.catch(() => {});
       await expect(
         control.acquire(nextIssue(), lifetime).run(lifetime),
       ).rejects.toBeDefined();
@@ -773,7 +964,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       expect(await reading).toBe(true);
       await closed;
       await unloading;
-      await nextOwner;
+      await published;
       expect(joined).toBe(true);
       expect(ownerUnloaded).toBe(true);
       expect(replacementReady).toBe(true);
