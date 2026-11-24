@@ -264,6 +264,7 @@ suite(
       const blocker = await db.reserve();
       const request = input({ invalidateReceiptIds: [old.receiptId] });
       const create = client.createDedicatedDatabase;
+      const inserts: PromiseLike<unknown>[] = [];
       let closed!: () => void, releaseEnd!: () => void;
       const clientClosed = new Promise<void>((resolve) => {
         closed = resolve;
@@ -274,6 +275,25 @@ suite(
       vi.spyOn(client, 'createDedicatedDatabase').mockImplementationOnce(
         (source) => {
           const owned = create(source);
+          const reserve = owned.reserve;
+          vi.spyOn(owned, 'reserve').mockImplementationOnce(async () => {
+            return new Proxy(await reserve(), {
+              apply(sql, receiver, args) {
+                const query: unknown = Reflect.apply(sql, receiver, args);
+                const parts: unknown = args[0];
+                // Capture the actual native query without changing execution.
+                if (
+                  Array.isArray(parts) &&
+                  typeof parts[0] === 'string' &&
+                  parts[0].startsWith(
+                    'insert into allrice_native_schedule_observation_receipts',
+                  )
+                )
+                  inserts.push(query as PromiseLike<unknown>);
+                return query;
+              },
+            });
+          });
           const end = owned.end;
           vi.spyOn(owned, 'end').mockImplementationOnce(async (options) => {
             await end(options);
@@ -304,6 +324,10 @@ suite(
         }
         await expect.poll(blockedWrite).toHaveLength(1);
         const [victim] = await blockedWrite();
+        expect(inserts).toHaveLength(1);
+        const nativeFailure = Promise.resolve(inserts[0]!).catch(
+          (error: unknown) => error,
+        );
         const [terminated] = await admin<
           { stopped: boolean }[]
         >`select pg_terminate_backend(pid, 5000) stopped from pg_stat_activity
@@ -313,13 +337,10 @@ suite(
         await clientClosed;
         expect(settled).not.toHaveBeenCalled();
         releaseEnd();
-        const error = await outcome;
-        expect(error).toBeInstanceOf(Error);
-        // The terminated backend may send its SQLSTATE or reset the socket
-        // before the driver receives the error response.
-        expect(['57P01', 'ECONNRESET']).toContain(
-          (error as NodeJS.ErrnoException).code,
-        );
+        const originalError = await nativeFailure;
+        expect(originalError).toBeInstanceOf(Error);
+        expect(await outcome).toBe(originalError);
+        expect(inserts).toHaveLength(1);
         expect(
           await admin`select pid from pg_stat_activity where pid=${victim!.pid}`,
         ).toEqual([]);
