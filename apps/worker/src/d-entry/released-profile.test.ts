@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   mkdir,
   mkdtemp,
@@ -236,7 +236,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       ),
     ).rejects.toThrow('D entry native owner is not bound');
 
-    const local = await hostFixture(issue('execute'));
+    const local = await hostFixture(issue('execute'), true, null);
     const neighbor = await hostFixture(issue('execute'));
     const control = createDEntryPrincipalControl(local.node, {
       carrier: lifetime,
@@ -246,11 +246,35 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       carrier: lifetime,
       cleanupTimeoutMs: 3000,
     });
-    const detach = local.host.allricePrincipal.observeProfileGraph(
-      two.registry,
+    const owner = await import(
+      new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
     );
+    const artifactPath = join(root, 'guest-auth.json');
+    const installOwner = (started?: () => void) =>
+      local.host.plugin({
+        apply(ctx: Context) {
+          const loading = owner.apply(
+            {
+              effect: ctx.effect.bind(ctx),
+              allricePrincipal: ctx.allricePrincipal,
+              connection: ctx.connection,
+              clientModules: two.registry,
+            },
+            {
+              artifactPath,
+              nonce: randomUUID(),
+              baseUrl: 'http://127.0.0.1:18881/',
+            },
+          );
+          started?.();
+          return loading;
+        },
+      });
+    const firstOwner = installOwner();
     const release = deferred();
+    let nextOwner: ReturnType<typeof installOwner> | undefined;
     try {
+      await firstOwner;
       const original = control.acquire(local.selected, lifetime);
       const page = await original.run(lifetime);
       const other = await otherControl
@@ -276,13 +300,36 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
         () => true,
       );
       await held.promise;
+      let ownerUnloaded = false;
+      const unloading = firstOwner.dispose().then(() => {
+        ownerUnloaded = true;
+      });
+      await expect.poll(() => page.revoked.aborted).toBe(true);
+      expect(ownerUnloaded).toBe(false);
+      const nextIssue = () => ({ ...local.selected, scopeId: randomUUID() });
+      await expect(
+        control.acquire(nextIssue(), lifetime).run(lifetime),
+      ).rejects.toBeDefined();
       await writeFile(
         nativeFile(two.directory),
         '/* a different native source generation */',
       );
       two.registry.rebuilt(names[0]!);
       expect(two.registry.graph().rev).not.toBe(native.rev);
-      await expect.poll(() => page.revoked.aborted).toBe(true);
+      const replacing = deferred();
+      nextOwner = installOwner(replacing.resolve);
+      await replacing.promise;
+      let replacementReady = false;
+      void Promise.resolve(nextOwner).then(
+        () => {
+          replacementReady = true;
+        },
+        () => {},
+      );
+      await expect(
+        control.acquire(nextIssue(), lifetime).run(lifetime),
+      ).rejects.toBeDefined();
+      expect(replacementReady).toBe(false);
       let joined = false;
       const closed = original.close().then(() => {
         joined = true;
@@ -293,7 +340,29 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       release.resolve();
       expect(await reading).toBe(true);
       await closed;
+      await unloading;
+      await nextOwner;
       expect(joined).toBe(true);
+      expect(ownerUnloaded).toBe(true);
+      expect(replacementReady).toBe(true);
+      expect(
+        JSON.parse(await readFile(artifactPath, 'utf8')).nonce,
+      ).toBeTruthy();
+      local.catalog.beforeList = undefined;
+      const fresh = nextIssue();
+      const activity = control.acquire(fresh, lifetime);
+      const reopened = await activity.run(lifetime);
+      expect(
+        (await reopened.invoke({ ...call, scopeId: fresh.scopeId }, lifetime))
+          .value,
+      ).toEqual({ records: [], hasMore: false });
+      await writeFile(
+        nativeFile(two.directory),
+        '/* the registered owner observes this next source change */',
+      );
+      two.registry.rebuilt(names[0]!);
+      await expect.poll(() => reopened.revoked.aborted).toBe(true);
+      await activity.close();
       expect(
         (
           await other.invoke(
@@ -304,7 +373,8 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       ).toEqual({ records: [], hasMore: false });
     } finally {
       release.resolve();
-      detach();
+      await nextOwner?.dispose();
+      await firstOwner.dispose();
       await Promise.all([control.close(), otherControl.close()]);
       await Promise.all([local.close(), neighbor.close()]);
     }

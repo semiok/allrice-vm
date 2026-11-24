@@ -283,6 +283,8 @@ class PrincipalService extends TypertRemoteService {
   ];
   readonly scopes = new Map<string, Scope>();
   private stopped = false;
+  private graphObserver?: { ready: boolean; close(): Promise<void> };
+  private graphRetirement = Promise.resolve();
   constructor(
     private readonly hostContext: Context,
     private readonly config: HostConfig & {
@@ -296,22 +298,67 @@ class PrincipalService extends TypertRemoteService {
     );
     hostContext.effect(() => async () => {
       this.stopped = true;
-      const results = await Promise.allSettled(
-        [...this.scopes.values()].map((scope) => scope.close()),
-      );
-      if (results.some((r) => r.status === 'rejected'))
+      if (this.graphObserver) await this.graphObserver.close();
+      else await this.graphRetirement;
+    });
+  }
+  private closeScopes() {
+    return Promise.allSettled(
+      [...this.scopes.values()].map((scope) => scope.close()),
+    ).then((results) => {
+      if (results.some((result) => result.status === 'rejected'))
         throw Error('PRINCIPAL_JOIN_UNKNOWN');
     });
   }
   /** Internal Cordis consumer of the installed native graph revision. The
    * existing private stream reports withdrawal before any scope join. */
-  observeProfileGraph(source: {
-    onGraphChanged(listener: () => void): () => void;
-  }) {
-    return source.onGraphChanged(() => {
-      for (const scope of this.scopes.values())
-        void scope.close().catch(() => {});
+  observeProfileGraph(
+    source: {
+      graph(): { rev: string };
+      onGraphChanged(listener: () => void): () => void;
+    },
+    retireOwner?: () => Promise<void>,
+  ) {
+    if (this.stopped || this.graphObserver) throw closed();
+    let retiring: Promise<void> | undefined;
+    const observer = {
+      ready: false,
+      close: () => {
+        if (retiring) return retiring;
+        observer.ready = false;
+        this.graphObserver = undefined;
+        const previous = this.graphRetirement;
+        retiring = this.graphRetirement = Promise.resolve().then(async () => {
+          const results = await Promise.allSettled([
+            previous,
+            closedScopes,
+            Promise.resolve().then(() => unsubscribe()),
+            Promise.resolve().then(() => retireOwner?.()),
+          ]);
+          if (results.some((result) => result.status === 'rejected'))
+            throw Error('PRINCIPAL_JOIN_UNKNOWN');
+        });
+        // Fence each scope now, including scopes still performing their
+        // initial lookup. The retired owner's effect joins the actual reads.
+        const closedScopes = this.closeScopes();
+        return retiring;
+      },
+    };
+    const unsubscribe = source.onGraphChanged(() => {
+      if (this.graphObserver !== observer || !observer.ready) return;
+      void this.closeScopes()
+        .catch(() => observer.close())
+        .catch(() => {});
     });
+    this.graphObserver = observer;
+    const ready = this.graphRetirement.then(() => {
+      if (this.stopped || this.graphObserver !== observer) throw closed();
+      // The subscription is already listening; the snapshot taken here sees
+      // changes between the previous unsubscribe and this registration.
+      if (!source.graph().rev) throw closed();
+      observer.ready = true;
+    });
+    return { ready, close: observer.close };
   }
   private raw(endpoint: (typeof endpoints)[number]) {
     if (this.stopped) throw closed();
@@ -344,6 +391,7 @@ class PrincipalService extends TypertRemoteService {
     signal: AbortSignal,
   ): RemoteStream<ScopeFrame, CloseCommand> {
     const { args, invocation } = this.raw('allricePrincipal/openScope');
+    if (!this.graphObserver?.ready) throw closed();
     issue = issueSchema.parse(args.issue);
     const { profile, binding } = this.config;
     if (

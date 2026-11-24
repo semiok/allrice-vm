@@ -223,7 +223,17 @@ class Catalog extends TypertRemoteService {
     }
   }
 }
-export async function hostFixture(selected = issue(), install = true) {
+const fixtureGraph = {
+  graph: () => ({ rev: 'fixed-principal-test-graph' }),
+  onGraphChanged: () => () => {},
+};
+export async function hostFixture(
+  selected = issue(),
+  install = true,
+  profileGraph:
+    | Parameters<Context['allricePrincipal']['observeProfileGraph']>[0]
+    | null = fixtureGraph,
+) {
   const host = new Context();
   await host.plugin(Credentials);
   await host.plugin(HostConnection);
@@ -281,7 +291,14 @@ export async function hostFixture(selected = issue(), install = true) {
       '@allrice/d-entry-principal/host',
     ),
   };
-  if (install) await host.plugin(PrincipalHost, config);
+  if (install) {
+    await host.plugin(PrincipalHost, config);
+    if (profileGraph) {
+      const observer = host.allricePrincipal.observeProfileGraph(profileGraph);
+      host.effect(() => observer.close);
+      await observer.ready;
+    }
+  }
   const parent = host.connection.createPeer({
     principal: { kind: 'owner' },
     interactions: 'none',
