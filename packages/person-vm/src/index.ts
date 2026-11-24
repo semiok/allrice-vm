@@ -59,6 +59,7 @@ export { createPersonVmResourcePort } from './resource-watch.ts';
 export {
   createPersonVmCommandMemoryObserver,
   PERSON_VM_COMMAND_MEMORY_PROGRAM,
+  PERSON_VM_COMMAND_MEMORY_VERIFIER,
 } from './native-command-observer.ts';
 export type {
   PersonVmManagedProbeJob,

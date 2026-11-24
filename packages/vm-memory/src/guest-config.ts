@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, normalize } from 'node:path';
-import { PERSON_VM_COMMAND_MEMORY_PROGRAM } from '@allrice/person-vm';
+import { dirname, isAbsolute, join, normalize } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { PERSON_VM_COMMAND_MEMORY_VERIFIER } from '@allrice/person-vm';
 import {
   VM_MEMORY_CONTRACT_VERSION,
   VM_PHYSICAL_MEMORY_BYTES,
@@ -101,6 +102,7 @@ export async function createVmMemoryGuestPlan(input: {
     'bash-env.sh',
     'launch-dsh.sh',
     'sample.cjs',
+    ...(receipt ? ['dsh-command-memory.mjs'] : []),
   ];
   const files = await Promise.all(
     names.map(async (name) => ({
@@ -121,19 +123,27 @@ export async function createVmMemoryGuestPlan(input: {
   if (receipt)
     files.push({
       path: receiptWriter,
-      // Adapt the staged-file argv to the exact public -e program. This is
-      // parameter plumbing, not another receipt format or command executor.
-      contents: `const env = process.env;
-process.argv = [process.argv[0], JSON.stringify({
-  cgroupRoot: env.ALLRICE_MEMORY_CGROUP_ROOT,
-  commandsGroup: env.ALLRICE_MEMORY_COMMANDS_GROUP,
-  dshGroup: env.ALLRICE_MEMORY_DSH_GROUP,
-  procRoot: env.ALLRICE_MEMORY_PROC_ROOT,
-  receiptDirectory: env.ALLRICE_MEMORY_RECEIPT_DIRECTORY,
-  executionRef: env.ALLRICE_MEMORY_EXECUTION_REF,
-  pid: Number(process.argv[2]),
-}), process.argv[3]];
-${PERSON_VM_COMMAND_MEMORY_PROGRAM}`,
+      contents: `${PERSON_VM_COMMAND_MEMORY_VERIFIER}
+const roots = ${JSON.stringify({ cgroupRoot, commandsGroup, dshGroup, procRoot: '/proc', receiptDirectory: receipt.receiptDirectory })};
+module.exports = executionRef =>
+  verifyCommandMemoryReceipt({ ...roots, executionRef }, 'complete-and-release', true);
+if (require.main === module) {
+  const env = process.env;
+  const evidence = verifyCommandMemoryReceipt({
+    cgroupRoot: env.ALLRICE_MEMORY_CGROUP_ROOT,
+    commandsGroup: env.ALLRICE_MEMORY_COMMANDS_GROUP,
+    dshGroup: env.ALLRICE_MEMORY_DSH_GROUP,
+    procRoot: env.ALLRICE_MEMORY_PROC_ROOT,
+    receiptDirectory: env.ALLRICE_MEMORY_RECEIPT_DIRECTORY,
+    executionRef: env.ALLRICE_MEMORY_EXECUTION_REF,
+    pid: Number(process.argv[2]),
+  }, process.argv[3]);
+  if (evidence) {
+    process.stdout.write(JSON.stringify(evidence));
+    if ('error' in evidence) process.exitCode = 1;
+  }
+}
+`,
       mode: 0o700,
     });
   return {
@@ -163,4 +173,45 @@ ${PERSON_VM_COMMAND_MEMORY_PROGRAM}`,
         : {}),
     },
   };
+}
+
+/** Overlay for the pinned native rc.2 Web profile. It keeps the native `bash`
+ * tool and places the command in its cgroup before executing the confined argv. */
+export function createPersonVmDshCommandMemoryPatch(
+  plan: Pick<VmMemoryGuestPlan, 'env' | 'files'>,
+  input: { cliPath: string; cleanupTimeoutMs: number },
+) {
+  const writer = plan.env.ALLRICE_MEMORY_RECEIPT_WRITER;
+  if (writer === undefined) return undefined;
+  const guard = plan.env.BASH_ENV;
+  const plugin = join(dirname(writer), 'dsh-command-memory.mjs');
+  if (
+    !guard ||
+    ![writer, guard, plugin, input.cliPath].every(
+      (path) => isAbsolute(path) && normalize(path) === path,
+    ) ||
+    ![writer, guard, plugin].every((path) =>
+      plan.files.some((file) => file.path === path),
+    ) ||
+    !Number.isSafeInteger(input.cleanupTimeoutMs) ||
+    input.cleanupTimeoutMs <= 0 ||
+    input.cleanupTimeoutMs > 2 ** 32 - 1
+  )
+    throw new Error('invalid_dsh_command_memory_patch');
+  return [
+    {
+      id: 'subprocess',
+      name: '@deepseek-ai/dsh-subprocess-local',
+      disabled: true,
+    },
+    {
+      insert: [
+        {
+          id: 'allrice-person-vm-command-memory',
+          name: pathToFileURL(plugin).href,
+          config: { ...input, guard, writer },
+        },
+      ],
+    },
+  ];
 }

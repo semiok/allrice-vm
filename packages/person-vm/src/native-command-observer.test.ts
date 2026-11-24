@@ -8,6 +8,7 @@ import type { PersonVmManagedJob } from './guest-bootstrap.ts';
 import {
   createPersonVmCommandMemoryObserver,
   PERSON_VM_COMMAND_MEMORY_PROGRAM,
+  PERSON_VM_COMMAND_MEMORY_VERIFIER,
   type PersonVmManagedProbeJob,
   type PersonVmManagedProbePort,
 } from './native-command-observer.ts';
@@ -85,6 +86,9 @@ function guest() {
     return {
       dev: p.startsWith(cfg.cgroupRoot) ? 5n : 7n,
       ino: p === childPath ? inode : 1n,
+      nlink: 1n,
+      mode: 0o600n,
+      size: BigInt(Buffer.byteLength(files.get(p) ?? '')),
       isDirectory: () => directories.has(p),
       isFile: () => files.has(p),
     };
@@ -119,6 +123,11 @@ function guest() {
       if (!files.has(p)) throw missing();
       return files.get(p)!;
     },
+    readSync: (fd: number, into: Buffer) => {
+      const p = descriptors.get(fd)!;
+      reads.push(p);
+      return Buffer.from(files.get(p)!).copy(into);
+    },
     writeFileSync: (
       p: string | number,
       contents: string,
@@ -149,6 +158,7 @@ function guest() {
   };
   const run = (
     phase: 'baseline' | 'admitted' | 'complete' | 'complete-and-release',
+    readAdmittedPid = false,
   ) => {
     let output = '';
     const process = {
@@ -161,11 +171,26 @@ function guest() {
       },
       exitCode: 0,
     };
-    runInNewContext(PERSON_VM_COMMAND_MEMORY_PROGRAM, {
+    const context = {
       process,
+      Buffer,
       require: (name: string) =>
         name === 'node:fs' ? fs : name === 'node:path' ? { posix } : undefined,
-    });
+    };
+    if (readAdmittedPid) {
+      const { pid: _pid, ...roots } = cfg;
+      const data = runInNewContext(
+        `${PERSON_VM_COMMAND_MEMORY_VERIFIER}\nverifyCommandMemoryReceipt(cfg, phase, true)`,
+        { ...context, cfg: roots, phase },
+      );
+      expect(descriptors.size).toBe(0);
+      return {
+        output: JSON.stringify(data),
+        exitCode: data.error ? 1 : 0,
+        data,
+      };
+    }
+    runInNewContext(PERSON_VM_COMMAND_MEMORY_PROGRAM, context);
     expect(descriptors.size).toBe(0);
     return {
       output,
@@ -279,6 +304,43 @@ function fixture(signalValue: number | null | undefined = 9) {
 }
 
 describe('command memory observer (synthetic kernel/native sources; not DSH/VM acceptance)', () => {
+  it('only consumes the admitted PID of its own bounded receipt after the child is empty', () => {
+    const g = guest();
+    expect(g.baseline().exitCode).toBe(0);
+    expect(g.admit().exitCode).toBe(0);
+    const admitted = g.files.get(receiptPath)!;
+    expect(g.run('complete-and-release', true).data.error).toBe(
+      'command-process-not-gone',
+    );
+    g.finish();
+    g.files.set(receiptPath, admitted.padEnd(4097, ' '));
+    expect(g.run('complete-and-release', true).data.error).toBe(
+      'invalid-receipt-file',
+    );
+    g.files.set(
+      receiptPath,
+      JSON.stringify({
+        ...JSON.parse(admitted),
+        executionRef: 'another-invocation',
+      }),
+    );
+    expect(g.run('complete-and-release', true).data.error).toBe(
+      'receipt-identity-mismatch',
+    );
+    expect(g.directories.has(childPath)).toBe(true);
+    g.files.set(receiptPath, admitted);
+    expect(g.run('complete-and-release', true).data).toMatchObject({
+      receipt: {
+        pid: cfg.pid,
+        executionRef: cfg.executionRef,
+        stage: 'admitted',
+      },
+      childJoined: true,
+      childReleased: true,
+    });
+    expect(g.files.has(receiptPath)).toBe(false);
+  });
+
   it('captures the empty pre-entry baseline, then witnesses the same birth/membership before payload', () => {
     const g = guest();
     expect(g.baseline()).toMatchObject({ exitCode: 0 });

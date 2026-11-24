@@ -302,20 +302,31 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     const c = this.options.readonlyDshDirectory;
     if (!c) return;
-    await this.artifact(binding, signal);
-    const inspection: unknown = JSON.parse(
-      await this.command(
-        binding,
-        ['inspect', this.name(binding), '--format', 'json'],
-        signal,
-      ),
+    const [artifact, inspection] = await this.inspectWithArtifact(
+      binding,
+      signal,
     );
+    if (artifact.status === 'rejected') throw artifact.reason;
+    if (inspection.status === 'rejected') throw inspection.reason;
+    signal.throwIfAborted();
     assertReadonlyArtifactInspection(
-      inspection,
+      inspection.value,
       this.name(binding),
       c,
       running,
     );
+  }
+  private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
+    // Both reads can overlap under the same owner. Join the native CLI even
+    // when the sealed reference fails before the caller can touch the VM.
+    return Promise.allSettled([
+      this.artifact(binding, signal),
+      this.command(
+        binding,
+        ['inspect', this.name(binding), '--format', 'json'],
+        signal,
+      ).then((output): unknown => JSON.parse(output)),
+    ]);
   }
   async prepare(binding: PersonVmBinding, mount: string, signal: AbortSignal) {
     const home = join(this.options.socketRoot, binding.vmId);
@@ -496,23 +507,22 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
   ) {
-    const inspection: unknown = JSON.parse(
-      await this.command(
-        receipt.binding,
-        ['inspect', this.name(receipt.binding), '--format', 'json'],
-        signal,
-      ),
+    const [artifact, inspection] = await this.inspectWithArtifact(
+      receipt.binding,
+      signal,
     );
-    await this.artifact(receipt.binding, signal);
+    if (inspection.status === 'rejected') throw inspection.reason;
+    if (artifact.status === 'rejected') throw artifact.reason;
+    signal.throwIfAborted();
     if (this.options.readonlyDshDirectory)
       assertReadonlyArtifactInspection(
-        inspection,
+        inspection.value,
         this.name(receipt.binding),
         this.options.readonlyDshDirectory,
         true,
       );
     assertWebEndpointInspection(
-      inspection,
+      inspection.value,
       this.name(receipt.binding),
       receipt,
       true,

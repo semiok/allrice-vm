@@ -278,6 +278,73 @@ async function readonlyFixture() {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  it.each(['startup', 'web endpoint'] as const)(
+    'joins both independent %s reads after one fails',
+    async (phase) => {
+      const mount = await directory();
+      const readonlyDshDirectory = await readonlyFixture();
+      const binding = {
+        vmId: randomUUID(),
+        personId: randomUUID(),
+        organizationId: randomUUID(),
+        instanceId: randomUUID(),
+        leaseEpoch: 1,
+      };
+      const metadata = Promise.withResolvers<void>();
+      const inspect = Promise.withResolvers<string>();
+      const runner = vi.fn(async (command: Parameters<typeof runCommand>[0]) =>
+        command.args[0] === 'inspect' ? inspect.promise : 'microsandbox 0.7.16',
+      );
+      const native = new MicrosandboxPersonVm({
+        binary: '/b',
+        libkrunfw: '/fw',
+        agentd: '/agentd',
+        image: readonlyImage,
+        readonlyDshDirectory,
+        rootDiskGiB: 20,
+        socketRoot: await socketDirectory(),
+        runner,
+      });
+      await native.prepare(binding, mount, signal());
+      const artifact = vi
+        .spyOn(native as unknown as { artifact(): Promise<void> }, 'artifact')
+        .mockImplementation(() => metadata.promise);
+      let settled = false;
+      const operation = (
+        phase === 'startup'
+          ? native.start(binding, signal())
+          : native.assertWebEndpoints(
+              { binding, endpoints: [], rosterDigest: '' },
+              signal(),
+            )
+      )
+        .catch((error: unknown) => error)
+        .finally(() => {
+          settled = true;
+        });
+      const firstFailure = new Error('read failure');
+      try {
+        expect(artifact).toHaveBeenCalledOnce();
+        expect(runner.mock.calls.map(([call]) => call.args[0])).toEqual([
+          '--version',
+          'inspect',
+        ]);
+        if (phase === 'startup') metadata.reject(firstFailure);
+        else inspect.reject(firstFailure);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+      } finally {
+        metadata.resolve();
+        inspect.resolve('{}');
+        await operation;
+      }
+      expect(await operation).toBe(firstFailure);
+      expect(runner.mock.calls.some(([call]) => call.args[0] === 'start')).toBe(
+        false,
+      );
+    },
+  );
+
   const readerConfiguration = {
     nodeExecutable: '/fixed-node/bin/node',
     cgroupRoot: '/sys/fs/cgroup',

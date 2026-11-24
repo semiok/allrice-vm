@@ -14,7 +14,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PERSON_VM_COMMAND_MEMORY_PROGRAM } from '@allrice/person-vm';
+import { PERSON_VM_COMMAND_MEMORY_VERIFIER } from '@allrice/person-vm';
 import {
   VM_MEMORY_PHASE4_REFERENCE_POLICY,
   VM_PHYSICAL_MEMORY_BYTES,
@@ -22,7 +22,10 @@ import {
 import type * as Platform from '@allrice/contracts';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { GuestMemorySample, VmMemoryPolicy } from './contract.ts';
-import { createVmMemoryGuestPlan as createPlan } from './guest-config.ts';
+import {
+  createPersonVmDshCommandMemoryPatch,
+  createVmMemoryGuestPlan as createPlan,
+} from './guest-config.ts';
 
 // Explicit historical policy is a fixture choice, never a production fallback.
 const createVmMemoryGuestPlan = (input: {
@@ -651,6 +654,12 @@ describe.sequential(
         '/fixture/encrypted/allrice-memory/bash-env.sh',
       );
       expect(plan.env.ALLRICE_MEMORY_COMMAND_OOM_SCORE).toBe('800');
+      expect(
+        createPersonVmDshCommandMemoryPatch(plan, {
+          cliPath: '/fixed-dsh/bin.js',
+          cleanupTimeoutMs: 10000,
+        }),
+      ).toBeUndefined();
       const launcher = plan.files.find((file) =>
         file.path.endsWith('/launch-dsh.sh'),
       )!.contents;
@@ -675,9 +684,33 @@ describe.sequential(
         file.path.endsWith('/command-observer.cjs'),
       )!;
       expect(writer.mode).toBe(0o700);
-      expect(writer.contents.endsWith(PERSON_VM_COMMAND_MEMORY_PROGRAM)).toBe(
-        true,
-      );
+      expect(
+        writer.contents.startsWith(PERSON_VM_COMMAND_MEMORY_VERIFIER),
+      ).toBe(true);
+      const input = { cliPath: '/fixed-dsh/bin.js', cleanupTimeoutMs: 10000 };
+      expect(createPersonVmDshCommandMemoryPatch(plan, input)).toEqual([
+        {
+          id: 'subprocess',
+          name: '@deepseek-ai/dsh-subprocess-local',
+          disabled: true,
+        },
+        {
+          insert: [
+            {
+              id: 'allrice-person-vm-command-memory',
+              name: 'file:///fixture/encrypted/allrice-memory/dsh-command-memory.mjs',
+              config: {
+                ...input,
+                writer: writer.path,
+                guard: plan.env.BASH_ENV,
+              },
+            },
+          ],
+        },
+      ]);
+      expect(() =>
+        createPersonVmDshCommandMemoryPatch({ ...plan, files: [] }, input),
+      ).toThrow('invalid_dsh_command_memory_patch');
       expect(plan.env).toMatchObject({
         ALLRICE_MEMORY_RECEIPT_NODE: '/fixed-node/bin/node',
         ALLRICE_MEMORY_RECEIPT_WRITER:
