@@ -519,8 +519,11 @@ function PublicationForm({
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault();
-                if (!busy && event.dataTransfer.files[0]) edits.current++;
-                setUpload(event.dataTransfer.files[0]);
+                const file = event.dataTransfer.files[0];
+                if (!busy && file) {
+                  edits.current++;
+                  setUpload(file);
+                }
               }}
             >
               <WorkbenchFileIcon kind="upload" />
