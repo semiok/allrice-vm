@@ -1905,11 +1905,10 @@ suite('MET-224 main-area brand media text workflow', () => {
         .getByText('选择插件，添加给 Rice。', { exact: true })
         .isVisible(),
     ).toBe(true);
-    expect(
-      await page
-        .getByText('想选题、写文章、安排发布计划', { exact: true })
-        .isVisible(),
-    ).toBe(true);
+    await page
+      .getByRole('region', { name: '选择插件', exact: true })
+      .getByText('想选题、写文章、安排发布计划', { exact: true })
+      .waitFor({ state: 'visible' });
     expect(await page.getByRole('dialog').count()).toBe(0);
     await page
       .getByRole('checkbox', { name: '品牌自媒体', exact: true })
