@@ -677,7 +677,7 @@ it(
       f.host.catalog.items = f.host.catalog.items.filter(
         (row) => row.sessionId !== nativeChild.sessionId,
       );
-      f.host.host.emit('api-session/removed', nativeChild);
+      f.host.host.emit('api-session/removed', nativeChild.sessionId);
       await updated.promise;
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect((await terminal.promise).headersSent).toBe(false);
