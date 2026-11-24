@@ -51,6 +51,7 @@ export function createDEntryProfile(
   trustedReleaseDirectory = directory,
 ) {
   const publications = new WeakMap<DEntryPageHandle, Promise<Publication>>();
+  const connections = new WeakMap<IncomingMessage['socket'], AbortSignal>();
   const pending = new Set<Promise<unknown>>();
   function track(work: Promise<unknown>) {
     pending.add(work);
@@ -62,6 +63,16 @@ export function createDEntryProfile(
   const lifetime = new AbortController();
   const serviceLifetime = AbortSignal.any([lifetime.signal, serviceSignal]);
   let closing: Promise<void> | undefined;
+
+  function socketLifetime(socket: IncomingMessage['socket']) {
+    const existing = connections.get(socket);
+    if (existing) return existing;
+    const controller = new AbortController();
+    connections.set(socket, controller.signal);
+    if (socket.closed) controller.abort();
+    else socket.once('close', () => controller.abort());
+    return controller.signal;
+  }
 
   async function publication(page: DEntryPageHandle, caller: AbortSignal) {
     caller.throwIfAborted();
@@ -130,9 +141,12 @@ export function createDEntryProfile(
       const disconnected = new AbortController();
       const stop = () => disconnected.abort();
       response.once('close', stop);
-      request.socket.once('close', stop);
-      if (request.socket.closed) stop();
-      const signal = AbortSignal.any([serviceLifetime, disconnected.signal]);
+      const physical = socketLifetime(request.socket);
+      const signal = AbortSignal.any([
+        serviceLifetime,
+        physical,
+        disconnected.signal,
+      ]);
       async function writeOwned(
         active: AbortSignal,
         write: () => void,
@@ -149,11 +163,11 @@ export function createDEntryProfile(
         const closed = () => settle(false);
         response.once('finish', finished);
         response.once('close', closed);
-        socket.once('close', closed);
+        physical.addEventListener('abort', closed, { once: true });
         void wire.then(() => {
           response.off('finish', finished);
           response.off('close', closed);
-          socket.off('close', closed);
+          physical.removeEventListener('abort', closed);
         });
 
         if (!response.socket && !active.aborted) {
@@ -165,14 +179,12 @@ export function createDEntryProfile(
             wake = resolve;
           });
           response.once('socket', wake);
-          socket.once('close', wake);
           active.addEventListener('abort', wake, { once: true });
           try {
             if (!response.socket && !active.aborted && !socket.closed)
               await turn;
           } finally {
             response.off('socket', wake);
-            socket.off('close', wake);
             active.removeEventListener('abort', wake);
           }
         }
@@ -479,7 +491,6 @@ export function createDEntryProfile(
         await writeOwned(signal, () => sendDEntryHttpProblem(response, error));
       } finally {
         response.off('close', stop);
-        request.socket.off('close', stop);
       }
       return true;
     }
