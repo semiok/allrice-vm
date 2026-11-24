@@ -601,13 +601,19 @@ suite(
         end $$`;
       await fixture.db`create trigger fixture_hold_favorite before insert on allrice_workbench_file_favorites
         for each row execute function fixture_hold_favorite()`;
-      const acquired = Promise.withResolvers<number>();
-      const release = Promise.withResolvers<void>();
+      let noteAcquired!: (pid: number) => void;
+      let release!: () => void;
+      const acquired = new Promise<number>((resolve) => {
+        noteAcquired = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
       const gate = fixture.db.begin(async (tx) => {
         const [row] = await tx<{ pid: number }[]>`
           select pg_backend_pid() pid from (select pg_advisory_xact_lock(7032,hashtext(${first.objectId}::text))) held`;
-        acquired.resolve(row!.pid);
-        await release.promise;
+        noteAcquired(row!.pid);
+        await released;
       });
       void gate.catch(() => {});
       let favorite: ReturnType<typeof setWorkbenchFileFavorite> | undefined;
@@ -620,7 +626,7 @@ suite(
         return row?.pid ?? 0;
       }
       try {
-        const advisory = await acquired.promise;
+        const advisory = await acquired;
         favorite = setWorkbenchFileFavorite(context, first.objectId, {
           favorite: true,
         });
@@ -631,7 +637,7 @@ suite(
         void deleting.catch(() => {});
         await expect.poll(() => blockedBy(writer)).toBeGreaterThan(0);
       } finally {
-        release.resolve();
+        release();
         await Promise.allSettled([gate, favorite, deleting]);
         await fixture.db`drop trigger fixture_hold_favorite on allrice_workbench_file_favorites`;
         await fixture.db`drop function fixture_hold_favorite()`;

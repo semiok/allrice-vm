@@ -1963,8 +1963,14 @@ suite(
         uploadInput(p),
         signal(),
       );
-      const held = Promise.withResolvers<number>();
-      const finish = Promise.withResolvers<void>();
+      let noteHeld!: (pid: number) => void;
+      let finish!: () => void;
+      const held = new Promise<number>((resolve) => {
+        noteHeld = resolve;
+      });
+      const released = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
       const defaults = {
         ...employeePanelsDependencies,
         storage: () => runtimeFixtureStorage(f.db),
@@ -1979,8 +1985,8 @@ suite(
             const [row] = await tx<
               { pid: number }[]
             >`select pg_backend_pid() pid`;
-            held.resolve(row!.pid);
-            await finish.promise;
+            noteHeld(row!.pid);
+            await released;
           }
           return current;
         },
@@ -1998,7 +2004,7 @@ suite(
       void writing.catch(() => {});
       let revoking: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
       try {
-        const writer = await held.promise;
+        const writer = await held;
         revoking = updateDEntryReleasePolicy(p.context, {
           revision: randomUUID(),
           defaultGeneration: '3.x',
@@ -2015,7 +2021,7 @@ suite(
           )
           .toBe(1);
       } finally {
-        finish.resolve();
+        finish();
         try {
           await Promise.all([writing, revoking]);
         } finally {

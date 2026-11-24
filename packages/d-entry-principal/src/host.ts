@@ -641,17 +641,19 @@ class PrincipalService extends TypertRemoteService {
       failureReason = error;
       throw error;
     } finally {
-      try {
-        await (failed ? join().catch(() => {}) : join());
-        if (failed) failTerminal(failureReason);
-        else if (closedDelivered && !signal.aborted) confirmTerminal();
-        else failTerminal(signal.reason ?? Error('PRINCIPAL_JOIN_UNKNOWN'));
-      } catch (error) {
-        failTerminal(error);
-        throw error;
-      } finally {
-        this.scopeControls.delete(terminal);
-      }
+      await (failed ? join().catch(() => {}) : join())
+        .then(
+          () => {
+            if (failed) failTerminal(failureReason);
+            else if (closedDelivered && !signal.aborted) confirmTerminal();
+            else failTerminal(signal.reason ?? Error('PRINCIPAL_JOIN_UNKNOWN'));
+          },
+          (error) => {
+            failTerminal(error);
+            throw error;
+          },
+        )
+        .finally(() => this.scopeControls.delete(terminal));
     }
   }
   private async native<T>(

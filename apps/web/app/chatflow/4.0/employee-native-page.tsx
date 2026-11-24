@@ -40,7 +40,6 @@ export function EmployeeNativePage({ query }: { query: string }) {
     let documentStarted = false;
     let remoteRevoked = false;
     let replacing: Promise<boolean> | undefined;
-    let setting: Promise<void> | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
     setFailed(false);
@@ -210,7 +209,7 @@ export function EmployeeNativePage({ query }: { query: string }) {
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
     };
-    setting = setup().catch(() => {
+    const setting = setup().catch(() => {
       if (!lifetime.signal.aborted) setFailed(true);
     });
     return () => {

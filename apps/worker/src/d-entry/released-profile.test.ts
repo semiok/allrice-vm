@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type * as NativeFs from 'node:fs/promises';
 import {
   mkdir,
   mkdtemp,
@@ -27,7 +28,7 @@ const authStage = vi.hoisted(() => ({
   afterWrite: undefined as ((filename: string) => Promise<void>) | undefined,
 }));
 vi.mock('node:fs/promises', async (load) => {
-  const fs = await load<typeof import('node:fs/promises')>();
+  const fs = await load<typeof NativeFs>();
   return {
     ...fs,
     async writeFile(...args: Parameters<typeof fs.writeFile>) {

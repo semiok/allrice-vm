@@ -137,21 +137,20 @@ export async function apply(ctx, config) {
       }
     } catch (error) {
       primary = { error };
-      throw error;
-    } finally {
-      try {
-        await rm(temporary, { force: true });
-      } catch (error) {
-        stagingFailure = {
-          error: primary
-            ? new AggregateError(
-                [primary.error, error],
-                'Native auth staging failed',
-              )
-            : error,
-        };
-        throw stagingFailure.error;
-      }
     }
+    try {
+      await rm(temporary, { force: true });
+    } catch (error) {
+      stagingFailure = {
+        error: primary
+          ? new AggregateError(
+              [primary.error, error],
+              'Native auth staging failed',
+            )
+          : error,
+      };
+      throw stagingFailure.error;
+    }
+    if (primary) throw primary.error;
   }
 }
