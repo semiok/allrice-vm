@@ -178,6 +178,8 @@ it.skipIf(!cli)(
     const nativeExit = latch(),
       socketClose = latch(),
       deliverExit = latch();
+    const transportClosing = latch();
+    let transportJoined = false;
     const queued: (() => void)[] = [];
     let holdingSocketEvents = true;
     const deliverSocketEvents = () => {
@@ -190,6 +192,13 @@ it.skipIf(!cli)(
         const transport = makeTransport(...args);
         return {
           ...transport,
+          close() {
+            const joined = transport.close();
+            transportClosing.resolve();
+            return joined.then(() => {
+              transportJoined = true;
+            });
+          },
           createWebSocket(url) {
             const wire = transport.createWebSocket(url);
             const socket = wire as unknown as WebSocket;
@@ -271,13 +280,18 @@ it.skipIf(!cli)(
     expect(retired).toBe(false);
     expect(f.owner.controlReady()).toBe(false);
     deliverExit.resolve();
-    deliverSocketEvents();
-    await new Promise<void>((done) => setImmediate(done));
-    expect(closed).toBe(false);
-    expect(retired).toBe(false);
+    await transportClosing.promise;
+    // The real close owns the I/O join before the queued terminal can notify
+    // the transport. Let the read finish with the socket join still pending.
     release.resolve();
     expect(await reading).toBeInstanceOf(Error);
+    await new Promise<void>((done) => setImmediate(done));
+    expect(transportJoined).toBe(false);
+    expect(closed).toBe(false);
+    expect(retired).toBe(false);
+    deliverSocketEvents();
     await Promise.all([retiring, reentrant]);
+    expect(transportJoined).toBe(true);
     expect(cancel).not.toHaveBeenCalled();
     expect(f.kills()).toBe(0);
   },
