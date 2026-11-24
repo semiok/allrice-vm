@@ -21,6 +21,7 @@ import { createDEntryPageRpc } from './principal-page-rpc.js';
 import { createDEntryPageMux } from './principal-profile-mux.js';
 import { createDEntryPageRequests } from './principal-requests.js';
 import { createDEntryProfile } from './profile.js';
+import { holdReleasedProfile } from './released-profile.js';
 import {
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
@@ -379,6 +380,19 @@ it(
       await readFile(join(directory, 'artifact.json'), 'utf8'),
     );
     const graph = DEntryProfileGraphSchema.parse(raw.profile.graph);
+    const source = new AbortController().signal;
+    // Report the first immutable release diagnostic before entering the HTTP
+    // boundary, which deliberately exposes only a generic dependency status.
+    await holdReleasedProfile(
+      directory,
+      {
+        revoked: source,
+        async readImmutableGraph() {
+          return graph;
+        },
+      },
+      source,
+    );
     // This runs the released app profile builder and actual non-owner Cordis
     // Peer. Only the VM receipt/current PostgreSQL lease is fixture-owned.
     const f = await fixture({ directory, graph });

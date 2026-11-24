@@ -26,11 +26,7 @@ type Frame = ComponentProps<typeof ChatSidebarFrame>;
 
 /** Business projection and operations supplied by the authenticated AllRice owner. */
 export interface EmployeeSidebarSnapshot {
-  tree: Omit<
-    Tree,
-    'collapsed' | 'onVisibleSessionsChange' | 'archive' | 'onPrepareSession'
-  > &
-    Pick<Partial<Tree>, 'onPrepareSession'> &
+  tree: Omit<Tree, 'collapsed' | 'onVisibleSessionsChange' | 'archive'> &
     Required<Pick<Tree, 'onNewSession' | 'onDetails' | 'onEmployeeNavigate'>>;
   archive?: NonNullable<Frame['archive']>;
   employeeArchiveOpen?: boolean;

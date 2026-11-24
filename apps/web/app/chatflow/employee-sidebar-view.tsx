@@ -62,7 +62,7 @@ export function EmployeeSidebarView({
   collapsed: boolean;
   onSelectSession: (id: string) => void;
   onEmployeeNavigate?: (instanceId: string) => void;
-  onPrepareSession: (id: string) => void;
+  onPrepareSession?: (id: string) => void;
   onDetails?: (assignmentId: string) => void;
   excludedEmployeeInstanceIds?: ReadonlySet<string>;
   onlyEmployeeInstanceId?: string;
@@ -168,7 +168,7 @@ export function EmployeeSidebarView({
     if (!(target instanceof Element)) return;
     const key = target.closest('[data-row-key]')?.getAttribute('data-row-key');
     if (key?.startsWith('session:'))
-      onPrepareSession(key.slice('session:'.length));
+      onPrepareSession?.(key.slice('session:'.length));
   };
   return (
     <div
@@ -258,8 +258,8 @@ export function EmployeeSidebarView({
                     <button
                       type="button"
                       key={session.id}
-                      onPointerEnter={() => onPrepareSession(session.id)}
-                      onFocus={() => onPrepareSession(session.id)}
+                      onPointerEnter={() => onPrepareSession?.(session.id)}
+                      onFocus={() => onPrepareSession?.(session.id)}
                       onClick={() => {
                         setRail(null);
                         onSelectSession(session.id);
