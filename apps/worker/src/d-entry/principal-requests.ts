@@ -66,14 +66,11 @@ export type DEntryPageHandle = Readonly<{
     signal: AbortSignal,
   ): ReturnType<typeof resolveDEntryNativeResource>;
   invalidate(reason: unknown): void;
+  use<T>(
+    signal: AbortSignal,
+    operation: (active: AbortSignal) => Promise<T>,
+  ): Promise<T>;
 }>;
-type Page = DEntryPageHandle &
-  Readonly<{
-    use<T>(
-      signal: AbortSignal,
-      operation: (active: AbortSignal) => Promise<T>,
-    ): Promise<T>;
-  }>;
 
 export function createDEntryPageRequests(deps: DEntryPageDependencies) {
   const pages = new Map<
@@ -81,17 +78,31 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     {
       sessionId: RequestContext['sessionId'];
       selection: DEntrySelectionInput;
-      page: Page;
+      page: DEntryPageHandle;
     }
   >();
 
-  async function history(token: string, input: Selection, signal: AbortSignal) {
+  async function authenticate(
+    token: string,
+    input: Selection,
+    signal: AbortSignal,
+  ) {
     signal.throwIfAborted();
     const context = await deps.authenticate(token, {
       organizationId: input.organizationId,
       workspaceId: input.selection.workspaceId,
     });
+    signal.throwIfAborted();
     if (!context) throw new DataAccessError('authentication_required');
+    return context;
+  }
+
+  async function currentHistory(
+    context: RequestContext,
+    input: Selection,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
     const identity = await deps.historyIdentity(
       context,
       input.selection,
@@ -99,6 +110,14 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     );
     signal.throwIfAborted();
     return { context, identity };
+  }
+
+  async function history(token: string, input: Selection, signal: AbortSignal) {
+    return currentHistory(
+      await authenticate(token, input, signal),
+      input,
+      signal,
+    );
   }
 
   async function own(
@@ -295,7 +314,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                 await assertCurrent(runningSignal);
                 await authorize(pin.rootNativeSessionId, 'read', runningSignal);
                 runningSignal.throwIfAborted();
-                const page: Page = {
+                const page: DEntryPageHandle = {
                   scope,
                   bindingRef: current.view.bindingRef,
                   fixedProfile: current.owner.fixedProfile,
@@ -362,22 +381,34 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     scopeId: string,
     caller: AbortSignal,
     operation: (page: DEntryPageHandle, active: AbortSignal) => Promise<T>,
+    failed?: (error: unknown, active: AbortSignal) => Promise<T>,
   ) {
+    const context = await authenticate(token, input, caller);
     const record = pages.get(scopeId);
-    if (!record || !sameSelection(record.selection, input.selection)) {
-      await history(token, input, caller);
+    if (
+      !record ||
+      record.sessionId !== context.sessionId ||
+      record.page.identity.organizationId !== context.organizationId ||
+      record.page.identity.organizationId !== input.organizationId ||
+      !sameSelection(record.selection, input.selection)
+    ) {
+      await currentHistory(context, input, caller);
       throw denied();
     }
     return record.page.use(caller, async (active) => {
-      const auth = await history(token, input, active);
-      if (
-        auth.context.sessionId !== record.sessionId ||
-        !sameDEntryIdentity(auth.identity, record.page.identity) ||
-        pages.get(scopeId) !== record
-      )
-        throw denied();
-      await record.page.assertCurrent(active);
-      return operation(record.page, active);
+      try {
+        const auth = await currentHistory(context, input, active);
+        if (
+          !sameDEntryIdentity(auth.identity, record.page.identity) ||
+          pages.get(scopeId) !== record
+        )
+          throw denied();
+        await record.page.assertCurrent(active);
+        return await operation(record.page, active);
+      } catch (error) {
+        if (!failed) throw error;
+        return failed(error, active);
+      }
     });
   }
 

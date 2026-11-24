@@ -97,13 +97,16 @@ async function fixture(release?: ProfileProof) {
         ? otherSession
         : null,
   );
+  const historyIdentity = vi.fn(
+    async (_context: unknown, selection: { threadId?: string }) => ({
+      ...f.identity,
+      threadId: selection.threadId ?? null,
+    }),
+  );
   const pages = createDEntryPageRequests({
     ...f.deps,
     authenticate,
-    historyIdentity: vi.fn(async (_context, selection) => ({
-      ...f.identity,
-      threadId: (selection as { threadId?: string }).threadId ?? null,
-    })),
+    historyIdentity,
     historyRoot: f.root,
   });
   const mux = createDEntryPageMux(pages, service.signal);
@@ -113,13 +116,17 @@ async function fixture(release?: ProfileProof) {
     service.signal,
     release?.directory,
   );
+  const completedProfiles = new WeakSet<ServerResponse>();
   const worker = createServer(async (request, response) => {
     if (request.url === '/fixture-before-profile') {
       response.writeHead(200, { 'content-type': 'text/plain' });
       response.write('unrelated handler still running');
       return;
     }
-    if (await profile.handle(request, response)) return;
+    if (await profile.handle(request, response)) {
+      completedProfiles.add(response);
+      return;
+    }
     if (!(await rpc.handle(request, response))) response.writeHead(404).end();
   });
   worker.on('upgrade', (request, socket, head) => {
@@ -239,6 +246,8 @@ async function fixture(release?: ProfileProof) {
     publish,
     profileSource,
     profileUrl,
+    historyIdentity,
+    completedProfiles,
     closeProfile: profile.close,
     worker,
     web,
@@ -685,6 +694,104 @@ it(
     expectEmptyDenial(preRead.raw());
     preRead.client.destroy();
 
+    const borrowing = await open(f);
+    const authorizing = deferred();
+    const finishHistory = deferred();
+    closes.push(async () => finishHistory.resolve());
+    const early = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: borrowing.scopeId,
+      onlyAsset: true,
+      beforeQueued: () => {
+        f.historyIdentity.mockImplementationOnce(
+          async (_context, selection) => {
+            authorizing.resolve();
+            await finishHistory.promise;
+            return { ...f.identity, threadId: selection.threadId ?? null };
+          },
+        );
+      },
+      beforeNext: () => authorizing.promise,
+    });
+    const [earlyHead, earlyAsset] = early.responses;
+    expect(earlyAsset!.listenerCount('socket')).toBe(0);
+    closePage(borrowing.peer);
+    await expect
+      .poll(async () => (await f.invoke(borrowing.scopeId)).status)
+      .toBe(404);
+    finishHistory.resolve();
+    expect(await borrowing.receive()).toMatchObject({
+      value: { type: 'closed' },
+    });
+    expect(earlyHead!.writableEnded).toBe(false);
+    earlyHead!.end();
+    await expect
+      .poll(() => early.raw().match(/HTTP\/1\.1 (200|404)/g))
+      .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404', 'HTTP/1.1 200']);
+    expectEmptyDenial(early.raw());
+    early.client.destroy();
+
+    const warm = await open(f);
+    const warming = await f.publish('bootstrap', warm.scopeId, {}, 'document');
+    expect(warming.status).toBe(200);
+    await warming.json();
+    const readingAsset = deferred();
+    const cancelledAsset = deferred();
+    const fallbackAsset = deferred();
+    closes.push(async () => fallbackAsset.resolve());
+    const disconnected = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: warm.scopeId,
+      onlyAsset: true,
+      beforeQueued: () => {
+        ownerProof.beforeGraphRead = async (signal) => {
+          ownerProof.beforeGraphRead = undefined;
+          readingAsset.resolve();
+          const stop = () => cancelledAsset.resolve();
+          signal.addEventListener('abort', stop, { once: true });
+          try {
+            if (signal.aborted) stop();
+            await Promise.race([cancelledAsset.promise, fallbackAsset.promise]);
+          } finally {
+            signal.removeEventListener('abort', stop);
+          }
+        };
+      },
+      beforeNext: () => readingAsset.promise,
+    });
+    const disconnectedAsset = disconnected.responses[1]!;
+    expect(disconnectedAsset.socket).toBeNull();
+    disconnected.client.destroy();
+    await expect
+      .poll(() => f.completedProfiles.has(disconnectedAsset))
+      .toBe(true);
+    await cancelledAsset.promise;
+    expect((await f.invoke(warm.scopeId)).status).toBe(200);
+    expect((await f.invoke(foreground.scopeId)).status).toBe(200);
+
+    expect(JSON.stringify(boot.injections.at(-1))).toContain('"id":"child"');
+    const waitingGrants = await open(f);
+    const grantPipeline = await pipelineAfterEvents(foreground.scopeId, {
+      awaitingId: waitingGrants.scopeId,
+      bootstrap: true,
+    });
+    const [grantHead, grantResponse] = grantPipeline.responses;
+    expect(grantResponse!.socket).toBeNull();
+    const oldCatalog = f.host.catalog.items;
+    try {
+      f.host.catalog.items = oldCatalog.filter(
+        (row) => row.sessionId !== 'child',
+      );
+      grantHead!.end();
+      await expect
+        .poll(() => grantPipeline.raw())
+        .toContain('__DSH_REMOTE_ACCESS__');
+      expect(grantPipeline.raw()).toContain('"id":"root"');
+      expect(grantPipeline.raw()).not.toContain('"id":"child"');
+      expect((await f.invoke(waitingGrants.scopeId)).status).toBe(200);
+    } finally {
+      f.host.catalog.items = oldCatalog;
+      grantPipeline.client.destroy();
+    }
+
     const draining = await pipelineAfterEvents(foreground.scopeId);
     const held = holdSocket(draining.responses[0]!);
     let terminal: Awaited<ReturnType<typeof receive>> | undefined;
@@ -714,13 +821,6 @@ it(
         .slice(1)
         .every((r) => r.socket === null && !r.headersSent),
     ).toBe(true);
-    const unrelated = await pipelineAfterEvents(second.scopeId, {
-      unrelated: true,
-    });
-    const [unrelatedHead, unrelatedDenial] = unrelated.responses;
-    const unrelatedFinish = once(unrelatedDenial!, 'finish');
-    expect(unrelatedDenial!.socket).toBeNull();
-    expect(unrelatedDenial!.headersSent).toBe(false);
     const heldErrors = holdSocket(errors.responses[0]!);
     let joined = false;
     const stopping = f.closeProfile().then(() => {
@@ -730,22 +830,117 @@ it(
     expect(joined).toBe(false);
     heldErrors.release.resolve();
     await heldErrors.closed;
+    await stopping;
+    expect(await pending).toBe(true);
+
+    const wireOnly = await fixture({ directory, graph, read });
+    const unrelated = await pipelineAfterEvents(
+      scopeId,
+      { unrelated: true },
+      wireOnly,
+    );
+    const [unrelatedHead, unrelatedDenial] = unrelated.responses;
+    const unrelatedFinish = once(unrelatedDenial!, 'finish');
+    expect(unrelatedDenial!.socket).toBeNull();
+    expect(unrelatedDenial!.headersSent).toBe(false);
+    let wireJoined = false;
+    const stoppingWire = wireOnly.closeProfile().then(() => {
+      wireJoined = true;
+    });
+    await expect
+      .poll(() => wireOnly.completedProfiles.has(unrelatedDenial!))
+      .toBe(true);
+    expect(unrelatedDenial!.statusCode).toBe(404);
     expect(unrelatedDenial!.writableFinished).toBe(false);
     expect(unrelatedHead!.writableEnded).toBe(false);
-    expect(joined).toBe(false);
+    expect(wireJoined).toBe(false);
     unrelatedHead!.end();
     await unrelatedFinish;
-    await stopping;
+    await stoppingWire;
     expect(unrelated.raw()).toContain('unrelated handler still running');
     await expect
       .poll(() => unrelated.raw().match(/HTTP\/1\.1 (200|404)/g))
       .toEqual(['HTTP/1.1 200', 'HTTP/1.1 404']);
     unrelated.client.destroy();
-    expect(await pending).toBe(true);
     closePage(peer);
     expect(await receive()).toMatchObject({ value: { type: 'closed' } });
     closePage(second.peer);
     expect(await second.receive()).toMatchObject({ value: { type: 'closed' } });
+
+    const firstProof = deferred<AbortSignal>();
+    const finishFirstProof = deferred();
+    closes.push(async () => finishFirstProof.resolve());
+    const sharedProof: ProfileProof = {
+      directory,
+      graph,
+      read,
+      async beforeGraphRead(signal) {
+        sharedProof.beforeGraphRead = undefined;
+        firstProof.resolve(signal);
+        await finishFirstProof.promise;
+      },
+    };
+    const shared = await fixture(sharedProof);
+    const sharedPage = await open(shared);
+    const caller = new AbortController();
+    const firstResponseOnWire = deferred<ServerResponse>();
+    shared.worker.once('request', (_request, response) =>
+      firstResponseOnWire.resolve(response),
+    );
+    const canceledRequest = shared.publish(
+      'bootstrap',
+      sharedPage.scopeId,
+      {},
+      'document',
+      caller.signal,
+    );
+    const firstWire = await firstResponseOnWire.promise;
+    const sharedSignal = await firstProof.promise;
+    caller.abort();
+    await expect(canceledRequest).rejects.toMatchObject({ name: 'AbortError' });
+    await expect.poll(() => shared.completedProfiles.has(firstWire)).toBe(true);
+    expect(sharedSignal.aborted).toBe(false);
+    const secondRequest = shared.publish(
+      'bootstrap',
+      sharedPage.scopeId,
+      {},
+      'document',
+    );
+    finishFirstProof.resolve();
+    const responseWithSharedProof = await secondRequest;
+    expect(responseWithSharedProof.status).toBe(200);
+    await responseWithSharedProof.json();
+
+    const shutdownPage = await open(shared);
+    const readBeforeShutdown = deferred<AbortSignal>();
+    const finishShutdown = deferred();
+    closes.push(async () => finishShutdown.resolve());
+    sharedProof.beforeGraphRead = async (signal) => {
+      sharedProof.beforeGraphRead = undefined;
+      readBeforeShutdown.resolve(signal);
+      await finishShutdown.promise;
+    };
+    const shutdownRequest = shared.publish(
+      'bootstrap',
+      shutdownPage.scopeId,
+      {},
+      'document',
+    );
+    const shutdownSignal = await readBeforeShutdown.promise;
+    let joinedProof = false;
+    const shutdown = shared.closeProfile().then(() => {
+      joinedProof = true;
+    });
+    const refused = await shutdownRequest;
+    expect(refused.status).toBe(404);
+    expect(await refused.text()).toBe('');
+    expect(shutdownSignal.aborted).toBe(true);
+    expect(joinedProof).toBe(false);
+    expect((await shared.invoke(sharedPage.scopeId)).status).toBe(200);
+    finishShutdown.resolve();
+    await shutdown;
+    expect(joinedProof).toBe(true);
+    expect((await shared.invoke(shutdownPage.scopeId)).status).toBe(200);
 
     const withdrawn = await fixture({ directory, graph, read });
     const live = await open(withdrawn);
@@ -782,6 +977,7 @@ it(
         errors = false,
         unrelated = false,
         onlyAsset = false,
+        bootstrap = false,
         beforeQueued,
         beforeNext,
       }: {
@@ -789,11 +985,13 @@ it(
         errors?: boolean;
         unrelated?: boolean;
         onlyAsset?: boolean;
+        bootstrap?: boolean;
         beforeQueued?: () => void;
         beforeNext?: () => Promise<void>;
       } = {},
+      subject = f,
     ) {
-      const worker = f.worker.address() as AddressInfo;
+      const worker = subject.worker.address() as AddressInfo;
       const client = createConnection({ host: '127.0.0.1', port: worker.port });
       client.on('error', () => {});
       closes.push(async () => client.destroy());
@@ -801,13 +999,13 @@ it(
       const responses: ServerResponse[] = [];
       const observed = (_request: unknown, response: ServerResponse) =>
         responses.push(response);
-      f.worker.on('request', observed);
+      subject.worker.on('request', observed);
       let body = '';
       client.on('data', (data) => {
         body += data.toString();
       });
-      const bindingRef = f.owner.bindingRef;
-      const events = f.profileUrl('events', id, { bindingRef });
+      const bindingRef = subject.owner.bindingRef;
+      const events = subject.profileUrl('events', id, { bindingRef });
       const serialize = (url: URL, headers = '') =>
         `GET ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${sessionToken}\r\n${headers}\r\n`;
       try {
@@ -833,7 +1031,7 @@ it(
           );
           await expect.poll(() => responses.length).toBe(unrelated ? 2 : 3);
         } else if (awaitingId) {
-          const asset = f.profileUrl('assets', awaitingId, {
+          const asset = subject.profileUrl('assets', awaitingId, {
             bindingRef,
             graphRev: target.graphRev,
             manifestSha256: target.manifestSha256,
@@ -841,11 +1039,13 @@ it(
           });
           const invalid = new URL(asset);
           invalid.searchParams.set('path', 'managed/absent.js');
-          const document = f.profileUrl('bootstrap', id);
+          const document = subject.profileUrl('bootstrap', id);
           beforeQueued?.();
           client.write(
-            serialize(asset, 'x-allrice-profile-request: static\r\n') +
-              (onlyAsset
+            (bootstrap
+              ? serialize(subject.profileUrl('bootstrap', awaitingId))
+              : serialize(asset, 'x-allrice-profile-request: static\r\n')) +
+              (onlyAsset || bootstrap
                 ? ''
                 : serialize(invalid, 'x-allrice-profile-request: static\r\n')),
           );
@@ -853,12 +1053,14 @@ it(
           client.write(
             serialize(document, 'x-allrice-profile-request: document\r\n'),
           );
-          await expect.poll(() => responses.length).toBe(onlyAsset ? 3 : 4);
+          await expect
+            .poll(() => responses.length)
+            .toBe(onlyAsset || bootstrap ? 3 : 4);
         }
         for (const queued of responses.slice(beforeNext ? 2 : 1))
           await expect.poll(() => queued.listenerCount('socket')).toBe(1);
       } finally {
-        f.worker.off('request', observed);
+        subject.worker.off('request', observed);
       }
       return { responses, client, raw: () => body };
     }
