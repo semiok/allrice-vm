@@ -338,9 +338,10 @@ suite('diagnostic-only panels causal probes; no acceptance claim', () => {
     artifacts = await mkdtemp(join(parent, 'employee-panels-causal-'));
     browser = await chromium.launch({
       headless: true,
+      // The favicon control requires Chromium's unified headless browser.
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
-        : {}),
+        : { channel: 'chromium' }),
     });
     await writeFile(
       join(artifacts, 'identity.json'),

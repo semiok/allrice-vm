@@ -40,7 +40,10 @@ import {
   claimReferenceProcessing,
   finishReferenceProcessing,
 } from '../../../../packages/database/src/reference-processing.ts';
-import { referenceLibraryOptions } from '../../../../packages/database/src/reference-library.ts';
+import {
+  completeReferenceUpload,
+  referenceLibraryOptions,
+} from '../../../../packages/database/src/reference-library.ts';
 import { createEmployeePanelsHandlers } from './employee-panels-http';
 import {
   employeePanelsDependencies,
@@ -786,24 +789,25 @@ suite(
             .waitFor();
           await expect.poll(() => receiptReads.at(-1)).toBe(pendingId);
           expect(publishWrites).toHaveLength(3);
-          expect(
-            await p.client.readWriteReceipt(
-              {
-                workspaceId: p.selection.workspaceId,
-                requestId: pendingId,
-                operation: 'publish-upload',
-              },
-              signal(),
-            ),
-          ).toMatchObject({ status: 'recorded', ready: false });
+          const storedA = await p.client.readWriteReceipt(
+            {
+              workspaceId: p.selection.workspaceId,
+              requestId: pendingId,
+              operation: 'publish-upload',
+            },
+            signal(),
+          );
+          expect(storedA).toMatchObject({ status: 'recorded', ready: false });
           expect(referenceWrites).toBe(0);
 
+          const receiptPath = (requestId: string) =>
+            '/write-receipts/' + requestId;
+          const receiptRoute = (requestId: string) =>
+            '**' + receiptPath(requestId) + '?*';
           const receiptResponse =
             (requestId: string) => (response: BrowserResponse) =>
               response.request().method() === 'GET' &&
-              new URL(response.url()).pathname.endsWith(
-                '/write-receipts/' + requestId,
-              );
+              new URL(response.url()).pathname.endsWith(receiptPath(requestId));
           async function checkReceipt(button: Locator, requestId: string) {
             const [response] = await Promise.all([
               page.waitForResponse(receiptResponse(requestId)),
@@ -811,31 +815,33 @@ suite(
             ]);
             return response;
           }
-          await page.route(
-            '**/api/v1/d-entry/panels/*/materials/publications?*',
-            (route) => route.abort('failed'),
-            { times: 1 },
-          );
-          await selectFile(
+          async function startUnknownUpload(fileName: string, content: string) {
+            await page.route(
+              '**/api/v1/d-entry/panels/*/materials/publications?*',
+              (route) => route.abort('failed'),
+              { times: 1 },
+            );
+            await selectFile(fileName, content);
+            const [unadmitted] = await Promise.all([
+              page.waitForRequest(
+                (request) =>
+                  request.method() === 'POST' &&
+                  new URL(request.url()).pathname.endsWith(
+                    '/materials/publications',
+                  ),
+              ),
+              publishMaterial(),
+            ]);
+            return (unadmitted.postDataJSON() as { requestId: string })
+              .requestId;
+          }
+          const independentId = await startUnknownUpload(
             '浏览器企业资料C.txt',
             '与 A 无关且回包未确认的资料。',
           );
-          const [unadmitted] = await Promise.all([
-            page.waitForRequest(
-              (request) =>
-                request.method() === 'POST' &&
-                new URL(request.url()).pathname.endsWith(
-                  '/materials/publications',
-                ),
-            ),
-            publishMaterial(),
-          ]);
-          const { requestId: independentId } = unadmitted.postDataJSON() as {
-            requestId: string;
-          };
           expect(independentId).not.toBe(pendingId);
           expect(publishWrites).toHaveLength(3);
-          const repeatedPosts: string[] = [];
+          const observedPosts: string[] = [];
           page.on('request', (request) => {
             if (
               request.method() === 'POST' &&
@@ -843,7 +849,9 @@ suite(
                 '/materials/publications',
               )
             )
-              repeatedPosts.push(request.url());
+              observedPosts.push(
+                (request.postDataJSON() as { requestId: string }).requestId,
+              );
           });
           const waiting = '发布结果待核，请按原请求核对。';
           const formWaiting = material
@@ -869,26 +877,6 @@ suite(
             .poll(() => checkAction(independentId).isEnabled())
             .toBe(true);
 
-          await page.route(
-            '**/write-receipts/' + independentId + '?*',
-            (route) => route.abort('failed'),
-            { times: 1 },
-          );
-          const [transientReceiptFailure] = await Promise.all([
-            page.waitForEvent('requestfailed', {
-              predicate: (request) =>
-                request.method() === 'GET' &&
-                new URL(request.url()).pathname.endsWith(
-                  '/write-receipts/' + independentId,
-                ),
-            }),
-            checkAction(independentId).click(),
-          ]);
-          expect(transientReceiptFailure.failure()).not.toBeNull();
-          await expect
-            .poll(() => checkAction(independentId).isEnabled())
-            .toBe(true);
-
           const openDialog = await material.elementHandle();
           await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
           const withdraw = (revision: string) =>
@@ -897,6 +885,55 @@ suite(
               defaultGeneration: '3.x',
               selections: [],
             });
+          const restore = (revision: string) =>
+            updateDEntryReleasePolicy(p.context, {
+              revision,
+              defaultGeneration: '3.x',
+              selections: [
+                {
+                  organizationId: p.context.organizationId,
+                  personId: p.context.actor.id,
+                  employeeInstanceId: p.selection.employeeInstanceId,
+                  generation: '4.0',
+                },
+              ],
+            });
+          const cacheKey = (await page.evaluate(
+            (id) =>
+              Object.keys(sessionStorage).find(
+                (key) =>
+                  key.startsWith('allrice:publication-receipts:v2:') &&
+                  (
+                    JSON.parse(sessionStorage.getItem(key)!) as {
+                      requestId: string;
+                    }[]
+                  ).some((entry) => entry.requestId === id),
+              ),
+            pendingId,
+          ))!;
+          expect(cacheKey).toBeDefined();
+          const marker =
+            'allrice:publication-receipt-denials:v1:' +
+            cacheKey +
+            '/' +
+            pendingId;
+          const readCache = (key: string) =>
+            page.evaluate((key) => sessionStorage.getItem(key), key);
+          const originalCache = await readCache(cacheKey);
+          await page.evaluate((marker) => {
+            const set = Storage.prototype.setItem;
+            let failOnce = true;
+            Storage.prototype.setItem = function (key, value) {
+              if (key === marker && failOnce) {
+                failOnce = false;
+                throw new DOMException(
+                  'Denial write failed',
+                  'QuotaExceededError',
+                );
+              }
+              set.call(this, key, value);
+            };
+          }, marker);
           await withdraw('fixture-open-dialog-receipt-withdrawal');
           const readsBeforeOpenDenial = receiptReads.length;
           const deniedInDialog = await checkReceipt(
@@ -922,21 +959,8 @@ suite(
             pendingId,
           ]);
           expect(await formWaiting.isVisible()).toBe(true);
+          expect(await readCache(marker)).toBeNull();
           expect(publishWrites).toHaveLength(3);
-
-          const onlyCheck = material.getByRole('button', {
-            name: '核对结果',
-            exact: true,
-          });
-          const deniedCurrentForm = await checkReceipt(
-            onlyCheck,
-            independentId,
-          );
-          expect(deniedCurrentForm.status()).toBe(403);
-          await formWaiting.waitFor({ state: 'detached', timeout: 5000 });
-          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
-            true,
-          );
 
           const sideReceipt = (requestId: string) =>
             page.getByRole('button', {
@@ -945,33 +969,106 @@ suite(
             });
           const pendingPublication = sideReceipt(pendingId);
           const independentPublication = sideReceipt(independentId);
-          const noSideKeys = async () => {
+          const sideWaiting = page
+            .getByRole('status')
+            .filter({ hasText: waiting });
+          const onlyIndependentVisible = async () => {
             expect(await pendingPublication.count()).toBe(0);
-            expect(await independentPublication.count()).toBe(0);
+            await independentPublication.waitFor({ timeout: 5000 });
           };
-          async function enterWithReceipts(enter: () => Promise<void>) {
-            const [first, independent] = await Promise.all([
-              page.waitForResponse(receiptResponse(pendingId), {
-                timeout: 5000,
-              }),
-              page.waitForResponse(receiptResponse(independentId), {
-                timeout: 5000,
-              }),
-              enter(),
-            ]);
-            return [first, independent] as const;
-          }
-          const deniedAfterClose = await enterWithReceipts(async () => {
+          const closeUpload = async () => {
             await material
               .getByRole('button', { name: '取消', exact: true })
               .click();
             await material.waitFor({ state: 'hidden' });
-            await noSideKeys();
-          });
-          expect(deniedAfterClose.map((response) => response.status())).toEqual(
-            [403, 403],
+          };
+          async function enterWithA(enter: () => Promise<void>) {
+            const [response] = await Promise.all([
+              page.waitForResponse(receiptResponse(pendingId), {
+                timeout: 5000,
+              }),
+              enter(),
+            ]);
+            return response;
+          }
+          async function enterWithAOnHold(
+            enter: () => Promise<void>,
+            whileHeld: () => Promise<void>,
+          ) {
+            let releaseRequest!: () => void;
+            const held = new Promise<void>((resolve) => {
+              releaseRequest = resolve;
+            });
+            await page.route(
+              receiptRoute(pendingId),
+              async (route) => {
+                await held;
+                await route.continue();
+              },
+              { times: 1 },
+            );
+            const request = page.waitForRequest(
+              (request) =>
+                request.method() === 'GET' &&
+                new URL(request.url()).pathname.endsWith(
+                  receiptPath(pendingId),
+                ),
+              { timeout: 5000 },
+            );
+            return enterWithA(async () => {
+              try {
+                await enter();
+                await request;
+                await whileHeld();
+              } finally {
+                releaseRequest();
+              }
+            });
+          }
+          const beforeClose = receiptReads.length;
+          const deniedAfterClose = await enterWithAOnHold(
+            closeUpload,
+            async () => {
+              await onlyIndependentVisible();
+              await page.route(
+                receiptRoute(independentId),
+                (route) => route.abort('failed'),
+                { times: 1 },
+              );
+              const [failure] = await Promise.all([
+                page.waitForEvent('requestfailed', {
+                  predicate: (request) =>
+                    request.method() === 'GET' &&
+                    new URL(request.url()).pathname.endsWith(
+                      receiptPath(independentId),
+                    ),
+                  timeout: 5000,
+                }),
+                independentPublication.click(),
+              ]);
+              expect(failure.failure()).not.toBeNull();
+              await sideWaiting.waitFor({ timeout: 5000 });
+              expect(receiptReads.slice(beforeClose)).toEqual([]);
+              await onlyIndependentVisible();
+            },
           );
-          await noSideKeys();
+          expect(deniedAfterClose.status()).toBe(403);
+          expect(receiptReads.slice(beforeClose)).toEqual([pendingId]);
+          await expect.poll(() => readCache(marker)).toBe('1');
+          expect(await readCache(cacheKey)).toBe(originalCache);
+          await onlyIndependentVisible();
+
+          // Mount from a fresh JS heap before entering the still-denied case.
+          await restore('fixture-receipt-fresh-heap-bootstrap');
+          await page.reload();
+          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
+          await withdraw('fixture-receipt-fresh-heap-withdrawal');
+          const deniedAfterReload = await enterWithAOnHold(
+            materials,
+            onlyIndependentVisible,
+          );
+          expect(deniedAfterReload.status()).toBe(403);
+          await onlyIndependentVisible();
 
           async function returnToMaterials() {
             await page
@@ -980,39 +1077,43 @@ suite(
               .click();
             await materials();
           }
-          const deniedAfterSwitch = await enterWithReceipts(returnToMaterials);
-          expect(
-            deniedAfterSwitch.map((response) => response.status()),
-          ).toEqual([403, 403]);
-          await noSideKeys();
+          const deniedAfterSwitch = await enterWithA(returnToMaterials);
+          expect(deniedAfterSwitch.status()).toBe(403);
+          await onlyIndependentVisible();
 
-          await updateDEntryReleasePolicy(p.context, {
-            revision: 'fixture-open-dialog-receipt-restored',
-            defaultGeneration: '3.x',
-            selections: [
-              {
-                organizationId: p.context.organizationId,
-                personId: p.context.actor.id,
-                employeeInstanceId: p.selection.employeeInstanceId,
-                generation: '4.0',
-              },
-            ],
-          });
-          const [originalReceipt, otherReceipt] =
-            await enterWithReceipts(returnToMaterials);
+          await page.evaluate((marker) => {
+            const remove = Storage.prototype.removeItem;
+            let failOnce = true;
+            Storage.prototype.removeItem = function (key) {
+              if (key === marker && failOnce) {
+                failOnce = false;
+                throw new DOMException(
+                  'Denial removal failed',
+                  'QuotaExceededError',
+                );
+              }
+              remove.call(this, key);
+            };
+          }, marker);
+          await restore('fixture-open-dialog-receipt-restored');
+          const originalReceipt = await enterWithA(returnToMaterials);
           expect(originalReceipt.status()).toBe(200);
           expect(await originalReceipt.json()).toMatchObject({
             requestId: pendingId,
             status: 'recorded',
             ready: false,
           });
+          await pendingPublication.waitFor();
+          expect(await readCache(marker)).toBe('1');
+          const otherReceipt = await checkReceipt(
+            independentPublication,
+            independentId,
+          );
           expect(otherReceipt.status()).toBe(200);
           expect(await otherReceipt.json()).toMatchObject({
             requestId: independentId,
             status: 'unknown',
           });
-          await pendingPublication.waitFor();
-          await independentPublication.waitFor();
           const readsBeforeUnknown = receiptReads.length;
           const unknown = await checkReceipt(pendingPublication, pendingId);
           expect(unknown.status()).toBe(200);
@@ -1021,11 +1122,9 @@ suite(
             status: 'recorded',
             ready: false,
           });
-          await page
-            .getByRole('status')
-            .filter({ hasText: waiting })
-            .first()
-            .waitFor();
+          await expect.poll(() => readCache(marker)).toBeNull();
+          expect(await readCache(cacheKey)).toBe(originalCache);
+          await expect.poll(() => sideWaiting.count()).toBe(2);
           expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
 
           await withdraw('fixture-browser-receipt-withdrawal');
@@ -1041,12 +1140,61 @@ suite(
           ).toBe(0);
           expect(await independentPublication.isVisible()).toBe(true);
           expect(await independentPublication.isEnabled()).toBe(true);
-          expect(
-            await page.getByRole('status').filter({ hasText: waiting }).count(),
-          ).toBe(1);
+          expect(await sideWaiting.count()).toBe(1);
           expect(receiptReads.slice(readsBeforeDenial)).toEqual([pendingId]);
           expect(publishWrites).toHaveLength(3);
-          expect(repeatedPosts).toEqual([]);
+          expect(observedPosts).toEqual([]);
+
+          await restore('fixture-original-publication-completes');
+          expect((await enterWithA(returnToMaterials)).status()).toBe(200);
+          expect(
+            (
+              await checkReceipt(independentPublication, independentId)
+            ).status(),
+          ).toBe(200);
+          await expect.poll(() => sideWaiting.count()).toBe(2);
+          expect(storedA.result?.revisionId).toBeDefined();
+          // The original reservation's immutable bytes were written before its
+          // provider acknowledgement was lost. Finish that reservation in PG.
+          await completeReferenceUpload(
+            p.context,
+            p.selection.workspaceId,
+            storedA.result!.revisionId!,
+          );
+          await openUpload();
+          await material
+            .getByRole('status')
+            .filter({ hasText: '原发布已完成。' })
+            .waitFor();
+          const currentFormId = await startUnknownUpload(
+            '浏览器企业资料D.txt',
+            '在当前弹窗里等待核对的独立上传。',
+          );
+          expect([pendingId, independentId]).not.toContain(currentFormId);
+          await formWaiting.waitFor();
+          const currentDialog = await material.elementHandle();
+          await withdraw('fixture-current-form-receipt-withdrawal');
+          const deniedCurrentForm = await checkReceipt(
+            checkAction(currentFormId),
+            currentFormId,
+          );
+          expect(deniedCurrentForm.status()).toBe(403);
+          await formWaiting.waitFor({ state: 'detached', timeout: 5000 });
+          expect(
+            await currentDialog?.evaluate((node) => node.isConnected),
+          ).toBe(true);
+          const [lastDenial] = await Promise.all([
+            page.waitForResponse(receiptResponse(currentFormId), {
+              timeout: 5000,
+            }),
+            closeUpload(),
+          ]);
+          expect(lastDenial.status()).toBe(403);
+          await onlyIndependentVisible();
+          expect(await sideReceipt(currentFormId).count()).toBe(0);
+          expect(await sideWaiting.count()).toBe(1);
+          expect(observedPosts).toEqual([currentFormId]);
+          expect(publishWrites).toHaveLength(3);
           await context.close();
         } finally {
           await browser?.close();

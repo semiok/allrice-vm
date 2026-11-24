@@ -180,9 +180,10 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
     browser = await chromium.launch({
       headless: true,
       args: ['--disable-lcd-text', '--disable-gpu'],
+      // The favicon control requires Chromium's unified headless browser.
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
-        : {}),
+        : { channel: 'chromium' }),
     });
     await writeFile(
       join(artifacts, 'identity.json'),

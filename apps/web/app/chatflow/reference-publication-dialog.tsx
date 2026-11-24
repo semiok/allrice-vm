@@ -68,7 +68,6 @@ const receiptSchema = z.strictObject({
   sourceId: UuidSchema.optional(),
   intentDigest: z.string().regex(/^[a-f0-9]{64}$/),
   outcome: z.enum(['recorded', 'rejected']).optional(),
-  accessDenied: z.literal(true).optional(),
 });
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
@@ -79,6 +78,7 @@ const publicationAccess = new Map<string, boolean>();
 const publicationRecordKey = (key: string, requestId: string) =>
   key + '/' + requestId;
 const receiptPrefix = 'allrice:publication-receipts:v2:';
+const receiptDenialPrefix = 'allrice:publication-receipt-denials:v1:';
 const receiptAddress = z.tuple([
   UuidSchema,
   UuidSchema,
@@ -127,33 +127,30 @@ function publicationReceiptUnavailable(
   key: string | undefined,
   receipt: PublicationReceipt,
 ) {
-  return (
-    (key
-      ? publicationAccess.get(publicationRecordKey(key, receipt.requestId))
-      : undefined) ??
-    receipt.accessDenied ??
-    false
-  );
+  if (!key) return false;
+  const id = publicationRecordKey(key, receipt.requestId);
+  const current = publicationAccess.get(id);
+  if (current !== undefined) return current;
+  try {
+    return sessionStorage.getItem(receiptDenialPrefix + id) === '1';
+  } catch {
+    return false;
+  }
 }
 function setPublicationReceiptUnavailable(
   key: string,
   receipt: PublicationReceipt,
   unavailable: boolean,
 ) {
-  if (publicationReceiptUnavailable(key, receipt) === unavailable) return;
-  publicationAccess.set(
-    publicationRecordKey(key, receipt.requestId),
-    unavailable,
-  );
+  const id = publicationRecordKey(key, receipt.requestId);
+  publicationAccess.set(id, unavailable);
   try {
-    rememberPublications(
-      key,
-      storedPublications(key).map((value) =>
-        value.requestId === receipt.requestId
-          ? { ...value, accessDenied: unavailable ? true : undefined }
-          : value,
-      ),
-    );
+    // Keep the receipt record readable by v2 clients. Reconcile the stored
+    // denial on every definite response so transient storage errors can heal.
+    const marker = receiptDenialPrefix + id;
+    if ((sessionStorage.getItem(marker) === '1') === unavailable) return;
+    if (unavailable) sessionStorage.setItem(marker, '1');
+    else sessionStorage.removeItem(marker);
   } catch {
     // Both entries in this tab still use the known access state.
   }
@@ -167,6 +164,7 @@ function settlePublication(
     publicationRecordKey(key, receipt.requestId),
     outcome,
   );
+  setPublicationReceiptUnavailable(key, receipt, false);
   try {
     rememberPublications(key, pendingPublications(key));
   } catch {
@@ -239,9 +237,14 @@ async function checkPublication(
     throw error;
   }
   signal.throwIfAborted();
-  setPublicationReceiptUnavailable(key, receipt, false);
-  if (result.status !== 'recorded' || result.ready === false || !result.result)
+  if (
+    result.status !== 'recorded' ||
+    result.ready === false ||
+    !result.result
+  ) {
+    setPublicationReceiptUnavailable(key, receipt, false);
     return;
+  }
   settlePublication(key, receipt, 'recorded');
   return 'recorded';
 }
@@ -253,6 +256,9 @@ type PendingPublication = {
   action: string;
   targetId: string;
 };
+type SidebarReceiptNote =
+  | { stage: 'checking'; message: string; reading: AbortSignal }
+  | { stage: 'waiting' | 'settled'; message: string };
 
 /** Recover the original request even when the completed write removed its row. */
 export function ReferencePublicationPending({
@@ -274,9 +280,7 @@ export function ReferencePublicationPending({
 }) {
   const { organizationId, employeeInstanceId, threadId } = receiptScope;
   const [records, setRecords] = useState<PendingPublication[]>([]);
-  const [notes, setNotes] = useState<
-    Record<string, { message: string; reading?: AbortSignal }>
-  >({});
+  const [notes, setNotes] = useState<Record<string, SidebarReceiptNote>>({});
   const checking = useRef(new Map<string, AbortSignal>()).current;
   const entrySignal = useRef<AbortSignal | null>(null);
   const reconcile = useCallback(
@@ -284,10 +288,18 @@ export function ReferencePublicationPending({
       const { id, key, receipt, action, targetId } = record;
       if (requestSignal.aborted || checking.get(id)?.aborted === false) return;
       checking.set(id, requestSignal);
-      const note = (message: string, reading?: AbortSignal) =>
-        setNotes((previous) => ({ ...previous, [id]: { message, reading } }));
+      const note = (value: SidebarReceiptNote) =>
+        setNotes((previous) => ({ ...previous, [id]: value }));
+      const waiting: SidebarReceiptNote = {
+        stage: 'waiting',
+        message: waitingForReceipt,
+      };
       if (!publicationReceiptUnavailable(key, receipt))
-        note('正在核对' + action + '…', requestSignal);
+        note({
+          stage: 'checking',
+          message: '正在核对' + action + '…',
+          reading: requestSignal,
+        });
       try {
         const outcome = await checkPublication(
           dataClient,
@@ -298,16 +310,18 @@ export function ReferencePublicationPending({
         );
         if (requestSignal.aborted) return;
         if (!outcome) {
-          note(waitingForReceipt);
+          note(waiting);
           return;
         }
         setRecords((previous) => previous.filter((value) => value.id !== id));
-        note(
-          action +
+        note({
+          stage: 'settled',
+          message:
+            action +
             (outcome === 'recorded' ? '已完成。' : '已拒绝。') +
             ' ' +
             targetId,
-        );
+        });
         if (outcome === 'recorded')
           window.dispatchEvent(new Event('allrice:workbench-files-changed'));
       } catch (error) {
@@ -319,7 +333,7 @@ export function ReferencePublicationPending({
             return next;
           });
         } else if (!publicationReceiptUnavailable(key, receipt)) {
-          note(waitingForReceipt);
+          note(waiting);
         }
       } finally {
         if (checking.get(id) === requestSignal) checking.delete(id);
@@ -410,7 +424,10 @@ export function ReferencePublicationPending({
       .map(({ id }) => id),
   );
   const visibleNotes = Object.entries(notes).filter(
-    ([id, note]) => !hidden.has(id) && !note.reading?.aborted,
+    ([id, note]) =>
+      !hidden.has(id) &&
+      (note.stage !== 'checking' || !note.reading.aborted) &&
+      (note.stage === 'settled' || !settledPublications.has(id)),
   );
   if (records.length === hidden.size && !visibleNotes.length) return null;
   return (
