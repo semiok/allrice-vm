@@ -394,6 +394,86 @@ suite(
       }
     });
 
+    it('uses the request present at click time when its receipt completes during the same intent hash', async () => {
+      const page = await browser.newPage();
+      const dialog = page.getByRole('dialog', { name: '上传企业资料' });
+      const upload = root(page).getByRole('button', {
+        name: '上传',
+        exact: true,
+      });
+      const publish = dialog.getByRole('button', { name: '发布', exact: true });
+      const choose = () =>
+        dialog.getByLabel('选择文件', { exact: true }).setInputFiles({
+          name: '同一意图.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('原件'),
+        });
+      try {
+        await page.goto(origin);
+        await page
+          .getByRole('button', { name: '企业资料', exact: true })
+          .click();
+        await page.evaluate(() =>
+          window.__panelDataFixture.losePublicationReply(),
+        );
+        await upload.click();
+        await choose();
+        await publish.click();
+        await dialog.getByRole('alert').waitFor();
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        await page.evaluate(() => {
+          window.__panelDataFixture.holdReceipt();
+          const original = crypto.subtle.digest.bind(crypto.subtle);
+          crypto.subtle.digest = async (algorithm, bytes) => {
+            document.body.dataset.publicationHashHeld = 'true';
+            await new Promise<void>((resolve) =>
+              window.addEventListener(
+                'release-publication-hash',
+                () => resolve(),
+                { once: true },
+              ),
+            );
+            return original(algorithm, bytes);
+          };
+        });
+        await upload.click();
+        await expect
+          .poll(
+            async () =>
+              (await evidence(page)).calls.filter(
+                (call) => call.method === 'readWriteReceipt',
+              ).length,
+          )
+          .toBe(1);
+        await choose();
+        await publish.click();
+        await page.waitForFunction(
+          () => document.body.dataset.publicationHashHeld === 'true',
+        );
+        await page.evaluate(() => window.__panelDataFixture.finishReceipt());
+        await dialog.getByText('原发布已完成。', { exact: true }).waitFor();
+        await page.evaluate(() =>
+          window.dispatchEvent(new Event('release-publication-hash')),
+        );
+        await expect.poll(() => publish.isEnabled()).toBe(true);
+        const calls = (await evidence(page)).calls;
+        const writes = calls.filter((call) => call.method === 'publishUpload');
+        expect(writes).toHaveLength(1);
+        expect(
+          calls.filter((call) => call.method === 'readWriteReceipt'),
+        ).toMatchObject([
+          {
+            input: {
+              requestId: (writes[0]!.input as { requestId: string }).requestId,
+            },
+          },
+        ]);
+        await expect.poll(() => dialog.getByRole('alert').count()).toBe(0);
+      } finally {
+        await page.close();
+      }
+    });
+
     it('blocks the POST if session storage refuses the original key', async () => {
       const page = await browser.newPage();
       try {

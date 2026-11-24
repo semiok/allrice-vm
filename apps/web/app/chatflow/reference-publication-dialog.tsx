@@ -64,16 +64,28 @@ const receiptSchema = z.strictObject({
   requestId: UuidSchema,
   sourceId: UuidSchema.optional(),
   intentDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  outcome: z.enum(['recorded', 'rejected']).optional(),
 });
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
+type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
+const settledPublications = new Map<string, ReceiptOutcome>();
+const settledKey = (key: string, requestId: string) => key + '/' + requestId;
 
 // Only the full intent fingerprint and original scoped receipt selectors
 // survive reload. File bytes and display metadata stay in the active form.
-function pendingPublications(key: string | undefined) {
+function storedPublications(key: string | undefined) {
   if (!key) return [];
   const value = sessionStorage.getItem(key);
   return receiptList.parse(value ? JSON.parse(value) : []);
+}
+function pendingPublications(key: string | undefined) {
+  if (!key) return [];
+  return storedPublications(key).filter(
+    (receipt) =>
+      !receipt.outcome &&
+      !settledPublications.has(settledKey(key, receipt.requestId)),
+  );
 }
 
 function rememberPublications(key: string, values: PublicationReceipt[]) {
@@ -85,6 +97,32 @@ function restorePublications(key: string | undefined) {
     return pendingPublications(key);
   } catch {
     return [];
+  }
+}
+function settlePublication(
+  key: string,
+  receipt: PublicationReceipt,
+  outcome: ReceiptOutcome,
+) {
+  settledPublications.set(settledKey(key, receipt.requestId), outcome);
+  try {
+    rememberPublications(key, pendingPublications(key));
+  } catch {
+    // Persist the known result if deleting the last pending entry failed.
+    try {
+      sessionStorage.setItem(
+        key,
+        JSON.stringify(
+          storedPublications(key).map((value) =>
+            value.requestId === receipt.requestId
+              ? { ...value, outcome }
+              : value,
+          ),
+        ),
+      );
+    } catch {
+      // This tab can still retain the authoritative result in memory.
+    }
   }
 }
 
@@ -185,10 +223,18 @@ function PublicationForm({
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
   const edits = useRef(0);
+  const waitingFor = useRef<string | undefined>(undefined);
   const checks = useRef(new Map<string, AbortController>()).current;
   const [initialReceipts] = useState(() => restorePublications(receiptKey));
   const [receipts, setReceipts] = useState(initialReceipts);
   const [receiptNotes, setReceiptNotes] = useState<Record<string, string>>({});
+  const completion = {
+    file: '原添加为企业资料已完成。',
+    upload: '原发布已完成。',
+    audience: '原资料编辑已完成。',
+    revoke: '原撤销已完成。',
+    delete: '原删除已完成。',
+  }[target.kind];
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -205,6 +251,13 @@ function PublicationForm({
       const controller = new AbortController();
       const note = (message: string) =>
         setReceiptNotes((prior) => ({ ...prior, [value.requestId]: message }));
+      const existing = settledPublications.get(
+        settledKey(receiptKey, value.requestId),
+      );
+      if (existing) {
+        if (existing === 'recorded') note(completion);
+        return;
+      }
       checks.set(value.requestId, controller);
       note('正在核对原发布结果…');
       try {
@@ -226,12 +279,16 @@ function PublicationForm({
           note(waitingForReceipt);
           return;
         }
-        const remaining = pendingPublications(receiptKey).filter(
-          (pending) => pending.requestId !== value.requestId,
+        settlePublication(receiptKey, value, 'recorded');
+        setReceipts((prior) =>
+          prior.filter((pending) => pending.requestId !== value.requestId),
         );
-        rememberPublications(receiptKey, remaining);
-        setReceipts(remaining);
-        note('原发布已完成。');
+        if (waitingFor.current === value.requestId) {
+          waitingFor.current = undefined;
+          setError((current) => (current === waitingForReceipt ? '' : current));
+        }
+        note(completion);
+        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
       } catch {
         if (alive.current && !controller.signal.aborted)
           note(waitingForReceipt);
@@ -240,7 +297,7 @@ function PublicationForm({
           checks.delete(value.requestId);
       }
     },
-    [data, checks, receiptKey, workspaceId],
+    [data, checks, receiptKey, workspaceId, completion],
   );
   useEffect(() => {
     for (const prior of initialReceipts) void reconcile(prior);
@@ -282,17 +339,13 @@ function PublicationForm({
             (target.kind === 'revoke' && publication.origin === 'file') ||
             (target.kind === 'delete' && publication.origin === 'upload')));
 
-  function forget(value: PublicationReceipt) {
+  function forget(value: PublicationReceipt, outcome: ReceiptOutcome) {
     if (!receiptKey) return;
-    try {
-      const remaining = pendingPublications(receiptKey).filter(
-        (pending) => pending.requestId !== value.requestId,
+    settlePublication(receiptKey, value, outcome);
+    if (alive.current)
+      setReceipts((prior) =>
+        prior.filter((pending) => pending.requestId !== value.requestId),
       );
-      rememberPublications(receiptKey, remaining);
-      if (alive.current) setReceipts(remaining);
-    } catch {
-      // Acknowledgement is still valid; this receipt can be read again.
-    }
   }
 
   async function save() {
@@ -311,6 +364,15 @@ function PublicationForm({
     transport.current = controller;
     let issued: PublicationReceipt | undefined;
     try {
+      function readPending() {
+        if (!receiptKey) throw new ReceiptStorageUnavailable();
+        try {
+          return pendingPublications(receiptKey);
+        } catch {
+          throw new ReceiptStorageUnavailable();
+        }
+      }
+      const atClick = dataClient ? readPending() : [];
       const audience = ReferenceAudienceSchema.parse({
         scope,
         departmentIds: scope === 'departments' ? [...departmentIds].sort() : [],
@@ -360,16 +422,10 @@ function PublicationForm({
       let requestId = requestIds.current.get(intentDigest) ?? proposed;
       if (dataClient) {
         if (!receiptKey) throw new ReceiptStorageUnavailable();
-        const held = (() => {
-          try {
-            return pendingPublications(receiptKey);
-          } catch {
-            throw new ReceiptStorageUnavailable();
-          }
-        })();
-        const prior = held.find(
-          (pending) => pending.intentDigest === intentDigest,
-        );
+        const held = readPending();
+        const sameIntent = (receipt: PublicationReceipt) =>
+          receipt.intentDigest === intentDigest;
+        const prior = atClick.find(sameIntent) ?? held.find(sameIntent);
         if (prior) {
           setReceipts(held);
           void reconcile(prior);
@@ -414,7 +470,7 @@ function PublicationForm({
               ? data.publishFile(body, controller.signal)
               : data.publishUpload(body, controller.signal);
           })();
-      if (issued) forget(issued);
+      if (issued) forget(issued, 'recorded');
       if (
         alive.current &&
         !controller.signal.aborted &&
@@ -428,11 +484,12 @@ function PublicationForm({
       if (issued && !definite) {
         if (alive.current && !controller.signal.aborted) {
           setReceipts(restorePublications(receiptKey));
+          waitingFor.current = issued.requestId;
           setError(waitingForReceipt);
         }
         return;
       }
-      if (issued) forget(issued);
+      if (issued) forget(issued, 'rejected');
       if (alive.current && !controller.signal.aborted) {
         setError(
           definite ||
