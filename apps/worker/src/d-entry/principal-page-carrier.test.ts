@@ -57,10 +57,39 @@ function observeProfileRequest(
   return ready.promise;
 }
 
-function rejectBeforeSharedWait(response: Response): never {
-  throw Error(
-    `Profile returned HTTP ${response.status} before the shared proof wait`,
-  );
+function startDocumentProfileRequest(
+  f: Awaited<ReturnType<typeof fixture>>,
+  scopeId: string,
+  active?: AbortSignal,
+) {
+  const arrival = observeProfileRequest(f, f.profileUrl('bootstrap', scopeId));
+  const response = f.publish('bootstrap', scopeId, {}, 'document', active);
+  return {
+    response,
+    completion: arrival.then(f.profileCompletion),
+    settlement: response.then(
+      (received) => ({ received }),
+      (error: unknown) => ({ error }),
+    ),
+  };
+}
+
+function waitForProfilePhase<T>(
+  phase: string,
+  reached: Promise<T>,
+  ...requests: ReturnType<typeof startDocumentProfileRequest>[]
+) {
+  return Promise.race([
+    reached,
+    ...requests.map(({ settlement }) =>
+      settlement.then((result) => {
+        if ('error' in result) throw result.error;
+        throw Error(
+          `Profile returned HTTP ${result.received.status} before ${phase}`,
+        );
+      }),
+    ),
+  ]);
 }
 
 // These loopback responses use either a fixed body length or Node's chunked
@@ -807,28 +836,25 @@ it(
       });
     closes.push(async () => pendingPublications.mockRestore());
     const cancel = new AbortController();
-    const firstWire = observeProfileRequest(
-      f,
-      f.profileUrl('bootstrap', page.scopeId),
-    );
-    const first = f.publish(
-      'bootstrap',
-      page.scopeId,
-      {},
-      'document',
-      cancel.signal,
-    );
-    void first.catch(() => {});
-    const firstDone = f.profileCompletion(await firstWire);
-    const sharedSignal = await shared.promise;
-    const other = f.publish('bootstrap', page.scopeId, {}, 'document');
-    void other.catch(() => {});
     try {
-      await Promise.race([
+      const first = startDocumentProfileRequest(f, page.scopeId, cancel.signal);
+      const firstDone = await waitForProfilePhase(
+        'the first request arrived',
+        first.completion,
+        first,
+      );
+      const sharedSignal = await waitForProfilePhase(
+        'the shared graph read',
+        shared.promise,
+        first,
+      );
+      const other = startDocumentProfileRequest(f, page.scopeId);
+      await waitForProfilePhase(
+        'both shared waiters registered',
         bothSubscribed.promise,
-        first.then(rejectBeforeSharedWait),
-        other.then(rejectBeforeSharedWait),
-      ]);
+        first,
+        other,
+      );
       expect(f.profileBorrows.mock.calls).toHaveLength(2);
       const [one, two] = f.profileBorrows.mock.calls.map(([signal]) => signal);
       expect(getEventListeners(one!, 'abort')).toHaveLength(1);
@@ -840,23 +866,32 @@ it(
       expect(secondWaiter).toBeTypeOf('function');
       const firstAbortedInWorker = once(one!, 'abort');
       cancel.abort(Error('the first wire left'));
-      await expect(first).rejects.toThrow('the first wire left');
-      await firstAbortedInWorker;
+      await expect(first.response).rejects.toThrow('the first wire left');
+      await waitForProfilePhase(
+        'the first Worker abort',
+        firstAbortedInWorker,
+        other,
+      );
       expect(getEventListeners(one!, 'abort')).toHaveLength(0);
       expect(getEventListeners(two!, 'abort')).toHaveLength(1);
       expect([...proof['waiters']]).toEqual([secondWaiter]);
-      await firstDone.promise;
+      await waitForProfilePhase(
+        'the first handler joined',
+        firstDone.promise,
+        other,
+      );
       expect(sharedSignal.aborted).toBe(false);
       expect(reads).toBe(1);
+      finish.resolve();
+      const result = await other.response;
+      expect(result.status).toBe(200);
+      expect(await result.json()).toMatchObject({ nativeSessionId: 'root' });
+      expect(
+        getEventListeners(f.profileBorrows.mock.calls[1]![0], 'abort'),
+      ).toHaveLength(0);
     } finally {
       finish.resolve();
     }
-    const result = await other;
-    expect(result.status).toBe(200);
-    expect(await result.json()).toMatchObject({ nativeSessionId: 'root' });
-    expect(
-      getEventListeners(f.profileBorrows.mock.calls[1]![0], 'abort'),
-    ).toHaveLength(0);
   },
 );
 
@@ -1331,49 +1366,54 @@ it(
     closes.push(async () => finishFirstProof.resolve());
     const sharedPage = await open(shared);
     const caller = new AbortController();
-    const firstResponseOnWire = observeProfileRequest(
-      shared,
-      shared.profileUrl('bootstrap', sharedPage.scopeId),
-    );
-    const canceledRequest = shared.publish(
-      'bootstrap',
-      sharedPage.scopeId,
-      {},
-      'document',
-      caller.signal,
-    );
-    void canceledRequest.catch(() => {});
-    const firstHandler = shared.profileCompletion(await firstResponseOnWire);
-    const sharedSignal = await firstProof.promise;
-    const secondBorrow = deferred();
-    vi.mocked(shared.owner.assertCurrent).mockImplementationOnce(async () => {
-      secondBorrow.resolve();
-    });
-    const secondRequest = shared.publish(
-      'bootstrap',
-      sharedPage.scopeId,
-      {},
-      'document',
-    );
     try {
-      await Promise.race([
+      const firstRequest = startDocumentProfileRequest(
+        shared,
+        sharedPage.scopeId,
+        caller.signal,
+      );
+      const firstHandler = await waitForProfilePhase(
+        'the first request arrived',
+        firstRequest.completion,
+        firstRequest,
+      );
+      const sharedSignal = await waitForProfilePhase(
+        'the shared graph read',
+        firstProof.promise,
+        firstRequest,
+      );
+      const secondBorrow = deferred();
+      vi.mocked(shared.owner.assertCurrent).mockImplementationOnce(async () => {
+        secondBorrow.resolve();
+      });
+      const secondRequest = startDocumentProfileRequest(
+        shared,
+        sharedPage.scopeId,
+      );
+      await waitForProfilePhase(
+        'the second borrow',
         secondBorrow.promise,
-        canceledRequest.then(rejectBeforeSharedWait),
-        secondRequest.then(rejectBeforeSharedWait),
-      ]);
+        firstRequest,
+        secondRequest,
+      );
       await new Promise<void>((resolve) => setImmediate(resolve));
       caller.abort();
-      await expect(canceledRequest).rejects.toMatchObject({
+      await expect(firstRequest.response).rejects.toMatchObject({
         name: 'AbortError',
       });
-      await firstHandler.promise;
+      await waitForProfilePhase(
+        'the first handler joined',
+        firstHandler.promise,
+        secondRequest,
+      );
       expect(sharedSignal.aborted).toBe(false);
+      finishFirstProof.resolve();
+      const responseWithSharedProof = await secondRequest.response;
+      expect(responseWithSharedProof.status).toBe(200);
+      await responseWithSharedProof.json();
     } finally {
       finishFirstProof.resolve();
     }
-    const responseWithSharedProof = await secondRequest;
-    expect(responseWithSharedProof.status).toBe(200);
-    await responseWithSharedProof.json();
 
     const shutdownPage = await open(shared);
     const readBeforeShutdown = deferred<AbortSignal>();
@@ -1384,27 +1424,33 @@ it(
       readBeforeShutdown.resolve(signal);
       await finishShutdown.promise;
     };
-    const shutdownRequest = shared.publish(
-      'bootstrap',
-      shutdownPage.scopeId,
-      {},
-      'document',
-    );
-    const shutdownSignal = await readBeforeShutdown.promise;
-    let joinedProof = false;
-    const shutdown = shared.closeProfile().then(() => {
-      joinedProof = true;
-    });
-    const refused = await shutdownRequest;
-    expect(refused.status).toBe(404);
-    expect(await refused.text()).toBe('');
-    expect(shutdownSignal.aborted).toBe(true);
-    expect(joinedProof).toBe(false);
-    expect((await shared.invoke(sharedPage.scopeId)).status).toBe(200);
-    finishShutdown.resolve();
-    await shutdown;
-    expect(joinedProof).toBe(true);
-    expect((await shared.invoke(shutdownPage.scopeId)).status).toBe(200);
+    try {
+      const shutdownRequest = startDocumentProfileRequest(
+        shared,
+        shutdownPage.scopeId,
+      );
+      const shutdownSignal = await waitForProfilePhase(
+        'the shutdown graph read',
+        readBeforeShutdown.promise,
+        shutdownRequest,
+      );
+      let joinedProof = false;
+      const shutdown = shared.closeProfile().then(() => {
+        joinedProof = true;
+      });
+      const refused = await shutdownRequest.response;
+      expect(refused.status).toBe(404);
+      expect(await refused.text()).toBe('');
+      expect(shutdownSignal.aborted).toBe(true);
+      expect(joinedProof).toBe(false);
+      expect((await shared.invoke(sharedPage.scopeId)).status).toBe(200);
+      finishShutdown.resolve();
+      await shutdown;
+      expect(joinedProof).toBe(true);
+      expect((await shared.invoke(shutdownPage.scopeId)).status).toBe(200);
+    } finally {
+      finishShutdown.resolve();
+    }
 
     const withdrawn = await fixture({ directory, graph, read });
     const live = await open(withdrawn);
