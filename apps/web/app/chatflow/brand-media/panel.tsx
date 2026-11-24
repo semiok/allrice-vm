@@ -2,6 +2,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -38,6 +39,7 @@ import {
 import { Images } from './images';
 import layout from './panel.module.css';
 type Tab = 'calendar' | 'topics' | 'articles';
+type ReadProjection = Tab | 'article' | 'runs';
 type References = BrandMediaTopic['references'];
 type Cursor = { createdAt: string; id: string };
 const stateNames = { draft: '草稿', scheduled: '已排期', published: '已发布' };
@@ -128,39 +130,72 @@ function BrandMediaAccessFeedback({
 
 export function BrandMediaPanel({
   client,
+  active = true,
+  onReturn,
   ...props
 }: Omit<BrandMediaPanelProps, 'client'> & {
   client: ReturnType<typeof createBrandMediaClient>;
 }) {
-  const [lifetime] = useState(() => new AbortController());
+  const scopeKey = [
+    client.scope.organizationId,
+    client.scope.workspaceId,
+    client.scope.ownerId,
+    client.scope.instanceId,
+  ].join('/');
+  const [visit, setVisit] = useState<{
+    lifetime: AbortController;
+    ordinal: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    if (!active) return;
+    const lifetime = new AbortController();
+    setVisit((old) => ({ lifetime, ordinal: (old?.ordinal ?? 0) + 1 }));
+    return () => lifetime.abort();
+  }, [active, scopeKey]);
+  const lifetime = visit?.lifetime;
   const [accessProblem, setAccessProblem] = useState<{
-    message: string;
+    lifetime: AbortController;
+    cause: Error;
     revoked: boolean;
   } | null>(null);
   const scopedClient = useMemo(
     () =>
-      client.forPanel({
-        signal: lifetime.signal,
-        hide: (cause) =>
-          setAccessProblem({ message: cause.message, revoked: false }),
-        reveal: () => setAccessProblem(null),
-        revoke(cause) {
-          lifetime.abort(cause);
-          setAccessProblem({ message: cause.message, revoked: true });
-        },
-      }),
+      lifetime
+        ? client.forPanel({
+            signal: lifetime.signal,
+            hide: (cause) =>
+              setAccessProblem({ lifetime, cause, revoked: false }),
+            reveal: (cause) =>
+              setAccessProblem((old) =>
+                old?.lifetime === lifetime && old.cause === cause ? null : old,
+              ),
+            revoke(cause) {
+              lifetime.abort(cause);
+              setAccessProblem({ lifetime, cause, revoked: true });
+            },
+          })
+        : null,
     [client, lifetime],
   );
-  return accessProblem?.revoked ? (
+  const problem = accessProblem?.lifetime === lifetime ? accessProblem : null;
+  const returnToChat = () => {
+    lifetime?.abort();
+    onReturn();
+  };
+  if (!visit || !scopedClient) return null;
+  return problem?.revoked ? (
     <BrandMediaAccessFeedback
-      message={accessProblem.message}
-      onReturn={props.onReturn}
+      message={problem.cause.message}
+      onReturn={returnToChat}
     />
   ) : (
     <BrandMediaPanelContent
       {...props}
+      key={visit.ordinal}
       client={scopedClient}
-      accessWarning={accessProblem?.message}
+      active={active}
+      onReturn={returnToChat}
+      accessWarning={problem?.cause.message}
     />
   );
 }
@@ -227,6 +262,14 @@ function BrandMediaPanelContent({
   }, [active]);
   const [detail, setDetail] = useState<BrandMediaArticle | null>(null);
   const detailGeneration = useRef(0);
+  const readEpoch = useRef<Record<ReadProjection, number>>({
+    topics: 0,
+    articles: 0,
+    calendar: 0,
+    article: 0,
+    runs: 0,
+  });
+  const rejectedArticles = useRef(new Map<string, number>());
   const acceptDetail = useCallback((article: BrandMediaArticle) => {
     detailGeneration.current++;
     setDetail((old) =>
@@ -235,6 +278,60 @@ function BrandMediaPanelContent({
   }, []);
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const discardRead = useCallback(
+    (projection: ReadProjection, cause: Error, articleId?: string) => {
+      readEpoch.current[projection]++;
+      setError(cause.message);
+      if (projection === 'runs') {
+        setRuns([]);
+        return;
+      }
+      if (projection === 'topics') {
+        setTopics([]);
+        setTopicCursor(null);
+        setForm((old) => (old?.kind === 'start' ? null : old));
+        return;
+      }
+      if (projection === 'articles') {
+        setArticles([]);
+        setArticleCursor(null);
+      }
+      if (projection === 'calendar') {
+        setCalendar([]);
+        return;
+      }
+
+      // One article can be held by the calendar, list, reader and open forms.
+      // Drop those copies except the ones for other, independently read rows.
+      const rejected = articleId ?? selectedIdRef.current;
+      if (!rejected) return;
+      for (const view of ['articles', 'calendar', 'article', 'runs'] as const)
+        if (view !== projection) readEpoch.current[view]++;
+      rejectedArticles.current.set(rejected, readEpoch.current.article);
+      if (projection !== 'articles')
+        setArticles((old) => old.filter((item) => item.id !== rejected));
+      setCalendar((old) => old.filter((item) => item.id !== rejected));
+      setRuns((old) =>
+        old.filter(
+          ({ invocation: { intent } }) =>
+            intent.operation === 'candidates' || intent.articleId !== rejected,
+        ),
+      );
+      setForm((old) =>
+        old?.kind === 'article' && old.article.id === rejected ? null : old,
+      );
+      setPublication((old) => (old?.article.id === rejected ? null : old));
+      setReferenceArticle((old) => (old?.id === rejected ? null : old));
+      if (selectedIdRef.current === rejected) {
+        detailGeneration.current++;
+        selectedIdRef.current = null;
+        setSelectedId(null);
+        setDetail(null);
+        setBody('');
+      }
+    },
+    [],
+  );
   const listed = articles.find((article) => article.id === selectedId);
   const selected =
     detail?.id === selectedId && (!listed || detail.revision >= listed.revision)
@@ -278,31 +375,46 @@ function BrandMediaPanelContent({
         !signal?.aborted &&
         selectedIdRef.current === articleId;
       const result = await client
-        .read({ view: 'article', articleId }, signal)
+        .read({ view: 'article', articleId }, signal, (cause) => {
+          if (current()) discardRead('article', cause, articleId);
+        })
         .catch((cause) => {
           if (current()) throw cause;
           return null;
         });
       if (current() && result?.view === 'article') acceptDetail(result.article);
     },
-    [client, acceptDetail],
+    [client, acceptDetail, discardRead],
   );
   const reload = useCallback(async () => {
     const version = ++generation.current;
     detailGeneration.current++;
+    const observed = { ...readEpoch.current };
+    const latest = () => version === generation.current;
+    const current = (projection: ReadProjection) =>
+      latest() && observed[projection] === readEpoch.current[projection];
+    const deny = (projection: ReadProjection) => (cause: Error) => {
+      if (latest()) discardRead(projection, cause);
+    };
     try {
       const [topicPage, articlePage, schedule, recovery] =
         await Promise.allSettled([
-          client.read({ view: 'topics' }),
-          client.read({
-            view: 'articles',
-            ...(state === 'all' ? {} : { state }),
-          }),
-          client.read({ view: 'calendar', month, timezone }),
-          client.runs(),
+          client.read({ view: 'topics' }, undefined, deny('topics')),
+          client.read(
+            { view: 'articles', ...(state === 'all' ? {} : { state }) },
+            undefined,
+            deny('articles'),
+          ),
+          client.read(
+            { view: 'calendar', month, timezone },
+            undefined,
+            deny('calendar'),
+          ),
+          client.runs(undefined, deny('runs')),
         ]);
-      if (version !== generation.current) return;
+      if (!latest()) return;
       if (
+        current('topics') &&
         topicPage.status === 'fulfilled' &&
         topicPage.value.view === 'topics'
       ) {
@@ -310,6 +422,7 @@ function BrandMediaPanelContent({
         setTopicCursor(topicPage.value.nextCursor);
       }
       if (
+        current('articles') &&
         articlePage.status === 'fulfilled' &&
         articlePage.value.view === 'articles'
       ) {
@@ -318,9 +431,14 @@ function BrandMediaPanelContent({
         setArticleCursor(page.nextCursor);
         setSelectedId((old) => old ?? page.items[0]?.id ?? null);
       }
-      if (schedule.status === 'fulfilled' && schedule.value.view === 'calendar')
+      if (
+        current('calendar') &&
+        schedule.status === 'fulfilled' &&
+        schedule.value.view === 'calendar'
+      )
         setCalendar(schedule.value.items);
-      if (recovery.status === 'fulfilled') setRuns(recovery.value.runs);
+      if (current('runs') && recovery.status === 'fulfilled')
+        setRuns(recovery.value.runs);
       const failed = [topicPage, articlePage, schedule, recovery].find(
         (value) => value.status === 'rejected',
       );
@@ -328,12 +446,12 @@ function BrandMediaPanelContent({
       const currentId = selectedIdRef.current;
       if (currentId) await readDetail(currentId);
     } catch (cause) {
-      if (version === generation.current)
+      if (latest())
         setError(
           cause instanceof Error ? cause.message : '暂时无法读取，请刷新重试。',
         );
     }
-  }, [client, month, timezone, state, readDetail]);
+  }, [client, month, timezone, state, readDetail, discardRead]);
   useEffect(() => {
     void reload();
     return () => {
@@ -341,7 +459,7 @@ function BrandMediaPanelContent({
       detailGeneration.current++;
     };
   }, [reload]);
-  useBrandMediaRunEvents(client, runs, reload, setError);
+  useBrandMediaRunEvents(client, active ? runs : [], reload, setError);
   useEffect(() => {
     if (!selectedId) {
       detailGeneration.current++;
@@ -359,22 +477,38 @@ function BrandMediaPanelContent({
   }, [readDetail, selectedId]);
   useEffect(() => {
     const controller = new AbortController();
+    const version = readEpoch.current.article;
+    const current = () =>
+      !controller.signal.aborted && version === readEpoch.current.article;
     setBody('');
-    if (selected?.body)
+    if (selected?.body) {
+      const articleId = selected.id;
       void client
-        .body(selected.body, controller.signal)
+        .body(selected.body, controller.signal, (cause) => {
+          if (current() && selectedIdRef.current === articleId)
+            discardRead('article', cause, articleId);
+        })
         .then((value) => {
-          if (!controller.signal.aborted) setBody(value);
+          if (current()) setBody(value);
         })
         .catch((cause) => {
-          if (!controller.signal.aborted) setError(cause.message);
+          if (current()) setError(cause.message);
         });
+    }
     return () => controller.abort();
-  }, [client, selected?.id, selected?.body?.objectId]);
+  }, [
+    client,
+    selected?.id,
+    selected?.body?.objectId,
+    selected?.body?.versionId,
+    selected?.body?.checksum,
+    discardRead,
+  ]);
   const command = async (
     input: NoRequest<Scoped<BrandMediaUserCommand>>,
     key: string,
   ) => {
+    const observedArticle = readEpoch.current.article;
     const previous = pendingCommands.current.get(key);
     const request =
       previous &&
@@ -408,7 +542,14 @@ function BrandMediaPanelContent({
     setError('');
     try {
       const result = await client.command(request.input);
-      if (result.kind === 'article') acceptDetail(result.article);
+      if (result.kind === 'article') {
+        if (
+          (rejectedArticles.current.get(result.article.id) ?? 0) >
+          observedArticle
+        )
+          throw Error('文章访问状态已变化，请刷新后继续。');
+        acceptDetail(result.article);
+      }
       if (result.kind === 'deleted' && selectedIdRef.current === result.id) {
         detailGeneration.current++;
         selectedIdRef.current = null;
@@ -452,22 +593,24 @@ function BrandMediaPanelContent({
         }
       }) ?? [];
   const generate = async (intent: Scoped<BrandMediaGenerateInput>) => {
+    const observedRuns = readEpoch.current.runs;
     const result = await client.generate(intent);
     // The receipt identifies this new Run, including follow-up queueing.
     // Preserve its native facts even if the subsequent cold read fails.
-    setRuns((old) => [
-      {
-        run: result.run,
-        sessionId: result.userMessage.sessionId,
-        invocation: result.invocation,
-        deliveries: [],
-        submission: null,
-        addedCandidates: [],
-        unavailable: false,
-        image: null,
-      },
-      ...old.filter((row) => row.run.id !== result.run.id),
-    ]);
+    if (observedRuns === readEpoch.current.runs)
+      setRuns((old) => [
+        {
+          run: result.run,
+          sessionId: result.userMessage.sessionId,
+          invocation: result.invocation,
+          deliveries: [],
+          submission: null,
+          addedCandidates: [],
+          unavailable: false,
+          image: null,
+        },
+        ...old.filter((row) => row.run.id !== result.run.id),
+      ]);
     await reload();
     return result;
   };
@@ -502,15 +645,20 @@ function BrandMediaPanelContent({
   const copyBody = async () => {
     if (!selected?.body || !active) return;
     const owner = copyLifetime.current,
-      revision = owner.revision;
+      revision = owner.revision,
+      articleEpoch = readEpoch.current.article;
     const current = () =>
       copyLifetime.current === owner &&
       owner.alive &&
-      owner.revision === revision;
+      owner.revision === revision &&
+      articleEpoch === readEpoch.current.article;
     const id = selected.id,
       file = selected.body;
     try {
-      const text = await client.body(file);
+      const text = await client.body(file, undefined, (cause) => {
+        if (current() && selectedIdRef.current === id)
+          discardRead('article', cause, id);
+      });
       if (!current() || selectedIdRef.current !== id) return;
       if (!(await writeClipboard(text))) throw Error('未能复制正文，请重试。');
       if (current()) setNotice('正文已复制');
@@ -523,14 +671,21 @@ function BrandMediaPanelContent({
     const cursor = view === 'topics' ? topicCursor : articleCursor;
     if (!cursor || busy) return;
     const version = generation.current;
+    const observed = readEpoch.current[view];
+    const latest = () => version === generation.current;
+    const current = () => latest() && observed === readEpoch.current[view];
     setBusy(true);
     try {
       const result = await client.read(
         view === 'topics'
           ? { view, cursor }
           : { view, cursor, ...(state === 'all' ? {} : { state }) },
+        undefined,
+        (cause) => {
+          if (latest()) discardRead(view, cause);
+        },
       );
-      if (version !== generation.current) return;
+      if (!current()) return;
       if (result.view === 'topics') {
         setTopics((old) => [
           ...old,
@@ -550,7 +705,8 @@ function BrandMediaPanelContent({
         setArticleCursor(result.nextCursor);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '读取失败');
+      if (current())
+        setError(cause instanceof Error ? cause.message : '读取失败');
     } finally {
       setBusy(false);
     }

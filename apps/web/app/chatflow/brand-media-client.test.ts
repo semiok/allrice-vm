@@ -40,17 +40,20 @@ describe('brand-media scoped access', () => {
     });
     return { promise, resolve };
   }
-  const denied = () =>
+  const denied = (
+    status = 403,
+    code: 'AUTHORIZATION_DENIED' | 'VERSION_CONFLICT' = 'AUTHORIZATION_DENIED',
+  ) =>
     Response.json(
       ApiErrorSchema.parse({
         error: {
-          code: 'AUTHORIZATION_DENIED',
+          code,
           message: '当前品牌请求被拒绝',
           requestId: id(11),
           retryable: false,
         },
       }),
-      { status: 403 },
+      { status },
     );
   const catalog = (enabled: boolean) =>
     Response.json({
@@ -113,17 +116,20 @@ describe('brand-media scoped access', () => {
       });
       vi.stubGlobal('fetch', fetch);
       const { client, hide, reveal, revoke } = panelClient();
+      const discard = vi.fn();
       hide.mockImplementation(() => {
         if (hide.mock.calls.length === 2) hidden.resolve();
       });
-      const current = expect(client.read({ view: 'articles' })).rejects.toThrow(
-        '当前品牌请求被拒绝',
-      );
-      const other = expect(client.read({ view: 'topics' })).rejects.toThrow(
-        '当前品牌请求被拒绝',
-      );
+      const current = expect(
+        client.read({ view: 'articles' }, undefined, discard),
+      ).rejects.toThrow('当前品牌请求被拒绝');
+      const other = expect(
+        client.read({ view: 'topics' }, undefined, discard),
+      ).rejects.toThrow('当前品牌请求被拒绝');
       await hidden.promise;
+      expect(discard).toHaveBeenCalledTimes(2);
       expect(hide).toHaveBeenCalled();
+      expect(reveal).not.toHaveBeenCalled();
       expect(revoke).not.toHaveBeenCalled();
       check.resolve(
         outcome === 'unknown'
@@ -136,6 +142,43 @@ describe('brand-media scoped access', () => {
       ).toHaveLength(1);
       expect(revoke).toHaveBeenCalledTimes(outcome === 'disabled' ? 1 : 0);
       expect(reveal.mock.calls.length > 0).toBe(outcome === 'enabled');
+    },
+  );
+
+  it.each([
+    [403, 'AUTHORIZATION_DENIED'],
+    [409, 'VERSION_CONFLICT'],
+  ] as const)(
+    'masks the panel on a typed %i from a write even when its catalog is down',
+    async (status, code) => {
+      const check = deferred<Response>();
+      const catalogRequested = deferred<void>();
+      const fetch = vi.fn((url: string) => {
+        if (url.includes('/modules')) {
+          catalogRequested.resolve();
+          return check.promise;
+        }
+        return Promise.resolve(denied(status, code));
+      });
+      vi.stubGlobal('fetch', fetch);
+      const { client, hide, reveal, revoke } = panelClient();
+      const command = expect(
+        client.command({
+          operation: 'article.publication',
+          articleId: id(20),
+          requestId: id(21),
+          expectedRevision: 1,
+          change: { action: 'unschedule' },
+        }),
+      ).rejects.toThrow('当前品牌请求被拒绝');
+      await catalogRequested.promise;
+      expect(hide).toHaveBeenCalledOnce();
+      check.resolve(
+        Response.json({ message: '目录暂不可用' }, { status: 503 }),
+      );
+      await command;
+      expect(reveal).not.toHaveBeenCalled();
+      expect(revoke).not.toHaveBeenCalled();
     },
   );
 

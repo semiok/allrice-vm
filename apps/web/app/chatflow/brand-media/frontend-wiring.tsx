@@ -33,6 +33,7 @@ import {
   RunSnapshotSchema,
   ReferenceRevisionSchema,
   ReferenceInputSelectionResultSchema,
+  ReferenceSelectionErrorSchema,
   ReferenceSearchCursorSchema,
   WorkbenchDeliverablesCatalogSchema,
   type ReferenceRevision,
@@ -172,6 +173,19 @@ function mayBeScopeDenial(cause: unknown): cause is BrandMediaRequestError {
   );
 }
 
+type OnBrandReadDenied = (cause: Error) => void;
+
+function recordReadDenied(cause: unknown): cause is BrandMediaRequestError {
+  return (
+    mayBeScopeDenial(cause) ||
+    (cause instanceof BrandMediaRequestError &&
+      cause.status === 409 &&
+      (cause.code === 'CONFLICT' ||
+        cause.code === 'REFERENCE_SELECTION_UNAVAILABLE' ||
+        cause.code === 'REFERENCE_PUBLICATION_REVOKED'))
+  );
+}
+
 async function json(
   url: string,
   headers: Record<string, string>,
@@ -191,7 +205,8 @@ async function json(
     throw new BrandMediaRequestError(
       body?.message ?? body?.error?.message ?? '暂时无法完成，请刷新后重试。',
       response.status,
-      ApiErrorSchema.safeParse(body).data?.error.code,
+      ApiErrorSchema.safeParse(body).data?.error.code ??
+        ReferenceSelectionErrorSchema.safeParse(body).data?.error.code,
     );
   return body;
 }
@@ -205,7 +220,7 @@ type OnBrandMediaRunAccepted = (
 type BrandMediaPanelAccess = {
   signal: AbortSignal;
   hide: (cause: Error) => void;
-  reveal: () => void;
+  reveal: (cause: Error) => void;
   revoke: (cause: Error) => void;
 };
 type BrandMediaScopeCheck = 'enabled' | 'unavailable' | 'unknown';
@@ -267,17 +282,22 @@ function brandMediaOperations(
   async function readOrWriteModule(
     query: string,
     options?: RequestInit,
-    scopeOnly = false,
+    {
+      scopeOnly,
+      onDenied,
+    }: {
+      scopeOnly?: boolean;
+      onDenied?: OnBrandReadDenied;
+    } = {},
   ) {
     try {
       return await request(base + '/brand-media' + query, options);
     } catch (cause) {
-      if (
-        access &&
-        !access.signal.aborted &&
-        !options?.signal?.aborted &&
-        mayBeScopeDenial(cause)
-      ) {
+      if (access?.signal.aborted || options?.signal?.aborted) throw cause;
+      // Projection denial precedes the catalog check. A current installation
+      // says nothing about the authorization of a previously loaded record.
+      if (onDenied && recordReadDenied(cause)) onDenied(cause);
+      if (access && mayBeScopeDenial(cause)) {
         if (
           scopeOnly ||
           cause.code === 'AUTHENTICATION_REQUIRED' ||
@@ -285,17 +305,12 @@ function brandMediaOperations(
         ) {
           access.revoke(cause);
         } else {
-          // Brand records can fail a downstream ACL with the same status.
-          // Suppress old reads while verifying the current employee's catalog.
-          if (
-            options?.method !== 'POST' &&
-            cause.code === 'AUTHORIZATION_DENIED'
-          )
-            access.hide(cause);
+          // Both reads and writes can report a lost module binding this way.
+          access.hide(cause);
           const outcome = await checkScope();
           if (!access.signal.aborted) {
             if (outcome === 'unavailable') access.revoke(cause);
-            if (outcome === 'enabled') access.reveal();
+            if (outcome === 'enabled') access.reveal(cause);
           }
         }
       }
@@ -315,7 +330,11 @@ function brandMediaOperations(
           requestId,
         }),
       }),
-    read: async (input: Scoped<BrandMediaReadInput>, signal?: AbortSignal) => {
+    read: async (
+      input: Scoped<BrandMediaReadInput>,
+      signal?: AbortSignal,
+      onDenied?: OnBrandReadDenied,
+    ) => {
       const params = new URLSearchParams({ workspaceId: scope.workspaceId });
       for (const [key, value] of Object.entries(input))
         if (value !== undefined)
@@ -324,7 +343,7 @@ function brandMediaOperations(
             typeof value === 'object' ? JSON.stringify(value) : String(value),
           );
       return BrandMediaReadResultSchema.parse(
-        await readOrWriteModule('?' + params, { signal }),
+        await readOrWriteModule('?' + params, { signal }, { onDenied }),
       );
     },
     command: async (command: Scoped<BrandMediaUserCommand>) => {
@@ -366,16 +385,20 @@ function brandMediaOperations(
       onAccepted?.(result.userMessage.sessionId, result.run);
       return result;
     },
-    runs: async (signal?: AbortSignal) =>
+    runs: async (signal?: AbortSignal, onDenied?: OnBrandReadDenied) =>
       runsSchema.parse(
-        await readOrWriteModule(q + '&view=runs', {
-          signal,
-        }),
+        await readOrWriteModule(q + '&view=runs', { signal }, { onDenied }),
       ),
     help: async (signal?: AbortSignal) =>
-      z
-        .object({ content: z.string(), checksum: z.string() })
-        .parse(await readOrWriteModule(q + '&view=help', { signal }, true)),
+      z.object({ content: z.string(), checksum: z.string() }).parse(
+        await readOrWriteModule(
+          q + '&view=help',
+          { signal },
+          {
+            scopeOnly: true,
+          },
+        ),
+      ),
     cancel: (runId: string) =>
       request(`/api/v1/runs/${runId}/cancel${q}`, {
         method: 'POST',
@@ -384,6 +407,7 @@ function brandMediaOperations(
     body: async (
       file: NonNullable<BrandMediaArticle['body']>,
       signal?: AbortSignal,
+      onDenied?: OnBrandReadDenied,
     ) => {
       const current = scopedSignal(signal);
       current?.throwIfAborted();
@@ -391,7 +415,12 @@ function brandMediaOperations(
         `/api/v1/files/${file.objectId}/download${q}`,
         { headers: scope.headers, signal: current, cache: 'no-store' },
       );
-      if (!response.ok) throw Error('正文文件暂时不可读，请重新核对权限。');
+      current?.throwIfAborted();
+      if (!response.ok) {
+        const cause = Error('正文文件暂时不可读，请重新核对权限。');
+        if ([401, 403, 404].includes(response.status)) onDenied?.(cause);
+        throw cause;
+      }
       const text = await response.text();
       current?.throwIfAborted();
       return text;
@@ -687,11 +716,18 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
   const current = useRef(key);
   current.current = key;
   const pending = useRef<{ key: string; requestId: string } | null>(null);
+  const directoryRead = useRef(0);
   const reload = useCallback(
     async (signal?: AbortSignal) => {
       if (!client) return;
+      const version = ++directoryRead.current;
       const result = await client.catalog(signal);
-      if (current.current !== key || signal?.aborted) return;
+      if (
+        current.current !== key ||
+        directoryRead.current !== version ||
+        signal?.aborted
+      )
+        return;
       const entry = result.modules.find(
         (module) => module.descriptor.id === brandMediaModule.id,
       );
@@ -716,8 +752,9 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     });
     return () => controller.abort();
   }, [reload, key]);
+  const available = directory?.key === key && directory.available;
   const add = async () => {
-    if (!client || busy || !checked) return;
+    if (!client || busy || !checked || !available) return;
     const capturedKey = key;
     const request =
       pending.current?.key === key
@@ -737,8 +774,21 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
       pending.current = null;
       setPicker(false);
     } catch (cause) {
-      if (ownsRequest())
-        setError(cause instanceof Error ? cause.message : '添加失败');
+      if (!ownsRequest()) return;
+      setError(cause instanceof Error ? cause.message : '添加失败');
+      if (mayBeScopeDenial(cause)) {
+        setChecked(false);
+        setDirectory(null);
+        try {
+          await reload();
+        } catch {
+          // The rejected installation has no current selectable directory.
+        }
+        if (ownsRequest()) {
+          pending.current = null;
+          setBusy(false);
+        }
+      }
     } finally {
       if (ownsRequest()) setBusy(false);
     }
@@ -753,7 +803,7 @@ export function useBrandMediaEntry(scope: BrandMediaClientScope | null) {
     error,
     add,
     enabled: directory?.key === key && directory.enabled,
-    available: directory?.key === key && directory.available,
+    available,
   };
 }
 export function BrandMediaPluginSection({
