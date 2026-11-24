@@ -7,6 +7,8 @@ import {
   writeFileSync,
   readFileSync,
   rmSync,
+  existsSync,
+  symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
@@ -266,7 +268,7 @@ describe('immutable CI material capture and final production inventory', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
-  it('matches the product material/tree identity, keeps merge and head SHAs separate, and refuses missing outputs or changed tracked source', () => {
+  it('binds the original CI checkout and requires complete production outputs only for validate', () => {
     const root = mkdtempSync(join(tmpdir(), 'allrice-ci-receipt-'));
     const git = (...args: string[]) =>
       execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -294,6 +296,38 @@ describe('immutable CI material capture and final production inventory', () => {
           scripts: { build: 'tsc -p tsconfig.build.json' },
         }),
       );
+      const principal = 'packages/d-entry-principal';
+      const history = 'packages/dsh-native-history-source';
+      const manifest = 'lib/current-principal.manifest.json';
+      file(
+        `${principal}/package.json`,
+        JSON.stringify({
+          name: '@allrice/d-entry-principal',
+          scripts: { build: 'node build.mjs' },
+          exports: {
+            './host': {
+              types: './lib/types/host.d.ts',
+              default: './lib/host.js',
+            },
+            './artifact': `./${manifest}`,
+          },
+        }),
+      );
+      file(
+        `${history}/package.json`,
+        JSON.stringify({
+          name: '@allrice/dsh-native-history-source',
+          scripts: { build: 'node build.mjs' },
+          exports: { './remote': './lib/typert.remote-client.js' },
+        }),
+      );
+      file(
+        'apps/web/package.json',
+        JSON.stringify({
+          name: '@allrice/web',
+          scripts: { build: 'next build' },
+        }),
+      );
       git('add', '.');
       git('commit', '-qm', 'fixture');
       const sha = git('rev-parse', 'HEAD'),
@@ -303,7 +337,12 @@ describe('immutable CI material capture and final production inventory', () => {
       );
       expect(repositoryGitTree(archive)).toBe(git('rev-parse', 'HEAD^{tree}'));
       const script = resolve('scripts/acceptance/platform/repository-ci.mjs');
-      const run = (mode: 'capture' | 'finish', eventName = 'pull_request') =>
+      const receiptPath = join(root, 'receipt.json');
+      const run = (
+        mode: 'capture' | 'finish',
+        eventName = 'pull_request',
+        job = 'validate',
+      ) =>
         execFileSync(
           process.execPath,
           [
@@ -321,7 +360,7 @@ describe('immutable CI material capture and final production inventory', () => {
               GITHUB_REPOSITORY_ID: '1469490636',
               GITHUB_RUN_ID: '123',
               GITHUB_RUN_ATTEMPT: '2',
-              GITHUB_JOB: 'validate',
+              GITHUB_JOB: job,
               GITHUB_EVENT_NAME: eventName,
               GITHUB_EVENT_PATH: join(root, 'event.json'),
               RUNNER_OS: 'Linux',
@@ -347,22 +386,82 @@ describe('immutable CI material capture and final production inventory', () => {
       expect(capture.dependencyConfigurationDigest).toBe(
         repositoryDependencyDigest(archive.files),
       );
-      expect(() => run('finish')).toThrow();
+      const readReceipt = () =>
+        RepositoryCiReceiptSchema.parse(
+          JSON.parse(readFileSync(receiptPath, 'utf8')),
+        );
+      for (const job of [
+        'compose-smoke',
+        'developer-bootstrap',
+        'tenant-workbench-browser',
+      ]) {
+        run('finish', 'pull_request', job);
+        expect(readReceipt()).toMatchObject({
+          job,
+          checkoutSha: sha,
+          build: null,
+        });
+        rmSync(receiptPath);
+      }
+      const rejectBuild = (reason: string) => {
+        expect(() => run('finish')).toThrow(reason);
+        expect(existsSync(receiptPath)).toBe(false);
+      };
+      rejectBuild('ENOENT');
       file(
         'packages/contracts/dist/index.js',
         'export const compiled = true;\n',
       );
+      file(`${principal}/dist/decoy.js`, 'unrelated output');
+      rejectBuild(`${principal}/lib`);
+      mkdirSync(join(root, principal, 'lib'));
+      rejectBuild(`CI_BUILD_OUTPUT_MISSING: ${principal}/lib`);
+      file(`${principal}/${manifest}`, '');
+      file(`${principal}/lib/host.js`, 'host');
+      file(`${principal}/lib/types/host.d.ts`, 'declaration');
+      rejectBuild(`CI_BUILD_EXPORT_MISSING: ${principal}/${manifest}`);
+      file(`${principal}/${manifest}`, '{}');
+      file(`${principal}/lib/host.js.map`, 'map');
+      file(`${history}/dist/typert.remote-client.js`, 'decoy remote');
+      rejectBuild(`${history}/lib`);
+      symlinkSync(join(root, history, 'dist'), join(root, history, 'lib'));
+      rejectBuild('CI_BUILD_SYMLINK');
+      rmSync(join(root, history, 'lib'));
+      file(`${history}/lib/typert.remote-client.js`, 'remote');
+      file('apps/web/dist/index.js', 'decoy web');
+      rejectBuild('apps/web/.next');
+      file('apps/web/.next/BUILD_ID', 'build');
+      file('apps/web/.next/cache/entry', 'ignored cache');
       run('finish');
-      const receipt = RepositoryCiReceiptSchema.parse(
-        JSON.parse(readFileSync(join(root, 'receipt.json'), 'utf8')),
-      );
+      const receipt = readReceipt();
       expect(receipt).toMatchObject({
         checkoutSha: sha,
         headSha: 'a'.repeat(40),
         runAttempt: 2,
-        build: { packages: [{ name: '@allrice/contracts', fileCount: 1 }] },
+        build: {
+          packages: [
+            { name: '@allrice/contracts', fileCount: 1 },
+            { name: '@allrice/d-entry-principal', fileCount: 4, sizeBytes: 20 },
+            {
+              name: '@allrice/dsh-native-history-source',
+              fileCount: 1,
+              sizeBytes: 6,
+            },
+            { name: '@allrice/web', fileCount: 1, sizeBytes: 5 },
+          ],
+        },
       });
-      rmSync(join(root, 'receipt.json'));
+      rmSync(receiptPath);
+      file(`${history}/lib/typert.remote-client.js`, 'Remote');
+      run('finish');
+      const changed = readReceipt().build!.packages;
+      const original = receipt.build!.packages;
+      expect(
+        changed
+          .filter((pkg, i) => pkg.outputDigest !== original[i]!.outputDigest)
+          .map((pkg) => pkg.path),
+      ).toEqual([history]);
+      rmSync(receiptPath);
       for (const eventName of ['push', 'schedule']) {
         file('event.json', '{}');
         run('finish', eventName);
@@ -382,10 +481,10 @@ describe('immutable CI material capture and final production inventory', () => {
         expect(RepositoryCiReceiptSchema.safeParse(observation).success).toBe(
           eventName === 'push',
         );
-        rmSync(join(root, 'receipt.json'));
+        rmSync(receiptPath);
       }
       file('package.json', JSON.stringify({ scripts: { build: 'different' } }));
-      expect(() => run('finish')).toThrow();
+      rejectBuild('CI_TRACKED_SOURCE_CHANGED');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

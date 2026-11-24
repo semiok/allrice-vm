@@ -22,6 +22,10 @@ const checks = [
   'tenant-workbench-browser',
   'compose-smoke',
 ];
+const libOutputPackages = new Set([
+  'packages/d-entry-principal',
+  'packages/dsh-native-history-source',
+]);
 const root = process.cwd(),
   git = (...args) =>
     execFileSync('git', args, {
@@ -50,7 +54,7 @@ function snapshot() {
   ).toString('utf8');
   if (!workspace.startsWith('packages:\n  - apps/*\n  - packages/*\n'))
     throw Error('CI_WORKSPACE_PLAN_CHANGED');
-  const packages = files
+  const buildPlan = files
     .filter((f) => /^(apps|packages)\/[^/]+\/package\.json$/.test(f.path))
     .map((f) => {
       const p = JSON.parse(
@@ -58,15 +62,18 @@ function snapshot() {
       );
       return p.scripts?.build
         ? {
-            name: p.name,
-            path: dirname(f.path),
-            scriptChecksum: ciDigest(p.scripts.build),
+            identity: {
+              name: p.name,
+              path: dirname(f.path),
+              scriptChecksum: ciDigest(p.scripts.build),
+            },
+            exportMap: p.exports,
           }
         : null;
     })
     .filter(Boolean)
-    .sort((a, b) => a.name.localeCompare(b.name));
-  return {
+    .sort((a, b) => a.identity.name.localeCompare(b.identity.name));
+  const source = {
     checkoutSha: sha,
     checkoutTree: tree,
     materialDigest: ciMaterialDigest(files),
@@ -80,12 +87,31 @@ function snapshot() {
       ),
     ),
     workflowBlob: git('rev-parse', sha + ':.github/workflows/ci.yml'),
-    packages,
+    packages: buildPlan.map(({ identity }) => identity),
   };
+  return { source, buildPlan };
 }
-function outputs(path) {
+
+function exportTargets(target) {
+  if (typeof target === 'string') return [target];
+  return Object.values(target ?? {}).flatMap(exportTargets);
+}
+
+function outputs(path, exportMap) {
+  const usesLib = libOutputPackages.has(path);
+  const directory = path === 'apps/web' ? '.next' : usesLib ? 'lib' : 'dist';
+  // Both native generators expose their compiled files through lib. Check the
+  // committed exports against the inventory of the actual build directory.
+  const exports = usesLib ? exportTargets(exportMap) : [];
+  if (
+    usesLib &&
+    (!exports.length || exports.some((e) => !e.startsWith('./lib/')))
+  )
+    throw Error(`CI_BUILD_EXPORT_LAYOUT: ${path}`);
+  const required = new Set(exports.map((e) => e.slice('./lib/'.length)));
   const files = [],
-    base = join(root, path, path === 'apps/web' ? '.next' : 'dist');
+    base = join(root, path, directory);
+  if (lstatSync(base).isSymbolicLink()) throw Error('CI_BUILD_SYMLINK');
   let bytes = 0;
   function visit(dir) {
     for (const name of readdirSync(dir).sort()) {
@@ -110,23 +136,30 @@ function outputs(path) {
         } finally {
           closeSync(fd);
         }
+        const relative = file.slice(base.length + 1);
         files.push({
-          path: file.slice(base.length + 1),
+          path: relative,
           sizeBytes: s.size,
           checksum: 'sha256:' + h.digest('hex'),
         });
+        if (s.size > 0) required.delete(relative);
       }
     }
   }
   visit(base);
-  if (!files.length || bytes === 0) throw Error('CI_BUILD_OUTPUT_MISSING');
+  if (!files.length || bytes === 0)
+    throw Error(`CI_BUILD_OUTPUT_MISSING: ${path}/${directory}`);
+  if (required.size)
+    throw Error(
+      `CI_BUILD_EXPORT_MISSING: ${path}/${directory}/${[...required].sort()[0]}`,
+    );
   return {
     outputDigest: ciDigest(JSON.stringify(files)),
     fileCount: files.length,
     sizeBytes: bytes,
   };
 }
-const current = snapshot();
+const { source: current, buildPlan } = snapshot();
 let result = current;
 if (mode === 'finish') {
   const capture = option('capture'),
@@ -174,9 +207,9 @@ if (mode === 'finish') {
             rootScript: JSON.parse(
               readFileSync(join(root, 'package.json'), 'utf8'),
             ).scripts.build,
-            packages: current.packages.map((p) => ({
-              ...p,
-              ...outputs(p.path),
+            packages: buildPlan.map(({ identity, exportMap }) => ({
+              ...identity,
+              ...outputs(identity.path, exportMap),
             })),
           }
         : null,
