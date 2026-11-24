@@ -57,12 +57,12 @@ export const employeeWebKernelOptions = {
 
 /** Run only inside the isolated build child, using the released launcher's
  * real application-readiness lifecycle. Never a SaaS Host or identity source. */
-async function collectProfileArtifacts(outputDirectory) {
+async function collectProfileArtifacts(outputDirectory, dshHome) {
   const { loadProfileDirectory, loadLayeredEnv } =
     await import('@deepseek-ai/dsh-app-boot');
   const { runProfile } = await import('@deepseek-ai/dsh/profile-boot');
   const { bootInjections } = await import('@deepseek-ai/dsh-client-modules');
-  const profileDir = join(process.env.DSH_HOME, 'profiles/allrice-web');
+  const profileDir = join(dshHome, 'profiles/allrice-web');
   await mkdir(join(profileDir, 'node_modules/@allrice'), { recursive: true });
   await symlink(
     packageRoot,
@@ -322,6 +322,7 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
   );
   await mkdir(join(outputDirectory, 'plugins'), { recursive: true });
   const state = await mkdtemp(join(outputDirectory, '.build-state-'));
+  const dshHome = join(state, 'dsh');
   try {
     for (const name of ['home', 'dsh', 'agents', 'tmp', 'work'])
       await mkdir(join(state, name));
@@ -332,6 +333,7 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
         fileURLToPath(import.meta.url),
         '--profile-artifacts',
         outputDirectory,
+        dshHome,
       ],
       {
         cwd: join(state, 'work'),
@@ -340,7 +342,7 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
         env: {
           PATH: dirname(process.execPath) + ':/usr/bin:/bin',
           HOME: join(state, 'home'),
-          DSH_HOME: join(state, 'dsh'),
+          DSH_HOME: dshHome,
           DSH_AGENTS_HOME: join(state, 'agents'),
           XDG_CONFIG_HOME: join(state, 'home/.config'),
           XDG_DATA_HOME: join(state, 'home/.local/share'),
@@ -453,7 +455,7 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   if (process.argv[2] === '--profile-artifacts') {
-    await collectProfileArtifacts(process.argv[3]);
+    await collectProfileArtifacts(process.argv[3], process.argv[4]);
   } else {
     const directory = process.argv[2] ?? join(packageRoot, 'dist/web-entry');
     const manifest = await (process.argv[2]
