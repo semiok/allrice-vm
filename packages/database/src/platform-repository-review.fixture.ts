@@ -45,11 +45,11 @@ export function repositoryReviewFixture(
     },
   };
   const remote = {
-    repositoryId: 1323769790 as const,
-    repository: 'semiok/allrice' as const,
+    repositoryId: 1469490636 as const,
+    repository: 'semiok/allrice-vm' as const,
     branch: `allrice/repairs/${id}`,
     number: 312,
-    url: 'https://github.com/semiok/allrice/pull/312',
+    url: 'https://github.com/semiok/allrice-vm/pull/312',
     headSha: head,
     tree,
     baseSha: source.baseSha,

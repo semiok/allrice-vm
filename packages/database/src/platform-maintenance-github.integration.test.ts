@@ -30,8 +30,8 @@ suite('central personal GitHub token and immutable identity', () => {
       String(url).endsWith('/user')
         ? { id: 901, login: 'semiok' }
         : {
-            id: 1323769790,
-            full_name: 'semiok/allrice',
+            id: 1469490636,
+            full_name: 'semiok/allrice-vm',
             permissions: { push: true },
           },
     ),
@@ -108,7 +108,7 @@ suite('central personal GitHub token and immutable identity', () => {
     ).toEqual(result);
     expect(vi.mocked(fetcher).mock.calls.length).toBe(calls);
     const [r] =
-      await f.db`select value from allrice_runtime_metadata where key='platform-maintenance-github-bot:1323769790'`;
+      await f.db`select value from allrice_runtime_metadata where key='platform-maintenance-github-bot:1469490636'`;
     expect(JSON.stringify(r)).not.toContain(token);
     expect(r!.value.secret.ciphertext).toMatch(/^[a-f0-9]+$/);
     expect(
@@ -161,8 +161,8 @@ suite('central personal GitHub token and immutable identity', () => {
         String(url).endsWith('/user')
           ? { id: 902, login: 'another-bot' }
           : {
-              id: 1323769790,
-              full_name: 'semiok/allrice',
+              id: 1469490636,
+              full_name: 'semiok/allrice-vm',
               permissions: { push: true },
             },
       )) as typeof fetch;

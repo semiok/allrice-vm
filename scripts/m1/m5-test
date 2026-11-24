@@ -19,14 +19,15 @@
 #     3600) or the tests are killed: "M5 中断", not a test failure; it starts again on M1. On
 #     M1 the same silence stops the run as stuck (exit 124).
 # --on m5 never falls back (exit 4 instead); --on m1 goes straight to M1.
-# Limits on M5 (all runs together, ~/allrice-test/limits): 48G, 16 vitest workers, 8 per run by
+# Fallback limits on M5 (both repositories together): 48G, 16 workers; the shared
+# ~/allrice-test/limits holds the approved 64G/32 configuration (29 usable). 8 per run by
 # default and at most 12. On M1: 2 runs of 2 workers. ALLRICE_TEST_DATABASE_URL is always set;
 # --db and --browser set ALLRICE_RUN_DB_INTEGRATION and ALLRICE_RUN_BROWSER_INTEGRATION. The
 # default build is `pnpm --filter @allrice/contracts build`, as `pnpm test` does. Output is also
-# kept in ~/allrice-dev/qa/m5-test/; the last line names the machine the run finished on.
+# kept in ~/allrice40-dev/qa/m5-test/; the last line names the machine the run finished on.
 #
-# codex: Astra (gpt-6-astra, or --model, at max) runs `codex exec` in that worktree after the install and
-# build. On M5 it may write only there (it can still read, and use the network); a pass that
+# codex: gpt-6.2-sol (or --model) runs `codex exec` at max in that worktree after the install
+# and build. On M5 it may write only there (it can still read, and use the network); a pass that
 # needs more, such as browser tests (Chrome does not start in Codex's sandbox), takes
 # --full-access and runs on M1, where Codex always has full access (AGENTS.md §9); with --on m5
 # only when the user agreed. The prompt is the text after `--`, or stdin. The result is
@@ -34,7 +35,12 @@
 set -euo pipefail
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
 export PATH="$HOME/.local/opt/node-22.23.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-HOST=${M5_TEST_HOST:-m5} REPO=${M5_TEST_REPO:-$HOME/allrice-repo} LOGS=$HOME/allrice-dev/qa/m5-test
+HOST=${M5_TEST_HOST:-m5} REPO=${M5_TEST_REPO:-$HOME/allrice40-repo} LOGS=$HOME/allrice40-dev/qa/m5-test
+REPOSITORY=semiok/allrice-vm REPOSITORY_ID=1469490636
+# Keep the existing namespace: old installed callers must see new callers' live leases.
+# Only result logs/checkouts are per repository; limits, slots and leases are shared.
+LEASES=$HOME/allrice-dev/qa/m5-test/leases
+M1_BASE=$HOME/allrice40-worktrees/.m5-test-m1
 # ServerAlive: a sleeping M5 is noticed within a minute.
 SSH=(${M5_TEST_SSH:-ssh} -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 STOPPED=199 # relay: this side was stopped (Ctrl-C), as opposed to the run there ending
@@ -51,7 +57,7 @@ on_host() {
   if [ "$where" = m5 ]; then
     "${SSH[@]}" "$HOST" "$(quote env M5T_TARGET=m5 "${settings[@]}" /bin/bash -c "$(cat "$BIN/m5-run")" m5-run "$@")"
   else
-    env M5T_TARGET=m1 "${settings[@]}" /bin/bash "$BIN/m5-run" "$@"
+    env M5T_TARGET=m1 M5T_REPO="$REPO" "${settings[@]}" /bin/bash "$BIN/m5-run" "$@"
   fi
 }
 # probe: sets m5 to ready, stale (reachable, not set up for these tools) or offline, and why;
@@ -111,10 +117,10 @@ sys.exit(rc if rc>=0 else 255)' "$1" "$2" "$STOPPED" $$ "${@:3}"
 # that slot). Stale lease files go too.
 leftovers() {
   local id f
-  for f in "$LOGS"/leases/*.lease; do [ ! -e "$f" ] || lock_held "$f" || rm -f "$f"; done
+  for f in "$LEASES"/*.lease; do [ ! -e "$f" ] || lock_held "$f" || rm -f "$f"; done
   for id in $owners; do
     [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}-[0-9]+$ ]] || continue
-    [ -f "$LOGS/leases/$id.lease" ] && lock_held "$LOGS/leases/$id.lease" || printf '%s ' "$id"
+    [ -f "$LEASES/$id.lease" ] && lock_held "$LEASES/$id.lease" || printf '%s ' "$id"
   done
 }
 
@@ -136,7 +142,7 @@ if [ "$cmd" = setup ]; then
   exit
 fi
 
-ref="" on=auto wait=600 build="pnpm --filter @allrice/contracts build" out="" full=0 model=gpt-6-astra test_env=""
+ref="" on=auto wait=600 build="pnpm --filter @allrice/contracts build" out="" full=0 model=gpt-6.2-sol test_env=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;
@@ -151,9 +157,9 @@ while [ $# -gt 0 ]; do
     --on) case "${2:-}" in auto | m5 | m1) on=$2 ;; *) die "--on takes auto, m5 or m1" ;; esac; shift ;;
     -o) [ "$cmd" = codex ] || die "-o is for m5-test codex"; [ -n "${2:-}" ] || die "-o takes a file"; out=$2; shift ;;
     --full-access) [ "$cmd" = codex ] || die "--full-access is for m5-test codex"; full=1 ;;
-    --model) # AGENTS.md §11: Sol in Codex-saving mode
+    --model)
       [ "$cmd" = codex ] || die "--model is for m5-test codex"
-      [[ "${2:-}" =~ ^gpt-[0-9a-z.-]+$ ]] || die "--model takes a model name such as gpt-6-astra"; model=$2; shift ;;
+      [[ "${2:-}" =~ ^gpt-[0-9a-z.-]+$ ]] || die "--model takes a model name such as gpt-6.2-sol"; model=$2; shift ;;
     -*) die "unknown option $1 (vitest arguments go after --)" ;;
     *) [ -z "$ref" ] || die "one commit only (vitest arguments go after --): $1"; ref=$1 ;;
   esac
@@ -183,33 +189,41 @@ idle=${M5_TEST_IDLE_SECONDS:-$([ "$cmd" = codex ] && echo 3600 || echo 1200)}
 dir=$(git rev-parse --show-toplevel 2>/dev/null) || dir=$REPO
 sha=$(git -C "$dir" rev-parse -q --verify "${ref:-HEAD}^{commit}") || die "not a commit: ${ref:-HEAD}"
 git -C "$REPO" cat-file -e "$sha^{commit}" 2>/dev/null || die "${sha:0:8} is not in $REPO: commit it in a worktree of $REPO"
+case "$(git -C "$REPO" remote get-url origin)" in
+  https://github.com/semiok/allrice-vm | https://github.com/semiok/allrice-vm.git | git@github.com:semiok/allrice-vm.git) ;;
+  *) die "repository origin must be $REPOSITORY (id $REPOSITORY_ID)" ;;
+esac
+[ "$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)" -ef "$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)" ] \
+  || die "current worktree belongs to another repository: $dir"
 if [ "$sha" = "$(git -C "$dir" rev-parse HEAD)" ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
   echo "m5-test: uncommitted changes in $dir are not part of this run (it tests ${sha:0:8})"
 fi
-mkdir -p "$LOGS/leases"
+mkdir -p "$LOGS" "$LEASES"
 find "$LOGS" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null || true
 run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$
 log=$LOGS/$run.log
+printf 'm5-test: repository %s id %s commit %s\n' "$REPOSITORY" "$REPOSITORY_ID" "$sha" | tee -a "$log"
 
 # attempt <m5|m1>: one run there; sets rc.
 attempt() {
   local where=$1 settings
   settings=(M5T_ACTION="$cmd" M5T_SHA="$sha" M5T_RUN="$run" M5T_CALLER="$(basename "$dir")" M5T_WAIT="$wait"
-    M5T_BUILD="$build" M5T_ENV="$test_env" M5T_FULL_ACCESS="$full" M5T_MODEL="$model")
+    M5T_BUILD="$build" M5T_ENV="$test_env" M5T_FULL_ACCESS="$full" M5T_MODEL="$model"
+    M5T_REPOSITORY="$REPOSITORY" M5T_REPOSITORY_ID="$REPOSITORY_ID")
   set +e
   if [ "$where" = m5 ]; then
     # The lease, locked while this side is attached to the run (locked before it gets its name,
     # so leftovers never takes it for a stale one). A later run on M5 stops this one if it is
     # still going once the lease is gone: M5 slept, M1 gave up, then M5 woke.
-    exec 8>"$LOGS/leases/$run.new"
-    flock_fd 8 && mv "$LOGS/leases/$run.new" "$LOGS/leases/$run.lease"
+    exec 8>"$LEASES/$run.new"
+    flock_fd 8 && mv "$LEASES/$run.new" "$LEASES/$run.lease"
     relay "$idle" "$log" "${SSH[@]}" "$HOST" "$(quote env M5T_TARGET=m5 "${settings[@]}" M5T_STOP="$(leftovers)" \
       /bin/bash -c "$(cat "$BIN/m5-run")" m5-run ${vargs[@]+"${vargs[@]}"})" <"${prompt:-/dev/null}"
     rc=$?
     exec 8>&-
-    rm -f "$LOGS/leases/$run.lease"
+    rm -f "$LEASES/$run.lease"
   else
-    relay "$idle" "$log" env M5T_TARGET=m1 "${settings[@]}" /bin/bash "$BIN/m5-run" ${vargs[@]+"${vargs[@]}"} <"${prompt:-/dev/null}"
+    relay "$idle" "$log" env M5T_TARGET=m1 M5T_REPO="$REPO" "${settings[@]}" /bin/bash "$BIN/m5-run" ${vargs[@]+"${vargs[@]}"} <"${prompt:-/dev/null}"
     rc=$?
     if [ "$rc" = 124 ]; then echo "m5-test: the run on M1 printed nothing for ${idle}s and was stopped as stuck" | tee -a "$log" >&2; fi
   fi
@@ -226,10 +240,10 @@ finished() {
 target=m1 dropped=""
 if [ "$on" != m1 ]; then
   probe
-  # The commit goes to a ref of its own (M5 keeps the newest 100), so later pushes send only
-  # what is new; a push that hangs (M5 fell asleep) gives up after two minutes.
+  # Use a sibling ref namespace so 3.x retention cannot prune a pending 4.0 checkout.
+  # A push that hangs (M5 fell asleep) gives up after two minutes.
   if [ "$m5" = ready ] && ! GIT_SSH_COMMAND=$(quote "${SSH[@]}") within 120 git -C "$REPO" push -q \
-    "$HOST:allrice-test/repo.git" "$sha:refs/m5-test/$run"; then
+    "$HOST:allrice-test/repo.git" "$sha:refs/m5-test-allrice-vm/$run"; then
     m5=offline why="推送提交到 M5 失败"
   fi
   if [ "$m5" = ready ]; then
@@ -260,9 +274,9 @@ if [ "$cmd" = codex ]; then # fetch the report and the patch; failing that is no
   patch=${out%.md}.patch fetched=1
   for f in "$out:md" "$patch:patch"; do
     if [ "$target" = m5 ]; then
-      within 60 "${SSH[@]}" "$HOST" "cat allrice-test/results/$run.${f##*:}" >"${f%:*}.part" 2>/dev/null </dev/null
+      within 60 "${SSH[@]}" "$HOST" "cat allrice-test/results/allrice-vm/$run.${f##*:}" >"${f%:*}.part" 2>/dev/null </dev/null
     else
-      cp "$HOME/allrice-worktrees/.m5-test-m1/results/$run.${f##*:}" "${f%:*}.part" 2>/dev/null
+      cp "$M1_BASE/results/$run.${f##*:}" "${f%:*}.part" 2>/dev/null
     fi && mv "${f%:*}.part" "${f%:*}" || { rm -f "${f%:*}.part"; fetched=0; }
   done
   if [ $fetched = 0 ] || [ ! -s "$out" ]; then

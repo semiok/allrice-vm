@@ -9,11 +9,11 @@ Worker 挂了：对话、定时任务、云端执行都停，排队的作业不�
 ## 第一步
 
 ```bash
-~/allrice-dev/bin/deploy-dev --status
-launchctl print gui/$(id -u)/ai.bplabs.allrice-dev-worker | grep -E "state|pid|runs|last exit|last terminating"
-tail -100 ~/Library/Logs/allrice-dev-worker.err.log
-tail -50 ~/Library/Logs/allrice-dev-web.err.log
-curl -s -m 5 http://127.0.0.1:3012/health/ready | head -c 600; echo
+~/allrice40-dev/bin/deploy-dev --status
+launchctl print gui/$(id -u)/ai.bplabs.allrice40-dev-worker | grep -E "state|pid|runs|last exit|last terminating"
+tail -100 ~/Library/Logs/allrice40-dev-worker.err.log
+tail -50 ~/Library/Logs/allrice40-dev-web.err.log
+curl -s -m 5 http://127.0.0.1:3312/health/ready | head -c 600; echo
 ```
 
 ## 判断
@@ -21,7 +21,7 @@ curl -s -m 5 http://127.0.0.1:3012/health/ready | head -c 600; echo
 | 现象                                           | 多半是                                                       |
 | ---------------------------------------------- | ------------------------------------------------------------ |
 | 刚部署完就开始                                 | 新版本问题（启动自检拒绝、迁移和代码不匹配）                 |
-| 日志里 `ECONNREFUSED 127.0.0.1:5432`           | 数据库，转 [m1-database.md](m1-database.md)                  |
+| 日志里 `ECONNREFUSED 127.0.0.1:5434`           | 数据库，转 [m1-database.md](m1-database.md)                  |
 | 日志里执行包、`REFERENCES_UNCOVERED`、启动自检 | 执行包或数据不匹配（AGENTS.md 第 5 节“已知限制”）            |
 | 内存（`memory_pressure` 低、进程被 kill -9）   | 内存不够：先停自己不用的验收实例                             |
 | `versions` 不一致                              | 部署中途失败或只重启了一个服务：`deploy-dev --status` 会显示 |
@@ -31,7 +31,7 @@ curl -s -m 5 http://127.0.0.1:3012/health/ready | head -c 600; echo
 1. **部署后出现**：发布负责人回滚 `deploy-dev --release-manager --rollback`（会先检查迁移和执行包兼容性，不兼容会拒绝），再在 MET 卡上记录。
 2. **部署中断留下半成品**（`--status` 提示未完成的部署）：发布负责人 `deploy-dev --release-manager --recover`。
 3. **依赖问题**（数据库、磁盘、沙箱）：先按对应手册处理依赖，Worker 一般会自己恢复。
-4. **原因不明**：保留日志，派 Codex Astra 只读诊断（命令见 [m1-monitor.md](m1-monitor.md#诊断交给-codex)）。不要反复手动重启掩盖问题。
+4. **原因不明**：保留日志，派 `gpt-6.2-sol` `max` 只读诊断（命令见 [m1-monitor.md](m1-monitor.md#诊断交给-codex)）。不要反复手动重启掩盖问题。
 
 ## 定时控制器卡住
 
@@ -40,11 +40,11 @@ curl -s -m 5 http://127.0.0.1:3012/health/ready | head -c 600; echo
 由发布负责人重启 Worker：
 
 ```bash
-~/allrice-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/ai.bplabs.allrice-dev-worker
-curl -s -m 5 http://127.0.0.1:3012/health/ready | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("detail"), (d.get("nativeOnceControl") or {}).get("state"))'
+~/allrice40-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/ai.bplabs.allrice40-dev-worker
+curl -s -m 5 http://127.0.0.1:3312/health/ready | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["status"], d.get("detail"), (d.get("nativeOnceControl") or {}).get("state"))'
 ```
 
-`ready` 且控制器变成 `active` 就好了，再跑 `~/allrice-dev/bin/smoke-test --dev --only reminder`（每次重启 Worker 之后都跑）。重启后仍然 blocked，看 `lastFault`，派 Codex Astra 只读诊断；一直 `cold`（Worker 被 `kill -9`、崩溃或数据库在它运行时停掉后常见），见[手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)。
+`ready` 且控制器变成 `active` 就好了，再跑 `~/allrice40-dev/bin/smoke-test --dev --only reminder`（每次重启 Worker 之后都跑）。重启后仍然 blocked，看 `lastFault`，派 `gpt-6.2-sol` `max` 只读诊断；一直 `cold`（Worker 被 `kill -9`、崩溃或数据库在它运行时停掉后常见），见[手册 8“接管被拒”](m1-schedule-not-fired.md#接管被拒)。
 
 ## 内存不足、DSH 进程越积越多
 
@@ -67,8 +67,8 @@ ps -axo rss,command | sort -nr | head -15
 ## 确认恢复
 
 ```bash
-~/allrice-dev/bin/deploy-dev --status
-~/allrice-dev/bin/smoke-test --dev
+~/allrice40-dev/bin/deploy-dev --status
+~/allrice40-dev/bin/smoke-test --dev
 ```
 
 ## 谁来做

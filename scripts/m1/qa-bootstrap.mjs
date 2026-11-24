@@ -5,7 +5,7 @@
 // portal Host/Origin so the normal portal authentication and same-origin checks apply.
 //
 //   node qa-bootstrap.mjs --port <webPort> --company <name> --username <user> --creds <file>
-//                         [--env ~/allrice-dev/.env] [--rice <file>]  (default: rice-standard.json next to this script)
+//                         [--env ~/allrice40-dev/.env] [--rice <file>]  (default: rice-standard.json next to this script)
 //                         [--no-cloud --drop-skills <id,id>]
 // --no-cloud publishes Rice without the cloud-sandbox tools (and the given skills
 // that require them), for instances whose cloud execution is switched off.
@@ -34,7 +34,7 @@ const port = Number(args.port);
 const company = args.company;
 const username = args.username;
 const credsPath = args.creds;
-const envPath = args.env ?? `${home}/allrice-dev/.env`;
+const envPath = args.env ?? `${home}/allrice40-dev/.env`;
 // The standard definition ships next to this script, so it matches the installed tools.
 const ricePath =
   args.rice ?? fileURLToPath(new URL('./rice-standard.json', import.meta.url));

@@ -55,7 +55,7 @@ suite('platform repository credential browser write reconciliation', () => {
     });
     const token = 'github_pat_' + 'SyntheticOnly'.repeat(7);
     let settings = MaintenanceGithubBotSchema.parse({
-      repository: 'semiok/allrice',
+      repository: 'semiok/allrice-vm',
       revision: 0,
       configured: false,
       state: 'not_configured',

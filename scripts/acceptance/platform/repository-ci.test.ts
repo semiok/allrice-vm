@@ -32,6 +32,44 @@ import {
   repositoryGitMaterialLimits,
 } from './repository-git-material.mjs';
 
+import { readDevReleaseSha } from './repository-baseline-dev.mjs';
+
+it('registers a baseline against the matching 4.0 Web and Worker release', async () => {
+  const sourceSha = 'a'.repeat(40);
+  const replies = new Map([
+    ['http://127.0.0.1:3311/api/health/ready', 'web'],
+    ['http://127.0.0.1:3312/health/ready', 'worker'],
+  ]);
+  const reply = async (
+    url: string | URL | Request,
+    differentWorker: boolean,
+  ) => {
+    const service = replies.get(String(url));
+    return Response.json({
+      status: 'ready',
+      identity: {
+        sourceSha,
+        sourceTree: 'b'.repeat(40),
+        service,
+        mode: 'production',
+        environment: 'dev',
+        manifestDigest:
+          'sha256:' +
+          (differentWorker && service === 'worker' ? 'd' : 'c').repeat(64),
+      },
+    });
+  };
+  await expect(readDevReleaseSha((url) => reply(url, false))).resolves.toBe(
+    sourceSha,
+  );
+  await expect(readDevReleaseSha((url) => reply(url, true))).rejects.toThrow(
+    'REPOSITORY_DEV_IDENTITY_MISMATCH',
+  );
+  await expect(
+    readDevReleaseSha(async () => Response.json({ status: 'ready' })),
+  ).rejects.toThrow('REPOSITORY_DEV_IDENTITY_UNAVAILABLE');
+});
+
 describe('immutable CI material capture and final production inventory', () => {
   it('keeps CI and registered source bounds aligned, accepts the exact total bound and rejects overflow without omitting blobs', () => {
     expect(repositoryGitMaterialLimits).toEqual({
@@ -80,7 +118,7 @@ describe('immutable CI material capture and final production inventory', () => {
       const baseline = RepositoryBaselineSchema.parse({
         version: 1,
         id: randomUUID(),
-        repositoryId: 'semiok/allrice',
+        repositoryId: 'semiok/allrice-vm',
         sourceSha: git('rev-parse', 'HEAD'),
         gitTree: git('rev-parse', 'HEAD^{tree}'),
         sourceDigest: repositoryMaterialDigest(archive.files),
@@ -104,6 +142,12 @@ describe('immutable CI material capture and final production inventory', () => {
       expect(readRepositoryArchive(packed, baseline).files).toHaveLength(
         count + 1,
       );
+      expect(
+        RepositoryBaselineSchema.safeParse({
+          ...baseline,
+          repositoryId: 'semiok/allrice',
+        }).success,
+      ).toBe(false);
       expect(
         RepositoryBaselineSchema.safeParse({
           ...baseline,
@@ -261,8 +305,8 @@ describe('immutable CI material capture and final production inventory', () => {
             cwd: root,
             env: {
               ...process.env,
-              GITHUB_REPOSITORY: 'semiok/allrice',
-              GITHUB_REPOSITORY_ID: '1323769790',
+              GITHUB_REPOSITORY: 'semiok/allrice-vm',
+              GITHUB_REPOSITORY_ID: '1469490636',
               GITHUB_RUN_ID: '123',
               GITHUB_RUN_ATTEMPT: '2',
               GITHUB_JOB: 'validate',

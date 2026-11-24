@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 
 FIELDS = ('task ref sha webPort workerPort database nativeArtifactId cloudExecution '
-          'setup updatedAt owner card createdAt expiresAt').split()
+          'setup updatedAt owner card createdAt expiresAt repository repositoryId repositoryExpiresAt').split()
 
 
 def stamp(now=None):
@@ -65,9 +65,15 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
+def expiry_field(data):
+    # Old allocators see a 4.0 instance as legacy, never as auto-reclaimable.
+    return 'repositoryExpiresAt' if data.get('repository') == 'semiok/allrice-vm' else 'expiresAt'
+
+
 def expired(data):
     # Legacy instances have no lease: never guess permission to delete them.
-    return bool(data.get('expiresAt')) and epoch(data['expiresAt']) <= time.time()
+    value = data.get(expiry_field(data))
+    return bool(value) and epoch(value) <= time.time()
 
 
 def duration(start):
@@ -153,7 +159,7 @@ def describe(path):
     data = read(path)
     state = process_state(path, data)
     created = epoch(data['createdAt']) if data.get('createdAt') else path.stat().st_mtime
-    lease = 'expired' if expired(data) else ('leased' if data.get('expiresAt') else 'legacy')
+    lease = 'expired' if expired(data) else ('leased' if data.get(expiry_field(data)) else 'legacy')
     return data, state, '%s owner=%s card=%s age=%s process=%s lease=%s' % (
         path.parent.name, data.get('owner', '?'), data.get('card', '?'), duration(created), state, lease)
 
@@ -269,9 +275,10 @@ def main(args):
     if command == 'renew':
         if not data.get('createdAt') or not data.get('owner') or not data.get('card'):
             raise ValueError('legacy instance: down then up with owner/card to adopt a lease')
-        data.update(expiresAt=stamp(time.time() + seconds(args[1])), updatedAt=stamp())
+        field = expiry_field(data)
+        data.update({field: stamp(time.time() + seconds(args[1])), 'updatedAt': stamp()})
         write(path, data)
-        print('renewed %s until %s' % (path.parent.name, data['expiresAt']))
+        print('renewed %s until %s' % (path.parent.name, data[field]))
     elif command == 'reclaimable':
         sys.exit(0 if expired(data) and process_state(path, data) == 'stopped' else 1)
     elif command == 'archive':

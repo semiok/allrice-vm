@@ -3,12 +3,21 @@
 M1_LAUNCHCTL=/bin/launchctl
 M1_PY=/usr/bin/python3
 M1_UID=$(/usr/bin/id -u)
-M1_DEV_DISABLED="$HOME/allrice-dev/qa/deploy-disabled"
+M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
+
+# QA allocation remains shared with 3.x. Select an instance by explicit repository
+# identity before reading its credentials, stopping jobs or changing its database.
+qa_owned() {
+  "$M1_PY" -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except (OSError,ValueError): sys.exit(1)
+sys.exit(0 if d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
+}
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
 # incompatible code. Keep their environment available for recovery and forward fixes.
 dev_plist() { # web|worker -> active plist, or the parked configuration
-  local p="$HOME/Library/LaunchAgents/ai.bplabs.allrice-dev-$1.plist"
+  local p="$HOME/Library/LaunchAgents/ai.bplabs.allrice40-dev-$1.plist"
   [ -f "$p" ] || p="$M1_DEV_DISABLED/$1.plist"
   printf '%s\n' "$p"
 }

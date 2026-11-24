@@ -2,7 +2,6 @@ import { readRepositoryGitMaterial } from './repository-git-material.mjs';
 import { execFileSync } from 'node:child_process';
 import {
   mkdirSync,
-  readFileSync,
   realpathSync,
   renameSync,
   writeFileSync,
@@ -23,6 +22,8 @@ import {
   repositoryDigest,
   loadRepositoryBaseline,
 } from '../../../packages/database/src/platform-repository-source.ts';
+import { platformRepository } from '../../../packages/database/src/platform-repository-credential-contracts.ts';
+import { readDevReleaseSha } from './repository-baseline-dev.mjs';
 import { prepareRepositoryCompiledDependencies } from './repository-compiled-dependencies.ts';
 
 // Operator CLI, not a model or HTTP tool. It cannot change refs or the worktree.
@@ -35,6 +36,7 @@ const directory = option('repository-dir'),
 if (!directory || !output)
   throw Error('Supply --repository-dir and --output-dir');
 const root = realpathSync(resolve(directory));
+const repository = platformRepository.fullName;
 const git = (...args: string[]) =>
   execFileSync('git', args, {
     cwd: root,
@@ -44,9 +46,9 @@ const git = (...args: string[]) =>
 if (
   git('rev-parse', '--show-toplevel') !== root ||
   ![
-    'https://github.com/semiok/allrice.git',
-    'https://github.com/semiok/allrice',
-    'git@github.com:semiok/allrice.git',
+    `https://github.com/${repository}.git`,
+    `https://github.com/${repository}`,
+    `git@github.com:${repository}.git`,
   ].includes(git('remote', 'get-url', 'origin')) ||
   git('status', '--porcelain')
     .split('\n')
@@ -86,13 +88,11 @@ const hash = repositoryDigest(
       : ''),
 ).slice(7);
 const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
-const active = JSON.parse(
-  readFileSync('/Users/a123/allrice-dev/.local/active-release.json', 'utf8'),
-);
+const observedDevSha = await readDevReleaseSha();
 const baseline = RepositoryBaselineSchema.parse({
   version: 1,
   id,
-  repositoryId: 'semiok/allrice',
+  repositoryId: repository,
   sourceSha: sha,
   gitTree: tree,
   sourceDigest,
@@ -103,7 +103,7 @@ const baseline = RepositoryBaselineSchema.parse({
   archiveBytes: bytes.length,
   fileCount: files.length,
   sourceBytes: files.reduce((n, f) => n + f.sizeBytes, 0),
-  observedDevSha: active.releaseSha,
+  observedDevSha,
   registeredAt: new Date().toISOString(),
   materializer: 'git-tracked-json-gzip-v1',
   profileId: repairProfileId,

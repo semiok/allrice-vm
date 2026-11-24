@@ -9,7 +9,7 @@ export function repairFixture(
   baseline = RepositoryBaselineSchema.parse({
     version: 1,
     id: randomUUID(),
-    repositoryId: 'semiok/allrice',
+    repositoryId: 'semiok/allrice-vm',
     sourceSha: 'a'.repeat(40),
     gitTree: 'b'.repeat(40),
     sourceDigest: 'sha256:' + 'a'.repeat(64),

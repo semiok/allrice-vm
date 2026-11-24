@@ -13,6 +13,8 @@ import {
   compiledRepairProfileId,
   legacyCompiledRepairInputBytes,
 } from './platform-repair-compiled-contracts.ts';
+import { platformRepository } from './platform-repository-credential-contracts.ts';
+
 export * from './platform-repair-compiled-contracts.ts';
 
 // Private platform source/profile contract. Ordinary project and Bridge limits
@@ -68,7 +70,7 @@ export const RepositoryBaselineSchema = z
   .object({
     version: z.literal(1),
     id: UuidSchema,
-    repositoryId: z.literal('semiok/allrice'),
+    repositoryId: z.literal(platformRepository.fullName),
     sourceSha: z.string().regex(/^[a-f0-9]{40}$/),
     gitTree: z.string().regex(/^[a-f0-9]{40}$/),
     sourceDigest: ChecksumSchema,

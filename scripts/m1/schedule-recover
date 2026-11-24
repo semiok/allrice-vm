@@ -44,11 +44,12 @@ ts=$(date +%Y%m%d-%H%M%S)
 case "$mode" in
   dev)
     [ -z "$execute" ] || [ -n "$manager" ] || die "only the release manager changes the shared Dev (AGENTS.md §9): add --release-manager" 6
-    LABEL=ai.bplabs.allrice-dev-worker; LOCK="$HOME/allrice-dev/.local/deploy.lock"
-    ROOTS="$HOME/allrice-dev-releases/"; ENVFILE="$HOME/allrice-dev/.env"
-    OUT="$HOME/allrice-backups/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --dev --only reminder" ;;
+    LABEL=ai.bplabs.allrice40-dev-worker; LOCK="$HOME/allrice40-dev/.local/deploy.lock"
+    ROOTS="$HOME/allrice40-dev-releases/"; ENVFILE="$HOME/allrice40-dev/.env"
+    OUT="$HOME/allrice40-backups/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --dev --only reminder" ;;
   instance)
     [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] && [ -f "$HOME/allrice-qa/$task/instance.json" ] || die "no QA instance: $task" 2
+    qa_owned "$HOME/allrice-qa/$task/instance.json" || die "QA instance belongs to another repository: $task" 2
     LABEL=ai.bplabs.allrice-qa-$task-worker; LOCK="$HOME/allrice-qa/.task-$task.lock"
     ROOTS="$HOME/allrice-qa/$task/"; ENVFILE="$HOME/allrice-qa/$task/.env"
     OUT="$HOME/allrice-qa/$task/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;

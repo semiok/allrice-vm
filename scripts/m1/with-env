@@ -1,6 +1,6 @@
 #!/bin/bash
 # with-env web|worker <command...> — run with the current launchd environment of that
-# shared-Dev service (~/allrice-dev/.env plus the plist's EnvironmentVariables,
+# shared-Dev service (~/allrice40-dev/.env plus the plist's EnvironmentVariables,
 # including a configuration parked by a refused recovery), excluding retired settings.
 # deploy-dev also uses this entrypoint for launchd so startup and precheck clean alike.
 # Refuses to run when the environment cannot be read, so nothing runs half-configured.
@@ -11,8 +11,8 @@ role=${1:-}; case "$role" in web|worker) ;; *) die "usage: with-env web|worker <
 shift; [ $# -ge 1 ] || die "no command given"
 plist=$(dev_plist "$role")
 [ -f "$plist" ] || die "missing $plist"
-[ -f "$HOME/allrice-dev/.env" ] || die "missing ~/allrice-dev/.env"
-set -a; source "$HOME/allrice-dev/.env"; set +a
+[ -f "$HOME/allrice40-dev/.env" ] || die "missing ~/allrice40-dev/.env"
+set -a; source "$HOME/allrice40-dev/.env"; set +a
 exports=$(/usr/bin/python3 - "$plist" <<'PY'
 import os,plistlib,shlex,sys
 env=plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']

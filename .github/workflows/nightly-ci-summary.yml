@@ -15,7 +15,8 @@ jobs:
   summarize:
     # A separate completed-event workflow also records cancelled scheduled CI.
     if: >-
-      always() && github.event.workflow_run.event == 'schedule' &&
+      always() && github.repository == 'semiok/allrice-vm' &&
+      github.repository_id == '1469490636' && github.event.workflow_run.event == 'schedule' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       github.event.workflow_run.path == '.github/workflows/ci.yml'
     runs-on: ubuntu-latest

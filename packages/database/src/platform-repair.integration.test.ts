@@ -254,7 +254,7 @@ suite('MET167 private repository repair normal Employee Run authority', () => {
     baseline = RepositoryBaselineSchema.parse({
       version: 1,
       id: randomUUID(),
-      repositoryId: 'semiok/allrice',
+      repositoryId: 'semiok/allrice-vm',
       sourceSha: 'a'.repeat(40),
       gitTree: 'b'.repeat(40),
       sourceDigest: repositoryMaterialDigest(archive.files),

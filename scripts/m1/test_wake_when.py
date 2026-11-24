@@ -31,7 +31,7 @@ class WakeWhen(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
-        self.base = self.home / 'allrice-dev'
+        self.base = self.home / 'allrice40-dev'
         self.base.mkdir()
         (self.base / 'wake-when.threads').write_text(THREADS.read_text())
         sessions = self.home / '.codex/sessions'
@@ -281,7 +281,7 @@ time.sleep(60)
         self.assertFalse(stale.exists())
         self.assert_released(item)
 
-    def fake_ci(self):
+    def fake_ci(self, repository='semiok/allrice'):
         gh = self.home / 'gh'
         gh.write_text('#!' + sys.executable + '''
 import json, os, sys, time
@@ -331,8 +331,9 @@ print('HTTP/2.0 200 OK\\nContent-Type: application/json\\n')
 print(json.dumps(dict(id=7 if mode == 'wrong-id' else 43868459286,
                      status=status, conclusion=mode if mode in ('failure','cancelled') else 'success')))
 ''')
+        gh.write_text(gh.read_text().replace('semiok/allrice', repository))
         gh.chmod(0o755)
-        return [str(gh), 'run', 'watch', '43868459286', '--repo', 'semiok/allrice', '--exit-status']
+        return [str(gh), 'run', 'watch', '43868459286', '--repo', repository, '--exit-status']
 
     def test_eof_reattaches_same_ci_without_early_wake_then_reports_real_success(self):
         command = self.fake_ci()
@@ -372,6 +373,37 @@ print(json.dumps(dict(id=7 if mode == 'wrong-id' else 43868459286,
             self.assertIn('at least 30 seconds', result.stderr)
         self.assertFalse((self.base / 'qa/wake-when').exists())
         self.assertFalse((self.home / 'gh-calls.jsonl').exists())
+
+    def test_top_level_repository_and_interval_are_bound_to_the_same_ci_run(self):
+        module = self.load_wake()
+        command = ['gh', 'run', 'watch', '42', '--exit-status']
+        target = module.ci_target(command, 'semiok/allrice-vm', 60)
+        self.assertEqual(target, dict(run=42, repo='semiok/allrice-vm', interval=60))
+        self.assertEqual(command, ['gh', 'run', 'watch', '42', '--repo', 'semiok/allrice-vm',
+                                  '--exit-status', '--interval', '60'])
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            module.ci_target(['gh', 'run', 'watch', '42', '--repo', 'semiok/allrice', '--exit-status'],
+                             'semiok/allrice-vm', 60)
+        with self.assertRaisesRegex(ValueError, 'conflicts'):
+            module.ci_target(['gh', 'run', 'watch', '42', '--repo', 'semiok/allrice-vm',
+                              '--exit-status', '--interval', '120'], 'semiok/allrice-vm', 60)
+        with self.assertRaisesRegex(ValueError, 'at least 30 seconds'):
+            module.ci_target(['gh', 'run', 'watch', '42', '--exit-status'], 'semiok/allrice-vm', 29)
+
+    def test_new_repository_top_level_ci_options_reach_watch_and_api_without_crossing_repositories(self):
+        command = self.fake_ci('semiok/allrice-vm')
+        command[4:6] = []
+        item = self.start('', command=command, timeout='5s',
+                          options=['--repo', 'semiok/allrice-vm', '--interval', '60'],
+                          extra_env={'CI_MODE': 'success'})
+        state = self.finished(item)
+        self.assertEqual(state['ci']['repo'], 'semiok/allrice-vm')
+        self.assertEqual(state['task']['conclusion'], 'success')
+        calls = [json.loads(line) for line in (self.home / 'gh-calls.jsonl').read_text().splitlines()]
+        self.assertEqual(calls[0], ['run', 'watch', '43868459286', '--repo', 'semiok/allrice-vm',
+                                    '--exit-status', '--interval', '60'])
+        self.assertEqual(calls[1], ['api', '--include', 'repos/semiok/allrice-vm/actions/runs/43868459286'])
+        self.assert_released(item)
 
     def test_rate_limit_waits_until_reset_without_early_notification(self):
         item = self.start('', command=self.fake_ci(), timeout='12s', extra_env={'CI_MODE': 'rate'})
@@ -607,7 +639,7 @@ print(json.dumps(dict(id=7 if mode == 'wrong-id' else 43868459286,
         fixture.setUp()
         queue_source = self.codex.read_text()
         self.home = Path(fixture.m1)
-        self.base = self.home / 'allrice-dev'
+        self.base = self.home / 'allrice40-dev'
         self.base.mkdir(exist_ok=True)
         (self.base / 'wake-when.threads').write_text(THREADS.read_text())
         sessions = self.home / '.codex/sessions'
@@ -657,7 +689,7 @@ print(json.dumps(dict(id=7 if mode == 'wrong-id' else 43868459286,
         command.write_text('#!' + sys.executable + '''
 import os
 from pathlib import Path
-root=Path.home()/'allrice-dev/qa/m5-test'
+root=Path.home()/'allrice40-dev/qa/m5-test'
 root.mkdir(parents=True,exist_ok=True)
 mode=os.environ['M5_RECEIPT']
 pid=os.getpid() if mode!='other-run' else 1
@@ -685,7 +717,7 @@ print(line)
         self.assertEqual(state['task']['status'], 'completed')
         receipt = json.loads(Path(state['terminalFile']).read_text())
         self.assertEqual((receipt['status'], receipt['exitCode']), ('completed', 6))
-        self.assertFalse((self.home / 'allrice-dev-releases').exists())
+        self.assertFalse((self.home / 'allrice40-dev-releases').exists())
         self.assert_released(item)
 
     def test_installer_seeds_whitelist_once_and_preserves_thread_rotation_on_upgrade(self):

@@ -70,7 +70,7 @@ suite(
       expect(result).toMatchObject({
         state: 'configured',
         revision: 1,
-        repository: 'semiok/allrice',
+        repository: 'semiok/allrice-vm',
         lastWriteRequestId: requestId,
       });
       expect(JSON.stringify(result)).not.toContain(token);
@@ -85,7 +85,7 @@ suite(
       expect(events).toHaveLength(1);
       expect(events[0]!.metadata).toEqual({
         revision: 1,
-        repositoryId: 1323769790,
+        repositoryId: 1469490636,
       });
     });
     it('isolates other administrators, refuses stale updates and rechecks revoked logins', async () => {

@@ -16,8 +16,8 @@ afterEach(async () => {
 });
 
 it.each([
-  'allrice-dev-releases/203d4532',
-  'allrice-worktrees/met-218-qa-build-identity',
+  'allrice40-dev-releases/203d4532',
+  'allrice40-worktrees/met-218-qa-build-identity',
   'allrice-qa/met-218-check/release',
   `allrice-qa/${'a'.repeat(31)}/release`,
 ])(
@@ -30,8 +30,8 @@ it.each([
 );
 
 it.each([
-  'allrice-dev-releases/203d4532/nested',
-  'allrice-worktrees/task/nested',
+  'allrice40-dev-releases/203d4532/nested',
+  'allrice40-worktrees/task/nested',
   'allrice-qa/met-218-check',
   'allrice-qa/release',
   'allrice-qa/met-218-check/other',
@@ -41,6 +41,8 @@ it.each([
   'allrice-qa/task_name/release',
   `allrice-qa/${'a'.repeat(32)}/release`,
   'uncontrolled/task/release',
+  'allrice-dev-releases/old-release',
+  'allrice-worktrees/old-task',
 ])(
   'rejects roots outside the supported directory and task boundaries: %s',
   async (path) => {

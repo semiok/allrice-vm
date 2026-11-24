@@ -9,11 +9,11 @@
 ## 第一步
 
 ```bash
-curl -s -m 5 http://127.0.0.1:3012/health/ready | /usr/bin/python3 -c 'import json,sys
+curl -s -m 5 http://127.0.0.1:3312/health/ready | /usr/bin/python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for k in ("nativeOnceControl","nativeRecurringControl"):
     c=d.get(k) or {}; print(k, c.get("state"), "ticks", c.get("tickCount"), "faults", c.get("faultCount"), "inFlight", c.get("inFlight"))'
-grep -iE "schedule|recurring|once" ~/Library/Logs/allrice-dev-worker.err.log | tail -30
+grep -iE "schedule|recurring|once" ~/Library/Logs/allrice40-dev-worker.err.log | tail -30
 ```
 
 隔一分钟再看一次 `tickCount`：在涨说明控制器活着。状态的含义（与监控的判断一致）：
@@ -28,7 +28,7 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice-dev-worker.err.log | t
 
 ## 处理
 
-1. **`blocked`/`closed`/`quarantined`、`cold` 且 `lastFault.phase` 是 `initialization`，或 `tickCount` 不涨**：整个 Worker 的定时部分停了。由发布负责人**重启 Worker**，命令见 [m1-worker-crash.md](m1-worker-crash.md#定时控制器卡住)（数据库断开过之后常见：`native_once_blocked`，不会自己恢复）。重启后仍不对，回滚到上一个版本，并派 Codex Astra 只读诊断。`disabled`、短暂的 `cold` 和 `starting` 不需要处理；一直 `cold` 见“接管被拒”。
+1. **`blocked`/`closed`/`quarantined`、`cold` 且 `lastFault.phase` 是 `initialization`，或 `tickCount` 不涨**：整个 Worker 的定时部分停了。由发布负责人**重启 Worker**，命令见 [m1-worker-crash.md](m1-worker-crash.md#定时控制器卡住)（数据库断开过之后常见：`native_once_blocked`，不会自己恢复）。重启后仍不对，回滚到上一个版本，并派 `gpt-6.2-sol` `max` 只读诊断。`disabled`、短暂的 `cold` 和 `starting` 不需要处理；一直 `cold` 见“接管被拒”。
 2. **`faultCount` 在涨**：控制器在跑但处理任务出错，看 Worker 日志里对应的错误码，按出错的任务处理。
 3. **控制器正常，个别任务没触发**：业务巡检告警里给了任务 ID。查任务状态和最近一次运行：
 
@@ -51,7 +51,7 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice-dev-worker.err.log | t
 1. 只读演示，看哪些分区卡住、会做什么：
 
    ```bash
-   ~/allrice-dev/bin/schedule-recover --dev
+   ~/allrice40-dev/bin/schedule-recover --dev
    ```
 
    标着 `ORPHAN` 的就是卡住的分区。退出码 4 表示有租约还没到期、又不是正在运行的 Worker 持有（比如 Worker 刚停）：到提示的时间之后再跑。别的状态（`closed, but its proof is not the audited one`、`open with an audit row`）这个工具不处理，派 Codex 只读诊断。
@@ -59,7 +59,7 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice-dev-worker.err.log | t
 2. 在 MET 卡上说一声，然后执行（最长约 5 分钟；从 agent 里跑要给足超时）：
 
    ```bash
-   ~/allrice-dev/bin/schedule-recover --dev --release-manager --execute
+   ~/allrice40-dev/bin/schedule-recover --dev --release-manager --execute
    ```
 
    它自己持部署锁（不要再套 `deploy-lock run`，也不能在持锁的 shell 里跑），依次：
@@ -75,5 +75,5 @@ grep -iE "schedule|recurring|once" ~/Library/Logs/allrice-dev-worker.err.log | t
 `scheduler`、`scheduler_takeover` 告警自动恢复后，用冒烟测试的提醒项确认（**每次重启 Worker 之后都跑**）：
 
 ```bash
-~/allrice-dev/bin/smoke-test --dev --only reminder
+~/allrice40-dev/bin/smoke-test --dev --only reminder
 ```

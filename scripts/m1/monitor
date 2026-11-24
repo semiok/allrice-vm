@@ -61,27 +61,27 @@ COMMON = {
     'confirmSeconds': 20,
     'roundTimeoutSeconds': 240,
     'intervalSeconds': 300,
-    'runbooks': 'https://github.com/semiok/allrice/blob/main/docs/runbooks/',
+    'runbooks': 'https://github.com/semiok/allrice-vm/blob/main/docs/runbooks/',
     'launchdLabel': None,
     'checks': None,  # run only these checks (names below); None = all
     'skipChecks': [],
 }
 M1 = dict(
     COMMON,
-    name='AllRice M1 Dev',
+    name='AllRice 4.0 M1 Dev',
     # Every 4 minutes: first look + the 20-second re-check + delivery stays under the
     # 10-minute target also for alerts that need two looks (a flapping key, the peer).
     intervalSeconds=240,
-    stateDir='~/allrice-dev/monitor',
-    envFile='~/allrice-dev/.env',
-    webPlist='~/Library/LaunchAgents/ai.bplabs.allrice-dev-web.plist',
-    workerPlist='~/Library/LaunchAgents/ai.bplabs.allrice-dev-worker.plist',
-    deployLock='~/allrice-dev/.local/deploy.lock',
-    deployInflight='~/allrice-dev/qa/deploy-inflight',
+    stateDir='~/allrice40-dev/monitor',
+    envFile='~/allrice40-dev/.env',
+    webPlist='~/Library/LaunchAgents/ai.bplabs.allrice40-dev-web.plist',
+    workerPlist='~/Library/LaunchAgents/ai.bplabs.allrice40-dev-worker.plist',
+    deployLock='~/allrice40-dev/.local/deploy.lock',
+    deployInflight='~/allrice40-dev/qa/deploy-inflight',
     deployGraceMinutes=45,
     psql='/opt/homebrew/bin/psql',
     peerSsh='huihuimac',
-    peerHeartbeat='.local/state/allrice-monitor-peer/heartbeat.json',
+    peerHeartbeat='.local/state/allrice40-monitor-peer/heartbeat.json',
     peerStaleMinutes=4,  # the peer starts a round every minute and writes its heartbeat then
     peerUnfinishedMinutes=4,
     peerTelegramStuckMinutes=3,  # the peer sends every minute: three failed rounds
@@ -94,14 +94,11 @@ M1 = dict(
     workerUrl=None,
     publicUrl=None,
     # component checks
-    tunnelLabel='ai.bplabs.allrice-m1-tunnel',
+    tunnelLabel='ai.bplabs.allrice40-dev-tunnel',
     tunnelMetrics=['http://127.0.0.1:%d/ready' % p for p in range(20241, 20246)],
-    # The other hostnames the tunnel serves for the same Web (~/.cloudflared/allrice-m1.yml,
-    # moved over at the 10-26 cutover, MET-216): probed like publicUrl, each its own alert.
-    # allrice-dsh is the server Rice Bridge pairs with (AllRicePairingServerURL); its root
-    # redirects to allrice-admin, so a path it serves itself is probed.
-    extraPublicUrls=['https://allrice.bplabs.xyz', 'https://allrice-admin.bplabs.xyz',
-                     'https://allrice-dsh.bplabs.xyz/api/health/ready'],
+    # Approved 4.0 hostnames. Routing and the isolated tunnel are configured only
+    # after deployment authorization; do not reuse the 3.x Bridge hostname.
+    extraPublicUrls=['https://allrice.bplabs.xyz', 'https://allrice-admin.bplabs.xyz'],
     docker='/opt/homebrew/bin/docker',
     officeContainer='allrice-office-renderer',
     vmWatchdog='allrice-cloud-watchdog',
@@ -116,8 +113,8 @@ M1 = dict(
     # The Worker keeps a DSH process per used conversation until it restarts (about
     # 100-180 MB each), so the count only grows between deploys.
     dshWarnProcesses=30,
-    backupLog='~/allrice-backups/logs/backup.log',
-    backupLabel='ai.bplabs.allrice-dev-backup',
+    backupLog='~/allrice40-backups/logs/backup.log',
+    backupLabel='ai.bplabs.allrice40-dev-backup',
     backupWarnHours=26,
     backupCriticalHours=50,
     subscriptionStaleMinutes=30,
@@ -146,17 +143,17 @@ M1 = dict(
         'failure_baseline_days': 7, 'failure_increase_min': 3, 'failure_increase_ratio': 2,
         'online_wait_warn_pct': 80, 'online_wait_critical_pct': 95,  # monitor quota alert convention; never execution limits
     },
-    pgLog='/opt/homebrew/var/log/postgresql@17.log',  # log_line_prefix '%m [%p] %d ' names the database
+    pgLog='~/allrice40-dev/.local/postgres/server.log',  # log_line_prefix '%m [%p] %d ' names the database
 )
 PEER = dict(
     COMMON,
     name='AllRice 看门（huihuimac）',
-    stateDir='~/.local/state/allrice-monitor-peer',
-    telegramEnv='~/.config/allrice-monitor/telegram.env',
+    stateDir='~/.local/state/allrice40-monitor-peer',
+    telegramEnv='~/.config/allrice40-monitor/telegram.env',
     m1Ssh='m1',
-    m1Heartbeat='allrice-dev/monitor/heartbeat.json',
-    m1DeployLock='allrice-dev/.local/deploy.lock',
-    m1Monitor='allrice-dev/bin/monitor',  # writes this side's incidents into M1's table
+    m1Heartbeat='allrice40-dev/monitor/heartbeat.json',
+    m1DeployLock='allrice40-dev/.local/deploy.lock',
+    m1Monitor='allrice40-dev/bin/monitor',  # writes this side's incidents into M1's table
     m1MonitorConfig=None,
     # M1 starts a round every 4 minutes and writes its heartbeat then: 6 minutes stale plus
     # one peer interval keeps "M1 monitor stopped" under 10 minutes.
@@ -735,7 +732,7 @@ def check_deploy(r):
     if not os.path.exists(expand(r.cfg['deployInflight'])) or deploying(r):
         return [finding('deploy', 'ok', '部署中断未恢复')]
     return [finding('deploy', 'critical', '部署中断未恢复', '%s 还在，但没有部署在进行：上一次部署被强行中止，Dev 可能停在半途' % r.cfg['deployInflight'],
-                    'm1-worker-crash.md', '~/allrice-dev/bin/deploy-dev --status（恢复由发布负责人 deploy-dev --release-manager --recover）')]
+                    'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status（恢复由发布负责人 deploy-dev --release-manager --recover）')]
 
 
 def check_service(r, role):
@@ -744,7 +741,7 @@ def check_service(r, role):
         return None
     path = '/api/health/ready' if role == 'web' else '/health/ready'
     title = 'Web 不可用' if role == 'web' else 'Worker 不可用'
-    step = '~/allrice-dev/bin/deploy-dev --status; tail -50 ~/Library/Logs/allrice-dev-%s.err.log' % role
+    step = '~/allrice40-dev/bin/deploy-dev --status; tail -50 ~/Library/Logs/allrice40-dev-%s.err.log' % role
     if not label or not base:
         return [finding(role, 'warning', title + '（读不到配置）', 'launchd 文件 %s 缺失或不完整' % r.cfg[role + 'Plist'], 'm1-worker-crash.md', step)]
     state, _, last = job_info(label)
@@ -766,7 +763,7 @@ def check_service(r, role):
             ctl = (answer or {}).get('nativeOnceControl' if 'once' in stuck else 'nativeRecurringControl') or {}
             out.append(finding('worker_stuck', 'critical', 'Worker 定时控制器卡住，要重启 Worker', '%s；控制器 %s，lastFault %s' % (
                 stuck, ctl.get('state'), short(json.dumps(ctl.get('lastFault'), ensure_ascii=False), 160)), 'm1-worker-crash.md#定时控制器卡住',
-                '发布负责人：~/allrice-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/%s' % label))
+                '发布负责人：~/allrice40-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/%s' % label))
         elif answer is not None:
             out.append(finding('worker_stuck', 'ok', 'Worker 定时控制器卡住，要重启 Worker'))
     return out
@@ -788,7 +785,7 @@ def check_versions(r):
     if a == b:
         return [finding('versions', 'ok', 'Web 与 Worker 版本不一致')]
     return [finding('versions', 'warning', 'Web 与 Worker 版本不一致', 'Web %s，Worker %s' % ((a or '?')[:8], (b or '?')[:8]),
-                    'm1-worker-crash.md', '~/allrice-dev/bin/deploy-dev --status')]
+                    'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status')]
 
 
 def check_scheduler(r):
@@ -885,7 +882,7 @@ def check_scheduler_takeover(r):
             problems.append('%s 已 cold %s，分区 %s %s%s' % (name, ago(since), part, '，'.join(why), '，定时任务不会触发' if bad == 'critical' else ''))
             sev = max(sev, bad, key=RANK.get)
     return [finding('scheduler_takeover', sev, '定时控制器接管不了分区', '；'.join(problems), 'm1-schedule-not-fired.md#接管被拒',
-                    '~/allrice-dev/bin/schedule-recover --dev（只读演示；由发布负责人加 --release-manager --execute 恢复）')]
+                    '~/allrice40-dev/bin/schedule-recover --dev（只读演示；由发布负责人加 --release-manager --execute 恢复）')]
 
 
 def check_restarts(r):
@@ -1536,7 +1533,7 @@ def check_backup(r):
     """The last successful run (backup.log) and how the last run ended (launchd's exit
     code), so a failed 04:00 run alerts with the next round, not a day later."""
     path, last = expand(r.cfg['backupLog']), None
-    step = 'tail -20 ~/allrice-backups/logs/backup.err.log; ls -la ~/allrice-backups/db | tail -3'
+    step = 'tail -20 ~/allrice40-backups/logs/backup.err.log; ls -la ~/allrice40-backups/db | tail -3'
     try:
         with open(path, errors='replace') as f:
             for line in f.readlines()[-100:]:
@@ -1605,7 +1602,7 @@ def judge_heartbeat(r, hb, keys, titles, stale, unfinished, stuck, severity, run
 def check_peer(r):
     """The huihuimac watchdog: without it nobody would notice M1 itself going down."""
     hb, err, _, _ = read_remote_heartbeat(r.cfg['peerSsh'], r.cfg['peerHeartbeat'])
-    step = 'ssh %s "launchctl print gui/\\$(id -u)/ai.bplabs.allrice-monitor-peer | head -20"' % r.cfg['peerSsh']
+    step = 'ssh %s "launchctl print gui/\\$(id -u)/ai.bplabs.allrice40-dev-monitor-peer | head -20"' % r.cfg['peerSsh']
     if not hb:
         return [finding('peer', 'warning', 'huihuimac 看门失效', err + '；M1 整机故障时将没人报警', 'm1-monitor.md', step)]
     r.facts['peer'] = hb
@@ -1625,7 +1622,7 @@ def check_monitor(r):
 
 
 # ---------- business checks (SQL, read-only) ----------
-# Each query is one SELECT on allrice_dev; thresholds come from the config key "business"
+# Each query is one SELECT on allrice40_dev; thresholds come from the config key "business"
 # as psql variables. The state semantics behind every query (which column is the
 # heartbeat, how a schedule proves it fired, where "unknown outcome" lives) are written
 # up with code references in docs/runbooks/m1-monitor.md#业务巡检. Queue, stuck and
@@ -1914,7 +1911,7 @@ select coalesce(json_agg(g order by g.today desc, g.code), '[]') as groups from 
   from f group by code having count(*) filter (where today) > 0) g"""
 
 BUSINESS_RUNBOOK = 'm1-monitor.md#业务巡检'
-SQL_STEP = 'psql 查 allrice_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
+SQL_STEP = 'psql 查 allrice40_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
 
 
 def biz(r, sql):
@@ -2529,7 +2526,7 @@ def check_m1(r):
     cannot be reached only m1_reachable is judged: its heartbeat is unknown, not stale."""
     cfg = r.cfg
     hb, err, reachable, holders = read_remote_heartbeat(cfg['m1Ssh'], cfg['m1Heartbeat'], cfg['m1DeployLock'])
-    step = 'ssh %s "~/allrice-dev/bin/monitor status"' % cfg['m1Ssh']
+    step = 'ssh %s "~/allrice40-dev/bin/monitor status"' % cfg['m1Ssh']
     out = [finding('m1_reachable', 'ok' if reachable else 'critical', 'M1 连不上', err + '（整机宕机、断网或 Tailscale 断开）',
                    'm1-monitor.md', 'tailscale status; ssh -v %s true' % cfg['m1Ssh'])]
     if not reachable:
@@ -2565,7 +2562,7 @@ PEER_CHECKS = [
 
 
 def launchd(cfg, action, peer):
-    label = cfg['launchdLabel'] or ('ai.bplabs.allrice-monitor-peer' if peer else 'ai.bplabs.allrice-dev-monitor')
+    label = cfg['launchdLabel'] or ('ai.bplabs.allrice40-dev-monitor-peer' if peer else 'ai.bplabs.allrice40-dev-monitor')
     path = expand('~/Library/LaunchAgents/%s.plist' % label)
     domain = 'gui/%d' % os.getuid()
     run(['/bin/launchctl', 'bootout', '%s/%s' % (domain, label)], 30)

@@ -55,8 +55,8 @@ suite('platform repository credential browser write reconciliation', () => {
     });
     const token = 'github_pat_' + 'SyntheticOnly'.repeat(7);
     let settings: PlatformRepositoryCredential = {
-      repositoryId: 1323769790,
-      repository: 'semiok/allrice',
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
       revision: 0,
       configured: false,
       state: 'not_configured',

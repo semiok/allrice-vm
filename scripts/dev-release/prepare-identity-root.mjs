@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 export async function resolveServiceBuildRoot(directory, home = homedir()) {
   const root = await realpath(resolve(directory));
-  const directRelease = ['allrice-dev-releases', 'allrice-worktrees'].some(
+  const directRelease = ['allrice40-dev-releases', 'allrice40-worktrees'].some(
     (parent) => dirname(root) === join(home, parent),
   );
   const taskRoot = dirname(root);

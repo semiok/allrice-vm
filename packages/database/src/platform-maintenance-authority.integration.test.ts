@@ -221,8 +221,8 @@ suite('immutable report-bound maintenance authority', () => {
             String(url).endsWith('/user')
               ? { id: 901, login: 'rice-maintenance' }
               : {
-                  id: 1323769790,
-                  full_name: 'semiok/allrice',
+                  id: 1469490636,
+                  full_name: 'semiok/allrice-vm',
                   permissions: { push: true },
                 },
           )) as typeof fetch,
@@ -275,7 +275,7 @@ suite('immutable report-bound maintenance authority', () => {
     baseline = RepositoryBaselineSchema.parse({
       version: 1,
       id: randomUUID(),
-      repositoryId: 'semiok/allrice',
+      repositoryId: 'semiok/allrice-vm',
       sourceSha: 'a'.repeat(40),
       gitTree: 'b'.repeat(40),
       sourceDigest: repositoryMaterialDigest(files),
@@ -447,6 +447,12 @@ suite('immutable report-bound maintenance authority', () => {
     const d = await recordMaintenanceDiagnosis(r.reportId, proof);
     expect(d.targetSha).toBe('a'.repeat(40));
     expect(d.defectId).not.toBeNull();
+    const [defect] =
+      await fixture.db`select repository_id from allrice_platform_maintenance_defects where id=${d.defectId}`;
+    expect(String(defect?.repository_id)).toBe('1469490636');
+    await expect(
+      fixture.db`update allrice_platform_maintenance_defects set repository_id=1323769790 where id=${d.defectId}`,
+    ).rejects.toMatchObject({ code: '23514' });
     expect((await recordMaintenanceDiagnosis(r.reportId, proof)).id).toBe(d.id);
     await expect(
       getMaintenanceReportAuthority(other, r.reportId),
@@ -1436,8 +1442,8 @@ suite('immutable report-bound maintenance authority', () => {
             String(url).endsWith('/user')
               ? { id: 901, login: 'rice-maintenance' }
               : {
-                  id: 1323769790,
-                  full_name: 'semiok/allrice',
+                  id: 1469490636,
+                  full_name: 'semiok/allrice-vm',
                   permissions: { push: true },
                 },
           )) as typeof fetch,

@@ -44,7 +44,7 @@ const manifestBodySchema = z
   .object({
     version: z.literal(1),
     environment: z.literal('dev'),
-    repository: z.literal('semiok/allrice'),
+    repository: z.literal('semiok/allrice-vm'),
     sourceSha: sha,
     sourceTree: sha,
     webBuildId: z.string().min(1).max(200),
@@ -410,7 +410,7 @@ export async function prepareServiceBuildManifest(input: {
   const body = manifestBodySchema.parse({
     version: 1,
     environment: 'dev',
-    repository: 'semiok/allrice',
+    repository: 'semiok/allrice-vm',
     sourceSha: input.sourceSha,
     sourceTree: input.sourceTree,
     webBuildId: (await bytesAt(root, 'apps/web/.next/BUILD_ID', input.observe))

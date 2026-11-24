@@ -115,7 +115,7 @@ export async function prepareDevelopmentDatabase() {
     run('docker', [
       'compose',
       '--project-name',
-      'allrice-dev',
+      'allrice40-dev',
       '--file',
       'compose.dev.yaml',
       'up',
@@ -167,7 +167,7 @@ export async function prepareOfficeRenderer() {
     run('docker', [
       'compose',
       '--project-name',
-      'allrice-dev',
+      'allrice40-dev',
       '--file',
       'compose.dev.yaml',
       'up',

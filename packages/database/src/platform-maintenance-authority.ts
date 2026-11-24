@@ -31,6 +31,8 @@ import {
   maintenanceGithubIdentity,
   readMaintenanceGithubBot,
 } from './platform-maintenance-github.ts';
+import { platformRepository } from './platform-repository-credential-contracts.ts';
+
 type Tx = postgres.TransactionSql;
 type Row = Record<string, unknown>;
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : null);
@@ -163,12 +165,12 @@ export async function recordMaintenanceDiagnosis(
         assertions: [...proof.failedAssertions].sort(),
       });
       const key = technicalDigest({
-        repositoryId: 1323769790,
+        repositoryId: platformRepository.id,
         family: 'command-output.credentials.v2',
         beforeChecksum: before,
         failureSignature,
       });
-      await tx`insert into allrice_platform_maintenance_defects(id,repository_id,defect_key,spec_id,before_checksum,failure_signature) values(${randomUUID()},1323769790,${key},${proof.specId},${before},${failureSignature}) on conflict(defect_key) do nothing`;
+      await tx`insert into allrice_platform_maintenance_defects(id,repository_id,defect_key,spec_id,before_checksum,failure_signature) values(${randomUUID()},${platformRepository.id},${key},${proof.specId},${before},${failureSignature}) on conflict(defect_key) do nothing`;
       const [d] =
         await tx`select id from allrice_platform_maintenance_defects where defect_key=${key}`;
       defectId = d!.id;

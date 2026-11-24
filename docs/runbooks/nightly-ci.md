@@ -14,10 +14,10 @@ PR/push 的审计基线沿旧值，schedule 没有 before/base，使用受测 HE
 看护可通过固定 workflow 文件名和 artifact 名读取：
 
 ```bash
-nightly_run=$(gh run list -R semiok/allrice --workflow ci.yml --event schedule --branch main --limit 1 --json databaseId --jq '.[0].databaseId')
-gh run view "$nightly_run" -R semiok/allrice --json createdAt,headSha,status,conclusion
-summary_run=$(gh run list -R semiok/allrice --workflow nightly-ci-summary.yml --event workflow_run --limit 100 --json databaseId,displayTitle --jq ".[] | select(.displayTitle == \"Nightly CI $nightly_run attempt 1\") | .databaseId" | head -1)
-gh run download "$summary_run" -R semiok/allrice --name "nightly-ci-summary-$nightly_run-1" --dir "nightly-$nightly_run"
+nightly_run=$(gh run list -R semiok/allrice-vm --workflow ci.yml --event schedule --branch main --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run view "$nightly_run" -R semiok/allrice-vm --json createdAt,headSha,status,conclusion
+summary_run=$(gh run list -R semiok/allrice-vm --workflow nightly-ci-summary.yml --event workflow_run --limit 100 --json databaseId,displayTitle --jq ".[] | select(.displayTitle == \"Nightly CI $nightly_run attempt 1\") | .databaseId" | head -1)
+gh run download "$summary_run" -R semiok/allrice-vm --name "nightly-ci-summary-$nightly_run-1" --dir "nightly-$nightly_run"
 jq '{status,headSha,runId,runAttempt,sourceConclusion,evidenceComplete,failureKind,firstFailureUrl,failedTests,failedSteps,evidenceProblems}' "nightly-$nightly_run/summary.json"
 ```
 
@@ -25,7 +25,7 @@ jq '{status,headSha,runId,runAttempt,sourceConclusion,evidenceComplete,failureKi
 及 artifact 名，并核对 source run 的 `createdAt` 属于目标北京时间夜次。
 缺 run、run 过旧或 nightly 尚未完成时没有本夜通过证据，不得沿用上一晚的绿结果。
 若最新 summary workflow 属于另一个 source run，下载指定 artifact 会失败；
-用 `gh api repos/semiok/allrice/actions/runs/<summary_run>/artifacts`
+用 `gh api repos/semiok/allrice-vm/actions/runs/<summary_run>/artifacts`
 按 `nightly-ci-summary-<nightly_run>-1` 找到对应摘要运行再取，不重跑 CI。
 
 `summary.json` 的 `status` 只有 success/failure。只有源 attempt 1、四门全部成功、

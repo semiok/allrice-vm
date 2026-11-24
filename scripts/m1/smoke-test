@@ -26,11 +26,12 @@ case "${1:-}" in
     shift
     web=$(penv "$(dev_plist web)" ALLRICE_WEB_PORT)
     worker=$(penv "$(dev_plist worker)" ALLRICE_WORKER_PORT)
-    creds="$HOME/allrice-dev/qa/smoke-cred.json"; out="$HOME/allrice-dev/qa/smoke/$ts"; extra=()
+    creds="$HOME/allrice40-dev/qa/smoke-cred.json"; out="$HOME/allrice40-dev/qa/smoke/$ts"; extra=()
     dbenv=$("$BIN/with-env" worker sh -c 'printf "%s\n%s" "$DATABASE_URL" "${ALLRICE_DSH_NATIVE_ARTIFACT_ID:-}"') || dbenv="" ;;
   --instance)
     task=${2:?task}; shift 2
     f="$HOME/allrice-qa/$task/instance.json"; [ -f "$f" ] || { echo "no QA instance: $task" >&2; exit 2; }
+    qa_owned "$f" || { echo "QA instance belongs to another repository: $task" >&2; exit 2; }
     web=$(json "$f" webPort); worker=$(json "$f" workerPort)
     creds="$HOME/allrice-qa/$task/creds.json"; out="$HOME/allrice-qa/$task/smoke/$ts"
     dbenv=$(set -a; . "$HOME/allrice-qa/$task/.env"; printf '%s\n%s' "$DATABASE_URL" "$(json "$f" nativeArtifactId)") || dbenv=""

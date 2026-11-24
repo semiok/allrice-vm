@@ -150,7 +150,7 @@ class Messages(unittest.TestCase):
         self.assertTrue(text.startswith('🟠 [演练] AllRice M1 Dev：1 项告警，1 项恢复'))
         self.assertIn('[警告] 磁盘余量不足', text)
         self.assertIn('   第一步：step', text)
-        self.assertIn('手册：https://github.com/semiok/allrice/blob/main/docs/runbooks/x.md', text)
+        self.assertIn('手册：https://github.com/semiok/allrice-vm/blob/main/docs/runbooks/x.md', text)
         self.assertIn('✅ 已恢复：坏了（持续 15 分钟）', text)
 
     def test_nothing_to_say(self):

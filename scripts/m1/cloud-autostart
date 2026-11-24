@@ -11,7 +11,7 @@
 #                                    (with its last exit code); exit 1 unless all are ready
 #   cloud-autostart install-agent [program]
 #                                    install and load the login agent (release manager
-#                                    only); program defaults to ~/allrice-dev/bin/cloud-autostart
+#                                    only); program defaults to ~/allrice40-dev/bin/cloud-autostart
 #
 # The VM profile, the colima binary and the renderer URL come from the shared Dev Worker's
 # launchd plist, so they are configured in one place. This only covers starting: a VM
@@ -22,7 +22,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd -P)
 . "$here/lib.sh"
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-LABEL=ai.bplabs.allrice-cloud-autostart
+LABEL=ai.bplabs.allrice40-dev-cloud-autostart
 WORKER_PLIST=$(dev_plist worker)
 CONTAINER=allrice-office-renderer
 say() { echo "[cloud-autostart $(date '+%F %T')] $*"; }
@@ -117,7 +117,7 @@ start)
   say "cloud watchdog attests ready"
   ;;
 install-agent)
-  program=${2:-$HOME/allrice-dev/bin/cloud-autostart}
+  program=${2:-$HOME/allrice40-dev/bin/cloud-autostart}
   [ -x "$program" ] || { echo "cloud-autostart: $program is not executable" >&2; exit 2; }
   # Never reload under a start that is still running: its colima would carry on beside
   # the new one.
@@ -138,8 +138,8 @@ spec = {
     # in its own session (see bounded), so ending this job never takes the VM down.
     'KeepAlive': {'SuccessfulExit': False},
     'ThrottleInterval': 60,
-    'StandardOutPath': f'{home}/Library/Logs/allrice-cloud-autostart.log',
-    'StandardErrorPath': f'{home}/Library/Logs/allrice-cloud-autostart.log',
+    'StandardOutPath': f'{home}/Library/Logs/allrice40-dev-cloud-autostart.log',
+    'StandardErrorPath': f'{home}/Library/Logs/allrice40-dev-cloud-autostart.log',
 }
 tmp = path + '.tmp'
 with open(tmp, 'wb') as f:

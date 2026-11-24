@@ -42,7 +42,7 @@ async function fixture() {
       repository: platformRepository.fullName,
       branch,
       number: 312,
-      url: 'https://github.com/semiok/allrice/pull/312',
+      url: 'https://github.com/semiok/allrice-vm/pull/312',
       headSha: head,
       baseSha: base,
       tree,

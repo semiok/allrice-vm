@@ -3470,7 +3470,7 @@ suite(
           release = r;
         });
       const holder = f.db.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${s.admin.actor.id}:1323769790`}))`;
+        await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${s.admin.actor.id}:1469490636`}))`;
         locked();
         await unblock;
       });
@@ -3501,7 +3501,7 @@ suite(
           release = r;
         });
       const holder = f.db.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${s.admin.actor.id}:1323769790`}))`;
+        await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${s.admin.actor.id}:1469490636`}))`;
         locked();
         await unblock;
       });

@@ -108,8 +108,8 @@ suite(
           (route: Route) =>
             route.fulfill({
               json: {
-                repositoryId: 1323769790,
-                repository: 'semiok/allrice',
+                repositoryId: 1469490636,
+                repository: 'semiok/allrice-vm',
                 revision: 1,
                 configured: true,
                 state: 'configured',
@@ -130,8 +130,8 @@ suite(
               publication ??= {
                 id,
                 branch,
-                repositoryId: 1323769790,
-                repository: 'semiok/allrice',
+                repositoryId: 1469490636,
+                repository: 'semiok/allrice-vm',
                 repairTaskId: repairId,
                 baseSha: 'a'.repeat(40),
                 candidateChecksum: 'sha256:' + 'b'.repeat(64),
