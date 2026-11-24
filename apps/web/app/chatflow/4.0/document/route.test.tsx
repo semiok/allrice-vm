@@ -142,6 +142,10 @@ it('preserves invalid empty/duplicate values on the page for the document parser
 
 it('requires the issued scope in the document address and leaves the two exact native HTTP routes denied', async () => {
   const scopeId = '00000000-0000-4000-8000-000000000003';
+  authenticated.mockResolvedValue({
+    actor: { type: 'user', id: '00000000-0000-4000-8000-000000000004' },
+    organizationId: '00000000-0000-4000-8000-000000000005',
+  });
   const claims = {
     bindingRef: 'leased-profile',
     graphRev: 'verified-graph',
