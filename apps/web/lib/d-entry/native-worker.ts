@@ -33,6 +33,26 @@ export async function requestDEntryWorker(
   fields: Record<string, unknown> = {},
 ) {
   input.signal.throwIfAborted();
+  const response = await requestWorker(
+    input.signal,
+    new URL(`/internal/d-entry/${path}`, workerBase()),
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${input.token}`,
+      },
+      body: JSON.stringify({
+        ...fields,
+        organizationId: input.context.organizationId,
+        selection: input.selection,
+      }),
+    },
+  );
+  return response;
+}
+
+function workerBase() {
   let base: URL;
   try {
     base = new URL(
@@ -50,22 +70,44 @@ export async function requestDEntryWorker(
     base.hash
   )
     throw new DEntryDependencyUnavailable('native-route');
-  const response = await fetch(new URL(`/internal/d-entry/${path}`, base), {
-    method: 'POST',
+  return base;
+}
+
+export function requestDEntryProfile(
+  input: {
+    token: string;
+    context: RequestContext;
+    selection: DEntrySelectionInput;
+    signal: AbortSignal;
+  },
+  type: 'bootstrap' | 'assets' | 'events',
+  selectors: Record<string, string>,
+  request?: 'document' | 'static',
+) {
+  input.signal.throwIfAborted();
+  const target = new URL(`/internal/d-entry/profile/${type}`, workerBase());
+  target.search = new URLSearchParams({
+    ...selectors,
+    ...input.selection,
+    organizationId: input.context.organizationId,
+  }).toString();
+  return requestWorker(input.signal, target, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${input.token}`,
+      ...(request && { 'x-allrice-profile-request': request }),
+    },
+  });
+}
+
+async function requestWorker(signal: AbortSignal, url: URL, init: RequestInit) {
+  const response = await fetch(url, {
+    ...init,
     redirect: 'error',
     cache: 'no-store',
-    signal: input.signal,
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${input.token}`,
-    },
-    body: JSON.stringify({
-      ...fields,
-      organizationId: input.context.organizationId,
-      selection: input.selection,
-    }),
+    signal,
   }).catch((error) => {
-    input.signal.throwIfAborted();
+    signal.throwIfAborted();
     throw new DEntryDependencyUnavailable('native-route', { cause: error });
   });
   if (!response.ok) {

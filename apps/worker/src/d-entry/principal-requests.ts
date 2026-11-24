@@ -55,6 +55,7 @@ function sameSelection(a: DEntrySelectionInput, b: DEntrySelectionInput) {
 export type DEntryPageHandle = Readonly<{
   scope: DEntryPrincipalControlScope;
   bindingRef: string;
+  fixedProfile?: import('./released-profile.js').DEntryFixedProfileSource;
   identity: DEntryIdentity;
   root: DEntryHistoryRootPin;
   signal: AbortSignal;
@@ -297,6 +298,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                 const page: Page = {
                   scope,
                   bindingRef: current.view.bindingRef,
+                  fixedProfile: current.owner.fixedProfile,
                   identity: auth.identity,
                   root: pin,
                   signal: lifetime,

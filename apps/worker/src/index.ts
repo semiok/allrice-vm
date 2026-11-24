@@ -25,6 +25,7 @@ import {
 } from './d-entry/principal-requests.js';
 import { createDEntryPageMux } from './d-entry/principal-profile-mux.js';
 import { createDEntryPageRpc } from './d-entry/principal-page-rpc.js';
+import { createDEntryProfile } from './d-entry/profile.js';
 import { createDEntryMuxHandler } from './d-entry/mux.js';
 import { createWorkerCurrentBusinessRuntime } from './business-runtime/current-producer.js';
 import {
@@ -482,7 +483,9 @@ const dEntryPageRpc = createDEntryPageRpc(
   dEntryDependencies.authenticate,
   httpAborter.signal,
 );
+const dEntryProfile = createDEntryProfile(dEntryPages, httpAborter.signal);
 const server = createServer(async (request, response) => {
+  if (await dEntryProfile.handle(request, response)) return;
   if (await dEntryPageRpc.handle(request, response)) return;
   if (await dEntryHttp(request, response, stopping)) return;
   if (await nativeRunDiagnosticsHttp(request, response, stopping)) return;
@@ -910,6 +913,7 @@ function shutdown(signal: string) {
       { name: 'd_entry_mux', run: () => dEntryMux.close() },
       { name: 'd_entry_page_mux', run: () => dEntryPageMux.close() },
       { name: 'd_entry_page_rpc', run: () => dEntryPageRpc.close() },
+      { name: 'd_entry_profile', run: () => dEntryProfile.close() },
       { name: 'd_entry_http', run: () => dEntryHttp.close() },
       {
         name: 'maintenance_abort',

@@ -18,7 +18,5 @@ export default async function EmployeeNativeEntryPage({
         : [value])
       query.append(key, item);
   }
-  return (
-    <EmployeeNativePage source={`/chatflow/4.0/document?${query.toString()}`} />
-  );
+  return <EmployeeNativePage query={query.toString()} />;
 }

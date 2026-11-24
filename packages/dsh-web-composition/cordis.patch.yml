@@ -55,3 +55,6 @@
 - id: ui-chat
   config:
     performanceUsage: compact
+# The installed employee profile publishes a single immutable release graph.
+- id: client-hmr
+  disabled: true

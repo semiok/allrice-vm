@@ -56,10 +56,13 @@ type ConsumedReceipt = Readonly<{
   rosterDigest: string;
   endpoints: readonly Readonly<OwnerView['endpoint']>[];
 }>;
+import type { DEntryFixedProfileSource } from './released-profile.js';
+
 export type ResolvedDEntryNativeOwner = Readonly<{
   receipt: ConsumedReceipt;
   endpoint: Readonly<OwnerView['endpoint']>;
   bindingRef: string;
+  fixedProfile?: DEntryFixedProfileSource;
   revoked: AbortSignal;
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;

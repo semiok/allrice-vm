@@ -33,10 +33,11 @@ beforeEach(() => {
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
-it('the Next product page targets only the fixed same-origin document, preserving selectors', async () => {
+it('the Next product page preserves selection before the client opens its long-lived owner', async () => {
   const page = await EntryPage({ searchParams: Promise.resolve(selection) });
   const html = renderToStaticMarkup(page);
-  expect(html).toContain('src="/chatflow/4.0/document?');
+  expect(html).toContain('data-employee-selection=');
+  expect(html).not.toContain('<iframe');
   expect(html).toContain('workspaceId=');
   expect(html).not.toContain('native-owner');
   expect(html).not.toContain('<script');

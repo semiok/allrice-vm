@@ -1,0 +1,81 @@
+import { DataAccessError } from '@allrice/database';
+import { apiProblem } from '../../../../../lib/api-error-response';
+import {
+  profileAddress,
+  profileDirectory,
+  profileInput,
+  profileStaticFile,
+  readProfileDirectory,
+} from '../../../../../lib/d-entry/profile';
+import { dEntryErrorResponse } from '../../../../../lib/d-entry/responses';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+const unavailable = () =>
+  apiProblem({
+    status: 403,
+    code: 'AUTHORIZATION_DENIED',
+    message: 'This native route requires the Host owner',
+    retryable: false,
+  });
+type Params = { params: Promise<{ publicationPath: string[] }> };
+export async function GET(request: Request, { params }: Params) {
+  try {
+    const target = readProfileDirectory(
+      request,
+      (await params).publicationPath,
+    );
+    if (target.path === 'native/api/file') return unavailable();
+    if (new URL(request.url).search) throw new DataAccessError('not_found');
+    const input = await profileInput(request, target.selection);
+    if (target.path !== 'native/index.html')
+      return await profileStaticFile(input, target, target.path);
+    const address = await profileAddress(input, target.scopeId);
+    if (
+      target.bindingRef !== address.bindingRef ||
+      target.manifestSha256 !== address.manifestSha256 ||
+      target.graphRev !== address.graphRev
+    )
+      throw new DataAccessError('not_found');
+    const assets = profileDirectory('static', address);
+    const { scopeId, bindingRef, graphRev, selection } = address;
+    const tenant = input.context.organizationId;
+    const attributes = [
+      ['scope-id', scopeId],
+      ['binding-ref', bindingRef],
+      ['graph-rev', graphRev],
+      ['organization-id', tenant],
+      ['workspace-id', selection.workspaceId],
+      ['employee-instance-id', selection.employeeInstanceId],
+      ['thread-id', selection.threadId ?? ''],
+    ]
+      .map(([key, value]) => `data-${key}="${value}"`)
+      .join(' ');
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><link rel="stylesheet" href="assets/index-BxpfOGf3.css"><link rel="stylesheet" href="assets/vendor-DV2921Zo.css"><link rel="stylesheet" href="${assets}/managed/employee-web-entry.css"></head><body><div id="app" ${attributes}></div><script type="module" src="${assets}/managed/employee-web-entry.js"></script></body></html>`;
+    return new Response(html, {
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'private, no-store',
+        'referrer-policy': 'no-referrer',
+        'x-content-type-options': 'nosniff',
+        'content-security-policy':
+          "frame-ancestors 'self'; base-uri 'none'; object-src 'none'",
+      },
+    });
+  } catch (error) {
+    return dEntryErrorResponse(error);
+  }
+}
+export async function POST(request: Request, { params }: Params) {
+  try {
+    const target = readProfileDirectory(
+      request,
+      (await params).publicationPath,
+    );
+    if (target.path === 'native/api/session/uploadFileBinary')
+      return unavailable();
+    throw new DataAccessError('not_found');
+  } catch (error) {
+    return dEntryErrorResponse(error);
+  }
+}

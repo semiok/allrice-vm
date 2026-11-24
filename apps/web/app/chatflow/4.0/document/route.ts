@@ -1,33 +1,47 @@
-import { DEntrySelectionInputSchema } from '@allrice/contracts';
+import {
+  DEntryPageBorrowSchema,
+  DEntrySelectionInputSchema,
+} from '@allrice/contracts';
 import { requireRequestContext } from '../../../../lib/identity/session';
-import { apiProblem } from '../../../../lib/api-error-response';
+import { currentNativeRequest } from '../../../../lib/d-entry/native-request';
+import { DEntryDependencyUnavailable } from '../../../../lib/d-entry/release-policy';
 import { resolveDEntryIdentity } from '../../../../lib/d-entry/identity';
+import {
+  exactProfileQuery,
+  profileAddress,
+  profileDirectory,
+} from '../../../../lib/d-entry/profile';
 import { dEntryErrorResponse } from '../../../../lib/d-entry/responses';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/** This is the real product document boundary, deliberately non-executable
- * until the original principal/snapshot/follow and complete
- * graph/events/assets carrier are delivered. No test producer can install one. */
 export async function GET(request: Request) {
   let response: Response;
   try {
     const context = await requireRequestContext(request);
-    const query = new URL(request.url).searchParams;
-    if ([...query.keys()].some((key) => query.getAll(key).length !== 1))
-      throw new SyntaxError('Entry selectors must be unique');
-    const selection = DEntrySelectionInputSchema.parse(
-      Object.fromEntries(query),
+    const query = exactProfileQuery(request.url);
+    if (!('scopeId' in query)) {
+      await resolveDEntryIdentity(
+        context,
+        DEntrySelectionInputSchema.parse(query),
+        'history',
+      );
+      throw new DEntryDependencyUnavailable('native-route');
+    }
+    const { scopeId, ...selection } = DEntryPageBorrowSchema.parse(query);
+    const input = await currentNativeRequest(
+      request,
+      selection,
+      context,
+      'history',
     );
-    await resolveDEntryIdentity(context, selection, 'history');
-    // Missing real principal or unified graph authority must never emit HTML,
-    // replay build-Host owner:true, or start a VM to obtain a viewer.
-    response = apiProblem({
-      status: 503,
-      code: 'DEPENDENCY_UNAVAILABLE',
-      message: '当前入口暂不可用',
-      retryable: false,
+    const location = await profileAddress(input, scopeId);
+    response = new Response(null, {
+      status: 307,
+      headers: {
+        location: profileDirectory('document', location) + '/native/index.html',
+      },
     });
   } catch (error) {
     response = dEntryErrorResponse(error);

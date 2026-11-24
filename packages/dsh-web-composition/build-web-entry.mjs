@@ -175,6 +175,7 @@ async function collectProfileArtifacts(outputDirectory) {
     }
     const result = {
       graph,
+      bootInjections: bootInjections(graph),
       files,
       // No collected values are emitted: owner:true and current configuration
       // must never become a release's replayable runtime identity/preferences.
@@ -288,7 +289,7 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
   const kernel = await build({
     ...employeeWebKernelOptions,
     absWorkingDir: packageRoot,
-    entryPoints: ['src/employee-web-entry.ts'],
+    entryPoints: { 'employee-web-entry': 'src/employee-product-entry.ts' },
     outdir: managedDirectory,
     entryNames: 'employee-web-entry',
     assetNames: 'assets/[name]-[hash]',
