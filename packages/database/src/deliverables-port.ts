@@ -170,8 +170,8 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
         {
           source,
           signal,
-          requireCurrentAccess: async () => {
-            await current(context, signal);
+          requireCurrentAccess: async (transaction) => {
+            await current(context, signal, transaction);
           },
         },
       );

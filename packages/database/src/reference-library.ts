@@ -974,10 +974,16 @@ export async function completeReferenceUpload(
   context: RequestContext,
   workspaceId: string,
   revisionId: string,
+  qualification?: {
+    signal?: AbortSignal;
+    requireCurrentAccess(transaction: postgres.TransactionSql): Promise<void>;
+  },
 ) {
   const c = scoped(context, workspaceId);
   await getDatabase().begin(async (tx) => {
+    qualification?.signal?.throwIfAborted();
     await readContentPrincipal(c, tx, true);
+    await qualification?.requireCurrentAccess(tx);
     const [r] =
       await tx`select knowledge_source_id,file_object_id,created_by,source_artifact_version_id from allrice_knowledge_revisions where id=${UuidSchema.parse(revisionId)}`;
     if (!r || r.created_by !== c.actor.id)
@@ -999,6 +1005,7 @@ export async function completeReferenceUpload(
       bound !== null,
     );
     if (source.status !== 'active') throw new DataAccessError('not_found');
+    qualification?.signal?.throwIfAborted();
     await tx`update allrice_storage_objects set state='ready',updated_at=clock_timestamp() where id=${r.file_object_id} and state='pending'`;
   });
 }
@@ -1227,18 +1234,23 @@ export async function publishReference(
       | AuthorizedDeliverableResource
       | ((signal: AbortSignal) => Promise<AuthorizedDeliverableResource>);
     signal?: AbortSignal;
-    requireCurrentAccess?: () => Promise<void>;
+    requireCurrentAccess?: (
+      transaction?: postgres.TransactionSql,
+    ) => Promise<void>;
   },
 ) {
   const v = ReferencePublishInputSchema.parse(input);
   const parameters = { purpose: v.purpose, audience: v.audience };
   const description = parameters.purpose || '企业资料';
   const context = scoped(contextInput, v.workspaceId);
-  const current = async () => {
+  const current = async (transaction?: postgres.TransactionSql) => {
     options?.signal?.throwIfAborted();
-    await options?.requireCurrentAccess?.();
+    await options?.requireCurrentAccess?.(transaction);
     options?.signal?.throwIfAborted();
   };
+  const qualification = options?.requireCurrentAccess
+    ? { signal: options.signal, requireCurrentAccess: current }
+    : undefined;
   await current();
   let bytes: Buffer | undefined;
   if (v.origin === 'upload') {
@@ -1277,6 +1289,7 @@ export async function publishReference(
       const principal = await readContentPrincipal(context, tx, true);
       if (!principal?.writable)
         throw new DataAccessError('authorization_denied');
+      await qualification?.requireCurrentAccess(tx);
       await lockReferenceRequest(tx, context, v.requestId);
       const operation = v.origin === 'file' ? 'artifact' : 'upload';
       const prior = await findReferenceRequest(
@@ -1445,7 +1458,7 @@ export async function publishReference(
             signal: options.signal,
             checksum: object.checksum,
             sizeBytes: object.sizeBytes,
-            recheck: current,
+            recheck: () => current(),
             openSource: () => storage.get(object),
             changed: () => new ReferenceLibraryError('source_unavailable'),
           });
@@ -1461,6 +1474,7 @@ export async function publishReference(
           context,
           v.workspaceId,
           prepared.reservation.revisionId,
+          qualification,
         );
         return {
           sourceId: prepared.reservation.sourceId,
@@ -1514,6 +1528,7 @@ export async function publishReference(
         context,
         v.workspaceId,
         prepared.reservation.revisionId,
+        qualification,
       );
     }
   }

@@ -359,7 +359,7 @@ async function snapshotFile(
   options?: {
     source: AuthorizedDeliverableResource;
     signal: AbortSignal;
-    requireCurrentAccess(): Promise<void>;
+    requireCurrentAccess(transaction?: TransactionSql): Promise<void>;
   },
 ) {
   await options?.requireCurrentAccess();
@@ -446,6 +446,7 @@ async function snapshotFile(
       context,
       context.workspaceId!,
       prepared.revisionId,
+      options,
     );
   }
   return prepared;
@@ -462,7 +463,7 @@ export async function captureWorkbenchFileReference(
   options?: {
     source: AuthorizedDeliverableResource;
     signal: AbortSignal;
-    requireCurrentAccess(): Promise<void>;
+    requireCurrentAccess(transaction?: TransactionSql): Promise<void>;
   },
 ) {
   const context = scoped(contextInput, workspaceId);

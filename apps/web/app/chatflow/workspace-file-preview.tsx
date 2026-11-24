@@ -293,16 +293,14 @@ export function WorkspaceFilePreview(props: {
     active: props.active ?? true,
     dataClient: props.dataClient,
     readOnly: props.fileActions?.readOnly,
-    onUse: props.fileActions?.onUse ?? (() => {}),
+    onUse: props.fileActions?.onUse,
     onTemplate: props.fileActions?.onTemplate,
   });
   const quote = () => {
     if (props.deliverable) void reference.useFile(props.deliverable);
   };
   const quoteDisabled =
-    !props.quotable ||
-    !!props.fileActions?.readOnly ||
-    reference.using !== null;
+    !props.quotable || !reference.canUse || reference.using !== null;
   const favoriteLabel = props.deliverable?.favorite ? '取消收藏' : '收藏';
   const publication = props.deliverable?.publication;
   const publicationOptions = useReferencePublicationOptions({

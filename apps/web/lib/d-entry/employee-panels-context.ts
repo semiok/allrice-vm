@@ -88,8 +88,22 @@ export async function requireEmployeePanelsContext(
     moduleId: BuiltinModuleId,
     candidate: RequestContext,
     signal: AbortSignal,
+    transaction?: Parameters<typeof requireEmployeePanelsAccess>[2],
   ) {
     signal.throwIfAborted();
+    if (transaction) {
+      // At the storage finalizer, the qualification and its writers must
+      // share the same database transaction and hold the same rows.
+      const next = await dependencies.authorize(
+        candidate,
+        selection,
+        transaction,
+      );
+      if (!sameDEntryIdentity(identity, next))
+        throw new DataAccessError('authorization_denied');
+      signal.throwIfAborted();
+      return;
+    }
     await dependencies.builtinModules.require(
       { moduleId, context, identity },
       signal,
@@ -114,23 +128,13 @@ export async function requireEmployeePanelsContext(
       currentModule('deliverables', context, signal),
     materials: createEnterpriseMaterialsPort({
       storage,
-      requireCurrentAccess: (candidate, signal) =>
-        currentModule('enterprise-materials', candidate, signal),
+      requireCurrentAccess: (candidate, signal, transaction) =>
+        currentModule('enterprise-materials', candidate, signal, transaction),
     }),
     deliverables: createDeliverablesPort({
       storage,
-      async requireCurrentAccess(candidate, signal, transaction) {
-        if (!transaction)
-          return currentModule('deliverables', candidate, signal);
-        const next = await dependencies.authorize(
-          candidate,
-          selection,
-          transaction,
-        );
-        if (!sameDEntryIdentity(identity, next))
-          throw new DataAccessError('authorization_denied');
-        signal.throwIfAborted();
-      },
+      requireCurrentAccess: (candidate, signal, transaction) =>
+        currentModule('deliverables', candidate, signal, transaction),
     }),
   };
 }

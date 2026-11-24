@@ -72,6 +72,7 @@ suite(
     let dropPublishReply = false;
     const publishWrites: string[] = [];
     const receiptReads: string[] = [];
+    let referenceWrites = 0;
 
     const routeNames: Record<
       string,
@@ -212,6 +213,8 @@ suite(
             const response = await handlers[name](request, {
               params: Promise.resolve(params),
             });
+            if (fixtureDocument && name === 'captureReference')
+              referenceWrites++;
             if (fixtureDocument && name === 'readWriteReceipt')
               receiptReads.push(params.requestId!);
             if (fixtureDocument && name === 'publish') {
@@ -466,6 +469,32 @@ suite(
             ).files.map((file) => file.objectId),
           ).toEqual([original.objectId]);
 
+          const row = files.getByRole('button', {
+            name: input.fileName,
+            exact: true,
+          });
+          const disabledQuote = files.getByRole('button', {
+            name: '引用到对话 ' + input.fileName,
+          });
+          expect(await disabledQuote.isDisabled()).toBe(true);
+          await row.click();
+          const quote = page.getByRole('button', {
+            name: '引用到对话',
+            exact: true,
+          });
+          await quote.waitFor();
+          expect(await quote.isDisabled()).toBe(true);
+          expect(referenceWrites).toBe(0);
+          await page
+            .getByRole('button', { name: '‹ 交付成果', exact: true })
+            .click();
+          await files
+            .getByRole('combobox', { name: '按员工筛选' })
+            .selectOption('');
+          await files
+            .getByRole('button', { name: '我的上传', exact: true })
+            .click();
+
           async function openPublication() {
             await options.click();
             await page
@@ -512,6 +541,39 @@ suite(
           expect(catalog.files[0]?.publication).toMatchObject({
             audience: { scope: 'personal' },
           });
+          await page
+            .getByRole('navigation', { name: '面板' })
+            .getByRole('button', { name: '企业资料' })
+            .click();
+          await page.getByRole('button', { name: '上传', exact: true }).click();
+          const material = page.getByRole('dialog', { name: '上传企业资料' });
+          const uploadedName = '浏览器企业资料.txt';
+          await material.locator('input[type=file]').setInputFiles({
+            name: uploadedName,
+            mimeType: 'text/plain',
+            buffer: Buffer.from('正式资料上传。'),
+          });
+          await material
+            .getByRole('button', { name: '发布', exact: true })
+            .click();
+          await page
+            .getByRole('status')
+            .filter({ hasText: '已发布' })
+            .waitFor();
+          expect(publishWrites).toHaveLength(2);
+          const uploadedMaterial = await p.client.readWriteReceipt(
+            {
+              workspaceId: p.selection.workspaceId,
+              requestId: publishWrites[1]!,
+              operation: 'publish-upload',
+            },
+            signal(),
+          );
+          expect(uploadedMaterial).toMatchObject({
+            status: 'recorded',
+            ready: true,
+          });
+          expect(referenceWrites).toBe(0);
           await context.close();
         } finally {
           await browser?.close();
@@ -1419,6 +1481,129 @@ suite(
         writing.mockRestore();
       }
     });
+    it.each([
+      'fresh publish-upload',
+      'fresh capture',
+      'recovered publish-file',
+    ] as const)(
+      'sequences %s completion with the real D qualification writer',
+      async (scenario) => {
+        const p = await person();
+        await release(p);
+        await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+        const original = await p.client.uploadDeliverable(
+          uploadInput(p),
+          signal(),
+        );
+        const input = uploadInput(p, '受管资格.txt');
+        const audience = { scope: 'personal' as const, departmentIds: [] };
+        const operation =
+          scenario === 'fresh capture'
+            ? 'capture'
+            : scenario === 'fresh publish-upload'
+              ? 'publish-upload'
+              : 'publish-file';
+        const write = () =>
+          operation === 'capture'
+            ? p.client.captureReference(
+                {
+                  workspaceId: input.workspaceId,
+                  objectId: original.objectId,
+                  requestId: input.requestId,
+                },
+                signal(),
+              )
+            : operation === 'publish-upload'
+              ? p.client.publishUpload(
+                  { ...input, origin: 'upload', purpose: '', audience },
+                  signal(),
+                )
+              : p.client.publishFile(
+                  {
+                    origin: 'file',
+                    workspaceId: input.workspaceId,
+                    requestId: input.requestId,
+                    objectId: original.objectId,
+                    purpose: '',
+                    audience,
+                  },
+                  signal(),
+                );
+        const storage = runtimeFixtureStorage(f.db);
+        const put = storage.put.bind(storage),
+          get = storage.get.bind(storage);
+        let completion = false;
+        let withdrawals = 0;
+        let pendingObject: string | undefined;
+        const writing = vi
+          .spyOn(storage, 'put')
+          .mockImplementation(async (object, bytes) => {
+            await put(object, bytes);
+            pendingObject = object.id;
+            if (operation === 'publish-file')
+              throw Error('independent copy put reply lost');
+            completion = true;
+          });
+        const reading = vi
+          .spyOn(storage, 'get')
+          .mockImplementation(async (object) => {
+            const bytes = await get(object);
+            if (operation === 'publish-file' && object.id === pendingObject)
+              completion = true;
+            return bytes;
+          });
+        handlers = createEmployeePanelsHandlers({
+          ...employeePanelsDependencies,
+          storage: () => storage,
+          async authorize(context, selection, transaction) {
+            if (transaction && completion && withdrawals === 0) {
+              withdrawals++;
+              await updateDEntryReleasePolicy(p.context, {
+                revision: 'fixture-reference-withdraw',
+                defaultGeneration: '3.x',
+                selections: [],
+              });
+            }
+            return employeePanelsDependencies.authorize(
+              context,
+              selection,
+              transaction,
+            );
+          },
+        });
+        try {
+          if (operation === 'publish-file')
+            await expect(write()).rejects.toBeInstanceOf(
+              EmployeePanelsWriteUnknownError,
+            );
+          await expect(write()).rejects.toMatchObject({
+            requestId: input.requestId,
+            cause: { status: 403 },
+          });
+          expect(withdrawals).toBe(1);
+          expect(writing).toHaveBeenCalledOnce();
+          expect(
+            await f.db`select state from allrice_storage_objects where id=${pendingObject!}`,
+          ).toEqual([{ state: 'pending' }]);
+          await release(p);
+          const check = {
+            workspaceId: input.workspaceId,
+            requestId: input.requestId,
+            operation,
+          };
+          expect(
+            await p.client.readWriteReceipt(check, signal()),
+          ).toMatchObject({ status: 'recorded', ready: false });
+        } finally {
+          writing.mockRestore();
+          reading.mockRestore();
+          handlers = createEmployeePanelsHandlers({
+            ...employeePanelsDependencies,
+            storage: () => runtimeFixtureStorage(f.db),
+          });
+        }
+      },
+    );
     it('replays the same material reservation from verified copy bytes after the original is withdrawn', async () => {
       const p = await person();
       await release(p);

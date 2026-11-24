@@ -1,3 +1,4 @@
+import type { TransactionSql } from 'postgres';
 import {
   MaterialsActionCommandProjectionSchema,
   MaterialsActionResultProjectionSchema,
@@ -44,6 +45,7 @@ export interface EnterpriseMaterialsPortOptions {
   requireCurrentAccess?: (
     context: RequestContext,
     signal: AbortSignal,
+    transaction?: TransactionSql,
   ) => Promise<void>;
 }
 
@@ -54,6 +56,7 @@ export function createEnterpriseMaterialsPort(
     contextInput: RequestContext,
     workspaceId: string,
     signal: AbortSignal,
+    transaction?: TransactionSql,
   ) {
     signal.throwIfAborted();
     const context = RequestContextSchema.parse(contextInput);
@@ -64,7 +67,7 @@ export function createEnterpriseMaterialsPort(
       !options.requireCurrentAccess
     )
       throw new DataAccessError('authorization_denied');
-    await options.requireCurrentAccess(context, signal);
+    await options.requireCurrentAccess(context, signal, transaction);
     signal.throwIfAborted();
     return context;
   }
@@ -148,8 +151,8 @@ export function createEnterpriseMaterialsPort(
         namePolicy: 'independent-material',
         source,
         signal,
-        requireCurrentAccess: async () => {
-          await current(context, value.workspaceId, signal);
+        requireCurrentAccess: async (transaction) => {
+          await current(context, value.workspaceId, signal, transaction);
         },
       });
       await current(context, value.workspaceId, signal);
@@ -238,6 +241,12 @@ export function createEnterpriseMaterialsPort(
           context,
           value.workspaceId,
           prepared.revisionId,
+          {
+            signal,
+            async requireCurrentAccess(transaction) {
+              await current(context, value.workspaceId, signal, transaction);
+            },
+          },
         );
       }
       await current(context, value.workspaceId, signal);
@@ -253,8 +262,8 @@ export function createEnterpriseMaterialsPort(
       const result = await publishReference(context, value, options.storage, {
         namePolicy: 'independent-material',
         signal,
-        requireCurrentAccess: async () => {
-          await current(context, value.workspaceId, signal);
+        requireCurrentAccess: async (transaction) => {
+          await current(context, value.workspaceId, signal, transaction);
         },
       });
       // Owner Promise joins storage/transaction. A revoked response does not

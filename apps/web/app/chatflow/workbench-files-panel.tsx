@@ -397,7 +397,7 @@ export function WorkbenchFilesPanel(props: {
                 <FileMenu
                   file={file}
                   disabled={
-                    !!props.readOnly ||
+                    !referenceActions.canUse ||
                     referenceActions.using !== null ||
                     !catalog?.quotableFileIds.includes(file.objectId)
                   }

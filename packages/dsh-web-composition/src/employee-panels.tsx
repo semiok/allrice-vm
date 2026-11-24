@@ -232,6 +232,7 @@ function employeePanelView(
       );
     }
     case 'files': {
+      const readOnly = snapshot.files.readOnly || !binding.port.useReference;
       const props = guardEmployeePanelProps(snapshot.files, current);
       const publish: typeof props.onPublish = publication
         ? (file) => edit({ kind: 'file', file })
@@ -251,13 +252,18 @@ function employeePanelView(
               snapshot.filePreview?.close();
             }}
             onPublish={publication ? publish : undefined}
+            fileActions={
+              readOnly
+                ? undefined
+                : { sessionId: props.sessionId, onUse: reference }
+            }
           />
         );
       return (
         <WorkbenchFilesPanel
           {...props}
           active
-          readOnly={snapshot.files.readOnly || !binding.port.useReference}
+          readOnly={readOnly}
           onUse={reference}
           onPublish={publish}
         />

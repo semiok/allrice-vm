@@ -16,13 +16,14 @@ export type WorkbenchFileReferenceProps = {
   active: boolean;
   dataClient?: EmployeePanelDataClient;
   readOnly?: boolean;
-  onUse: (reference: ReferenceRevision) => void;
+  onUse?: (reference: ReferenceRevision) => void;
   onTemplate?: (reference: ReferenceRevision) => void;
 };
 
 /** The existing fixed-snapshot preparation, shared by the list and preview. */
 export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
   const data = useEmployeePanelData(props);
+  const canUse = props.active && !props.readOnly && !!props.onUse;
   const [using, setUsing] = useState<string | null>(null);
   const [pending, setPending] = useState<{
     fileId: string;
@@ -41,9 +42,9 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
       lifetime.current++;
       operation.current?.abort();
     };
-  }, [props.workspaceId, props.sessionId, props.active, props.readOnly, data]);
+  }, [props.workspaceId, props.sessionId, canUse, data]);
   useEffect(() => {
-    if (!props.active || !pending) return;
+    if (!canUse || !pending) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       void data
@@ -64,10 +65,10 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
           )
             throw Error('所选文件的访问权限已变化，请重新选择。');
           if (current.processing === 'ready') {
-            if (!props.readOnly) props.onUse(current);
+            props.onUse?.(current);
             setPending(null);
             setUsing(null);
-            setNotice(props.readOnly ? '当前会话已归档。' : '');
+            setNotice('');
           } else if (
             ['failed', 'unsupported', 'uploading'].includes(current.processing)
           ) {
@@ -94,17 +95,9 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [
-    pending,
-    data,
-    props.active,
-    props.workspaceId,
-    props.headers,
-    props.readOnly,
-    props.onUse,
-  ]);
+  }, [pending, data, canUse, props.workspaceId, props.headers, props.onUse]);
   async function useFile(file: WorkbenchFile) {
-    if (using || props.readOnly || !props.active) return;
+    if (using || !canUse) return;
     if (file.reference?.companyTemplate) {
       props.onTemplate?.(file.reference);
       return;
@@ -132,7 +125,7 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
         (raw as { reference: unknown }).reference,
       );
       if (reference.processing === 'ready') {
-        props.onUse(reference);
+        props.onUse?.(reference);
         setUsing(null);
       } else if (['saved', 'processing'].includes(reference.processing))
         setPending({ fileId: file.objectId, reference });
@@ -150,6 +143,7 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
     }
   }
   return {
+    canUse,
     using,
     pending,
     error,
