@@ -17,6 +17,7 @@ export * from './d-entry-release-policy.ts';
 export * from './d-entry-admission.ts';
 export * from './d-entry-native-root.ts';
 export * from './d-entry-authority.ts';
+export { requireEmployeePanelsAccess } from './employee-panels-access.ts';
 export { requireCurrentPlatformAdmin } from './platform-authority.ts';
 export * from './user-preferences.ts';
 export * from './tenant-administration.ts';
@@ -385,6 +386,16 @@ export {
 } from './automation-catalog.ts';
 
 export * from './workbench-files.ts';
+export {
+  createDeliverablesPort,
+  DeliverableReadError,
+  type DeliverablesPortOptions,
+} from './deliverables-port.ts';
+export { createDeliverablesMcpReadPort } from './deliverables-mcp-read-port.ts';
+export {
+  createEnterpriseMaterialsPort,
+  type EnterpriseMaterialsPortOptions,
+} from './enterprise-materials-port.ts';
 export {
   runManualAutomation,
   getManualAutomationRun,
