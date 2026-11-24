@@ -18,6 +18,9 @@ qa_label() { printf 'ai.bplabs.allrice40-qa-%s-%s\n' "$1" "$2"; }
 qa_owned() {
   "$M1_PY" "$M1_TOOLS/service_target.py" qa-owned "$1"
 }
+qa_database() {
+  "$M1_PY" "$M1_TOOLS/service_target.py" qa-database "$1"
+}
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
 # incompatible code. Keep their environment available for recovery and forward fixes.
@@ -108,12 +111,18 @@ for field, expected in zip(("path", "working directory"), sys.argv[1:]):
   if [ -n "$pid" ]; then echo "running $pid"; else echo loaded; fi
 }
 
-# port_open <port>: exit 0 when something accepts connections on 127.0.0.1:<port>.
+# port_open <port>: exit 0 for a listening port, 1 for a refused connection and 2 for an unknown result.
 port_open() {
   "$M1_PY" -c 'import socket,sys
-try: socket.create_connection(("127.0.0.1",int(sys.argv[1])),0.5).close()
-except OSError: sys.exit(1)' "$1"
+try:
+    port=int(sys.argv[1])
+    if not 1<=port<=65535: sys.exit(2)
+    socket.create_connection(("127.0.0.1",port),0.5).close()
+except ConnectionRefusedError: sys.exit(1)
+except (ValueError,OSError): sys.exit(2)' "$1"
 }
+
+port_closed() { local rc=0; port_open "$1" || rc=$?; [ "$rc" -eq 1 ]; }
 
 # stop_job <label> [port [plist cwd]]: boot the job out and wait (max 90s) until launchd no longer
 # knows it, its last process has exited and the port is closed. launchd kills the job's
@@ -129,7 +138,7 @@ stop_job() {
   fi
   for i in $(seq 1 90); do
     state=$(job_state "$label" "$@") || return 1
-    if [ "$state" = gone ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } && { [ -z "$port" ] || ! port_open "$port"; }; then
+    if [ "$state" = gone ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; } && { [ -z "$port" ] || port_closed "$port"; }; then
       return 0
     fi
     sleep 1

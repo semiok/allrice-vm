@@ -71,7 +71,7 @@ case "$mode" in
     qa_owned "$INSTANCE" || die "no QA instance in this repository: $task" 2
     release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$INSTANCE") && [ -n "$release" ] \
       || die "cannot verify the reserved worktree of $task" 2
-    DBNAME=allrice40_qa_${task//-/_}
+    DBNAME=$(qa_database "$INSTANCE") || die "cannot verify the database of $task" 2
     ROOTS="$dir/|$release/"; ENVFILE="$dir/.env"
     OUT="$dir/schedule-recover-$ts"; SMOKE="$BIN/smoke-test --instance $task --only reminder" ;;
   *) usage ;;
@@ -163,6 +163,7 @@ def env_files(toks): # node options up to the script, -e/-p or "-" (the rest bel
             if t.startswith(o+"="): out.append((o,t[len(o)+1:]))
             elif t==o and i+1<len(toks): out.append((o,toks[i+1]))
         i+=2 if t in ("--env-file","--env-file-if-exists","-r","--require","--import","--loader","--experimental-loader","-C","--conditions","--input-type","--title") else 1
+    if i<len(toks) and toks[i]=="--": i+=1
     return out,toks[:i+1]
 def alive(pid):
     try: os.kill(int(pid),0); return True

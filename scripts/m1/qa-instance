@@ -26,9 +26,7 @@ PENDING_WORKTREE=""
 die() { echo "qa-instance: $*" >&2; exit 1; }
 say() { echo "[qa-instance] $*"; }
 valid_task() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "task name must match [a-z0-9-], max 31 chars: $1"; }
-db_name() { echo "allrice40_qa_${1//-/_}"; }
 instances() { ls -1d "$M1_QA"/*/instance.json 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null || true; }
-port_busy() { port_open "$1"; }
 json_get() { /usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
 
 write_instance() {  # uses the caller's allocation/build variables
@@ -56,38 +54,65 @@ lease['write'](p, instance)
 PY
 }
 
-admin_sql() { psql -XqAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -d postgres -c "$1"; }
+admin_psql() { psql -XqAt -v ON_ERROR_STOP=1 -h 127.0.0.1 -d postgres "$@"; }
+DB_IDENTITY_SQL="oid::text || ':' || coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '')"
 
 database_identity() {
-  admin_sql "select oid::text || ':' || coalesce(pg_catalog.shobj_description(oid, 'pg_database'), '')
-             from pg_catalog.pg_database where datname='$1'"
+  admin_psql -c "select $DB_IDENTITY_SQL from pg_catalog.pg_database where datname='$1'"
+}
+
+# The catalog change takes the database object lock. Verify what it actually
+# changed before committing, so a same-name replacement rolls the change back.
+guarded_database_change() {
+  local change=$1 db=$2 expected=$3 result
+  result=$(admin_psql <<SQL
+BEGIN;
+$change;
+SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_database
+  WHERE datname='$db' AND ($DB_IDENTITY_SQL) = '$expected') AS owner_matches
+\gset
+\if :owner_matches
+COMMIT;
+SELECT 'confirmed';
+\else
+ROLLBACK;
+\endif
+SQL
+  ) || return 1
+  [ "$result" = confirmed ]
 }
 
 create_database() {
-  local f=$1 db=$2 current token expected
-  current=$(database_identity "$db") || die "cannot inspect database $db"
-  [ -z "$current" ] || die "database $db already exists"
-  # A lost response from createdb leaves ownership unknown until PostgreSQL confirms our marker.
-  token=$("$M1_PY" -c 'import uuid; print(uuid.uuid4().hex)') || return 1
+  local f=$1 db=$2 previous=$3 name current token oid marker expected
+  for name in "$previous" "$db"; do
+    current=$(database_identity "$name") || die "cannot inspect database $name"
+    [ -z "$current" ] || die "database $name already exists"
+  done
+  token=${db#allrice40_qa_}
+  # Use a normal-range PostgreSQL OID known before CREATE so a later catalog
+  # lookup cannot accidentally adopt a replacement. OID collisions refuse CREATE.
+  oid=$((16#${token:0:8} % 4294950912 + 16384))
+  marker="allrice40-qa:$token"; expected="$oid:$marker"
   "$M1_PY" "$LEASE" record-database "$f" pending || die "cannot record database creation intent"
-  createdb -h 127.0.0.1 "$db" || die "database creation failed for $db"
-  current=$(database_identity "$db") || die "cannot inspect newly created database $db"
-  [[ "$current" =~ ^[1-9][0-9]*:$ ]] || die "cannot identify newly created database $db"
-  expected="${current}allrice40-qa:$token"
+  admin_psql -c "CREATE DATABASE \"$db\" OID $oid" || die "database creation failed for $db"
   "$M1_PY" "$LEASE" record-database "$f" "$expected" || die "cannot record database identity"
-  admin_sql "comment on database \"$db\" is 'allrice40-qa:$token'" || die "cannot mark database $db"
-  current=$(database_identity "$db") || die "cannot verify database $db"
-  [ "$current" = "$expected" ] || die "database $db does not match the instance ownership marker"
+  guarded_database_change "COMMENT ON DATABASE \"$db\" IS '$marker'" "$db" "$expected" \
+    || die "cannot confirm and mark the created database $db"
 }
 
 database_to_drop() { # Never act on an unmarked or replaced database at the same name.
-  local f=$1 db=$2 claim actual
-  claim=$("$M1_PY" "$LEASE" database-claim "$f") || return 1
+  local db=$1 retired=$2 claim=$3 actual parked
   [ -n "$claim" ] || return 0
   actual=$(database_identity "$db") || return 1
-  [ -n "$actual" ] || return 0
-  [ "$claim" = "$actual" ] && [ "$claim" != pending ] || return 1
-  printf '%s\n' "$actual"
+  if [ "$claim" = pending ]; then [ -z "$actual" ]; return; fi
+  parked=$(database_identity "$retired") || return 1
+  if [ -n "$parked" ]; then
+    [ "$actual" != "$claim" ] && [ "$parked" = "$claim" ] || return 1
+    printf '%s\n' "$retired"
+  elif [ -n "$actual" ]; then
+    [ "$actual" = "$claim" ] || return 1
+    printf '%s\n' "$db"
+  fi
 }
 
 launch_plist_path() { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$1"; }
@@ -102,29 +127,42 @@ require_launch_slot() {
   [ "$state" = gone ] || die "LaunchAgent $label already loaded"
 }
 
+confirm_port_closed() {
+  local role=$1 port=$2
+  [[ "$port" =~ ^32[0-9][0-9]$ ]] && port_closed "$port" \
+    || { echo "cannot confirm recorded $role port is closed: $port" >&2; return 1; }
+}
+
 published_services() { # Preflight both roles before any stop, unlink or database drop.
-  local task=$1 f=$2 release=$3 role label plist state job
+  local task=$1 f=$2 release=$3 role label plist state job port
   for role in web worker; do
     label=$(qa_label "$task" "$role"); plist=$(launch_plist_path "$label")
     state=$("$M1_PY" "$LEASE" plist-claim "$f" "$role" "$plist") || return 1
     [ "$state" != unpublished ] || continue
     job=$(job_state "$label" "$plist" "$(launch_directory "$release" "$role")") || return 1
-    if [ "$state" = published ]; then
-      printf '%s\n' "$role"
-    elif [ "$job" != gone ]; then
-      return 1
+    if [ "$state" = absent ]; then
+      [ "$job" = gone ] || return 1
+      port=$(json_get "$f" "${role}Port") || return 1
+      confirm_port_closed "$role" "$port" || return 1
     fi
+    printf '%s\n' "$role"
   done
 }
 
 stop_services() {
-  local task=$1 f=$2 release=$3 roles=$4 role label plist port state
+  local task=$1 f=$2 release=$3 roles=$4 role label plist port state job cwd
   for role in $roles; do
     label=$(qa_label "$task" "$role"); plist=$(launch_plist_path "$label")
     port=$(json_get "$f" "${role}Port") || return 1
     state=$("$M1_PY" "$LEASE" plist-claim "$f" "$role" "$plist") || return 1
-    [ "$state" = published ] || return 1
-    stop_job "$label" "$port" "$plist" "$(launch_directory "$release" "$role")" || return 1
+    cwd=$(launch_directory "$release" "$role")
+    case "$state" in
+      published) stop_job "$label" "$port" "$plist" "$cwd" || return 1 ;;
+      absent)
+        job=$(job_state "$label" "$plist" "$cwd") && [ "$job" = gone ] || return 1
+        confirm_port_closed "$role" "$port" || return 1 ;;
+      *) return 1 ;;
+    esac
   done
   for role in $roles; do
     plist=$(launch_plist_path "$(qa_label "$task" "$role")")
@@ -193,19 +231,26 @@ reclaim_one() {
 
 cmd_down() {
   local task=$1; valid_task "$task"
-  local dir db release f owned_db roles; dir=$(qa_instance_dir "$task"); db=$(db_name "$task"); f="$dir/instance.json"
+  local dir db release f claim retired owned_db roles actual; dir=$(qa_instance_dir "$task"); f="$dir/instance.json"
   qa_owned "$f" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
+  db=$(qa_database "$f") || die "cannot verify the database of $task"
   release=$("$M1_PY" "$M1_TOOLS/service_target.py" qa-worktree "$f") \
     || die "cannot verify the reserved worktree of $task; instance left in place"
-  owned_db=$(database_to_drop "$f" "$db") || die "cannot verify ownership of database $db; instance left in place"
+  claim=$("$M1_PY" "$LEASE" database-claim "$f") || die "cannot read database ownership of $task"
+  retired="allrice40_qa_retired_${claim##*:}"
+  owned_db=$(database_to_drop "$db" "$retired" "$claim") || die "cannot verify ownership of database $db; instance left in place"
   roles=$(published_services "$task" "$f" "$release") || die "cannot verify LaunchAgent ownership for $task; instance left in place"
   stop_services "$task" "$f" "$release" "$roles" || die "cannot cleanly stop services for $task; database and instance left in place"
   if [ -n "$owned_db" ]; then
-    owned_db=$(database_to_drop "$f" "$db") || die "database ownership changed for $db; instance left in place"
-    if [ -n "$owned_db" ]; then
-      dropdb -h 127.0.0.1 --force "$db" || die "cannot drop database $db; instance left in place"
-      say "dropped database $db"
+    if [ "$owned_db" = "$db" ]; then
+      guarded_database_change "ALTER DATABASE \"$db\" RENAME TO \"$retired\"" "$retired" "$claim" \
+        || die "cannot retire owned database $db; instance left in place"
     fi
+    actual=$(database_identity "$retired") || die "cannot verify retired database $retired"
+    [ "$actual" = "$claim" ] || die "retired database $retired changed; instance left in place"
+    # Only our retired name can be removed. RENAME refused if any session was still connected.
+    dropdb -h 127.0.0.1 "$retired" || die "cannot drop retired database $retired; instance left in place"
+    say "dropped database $db"
   fi
   if [ -n "$release" ]; then
     # A failed worktree add can leave the reserved directory empty and unregistered.
@@ -219,9 +264,9 @@ cmd_down() {
 # Called by cmd_up while it holds the allocation lock. Checks the limit, picks the first
 # free port pair 3200+2n / 3201+2n, writes instance.json (setup=building), prints "web worker".
 cmd_alloc() {
-  local task=$1 ref=$2 sha=$3
-  local dir db n web worker found=0 claimed=" " t p artifact="" release=""
-  dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
+  local task=$1 ref=$2 sha=$3 db=$4
+  local dir n web worker found=0 claimed=" " t p artifact="" release=""
+  dir=$(qa_instance_dir "$task")
   [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "instance path already exists: $dir (qa-instance down $task first)"
   if [ "$(instances | wc -l | tr -d ' ')" -ge "$MAX_INSTANCES" ]; then
     reclaim_one || true
@@ -239,7 +284,7 @@ cmd_alloc() {
   for n in $(seq 0 49); do
     web=$((3200 + 2 * n)); worker=$((web + 1))
     [[ "$claimed" == *" $web "* || "$claimed" == *" $worker "* ]] && continue
-    if ! port_busy "$web" && ! port_busy "$worker"; then found=1; break; fi
+    if port_closed "$web" && port_closed "$worker"; then found=1; break; fi
   done
   [ $found = 1 ] || die "no free port pair in 3200-3299"
   mkdir -m 700 "$dir" || return 2
@@ -279,7 +324,8 @@ cmd_up() {
   [[ "$card" =~ ^[A-Z][A-Z0-9]*-[1-9][0-9]*$ ]] || die '--card (e.g. MET-220) is required'
   ttl=$(/usr/bin/python3 "$LEASE" ttl "$ttl") || exit 2
   local waited_since; waited_since=$(date +%s)
-  local dir db; dir=$(qa_instance_dir "$task"); db=$(db_name "$task")
+  local dir db; dir=$(qa_instance_dir "$task")
+  db=$("$M1_PY" -c 'import uuid; print("allrice40_qa_" + uuid.uuid4().hex)')
   [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "instance path already exists: $dir (qa-instance down $task first)"
 
   dev_plist_pair || die "refusing a mismatched Dev configuration"
@@ -294,7 +340,7 @@ cmd_up() {
   while :; do
     exec 7>>"$M1_QA/.alloc.lock"
     flock_fd 7 30 || die "another qa-instance up is still allocating; try again shortly"
-    if ports=$(cmd_alloc "$task" "$ref" "$sha"); then exec 7>&-; break; else rc=$?; fi
+    if ports=$(cmd_alloc "$task" "$ref" "$sha" "$db"); then exec 7>&-; break; else rc=$?; fi
     exec 7>&-
     [ "$rc" -eq 75 ] && [ "$wait" -eq 1 ] || return "$rc"
     [ -n "${LINEAR_API_KEY:-}" ] || die 'up --wait requires LINEAR_API_KEY for owner-card reminders; do not read Dev credentials'
@@ -395,7 +441,7 @@ PY
     label=$(qa_label "$task" "$role"); launch_plist=$(launch_plist_path "$label")
     require_launch_slot "$label" "$launch_plist"
   done
-  create_database "$dir/instance.json" "$db"
+  create_database "$dir/instance.json" "$db" "allrice40_qa_${task//-/_}"
 
   say "preparing database"
   ( cd "$release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \

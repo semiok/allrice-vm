@@ -20,10 +20,14 @@ ARTIFACT_ID = 'sha256:' + 'b' * 64
 SYSTEM_STUB = '''
 import fcntl, os, socket
 
-def no_listener(*args, **kwargs):
+def local_port(address, *args, **kwargs):
+    if str(address[1]) == os.environ.get('QA_TEST_PORT_OPEN'):
+        return socket.socket()
+    if str(address[1]) == os.environ.get('QA_TEST_PORT_UNKNOWN'):
+        raise TimeoutError('fixture could not read the port')
     raise ConnectionRefusedError
 
-socket.create_connection = no_listener
+socket.create_connection = local_port
 attempts = os.environ.get('QA_TEST_LOCK_ATTEMPTS')
 if attempts:
     flock = fcntl.flock
@@ -45,8 +49,9 @@ COMMAND_STUB = '''#!/usr/bin/python3
 import json, os, plistlib, re, sys, shutil, fcntl
 from pathlib import Path
 command, args = Path(sys.argv[0]).name, sys.argv[1:]
+sql_input = sys.stdin.read() if command == 'psql' and '-c' not in args and '-Atc' not in args else ''
 with open(os.environ['QA_TEST_EVENTS'], 'a') as f:
-    f.write(json.dumps({'command': command, 'args': args, 'cwd': os.getcwd()}) + '\\n')
+    f.write(json.dumps({'command': command, 'args': args, 'cwd': os.getcwd(), 'stdin': sql_input}) + '\\n')
 databases, jobs = Path.home() / 'qa-databases', Path.home() / 'qa-jobs'
 if command == 'git':
     if 'rev-parse' in args:
@@ -114,16 +119,36 @@ elif command == 'ps':
 elif command == 'psql':
     query = args[-1]
     lookup = re.search(r"datname='([a-z0-9_]+)'", query)
-    comment = re.fullmatch('comment on database "([a-z0-9_]+)" is .([^\"]+).', query)
-    if lookup:
+    create = re.fullmatch(r'CREATE DATABASE "([a-z0-9_]+)" OID ([0-9]+)', query)
+    if create:
+        path = databases / create[1]
+        with path.open('x') as f:
+            f.write('1:' if os.environ.get('QA_TEST_SWAP_AFTER_CREATE') else create[2] + ':')
+        if os.environ.get('QA_TEST_CREATE_UNKNOWN'):
+            sys.exit(49)
+    elif lookup:
         if os.environ.get('QA_TEST_DB_UNKNOWN'):
             sys.exit(48)
         path = databases / lookup[1]
         if path.is_file():
             print(path.read_text() if 'oid::text' in query else 1)
-    elif comment:
-        path = databases / comment[1]
-        path.write_text(path.read_text().split(':')[0] + ':' + comment[2])
+    elif sql_input:
+        expected = re.search(r" = '([0-9]+:allrice40-qa:[a-f0-9]+)'", sql_input)[1]
+        comment = re.search(r'COMMENT ON DATABASE "([a-z0-9_]+)" IS (.+);', sql_input)
+        if comment:
+            path = databases / comment[1]
+            stamp = path.read_text().partition(':')[0] + ':' + comment[2].strip("'")
+            if stamp == expected:
+                path.write_text(stamp)
+                print('confirmed')
+        else:
+            rename = re.search(r'ALTER DATABASE "([a-z0-9_]+)" RENAME TO "([a-z0-9_]+)"', sql_input)
+            path, parked = databases / rename[1], databases / rename[2]
+            if os.environ.get('QA_TEST_SWAP_BEFORE_RETIRE'):
+                path.write_text('1:' + expected.partition(':')[2])
+            if path.read_text() == expected and not parked.exists():
+                path.rename(parked)
+                print('confirmed')
 elif command == 'createdb':
     path = databases / args[-1]
     with path.open('x') as f:
@@ -131,6 +156,8 @@ elif command == 'createdb':
     if os.environ.get('QA_TEST_CREATE_UNKNOWN'):
         sys.exit(49)
 elif command == 'dropdb':
+    if os.environ.get('QA_TEST_DROP_FAIL'):
+        sys.exit(51)
     (databases / args[-1]).unlink()
 elif command == 'pnpm' and args == ['db:prepare'] and os.environ.get('QA_TEST_DB_PREP_FAIL'):
     sys.exit(50)
@@ -302,7 +329,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         build = next(i for i, e in enumerate(events) if e['command'] == 'pnpm' and 'build' in e['args'])
         native = next(i for i, e in enumerate(events) if e['command'] == 'node' and 'prepare-native-artifact.mjs' in e['args'][0])
         identity = next(i for i, e in enumerate(events) if e['command'] == 'node' and 'prepare-identity.mjs' in e['args'][0])
-        database = next(i for i, e in enumerate(events) if e['command'] == 'createdb')
+        database = next(i for i, e in enumerate(events) if e['command'] == 'psql' and e['args'][-1].startswith('CREATE DATABASE'))
         start = next(i for i, e in enumerate(events) if e['command'] == 'launchctl' and e['args'][0] == 'bootstrap')
         self.assertLess(build, native)
         self.assertLess(native, identity)
@@ -335,7 +362,8 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertNotIn('expiresAt', data, 'old allocator must treat the new instance as legacy')
         self.assertEqual(data['repository'], 'semiok/allrice-vm')
         self.assertEqual(data['repositoryId'], 1469490636)
-        self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
+        self.assertRegex(data['database'], r'^allrice40_qa_[a-f0-9]{32}$')
+        self.assertEqual((self.db_dir / data['database']).read_text(), data['databaseClaim'])
         worker = str(data['workerPort'])
         self.assertEqual(envs['web']['ALLRICE_WORKER_PORT'], worker)
         self.assertEqual(envs['worker']['ALLRICE_WORKER_PORT'], worker)
@@ -438,7 +466,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         up, events = self.up()
         self.assertNotEqual(up.returncode, 0)
         self.assertIn('already exists', up.stderr)
-        self.assertFalse(any(event['command'] == 'createdb' for event in events))
+        self.assertFalse(any(event['args'][-1].startswith('CREATE DATABASE') for event in events))
         self.assertIsNone(json.loads((self.instance / 'instance.json').read_text())['databaseClaim'])
         down = self.cli('down', 'met-218-test')
         self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
@@ -450,14 +478,17 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertNotEqual(up.returncode, 0)
         self.assertIn('database creation failed', up.stderr)
         checkpoint = self.instance / 'instance.json'
-        self.assertEqual(json.loads(checkpoint.read_text())['databaseClaim'], 'pending')
-        db = self.db_dir / 'allrice40_qa_met_218_test'
+        data = json.loads(checkpoint.read_text())
+        self.assertEqual(data['databaseClaim'], 'pending')
+        db = self.db_dir / data['database']
+        actual = db.read_text()
         before = len(Path(self.events).read_text())
         down = self.cli('down', 'met-218-test')
         self.assertNotEqual(down.returncode, 0)
         self.assertIn('cannot verify ownership of database', down.stderr)
         self.assert_no_cleanup_since(before)
-        self.assertEqual(db.read_text(), '49000:')
+        self.assertRegex(actual, r'^[1-9][0-9]*:$')
+        self.assertEqual(db.read_text(), actual)
         self.assertTrue(checkpoint.is_file())
         db.unlink()
         retry = self.cli('down', 'met-218-test')
@@ -469,10 +500,11 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertNotEqual(up.returncode, 0)
         self.assertIn('db:prepare failed', up.stderr)
         checkpoint = self.instance / 'instance.json'
-        claim = json.loads(checkpoint.read_text())['databaseClaim']
-        db = self.db_dir / 'allrice40_qa_met_218_test'
+        data = json.loads(checkpoint.read_text())
+        claim = data['databaseClaim']
+        db = self.db_dir / data['database']
         self.assertEqual(db.read_text(), claim)
-        for actual, extra in (('1:' + claim.split(':', 1)[1], {}), ('49000:other generation', {}),
+        for actual, extra in (('1:' + claim.split(':', 1)[1], {}), (claim.partition(':')[0] + ':other generation', {}),
                               (claim, {'QA_TEST_DB_UNKNOWN': '1'})):
             with self.subTest(actual=actual, extra=extra):
                 db.write_text(actual)
@@ -489,6 +521,49 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertFalse(db.exists())
         self.assertFalse(self.instance.exists())
 
+    def test_create_does_not_mark_a_database_replaced_before_ownership_is_confirmed(self):
+        up, _ = self.up(QA_TEST_SWAP_AFTER_CREATE='1')
+        self.assertNotEqual(up.returncode, 0)
+        self.assertIn('cannot confirm and mark the created database', up.stderr)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        db = self.db_dir / data['database']
+        self.assertEqual(db.read_text(), '1:')
+        down = self.cli('down', 'met-218-test')
+        self.assertNotEqual(down.returncode, 0)
+        self.assertEqual(db.read_text(), '1:')
+        self.assertTrue(self.instance.is_dir())
+
+    def test_guarded_retirement_preserves_database_replaced_after_down_preflight(self):
+        up, _ = self.up(QA_TEST_DB_PREP_FAIL='1')
+        self.assertIn('db:prepare failed', up.stderr)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        db = self.db_dir / data['database']
+        before = len(Path(self.events).read_text())
+        down = self.cli('down', 'met-218-test', QA_TEST_SWAP_BEFORE_RETIRE='1')
+        self.assertIn('cannot retire owned database', down.stderr)
+        self.assertNotEqual(down.returncode, 0)
+        self.assertEqual(db.read_text(), '1:' + data['databaseClaim'].partition(':')[2])
+        self.assertEqual(list(self.db_dir.iterdir()), [db])
+        self.assert_no_cleanup_since(before)
+        self.assertTrue(self.instance.is_dir())
+
+    def test_retry_drops_only_retired_database_when_active_name_has_been_reused(self):
+        up, _ = self.up(QA_TEST_DB_PREP_FAIL='1')
+        self.assertIn('db:prepare failed', up.stderr)
+        data = json.loads((self.instance / 'instance.json').read_text())
+        db = self.db_dir / data['database']
+        retired = self.db_dir / ('allrice40_qa_retired_' + data['databaseClaim'].split(':')[-1])
+        down = self.cli('down', 'met-218-test', QA_TEST_DROP_FAIL='1')
+        self.assertIn('cannot drop retired database', down.stderr)
+        self.assertNotEqual(down.returncode, 0)
+        self.assertFalse(db.exists())
+        self.assertEqual(retired.read_text(), data['databaseClaim'])
+        db.write_text('1:replacement')
+        retry = self.cli('down', 'met-218-test')
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertEqual(db.read_text(), '1:replacement')
+        self.assertFalse(retired.exists() or self.instance.exists())
+
     def test_preexisting_launchagent_survives_failed_up_and_down(self):
         label = 'ai.bplabs.allrice40-qa-met-218-test-worker'
         plist, job = self.agents / (label + '.plist'), self.jobs / label
@@ -502,7 +577,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
                 up, events = self.up()
                 self.assertIn(message, up.stderr)
                 self.assertNotEqual(up.returncode, 0)
-                self.assertFalse(any(e['command'] == 'createdb' for e in events))
+                self.assertFalse(any(e['args'][-1].startswith('CREATE DATABASE') for e in events))
                 down = self.cli('down', 'met-218-test')
                 self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
                 self.assertEqual((path.stat().st_ino, path.read_text()), (before, original))
@@ -553,6 +628,28 @@ class QaInstanceBuildIdentity(unittest.TestCase):
                          ['ai.bplabs.allrice40-qa-met-218-test-worker'])
         self.assertFalse(list(self.agents.glob('ai.bplabs.allrice40-qa-*.plist')))
         self.assertFalse(list(self.db_dir.iterdir()))
+
+    def test_down_requires_closed_original_port_when_published_plist_and_job_are_gone(self):
+        up, _ = self.up()
+        self.assertEqual(up.returncode, 0, up.stdout + up.stderr)
+        label = 'ai.bplabs.allrice40-qa-met-218-test-worker'
+        (self.agents / (label + '.plist')).unlink()
+        (self.jobs / label).unlink()
+        metadata = (self.instance / 'instance.json').read_bytes()
+        data = json.loads(metadata)
+        db = self.db_dir / data['database']
+        for mock_port in ('QA_TEST_PORT_OPEN', 'QA_TEST_PORT_UNKNOWN'):
+            with self.subTest(mock_port=mock_port):
+                before = len(Path(self.events).read_text())
+                down = self.cli('down', 'met-218-test', **{mock_port: str(data['workerPort'])})
+                self.assertNotEqual(down.returncode, 0, down.stdout + down.stderr)
+                self.assertIn('cannot confirm recorded worker port', down.stderr)
+                self.assert_no_cleanup_since(before)
+                self.assertEqual(db.read_text(), data['databaseClaim'])
+                self.assertEqual((self.instance / 'instance.json').read_bytes(), metadata)
+        down = self.cli('down', 'met-218-test')
+        self.assertEqual(down.returncode, 0, down.stdout + down.stderr)
+        self.assertFalse(db.exists() or self.instance.exists())
 
     def test_mixed_generations_share_three_slots_and_port_pairs_concurrently(self):
         qa = self.instance.parent
@@ -612,7 +709,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         for old_down in (True, False):
             with self.subTest(old_down=old_down):
                 if old_down:
-                    protected = (self.instance, new_release, 'allrice40', 'allrice40_qa_met_218_test')
+                    protected = (self.instance, new_release, 'allrice40', record['database'])
                     protected_lock, removed, down = qa / ('.task40-' + task + '.lock'), old_instance, self.legacy_cli
                     invalid = self.legacy_cli('down', self.instance.name)
                     self.assertIn('task name must match', invalid.stderr)

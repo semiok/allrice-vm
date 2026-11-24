@@ -22,6 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY_DEV = os.path.join(HERE, 'deploy-dev')
 _pinned = os.path.expanduser('~/.local/opt/node-22.23.2/bin/node')
 NODE = _pinned if os.path.exists(_pinned) else shutil.which('node')
+QA_DATABASE = 'allrice40_qa_' + '4' * 32
+QA_DATABASE_URL = 'postgres://tester@127.0.0.1:5434/' + QA_DATABASE
 ARCHIVED = [
     '0073_gemini_model_provider.sql',
     '0213_native_chat_executor_transitions.sql',
@@ -548,7 +550,7 @@ class DeployDevMigrations(unittest.TestCase):
                                      capture_output=True, text=True, timeout=10)
             self.assertEqual(started.returncode, 0, started.stderr)
             actual = json.loads(started.stdout)
-            self.assertEqual(actual['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(actual['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(actual['ALLRICE_STORAGE_ROOT'], qa + '/.local/storage')
             self.assertEqual(actual['ALLRICE_DSH_PLATFORM_HOME'], self.home + '/allrice40-dev/.local/dsh-platform')
             self.assertEqual(actual['ALLRICE_WORKER_INTERNAL_URL'], 'http://127.0.0.1:3201')
@@ -571,11 +573,11 @@ class DeployDevMigrations(unittest.TestCase):
         entry = os.stat(release)
         write(os.path.join(directory, 'instance.json'), json.dumps(dict(
             task=task, repository='semiok/allrice-vm', repositoryId=1469490636,
-            webPort=3200, workerPort=3201, nativeArtifactId='new-art',
+            webPort=3200, workerPort=3201, nativeArtifactId='new-art', database=QA_DATABASE,
             worktree=dict(name=os.path.basename(release), device=entry.st_dev, inode=entry.st_ino))))
-        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=allrice40_qa_${task//-/_}; web=3200; worker=3201; '
+        p = self.run_dd('task=$QA_TASK; dir=$QA_DIR; release=$QA_RELEASE; db=$QA_DATABASE; web=3200; worker=3201; '
                         'sha=$SHA; artifact=new-art;\n' + script, [],
-                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, SHA='b' * 40, USER='tester')
+                        QA_TASK=task, QA_DIR=directory, QA_RELEASE=release, QA_DATABASE=QA_DATABASE, SHA='b' * 40, USER='tester')
         self.assertEqual(p.returncode, 0, p.stderr)
         return directory
 
@@ -586,13 +588,14 @@ class DeployDevMigrations(unittest.TestCase):
             value = self.read_plist(os.path.join(directory, role + '.plist'))
             env = value['EnvironmentVariables']
             self.assertEqual(env['ALLRICE_DSH_PLATFORM_HOME'], os.path.join(self.home, 'allrice40-dev/.local/dsh-platform'))
-            p = self.run_dd('service_plist_config "$PLIST" "$LABEL" "$PORT_KEY" "$PORT" allrice40_qa_tool_test', [],
+            p = self.run_dd('service_plist_config "$PLIST" "$LABEL" "$PORT_KEY" "$PORT" "$QA_DATABASE"', [],
                             PLIST=os.path.join(directory, role + '.plist'), LABEL=value['Label'],
+                            QA_DATABASE=QA_DATABASE,
                             PORT_KEY='ALLRICE_' + role.upper() + '_PORT', PORT=env['ALLRICE_' + role.upper() + '_PORT'])
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assert_no_legacy_settings(value['EnvironmentVariables'])
             self.assertEqual(value['EnvironmentVariables']['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
-            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(value['EnvironmentVariables']['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(value['EnvironmentVariables']['UNRELATED_SETTING'], 'keep')
 
     def test_qa_env_does_not_copy_retired_settings(self):
@@ -609,9 +612,21 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         with open(os.path.join(directory, '.env')) as f:
             env = dict(line.rstrip('\n').split('=', 1) for line in f)
-        self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+        self.assertEqual(env['DATABASE_URL'], QA_DATABASE_URL)
         self.assertEqual(env['UNRELATED_ENV'], 'keep')
         self.assert_no_legacy_settings(env)
+
+    def test_qa_plist_cannot_select_another_instance_database(self):
+        directory = self.write_qa_plists()
+        path = os.path.join(directory, 'worker.plist')
+        worker = self.read_plist(path)
+        other = 'allrice40_qa_' + '5' * 32
+        worker['EnvironmentVariables']['DATABASE_URL'] = 'postgres://tester@127.0.0.1:5434/' + other
+        with open(path, 'wb') as f:
+            plistlib.dump(worker, f)
+        p = self.run_dd('service_plist_config "$PLIST" "$LABEL" ALLRICE_WORKER_PORT 3201 "$DATABASE"', [],
+                        PLIST=path, LABEL=worker['Label'], DATABASE=other)
+        self.assertNotEqual(p.returncode, 0)
 
     def test_contract_refusal_is_recorded_for_automatic_restore_and_recover(self):
         old = self.release(store=False)
@@ -1162,7 +1177,7 @@ class DeployDevMigrations(unittest.TestCase):
         directory = self.write_qa_plists()
         for role in ('web', 'worker'):
             env = self.read_plist(os.path.join(directory, role + '.plist'))['EnvironmentVariables']
-            self.assertEqual(env['DATABASE_URL'], 'postgres://tester@127.0.0.1:5434/allrice40_qa_tool_test')
+            self.assertEqual(env['DATABASE_URL'], QA_DATABASE_URL)
             self.assertEqual(env['ALLRICE_DSH_NATIVE_ARTIFACT_ID'], 'new-art')
         self.assert_parked()
 
@@ -1348,11 +1363,13 @@ class DeployDevMigrations(unittest.TestCase):
             ('release cwd', '/tmp/unrelated.mjs', release, False),
             ('absolute release script', os.path.join(release, 'apps/worker/dist/index.js'), self.home, False),
             ('relative release script', relative, self.home, False),
+            ('script after end of options', '-- ' + relative, self.home, False),
             ('instance cwd', '/tmp/unrelated.mjs', instance, False),
+            ('3.x script after end of options', '-- ' + os.path.join(old, 'apps/worker/dist/index.js'), self.home, True),
             ('same name 3.x release', os.path.join(old, 'apps/worker/dist/index.js'), old, True),
         ):
             with self.subTest(name=name):
-                proof = os.path.join(self.tmp, 'scan-proof')
+                proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
                 p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
                                          ROWS=json.dumps(rows), PROOF=proof,
                                          PROCESS_ARGS=f'999999 1 node {script}\n', PROCESS_CWD=f'p999999\nn{cwd}\n')

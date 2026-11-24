@@ -55,6 +55,14 @@ def qa_instance_data(path):
     return data
 
 
+def qa_instance_database(data):
+    name = data.get('database')
+    legacy = 'allrice40_qa_' + data['task'].replace('-', '_')
+    if not isinstance(name, str) or (name != legacy and not re.fullmatch(r'allrice40_qa_[a-f0-9]{32}', name)):
+        raise ValueError('invalid 4.0 QA database name')
+    return name
+
+
 def qa_worktree(data):
     """Resolve the directory reserved by this instance before git worktree add."""
     if 'worktree' not in data:
@@ -179,10 +187,11 @@ def _service_config(plist, label, port_key, port, database, tools, worker_port):
     task = None
     if database != DEV_DATABASE:
         match = re.fullmatch(re.escape(QA_LABEL_PREFIX) + '(' + QA_TASK_PATTERN + ')-' + role, label)
-        if (not match or database != 'allrice40_qa_' + match[1].replace('-', '_')
-                or not 3200 <= int(port) <= 3299):
+        if not match or not 3200 <= int(port) <= 3299:
             return None
         task = match[1]
+        if database != qa_instance_database(qa_instance_data(qa_instance_dir(task) / 'instance.json')):
+            return None
     if (plist.get('Label') != label or not isinstance(env, dict)
             or not all(isinstance(value, str) for value in env.values())
             or env.get('HOME', str(home)) != str(home)
@@ -251,13 +260,15 @@ def _service_config(plist, label, port_key, port, database, tools, worker_port):
 
 
 def main():
-    if sys.argv[1] in ('qa-owned', 'qa-worktree'):
+    if sys.argv[1] in ('qa-owned', 'qa-worktree', 'qa-database'):
         try:
             data = qa_instance_data(Path(sys.argv[2]))
             if sys.argv[1] == 'qa-worktree':
                 release = qa_worktree(data)
                 if release:
                     print(release)
+            elif sys.argv[1] == 'qa-database':
+                print(qa_instance_database(data))
         except (OSError, RuntimeError, ValueError):
             sys.exit(1)
         return

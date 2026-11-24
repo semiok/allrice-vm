@@ -42,7 +42,7 @@ case "${1:-}" in
     qa_owned "$f" || { echo "QA instance belongs to another repository: $task" >&2; exit 2; }
     web=$(json "$f" webPort); worker=$(json "$f" workerPort)
     creds="$dir/creds.json"; out="$dir/smoke/$ts"
-    qa_db=allrice40_qa_${task//-/_}
+    qa_db=$(qa_database "$f") || exit 2
     web_label=$(qa_label "$task" web); worker_label=$(qa_label "$task" worker)
     qa_web="$HOME/Library/LaunchAgents/$web_label.plist"
     qa_worker="$HOME/Library/LaunchAgents/$worker_label.plist"
