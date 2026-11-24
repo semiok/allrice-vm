@@ -118,9 +118,12 @@ export function createDEntryProfile(
       async function writeOwned(active: AbortSignal, write: () => void) {
         if (response.writableFinished || response.closed) return;
         const { socket } = request;
-        const joined = Promise.withResolvers<boolean>();
-        const finished = () => joined.resolve(true);
-        const closed = () => joined.resolve(false);
+        let settle!: (sent: boolean) => void;
+        const joined = new Promise<boolean>((resolve) => {
+          settle = resolve;
+        });
+        const finished = () => settle(true);
+        const closed = () => settle(false);
         const abort = () => {
           if (response.writableFinished || response.closed) return;
           const queued = response.socket === null;
@@ -137,10 +140,10 @@ export function createDEntryProfile(
           if (socket.closed) closed();
           else if (active.aborted) abort();
           else write();
-          return await joined.promise;
+          return await joined;
         } catch (error) {
           abort();
-          await joined.promise;
+          await joined;
           throw error;
         } finally {
           response.off('finish', finished);

@@ -529,16 +529,16 @@ it(
       () => true,
     );
     const transfer = await pipelineAfterEvents(scopeId);
-    const asset = transfer.responses[1]!;
-    await expect.poll(() => asset.writableEnded).toBe(true);
-    expect(asset.socket).toBeNull();
-    expect(asset.writableFinished).toBe(false);
+    const queuedAsset = transfer.responses[1]!;
+    await expect.poll(() => queuedAsset.writableEnded).toBe(true);
+    expect(queuedAsset.socket).toBeNull();
+    expect(queuedAsset.writableFinished).toBe(false);
     let terminal: Awaited<ReturnType<typeof receive>> | undefined;
     const terminalPromise = receive().then((frame) => (terminal = frame));
     closePage(peer);
     await transfer.fenced.promise;
-    expect(asset.writableFinished).toBe(false);
-    expect(asset.destroyed).toBe(true);
+    expect(queuedAsset.writableFinished).toBe(false);
+    expect(queuedAsset.destroyed).toBe(true);
     expect((await f.invoke(scopeId)).status).toBe(404);
     expect(terminal).toBeUndefined();
     transfer.release.resolve();
