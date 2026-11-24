@@ -37,10 +37,7 @@ import {
   ReferenceSelectionUnavailableError,
   referenceSelectionMessage,
 } from '../../lib/chatflow/reference-selection';
-import {
-  EmployeeSceneDialog,
-  EmployeeSceneList,
-} from './employee-scene-dialog';
+import { EmployeeSceneDialog } from './employee-scene-dialog';
 import {
   EmployeeSkillsHost,
   EmployeeSkillConfirmationLayer,
@@ -48,13 +45,10 @@ import {
 } from './employee-skills-host';
 import type { EmployeeSkill } from './employee-skills-section';
 import { employeeSkillHostCopy } from './employee-skill-host-copy';
-import {
-  EmployeeCapabilitiesPanel,
-  EmployeeCapabilitiesSections,
-} from './employee-capabilities-panel';
+import { EmployeeCapabilitiesPanel } from './employee-capabilities-panel';
+import { EmployeeCapabilitiesSections } from './employee-capabilities-sections';
 import {
   BrandMediaHost,
-  BrandMediaPluginSection,
   BrandMediaPluginPicker,
   createBrandMediaClient,
   runActive,
@@ -2603,42 +2597,44 @@ export function ChatFlowClient({
       ? employeeChoiceProfile(workspace, sceneTarget)?.name
       : undefined) ??
     activeEmployeeName;
-  const capabilitySections = (origin: 'top' | 'employee') => (
-    <EmployeeCapabilitiesSections
-      onSkillNavigate={() => {
-        setSkillHostOrigin(origin);
-      }}
-    >
-      <BrandMediaPluginSection
-        controller={brandMediaEntry}
-        headingId={`employee-plugins-${origin}`}
-        onOpen={() => {
-          if (!sceneTarget) return;
-          setBrandMediaHost((current) => ({
-            scope: settingsScope,
-            instanceId: sceneTarget,
-            name: capabilityEmployeeName,
-            sessionId:
-              sceneTarget === activeEmployee?.instanceId ? activeId : null,
-            serial: (current?.serial ?? 0) + 1,
-            open: true,
-          }));
-          setEmployeeDetailsOpen(false);
+  function openBrandMedia() {
+    if (!sceneTarget) return;
+    setBrandMediaHost((current) => ({
+      scope: settingsScope,
+      instanceId: sceneTarget,
+      name: capabilityEmployeeName,
+      sessionId: sceneTarget === activeEmployee?.instanceId ? activeId : null,
+      serial: (current?.serial ?? 0) + 1,
+      open: true,
+    }));
+    setEmployeeDetailsOpen(false);
+  }
+  function capabilitySections(origin: 'top' | 'employee') {
+    const openScene =
+      origin === 'employee' ? openEmployeeScene : openCapabilityScene;
+    return (
+      <EmployeeCapabilitiesSections
+        plugins={{
+          controller: brandMediaEntry,
+          headingId: `employee-plugins-${origin}`,
+          onOpen: openBrandMedia,
         }}
+        scenes={{
+          controller: sceneCatalog,
+          employeeName: capabilityEmployeeName,
+          onChoose: openScene,
+          onCreate: () => openScene(),
+        }}
+        onSkillNavigate={() => setSkillHostOrigin(origin)}
       />
-      <EmployeeSceneList
-        controller={sceneCatalog}
-        employeeName={capabilityEmployeeName}
-        embedded
-        onChoose={
-          origin === 'employee' ? openEmployeeScene : openCapabilityScene
-        }
-        onCreate={() =>
-          origin === 'employee' ? openEmployeeScene() : openCapabilityScene()
-        }
-      />
-    </EmployeeCapabilitiesSections>
-  );
+    );
+  }
+  const brandMediaPicker = brandMediaEntry.picker ? (
+    <BrandMediaPluginPicker
+      controller={brandMediaEntry}
+      employeeName={capabilityEmployeeName}
+    />
+  ) : undefined;
   const sceneDialog = (inline = false) => (
     <EmployeeSceneDialog
       key={`${sceneCatalog.key}/${currentSceneRequest?.revision ?? 0}`}
@@ -3629,14 +3625,10 @@ export function ChatFlowClient({
                   active={active}
                   onRead={sceneCatalog.ensureLoaded}
                   layer={
-                    brandMediaEntry.picker ? (
-                      <BrandMediaPluginPicker
-                        controller={brandMediaEntry}
-                        employeeName={capabilityEmployeeName}
-                      />
-                    ) : currentSceneRequest?.origin === 'top' ? (
-                      sceneDialog(true)
-                    ) : undefined
+                    brandMediaPicker ??
+                    (currentSceneRequest?.origin === 'top'
+                      ? sceneDialog(true)
+                      : undefined)
                   }
                   showSkills={skillHostOrigin === 'top'}
                 >
@@ -3863,16 +3855,7 @@ export function ChatFlowClient({
         workspaceId={workspace.workspaceId}
         headers={tenantHeaders}
         sceneCatalog={sceneCatalog}
-        capabilitiesContent={
-          brandMediaEntry.picker ? (
-            <BrandMediaPluginPicker
-              controller={brandMediaEntry}
-              employeeName={capabilityEmployeeName}
-            />
-          ) : (
-            capabilitySections('employee')
-          )
-        }
+        capabilitiesContent={brandMediaPicker ?? capabilitySections('employee')}
         capabilitiesOwner={skillHostOrigin === 'employee'}
         reuseSceneSnapshot={reuseDetailsSceneSnapshot.current}
         onOpenScene={openEmployeeScene}
