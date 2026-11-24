@@ -599,7 +599,7 @@ it(
     expect(roleAsset!.socket).toBeNull();
     // The authoritative lookup now denies B. Its watcher has not sent any
     // cancellation signal. The HTTP writer must read again after its turn.
-    f.owner.assertCurrent.mockRejectedValueOnce(
+    vi.mocked(f.owner.assertCurrent).mockRejectedValueOnce(
       new DataAccessError('authorization_denied'),
     );
     roleHead!.end();
@@ -621,7 +621,7 @@ it(
     const checking = deferred();
     const finishCheck = deferred();
     closes.push(async () => finishCheck.resolve());
-    f.owner.assertCurrent.mockImplementationOnce(async () => {
+    vi.mocked(f.owner.assertCurrent).mockImplementationOnce(async () => {
       checking.resolve();
       await finishCheck.promise;
     });
