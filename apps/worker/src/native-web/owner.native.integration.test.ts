@@ -178,7 +178,9 @@ it.skipIf(!cli)(
     const nativeExit = latch(),
       socketClose = latch(),
       deliverExit = latch();
-    const transportClosing = latch();
+    const transportClosing = latch(),
+      actualTransportJoined = latch(),
+      deliverTransportJoin = latch();
     let transportJoined = false;
     const queued: (() => void)[] = [];
     let holdingSocketEvents = true;
@@ -195,8 +197,10 @@ it.skipIf(!cli)(
           close() {
             const joined = transport.close();
             transportClosing.resolve();
-            return joined.then(() => {
+            return joined.then(async () => {
               transportJoined = true;
+              actualTransportJoined.resolve();
+              await deliverTransportJoin.promise;
             });
           },
           createWebSocket(url) {
@@ -221,6 +225,7 @@ it.skipIf(!cli)(
     cleanup.push(async () => {
       deliverExit.resolve();
       deliverSocketEvents();
+      deliverTransportJoin.resolve();
       release.resolve();
     });
     const f = await setup((scope) => {
@@ -290,6 +295,16 @@ it.skipIf(!cli)(
     expect(closed).toBe(false);
     expect(retired).toBe(false);
     deliverSocketEvents();
+    await actualTransportJoined.promise;
+    // The real socket and independent read have joined. Only the result
+    // returned from this transport close call is held for the owner.
+    await new Promise<void>((done) => setImmediate(done));
+    expect(retired, 'retire must await the transport close result').toBe(false);
+    expect(
+      closed,
+      'reentrant close must await the transport close result',
+    ).toBe(false);
+    deliverTransportJoin.resolve();
     await Promise.all([retiring, reentrant]);
     expect(transportJoined).toBe(true);
     expect(cancel).not.toHaveBeenCalled();
