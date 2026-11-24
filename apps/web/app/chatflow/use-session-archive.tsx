@@ -103,6 +103,8 @@ export function useSessionArchive({
       const previous =
         cached?.scope === scope && cached.filter === filter ? cached : null;
       const ticket = ++generation.current;
+      const current = () =>
+        ticket === generation.current && currentScope.current === scope;
       employeeRequests.current.clear();
       setPage((old) =>
         old
@@ -125,12 +127,14 @@ export function useSessionArchive({
           archived: filter === 'only' ? 'only' : String(filter === 'show'),
         });
         if (cursor) query.set('cursor', cursor);
-        const result = await fetch(`/api/v1/sessions?${query}`, {
+        const response = await fetch(`/api/v1/sessions?${query}`, {
           headers,
           cache: 'no-store',
-        }).then(readJson<Page>);
-        if (ticket !== generation.current || currentScope.current !== scope)
-          return;
+        });
+        // readJson can navigate on 401 before reading the response body.
+        if (!current()) return;
+        const result = await readJson<Page>(response);
+        if (!current()) return;
         if (!Array.isArray(result.sessions))
           throw new Error('工作记录响应无效，请重试');
         // The global first page may contain only the busiest employee. Refresh
@@ -155,11 +159,13 @@ export function useSessionArchive({
                   const employeeQuery = new URLSearchParams(query);
                   employeeQuery.set('employeeInstanceId', employeeId);
                   if (nextCursor) employeeQuery.set('cursor', nextCursor);
-                  const next = await fetch(
+                  const response = await fetch(
                     `/api/v1/sessions?${employeeQuery}`,
                     { headers, cache: 'no-store' },
-                  ).then(readJson<Page>);
-                  if (ticket !== generation.current) return null;
+                  );
+                  if (!current()) return null;
+                  const next = await readJson<Page>(response);
+                  if (!current()) return null;
                   if (
                     !Array.isArray(next.sessions) ||
                     next.sessions.some(
@@ -178,8 +184,7 @@ export function useSessionArchive({
                 };
               }),
             );
-        if (ticket !== generation.current || currentScope.current !== scope)
-          return;
+        if (!current()) return;
         // Replace both projections with current server facts. Never union an
         // old running=true into a terminal read or discard a successor Run.
         onActivities(
@@ -231,7 +236,7 @@ export function useSessionArchive({
           };
         });
       } catch (cause) {
-        if (ticket === generation.current && currentScope.current === scope)
+        if (current())
           setLoadError({
             scope,
             filter,
@@ -351,10 +356,13 @@ export function useSessionArchive({
         archived: filter === 'only' ? 'only' : String(filter === 'show'),
       });
       if (cursor) query.set('cursor', cursor);
-      const result = await fetch(`/api/v1/sessions?${query}`, {
+      const response = await fetch(`/api/v1/sessions?${query}`, {
         headers,
         cache: 'no-store',
-      }).then(readJson<Page>);
+      });
+      if (!current()) return;
+      const result = await readJson<Page>(response);
+      if (!current()) return;
       if (
         !Array.isArray(result.sessions) ||
         result.sessions.some((s) => sessionEmployeeKey(s) !== employeeId)

@@ -1,9 +1,10 @@
 import { createServer, type Server } from 'node:http';
-import { mkdir, readFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  ApiErrorSchema,
   brandMediaRelease,
   type BrandMediaArticle,
   type BrandMediaTopic,
@@ -12,6 +13,7 @@ import {
 } from '@allrice/contracts';
 import type {
   Browser,
+  Download,
   Page,
   Request,
 } from '../../../worker/node_modules/playwright-core/index.js';
@@ -38,6 +40,29 @@ const png =
 const imageFile = { objectId: id(80), versionId: id(81), checksum };
 type ImageFile = { fileName: string; mediaType: string; base64: string };
 const cursor = { createdAt: stamp, id: id(200) };
+function gate<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+const moduleDirectory = (url: URL) => url.pathname.endsWith('/modules');
+const brandEndpoint = (url: URL) => url.pathname.endsWith('/brand-media');
+const brandView = (url: URL, view: string) =>
+  brandEndpoint(url) && url.searchParams.get('view') === view;
+const accessProblem = (
+  message: string,
+  code:
+    | 'AUTHENTICATION_REQUIRED'
+    | 'AUTHORIZATION_DENIED'
+    | 'REFERENCE_SELECTION_UNAVAILABLE'
+    | 'VERSION_CONFLICT'
+    | 'RESOURCE_NOT_FOUND' = 'AUTHORIZATION_DENIED',
+) =>
+  ApiErrorSchema.parse({
+    error: { code, message, requestId: id(777), retryable: false },
+  });
 const topic = (n = 10): BrandMediaTopic => ({
   workspaceId: scope.workspaceId,
   instanceId: scope.instanceId,
@@ -260,6 +285,75 @@ type State = {
   bodyGate?: Promise<void>;
 };
 
+async function compareComposerProbes(
+  page: Page,
+  cyan: Buffer,
+  magenta: Buffer,
+) {
+  return page.evaluate(
+    async ([cyan, magenta]) => {
+      const decode = async (data: string) => {
+        const response = await fetch(`data:image/png;base64,${data}`);
+        const image = await createImageBitmap(await response.blob(), {
+          colorSpaceConversion: 'none',
+        });
+        try {
+          const { width, height } = image;
+          const context = new OffscreenCanvas(width, height).getContext('2d');
+          if (!context) throw Error('Cannot read composer probe pixels');
+          context.drawImage(image, 0, 0);
+          return context.getImageData(0, 0, width, height);
+        } finally {
+          image.close();
+        }
+      };
+      const [first, second] = await Promise.all([
+        decode(cyan),
+        decode(magenta),
+      ]);
+      const { width, height, data: before } = first;
+      if (width !== second.width || height !== second.height)
+        throw Error('Composer probe screenshot dimensions changed');
+      const after = second.data;
+      let changedPixels = 0,
+        neutralPixels = 0,
+        probePixels = 0;
+      let firstDifference;
+      const gray = (pixels: Uint8ClampedArray, offset: number) =>
+        pixels[offset] === pixels[offset + 1] &&
+        pixels[offset + 1] === pixels[offset + 2];
+      for (let offset = 0; offset < before.length; offset += 4) {
+        const red = after[offset]! - before[offset]!,
+          green = after[offset + 1]! - before[offset + 1]!,
+          blue = after[offset + 2]! - before[offset + 2]!,
+          alpha = after[offset + 3]! - before[offset + 3]!;
+        if (red === 0 && green === 0 && blue === 0 && alpha === 0) continue;
+        changedPixels++;
+        firstDifference ??= {
+          x: (offset / 4) % width,
+          y: Math.floor(offset / 4 / width),
+          cyan: Array.from(before.subarray(offset, offset + 4)),
+          magenta: Array.from(after.subarray(offset, offset + 4)),
+        };
+        // Gray foreground redraws change luminance only. An exposed cyan to
+        // magenta switch increases red and decreases green, even under a scrim.
+        if (alpha === 0 && gray(before, offset) && gray(after, offset))
+          neutralPixels++;
+        if (red > 0 && green < 0 && blue === 0 && alpha === 0) probePixels++;
+      }
+      return {
+        width,
+        height,
+        changedPixels,
+        neutralPixels,
+        probePixels,
+        firstDifference,
+      };
+    },
+    [cyan.toString('base64'), magenta.toString('base64')] as const,
+  );
+}
+
 suite('MET-224 main-area brand media text workflow', () => {
   let browser: Browser, server: Server, origin: string;
   const evidence = resolve('.local/met224-brand-media-p3');
@@ -374,10 +468,9 @@ suite('MET-224 main-area brand media text workflow', () => {
     );
     browser = await chromium.launch({
       headless: true,
-      // Use Chromium's software compositor for the exact paint oracle below.
+      // Use Chromium's software compositor for repeatable probe captures.
       // macOS GPU rasterization changes rounded-edge gray values between
       // screenshots even when an opaque layer fully covers the changed seat.
-      // This keeps zero pixel tolerance; the missing-isolation control stays.
       args: ['--disable-gpu'],
       executablePath:
         process.env.ALLRICE_TEST_CHROME_EXECUTABLE ??
@@ -663,6 +756,10 @@ suite('MET-224 main-area brand media text workflow', () => {
         return route.fulfill({
           status: 200,
           contentType: 'text/plain',
+          headers: {
+            'Content-Disposition':
+              "attachment; filename*=UTF-8''allrice-export",
+          },
           body: '不可直接改写的正文\n第二段',
         });
       }
@@ -787,6 +884,99 @@ suite('MET-224 main-area brand media text workflow', () => {
   }
   const panel = (page: Page) =>
     page.getByRole('region', { name: '品牌自媒体', exact: true });
+  async function finishDespiteAbort(
+    page: Page,
+    path: string,
+    observeBlob = false,
+  ) {
+    await page.evaluate(
+      ({ path, observeBlob }) => {
+        const fetch = window.fetch.bind(window);
+        window.fetch = async (input, options) => {
+          if (
+            typeof input !== 'string' ||
+            new URL(input, location.href).pathname !== path
+          )
+            return fetch(input, options);
+          const response = await fetch(input, {
+            ...options,
+            signal: undefined,
+          });
+          if (observeBlob) {
+            const settled = () => {
+              document.body.dataset.lateImageRead = 'settled';
+            };
+            if (options?.signal?.aborted) setTimeout(settled, 0);
+            const blob = response.blob.bind(response);
+            response.blob = async () => {
+              const bytes = await blob();
+              setTimeout(settled, 0);
+              return bytes;
+            };
+          }
+          return response;
+        };
+      },
+      { path, observeBlob },
+    );
+  }
+  async function holdBodyDelivery(page: Page, path: string) {
+    await page.evaluate((path) => {
+      const fetch = window.fetch.bind(window);
+      const click = HTMLAnchorElement.prototype.click;
+      const release = new Promise<void>((done) => {
+        window.addEventListener('finish-body-delivery', () => done(), {
+          once: true,
+        });
+      });
+      let first = true;
+      window.fetch = async (input, options) => {
+        const response = await fetch(input, options);
+        if (
+          first &&
+          typeof input === 'string' &&
+          new URL(input, location.href).pathname === path
+        ) {
+          first = false;
+          const blob = response.blob.bind(response);
+          response.blob = async () => {
+            document.body.dataset.deliveryHeaders = String(response.status);
+            await release;
+            const bytes = await blob();
+            setTimeout(() => {
+              document.body.dataset.deliveryBytes = String(bytes.size);
+            }, 0);
+            return bytes;
+          };
+        }
+        return response;
+      };
+      HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+        if (this.hasAttribute('download'))
+          document.body.dataset.deliverySave = this.download;
+        click.call(this);
+      };
+    }, path);
+  }
+  async function observeLateRunRead(page: Page) {
+    await page.evaluate(() => {
+      const fetch = window.fetch.bind(window);
+      window.fetch = async (input, options) => {
+        const response = await fetch(input, options);
+        if (response.headers.has('x-fixture-late-run-read')) {
+          const json = response.json.bind(response);
+          response.json = async () => {
+            const value = await json();
+            setTimeout(() => {
+              document.body.dataset.lateRunRead = 'settled';
+            }, 0);
+            return value;
+          };
+        }
+        return response;
+      };
+    });
+  }
   async function topicsPage(page: Page) {
     await page.getByRole('tab', { name: '选题库', exact: true }).click();
   }
@@ -802,6 +992,581 @@ suite('MET-224 main-area brand media text workflow', () => {
         req.body?.operation === 'article' ||
         req.body?.operation === 'image',
     );
+
+  it('removes cached brand content on current access loss and never restores a late result or a reopened copy', async () => {
+    const f = await fixture();
+    const { page } = f;
+    const lateEntered = gate();
+    const releaseLate = gate();
+    const lateFinished = gate<{ canceled: boolean; error?: unknown }>();
+    const checkEntered = gate();
+    const releaseCheck = gate();
+    const accessDenied = accessProblem(
+      '当前员工尚未添加这个插件，或绑定已撤销。',
+    );
+    try {
+      await f.open();
+      await topicsPage(page);
+      await panel(page).getByText('新品故事 10', { exact: true }).waitFor();
+      await page.getByRole('tab', { name: '文章库', exact: true }).click();
+      await expect
+        .poll(() => page.getByLabel('文章正文').textContent())
+        .toContain('不可直接改写的正文');
+      await page.getByRole('tab', { name: '排期表', exact: true }).click();
+
+      await page.route(
+        (url) => brandView(url, 'articles'),
+        async (route) => {
+          lateEntered.resolve();
+          await releaseLate.promise;
+          try {
+            await route.fulfill({
+              json: {
+                view: 'articles',
+                items: [article(99)],
+                nextCursor: null,
+              },
+            });
+            lateFinished.resolve({ canceled: false });
+          } catch (error) {
+            lateFinished.resolve({
+              canceled:
+                route.request().failure()?.errorText === 'net::ERR_ABORTED',
+              error,
+            });
+          }
+        },
+      );
+      await page.route(
+        (url) => brandView(url, 'calendar'),
+        async (route) => {
+          await lateEntered.promise;
+          await route.fulfill({ status: 403, json: accessDenied });
+        },
+      );
+      await page.route(moduleDirectory, async (route) => {
+        checkEntered.resolve();
+        await releaseCheck.promise;
+        await route.fulfill({
+          json: {
+            modules: [
+              {
+                descriptor: {
+                  id: 'allrice.brand-media',
+                  displayName: '品牌自媒体',
+                },
+                binding: { ...binding, revokedAt: stamp },
+                enabled: false,
+                available: false,
+              },
+            ],
+          },
+        });
+      });
+
+      await page.getByRole('button', { name: '下个月', exact: true }).click();
+      await checkEntered.promise;
+      await panel(page).getByRole('alert').waitFor();
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|新品故事|文章 20/,
+      );
+
+      const checked = page.waitForResponse((response) =>
+        moduleDirectory(new URL(response.url())),
+      );
+      releaseCheck.resolve();
+      expect((await checked).ok()).toBe(true);
+      releaseLate.resolve();
+      const late = await lateFinished.promise;
+      if (!late.canceled && late.error) throw late.error;
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|月历里的旧文章/,
+      );
+      await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+      await page.getByRole('heading', { name: '原聊天' }).waitFor();
+      expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+        '未发送的聊天草稿',
+      );
+      await page.getByLabel('草稿附件').waitFor();
+
+      await page.route(brandEndpoint, (route) =>
+        route.fulfill({ status: 403, json: accessDenied }),
+      );
+      await page
+        .getByRole('button', { name: '打开 品牌自媒体', exact: true })
+        .click();
+      await panel(page).getByRole('alert').waitFor();
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toMatch(
+        /不可直接改写的正文|新品故事|月历里的旧文章/,
+      );
+      expect(
+        f.state.requests.filter((request) => request.method === 'POST'),
+      ).toHaveLength(0);
+    } finally {
+      lateEntered.resolve();
+      releaseLate.resolve();
+      releaseCheck.resolve();
+      await f.close();
+    }
+  });
+
+  it.each(['forbidden', 'binding-conflict', 'readonly', 'offline'] as const)(
+    'suspends private content only for a possible loss of access on a write (%s)',
+    async (outcome) => {
+      const document = article();
+      document.publication = {
+        state: 'scheduled',
+        schedule: { plannedAt: stamp, timezone: 'Asia/Shanghai' },
+        links: null,
+      };
+      const f = await fixture({ articles: [document] });
+      const { page } = f;
+      const check = gate();
+      let checkCount = 0;
+      try {
+        await f.open();
+        await page.getByRole('tab', { name: '文章库', exact: true }).click();
+        const body = page.getByLabel('文章正文');
+        await expect
+          .poll(() => body.textContent())
+          .toContain('不可直接改写的正文');
+        await page.route(brandEndpoint, (route) => {
+          if (route.request().method() !== 'POST') return route.fallback();
+          if (outcome === 'offline') return route.abort('internetdisconnected');
+          return route.fulfill({
+            status: outcome === 'binding-conflict' ? 409 : 403,
+            json: accessProblem(
+              '取消排期被服务拒绝',
+              outcome === 'binding-conflict'
+                ? 'VERSION_CONFLICT'
+                : 'AUTHORIZATION_DENIED',
+            ),
+          });
+        });
+        await page.route(moduleDirectory, async (route) => {
+          checkCount++;
+          await check.promise;
+          if (outcome === 'readonly') return route.fallback();
+          return route.fulfill({
+            status: 503,
+            json: { message: '目录暂不可用' },
+          });
+        });
+        await panel(page)
+          .getByRole('button', { name: '取消排期', exact: true })
+          .click();
+        await panel(page).getByRole('alert').waitFor();
+        if (outcome === 'offline') {
+          expect(checkCount).toBe(0);
+        } else {
+          await expect.poll(() => checkCount).toBe(1);
+          expect(await panel(page).getByRole('tab').count()).toBe(0);
+          expect(await panel(page).textContent()).not.toContain(
+            '不可直接改写的正文',
+          );
+          const reply = page.waitForResponse((response) =>
+            moduleDirectory(new URL(response.url())),
+          );
+          check.resolve();
+          await (await reply).finished();
+          if (outcome !== 'readonly') {
+            await page.evaluate(() => new Promise(requestAnimationFrame));
+            expect(await panel(page).getByRole('tab').count()).toBe(0);
+            expect(await panel(page).textContent()).not.toContain(
+              '不可直接改写的正文',
+            );
+          }
+        }
+        if (outcome === 'offline' || outcome === 'readonly') {
+          await panel(page)
+            .getByRole('tab', { name: '文章库', exact: true })
+            .waitFor();
+          await expect
+            .poll(() => body.textContent())
+            .toContain('不可直接改写的正文');
+        }
+        await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+        expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+          '未发送的聊天草稿',
+        );
+      } finally {
+        check.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['topics', 'article'] as const)(
+    'an enabled catalog does not restore a denied %s projection before a fresh authorized read',
+    async (view) => {
+      const f = await fixture({
+        articles: [article(), { ...article(21), body: null }],
+      });
+      const { page } = f;
+      let denied = true;
+      const missing = view === 'topics' ? '新品故事 10' : '文章 20';
+      const message = '固定文件现权已撤销';
+      try {
+        await f.open();
+        await topicsPage(page);
+        await panel(page).getByText('新品故事 10', { exact: true }).waitFor();
+        await page.getByRole('tab', { name: '文章库', exact: true }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toContain('不可直接改写的正文');
+        await page.route(
+          (url) =>
+            brandView(url, view) &&
+            (view === 'topics' || url.searchParams.get('articleId') === id(20)),
+          (route) =>
+            denied
+              ? route.fulfill({ status: 403, json: accessProblem(message) })
+              : route.fallback(),
+        );
+        await page.getByRole('tab', { name: '排期表', exact: true }).click();
+        await panel(page)
+          .getByRole('button', { name: '下个月', exact: true })
+          .click();
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: message })
+          .waitFor();
+
+        await topicsPage(page);
+        expect(
+          await panel(page).getByText('新品故事 10', { exact: true }).count(),
+        ).toBe(view === 'topics' ? 0 : 1);
+        await page.getByRole('tab', { name: '文章库', exact: true }).click();
+        const other = panel(page).getByRole('button', {
+          name: '文章 21',
+          exact: true,
+        });
+        await other.waitFor();
+        if (view === 'article') {
+          expect(
+            await panel(page).getByText(missing, { exact: true }).count(),
+          ).toBe(0);
+          expect(await panel(page).getByLabel('文章正文').count()).toBe(0);
+          await other.click();
+          await panel(page)
+            .getByRole('heading', { name: '文章 21', exact: true })
+            .waitFor();
+        }
+        denied = false;
+        const fresh = '重新授权的内容';
+        if (view === 'topics') f.state.topics[0]!.candidate.title = fresh;
+        else f.state.articles[0]!.title = fresh;
+        await page.getByRole('tab', { name: '排期表', exact: true }).click();
+        await panel(page)
+          .getByRole('button', { name: '下个月', exact: true })
+          .click();
+        await page
+          .getByRole('tab', {
+            name: view === 'topics' ? '选题库' : '文章库',
+            exact: true,
+          })
+          .click();
+        await panel(page).getByText(fresh, { exact: true }).first().waitFor();
+        expect(
+          await panel(page).getByText(missing, { exact: true }).count(),
+        ).toBe(0);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+
+  it('only a catalog started after a rejected write can clear that access warning', async () => {
+    const stored = article();
+    stored.publication = {
+      state: 'scheduled',
+      schedule: { plannedAt: stamp, timezone: 'Asia/Shanghai' },
+      links: null,
+    };
+    const f = await fixture({ articles: [stored] });
+    const { page } = f;
+    const entered = gate();
+    const refuse = gate();
+    const oldCheck = gate();
+    const newCheck = gate();
+    let checks = 0;
+    const readDenied = '选题固定资料已撤销';
+    const writeDenied = '取消排期时绑定已撤销';
+    try {
+      await f.open();
+      await panel(page)
+        .getByRole('tab', { name: '文章库', exact: true })
+        .click();
+      await expect
+        .poll(() => panel(page).getByLabel('文章正文').textContent())
+        .toContain('不可直接改写的正文');
+      await page.route(brandEndpoint, async (route) => {
+        if (route.request().method() === 'POST') {
+          entered.resolve();
+          await refuse.promise;
+          return route.fulfill({
+            status: 403,
+            json: accessProblem(writeDenied),
+          });
+        }
+        if (brandView(new URL(route.request().url()), 'topics'))
+          return route.fulfill({
+            status: 403,
+            json: accessProblem(readDenied),
+          });
+        return route.fallback();
+      });
+      await page.route(moduleDirectory, async (route) => {
+        if (++checks === 1) {
+          await oldCheck.promise;
+          return route.fallback();
+        }
+        await newCheck.promise;
+        return route.fulfill({
+          status: 503,
+          json: { message: '最新目录暂不可用' },
+        });
+      });
+      await panel(page)
+        .getByRole('button', { name: '取消排期', exact: true })
+        .click();
+      await entered.promise;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: readDenied })
+        .waitFor();
+      await expect.poll(() => checks).toBe(1);
+      refuse.resolve();
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: writeDenied })
+        .waitFor();
+      const oldReply = page.waitForResponse((response) =>
+        moduleDirectory(new URL(response.url())),
+      );
+      oldCheck.resolve();
+      await (await oldReply).finished();
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+      expect(await panel(page).textContent()).not.toContain(
+        '不可直接改写的正文',
+      );
+      await expect.poll(() => checks).toBe(2);
+      const newReply = page.waitForResponse(
+        (response) =>
+          moduleDirectory(new URL(response.url())) && response.status() === 503,
+      );
+      newCheck.resolve();
+      await (await newReply).finished();
+      expect(await panel(page).getByRole('tab').count()).toBe(0);
+    } finally {
+      refuse.resolve();
+      oldCheck.resolve();
+      newCheck.resolve();
+      await f.close();
+    }
+  });
+
+  it('a late article A refusal removes A after selecting B and fences an older list result', async () => {
+    const f = await fixture({ articles: [article(), article(21)] });
+    const { page } = f;
+    const detailStarted = gate();
+    const detail = gate();
+    const listStarted = gate();
+    const list = gate();
+    let holdList = false;
+    let denyA = true;
+    const missing = '文章 20';
+    const independent = '文章 21';
+    const denial = '当前员工的这篇文章已删除';
+    const denialAlert = panel(page)
+      .getByRole('alert')
+      .filter({ hasText: denial });
+    try {
+      await f.open();
+      await panel(page)
+        .getByRole('tab', { name: '文章库', exact: true })
+        .click();
+      await expect
+        .poll(() => panel(page).getByLabel('文章正文').textContent())
+        .toContain('不可直接改写的正文');
+      await page.route(brandEndpoint, async (route) => {
+        const url = new URL(route.request().url());
+        if (
+          denyA &&
+          brandView(url, 'article') &&
+          url.searchParams.get('articleId') === id(20)
+        ) {
+          detailStarted.resolve();
+          await detail.promise;
+          return route.fulfill({
+            status: 404,
+            json: accessProblem(denial, 'RESOURCE_NOT_FOUND'),
+          });
+        }
+        if (holdList && brandView(url, 'articles')) {
+          listStarted.resolve();
+          await list.promise;
+        }
+        return route.fallback();
+      });
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await detailStarted.promise;
+      const otherRead = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          brandView(url, 'article') &&
+          url.searchParams.get('articleId') === id(21)
+        );
+      });
+      await panel(page)
+        .getByRole('button', { name: independent, exact: true })
+        .click();
+      await (await otherRead).finished();
+      await panel(page)
+        .getByRole('heading', { name: independent, exact: true })
+        .waitFor();
+
+      holdList = true;
+      const refreshedB = '文章 21 的列表已更新';
+      f.state.articles[1] = { ...article(21), title: refreshedB };
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await listStarted.promise;
+      detail.resolve();
+      await denialAlert.waitFor();
+      await panel(page)
+        .getByRole('heading', { name: independent, exact: true })
+        .waitFor();
+      expect(
+        await panel(page)
+          .getByRole('button', { name: missing, exact: true })
+          .count(),
+      ).toBe(0);
+      holdList = false;
+      list.resolve();
+      await panel(page)
+        .getByRole('button', { name: refreshedB, exact: true })
+        .waitFor();
+      expect(
+        await panel(page)
+          .getByRole('button', { name: missing, exact: true })
+          .count(),
+      ).toBe(0);
+      expect(await denialAlert.isVisible()).toBe(true);
+
+      const newerB = '文章 21 再次成功读取';
+      f.state.articles = [{ ...article(21), title: newerB }];
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('button', { name: newerB, exact: true })
+        .waitFor();
+      expect(await denialAlert.isVisible()).toBe(true);
+
+      denyA = false;
+      const restored = '文章 20 重新取得授权';
+      f.state.articles.push({ ...article(), title: restored });
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('button', { name: restored, exact: true })
+        .click();
+      await panel(page)
+        .getByRole('heading', { name: restored, exact: true })
+        .waitFor();
+      await denialAlert.waitFor({ state: 'hidden' });
+    } finally {
+      detail.resolve();
+      list.resolve();
+      await f.close();
+    }
+  });
+
+  it('keeps independently authorized detail, calendar, and Run results when the article list is denied', async () => {
+    const stored = article(21);
+    const month = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+    }).format(new Date());
+    stored.publication = {
+      state: 'scheduled',
+      schedule: {
+        plannedAt: month + '-16T08:00:00.000Z',
+        timezone: 'Asia/Shanghai',
+      },
+      links: null,
+    };
+    const f = await fixture({ articles: [article(), stored] });
+    const { page } = f;
+    const directory = gate();
+    const denial = '文章列表中的一份资料不可读';
+    try {
+      await f.open();
+      await panel(page)
+        .getByRole('tab', { name: '文章库', exact: true })
+        .click();
+      const detail = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          brandView(url, 'article') &&
+          url.searchParams.get('articleId') === stored.id
+        );
+      });
+      await panel(page)
+        .getByRole('button', { name: stored.title, exact: true })
+        .click();
+      await (await detail).finished();
+      await expect
+        .poll(() => panel(page).getByLabel('文章正文').textContent())
+        .toContain('不可直接改写的正文');
+
+      const updated = { ...stored, revision: 2, title: '仍受权的新日历文章' };
+      f.state.articles[1] = updated;
+      const run = recovery('article');
+      run.invocation.intent.articleId = stored.id;
+      run.submission = { articleUpdated: false, revision: null };
+      f.state.runs = [run];
+      await page.route(
+        (url) => brandView(url, 'articles'),
+        (route) => route.fulfill({ status: 403, json: accessProblem(denial) }),
+      );
+      await page.route(moduleDirectory, async (route) => {
+        await directory.promise;
+        await route.fallback();
+      });
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: denial })
+        .waitFor();
+      directory.resolve();
+      await panel(page)
+        .getByRole('heading', { name: updated.title, exact: true })
+        .waitFor();
+      expect(
+        await panel(page)
+          .getByRole('button', { name: '文章 20', exact: true })
+          .count(),
+      ).toBe(0);
+      await panel(page)
+        .getByText('本次正文成果已保留，文章未更新，请核对当前文章。', {
+          exact: true,
+        })
+        .waitFor();
+      await panel(page)
+        .getByRole('tab', { name: '排期表', exact: true })
+        .click();
+      await panel(page)
+        .getByRole('button', { name: updated.title, exact: true })
+        .waitFor();
+    } finally {
+      directory.resolve();
+      await f.close();
+    }
+  });
 
   it('opening only the main area preserves the original draft/attachment, sidebar geometry and visible focus across all tabs', async () => {
     const f = await fixture();
@@ -939,41 +1704,106 @@ suite('MET-224 main-area brand media text workflow', () => {
           });
         for (const inset of insets)
           expect(Math.abs(inset - 12)).toBeLessThanOrEqual(0.5);
-        const assertCovered = async (name: string) => {
-          const prefix = resolve(
-            evidence,
-            `native-composer-${surface.width}-${surface.colorScheme}-${name}`,
-          );
+        const assertComposerPaint = async (name: string, covered = true) => {
+          const label = `native-composer-${surface.width}-${surface.colorScheme}-${name}`;
+          const prefix = resolve(evidence, label);
           // inert does not stop painting. Keep the native seat and all layers
           // mounted in both probes. Only the same paint variable changes;
           // adding/removing layers can rerasterize unrelated alpha edges.
-          await page.screenshot({
-            path: prefix + '-mounted.png',
-            animations: 'disabled',
-          });
+          if (covered)
+            await page.screenshot({
+              path: prefix + '-mounted.png',
+              animations: 'disabled',
+            });
+          await seat.evaluate((el) =>
+            el.style.setProperty('--met224-probe-color', 'cyan'),
+          );
           const probe = await page.addStyleTag({
-            content:
-              '[data-composer-seat], [data-composer-seat] * { background: var(--met224-probe-color) !important; color: var(--met224-probe-color) !important; border-color: var(--met224-probe-color) !important; box-shadow: none !important; }',
+            // Hide the caret for both frames without Playwright changing the
+            // visible article editor's inline style for each screenshot.
+            content: `input, textarea, [contenteditable] { caret-color: transparent !important; }
+              [data-composer-seat], [data-composer-seat] * { background: var(--met224-probe-color) !important; color: var(--met224-probe-color) !important; border-color: var(--met224-probe-color) !important; box-shadow: none !important; }`,
           });
-          try {
-            await seat.evaluate((el) =>
-              el.style.setProperty('--met224-probe-color', 'cyan'),
+          const paint = () =>
+            page.evaluate(
+              () =>
+                new Promise<void>((done) =>
+                  requestAnimationFrame(() =>
+                    requestAnimationFrame(() => done()),
+                  ),
+                ),
             );
+          try {
+            await paint();
             const cyan = await page.screenshot({
               path: prefix + '-composer-cyan.png',
               animations: 'disabled',
+              caret: 'initial',
               clip: composerClip,
             });
             await seat.evaluate((el) =>
               el.style.setProperty('--met224-probe-color', 'magenta'),
             );
+            await paint();
             const magenta = await page.screenshot({
               path: prefix + '-composer-magenta.png',
               animations: 'disabled',
+              caret: 'initial',
               clip: composerClip,
             });
-            // Every pixel in the native seat/viewport intersection is exact.
-            expect(cyan.equals(magenta)).toBe(true);
+            const equalPng = cyan.equals(magenta);
+            if (covered && equalPng) return;
+            const preserve = async (comparison: object) => {
+              const batch = process.env.ALLRICE_CI_COLLECTION_BATCH;
+              const directory = batch
+                ? resolve(dirname(resolve(batch)), 'brand-media-composer')
+                : evidence;
+              await mkdir(directory, { recursive: true });
+              const files = ['composer-cyan', 'composer-magenta'];
+              if (covered) files.push('mounted');
+              await Promise.all([
+                writeFile(
+                  resolve(directory, label + '-comparison.json'),
+                  JSON.stringify(
+                    {
+                      name,
+                      surface,
+                      composerClip,
+                      covered,
+                      equalPng,
+                      browserVersion: browser.version(),
+                      comparison,
+                    },
+                    null,
+                    2,
+                  ),
+                ),
+                ...(batch
+                  ? files.map((file) =>
+                      copyFile(
+                        `${prefix}-${file}.png`,
+                        resolve(directory, `${label}-${file}.png`),
+                      ),
+                    )
+                  : []),
+              ]);
+            };
+            const pixels = await compareComposerProbes(
+              page,
+              cyan,
+              magenta,
+            ).catch(async (error: unknown) => {
+              await preserve({ error: String(error) });
+              throw error;
+            });
+            if (covered || pixels.probePixels === 0) await preserve(pixels);
+            if (covered) {
+              expect(pixels.changedPixels - pixels.neutralPixels, label).toBe(
+                0,
+              );
+            } else {
+              expect(pixels.probePixels, label).toBeGreaterThan(0);
+            }
           } finally {
             await probe.evaluate((el) => (el as HTMLStyleElement).remove());
             await seat.evaluate((el) =>
@@ -988,32 +1818,17 @@ suite('MET-224 main-area brand media text workflow', () => {
               .poll(() => page.getByLabel('文章正文').textContent())
               .toContain('不可直接改写的正文');
           await page.evaluate(() => document.fonts.ready);
-          await assertCovered(tab);
+          await assertComposerPaint(tab);
         }
         await page.getByRole('button', { name: 'ⓘ 使用说明' }).click();
         await page.getByRole('dialog', { name: '使用说明' }).waitFor();
-        await assertCovered('help');
-        const covered = await page.screenshot({
-          animations: 'disabled',
-          clip: composerClip,
-        });
+        await assertComposerPaint('help');
         const conversation = seat.locator('xpath=ancestor::*[@aria-hidden][1]');
         await conversation.evaluate((el) => {
           (el as HTMLElement).style.isolation = 'auto';
         });
         try {
-          expect(
-            covered.equals(
-              await page.screenshot({
-                path: resolve(
-                  evidence,
-                  `native-composer-${surface.width}-${surface.colorScheme}-without-isolation.png`,
-                ),
-                animations: 'disabled',
-                clip: composerClip,
-              }),
-            ),
-          ).toBe(false);
+          await assertComposerPaint('without-isolation', false);
         } finally {
           await conversation.evaluate((el) =>
             (el as HTMLElement).style.removeProperty('isolation'),
@@ -1134,6 +1949,176 @@ suite('MET-224 main-area brand media text workflow', () => {
         .isVisible(),
     ).toBe(true);
     await f.close();
+  });
+
+  it.each(['denied', 'restored', 'restored-later', 'offline'] as const)(
+    'refreshes picker availability on a rejected add and keeps uncertain retries (%s)',
+    async (outcome) => {
+      const f = await fixture({ installed: new Set() });
+      const { page } = f;
+      const check = gate();
+      let reads = 0;
+      let available = outcome === 'restored';
+      const adds: unknown[] = [];
+      const picker = page.getByRole('region', {
+        name: '选择插件',
+        exact: true,
+      });
+      const checkbox = picker.getByRole('checkbox', {
+        name: '品牌自媒体',
+        exact: true,
+      });
+      const add = picker.getByRole('button', { name: '添加', exact: true });
+      const message = '当前账号无权添加插件';
+      try {
+        await page
+          .getByRole('button', { name: '添加插件', exact: true })
+          .click();
+        await checkbox.check();
+        await page.route(moduleDirectory, async (route) => {
+          const request = route.request();
+          if (request.method() === 'POST') {
+            adds.push(request.postDataJSON().requestId);
+            if (adds.length > 1) return route.fallback();
+            return outcome === 'offline'
+              ? route.abort('internetdisconnected')
+              : route.fulfill({ status: 403, json: accessProblem(message) });
+          }
+          reads++;
+          if (outcome === 'offline') return route.fallback();
+          await check.promise;
+          return route.fulfill({
+            json: {
+              modules: [
+                {
+                  descriptor: {
+                    id: 'allrice.brand-media',
+                    displayName: '品牌自媒体',
+                  },
+                  binding: null,
+                  enabled: false,
+                  available,
+                },
+              ],
+            },
+          });
+        });
+        await add.click();
+        await picker.getByRole('alert').waitFor();
+        if (outcome === 'offline') {
+          expect(reads).toBe(0);
+          expect(await checkbox.isChecked()).toBe(true);
+          await add.click();
+          await page
+            .getByRole('button', { name: '打开 品牌自媒体', exact: true })
+            .waitFor();
+          expect(adds).toHaveLength(2);
+          expect(adds[0]).toBe(adds[1]);
+          return;
+        }
+        await expect.poll(() => reads).toBe(1);
+        expect(await checkbox.count()).toBe(0);
+        expect(await add.isDisabled()).toBe(true);
+        const reply = page.waitForResponse(
+          (response) =>
+            response.request().method() === 'GET' &&
+            moduleDirectory(new URL(response.url())),
+        );
+        check.resolve();
+        await (await reply).finished();
+        if (outcome === 'restored') {
+          await checkbox.waitFor();
+          expect(await checkbox.isChecked()).toBe(false);
+        } else {
+          await picker
+            .getByRole('heading', { name: '暂无可添加的插件', exact: true })
+            .waitFor();
+          expect(await checkbox.count()).toBe(0);
+        }
+        if (outcome === 'restored-later') {
+          await picker
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
+          available = true;
+          await page
+            .getByRole('button', { name: '添加插件', exact: true })
+            .click();
+          await expect.poll(() => reads).toBe(2);
+          await checkbox.waitFor();
+          expect(await checkbox.isChecked()).toBe(false);
+        }
+        expect(await add.isDisabled()).toBe(true);
+        expect(adds).toHaveLength(1);
+      } finally {
+        check.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it('distinguishes loading, confirmed empty and directory errors on picker reopen', async () => {
+    const f = await fixture({ installed: new Set() });
+    const { page } = f;
+    const reply = [gate(), gate(), gate()];
+    let requested = 0;
+    const picker = page.getByRole('region', { name: '选择插件', exact: true });
+    const open = page.getByRole('button', { name: '添加插件', exact: true });
+    const empty = picker.getByRole('heading', {
+      name: '暂无可添加的插件',
+      exact: true,
+    });
+    const add = picker.getByRole('button', { name: '添加', exact: true });
+    const loading = picker.getByRole('status').filter({ hasText: '正在读取…' });
+    const checkbox = picker.getByRole('checkbox', {
+      name: '品牌自媒体',
+      exact: true,
+    });
+    try {
+      await page.route(moduleDirectory, async (route) => {
+        if (route.request().method() !== 'GET') return route.fallback();
+        const step = requested++;
+        await reply[step]?.promise;
+        if (step === 0)
+          return route.fulfill({
+            status: 503,
+            json: { message: '当前目录暂时无法读取' },
+          });
+        if (step === 1) return route.fulfill({ json: { modules: [] } });
+        return route.fallback();
+      });
+      for (const step of [0, 1, 2]) {
+        await open.click();
+        await expect.poll(() => requested).toBe(step + 1);
+        expect(await empty.count()).toBe(0);
+        await loading.waitFor();
+        expect(await add.isDisabled()).toBe(true);
+        reply[step]!.resolve();
+        if (step === 0) {
+          await picker
+            .getByRole('alert')
+            .filter({ hasText: '当前目录暂时无法读取' })
+            .waitFor();
+          expect(await empty.count()).toBe(0);
+        } else if (step === 1) {
+          await empty.waitFor();
+          expect(await picker.getByRole('alert').count()).toBe(0);
+        } else {
+          await checkbox.waitFor();
+          expect(await checkbox.isChecked()).toBe(false);
+          expect(await empty.count()).toBe(0);
+          expect(await picker.getByRole('alert').count()).toBe(0);
+        }
+        expect(await loading.count()).toBe(0);
+        expect(await add.isDisabled()).toBe(true);
+        await picker.getByRole('button', { name: '取消', exact: true }).click();
+      }
+      expect(
+        f.state.requests.filter((request) => request.method === 'POST'),
+      ).toHaveLength(0);
+    } finally {
+      for (const pending of reply) pending.resolve();
+      await f.close();
+    }
   });
 
   it('candidate direction, references and immutable candidates stay on one page, and only a human adds a topic', async () => {
@@ -2121,11 +3106,46 @@ suite('MET-224 main-area brand media text workflow', () => {
         })
         .isVisible(),
     ).toBe(true);
+    await expect
+      .poll(() => page.getByLabel('文章正文').textContent())
+      .toBe('不可直接改写的正文\n第二段');
+    const url = new URL(
+      `/api/v1/files/${file.objectId}/download?workspaceId=${scope.workspaceId}`,
+      page.url(),
+    ).href;
+    const requested = page.waitForRequest((request) => request.url() === url);
+    const response = page.waitForResponse((reply) => reply.url() === url);
+    await page.evaluate(() => {
+      const click = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+        if (this.download)
+          document.body.dataset.requestedAttachmentName = this.download;
+        click.call(this);
+      };
+    });
+    const delivered = page.waitForEvent('download');
+    const action = page.getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    await action.focus();
     expect(
-      await page
-        .getByRole('link', { name: '查看本次正文成果' })
-        .getAttribute('href'),
-    ).toContain(file.objectId);
+      await action.evaluate((element) => document.activeElement === element),
+    ).toBe(true);
+    await page.keyboard.press('Enter');
+    expect((await requested).method()).toBe('GET');
+    expect((await response).headers()).toMatchObject({
+      'content-type': 'text/plain',
+      'content-disposition': "attachment; filename*=UTF-8''allrice-export",
+    });
+    const download = await delivered;
+    expect(
+      await page.locator('body').getAttribute('data-requested-attachment-name'),
+    ).toBe('allrice-export');
+    expect(download.suggestedFilename()).toBe('allrice-export');
+    expect(await readFile((await download.path())!, 'utf8')).toBe(
+      '不可直接改写的正文\n第二段',
+    );
     expect(
       await page
         .getByRole('button', { name: '改时间', exact: true })
@@ -2133,6 +3153,1092 @@ suite('MET-224 main-area brand media text workflow', () => {
     ).toBe(true);
     await f.close();
   });
+  it.each([403, 404])(
+    'a refused article delivery (%i) evicts only its pin and clears on its own successful read',
+    async (status) => {
+      const newFile = {
+        objectId: id(82),
+        versionId: id(83),
+        checksum: 'sha256:' + 'b'.repeat(64),
+      };
+      const stored = { ...article(), body: newFile };
+      const run = recovery('article');
+      const original = run.deliveries[0]!;
+      const current = { ...original, file: newFile };
+      run.deliveries = [original, current];
+      const f = await fixture({ articles: [stored], runs: [run] });
+      const { page } = f;
+      const path = `/api/v1/files/${original.file.objectId}/download`;
+      const contents = page.getByLabel('文章正文');
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const warning = panel(page)
+        .getByRole('alert')
+        .filter({ hasText: '正文文件暂时不可读' });
+      let saves = 0;
+      let refused = true;
+      page.on('download', () => saves++);
+      try {
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await expect
+          .poll(() => contents.textContent())
+          .toContain('不可直接改写的正文');
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await page.route(
+          (url) => url.pathname === path,
+          (route) =>
+            refused
+              ? route.fulfill({
+                  status,
+                  json: accessProblem(
+                    '该正文文件已不可读取',
+                    status === 403
+                      ? 'AUTHORIZATION_DENIED'
+                      : 'RESOURCE_NOT_FOUND',
+                  ),
+                })
+              : route.fallback(),
+        );
+        await deliveries.first().press('Enter');
+        await warning.waitFor();
+        expect(await deliveries.count()).toBe(1);
+        expect(await contents.textContent()).toContain('不可直接改写的正文');
+        expect(saves).toBe(0);
+
+        refused = false;
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await expect.poll(() => deliveries.count()).toBe(2);
+        expect(await warning.isVisible()).toBe(true);
+        const saved = page.waitForEvent('download');
+        await deliveries.first().press('Enter');
+        expect((await saved).suggestedFilename()).toBe('allrice-export');
+        await warning.waitFor({ state: 'hidden' });
+        expect(saves).toBe(1);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+
+  it('fences a pending download after a later refusal for the same body pin', async () => {
+    const f = await fixture({ runs: [recovery('article')] });
+    const { page } = f;
+    const path = `/api/v1/files/${file.objectId}/download`;
+    const contents = page.getByLabel('文章正文');
+    const deliveries = panel(page).getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    const expected = '不可直接改写的正文\n第二段';
+    let fileRequests = 0;
+    let deny = true;
+    try {
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect.poll(() => contents.textContent()).toBe(expected);
+      await holdBodyDelivery(page, path);
+      await page.route(
+        (url) => url.pathname === path,
+        async (route) => {
+          if (++fileRequests === 1 || !deny) return route.fallback();
+          return route.fulfill({
+            status: 403,
+            json: accessProblem('该文件已撤销当前读取授权'),
+          });
+        },
+      );
+      await deliveries.press('Enter');
+      await page.locator('body[data-delivery-headers="200"]').waitFor();
+      await panel(page).getByRole('button', { name: '复制正文' }).click();
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: '正文文件暂时不可读' })
+        .waitFor();
+      expect(await deliveries.count()).toBe(0);
+      expect(await contents.count()).toBe(0);
+      expect(fileRequests).toBe(2);
+
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      await page
+        .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+        .waitFor();
+      expect(
+        await page.locator('body').getAttribute('data-delivery-save'),
+      ).toBeNull();
+
+      deny = false;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await expect.poll(() => contents.textContent()).toBe(expected);
+      const saved = page.waitForEvent('download');
+      await deliveries.press('Enter');
+      const download = await saved;
+      expect(download.suggestedFilename()).toBe('allrice-export');
+      expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+    } finally {
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      await f.close();
+    }
+  });
+
+  it.each(['unavailable', 'empty'] as const)(
+    'keeps independent delivery buttons after the current pin is refused and honors a fresh %s Run read',
+    async (outcome) => {
+      const run = recovery('article');
+      const sibling = { ...file, objectId: id(82), versionId: id(83) };
+      run.deliveries.push({ ...run.deliveries[0]!, file: sibling });
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const topicsStarted = gate();
+      const finishTopics = gate();
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const contents = page.getByLabel('文章正文');
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => contents.textContent())
+          .toContain('不可直接改写的正文');
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await page.route(
+          (url) => url.pathname === `/api/v1/files/${file.objectId}/download`,
+          (route) => route.fulfill({ status: 404, body: '' }),
+        );
+        await deliveries.first().press('Enter');
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: '正文文件暂时不可读' })
+          .waitFor();
+        expect(await contents.count()).toBe(0);
+        expect(
+          await panel(page).getByText('文章 20', { exact: true }).count(),
+        ).toBe(0);
+        expect(await deliveries.count()).toBe(1);
+        const request = page.waitForRequest(
+          (req) =>
+            new URL(req.url()).pathname ===
+            `/api/v1/files/${sibling.objectId}/download`,
+        );
+        const saved = page.waitForEvent('download');
+        await deliveries.press('Enter');
+        expect((await request).method()).toBe('GET');
+        expect((await saved).suggestedFilename()).toBe('allrice-export');
+
+        f.state.articles[0] = { ...article(), revision: 2, body: null };
+        f.state.runs =
+          outcome === 'empty'
+            ? []
+            : [{ ...run, unavailable: true, deliveries: [] }];
+        await page.route(
+          (url) => brandView(url, 'topics'),
+          async (route) => {
+            topicsStarted.resolve();
+            await finishTopics.promise;
+            return route.fallback();
+          },
+        );
+        const reread = page.waitForResponse((response) =>
+          brandView(new URL(response.url()), 'runs'),
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await topicsStarted.promise;
+        expect(await (await reread).json()).toEqual({ runs: f.state.runs });
+        await expect.poll(() => deliveries.count()).toBe(0);
+        finishTopics.resolve();
+        await expect.poll(() => contents.textContent()).toBe('正文还未生成');
+        expect(await deliveries.count()).toBe(0);
+      } finally {
+        finishTopics.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['unavailable', 'empty', 'authorized'] as const)(
+    'checks a fresh %s Run before saving a pending delivery',
+    async (outcome) => {
+      const run = recovery('article');
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const expected = '不可直接改写的正文\n第二段';
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+        await deliveries.press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        f.state.runs =
+          outcome === 'empty'
+            ? []
+            : [
+                outcome === 'unavailable'
+                  ? { ...run, unavailable: true, deliveries: [] }
+                  : {
+                      ...run,
+                      submission: { articleUpdated: true, revision: 2 },
+                    },
+              ];
+        const reread = page.waitForResponse((response) =>
+          brandView(new URL(response.url()), 'runs'),
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        expect(await (await reread).json()).toEqual({ runs: f.state.runs });
+        const saved =
+          outcome === 'authorized' ? page.waitForEvent('download') : null;
+        if (saved) {
+          await panel(page)
+            .getByText('本次正文已保存（版本 2）', { exact: true })
+            .waitFor();
+        } else {
+          await expect.poll(() => deliveries.count()).toBe(0);
+        }
+        await page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+        await page
+          .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+          .waitFor();
+        if (saved) {
+          const download = await saved;
+          expect(download.suggestedFilename()).toBe('allrice-export');
+          expect(await readFile((await download.path())!, 'utf8')).toBe(
+            expected,
+          );
+        } else {
+          expect(
+            await page.locator('body').getAttribute('data-delivery-save'),
+          ).toBeNull();
+        }
+      } finally {
+        await page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['unavailable', 'empty', 'pin removed', 'sibling removed'] as const)(
+    'keeps the original download decision after a %s Run projection changes',
+    async (outcome) => {
+      const run = recovery('article');
+      const main = run.deliveries[0]!;
+      const sibling = {
+        ...main,
+        file: { ...file, objectId: id(82), versionId: id(83) },
+      };
+      run.deliveries.push(sibling);
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const path = `/api/v1/files/${file.objectId}/download`;
+      const expected = '不可直接改写的正文\n第二段';
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const continuouslyAllowed = outcome === 'sibling removed';
+      const applyRuns = async (runs: Recovery[]) => {
+        f.state.runs = runs;
+        const response = page.waitForResponse((value) =>
+          brandView(new URL(value.url()), 'runs'),
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        expect(await (await response).json()).toEqual({ runs });
+      };
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await holdBodyDelivery(page, path);
+        await deliveries.first().press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        const changed = {
+          unavailable: [{ ...run, unavailable: true, deliveries: [] }],
+          empty: [],
+          'pin removed': [{ ...run, deliveries: [sibling] }],
+          'sibling removed': [{ ...run, deliveries: [main] }],
+        }[outcome];
+        await applyRuns(changed);
+        await expect
+          .poll(() => deliveries.count())
+          .toBe(changed[0]?.deliveries.length ?? 0);
+        if (!continuouslyAllowed) {
+          await applyRuns([run]);
+          await expect.poll(() => deliveries.count()).toBe(2);
+        }
+
+        let saved = continuouslyAllowed
+          ? page.waitForEvent('download')
+          : undefined;
+        await finishDownload();
+        await page
+          .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+          .waitFor();
+        if (!saved) {
+          expect(
+            await page.locator('body').getAttribute('data-delivery-save'),
+          ).toBeNull();
+          const request = page.waitForRequest(
+            (value) => new URL(value.url()).pathname === path,
+          );
+          saved = page.waitForEvent('download');
+          await deliveries.first().press('Enter');
+          expect((await request).method()).toBe('GET');
+        }
+        const download = await saved;
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      } finally {
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['unavailable', 'forbidden', '503'] as const)(
+    'settles an in-flight save when an overlapping Run read returns %s',
+    async (outcome) => {
+      const run = recovery('article');
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const expected = '不可直接改写的正文\n第二段';
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const latestStarted = gate();
+      const releaseLatest = gate();
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      let requests = 0;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await deliveries.waitFor();
+        await observeLateRunRead(page);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (++requests !== 1) {
+              latestStarted.resolve();
+              await releaseLatest.promise;
+              return route.fallback();
+            }
+            olderStarted.resolve();
+            await releaseOlder.promise;
+            const response = {
+              unavailable: {
+                status: 200,
+                json: { runs: [{ ...run, unavailable: true, deliveries: [] }] },
+              },
+              forbidden: {
+                status: 403,
+                json: accessProblem('较早的成果读取已拒绝'),
+              },
+              503: { status: 503, json: { message: '成果读取暂时不可用' } },
+            }[outcome];
+            return route.fulfill({
+              ...response,
+              headers: { 'x-fixture-late-run-read': 'yes' },
+            });
+          },
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await olderStarted.promise;
+        await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+        await deliveries.press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        f.state.runs = [
+          { ...run, submission: { articleUpdated: true, revision: 2 } },
+        ];
+        const latestStatus = panel(page).getByText('本次正文已保存（版本 2）', {
+          exact: true,
+        });
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await latestStarted.promise;
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        if (outcome === 'forbidden') {
+          releaseLatest.resolve();
+          await latestStatus.waitFor();
+        }
+
+        const saved =
+          outcome === '503' ? page.waitForEvent('download') : undefined;
+        await finishDownload();
+        await page
+          .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+          .waitFor();
+        if (saved) {
+          const download = await saved;
+          expect(download.suggestedFilename()).toBe('allrice-export');
+          expect(await readFile((await download.path())!, 'utf8')).toBe(
+            expected,
+          );
+        } else {
+          expect(
+            await page.locator('body').getAttribute('data-delivery-save'),
+          ).toBeNull();
+        }
+        await expect
+          .poll(() => deliveries.count())
+          .toBe(outcome === 'unavailable' ? 0 : 1);
+        releaseLatest.resolve();
+        await latestStatus.waitFor();
+        expect(await deliveries.count()).toBe(1);
+      } finally {
+        releaseOlder.resolve();
+        releaseLatest.resolve();
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['new read', 'new visit'] as const)(
+    'preserves a save authorized by a %s when an older Run read returns unavailable',
+    async (outcome) => {
+      const run = recovery('article');
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const expected = '不可直接改写的正文\n第二段';
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      let first = true;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await deliveries.waitFor();
+        if (outcome === 'new visit')
+          await finishDespiteAbort(
+            page,
+            `/api/v1/employee-instances/${scope.instanceId}/brand-media`,
+          );
+        await observeLateRunRead(page);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (!first) return route.fallback();
+            first = false;
+            olderStarted.resolve();
+            await releaseOlder.promise;
+            return route.fulfill({
+              status: 200,
+              headers: { 'x-fixture-late-run-read': 'yes' },
+              json: { runs: [{ ...run, unavailable: true, deliveries: [] }] },
+            });
+          },
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await olderStarted.promise;
+        f.state.runs = [
+          { ...run, submission: { articleUpdated: true, revision: 2 } },
+        ];
+        if (outcome === 'new visit') {
+          await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+          await f.open();
+          await panel(page).getByRole('tab', { name: '文章库' }).click();
+        } else {
+          await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        }
+        const latestStatus = panel(page).getByText('本次正文已保存（版本 2）', {
+          exact: true,
+        });
+        await latestStatus.waitFor();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+        await deliveries.press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        expect(await latestStatus.isVisible()).toBe(true);
+        expect(await deliveries.count()).toBe(1);
+        const saved = page.waitForEvent('download');
+        await finishDownload();
+        const download = await saved;
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      } finally {
+        releaseOlder.resolve();
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['pending', '503', 'one pin'] as const)(
+    'does not request a withdrawn delivery before fresh Run authorization (%s)',
+    async (outcome) => {
+      const run = recovery('article');
+      const target = { ...file, objectId: id(82), versionId: id(83) };
+      const sibling = { ...file, objectId: id(85), versionId: id(86) };
+      const output = run.deliveries[0]!;
+      run.deliveries = [
+        { ...output, file: target },
+        { ...output, file: sibling },
+      ];
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const staleAction = page.locator('[data-fixture-withdrawn-delivery]');
+      const path = `/api/v1/files/${target.objectId}/download`;
+      const fileRequests = () =>
+        page
+          .locator('body')
+          .getAttribute('data-fixture-target-gets')
+          .then(Number);
+      const positiveStarted = gate();
+      const releasePositive = gate();
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const latestStarted = gate();
+      const releaseLatest = gate();
+      const refresh = () =>
+        page.evaluate(() => window.dispatchEvent(new Event('online')));
+      let holdOlderPositive = outcome === 'pending';
+      let reads = 0;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await deliveries
+          .first()
+          .evaluate((button) =>
+            button.setAttribute('data-fixture-withdrawn-delivery', ''),
+          );
+        await observeLateRunRead(page);
+        await page.evaluate((path) => {
+          const fetch = window.fetch.bind(window);
+          document.body.dataset.fixtureTargetGets = '0';
+          window.fetch = (input, options) => {
+            if (
+              typeof input === 'string' &&
+              new URL(input, location.href).pathname === path
+            ) {
+              const body = document.body;
+              body.dataset.fixtureTargetGets = String(
+                Number(body.dataset.fixtureTargetGets) + 1,
+              );
+            }
+            return fetch(input, options);
+          };
+        }, path);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (holdOlderPositive) {
+              holdOlderPositive = false;
+              positiveStarted.resolve();
+              await releasePositive.promise;
+              return route.fulfill({
+                status: 200,
+                headers: { 'x-fixture-late-run-read': 'yes' },
+                json: { runs: [run] },
+              });
+            }
+            if (++reads === 1) {
+              olderStarted.resolve();
+              await releaseOlder.promise;
+              const row =
+                outcome === 'one pin'
+                  ? { ...run, deliveries: [run.deliveries[1]!] }
+                  : { ...run, unavailable: true, deliveries: [] };
+              return route.fulfill({
+                status: 200,
+                headers: { 'x-fixture-late-run-read': 'yes' },
+                json: { runs: [row] },
+              });
+            }
+            if (reads === 2) {
+              latestStarted.resolve();
+              await releaseLatest.promise;
+              if (outcome === '503')
+                return route.fulfill({
+                  status: 503,
+                  json: { message: '成果读取暂时不可用' },
+                });
+            }
+            return route.fallback();
+          },
+        );
+
+        if (outcome === 'pending') {
+          await refresh();
+          await positiveStarted.promise;
+        }
+        await refresh();
+        await olderStarted.promise;
+        await refresh();
+        await latestStarted.promise;
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        if (outcome === 'pending') {
+          await page.evaluate(() => {
+            delete document.body.dataset.lateRunRead;
+          });
+          releasePositive.resolve();
+          await page.locator('body[data-late-run-read="settled"]').waitFor();
+        }
+        if (outcome === '503') {
+          releaseLatest.resolve();
+          await panel(page)
+            .getByRole('alert')
+            .filter({ hasText: '成果读取暂时不可用' })
+            .waitFor();
+        }
+        expect(await fileRequests()).toBe(0);
+        if (await staleAction.isVisible()) {
+          const requested = page
+            .waitForRequest(
+              (request) => new URL(request.url()).pathname === path,
+            )
+            .catch(() => null);
+          await staleAction.press('Enter');
+          if (await fileRequests())
+            expect((await requested)?.method()).toBe('GET');
+        }
+        expect(await fileRequests()).toBe(0);
+        expect(await deliveries.count()).toBe(outcome === 'one pin' ? 1 : 0);
+
+        if (outcome === 'one pin') {
+          const requested = page.waitForRequest(
+            (request) =>
+              new URL(request.url()).pathname ===
+              `/api/v1/files/${sibling.objectId}/download`,
+          );
+          const saved = page.waitForEvent('download');
+          await deliveries.press('Enter');
+          expect((await requested).method()).toBe('GET');
+          expect((await saved).suggestedFilename()).toBe('allrice-export');
+          expect(await fileRequests()).toBe(0);
+        }
+
+        if (outcome === '503') await refresh();
+        else releaseLatest.resolve();
+        await expect.poll(() => deliveries.count()).toBe(2);
+        const saved = page.waitForEvent('download');
+        await deliveries.first().press('Enter');
+        const download = await saved;
+        expect(await fileRequests()).toBe(1);
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(
+          '不可直接改写的正文\n第二段',
+        );
+      } finally {
+        releasePositive.resolve();
+        releaseOlder.resolve();
+        releaseLatest.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it('saves an authorized response across a same-Run generation receipt replay', async () => {
+    const f = await fixture({ loseGenerateResponseOnce: true });
+    const { page } = f;
+    const expected = '不可直接改写的正文\n第二段';
+    const pin = { ...file, objectId: id(82), versionId: id(83) };
+    const path = `/api/v1/files/${pin.objectId}/download`;
+    const deliveries = panel(page).getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    const action = page.getByRole('button', { name: '修改', exact: true });
+    const refreshEntered = gate();
+    const releaseRefresh = gate();
+    const downloads: Download[] = [];
+    page.on('download', (download) => downloads.push(download));
+    const runResponse = () =>
+      page.waitForResponse((response) =>
+        brandView(new URL(response.url()), 'runs'),
+      );
+    const finishDownload = () =>
+      page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+
+    try {
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect
+        .poll(() => page.getByLabel('文章正文').textContent())
+        .toBe(expected);
+      await page.getByLabel('修改意见').fill('保留正文并生成一份改稿');
+      await action.click();
+      await page.getByText('生成已受理但回执丢失', { exact: true }).waitFor();
+
+      const originalRequest = generates(f.state)[0]!.body;
+      const row = f.state.runs[0]!;
+      const runId = row.run.id;
+      row.run = runSnapshot(Number(runId.slice(-12)), 'succeeded');
+      row.deliveries = [{ file: pin, format: 'txt', content: expected }];
+      row.submission = { articleUpdated: false, revision: null };
+      const initial = runResponse();
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      const initialSnapshot = await (await initial).json();
+      expect(initialSnapshot).toEqual({ runs: [row] });
+      await expect.poll(() => deliveries.count()).toBe(1);
+
+      await holdBodyDelivery(page, path);
+      const requested = page.waitForRequest(
+        (request) => new URL(request.url()).pathname === path,
+      );
+      await deliveries.press('Enter');
+      expect((await requested).method()).toBe('GET');
+      await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+      let refreshes = 0;
+      await page.route(
+        (url) => brandView(url, 'runs'),
+        async (route) => {
+          refreshes++;
+          refreshEntered.resolve();
+          await releaseRefresh.promise;
+          await route.fallback();
+        },
+      );
+      const replay = page.waitForResponse(
+        (response) =>
+          brandEndpoint(new URL(response.url())) &&
+          response.request().method() === 'POST',
+      );
+      await action.click();
+      expect((await (await replay).json()).run.id).toBe(runId);
+      expect(generates(f.state)).toHaveLength(2);
+      expect(generates(f.state)[1]!.body).toEqual(originalRequest);
+      await refreshEntered.promise;
+
+      await finishDownload();
+      await page
+        .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+        .waitFor();
+      expect(
+        await page.locator('body').getAttribute('data-delivery-save'),
+      ).toBe('allrice-export');
+      await expect.poll(() => downloads.length).toBe(1);
+      const download = downloads[0]!;
+      expect(download.suggestedFilename()).toBe('allrice-export');
+      expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      expect(await deliveries.count()).toBe(1);
+
+      const refreshed = runResponse();
+      releaseRefresh.resolve();
+      expect(await (await refreshed).json()).toEqual(initialSnapshot);
+      expect(refreshes).toBe(1);
+    } finally {
+      releaseRefresh.resolve();
+      await finishDownload();
+      await f.close();
+    }
+  });
+
+  it('keeps only independently authorized Run deliveries while article detail is refused', async () => {
+    const stored = article();
+    stored.references = [
+      {
+        origin: 'reference',
+        sourceId: refs[0]!.sourceId,
+        revisionId: refs[0]!.revisionId,
+      },
+    ];
+    const run = recovery('article');
+    const f = await fixture({ articles: [stored], runs: [run] });
+    const { page } = f;
+    const restoreDetail = gate();
+    const deliveries = panel(page).getByRole('button', {
+      name: '查看本次正文成果',
+      exact: true,
+    });
+    const contents = panel(page).getByLabel('文章正文');
+    const message = '这篇文章新加入的参考资料已不可读';
+    let refused = true;
+    try {
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect
+        .poll(() => contents.textContent())
+        .toContain('不可直接改写的正文');
+      await panel(page).getByText(refs[0]!.fileName, { exact: true }).waitFor();
+      await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+      await deliveries.press('Enter');
+      await page.locator('body[data-delivery-headers="200"]').waitFor();
+      await page.route(brandEndpoint, async (route) => {
+        const url = new URL(route.request().url());
+        if (
+          refused &&
+          (brandView(url, 'articles') || brandView(url, 'article'))
+        )
+          return route.fulfill({
+            status: 409,
+            json: accessProblem(message, 'REFERENCE_SELECTION_UNAVAILABLE'),
+          });
+        if (brandView(url, 'article')) await restoreDetail.promise;
+        return route.fallback();
+      });
+      const reread = page.waitForResponse((response) =>
+        brandView(new URL(response.url()), 'runs'),
+      );
+      const detail = page.waitForResponse((response) =>
+        brandView(new URL(response.url()), 'article'),
+      );
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      expect(await (await reread).json()).toEqual({ runs: [run] });
+      expect((await detail).status()).toBe(409);
+      await panel(page)
+        .getByRole('alert')
+        .filter({ hasText: message })
+        .waitFor();
+      await contents.waitFor({ state: 'detached' });
+      expect(
+        await panel(page).getByText(stored.title, { exact: true }).count(),
+      ).toBe(0);
+      expect(
+        await panel(page).getByText(refs[0]!.fileName, { exact: true }).count(),
+      ).toBe(0);
+      expect(await deliveries.count()).toBe(1);
+      const saved = page.waitForEvent('download');
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      const download = await saved;
+      expect(download.suggestedFilename()).toBe('allrice-export');
+      expect(await readFile((await download.path())!, 'utf8')).toBe(
+        '不可直接改写的正文\n第二段',
+      );
+
+      f.state.runs = [{ ...run, unavailable: true, deliveries: [] }];
+      f.state.articles[0] = {
+        ...article(),
+        revision: 2,
+        title: '重新获权的文章',
+      };
+      refused = false;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('button', { name: '重新获权的文章', exact: true })
+        .waitFor();
+      expect(await contents.count()).toBe(0);
+      expect(await deliveries.count()).toBe(0);
+
+      restoreDetail.resolve();
+      await panel(page)
+        .getByRole('heading', { name: '重新获权的文章', exact: true })
+        .waitFor();
+      await expect
+        .poll(() => contents.textContent())
+        .toContain('不可直接改写的正文');
+      expect(await deliveries.count()).toBe(0);
+    } finally {
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('finish-body-delivery')),
+      );
+      restoreDetail.resolve();
+      await f.close();
+    }
+  });
+
+  it('reports a clipboard rejection after concurrent help opens successfully', async () => {
+    const f = await fixture();
+    const { page } = f;
+    const copy = panel(page).getByRole('button', {
+      name: '复制正文',
+      exact: true,
+    });
+    const problem = panel(page)
+      .getByRole('alert')
+      .filter({ hasText: '未能复制正文' });
+    try {
+      await page
+        .context()
+        .grantPermissions(['clipboard-read', 'clipboard-write']);
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect.poll(() => copy.isEnabled()).toBe(true);
+      await page.evaluate(() => {
+        Object.defineProperty(navigator.clipboard, 'writeText', {
+          configurable: true,
+          value: () =>
+            new Promise<void>((_, reject) => {
+              window.addEventListener(
+                'reject-brand-copy',
+                () => reject(Error('Synthetic clipboard rejection')),
+                { once: true },
+              );
+              document.body.dataset.brandCopyPending = 'true';
+            }),
+        });
+      });
+      await copy.click();
+      await page.locator('body[data-brand-copy-pending="true"]').waitFor();
+      await panel(page).getByRole('button', { name: 'ⓘ 使用说明' }).click();
+      const help = page.getByRole('dialog', { name: '使用说明' });
+      await help.waitFor();
+      await page.evaluate(() =>
+        window.dispatchEvent(new Event('reject-brand-copy')),
+      );
+      await help.getByRole('button', { name: '关闭使用说明' }).click();
+      await page.evaluate(
+        () =>
+          new Promise<void>((done) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => done())),
+          ),
+      );
+      expect(await problem.isVisible()).toBe(true);
+      expect(
+        await panel(page).getByText('正文已复制', { exact: true }).count(),
+      ).toBe(0);
+      await page.evaluate(() =>
+        Reflect.deleteProperty(navigator.clipboard, 'writeText'),
+      );
+      await copy.click();
+      await panel(page).getByText('正文已复制', { exact: true }).waitFor();
+      expect(await problem.count()).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('keeps separate read refusals and a failed clipboard action through independent recovery', async () => {
+    const other = {
+      ...article(21),
+      body: { ...file, objectId: id(82), versionId: id(83) },
+    };
+    const f = await fixture({ articles: [article(), other] });
+    const { page } = f;
+    const started = gate();
+    const release = gate();
+    const alerts = panel(page).getByRole('alert');
+    const bodyFailure = alerts.filter({ hasText: '正文文件暂时不可读' });
+    const topicMessage = '这次选题读取的参考资料已不可用';
+    const topicFailure = alerts.filter({ hasText: topicMessage });
+    const copyFailure = alerts.filter({ hasText: '未能复制正文' });
+    const copy = panel(page).getByRole('button', {
+      name: '复制正文',
+      exact: true,
+    });
+    let denyTopics = true;
+    try {
+      await page
+        .context()
+        .grantPermissions(['clipboard-read', 'clipboard-write']);
+      await f.open();
+      await panel(page).getByRole('tab', { name: '文章库' }).click();
+      await expect.poll(() => copy.isEnabled()).toBe(true);
+      await page.route(
+        (url) => url.pathname === `/api/v1/files/${file.objectId}/download`,
+        (route) => route.fulfill({ status: 403, body: '' }),
+      );
+      await page.route(
+        (url) => brandView(url, 'topics'),
+        async (route) => {
+          if (!denyTopics) return route.fallback();
+          started.resolve();
+          await release.promise;
+          return route.fulfill({
+            status: 409,
+            json: accessProblem(
+              topicMessage,
+              'REFERENCE_SELECTION_UNAVAILABLE',
+            ),
+          });
+        },
+      );
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await started.promise;
+      await copy.click();
+      await bodyFailure.waitFor();
+      await panel(page)
+        .getByRole('button', { name: other.title, exact: true })
+        .click();
+      await expect.poll(() => copy.isEnabled()).toBe(true);
+      release.resolve();
+      await topicFailure.waitFor();
+      expect(await bodyFailure.isVisible()).toBe(true);
+
+      await page.evaluate(() => {
+        Object.defineProperty(navigator.clipboard, 'writeText', {
+          configurable: true,
+          value: async () => {
+            throw new Error('Synthetic clipboard rejection');
+          },
+        });
+      });
+      await copy.click();
+      await copyFailure.waitFor();
+      expect(await bodyFailure.isVisible()).toBe(true);
+      expect(await topicFailure.isVisible()).toBe(true);
+
+      denyTopics = false;
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await topicFailure.waitFor({ state: 'hidden' });
+      expect(await bodyFailure.isVisible()).toBe(true);
+      expect(await copyFailure.isVisible()).toBe(true);
+
+      await page.evaluate(() =>
+        Reflect.deleteProperty(navigator.clipboard, 'writeText'),
+      );
+      await copy.click();
+      await page.getByText('正文已复制', { exact: true }).waitFor();
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+        '不可直接改写的正文\n第二段',
+      );
+      expect(await copyFailure.isVisible()).toBe(false);
+      expect(await bodyFailure.isVisible()).toBe(true);
+    } finally {
+      release.resolve();
+      await f.close();
+    }
+  });
+
   async function imagesPage(f: Awaited<ReturnType<typeof fixture>>) {
     await f.open();
     await f.page.getByRole('tab', { name: '文章库', exact: true }).click();
@@ -2486,6 +4592,223 @@ suite('MET-224 main-area brand media text workflow', () => {
     await f.close();
   });
 
+  it.each(['image', 'body'] as const)(
+    'never downloads a late original or starts the next image after returning and reopening without access (%s)',
+    async (kind) => {
+      const stored = article();
+      stored.images = [
+        { source: 'generated', operationId: id(350), file: imageFile },
+        {
+          source: 'uploaded',
+          origin: 'upload',
+          file: { objectId: id(90), checksum },
+        },
+      ];
+      const f = await fixture({
+        articles: [stored],
+        runs: kind === 'body' ? [recovery('article')] : [],
+      });
+      const { page } = f;
+      const first =
+        kind === 'body'
+          ? `/api/v1/files/${file.objectId}/download`
+          : `/api/v1/workbench/files/${id(80)}/download`;
+      const second = `/api/v1/workbench/files/${id(90)}/download`;
+      const requested = gate();
+      const release = gate();
+      const downloads: string[] = [];
+      page.on('download', (item) => downloads.push(item.suggestedFilename()));
+      try {
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await expect
+          .poll(() => panel(page).getByLabel('文章正文').textContent())
+          .toContain('不可直接改写的正文');
+        await finishDespiteAbort(page, first, true);
+        await page.evaluate(() => {
+          const click = HTMLAnchorElement.prototype.click;
+          HTMLAnchorElement.prototype.click = function (
+            this: HTMLAnchorElement,
+          ) {
+            if (this.download)
+              document.body.dataset.lateImageSave = this.download;
+            click.call(this);
+          };
+        });
+        await page.route(
+          (url) => url.pathname === first,
+          async (route) => {
+            requested.resolve();
+            await release.promise;
+            await route.fallback();
+          },
+        );
+        const action = panel(page).getByRole('button', {
+          name: kind === 'body' ? '查看本次正文成果' : '下载全部',
+          exact: true,
+        });
+        if (kind === 'body') await action.press('Enter');
+        else await action.click();
+        await requested.promise;
+        await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+        await page
+          .getByRole('heading', { name: '原聊天', exact: true })
+          .waitFor();
+        expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+          '未发送的聊天草稿',
+        );
+
+        const message = '当前员工的品牌自媒体绑定已撤销';
+        await page.route(brandEndpoint, (route) =>
+          route.fulfill({ status: 403, json: accessProblem(message) }),
+        );
+        await page.route(moduleDirectory, (route) =>
+          route.fulfill({
+            json: {
+              modules: [
+                {
+                  descriptor: {
+                    id: 'allrice.brand-media',
+                    displayName: '品牌自媒体',
+                  },
+                  binding: { ...binding, revokedAt: stamp },
+                  enabled: false,
+                  available: false,
+                },
+              ],
+            },
+          }),
+        );
+        const checked = page.waitForResponse((response) =>
+          moduleDirectory(new URL(response.url())),
+        );
+        await page
+          .getByRole('button', { name: '打开 品牌自媒体', exact: true })
+          .click();
+        await (await checked).finished();
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: message })
+          .waitFor();
+        expect(await panel(page).getByRole('tab').count()).toBe(0);
+        const settled = Promise.race([
+          page.waitForEvent('download').then(() => 'saved'),
+          page
+            .locator('body[data-late-image-read="settled"]')
+            .waitFor({ state: 'attached' })
+            .then(() => 'read'),
+        ]);
+        release.resolve();
+        expect(await settled).toBe('read');
+        expect(
+          await page.locator('body').getAttribute('data-late-image-save'),
+        ).toBeNull();
+        expect(downloads).toEqual([]);
+        expect(
+          f.state.requests.some((request) => request.path.startsWith(second)),
+        ).toBe(false);
+      } finally {
+        release.resolve();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['loaded', 'late', 'offline'] as const)(
+    'keeps other previews and only clears a file on a definitive denied download (%s)',
+    async (kind) => {
+      const stored = article();
+      stored.images = [
+        { source: 'generated', operationId: id(350), file: imageFile },
+        {
+          source: 'uploaded',
+          origin: 'upload',
+          file: { objectId: id(90), checksum },
+        },
+      ];
+      const f = await fixture({
+        articles: [stored],
+        imageFiles: {
+          [id(80)]: {
+            fileName: '封面原图.png',
+            mediaType: 'image/png',
+            base64: png,
+          },
+          [id(90)]: {
+            fileName: '第二张原图.png',
+            mediaType: 'image/png',
+            base64: png,
+          },
+        },
+      });
+      const { page } = f;
+      const preview = gate();
+      const coverPath = `/api/v1/workbench/files/${id(80)}`;
+      const section = page.getByRole('region', { name: '文章配图' });
+      const cover = section.getByLabel('封面图', { exact: true });
+      const other = section.getByLabel('配图 1', { exact: true });
+      try {
+        if (kind === 'late') {
+          await page.route(
+            (url) => url.pathname === coverPath + '/preview',
+            async (route) => {
+              await preview.promise;
+              await route.fallback();
+            },
+          );
+        }
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await other.getByRole('img').waitFor();
+        if (kind !== 'late') await cover.getByRole('img').waitFor();
+        await page.route(
+          (url) => url.pathname === coverPath + '/download',
+          (route) =>
+            kind === 'offline'
+              ? route.abort('internetdisconnected')
+              : route.fulfill({
+                  status: kind === 'late' ? 404 : 403,
+                  json: accessProblem(
+                    '当前配图已不可读取',
+                    kind === 'late'
+                      ? 'RESOURCE_NOT_FOUND'
+                      : 'AUTHORIZATION_DENIED',
+                  ),
+                }),
+        );
+        await cover.getByRole('button', { name: '下载', exact: true }).click();
+        await section.getByRole('alert').first().waitFor();
+        if (kind === 'late') {
+          const reply = page.waitForResponse(
+            (response) =>
+              new URL(response.url()).pathname === coverPath + '/preview',
+          );
+          preview.resolve();
+          expect((await reply).ok()).toBe(true);
+          await page.evaluate(
+            () =>
+              new Promise<void>((done) =>
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => done()),
+                ),
+              ),
+          );
+        }
+        expect(await cover.getByRole('img').count()).toBe(
+          kind === 'offline' ? 1 : 0,
+        );
+        expect(await other.getByRole('img').isVisible()).toBe(true);
+      } finally {
+        preview.resolve();
+        await f.close();
+      }
+    },
+  );
+
   it('copies only the exact plain body and reports clipboard rejection without claiming success', async () => {
     const f = await fixture(),
       { page } = f;
@@ -2519,6 +4842,221 @@ suite('MET-224 main-area brand media text workflow', () => {
     await f.close();
   });
 
+  it.each(['new-pin', 'switch-to-B', 'expired-visit', 'closed-visit'] as const)(
+    'a late denial for the copied body evicts only its exact article and pin (%s)',
+    async (change) => {
+      const old = article();
+      const month = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+      }).format(new Date());
+      old.publication = {
+        state: 'scheduled',
+        schedule: {
+          plannedAt: month + '-16T08:00:00.000Z',
+          timezone: 'Asia/Shanghai',
+        },
+        links: null,
+      };
+      const newPin = {
+        objectId: id(82),
+        versionId: id(83),
+        checksum: 'sha256:' + 'b'.repeat(64),
+      };
+      const next = {
+        ...old,
+        id: change === 'switch-to-B' ? id(21) : old.id,
+        revision: 2,
+        body: newPin,
+        title: '独立授权的新文章正文',
+      };
+      const run = recovery('article');
+      run.invocation.intent.articleId = next.id;
+      run.submission = { articleUpdated: false, revision: null };
+      const delivery = { ...run.deliveries[0]!, file: newPin };
+      run.deliveries =
+        change === 'switch-to-B' ? [delivery] : [run.deliveries[0]!, delivery];
+      const f = await fixture({
+        articles: change === 'switch-to-B' ? [old, next] : [old],
+        runs: [run],
+      });
+      const { page } = f;
+      const requested = gate();
+      const refuse = gate();
+      const bodyPath = (objectId: string) =>
+        '/api/v1/files/' + objectId + '/download';
+      const authLost = change === 'expired-visit' || change === 'closed-visit';
+      try {
+        await page
+          .context()
+          .grantPermissions(['clipboard-read', 'clipboard-write']);
+        await page.evaluate(() =>
+          navigator.clipboard.writeText('保持原剪贴板'),
+        );
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toContain('不可直接改写的正文');
+        if (change === 'closed-visit')
+          await finishDespiteAbort(page, bodyPath(file.objectId));
+        await page.route(
+          (url) => url.pathname === bodyPath(file.objectId),
+          async (route) => {
+            requested.resolve();
+            await refuse.promise;
+            await route.fulfill({
+              status: authLost ? 401 : 403,
+              json: authLost
+                ? accessProblem(
+                    'Authentication required',
+                    'AUTHENTICATION_REQUIRED',
+                  )
+                : accessProblem('旧正文的文件授权已撤销'),
+            });
+          },
+        );
+        await page.route(
+          (url) => url.pathname === bodyPath(newPin.objectId),
+          (route) =>
+            route.fulfill({
+              contentType: 'text/plain',
+              body: '经独立读取的新版本字节',
+            }),
+        );
+        await panel(page)
+          .getByRole('button', { name: '复制正文', exact: true })
+          .click();
+        await requested.promise;
+        const authorized = page.waitForResponse((response) => {
+          const url = new URL(response.url());
+          return (
+            brandView(url, 'article') &&
+            url.searchParams.get('articleId') === next.id
+          );
+        });
+        if (change !== 'switch-to-B') {
+          f.state.articles[0] = next;
+          await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        } else {
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .click();
+        }
+        const receipt = await authorized;
+        expect((await receipt.json()).article.body).toEqual(newPin);
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe('经独立读取的新版本字节');
+        if (authLost) {
+          if (change === 'closed-visit') {
+            await panel(page)
+              .getByRole('button', { name: '← 回到对话' })
+              .click();
+            await f.open();
+            await panel(page)
+              .getByRole('tab', { name: '文章库', exact: true })
+              .click();
+            await expect
+              .poll(() => page.getByLabel('文章正文').textContent())
+              .toBe('经独立读取的新版本字节');
+          }
+          const denied = page.waitForResponse(
+            (response) =>
+              new URL(response.url()).pathname === bodyPath(file.objectId) &&
+              response.status() === 401,
+          );
+          refuse.resolve();
+          const response = await denied;
+          // The active 401 terminates its own response body with the visit.
+          // A retired response deliberately lets its body finish uncooperatively.
+          if (change === 'closed-visit') await response.finished();
+          await page.evaluate(
+            () =>
+              new Promise<void>((done) =>
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => done()),
+                ),
+              ),
+          );
+          const expired = panel(page)
+            .getByRole('alert')
+            .filter({ hasText: '登录已过期，请重新登录' });
+          if (change === 'expired-visit') {
+            expect(await expired.isVisible()).toBe(true);
+            expect(await panel(page).getByRole('tab').count()).toBe(0);
+            expect(await panel(page).getByLabel('文章正文').count()).toBe(0);
+            await panel(page)
+              .getByRole('button', { name: '← 回到对话' })
+              .click();
+            expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+              '未发送的聊天草稿',
+            );
+          } else {
+            expect(await expired.count()).toBe(0);
+            expect(await page.getByLabel('文章正文').textContent()).toBe(
+              '经独立读取的新版本字节',
+            );
+          }
+          expect(
+            await page.evaluate(() => navigator.clipboard.readText()),
+          ).toBe('保持原剪贴板');
+          return;
+        }
+        refuse.resolve();
+        await panel(page)
+          .getByRole('alert')
+          .filter({ hasText: '正文文件暂时不可读' })
+          .waitFor();
+        expect(
+          await panel(page)
+            .getByRole('heading', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(await page.getByLabel('文章正文').textContent()).toBe(
+          '经独立读取的新版本字节',
+        );
+        expect(
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: old.title, exact: true })
+            .count(),
+        ).toBe(0);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: '查看本次正文成果', exact: true })
+            .count(),
+        ).toBe(1);
+        expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+          '保持原剪贴板',
+        );
+        await panel(page)
+          .getByRole('tab', { name: '排期表', exact: true })
+          .click();
+        expect(
+          await panel(page)
+            .getByRole('button', { name: next.title, exact: true })
+            .isVisible(),
+        ).toBe(true);
+        expect(
+          await panel(page)
+            .getByRole('button', { name: old.title, exact: true })
+            .count(),
+        ).toBe(0);
+      } finally {
+        refuse.resolve();
+        await f.close();
+      }
+    },
+  );
+
   it.each(['body-pin', 'host-hidden', 'scope-unmount'] as const)(
     'a delayed copy read cannot overwrite the clipboard after %s changes',
     async (change) => {
@@ -2532,6 +5070,7 @@ suite('MET-224 main-area brand media text workflow', () => {
       await page.getByRole('tab', { name: '文章库', exact: true }).click();
       const copy = page.getByRole('button', { name: '复制正文', exact: true });
       await expect.poll(() => copy.isEnabled()).toBe(true);
+      await finishDespiteAbort(page, `/api/v1/files/${file.objectId}/download`);
       let release!: () => void;
       f.state.bodyGate = new Promise<void>((resolve) => {
         release = resolve;
@@ -2539,7 +5078,13 @@ suite('MET-224 main-area brand media text workflow', () => {
       const before = f.state.requests.filter((req) =>
         req.path.startsWith('/api/v1/files/'),
       ).length;
+      const copyRequested = page.waitForRequest(
+        (req) =>
+          new URL(req.url()).pathname ===
+          `/api/v1/files/${file.objectId}/download`,
+      );
       await copy.click();
+      const copyRequest = await copyRequested;
       await expect
         .poll(
           () =>
@@ -2577,9 +5122,7 @@ suite('MET-224 main-area brand media text workflow', () => {
           .getByRole('button', { name: '另一个员工', exact: true })
           .click();
       const response = page.waitForResponse(
-        (res) =>
-          res.url().includes('/api/v1/files/') &&
-          res.url().includes('/download'),
+        (res) => res.request() === copyRequest,
       );
       f.state.bodyGate = undefined;
       release();
