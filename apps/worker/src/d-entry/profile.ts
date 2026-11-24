@@ -39,13 +39,18 @@ type Publication = {
   bootstrap: 'available' | 'sending' | 'sent';
   events: boolean;
 };
+type PublicationResult = { value: Publication } | { error: unknown };
+type PublicationWait = {
+  result?: PublicationResult;
+  waiters: Set<(result: PublicationResult) => void>;
+};
 
 export function createDEntryProfile(
   pages: ReturnType<typeof createDEntryPageRequests>,
   serviceSignal: AbortSignal,
   trustedReleaseDirectory?: string,
 ) {
-  const publications = new WeakMap<DEntryPageHandle, Promise<Publication>>();
+  const publications = new WeakMap<DEntryPageHandle, PublicationWait>();
   const connections = new WeakMap<IncomingMessage['socket'], AbortSignal>();
   const pending = new Set<Promise<unknown>>();
   function track(work: Promise<unknown>) {
@@ -74,55 +79,74 @@ export function createDEntryProfile(
     if (!page.fixedProfile) throw new DEntryNativeUnavailable();
     let held = publications.get(page);
     if (!held) {
+      const opening: PublicationWait = { waiters: new Set() };
       const source = page.fixedProfile;
       const revoked = () => page.invalidate(source.revoked.reason);
-      source.revoked.addEventListener('abort', revoked, { once: true });
       const shared = AbortSignal.any([page.signal, serviceLifetime]);
+      shared.throwIfAborted();
+      if (source.revoked.aborted) {
+        revoked();
+        source.revoked.throwIfAborted();
+      }
+      source.revoked.addEventListener('abort', revoked, { once: true });
       shared.addEventListener(
         'abort',
         () => source.revoked.removeEventListener('abort', revoked),
         { once: true },
       );
-      if (source.revoked.aborted) revoked();
       // The first finite preflight can finish before bootstrap/assets requests.
       // This verified release stays bound to the current page/source lifetime.
-      held = page
-        .use(serviceLifetime, async (active) => {
-          if (trustedReleaseDirectory)
-            return holdReleasedProfile(trustedReleaseDirectory, source, active);
-          const seal = await readWorkerEmployeeWebSeal(active);
-          return holdReleasedProfile(
-            seal.directory,
-            source,
-            active,
-            seal.manifestSha256,
-          );
-        })
-        .then((release) => ({
-          release,
-          bootstrap: 'available',
-          events: false,
-        }));
-      publications.set(page, held);
-      track(held);
-      void held.catch((error) => {
-        publications.delete(page);
-        if (!shared.aborted) page.invalidate(error);
+      const proof = page.use(serviceLifetime, async (active) => {
+        if (trustedReleaseDirectory)
+          return holdReleasedProfile(trustedReleaseDirectory, source, active);
+        const seal = await readWorkerEmployeeWebSeal(active);
+        return holdReleasedProfile(
+          seal.directory,
+          source,
+          active,
+          seal.manifestSha256,
+        );
       });
+      publications.set(page, opening);
+      track(proof);
+      const finish = (result: PublicationResult) => {
+        opening.result = result;
+        for (const receive of opening.waiters) receive(result);
+        opening.waiters.clear();
+      };
+      void proof.then(
+        (release) =>
+          finish({
+            value: { release, bootstrap: 'available', events: false },
+          }),
+        (error) => {
+          publications.delete(page);
+          if (!shared.aborted) page.invalidate(error);
+          finish({ error });
+        },
+      );
+      held = opening;
     }
-    let stop!: () => void;
-    try {
-      const current = await new Promise<Publication>((resolve, reject) => {
-        stop = () => reject(caller.reason);
+    const wait = held;
+    const result =
+      wait.result ??
+      (await new Promise<PublicationResult>((resolve, reject) => {
+        const receive = (value: PublicationResult) => {
+          caller.removeEventListener('abort', stop);
+          resolve(value);
+        };
+        const stop = () => {
+          caller.removeEventListener('abort', stop);
+          wait.waiters.delete(receive);
+          reject(caller.reason);
+        };
+        wait.waiters.add(receive);
         caller.addEventListener('abort', stop, { once: true });
         if (caller.aborted) stop();
-        void held!.then(resolve, reject);
-      });
-      caller.throwIfAborted();
-      return current;
-    } finally {
-      caller.removeEventListener('abort', stop);
-    }
+      }));
+    caller.throwIfAborted();
+    if ('error' in result) throw result.error;
+    return result.value;
   }
 
   function service(request: IncomingMessage, response: ServerResponse) {
@@ -404,6 +428,7 @@ export function createDEntryProfile(
                       first.value.value.owner !== false
                     )
                       throw new DEntryNativeUnavailable();
+                    await verify();
                     body = JSON.stringify(
                       DEntryProfileBootstrapSchema.parse({
                         version: 1,

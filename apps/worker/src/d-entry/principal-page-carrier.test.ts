@@ -903,16 +903,22 @@ it(
     );
     const firstWire = await firstResponseOnWire.promise;
     const sharedSignal = await firstProof.promise;
-    caller.abort();
-    await expect(canceledRequest).rejects.toMatchObject({ name: 'AbortError' });
-    await expect.poll(() => shared.completedProfiles.has(firstWire)).toBe(true);
-    expect(sharedSignal.aborted).toBe(false);
+    const secondBorrow = deferred();
+    vi.mocked(shared.owner.assertCurrent).mockImplementationOnce(async () => {
+      secondBorrow.resolve();
+    });
     const secondRequest = shared.publish(
       'bootstrap',
       sharedPage.scopeId,
       {},
       'document',
     );
+    await secondBorrow.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    caller.abort();
+    await expect(canceledRequest).rejects.toMatchObject({ name: 'AbortError' });
+    await expect.poll(() => shared.completedProfiles.has(firstWire)).toBe(true);
+    expect(sharedSignal.aborted).toBe(false);
     finishFirstProof.resolve();
     const responseWithSharedProof = await secondRequest;
     expect(responseWithSharedProof.status).toBe(200);
