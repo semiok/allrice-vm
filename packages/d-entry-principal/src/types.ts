@@ -45,6 +45,7 @@ export type ScopeFrame =
       principal: DEntryPrincipal;
       baseline: NonOwnerBaseline;
     }>
+  | Readonly<{ type: 'revoked'; scopeId: string }>
   | Readonly<{ type: 'closed'; scopeId: string }>;
 export type InputOf<M> = M extends {
   input(options?: TypertRemoteInputOptions): TypertRemoteValue<infer I>;

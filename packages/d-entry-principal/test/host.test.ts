@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionId } from '@deepseek-ai/dsh-session';
-import { remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol';
+import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol';
 import * as PrincipalHost from '@allrice/d-entry-principal/host';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
@@ -731,6 +731,9 @@ describe('public rc.2 Host issuer, generated faces and real in-process Node carr
     await expect(first).rejects.toThrow('PRINCIPAL_ROOT_INVALID');
     expect(await iterator.next()).toMatchObject({ done: true });
     expect(await terminal).toMatchObject({
+      value: { type: 'revoked', scopeId: fixture.selected.scopeId },
+    });
+    expect(await scope.iterator.next()).toMatchObject({
       value: { type: 'closed', scopeId: fixture.selected.scopeId },
     });
     expect(await scope.iterator.next()).toMatchObject({ done: true });
@@ -760,6 +763,53 @@ describe('public rc.2 Host issuer, generated faces and real in-process Node carr
     expect(fixture.catalog.pages).toHaveLength(1);
     await close(scope.handle, scope.iterator);
   });
+
+  it.each(['mechanical cancellation', 'independent failure'] as const)(
+    'keeps an initial catalog %s distinct when the guest withdraws during its read',
+    async (outcome) => {
+      const fixture = await setup();
+      const entered = deferred(),
+        release = deferred();
+      fixture.catalog.beforeList = async (signal) => {
+        entered.resolve();
+        await release.promise;
+        if (outcome === 'independent failure')
+          throw new RemoteError(
+            'gateway/service-unavailable',
+            'original catalog fault',
+            { source: 'initial list' },
+          );
+        signal.throwIfAborted();
+      };
+      const handle = TYPERT_REMOTE.methods['allricePrincipal/openScope'].invoke(
+        fixture.node.remote,
+        { issue: fixture.selected },
+      );
+      const iterator = handle[Symbol.asyncIterator]();
+      const first = iterator.next();
+      void first.catch(() => {});
+      await entered.promise;
+      const scope = fixture.host.allricePrincipal.scopes.get(
+        fixture.selected.scopeId,
+      );
+      if (!scope) throw Error('actual scope missing');
+      const joined = scope.close();
+      release.resolve();
+      await joined;
+      if (outcome === 'independent failure')
+        await expect(first).rejects.toMatchObject({
+          code: 'gateway/service-unavailable',
+          message: 'original catalog fault',
+          details: { source: 'initial list' },
+        });
+      else
+        expect(await first).toMatchObject({
+          value: { type: 'closed', scopeId: fixture.selected.scopeId },
+        });
+      expect(await iterator.next()).toMatchObject({ done: true });
+      expect(fixture.parent.signal.aborted).toBe(false);
+    },
+  );
 
   it('rejects a different parent, undeclared global/control/list actions and raw nested extras before normal decode can erase them', async () => {
     const fixture = await setup();

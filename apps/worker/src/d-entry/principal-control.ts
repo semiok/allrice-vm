@@ -34,6 +34,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
   private closing = false;
   private joined?: Promise<void>;
   private closed = false;
+  private withdrawn = false;
   private failure: unknown;
   readonly done: Promise<void>;
   constructor(
@@ -54,6 +55,8 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
             fence?.(Error('PRINCIPAL_SCOPE_CLOSED'));
             continue;
           }
+          if (this.withdrawn) throw unknown();
+          if (frame.type === 'revoked') this.withdrawn = true;
           if (!receive(frame) || this.closing) continue;
           this.item = frame;
           this.changed.resolve();
@@ -94,7 +97,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deliveryErrors: unknown[] = [];
       try {
-        if (!this.ended && !this.closed) {
+        if (!this.ended && !this.closed && !this.withdrawn) {
           try {
             this.handle.send('close');
             this.handle.end();
@@ -217,6 +220,10 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'revoked' && published) {
+                  revoked.abort(Error('PRINCIPAL_SCOPE_REVOKED'));
+                  return false;
+                }
                 if (
                   frame.type !== 'opened' ||
                   frame.baseline.owner ||

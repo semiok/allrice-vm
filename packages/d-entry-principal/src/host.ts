@@ -357,7 +357,15 @@ class PrincipalService extends TypertRemoteService {
       }),
     );
     this.scopes.set(issue.scopeId, scope);
-    const gate = signalGate(AbortSignal.any([signal, scope.abort.signal]));
+    const gate = signalGate(signal);
+    let withdrawn = false;
+    let opened = false;
+    const withdraw = () => {
+      withdrawn = !gate.abort.signal.aborted;
+      gate.stop();
+    };
+    scope.abort.signal.addEventListener('abort', withdraw, { once: true });
+    if (scope.abort.signal.aborted) withdraw();
     const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
     const pump = commands(input, gate.stop).catch((error) => {
       gate.stop();
@@ -383,6 +391,7 @@ class PrincipalService extends TypertRemoteService {
             throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
         } finally {
           gate.detach();
+          scope.abort.signal.removeEventListener('abort', withdraw);
         }
       }));
     let failed = false;
@@ -390,13 +399,21 @@ class PrincipalService extends TypertRemoteService {
       try {
         await scope.ready;
       } catch (error) {
-        if (!gate.abort.signal.aborted) throw error;
+        const failure = remoteErrorOf(error);
+        if (
+          !scope.abort.signal.aborted ||
+          (error !== scope.abort.signal.reason &&
+            (failure?.code !== 'gateway/cancelled' ||
+              failure.cause !== scope.abort.signal.reason))
+        )
+          throw error;
       }
       if (!gate.abort.signal.aborted) {
         const peer = scope.peer;
         if (!peer || peer.principal.kind !== 'allrice-d-entry') throw closed();
         const baseline = this.ctx.remoteAccess.snapshotFor(peer.principal);
         if (baseline.owner) throw Error('PRINCIPAL_OWNER_BASELINE');
+        opened = true;
         yield {
           type: 'opened',
           scopeId: issue.scopeId,
@@ -405,6 +422,8 @@ class PrincipalService extends TypertRemoteService {
         };
       }
       await gate.done;
+      if (opened && withdrawn && !signal.aborted)
+        yield { type: 'revoked', scopeId: issue.scopeId };
       await join();
       yield { type: 'closed', scopeId: issue.scopeId };
     } catch (error) {

@@ -394,7 +394,15 @@ describe('Node control uses the real generated issuer over the same native Peer 
     async (terminal) => {
       const fixture = await setup();
       const buffered = deferred(),
-        endControl = deferred();
+        endControl = deferred(),
+        cleanupEntered = deferred(),
+        cleanupRelease = deferred();
+      if (terminal === 'guest withdrawal') {
+        fixture.catalog.afterFollow = async () => {
+          cleanupEntered.resolve();
+          await cleanupRelease.promise;
+        };
+      }
       const original = fixture.wire.open;
       if (!original) throw Error('actual carrier missing');
       vi.spyOn(fixture.wire, 'open').mockImplementation(
@@ -411,7 +419,8 @@ describe('Node control uses the real generated issuer over the same native Peer 
                   endpoint === 'allricePrincipal/streamScoped' &&
                   typeof value === 'object' &&
                   value &&
-                  Reflect.get(value, 'type') === 'baseline'
+                  Reflect.get(value, 'type') ===
+                    (terminal === 'guest withdrawal' ? 'snapshot' : 'baseline')
                 )
                   buffered.resolve();
                 yield frame;
@@ -449,11 +458,21 @@ describe('Node control uses the real generated issuer over the same native Peer 
       );
       const second = await other.run(new AbortController().signal);
       const stream = scope.stream(
-        {
-          endpoint: 'remoteAccess/follow',
-          scopeId: scope.opened.scopeId,
-          args: {},
-        },
+        terminal === 'guest withdrawal'
+          ? {
+              endpoint: 'session/follow',
+              scopeId: scope.opened.scopeId,
+              args: {
+                request: {
+                  address: { kind: 'session', sessionId: SessionId('root') },
+                },
+              },
+            }
+          : {
+              endpoint: 'remoteAccess/follow',
+              scopeId: scope.opened.scopeId,
+              args: {},
+            },
         new AbortController().signal,
       );
       const revoked = deferred();
@@ -468,12 +487,29 @@ describe('Node control uses the real generated issuer over the same native Peer 
       } else {
         endControl.resolve();
       }
-      await revoked.promise;
-      await expect(stream[Symbol.asyncIterator]().next()).rejects.toBeDefined();
-      if (terminal === 'guest withdrawal')
+      if (terminal === 'guest withdrawal') {
+        try {
+          await Promise.all([revoked.promise, cleanupEntered.promise]);
+          const closing = first.close();
+          const done = vi.fn();
+          void closing.then(done, done);
+          await expect(stream[Symbol.asyncIterator]().next()).rejects.toThrow(
+            'PRINCIPAL_SCOPE_REVOKED',
+          );
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(done).not.toHaveBeenCalled();
+          expect(second.revoked.aborted).toBe(false);
+        } finally {
+          cleanupRelease.resolve();
+        }
         await expect(first.close()).resolves.toBeUndefined();
-      else
+      } else {
+        await revoked.promise;
+        await expect(
+          stream[Symbol.asyncIterator]().next(),
+        ).rejects.toBeDefined();
         await expect(first.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');
+      }
       expect(fixture.carrier.signal.aborted).toBe(false);
       expect(fixture.parent.signal.aborted).toBe(false);
       expect(second.revoked.aborted).toBe(false);
