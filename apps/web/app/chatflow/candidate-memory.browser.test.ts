@@ -463,7 +463,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
     path: string,
     init: RequestInit = {},
     token = ownerToken,
-    workspace = identity.workspace,
+    workspace: string = identity.workspace,
     instance: string = token === foreignToken
       ? foreign.assignment
       : identity.assignment,
@@ -868,7 +868,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
             (
               await api(
                 '/' + memory.id,
-                write(exact(memory), 'DELETE'),
+                write(exact(memory, instance), 'DELETE'),
                 ownerToken,
                 identity.workspace,
                 instance,
