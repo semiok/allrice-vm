@@ -136,7 +136,7 @@ worker_procs() {
   if [ "$mode" = dev ] || [ "$("$M1_PY" "$BIN/qa-lease.py" plist-claim "$INSTANCE" web "$WEB_CONFIG" 2>/dev/null)" = published ]; then
     web_state=$(job_state "$WEB_LABEL" "$WEB_CONFIG" "$release/apps/web") || web_state=""
   fi
-  "$M1_PY" "$BIN/schedule-recover-processes.py" scan "$DBNAME" "$ROOTS" "$WORKER_TREE" "$release" "$PORT" \
+  "$M1_PY" "$BIN/schedule-recover-processes.py" scan "$1" "$DBNAME" "$ROOTS" "$WORKER_TREE" "$release" "$PORT" \
     "$WEB_CONFIG" "$WEB_LABEL" "$WEB_PORT" "$web_state"
 }
 worker_sessions() { RO=1 sql -c "select count(*) from pg_stat_activity where datname = current_database() and application_name = 'allrice-worker'"; }
@@ -195,8 +195,9 @@ fi
 [ "$was" = gone ] || STOPPED=1
 say "stopping $LABEL"
 stop_job "$LABEL" "$PORT" "$PLIST" "$release" || die "the Worker did not stop; nothing written"
+process_report="$OUT/process-observations.json"
 for i in $(seq 1 10); do
-  left=$(worker_procs) || die "cannot list processes; nothing written"
+  left=$(worker_procs "$process_report") || die "cannot verify process observations; nothing written"
   sessions=$(worker_sessions) || die "cannot read the database sessions; nothing written"
   [ -z "$left" ] && [ "$sessions" = 0 ] && break; sleep 1
 done
@@ -212,7 +213,8 @@ show "$after" "-" >/dev/null
 evidence=$("$M1_PY" -c 'import json,sys
 k=("target","workerLabel","workerJobBefore","runningWorkerBeforeStop","hostBootAt","checkedAt","toolsVersion")
 d=dict(zip(k,sys.argv[1:]),basis="worker_stopped",tool="scripts/m1/schedule-recover",
-       ownerExit="Worker job stopped; known descendants exited; checked process launch environments and target paths; no allrice-worker session")
+       processObservations="process-observations.json",
+       ownerExit="Worker job stopped; known descendants exited; checked launch environments or lsof evidence; no allrice-worker session")
 print(json.dumps(dict(d,runningWorkerBeforeStop=None if d["runningWorkerBeforeStop"]=="-" else d["runningWorkerBeforeStop"])))' \
   "$mode${task:+:$task}" "$LABEL" "${was%% *}" "$worker_id" "$(boot_at)" "$checked" "$(cut -c1-12 "$BIN/TOOLS_VERSION" 2>/dev/null || echo source)")
 sql -1 -f "$BIN/schedule-recover.sql" -v targets="$expect" -v evidence="$evidence" -v database_claim="$DATABASE_CLAIM" >/dev/null ||

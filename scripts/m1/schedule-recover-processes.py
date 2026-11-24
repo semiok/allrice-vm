@@ -1,5 +1,6 @@
 """Identify processes that may still own schedule partitions during M1 recovery."""
 import ctypes
+import ipaddress
 import json
 import os
 import plistlib
@@ -9,7 +10,8 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import NamedTuple
+from urllib.parse import unquote, urlsplit
 
 from service_target import canonical, dotenv_environment, service_config
 
@@ -26,10 +28,21 @@ LOADER_PREFIXES = ('DYLD_', 'LD_', 'NODE_')
 LOADER_SETTINGS = {'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES'}
 ENV_UNAVAILABLE = '无法读取进程启动环境。请按 PID 核查该进程的所属服务与启动环境可见性。'
 WORKER_DESCENDANT = '停止前已核实为 Worker 或其子进程。请核查该进程已退出。'
+LSOF_UNAVAILABLE = '无法核实 lsof 的工作目录、文件或连接。请检查 lsof 读取错误和权限。'
+PG_PORT = '5434'
+PG_SOCKET = '.s.PGSQL.' + PG_PORT
 
 
 class UnverifiedStartup(ValueError):
     """A reason safe to show without revealing arguments, environment or credentials."""
+
+
+class OpenFile(NamedTuple):
+    descriptor: str
+    kind: str
+    name: str
+    device: str
+    protocol: str
 
 
 def loader_setting(key):
@@ -180,18 +193,50 @@ def ps():
     return processes
 
 
-def process_cwds():
-    result = subprocess.run(['/usr/sbin/lsof', '-a', '-u', str(os.getuid()), '-d', 'cwd', '-Fpn'],
-                            capture_output=True, text=True)
-    if result.returncode != 0:
-        raise ValueError('lsof failed')
-    paths, pid = {}, None
-    for line in result.stdout.splitlines():
-        if line.startswith('p'):
-            pid = line[1:]
-        elif line.startswith('n') and pid:
-            paths[pid] = Path(line[1:])
-    return paths
+def process_files():
+    try:
+        result = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-u', str(os.getuid()), '-F0pdftPn'],
+                                capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        raise UnverifiedStartup(LSOF_UNAVAILABLE) from None
+    if result.returncode != 0 or result.stderr or (result.stdout and not result.stdout.endswith(b'\0\n')):
+        raise UnverifiedStartup(LSOF_UNAVAILABLE)
+    files, pid = {}, None
+    # -F0 terminates fields with NUL and each process or file set with a newline.
+    for entry in result.stdout.split(b'\0\n'):
+        if not entry:
+            continue
+        fields = {field[:1]: os.fsdecode(field[1:]) for field in entry.split(b'\0')}
+        if b'p' in fields and fields[b'p'].isdigit():
+            pid = fields[b'p']
+            files[pid] = []
+        elif pid is not None and b'f' in fields:
+            files[pid].append(OpenFile(fields[b'f'], fields.get(b't', ''), fields.get(b'n', ''),
+                                       fields.get(b'd', ''), fields.get(b'P', '')))
+        else:
+            raise UnverifiedStartup(LSOF_UNAVAILABLE)
+    return files
+
+
+def pg_unix_socket(file):
+    return file.kind == 'unix' and file.name.startswith('/') and Path(file.name).name == PG_SOCKET
+
+
+def pg_connection(file, unix_peers):
+    if file.kind == 'unix':
+        return pg_unix_socket(file) or (file.name.startswith('->') and file.name[2:] in unix_peers)
+    if file.protocol != 'TCP' or '->' not in file.name:
+        return False
+    host, _, port = file.name.rsplit('->', 1)[1].rpartition(':')
+    if port != PG_PORT:
+        return False
+    try:
+        address = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        raise UnverifiedStartup(LSOF_UNAVAILABLE) from None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
 
 
 def alive(pid):
@@ -217,12 +262,12 @@ def worker_tree(pid):
     while pending:
         child = pending.pop()
         try:
-            known[child] = process_started(int(child))
+            known[child] = {'started': process_started(int(child)), 'command': processes[child][1]}
         except OSError:
             if alive(child):
                 raise
         pending.extend(children.get(child, ()))
-    if known.get(pid) != root_start or process_started(int(pid)) != root_start:
+    if known.get(pid, {}).get('started') != root_start or process_started(int(pid)) != root_start:
         raise ValueError('Worker changed while recording descendants')
     print(json.dumps(known))
 
@@ -239,15 +284,33 @@ def targets_database(value, db):
         raise UnverifiedStartup('DATABASE_URL 的 URL 路径缺少库名。请核查启动配置并显式填写 /数据库名。')
     if (target.scheme not in ('postgres', 'postgresql') or target.query or target.fragment
             or not re.fullmatch(r'/[a-zA-Z0-9_-]+', target.path)
-            or (host and any(char in host for char in '%,'))
             or (port is not None and port < 1) or any(ord(char) <= 32 for char in value)):
         raise UnverifiedStartup('DATABASE_URL 无法核实。请核查连接串使用明确的主机、端口和单一库名。')
-    return host in (None, '127.0.0.1', 'localhost', '::1') and target.path[1:] == db
+    if target.path[1:] == db:
+        if host in (None, '127.0.0.1', 'localhost', '::1') or unix_dsn_host(host):
+            return True
+        raise UnverifiedStartup('DATABASE_URL 使用非标准主机且库名与目标相同。请把 DSN 改成标准本机地址，或确认这个进程不连目标库。')
+    if host and any(char in host for char in '%,') and not unix_dsn_host(host):
+        raise UnverifiedStartup('DATABASE_URL 无法核实。请核查连接串使用明确的主机、端口和单一库名。')
+    return False
 
 
-def main(db, roots, known_tree, *web_settings):
+def unix_dsn_host(host):
+    # libpq accepts a percent-encoded absolute socket directory in the host field.
+    if not re.match(r'%2[fF]', host) or re.search(r'%(?![a-fA-F0-9]{2})', host):
+        return False
+    try:
+        directory = unquote(host, errors='strict')
+    except UnicodeDecodeError:
+        return False
+    return (directory.startswith('/') and not directory.startswith('//') and directory == os.path.normpath(directory)
+            and not any(ord(char) < 32 for char in directory))
+
+
+def scan_processes(db, roots, known_tree, *web_settings):
     def scoped(path):
-        return any(Path(path).resolve().is_relative_to(root) for root in scope)
+        resolved = Path(path).resolve()
+        return any(resolved.is_relative_to(root) for root in scope)
 
     def scoped_argument(arg, here):
         path = arg.split('=', 1)[1] if arg.startswith('-') and '=' in arg else arg
@@ -257,65 +320,123 @@ def main(db, roots, known_tree, *web_settings):
     scope = [Path(root).resolve() for root in roots.split('|')]
     known = json.loads(known_tree)
     web = verified_web_launch(db, *web_settings)
-    processes, cwds = ps(), process_cwds()
-    # A known descendant missing from the current UID list may still be alive.
-    for pid in known.keys() - processes.keys():
-        try:
-            if process_started(int(pid)) == known[pid]:
-                print(pid, WORKER_DESCENDANT)
-        except OSError:
-            if alive(pid):
-                print(pid, ENV_UNAVAILABLE)
+    processes, files = ps(), process_files()
+    unix_peers = {file.device for entries in files.values() for file in entries
+                  if file.device and pg_unix_socket(file)}
     ancestors, pid = set(), str(os.getpid())
     while pid in processes and pid not in ancestors:
         ancestors.add(pid)
         pid = processes[pid][0]
-    for pid, (_, name) in processes.items():
-        if pid in ancestors:
-            continue
-        here = cwds.get(pid)
+
+    def classify(pid, name, entries):
+        if pid in known:
+            try:
+                if process_started(int(pid)) == known[pid]['started']:
+                    return False, WORKER_DESCENDANT
+            except OSError:
+                if alive(pid):
+                    return False, ENV_UNAVAILABLE
+            if pid not in processes:
+                return True, '已记录的进程在本次采样中已退出。'
+        cwd = next((file.name for file in entries if file.descriptor == 'cwd' and file.name.startswith('/')), None)
+        here = Path(cwd) if cwd else None
         try:
             observed, args, inherited, start = observe_process(int(pid))
         except (OSError, ValueError, struct.error):
-            if here is not None or alive(pid):
-                print(pid, ENV_UNAVAILABLE)
-            continue
+            if here is None and not alive(pid):
+                return True, '进程在检查启动信息时已退出。'
+            observed, inherited = '', None
+        node = name == 'node' or Path(observed).name == 'node' or (web and pid == web[0])
         if not inherited:
-            print(pid, ENV_UNAVAILABLE)
-            continue
-        if known.get(pid) == start:
-            print(pid, WORKER_DESCENDANT)
-            continue
+            if node:
+                return False, ENV_UNAVAILABLE
+            if here is None or any(
+                    not file.name or file.descriptor in ('err', 'NOFD') or (
+                        not file.name.startswith('/') and (
+                            'info error:' in file.name
+                            or file.name.startswith(('Permission denied', 'Operation not permitted'))
+                        )
+                    ) for file in entries):
+                return False, LSOF_UNAVAILABLE
+            if scoped(here):
+                return False, '启动环境不可见，lsof 显示工作目录属于目标。'
+            if any(file.name.startswith('/') and scoped(file.name) for file in entries):
+                return False, '启动环境不可见，lsof 显示打开文件属于目标。'
+            if any(pg_connection(file, unix_peers) for file in entries):
+                return False, '启动环境不可见，lsof 显示本机 PostgreSQL 5434 端点连接。'
+            return True, '启动环境不可见，lsof 未见目标工作目录、打开文件或 PG 连接，且不属于已记录 Worker 子树。'
+        if not node:
+            if targets_database(inherited.get('DATABASE_URL', ''), db):
+                return False, 'DATABASE_URL 指向目标库。请核查该进程已退出。'
+            if ((here is not None and scoped(here)) or (Path(observed).is_absolute() and scoped(observed))
+                    or any(scoped_argument(arg, here) for arg in args)):
+                return False, '启动路径或工作目录属于目标。请核查该进程已退出。'
+            return True, '可读启动环境与观测到的路径未指向目标。'
+        if here is None or not canonical(here) or not here.is_dir():
+            return False, 'Node 工作目录无法核实。请按 PID 核查 cwd。'
+        if Path(observed).resolve() != PINNED_NODE.resolve():
+            return False, 'Node 不是当前工具可核实的固定运行时。请按 PID 核查运行时。'
+        if not args or (args[0] != 'node' and not Path(args[0]).is_absolute()):
+            return False, 'Node 的启动入口无法核实。请按 PID 核查启动命令。'
         try:
-            if name != 'node' and Path(observed).name != 'node' and not (web and pid == web[0]):
-                database = targets_database(inherited.get('DATABASE_URL', ''), db)
-                if (database or (here is not None and scoped(here))
-                        or (Path(observed).is_absolute() and scoped(observed))
-                        or any(scoped_argument(arg, here) for arg in args)):
-                    print(pid, '进程使用目标库或目标工作路径。请核查该进程已退出。')
-                continue
-            if (here is None or not canonical(here) or not here.is_dir()
-                    or not args or Path(observed).resolve() != PINNED_NODE.resolve()):
-                raise ValueError('process executable or cwd is unknown')
-            if args[0] != 'node' and not Path(args[0]).is_absolute():
-                raise ValueError('unverified Node argv[0]')
-            index, files = plain_node_options(args[1:], allow_env_files=True)
+            index, env_files = plain_node_options(args[1:], allow_env_files=True)
             script = Path(args[index + 1])
-            if (script.suffix not in ('.js', '.mjs', '.cjs') or not canonical(script)
-                    or not launch_file(script.stat(), start)):
-                raise ValueError('entry is not a verifiable absolute file')
-            if not ordinary_script_arguments(script, args[index + 2:]):
-                raise ValueError('arguments after the entry are not a plain startup')
-            environment = effective_environment(start, inherited, files)
-            database = targets_database(environment.get('DATABASE_URL', ''), db)
-            if web and pid == web[0] and args == web[1] and here == web[2] and script == web[3]:
-                continue
-            if scoped(here) or scoped(script) or any(map(scoped, files)) or database:
-                print(pid, script)
+        except (ValueError, IndexError):
+            return False, 'Node 启动参数无法确认为普通文件启动。请按 PID 核查入口前的选项。'
+        if (script.suffix not in ('.js', '.mjs', '.cjs') or not canonical(script)
+                or not launch_file(script.stat(), start)):
+            return False, 'Node 入口无法核实为启动时的规范绝对文件。请按 PID 核查入口路径。'
+        if not ordinary_script_arguments(script, args[index + 2:]):
+            return False, 'Node 入口后的参数不属于已核实的启动方式。请按 PID 核查入口后的参数。'
+        try:
+            environment = effective_environment(start, inherited, env_files)
+        except UnverifiedStartup:
+            raise
+        except (ValueError, OSError, subprocess.SubprocessError):
+            return False, 'Node 环境文件或启动环境无法核实。请按 PID 核查 --env-file 和加载选项。'
+        database = targets_database(environment.get('DATABASE_URL', ''), db)
+        if web and pid == web[0] and args == web[1] and here == web[2] and script == web[3]:
+            return True, '已核实为当前 release 的 Web 进程。'
+        if database:
+            return False, 'DATABASE_URL 指向目标库。请核查该进程已退出。'
+        if scoped(here) or scoped(script) or any(map(scoped, env_files)):
+            return False, 'Node 入口、工作目录或环境文件属于目标。'
+        return True, '已核实普通 Node 文件启动，入口与启动环境未指向目标。'
+
+    observations = []
+    # A known descendant missing from the current UID list may still be alive.
+    for pid in sorted((processes.keys() | known.keys()) - ancestors, key=int):
+        name = processes[pid][1] if pid in processes else known[pid]['command']
+        try:
+            allowed, reason = classify(pid, name, files.get(pid, ()))
         except UnverifiedStartup as error:
-            print(pid, error)
+            allowed, reason = False, str(error)
         except (OSError, RuntimeError, ValueError, IndexError, AttributeError, subprocess.SubprocessError):
-            print(pid, '启动参数或文件来源无法核实。请按 PID 核查实际入口和环境文件。')
+            allowed, reason = False, '启动参数或文件来源无法核实。请按 PID 核查实际入口和环境文件。'
+        command = ''.join(char if char.isprintable() else '?' for char in name)
+        observations.append({'pid': int(pid), 'command': command, 'allowed': allowed, 'reason': reason})
+    return observations
+
+
+def main(report_path, *arguments):
+    report_path = Path(report_path)
+    try:
+        observations = scan_processes(*arguments)
+    except UnverifiedStartup as error:
+        reason = str(error)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        reason = '无法完整读取进程清单。请核查本机进程观测权限。'
+    else:
+        allowed = sum(row['allowed'] for row in observations)
+        report = {'status': 'complete', 'total': len(observations), 'allowed': allowed,
+                  'blocked': len(observations) - allowed, 'processes': observations}
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        for row in observations:
+            if not row['allowed']:
+                print(row['pid'], row['command'], row['reason'])
+        return
+    report_path.write_text(json.dumps({'status': 'error', 'reason': reason}, ensure_ascii=False) + '\n', encoding='utf-8')
+    sys.exit(reason)
 
 
 if __name__ == '__main__':

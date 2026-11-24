@@ -73,7 +73,12 @@ class DeployDevMigrations(unittest.TestCase):
         write(os.path.join(self.stubs, 'ps'), '#!/bin/sh\n'
               'if [ -z "$PROCESS_TREE_STOPPED" ] && [ -n "$PROCESS_ARGS_BEFORE" ]; then '
               'printf "%s" "$PROCESS_ARGS_BEFORE"; else printf "%s" "$PROCESS_ARGS"; fi\n', 0o755)
-        write(os.path.join(self.stubs, 'lsof'), '#!/bin/sh\nprintf "%s" "$PROCESS_CWD"\n', 0o755)
+        write(os.path.join(self.stubs, 'lsof'), '#!' + sys.executable + '\n'
+              'import json,os,sys\n'
+              'for fields in json.loads(os.environ.get("PROCESS_LSOF", "[]")):\n'
+              '    sys.stdout.buffer.write(("\\0".join(fields) + "\\0\\n").encode())\n'
+              'print(os.environ.get("PROCESS_LSOF_WARNING", ""), end="", file=sys.stderr)\n'
+              'sys.exit(int(os.environ.get("PROCESS_LSOF_EXIT", "0")))\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
         self.snapshots = os.path.join(self.home, 'allrice40-dev/qa/pre-migrate')
@@ -1371,6 +1376,8 @@ def observe_process(pid):
               'import json,os,sys\n'
               'if "-f" in sys.argv:\n'
               '    if os.environ.get("SQL_FAIL"): sys.exit(1)\n'
+              '    evidence=next(a.split("=",1)[1] for a in sys.argv if a.startswith("evidence="))\n'
+              '    assert json.loads(evidence)["processObservations"] == "process-observations.json"\n'
               '    claim=next((a.split("=",1)[1] for a in sys.argv if a.startswith("database_claim=")), "")\n'
               '    open(os.environ["PROOF"],"w").write(claim); sys.exit(0)\n'
               'if "pg_stat_activity" in sys.argv[-1]: print(0); sys.exit(0)\n'
@@ -1509,10 +1516,18 @@ def observe_process(pid):
         secret = 'fictional-fixture-password'
         dsn = 'postgres://tester:' + secret + '@127.0.0.1:5434'
         target = '/allrice40_qa_recover_evidence'
+        review_host = '请把 DSN 改成标准本机地址，或确认这个进程不连目标库'
         for name, value, extra, allowed, reason in (
             ('full other database takes precedence', dsn + '/allrice_qa_recover_evidence',
              {'PGDATABASE': target[1:]}, True, None),
             ('full target database', dsn + target, {'PGDATABASE': 'other'}, False, None),
+            ('target at localhost', 'postgres://localhost' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target at IPv6 loopback', 'postgres://[::1]' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target via default socket', 'postgresql://' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target via explicit socket', 'postgres://%2Fprivate%2Ftmp' + target, {}, False, 'DATABASE_URL 指向目标库'),
+            ('target at abbreviated loopback', 'postgres://127.1' + target, {}, False, review_host),
+            ('target at nonstandard host', 'postgres://pg-fixture.invalid' + target, {}, False, review_host),
+            ('other database at nonstandard host', 'postgres://pg-fixture.invalid/other', {}, True, None),
             ('empty path despite PGDATABASE', dsn, {'PGDATABASE': 'other'}, False, 'URL 路径缺少库名'),
             ('slash path despite username', dsn + '/', {}, False, 'URL 路径缺少库名'),
             ('unverified connection overrides', dsn + '/other?database=' + target[1:], {}, False, 'DATABASE_URL 无法核实'),
@@ -1528,31 +1543,77 @@ def observe_process(pid):
         helper = '/bin/sh'
         for name, args, cwd, allowed, facts in (
             ('visible unrelated helper', [helper, entry], outside, True, {}),
-            ('helper environment hidden outside scope', [helper, entry], outside, False,
-             dict(env_visible=False, reason='无法读取进程启动环境')),
-            ('helper native environment unavailable', [helper, entry], outside, False,
-             dict(observed=False, reason='无法读取进程启动环境')),
+            ('helper environment hidden outside scope', [helper, entry], outside, True,
+             dict(env_visible=False, reason='lsof 未见目标')),
+            ('helper native environment unavailable', [helper, entry], outside, True,
+             dict(observed=False, reason='lsof 未见目标')),
             ('helper environment hidden in target cwd', [helper, entry], instance, False,
-             dict(env_visible=False, reason='无法读取进程启动环境')),
+             dict(env_visible=False, reason='lsof 显示工作目录属于目标')),
             ('helper with target cwd', [helper, entry], instance, False, {}),
             ('helper with target launch path', [helper, os.path.join(instance, 'helper.sh')], outside, False, {}),
             ('known Worker descendant reparented', [helper, entry], outside, False,
-             dict(worker_parent=True, reason='999999 停止前已核实为 Worker 或其子进程')),
+             dict(worker_parent=True, env_visible=False, reason='停止前已核实为 Worker 或其子进程')),
             ('known Worker descendant off current list', [helper, entry], outside, False,
-             dict(worker_parent=True, listed=False, reason='999999 停止前已核实为 Worker 或其子进程')),
+             dict(worker_parent=True, listed=False, reason='停止前已核实为 Worker 或其子进程')),
         ):
             with self.subTest(name=name):
                 self.check_recovery_scan(task, rows, name, args, cwd, allowed, executable=helper, **facts)
 
+    def test_schedule_recover_uses_lsof_for_helpers_with_hidden_environments(self):
+        task = 'recover-open-files'
+        _, worker, _ = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        safe = 'lsof 未见目标'
+        connection = 'lsof 显示本机 PostgreSQL 5434 端点连接'
+        unreadable = '无法核实 lsof'
+        secret = 'fixture-sensitive-file-name'
+        opened = os.path.join(worker['WorkingDirectory'], secret)
+        write(opened, '// synthetic fixture\n')
+        for name, allowed, reason, facts in (
+            ('open file in target', False, 'lsof 显示打开文件属于目标',
+             dict(file_sets=[['f3', 'tREG', 'n' + opened]])),
+            ('open file outside target', True, safe,
+             dict(file_sets=[['f3', 'tREG', 'n' + os.path.join(self.home, secret)]])),
+            ('loopback IPv4 PG connection', False, connection,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->127.0.0.1:5434']])),
+            ('loopback IPv6 PG connection', False, connection,
+             dict(file_sets=[['f4', 'tIPv6', 'PTCP', 'n[::1]:49600->[::1]:5434']])),
+            ('PG listener is not a TCP client', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:5434']])),
+            ('local TCP connection to another port', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->127.0.0.1:5432']])),
+            ('same port on nonlocal host', True, safe,
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->192.0.2.1:5434']])),
+            ('Unix PG socket by name', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'n/private/tmp/.s.PGSQL.5434']])),
+            ('Unix PG socket by peer', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n/private/tmp/.s.PGSQL.5434']])),
+            ('Unix peer for different PG port', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n/private/tmp/.s.PGSQL.5432']])),
+            ('lsof has no record for a still present process', False, unreadable, dict(cwd=None)),
+            ('per PID lsof permission error', False, unreadable,
+             dict(file_sets=[['ferr', 'tunknown', 'nFD info error: Operation not permitted']])),
+            ('lsof returned an error', False, unreadable, dict(lsof_exit=1)),
+            ('lsof stdout with a permission warning', False, unreadable,
+             dict(lsof_warning='lsof: Permission denied: ' + secret)),
+        ):
+            with self.subTest(name=name):
+                cwd = facts.pop('cwd', self.home)
+                self.check_recovery_scan(task, rows, name, ['/bin/sh'], cwd, allowed,
+                                         executable='/bin/sh', env_visible=False, reason=reason, secret=secret, **facts)
     def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
                             web_pid='', observed=True, job_plist=None, executable=NODE, env_visible=True,
-                            worker_parent=False, listed=True, reason=None, secret=None):
+                            worker_parent=False, listed=True, reason=None, secret=None,
+                            file_sets=(), lsof_exit=0, lsof_warning=''):
         proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
         started = started or time.time_ns()
         environment = dict(HOME=self.home, **(environment or {})) if env_visible else {}
         snapshot = dict(executable=executable, args=args, environment=environment, started=started) if observed else None
         command = os.path.basename(executable)
         before = f'999998 1 node\n999999 999998 {command}\n' if worker_parent else ''
+        file_sets = [['p999999'], ['fcwd', 'tDIR', 'n' + cwd], *file_sets] if cwd else []
         p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
                                  ROWS=json.dumps(rows), PROOF=proof, PROCESS_WEB_PID=web_pid,
                                  PROCESS_WEB_PLIST=job_plist or self.recovery_web_plist, PROCESS_WEB_CWD=self.recovery_web_cwd,
@@ -1560,18 +1621,39 @@ def observe_process(pid):
                                  PROCESS_WORKER_PLIST=self.recovery_worker_plist, PROCESS_WORKER_CWD=self.recovery_worker_cwd,
                                  PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=f'999999 1 {command}\n' if listed else '',
                                  PROCESS_ARGS_BEFORE=before, PROCESS_STARTS=json.dumps({'999998': started - 1, '999999': started}),
-                                 PROCESS_CWD=f'p999999\nn{cwd}\n')
+                                 PROCESS_LSOF=json.dumps(file_sets), PROCESS_LSOF_EXIT=str(lsof_exit),
+                                 PROCESS_LSOF_WARNING=lsof_warning)
         self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
         self.assertEqual(os.path.exists(proof), allowed)
+        instance = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
+        latest = sorted(name for name in os.listdir(instance) if name.startswith('schedule-recover-'))[-1]
+        with open(os.path.join(instance, latest, 'process-observations.json'), encoding='utf-8') as stream:
+            report = json.load(stream)
+        if lsof_exit or lsof_warning:
+            self.assertEqual(report['status'], 'error')
+            self.assertNotIn('processes', report)
+            self.assertIn('cannot verify process observations', p.stderr)
+        else:
+            self.assertEqual(report['status'], 'complete')
+            count = 1 + int(worker_parent)
+            self.assertEqual((report['total'], report['allowed'], report['blocked']),
+                             (count, int(allowed) + int(worker_parent), int(not allowed)))
+            self.assertEqual(len(report['processes']), count)
+            observed = report['processes'][-1]
+            self.assertEqual(set(observed), {'pid', 'command', 'allowed', 'reason'})
+            self.assertEqual((observed['pid'], observed['command'], observed['allowed']), (999999, command, allowed))
         if allowed:
             with open(proof) as f:
                 self.assertEqual(f.read(), QA_DATABASE_CLAIM)
-        else:
+        elif not (lsof_exit or lsof_warning):
             self.assertIn('processes that could own the partitions are still running', p.stderr)
         if reason:
-            self.assertIn(reason, p.stderr)
+            self.assertIn(reason, report['reason'] if report['status'] == 'error' else observed['reason'])
+            if not allowed:
+                self.assertIn(reason, p.stderr)
         if secret:
             self.assertNotIn(secret, p.stdout + p.stderr)
+            self.assertNotIn(secret, json.dumps(report))
 
     def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
         worker = self.plist('worker')
