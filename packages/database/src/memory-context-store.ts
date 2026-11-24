@@ -15,7 +15,10 @@ import {
   type RunMemoryContextV2State,
 } from '@allrice/contracts';
 import { lockEmployeeMemoryOrder } from './employee-memory-management.ts';
-import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
+import {
+  matchesStoredNativeMemoryIndexV2,
+  renderNativeMemoryIndexV2,
+} from './memory-context-render.ts';
 import { MemoryContextError } from './run-memory-context.ts';
 import { runtimePolicyDigest } from './runtime-policy-digest.ts';
 import { MemoryRuntimeModuleOriginSchema } from './memory-runtime-binding.ts';
@@ -204,15 +207,14 @@ async function currentPairs(
       return unavailable();
     return parsed.data;
   });
-  if (
-    renderNativeMemoryIndexV2(
-      pairs.map((pair) => ({
-        summary: pair.summary,
-        hasDetails: pair.details !== null,
-      })),
-    ) !== document
-  )
-    return unavailable();
+  const items = pairs.map((pair) => ({
+    summary: pair.summary,
+    hasDetails: pair.details !== null,
+  }));
+  const matches = issuing
+    ? renderNativeMemoryIndexV2(items) === document
+    : matchesStoredNativeMemoryIndexV2(items, document);
+  if (!matches) return unavailable();
   return pairs;
 }
 

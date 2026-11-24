@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { renderMemoryIndexV2 } from '@allrice/contracts';
+import {
+  EmployeeDocumentsSchema,
+  memoryIndexPolicy,
+  renderMemoryIndexV2,
+} from '@allrice/contracts';
 import { renderNativeMemoryIndexV2 } from './memory-context-render.ts';
 
 describe('native memory index content format, not an authorization', () => {
@@ -17,21 +21,37 @@ describe('native memory index content format, not an authorization', () => {
     const native = renderNativeMemoryIndexV2(items);
     expect(native).toBe(
       legacy.replace(
-        'Read marked details with workspace_memory_read(number)',
-        'Read marked details with memory_read(number)',
+        'Confirmed memory summaries. Read marked details with workspace_memory_read(number)',
+        'Confirmed summaries. Read marked details with mcp__allrice__memory_read(number)',
       ),
     );
     expect(native).toContain('[2] workspace_memory_read(number)');
-    expect(native).toContain('with memory_read(number) before');
+    expect(native).toContain('with mcp__allrice__memory_read(number) before');
   });
 
-  it('retains empty/100/101 behavior without adding an index for empty memory', () => {
+  it('keeps all 100 four-byte summaries inside the existing initial UTF-8 budget', () => {
     expect(renderNativeMemoryIndexV2([])).toBe('');
-    const items = Array.from({ length: 100 }, (_, i) => ({
-      summary: `摘要${i}`,
-      hasDetails: false,
+    const summary = '🧑'.repeat(40);
+    const items = Array.from({ length: 100 }, () => ({
+      summary,
+      hasDetails: true,
     }));
-    expect(renderNativeMemoryIndexV2(items)).toContain('[100] 摘要99');
+    const document = renderNativeMemoryIndexV2(items);
+    expect(
+      document.split('\n').filter((line) => line.startsWith('[')),
+    ).toHaveLength(100);
+    expect(document).toContain(`[100] ${summary}（有说明）`);
+    expect(Buffer.byteLength(document, 'utf8')).toBe(18_300);
+    expect(Buffer.byteLength(document, 'utf8')).toBeLessThanOrEqual(
+      memoryIndexPolicy.maximumInitialBytes,
+    );
+    expect(
+      EmployeeDocumentsSchema.parse({
+        schemaVersion: 2,
+        user: '',
+        memory: document,
+      }).memory,
+    ).toBe(document);
     expect(() => renderNativeMemoryIndexV2([...items, items[0]!])).toThrow(
       'MEMORY_CONTEXT_UNAVAILABLE',
     );

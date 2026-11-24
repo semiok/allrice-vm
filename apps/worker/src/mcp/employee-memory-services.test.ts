@@ -1,4 +1,12 @@
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import type { EmployeeMemoryPort } from '@allrice/database';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import { apply } from '@deepseek-ai/dsh-mcp-client';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime from '@deepseek-ai/dsh-tools';
 import {
   createAllriceMcpServer,
   type AllriceMcpScope,
@@ -6,8 +14,9 @@ import {
 } from './allrice-server.ts';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { renderNativeMemoryIndexV2 } from '../../../../packages/database/src/memory-context-render.ts';
 
 const fixtures = vi.hoisted(() => ({
   identity: vi.fn(),
@@ -64,8 +73,8 @@ const port: Pick<EmployeeMemoryPort, 'readOrdinal' | 'remember'> = {
 };
 const live = () => new AbortController().signal;
 const sdkConnections: (() => Promise<void>)[] = [];
-async function connectMemoryServices(services: AllriceMcpServices) {
-  const controller = createAllriceMcpServer({
+function memoryServer(services: AllriceMcpServices) {
+  return createAllriceMcpServer({
     host: {
       binding: {
         personId: scope.personId,
@@ -80,6 +89,9 @@ async function connectMemoryServices(services: AllriceMcpServices) {
     },
     services,
   });
+}
+async function connectMemoryServices(services: AllriceMcpServices) {
+  const controller = memoryServer(services);
   const client = new Client({
     name: 'memory-adapter-contract-fixture',
     version: '1',
@@ -176,30 +188,97 @@ describe('formal MCP memory callbacks with explicit contracts', () => {
       expect.any(AbortSignal),
     );
   });
-  it('keeps a missing real target producer closed over the actual SDK-to-adapter path', async () => {
-    const client = await connectMemoryServices(
-      bindEmployeeMemoryMcpServices({ port }),
+  it('publishes the exact index tool name in the real DSH client and reads with it', async () => {
+    const actual = vi.fn().mockResolvedValue(target);
+    const controller = memoryServer(
+      bindEmployeeMemoryMcpServices({ port, targets: { actual } }),
     );
-    await expect(
-      client.callTool({
-        name: 'memory_remember',
-        arguments: { summary: 'fact' },
-      }),
-    ).rejects.toMatchObject({ code: ErrorCode.InternalError });
-    expect(fixtures.identity).not.toHaveBeenCalled();
-    expect(fixtures.remember).not.toHaveBeenCalled();
-    expect(fixtures.read).not.toHaveBeenCalled();
-  });
-  it('keeps production target/B/call producer missing and refuses without invoking business or identity reads', async () => {
-    const services = bindEmployeeMemoryMcpServices({ port });
-    for (const operation of [
-      () => services.memoryRead!(scope, { number: 1 }, live()),
-      () => services.memoryRemember!(scope, { summary: '候选' }, live()),
-    ])
-      await expect(operation()).rejects.toMatchObject({
-        code: 'business_runtime_dependency_unavailable',
-        dependency: 'memory.native-target',
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: randomUUID,
+      enableJsonResponse: true,
+    });
+    const http = createServer((request, response) => {
+      void transport
+        .handleRequest(request, response)
+        .catch(() => response.destroy());
+    });
+    const ctx = new Context();
+    try {
+      await controller.server.connect(transport);
+      await once(http.listen(0, '127.0.0.1'), 'listening');
+      const address = http.address();
+      if (!address || typeof address === 'string')
+        throw Error('MCP fixture address unavailable');
+      await ctx.plugin(SystemPrompt);
+      await ctx.plugin(ToolRuntime);
+      await apply(ctx, {
+        transport: 'streamable-http',
+        serverName: 'allrice',
+        url: `http://127.0.0.1:${address.port}/mcp`,
+        headers: {},
+        toolCallTimeoutMs: 10_000,
+        failOnStartupError: true,
+        reconnect: { enabled: false },
       });
+      const name = ctx.tools
+        .schemas()
+        .find((tool) => tool.name.endsWith('__memory_read'))?.name;
+      expect(name).toBe('mcp__allrice__memory_read');
+      expect(
+        renderNativeMemoryIndexV2([{ summary: '财务规则', hasDetails: true }]),
+      ).toContain(`with ${name}(number) before`);
+      const result = await ctx.tools.execute({
+        name: name!,
+        arguments: { number: 1 },
+        signal: live(),
+        callId: ToolCallId('memory-index-catalog-fixture'),
+      });
+      expect(result.content).toEqual([
+        { type: 'text', text: 'complete already-metered detail' },
+      ]);
+      expect(actual).toHaveBeenCalledOnce();
+      expect(fixtures.read).toHaveBeenCalledExactlyOnceWith(
+        scope.requestContext,
+        target,
+        { number: 1 },
+        expect.any(AbortSignal),
+      );
+    } finally {
+      try {
+        await ctx.fiber.dispose();
+      } finally {
+        await Promise.all([controller.close(), http[Symbol.asyncDispose]()]);
+      }
+    }
+  });
+  it('hides both memory tools without a target producer and returns the existing unbound-tool result', async () => {
+    const services = bindEmployeeMemoryMcpServices({ port });
+    const client = await connectMemoryServices(services);
+    expect(services).toEqual({ executionGeneration: '4.0' });
+    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
+      'identity_read',
+    ]);
+    for (const call of [
+      { name: 'memory_read', arguments: { number: 1 } },
+      { name: 'memory_remember', arguments: { summary: 'fact' } },
+    ]) {
+      expect(await client.callTool(call)).toEqual({
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: {
+                code: 'DEPENDENCY_UNAVAILABLE',
+                message: 'This tool is currently unavailable.',
+                requestId: scope.requestContext.requestId,
+                retryable: false,
+              },
+            }),
+          },
+        ],
+      });
+    }
     expect(fixtures.identity).not.toHaveBeenCalled();
     expect(fixtures.read).not.toHaveBeenCalled();
     expect(fixtures.remember).not.toHaveBeenCalled();

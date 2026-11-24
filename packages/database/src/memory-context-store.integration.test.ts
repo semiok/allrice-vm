@@ -9,6 +9,7 @@ import {
   RunMemoryContextV2StateSchema,
   memoryIndexPolicy,
   renderMemoryDetailV2,
+  renderMemoryIndexV2,
   type PersonalMemoryPair,
   type RequestContext,
 } from '@allrice/contracts';
@@ -325,6 +326,67 @@ suite(
       const [row] =
         await database.db`select module_release from allrice_employee_memory_contexts where id=${issued.id}`;
       expect(row!.module_release).toEqual(issued.origin.moduleRelease);
+    });
+
+    it('restores the original wire-name document and consumed budget only for an existing B', async () => {
+      const pair = { summary: '原有索引😀', details: '使用原预算' };
+      const f = await setup([pair]);
+      const document = renderMemoryIndexV2([
+        { summary: pair.summary, hasDetails: true },
+      ]).replace(
+        'Read marked details with workspace_memory_read(number)',
+        'Read marked details with memory_read(number)',
+      );
+      const bytes = Buffer.byteLength(document, 'utf8');
+      await expect(
+        f.transaction(f.rootSessionRef, live(), async (tx) => {
+          const draft = await f.draft(tx);
+          return issueMemoryContextStorage(
+            tx,
+            f.key,
+            {
+              ...draft,
+              document,
+              state: {
+                ...draft.state,
+                initial: {
+                  ...draft.state.initial,
+                  documentDigest: runtimePolicyDigest(document),
+                  bytes,
+                },
+                spentBytes: bytes,
+              },
+            },
+            live(),
+          );
+        }),
+      ).rejects.toMatchObject(refused);
+      expect(await f.stored()).toBeNull();
+
+      const issued = await f.issue();
+      const detail = renderMemoryDetailV2(1, pair);
+      const detailBytes = Buffer.byteLength(detail, 'utf8');
+      const state = {
+        ...issued.state,
+        initial: {
+          ...issued.state.initial,
+          documentDigest: runtimePolicyDigest(document),
+          bytes,
+        },
+        spentBytes: bytes + detailBytes,
+        toolReads: 1,
+      };
+      await database.db`update allrice_employee_memory_contexts
+        set document=${document},state=${database.db.json(state)} where id=${issued.id}`;
+
+      await expect(f.issue()).resolves.toEqual({ ...issued, document, state });
+      expect(await f.stored()).toEqual({ id: issued.id, document, state });
+      expect(await f.read(1)).toBe(detail);
+      expect(await f.stored()).toEqual({
+        id: issued.id,
+        document,
+        state: { ...state, spentBytes: bytes + 2 * detailBytes, toolReads: 2 },
+      });
     });
 
     it('rejects an unknown original builtin version without spending or repairing the stored context', async () => {

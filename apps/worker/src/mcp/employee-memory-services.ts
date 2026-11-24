@@ -7,10 +7,7 @@ import {
   EmployeeMemoryWriteOutcomeUnknown,
 } from '@allrice/database';
 import { readDEntryBusinessIdentity } from '../business-runtime/d-entry-current.ts';
-import {
-  denyBusinessProjection,
-  EmployeeBusinessRuntimeError,
-} from '../business-runtime/contract.ts';
+import { denyBusinessProjection } from '../business-runtime/contract.ts';
 import type {
   AllriceMcpMemoryRead,
   AllriceMcpMemoryRemember,
@@ -36,14 +33,13 @@ export function bindEmployeeMemoryMcpServices(
   AllriceMcpServices,
   'executionGeneration' | 'memoryRead' | 'memoryRemember'
 > {
+  const { targets } = options;
+  // The existing MCP server publishes only present business callbacks.
+  if (typeof targets?.actual !== 'function')
+    return { executionGeneration: '4.0' };
   const port = options.port ?? createEmployeeMemoryPort();
-  async function target(scope: AllriceMcpScope, signal: AbortSignal) {
+  const target = async (scope: AllriceMcpScope, signal: AbortSignal) => {
     signal.throwIfAborted();
-    if (!options.targets)
-      throw new EmployeeBusinessRuntimeError(
-        'business_runtime_dependency_unavailable',
-        'memory.native-target',
-      );
     const context = scope.requestContext;
     if (
       scope.executionGeneration !== '4.0' ||
@@ -56,7 +52,7 @@ export function bindEmployeeMemoryMcpServices(
         context.workspaceId.toLowerCase() !== scope.workspaceId.toLowerCase())
     )
       denyBusinessProjection('memory.identity');
-    const selected = await options.targets.actual(scope, signal);
+    const selected = await targets.actual(scope, signal);
     signal.throwIfAborted();
     if (
       selected.workspaceId.toLowerCase() !== scope.workspaceId.toLowerCase() ||
@@ -82,7 +78,7 @@ export function bindEmployeeMemoryMcpServices(
     );
     signal.throwIfAborted();
     return selected;
-  }
+  };
   const memoryRead: AllriceMcpMemoryRead = async (scope, input, signal) => {
     const selected = await target(scope, signal);
     const text = await port.readOrdinal(
