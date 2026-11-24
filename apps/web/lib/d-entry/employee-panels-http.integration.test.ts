@@ -835,6 +835,21 @@ suite(
           };
           expect(independentId).not.toBe(pendingId);
           expect(publishWrites).toHaveLength(3);
+          const repeatedPosts: string[] = [];
+          page.on('request', (request) => {
+            if (
+              request.method() === 'POST' &&
+              new URL(request.url()).pathname.includes(
+                '/materials/publications',
+              )
+            )
+              repeatedPosts.push(request.url());
+          });
+          const waiting = '发布结果待核，请按原请求核对。';
+          const formWaiting = material
+            .getByRole('alert')
+            .filter({ hasText: waiting });
+          await formWaiting.waitFor();
           const checkAction = (requestId: string) =>
             material.getByRole('button', {
               name: '核对结果 ' + requestId.slice(0, 8),
@@ -906,7 +921,70 @@ suite(
           expect(receiptReads.slice(readsBeforeOpenDenial)).toEqual([
             pendingId,
           ]);
+          expect(await formWaiting.isVisible()).toBe(true);
           expect(publishWrites).toHaveLength(3);
+
+          const onlyCheck = material.getByRole('button', {
+            name: '核对结果',
+            exact: true,
+          });
+          const deniedCurrentForm = await checkReceipt(
+            onlyCheck,
+            independentId,
+          );
+          expect(deniedCurrentForm.status()).toBe(403);
+          await formWaiting.waitFor({ state: 'detached', timeout: 5000 });
+          expect(await openDialog?.evaluate((node) => node.isConnected)).toBe(
+            true,
+          );
+
+          const sideReceipt = (requestId: string) =>
+            page.getByRole('button', {
+              name: '核对原发布 ' + requestId,
+              exact: true,
+            });
+          const pendingPublication = sideReceipt(pendingId);
+          const independentPublication = sideReceipt(independentId);
+          const noSideKeys = async () => {
+            expect(await pendingPublication.count()).toBe(0);
+            expect(await independentPublication.count()).toBe(0);
+          };
+          async function enterWithReceipts(enter: () => Promise<void>) {
+            const [first, independent] = await Promise.all([
+              page.waitForResponse(receiptResponse(pendingId), {
+                timeout: 5000,
+              }),
+              page.waitForResponse(receiptResponse(independentId), {
+                timeout: 5000,
+              }),
+              enter(),
+            ]);
+            return [first, independent] as const;
+          }
+          const deniedAfterClose = await enterWithReceipts(async () => {
+            await material
+              .getByRole('button', { name: '取消', exact: true })
+              .click();
+            await material.waitFor({ state: 'hidden' });
+            await noSideKeys();
+          });
+          expect(deniedAfterClose.map((response) => response.status())).toEqual(
+            [403, 403],
+          );
+          await noSideKeys();
+
+          async function returnToMaterials() {
+            await page
+              .getByRole('navigation', { name: '面板' })
+              .getByRole('button', { name: '交付成果' })
+              .click();
+            await materials();
+          }
+          const deniedAfterSwitch = await enterWithReceipts(returnToMaterials);
+          expect(
+            deniedAfterSwitch.map((response) => response.status()),
+          ).toEqual([403, 403]);
+          await noSideKeys();
 
           await updateDEntryReleasePolicy(p.context, {
             revision: 'fixture-open-dialog-receipt-restored',
@@ -920,27 +998,21 @@ suite(
               },
             ],
           });
-          const onlyCheck = material.getByRole('button', {
-            name: '核对结果',
-            exact: true,
+          const [originalReceipt, otherReceipt] =
+            await enterWithReceipts(returnToMaterials);
+          expect(originalReceipt.status()).toBe(200);
+          expect(await originalReceipt.json()).toMatchObject({
+            requestId: pendingId,
+            status: 'recorded',
+            ready: false,
           });
-          const survivingReceipt = await checkReceipt(onlyCheck, independentId);
-          expect(survivingReceipt.status()).toBe(200);
-          expect(await survivingReceipt.json()).toMatchObject({
+          expect(otherReceipt.status()).toBe(200);
+          expect(await otherReceipt.json()).toMatchObject({
             requestId: independentId,
             status: 'unknown',
           });
-          expect(publishWrites).toHaveLength(3);
-
-          await material
-            .getByRole('button', { name: '取消', exact: true })
-            .click();
-          await material.waitFor({ state: 'hidden' });
-          const pendingPublication = page.getByRole('button', {
-            name: '核对原发布 ' + pendingId,
-            exact: true,
-          });
           await pendingPublication.waitFor();
+          await independentPublication.waitFor();
           const readsBeforeUnknown = receiptReads.length;
           const unknown = await checkReceipt(pendingPublication, pendingId);
           expect(unknown.status()).toBe(200);
@@ -951,7 +1023,8 @@ suite(
           });
           await page
             .getByRole('status')
-            .filter({ hasText: '发布结果待核，请按原请求核对。' })
+            .filter({ hasText: waiting })
+            .first()
             .waitFor();
           expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
 
@@ -966,8 +1039,14 @@ suite(
           expect(
             await page.getByText(pendingId, { exact: false }).count(),
           ).toBe(0);
+          expect(await independentPublication.isVisible()).toBe(true);
+          expect(await independentPublication.isEnabled()).toBe(true);
+          expect(
+            await page.getByRole('status').filter({ hasText: waiting }).count(),
+          ).toBe(1);
           expect(receiptReads.slice(readsBeforeDenial)).toEqual([pendingId]);
           expect(publishWrites).toHaveLength(3);
+          expect(repeatedPosts).toEqual([]);
           await context.close();
         } finally {
           await browser?.close();

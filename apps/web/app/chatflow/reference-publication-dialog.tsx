@@ -68,13 +68,16 @@ const receiptSchema = z.strictObject({
   sourceId: UuidSchema.optional(),
   intentDigest: z.string().regex(/^[a-f0-9]{64}$/),
   outcome: z.enum(['recorded', 'rejected']).optional(),
+  accessDenied: z.literal(true).optional(),
 });
 type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
 type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
 type ReceiptCheckStage = 'checking' | 'waiting' | 'settled' | 'unavailable';
 const settledPublications = new Map<string, ReceiptOutcome>();
-const settledKey = (key: string, requestId: string) => key + '/' + requestId;
+const publicationAccess = new Map<string, boolean>();
+const publicationRecordKey = (key: string, requestId: string) =>
+  key + '/' + requestId;
 const receiptPrefix = 'allrice:publication-receipts:v2:';
 const receiptAddress = z.tuple([
   UuidSchema,
@@ -93,8 +96,8 @@ const receiptActions = {
   delete: '原删除',
 };
 
-// Only the full intent fingerprint and original scoped receipt selectors
-// survive reload. File bytes and display metadata stay in the active form.
+// Keep the original selector, intent digest and known status across reloads.
+// File bytes and display metadata stay in the active form.
 function storedPublications(key: string | undefined) {
   if (!key) return [];
   const value = sessionStorage.getItem(key);
@@ -105,7 +108,7 @@ function pendingPublications(key: string | undefined) {
   return storedPublications(key).filter(
     (receipt) =>
       !receipt.outcome &&
-      !settledPublications.has(settledKey(key, receipt.requestId)),
+      !settledPublications.has(publicationRecordKey(key, receipt.requestId)),
   );
 }
 
@@ -120,12 +123,50 @@ function restorePublications(key: string | undefined) {
     return [];
   }
 }
+function publicationReceiptUnavailable(
+  key: string | undefined,
+  receipt: PublicationReceipt,
+) {
+  return (
+    (key
+      ? publicationAccess.get(publicationRecordKey(key, receipt.requestId))
+      : undefined) ??
+    receipt.accessDenied ??
+    false
+  );
+}
+function setPublicationReceiptUnavailable(
+  key: string,
+  receipt: PublicationReceipt,
+  unavailable: boolean,
+) {
+  if (publicationReceiptUnavailable(key, receipt) === unavailable) return;
+  publicationAccess.set(
+    publicationRecordKey(key, receipt.requestId),
+    unavailable,
+  );
+  try {
+    rememberPublications(
+      key,
+      storedPublications(key).map((value) =>
+        value.requestId === receipt.requestId
+          ? { ...value, accessDenied: unavailable ? true : undefined }
+          : value,
+      ),
+    );
+  } catch {
+    // Both entries in this tab still use the known access state.
+  }
+}
 function settlePublication(
   key: string,
   receipt: PublicationReceipt,
   outcome: ReceiptOutcome,
 ) {
-  settledPublications.set(settledKey(key, receipt.requestId), outcome);
+  settledPublications.set(
+    publicationRecordKey(key, receipt.requestId),
+    outcome,
+  );
   try {
     rememberPublications(key, pendingPublications(key));
   } catch {
@@ -160,6 +201,7 @@ async function publicationFingerprint(value: unknown) {
 class ReceiptStorageUnavailable extends Error {}
 
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
+const unavailableReceipt = '当前无法核对原发布请求。';
 
 function receiptAccessDenied(error: unknown) {
   return (
@@ -175,18 +217,29 @@ async function checkPublication(
   receipt: PublicationReceipt,
   signal: AbortSignal,
 ): Promise<ReceiptOutcome | undefined> {
-  const known = settledPublications.get(settledKey(key, receipt.requestId));
-  if (known) return known;
-  const result = await data.readWriteReceipt(
-    {
-      workspaceId,
-      operation: receipt.operation,
-      requestId: receipt.requestId,
-      sourceId: receipt.sourceId,
-    },
-    signal,
+  const known = settledPublications.get(
+    publicationRecordKey(key, receipt.requestId),
   );
+  if (known) return known;
+  let result: Awaited<ReturnType<EmployeePanelDataClient['readWriteReceipt']>>;
+  try {
+    result = await data.readWriteReceipt(
+      {
+        workspaceId,
+        operation: receipt.operation,
+        requestId: receipt.requestId,
+        sourceId: receipt.sourceId,
+      },
+      signal,
+    );
+  } catch (error) {
+    signal.throwIfAborted();
+    if (receiptAccessDenied(error))
+      setPublicationReceiptUnavailable(key, receipt, true);
+    throw error;
+  }
   signal.throwIfAborted();
+  setPublicationReceiptUnavailable(key, receipt, false);
   if (result.status !== 'recorded' || result.ready === false || !result.result)
     return;
   settlePublication(key, receipt, 'recorded');
@@ -194,6 +247,7 @@ async function checkPublication(
 }
 
 type PendingPublication = {
+  id: string;
   key: string;
   receipt: PublicationReceipt;
   action: string;
@@ -220,8 +274,60 @@ export function ReferencePublicationPending({
 }) {
   const { organizationId, employeeInstanceId, threadId } = receiptScope;
   const [records, setRecords] = useState<PendingPublication[]>([]);
-  const [notes, setNotes] = useState<Record<string, string>>({});
-  const checking = useRef(new Set<string>()).current;
+  const [notes, setNotes] = useState<
+    Record<string, { message: string; reading?: AbortSignal }>
+  >({});
+  const checking = useRef(new Map<string, AbortSignal>()).current;
+  const entrySignal = useRef<AbortSignal | null>(null);
+  const reconcile = useCallback(
+    async (record: PendingPublication, requestSignal: AbortSignal) => {
+      const { id, key, receipt, action, targetId } = record;
+      if (requestSignal.aborted || checking.get(id)?.aborted === false) return;
+      checking.set(id, requestSignal);
+      const note = (message: string, reading?: AbortSignal) =>
+        setNotes((previous) => ({ ...previous, [id]: { message, reading } }));
+      if (!publicationReceiptUnavailable(key, receipt))
+        note('正在核对' + action + '…', requestSignal);
+      try {
+        const outcome = await checkPublication(
+          dataClient,
+          workspaceId,
+          key,
+          receipt,
+          requestSignal,
+        );
+        if (requestSignal.aborted) return;
+        if (!outcome) {
+          note(waitingForReceipt);
+          return;
+        }
+        setRecords((previous) => previous.filter((value) => value.id !== id));
+        note(
+          action +
+            (outcome === 'recorded' ? '已完成。' : '已拒绝。') +
+            ' ' +
+            targetId,
+        );
+        if (outcome === 'recorded')
+          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+      } catch (error) {
+        if (requestSignal.aborted) return;
+        if (receiptAccessDenied(error)) {
+          setNotes((previous) => {
+            const next = { ...previous };
+            delete next[id];
+            return next;
+          });
+        } else if (!publicationReceiptUnavailable(key, receipt)) {
+          note(waitingForReceipt);
+        }
+      } finally {
+        if (checking.get(id) === requestSignal) checking.delete(id);
+      }
+    },
+    [checking, dataClient, workspaceId],
+  );
+
   useEffect(() => {
     if (dialogOpen || signal.aborted) return;
     const found: PendingPublication[] = [];
@@ -259,6 +365,7 @@ export function ReferencePublicationPending({
                     receipt.operation === 'change-publication';
             if (matches)
               found.push({
+                id: publicationRecordKey(key, receipt.requestId),
                 key,
                 receipt,
                 action: receiptActions[action],
@@ -273,77 +380,62 @@ export function ReferencePublicationPending({
       return;
     }
     setRecords(found);
+    const controller = new AbortController();
+    const currentSignal = AbortSignal.any([signal, controller.signal]);
+    entrySignal.current = currentSignal;
+    // A fresh entry can recover a denied receipt only through its original GET.
+    for (const record of found) {
+      if (publicationReceiptUnavailable(record.key, record.receipt))
+        void reconcile(record, currentSignal);
+    }
+    return () => {
+      controller.abort();
+      entrySignal.current = null;
+    };
   }, [
     dialogOpen,
     employeeInstanceId,
     organizationId,
     panel,
+    reconcile,
     signal,
     threadId,
     viewerId,
     workspaceId,
   ]);
 
-  async function reconcile(record: PendingPublication) {
-    const { key, receipt, action, targetId } = record;
-    const id = receipt.requestId;
-    if (signal.aborted || checking.has(id)) return;
-    checking.add(id);
-    const note = (value: string) =>
-      setNotes((previous) => ({ ...previous, [id]: value }));
-    note('正在核对' + action + '…');
-    try {
-      const outcome = await checkPublication(
-        dataClient,
-        workspaceId,
-        key,
-        receipt,
-        signal,
-      );
-      if (signal.aborted) return;
-      if (!outcome) {
-        note(waitingForReceipt);
-        return;
-      }
-      setRecords((previous) =>
-        previous.filter(({ receipt }) => receipt.requestId !== id),
-      );
-      note(
-        action +
-          (outcome === 'recorded' ? '已完成。' : '已拒绝。') +
-          ' ' +
-          targetId,
-      );
-      if (outcome === 'recorded')
-        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
-    } catch (error) {
-      if (signal.aborted) return;
-      if (receiptAccessDenied(error)) {
-        setRecords([]);
-        setNotes({});
-      } else note(waitingForReceipt);
-    } finally {
-      checking.delete(id);
-    }
-  }
-
-  if (!records.length && !Object.keys(notes).length) return null;
+  const hidden = new Set(
+    records
+      .filter(({ key, receipt }) => publicationReceiptUnavailable(key, receipt))
+      .map(({ id }) => id),
+  );
+  const visibleNotes = Object.entries(notes).filter(
+    ([id, note]) => !hidden.has(id) && !note.reading?.aborted,
+  );
+  if (records.length === hidden.size && !visibleNotes.length) return null;
   return (
     <div hidden={dialogOpen} className={css.recovery}>
-      {records.map((record) => (
-        <Button
-          key={record.receipt.requestId}
-          type="button"
-          variant="ghost"
-          disabled={checking.has(record.receipt.requestId)}
-          onClick={() => void reconcile(record)}
-        >
-          核对{record.action} {record.targetId}
-        </Button>
-      ))}
-      {Object.entries(notes).map(([id, note]) => (
+      {records.map((record) => {
+        const { id } = record;
+        if (hidden.has(id)) return null;
+        return (
+          <Button
+            key={id}
+            type="button"
+            variant="ghost"
+            disabled={checking.get(id)?.aborted === false}
+            onClick={() => {
+              if (entrySignal.current)
+                void reconcile(record, entrySignal.current);
+            }}
+          >
+            核对{record.action} {record.targetId}
+          </Button>
+        );
+      })}
+      {visibleNotes.map(([id, note]) => (
         <p key={id} role="status">
-          {note}
+          {note.message}
         </p>
       ))}
     </div>
@@ -462,11 +554,13 @@ function PublicationForm({
         message: string,
         keepUnavailable = false,
       ) =>
-        setReceiptNotes((prior) =>
-          keepUnavailable && prior[value.requestId]?.stage === 'unavailable'
-            ? prior
-            : { ...prior, [value.requestId]: { stage, message } },
-        );
+        setReceiptNotes((prior) => ({
+          ...prior,
+          [value.requestId]:
+            keepUnavailable && publicationReceiptUnavailable(receiptKey, value)
+              ? { stage: 'unavailable', message: unavailableReceipt }
+              : { stage, message },
+        }));
       const clearWaitingError = () =>
         setError((current) =>
           current?.pendingRequestId === value.requestId ? undefined : current,
@@ -507,7 +601,7 @@ function PublicationForm({
           clearWaitingError();
           // Read denial says nothing about whether the original write ran.
           // Keep its scoped key for a later authorized lookup.
-          note('unavailable', '当前无法核对原发布请求。');
+          note('unavailable', unavailableReceipt);
         } else note('waiting', waitingForReceipt, true);
       } finally {
         if (checks.get(value.requestId) === controller)
@@ -730,7 +824,7 @@ function PublicationForm({
 
   const shownError = error?.message || download.error || available.error;
   const visibleReceipts = receipts.filter(
-    ({ requestId }) => receiptNotes[requestId]?.stage !== 'unavailable',
+    (receipt) => !publicationReceiptUnavailable(receiptKey, receipt),
   );
   return (
     <DshDialog
