@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createServer } from 'node:http';
+import { createServer, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import type { Browser } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
@@ -72,6 +72,7 @@ suite(
     const fixtureAssets = new Map<string, Uint8Array>();
     let fixtureDocument: string | undefined;
     let dropPublishReply = false;
+    let incompleteReply: ServerResponse | undefined;
     const publishWrites: string[] = [];
     const receiptReads: string[] = [];
     let referenceWrites = 0;
@@ -229,7 +230,13 @@ suite(
               if (dropPublishReply && response.ok) {
                 dropPublishReply = false;
                 await response.body?.cancel();
-                outgoing.destroy();
+                incompleteReply = outgoing;
+                outgoing.writeHead(response.status, {
+                  'Content-Type': 'application/json',
+                  'Content-Length': '100',
+                });
+                outgoing.write('{"sourceId":');
+                await once(outgoing, 'close');
                 return;
               }
             }
@@ -500,9 +507,18 @@ suite(
           await openPublication();
           const dialog = page.getByRole('dialog', { name: '添加为企业资料' });
           dropPublishReply = true;
-          await dialog
-            .getByRole('button', { name: '确认', exact: true })
-            .click();
+          const [interrupted] = await Promise.all([
+            page.waitForResponse(
+              (response) =>
+                response.request().method() === 'POST' &&
+                response.url().includes('/materials/publications?'),
+              { timeout: 5000 },
+            ),
+            dialog.getByRole('button', { name: '确认', exact: true }).click(),
+          ]);
+          expect(interrupted.status()).toBe(200);
+          expect(incompleteReply?.writableFinished).toBe(false);
+          incompleteReply?.destroy();
           await expect
             .poll(async () => ({
               statuses: publicationStatuses,
@@ -580,6 +596,8 @@ suite(
           await context.close();
         } finally {
           await browser?.close();
+          incompleteReply?.destroy();
+          incompleteReply = undefined;
           fixtureDocument = undefined;
           fixtureAssets.clear();
           dropPublishReply = false;
