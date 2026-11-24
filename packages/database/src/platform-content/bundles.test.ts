@@ -7,14 +7,32 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
+import type * as FsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadPlatformContentCatalog } from './catalog.ts';
 import { skillBundleChecksum, skillBytesChecksum } from '../skill-bundles.ts';
+import { createBuiltinSkillSourcesPort } from '../capabilities/builtin-skill-sources.ts';
+
+const sourceIo = vi.hoisted(() => ({
+  onOpen: undefined as
+    undefined | ((handle: Awaited<ReturnType<typeof FsPromises.open>>) => void),
+}));
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof FsPromises>('node:fs/promises');
+  return {
+    ...actual,
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const handle = await actual.open(...args);
+      sourceIo.onOpen?.(handle);
+      return handle;
+    },
+  };
+});
 
 const temporary: string[] = [];
 async function fixture() {
@@ -109,6 +127,8 @@ async function fixture() {
   };
 }
 afterEach(async () => {
+  sourceIo.onOpen = undefined;
+  vi.restoreAllMocks();
   for (const path of temporary.splice(0)) {
     if (!path.startsWith(join(tmpdir(), 'allrice-skillbundle-')))
       throw Error('unsafe test cleanup');
@@ -116,6 +136,89 @@ afterEach(async () => {
   }
 });
 describe('P18 real file assembly stays in reviewed resource tree', () => {
+  it.each([false, true])(
+    'joins canceled reads and handle close (close failure: %s)',
+    async (closeFailure) => {
+      const f = await fixture();
+      const controller = new AbortController();
+      const reason = new Error('source read canceled');
+      let beginRead!: () => void, resumeRead!: () => void;
+      let beginClose!: () => void, resumeClose!: () => void;
+      const reading = new Promise<void>((resolve) => {
+        beginRead = resolve;
+      });
+      const readGate = new Promise<void>((resolve) => {
+        resumeRead = resolve;
+      });
+      const closing = new Promise<void>((resolve) => {
+        beginClose = resolve;
+      });
+      const closeGate = new Promise<void>((resolve) => {
+        resumeClose = resolve;
+      });
+      let closed = false,
+        settled = false;
+      let readOptions: unknown;
+      sourceIo.onOpen = (handle) => {
+        const originalRead = handle.readFile.bind(handle);
+        const originalClose = handle.close.bind(handle);
+        vi.spyOn(handle, 'readFile').mockImplementation(async (options) => {
+          readOptions = options;
+          beginRead();
+          await readGate;
+          return originalRead(options);
+        });
+        vi.spyOn(handle, 'close').mockImplementation(async () => {
+          beginClose();
+          await closeGate;
+          await originalClose();
+          closed = true;
+          if (closeFailure) throw Error('/private/source/close failed');
+        });
+      };
+      const result = createBuiltinSkillSourcesPort(f.directory)
+        .listSources(controller.signal)
+        .then(
+          () => {
+            settled = true;
+            return null;
+          },
+          (error: unknown) => {
+            settled = true;
+            return error;
+          },
+        );
+      try {
+        await reading;
+        expect(readOptions).toMatchObject({ signal: controller.signal });
+        controller.abort(reason);
+        expect(settled).toBe(false);
+        resumeRead();
+        await closing;
+        expect(settled).toBe(false);
+        expect(closed).toBe(false);
+        resumeClose();
+        const failure = await result;
+        if (closeFailure) {
+          expect(failure).toBeInstanceOf(AggregateError);
+          expect((failure as AggregateError).errors).toEqual([
+            reason,
+            expect.objectContaining({ code: 'source_unavailable' }),
+          ]);
+          expect(String((failure as AggregateError).errors)).not.toContain(
+            '/private/source',
+          );
+        } else expect(failure).toBe(reason);
+        expect(closed).toBe(true);
+      } finally {
+        resumeRead();
+        resumeClose();
+        await result;
+        sourceIo.onOpen = undefined;
+        vi.restoreAllMocks();
+      }
+    },
+  );
   it('loads exact resource bytes and checksums without executing the script', async () => {
     const f = await fixture(),
       catalog = await loadPlatformContentCatalog(f.directory);

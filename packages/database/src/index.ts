@@ -75,6 +75,7 @@ export {
   NativeWaitAuthorityError,
 } from './task-native-wait.ts';
 export * from './skill-bundles.ts';
+export * from './capabilities/builtin-skill-sources.ts';
 export * from './message-feedback.ts';
 export * from './mcp-connections.ts';
 export * from './mcp-managed-connections.ts';
@@ -426,3 +427,8 @@ export {
 } from './deliverables-mcp-port.ts';
 
 export * from './employee-memory-port.ts';
+export * from './capabilities/native-schedule-observation-ledger.ts';
+export {
+  createPostgresPersonalSkillPackageSource,
+  type PersonalSkillPackageRead,
+} from './capabilities/personal-skill-package-source.ts';
