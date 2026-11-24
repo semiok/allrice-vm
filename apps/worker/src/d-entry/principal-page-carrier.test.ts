@@ -326,6 +326,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
 
   let ack: unknown;
   const closed = life.receive().then((frame) => (ack = frame));
+  const cleanTransport = once(life.peer, 'close');
   closePage(life.peer);
   try {
     await finishingNative.promise;
@@ -340,6 +341,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
     value: { type: 'closed', scopeId: life.scopeId },
   });
   expect(await life.receive()).toEqual({ type: 'end', streamId: 'life' });
+  expect((await cleanTransport)[0]).toBe(1000);
 });
 
 it('refuses duplicate selectors, unauthorized login and cross-session borrow without disturbing the page', async () => {

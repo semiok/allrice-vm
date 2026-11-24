@@ -245,10 +245,17 @@ export function createDEntryNativeGateway({
                 );
               }
             };
-            await Promise.allSettled([
+            const [, downlink] = await Promise.allSettled([
               forward(peer, worker).finally(stop),
               forward(worker, peer).finally(stop),
             ]);
+            if (page && !input.scopeId && downlink.status === 'fulfilled') {
+              // Follow the actual delivered native frames with the normal
+              // browser socket handshake. Terminate would make even an exact
+              // closed/end look like an incomplete local transport.
+              peer.close(1000);
+              await browserClosed;
+            }
           } finally {
             abort.signal.removeEventListener('abort', terminate);
           }
