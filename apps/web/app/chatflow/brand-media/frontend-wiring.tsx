@@ -106,7 +106,7 @@ const runsSchema = z.object({
   ),
 });
 export type BrandMediaRun = z.infer<typeof runsSchema>['runs'][number];
-export const runActive = (run: Pick<BrandMediaRun, 'run'>) =>
+export const runActive = (run: { run: Pick<BrandMediaRun['run'], 'status'> }) =>
   !['succeeded', 'failed', 'canceled', 'needs_attention'].includes(
     run.run.status,
   );
@@ -205,7 +205,7 @@ type Scoped<T> = T extends unknown
   : never;
 type OnBrandMediaRunAccepted = (
   sessionId: string,
-  run: z.infer<typeof RunSnapshotSchema>,
+  run: Pick<BrandMediaRun['run'], 'id' | 'status'>,
 ) => void;
 type BrandMediaPanelAccess = {
   signal: AbortSignal;
@@ -233,8 +233,15 @@ function brandMediaOperations(
     access.revoke(expired);
     throw expired;
   };
-  const request = async (url: string, options?: RequestInit) => {
-    const signal = scopedSignal(options?.signal);
+  const request = async (
+    url: string,
+    options?: RequestInit,
+    keepHostReceipt = false,
+  ) => {
+    access?.signal.throwIfAborted();
+    const signal = keepHostReceipt
+      ? options?.signal
+      : scopedSignal(options?.signal);
     signal?.throwIfAborted();
     const response = await fetch(url, {
       cache: 'no-store',
@@ -351,13 +358,19 @@ function brandMediaOperations(
     {
       scopeOnly,
       onDenied,
+      keepHostReceipt,
     }: {
       scopeOnly?: boolean;
       onDenied?: OnBrandReadDenied;
+      keepHostReceipt?: boolean;
     } = {},
   ) {
     try {
-      return await request(base + '/brand-media' + query, options);
+      return await request(
+        base + '/brand-media' + query,
+        options,
+        keepHostReceipt,
+      );
     } catch (cause) {
       if (access?.signal.aborted || options?.signal?.aborted) throw cause;
       // Projection denial precedes the catalog check. A current installation
@@ -439,17 +452,23 @@ function brandMediaOperations(
           userMessage: z.object({ sessionId: z.uuid() }),
         })
         .parse(
-          await readOrWriteModule('', {
-            method: 'POST',
-            body: JSON.stringify({
-              ...intent,
-              workspaceId: scope.workspaceId,
-              instanceId: scope.instanceId,
-            }),
-          }),
+          await readOrWriteModule(
+            '',
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                ...intent,
+                workspaceId: scope.workspaceId,
+                instanceId: scope.instanceId,
+              }),
+            },
+            { keepHostReceipt: !!onAccepted },
+          ),
         );
+      // The host can reconcile an accepted write after its panel retires.
+      const { id, status } = result.run;
+      onAccepted?.(result.userMessage.sessionId, { id, status });
       access?.signal.throwIfAborted();
-      onAccepted?.(result.userMessage.sessionId, result.run);
       return result;
     },
     runs: async (signal?: AbortSignal, onDenied?: OnBrandReadDenied) =>

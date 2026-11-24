@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiErrorSchema, brandMediaModule } from '@allrice/contracts';
+import {
+  ApiErrorSchema,
+  brandMediaModule,
+  brandMediaRelease,
+} from '@allrice/contracts';
 import { createBrandMediaClient } from './brand-media/frontend-wiring';
 
 const id = (n: number) =>
@@ -66,13 +70,15 @@ describe('brand-media scoped access', () => {
         },
       ],
     });
-  function panelClient() {
+  function panelClient(
+    onAccepted?: Parameters<typeof createBrandMediaClient>[1],
+  ) {
     const lifetime = new AbortController();
     const revoke = vi.fn((error: Error) => lifetime.abort(error));
     const hide = vi.fn();
     const reveal = vi.fn();
     return {
-      client: createBrandMediaClient(scope).forPanel({
+      client: createBrandMediaClient(scope, onAccepted).forPanel({
         signal: lifetime.signal,
         hide,
         reveal,
@@ -84,6 +90,99 @@ describe('brand-media scoped access', () => {
       lifetime,
     };
   }
+
+  it.each([200, 401])(
+    'settles a generating visit retired before the host receipt (%i)',
+    async (status) => {
+      const late = deferred<Response>();
+      const fetch = vi.fn(() => late.promise);
+      vi.stubGlobal('fetch', fetch);
+      const accepted = vi.fn();
+      const { client, hide, revoke, lifetime } = panelClient(accepted);
+      const input = {
+        operation: 'candidates' as const,
+        requestId: id(7),
+        sessionId: id(8),
+        direction: '主持人的合成选题',
+        references: [],
+      };
+      const at = '2026-11-24T16:00:00.000Z';
+      const { organizationId, workspaceId, ownerId, instanceId } = scope;
+      const run = {
+        id: id(9),
+        organizationId,
+        workspaceId,
+        ownerId,
+        status: 'queued',
+        job: {
+          id: id(10),
+          organizationId,
+          workspaceId,
+          ownerId,
+          status: 'queued',
+          idempotencyKey: 'retired-host-receipt',
+          priority: 0,
+          attempt: 0,
+          maxAttempts: 3,
+          availableAt: at,
+          timeoutAt: at,
+          payload: {
+            schemaVersion: 1,
+            type: 'allrice.employee.run',
+            input: {},
+          },
+          lease: null,
+        },
+        cancelRequestedAt: null,
+        result: null,
+        error: null,
+        createdAt: at,
+        updatedAt: at,
+      };
+      const settled = expect(client.generate(input)).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+      expect(fetch).toHaveBeenCalledExactlyOnceWith(
+        `/api/v1/employee-instances/${instanceId}/brand-media`,
+        expect.objectContaining({ method: 'POST', signal: undefined }),
+      );
+      lifetime.abort();
+      late.resolve(
+        status === 200
+          ? Response.json({
+              run,
+              invocation: {
+                module: {
+                  organizationId,
+                  workspaceId,
+                  ownerId,
+                  instanceId,
+                  release: brandMediaRelease,
+                  revision: 1,
+                  enabledAt: at,
+                  revokedAt: null,
+                },
+                intent: { ...input, workspaceId, instanceId },
+              },
+              userMessage: { sessionId: input.sessionId },
+            })
+          : new Response(null, { status }),
+      );
+      await settled;
+      if (status === 200)
+        expect(accepted).toHaveBeenCalledExactlyOnceWith(input.sessionId, {
+          id: run.id,
+          status: 'queued',
+        });
+      else expect(accepted).not.toHaveBeenCalled();
+      expect(revoke).not.toHaveBeenCalled();
+      expect(hide).not.toHaveBeenCalled();
+      await expect(client.generate(input)).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+      expect(fetch).toHaveBeenCalledOnce();
+    },
+  );
 
   it('fences an already requested body on the module-only denial without waiting for another read', async () => {
     const late = deferred<Response>();
