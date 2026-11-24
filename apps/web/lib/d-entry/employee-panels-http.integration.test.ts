@@ -1265,7 +1265,7 @@ suite(
         };
         const pending = await p.client.readWriteReceipt(check, signal());
         expect(pending).toMatchObject({ status: 'recorded', ready: false });
-        await f.db`update allrice_storage_objects set deleted_at=clock_timestamp() where id=${original.objectId}`;
+        await f.db`update allrice_storage_objects set retention_until=clock_timestamp()-interval '1 day' where id=${original.objectId}`;
         const replay = await p.client.publishFile(input, signal());
         expect(replay).toEqual(pending.result);
         expect(await p.client.readWriteReceipt(check, signal())).toMatchObject({

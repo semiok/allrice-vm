@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { TransactionSql } from 'postgres';
 import {
   ContentOwnershipSchema,
   WorkbenchFileSchema,
@@ -226,7 +227,7 @@ export async function uploadWorkbenchFile(
   storage: StoragePort,
   qualification?: {
     signal: AbortSignal;
-    current(transaction?: postgres.TransactionSql): Promise<void>;
+    current(transaction?: TransactionSql): Promise<void>;
   },
 ) {
   const value = WorkbenchFileUploadSchema.parse(input),

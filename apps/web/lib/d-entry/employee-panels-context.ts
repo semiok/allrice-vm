@@ -110,6 +110,8 @@ export async function requireEmployeePanelsContext(
     context,
     selection,
     current: () => current(context, request.signal),
+    requireDeliverables: (signal: AbortSignal) =>
+      currentModule('deliverables', context, signal),
     materials: createEnterpriseMaterialsPort({
       storage,
       requireCurrentAccess: (candidate, signal) =>

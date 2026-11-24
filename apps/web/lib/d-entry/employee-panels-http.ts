@@ -150,7 +150,7 @@ export function createEmployeePanelsHandlers(
         },
         { source, offset, signal: request.signal },
       );
-      await authorize();
+      await authorize(request.signal);
       return result;
     });
   const download = (kind: 'material' | 'file') =>
@@ -220,6 +220,7 @@ export function createEmployeePanelsHandlers(
           value,
           request.signal,
         );
+      await scope.requireDeliverables(request.signal);
       return scope.materials.publishFile(
         scope.context,
         value,

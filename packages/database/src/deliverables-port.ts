@@ -87,7 +87,7 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
     objectId: string,
     signal: AbortSignal,
   ) {
-    signal.throwIfAborted();
+    await current(context, signal);
     // Candidate eligibility is the same owner-only business directory used for
     // favorites. Reference copies and arbitrary storage objects are excluded.
     const file = await readPersonalWorkbenchFile(context, objectId);
@@ -105,11 +105,7 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
     objectId: string,
     checksum: string | undefined,
     signal: AbortSignal,
-  ): Promise<
-    AuthorizedDeliverableResource & {
-      reauthorize(signal: AbortSignal): Promise<void>;
-    }
-  > {
+  ) {
     const original = await ownedFile(context, objectId, signal);
     if (checksum !== undefined && original.object.checksum !== checksum)
       throw new DataAccessError('not_found');
@@ -128,14 +124,11 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
         throw new DataAccessError('not_found');
       return file;
     }
-    return {
+    const resource: AuthorizedDeliverableResource = {
       source,
       fileName: original.row.file_name,
       mediaType: original.object.mediaType,
       sizeBytes: original.object.sizeBytes,
-      async reauthorize(signal) {
-        await recheck(signal);
-      },
       async open(openSignal) {
         return createAuthorizedFileResource({
           signal,
@@ -150,13 +143,24 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
         })(openSignal);
       },
     };
+    return {
+      resource,
+      async reauthorize(signal: AbortSignal) {
+        await recheck(signal);
+      },
+    };
   }
   return {
     async captureReference(contextInput, input, signal) {
       const value = DeliverableCaptureReferenceQuerySchema.parse(input);
       const context = await current(contextInput, signal);
       workspace(context, value.workspaceId);
-      const source = await resource(context, value.objectId, undefined, signal);
+      const { resource: source } = await resource(
+        context,
+        value.objectId,
+        undefined,
+        signal,
+      );
       const reference = await captureWorkbenchFileReference(
         context,
         value.workspaceId,
@@ -258,17 +262,19 @@ export function createDeliverablesPort(options: DeliverablesPortOptions) {
     async authorizedResource(contextInput, input, signal) {
       const context = await current(contextInput, signal);
       const value = ArtifactSourceFileSchema.parse(input);
-      return resource(context, value.objectId, value.checksum, signal);
+      return (await resource(context, value.objectId, value.checksum, signal))
+        .resource;
     },
     async download(contextInput, input, signal) {
       const context = await current(contextInput, signal);
       const value = DeliverableObjectQueryProjectionSchema.parse(input);
-      return resource(context, value.objectId, undefined, signal);
+      const owned = await resource(context, value.objectId, undefined, signal);
+      return { ...owned.resource, reauthorize: owned.reauthorize };
     },
     async readExact(contextInput, input, signal) {
       const context = await current(contextInput, signal);
       const value = DeliverableReadInputProjectionSchema.parse(input);
-      const file = await resource(
+      const { resource: file } = await resource(
         context,
         value.objectId,
         value.checksum,

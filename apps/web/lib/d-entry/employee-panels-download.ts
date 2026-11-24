@@ -150,9 +150,11 @@ export async function preparePanelDownload(
     await rmdir(directory);
     directory = undefined;
     reader = (await resource.open(active)).getReader();
+    active.throwIfAborted();
     let size = 0;
     const hash = createHash('sha256');
     for (;;) {
+      active.throwIfAborted();
       const chunk = await reader.read();
       await current();
       if (chunk.done) break;
