@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type { Browser } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { pipeline } from 'node:stream/promises';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import {
   DataAccessError,
@@ -235,21 +236,9 @@ suite(
               response.status,
               Object.fromEntries(response.headers),
             );
-            if (response.body) {
-              const reader = response.body.getReader();
-              try {
-                for (;;) {
-                  const chunk = await reader.read();
-                  if (chunk.done) break;
-                  if (!outgoing.write(chunk.value))
-                    await once(outgoing, 'drain');
-                }
-              } finally {
-                await reader.cancel();
-                reader.releaseLock();
-              }
-            }
-            outgoing.end();
+            if (response.body)
+              await pipeline(response.body, outgoing, { signal: stop.signal });
+            else outgoing.end();
           },
         );
         running.add(work);
@@ -481,8 +470,9 @@ suite(
             name: '引用到对话',
             exact: true,
           });
-          await quote.waitFor();
-          expect(await quote.isDisabled()).toBe(true);
+          await expect.poll(() => quote.count()).toBe(2);
+          for (const control of await quote.all())
+            expect(await control.isDisabled()).toBe(true);
           expect(referenceWrites).toBe(0);
           await page
             .getByRole('button', { name: '‹ 交付成果', exact: true })
