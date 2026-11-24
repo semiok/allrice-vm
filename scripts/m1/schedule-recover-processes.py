@@ -28,9 +28,15 @@ LOADER_PREFIXES = ('DYLD_', 'LD_', 'NODE_')
 LOADER_SETTINGS = {'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES'}
 ENV_UNAVAILABLE = '无法读取进程启动环境。请按 PID 核查该进程的所属服务与启动环境可见性。'
 WORKER_DESCENDANT = '停止前已核实为 Worker 或其子进程。请核查该进程已退出。'
-LSOF_UNAVAILABLE = '无法核实 lsof 的工作目录、文件或连接。请检查 lsof 读取错误和权限。'
+LSOF_UNAVAILABLE = '无法核实 lsof 的工作目录、文件或连接。'
 PG_PORT = '5434'
 PG_SOCKET = '.s.PGSQL.' + PG_PORT
+UNNAMED_HANDLES = {'NPOLICY', 'NEXUS', 'KQUEUE', 'PIPE'}
+NON_FILE_HANDLES = UNNAMED_HANDLES | {'CHAN', 'systm', 'rte'}
+PATH_FILES = {'REG', 'DIR', 'CHR', 'BLK', 'FIFO', 'LINK'}
+EARLY_SOURCE_OPTIONS = ENV_FILE_OPTIONS | {'--experimental-config-file', '--experimental-default-config-file',
+                                          '--require', '--import', '--loader', '--experimental-loader', '--eval',
+                                          '--snapshot-blob', '--build-snapshot', '--build-snapshot-config'}
 
 
 class UnverifiedStartup(ValueError):
@@ -197,10 +203,16 @@ def process_files():
     try:
         result = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-u', str(os.getuid()), '-F0pdftPn'],
                                 capture_output=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        raise UnverifiedStartup(LSOF_UNAVAILABLE) from None
-    if result.returncode != 0 or result.stderr or (result.stdout and not result.stdout.endswith(b'\0\n')):
-        raise UnverifiedStartup(LSOF_UNAVAILABLE)
+    except OSError as error:
+        raise UnverifiedStartup(lsof_problem('无法执行 lsof', errno=error.errno)) from None
+    except subprocess.SubprocessError:
+        raise UnverifiedStartup(lsof_problem('lsof 未完成观测')) from None
+    if result.returncode != 0 or result.stderr:
+        diagnostic = os.fsdecode(result.stderr)
+        returncode = f'退出码 {result.returncode}' if result.returncode else '报告诊断'
+        raise UnverifiedStartup(lsof_problem(f'lsof {returncode}', diagnostic=diagnostic))
+    if result.stdout and not result.stdout.endswith(b'\0\n'):
+        raise UnverifiedStartup(lsof_problem('lsof 字段记录不完整'))
     files, pid = {}, None
     # -F0 terminates fields with NUL and each process or file set with a newline.
     for entry in result.stdout.split(b'\0\n'):
@@ -214,29 +226,79 @@ def process_files():
             files[pid].append(OpenFile(fields[b'f'], fields.get(b't', ''), fields.get(b'n', ''),
                                        fields.get(b'd', ''), fields.get(b'P', '')))
         else:
-            raise UnverifiedStartup(LSOF_UNAVAILABLE)
+            raise UnverifiedStartup(lsof_problem('lsof 字段记录不完整'))
     return files
+
+
+def lsof_problem(reason, file_type=None, diagnostic='', errno=None):
+    if file_type is not None:
+        label = file_type if re.fullmatch(r'[a-zA-Z0-9_-]{1,20}', file_type) else '未提供或无法识别'
+        reason += f'（TYPE={label}）'
+    if any(error in diagnostic for error in ('Permission denied', 'Operation not permitted')):
+        reason += '，lsof 报告权限错误'
+    if errno is None:
+        reported = re.search(r'\berrno\s*[=:]\s*([0-9]+)', diagnostic)
+        errno = reported.group(1) if reported else None
+    detail = f'errno={errno}' if errno is not None else '系统未提供 errno'
+    return f'{LSOF_UNAVAILABLE} {reason}。{detail}。'
 
 
 def pg_unix_socket(file):
     return file.kind == 'unix' and file.name.startswith('/') and Path(file.name).name == PG_SOCKET
 
 
-def pg_connection(file, unix_peers):
-    if file.kind == 'unix':
-        return pg_unix_socket(file) or (file.name.startswith('->') and file.name[2:] in unix_peers)
-    if file.protocol != 'TCP' or '->' not in file.name:
-        return False
-    host, _, port = file.name.rsplit('->', 1)[1].rpartition(':')
-    if port != PG_PORT:
-        return False
-    try:
-        address = ipaddress.ip_address(host.strip('[]'))
-    except ValueError:
-        raise UnverifiedStartup(LSOF_UNAVAILABLE) from None
+def internet_endpoint(value):
+    host, separator, port = value.rpartition(':')
+    if not separator or not host or not re.fullmatch(r'\*|[0-9]{1,5}', port):
+        raise ValueError('invalid address')
+    address = None if host == '*' else ipaddress.ip_address(host.strip('[]').split('%', 1)[0])
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         address = address.ipv4_mapped
-    return address.is_loopback
+    if port != '*' and int(port) > 65535:
+        raise ValueError('invalid port')
+    return address, port
+
+
+def pg_connection(file, unix_devices):
+    if file.kind == 'unix':
+        if file.name.startswith('/'):
+            return pg_unix_socket(file)
+        peer = unix_devices.get(file.name[2:]) if re.fullmatch(r'->0x[a-fA-F0-9]+', file.name) else None
+        if peer and peer.name.startswith('/'):
+            return pg_unix_socket(peer)
+        if peer and file.device and peer.name == '->' + file.device:
+            return False  # Both observed endpoints are unnamed.
+        raise UnverifiedStartup(lsof_problem('Unix 套接字或对端地址无法核实', file.kind))
+    if file.kind not in ('IPv4', 'IPv6'):
+        return False
+    try:
+        if file.protocol not in ('TCP', 'UDP'):
+            raise ValueError('unknown protocol')
+        local, arrow, remote = file.name.partition('->')
+        internet_endpoint(local)
+        if not arrow:
+            return False
+        address, port = internet_endpoint(remote)
+        if address is None or port == '*':
+            raise ValueError('incomplete peer')
+        return port == PG_PORT and address.is_loopback
+    except ValueError:
+        raise UnverifiedStartup(lsof_problem('TCP/UDP 连接记录不完整', file.kind)) from None
+
+
+def file_gap(file):
+    if file.descriptor in ('err', 'NOFD') or (not file.name.startswith('/') and (
+            'info error:' in file.name or file.name.startswith(('Permission denied', 'Operation not permitted')))):
+        return lsof_problem('lsof 记录了逐 PID 文件读取错误', file.kind, file.name)
+    if file.kind in ('unix', 'IPv4', 'IPv6'):
+        return None  # Endpoint completeness is checked by pg_connection.
+    if file.kind in PATH_FILES:
+        return None if file.name.startswith('/') else lsof_problem('文件路径无法核实', file.kind)
+    if file.kind in NON_FILE_HANDLES:
+        if file.name or file.kind in UNNAMED_HANDLES:
+            return None
+        return lsof_problem('此句柄没有可核实的名称', file.kind)
+    return lsof_problem('未识别的文件描述符类型', file.kind)
 
 
 def alive(pid):
@@ -321,8 +383,11 @@ def scan_processes(db, roots, known_tree, *web_settings):
     known = json.loads(known_tree)
     web = verified_web_launch(db, *web_settings)
     processes, files = ps(), process_files()
-    unix_peers = {file.device for entries in files.values() for file in entries
-                  if file.device and pg_unix_socket(file)}
+    unix_devices = {}
+    for entries in files.values():
+        for file in entries:
+            if file.kind == 'unix' and file.device and (file.device not in unix_devices or pg_unix_socket(file)):
+                unix_devices[file.device] = file
     ancestors, pid = set(), str(os.getpid())
     while pid in processes and pid not in ancestors:
         ancestors.add(pid)
@@ -350,20 +415,23 @@ def scan_processes(db, roots, known_tree, *web_settings):
         if not inherited:
             if node:
                 return False, ENV_UNAVAILABLE
-            if here is None or any(
-                    not file.name or file.descriptor in ('err', 'NOFD') or (
-                        not file.name.startswith('/') and (
-                            'info error:' in file.name
-                            or file.name.startswith(('Permission denied', 'Operation not permitted'))
-                        )
-                    ) for file in entries):
-                return False, LSOF_UNAVAILABLE
-            if scoped(here):
+            if here is not None and scoped(here):
                 return False, '启动环境不可见，lsof 显示工作目录属于目标。'
             if any(file.name.startswith('/') and scoped(file.name) for file in entries):
                 return False, '启动环境不可见，lsof 显示打开文件属于目标。'
-            if any(pg_connection(file, unix_peers) for file in entries):
-                return False, '启动环境不可见，lsof 显示本机 PostgreSQL 5434 端点连接。'
+            gap = lsof_problem('未看到此进程的可核实 cwd', '') if here is None else None
+            for file in entries:
+                problem = file_gap(file)
+                if problem:
+                    gap = gap or problem
+                    continue
+                try:
+                    if pg_connection(file, unix_devices):
+                        return False, '启动环境不可见，lsof 显示本机 PostgreSQL 5434 端点连接。'
+                except UnverifiedStartup as error:
+                    gap = gap or str(error)
+            if gap:
+                return False, gap
             return True, '启动环境不可见，lsof 未见目标工作目录、打开文件或 PG 连接，且不属于已记录 Worker 子树。'
         if not node:
             if targets_database(inherited.get('DATABASE_URL', ''), db):
@@ -374,15 +442,32 @@ def scan_processes(db, roots, known_tree, *web_settings):
             return True, '可读启动环境与观测到的路径未指向目标。'
         if here is None or not canonical(here) or not here.is_dir():
             return False, 'Node 工作目录无法核实。请按 PID 核查 cwd。'
-        if Path(observed).resolve() != PINNED_NODE.resolve():
-            return False, 'Node 不是当前工具可核实的固定运行时。请按 PID 核查运行时。'
         if not args or (args[0] != 'node' and not Path(args[0]).is_absolute()):
             return False, 'Node 的启动入口无法核实。请按 PID 核查启动命令。'
         try:
             index, env_files = plain_node_options(args[1:], allow_env_files=True)
             script = Path(args[index + 1])
         except (ValueError, IndexError):
-            return False, 'Node 启动参数无法确认为普通文件启动。请按 PID 核查入口前的选项。'
+            return False, 'Node 启动参数无法确认为普通文件启动，入口前的选项可能改变代码来源。请按 PID 核查。'
+        # Node can read env/config options even after an apparent script entry.
+        source_option = any(arg.partition('=')[0].replace('_', '-') in EARLY_SOURCE_OPTIONS
+                            or (arg.startswith(('-r', '-e', '-p')) and not arg.startswith('--'))
+                            for arg in args[1:])
+        markers = (db, PG_PORT, *map(str, scope))
+        if (not env_files and not source_option and not scoped(here) and not scoped(script)
+                and script.suffix in ('.js', '.mjs', '.cjs') and canonical(script) and script.is_file()
+                and not any(scoped_argument(arg, here) for arg in args[1:])
+                and not any(marker in value for value in (*args, *inherited.keys(), *inherited.values())
+                            for marker in markers)):
+            if not targets_database(inherited.get('DATABASE_URL', ''), db):
+                try:
+                    effective_environment(start, inherited, [])
+                except ValueError:
+                    return False, 'Node 启动环境含无法核实作用的加载设置。请按 PID 核查运行时的启动环境。'
+                else:
+                    return True, '可读的普通 Node 启动未见目标库、5434、目标路径或额外代码来源。'
+        if Path(observed).resolve() != PINNED_NODE.resolve():
+            return False, 'Node 使用其他运行时且无法凭可读的启动证据排除归属。请按 PID 核查。'
         if (script.suffix not in ('.js', '.mjs', '.cjs') or not canonical(script)
                 or not launch_file(script.stat(), start)):
             return False, 'Node 入口无法核实为启动时的规范绝对文件。请按 PID 核查入口路径。'

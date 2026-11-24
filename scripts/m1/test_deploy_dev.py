@@ -1380,7 +1380,7 @@ def observe_process(pid):
               '    assert json.loads(evidence)["processObservations"] == "process-observations.json"\n'
               '    claim=next((a.split("=",1)[1] for a in sys.argv if a.startswith("database_claim=")), "")\n'
               '    open(os.environ["PROOF"],"w").write(claim); sys.exit(0)\n'
-              'if "pg_stat_activity" in sys.argv[-1]: print(0); sys.exit(0)\n'
+              'if "pg_stat_activity" in sys.argv[-1]: print(os.environ.get("WORKER_SESSIONS", "0")); sys.exit(0)\n'
               'rows=json.loads(os.environ["ROWS"])\n'
               'if os.path.exists(os.environ["PROOF"]): rows[0].update(closed=True,audit=True)\n'
               'print(json.dumps(rows))\n', 0o755)
@@ -1574,10 +1574,22 @@ def observe_process(pid):
              dict(file_sets=[['f3', 'tREG', 'n' + opened]])),
             ('open file outside target', True, safe,
              dict(file_sets=[['f3', 'tREG', 'n' + os.path.join(self.home, secret)]])),
+            ('confirmed unnamed system handles', True, safe,
+             dict(file_sets=[['f3', 'tNPOLICY', 'n'], ['f4', 'tNEXUS', 'n'], ['f5', 'tKQUEUE', 'n'], ['f6', 'tPIPE', 'n']])),
+            ('unnamed unknown descriptor', False, 'TYPE=unknown',
+             dict(file_sets=[['f3', 'tunknown', 'n']])),
+            ('unknown descriptor names a target file', False, '打开文件属于目标',
+             dict(file_sets=[['f3', 'tunknown', 'n' + opened]])),
+            ('known unnamed handle with explicit error', False, 'errno=13',
+             dict(file_sets=[['ferr', 'tNPOLICY', 'nFD info error: Permission denied errno=13']])),
             ('loopback IPv4 PG connection', False, connection,
              dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->127.0.0.1:5434']])),
             ('loopback IPv6 PG connection', False, connection,
              dict(file_sets=[['f4', 'tIPv6', 'PTCP', 'n[::1]:49600->[::1]:5434']])),
+            ('loopback UDP PG endpoint', False, connection,
+             dict(file_sets=[['f4', 'tIPv4', 'PUDP', 'n127.0.0.1:49600->127.0.0.1:5434']])),
+            ('incomplete IP peer', False, 'TCP/UDP 连接记录不完整（TYPE=IPv4）',
+             dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:49600->']])),
             ('PG listener is not a TCP client', True, safe,
              dict(file_sets=[['f4', 'tIPv4', 'PTCP', 'n127.0.0.1:5434']])),
             ('local TCP connection to another port', True, safe,
@@ -1592,8 +1604,15 @@ def observe_process(pid):
             ('Unix peer for different PG port', True, safe,
              dict(file_sets=[['f4', 'tunix', 'n->0xabc'], ['p999997'],
                              ['f5', 'tunix', 'd0xabc', 'n/private/tmp/.s.PGSQL.5432']])),
+            ('identified unnamed Unix pair', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc'], ['p999997'],
+                             ['f5', 'tunix', 'd0xabc', 'n->0xdef']])),
+            ('Unix endpoint name missing', False, 'Unix 套接字或对端地址无法核实（TYPE=unix）',
+             dict(file_sets=[['f4', 'tunix', 'n']])),
+            ('Unix peer not observed', False, 'Unix 套接字或对端地址无法核实（TYPE=unix）',
+             dict(file_sets=[['f4', 'tunix', 'n->0xabc']])),
             ('lsof has no record for a still present process', False, unreadable, dict(cwd=None)),
-            ('per PID lsof permission error', False, unreadable,
+            ('per PID lsof permission error', False, '系统未提供 errno',
              dict(file_sets=[['ferr', 'tunknown', 'nFD info error: Operation not permitted']])),
             ('lsof returned an error', False, unreadable, dict(lsof_exit=1)),
             ('lsof stdout with a permission warning', False, unreadable,
@@ -1603,6 +1622,53 @@ def observe_process(pid):
                 cwd = facts.pop('cwd', self.home)
                 self.check_recovery_scan(task, rows, name, ['/bin/sh'], cwd, allowed,
                                          executable='/bin/sh', env_visible=False, reason=reason, secret=secret, **facts)
+
+    def test_schedule_recover_checks_disjoint_node_without_trusting_its_runtime(self):
+        task = 'recover-other-node'
+        instance, worker, _ = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        runtime = os.path.join(self.tmp, 'alternate-runtime', 'node')
+        script = os.path.join(self.home, 'outside', 'ordinary.mjs')
+        env_file = os.path.join(self.tmp, 'outside.env')
+        write(runtime, 'inert fixture')
+        write(script, '// inert fixture\n')
+        write(env_file, 'FIXTURE=ordinary\n')
+        for name, args, cwd, env, allowed in (
+            ('alternate Node outside target', [runtime, script, '--ordinary-app-argument'], self.home, {}, True),
+            ('alternate Node with 5434', [runtime, script], self.home, {'PGPORT': '5434'}, False),
+            ('alternate Node with target cwd', [runtime, script], instance, {}, False),
+            ('alternate Node with target path', [runtime, script, worker['WorkingDirectory']], self.home, {}, False),
+            ('alternate Node with target database', [runtime, script], self.home,
+             {'DATABASE_URL': 'postgres://localhost/allrice40_qa_recover_other_node'}, False),
+            ('alternate Node with env file', [runtime, '--env-file=' + env_file, script], self.home, {}, False),
+            ('early env file option after script', [runtime, script, '--env-file=' + env_file], self.home, {}, False),
+            ('alternate runtime with startup config after script', [runtime, script, '--experimental-config-file=' + env_file],
+             self.home, {}, False),
+            ('alternate Node with preloaded code', [runtime, script], self.home,
+             {'NODE_OPTIONS': '--import /unexecuted-fixture.mjs'}, False),
+            ('unknown Node launch mode', [runtime, '--unverified-launch-mode', script], self.home, {}, False),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, executable=runtime, environment=env,
+                                         reason='普通 Node 启动未见目标库' if allowed else None)
+        self.check_recovery_scan(task, rows, 'outside Node with a newer entry file', [runtime, script], self.home, True,
+                                 executable=runtime, started=os.stat(script).st_ctime_ns - 1,
+                                 reason='普通 Node 启动未见目标库')
+        self.check_recovery_scan(task, rows, 'Node with opaque loader environment', [runtime, script], self.home, False,
+                                 executable=runtime, environment={'NODE_FIXTURE_SETTINGS': 'opaque'},
+                                 reason='启动环境含无法核实作用的加载设置')
+
+    def test_schedule_recover_refuses_a_visible_worker_database_session(self):
+        task = 'recover-worker-session'
+        self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        proof = os.path.join(self.tmp, 'worker-session-proof')
+        result = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
+                                      ROWS=json.dumps(rows), PROOF=proof, WORKER_SESSIONS='1')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('1 Worker session(s) still on the database', result.stderr)
+        self.assertFalse(os.path.exists(proof))
+
     def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
                             web_pid='', observed=True, job_plist=None, executable=NODE, env_visible=True,
                             worker_parent=False, listed=True, reason=None, secret=None,
