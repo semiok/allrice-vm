@@ -258,20 +258,36 @@ function BrandMediaPanelContent({
     >({}),
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
-  const projectedRuns = useRef(runs);
-  const pendingSaves = useRef(new Set<(runs: BrandMediaRun[]) => boolean>());
-  const publishRuns = useCallback((update: SetStateAction<BrandMediaRun[]>) => {
-    const next =
-      typeof update === 'function' ? update(projectedRuns.current) : update;
-    const saves = pendingSaves.current;
-    // A save keeps its registration only while each projection authorizes it.
-    for (const allowedIn of saves) {
-      if (!allowedIn(next)) saves.delete(allowedIn);
-    }
-    // A pending file save can finish before React renders this same snapshot.
-    projectedRuns.current = next;
-    setRenderedRuns(next);
-  }, []);
+  const projectedRuns = useRef({ rows: runs, readVersion: 0 });
+  const pendingSaves = useRef(
+    new Map<(runs: BrandMediaRun[]) => boolean, number>(),
+  );
+  const invalidateSaves = useCallback(
+    (next: BrandMediaRun[], readVersion: number) => {
+      const saves = pendingSaves.current;
+      for (const [allowedIn, authorizedBy] of saves) {
+        if (authorizedBy <= readVersion && !allowedIn(next))
+          saves.delete(allowedIn);
+      }
+    },
+    [],
+  );
+  const publishRuns = useCallback(
+    (
+      update: SetStateAction<BrandMediaRun[]>,
+      readVersion = projectedRuns.current.readVersion,
+    ) => {
+      const next =
+        typeof update === 'function'
+          ? update(projectedRuns.current.rows)
+          : update;
+      invalidateSaves(next, readVersion);
+      // A pending file save can finish before React renders this same snapshot.
+      projectedRuns.current = { rows: next, readVersion };
+      setRenderedRuns(next);
+    },
+    [invalidateSaves],
+  );
   const [help, setHelp] = useState<string | null>(null),
     [body, setBody] = useState<{
       articleId: string;
@@ -525,6 +541,10 @@ function BrandMediaPanelContent({
     const deny = (projection: ReadProjection) => (cause: Error) => {
       if (latest()) discardRead(projection, cause);
     };
+    const denyRunRead = (cause: Error) => {
+      if (latest()) discardRead('runs', cause);
+      else invalidateSaves([], version);
+    };
     try {
       const [topicPage, articlePage, schedule, recovery] =
         await Promise.allSettled([
@@ -539,14 +559,19 @@ function BrandMediaPanelContent({
             undefined,
             deny('calendar'),
           ),
-          client.runs(undefined, deny('runs')).then(({ runs }) => {
-            if (!current('runs')) return;
+          client.runs(undefined, denyRunRead).then(({ runs }) => {
+            if (!current('runs')) {
+              // A superseded read may still revoke a save from its generation.
+              invalidateSaves(runs, version);
+              return;
+            }
             publishRuns(
               runs.map((row) =>
                 filterDeliveries(row, (file) =>
                   pinAllowedSince(relatedArticle(row), observedDenial, file),
                 ),
               ),
+              version,
             );
             clearReadFailure('runs', observedDenial);
           }),
@@ -613,6 +638,7 @@ function BrandMediaPanelContent({
     discardRead,
     articleAllowedSince,
     pinAllowedSince,
+    invalidateSaves,
     publishRuns,
     clearReadFailure,
     setError,
@@ -765,7 +791,7 @@ function BrandMediaPanelContent({
         'articleId' in intent ? intent.articleId : undefined,
         observedArticle,
       ) &&
-      !projectedRuns.current.some(({ run }) => run.id === result.run.id)
+      !projectedRuns.current.rows.some(({ run }) => run.id === result.run.id)
     )
       publishRuns((old) => [
         {
@@ -856,9 +882,10 @@ function BrandMediaPanelContent({
         )
       );
     };
-    if (!allowedIn(projectedRuns.current)) return;
+    const { rows, readVersion } = projectedRuns.current;
+    if (!allowedIn(rows)) return;
     const saves = pendingSaves.current;
-    saves.add(allowedIn);
+    saves.set(allowedIn, readVersion);
     const current = () =>
       saves.has(allowedIn) && pinAllowedSince(articleId, observed, file);
     const fail = beginAction();

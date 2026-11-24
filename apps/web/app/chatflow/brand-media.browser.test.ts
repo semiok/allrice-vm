@@ -890,6 +890,25 @@ suite('MET-224 main-area brand media text workflow', () => {
       };
     }, path);
   }
+  async function observeLateRunRead(page: Page) {
+    await page.evaluate(() => {
+      const fetch = window.fetch.bind(window);
+      window.fetch = async (input, options) => {
+        const response = await fetch(input, options);
+        if (response.headers.has('x-fixture-late-run-read')) {
+          const json = response.json.bind(response);
+          response.json = async () => {
+            const value = await json();
+            setTimeout(() => {
+              document.body.dataset.lateRunRead = 'settled';
+            }, 0);
+            return value;
+          };
+        }
+        return response;
+      };
+    });
+  }
   async function topicsPage(page: Page) {
     await page.getByRole('tab', { name: '选题库', exact: true }).click();
   }
@@ -3394,6 +3413,193 @@ suite('MET-224 main-area brand media text workflow', () => {
         expect(download.suggestedFilename()).toBe('allrice-export');
         expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
       } finally {
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['unavailable', 'forbidden', '503'] as const)(
+    'settles an in-flight save when an overlapping Run read returns %s',
+    async (outcome) => {
+      const run = recovery('article');
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const expected = '不可直接改写的正文\n第二段';
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const latestStarted = gate();
+      const releaseLatest = gate();
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      let requests = 0;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await deliveries.waitFor();
+        await observeLateRunRead(page);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (++requests !== 1) {
+              latestStarted.resolve();
+              await releaseLatest.promise;
+              return route.fallback();
+            }
+            olderStarted.resolve();
+            await releaseOlder.promise;
+            const response = {
+              unavailable: {
+                status: 200,
+                json: { runs: [{ ...run, unavailable: true, deliveries: [] }] },
+              },
+              forbidden: {
+                status: 403,
+                json: accessProblem('较早的成果读取已拒绝'),
+              },
+              503: { status: 503, json: { message: '成果读取暂时不可用' } },
+            }[outcome];
+            return route.fulfill({
+              ...response,
+              headers: { 'x-fixture-late-run-read': 'yes' },
+            });
+          },
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await olderStarted.promise;
+        await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+        await deliveries.press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        f.state.runs = [
+          { ...run, submission: { articleUpdated: true, revision: 2 } },
+        ];
+        const latestStatus = panel(page).getByText('本次正文已保存（版本 2）', {
+          exact: true,
+        });
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await latestStarted.promise;
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        if (outcome === 'forbidden') {
+          releaseLatest.resolve();
+          await latestStatus.waitFor();
+        }
+
+        const saved =
+          outcome === '503' ? page.waitForEvent('download') : undefined;
+        await finishDownload();
+        await page
+          .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+          .waitFor();
+        if (saved) {
+          const download = await saved;
+          expect(download.suggestedFilename()).toBe('allrice-export');
+          expect(await readFile((await download.path())!, 'utf8')).toBe(
+            expected,
+          );
+        } else {
+          expect(
+            await page.locator('body').getAttribute('data-delivery-save'),
+          ).toBeNull();
+        }
+        expect(await deliveries.count()).toBe(1);
+        releaseLatest.resolve();
+        await latestStatus.waitFor();
+      } finally {
+        releaseOlder.resolve();
+        releaseLatest.resolve();
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
+  it.each(['new read', 'new visit'] as const)(
+    'preserves a save authorized by a %s when an older Run read returns unavailable',
+    async (outcome) => {
+      const run = recovery('article');
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const expected = '不可直接改写的正文\n第二段';
+      const olderStarted = gate();
+      const releaseOlder = gate();
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      let first = true;
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await deliveries.waitFor();
+        if (outcome === 'new visit')
+          await finishDespiteAbort(
+            page,
+            `/api/v1/employee-instances/${scope.instanceId}/brand-media`,
+          );
+        await observeLateRunRead(page);
+        await page.route(
+          (url) => brandView(url, 'runs'),
+          async (route) => {
+            if (!first) return route.fallback();
+            first = false;
+            olderStarted.resolve();
+            await releaseOlder.promise;
+            return route.fulfill({
+              status: 200,
+              headers: { 'x-fixture-late-run-read': 'yes' },
+              json: { runs: [{ ...run, unavailable: true, deliveries: [] }] },
+            });
+          },
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await olderStarted.promise;
+        f.state.runs = [
+          { ...run, submission: { articleUpdated: true, revision: 2 } },
+        ];
+        if (outcome === 'new visit') {
+          await panel(page).getByRole('button', { name: '← 回到对话' }).click();
+          await f.open();
+          await panel(page).getByRole('tab', { name: '文章库' }).click();
+        } else {
+          await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        }
+        const latestStatus = panel(page).getByText('本次正文已保存（版本 2）', {
+          exact: true,
+        });
+        await latestStatus.waitFor();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await holdBodyDelivery(page, `/api/v1/files/${file.objectId}/download`);
+        await deliveries.press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        releaseOlder.resolve();
+        await page.locator('body[data-late-run-read="settled"]').waitFor();
+        expect(await latestStatus.isVisible()).toBe(true);
+        expect(await deliveries.count()).toBe(1);
+        const saved = page.waitForEvent('download');
+        await finishDownload();
+        const download = await saved;
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      } finally {
+        releaseOlder.resolve();
         await finishDownload();
         await f.close();
       }
