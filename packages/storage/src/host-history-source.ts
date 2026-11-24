@@ -90,12 +90,50 @@ export type CommittedHostHistorySource = Readonly<{
   digest: string;
   manifest: HostHistorySource;
 }>;
+const CommittedSourceSchema = z
+  .object({
+    digest: ChecksumSchema,
+    manifest: HostHistorySourceSchema,
+  })
+  .strict();
+const legacyManifestName = /^[a-f0-9]{64}\.json$/;
+const commitName = (index: number) => `commit-${index}.json`;
 
 function fail(): never {
   throw new HostHistoryIntegrityError();
 }
 function same(a: unknown, b: unknown) {
   return hostHistoryDigest(a) === hostHistoryDigest(b);
+}
+
+async function readManifest(
+  directory: string,
+  name: string,
+  signal: AbortSignal,
+): Promise<CommittedHostHistorySource> {
+  signal.throwIfAborted();
+  const file = await open(
+    join(directory, name),
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
+  try {
+    const value: unknown = JSON.parse(
+      await file.readFile({ encoding: 'utf8', signal }),
+    );
+    const source = legacyManifestName.test(name)
+      ? {
+          digest: `sha256:${name.slice(0, -5)}`,
+          manifest: HostHistorySourceSchema.parse(value),
+        }
+      : CommittedSourceSchema.parse(value);
+    if (hostHistoryDigest(source.manifest) !== source.digest) fail();
+    return source;
+  } catch {
+    signal.throwIfAborted();
+    return fail();
+  } finally {
+    await file.close();
+  }
 }
 
 /** Validate the complete ancestry against the exact referenced snapshots.
@@ -226,7 +264,10 @@ function compare(
 /** Immutable manifests are committed last, outside the VM. There is no latest
  * pointer, authority cache, GC, scheduling or execution/resume dependency. */
 export class HostHistorySourceStore {
-  private readonly verified = new WeakSet<object>();
+  private readonly verified = new WeakMap<
+    CommittedHostHistorySource,
+    CommittedHostHistorySource
+  >();
   constructor(
     private readonly root: string,
     private readonly raw: HostHistoryStorePort,
@@ -253,14 +294,34 @@ export class HostHistorySourceStore {
       nativeSessionId: ref.parse(requestedSnapshot.nativeSessionId),
       snapshotDigest: ChecksumSchema.parse(requestedSnapshot.snapshotDigest),
     };
+    const { selected } = await this.readCommitted(key, signal, requested);
+    if (selected) this.verified.set(selected, structuredClone(selected));
+    return selected;
+  }
+  private async readCommitted(
+    key: HostHistorySourceKey,
+    signal: AbortSignal,
+    requested?: Readonly<{ nativeSessionId: string; snapshotDigest: string }>,
+  ) {
     signal.throwIfAborted();
     const directory = this.directory(key);
     let names: string[];
     try {
       names = await readdir(directory);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return { selected: null, selectedSnapshots: undefined, nextCommit: 0 };
+    }
+    const commits = new Set(
+      names.filter((name) => /^commit-.*\.json$/.test(name)),
+    );
+    const ordered = names
+      .filter((name) => legacyManifestName.test(name))
+      .sort();
+    for (let index = 0; index < commits.size; index++) {
+      const name = commitName(index);
+      if (!commits.has(name)) fail();
+      ordered.push(name);
     }
     let selected: CommittedHostHistorySource | null = null;
     let selectedSnapshots: Map<string, HostHistorySnapshot> | undefined;
@@ -268,27 +329,10 @@ export class HostHistorySourceStore {
       manifest: HostHistorySource;
       snapshots: Map<string, HostHistorySnapshot>;
     }[] = [];
-    for (const name of names.sort()) {
-      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
-      signal.throwIfAborted();
-      const file = await open(
-        join(directory, name),
-        constants.O_RDONLY | constants.O_NOFOLLOW,
-      );
-      let manifest: HostHistorySource;
-      try {
-        manifest = HostHistorySourceSchema.parse(
-          JSON.parse(await file.readFile({ encoding: 'utf8', signal })),
-        );
-      } catch {
-        signal.throwIfAborted();
-        fail();
-      } finally {
-        await file.close();
-      }
-      const digest = hostHistoryDigest(manifest);
-      if (`${digest.slice(7)}.json` !== name || !same(manifest.key, key))
-        fail();
+    for (const name of ordered) {
+      const source = await readManifest(directory, name, signal);
+      const { digest, manifest } = source;
+      if (!same(manifest.key, key)) fail();
       const snapshots = await validate(manifest, this.raw, signal);
       for (const previous of candidates)
         compare(manifest, previous.manifest, snapshots, previous.snapshots);
@@ -314,13 +358,12 @@ export class HostHistorySourceStore {
         if (direction < 0 || (direction === 0 && digest < selected.digest))
           continue;
       }
-      selected = { digest, manifest };
+      selected = source;
       selectedSnapshots = snapshots;
     }
     signal.throwIfAborted();
     if (requested && !selected) fail();
-    if (selected) this.verified.add(selected);
-    return selected;
+    return { selected, selectedSnapshots, nextCommit: commits.size };
   }
   async publish(
     input: HostHistorySource,
@@ -328,37 +371,24 @@ export class HostHistorySourceStore {
   ): Promise<string> {
     const manifest = HostHistorySourceSchema.parse(input);
     const snapshots = await validate(manifest, this.raw, signal);
-    const previous = await this.read(manifest.key, signal);
-    if (previous) {
-      const olderSnapshots = await validate(
-        previous.manifest,
-        this.raw,
-        signal,
-      );
-      if (compare(manifest, previous.manifest, snapshots, olderSnapshots) < 0)
-        fail();
-      for (const row of previous.manifest.sessions) {
-        const current = snapshots.get(row.binding.nativeSessionId);
-        const older = await this.raw.read(
-          row.binding,
-          signal,
-          row.snapshotDigest,
-        );
-        if (
-          !current ||
-          !older ||
-          current.source.throughSeq < older.snapshot.source.throughSeq
-        )
-          fail();
-      }
-    }
+    const { selected, selectedSnapshots, nextCommit } =
+      await this.readCommitted(manifest.key, signal);
+    if (
+      selected &&
+      compare(manifest, selected.manifest, snapshots, selectedSnapshots!) < 0
+    )
+      fail();
     const digest = hostHistoryDigest(manifest),
       directory = this.directory(manifest.key);
+    if (selected?.digest === digest) return digest;
+    // Every publisher that validated the same ledger cut competes for this
+    // one immutable slot, even across independent store instances/processes.
+    const name = commitName(nextCommit);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const temporary = join(directory, `${randomUUID()}.tmp`);
     const file = await open(temporary, 'wx', 0o600);
     try {
-      await file.writeFile(JSON.stringify(manifest), {
+      await file.writeFile(JSON.stringify({ digest, manifest }), {
         encoding: 'utf8',
         signal,
       });
@@ -366,9 +396,11 @@ export class HostHistorySourceStore {
       await file.close();
       signal.throwIfAborted();
       try {
-        await link(temporary, join(directory, `${digest.slice(7)}.json`));
+        await link(temporary, join(directory, name));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const winner = await readManifest(directory, name, signal);
+        if (winner.digest !== digest) fail();
       }
       const parent = await open(directory, 'r');
       try {
@@ -380,15 +412,20 @@ export class HostHistorySourceStore {
       await file.close().catch(() => undefined);
       await rm(temporary, { force: true });
     }
-    await this.read(manifest.key, signal);
+    signal.throwIfAborted();
     return digest;
   }
   /** One request's immutable selection. Never reselect on subsequent page,
    * download or reauthorization calls. Explicit uncommitted digests refuse. */
   committedStore(selected: CommittedHostHistorySource): HostHistoryStorePort {
-    if (!this.verified.has(selected)) fail();
-    const manifest = HostHistorySourceSchema.parse(selected.manifest);
-    if (hostHistoryDigest(manifest) !== selected.digest) fail();
+    const verified = this.verified.get(selected);
+    if (
+      !verified ||
+      verified.digest !== selected.digest ||
+      verified.digest !== hostHistoryDigest(selected.manifest)
+    )
+      fail();
+    const { manifest } = verified;
     return {
       async publish() {
         return fail();

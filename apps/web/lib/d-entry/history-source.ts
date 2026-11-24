@@ -122,7 +122,8 @@ export function createColdHistorySource(input: {
         if (
           !identity.threadId ||
           context.organizationId !== identity.organizationId ||
-          context.workspaceId !== identity.workspaceId
+          (context.workspaceId !== null &&
+            context.workspaceId !== identity.workspaceId)
         )
           fail();
         const callerKey = JSON.stringify([

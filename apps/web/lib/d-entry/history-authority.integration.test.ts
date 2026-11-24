@@ -450,6 +450,21 @@ suite(
       };
     }
 
+    it('accepts an organization-level cookie for its own selected workspace and refuses a conflicting workspace', async () => {
+      const f = await setup();
+      const handlers = createDEntryHistoryRouteHandlers(f.ports);
+      const request = f.request();
+      request.headers.delete('x-allrice-workspace-id');
+      const result = await handlers.history(request);
+      expect(result.status).toBe(200);
+      expect((await result.json()).snapshotDigest).toBe(f.digest);
+      const conflicting = f.request();
+      conflicting.headers.set('x-allrice-workspace-id', randomUUID());
+      const denied = await handlers.history(conflicting);
+      expect([401, 404]).toContain(denied.status);
+      expect(f.createColdSource).toHaveBeenCalledTimes(1);
+    });
+
     it('“关机后读历史，不继续旧执行” authenticates the actual cookie and reads persistent paginated projection with formal root/watch', async () => {
       const f = await setup();
       const pin = await getDEntryHistoryRootPin(f.context, f.selection);

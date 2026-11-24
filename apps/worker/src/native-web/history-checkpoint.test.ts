@@ -106,12 +106,33 @@ async function fixture() {
       binding,
       { ...binding, nativeSessionId: 'child', parentNativeSessionId: 'root' },
     ],
-    native: { readCut: vi.fn(async () => JSON.stringify(cut)) },
-    authorize: vi.fn(async (binding: HostHistoryBinding) => ({
-      binding,
+    native: {
+      binding: {
+        vmId: key.vmId,
+        instanceId: 'actual-original-host-receipt',
+        organizationId: key.organizationId,
+        personId: key.personId,
+        leaseEpoch: 1,
+      },
+      endpoint: {
+        workspaceId: key.workspaceId,
+        employeeInstanceId: key.employeeInstanceId,
+      },
+      profile: {
+        nativeProfileRef: 'actual-original-profile-receipt',
+        configurationRef: 'original-configuration-release',
+        configurationDigest: hostHistoryDigest({ original: 'configuration' }),
+      },
       revoked: signal(),
-    })),
-    attachments: vi.fn(async () => []),
+      assertCurrent: vi.fn(async () => {}),
+      readCut: vi.fn(async () => JSON.stringify(cut)),
+    },
+    authorize: vi.fn<
+      Parameters<typeof checkpointNativeHistory>[0]['authorize']
+    >(async (binding) => ({ binding, revoked: signal() })),
+    attachments: vi.fn<
+      Parameters<typeof checkpointNativeHistory>[0]['attachments']
+    >(async () => []),
     snapshots,
     sources,
     signal: signal(),
@@ -155,6 +176,62 @@ describe('native history checkpoint', () => {
       );
     }
     expect(f.input.native.readCut).toHaveBeenCalledTimes(1);
+    expect(f.input.native.assertCurrent).toHaveBeenCalledTimes(3);
+  });
+  it('rejects valid cuts from a different actual VM, host, employee endpoint or profile before reading', async () => {
+    const f = await fixture();
+    for (const native of [
+      {
+        ...f.input.native,
+        binding: { ...f.input.native.binding, vmId: randomUUID() },
+      },
+      {
+        ...f.input.native,
+        binding: { ...f.input.native.binding, instanceId: randomUUID() },
+      },
+      {
+        ...f.input.native,
+        binding: { ...f.input.native.binding, personId: randomUUID() },
+      },
+      {
+        ...f.input.native,
+        endpoint: {
+          ...f.input.native.endpoint,
+          employeeInstanceId: randomUUID(),
+        },
+      },
+      {
+        ...f.input.native,
+        profile: {
+          ...f.input.native.profile,
+          nativeProfileRef: 'wrong-profile',
+        },
+      },
+      {
+        ...f.input.native,
+        profile: {
+          ...f.input.native.profile,
+          configurationDigest: hostHistoryDigest('wrong-configuration'),
+        },
+      },
+    ]) {
+      await expect(
+        checkpointNativeHistory({ ...f.input, native }),
+      ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    }
+    expect(f.input.native.readCut).not.toHaveBeenCalled();
+    expect(f.input.attachments).not.toHaveBeenCalled();
+  });
+  it('rechecks the actual owner after awaiting the native cut and refuses late bytes', async () => {
+    const f = await fixture();
+    const revoked = Error('native owner replaced');
+    f.input.native.assertCurrent
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(revoked);
+    await expect(checkpointNativeHistory(f.input)).rejects.toBe(revoked);
+    expect(f.input.native.readCut).toHaveBeenCalledTimes(1);
+    expect(f.input.attachments).not.toHaveBeenCalled();
+    expect(await f.input.sources.read(f.key, signal())).toBeNull();
   });
   it('does not reconstruct missing original facts or dispatch a read without them', async () => {
     const f = await fixture();
@@ -192,7 +269,10 @@ describe('native history checkpoint', () => {
       await expect(
         checkpointNativeHistory({
           ...f.input,
-          native: { readCut: async () => JSON.stringify(bad) },
+          native: {
+            ...f.input.native,
+            readCut: async () => JSON.stringify(bad),
+          },
         }),
       ).rejects.toBeDefined();
       expect(await f.input.sources.read(f.key, signal())).toBeNull();
@@ -221,7 +301,7 @@ describe('native history checkpoint', () => {
     });
     const work = checkpointNativeHistory({
       ...f.input,
-      native: { readCut },
+      native: { ...f.input.native, readCut },
       signal: controller.signal,
     });
     let settled = false;
@@ -251,7 +331,10 @@ describe('native history checkpoint', () => {
     await expect(
       checkpointNativeHistory({
         ...f.input,
-        native: { readCut: async () => JSON.stringify(malformed) },
+        native: {
+          ...f.input.native,
+          readCut: async () => JSON.stringify(malformed),
+        },
       }),
     ).rejects.toThrow();
     expect(await f.input.sources.read(f.key, signal())).toBeNull();
@@ -276,6 +359,77 @@ describe('native history checkpoint', () => {
     revoked.abort();
     finish.release();
     await expect(work).rejects.toBeDefined();
+    expect(await f.input.sources.read(f.key, signal())).toBeNull();
+  });
+  it('immediately aborts and joins the next authorization when the first grant is revoked', async () => {
+    const f = await fixture();
+    const first = new AbortController();
+    const entered = gate(),
+      finish = gate();
+    let laterSignal: AbortSignal | undefined;
+    f.input.authorize
+      .mockImplementationOnce(async (binding) => ({
+        binding,
+        revoked: first.signal,
+      }))
+      .mockImplementationOnce(async (binding, active) => {
+        laterSignal = active;
+        entered.release();
+        await finish.promise;
+        return { binding, revoked: signal() };
+      });
+    const work = checkpointNativeHistory(f.input);
+    const done = vi.fn();
+    void work.then(done, done);
+    await entered.promise;
+    const reason = Error('original grant revoked');
+    try {
+      first.abort(reason);
+      expect(laterSignal?.reason).toBe(reason);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(done).not.toHaveBeenCalled();
+      expect(f.input.native.readCut).not.toHaveBeenCalled();
+    } finally {
+      finish.release();
+      await expect(work).rejects.toBe(reason);
+    }
+  });
+  it('propagates a later root grant revocation to an independently authorized child and joins its attachment I/O', async () => {
+    const f = await fixture();
+    const late = new AbortController();
+    const entered = gate(),
+      finish = gate();
+    let rootReads = 0;
+    let attachmentSignal: AbortSignal | undefined;
+    f.input.authorize.mockImplementation(async (binding) => ({
+      binding,
+      revoked:
+        binding.nativeSessionId === 'root' && ++rootReads === 2
+          ? late.signal
+          : signal(),
+    }));
+    f.input.attachments.mockImplementation(async (binding, active) => {
+      if (binding.nativeSessionId === 'child') {
+        attachmentSignal = active;
+        entered.release();
+        await finish.promise;
+      }
+      return [];
+    });
+    const work = checkpointNativeHistory(f.input);
+    const done = vi.fn();
+    void work.then(done, done);
+    await entered.promise;
+    const reason = Error('renewed root grant revoked');
+    try {
+      late.abort(reason);
+      expect(attachmentSignal?.reason).toBe(reason);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(done).not.toHaveBeenCalled();
+    } finally {
+      finish.release();
+      await expect(work).rejects.toBe(reason);
+    }
     expect(await f.input.sources.read(f.key, signal())).toBeNull();
   });
 });

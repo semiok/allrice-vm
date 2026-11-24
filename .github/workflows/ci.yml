@@ -54,10 +54,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Build same-release public principal faces before runtime imports
-        run: |
-          pnpm --filter @allrice/contracts build
-          pnpm --filter @allrice/d-entry-principal build
+      - name: Build generated test dependencies
+        run: pnpm build:test-sources
       - name: Read locked browser and runner cache identities
         id: browser-cache-identity
         run: |
@@ -220,8 +218,6 @@ jobs:
       - run: pnpm dsh-ui:verify
       - run: pnpm format:check
       - run: pnpm lint
-      - name: Build readonly native history transport before typecheck and tests
-        run: pnpm --filter @allrice/dsh-native-history-source build
       - run: pnpm typecheck
       # MET-220 R1: no new regex or keyword match on the user's Chinese wording outside
       # the baseline, and the baseline holds nothing its base commit's did not.
@@ -252,8 +248,7 @@ jobs:
           ALLRICE_NATIVE_ONCE_PROBE_MODULE_BASE: ${{ github.workspace }}/apps/worker/package.json
           TSX_TSCONFIG_PATH: ${{ github.workspace }}/tsconfig.base.json
         run: |
-          pnpm --filter @allrice/contracts build
-          pnpm --filter @allrice/dsh-web-composition build
+          pnpm build:test-sources
           node --test --test-concurrency=1 scripts/ci-integration-tests.node.test.mjs
           node scripts/ci-integration-tests.mjs run native -- --maxWorkers=2 --outputFile=.local/quality/native/vitest-native.json
       - name: Collect deterministic scenario evidence without rerunning tests

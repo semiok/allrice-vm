@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events';
 import { z } from 'zod';
 import {
   Session,
@@ -8,6 +9,10 @@ import {
 } from '@deepseek-ai/dsh-session';
 import { currentSessionMessageProjections } from '@deepseek-ai/dsh-session-format-catalog/message-projections';
 import type { NativeHistoryCut } from '@allrice/dsh-native-history-source/types';
+import type {
+  PersonVmBinding,
+  PersonVmWebEndpointReceipt,
+} from '@allrice/person-vm';
 import {
   HostHistoryBindingSchema,
   type HostHistoryBinding,
@@ -24,6 +29,28 @@ import {
 import { captureHostHistory } from '../harness/host-history.js';
 
 type Capture = Parameters<typeof captureHostHistory>[0];
+type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
+
+/** The authenticated reader owns these facts alongside its actual transport.
+ * They are sampled from its verified launch and profile, independently of the
+ * original history receipts. A caller must keep the port unbound without those
+ * sources. The serialized native cut contains session data only. */
+type NativeHistoryReader = Readonly<{
+  binding: Readonly<PersonVmBinding>;
+  endpoint: Readonly<Pick<Endpoint, 'workspaceId' | 'employeeInstanceId'>>;
+  profile: Readonly<
+    Pick<
+      HostHistoryBinding,
+      'nativeProfileRef' | 'configurationRef' | 'configurationDigest'
+    >
+  >;
+  revoked: AbortSignal;
+  assertCurrent(signal: AbortSignal): Promise<void>;
+  readCut(
+    request: { rootSessionId: string },
+    signal: AbortSignal,
+  ): Promise<string>;
+}>;
 
 /** Validate the transport envelope, then let native current-format restoration
  * validate its complete header/log. This detached value is never published to
@@ -99,12 +126,7 @@ function decodeCut(text: string): NativeHistoryCut {
 export async function checkpointNativeHistory(input: {
   key: HostHistorySourceKey;
   originalBindings: readonly HostHistoryBinding[];
-  native: {
-    readCut(
-      request: { rootSessionId: string },
-      signal: AbortSignal,
-    ): Promise<string>;
-  };
+  native: NativeHistoryReader;
   authorize: Capture['authorize'];
   attachments: Capture['attachments'];
   snapshots: Capture['store'];
@@ -120,6 +142,29 @@ export async function checkpointNativeHistory(input: {
   );
   const fail: () => never = () => {
     throw new HostHistoryIntegrityError();
+  };
+  const native = input.native;
+  const actualBinding = (binding: HostHistoryBinding) => ({
+    ...binding,
+    organizationId: native.binding.organizationId,
+    workspaceId: native.endpoint.workspaceId,
+    personId: native.binding.personId,
+    employeeInstanceId: native.endpoint.employeeInstanceId,
+    nativeInstanceRef: native.binding.instanceId,
+    nativeProfileRef: native.profile.nativeProfileRef,
+    configurationRef: native.profile.configurationRef,
+    configurationDigest: native.profile.configurationDigest,
+  });
+  const assertOrigin = () => {
+    if (
+      native.binding.vmId !== key.vmId ||
+      bindings.some(
+        (binding) =>
+          hostHistoryDigest(actualBinding(binding)) !==
+          hostHistoryDigest(binding),
+      )
+    )
+      fail();
   };
   if (
     !root ||
@@ -140,7 +185,13 @@ export async function checkpointNativeHistory(input: {
     )
   )
     fail();
-  const revocations: AbortSignal[] = [input.signal];
+  assertOrigin();
+  const grants = new AbortController();
+  const signal = AbortSignal.any([input.signal, native.revoked, grants.signal]);
+  const revocations = new Map<
+    AbortSignal,
+    ReturnType<typeof addAbortListener>
+  >();
   const authorize = async (
     binding: HostHistoryBinding,
     active: AbortSignal,
@@ -149,107 +200,122 @@ export async function checkpointNativeHistory(input: {
     const grant = await input.authorize(binding, active);
     active.throwIfAborted();
     if (hostHistoryDigest(grant.binding) !== hostHistoryDigest(binding)) fail();
-    revocations.push(grant.revoked);
     grant.revoked.throwIfAborted();
+    if (!revocations.has(grant.revoked))
+      revocations.set(
+        grant.revoked,
+        addAbortListener(grant.revoked, () =>
+          grants.abort(grant.revoked.reason),
+        ),
+      );
     return grant;
   };
-  for (const binding of bindings) await authorize(binding, input.signal);
-  const signal = AbortSignal.any(revocations);
-  signal.throwIfAborted();
-  // A JSON transport is not authority. Materialize the actual returned vector
-  // before any attachment/storage await can let a mutable producer change it.
-  const cut = decodeCut(
-    await input.native.readCut(
+  try {
+    for (const binding of bindings) await authorize(binding, signal);
+    await native.assertCurrent(signal);
+    signal.throwIfAborted();
+    assertOrigin();
+    const serialized = await native.readCut(
       { rootSessionId: key.rootNativeSessionId },
       signal,
-    ),
-  );
-  signal.throwIfAborted();
-  if (
-    cut.rootSessionId !== key.rootNativeSessionId ||
-    cut.sessions.length !== bindings.length ||
-    new Set(cut.sessions.map((row) => row.meta.id)).size !== cut.sessions.length
-  )
-    fail();
-  const sessions: HostHistorySource['sessions'] = [];
-  const edges: HostHistorySource['edges'] = [];
-  for (const row of cut.sessions) {
-    const binding = bindings.find(
-      (binding) => binding.nativeSessionId === row.meta.id,
     );
-    if (!binding || row.meta.version !== 4) fail();
-    const parentId = binding.parentNativeSessionId;
-    if (parentId !== null) {
-      const parent = cut.sessions.find((row) => row.meta.id === parentId);
-      const catalog = parent?.catalog.filter(
-        (entry) => entry.id === row.meta.id,
+    signal.throwIfAborted();
+    await native.assertCurrent(signal);
+    signal.throwIfAborted();
+    assertOrigin();
+    const cut = decodeCut(serialized);
+    if (
+      cut.rootSessionId !== key.rootNativeSessionId ||
+      cut.sessions.length !== bindings.length ||
+      new Set(cut.sessions.map((row) => row.meta.id)).size !==
+        cut.sessions.length
+    )
+      fail();
+    const sessions: HostHistorySource['sessions'] = [];
+    const edges: HostHistorySource['edges'] = [];
+    for (const row of cut.sessions) {
+      const binding = bindings.find(
+        (binding) => binding.nativeSessionId === row.meta.id,
       );
-      if (
-        !parent ||
-        catalog?.length !== 1 ||
-        !['one-shot', 'continuable'].includes(catalog[0]!.mode) ||
-        catalog[0]!.createdAt !== row.meta.createdAt
-      )
-        fail();
-      const event = parent.events.find(
-        (event) =>
-          event.type === 'subagent/catalog' &&
-          event.seq >= parent.inheritedEventCount &&
-          event.data.childId === row.meta.id &&
-          event.data.childCreatedAt === row.meta.createdAt &&
-          event.data.mode === catalog[0]!.mode,
-      );
-      if (!event) fail();
-      // The source schema validates/hash-binds the real complete catalog event.
-      edges.push({
-        parentNativeSessionId: parentId,
-        childNativeSessionId: row.meta.id,
-        parentEvent:
-          HostHistorySourceSchema.shape.edges.element.shape.parentEvent.parse(
-            event,
+      if (!binding || row.meta.version !== 4) fail();
+      const parentId = binding.parentNativeSessionId;
+      if (parentId !== null) {
+        const parent = cut.sessions.find((row) => row.meta.id === parentId);
+        const catalog = parent?.catalog.filter(
+          (entry) => entry.id === row.meta.id,
+        );
+        if (
+          !parent ||
+          catalog?.length !== 1 ||
+          !['one-shot', 'continuable'].includes(catalog[0]!.mode) ||
+          catalog[0]!.createdAt !== row.meta.createdAt
+        )
+          fail();
+        const event = parent.events.find(
+          (event) =>
+            event.type === 'subagent/catalog' &&
+            event.seq >= parent.inheritedEventCount &&
+            event.data.childId === row.meta.id &&
+            event.data.childCreatedAt === row.meta.createdAt &&
+            event.data.mode === catalog[0]!.mode,
+        );
+        if (!event) fail();
+        // The source schema validates/hash-binds the real complete catalog event.
+        edges.push({
+          parentNativeSessionId: parentId,
+          childNativeSessionId: row.meta.id,
+          parentEvent:
+            HostHistorySourceSchema.shape.edges.element.shape.parentEvent.parse(
+              event,
+            ),
+        });
+      }
+      const exported = await captureHostHistory({
+        binding,
+        native: {
+          binding: actualBinding(binding),
+          async inspect(id, active) {
+            active?.throwIfAborted();
+            if (id !== SessionId(row.meta.id)) fail();
+            return {
+              meta: row.meta,
+              inheritedEventCount: SessionLogOffset(row.inheritedEventCount),
+              events: row.events,
+            };
+          },
+        },
+        authorize,
+        store: input.snapshots,
+        attachments: input.attachments,
+        signal,
+      });
+      signal.throwIfAborted();
+      sessions.push({
+        binding,
+        snapshotDigest: exported.digest,
+        header:
+          HostHistorySourceSchema.shape.sessions.element.shape.header.parse(
+            row.meta,
           ),
       });
     }
-    const exported = await captureHostHistory({
-      binding,
-      native: {
-        binding,
-        async inspect(id, active) {
-          active?.throwIfAborted();
-          if (id !== SessionId(row.meta.id)) fail();
-          return {
-            meta: row.meta,
-            inheritedEventCount: SessionLogOffset(row.inheritedEventCount),
-            events: row.events,
-          };
-        },
-      },
-      authorize,
-      store: input.snapshots,
-      attachments: input.attachments,
-      signal,
-    });
+    for (const binding of bindings) await authorize(binding, signal);
+    await native.assertCurrent(signal);
     signal.throwIfAborted();
-    sessions.push({
-      binding,
-      snapshotDigest: exported.digest,
-      header: HostHistorySourceSchema.shape.sessions.element.shape.header.parse(
-        row.meta,
-      ),
-    });
+    assertOrigin();
+    // Unreferenced snapshots are deliberately not readable through the cold
+    // adapter. Commit last, after the complete source/attachment/capture joins.
+    const manifest: HostHistorySource = {
+      schemaVersion: 1,
+      key,
+      sessions,
+      edges,
+    };
+    const digest = await input.sources.publish(manifest, signal);
+    signal.throwIfAborted();
+    return { digest, manifest };
+  } finally {
+    for (const subscription of revocations.values())
+      subscription[Symbol.dispose]();
   }
-  for (const binding of bindings) await authorize(binding, signal);
-  const finalSignal = AbortSignal.any(revocations);
-  finalSignal.throwIfAborted();
-  // Unreferenced snapshots are deliberately not readable through the cold
-  // adapter. Commit last, after the complete source/attachment/capture joins.
-  const manifest: HostHistorySource = {
-    schemaVersion: 1,
-    key,
-    sessions,
-    edges,
-  };
-  const digest = await input.sources.publish(manifest, finalSignal);
-  finalSignal.throwIfAborted();
-  return { digest, manifest };
 }

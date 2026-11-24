@@ -23,7 +23,8 @@
 # ~/allrice-test/limits holds the approved 64G/32 configuration (29 usable). 8 per run by
 # default and at most 12. On M1: 2 runs of 2 workers. ALLRICE_TEST_DATABASE_URL is always set;
 # --db and --browser set ALLRICE_RUN_DB_INTEGRATION and ALLRICE_RUN_BROWSER_INTEGRATION. The
-# default build is `pnpm --filter @allrice/contracts build`, as `pnpm test` does. Output is also
+# default build is the tested commit's `pnpm build:test-sources`, as `pnpm test` does.
+# Older commits build contracts directly. Output is also
 # kept in ~/allrice40-dev/qa/m5-test/; the last line names the machine the run finished on.
 #
 # codex: gpt-6.2-sol (or --model) runs `codex exec` at max in that worktree after the install
@@ -142,7 +143,8 @@ if [ "$cmd" = setup ]; then
   exit
 fi
 
-ref="" on=auto wait=600 build="pnpm --filter @allrice/contracts build" out="" full=0 model=gpt-6.2-sol test_env=""
+default_build='if node -e "process.exit(require(\"./package.json\").scripts?.[\"build:test-sources\"] ? 0 : 1)"; then pnpm build:test-sources; else pnpm --filter @allrice/contracts build; fi'
+ref="" on=auto wait=600 build="$default_build" out="" full=0 model=gpt-6.2-sol test_env=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; break ;;

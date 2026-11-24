@@ -1,5 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -97,6 +104,48 @@ async function fixture() {
   return { root, raw, sources, b, key, manifest, snapshot };
 }
 
+async function withChild(f: Awaited<ReturnType<typeof fixture>>) {
+  const header = {
+    id: 'child',
+    version: 4 as const,
+    createdAt: 2,
+    isSeeded: false,
+  };
+  const event = {
+    type: 'subagent/catalog' as const,
+    seq: 0,
+    time: 2,
+    data: {
+      version: 0 as const,
+      childId: 'child',
+      childCreatedAt: 2,
+      mode: 'one-shot' as const,
+    },
+  };
+  const parent = f.snapshot(f.b, 1);
+  parent.source.eventHashes = [hostHistoryDigest(event)];
+  const binding = {
+    ...f.b,
+    nativeSessionId: 'child',
+    parentNativeSessionId: 'root',
+  };
+  const child = f.snapshot(binding);
+  child.source.headerHash = hostHistoryDigest(header);
+  const manifest = structuredClone(f.manifest);
+  manifest.sessions[0]!.snapshotDigest = await f.raw.publish(parent, signal());
+  manifest.sessions.push({
+    binding,
+    header,
+    snapshotDigest: await f.raw.publish(child, signal()),
+  });
+  manifest.edges.push({
+    parentNativeSessionId: 'root',
+    childNativeSessionId: 'child',
+    parentEvent: event,
+  });
+  return { parent, child, manifest };
+}
+
 describe('committed host history source', () => {
   it('does not expose an already-published snapshot before manifest commit', async () => {
     const f = await fixture();
@@ -176,47 +225,7 @@ describe('committed host history source', () => {
   });
   it('checks original header, exact own catalog event, complete ancestry and crossed vectors', async () => {
     const f = await fixture();
-    const childHeader = {
-      id: 'child',
-      version: 4 as const,
-      createdAt: 2,
-      isSeeded: false,
-    };
-    const event = {
-      type: 'subagent/catalog' as const,
-      seq: 0,
-      time: 2,
-      data: {
-        version: 0 as const,
-        childId: 'child',
-        childCreatedAt: 2,
-        mode: 'one-shot' as const,
-      },
-    };
-    const parent = f.snapshot(f.b, 1);
-    parent.source.eventHashes = [hostHistoryDigest(event)];
-    const childBinding = {
-      ...f.b,
-      nativeSessionId: 'child',
-      parentNativeSessionId: 'root',
-    };
-    const child = f.snapshot(childBinding);
-    child.source.headerHash = hostHistoryDigest(childHeader);
-    const manifest = structuredClone(f.manifest);
-    manifest.sessions[0]!.snapshotDigest = await f.raw.publish(
-      parent,
-      signal(),
-    );
-    manifest.sessions.push({
-      binding: childBinding,
-      header: childHeader,
-      snapshotDigest: await f.raw.publish(child, signal()),
-    });
-    manifest.edges.push({
-      parentNativeSessionId: 'root',
-      childNativeSessionId: 'child',
-      parentEvent: event,
-    });
+    const { parent, child, manifest } = await withChild(f);
     await f.sources.publish(manifest, signal());
     for (const mutate of [
       (m: HostHistorySource) => {
@@ -265,6 +274,146 @@ describe('committed host history source', () => {
       advancedParent,
     );
   });
+
+  it('serializes concurrent incompatible cuts from independent publishers without corrupting prior cursors', async () => {
+    const f = await fixture();
+    const { parent, child, manifest } = await withChild(f);
+    await f.sources.publish(manifest, signal());
+    const original = manifest.sessions[0]!.snapshotDigest;
+    const updates = [parent, child].map((value, index) => {
+      const next = structuredClone(value);
+      next.source.throughSeq++;
+      next.source.eventHashes.push(hostHistoryDigest({ update: index }));
+      return next;
+    });
+    const digests = await Promise.all(
+      updates.map((value) => f.raw.publish(value, signal())),
+    );
+    const candidates = digests.map((digest, index) => {
+      const candidate = structuredClone(manifest);
+      candidate.sessions[index]!.snapshotDigest = digest;
+      return candidate;
+    });
+    const ready = [gate(), gate()];
+    const release = gate();
+    const publishers = ready.map((gate) => {
+      let reads = 0;
+      return new HostHistorySourceStore(f.root, {
+        publish: f.raw.publish.bind(f.raw),
+        async read(...args) {
+          // Both publishers have validated their candidate and taken the
+          // directory listing before either can finish reading the old cut.
+          if (++reads === manifest.sessions.length + 1) {
+            gate.release();
+            await release.promise;
+          }
+          return f.raw.read(...args);
+        },
+      });
+    });
+    const outcomes = Promise.allSettled(
+      publishers.map((publisher, index) =>
+        publisher.publish(candidates[index]!, signal()),
+      ),
+    );
+    try {
+      await Promise.race([
+        Promise.all(ready.map((entry) => entry.promise)),
+        outcomes.then(() => {
+          throw Error(
+            'Publishers exited before reading the same committed cut',
+          );
+        }),
+      ]);
+    } finally {
+      release.release();
+    }
+    const results = await outcomes;
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(
+      1,
+    );
+    const losingIndex = results.findIndex(
+      ({ status }) => status === 'rejected',
+    );
+    expect(results[losingIndex]).toMatchObject({
+      status: 'rejected',
+      reason: expect.any(HostHistoryIntegrityError),
+    });
+    const cursor = (await f.sources.read(f.key, signal(), {
+      nativeSessionId: 'root',
+      snapshotDigest: original,
+    }))!;
+    expect(
+      (await f.sources.committedStore(cursor).read(f.b, signal()))?.digest,
+    ).toBe(original);
+    await expect(
+      f.sources.read(f.key, signal(), {
+        nativeSessionId: updates[losingIndex]!.binding.nativeSessionId,
+        snapshotDigest: digests[losingIndex]!,
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    const combined = structuredClone(manifest);
+    combined.sessions.forEach((row, index) => {
+      row.snapshotDigest = digests[index]!;
+    });
+    const digest = await f.sources.publish(combined, signal());
+    expect(await f.sources.read(f.key, signal())).toEqual({
+      digest,
+      manifest: combined,
+    });
+  });
+
+  it('reads legacy digest-named cuts and continues their verified history', async () => {
+    const f = await fixture();
+    const directory = join(
+      f.root,
+      'sources',
+      hostHistoryDigest(f.key).slice(7),
+    );
+    const digest = hostHistoryDigest(f.manifest);
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, `${digest.slice(7)}.json`),
+      JSON.stringify(f.manifest),
+    );
+    expect(await f.sources.read(f.key, signal())).toEqual({
+      digest,
+      manifest: f.manifest,
+    });
+    const next = structuredClone(f.manifest);
+    next.sessions[0]!.snapshotDigest = await f.raw.publish(
+      f.snapshot(f.b, 1),
+      signal(),
+    );
+    expect(await f.sources.publish(next, signal())).toBe(
+      hostHistoryDigest(next),
+    );
+    expect(
+      await f.sources.read(f.key, signal(), {
+        nativeSessionId: 'root',
+        snapshotDigest: f.manifest.sessions[0]!.snapshotDigest,
+      }),
+    ).toEqual({ digest, manifest: f.manifest });
+  });
+
+  it('retains the privately verified manifest even when the caller changes its digest and members', async () => {
+    const f = await fixture();
+    await f.sources.publish(f.manifest, signal());
+    const selected = (await f.sources.read(f.key, signal()))!;
+    const original = f.sources.committedStore(selected);
+    const unpublished = await f.raw.publish(f.snapshot(f.b, 1), signal());
+    selected.manifest.sessions[0]!.snapshotDigest = unpublished;
+    Object.assign(selected, { digest: hostHistoryDigest(selected.manifest) });
+    expect(() => f.sources.committedStore(selected)).toThrow(
+      HostHistoryIntegrityError,
+    );
+    await expect(
+      original.read(f.b, signal(), unpublished),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    expect((await original.read(f.b, signal()))?.digest).toBe(
+      f.manifest.sessions[0]!.snapshotDigest,
+    );
+  });
   it('refuses missing roots and cross-person bindings', async () => {
     const f = await fixture();
     for (const mutate of [
@@ -302,7 +451,7 @@ describe('committed host history source', () => {
       (await readdir(dir)).find((name) => name.endsWith('.json'))!,
     );
     const value = JSON.parse(await readFile(file, 'utf8'));
-    value.key.rootBindingRef = 'replaced';
+    value.manifest.key.rootBindingRef = 'replaced';
     await writeFile(file, JSON.stringify(value));
     await expect(f.sources.read(f.key, signal())).rejects.toBeInstanceOf(
       HostHistoryIntegrityError,
