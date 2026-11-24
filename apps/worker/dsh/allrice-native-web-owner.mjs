@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { renameSync } from 'node:fs';
+import { renameSync, write } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { isIP } from 'node:net';
@@ -266,12 +266,18 @@ export function apply(ctx, config) {
     publicationFailure ??= { error };
     void retire().catch(() => {});
     if (publishing) {
-      // Cordis CLI logs this startup failure. Error messages and filesystem
-      // paths can contain generation credentials, so only report known codes.
+      // The rc.2 startup log exporter is removed before appReady. Write only
+      // the bounded marker to the existing native job's stderr, after fencing.
       const code = publicationCodes.has(error?.code) ? error.code : 'FAILED';
-      ctx.logger.error(
-        `Native web auth publication failed [${publicationStage}/${code}]`,
-      );
+      try {
+        write(
+          2,
+          `Native web auth publication failed [${publicationStage}/${code}]\n`,
+          () => {},
+        );
+      } catch {
+        // A closed diagnostic sink cannot change the retirement result.
+      }
     }
   });
 
