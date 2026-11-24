@@ -71,16 +71,22 @@ export function createDEntryProfile(
         { once: true },
       );
       if (source.revoked.aborted) revoked();
-      held = holdReleasedProfile(trustedReleaseDirectory, source, caller).then(
-        (release) => ({ release, bootstrap: 'available', events: false }),
-      );
+      // The first finite preflight can finish before bootstrap/assets requests.
+      // This verified release stays bound to the current page/source lifetime.
+      held = holdReleasedProfile(
+        trustedReleaseDirectory,
+        source,
+        page.signal,
+      ).then((release) => ({ release, bootstrap: 'available', events: false }));
       publications.set(page, held);
       void held.catch((error) => {
         publications.delete(page);
-        if (!caller.aborted && !page.signal.aborted) page.invalidate(error);
+        if (!page.signal.aborted) page.invalidate(error);
       });
     }
-    return held;
+    const current = await held;
+    caller.throwIfAborted();
+    return current;
   }
 
   async function json(

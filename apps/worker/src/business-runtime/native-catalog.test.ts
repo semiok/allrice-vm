@@ -57,6 +57,11 @@ function fixture() {
       ok: true as const,
       value: base.catalog,
     })),
+    readImmutableGraphFor: vi.fn<NativeWebOwner['readImmutableGraphFor']>(
+      async () => {
+        throw new DEntryNativeUnavailable();
+      },
+    ),
     readModelCatalogFor: vi.fn<NativeWebOwner['readModelCatalogFor']>(
       async () => {
         throw new DEntryNativeUnavailable();
