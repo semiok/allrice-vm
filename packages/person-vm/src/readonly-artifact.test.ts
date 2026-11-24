@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   chmod,
   lstat,
@@ -131,15 +132,14 @@ function inspection(c: ReadonlyDshDirectory) {
   };
 }
 
-it('requires the independently sealed control bytes and an exact active read-only mount beside DSH', async () => {
-  const f = await fixture();
+async function controlFixture(root: string) {
   const files = new Map(
     COMMAND_MEMORY_CONTROL_FILES.map((name) => [name, Buffer.from(name)]),
   );
   const sha256 = hashCommandMemoryControlFiles(files);
   const controls = {
     sha256,
-    hostDirectory: join(f.root, sha256),
+    hostDirectory: join(root, sha256),
     guestDirectory: `/opt/allrice/command-memory/${sha256}`,
   };
   await mkdir(controls.hostDirectory, { mode: 0o700 });
@@ -148,6 +148,24 @@ it('requires the independently sealed control bytes and an exact active read-onl
     await writeFile(path, files.get(name)!);
     await chmod(path, name === 'launch-dsh.sh' ? 0o555 : 0o444);
   }
+  return controls;
+}
+
+it('rejects a non-regular control artifact with no writer waiting on the pipe', async () => {
+  const { root } = await fixture();
+  const controls = await controlFixture(root);
+  const guard = join(controls.hostDirectory, 'bash-env.sh');
+  await rm(guard);
+  execFileSync('/usr/bin/mkfifo', [guard]);
+  await chmod(guard, 0o444);
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('requires the independently sealed control bytes and an exact active read-only mount beside DSH', async () => {
+  const f = await fixture();
+  const controls = await controlFixture(f.root);
   await expect(
     verifyReadonlyCommandMemoryDirectory(controls, signal()),
   ).resolves.toBeUndefined();

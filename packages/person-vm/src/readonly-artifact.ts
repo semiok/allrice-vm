@@ -134,7 +134,10 @@ async function metadataFile(
   expectedMode = 0o600,
 ) {
   signal.throwIfAborted();
-  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
     const s = await fd.stat({ bigint: true });
     owned(s);

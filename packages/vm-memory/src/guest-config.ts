@@ -128,15 +128,21 @@ export async function createVmMemoryGuestPlan(input: {
   )
     throw new Error('invalid_guest_memory_directory');
   const directory = join(root, 'allrice-memory');
+  const configuredReceipt = input.commandReceipt;
+  const legacyReceipt = configuredReceipt && {
+    nodeExecutable: configuredReceipt.nodeExecutable,
+    receiptDirectory: configuredReceipt.receiptDirectory,
+  };
+  const configuredControls = input.dshCommandMemory;
   const controls =
-    input.dshCommandMemory &&
-    checkedReadonlyCommandMemoryDirectory(input.dshCommandMemory);
-  if (controls && input.commandReceipt)
+    configuredControls &&
+    checkedReadonlyCommandMemoryDirectory(configuredControls);
+  if (controls && legacyReceipt)
     throw new Error('ambiguous_command_memory_owner');
   const controlDirectory = controls?.guestDirectory ?? directory;
   const receipt = controls
     ? { nodeExecutable: guestNodeExecutable, receiptDirectory }
-    : input.commandReceipt;
+    : legacyReceipt;
   if (
     receipt &&
     (![receipt.nodeExecutable, receipt.receiptDirectory].every(

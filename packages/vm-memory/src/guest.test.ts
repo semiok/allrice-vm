@@ -712,6 +712,30 @@ describe.sequential(
         ).rejects.toThrow('invalid_command_receipt_configuration');
     });
 
+    it('uses the same snapshotted receipt paths for config and launch across staging reads', async () => {
+      const commandReceipt = {
+        nodeExecutable: '/fixed-node/bin/node',
+        receiptDirectory: '/fixture/encrypted/receipts',
+      };
+      const creating = createVmMemoryGuestPlan({
+        persistentDirectory: '/fixture/encrypted',
+        commandReceipt,
+      });
+      commandReceipt.nodeExecutable = '/changed/bin/node';
+      commandReceipt.receiptDirectory = '/changed/receipts';
+      const plan = await creating;
+      expect(plan.env.ALLRICE_MEMORY_RECEIPT_NODE).toBe('/fixed-node/bin/node');
+      const config = plan.files.find(
+        (file) => file.path === plan.initialize.args[1],
+      )!;
+      expect(JSON.parse(config.contents).receiptDirectory).toBe(
+        '/fixture/encrypted/receipts',
+      );
+      expect(plan.env.ALLRICE_MEMORY_RECEIPT_DIRECTORY).toBe(
+        '/fixture/encrypted/receipts',
+      );
+    });
+
     it('binds the native overlay to the separate sealed program and keeps write state out of the workspace', async () => {
       const artifact = await readPersonVmDshCommandMemoryControls();
       expect(artifact.files.map((file) => file.name)).toEqual([
