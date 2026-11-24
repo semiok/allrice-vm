@@ -105,6 +105,41 @@ describe('brand-media scoped access', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it('expires the live visit when a canceled body reader still reports authentication loss', async () => {
+    const late = deferred<Response>();
+    const fetch = vi.fn(() => late.promise);
+    vi.stubGlobal('fetch', fetch);
+    const { client, hide, revoke } = panelClient();
+    const reader = new AbortController();
+    const discard = vi.fn();
+    const current = expect(
+      client.body(
+        { objectId: id(7), versionId: id(8), checksum },
+        reader.signal,
+        discard,
+      ),
+    ).rejects.toThrow('登录已过期，请重新登录');
+    reader.abort();
+    late.resolve(
+      Response.json(
+        {
+          error: {
+            code: 'AUTHENTICATION_REQUIRED',
+            message: 'Authentication required',
+            requestId: id(11),
+            retryable: false,
+          },
+        },
+        { status: 401 },
+      ),
+    );
+    await current;
+    expect(revoke).toHaveBeenCalledOnce();
+    expect(discard).not.toHaveBeenCalled();
+    expect(hide).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it.each(['disabled', 'enabled', 'unknown'] as const)(
     'joins one scoped catalog check for concurrent branded record denials (%s)',
     async (outcome) => {

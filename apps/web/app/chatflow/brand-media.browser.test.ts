@@ -53,6 +53,7 @@ const brandView = (url: URL, view: string) =>
 const accessProblem = (
   message: string,
   code:
+    | 'AUTHENTICATION_REQUIRED'
     | 'AUTHORIZATION_DENIED'
     | 'VERSION_CONFLICT'
     | 'RESOURCE_NOT_FOUND' = 'AUTHORIZATION_DENIED',
@@ -1251,9 +1252,13 @@ suite('MET-224 main-area brand media text workflow', () => {
     const listStarted = gate();
     const list = gate();
     let holdList = false;
+    let denyA = true;
     const missing = '文章 20';
     const independent = '文章 21';
     const denial = '当前员工的这篇文章已删除';
+    const denialAlert = panel(page)
+      .getByRole('alert')
+      .filter({ hasText: denial });
     try {
       await f.open();
       await panel(page)
@@ -1265,6 +1270,7 @@ suite('MET-224 main-area brand media text workflow', () => {
       await page.route(brandEndpoint, async (route) => {
         const url = new URL(route.request().url());
         if (
+          denyA &&
           brandView(url, 'article') &&
           url.searchParams.get('articleId') === id(20)
         ) {
@@ -1304,10 +1310,7 @@ suite('MET-224 main-area brand media text workflow', () => {
       await page.evaluate(() => window.dispatchEvent(new Event('online')));
       await listStarted.promise;
       detail.resolve();
-      await panel(page)
-        .getByRole('alert')
-        .filter({ hasText: denial })
-        .waitFor();
+      await denialAlert.waitFor();
       await panel(page)
         .getByRole('heading', { name: independent, exact: true })
         .waitFor();
@@ -1326,6 +1329,27 @@ suite('MET-224 main-area brand media text workflow', () => {
           .getByRole('button', { name: missing, exact: true })
           .count(),
       ).toBe(0);
+      expect(await denialAlert.isVisible()).toBe(true);
+
+      const newerB = '文章 21 再次成功读取';
+      f.state.articles = [{ ...article(21), title: newerB }];
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('button', { name: newerB, exact: true })
+        .waitFor();
+      expect(await denialAlert.isVisible()).toBe(true);
+
+      denyA = false;
+      const restored = '文章 20 重新取得授权';
+      f.state.articles.push({ ...article(), title: restored });
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await panel(page)
+        .getByRole('button', { name: restored, exact: true })
+        .click();
+      await panel(page)
+        .getByRole('heading', { name: restored, exact: true })
+        .waitFor();
+      await denialAlert.waitFor({ state: 'hidden' });
     } finally {
       detail.resolve();
       list.resolve();
@@ -2967,6 +2991,78 @@ suite('MET-224 main-area brand media text workflow', () => {
     ).toBe(true);
     await f.close();
   });
+  it.each([403, 404])(
+    'a refused article delivery (%i) evicts only its pin and clears on its own successful read',
+    async (status) => {
+      const newFile = {
+        objectId: id(82),
+        versionId: id(83),
+        checksum: 'sha256:' + 'b'.repeat(64),
+      };
+      const stored = { ...article(), body: newFile };
+      const run = recovery('article');
+      const original = run.deliveries[0]!;
+      const current = { ...original, file: newFile };
+      run.deliveries = [original, current];
+      const f = await fixture({ articles: [stored], runs: [run] });
+      const { page } = f;
+      const path = `/api/v1/files/${original.file.objectId}/download`;
+      const contents = page.getByLabel('文章正文');
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const warning = panel(page)
+        .getByRole('alert')
+        .filter({ hasText: '正文文件暂时不可读' });
+      let saves = 0;
+      let refused = true;
+      page.on('download', () => saves++);
+      try {
+        await f.open();
+        await panel(page)
+          .getByRole('tab', { name: '文章库', exact: true })
+          .click();
+        await expect
+          .poll(() => contents.textContent())
+          .toContain('不可直接改写的正文');
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await page.route(
+          (url) => url.pathname === path,
+          (route) =>
+            refused
+              ? route.fulfill({
+                  status,
+                  json: accessProblem(
+                    '该正文文件已不可读取',
+                    status === 403
+                      ? 'AUTHORIZATION_DENIED'
+                      : 'RESOURCE_NOT_FOUND',
+                  ),
+                })
+              : route.fallback(),
+        );
+        await deliveries.first().press('Enter');
+        await warning.waitFor();
+        expect(await deliveries.count()).toBe(1);
+        expect(await contents.textContent()).toContain('不可直接改写的正文');
+        expect(saves).toBe(0);
+
+        refused = false;
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        await expect.poll(() => deliveries.count()).toBe(2);
+        expect(await warning.isVisible()).toBe(true);
+        const saved = page.waitForEvent('download');
+        await deliveries.first().press('Enter');
+        expect((await saved).suggestedFilename()).toBe('allrice-export');
+        await warning.waitFor({ state: 'hidden' });
+        expect(saves).toBe(1);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+
   async function imagesPage(f: Awaited<ReturnType<typeof fixture>>) {
     await f.open();
     await f.page.getByRole('tab', { name: '文章库', exact: true }).click();
@@ -3570,7 +3666,7 @@ suite('MET-224 main-area brand media text workflow', () => {
     await f.close();
   });
 
-  it.each(['new-pin', 'switch-to-B'] as const)(
+  it.each(['new-pin', 'switch-to-B', 'expired-visit', 'closed-visit'] as const)(
     'a late denial for the copied body evicts only its exact article and pin (%s)',
     async (change) => {
       const old = article();
@@ -3594,7 +3690,7 @@ suite('MET-224 main-area brand media text workflow', () => {
       };
       const next = {
         ...old,
-        id: change === 'new-pin' ? old.id : id(21),
+        id: change === 'switch-to-B' ? id(21) : old.id,
         revision: 2,
         body: newPin,
         title: '独立授权的新文章正文',
@@ -3604,9 +3700,9 @@ suite('MET-224 main-area brand media text workflow', () => {
       run.submission = { articleUpdated: false, revision: null };
       const delivery = { ...run.deliveries[0]!, file: newPin };
       run.deliveries =
-        change === 'new-pin' ? [run.deliveries[0]!, delivery] : [delivery];
+        change === 'switch-to-B' ? [delivery] : [run.deliveries[0]!, delivery];
       const f = await fixture({
-        articles: change === 'new-pin' ? [old] : [old, next],
+        articles: change === 'switch-to-B' ? [old, next] : [old],
         runs: [run],
       });
       const { page } = f;
@@ -3614,6 +3710,7 @@ suite('MET-224 main-area brand media text workflow', () => {
       const refuse = gate();
       const bodyPath = (objectId: string) =>
         '/api/v1/files/' + objectId + '/download';
+      const authLost = change === 'expired-visit' || change === 'closed-visit';
       try {
         await page
           .context()
@@ -3628,14 +3725,21 @@ suite('MET-224 main-area brand media text workflow', () => {
         await expect
           .poll(() => page.getByLabel('文章正文').textContent())
           .toContain('不可直接改写的正文');
+        if (change === 'closed-visit')
+          await finishDespiteAbort(page, bodyPath(file.objectId));
         await page.route(
           (url) => url.pathname === bodyPath(file.objectId),
           async (route) => {
             requested.resolve();
             await refuse.promise;
             await route.fulfill({
-              status: 403,
-              json: accessProblem('旧正文的文件授权已撤销'),
+              status: authLost ? 401 : 403,
+              json: authLost
+                ? accessProblem(
+                    'Authentication required',
+                    'AUTHENTICATION_REQUIRED',
+                  )
+                : accessProblem('旧正文的文件授权已撤销'),
             });
           },
         );
@@ -3658,7 +3762,7 @@ suite('MET-224 main-area brand media text workflow', () => {
             url.searchParams.get('articleId') === next.id
           );
         });
-        if (change === 'new-pin') {
+        if (change !== 'switch-to-B') {
           f.state.articles[0] = next;
           await page.evaluate(() => window.dispatchEvent(new Event('online')));
         } else {
@@ -3671,6 +3775,61 @@ suite('MET-224 main-area brand media text workflow', () => {
         await expect
           .poll(() => page.getByLabel('文章正文').textContent())
           .toBe('经独立读取的新版本字节');
+        if (authLost) {
+          if (change === 'closed-visit') {
+            await panel(page)
+              .getByRole('button', { name: '← 回到对话' })
+              .click();
+            await f.open();
+            await panel(page)
+              .getByRole('tab', { name: '文章库', exact: true })
+              .click();
+            await expect
+              .poll(() => page.getByLabel('文章正文').textContent())
+              .toBe('经独立读取的新版本字节');
+          }
+          const denied = page.waitForResponse(
+            (response) =>
+              new URL(response.url()).pathname === bodyPath(file.objectId) &&
+              response.status() === 401,
+          );
+          refuse.resolve();
+          const response = await denied;
+          // The active 401 terminates its own response body with the visit.
+          // A retired response deliberately lets its body finish uncooperatively.
+          if (change === 'closed-visit') await response.finished();
+          await page.evaluate(
+            () =>
+              new Promise<void>((done) =>
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => done()),
+                ),
+              ),
+          );
+          const expired = panel(page)
+            .getByRole('alert')
+            .filter({ hasText: '登录已过期，请重新登录' });
+          if (change === 'expired-visit') {
+            expect(await expired.isVisible()).toBe(true);
+            expect(await panel(page).getByRole('tab').count()).toBe(0);
+            expect(await panel(page).getByLabel('文章正文').count()).toBe(0);
+            await panel(page)
+              .getByRole('button', { name: '← 回到对话' })
+              .click();
+            expect(await page.getByLabel('聊天草稿').inputValue()).toBe(
+              '未发送的聊天草稿',
+            );
+          } else {
+            expect(await expired.count()).toBe(0);
+            expect(await page.getByLabel('文章正文').textContent()).toBe(
+              '经独立读取的新版本字节',
+            );
+          }
+          expect(
+            await page.evaluate(() => navigator.clipboard.readText()),
+          ).toBe('保持原剪贴板');
+          return;
+        }
         refuse.resolve();
         await panel(page)
           .getByRole('alert')

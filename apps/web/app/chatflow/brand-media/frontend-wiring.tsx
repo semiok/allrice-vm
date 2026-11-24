@@ -47,6 +47,7 @@ import {
   type BrandMediaReadInput,
   type BrandMediaTopic,
 } from '@allrice/contracts';
+import { requestFailureMessage } from '../../../lib/chatflow/request-failure';
 import { EmployeePluginSection } from '../employee-capability-presentation';
 import { createSessionRunStream } from '../session-run-stream';
 import css from './frontend-wiring.module.css';
@@ -176,7 +177,6 @@ function mayBeScopeDenial(cause: unknown): cause is BrandMediaRequestError {
 }
 
 type OnBrandReadDenied = (cause: Error) => void;
-const isFileDenied = (status: number) => [401, 403, 404].includes(status);
 
 function recordReadDenied(cause: unknown): cause is BrandMediaRequestError {
   return (
@@ -239,6 +239,13 @@ function brandMediaOperations(
     access && signal
       ? AbortSignal.any([access.signal, signal])
       : (access?.signal ?? signal);
+  const revokeAuthentication = (status: number) => {
+    if (!access || status !== 401) return;
+    access.signal.throwIfAborted();
+    const expired = new Error(requestFailureMessage({ status }));
+    access.revoke(expired);
+    throw expired;
+  };
   const request = async (url: string, options?: RequestInit) => {
     const signal = scopedSignal(options?.signal);
     signal?.throwIfAborted();
@@ -246,10 +253,59 @@ function brandMediaOperations(
       url,
       scope.headers,
       signal ? { ...options, signal } : options,
-    );
+    ).catch((cause) => {
+      if (
+        cause instanceof BrandMediaRequestError &&
+        cause.code === 'AUTHENTICATION_REQUIRED'
+      )
+        revokeAuthentication(cause.status);
+      throw cause;
+    });
     signal?.throwIfAborted();
     return raw;
   };
+  function rejectFile(
+    status: number,
+    cause: Error,
+    onDenied?: OnBrandReadDenied,
+  ): never {
+    // A file response can outlive the selected pin, but only the visit that
+    // issued the request may act on its authorization result.
+    access?.signal.throwIfAborted();
+    revokeAuthentication(status);
+    if (status === 403 || status === 404) onDenied?.(cause);
+    throw cause;
+  }
+  async function downloadResponse(
+    objectId: string,
+    kind: 'image' | 'delivery',
+    onDenied?: OnBrandReadDenied,
+    reader?: AbortSignal,
+  ) {
+    const signal = scopedSignal(reader);
+    signal?.throwIfAborted();
+    const image = kind === 'image';
+    const response = await fetch(
+      `/api/v1/${image ? 'workbench/files' : 'files'}/${objectId}/download${q}`,
+      {
+        headers: scope.headers,
+        signal,
+        cache: 'no-store',
+      },
+    );
+    if (!response.ok)
+      rejectFile(
+        response.status,
+        Error(
+          image
+            ? '原图暂时不可下载，请核对权限后重试。'
+            : '正文文件暂时不可读，请重新核对权限。',
+        ),
+        onDenied,
+      );
+    signal?.throwIfAborted();
+    return { response, signal };
+  }
   const catalog = async (signal?: AbortSignal) =>
     z
       .object({
@@ -432,18 +488,12 @@ function brandMediaOperations(
       signal?: AbortSignal,
       onDenied?: OnBrandReadDenied,
     ) => {
-      const current = scopedSignal(signal);
-      current?.throwIfAborted();
-      const response = await fetch(
-        `/api/v1/files/${file.objectId}/download${q}`,
-        { headers: scope.headers, signal: current, cache: 'no-store' },
+      const { response, signal: current } = await downloadResponse(
+        file.objectId,
+        'delivery',
+        onDenied,
+        signal,
       );
-      current?.throwIfAborted();
-      if (!response.ok) {
-        const cause = Error('正文文件暂时不可读，请重新核对权限。');
-        if (isFileDenied(response.status)) onDenied?.(cause);
-        throw cause;
-      }
       const text = await response.text();
       current?.throwIfAborted();
       return text;
@@ -570,13 +620,10 @@ function brandMediaOperations(
         `/api/v1/workbench/files/${objectId}/preview${q}`,
         { signal },
       ).catch((cause) => {
-        if (
-          !access?.signal.aborted &&
-          !signal?.aborted &&
-          cause instanceof BrandMediaRequestError &&
-          isFileDenied(cause.status)
-        )
-          denyImage(objectId, cause);
+        if (cause instanceof BrandMediaRequestError)
+          rejectFile(cause.status, cause, (denial) =>
+            denyImage(objectId, denial),
+          );
         throw cause;
       });
       const preview = z
@@ -588,25 +635,18 @@ function brandMediaOperations(
         .parse(raw);
       return `data:${preview.mediaType};base64,${preview.base64}`;
     },
-    download: async (objectId: string, kind: 'image' | 'delivery') => {
-      const signal = scopedSignal();
+    download: async (
+      objectId: string,
+      kind: 'image' | 'delivery',
+      onDenied?: OnBrandReadDenied,
+    ) => {
       const image = kind === 'image';
       const observed = imageAccess.denial(objectId);
-      signal?.throwIfAborted();
-      const response = await fetch(
-        `/api/v1/${image ? 'workbench/files' : 'files'}/${objectId}/download${q}`,
-        { headers: scope.headers, signal, cache: 'no-store' },
+      const { response, signal } = await downloadResponse(
+        objectId,
+        kind,
+        image ? (cause) => denyImage(objectId, cause) : onDenied,
       );
-      signal?.throwIfAborted();
-      if (!response.ok) {
-        const cause = Error(
-          image
-            ? '原图暂时不可下载，请核对权限后重试。'
-            : '正文文件暂时不可读，请重新核对权限。',
-        );
-        if (image && isFileDenied(response.status)) denyImage(objectId, cause);
-        throw cause;
-      }
       const disposition = response.headers.get('Content-Disposition') ?? '';
       const name = disposition.split("filename*=UTF-8''")[1];
       const bytes = await response.blob();
