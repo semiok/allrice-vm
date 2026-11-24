@@ -4,13 +4,17 @@
 -- the partitions is left. psql variables:
 --   targets   [{partitionId, ownerId, epoch, tokenDigest}] as the tool read them
 --   evidence  the exit it verified (an object), kept in each proof
---   database_claim  expected PostgreSQL OID and ownership marker when recorded by QA
+--   database_claim  optional PostgreSQL OID and ownership marker when recorded by QA
 -- Writes what releaseClosedWriter writes after a clean shutdown
 -- (packages/database/src/native-schedule-control-sql.ts): the audit row, then closed=true
 -- with the same proof, so the next Worker's validClose accepts it. Owner, epoch and token
 -- stay; occurrences, controls and journals are not touched. A partition that is not
 -- exactly as read, still open with an expired lease and no proof yet raises, and nothing
 -- of the transaction is written.
+\if :{?database_claim}
+\else
+  \set database_claim ''
+\endif
 SELECT set_config('allrice.recover_targets', :'targets', true), set_config('allrice.recover_evidence', :'evidence', true);
 SELECT set_config('allrice.recover_database_claim', :'database_claim', true);
 DO $recover$

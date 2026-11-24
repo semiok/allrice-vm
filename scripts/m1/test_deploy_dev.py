@@ -70,8 +70,9 @@ class DeployDevMigrations(unittest.TestCase):
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
         write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\nexit 113\n', 0o755)
-        write(os.path.join(self.stubs, 'ps'), '#!/bin/sh\nif [ "$1" = -E ]; then printf "%s" "${PROCESS_FULL:-$PROCESS_ARGS}"; '
-              'else printf "%s" "$PROCESS_ARGS"; fi\n', 0o755)
+        write(os.path.join(self.stubs, 'ps'), '#!/bin/sh\n'
+              'if [ -z "$PROCESS_TREE_STOPPED" ] && [ -n "$PROCESS_ARGS_BEFORE" ]; then '
+              'printf "%s" "$PROCESS_ARGS_BEFORE"; else printf "%s" "$PROCESS_ARGS"; fi\n', 0o755)
         write(os.path.join(self.stubs, 'lsof'), '#!/bin/sh\nprintf "%s" "$PROCESS_CWD"\n', 0o755)
         if sys.platform != 'darwin':  # GNU cp has no clonefile flag
             write(os.path.join(self.stubs, 'cp'), '#!/bin/sh\n[ "$1" != -c ] || shift\nexec /bin/cp "$@"\n', 0o755)
@@ -1193,7 +1194,7 @@ class DeployDevMigrations(unittest.TestCase):
         with open(os.path.join(HERE, 'lib.sh')) as f:
             write(os.path.join(directory, 'lib.sh'), f.read() + '\n' +
                   ('' if name == 'schedule-recover' else 'job_state() { echo gone; };\n') +
-                  'stop_job() { :; };\n'
+                  'stop_job() { export PROCESS_TREE_STOPPED=1; };\n'
                   'start_job() { echo UNEXPECTED_START >&2; return 90; };\n'
                   'M1_LAUNCHCTL="$TEST_STUBS/launchctl"\n')
         shutil.copyfile(os.path.join(HERE, 'with-env'), os.path.join(directory, 'with-env'))
@@ -1211,9 +1212,14 @@ class DeployDevMigrations(unittest.TestCase):
             with open(os.path.join(HERE, 'schedule-recover-processes.py')) as f:
                 source = f.read()
             source = source.replace('def observe_process(pid):', 'def native_observe_process(pid):', 1)
+            source = source.replace('def process_started(pid):', 'def native_process_started(pid):', 1)
             marker = "if __name__ == '__main__':"
-            source = source.replace(marker, '''def observe_process(pid):
-    import json
+            source = source.replace(marker, '''def process_started(pid):
+    if str(pid) == os.environ.get('PROCESS_WORKER_PID') and os.environ.get('PROCESS_TREE_STOPPED'):
+        raise OSError('fixture Worker exited')
+    return json.loads(os.environ.get('PROCESS_STARTS', '{}'))[str(pid)]
+
+def observe_process(pid):
     row = json.loads(os.environ.get('PROCESS_SNAPSHOT', 'null'))
     if row is None:
         raise OSError('fixture process environment unavailable')
@@ -1373,8 +1379,7 @@ class DeployDevMigrations(unittest.TestCase):
               'print(json.dumps(rows))\n', 0o755)
         return rows
 
-    def test_schedule_recover_checks_the_verified_worktree_and_instance_directory(self):
-        task = 'recover-scan'
+    def recovery_scan_fixture(self, task):
         instance = self.write_qa_plists(task)
         worker = self.read_plist(os.path.join(instance, 'worker.plist'))
         web = self.read_plist(os.path.join(instance, 'web.plist'))
@@ -1386,10 +1391,21 @@ class DeployDevMigrations(unittest.TestCase):
                            env=dict(HOME=self.home, PATH=os.defpath), capture_output=True, text=True, check=True)
         self.recovery_web_plist = destination
         self.recovery_web_cwd = web['WorkingDirectory']
+        self.recovery_worker_plist = os.path.join(agents, worker['Label'] + '.plist')
+        self.recovery_worker_cwd = worker['WorkingDirectory']
         write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\n'
-              'case "$2" in *-web) [ -n "$PROCESS_WEB_PID" ] || exit 113 ;; *) exit 113 ;; esac\n'
-              'printf "path = %s\\nworking directory = %s\\npid = %s\\n" '
-              '"$PROCESS_WEB_PLIST" "$PROCESS_WEB_CWD" "$PROCESS_WEB_PID"\n', 0o755)
+              'case "$2" in\n'
+              '  *-web) set -- "$PROCESS_WEB_PLIST" "$PROCESS_WEB_CWD" "$PROCESS_WEB_PID" ;;\n'
+              '  *-worker) [ -z "$PROCESS_TREE_STOPPED" ] || exit 113; '
+              'set -- "$PROCESS_WORKER_PLIST" "$PROCESS_WORKER_CWD" "$PROCESS_WORKER_PID" ;;\n'
+              '  *) exit 113 ;;\n'
+              'esac\n[ -n "$3" ] || exit 113\n'
+              'printf "path = %s\\nworking directory = %s\\npid = %s\\n" "$@"\n', 0o755)
+        return instance, worker, web
+
+    def test_schedule_recover_checks_the_verified_worktree_and_instance_directory(self):
+        task = 'recover-scan'
+        instance, worker, web = self.recovery_scan_fixture(task)
         release = worker['WorkingDirectory']
         web_entry = web['ProgramArguments'][2]
         old = os.path.join(self.home, 'allrice-qa', task, 'release')
@@ -1470,18 +1486,81 @@ class DeployDevMigrations(unittest.TestCase):
         self.check_recovery_scan(task, rows, 'Web plist has an unrelated inode', web_args, web_cwd, False,
                                  environment=db_env, **web_state)
 
+    def test_schedule_recover_refuses_uncertain_launch_evidence(self):
+        task = 'recover-evidence'
+        instance, worker, web = self.recovery_scan_fixture(task)
+        rows = self.seed_recovery_partition()
+        entry = os.path.join(self.home, 'allrice-qa', task, 'release', 'ordinary.mjs')
+        write(entry, '// inert fixture\n')
+        outside = os.path.dirname(entry)
+        for name, contents, allowed in (
+            ('LF', b'FIXTURE_FIRST=one\nFIXTURE_SECOND=two\n', True),
+            ('CRLF', b'FIXTURE_FIRST=one\r\nFIXTURE_SECOND=two\r\n', True),
+            ('standalone CR between fields', b'FIXTURE_FIRST=one\rFIXTURE_SECOND=two\n', False),
+            ('standalone CR inside a key', b'FIXTURE_\rSECOND=two\n', False),
+        ):
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp, name + '.env')
+                with open(path, 'wb') as dotenv:
+                    dotenv.write(contents)
+                self.check_recovery_scan(task, rows, name, [NODE, '--env-file=' + path, entry], outside, allowed,
+                                         reason=None if allowed else '环境文件含独立回车')
+
+        secret = 'fictional-fixture-password'
+        dsn = 'postgres://tester:' + secret + '@127.0.0.1:5434'
+        target = '/allrice40_qa_recover_evidence'
+        for name, value, extra, allowed, reason in (
+            ('full other database takes precedence', dsn + '/allrice_qa_recover_evidence',
+             {'PGDATABASE': target[1:]}, True, None),
+            ('full target database', dsn + target, {'PGDATABASE': 'other'}, False, None),
+            ('empty path despite PGDATABASE', dsn, {'PGDATABASE': 'other'}, False, 'URL 路径缺少库名'),
+            ('slash path despite username', dsn + '/', {}, False, 'URL 路径缺少库名'),
+            ('unverified connection overrides', dsn + '/other?database=' + target[1:], {}, False, 'DATABASE_URL 无法核实'),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, [NODE, entry], outside, allowed,
+                                         environment=dict(extra, DATABASE_URL=value), reason=reason, secret=secret)
+        self.check_recovery_scan(task, rows, 'official Web with pathless DSN',
+                                 web['ProgramArguments'], web['WorkingDirectory'], False,
+                                 web_pid='999999', environment={'DATABASE_URL': dsn + '/', 'PGDATABASE': target[1:]},
+                                 reason='URL 路径缺少库名', secret=secret)
+
+        helper = '/bin/sh'
+        for name, args, cwd, allowed, facts in (
+            ('visible unrelated helper', [helper, entry], outside, True, {}),
+            ('helper environment hidden outside scope', [helper, entry], outside, False,
+             dict(env_visible=False, reason='无法读取进程启动环境')),
+            ('helper native environment unavailable', [helper, entry], outside, False,
+             dict(observed=False, reason='无法读取进程启动环境')),
+            ('helper environment hidden in target cwd', [helper, entry], instance, False,
+             dict(env_visible=False, reason='无法读取进程启动环境')),
+            ('helper with target cwd', [helper, entry], instance, False, {}),
+            ('helper with target launch path', [helper, os.path.join(instance, 'helper.sh')], outside, False, {}),
+            ('known Worker descendant reparented', [helper, entry], outside, False,
+             dict(worker_parent=True, reason='999999 停止前已核实为 Worker 或其子进程')),
+            ('known Worker descendant off current list', [helper, entry], outside, False,
+             dict(worker_parent=True, listed=False, reason='999999 停止前已核实为 Worker 或其子进程')),
+        ):
+            with self.subTest(name=name):
+                self.check_recovery_scan(task, rows, name, args, cwd, allowed, executable=helper, **facts)
+
     def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
-                            web_pid='', observed=True, job_plist=None):
+                            web_pid='', observed=True, job_plist=None, executable=NODE, env_visible=True,
+                            worker_parent=False, listed=True, reason=None, secret=None):
         proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
-        environment = dict(HOME=self.home, **(environment or {}))
-        snapshot = dict(executable=NODE, args=args, environment=environment, started=started or time.time_ns()) if observed else None
-        command = '999999 1 node ' + ' '.join(args)
-        full = command + ' ' + ' '.join(f'{key}={value}' for key, value in environment.items())
+        started = started or time.time_ns()
+        environment = dict(HOME=self.home, **(environment or {})) if env_visible else {}
+        snapshot = dict(executable=executable, args=args, environment=environment, started=started) if observed else None
+        command = os.path.basename(executable)
+        before = f'999998 1 node\n999999 999998 {command}\n' if worker_parent else ''
         p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
                                  ROWS=json.dumps(rows), PROOF=proof, PROCESS_WEB_PID=web_pid,
                                  PROCESS_WEB_PLIST=job_plist or self.recovery_web_plist, PROCESS_WEB_CWD=self.recovery_web_cwd,
-                                 PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=command + '\n',
-                                 PROCESS_FULL=full + '\n', PROCESS_CWD=f'p999999\nn{cwd}\n')
+                                 PROCESS_WORKER_PID='999998' if worker_parent else '',
+                                 PROCESS_WORKER_PLIST=self.recovery_worker_plist, PROCESS_WORKER_CWD=self.recovery_worker_cwd,
+                                 PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=f'999999 1 {command}\n' if listed else '',
+                                 PROCESS_ARGS_BEFORE=before, PROCESS_STARTS=json.dumps({'999998': started - 1, '999999': started}),
+                                 PROCESS_CWD=f'p999999\nn{cwd}\n')
         self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
         self.assertEqual(os.path.exists(proof), allowed)
         if allowed:
@@ -1489,6 +1568,10 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertEqual(f.read(), QA_DATABASE_CLAIM)
         else:
             self.assertIn('processes that could own the partitions are still running', p.stderr)
+        if reason:
+            self.assertIn(reason, p.stderr)
+        if secret:
+            self.assertNotIn(secret, p.stdout + p.stderr)
 
     def test_schedule_recover_uses_parked_config_and_leaves_worker_stopped(self):
         worker = self.plist('worker')

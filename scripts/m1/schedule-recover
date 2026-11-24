@@ -42,7 +42,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 ts=$(date +%Y%m%d-%H%M%S)
-TASK_LOCKED="" OUT_ORPHANS="" OUT_OTHERS="" DATABASE_CLAIM=""
+TASK_LOCKED="" OUT_ORPHANS="" OUT_OTHERS="" DATABASE_CLAIM="" WORKER_TREE="{}"
 cleanup() {
   if [ -n "$OUT_ORPHANS" ]; then rm -f "$OUT_ORPHANS"; fi
   if [ -n "$OUT_OTHERS" ]; then rm -f "$OUT_OTHERS"; fi
@@ -136,7 +136,7 @@ worker_procs() {
   if [ "$mode" = dev ] || [ "$("$M1_PY" "$BIN/qa-lease.py" plist-claim "$INSTANCE" web "$WEB_CONFIG" 2>/dev/null)" = published ]; then
     web_state=$(job_state "$WEB_LABEL" "$WEB_CONFIG" "$release/apps/web") || web_state=""
   fi
-  "$M1_PY" "$BIN/schedule-recover-processes.py" "$DBNAME" "$ROOTS" "$release" "$PORT" \
+  "$M1_PY" "$BIN/schedule-recover-processes.py" scan "$DBNAME" "$ROOTS" "$WORKER_TREE" "$release" "$PORT" \
     "$WEB_CONFIG" "$WEB_LABEL" "$WEB_PORT" "$web_state"
 }
 worker_sessions() { RO=1 sql -c "select count(*) from pg_stat_activity where datname = current_database() and application_name = 'allrice-worker'"; }
@@ -146,7 +146,10 @@ print(time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(s)))'; }
 
 read -r status once recurring worker_id <<<"$(worker_ready)"
 was=$(job_state "$LABEL") || die "cannot read the launchd state of $LABEL"
-if [ -n "$execute" ] && [ "$was" != gone ]; then verify_worker "$PLIST" || exit 2; fi
+if [ -n "$execute" ] && [ "$was" != gone ]; then
+  verify_worker "$PLIST" || exit 2
+  [ "$(job_state "$LABEL" "$PLIST" "$release")" = "$was" ] || die "cannot verify the running Worker and its configuration"
+fi
 say "target $mode${task:+ $task}: Worker $LABEL ${was%% *} and $status, controllers once=$once recurring=$recurring, worker $worker_id; host booted $(boot_at)"
 OUT_ORPHANS=$(mktemp); OUT_OTHERS=$(mktemp)
 before=$(partitions) || die "cannot read the partitions"
@@ -183,9 +186,15 @@ restore() { # however the run ends after the stop, a Worker that was loaded runs
   exit "$rc"
 }
 trap restore EXIT; trap 'exit 130' INT TERM HUP
+[ "$(job_state "$LABEL" "$PLIST" "$release")" = "$was" ] || die "the Worker changed before shutdown; nothing written"
+if [[ "$was" = running\ * ]]; then
+  WORKER_TREE=$("$M1_PY" "$BIN/schedule-recover-processes.py" worker-tree "${was#running }") \
+    || die "cannot record the running Worker's descendants; nothing written"
+  [ "$(job_state "$LABEL" "$PLIST" "$release")" = "$was" ] || die "the Worker changed while recording descendants; nothing written"
+fi
 [ "$was" = gone ] || STOPPED=1
 say "stopping $LABEL"
-stop_job "$LABEL" "$PORT" || die "the Worker did not stop; nothing written"
+stop_job "$LABEL" "$PORT" "$PLIST" "$release" || die "the Worker did not stop; nothing written"
 for i in $(seq 1 10); do
   left=$(worker_procs) || die "cannot list processes; nothing written"
   sessions=$(worker_sessions) || die "cannot read the database sessions; nothing written"
@@ -203,7 +212,7 @@ show "$after" "-" >/dev/null
 evidence=$("$M1_PY" -c 'import json,sys
 k=("target","workerLabel","workerJobBefore","runningWorkerBeforeStop","hostBootAt","checkedAt","toolsVersion")
 d=dict(zip(k,sys.argv[1:]),basis="worker_stopped",tool="scripts/m1/schedule-recover",
-       ownerExit="Worker job stopped; no process with DATABASE_URL on this database or from its release or env file; no allrice-worker session")
+       ownerExit="Worker job stopped; known descendants exited; checked process launch environments and target paths; no allrice-worker session")
 print(json.dumps(dict(d,runningWorkerBeforeStop=None if d["runningWorkerBeforeStop"]=="-" else d["runningWorkerBeforeStop"])))' \
   "$mode${task:+:$task}" "$LABEL" "${was%% *}" "$worker_id" "$(boot_at)" "$checked" "$(cut -c1-12 "$BIN/TOOLS_VERSION" 2>/dev/null || echo source)")
 sql -1 -f "$BIN/schedule-recover.sql" -v targets="$expect" -v evidence="$evidence" -v database_claim="$DATABASE_CLAIM" >/dev/null ||

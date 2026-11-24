@@ -127,7 +127,7 @@ const { parseEnv } = require('node:util');
 const env = parseEnv(readFileSync(0, 'utf8'));
 const keys = process.argv.slice(1);
 process.stdout.write(JSON.stringify(keys.length ? Object.fromEntries(keys.map(key => [key, env[key]])) : env));
-''', *keys], input=contents, text=True, capture_output=True, check=True, timeout=5, env={})
+''', *keys], input=contents, capture_output=True, check=True, timeout=5, env={})
     return json.loads(result.stdout)
 
 
@@ -136,8 +136,8 @@ def controller_settings(env, loaded_env_file):
     missing = [key for key in CONTROLLER_KEYS if key not in env]
     defaults = {}
     if loaded_env_file and missing:
-        dotenv = loaded_env_file.read_text()
-        if any(key in dotenv for key in missing):
+        dotenv = loaded_env_file.read_bytes()
+        if any(key.encode() in dotenv for key in missing):
             pinned = Path.home() / '.local/opt/node-22.23.2/bin/node'
             node = shutil.which(str(pinned)) or shutil.which('node') or shutil.which('node', path='/opt/homebrew/bin:/usr/local/bin')
             if not node:
