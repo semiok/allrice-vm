@@ -2,10 +2,7 @@
  * These adapt the existing business port; they create no runtime factory,
  * SQL transaction, B/call association or production producer registration. */
 import type { EmployeeMemoryPort } from '@allrice/database';
-import {
-  createEmployeeMemoryPort,
-  EmployeeMemoryWriteOutcomeUnknown,
-} from '@allrice/database';
+import { EmployeeMemoryWriteOutcomeUnknown } from '@allrice/database';
 import { readDEntryBusinessIdentity } from '../business-runtime/d-entry-current.ts';
 import { denyBusinessProjection } from '../business-runtime/contract.ts';
 import type {
@@ -33,11 +30,11 @@ export function bindEmployeeMemoryMcpServices(
   AllriceMcpServices,
   'executionGeneration' | 'memoryRead' | 'memoryRemember'
 > {
-  const { targets } = options;
-  // The existing MCP server publishes only present business callbacks.
-  if (typeof targets?.actual !== 'function')
+  const { port, targets } = options;
+  // The default database port has no native runtime assembly. Only advertise
+  // callbacks when the host explicitly binds both business and target readers.
+  if (!port || typeof targets?.actual !== 'function')
     return { executionGeneration: '4.0' };
-  const port = options.port ?? createEmployeeMemoryPort();
   const target = async (scope: AllriceMcpScope, signal: AbortSignal) => {
     signal.throwIfAborted();
     const context = scope.requestContext;

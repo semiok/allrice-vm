@@ -23,8 +23,8 @@ const fixtures = vi.hoisted(() => ({
   read: vi.fn(),
   remember: vi.fn(),
 }));
-// Explicit identity/business contract fakes. The production adapter still
-// imports the actual 271 reader and the public memory port, never these fakes.
+// Identity and the explicitly supplied business port are contract fixtures.
+// Production dispatch uses the original 271 reader and the host's bound port.
 vi.mock('../business-runtime/d-entry-current.ts', () => ({
   readDEntryBusinessIdentity: fixtures.identity,
 }));
@@ -251,38 +251,47 @@ describe('formal MCP memory callbacks with explicit contracts', () => {
       }
     }
   });
-  it('hides both memory tools without a target producer and returns the existing unbound-tool result', async () => {
-    const services = bindEmployeeMemoryMcpServices({ port });
-    const client = await connectMemoryServices(services);
-    expect(services).toEqual({ executionGeneration: '4.0' });
-    expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual([
-      'identity_read',
-    ]);
-    for (const call of [
-      { name: 'memory_read', arguments: { number: 1 } },
-      { name: 'memory_remember', arguments: { summary: 'fact' } },
-    ]) {
-      expect(await client.callTool(call)).toEqual({
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: {
-                code: 'DEPENDENCY_UNAVAILABLE',
-                message: 'This tool is currently unavailable.',
-                requestId: scope.requestContext.requestId,
-                retryable: false,
-              },
-            }),
-          },
-        ],
-      });
-    }
-    expect(fixtures.identity).not.toHaveBeenCalled();
-    expect(fixtures.read).not.toHaveBeenCalled();
-    expect(fixtures.remember).not.toHaveBeenCalled();
-  });
+  it.each(['neither dependency', 'port only', 'target reader only'] as const)(
+    'hides and refuses both memory tools with %s',
+    async (dependency) => {
+      const actual = vi.fn().mockResolvedValue(target);
+      const options = {
+        'neither dependency': undefined,
+        'port only': { port },
+        'target reader only': { targets: { actual } },
+      }[dependency];
+      const services = bindEmployeeMemoryMcpServices(options);
+      const client = await connectMemoryServices(services);
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(
+        ['identity_read'],
+      );
+      for (const call of [
+        { name: 'memory_read', arguments: { number: 1 } },
+        { name: 'memory_remember', arguments: { summary: 'fact' } },
+      ]) {
+        expect(await client.callTool(call)).toEqual({
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: {
+                  code: 'DEPENDENCY_UNAVAILABLE',
+                  message: 'This tool is currently unavailable.',
+                  requestId: scope.requestContext.requestId,
+                  retryable: false,
+                },
+              }),
+            },
+          ],
+        });
+      }
+      expect(actual).not.toHaveBeenCalled();
+      expect(fixtures.identity).not.toHaveBeenCalled();
+      expect(fixtures.read).not.toHaveBeenCalled();
+      expect(fixtures.remember).not.toHaveBeenCalled();
+    },
+  );
   it('uses original authenticated scope and the actual execute identity reader before the business port', async () => {
     const actual = vi.fn().mockResolvedValue(target),
       services = bindEmployeeMemoryMcpServices({ port, targets: { actual } });
