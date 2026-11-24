@@ -74,6 +74,13 @@ export const reviewedGetLocks: readonly {
   reason: string;
 }[] = [];
 
+const EMPLOYEE_MEMORY_SOURCE_GET_REVIEW =
+  'The personal source GET uses a read-only repeatable-read snapshot. ' +
+  'Administrator source skips personal qualification. readAdmin uses plain SELECTs and the existing append-only audit INSERT in a repeatable-read transaction without explicit row or advisory lock clauses. ' +
+  'Foreign-key checks on the audit INSERT can take implicit KEY SHARE locks. ' +
+  'Existing GET session authentication updates last_seen_at before the business call, outside this explicit-clause gate. ' +
+  'Re-review changes to either GET assembly or implementation.';
+
 /** Interface-typed calls on GET paths the audit cannot follow. */
 export const reviewedUnresolvedCalls: readonly {
   target: string;
@@ -107,5 +114,18 @@ export const reviewedUnresolvedCalls: readonly {
   {
     target: 'packages/contracts/src/storage.ts get',
     reason: 'Object storage adapters read blobs; they run no SQL.',
+  },
+  {
+    target: 'packages/database/src/builtin-modules.ts require',
+    reason: `The personal Web assembly uses createApplicationBuiltinModuleAuthority('web'). The require implementation reads build identity from the filesystem or process cache and checks the frozen built-in policy without SQL. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
+  },
+  {
+    target:
+      'packages/database/src/employee-memory-port.ts requireCurrentAccess',
+    reason: `The personal Web callback resolves D-entry history with only the workspace and employee instance IDs. Current instance and assignment checks use plain SELECT with lock=false. The callback then checks the built-in module policy. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
+  },
+  {
+    target: 'packages/database/src/employee-memory-port.ts source',
+    reason: `The port selects getPersonalEmployeeMemorySource or getAdminEmployeeMemorySource based on the parsed organizationId. The personal branch checks current access before and after the owner read, whose scope uses the default write=false. ${EMPLOYEE_MEMORY_SOURCE_GET_REVIEW}`,
   },
 ];

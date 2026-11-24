@@ -1,8 +1,11 @@
 'use client';
 
-import { useRef } from 'react';
+import { useMemo, useRef } from 'react';
 import { EmployeeMemoryManager } from './employee-memory-manager';
-import type { MemoryWriteStore } from '../../lib/memory/employee-memory-client';
+import {
+  personalEmployeeMemorySourceReader,
+  type MemoryWriteStore,
+} from '../../lib/memory/employee-memory-client';
 import css from './workbench-experience-panel.module.css';
 
 /** The retained dock kind hosts current employee memory only. */
@@ -16,6 +19,10 @@ export function WorkbenchExperiencePanel(props: {
   memoryWrites?: MemoryWriteStore;
 }) {
   const localMemoryWrites = useRef<MemoryWriteStore>(new Map());
+  const readSource = useMemo(
+    () => personalEmployeeMemorySourceReader(props.headers),
+    [props.headers],
+  );
   return (
     <section
       className={css.panel}
@@ -36,6 +43,7 @@ export function WorkbenchExperiencePanel(props: {
           }
           headers={props.headers}
           writes={props.memoryWrites ?? localMemoryWrites.current}
+          readSource={readSource}
           active={props.active}
         />
       </div>
