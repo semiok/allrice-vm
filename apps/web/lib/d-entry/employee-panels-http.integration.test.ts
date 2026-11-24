@@ -859,7 +859,7 @@ suite(
             (route) => route.abort('failed'),
             { times: 1 },
           );
-          const [interrupted] = await Promise.all([
+          const [transientReceiptFailure] = await Promise.all([
             page.waitForEvent('requestfailed', {
               predicate: (request) =>
                 request.method() === 'GET' &&
@@ -869,7 +869,7 @@ suite(
             }),
             checkAction(independentId).click(),
           ]);
-          expect(interrupted.failure()).not.toBeNull();
+          expect(transientReceiptFailure.failure()).not.toBeNull();
           await expect
             .poll(() => checkAction(independentId).isEnabled())
             .toBe(true);
