@@ -19,6 +19,7 @@ export interface DEntryFixedProfileSource {
   readImmutableGraph(signal: AbortSignal): Promise<unknown>;
   readImmutableBundle(
     reference: string,
+    expectedBytes: number,
     signal: AbortSignal,
   ): Promise<Uint8Array>;
 }
@@ -284,11 +285,21 @@ export async function holdReleasedProfile(
       return { data: replaceMapTrailer(data, oldMap, newMap), media };
     };
     const expected = await read(active);
-    const expectedMap = await readBytes(sourceMap, active);
-    const native = await source.readImmutableBundle(current.url, active);
-    const nativeMap = await source.readImmutableBundle(newMap, active);
+    const native = await source.readImmutableBundle(
+      current.url,
+      expected.data.byteLength,
+      active,
+    );
     active.throwIfAborted();
-    if (!expected.data.equals(native) || !expectedMap.data.equals(nativeMap))
+    if (!expected.data.equals(native)) throw new DEntryNativeUnavailable();
+    const expectedMap = await readBytes(sourceMap, active);
+    const nativeMap = await source.readImmutableBundle(
+      newMap,
+      expectedMap.data.byteLength,
+      active,
+    );
+    active.throwIfAborted();
+    if (!expectedMap.data.equals(nativeMap))
       throw new DEntryNativeUnavailable();
     if (checked.has(current.url) || relocated.has(sealed.url))
       throw new DEntryNativeUnavailable();

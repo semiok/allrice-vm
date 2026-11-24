@@ -54,6 +54,7 @@ export type PublishedNativeCatalog = Readonly<{
     readImmutableBundleFor?(
       context: RequestContext,
       reference: string,
+      expectedBytes: number,
       signal: AbortSignal,
     ): Promise<Uint8Array>;
     readSessionsFor(
@@ -195,12 +196,21 @@ export function createDEntryNativeCatalogPort(input: {
                     return graph;
                   });
                 },
-                readImmutableBundle(reference: string, reading: AbortSignal) {
+                readImmutableBundle(
+                  reference: string,
+                  expectedBytes: number,
+                  reading: AbortSignal,
+                ) {
                   return own(async () => {
                     const who = context;
                     const active = AbortSignal.any([reading, revoked]);
                     await current(who, active);
-                    const bytes = await readBundle(who, reference, active);
+                    const bytes = await readBundle(
+                      who,
+                      reference,
+                      expectedBytes,
+                      active,
+                    );
                     await current(who, active);
                     return bytes;
                   });

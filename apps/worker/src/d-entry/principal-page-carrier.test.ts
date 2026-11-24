@@ -85,7 +85,8 @@ async function fixture(release?: ProfileProof) {
           signal.throwIfAborted();
           return release.graph;
         },
-        readImmutableBundle: release.read,
+        readImmutableBundle: (reference, _bytes, signal) =>
+          release.read(reference, signal),
       },
     });
   const otherSession = { ...f.context, sessionId: randomUUID() };
@@ -445,7 +446,8 @@ it(
         async readImmutableGraph() {
           return graph;
         },
-        readImmutableBundle: read,
+        readImmutableBundle: (reference, _bytes, signal) =>
+          read(reference, signal),
       },
       source,
     );

@@ -1,4 +1,5 @@
 import { Agent, createServer } from 'node:http';
+import type { ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import type { Duplex } from 'node:stream';
 import type { Socket } from 'node:net';
@@ -25,6 +26,108 @@ afterEach(async () => {
   const failed = results.find((result) => result.status === 'rejected');
   if (failed?.status === 'rejected') throw failed.reason;
 });
+
+it('bounds actual streamed profile bytes and joins the socket of an oversized response before rejecting', async () => {
+  const reply = Promise.withResolvers<ServerResponse>();
+  const server = createServer((_request, response) => {
+    response.writeHead(200);
+    response.flushHeaders();
+    reply.resolve(response);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const assigned = Promise.withResolvers<Duplex>();
+  const create = Agent.prototype.createConnection;
+  vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
+    this: Agent,
+    ...args: Parameters<Agent['createConnection']>
+  ) {
+    const socket = create.apply(this, args);
+    if (socket) assigned.resolve(socket);
+    return socket;
+  });
+  const transport = nativeWebTransport(
+    origin,
+    new AbortController().signal,
+    () => {},
+  );
+  const release = latch();
+  cleanup.push(async () => {
+    release.resolve();
+    await transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  });
+  const reading = transport.readExact(
+    new URL('/plugins/?test=oversized', origin),
+    3,
+    new AbortController().signal,
+  );
+  let settled = false;
+  void reading.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  const socket = await assigned.promise;
+  const cancelling = latch();
+  const close = socket.destroy.bind(socket);
+  vi.spyOn(socket, 'destroy').mockImplementation((error) => {
+    cancelling.resolve();
+    void release.promise.then(() => close(error));
+    return socket;
+  });
+  const closed = once(socket, 'close');
+  const response = await reply.promise;
+  response.write('abc');
+  response.write('over the attested length');
+  await cancelling.promise;
+  expect(response.writableEnded).toBe(false);
+  expect(settled).toBe(false);
+  expect(socket.closed).toBe(false);
+  release.resolve();
+  await closed;
+  await expect(reading).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('rejects an actual short body and joins a caller-canceled bounded reader with its original reason', async () => {
+  const waiting = latch();
+  const server = createServer((request, response) => {
+    if (request.url === '/cancel') {
+      response.write('a');
+      waiting.resolve();
+    } else {
+      response.write(request.url === '/exact' ? 'abc' : 'ab');
+      response.end();
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const caller = new AbortController();
+  const transport = nativeWebTransport(
+    origin,
+    new AbortController().signal,
+    () => {},
+  );
+  cleanup.push(async () => {
+    await transport.close();
+    server.closeAllConnections();
+    await new Promise<void>((done) => server.close(() => done()));
+  });
+  const read = (path: string) =>
+    transport.readExact(new URL(path, origin), 3, caller.signal);
+  expect(Buffer.from(await read('/exact')).toString()).toBe('abc');
+  await expect(read('/short')).rejects.toMatchObject({
+    code: 'PROVIDER_FAILED',
+  });
+  const cancellation = read('/cancel');
+  await waiting.promise;
+  const reason = Error('proof reader revoked by its caller');
+  caller.abort(reason);
+  await expect(cancellation).rejects.toBe(reason);
+});
+
 for (const accepted of [false, true])
   it(`close joins exact HTTP request ${accepted ? 'after accept' : 'before socket assignment'}`, async () => {
     // Transport-only close fixture; never a dummy DSH RPC/readiness server.

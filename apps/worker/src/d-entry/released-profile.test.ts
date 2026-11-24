@@ -177,8 +177,11 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       async readImmutableGraph() {
         return native;
       },
-      readImmutableBundle: (reference: string) =>
-        bundle(two.registry, reference),
+      async readImmutableBundle(reference: string, bytes: number) {
+        const value = await bundle(two.registry, reference);
+        expect(bytes).toBe(value.byteLength);
+        return value;
+      },
     };
     const serving = await holdReleasedProfile(directory, current, lifetime);
     expect(serving.graph).toEqual(native);
@@ -196,13 +199,15 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
       target.url,
       target.url.replaceAll('/client.js', '/client.js.map'),
     ]) {
+      const requested: string[] = [];
       await expect(
         holdReleasedProfile(
           directory,
           {
             ...current,
-            async readImmutableBundle(reference) {
-              const value = await current.readImmutableBundle(reference);
+            async readImmutableBundle(reference, bytes) {
+              requested.push(reference);
+              const value = await current.readImmutableBundle(reference, bytes);
               return reference === corrupt
                 ? Buffer.concat([Buffer.from('x'), value])
                 : value;
@@ -211,6 +216,7 @@ it('attests each exact graph resource from independently installed rc.2 bytes an
           lifetime,
         ),
       ).rejects.toThrow('D entry native owner is not bound');
+      if (corrupt === target.url) expect(requested).toEqual([target.url]);
     }
     await expect(
       holdReleasedProfile(

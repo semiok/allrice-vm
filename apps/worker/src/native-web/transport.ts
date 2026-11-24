@@ -1,4 +1,9 @@
-import { request, Agent, type ClientRequest } from 'node:http';
+import {
+  request,
+  Agent,
+  type ClientRequest,
+  type IncomingMessage,
+} from 'node:http';
 import type { Duplex } from 'node:stream';
 import WebSocket from 'ws';
 import type {
@@ -66,78 +71,144 @@ export function nativeWebTransport(
       throw new PersonVmError('PROVIDER_FAILED');
     return url;
   }
+  function prepareRequest(
+    input: string | URL,
+    init: Parameters<RpcFetch>[1],
+    receive: (response: IncomingMessage) => void,
+  ) {
+    const url = target(input);
+    const headers = new Headers(init.headers);
+    headers.set('host', url.host);
+    headers.set('origin', new URL(origin).origin);
+    if (cookie) headers.set('cookie', cookie);
+    const callSignal = init.signal
+      ? AbortSignal.any([signal, init.signal])
+      : signal;
+    // Native Connection unary calls provide their already encoded JSON string.
+    const body = init.body;
+    if (body !== undefined && body !== null && typeof body !== 'string')
+      throw new PersonVmError('PROVIDER_FAILED');
+    const call = request(
+      url,
+      {
+        method: init.method,
+        headers: Object.fromEntries(headers),
+        agent,
+        signal: callSignal,
+      },
+      receive,
+    );
+    requestJoin(call);
+    return { call, send: () => call.end(body) };
+  }
   const fetch: RpcFetch = (input, init) =>
     new Promise((resolve, reject) => {
       try {
-        const url = target(input);
-        const headers = new Headers(init.headers);
-        headers.set('host', url.host);
-        headers.set('origin', new URL(origin).origin);
-        if (cookie) headers.set('cookie', cookie);
-        const callSignal = init.signal
-          ? AbortSignal.any([signal, init.signal])
-          : signal;
-        const call = request(
-          url,
-          {
-            method: init.method,
-            headers: Object.fromEntries(headers),
-            agent,
-            signal: callSignal,
-          },
-          (response) => {
-            const chunks: Buffer[] = [];
-            response.on('data', (chunk: Buffer) => chunks.push(chunk));
-            response.on('error', () =>
-              reject(new PersonVmError('PROVIDER_FAILED')),
-            );
-            response.on('end', () => {
-              try {
-                const output = new Headers();
-                for (const [key, value] of Object.entries(response.headers))
-                  for (const item of Array.isArray(value)
-                    ? value
-                    : value === undefined
-                      ? []
-                      : [value])
-                    output.append(key, item);
-                const body = Buffer.concat(chunks);
-                resolve(
-                  new Response(
-                    body.length ? Uint8Array.from(body).buffer : null,
-                    {
-                      status: response.statusCode!,
-                      headers: output,
-                    },
-                  ),
-                );
-              } catch {
-                reject(new PersonVmError('PROVIDER_FAILED'));
-              }
-            });
-          },
-        );
-        requestJoin(call);
+        const { call, send } = prepareRequest(input, init, (response) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('error', () =>
+            reject(new PersonVmError('PROVIDER_FAILED')),
+          );
+          response.on('end', () => {
+            try {
+              const output = new Headers();
+              for (const [key, value] of Object.entries(response.headers))
+                for (const item of Array.isArray(value)
+                  ? value
+                  : value === undefined
+                    ? []
+                    : [value])
+                  output.append(key, item);
+              const body = Buffer.concat(chunks);
+              resolve(
+                new Response(
+                  body.length ? Uint8Array.from(body).buffer : null,
+                  {
+                    status: response.statusCode!,
+                    headers: output,
+                  },
+                ),
+              );
+            } catch {
+              reject(new PersonVmError('PROVIDER_FAILED'));
+            }
+          });
+        });
         // A closed, unanswered request is not a reply.
         call.once('close', () => reject(new PersonVmError('PROVIDER_FAILED')));
         call.on('error', () => reject(new PersonVmError('PROVIDER_FAILED')));
-        // Native Connection unary calls provide their already encoded JSON string.
-        if (
-          init.body !== undefined &&
-          init.body !== null &&
-          typeof init.body !== 'string'
-        ) {
-          call.destroy();
-          reject(new PersonVmError('PROVIDER_FAILED'));
-          return;
-        }
-        call.end(init.body);
+        send();
       } catch {
         reject(new PersonVmError('PROVIDER_FAILED'));
       }
     });
+  /** Profile attestation already holds the sealed length. Limit the actual
+   * response stream and keep ownership through physical cancellation. */
+  async function readExact(
+    input: URL,
+    bytes: number,
+    caller: AbortSignal,
+  ): Promise<Uint8Array> {
+    const active = AbortSignal.any([signal, caller]);
+    active.throwIfAborted();
+    if (!Number.isSafeInteger(bytes) || bytes < 1)
+      throw new PersonVmError('PROVIDER_FAILED');
+    const data = Buffer.allocUnsafe(bytes);
+    return new Promise((resolve, reject) => {
+      let received = 0;
+      let complete = false;
+      let failure: { reason: unknown } | undefined;
+      let socket: Duplex | undefined;
+      const fail = () => {
+        failure ??= {
+          reason: active.aborted
+            ? active.reason
+            : new PersonVmError('PROVIDER_FAILED'),
+        };
+      };
+      const { call, send } = prepareRequest(
+        input,
+        { method: 'GET', headers: { connection: 'close' }, signal: active },
+        (response) => {
+          response.once('error', fail);
+          if (response.statusCode !== 200) {
+            fail();
+            response.destroy();
+            return;
+          }
+          response.on('data', (chunk: Buffer) => {
+            if (failure) return;
+            if (chunk.length > data.length - received) {
+              fail();
+              response.destroy();
+              return;
+            }
+            received += chunk.copy(data, received);
+          });
+          response.once('end', () => {
+            complete = received === data.length;
+            if (!complete) fail();
+          });
+        },
+      );
+      call.once('socket', (assigned) => (socket = assigned));
+      call.on('error', fail);
+      call.once('close', () => {
+        const finish = () => {
+          if (!complete || active.aborted) fail();
+          if (failure) reject(failure.reason);
+          else resolve(data);
+        };
+        if (socket && !socket.closed) socket.once('close', finish);
+        else finish();
+      });
+      send();
+    });
+  }
   return {
     fetch,
+    readExact,
     async authenticate(authenticatedUrl: string) {
       const url = target(authenticatedUrl);
       url.pathname = '/connect';

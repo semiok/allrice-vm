@@ -332,6 +332,7 @@ export async function openNativeWebOwner(input: {
       readImmutableBundleFor(
         context: RequestContext,
         reference: string,
+        expectedBytes: number,
         requestSignal: AbortSignal,
       ) {
         const current = AbortSignal.any([signal, requestSignal]);
@@ -350,13 +351,7 @@ export async function openNativeWebOwner(input: {
             if (url.pathname !== '/plugins/' || url.hash)
               throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const reply = await transport.fetch(url, {
-              method: 'GET',
-              redirect: 'error',
-              signal: current,
-            });
-            if (!reply.ok) throw new PersonVmError('RUNTIME_NOT_READY');
-            const data = new Uint8Array(await reply.arrayBuffer());
+            const data = await transport.readExact(url, expectedBytes, current);
             await input.vm.assertCurrentBinding(context, binding, current);
             current.throwIfAborted();
             return data;
