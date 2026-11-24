@@ -148,7 +148,7 @@ it('joins its own created socket when canceled before ClientRequest assigns it',
   const emit = ClientRequest.prototype.emit;
   vi.spyOn(ClientRequest.prototype, 'emit').mockImplementation(function (
     this: ClientRequest,
-    event: string,
+    event: string | symbol,
     ...args: unknown[]
   ) {
     if (this.path === '/before-assignment' && event === 'socket')
