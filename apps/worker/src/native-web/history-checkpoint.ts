@@ -22,6 +22,7 @@ import {
   HostHistoryIntegrityError,
   HostHistorySourceKeySchema,
   HostHistorySourceSchema,
+  type CommittedHostHistorySource,
   type HostHistorySource,
   type HostHistorySourceKey,
   type HostHistorySourceStore,
@@ -144,24 +145,45 @@ export async function checkpointNativeHistory(input: {
     throw new HostHistoryIntegrityError();
   };
   const native = input.native;
+  const instance = native.binding.instanceId;
+  let previous: CommittedHostHistorySource | null = null;
+  const priorBinding = (id: string) =>
+    previous?.manifest.sessions.find(
+      (row) => row.binding.nativeSessionId === id,
+    )?.binding;
   const actualBinding = (binding: HostHistoryBinding) => ({
     ...binding,
     organizationId: native.binding.organizationId,
     workspaceId: native.endpoint.workspaceId,
     personId: native.binding.personId,
     employeeInstanceId: native.endpoint.employeeInstanceId,
-    nativeInstanceRef: native.binding.instanceId,
+    nativeInstanceRef:
+      priorBinding(binding.nativeSessionId)?.nativeInstanceRef ?? instance,
     nativeProfileRef: native.profile.nativeProfileRef,
     configurationRef: native.profile.configurationRef,
     configurationDigest: native.profile.configurationDigest,
   });
-  const assertOrigin = () => {
+  const assertOwner = () => {
     if (
       native.binding.vmId !== key.vmId ||
+      native.binding.instanceId !== instance ||
+      native.binding.organizationId !== key.organizationId ||
+      native.binding.personId !== key.personId ||
+      native.endpoint.workspaceId !== key.workspaceId ||
+      native.endpoint.employeeInstanceId !== key.employeeInstanceId
+    )
+      fail();
+  };
+  const assertOrigin = () => {
+    assertOwner();
+    if (
       bindings.some(
         (binding) =>
           hostHistoryDigest(actualBinding(binding)) !==
-          hostHistoryDigest(binding),
+            hostHistoryDigest(binding) ||
+          (priorBinding(binding.nativeSessionId) !== undefined &&
+            hostHistoryDigest(priorBinding(binding.nativeSessionId)) !==
+              hostHistoryDigest(binding)),
       )
     )
       fail();
@@ -185,7 +207,7 @@ export async function checkpointNativeHistory(input: {
     )
   )
     fail();
-  assertOrigin();
+  assertOwner();
   const grants = new AbortController();
   const signal = AbortSignal.any([input.signal, native.revoked, grants.signal]);
   const revocations = new Map<
@@ -214,6 +236,13 @@ export async function checkpointNativeHistory(input: {
     for (const binding of bindings) await authorize(binding, signal);
     await native.assertCurrent(signal);
     signal.throwIfAborted();
+    if (root.nativeInstanceRef !== instance) {
+      // The exact old root key is the continuity proof across native restarts.
+      // Its verified members keep their original birth instance. A new member
+      // can only reuse a birth fact from the actual current reader.
+      previous = await input.sources.read(key, signal);
+      if (!previous) fail();
+    }
     assertOrigin();
     const serialized = await native.readCut(
       { rootSessionId: key.rootNativeSessionId },
@@ -231,6 +260,28 @@ export async function checkpointNativeHistory(input: {
         cut.sessions.length
     )
       fail();
+    if (previous) {
+      const committed = input.sources.committedStore(previous);
+      for (const { binding, snapshotDigest } of previous.manifest.sessions) {
+        const row = cut.sessions.find(
+          (row) => row.meta.id === binding.nativeSessionId,
+        );
+        if (!row) fail();
+        const source = (await committed.read(binding, signal, snapshotDigest))
+          ?.snapshot.source;
+        if (
+          !source ||
+          source.headerHash !== hostHistoryDigest(row.meta) ||
+          source.inheritedEventCount !== row.inheritedEventCount ||
+          source.eventHashes.length > row.events.length ||
+          source.eventHashes.some(
+            (hash, index) => hash !== hostHistoryDigest(row.events[index]),
+          )
+        )
+          fail();
+      }
+      signal.throwIfAborted();
+    }
     const sessions: HostHistorySource['sessions'] = [];
     const edges: HostHistorySource['edges'] = [];
     for (const row of cut.sessions) {

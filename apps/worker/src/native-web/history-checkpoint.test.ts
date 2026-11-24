@@ -233,6 +233,57 @@ describe('native history checkpoint', () => {
     expect(f.input.attachments).not.toHaveBeenCalled();
     expect(await f.input.sources.read(f.key, signal())).toBeNull();
   });
+  it('uses a verified birth cut for the same VM and employee after restart without rewriting birth provenance', async () => {
+    const f = await fixture();
+    const original = await checkpointNativeHistory(f.input);
+    const native = {
+      ...f.input.native,
+      binding: {
+        ...f.input.native.binding,
+        instanceId: randomUUID(),
+        leaseEpoch: 2,
+      },
+    };
+    const result = await checkpointNativeHistory({ ...f.input, native });
+    expect(result).toEqual(original);
+    expect(result.manifest.sessions[0]!.binding.nativeInstanceRef).toBe(
+      f.input.native.binding.instanceId,
+    );
+    expect(native.readCut).toHaveBeenCalledTimes(2);
+
+    await expect(
+      checkpointNativeHistory({
+        ...f.input,
+        native,
+        key: { ...f.key, rootBindingRef: randomUUID() },
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    await expect(
+      checkpointNativeHistory({
+        ...f.input,
+        native: {
+          ...native,
+          endpoint: { ...native.endpoint, employeeInstanceId: randomUUID() },
+        },
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    expect(native.readCut).toHaveBeenCalledTimes(2);
+
+    const unrelated = structuredClone(f.cut);
+    Object.assign(unrelated.sessions[0]!.meta, { createdAt: 9 });
+    f.input.attachments.mockClear();
+    await expect(
+      checkpointNativeHistory({
+        ...f.input,
+        native: { ...native, readCut: async () => JSON.stringify(unrelated) },
+      }),
+    ).rejects.toBeInstanceOf(HostHistoryIntegrityError);
+    expect(f.input.attachments).not.toHaveBeenCalled();
+    expect(await f.input.sources.read(f.key, signal())).toEqual({
+      digest: original.digest,
+      manifest: original.manifest,
+    });
+  });
   it('does not reconstruct missing original facts or dispatch a read without them', async () => {
     const f = await fixture();
     await expect(

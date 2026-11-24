@@ -395,6 +395,96 @@ describe('committed host history source', () => {
       }),
     ).toEqual({ digest, manifest: f.manifest });
   });
+  it('rechecks the winning slot and commits a concurrent cut that strictly extends it', async () => {
+    const f = await fixture();
+    await f.sources.publish(f.manifest, signal());
+    const cuts = await Promise.all(
+      [1, 2].map(async (count) => {
+        const cut = structuredClone(f.manifest);
+        cut.sessions[0]!.snapshotDigest = await f.raw.publish(
+          f.snapshot(f.b, count),
+          signal(),
+        );
+        return cut;
+      }),
+    );
+    const entered = [gate(), gate()];
+    const release = [gate(), gate()];
+    const pending = cuts.map((cut, index) => {
+      let reads = 0;
+      const publisher = new HostHistorySourceStore(f.root, {
+        publish: f.raw.publish.bind(f.raw),
+        async read(...args) {
+          if (++reads === 2) {
+            entered[index]!.release();
+            await release[index]!.promise;
+          }
+          return f.raw.read(...args);
+        },
+      });
+      return publisher.publish(cut, signal());
+    });
+    const outcomes = Promise.allSettled(pending);
+    try {
+      await Promise.race([
+        Promise.all(entered.map(({ promise }) => promise)),
+        outcomes.then(() => {
+          throw Error('publishers did not both read the prior slot');
+        }),
+      ]);
+      release[0]!.release();
+      expect(await pending[0]).toBe(hostHistoryDigest(cuts[0]));
+    } finally {
+      release.forEach(({ release }) => release());
+    }
+    expect(await outcomes).toEqual(
+      cuts.map((cut) => ({
+        status: 'fulfilled',
+        value: hostHistoryDigest(cut),
+      })),
+    );
+    expect((await f.sources.read(f.key, signal()))?.manifest).toEqual(cuts[1]);
+  });
+
+  it('keeps equal reordered or already committed cuts idempotent and detects copied slot records', async () => {
+    const f = await fixture();
+    const { parent, manifest } = await withChild(f);
+    const original = await f.sources.publish(manifest, signal());
+    const reordered = structuredClone(manifest);
+    reordered.sessions.reverse();
+    expect(await f.sources.publish(reordered, signal())).toBe(original);
+
+    const next = structuredClone(manifest);
+    parent.source.throughSeq++;
+    parent.source.eventHashes.push(hostHistoryDigest('new-parent'));
+    next.sessions[0]!.snapshotDigest = await f.raw.publish(parent, signal());
+    await f.sources.publish(next, signal());
+    expect(await f.sources.publish(manifest, signal())).toBe(original);
+    const directory = join(
+      f.root,
+      'sources',
+      hostHistoryDigest(f.key).slice(7),
+    );
+    expect((await readdir(directory)).sort()).toEqual([
+      'commit-0.json',
+      'commit-1.json',
+    ]);
+    const record = JSON.parse(
+      await readFile(join(directory, 'commit-0.json'), 'utf8'),
+    );
+    const later = JSON.parse(
+      await readFile(join(directory, 'commit-1.json'), 'utf8'),
+    );
+    await writeFile(join(directory, 'commit-1.json'), JSON.stringify(record));
+    await expect(f.sources.read(f.key, signal())).rejects.toBeInstanceOf(
+      HostHistoryIntegrityError,
+    );
+    later.previous = hostHistoryDigest('wrong-predecessor');
+    await writeFile(join(directory, 'commit-1.json'), JSON.stringify(later));
+    await expect(f.sources.read(f.key, signal())).rejects.toBeInstanceOf(
+      HostHistoryIntegrityError,
+    );
+  });
 
   it('retains the privately verified manifest even when the caller changes its digest and members', async () => {
     const f = await fixture();

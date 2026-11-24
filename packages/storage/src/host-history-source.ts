@@ -92,6 +92,8 @@ export type CommittedHostHistorySource = Readonly<{
 }>;
 const CommittedSourceSchema = z
   .object({
+    index: number,
+    previous: ChecksumSchema.nullable(),
     digest: ChecksumSchema,
     manifest: HostHistorySourceSchema,
   })
@@ -110,7 +112,8 @@ async function readManifest(
   directory: string,
   name: string,
   signal: AbortSignal,
-): Promise<CommittedHostHistorySource> {
+  slot?: { index: number; previous: string | null },
+): Promise<CommittedHostHistorySource & { commitDigest?: string }> {
   signal.throwIfAborted();
   const file = await open(
     join(directory, name),
@@ -120,20 +123,43 @@ async function readManifest(
     const value: unknown = JSON.parse(
       await file.readFile({ encoding: 'utf8', signal }),
     );
-    const source = legacyManifestName.test(name)
-      ? {
+    const source = slot
+      ? CommittedSourceSchema.parse(value)
+      : {
           digest: `sha256:${name.slice(0, -5)}`,
           manifest: HostHistorySourceSchema.parse(value),
-        }
-      : CommittedSourceSchema.parse(value);
+        };
     if (hostHistoryDigest(source.manifest) !== source.digest) fail();
-    return source;
+    if (
+      slot &&
+      (!('index' in source) ||
+        source.index !== slot.index ||
+        source.previous !== slot.previous)
+    )
+      fail();
+    return {
+      digest: source.digest,
+      manifest: source.manifest,
+      ...(slot ? { commitDigest: hostHistoryDigest(source) } : {}),
+    };
   } catch {
     signal.throwIfAborted();
     return fail();
   } finally {
     await file.close();
   }
+}
+
+function contentDigest(manifest: HostHistorySource) {
+  return hostHistoryDigest({
+    ...manifest,
+    sessions: Object.fromEntries(
+      manifest.sessions.map((row) => [row.binding.nativeSessionId, row]),
+    ),
+    edges: Object.fromEntries(
+      manifest.edges.map((row) => [row.childNativeSessionId, row]),
+    ),
+  });
 }
 
 /** Validate the complete ancestry against the exact referenced snapshots.
@@ -305,19 +331,26 @@ export class HostHistorySourceStore {
   ) {
     signal.throwIfAborted();
     const directory = this.directory(key);
+    const digests = new Map<string, string>();
     let names: string[];
     try {
       names = await readdir(directory);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      return { selected: null, selectedSnapshots: undefined, nextCommit: 0 };
+      signal.throwIfAborted();
+      return {
+        selected: null,
+        selectedSnapshots: undefined,
+        digests,
+        slot: { index: 0, previous: null },
+      };
     }
     const commits = new Set(
       names.filter((name) => /^commit-.*\.json$/.test(name)),
     );
-    const ordered = names
-      .filter((name) => legacyManifestName.test(name))
-      .sort();
+    const legacy = names.filter((name) => legacyManifestName.test(name)).sort();
+    let previous = legacy.length ? hostHistoryDigest(legacy) : null;
+    const ordered = [...legacy];
     for (let index = 0; index < commits.size; index++) {
       const name = commitName(index);
       if (!commits.has(name)) fail();
@@ -329,14 +362,23 @@ export class HostHistorySourceStore {
       manifest: HostHistorySource;
       snapshots: Map<string, HostHistorySnapshot>;
     }[] = [];
-    for (const name of ordered) {
-      const source = await readManifest(directory, name, signal);
-      const { digest, manifest } = source;
+    for (const [index, name] of ordered.entries()) {
+      const { digest, manifest, commitDigest } = await readManifest(
+        directory,
+        name,
+        signal,
+        index < legacy.length
+          ? undefined
+          : { index: index - legacy.length, previous },
+      );
+      if (commitDigest) previous = commitDigest;
       if (!same(manifest.key, key)) fail();
       const snapshots = await validate(manifest, this.raw, signal);
       for (const previous of candidates)
         compare(manifest, previous.manifest, snapshots, previous.snapshots);
       candidates.push({ manifest, snapshots });
+      const content = contentDigest(manifest);
+      if (!digests.has(content)) digests.set(content, digest);
       // Still validate/compare every committed vector. A browser digest may
       // only select a manifest that actually committed this exact member.
       if (
@@ -358,12 +400,17 @@ export class HostHistorySourceStore {
         if (direction < 0 || (direction === 0 && digest < selected.digest))
           continue;
       }
-      selected = source;
+      selected = { digest, manifest };
       selectedSnapshots = snapshots;
     }
     signal.throwIfAborted();
     if (requested && !selected) fail();
-    return { selected, selectedSnapshots, nextCommit: commits.size };
+    return {
+      selected,
+      selectedSnapshots,
+      digests,
+      slot: { index: commits.size, previous },
+    };
   }
   async publish(
     input: HostHistorySource,
@@ -371,24 +418,35 @@ export class HostHistorySourceStore {
   ): Promise<string> {
     const manifest = HostHistorySourceSchema.parse(input);
     const snapshots = await validate(manifest, this.raw, signal);
-    const { selected, selectedSnapshots, nextCommit } =
-      await this.readCommitted(manifest.key, signal);
-    if (
-      selected &&
-      compare(manifest, selected.manifest, snapshots, selectedSnapshots!) < 0
-    )
-      fail();
     const digest = hostHistoryDigest(manifest),
       directory = this.directory(manifest.key);
-    if (selected?.digest === digest) return digest;
-    // Every publisher that validated the same ledger cut competes for this
-    // one immutable slot, even across independent store instances/processes.
-    const name = commitName(nextCommit);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    const content = contentDigest(manifest);
+    for (;;) {
+      const { selected, selectedSnapshots, digests, slot } =
+        await this.readCommitted(manifest.key, signal);
+      const committed = digests.get(content);
+      if (committed) return committed;
+      if (
+        selected &&
+        compare(manifest, selected.manifest, snapshots, selectedSnapshots!) < 0
+      )
+        fail();
+      // A lost atomic claim leaves only private staging bytes. Verify the
+      // winner and retry only if this immutable cut still extends that history.
+      if (await this.commit(directory, { ...slot, digest, manifest }, signal))
+        return digest;
+    }
+  }
+  private async commit(
+    directory: string,
+    record: z.infer<typeof CommittedSourceSchema>,
+    signal: AbortSignal,
+  ) {
     const temporary = join(directory, `${randomUUID()}.tmp`);
     const file = await open(temporary, 'wx', 0o600);
     try {
-      await file.writeFile(JSON.stringify({ digest, manifest }), {
+      await file.writeFile(JSON.stringify(record), {
         encoding: 'utf8',
         signal,
       });
@@ -396,11 +454,10 @@ export class HostHistorySourceStore {
       await file.close();
       signal.throwIfAborted();
       try {
-        await link(temporary, join(directory, name));
+        await link(temporary, join(directory, commitName(record.index)));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const winner = await readManifest(directory, name, signal);
-        if (winner.digest !== digest) fail();
+        return false;
       }
       const parent = await open(directory, 'r');
       try {
@@ -413,7 +470,7 @@ export class HostHistorySourceStore {
       await rm(temporary, { force: true });
     }
     signal.throwIfAborted();
-    return digest;
+    return true;
   }
   /** One request's immutable selection. Never reselect on subsequent page,
    * download or reauthorization calls. Explicit uncommitted digests refuse. */
