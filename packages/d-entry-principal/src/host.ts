@@ -212,22 +212,24 @@ class Scope implements Projection {
     this.active = false;
     this.bindings = [];
     this.ctx.remoteAccess.invalidate();
-    const task = this.refreshQueue.then(async () => {
-      this.abort.signal.throwIfAborted();
-      const catalog = await this.ctx.sessionController.list(
-        {},
-        this.abort.signal,
-      );
-      this.abort.signal.throwIfAborted();
-      const bindings = projectSessions(this.issue, catalog.items);
-      // A later hint/read already fenced this projection. Only the last
-      // actual read in the queue may publish it again.
-      if (this.refreshQueue === task) {
-        this.bindings = bindings;
-        this.active = true;
-        this.ctx.remoteAccess.invalidate();
-      }
-    });
+    const task = this.refreshQueue
+      .catch(() => undefined)
+      .then(async () => {
+        this.abort.signal.throwIfAborted();
+        const catalog = await this.ctx.sessionController.list(
+          {},
+          this.abort.signal,
+        );
+        this.abort.signal.throwIfAborted();
+        const bindings = projectSessions(this.issue, catalog.items);
+        // A later hint/read already fenced this projection. Only the last
+        // actual read in the queue may publish it again.
+        if (this.refreshQueue === task) {
+          this.bindings = bindings;
+          this.active = true;
+          this.ctx.remoteAccess.invalidate();
+        }
+      });
     this.refreshQueue = this.track(task);
     return task;
   }
@@ -355,7 +357,7 @@ class PrincipalService extends TypertRemoteService {
       }),
     );
     this.scopes.set(issue.scopeId, scope);
-    const gate = signalGate(signal);
+    const gate = signalGate(AbortSignal.any([signal, scope.abort.signal]));
     const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
     const pump = commands(input, gate.stop).catch((error) => {
       gate.stop();
@@ -363,6 +365,27 @@ class PrincipalService extends TypertRemoteService {
     });
     void pump.catch(() => {});
     void gate.done.then(() => scope.close()).catch(() => {});
+    let cleanup: Promise<void> | undefined;
+    const join = () =>
+      (cleanup ??= Promise.resolve().then(async () => {
+        gate.stop();
+        try {
+          const results = await Promise.allSettled([
+            scope.close(),
+            Promise.resolve().then(() => input.return?.()),
+          ]);
+          const commands = await Promise.allSettled([pump]);
+          const failures = [...results, ...commands].flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          );
+          if (failures.length === 1) throw failures[0];
+          if (failures.length)
+            throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
+        } finally {
+          gate.detach();
+        }
+      }));
+    let failed = false;
     try {
       try {
         await scope.ready;
@@ -382,14 +405,13 @@ class PrincipalService extends TypertRemoteService {
         };
       }
       await gate.done;
-      await scope.close();
+      await join();
       yield { type: 'closed', scopeId: issue.scopeId };
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
-      gate.stop();
-      await scope.close();
-      await input.return?.();
-      await pump;
-      gate.detach();
+      await (failed ? join().catch(() => {}) : join());
     }
   }
   private async native<T>(
@@ -644,7 +666,7 @@ class PrincipalService extends TypertRemoteService {
           // Only the native Gateway cancellation caused by our own close is
           // mechanical. Its in-process cause is the exact signal reason.
           if (
-            gate.abort.signal.aborted &&
+            (gate.abort.signal.aborted || scope.abort.signal.aborted) &&
             !signal.aborted &&
             failure?.code === 'gateway/cancelled' &&
             failure.cause === active.reason

@@ -702,6 +702,8 @@ describe('public rc.2 Host issuer, generated faces and real in-process Node carr
     const iterator = handle[Symbol.asyncIterator]();
     const first = iterator.next();
     void first.catch(() => {});
+    const terminal = scope.iterator.next();
+    void terminal.catch(() => {});
     try {
       await vi.waitFor(() =>
         expect(
@@ -728,7 +730,10 @@ describe('public rc.2 Host issuer, generated faces and real in-process Node carr
     expect(await unary).toMatchObject({ ok: false });
     await expect(first).rejects.toThrow('PRINCIPAL_ROOT_INVALID');
     expect(await iterator.next()).toMatchObject({ done: true });
-    await close(scope.handle, scope.iterator);
+    expect(await terminal).toMatchObject({
+      value: { type: 'closed', scopeId: fixture.selected.scopeId },
+    });
+    expect(await scope.iterator.next()).toMatchObject({ done: true });
     expect(readSettled).toBe(true);
     expect(
       native.mock.calls.some((call) => call[0] === 'remoteAccess/follow'),
@@ -736,6 +741,24 @@ describe('public rc.2 Host issuer, generated faces and real in-process Node carr
     expect(await page(fixture)).toMatchObject({ ok: false });
     expect(fixture.catalog.pages).toHaveLength(0);
     expect(fixture.parent.signal.aborted).toBe(false);
+  });
+
+  it('retains a transient catalog read error and performs a fresh lookup for the next page request', async () => {
+    const fixture = await setup();
+    const scope = await opened(fixture);
+    const list = vi
+      .fn()
+      .mockRejectedValueOnce(Error('temporary native list failure'));
+    fixture.catalog.beforeList = list;
+    expect(await page(fixture)).toMatchObject({
+      ok: false,
+      error: { message: 'temporary native list failure' },
+    });
+    expect(fixture.catalog.pages).toHaveLength(0);
+    expect(await page(fixture)).toMatchObject({ ok: true });
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(fixture.catalog.pages).toHaveLength(1);
+    await close(scope.handle, scope.iterator);
   });
 
   it('rejects a different parent, undeclared global/control/list actions and raw nested extras before normal decode can erase them', async () => {

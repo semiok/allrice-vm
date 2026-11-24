@@ -42,6 +42,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     private readonly timeoutMs: number,
     parser: TypertSchema<T>,
     receive: (frame: T) => boolean,
+    fence?: (reason: unknown) => void,
   ) {
     this.done = (async () => {
       try {
@@ -50,6 +51,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
           if (frame.scopeId !== scopeId || this.closed) throw unknown();
           if (frame.type === 'closed') {
             this.closed = true;
+            fence?.(Error('PRINCIPAL_SCOPE_CLOSED'));
             continue;
           }
           if (!receive(frame) || this.closing) continue;
@@ -61,6 +63,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
         if (!this.closed) throw unknown();
       } catch (error) {
         this.failure = error;
+        fence?.(error);
         throw error;
       } finally {
         this.ended = true;
@@ -90,7 +93,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     this.joined = Promise.resolve().then(async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        if (!this.ended) {
+        if (!this.ended && !this.closed) {
           this.handle.send('close');
           this.handle.end();
         }
@@ -218,10 +221,10 @@ export function createDEntryPrincipalControl(
                 opened.resolve(frame);
                 return false;
               },
-            );
-            void relay.done.then(
-              () => opened.reject(unknown()),
-              (error) => opened.reject(error),
+              (reason) => {
+                if (published) revoked.abort(reason);
+                else opened.reject(reason);
+              },
             );
             if (business.aborted || joined) void relay.close().catch(() => {});
             const first = await opened.promise;

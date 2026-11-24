@@ -389,6 +389,115 @@ describe('Node control uses the real generated issuer over the same native Peer 
     await fixture.control.close();
   });
 
+  it.each(['guest withdrawal', 'truncated control', 'failed control'] as const)(
+    '%s revokes an opened scope and withholds its buffered child while the other page stays authorized',
+    async (terminal) => {
+      const fixture = await setup();
+      const buffered = deferred(),
+        endControl = deferred();
+      const original = fixture.wire.open;
+      if (!original) throw Error('actual carrier missing');
+      vi.spyOn(fixture.wire, 'open').mockImplementation(
+        (channel, endpoint, payload, signal, uplink) => {
+          const source = original(channel, endpoint, payload, signal, uplink);
+          return {
+            async *[Symbol.asyncIterator]() {
+              for await (const frame of source) {
+                const value =
+                  typeof frame === 'object' && frame
+                    ? Reflect.get(frame, 'value')
+                    : undefined;
+                if (
+                  endpoint === 'allricePrincipal/streamScoped' &&
+                  typeof value === 'object' &&
+                  value &&
+                  Reflect.get(value, 'type') === 'baseline'
+                )
+                  buffered.resolve();
+                yield frame;
+                if (
+                  terminal !== 'guest withdrawal' &&
+                  endpoint === 'allricePrincipal/openScope' &&
+                  typeof frame === 'object' &&
+                  frame &&
+                  Reflect.get(frame, 'type') === 'opened' &&
+                  Reflect.get(frame, 'scopeId') === fixture.selected.scopeId
+                ) {
+                  await endControl.promise;
+                  if (terminal === 'failed control')
+                    throw Error('actual control carrier fault');
+                  return;
+                }
+              }
+            },
+          };
+        },
+      );
+      const first = fixture.control.acquire(
+        fixture.selected,
+        new AbortController().signal,
+      );
+      const scope = await first.run(new AbortController().signal);
+      const otherIssue = {
+        ...fixture.selected,
+        scopeId: randomUUID(),
+        root: { ...fixture.selected.root, nativeSessionId: 'other' },
+      };
+      const other = fixture.control.acquire(
+        otherIssue,
+        new AbortController().signal,
+      );
+      const second = await other.run(new AbortController().signal);
+      const stream = scope.stream(
+        {
+          endpoint: 'remoteAccess/follow',
+          scopeId: scope.opened.scopeId,
+          args: {},
+        },
+        new AbortController().signal,
+      );
+      const revoked = deferred();
+      scope.revoked.addEventListener('abort', () => revoked.resolve(), {
+        once: true,
+      });
+      await buffered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (terminal === 'guest withdrawal') {
+        fixture.catalog.items = [summary('other')];
+        fixture.host.emit('api-session/removed', SessionId('root'));
+      } else {
+        endControl.resolve();
+      }
+      await revoked.promise;
+      await expect(stream[Symbol.asyncIterator]().next()).rejects.toBeDefined();
+      if (terminal === 'guest withdrawal')
+        await expect(first.close()).resolves.toBeUndefined();
+      else
+        await expect(first.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');
+      expect(fixture.carrier.signal.aborted).toBe(false);
+      expect(fixture.parent.signal.aborted).toBe(false);
+      expect(second.revoked.aborted).toBe(false);
+      expect(
+        await second.invoke(
+          {
+            scopeId: otherIssue.scopeId,
+            endpoint: 'session/page',
+            args: {
+              request: {
+                address: { kind: 'session', sessionId: SessionId('other') },
+                throughSeq: 0,
+              },
+            },
+          },
+          new AbortController().signal,
+        ),
+      ).toMatchObject({ endpoint: 'session/page' });
+      await other.close();
+      if (terminal === 'guest withdrawal') await fixture.control.close();
+      else await fixture.control.drainLocal();
+    },
+  );
+
   it.each(['child', 'page', 'business'] as const)(
     '%s close joins an actual pending RemoteAccess next without poisoning another activity',
     async (mode) => {

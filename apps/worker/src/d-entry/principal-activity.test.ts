@@ -79,6 +79,58 @@ describe('catalog owned activity fences and actual child join', () => {
     expect(current).not.toHaveBeenCalled();
   });
 
+  it('releases the catalog child when the returned scope closes and preserves the sibling', async () => {
+    const fixture = await hostFixture();
+    fixtures.push(fixture);
+    const carrier = new AbortController();
+    const control = createDEntryPrincipalControl(fixture.node, {
+      carrier: carrier.signal,
+      cleanupTimeoutMs: 1000,
+    });
+    const group = createDEntryPrincipalChildren(carrier.signal);
+    const otherIssue = { ...fixture.selected, scopeId: randomUUID() };
+    const owned = [fixture.selected, otherIssue].map((issue) => {
+      const child = control.acquire(issue, carrier.signal);
+      const close = vi.fn(() => child.close());
+      const activity = group.acquire({
+        signal: carrier.signal,
+        assertCurrent: async () => {},
+        acquire: () => ({ run: child.run, close }),
+      });
+      return { activity, close };
+    });
+    const [first, second] = await Promise.all(
+      owned.map(({ activity }) => activity.run(carrier.signal)),
+    );
+    const closing = first!.close();
+    expect(first!.close()).toBe(closing);
+    await closing;
+    expect(owned[0]!.close).toHaveBeenCalledOnce();
+    await expect(owned[0]!.activity.run(carrier.signal)).rejects.toThrow(
+      'PRINCIPAL_SCOPE_CLOSED',
+    );
+    expect(second!.revoked.aborted).toBe(false);
+    expect(
+      await second!.invoke(
+        {
+          scopeId: otherIssue.scopeId,
+          endpoint: 'session/page',
+          args: {
+            request: {
+              address: { kind: 'session', sessionId: SessionId('root') },
+              throughSeq: 0,
+            },
+          },
+        },
+        carrier.signal,
+      ),
+    ).toMatchObject({ endpoint: 'session/page' });
+    await group.close();
+    expect(owned[0]!.close).toHaveBeenCalledOnce();
+    expect(owned[1]!.close).toHaveBeenCalledOnce();
+    await control.close();
+  });
+
   it('waits the genuine pending pre-run current read after child close; normal stale abort cannot publish a late scope', async () => {
     const group = createDEntryPrincipalChildren(new AbortController().signal);
     const child = negativeChild(),

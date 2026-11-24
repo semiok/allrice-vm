@@ -41,6 +41,7 @@ export function createDEntryPrincipalChildren(lifetime: AbortSignal) {
       let acquisitionFailed = false;
       let running: ReturnType<DEntryPrincipalActivity['run']> | undefined;
       let joined: Promise<void> | undefined;
+      let detachScope = () => {};
       const activity: DEntryPrincipalActivity = {
         run(caller) {
           if (signal.aborted || joined)
@@ -54,9 +55,13 @@ export function createDEntryPrincipalChildren(lifetime: AbortSignal) {
             await input.assertCurrent(current);
             current.throwIfAborted();
             const scope = await child.run(current);
+            scope.revoked.addEventListener('abort', cancelled, { once: true });
+            detachScope = () =>
+              scope.revoked.removeEventListener('abort', cancelled);
+            if (scope.revoked.aborted) cancelled();
             await input.assertCurrent(current);
             current.throwIfAborted();
-            return scope;
+            return { ...scope, close: activity.close };
           });
           // This continuation runs outside `running`: close can join it
           // without a cycle, including a post-open guard's own rejection.
@@ -71,6 +76,8 @@ export function createDEntryPrincipalChildren(lifetime: AbortSignal) {
             const results = await Promise.allSettled([child?.close()]);
             // The child close settles first/late-open; current guards then really join.
             await Promise.allSettled([running]);
+            detachScope();
+            signal.removeEventListener('abort', cancelled);
             const failures = results.flatMap((result) =>
               result.status === 'rejected' ? [result.reason] : [],
             );
@@ -82,7 +89,6 @@ export function createDEntryPrincipalChildren(lifetime: AbortSignal) {
                   'PRINCIPAL_CHILD_JOIN_FAILED',
                 ),
               });
-            signal.removeEventListener('abort', cancelled);
             children.delete(activity);
           });
           abort.abort();
