@@ -73,21 +73,44 @@ const fail = (message: string): never => {
   throw Error('Invalid native placement experiment: ' + message);
 };
 
-export const nativeRightbarClassSuffix = '_rightbarCol';
-
-// The empty stylesheet must leave the native mount and its ancestry exact.
-export function placementMountIdentity(
+/** The one extra ancestor must be the test-owned host around the same app. */
+export function placementWrapperIdentity(
   before: PanelsCausalSnapshot,
   attached: PanelsCausalSnapshot,
 ) {
-  if (!same(before.ancestors, attached.ancestors))
-    fail('ancestor identity, geometry or paint changed during attachment');
-  const mounts = before.ancestors.filter((node) =>
-    node.className?.endsWith(nativeRightbarClassSuffix),
+  const oldIds = new Set(before.ancestors.map((node) => node.identity));
+  const extras = attached.ancestors.filter(
+    (node) => !oldIds.has(node.identity),
   );
-  if (mounts.length !== 1 || mounts[0]!.tag !== 'DIV')
-    fail('native sidebar mount identity missing');
-  return mounts[0]!.identity;
+  if (extras.length !== 1) fail('not exactly one new owned ancestor');
+  const wrapper = extras[0]!;
+  const index = attached.ancestors.indexOf(wrapper);
+  const app = attached.ancestors[index - 1];
+  const oldApp = before.ancestors[index - 1];
+  if (
+    !app ||
+    !oldApp ||
+    app.identity !== oldApp.identity ||
+    app.parentIdentity !== wrapper.identity ||
+    wrapper.parentIdentity !== oldApp.parentIdentity ||
+    wrapper.tag !== 'DIV' ||
+    wrapper.className !== null ||
+    wrapper.styles.display !== 'contents' ||
+    wrapper.styles.position !== 'static' ||
+    wrapper.styles.transform !== 'none' ||
+    !same(wrapper.rect, { x: 0, y: 0, width: 0, height: 0 })
+  )
+    fail('host is not the planned identity wrapper around the same app');
+  const normalized = attached.ancestors
+    .filter((node) => node.identity !== wrapper.identity)
+    .map((node) =>
+      node.identity === app!.identity
+        ? { ...node, parentIdentity: oldApp!.parentIdentity }
+        : node,
+    );
+  if (!same(before.ancestors, normalized))
+    fail('existing ancestor geometry/clip/paint changed during attachment');
+  return wrapper.identity;
 }
 
 /** Fixed viewport coordinates: only this host's known transform matrix differs.
@@ -95,7 +118,7 @@ export function placementMountIdentity(
 export function assertPlacementAncestors(
   transform: PanelsCausalSnapshot,
   layout: PanelsCausalSnapshot,
-  placementIdentity: number,
+  wrapperIdentity: number,
   offset: { x: number; y: number },
 ) {
   const allowed = [
@@ -103,14 +126,14 @@ export function assertPlacementAncestors(
     `matrix(1, 0, 0, 1, ${offset.x}, ${offset.y})`,
   ];
   const normalized = (value: PanelsCausalSnapshot) => {
-    const roots = value.ancestors.filter(
-      (node) => node.identity === placementIdentity,
+    const wrappers = value.ancestors.filter(
+      (node) => node.identity === wrapperIdentity,
     );
-    if (roots.length !== 1) fail('owned ancestor identity lost');
-    if (!allowed.includes(roots[0]!.styles.transform!))
+    if (wrappers.length !== 1) fail('owned ancestor identity lost');
+    if (!allowed.includes(wrappers[0]!.styles.transform!))
       fail('unplanned host transform');
     return value.ancestors.map((node) =>
-      node.identity === placementIdentity
+      node.identity === wrapperIdentity
         ? {
             ...node,
             styles: { ...node.styles, transform: '<owned placement matrix>' },

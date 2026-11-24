@@ -29,8 +29,7 @@ import {
 import {
   assertPlacementAncestors,
   classifyNativePlacementEffect,
-  nativeRightbarClassSuffix,
-  placementMountIdentity,
+  placementWrapperIdentity,
 } from './employee-panels-native-placement';
 
 const suite =
@@ -133,71 +132,59 @@ async function dismissInitialNativeCatalog(page: Page, out: string) {
   );
 }
 
-// Own a positioning stylesheet on the rightbar column of the released shell.
-// The existing mount, its content and adjacent native chrome stay in place in
-// the DOM. Only the sidebar box is positioned by the two test mechanisms.
+// This closure owns a new DOM host only. Existing product nodes/styles are never edited.
 async function nativeHost(page: Page, offset: { x: number; y: number }) {
   return page.evaluateHandle(
-    ({ offset, selector }) => {
+    ({ offset, nonce }) => {
       const panel = document.querySelector('section[aria-label="Rice · 记忆"]');
-      const surface = panel?.parentElement;
-      const mounts = document.querySelectorAll<HTMLElement>(selector);
-      const mount = mounts[0];
-      const badge = document.querySelector(
-        'button[aria-label="交付成果，5 项新增"]',
-      );
-      if (
-        !panel ||
-        !surface ||
-        mounts.length !== 1 ||
-        !mount?.contains(surface) ||
-        !badge ||
-        mount.contains(badge)
-      )
-        throw Error('Missing native sidebar mount or adjacent unread control');
-      const parent = mount.parentNode,
-        next = mount.nextSibling;
-      const sheets = [...document.adoptedStyleSheets];
-      const sheet = new CSSStyleSheet();
-      let mode: 'identity' | 'transform' | 'layout' = 'identity';
-      let expectedCss = '';
-      const inputs = () => ({
-        mount: mount.getAttribute('style'),
+      if (!(panel instanceof HTMLElement))
+        throw Error('Missing isolated native panel');
+      const surface = panel.parentElement!;
+      let app = panel;
+      while (app.parentElement && app.parentElement !== document.body)
+        app = app.parentElement;
+      if (app.parentElement !== document.body)
+        throw Error('Missing native application root');
+      const parent = document.body,
+        next = app.nextSibling;
+      const original = {
+        app: app.getAttribute('style'),
         surface: surface.getAttribute('style'),
-      });
-      const position = () => {
-        const style = getComputedStyle(mount);
-        return {
-          display: style.display,
-          position: style.position,
-          left: style.left,
-          top: style.top,
-          transform: style.transform,
-        };
       };
-      const original = inputs(),
-        initial = position();
+      const wrapper = document.createElement('div');
+      wrapper.dataset.nativePlacementOwner = nonce;
+      wrapper.style.display = 'contents';
+      let expectedStyle = wrapper.getAttribute('style');
+      let mode: 'identity' | 'transform' | 'layout' = 'identity';
+      const moveBefore = (destination: Element, before: Element | null) => {
+        const move: unknown = Reflect.get(destination, 'moveBefore');
+        if (typeof move !== 'function')
+          throw Error(
+            'Expected the locked browser to support state-preserving DOM moves',
+          );
+        Reflect.apply(move, destination, [app, before]);
+      };
       const sameNodes = () => {
         if (
           panel.parentElement !== surface ||
-          !mount.contains(surface) ||
-          mount.parentNode !== parent ||
-          mount.nextSibling !== next ||
-          document.querySelector(selector) !== mount ||
-          !badge.isConnected ||
-          mount.contains(badge) ||
-          JSON.stringify(inputs()) !== JSON.stringify(original)
+          !app.contains(surface) ||
+          app.getAttribute('style') !== original.app ||
+          surface.getAttribute('style') !== original.surface
         )
-          throw Error('Native identity, ancestry or inline style changed');
+          throw Error('Native identity/style changed; refuse mutation');
       };
-      const sameSheets = (attached: boolean) => {
-        const expected = attached ? [...sheets, sheet] : sheets;
-        const current = document.adoptedStyleSheets;
+      const wrapped = () => {
+        sameNodes();
         if (
-          expected.length !== current.length ||
-          expected.some((value, index) => current[index] !== value)
+          wrapper.parentNode !== parent ||
+          app.parentNode !== wrapper ||
+          wrapper.nextSibling !== next ||
+          wrapper.childNodes.length !== 1 ||
+          wrapper.attributes.length !== 2 ||
+          wrapper.dataset.nativePlacementOwner !== nonce ||
+          wrapper.getAttribute('style') !== expectedStyle
         )
-          throw Error('Native placement stylesheet ownership changed');
+          throw Error('Native host ownership changed; refuse mutation');
       };
       const measure = () => {
         const rect = (node: Element) => {
@@ -213,7 +200,7 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
           clipMetrics.push({
             tag: node.tagName,
             className: node.getAttribute('class'),
-            placementMount: node === mount,
+            ownedWrapper: node === wrapper,
             rect: rect(node),
             clientLeft: node.clientLeft,
             clientTop: node.clientTop,
@@ -251,75 +238,104 @@ async function nativeHost(page: Page, offset: { x: number; y: number }) {
           },
         };
       };
-      let attached = false;
       const inspect = () => {
-        sameNodes();
-        sameSheets(true);
-        const css = Array.from(sheet.cssRules, (rule) => rule.cssText).join(
-          '\n',
-        );
-        const placement = position();
+        wrapped();
+        const style = getComputedStyle(wrapper);
+        const placement = {
+          display: style.display,
+          position: style.position,
+          left: style.left,
+          top: style.top,
+          transform: style.transform,
+        };
         const x = mode === 'layout' ? offset.x : 0;
         const y = mode === 'layout' ? offset.y : 0;
         const tx = mode === 'transform' ? offset.x : 0;
         const ty = mode === 'transform' ? offset.y : 0;
         const expected =
           mode === 'identity'
-            ? initial
+            ? {
+                display: 'contents',
+                position: 'static',
+                left: 'auto',
+                top: 'auto',
+                transform: 'none',
+              }
             : {
-                ...initial,
+                display: 'block',
                 position: 'relative',
                 left: `${x}px`,
                 top: `${y}px`,
                 transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
               };
         if (
-          css !== expectedCss ||
-          JSON.stringify(placement) !== JSON.stringify(expected)
+          JSON.stringify(placement) !== JSON.stringify(expected) ||
+          (mode === 'identity' && wrapper.getClientRects().length !== 0)
         )
           throw Error('Owned placement does not equal the declared mechanism');
-        return { mode, offset, original, css, placement, metrics: measure() };
+        return {
+          mode,
+          offset,
+          original,
+          rawStyle: expectedStyle,
+          placement,
+          metrics: measure(),
+        };
       };
       return {
         attach() {
           sameNodes();
-          sameSheets(false);
-          document.adoptedStyleSheets = [...sheets, sheet];
-          attached = true;
+          if (
+            app.parentNode !== parent ||
+            app.nextSibling !== next ||
+            wrapper.parentNode
+          )
+            throw Error('Native order changed before attachment');
+          parent.insertBefore(wrapper, app);
+          moveBefore(wrapper, null);
           return inspect();
         },
         place(value: 'transform' | 'layout') {
-          inspect();
-          const x = value === 'layout' ? offset.x : 0;
-          const y = value === 'layout' ? offset.y : 0;
-          const tx = value === 'transform' ? offset.x : 0;
-          const ty = value === 'transform' ? offset.y : 0;
-          sheet.replaceSync(
-            `${selector} { position: relative; left: ${x}px; top: ${y}px; transform: translate(${tx}px, ${ty}px); }`,
-          );
-          expectedCss = sheet.cssRules[0]!.cssText;
+          wrapped();
+          wrapper.style.cssText =
+            'display:block;width:100%;height:100%;min-height:0;position:relative';
+          wrapper.style.left = `${value === 'layout' ? offset.x : 0}px`;
+          wrapper.style.top = `${value === 'layout' ? offset.y : 0}px`;
+          wrapper.style.transform = `translate(${value === 'transform' ? offset.x : 0}px,${value === 'transform' ? offset.y : 0}px)`;
           mode = value;
+          expectedStyle = wrapper.getAttribute('style');
           return inspect();
         },
         inspect,
         restore() {
-          if (attached) {
-            sameSheets(true);
-            document.adoptedStyleSheets = sheets;
-            attached = false;
-          }
           sameNodes();
-          sameSheets(false);
-          if (JSON.stringify(position()) !== JSON.stringify(initial))
-            throw Error('Native sidebar positioning did not restore');
-          return { restored: true, original, actual: inputs() };
+          if (app.parentNode === wrapper) {
+            wrapped();
+            moveBefore(parent, wrapper);
+            wrapper.remove();
+          } else if (
+            wrapper.parentNode ||
+            app.parentNode !== parent ||
+            app.nextSibling !== next
+          )
+            throw Error('Native attachment cannot be safely restored');
+          const restored =
+            app.parentNode === parent &&
+            app.nextSibling === next &&
+            !wrapper.isConnected;
+          if (!restored) throw Error('Native DOM order not restored');
+          return {
+            restored,
+            original,
+            actual: {
+              app: app.getAttribute('style'),
+              surface: surface.getAttribute('style'),
+            },
+          };
         },
       };
     },
-    {
-      offset,
-      selector: `body > #root [class$="${nativeRightbarClassSuffix}"]`,
-    },
+    { offset, nonce: randomUUID() },
   );
 }
 
@@ -405,7 +421,7 @@ suite(
         layout: Awaited<ReturnType<typeof capture>> | undefined,
         returned: Awaited<ReturnType<typeof capture>> | undefined;
       let valid = false,
-        placementIdentity: number | undefined;
+        wrapperIdentity: number | undefined;
       const compare = (
         a: Awaited<ReturnType<typeof capture>>,
         b: Awaited<ReturnType<typeof capture>>,
@@ -414,17 +430,34 @@ suite(
         fullFramePanelWindow: compareSidebarPixels(a.window, b.window),
         fullFrame: compareSidebarPixels(a.frame, b.frame),
       });
-      const unchanged = (
+      const verifyUnchanged = async (
+        file: string,
         a: Awaited<ReturnType<typeof capture>>,
         b: Awaited<ReturnType<typeof capture>>,
         label: string,
       ) => {
-        const pixels = compare(a, b),
-          pngShaMatches = {
-            formalElement: sha(a.element) === sha(b.element),
-            fullFramePanelWindow: sha(a.window) === sha(b.window),
-            fullFrame: sha(a.frame) === sha(b.frame),
-          };
+        const digests = (sample: Awaited<ReturnType<typeof capture>>) => ({
+          formalElement: sha(sample.element),
+          fullFramePanelWindow: sha(sample.window),
+          fullFrame: sha(sample.frame),
+        });
+        const pixels = compare(a, b);
+        const expectedSha256 = digests(a),
+          actualSha256 = digests(b);
+        const pngShaMatches = {
+          formalElement:
+            expectedSha256.formalElement === actualSha256.formalElement,
+          fullFramePanelWindow:
+            expectedSha256.fullFramePanelWindow ===
+            actualSha256.fullFramePanelWindow,
+          fullFrame: expectedSha256.fullFrame === actualSha256.fullFrame,
+        };
+        await save(file, {
+          ...pixels,
+          pngShaMatches,
+          expectedSha256,
+          actualSha256,
+        });
         for (const [kind, value] of Object.entries(pixels))
           expect(value.changedPixels, label + '/' + kind).toBe(0);
         expect(pngShaMatches, label + '/PNG bytes').toEqual({
@@ -432,7 +465,6 @@ suite(
           fullFramePanelWindow: true,
           fullFrame: true,
         });
-        return { ...pixels, pngShaMatches };
       };
       async function capture(
         page: Page,
@@ -714,9 +746,11 @@ suite(
         const repeated = await capture(native, 'native-original-repeat');
         assertCausalInvariant(original.value, repeated.value);
         expect(repeated.value.ancestors).toEqual(original.value.ancestors);
-        await save(
+        await verifyUnchanged(
           'native-original-repeat-control.json',
-          unchanged(original, repeated, 'unmodified native repeat'),
+          original,
+          repeated,
+          'unmodified native repeat',
         );
         const unreadDeliveryBadge = native
           .getByRole('button', {
@@ -734,13 +768,15 @@ suite(
         await settle(native);
         baseline = await capture(native, 'native-attached', true);
         assertCausalInvariant(original.value, baseline.value);
-        placementIdentity = placementMountIdentity(
+        wrapperIdentity = placementWrapperIdentity(
           original.value,
           baseline.value,
         );
-        await save(
+        await verifyUnchanged(
           'attachment-control.json',
-          unchanged(original, baseline, 'native empty stylesheet attachment'),
+          original,
+          baseline,
+          'native host identity attachment',
         );
         for (const [label, mode] of [
           ['native-transform', 'transform'],
@@ -749,7 +785,6 @@ suite(
         ] as const) {
           await owner.evaluate((handle, mode) => handle.place(mode), mode);
           await settle(native);
-          expect(await unreadDeliveryBadge.isVisible()).toBe(true);
           const current = await capture(native, label, true);
           expect(current.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
           assertCausalInvariant(baseline.value, current.value, offset);
@@ -759,7 +794,7 @@ suite(
             assertPlacementAncestors(
               transform.value,
               current.value,
-              placementIdentity,
+              wrapperIdentity,
               offset,
             );
             expect(current.owner!.metrics).toEqual(transform.owner!.metrics);
@@ -791,9 +826,11 @@ suite(
             allMeasuredDifferences: differences,
           });
         }
-        await save(
+        await verifyUnchanged(
           'transform-return-control.json',
-          unchanged(transform!, returned!, 'same mechanism exact return'),
+          transform!,
+          returned!,
+          'same mechanism exact return',
         );
         expect(returned!.owner).toEqual(transform!.owner);
         await save('comparisons.json', {
@@ -826,9 +863,11 @@ suite(
               expect(restored.value.ancestors).toEqual(
                 original.value.ancestors,
               );
-              await save(
+              await verifyUnchanged(
                 'restored-control.json',
-                unchanged(original, restored, 'native exact stylesheet detach'),
+                original,
+                restored,
+                'native exact detach',
               );
             }
           }
@@ -842,9 +881,11 @@ suite(
             const end = await capture(reference, 'reference-end');
             assertCausalInvariant(refStart.value, end.value);
             expect(end.value.ancestors).toEqual(refStart.value.ancestors);
-            await save(
+            await verifyUnchanged(
               'reference-control.json',
-              unchanged(refStart, end, 'untouched reference'),
+              refStart,
+              end,
+              'untouched reference',
             );
           }
         } catch (error) {
@@ -929,7 +970,7 @@ suite(
           pointerControl,
           valid,
           effect,
-          placementIdentity,
+          wrapperIdentity,
           phases: phaseRecords,
           captures,
           comparisons: values,
