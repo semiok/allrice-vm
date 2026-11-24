@@ -1,10 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { z } from 'zod';
+import { EmployeePanelsWriteRejectedError } from '../../lib/chatflow/employee-panel-data-http';
 import {
   ReferenceAudienceSchema,
   ReferencePublicationActionSchema,
   ReferencePublishInputSchema,
+  UuidSchema,
   type ReferenceRevision,
   type WorkbenchDeliverable,
 } from '@allrice/contracts';
@@ -48,14 +51,50 @@ type Props = {
   onSaved: (result: { sourceId: string; revisionId?: string }) => void;
 };
 
-type PublicationReceipt = {
-  operation: 'publish-file' | 'publish-upload' | 'change-publication';
-  requestId: string;
-  sourceId?: string;
-};
-// The dialog may unmount after a write has entered the transport. Keep only
-// its original receipt selector for the same editor and target.
-const unresolvedPublications = new Map<string, PublicationReceipt>();
+const receiptSchema = z.strictObject({
+  operation: z.enum(['publish-file', 'publish-upload', 'change-publication']),
+  requestId: UuidSchema,
+  sourceId: UuidSchema.optional(),
+  uploadDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+});
+type PublicationReceipt = z.infer<typeof receiptSchema>;
+const receiptList = z.array(receiptSchema);
+const unresolvedPublications = new Map<string, PublicationReceipt[]>();
+
+// Only the original receipt selectors and an upload fingerprint survive a
+// reload of this tab. Keep file content and display metadata in the form.
+function pendingPublications(key: string) {
+  const known = unresolvedPublications.get(key);
+  if (known) return known;
+  try {
+    const value = sessionStorage.getItem(key);
+    const parsed = receiptList.safeParse(value ? JSON.parse(value) : []);
+    if (parsed.success) return parsed.data;
+  } catch {}
+  return [];
+}
+
+function rememberPublications(key: string, values: PublicationReceipt[]) {
+  unresolvedPublications.set(key, values);
+  try {
+    if (values.length) sessionStorage.setItem(key, JSON.stringify(values));
+    else sessionStorage.removeItem(key);
+  } catch {}
+}
+
+async function publicationFingerprint(value: unknown) {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(JSON.stringify(value)),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('');
+}
+
 const waitingForReceipt = '发布结果待核，请按原请求核对。';
 
 // Replacing the account, workspace or precise target discards local form state
@@ -103,12 +142,15 @@ function PublicationForm({
   });
   const options = available.options;
   const reference = 'reference' in target ? target.reference : null;
-  const receiptKey = JSON.stringify([
-    workspaceId,
-    viewerId,
-    target.kind,
-    target.kind === 'file' ? target.file.objectId : reference?.sourceId,
-  ]);
+  const receiptKey =
+    'allrice:publication-receipts:v1:' +
+    JSON.stringify([
+      headers['x-allrice-organization-id'],
+      workspaceId,
+      viewerId,
+      target.kind,
+      target.kind === 'file' ? target.file.objectId : reference?.sourceId,
+    ]);
   const publication = reference?.publication;
   const destructive = target.kind === 'revoke' || target.kind === 'delete';
   const [scope, setScope] = useState(publication?.audience.scope ?? 'personal');
@@ -124,10 +166,12 @@ function PublicationForm({
   const transport = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const requestIds = useRef(new Map<string, string>());
-  const [initialReceipt] = useState(() =>
-    dataClient ? unresolvedPublications.get(receiptKey) : undefined,
+  const [initialReceipts] = useState(() =>
+    dataClient ? pendingPublications(receiptKey) : [],
   );
-  const [receipt, setReceipt] = useState(initialReceipt);
+  const [receipts, setReceipts] = useState(initialReceipts);
+  const receipt = receipts[0];
+  const checking = !!receipt && (target.kind !== 'upload' || !upload);
   const savedResult = useRef(onSaved);
   savedResult.current = onSaved;
   useEffect(() => {
@@ -148,7 +192,12 @@ function PublicationForm({
       transport.current = controller;
       try {
         const result = await data.readWriteReceipt(
-          { workspaceId, ...value },
+          {
+            workspaceId,
+            operation: value.operation,
+            requestId: value.requestId,
+            sourceId: value.sourceId,
+          },
           controller.signal,
         );
         if (!alive.current || controller.signal.aborted) return;
@@ -158,9 +207,16 @@ function PublicationForm({
           result.result &&
           'sourceId' in result.result
         ) {
-          if (unresolvedPublications.get(receiptKey) !== value) return;
-          unresolvedPublications.delete(receiptKey);
-          setReceipt(undefined);
+          const previous = pendingPublications(receiptKey);
+          if (
+            !previous.some((pending) => pending.requestId === value.requestId)
+          )
+            return;
+          const remaining = previous.filter(
+            (pending) => pending.requestId !== value.requestId,
+          );
+          rememberPublications(receiptKey, remaining);
+          setReceipts(remaining);
           setError('');
           savedResult.current(result.result);
         }
@@ -176,8 +232,8 @@ function PublicationForm({
     [data, receiptKey, workspaceId],
   );
   useEffect(() => {
-    if (initialReceipt) void reconcile(initialReceipt);
-  }, [initialReceipt, reconcile]);
+    if (initialReceipts[0]) void reconcile(initialReceipts[0]);
+  }, [initialReceipts, reconcile]);
 
   const title = {
     file: '添加为企业资料',
@@ -215,12 +271,19 @@ function PublicationForm({
             (target.kind === 'revoke' && publication.origin === 'file') ||
             (target.kind === 'delete' && publication.origin === 'upload')));
 
+  function forget(value: PublicationReceipt) {
+    const remaining = pendingPublications(receiptKey).filter(
+      (pending) => pending.requestId !== value.requestId,
+    );
+    rememberPublications(receiptKey, remaining);
+    if (alive.current) setReceipts(remaining);
+  }
+
   async function save() {
-    const existing =
-      receipt ?? (dataClient && unresolvedPublications.get(receiptKey));
-    if (existing) {
-      setReceipt(existing);
-      await reconcile(existing);
+    const previous = dataClient ? pendingPublications(receiptKey) : [];
+    if (previous[0] && (target.kind !== 'upload' || !upload)) {
+      setReceipts(previous);
+      await reconcile(previous[0]);
       return;
     }
     if (
@@ -276,23 +339,29 @@ function PublicationForm({
         : ReferencePublishInputSchema;
       const parsed = schema.parse({ ...value, requestId: crypto.randomUUID() });
       const { requestId: proposed, ...canonical } = parsed;
-      // Keep only a compact payload identity between retries, not another full
-      // base64 upload for every edit of its purpose or audience.
-      const digest = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(JSON.stringify(canonical)),
-      );
+      const uploadDigest =
+        parsed && 'origin' in parsed && parsed.origin === 'upload'
+          ? await publicationFingerprint({
+              fileName: parsed.fileName,
+              mediaType: parsed.mediaType,
+              contentBase64: parsed.contentBase64,
+            })
+          : undefined;
+      const key = dataClient
+        ? undefined
+        : await publicationFingerprint(canonical);
       if (!alive.current || controller.signal.aborted) return;
-      const key = Array.from(new Uint8Array(digest), (byte) =>
-        byte.toString(16).padStart(2, '0'),
-      ).join('');
-      const requestId = requestIds.current.get(key) ?? proposed;
-      requestIds.current.set(key, requestId);
+      const requestId = (key && requestIds.current.get(key)) || proposed;
+      if (key) requestIds.current.set(key, requestId);
       if (dataClient) {
-        const prior = unresolvedPublications.get(receiptKey);
+        const held = pendingPublications(receiptKey);
+        const prior = uploadDigest
+          ? held.find((pending) => pending.uploadDigest === uploadDigest)
+          : held[0];
         if (prior) {
-          setReceipt(prior);
-          setError(waitingForReceipt);
+          setReceipts(held);
+          pending.current = false;
+          await reconcile(prior);
           return;
         }
         issued = {
@@ -303,8 +372,9 @@ function PublicationForm({
               ? 'publish-file'
               : 'publish-upload',
           ...(reference ? { sourceId: reference.sourceId } : {}),
+          ...(uploadDigest ? { uploadDigest } : {}),
         };
-        unresolvedPublications.set(receiptKey, issued);
+        rememberPublications(receiptKey, [issued, ...held]);
       }
       const saved = reference
         ? await data.changePublication(
@@ -326,22 +396,24 @@ function PublicationForm({
               ? data.publishFile(body, controller.signal)
               : data.publishUpload(body, controller.signal);
           })();
-      if (issued && unresolvedPublications.get(receiptKey) === issued)
-        unresolvedPublications.delete(receiptKey);
+      if (issued) forget(issued);
       if (alive.current && !controller.signal.aborted) onSaved(saved);
     } catch (caught) {
-      if (issued && !(caught instanceof EmployeePanelDataUnavailableError)) {
+      const definite =
+        caught instanceof EmployeePanelDataUnavailableError ||
+        caught instanceof EmployeePanelsWriteRejectedError;
+      if (issued && !definite) {
         if (alive.current && !controller.signal.aborted) {
-          setReceipt(issued);
+          setReceipts(pendingPublications(receiptKey));
+          setUpload(null);
           setError(waitingForReceipt);
         }
         return;
       }
-      if (issued && unresolvedPublications.get(receiptKey) === issued)
-        unresolvedPublications.delete(receiptKey);
+      if (issued) forget(issued);
       if (alive.current && !controller.signal.aborted) {
         setError(
-          caught instanceof EmployeePanelDataUnavailableError ||
+          definite ||
             (reference && caught instanceof Error && 'status' in caught)
             ? caught.message
             : '发布未完成，请重试。',
@@ -555,13 +627,23 @@ function PublicationForm({
               先下载
             </a>
           ))}
+        {receipt && !checking && (
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => void reconcile(receipt)}
+          >
+            核对结果
+          </Button>
+        )}
         <Button
           type="button"
           variant="primary"
           className={destructive ? css.danger : undefined}
           disabled={
             busy ||
-            (!receipt &&
+            (!checking &&
               (!permitted ||
                 (!destructive &&
                   scope === 'departments' &&
@@ -570,7 +652,7 @@ function PublicationForm({
           }
           onClick={() => void save()}
         >
-          {receipt ? '核对结果' : confirmation}
+          {checking ? '核对结果' : confirmation}
         </Button>
       </footer>
     </DshDialog>

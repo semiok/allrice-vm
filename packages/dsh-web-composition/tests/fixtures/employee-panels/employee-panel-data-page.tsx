@@ -51,6 +51,7 @@ files[2]!.favorite = true;
 let references = structuredClone(sample.references);
 let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
+let metadataCode: string | undefined;
 let publicationReplyLost = false;
 let receiptReady = false;
 let serial = 850;
@@ -136,6 +137,7 @@ const bound = createEmployeePanelDataClient({
     if (input.objectId && metadataStatus)
       throw Object.assign(Error('文件服务拒绝读取'), {
         status: metadataStatus,
+        code: metadataCode,
       });
     const visible =
       state === 'empty'
@@ -362,8 +364,9 @@ function Fixture() {
       mutateOriginal() {
         bytes.set(uid(300), '后续另存的内容');
       },
-      refusePreview(status) {
+      refusePreview(status, code) {
         metadataStatus = status;
+        metadataCode = code;
         window.dispatchEvent(new Event('allrice:workbench-files-changed'));
       },
       losePublicationReply() {

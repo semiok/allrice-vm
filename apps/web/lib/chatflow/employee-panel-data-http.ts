@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  ApiErrorSchema,
   DEntrySelectionInputSchema,
   DeliverableFavoriteResultProjectionSchema,
   DeliverableUploadResultProjectionSchema,
@@ -24,6 +25,41 @@ import {
 import { WorkbenchDeliverablesActionsCatalogSchema } from './workbench-file-actions';
 import { parseArtifactPreview } from './workbench-model';
 import { checkReferenceSelectionFailure } from './reference-selection';
+
+export class EmployeePanelsHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'EmployeePanelsHttpError';
+  }
+}
+
+/** The original BFF confirmed the request never made a reservation. */
+export class EmployeePanelsWriteRejectedError extends EmployeePanelsHttpError {}
+
+async function panelError(response: Response) {
+  const parsed = ApiErrorSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  const error = parsed.success ? parsed.data.error : undefined;
+  return new EmployeePanelsHttpError(
+    response.status,
+    error?.message ?? `文件服务请求失败 (${response.status})。`,
+    error?.code,
+  );
+}
+
+function rejectedBeforeUpload(error: EmployeePanelsHttpError) {
+  return (
+    (error.status === 413 && error.code === 'QUOTA_EXCEEDED') ||
+    (error.status === 400 &&
+      error.code === 'VALIDATION_FAILED' &&
+      error.message === '文件为空、格式无效或超过 50 MiB。')
+  );
+}
 
 export class EmployeePanelsWriteUnknownError extends Error {
   constructor(
@@ -111,10 +147,19 @@ export function createEmployeePanelsHttpClient(
           : { body: JSON.stringify(config.body) }),
       });
       await checkReferenceSelectionFailure(response, config.revisions ?? []);
-      if (!response.ok)
-        throw Object.assign(Error(`文件服务请求失败 (${response.status})。`), {
-          status: response.status,
-        });
+      if (!response.ok) {
+        const error = await panelError(response);
+        if (
+          config.operation === 'publish-upload' &&
+          rejectedBeforeUpload(error)
+        )
+          throw new EmployeePanelsWriteRejectedError(
+            error.status,
+            error.message,
+            error.code,
+          );
+        throw error;
+      }
       const result: unknown = config.blob
         ? await response.blob()
         : await response.json();
@@ -123,6 +168,7 @@ export function createEmployeePanelsHttpClient(
     } catch (error) {
       // No automatic replay or new requestId. Caller can only read the original
       // receipt; an absent receipt still does not establish that nothing ran.
+      if (error instanceof EmployeePanelsWriteRejectedError) throw error;
       if (config.operation && config.requestId)
         throw new EmployeePanelsWriteUnknownError(
           config.operation,

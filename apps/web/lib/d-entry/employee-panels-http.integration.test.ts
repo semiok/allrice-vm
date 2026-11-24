@@ -40,6 +40,7 @@ import {
   createEmployeePanelsHttpClient,
   readEmployeePanelsWriteReceipt,
   EmployeePanelsWriteUnknownError,
+  EmployeePanelsWriteRejectedError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
 import { GET as readWorkspace } from '../../app/api/v1/workspace/route';
@@ -581,30 +582,70 @@ suite(
           expect(catalog.files[0]?.publication).toMatchObject({
             audience: { scope: 'personal' },
           });
-          await page
-            .getByRole('navigation', { name: '面板' })
-            .getByRole('button', { name: '企业资料' })
-            .click();
-          await page.getByRole('button', { name: '上传', exact: true }).click();
+          const materials = () =>
+            page
+              .getByRole('navigation', { name: '面板' })
+              .getByRole('button', { name: '企业资料' })
+              .click();
+          const openUpload = () =>
+            page.getByRole('button', { name: '上传', exact: true }).click();
           const material = page.getByRole('dialog', { name: '上传企业资料' });
-          const uploadedName = '浏览器企业资料.txt';
-          await material.locator('input[type=file]').setInputFiles({
-            name: uploadedName,
-            mimeType: 'text/plain',
-            buffer: Buffer.from('正式资料上传。'),
+          async function selectFile(name: string, text: string) {
+            await material
+              .locator('input[type=file]')
+              .setInputFiles({
+                name,
+                mimeType: 'text/plain',
+                buffer: Buffer.from(text),
+              });
+          }
+          async function publishMaterial() {
+            await material
+              .getByRole('button', { name: '发布', exact: true })
+              .click();
+          }
+
+          const storage = runtimeFixtureStorage(f.db);
+          const put = storage.put.bind(storage);
+          vi.spyOn(storage, 'put').mockImplementationOnce(
+            async (object, bytes) => {
+              await put(object, bytes);
+              throw Error('Upload A acknowledgement lost');
+            },
+          );
+          handlers = createEmployeePanelsHandlers({
+            ...employeePanelsDependencies,
+            storage: () => storage,
           });
+          await materials();
+          await openUpload();
+          await selectFile('浏览器企业资料A.txt', '资料 A 的已写字节。');
+          await publishMaterial();
           await material
-            .getByRole('button', { name: '发布', exact: true })
-            .click();
+            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .waitFor();
+          const pendingId = publishWrites[1]!;
+          expect(publishWrites).toHaveLength(2);
+          expect(publicationStatuses[1]).toBe(500);
+          await page.reload();
+          await materials();
+          await openUpload();
+          await expect.poll(() => receiptReads.at(-1)).toBe(pendingId);
+          await selectFile('浏览器企业资料B.txt', '与 A 无关的正式资料上传。');
+          await material
+            .getByRole('button', { name: '核对结果', exact: true })
+            .waitFor();
+          await publishMaterial();
           await page
             .getByRole('status')
             .filter({ hasText: '已发布' })
             .waitFor();
-          expect(publishWrites).toHaveLength(2);
+          expect(publishWrites).toHaveLength(3);
+          expect(publishWrites[2]).not.toBe(pendingId);
           const uploadedMaterial = await p.client.readWriteReceipt(
             {
               workspaceId: p.selection.workspaceId,
-              requestId: publishWrites[1]!,
+              requestId: publishWrites[2]!,
               operation: 'publish-upload',
             },
             signal(),
@@ -613,18 +654,67 @@ suite(
             status: 'recorded',
             ready: true,
           });
+          await openUpload();
+          await material
+            .getByRole('button', { name: '核对结果', exact: true })
+            .waitFor();
+          await expect.poll(() => receiptReads.at(-1)).toBe(pendingId);
+          expect(publishWrites).toHaveLength(3);
+          expect(
+            await p.client.readWriteReceipt(
+              {
+                workspaceId: p.selection.workspaceId,
+                requestId: pendingId,
+                operation: 'publish-upload',
+              },
+              signal(),
+            ),
+          ).toMatchObject({ status: 'recorded', ready: false });
           expect(referenceWrites).toBe(0);
           await context.close();
         } finally {
           await browser?.close();
           incompleteReply?.destroy();
           incompleteReply = undefined;
+          handlers = createEmployeePanelsHandlers({
+            ...employeePanelsDependencies,
+            storage: () => runtimeFixtureStorage(f.db),
+          });
           fixtureDocument = undefined;
           fixtureAssets.clear();
           dropPublishReply = false;
         }
       },
     );
+    it('distinguishes the original upload validation response from an unknown write', async () => {
+      const p = await person();
+      await release(p);
+      const input = {
+        ...uploadInput(p),
+        contentBase64: '',
+        origin: 'upload' as const,
+        purpose: '',
+        audience: { scope: 'personal' as const, departmentIds: [] },
+      };
+      const response = p.client.publishUpload(input, signal());
+      await expect(response).rejects.toBeInstanceOf(
+        EmployeePanelsWriteRejectedError,
+      );
+      await expect(response).rejects.toMatchObject({
+        status: 400,
+        code: 'VALIDATION_FAILED',
+      });
+      expect(
+        await p.client.readWriteReceipt(
+          {
+            workspaceId: input.workspaceId,
+            requestId: input.requestId,
+            operation: 'publish-upload',
+          },
+          signal(),
+        ),
+      ).toMatchObject({ status: 'unknown', result: null });
+    });
     it('uploads independent same-name files, favorites all employees, publishes a fixed copy and rejects its exact selection after revoke without B/MCP/VM', async () => {
       const p = await person();
       await release(p);

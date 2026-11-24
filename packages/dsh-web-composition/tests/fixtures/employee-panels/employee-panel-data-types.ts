@@ -13,7 +13,7 @@ export interface PanelDataFixture {
   setState(value: PanelDataState): void;
   setKind(value: 'files' | 'materials'): void;
   mutateOriginal(): void;
-  refusePreview(status: number): void;
+  refusePreview(status: number, code?: string): void;
   losePublicationReply(): void;
   finishReceipt(): void;
   evidence(): {

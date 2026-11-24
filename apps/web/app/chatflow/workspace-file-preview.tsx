@@ -41,7 +41,10 @@ import { useReferencePublicationOptions } from './use-reference-publication-opti
 const accessDenied = (error: unknown) =>
   error instanceof Error &&
   'status' in error &&
-  [401, 403, 404].some((status) => status === error.status);
+  ([401, 403, 404].some((status) => status === error.status) ||
+    (error.status === 409 &&
+      'code' in error &&
+      error.code === 'EMPLOYEE_INSTANCE_ARCHIVED'));
 
 /** Used by business file cards as well as the owner directory. Resolve metadata
  * before the toolbar mounts, including when an old card points at a denied file. */

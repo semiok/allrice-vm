@@ -179,35 +179,45 @@ suite(
       if (server) await new Promise<void>((done) => server.close(() => done()));
     });
 
-    it('removes open file contents and actions after the current metadata read returns 403', async () => {
-      const page = await browser.newPage();
-      try {
-        await page.goto(origin);
-        await root(page).getByText(firstFile, { exact: true }).click();
-        await root(page)
-          .getByText('这是固定文件第一页。', { exact: false })
-          .waitFor();
-        await page.evaluate(() => window.__panelDataFixture.refusePreview(403));
-        await root(page).getByText('无权访问', { exact: true }).waitFor();
-        expect(
+    it.each([
+      { status: 403 },
+      { status: 409, code: 'EMPLOYEE_INSTANCE_ARCHIVED' },
+    ])(
+      'removes file contents and actions after the terminal metadata status $status',
+      async ({ status, code }) => {
+        const page = await browser.newPage();
+        try {
+          await page.goto(origin);
+          await root(page).getByText(firstFile, { exact: true }).click();
           await root(page)
             .getByText('这是固定文件第一页。', { exact: false })
-            .count(),
-        ).toBe(0);
-        expect(
-          await root(page).locator('header[aria-label="文件操作"]').count(),
-        ).toBe(0);
-        expect(
-          (await evidence(page)).calls.filter(
-            (call) =>
-              call.method === 'listDeliverables' &&
-              (call.input as { objectId?: string }).objectId,
-          ),
-        ).toHaveLength(2);
-      } finally {
-        await page.close();
-      }
-    });
+            .waitFor();
+          await page.evaluate(
+            ({ status, code }) =>
+              window.__panelDataFixture.refusePreview(status, code),
+            { status, code },
+          );
+          await root(page).getByText('无权访问', { exact: true }).waitFor();
+          expect(
+            await root(page)
+              .getByText('这是固定文件第一页。', { exact: false })
+              .count(),
+          ).toBe(0);
+          expect(
+            await root(page).locator('header[aria-label="文件操作"]').count(),
+          ).toBe(0);
+          expect(
+            (await evidence(page)).calls.filter(
+              (call) =>
+                call.method === 'listDeliverables' &&
+                (call.input as { objectId?: string }).objectId,
+            ),
+          ).toHaveLength(2);
+        } finally {
+          await page.close();
+        }
+      },
+    );
 
     it('reopens an ambiguous publication on its original receipt and never submits a second upload', async () => {
       const page = await browser.newPage();
