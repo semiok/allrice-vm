@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import re
+import socket
 import stat
 import struct
 import subprocess
@@ -19,10 +20,14 @@ from service_target import canonical, dotenv_environment, service_config
 VALUE_OPTIONS = {
     '--unhandled-rejections': r'strict|throw|warn|warn-with-error-code|none',
     '--max-http-header-size': r'[0-9]+',
+    '--max-old-space-size': r'[0-9]+',
 }
+BOOLEAN_OPTIONS = {'--enable-source-maps', '--no-warnings', '--trace-warnings', '--trace-deprecation', '--trace-uncaught'}
 ENV_FILE_OPTIONS = {'--env-file', '--env-file-if-exists'}
 WEB_OPTIONS = {'--hostname': r'127\.0\.0\.1|0\.0\.0\.0|localhost|::1?', '--port': r'[0-9]+'}
 BSD_INFO = struct.Struct('=12I16s32s6IQQ')  # Darwin proc_bsdinfo, including start time
+SOCKET_FDINFO_SIZE = 792  # Darwin struct socket_fdinfo from <sys/proc_info.h>
+UNIX_SOCKET_FLAVOR = 3  # PROC_PIDFDSOCKETINFO
 PINNED_NODE = Path.home() / '.local/opt/node-22.23.2/bin/node'
 LOADER_PREFIXES = ('DYLD_', 'LD_', 'NODE_')
 LOADER_SETTINGS = {'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES'}
@@ -58,8 +63,9 @@ def loader_setting(key):
 def process_started(pid):
     system = ctypes.CDLL(None, use_errno=True)
     info = ctypes.create_string_buffer(BSD_INFO.size)
+    ctypes.set_errno(0)
     if system.proc_pidinfo(pid, 3, 0, info, BSD_INFO.size) != BSD_INFO.size:  # PROC_PIDTBSDINFO
-        raise OSError('process start time unavailable')
+        raise OSError(ctypes.get_errno() or None, 'process start time unavailable')
     seconds, microseconds = BSD_INFO.unpack(info.raw)[-2:]
     return seconds * 10**9 + microseconds * 1000
 
@@ -70,10 +76,14 @@ def observe_process(pid):
     start = process_started(pid)
     mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
     length = ctypes.c_size_t()
+    ctypes.set_errno(0)
     if system.sysctl(mib, 3, None, ctypes.byref(length), None, 0) or not length.value:
-        raise OSError('process arguments unavailable')
+        raise OSError(ctypes.get_errno() or None, 'process arguments unavailable')
     data = ctypes.create_string_buffer(length.value)
-    if system.sysctl(mib, 3, data, ctypes.byref(length), None, 0) or process_started(pid) != start:
+    ctypes.set_errno(0)
+    if system.sysctl(mib, 3, data, ctypes.byref(length), None, 0):
+        raise OSError(ctypes.get_errno() or None, 'process arguments unavailable')
+    if process_started(pid) != start:
         raise OSError('process arguments changed during inspection')
     payload = data.raw[:length.value]
     argc = struct.unpack_from('=i', payload)[0]
@@ -105,9 +115,12 @@ def plain_node_options(args, allow_env_files):
             return i + 1, files
         key, eq, value = args[i].partition('=')
         i += 1
+        if key in BOOLEAN_OPTIONS and not eq:
+            continue
         is_env_file = key in ENV_FILE_OPTIONS and allow_env_files
         if key not in VALUE_OPTIONS and not is_env_file:
-            raise ValueError('unknown Node launch option')
+            kind = 'long' if key.startswith('--') else 'short'
+            raise ValueError(f'unrecognized {kind} startup option')
         if not eq:
             if i >= len(args) or args[i].startswith('-'):
                 raise ValueError('missing Node launch option value')
@@ -130,6 +143,30 @@ def ordinary_script_arguments(script, args):
 
 def launch_file(st, start):
     return stat.S_ISREG(st.st_mode) and max(st.st_ctime_ns, st.st_mtime_ns) <= start
+
+
+def node_options_kind(raw_options):
+    if not raw_options:
+        return 'empty'
+    # The small scalar whitelist needs no quoting or escape interpretation.
+    if re.fullmatch(r'[a-z0-9 =-]*', raw_options):
+        options = raw_options.split()
+        try:
+            i, _ = plain_node_options(options, allow_env_files=False)
+        except ValueError:
+            pass
+        else:
+            if i == len(options):
+                return 'recognized neutral options'
+    return 'unverified'
+
+
+def loader_categories(environment):
+    categories = {prefix for key, value in environment.items() if value and key not in ('NODE_ENV', 'NODE_OPTIONS')
+                  for prefix in LOADER_PREFIXES if key.startswith(prefix)}
+    if any(environment.get(key) for key in LOADER_SETTINGS):
+        categories.add('OpenSSL')
+    return sorted(categories)
 
 
 def effective_environment(start, inherited, files):
@@ -159,14 +196,7 @@ def effective_environment(start, inherited, files):
             raise UnverifiedStartup('环境文件编码无法核实。请核查 --env-file 使用 UTF-8 文本且无 NUL 字节。') from None
         environment.update(dotenv_environment(contents, PINNED_NODE))
     environment.update(inherited)
-    # The small scalar whitelist needs no quoting or escape interpretation.
-    raw_options = environment.get('NODE_OPTIONS', '')
-    if not re.fullmatch(r'[a-z0-9 =-]*', raw_options):
-        raise ValueError('unverified Node startup options')
-    options = raw_options.split()
-    i, _ = plain_node_options(options, allow_env_files=False)
-    if i != len(options) or any(value for key, value in environment.items()
-                                if loader_setting(key) and key not in ('NODE_ENV', 'NODE_OPTIONS')):
+    if node_options_kind(environment.get('NODE_OPTIONS', '')) == 'unverified' or loader_categories(environment):
         raise ValueError('unverified Node startup environment')
     return environment
 
@@ -247,6 +277,56 @@ def pg_unix_socket(file):
     return file.kind == 'unix' and file.name.startswith('/') and Path(file.name).name == PG_SOCKET
 
 
+def unix_address(info, offset):
+    length, family = info[offset:offset + 2]  # sockaddr_un.sun_len and sun_family
+    if (length, family) == (0, 0):
+        return ''
+    if not 2 <= length <= 106 or family != socket.AF_UNIX:
+        raise ValueError('Unix 套接字地址格式无法核实')
+    name, _, padding = info[offset + 2:offset + length].partition(b'\0')
+    if not name and any(padding):
+        raise ValueError('Unix 套接字名称格式无法核实')
+    return os.fsdecode(name)
+
+
+def observe_unix_socket(pid, file):
+    """Read a candidate's own socket, including the peer address held by the kernel."""
+    if not file.descriptor.isdecimal() or not re.fullmatch(r'0x[a-fA-F0-9]+', file.device):
+        raise ValueError('Unix 套接字缺少可核实的 FD 或 PCB 标识')
+    system = ctypes.CDLL(None, use_errno=True)
+    start = process_started(pid)
+    buffer = ctypes.create_string_buffer(SOCKET_FDINFO_SIZE)
+    ctypes.set_errno(0)
+    size = system.proc_pidfdinfo(pid, int(file.descriptor), UNIX_SOCKET_FLAVOR, buffer, SOCKET_FDINFO_SIZE)
+    if size != SOCKET_FDINFO_SIZE:
+        raise OSError(ctypes.get_errno() or None, 'proc_pidfdinfo socket read failed')
+    info = buffer.raw
+    # socket_info fields, then un_sockinfo inside socket_info.soi_proto.
+    pcb = struct.unpack_from('=Q', info, 168)[0]
+    family = struct.unpack_from('=i', info, 184)[0]
+    state = struct.unpack_from('=H', info, 192)[0]
+    kind = struct.unpack_from('=i', info, 256)[0]
+    peer = struct.unpack_from('=Q', info, 272)[0]
+    if ((family, kind) != (socket.AF_UNIX, 3) or pcb != int(file.device, 16)
+            or process_started(pid) != start):
+        raise ValueError('Unix 套接字身份在采样中无法核实')
+    if file.name in ('->(none)', '(none)'):
+        same_peer = not peer
+    elif file.name.startswith('->'):
+        same_peer = bool(re.fullmatch(r'->0x[a-fA-F0-9]+', file.name) and peer == int(file.name[2:], 16))
+    else:
+        same_peer = not file.name
+    if not same_peer:
+        raise ValueError('Unix 套接字对端在采样中无法核实')
+    local, remote = unix_address(info, 280), unix_address(info, 535)
+    target = any(name and Path(name).name == PG_SOCKET for name in (local, remote))
+    connected = bool(state & 2)
+    # Keep transitional states uncertain unless a target address is already visible.
+    if not target and (state & (4 | 8) or connected != bool(peer) or (remote and not connected)):
+        raise ValueError('Unix 套接字连接状态无法核实')
+    return {'connected': connected, 'localNamed': bool(local), 'peerNamed': bool(remote), 'targetPg': target}
+
+
 def internet_endpoint(value):
     host, separator, port = value.rpartition(':')
     if not separator or not host or not re.fullmatch(r'\*|[0-9]{1,5}', port):
@@ -259,16 +339,34 @@ def internet_endpoint(value):
     return address, port
 
 
-def pg_connection(file, unix_devices):
+def pg_connection(pid, file, unix_devices, evidence):
     if file.kind == 'unix':
+        table = {'type': 'unix', 'source': 'lsof'}
         if file.name.startswith('/'):
-            return pg_unix_socket(file)
+            target = pg_unix_socket(file)
+            evidence.append(dict(table, localNamed=True, targetPg=target))
+            return target
         peer = unix_devices.get(file.name[2:]) if re.fullmatch(r'->0x[a-fA-F0-9]+', file.name) else None
         if peer and peer.name.startswith('/'):
-            return pg_unix_socket(peer)
+            target = pg_unix_socket(peer)
+            evidence.append(dict(table, peerNamed=True, targetPg=target))
+            return target
         if peer and file.device and peer.name == '->' + file.device:
+            evidence.append(dict(table, localNamed=False, peerNamed=False, connected=True, targetPg=False))
             return False  # Both observed endpoints are unnamed.
-        raise UnverifiedStartup(lsof_problem('Unix 套接字或对端地址无法核实', file.kind))
+        table['source'] = 'proc_pidfdinfo'
+        try:
+            info = observe_unix_socket(pid, file)
+        except OSError as error:
+            reason = lsof_problem('本机 Unix FD 读取失败', file.kind, errno=error.errno)
+            evidence.append(dict(table, error=reason, errno=error.errno))
+            raise UnverifiedStartup(reason) from None
+        except ValueError as error:
+            reason = lsof_problem(str(error), file.kind)
+            evidence.append(dict(table, error=reason, errno=None))
+            raise UnverifiedStartup(reason) from None
+        evidence.append(dict(table, **info))
+        return info['targetPg']
     if file.kind not in ('IPv4', 'IPv6'):
         return False
     try:
@@ -393,7 +491,7 @@ def scan_processes(db, roots, known_tree, *web_settings):
         ancestors.add(pid)
         pid = processes[pid][0]
 
-    def classify(pid, name, entries):
+    def classify(pid, name, entries, evidence):
         if pid in known:
             try:
                 if process_started(int(pid)) == known[pid]['started']:
@@ -405,13 +503,20 @@ def scan_processes(db, roots, known_tree, *web_settings):
                 return True, '已记录的进程在本次采样中已退出。'
         cwd = next((file.name for file in entries if file.descriptor == 'cwd' and file.name.startswith('/')), None)
         here = Path(cwd) if cwd else None
+        startup_status, startup_errno = 'read', None
         try:
             observed, args, inherited, start = observe_process(int(pid))
-        except (OSError, ValueError, struct.error):
+        except (OSError, ValueError, struct.error) as error:
             if here is None and not alive(pid):
                 return True, '进程在检查启动信息时已退出。'
+            startup_status = 'read failed' if isinstance(error, OSError) else 'startup record incomplete'
+            startup_errno = getattr(error, 'errno', None)
             observed, inherited = '', None
         node = name == 'node' or Path(observed).name == 'node' or (web and pid == web[0])
+        if node:
+            facts = {'type': 'node', 'environment': startup_status if inherited or startup_status != 'read' else 'empty',
+                     'errno': startup_errno, 'cwdVisible': here is not None}
+            evidence['startup'] = facts
         if not inherited:
             if node:
                 return False, ENV_UNAVAILABLE
@@ -419,20 +524,25 @@ def scan_processes(db, roots, known_tree, *web_settings):
                 return False, '启动环境不可见，lsof 显示工作目录属于目标。'
             if any(file.name.startswith('/') and scoped(file.name) for file in entries):
                 return False, '启动环境不可见，lsof 显示打开文件属于目标。'
-            gap = lsof_problem('未看到此进程的可核实 cwd', '') if here is None else None
+            gaps = [lsof_problem('未看到此进程的可核实 cwd', '')] if here is None else []
+            sockets = []
             for file in entries:
                 problem = file_gap(file)
                 if problem:
-                    gap = gap or problem
+                    gaps.append(problem)
                     continue
                 try:
-                    if pg_connection(file, unix_devices):
-                        return False, '启动环境不可见，lsof 显示本机 PostgreSQL 5434 端点连接。'
+                    if pg_connection(int(pid), file, unix_devices, sockets):
+                        if sockets:
+                            evidence['unixSockets'] = sockets
+                        return False, '启动环境不可见，套接字观测命中本机 PostgreSQL 5434 端点。'
                 except UnverifiedStartup as error:
-                    gap = gap or str(error)
-            if gap:
-                return False, gap
-            return True, '启动环境不可见，lsof 未见目标工作目录、打开文件或 PG 连接，且不属于已记录 Worker 子树。'
+                    gaps.append(str(error))
+            if sockets:
+                evidence['unixSockets'] = sockets
+            if gaps:
+                return False, ' '.join(dict.fromkeys(gaps))
+            return True, '启动环境不可见，文件和套接字观测未见目标目录、打开文件或 PG 连接，且不属于已记录 Worker 子树。'
         if not node:
             if targets_database(inherited.get('DATABASE_URL', ''), db):
                 return False, 'DATABASE_URL 指向目标库。请核查该进程已退出。'
@@ -440,32 +550,44 @@ def scan_processes(db, roots, known_tree, *web_settings):
                     or any(scoped_argument(arg, here) for arg in args)):
                 return False, '启动路径或工作目录属于目标。请核查该进程已退出。'
             return True, '可读启动环境与观测到的路径未指向目标。'
+        values = (*args, *inherited.keys(), *inherited.values())
+        source_keys = {arg.partition('=')[0].replace('_', '-') for arg in args[1:]}
+        source_option = bool(source_keys & EARLY_SOURCE_OPTIONS) or any(
+            arg.startswith(('-r', '-e', '-p')) and not arg.startswith('--') for arg in args[1:])
+        facts.update(targetDatabaseMarker=any(db in value for value in values),
+                     targetPortMarker=any(PG_PORT in value for value in values),
+                     targetPathMarker=any(str(root) in value for value in values for root in scope),
+                     envFileFlag=bool(source_keys & ENV_FILE_OPTIONS), extraCodeSourceFlag=source_option,
+                     nodeOptions=node_options_kind(inherited.get('NODE_OPTIONS', '')),
+                     loaderEnvironment=loader_categories(inherited))
         if here is None or not canonical(here) or not here.is_dir():
             return False, 'Node 工作目录无法核实。请按 PID 核查 cwd。'
+        facts['cwdOutsideTarget'] = not scoped(here)
         if not args or (args[0] != 'node' and not Path(args[0]).is_absolute()):
             return False, 'Node 的启动入口无法核实。请按 PID 核查启动命令。'
         try:
             index, env_files = plain_node_options(args[1:], allow_env_files=True)
             script = Path(args[index + 1])
-        except (ValueError, IndexError):
+        except ValueError as error:
+            facts['startupOptions'] = str(error)
             return False, 'Node 启动参数无法确认为普通文件启动，入口前的选项可能改变代码来源。请按 PID 核查。'
+        except IndexError:
+            facts['startupOptions'] = 'entry missing'
+            return False, 'Node 缺少可核实的普通文件入口。请按 PID 核查。'
+        facts['startupOptions'] = 'recognized'
+        facts['entryForm'] = 'absolute' if script.is_absolute() else 'relative'
+        if not script.is_absolute():
+            script = here / script
+        facts['entryOutsideTarget'] = not scoped(script)
         # Node can read env/config options even after an apparent script entry.
-        source_option = any(arg.partition('=')[0].replace('_', '-') in EARLY_SOURCE_OPTIONS
-                            or (arg.startswith(('-r', '-e', '-p')) and not arg.startswith('--'))
-                            for arg in args[1:])
-        markers = (db, PG_PORT, *map(str, scope))
-        if (not env_files and not source_option and not scoped(here) and not scoped(script)
+        if (not env_files and not source_option and facts['cwdOutsideTarget'] and facts['entryOutsideTarget']
                 and script.suffix in ('.js', '.mjs', '.cjs') and canonical(script) and script.is_file()
                 and not any(scoped_argument(arg, here) for arg in args[1:])
-                and not any(marker in value for value in (*args, *inherited.keys(), *inherited.values())
-                            for marker in markers)):
+                and not any(facts[key] for key in ('targetDatabaseMarker', 'targetPortMarker', 'targetPathMarker'))):
             if not targets_database(inherited.get('DATABASE_URL', ''), db):
-                try:
-                    effective_environment(start, inherited, [])
-                except ValueError:
+                if facts['nodeOptions'] == 'unverified' or facts['loaderEnvironment']:
                     return False, 'Node 启动环境含无法核实作用的加载设置。请按 PID 核查运行时的启动环境。'
-                else:
-                    return True, '可读的普通 Node 启动未见目标库、5434、目标路径或额外代码来源。'
+                return True, '可读的普通 Node 启动未见目标库、5434、目标路径或额外代码来源。'
         if Path(observed).resolve() != PINNED_NODE.resolve():
             return False, 'Node 使用其他运行时且无法凭可读的启动证据排除归属。请按 PID 核查。'
         if (script.suffix not in ('.js', '.mjs', '.cjs') or not canonical(script)
@@ -492,14 +614,18 @@ def scan_processes(db, roots, known_tree, *web_settings):
     # A known descendant missing from the current UID list may still be alive.
     for pid in sorted((processes.keys() | known.keys()) - ancestors, key=int):
         name = processes[pid][1] if pid in processes else known[pid]['command']
+        evidence = {}
         try:
-            allowed, reason = classify(pid, name, files.get(pid, ()))
+            allowed, reason = classify(pid, name, files.get(pid, ()), evidence)
         except UnverifiedStartup as error:
             allowed, reason = False, str(error)
         except (OSError, RuntimeError, ValueError, IndexError, AttributeError, subprocess.SubprocessError):
             allowed, reason = False, '启动参数或文件来源无法核实。请按 PID 核查实际入口和环境文件。'
         command = ''.join(char if char.isprintable() else '?' for char in name)
-        observations.append({'pid': int(pid), 'command': command, 'allowed': allowed, 'reason': reason})
+        row = {'pid': int(pid), 'command': command, 'allowed': allowed, 'reason': reason}
+        if evidence:
+            row['evidence'] = evidence
+        observations.append(row)
     return observations
 
 

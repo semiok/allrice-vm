@@ -1218,6 +1218,7 @@ class DeployDevMigrations(unittest.TestCase):
                 source = f.read()
             source = source.replace('def observe_process(pid):', 'def native_observe_process(pid):', 1)
             source = source.replace('def process_started(pid):', 'def native_process_started(pid):', 1)
+            source = source.replace('def observe_unix_socket(pid, file):', 'def native_observe_unix_socket(pid, file):', 1)
             marker = "if __name__ == '__main__':"
             source = source.replace(marker, '''def process_started(pid):
     if str(pid) == os.environ.get('PROCESS_WORKER_PID') and os.environ.get('PROCESS_TREE_STOPPED'):
@@ -1229,6 +1230,15 @@ def observe_process(pid):
     if row is None:
         raise OSError('fixture process environment unavailable')
     return row['executable'], row['args'], row['environment'], row['started']
+
+def observe_unix_socket(pid, file):
+    rows = json.loads(os.environ.get('PROCESS_UNIX_SOCKETS', '{}'))
+    if file.descriptor not in rows:
+        raise ValueError('Unix 套接字缺少可核实的 FD 或 PCB 标识')
+    row = rows[file.descriptor]
+    if 'errno' in row:
+        raise OSError(row['errno'], 'fixture socket read failure')
+    return row
 
 ''' + marker)
             for path in ('/bin/ps', '/usr/sbin/lsof'):
@@ -1544,9 +1554,9 @@ def observe_process(pid):
         for name, args, cwd, allowed, facts in (
             ('visible unrelated helper', [helper, entry], outside, True, {}),
             ('helper environment hidden outside scope', [helper, entry], outside, True,
-             dict(env_visible=False, reason='lsof 未见目标')),
+             dict(env_visible=False, reason='套接字观测未见目标')),
             ('helper native environment unavailable', [helper, entry], outside, True,
-             dict(observed=False, reason='lsof 未见目标')),
+             dict(observed=False, reason='套接字观测未见目标')),
             ('helper environment hidden in target cwd', [helper, entry], instance, False,
              dict(env_visible=False, reason='lsof 显示工作目录属于目标')),
             ('helper with target cwd', [helper, entry], instance, False, {}),
@@ -1563,8 +1573,8 @@ def observe_process(pid):
         task = 'recover-open-files'
         _, worker, _ = self.recovery_scan_fixture(task)
         rows = self.seed_recovery_partition()
-        safe = 'lsof 未见目标'
-        connection = 'lsof 显示本机 PostgreSQL 5434 端点连接'
+        safe = '套接字观测未见目标'
+        connection = '套接字观测命中本机 PostgreSQL 5434 端点'
         unreadable = '无法核实 lsof'
         secret = 'fixture-sensitive-file-name'
         opened = os.path.join(worker['WorkingDirectory'], secret)
@@ -1607,10 +1617,26 @@ def observe_process(pid):
             ('identified unnamed Unix pair', True, safe,
              dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc'], ['p999997'],
                              ['f5', 'tunix', 'd0xabc', 'n->0xdef']])),
-            ('Unix endpoint name missing', False, 'Unix 套接字或对端地址无法核实（TYPE=unix）',
+            ('Unix endpoint name missing', False, 'Unix 套接字缺少可核实的 FD 或 PCB 标识（TYPE=unix）',
              dict(file_sets=[['f4', 'tunix', 'n']])),
-            ('Unix peer not observed', False, 'Unix 套接字或对端地址无法核实（TYPE=unix）',
+            ('Unix peer not observed', False, 'Unix 套接字缺少可核实的 FD 或 PCB 标识（TYPE=unix）',
              dict(file_sets=[['f4', 'tunix', 'n->0xabc']])),
+            ('PG peer available via candidate FD alone', False, connection,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=True, targetPg=True)})),
+            ('non-PG named peer available via candidate FD alone', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=True, targetPg=False)})),
+            ('kernel confirms connected endpoints both unnamed', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']],
+                  unix_sockets={'4': dict(connected=True, localNamed=False, peerNamed=False, targetPg=False)})),
+            ('kernel confirms unbound and unconnected', True, safe,
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->(none)']],
+                  unix_sockets={'4': dict(connected=False, localNamed=False, peerNamed=False, targetPg=False)})),
+            ('kernel socket read denied out of index', False, '本机 Unix FD 读取失败（TYPE=unix）。errno=13',
+             dict(file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']], unix_sockets={'4': {'errno': 13}})),
+            ('missing cwd preserves the FD errno', False, '本机 Unix FD 读取失败（TYPE=unix）。errno=13',
+             dict(cwd=None, file_sets=[['f4', 'tunix', 'd0xdef', 'n->0xabc']], unix_sockets={'4': {'errno': 13}})),
             ('lsof has no record for a still present process', False, unreadable, dict(cwd=None)),
             ('per PID lsof permission error', False, '系统未提供 errno',
              dict(file_sets=[['ferr', 'tunknown', 'nFD info error: Operation not permitted']])),
@@ -1635,6 +1661,9 @@ def observe_process(pid):
         write(env_file, 'FIXTURE=ordinary\n')
         for name, args, cwd, env, allowed in (
             ('alternate Node outside target', [runtime, script, '--ordinary-app-argument'], self.home, {}, True),
+            ('alternate Node with relative entry and neutral options',
+             [runtime, '--enable-source-maps', './ordinary.mjs'], os.path.dirname(script),
+             {'NODE_OPTIONS': '--trace-warnings --max-old-space-size=1024'}, True),
             ('alternate Node with 5434', [runtime, script], self.home, {'PGPORT': '5434'}, False),
             ('alternate Node with target cwd', [runtime, script], instance, {}, False),
             ('alternate Node with target path', [runtime, script, worker['WorkingDirectory']], self.home, {}, False),
@@ -1672,14 +1701,16 @@ def observe_process(pid):
     def check_recovery_scan(self, task, rows, name, args, cwd, allowed, *, environment=None, started=None,
                             web_pid='', observed=True, job_plist=None, executable=NODE, env_visible=True,
                             worker_parent=False, listed=True, reason=None, secret=None,
-                            file_sets=(), lsof_exit=0, lsof_warning=''):
+                            file_sets=(), lsof_exit=0, lsof_warning='', unix_sockets=None):
         proof = os.path.join(self.tmp, 'scan-proof-' + name.replace(' ', '-'))
         started = started or time.time_ns()
         environment = dict(HOME=self.home, **(environment or {})) if env_visible else {}
         snapshot = dict(executable=executable, args=args, environment=environment, started=started) if observed else None
         command = os.path.basename(executable)
         before = f'999998 1 node\n999999 999998 {command}\n' if worker_parent else ''
-        file_sets = [['p999999'], ['fcwd', 'tDIR', 'n' + cwd], *file_sets] if cwd else []
+        file_sets = ([['fcwd', 'tDIR', 'n' + cwd]] if cwd else []) + list(file_sets)
+        if file_sets:
+            file_sets.insert(0, ['p999999'])
         p = self.run_config_tool('schedule-recover', '--instance', task, '--execute',
                                  ROWS=json.dumps(rows), PROOF=proof, PROCESS_WEB_PID=web_pid,
                                  PROCESS_WEB_PLIST=job_plist or self.recovery_web_plist, PROCESS_WEB_CWD=self.recovery_web_cwd,
@@ -1688,7 +1719,7 @@ def observe_process(pid):
                                  PROCESS_SNAPSHOT=json.dumps(snapshot), PROCESS_ARGS=f'999999 1 {command}\n' if listed else '',
                                  PROCESS_ARGS_BEFORE=before, PROCESS_STARTS=json.dumps({'999998': started - 1, '999999': started}),
                                  PROCESS_LSOF=json.dumps(file_sets), PROCESS_LSOF_EXIT=str(lsof_exit),
-                                 PROCESS_LSOF_WARNING=lsof_warning)
+                                 PROCESS_LSOF_WARNING=lsof_warning, PROCESS_UNIX_SOCKETS=json.dumps(unix_sockets or {}))
         self.assertEqual(p.returncode, 0 if allowed else 1, p.stdout + p.stderr)
         self.assertEqual(os.path.exists(proof), allowed)
         instance = os.path.join(self.home, 'allrice-qa', '_allrice40-' + task)
@@ -1706,8 +1737,16 @@ def observe_process(pid):
                              (count, int(allowed) + int(worker_parent), int(not allowed)))
             self.assertEqual(len(report['processes']), count)
             observed = report['processes'][-1]
-            self.assertEqual(set(observed), {'pid', 'command', 'allowed', 'reason'})
+            self.assertEqual(set(observed) - {'evidence'}, {'pid', 'command', 'allowed', 'reason'})
             self.assertEqual((observed['pid'], observed['command'], observed['allowed']), (999999, command, allowed))
+            if unix_sockets:
+                native = [item for item in observed['evidence']['unixSockets'] if item['source'] == 'proc_pidfdinfo']
+                self.assertEqual(len(native), len(unix_sockets))
+                for info, fixture in zip(native, unix_sockets.values()):
+                    self.assertEqual(info['type'], 'unix')
+                    self.assertEqual({key: info[key] for key in fixture}, fixture)
+                if cwd is None:
+                    self.assertIn('未看到此进程的可核实 cwd', observed['reason'])
         if allowed:
             with open(proof) as f:
                 self.assertEqual(f.read(), QA_DATABASE_CLAIM)
