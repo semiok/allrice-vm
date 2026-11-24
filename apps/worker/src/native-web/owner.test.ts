@@ -61,7 +61,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   };
   const profile = [
     { path: 'package.json', contents: '{"name":"fixture-profile"}' },
-  ];
+  ] as const;
   const a = await prepareNativeWebLaunch(config, binding, profile),
     b = await prepareNativeWebLaunch(
       {
