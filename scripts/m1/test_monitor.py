@@ -917,20 +917,54 @@ class Config(unittest.TestCase):
             config = home / 'peer-config.json'
             config.write_text(json.dumps({'stateDir': str(state)}))
             checkpoint = state / 'state.json'
-            checkpoint.write_text(json.dumps({'drillTarget': {'tag': 'outage', 'role': 'peer'}}))
-            original = checkpoint.read_bytes()
             agents = home / 'Library/LaunchAgents'
             agents.mkdir(parents=True)
             for label in ('ai.bplabs.allrice40-dev-monitor', 'ai.bplabs.allrice40-dev-monitor-peer'):
                 (agents / (label + '.plist')).write_bytes(b'existing timer')
+            cases = (
+                ('other target', b'{"drillTarget": {"tag": "outage", "role": "peer"}}', 'different target'),
+                ('unreadable', b'{}', 'fixture unreadable'),
+                ('malformed JSON', b'{', 'cannot use checkpoint'),
+                ('invalid checkpoint', b'[]', 'state is not an object'),
+                ('invalid field', b'{"alerts": []}', 'invalid alerts'),
+                ('invalid alert', b'{"alerts": {"disk": 1}}', 'invalid alert'),
+            )
+            real_open = open
             for peer_flag in ([], ['--peer']):
-                with self.subTest(peer_flag=peer_flag):
-                    with self.assertRaisesRegex(SystemExit, 'state belongs to a different target'), \
-                            mock.patch.object(monitor, 'run') as run:
-                        monitor.main(['launchd', 'install', *peer_flag, '--config', str(config)])
-                    run.assert_not_called()
-                    self.assertEqual(checkpoint.read_bytes(), original)
-                    self.assertEqual(sorted(p.read_bytes() for p in agents.iterdir()), [b'existing timer'] * 2)
+                for condition, original, message in cases:
+                    with self.subTest(peer_flag=peer_flag, condition=condition):
+                        checkpoint.write_bytes(original)
+
+                        def open_file(path, *args, **kwargs):
+                            if condition == 'unreadable' and os.fspath(path) == str(checkpoint):
+                                raise PermissionError('fixture unreadable')
+                            return real_open(path, *args, **kwargs)
+
+                        with self.assertRaisesRegex(SystemExit, message), mock.patch('builtins.open', side_effect=open_file), \
+                                mock.patch.object(monitor, 'run') as run:
+                            monitor.main(['launchd', 'install', *peer_flag, '--config', str(config)])
+                        run.assert_not_called()
+                        self.assertEqual(checkpoint.read_bytes(), original)
+                        self.assertEqual(sorted(p.read_bytes() for p in agents.iterdir()), [b'existing timer'] * 2)
+
+    def test_first_formal_install_can_start_without_a_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):
+            home = Path(tmp).resolve()
+            config = home / 'config.json'
+            agents = home / 'Library/LaunchAgents'
+            agents.mkdir(parents=True)
+            for peer in (False, True):
+                with self.subTest(peer=peer):
+                    state = home / ('new-peer' if peer else 'new-monitor')
+                    config.write_text(json.dumps({'stateDir': str(state)}))
+                    calls = [(0, '', ''), (113, '', ''), (0, '', '')]
+                    with mock.patch.object(monitor, 'run', side_effect=calls) as run, mock.patch('builtins.print'):
+                        monitor.main(['launchd', 'install', '--config', str(config), *(['--peer'] if peer else [])])
+                    label = 'ai.bplabs.allrice40-dev-monitor' + ('-peer' if peer else '')
+                    self.assertEqual([call.args[0][1] for call in run.call_args_list], ['bootout', 'print', 'bootstrap'])
+                    plist = monitor.plistlib.loads((agents / (label + '.plist')).read_bytes())
+                    self.assertEqual(plist['ProgramArguments'][-3:], ['peer' if peer else 'run', '--config', str(config)])
+                    self.assertFalse((state / 'state.json').exists())
 
     def test_legacy_drill_resumes_same_queue_and_removes_its_original_timer(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, HOME=tmp):

@@ -2761,11 +2761,27 @@ PEER_CHECKS = [
 
 def launchd(cfg, action, peer):
     if action == 'install':
-        state = read_json(os.path.join(cfg['stateDir'], 'state.json'), {})
+        path = os.path.join(cfg['stateDir'], 'state.json')
         try:
+            try:
+                with open(path) as file:
+                    state = json.load(file)
+            except FileNotFoundError:
+                if os.path.lexists(path):
+                    raise
+                state = {}
             checkpoint_for_target(cfg, peer, state)
-        except CheckError as err:
-            sys.exit('monitor: ' + str(err))
+            for key, kind in (('drillTarget', dict), ('alerts', dict), ('telegram', dict),
+                              ('opens', dict), ('outbox', list), ('incidentOutbox', list),
+                              ('history', list), ('rounds', list)):
+                if key in state and not isinstance(state[key], kind):
+                    raise CheckError('monitor state has an invalid ' + key)
+            if any(not isinstance(alert, dict) or 'severity' not in alert for alert in state.get('alerts', {}).values()):
+                raise CheckError('monitor state has an invalid alert')
+            if state.get('lastRound') is not None and not isinstance(state['lastRound'], dict):
+                raise CheckError('monitor state has an invalid lastRound')
+        except (OSError, ValueError, CheckError) as err:
+            sys.exit('monitor: cannot use checkpoint %s: %s' % (path, err))
         os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     label = cfg['launchdLabel'] or ('ai.bplabs.allrice40-dev-monitor-peer' if peer else 'ai.bplabs.allrice40-dev-monitor')
     path = expand('~/Library/LaunchAgents/%s.plist' % label)
