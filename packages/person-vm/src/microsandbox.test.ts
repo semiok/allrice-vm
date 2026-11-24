@@ -278,6 +278,16 @@ async function readonlyFixture() {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  function pendingRead<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((resolveRead, rejectRead) => {
+      resolve = resolveRead;
+      reject = rejectRead;
+    });
+    return { promise, resolve, reject };
+  }
+
   it.each(['startup', 'web endpoint'] as const)(
     'joins both independent %s reads after one fails',
     async (phase) => {
@@ -290,8 +300,8 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         instanceId: randomUUID(),
         leaseEpoch: 1,
       };
-      const metadata = Promise.withResolvers<void>();
-      const inspect = Promise.withResolvers<string>();
+      const metadata = pendingRead<void>();
+      const inspect = pendingRead<string>();
       const runner = vi.fn(async (command: Parameters<typeof runCommand>[0]) =>
         command.args[0] === 'inspect' ? inspect.promise : 'microsandbox 0.7.16',
       );
