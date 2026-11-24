@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { once } from 'node:events';
+import { on, once } from 'node:events';
+import { watch } from 'node:fs';
 import {
   access,
   cp,
@@ -16,7 +17,9 @@ import {
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { expect, vi } from 'vitest';
 import type { RequestContext } from '@allrice/contracts';
 import { readReleasedGuestProfile } from '../d-entry/released-profile.js';
@@ -34,6 +37,36 @@ import {
 import { runCommand } from '../../../../packages/person-vm/src/process.ts';
 import { prepareNativeWebLaunch, type NativeWebLaunch } from './launch.js';
 import { openNativeWebOwner } from './owner.js';
+
+async function releaseNativeStartup(
+  eventsPath: string,
+  releasePath: string,
+  authPath: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const file = watch(eventsPath);
+  const changes = on(file, 'change', { signal });
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const events = (await readFile(eventsPath, 'utf8')).split('\n');
+      if (events.includes('before-app-ready')) {
+        await expect(access(authPath)).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+        if (events.includes('reader-enoent')) {
+          await writeFile(releasePath, '', { flag: 'wx' });
+          return;
+        }
+      }
+      await changes.next();
+    }
+  } finally {
+    file.close();
+    await changes.return?.();
+  }
+}
 
 async function isolatedCli(root: string, installedCli: string) {
   const originalPackage = resolve(dirname(installedCli), '..');
@@ -106,8 +139,12 @@ export async function setupNativeWebFixture(
     scope: PersonVmBootstrapScope,
     lifetime: AbortController,
   ) => void,
-  isolateProfile = false,
+  isolated?: {
+    resetProbe?: boolean;
+    onPublicationDiagnostic?: (text: string) => void;
+  },
 ) {
+  const isolateProfile = isolated !== undefined;
   if (!installedCli) throw Error('The exact rc.2 CLI is required');
   expect(
     createHash('sha256')
@@ -178,10 +215,29 @@ export async function setupNativeWebFixture(
     principalProfile,
   };
   const launch = await prepareNativeWebLaunch(configuration, binding, profile);
+  const bootGate = join(root, 'native-startup-gate.mjs');
+  const eventPrefix = join(root, 'native-startup');
+  const readerTrace = join(root, 'trace-native-reader.mjs');
   async function stage(ownerLaunch: NativeWebLaunch) {
     for (const file of ownerLaunch.files) {
       await mkdir(dirname(file.path), { recursive: true });
-      await writeFile(file.path, file.contents, { mode: file.mode });
+      let contents = file.contents;
+      if (
+        isolateProfile &&
+        file.path === join(dshHome, 'native-web/owner.patch.json')
+      ) {
+        const patch = JSON.parse(contents);
+        patch.push({
+          insert: [
+            {
+              id: 'fixture-native-startup-gate',
+              name: pathToFileURL(bootGate).href,
+            },
+          ],
+        });
+        contents = JSON.stringify(patch);
+      }
+      await writeFile(file.path, contents, { mode: file.mode });
     }
   }
   await stage(launch);
@@ -193,6 +249,70 @@ export async function setupNativeWebFixture(
   );
   const tracer = join(root, 'trace-profile-patch.mjs');
   if (isolateProfile) {
+    // The extra loader entry keeps the real launcher before appReady, after
+    // its actual owner entry has applied. No native profile bytes are replaced.
+    await writeFile(
+      bootGate,
+      `
+      import { appendFileSync, existsSync, watch } from 'node:fs';
+      export { inject } from ${JSON.stringify(pathToFileURL(join(dshHome, 'native-web/owner.mjs')).href)};
+      export async function apply(ctx) {
+        const { fiber: owner } = await new Promise(resolve => {
+          const find = () => {
+            const entry = [...ctx.loader.entries()].find(({ options }) =>
+              options.id === 'allrice-native-web-owner');
+            if (!entry?.fiber) return;
+            off();
+            resolve({ fiber: entry.fiber });
+          };
+          const off = ctx.on('internal/plugin', () => queueMicrotask(find));
+          find();
+        });
+        await owner.await();
+        if (owner.state !== 2) throw Error('Real owner did not reach Cordis ACTIVE before the startup gate');
+        let ready = false;
+        const off = ctx.appReady.onReady(() => { ready = true; });
+        try {
+          if (ready) throw Error('Expected gate before launcher appReady');
+          const base = ${JSON.stringify(eventPrefix)} + '.' + process.pid;
+          await new Promise(resolve => {
+            const stop = () => {
+              changes.close();
+              process.off('SIGTERM', stop);
+              resolve();
+            };
+            const changes = watch(${JSON.stringify(root)}, () => {
+              if (existsSync(base + '.release')) stop();
+            });
+            process.once('SIGTERM', stop);
+            appendFileSync(base + '.events', 'before-app-ready\\n');
+          });
+          if (ready) throw Error('Launcher notified appReady while its loader was pending');
+        } finally {
+          off();
+        }
+      }
+    `,
+    );
+    await writeFile(
+      readerTrace,
+      `
+      import fs from 'node:fs';
+      const open = fs.openSync;
+      fs.openSync = function (filename, ...args) {
+        if (filename !== process.argv[1]) return open(filename, ...args);
+        let fd;
+        try {
+          fd = open(filename, ...args);
+        } catch (error) {
+          if (error.code === 'ENOENT') fs.appendFileSync(process.argv[3], 'reader-enoent\\n');
+          throw error;
+        }
+        fs.appendFileSync(process.argv[3], 'reader-open\\n');
+        return fd;
+      };
+    `,
+    );
     const appBoot = pathToFileURL(
       createRequire(cliPath).resolve('@deepseek-ai/dsh-app-boot'),
     ).href;
@@ -227,7 +347,27 @@ export async function setupNativeWebFixture(
       tracer,
       `
       import fs from 'node:fs';
+      import { Server } from 'node:http';
       import { syncBuiltinESMExports } from 'node:module';
+      const events = ${JSON.stringify(eventPrefix)} + '.' + process.pid + '.events';
+      const mark = (event) => fs.appendFileSync(events, event + '\\n');
+      const emit = Server.prototype.emit;
+      Server.prototype.emit = function (event, ...args) {
+        const [request, socket] = args;
+        if (event === 'request' && request.method === 'GET') {
+          const target = new URL(request.url, 'http://fixture');
+          if (target.searchParams.has('token')) {
+            if (target.pathname === '/connect') mark('api-login');
+            if (target.pathname === '/') mark('index-login');
+          }
+        }
+        if (event === 'upgrade' && request.url === '/api/remote.mux' &&
+            !request.headers.cookie && !request.headers.authorization) {
+          mark('mux-probe');
+          if (${isolated.resetProbe === true}) { socket.destroy(); return true; }
+        }
+        return emit.call(this, event, ...args);
+      };
       const read = fs.readFileSync;
       fs.readFileSync = function (file, ...args) {
         const value = read(file, ...args);
@@ -244,6 +384,15 @@ export async function setupNativeWebFixture(
   const startup = new AbortController(),
     lifetime = new AbortController();
   const diagnostics = new Set<string>();
+  const startupTraces = new Map<
+    ReturnType<typeof spawn>,
+    {
+      eventsPath: string;
+      releasePath: string;
+      reads: number;
+      receipts: number;
+    }
+  >();
   let authRead = false;
   let kills = 0,
     waitSignal: AbortSignal | undefined,
@@ -269,7 +418,7 @@ export async function setupNativeWebFixture(
             DO_NOT_TRACK: '1',
             NPM_CONFIG_OFFLINE: 'true',
           },
-          stdio: isolateProfile ? ['ignore', 'ignore', 'pipe'] : 'ignore',
+          stdio: isolateProfile ? ['ignore', 'pipe', 'pipe'] : 'ignore',
         },
       );
       child.stderr?.setEncoding('utf8');
@@ -281,6 +430,26 @@ export async function setupNativeWebFixture(
         ))
           diagnostics.add('missing ' + missing[1]);
       });
+      if (isolated) {
+        for (const stream of [child.stdout, child.stderr]) {
+          if (!stream) continue;
+          const lines = createInterface({ input: stream });
+          lines.on('line', (line) => {
+            const visible = stripVTControlCharacters(line);
+            const start = visible.indexOf('Native web auth publication failed');
+            if (start < 0) return;
+            const message = visible.slice(start);
+            const safe =
+              !visible.includes(root) &&
+              /^Native web auth publication failed \[(readiness|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
+                message,
+              );
+            isolated.onPublicationDiagnostic?.(
+              safe ? message : '<invalid auth diagnostic>',
+            );
+          });
+        }
+      }
       exited = new Promise<{ exitCode: number; timedOut: boolean }>(
         (done, reject) => {
           child.once('error', reject);
@@ -321,22 +490,62 @@ export async function setupNativeWebFixture(
         processHandle.kill('SIGKILL');
         await processExit;
       });
+      if (isolateProfile) {
+        const evidence = `${eventPrefix}.${processHandle.pid}`;
+        const trace = {
+          eventsPath: `${evidence}.events`,
+          releasePath: `${evidence}.release`,
+          reads: 0,
+          receipts: 0,
+        };
+        await writeFile(trace.eventsPath, '', { flag: 'a' });
+        startupTraces.set(processHandle, trace);
+      }
       return job;
     },
     async readNativeWebAuth(request) {
       const file = nativeWebAuthArtifact(request);
-      const text = await runCommand({
+      const trace = startupTraces.get(child);
+      if (isolateProfile && !trace)
+        throw Error('Native startup trace is unavailable');
+      if (trace) trace.reads++;
+      const cancelGate = new AbortController();
+      const signal = AbortSignal.any([
+        startup.signal,
+        AbortSignal.timeout(request.timeoutMs),
+        cancelGate.signal,
+      ]);
+      const read = runCommand({
         executable: process.execPath,
-        args: ['-e', NATIVE_WEB_AUTH_READER, file.path, String(file.maxBytes)],
+        args: [
+          ...(trace ? ['--import', readerTrace] : []),
+          '-e',
+          NATIVE_WEB_AUTH_READER,
+          file.path,
+          String(file.maxBytes),
+          ...(trace ? [trace.eventsPath] : []),
+        ],
         env: { PATH: dirname(process.execPath), HOME: root },
-        signal: AbortSignal.any([
-          startup.signal,
-          AbortSignal.timeout(request.timeoutMs),
-        ]),
+        signal,
       });
-      const auth = parseNativeWebAuth(text, request);
-      authRead = true;
-      return auth;
+      const release =
+        trace &&
+        releaseNativeStartup(
+          trace.eventsPath,
+          trace.releasePath,
+          file.path,
+          signal,
+        );
+      try {
+        const [text] = await Promise.all([read, release]);
+        const auth = parseNativeWebAuth(text, request);
+        authRead = true;
+        if (trace) trace.receipts++;
+        return auth;
+      } finally {
+        cancelGate.abort();
+        await Promise.allSettled([read, release]);
+      }
     },
   };
   const context: RequestContext = {
@@ -373,6 +582,15 @@ export async function setupNativeWebFixture(
     if (expectedCloseFailure === undefined) await owner.close();
     else await expect(owner.close()).rejects.toBe(expectedCloseFailure);
   });
+  async function observeNativeStartup(processHandle: ReturnType<typeof spawn>) {
+    const trace = startupTraces.get(processHandle);
+    if (!trace) throw Error('Native startup trace is unavailable');
+    return {
+      reads: trace.reads,
+      receipts: trace.receipts,
+      events: (await readFile(trace.eventsPath, 'utf8')).trim().split('\n'),
+    };
+  }
   return {
     owner,
     seal,
@@ -392,6 +610,7 @@ export async function setupNativeWebFixture(
     startup,
     lifetime,
     child,
+    observeNativeStartup,
     async restartRetained() {
       if (
         !isolateProfile ||

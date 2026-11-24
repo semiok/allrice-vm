@@ -20,6 +20,20 @@ export const inject = [
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
 const original = (value) => value?.[cordisOriginal] ?? value;
+const publicationCodes = new Set([
+  'EACCES',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EEXIST',
+  'EHOSTUNREACH',
+  'EIO',
+  'EISDIR',
+  'ENOENT',
+  'ENOSPC',
+  'ENOTDIR',
+  'EPERM',
+  'ETIMEDOUT',
+]);
 
 async function waitWhileOwned(signal, subscribe) {
   let stop, unsubscribe;
@@ -166,6 +180,7 @@ export function apply(ctx, config) {
   const lifetime = new globalThis.AbortController();
   const { signal } = lifetime;
   const canceled = Error('Native auth publication canceled');
+  let publicationStage = 'readiness';
   let publishing;
   let publicationFailure;
   let stagingCleanupFailure;
@@ -250,6 +265,14 @@ export function apply(ctx, config) {
     if (!current()) return;
     publicationFailure ??= { error };
     void retire().catch(() => {});
+    if (publishing) {
+      // Cordis CLI logs this startup failure. Error messages and filesystem
+      // paths can contain generation credentials, so only report known codes.
+      const code = publicationCodes.has(error?.code) ? error.code : 'FAILED';
+      ctx.logger.error(
+        `Native web auth publication failed [${publicationStage}/${code}]`,
+      );
+    }
   });
 
   async function publish() {
@@ -265,8 +288,10 @@ export function apply(ctx, config) {
     )
       return;
     if (!current()) return;
+    publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;
+    publicationStage = 'artifact';
     await mkdir(dirname(artifactPath), { recursive: true, mode: 0o700 });
     if (!current()) return;
     let primary;

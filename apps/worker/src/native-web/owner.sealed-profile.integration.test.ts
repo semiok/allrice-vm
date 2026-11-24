@@ -25,25 +25,51 @@ afterEach(async () => {
     if (result.status === 'rejected') throw result.reason;
 });
 
+function releasedCli() {
+  const install = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  return join(
+    dirname(install.resolve('@deepseek-ai/dsh/package.json')),
+    'lib/bin.js',
+  );
+}
+
+function assertOneNativeLogin(startup: {
+  reads: number;
+  receipts: number;
+  events: string[];
+}) {
+  expect(startup.reads).toBe(1);
+  expect(startup.receipts).toBe(1);
+  expect(startup.events.indexOf('reader-enoent')).toBeGreaterThanOrEqual(0);
+  expect(startup.events.indexOf('reader-enoent')).toBeLessThan(
+    startup.events.indexOf('mux-probe'),
+  );
+  expect(startup.events.filter((event) => event !== 'reader-enoent')).toEqual([
+    'before-app-ready',
+    'mux-probe',
+    'reader-open',
+    'api-login',
+    'index-login',
+  ]);
+}
+
 it(
   'boots the Worker-sealed AllRice web profile in an initially absent employee DSH_HOME',
   {
     timeout: 30_000,
   },
   async () => {
-    const install = createRequire(
-      new URL(
-        '../../../../packages/dsh-web-composition/package.json',
-        import.meta.url,
-      ),
-    );
-    const installed = dirname(install.resolve('@deepseek-ai/dsh/package.json'));
     const f = await setupNativeWebFixture(
-      join(installed, 'lib/bin.js'),
+      releasedCli(),
       roots,
       cleanup,
       undefined,
-      true,
+      {},
     );
     const active = new AbortController().signal;
     expect(f.launch.command.args.slice(1, 3)).toEqual([
@@ -52,6 +78,7 @@ it(
     ]);
     expect(f.owner.controlReady()).toBe(true);
     expect((await f.owner.readSessions(active)).ok).toBe(true);
+    assertOneNativeLogin(await f.observeNativeStartup(f.child));
     const patch = await f.observedProfilePatch();
     expect(patch.actual).toEqual([patch.expected]);
     const built = JSON.parse(
@@ -122,6 +149,7 @@ it(
     expect(second.child.pid).not.toBe(f.child.pid);
     expect(second.owner.controlReady()).toBe(true);
     expect((await second.owner.readSessions(active)).ok).toBe(true);
+    assertOneNativeLogin(await f.observeNativeStartup(second.child));
     const secondNonce = nativeWebAuthArtifact(second.launch.auth).path;
     await access(secondNonce);
     await second.owner.close();
@@ -153,5 +181,22 @@ it(
     await expect(prepareAgain()).rejects.toThrow(
       'Missing Employee Web artifact file: guest/cordis.patch.yml',
     );
+  },
+);
+
+it(
+  'reports exactly one safe native mux startup diagnostic through the released DSH CLI',
+  { timeout: 30_000 },
+  async () => {
+    const diagnostics: string[] = [];
+    await expect(
+      setupNativeWebFixture(releasedCli(), roots, cleanup, undefined, {
+        resetProbe: true,
+        onPublicationDiagnostic: (message) => diagnostics.push(message),
+      }),
+    ).rejects.toMatchObject({ cause: { code: 'PROVIDER_FAILED' } });
+    expect(diagnostics).toEqual([
+      'Native web auth publication failed [mux/ECONNRESET]',
+    ]);
   },
 );
