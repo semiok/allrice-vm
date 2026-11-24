@@ -6,7 +6,12 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { getEventListeners, on, once } from 'node:events';
 import { get, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createConnection, type AddressInfo, type Socket } from 'node:net';
+import {
+  createConnection,
+  createServer as createTcpServer,
+  type AddressInfo,
+  type Socket,
+} from 'node:net';
 import { expect, it, vi } from 'vitest';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -104,6 +109,55 @@ function observeProfileWire(socket: Socket) {
   }
   return { head, chunk, body, dispose: () => chunks.return?.() };
 }
+
+it.each(['EOF', 'socket error'] as const)(
+  'settles the actual profile wire on %s before a full header',
+  async (terminal) => {
+    const accepted = deferred<Socket>();
+    const server = createTcpServer(accepted.resolve).listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    closes.push(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    const client = createConnection({
+      host: '127.0.0.1',
+      port: (server.address() as AddressInfo).port,
+    });
+    const wire = observeProfileWire(client);
+    const closed = new Promise<void>((resolve) => {
+      client.once('close', () => resolve());
+    });
+    closes.push(async () => {
+      client.destroy();
+      await closed;
+      await wire.dispose();
+    });
+    await once(client, 'connect');
+    const peer = await accepted.promise;
+    closes.push(async () => peer.destroy());
+    let delivered = false;
+    const ready = wire.head(200).then(() => {
+      delivered = true;
+    });
+    const expectedError = Error('Independent socket failure');
+    const rejected =
+      terminal === 'EOF'
+        ? expect(ready).rejects.toThrow(
+            'Profile socket closed before complete response headers',
+          )
+        : expect(ready).rejects.toBe(expectedError);
+    const observed = once(client, 'data');
+    peer.write('HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n');
+    await observed;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(delivered).toBe(false);
+    if (terminal === 'EOF') peer.end();
+    else client.destroy(expectedError);
+    await rejected;
+    await closed;
+    expect(getEventListeners(client, 'data')).toHaveLength(0);
+  },
+);
 
 it('issues only once, borrows the same actual native Peer for unary and stream and joins before closed/end', async () => {
   const f = await fixture();
