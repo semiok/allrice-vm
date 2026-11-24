@@ -9,7 +9,6 @@ import { createServer, get, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
-import { employeeWebKernelOptions } from '../../../../packages/dsh-web-composition/build-web-entry.mjs';
 import { afterEach, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import {
@@ -631,6 +630,12 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
         import.meta.url,
       ),
     );
+    const { employeeWebKernelOptions } = (await import(
+      new URL(
+        '../../../../packages/dsh-web-composition/build-web-entry.mjs',
+        import.meta.url,
+      ).href
+    )) as { employeeWebKernelOptions: { loader: Record<string, string> } };
     function bundle(resolveDir: string, source: string) {
       return require('esbuild')
         .build({
