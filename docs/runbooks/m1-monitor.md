@@ -6,10 +6,10 @@
 
 | 部分            | 位置                                                                                                            | 频率      |
 | --------------- | --------------------------------------------------------------------------------------------------------------- | --------- |
-| 组件健康        | M1 `~/allrice-dev/bin/monitor run`，launchd `ai.bplabs.allrice-dev-monitor`                                     | 每 4 分钟 |
-| 业务巡检（SQL） | 同上，只读查询 `allrice_dev`                                                                                    | 每 4 分钟 |
+| 组件健康        | M1 `~/allrice40-dev/bin/monitor run`，launchd `ai.bplabs.allrice40-dev-monitor`                                 | 每 4 分钟 |
+| 业务巡检（SQL） | 同上，只读查询 `allrice40_dev`                                                                                  | 每 4 分钟 |
 | 入口拨测        | 同上（从 M1 经 Cloudflare 访问）+ huihuimac 的 `monitor peer`（从 M1 之外访问）                                 | 每 4 分钟 |
-| 互相看门        | huihuimac `monitor peer`，launchd `ai.bplabs.allrice-monitor-peer`；M1 也检查它的心跳                           | 每 1 分钟 |
+| 互相看门        | huihuimac `monitor peer`，launchd `ai.bplabs.allrice40-dev-monitor-peer`；M1 也检查它的心跳                     | 每 1 分钟 |
 | 日报            | M1 每天 09:00 之后的第一轮发出                                                                                  | 每天      |
 | 告警出口        | Telegram（凭证只在两台机器的本地文件里）+ 表 `allrice_operational_incidents`（huihuimac 的经 SSH 写进 M1 的表） | 有变化时  |
 
@@ -17,7 +17,7 @@
 
 ## 告警规则
 
-- 每项检查有固定的键（如 `worker`、`disk:~`、`sandbox_vm:allrice-cloud-arm`）。一个键变坏时开一条告警；一直坏着不重复发，只在升级（警告→严重）或提醒（严重每 60 分钟、警告每 6 小时）时再发；变好时发“已恢复”和持续时长。
+- 每项检查有固定的键（如 `worker`、`disk:~`、`sandbox_vm:<4.0 profile>`）。一个键变坏时开一条告警；一直坏着不重复发，只在升级（警告→严重）或提醒（严重每 60 分钟、警告每 6 小时）时再发；变好时发“已恢复”和持续时长。
 - `quota`（模型订阅额度）的持续提醒单独改为每 24 小时一次，从上次通知起算；首次、警告→严重、provider 明确报告额度用完、恢复仍立即通知。额度用完在同一未恢复告警内只升级通知一次，其他告警频率不变。
 - 同一轮里所有变化合成**一条**消息；太长时按告警拆成几条（标 1/2、2/2），不会截掉后面的告警。组件类检查失败后隔 20 秒重查一次，仍失败才告警，避免一次抖动就报警；按项判断，同一检查里首查正常、只在重查时失败的项（如另一个域名、另一个 VM）本轮记为未知，下一轮再看两次。
 - 1 小时内同一个键反复出现 3 次，发一条“反复”通知后静默 1 小时（仍写事件表）。静默期间坏了且下一轮仍然坏（真故障而不是抖动），立即打破静默照常告警；静默中升级也结束静默；静默期间恢复的，静默结束时补发“已恢复”。
@@ -34,30 +34,30 @@
 
 ## 检查项与阈值
 
-阈值都在 `scripts/m1/monitor` 顶部的默认配置里，可以在 `~/allrice-dev/monitor/config.json` 里覆盖（只写要改的键）。
+阈值都在 `scripts/m1/monitor` 顶部的默认配置里，可以在 `~/allrice40-dev/monitor/config.json` 里覆盖（只写要改的键）。
 
-| 键                                            | 查什么                                                                                          | 告警条件（初始值）                                                                                                                                                                                                                       | 手册                                                        |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `postgres`                                    | `select 1`                                                                                      | 连不上或 5 秒无响应：严重                                                                                                                                                                                                                | [数据库](m1-database.md)                                    |
-| `web` / `worker`                              | launchd 状态 + `/api/health/ready`、`/health/ready`（不 ready 时带上 `detail`）                 | 不是 `ready`：严重；`native_once_blocked` 等定时控制器卡住另开一条 `worker_stuck`（带重启 Worker 的命令；Worker 已经报着不可用时也会单独通知）                                                                                           | [Worker 崩溃](m1-worker-crash.md)                           |
-| `versions`                                    | 两个服务上报的 `sourceSha`                                                                      | 不一致：警告                                                                                                                                                                                                                             | [Worker 崩溃](m1-worker-crash.md)                           |
-| `restarts:<label>`                            | launchd 的 `runs` 计数（Web、Worker、隧道）                                                     | 60 分钟内重启 2 次：警告；3 次：严重（1 次是 launchd 拉起来了或手工 kickstart，停机由就绪检查管）                                                                                                                                        | [Worker 崩溃](m1-worker-crash.md)                           |
-| `scheduler`                                   | Worker 就绪接口里的原生一次性/周期控制器                                                        | `blocked`/`closed`/`quarantined`、初始化失败或 3 分钟 `tickCount` 不涨：严重；`starting`/`stopping` 超 10 分钟、`faultCount` 增加：警告。`cold`（短暂）、`disabled` 不报                                                                 | [定时任务没触发](m1-schedule-not-fired.md)                  |
-| `scheduler_takeover`                          | 一直 `cold` 的控制器，只读查它的分区                                                            | 连续两轮（3 分钟以上）`cold`：分区仍被已停的 owner 持有（租约过期、没有关闭证明）、证明和审计表对不上，或有命令等着交给原生时钟：严重；其余情况：警告                                                                                    | [手册 8](m1-schedule-not-fired.md#接管被拒)                 |
-| `sandbox_vm:<profile>`                        | `colima status`、VM 内 docker、`allrice-cloud-watchdog` 服务、`watchdog.py --attest` 证明       | 任一不正常（证明不是 `ready: true` 也算）：严重。只有守护停时镜像和 Office 照常检查                                                                                                                                                      | [沙箱 VM](m1-sandbox-vm.md)                                 |
-| `images`                                      | 运行中版本钉死的镜像（从发布目录的 `cloud-platform.js` 读，部署后自动跟上）是否都在 VM 里       | 缺任何一个：严重                                                                                                                                                                                                                         | [镜像丢失](m1-missing-image.md)                             |
-| `office`                                      | 容器 `allrice-office-renderer` 在运行且健康，`/health` 返回 `ready: true`                       | 任一不正常：严重                                                                                                                                                                                                                         | [沙箱 VM](m1-sandbox-vm.md#office-渲染容器)                 |
-| `subscription`                                | 启用的 Codex 订阅槽位：授权状态、状态更新时间                                                   | 无启用槽位/`disconnected`：严重；其他授权错误连续两轮（3 分钟以上）：严重；30 分钟没更新：警告。确认期间不判断                                                                                                                           | [模型订阅](m1-model-subscription.md)                        |
-| `model_authorization`                         | DSH 既有 Codex 授权的 `payload.expires`（Unix 毫秒）和新增完整 Worker `Handler failed` 系统记录 | 72 小时内警告、24 小时内严重；明确 `DSH_PI_AI_ERROR` 且 message 为 `Your authentication token has expired` 的新增记录报严重。每阶段一次，message/cause 不双计；恢复须到期版本前移且在未来，并有至少 240 秒完整可读、无新增错误的扫描窗口 | [模型授权](m1-model-subscription.md#授权到期与确证过期错误) |
-| `model_authorization_data`                    | 上述到期字段、日志可读性及游标连续性                                                            | 读取失败、格式不支持、记录未完、扫描积压或不可补读缺口：警告“无法判断”；不能恢复原授权故障。不可补缺口保留未知证据，直到新有效到期版本及完整安静窗口                                                                                     | [模型授权](m1-model-subscription.md#授权到期与确证过期错误) |
-| `quota`                                       | 启用槽位的额度（只算供应商标为已测量的窗口）                                                    | 用完/≥95%：严重；≥80%、连续 30 分钟读不到：警告。读不到时不判断，已有的额度告警保持原状                                                                                                                                                  | [模型订阅](m1-model-subscription.md)                        |
-| `tunnel`                                      | launchd 隧道进程 + cloudflared 指标端口 `/ready` 的就绪连接数                                   | 进程不在或就绪连接为 0：严重                                                                                                                                                                                                             | [隧道断开](m1-tunnel.md)                                    |
-| `public_entry` / `public_entry:<域名>`        | `ALLRICE_PUBLIC_URL` 和 `extraPublicUrls`（员工入口、管理后台、Bridge），跟随跳转应得 200       | 15 秒内拿不到 200：严重                                                                                                                                                                                                                  | [隧道断开](m1-tunnel.md)                                    |
-| `disk:<路径>`                                 | 可用空间                                                                                        | 低于 100 GiB：警告；低于 30 GiB：严重                                                                                                                                                                                                    | [磁盘快满](m1-disk-space.md)                                |
-| `backup`                                      | 每日备份日志里最后一次 `ok` + launchd `ai.bplabs.allrice-dev-backup` 上次的退出码               | 上次运行失败或超过 50 小时/没有记录：严重；超过 26 小时、定时任务没加载：警告                                                                                                                                                            | [数据库](m1-database.md#每日备份)                           |
-| `peer` / `peer_telegram`                      | huihuimac 看门的心跳（与 huihuimac 看 M1 的判断相同）                                           | 4 分钟没更新、4 分钟没有一轮跑完、连不上：警告；连续 3 分钟发不出 Telegram：警告                                                                                                                                                         | 本页“看门”                                                  |
-| `monitor` / `monitor_round` / `monitor_state` | 事件表写入积压、单轮超过 240 秒、状态文件损坏                                                   | 积压 30 分钟：警告；超时：严重；损坏：警告                                                                                                                                                                                               | 本页                                                        |
-| `business.*`                                  | 业务巡检                                                                                        | 见“业务巡检”                                                                                                                                                                                                                             | 见“业务巡检”                                                |
+| 键                                                       | 查什么                                                                                          | 告警条件（初始值）                                                                                                                                                                                                                       | 手册                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `postgres`                                               | `select 1`                                                                                      | 连不上或 5 秒无响应：严重                                                                                                                                                                                                                | [数据库](m1-database.md)                                    |
+| `web` / `worker`                                         | launchd 状态 + `/api/health/ready`、`/health/ready`（不 ready 时带上 `detail`）                 | 不是 `ready`：严重；`native_once_blocked` 等定时控制器卡住另开一条 `worker_stuck`（带重启 Worker 的命令；Worker 已经报着不可用时也会单独通知）                                                                                           | [Worker 崩溃](m1-worker-crash.md)                           |
+| `versions`                                               | 两个服务上报的 `sourceSha`                                                                      | 不一致：警告                                                                                                                                                                                                                             | [Worker 崩溃](m1-worker-crash.md)                           |
+| `restarts:<label>`                                       | launchd 的 `runs` 计数（Web、Worker、隧道）                                                     | 60 分钟内重启 2 次：警告；3 次：严重（1 次是 launchd 拉起来了或手工 kickstart，停机由就绪检查管）                                                                                                                                        | [Worker 崩溃](m1-worker-crash.md)                           |
+| `scheduler`                                              | Worker 就绪接口里的原生一次性/周期控制器                                                        | `blocked`/`closed`/`quarantined`、初始化失败或 3 分钟 `tickCount` 不涨：严重；`starting`/`stopping` 超 10 分钟、`faultCount` 增加：警告。`cold`（短暂）、`disabled` 不报                                                                 | [定时任务没触发](m1-schedule-not-fired.md)                  |
+| `scheduler_takeover`                                     | 一直 `cold` 的控制器，只读查它的分区                                                            | 连续两轮（3 分钟以上）`cold`：分区仍被已停的 owner 持有（租约过期、没有关闭证明）、证明和审计表对不上，或有命令等着交给原生时钟：严重；其余情况：警告                                                                                    | [手册 8](m1-schedule-not-fired.md#接管被拒)                 |
+| `sandbox_vm:<profile>`                                   | `colima status`、VM 内 docker、`allrice-cloud-watchdog` 服务、`watchdog.py --attest` 证明       | 任一不正常（证明不是 `ready: true` 也算）：严重。只有守护停时镜像和 Office 照常检查                                                                                                                                                      | [沙箱 VM](m1-sandbox-vm.md)                                 |
+| `images`                                                 | 运行中版本钉死的镜像（从发布目录的 `cloud-platform.js` 读，部署后自动跟上）是否都在 VM 里       | 缺任何一个：严重                                                                                                                                                                                                                         | [镜像丢失](m1-missing-image.md)                             |
+| `office`                                                 | 容器 `allrice-office-renderer` 在运行且健康，`/health` 返回 `ready: true`                       | 任一不正常：严重                                                                                                                                                                                                                         | [沙箱 VM](m1-sandbox-vm.md#office-渲染容器)                 |
+| `subscription`                                           | 启用的 Codex 订阅槽位：授权状态、状态更新时间                                                   | 无启用槽位/`disconnected`：严重；其他授权错误连续两轮（3 分钟以上）：严重；30 分钟没更新：警告。确认期间不判断                                                                                                                           | [模型订阅](m1-model-subscription.md)                        |
+| `model_authorization`                                    | DSH 既有 Codex 授权的 `payload.expires`（Unix 毫秒）和新增完整 Worker `Handler failed` 系统记录 | 72 小时内警告、24 小时内严重；明确 `DSH_PI_AI_ERROR` 且 message 为 `Your authentication token has expired` 的新增记录报严重。每阶段一次，message/cause 不双计；恢复须到期版本前移且在未来，并有至少 240 秒完整可读、无新增错误的扫描窗口 | [模型授权](m1-model-subscription.md#授权到期与确证过期错误) |
+| `model_authorization_data`                               | 上述到期字段、日志可读性及游标连续性                                                            | 读取失败、格式不支持、记录未完、扫描积压或不可补读缺口：警告“无法判断”；不能恢复原授权故障。不可补缺口保留未知证据，直到新有效到期版本及完整安静窗口                                                                                     | [模型授权](m1-model-subscription.md#授权到期与确证过期错误) |
+| `quota`                                                  | 启用槽位的额度（只算供应商标为已测量的窗口）                                                    | 用完/≥95%：严重；≥80%、连续 30 分钟读不到：警告。读不到时不判断，已有的额度告警保持原状                                                                                                                                                  | [模型订阅](m1-model-subscription.md)                        |
+| `tunnel`                                                 | launchd 隧道进程 + cloudflared 指标端口 `/ready` 的就绪连接数                                   | 进程不在或就绪连接为 0：严重                                                                                                                                                                                                             | [隧道断开](m1-tunnel.md)                                    |
+| `public_entry` / `public_entry:allrice-admin.bplabs.xyz` | 两个 4.0 域各自请求 `/api/health/ready`，必须返回 HTTP 200 和已验证的 4.0 Web 身份              | 15 秒内未确认时告警                                                                                                                                                                                                                      | [隧道](m1-tunnel.md)                                        |
+| `disk:<路径>`                                            | 可用空间                                                                                        | 低于 100 GiB：警告；低于 30 GiB：严重                                                                                                                                                                                                    | [磁盘快满](m1-disk-space.md)                                |
+| `backup`                                                 | 每日备份日志里最后一次 `ok` + launchd `ai.bplabs.allrice40-dev-backup` 上次的退出码             | 上次运行失败或超过 50 小时/没有记录：严重；超过 26 小时、定时任务没加载：警告                                                                                                                                                            | [数据库](m1-database.md#每日备份)                           |
+| `peer` / `peer_telegram`                                 | huihuimac 看门的心跳（与 huihuimac 看 M1 的判断相同）                                           | 4 分钟没更新、4 分钟没有一轮跑完、连不上：警告；连续 3 分钟发不出 Telegram：警告                                                                                                                                                         | 本页“看门”                                                  |
+| `monitor` / `monitor_round` / `monitor_state`            | 事件表写入积压、单轮超过 240 秒、状态文件损坏                                                   | 积压 30 分钟：警告；超时：严重；损坏：警告                                                                                                                                                                                               | 本页                                                        |
+| `business.*`                                             | 业务巡检                                                                                        | 见“业务巡检”                                                                                                                                                                                                                             | 见“业务巡检”                                                |
 
 授权检查复用本脚本的文件锁、状态、告警合并、Telegram 和 incident 待发队列，不另起定时器或发送器。到期文件路径默认从 Worker launchd 环境或共享 Dev `.env` 的 `ALLRICE_DSH_PLATFORM_HOME` 派生为 `.credentials.yaml`；日志路径默认取 Worker plist 的 `StandardErrorPath`。可用既有 `config.json` 的 `modelAuthCredentials`、`modelAuthLog` 显式覆盖这两个路径。只投影 `records['llm-pi-ai/openai-codex'].payload.expires`，不刷新、写入或复制授权，也不发真实模型请求。状态只保留到期时间、安全游标、游标前最多 256 字节的局部摘要、布尔解析标记、数量及观察时间，不保留凭据其他字段或原始日志残行。
 
@@ -71,16 +71,16 @@
 
 huihuimac 一侧（`monitor peer`）：
 
-| 键             | 告警条件                                                                                    |
-| -------------- | ------------------------------------------------------------------------------------------- |
-| `m1_reachable` | SSH 连不上 M1（整机宕机、断网、Tailscale 断开）：严重                                       |
-| `m1_heartbeat` | M1 监控心跳超过 6 分钟没更新、6 分钟没有一轮跑完（每轮开始了又出错）或读不到：严重          |
-| `m1_telegram`  | M1 监控没配置 Telegram，或从第一次发送失败起已超过 8 分钟（两轮）：警告                     |
-| `public_entry` | 从 huihuimac 访问 M1 心跳里报告的公网地址，15 秒内拿不到 200：严重；M1 的部署锁被持有时暂停 |
+| 键                                                       | 告警条件                                                                           |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `m1_reachable`                                           | SSH 连不上 M1（整机宕机、断网、Tailscale 断开）：严重                              |
+| `m1_heartbeat`                                           | M1 监控心跳超过 6 分钟没更新、6 分钟没有一轮跑完（每轮开始了又出错）或读不到：严重 |
+| `m1_telegram`                                            | M1 监控没配置 Telegram，或从第一次发送失败起已超过 8 分钟（两轮）：警告            |
+| `public_entry` / `public_entry:allrice-admin.bplabs.xyz` | 两个 4.0 域各自请求 `/api/health/ready`，必须返回 HTTP 200 和已验证的 4.0 Web 身份 | 15 秒内未确认时告警 | [隧道](m1-tunnel.md) |
 
 ## 业务巡检
 
-每轮对 `allrice_dev` 跑业务只读 SQL，另读一次 Postgres 日志（`default_transaction_read_only`、单条 15 秒超时）。SQL 原文在 `scripts/m1/monitor` 的 `SQL_*` 常量里，阈值是 `config.json` 的 `business` 键。Dev 处于维护窗口（`allrice_dev_maintenance.state` 不是 `open`）时，Worker 故意不领任务，带 `admission` 的几项本轮不判断。
+每轮对 `allrice40_dev` 跑业务只读 SQL，另读一次 Postgres 日志（`default_transaction_read_only`、单条 15 秒超时）。SQL 原文在 `scripts/m1/monitor` 的 `SQL_*` 常量里，阈值是 `config.json` 的 `business` 键。Dev 处于维护窗口（`allrice_dev_maintenance.state` 不是 `open`）时，Worker 故意不领任务，带 `admission` 的几项本轮不判断。
 
 | 键                                                     | 判断依据（代码）                                                                                                                                                          | 初始阈值                                                                                                                                                                                            |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -115,9 +115,9 @@ huihuimac 一侧（`monitor peer`）：
 
 ## 安装（发布负责人）
 
-M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice-dev/bin`。第一次另需两步：
+M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice40-dev/bin`。4.0 Dev 获准启用且已在新环境准备就绪后，由发布负责人完成以下两步。
 
-1. 告警凭证：`~/allrice-dev/monitor/telegram.env`（权限 600，不进仓库、不放 Dev 的 `.env`）：
+1. 告警凭证：`~/allrice40-dev/monitor/telegram.env`（权限 600，不进仓库、不放 Dev 的 `.env`）：
 
    ```bash
    TELEGRAM_BOT_TOKEN=<bot token>
@@ -129,63 +129,65 @@ M1 上，`scripts/m1/install` 会把 `monitor` 装进 `~/allrice-dev/bin`。第�
 2. 安装定时任务并发一条测试消息：
 
    ```bash
-   ~/allrice-dev/bin/monitor test-alert
-   ~/allrice-dev/bin/monitor launchd install
+   ~/allrice40-dev/bin/monitor test-alert
+   ~/allrice40-dev/bin/monitor launchd install
    ```
 
-   plist 指向 `~/allrice-dev/bin/monitor`，以后 `scripts/m1/install` 换版本时自动用新版，不用重装 launchd。
+   plist 指向 `~/allrice40-dev/bin/monitor`，以后 `scripts/m1/install` 换版本时自动用新版，不用重装 launchd。
 
 huihuimac 上（没有 AllRice 仓库副本，直接复制 M1 已安装的版本）：
 
 ```bash
-mkdir -p ~/.local/share/allrice-monitor ~/.local/state/allrice-monitor-peer
-scp m1:allrice-dev/bin/monitor m1:allrice-dev/bin/TOOLS_VERSION ~/.local/share/allrice-monitor/
-# 凭证在 ~/.config/allrice-monitor/telegram.env（同上格式，权限 600，目录 700）
-/usr/bin/python3 ~/.local/share/allrice-monitor/monitor test-alert --peer
-/usr/bin/python3 ~/.local/share/allrice-monitor/monitor launchd install --peer
+mkdir -p ~/.local/share/allrice40-monitor ~/.local/state/allrice40-monitor-peer
+scp m1:allrice40-dev/bin/monitor m1:allrice40-dev/bin/service_target.py m1:allrice40-dev/bin/TOOLS_VERSION ~/.local/share/allrice40-monitor/
+# 凭证在 ~/.config/allrice40-monitor/telegram.env（同上格式，权限 600，目录 700）
+/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor test-alert --peer
+/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor launchd install --peer
 ```
 
-huihuimac 的告警通过 `ssh m1 allrice-dev/bin/monitor ingest-incidents` 写进 M1 的事件表，所以 M1 上要先装好 `monitor`。
+huihuimac 的告警通过 `ssh m1 allrice40-dev/bin/monitor ingest-incidents` 写进 M1 的事件表，所以 M1 上要先装好 `monitor`。
 
-事件表要先有迁移 `0220`（随 Dev 部署执行），否则写入会被 `kind` 约束拒绝，30 分钟后报 `monitor`；监控本身照常检查和发 Telegram。`scripts/m1/install` 装之前会用 `/usr/bin/python3`（3.9）跑一遍 `scripts/m1/test_monitor.py`。
+事件表要先有迁移 `0220`（随 Dev 部署执行）。每轮把告警状态和事件待发队列一同存盘。Worker 配置暂不可用、写库地址校验失败或事件表拒绝写入时，队列保留，连续 30 分钟后报 `monitor`。可信的 4.0 连接目标恢复后补写。`scripts/m1/install` 安装前会用 `/usr/bin/python3`（3.9）跑 `scripts/m1/test_monitor.py`。
 
 ## 日常命令
 
 ```bash
-~/allrice-dev/bin/monitor status          # 未恢复的告警、上一轮、Telegram 和事件表积压
-~/allrice-dev/bin/monitor run --dry-run   # 现在跑一遍，只打印，不发不写
-~/allrice-dev/bin/monitor daily           # 立刻发日报
-~/allrice-dev/bin/monitor failures --json # 24 小时失败按错误码分组（新出现/变多/其余），给每日问题报告读
-~/allrice-dev/bin/monitor online-waits --json # 当前前台待答Run、实际占位/容量及来源；只读，可截图
-tail -50 ~/allrice-dev/monitor/monitor.log
+~/allrice40-dev/bin/monitor status          # 未恢复的告警、上一轮、Telegram 和事件表积压
+~/allrice40-dev/bin/monitor run --dry-run   # 现在跑一遍，只打印，不发不写
+~/allrice40-dev/bin/monitor daily           # 立刻发日报
+~/allrice40-dev/bin/monitor failures --json # 24 小时失败按错误码分组（新出现/变多/其余），给每日问题报告读
+~/allrice40-dev/bin/monitor online-waits --json # 当前前台待答Run、实际占位/容量及来源；只读，可截图
+tail -50 ~/allrice40-dev/monitor/monitor.log
 ```
 
-调阈值、关某项检查：在 `~/allrice-dev/monitor/config.json` 写覆盖值，例如 `{"skipChecks": ["peer"], "disks": [{"path": "~", "warnFreeGiB": 80, "criticalFreeGiB": 20}]}`。下一轮生效。
+调阈值、关某项检查：在 `~/allrice40-dev/monitor/config.json` 写覆盖值，例如 `{"skipChecks": ["peer"], "disks": [{"path": "~", "warnFreeGiB": 80, "criticalFreeGiB": 20}]}`。下一轮生效。
 
 ## 看门（监控自己挂了）
 
-- M1 每轮开始和结束都写 `~/allrice-dev/monitor/heartbeat.json`；huihuimac 每 1 分钟用 SSH 读它。M1 整机宕机约 1–2 分钟报 `m1_reachable`；监控停了最迟约 7.5 分钟（6 分钟阈值 + 1 分钟间隔 + 重查）报 `m1_heartbeat`；每轮开始又出错（心跳在刷新但没有一轮跑完）约 7.5 分钟报 `m1_heartbeat`。
-- huihuimac 每轮写 `~/.local/state/allrice-monitor-peer/heartbeat.json`，M1 每轮读它（`peer`、`peer_telegram`，判断和上面相同）。huihuimac 停了或发不出 Telegram，M1 报警告：此时 M1 整机故障将没人报警，尽快恢复。
-- 收到 `m1_heartbeat`：`ssh m1 '~/allrice-dev/bin/monitor status; launchctl print gui/$(id -u)/ai.bplabs.allrice-dev-monitor | head -20; tail -50 ~/allrice-dev/monitor/monitor.log'`。
+- M1 每轮开始和结束都写 `~/allrice40-dev/monitor/heartbeat.json`；huihuimac 每 1 分钟用 SSH 读它。M1 整机宕机约 1–2 分钟报 `m1_reachable`；监控停了最迟约 7.5 分钟（6 分钟阈值 + 1 分钟间隔 + 重查）报 `m1_heartbeat`；每轮开始又出错（心跳在刷新但没有一轮跑完）约 7.5 分钟报 `m1_heartbeat`。
+- huihuimac 每轮写 `~/.local/state/allrice40-monitor-peer/heartbeat.json`，M1 每轮读它（`peer`、`peer_telegram`，判断和上面相同）。huihuimac 停了或发不出 Telegram，M1 报警告：此时 M1 整机故障将没人报警，尽快恢复。
+- 收到 `m1_heartbeat`：`ssh m1 '~/allrice40-dev/bin/monitor status; launchctl print gui/$(id -u)/ai.bplabs.allrice40-dev-monitor | head -20; tail -50 ~/allrice40-dev/monitor/monitor.log'`。
 - 收到 `m1_reachable`：先确认 huihuimac 自己的网络和 Tailscale（`tailscale status`）；M1 在线但 SSH 不通，让用户到机器旁查看。M1 开着 FileVault，**无人值守重启后要有人到机器前登录**，服务才会起来。
 
 ## 诊断交给 Codex
 
-需要定位根因时，派 Codex Astra 做只读诊断（AGENTS.md 第 9 节“线上问题诊断”），结论回报用户：
+需要定位根因时，派 `gpt-6.2-sol` `max` 做只读诊断（AGENTS.md 第 9 节“线上问题诊断”），结论回报用户：
 
 ```bash
-~/.local/bin/codex exec -C ~/allrice-repo -m gpt-6-astra -c model_reasoning_effort=max -s read-only \
-  -o ~/allrice-dev/qa/codex/diagnose-$(date +%m%d-%H%M).md \
+~/.local/bin/codex exec -C ~/allrice40-repo -m gpt-6.2-sol -c model_reasoning_effort=max -s read-only \
+  -o ~/allrice40-dev/qa/codex/diagnose-$(date +%m%d-%H%M).md \
   "只读诊断 M1 Dev 告警：<粘贴告警原文>。查 deploy-dev --status、相关日志和只读 SQL，给出根因、证据和建议修法，不改代码、数据和配置。" </dev/null
 ```
 
 ## 演练
 
-告警链路至少按下面四种演练过一遍（MET-222 记录）。演练用独立的状态目录、标签“演练”和独立的事件库，不碰共享 Dev 的服务、沙箱 VM 和库：
+告警链路的历史演练见 MET-222。4.0 演练使用 `--drill --config <文件>`。M1 的 `stateDir` 为 `~/allrice40-dev/monitor-drills/<代号>`，看门端为 `~/.local/state/allrice40-monitor-peer-drills/<代号>`。两端用相同代号（小写字母开头，可含数字和短横线），配置文件放在各自目录内，命名为 `config.json`。将演练 Telegram 配置放在该状态目录内。
+
+M1 配置的 `incidentDatabaseUrl` 指向独立测试 PostgreSQL，例如 `postgres://test@127.0.0.1:5544/allrice40_monitor_drill_outage`（代号 `outage`）。库名后缀用下划线替换代号中的短横线，事件表须包含 `0220` 的事件类型。看门端将事件送到 M1 同代号的 `ingest-incidents --drill`。可先执行 `monitor run --drill --config <文件>`、`monitor peer --drill --config <文件>`，验证两端状态和事件表，再用相同参数安装演练定时任务。看门端的安装命令另加 `--peer`。告警已带“演练”标签，触发前只配置独立测试 VM、镜像或磁盘。
 
 | 故障         | 做法                                                                                           |
 | ------------ | ---------------------------------------------------------------------------------------------- |
 | 沙箱 VM 停了 | 另建一个最小的 colima 测试实例，加进 `extraColimaProfiles`，`colima stop` 它                   |
-| 镜像丢失     | 在 VM 里构建一个测试镜像，把它的 ID 加进 `extraImages`，再 `docker rmi` 删掉                   |
+| 镜像丢失     | 将测试 VM 设为 `colimaProfile`，把测试镜像的 ID 加进 `extraImages`，再在该 VM 里删除测试镜像   |
 | 磁盘快满     | `hdiutil` 建一个小磁盘映像挂载，加进 `disks`，用 `dd` 填满（`mkfile -n` 是稀疏文件，不占空间） |
 | 监控停了     | 停掉演练用的 M1 监控定时任务，等 huihuimac 报 `m1_heartbeat`                                   |

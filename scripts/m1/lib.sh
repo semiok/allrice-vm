@@ -3,15 +3,47 @@
 M1_LAUNCHCTL=/bin/launchctl
 M1_PY=/usr/bin/python3
 M1_UID=$(/usr/bin/id -u)
-M1_DEV_DISABLED="$HOME/allrice-dev/qa/deploy-disabled"
+M1_TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+M1_DEV_DISABLED="$HOME/allrice40-dev/qa/deploy-disabled"
+M1_DEV_BACKUP_DIRS="storage executions dsh-runtime-m1 native-once-control-m1 native-recurring-control-m1 dsh-platform"
+
+# QA allocation remains shared with 3.x. Select an instance by explicit repository
+# identity before reading its credentials, stopping jobs or changing its database.
+qa_owned() {
+  "$M1_PY" -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except (OSError,ValueError): sys.exit(1)
+sys.exit(0 if isinstance(d,dict) and d.get("repository")=="semiok/allrice-vm" and d.get("repositoryId")==1469490636 else 1)' "$1"
+}
 
 # A refused recovery parks the plists outside LaunchAgents so login cannot start
 # incompatible code. Keep their environment available for recovery and forward fixes.
 dev_plist() { # web|worker -> active plist, or the parked configuration
-  local p="$HOME/Library/LaunchAgents/ai.bplabs.allrice-dev-$1.plist"
+  local p="$HOME/Library/LaunchAgents/ai.bplabs.allrice40-dev-$1.plist"
   [ -f "$p" ] || p="$M1_DEV_DISABLED/$1.plist"
   printf '%s\n' "$p"
 }
+
+# Check the exact launchd target and parse the connection URL before a caller
+# starts a service, stops one, or uses the database. Query parameters can
+# override libpq's host, port or database and are excluded from these URLs.
+service_plist_config() { # path label port-key port database [exports]
+  "$M1_PY" "$M1_TOOLS/service_target.py" "$@"
+}
+
+dev_plist_config() { # web|worker [plist path] [exports]
+  local role=$1 key port
+  case "$role" in
+    web) key=ALLRICE_WEB_PORT; port=3311 ;;
+    worker) key=ALLRICE_WORKER_PORT; port=3312 ;;
+    *) return 2 ;;
+  esac
+  service_plist_config "${2:-$(dev_plist "$role")}" "ai.bplabs.allrice40-dev-$role" "$key" "$port" allrice40_dev ${3:+"$3"}
+}
+
+dev_plist_pair() { dev_plist_config web && dev_plist_config worker; }
+
+dev_release_config() { "$M1_PY" "$M1_TOOLS/service_target.py" release "$@"; }
 
 # flock_fd <fd> [seconds]: take an exclusive kernel lock on the file open at <fd>, waiting
 # up to [seconds] (default 0). Exit 0 = held, 1 = still busy. The lock belongs to the open

@@ -6,14 +6,14 @@
 #   deploy-lock status                                  who holds it; exit 0 free / 3 held
 #   deploy-lock run <task> [--wait <s>] -- <command…>   run <command> while holding the lock
 #
-# It is a kernel lock (flock) on ~/allrice-dev/.local/deploy.lock that <command> and all
+# It is a kernel lock (flock) on ~/allrice40-dev/.local/deploy.lock that <command> and all
 # its children inherit: it is released when the last of them exits, also when they are
 # killed, and never while any of them is still working. There is no expiry or takeover:
 # a holder that hangs has to be looked at and stopped by a person.
 # deploy-dev and scripts/m1/install take the same lock themselves.
 set -euo pipefail
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
-LOCK="$HOME/allrice-dev/.local/deploy.lock"; OWNER="$LOCK.owner"
+LOCK="$HOME/allrice40-dev/.local/deploy.lock"; OWNER="$LOCK.owner"
 die() { echo "deploy-lock: $1" >&2; exit "${2:-1}"; }
 describe() {
   "$M1_PY" -c 'import json,sys,time

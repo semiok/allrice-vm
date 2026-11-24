@@ -179,7 +179,7 @@ function fixture(
     const rows = blobs.map((f) => ({
       ...f,
       type: 'blob',
-      url: `https://api.github.com/repos/semiok/allrice/git/blobs/${f.sha}`,
+      url: `https://api.github.com/repos/semiok/allrice-vm/git/blobs/${f.sha}`,
     }));
     if (capacity) {
       const directories = new Map<string, typeof blobs>();
@@ -199,7 +199,8 @@ function fixture(
           mode: '040000',
           type: 'tree',
           sha,
-          url: 'https://api.github.com/repos/semiok/allrice/git/trees/' + sha,
+          url:
+            'https://api.github.com/repos/semiok/allrice-vm/git/trees/' + sha,
         });
       }
     }
@@ -255,7 +256,7 @@ function fixture(
   const namedLabels = new Set<string>();
   const fetcher = (async (input, init) => {
     const url = new URL(String(input));
-    const path = url.pathname.replace('/repos/semiok/allrice', '');
+    const path = url.pathname.replace('/repos/semiok/allrice-vm', '');
     if (init?.method === 'POST') {
       const payload = JSON.parse(String(init.body));
       const step: RepositoryPublicationStep =
@@ -292,7 +293,7 @@ function fixture(
                 }
               : {}),
             number: 312,
-            html_url: 'https://github.com/semiok/allrice/pull/312',
+            html_url: 'https://github.com/semiok/allrice-vm/pull/312',
             draft: true,
             state: 'open',
             head: {

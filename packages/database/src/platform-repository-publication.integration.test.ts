@@ -361,7 +361,7 @@ suite('private publication canonical queue and authority boundaries', () => {
     const inside = new Promise<void>((r) => (entered = r)),
       blocked = new Promise<void>((r) => (release = r));
     const held = f.db.begin(async (tx) => {
-      await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${admin.actor.id}:1323769790`}))`;
+      await tx`select pg_advisory_xact_lock(hashtext(${`platform-repository-credential:${admin.actor.id}:1469490636`}))`;
       entered();
       await blocked;
     });
@@ -388,11 +388,11 @@ suite('private publication canonical queue and authority boundaries', () => {
     const row = await readRepositoryAction(lease),
       source = row.source;
     const remote = {
-      repositoryId: 1323769790,
-      repository: 'semiok/allrice',
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
       branch: 'allrice/repairs/' + p.id,
       number: 312,
-      url: 'https://github.com/semiok/allrice/pull/312',
+      url: 'https://github.com/semiok/allrice-vm/pull/312',
       headSha: metadata.commit,
       tree,
       baseSha: source.baseSha,
@@ -418,8 +418,8 @@ suite('private publication canonical queue and authority boundaries', () => {
       receipt: {
         version: 1,
         scope: 'allrice.repository-ci.v1',
-        repositoryId: 1323769790,
-        repository: 'semiok/allrice',
+        repositoryId: 1469490636,
+        repository: 'semiok/allrice-vm',
         workflowPath: '.github/workflows/ci.yml',
         workflowBlob: metadata.workflowBlob,
         workflowRunId: 100,

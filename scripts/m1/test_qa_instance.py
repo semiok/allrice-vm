@@ -32,8 +32,18 @@ if command == 'git':
 elif command == 'node':
     if args[0].endswith('/prepare-native-artifact.mjs'):
         print(json.dumps({'artifactId': 'sha256:' + 'b' * 64}))
-    elif args[0].endswith('/prepare-identity.mjs') and os.environ.get('QA_TEST_IDENTITY_FAIL'):
-        sys.exit(42)
+    elif args[0].endswith('/prepare-identity.mjs'):
+        if os.environ.get('QA_TEST_IDENTITY_FAIL'):
+            sys.exit(42)
+        release = Path(args[1].split('=', 1)[1]); sha = args[2].split('=', 1)[1]
+        for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js'):
+            path = release / entry
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        identity = release / '.local/dev-build-identity.json'
+        identity.parent.mkdir(exist_ok=True)
+        identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
+            environment='dev', sourceSha=sha, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
     elif args[0].endswith('/qa-bootstrap.mjs'):
         template = args[args.index('--rice') + 1] if '--rice' in args else str(Path(args[0]).with_name('rice-standard.json'))
         if json.loads(Path(template).read_text()).get('version') != 'ref':
@@ -81,21 +91,45 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         with open(self.script, 'w') as f:
             f.write(definitions + host_stubs + 'cmd_up "$@"\n')
         shutil.copyfile(os.path.join(HERE, 'lib.sh'), os.path.join(self.tmp, 'lib.sh'))
+        shutil.copyfile(os.path.join(HERE, 'service_target.py'), os.path.join(self.tmp, 'service_target.py'))
         shutil.copyfile(os.path.join(HERE, 'qa-lease.py'), os.path.join(self.tmp, 'qa-lease.py'))
         Path(self.tmp, 'rice-standard.json').write_text('{"version":"installed-old","toolNames":["workspace.memory.search"]}')
         self.dispatch_script = os.path.join(self.tmp, 'qa-instance-cli')
         Path(self.dispatch_script).write_text(definitions + host_stubs + marker + dispatch)
-        dev = os.path.join(self.home, 'allrice-dev')
+        dev = os.path.join(self.home, 'allrice40-dev')
         os.makedirs(dev)
         with open(os.path.join(dev, '.env'), 'w') as f:
-            f.write('DATABASE_URL=postgres://stub/allrice_dev\nUNRELATED_SETTING=keep\n')
+            f.write('DATABASE_URL=postgres://stub/allrice_dev\nUNRELATED_SETTING=keep\n'
+                    'ALLRICE_WORKER_PORT=3012\nALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012\n')
+        release = Path(self.home, 'allrice40-dev-releases', 'sealed')
+        for entry in ('apps/web/server.mjs', 'apps/worker/dist/index.js'):
+            path = release / entry
+            path.parent.mkdir(parents=True)
+            path.touch()
+        identity = release / '.local/dev-build-identity.json'
+        identity.parent.mkdir()
+        identity.write_text(json.dumps(dict(repository='semiok/allrice-vm', repositoryId=1469490636,
+            environment='dev', sourceSha=SOURCE_SHA, sourceTree='d'*40, manifestDigest='sha256:'+'e'*64)))
         agents = os.path.join(self.home, 'Library/LaunchAgents')
         os.makedirs(agents)
         for role in ('web', 'worker'):
-            with open(os.path.join(agents, 'ai.bplabs.allrice-dev-' + role + '.plist'), 'wb') as f:
+            entry = 'apps/web/server.mjs' if role == 'web' else 'apps/worker/dist/index.js'
+            with open(os.path.join(agents, 'ai.bplabs.allrice40-dev-' + role + '.plist'), 'wb') as f:
                 plistlib.dump({
-                    'ProgramArguments': [os.path.join(node_bin, 'node'), '--env-file=/unused', '/unused'],
+                    'Label': 'ai.bplabs.allrice40-dev-' + role,
+                    'ProgramArguments': [os.path.join(node_bin, 'node'),
+                                         '--env-file=' + os.path.join(dev, '.env'),
+                                         str(release / entry)],
+                    'WorkingDirectory': str(release / 'apps/web' if role == 'web' else release),
                     'EnvironmentVariables': {
+                        'DATABASE_URL': 'postgres://tester@127.0.0.1:5434/allrice40_dev',
+                        'ALLRICE_WEB_PORT': '3311', 'ALLRICE_WORKER_PORT': '3312',
+                        'ALLRICE_WORKER_INTERNAL_URL': 'http://127.0.0.1:3312',
+                        'ALLRICE_RELEASE_SHA': SOURCE_SHA,
+                        'ALLRICE_STORAGE_ROOT': dev + '/.local/storage',
+                        'ALLRICE_EXECUTION_ROOT': dev + '/.local/executions',
+                        'ALLRICE_DSH_RUNTIME_ROOT': dev + '/.local/dsh-runtime-m1',
+                        'ALLRICE_DSH_PLATFORM_HOME': dev + '/.local/dsh-platform',
                         'ALLRICE_DEV_MAINTENANCE_ENABLED': '1',
                         'ALLRICE_CLOUD_RUNNER_ENABLED': '1',
                         'ALLRICE_CLOUD_MCP_ENABLED': '1',
@@ -129,9 +163,11 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             'scripts/dev-release/prepare-identity.mjs', '--root=' + self.release,
             '--release-sha=' + SOURCE_SHA,
         ])
+        envs = {}
         for role in ('web', 'worker'):
             with open(os.path.join(os.path.dirname(self.release), role + '.plist'), 'rb') as f:
                 env = plistlib.load(f)['EnvironmentVariables']
+            envs[role] = env
             self.assertEqual(env['ALLRICE_DEV_MAINTENANCE_ENABLED'], '0')
             self.assertEqual(env['ALLRICE_CLOUD_RUNNER_ENABLED'], '0')
             self.assertEqual(env['ALLRICE_CLOUD_MCP_ENABLED'], '0')
@@ -143,7 +179,18 @@ class QaInstanceBuildIdentity(unittest.TestCase):
             self.assertEqual(data['setup'], 'ready')
             self.assertEqual(data['owner'], 'test-line')
             self.assertEqual(data['card'], 'MET-218')
-            self.assertIn('expiresAt', data)
+            self.assertIn('repositoryExpiresAt', data)
+            self.assertNotIn('expiresAt', data, 'old allocator must treat the new instance as legacy')
+            self.assertEqual(data['repository'], 'semiok/allrice-vm')
+            self.assertEqual(data['repositoryId'], 1469490636)
+            self.assertEqual(data['database'], 'allrice40_qa_met_218_test')
+        worker = str(data['workerPort'])
+        self.assertEqual(envs['web']['ALLRICE_WORKER_PORT'], worker)
+        self.assertEqual(envs['worker']['ALLRICE_WORKER_PORT'], worker)
+        self.assertEqual(envs['web']['ALLRICE_WORKER_INTERNAL_URL'], f'http://127.0.0.1:{worker}')
+        dotenv = Path(self.release).parent.joinpath('.env').read_text()
+        self.assertIn(f'ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:{worker}\n', dotenv)
+        self.assertNotIn('ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:3012', dotenv)
         bootstrap = next(e for e in events if e['command'] == 'node' and e['args'][0].endswith('/qa-bootstrap.mjs'))
         self.assertEqual(bootstrap['args'][bootstrap['args'].index('--rice') + 1], self.release + '/scripts/m1/rice-standard.json')
 
@@ -171,10 +218,10 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         now = time.time()
         from datetime import datetime, timezone
         stamp = lambda value: datetime.fromtimestamp(value, timezone.utc).isoformat()
-        data = {'task': task, 'webPort': 3298, 'workerPort': 3299, 'sha': SOURCE_SHA,
-                'ref': SOURCE_SHA, 'database': 'allrice_qa_' + task.replace('-', '_'),
-                'owner': 'owner-' + task, 'card': 'MET-220', 'createdAt': stamp(now - 86400),
-                'expiresAt': stamp(now - 60 if expired else now + 600)}
+        data = {'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636, 'task': task, 'webPort': 3298, 'workerPort': 3299, 'sha': SOURCE_SHA,
+                'ref': SOURCE_SHA, 'database': 'allrice40_qa_' + task.replace('-', '_'),
+                'owner': 'owner-' + task, 'card': 'MET-220', 'repositoryCreatedAt': stamp(now - 86400),
+                'repositoryExpiresAt': stamp(now - 60 if expired else now + 600)}
         (directory / 'instance.json').write_text(json.dumps(data))
         (directory / 'creds.json').write_text('SECRET-CREDS')
         (directory / '.env').write_text('SECRET-ENV')
@@ -192,7 +239,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertTrue(live.exists())
         self.assertTrue(fresh.exists())
-        archives = list(Path(self.home, 'allrice-dev/qa/codex/qa-reclaimed').iterdir())
+        archives = list(Path(self.home, 'allrice40-dev/qa/codex/qa-reclaimed').iterdir())
         self.assertEqual(len(archives), 1)
         files = sorted(str(p.relative_to(archives[0])) for p in archives[0].rglob('*') if p.is_file())
         self.assertEqual(files, ['instance.json', 'logs/build.log'])
@@ -207,7 +254,7 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         self.assertIn('owner=owner-one', result.stderr)
         self.assertIn('process=running lease=expired', result.stderr)
         self.assertEqual(len(list(Path(self.home, 'allrice-qa').glob('*/instance.json'))), 3)
-        self.assertFalse(Path(self.home, 'allrice-dev/qa/codex/qa-reclaimed').exists())
+        self.assertFalse(Path(self.home, 'allrice40-dev/qa/codex/qa-reclaimed').exists())
 
     def test_renew_preserves_creation_and_caps_ttl(self):
         directory = self.seed('renew-me')
@@ -215,11 +262,33 @@ class QaInstanceBuildIdentity(unittest.TestCase):
         result = self.cli('renew', 'renew-me', '--ttl', '24h')
         self.assertEqual(result.returncode, 0, result.stderr)
         after = json.loads((directory / 'instance.json').read_text())
-        self.assertEqual(before['createdAt'], after['createdAt'])
-        self.assertNotEqual(before['expiresAt'], after['expiresAt'])
+        self.assertEqual(before['repositoryCreatedAt'], after['repositoryCreatedAt'])
+        self.assertNotIn('createdAt', after)
+        self.assertNotIn('expiresAt', after)
+        self.assertNotEqual(before['repositoryExpiresAt'], after['repositoryExpiresAt'])
         refused = self.cli('renew', 'renew-me', '--ttl', '25h')
         self.assertNotEqual(refused.returncode, 0)
         self.assertEqual(after, json.loads((directory / 'instance.json').read_text()))
+
+    def test_old_repository_instances_count_toward_capacity_but_cannot_be_reclaimed_or_changed(self):
+        for task in ['old-one', 'old-two', 'old-three']:
+            directory = self.seed(task)
+            path = directory / 'instance.json'
+            data = json.loads(path.read_text())
+            data.pop('repository')
+            data.pop('repositoryId')
+            data['createdAt'] = data.pop('repositoryCreatedAt')
+            data['expiresAt'] = data.pop('repositoryExpiresAt')
+            path.write_text(json.dumps(data))
+        result = self.cli('up', 'met-218-test', '--owner', 'tester', '--card', 'MET-218')
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        for operation in ['renew', 'down']:
+            result = self.cli(operation, 'old-one')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('does not belong to semiok/allrice-vm', result.stderr)
+        self.assertEqual(len(list(Path(self.home, 'allrice-qa').glob('*/instance.json'))), 3)
+        events = [json.loads(line) for line in Path(self.events).read_text().splitlines()]
+        self.assertFalse(any(e['command'] in ('createdb', 'dropdb') for e in events))
 
     def test_wait_does_not_hold_allocator_and_continues_when_owner_releases(self):
         for task in ['one', 'two', 'three']:

@@ -14,6 +14,8 @@ import sys
 import time
 import wake_runtime as runtime
 
+# One seven-line scheduler on M1, even while repository/Dev paths are cut over.
+# Reuse this label when the release manager migrates it; never start a second dog.
 LABEL = 'ai.bplabs.allrice-m1-dog'
 INTERVAL = 600
 

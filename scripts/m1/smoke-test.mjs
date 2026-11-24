@@ -4,7 +4,7 @@
 // run's session), office (.docx), csv (Python chart), browser (cloud browser),
 // reminder (fires within ~2 minutes). Real model calls — not a unit test.
 //
-//   node smoke-test.mjs --url http://127.0.0.1:3011 [--worker-url http://127.0.0.1:3012] --creds <file>
+//   node smoke-test.mjs --url http://127.0.0.1:3311 [--worker-url http://127.0.0.1:3312] --creds <file>
 //                       [--only chat,reminder] [--out <dir>] [--expect-sha <sha>] [--continue-session <id>]
 //
 // Writes <out>/result.json (with the session each check used) and one screenshot per
@@ -66,7 +66,7 @@ const out =
 fs.mkdirSync(out, { recursive: true, mode: 0o700 });
 
 // playwright-core from the shared Dev release (any AllRice release has it).
-const releases = path.join(os.homedir(), 'allrice-dev-releases');
+const releases = path.join(os.homedir(), 'allrice40-dev-releases');
 const pwDir = fs
   .readdirSync(releases)
   .map((r) => path.join(releases, r, 'node_modules/.pnpm'))
@@ -78,7 +78,7 @@ const pwDir = fs
       .map((d) => path.join(p, d, 'node_modules/playwright-core')),
   )[0];
 if (!pwDir) {
-  console.error('playwright-core not found under ~/allrice-dev-releases');
+  console.error('playwright-core not found under ~/allrice40-dev-releases');
   process.exit(2);
 }
 const { chromium } = createRequire(import.meta.url)(pwDir);

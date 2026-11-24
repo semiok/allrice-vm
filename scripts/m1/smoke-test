@@ -16,6 +16,7 @@
 # (the session was continued across artifacts). With no earlier session it starts one for
 # next time: skipped, not failed.
 set -euo pipefail
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 NODE="$HOME/.local/opt/node-22.23.2/bin/node"; BIN=$(cd "$(dirname "$0")" && pwd -P)
 . "$BIN/lib.sh"
 ts=$(date +%Y%m%d-%H%M%S)
@@ -24,16 +25,29 @@ penv() { /usr/bin/python3 -c 'import plistlib,os,sys;print(plistlib.load(open(os
 case "${1:-}" in
   --dev)
     shift
+    dev_plist_pair || exit 2
     web=$(penv "$(dev_plist web)" ALLRICE_WEB_PORT)
     worker=$(penv "$(dev_plist worker)" ALLRICE_WORKER_PORT)
-    creds="$HOME/allrice-dev/qa/smoke-cred.json"; out="$HOME/allrice-dev/qa/smoke/$ts"; extra=()
-    dbenv=$("$BIN/with-env" worker sh -c 'printf "%s\n%s" "$DATABASE_URL" "${ALLRICE_DSH_NATIVE_ARTIFACT_ID:-}"') || dbenv="" ;;
+    creds="$HOME/allrice40-dev/qa/smoke-cred.json"; out="$HOME/allrice40-dev/qa/smoke/$ts"; extra=()
+    dbenv=$("$BIN/with-env" worker sh -c 'printf "%s\n%s" "$DATABASE_URL" "${ALLRICE_DSH_NATIVE_ARTIFACT_ID:-}"') || exit 2 ;;
   --instance)
     task=${2:?task}; shift 2
+    [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || exit 2
+    [ -d "$HOME/allrice-qa" ] || exit 2
+    task_lock="$HOME/allrice-qa/.task-$task.lock"
+    qa_task_lock "$task_lock" || { echo "QA instance is being changed: $task" >&2; exit 3; }
+    trap 'qa_task_unlock "$task_lock"' EXIT
     f="$HOME/allrice-qa/$task/instance.json"; [ -f "$f" ] || { echo "no QA instance: $task" >&2; exit 2; }
+    qa_owned "$f" || { echo "QA instance belongs to another repository: $task" >&2; exit 2; }
     web=$(json "$f" webPort); worker=$(json "$f" workerPort)
     creds="$HOME/allrice-qa/$task/creds.json"; out="$HOME/allrice-qa/$task/smoke/$ts"
-    dbenv=$(set -a; . "$HOME/allrice-qa/$task/.env"; printf '%s\n%s' "$DATABASE_URL" "$(json "$f" nativeArtifactId)") || dbenv=""
+    qa_label="ai.bplabs.allrice-qa-$task"
+    qa_db=allrice40_qa_${task//-/_}
+    qa_web="$HOME/Library/LaunchAgents/$qa_label-web.plist"
+    qa_worker="$HOME/Library/LaunchAgents/$qa_label-worker.plist"
+    service_plist_config "$qa_web" "$qa_label-web" ALLRICE_WEB_PORT "$web" "$qa_db" "worker-port=$worker" || exit 2
+    service_plist_config "$qa_worker" "$qa_label-worker" ALLRICE_WORKER_PORT "$worker" "$qa_db" || exit 2
+    dbenv=$(printf '%s\n%s' "$(penv "$qa_worker" DATABASE_URL)" "$(json "$f" nativeArtifactId)")
     extra=(); [[ " $* " == *" --only "* ]] || extra=(--only chat,continue,browser,reminder) ;;
   *) sed -n 2,17p "$0"; exit 2 ;;
 esac
@@ -126,6 +140,12 @@ if [ "$only" = all ] || [[ ",$only," == *,continue,* ]]; then
   [ -z "$seed" ] || cont=(--continue-session "${seed%% *}")
 fi
 rc=0 started=$(date +%s)
+# An interrupted caller closes its own descriptor. Children still doing work
+# keep their locks until they exit, so don't unlink the inode in an EXIT trap.
+trap - EXIT
 "$NODE" "$BIN/smoke-test.mjs" --url "http://127.0.0.1:$web" --worker-url "http://127.0.0.1:$worker" \
   --creds "$creds" --out "$out" ${cont[@]+"${cont[@]}"} ${extra[@]+"${extra[@]}"} "$@" || rc=$?
-exec /usr/bin/python3 -c "$SMOKE_PY" verify "$out" "$seal" "${seed#* }" "$started" "$rc"
+verdict=0
+/usr/bin/python3 -c "$SMOKE_PY" verify "$out" "$seal" "${seed#* }" "$started" "$rc" || verdict=$?
+[ -z "${task_lock:-}" ] || qa_task_unlock "$task_lock"
+exit "$verdict"

@@ -16,7 +16,7 @@ QUEUE_DELAYS = (1, 2, 4)
 
 
 def base():
-    return Path.home() / 'allrice-dev'
+    return Path.home() / 'allrice40-dev'
 
 
 def root():

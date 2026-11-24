@@ -5,6 +5,7 @@
 # stubs that record what they were given.
 #   python3 -m unittest discover -s scripts/m1 -p 'test_*.py'
 import os
+from pathlib import Path
 import shutil
 import signal
 import subprocess
@@ -30,6 +31,12 @@ case "$*" in
   *M5T_ACTION=test*|*M5T_ACTION=codex*)
     [ ! -e hang ] || { echo "starting"; sleep 30; exit 0; }
     [ ! -e drop ] || { HOME=$PWD /bin/sh -c "$*" | grep -v '^m5-test: done on '; exit 255; }
+    [ ! -e wrong-receipt ] || { HOME=$PWD /bin/sh -c "$*" | sed '/^m5-test: result repository /s/id 1469490636 /id 1323769790 /'; exit 0; }
+    [ ! -e before-guardian-drop ] || {
+      HOME=$PWD M5T_GUARDED=1 M5T_GUARD_RECEIPT_FD=3 /bin/sh -c "$*" 3>inner-receipt
+      [ -s inner-receipt ] || exit 88
+      exit 255
+    }
     [ ! -e late-drop ] || { HOME=$PWD /bin/sh -c "$*"; exit 255; }
     [ ! -e slept ] || { HOME=$PWD /bin/sh -c "$*"; echo "m5-test: M5 was asleep 40s during this run; it is no verdict"; exit 76; } ;;
 esac
@@ -123,8 +130,9 @@ class M5Test(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.m1 = os.path.join(self.tmp, 'm1')  # HOME on M1
         self.m5 = os.path.join(self.tmp, 'm5')  # HOME on M5
-        self.repo = os.path.join(self.m1, 'allrice-repo')
+        self.repo = os.path.join(self.m1, 'allrice40-repo')
         self.git('init', '-q', '-b', 'main', self.repo, cwd=self.tmp)
+        self.git('remote', 'add', 'origin', 'https://github.com/semiok/allrice-vm.git')
         write(os.path.join(self.repo, 'README.md'), 'hi\n')
         write(os.path.join(self.repo, '.gitignore'), 'node_modules\n')
         self.git('add', '.')
@@ -191,7 +199,7 @@ class M5Test(unittest.TestCase):
         self.assertEqual(calls[-1][6:], [os.path.join(self.base, 'slots/slot-1'), '8', '54329', self.th,
                                          os.path.join(self.base, 'slots/slot-1/apps/worker/package.json')])
         self.assertEqual(self.calls(self.m1), [])
-        refs = self.git('for-each-ref', '--format=%(objectname)', 'refs/m5-test', cwd=os.path.join(self.base, 'repo.git')).split()
+        refs = self.git('for-each-ref', '--format=%(objectname)', 'refs/m5-test-allrice-vm', cwd=os.path.join(self.base, 'repo.git')).split()
         self.assertEqual(refs, [self.sha])
         self.assertEqual(os.listdir(self.leases), [])  # the lease went with the run
         log = p.stdout.strip().splitlines()[-1].split('; log ')[1]
@@ -246,7 +254,7 @@ class M5Test(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ['install --frozen-lockfile --prefer-offline', 'exec vitest run d.test.ts --maxWorkers=2'])
         self.assertEqual(calls[-1][1:4], ['postgres://a123@127.0.0.1:5432/allrice_b2', '', '1'])
         self.assertEqual(calls[-1][8:10], ['5432', self.m1])
-        self.assertEqual(calls[-1][6], os.path.join(self.m1, 'allrice-worktrees/.m5-test-m1/slots/slot-1'))
+        self.assertEqual(calls[-1][6], os.path.join(self.m1, 'allrice40-worktrees/.m5-test-m1/slots/slot-1'))
         self.assertEqual(self.git('rev-parse', 'HEAD', cwd=calls[-1][6]).strip(), self.sha)
         self.assertEqual(self.run_m5('--no-build', '--', 'd.test.ts').returncode, 0)  # M1 keeps its node_modules too
         self.assertTrue(os.path.exists(os.path.join(calls[-1][6], 'node_modules/kept')))
@@ -295,6 +303,89 @@ class M5Test(unittest.TestCase):
         self.assertIn('4 of 6 workers busy', p.stdout)
         self.assertIn('M5 没有空位（等了 0 秒），改在 M1 跑', p.stdout)
         self.assertEqual(len(self.calls(self.m1)), 3)
+
+    def test_new_run_lease_is_visible_to_the_old_callers_namespace(self):
+        # The old installed leftovers() knows only allrice-dev/qa/m5-test/leases.
+        # Keep a real candidate run attached while inspecting that exact namespace.
+        p = subprocess.Popen([M5_TEST, '--on', 'm5', '--build', 'sleep 3', '--', 'identity.test.ts'],
+                             cwd=self.repo, env=dict(os.environ, HOME=self.m1, M5_FAKE_HOME=self.m5,
+                             M5_TEST_SSH=self.ssh, **GIT_ENV), stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: p.poll() is not None or p.kill())
+        deadline = time.monotonic() + 10
+        leases = []
+        while time.monotonic() < deadline:
+            leases = list(Path(self.leases).glob('*.lease'))
+            if leases:
+                break
+            time.sleep(.05)
+        self.assertEqual(len(leases), 1)
+        legacy_view = subprocess.run([sys.executable, '-c',
+            'import fcntl,sys; f=open(sys.argv[1],"a")\n'
+            'try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n'
+            'except BlockingIOError: sys.exit(0)\n'
+            'sys.exit(1)', str(leases[0])])
+        self.assertEqual(legacy_view.returncode, 0, 'old caller must see the live lease as held')
+        # The old retention prefix cannot see or prune 4.0 refs, even before checkout.
+        repository = os.path.join(self.base, 'repo.git')
+        self.assertEqual(self.git('for-each-ref', '--format=%(refname)', 'refs/m5-test', cwd=repository), '')
+        self.assertEqual(self.git('for-each-ref', '--format=%(objectname)', 'refs/m5-test-allrice-vm', cwd=repository).strip(), self.sha)
+        output = p.communicate(timeout=20)[0]
+        self.assertEqual(p.returncode, 0, output)
+        self.assertIn('repository semiok/allrice-vm id 1469490636 commit ' + self.sha, output)
+        self.assertIn('/allrice40-dev/qa/m5-test/', output)
+        self.assertEqual(os.listdir(self.leases), [])
+
+    def test_m1_fallback_shares_old_slots_without_writing_old_checkouts(self):
+        shared = os.path.join(self.m1, 'allrice-worktrees/.m5-test-m1')
+        old_checkout = os.path.join(shared, 'slots/slot-1/sentinel')
+        write(old_checkout, 'old repository stays here')
+        self.hold(os.path.join(shared, 'locks/slot-1.lock'))
+        p = self.run_m5('--on', 'm1', '--wait', '0', '--no-build', '--', 'isolation.test.ts')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.calls(self.m1)[-1][6], os.path.join(self.m1, 'allrice40-worktrees/.m5-test-m1/slots/slot-2'))
+        self.assertEqual(read(old_checkout), 'old repository stays here')
+        self.hold(os.path.join(shared, 'locks/slot-2.lock'))
+        p = self.run_m5('--on', 'm1', '--wait', '0', '--no-build', '--', 'isolation.test.ts')
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn('2 of 2 runs busy', p.stdout)
+
+    def test_unpublished_lease_never_starts_remote_test_process(self):
+        isolated = Path(self.tmp, 'tools')
+        isolated.mkdir()
+        for name in ('m5-test', 'm5-run', 'lib.sh', 'm5_result.py'):
+            shutil.copy2(Path(HERE, name), isolated / name)
+        lib = isolated / 'lib.sh'
+        original = lib.read_text()
+        fake_mv = Path(self.m1, '.local/opt/node-22.23.2/bin/mv')
+        for broken in ('lock', 'rename'):
+            with self.subTest(broken=broken):
+                lib.write_text(original + ('\nflock_fd() { return 1; }\n' if broken == 'lock' else ''))
+                if broken == 'rename':
+                    write(str(fake_mv), '#!/bin/sh\nexit 1\n', 0o755)
+                p = subprocess.run([str(isolated / 'm5-test'), '--on', 'm5', '--no-build', '--', 'must-not.test.ts'],
+                    cwd=self.repo, env=dict(os.environ, HOME=self.m1, M5_FAKE_HOME=self.m5,
+                    M5_TEST_SSH=self.ssh, **GIT_ENV), capture_output=True, text=True, timeout=20)
+                self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+                self.assertIn('未启动远端测试', p.stdout + p.stderr)
+                self.assertEqual(self.calls(self.th), [])
+                self.assertEqual(os.listdir(self.leases), [])
+
+    def test_wrong_remote_completion_is_unknown_to_caller(self):
+        write(os.path.join(self.m5, 'wrong-receipt'), '')
+        p = self.run_m5('--on', 'm5', '--no-build', '--', 'receipt.test.ts')
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertIn('vitest says hello', p.stdout)
+        self.assertIn('done on M5', p.stdout)
+        self.assertNotIn('finished on M5', p.stdout)
+
+    def test_wrong_repository_origin_is_refused_before_push_or_lease(self):
+        self.git('remote', 'set-url', 'origin', 'https://github.com/semiok/allrice.git')
+        p = self.run_m5('--on', 'm5', '--', 'identity.test.ts')
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('repository origin must be semiok/allrice-vm (id 1469490636)', p.stderr)
+        self.assertEqual(self.calls(self.th), [])
+        self.assertFalse(os.path.exists(self.leases))
 
     def test_warning_halves_all_runs_together(self):
         self.limits(WORKERS_TOTAL=8, WORKERS_MAX=8)
@@ -649,7 +740,7 @@ class M5Test(unittest.TestCase):
         self.assertTrue(prompt.endswith('\n\n写测试并运行\n'), prompt)
         self.assertEqual(read(os.path.join(self.th, 'codex.workers')), '4\n')  # Codex's vitest runs are capped too
         args = read(os.path.join(self.th, 'codex.args'))
-        for part in ('exec --ephemeral -C %s/slots/slot-1 ' % self.base, '-m gpt-6-astra -c model_reasoning_effort=max',
+        for part in ('exec --ephemeral -C %s/slots/slot-1 ' % self.base, '-m gpt-6.2-sol -c model_reasoning_effort=max',
                      '-c allow_login_shell=false -c shell_environment_policy.inherit=all',
                      '-s workspace-write -c sandbox_workspace_write.network_access=true'):
             self.assertIn(part, args)
@@ -683,10 +774,10 @@ class M5Test(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('-s danger-full-access', read(os.path.join(self.m1, 'codex.args')))
         self.assertEqual(read(out), 'test report\n')
-        self.assertIn('-m gpt-6-astra ', read(os.path.join(self.m1, 'codex.args')))
-        p = self.run_m5('codex', '--model', 'gpt-6.1-sol', '--no-build', '-o', out, '--', 'test it')  # Codex-saving mode
+        self.assertIn('-m gpt-6.2-sol -c model_reasoning_effort=max', read(os.path.join(self.m1, 'codex.args')))
+        p = self.run_m5('codex', '--model', 'gpt-6.2-sol', '--no-build', '-o', out, '--', 'test it')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertIn('-m gpt-6.1-sol ', read(os.path.join(self.m1, 'codex.args')))
+        self.assertIn('-m gpt-6.2-sol -c model_reasoning_effort=max', read(os.path.join(self.m1, 'codex.args')))
         self.assertEqual(self.run_m5('codex', '--model', 'x; rm', '-o', out, '--', 'y').returncode, 2)
         prompt = read(os.path.join(self.m1, 'codex.prompt'))
         self.assertTrue(prompt.startswith('【运行环境，m5-test 附加】你在 M1 上'), prompt)
@@ -702,6 +793,15 @@ class M5Test(unittest.TestCase):
                 p = self.run_m5(*args)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertEqual(self.calls(self.th) + self.calls(self.m1), [])
+
+    def test_disconnect_after_child_receipt_but_before_guardian_is_unknown(self):
+        write(os.path.join(self.m5, 'before-guardian-drop'), '')
+        p = self.run_m5('--on', 'm5', '--no-build', '--', 'receipt.test.ts')
+        self.assertEqual(p.returncode, 4, p.stdout + p.stderr)
+        self.assertIn('vitest says hello', p.stdout)
+        self.assertIn('done on M5', read(os.path.join(self.m5, 'inner-receipt')))
+        self.assertNotIn('finished on M5', p.stdout)
+        self.assertNotIn('m5-test: result repository', p.stdout)
 
     def test_exit_code_after_a_late_drop_comes_from_the_run(self):
         write(os.path.join(self.m5, 'late-drop'), '')  # the connection broke after the closing line

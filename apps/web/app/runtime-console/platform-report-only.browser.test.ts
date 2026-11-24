@@ -228,7 +228,7 @@ suite('report-only historical repair view', () => {
         nextCursor: null,
       }),
       [endpoint + '/maintenance/github-bot']: MaintenanceGithubBotSchema.parse({
-        repository: 'semiok/allrice',
+        repository: 'semiok/allrice-vm',
         revision: 0,
         configured: false,
         state: 'not_configured',
@@ -244,8 +244,8 @@ suite('report-only historical repair view', () => {
       [endpoint + '/repair']: [historical],
       [endpoint + '/repository-credential']:
         PlatformRepositoryCredentialSchema.parse({
-          repositoryId: 1323769790,
-          repository: 'semiok/allrice',
+          repositoryId: 1469490636,
+          repository: 'semiok/allrice-vm',
           revision: 0,
           configured: false,
           state: 'not_configured',

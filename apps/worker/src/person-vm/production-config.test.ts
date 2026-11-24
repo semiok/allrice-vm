@@ -151,7 +151,8 @@ async function seal(config: unknown = value(), include = true) {
   const body = {
     version: 1,
     environment: 'dev',
-    repository: 'semiok/allrice',
+    repository: 'semiok/allrice-vm',
+    repositoryId: 1469490636,
     sourceSha: 'a'.repeat(40),
     sourceTree: 'b'.repeat(40),
     webBuildId: 'synthetic-build',
@@ -173,6 +174,8 @@ async function seal(config: unknown = value(), include = true) {
   build = {
     version: 1,
     environment: 'dev',
+    repository: 'semiok/allrice-vm',
+    repositoryId: 1469490636,
     service: 'worker',
     mode: 'production',
     sourceSha: body.sourceSha,

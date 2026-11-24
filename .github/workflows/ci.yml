@@ -313,10 +313,10 @@ jobs:
           node --import tsx scripts/dsh-convergence-gate.ts --tables --base "$BASE"
       - name: Reserve PostgreSQL lock capacity for disposable migration schemas
         run: |
-          docker compose --project-name allrice-dev --file compose.dev.yaml exec -T postgres psql -U allrice -d allrice -v ON_ERROR_STOP=1 -c 'ALTER SYSTEM SET max_locks_per_transaction = 512;'
-          docker compose --project-name allrice-dev --file compose.dev.yaml restart postgres
+          docker compose --project-name allrice40-dev --file compose.dev.yaml exec -T postgres psql -U allrice -d allrice -v ON_ERROR_STOP=1 -c 'ALTER SYSTEM SET max_locks_per_transaction = 512;'
+          docker compose --project-name allrice40-dev --file compose.dev.yaml restart postgres
           for attempt in $(seq 1 30); do
-            if docker compose --project-name allrice-dev --file compose.dev.yaml exec -T postgres pg_isready -U allrice -d allrice; then
+            if docker compose --project-name allrice40-dev --file compose.dev.yaml exec -T postgres pg_isready -U allrice -d allrice; then
               exit 0
             fi
             sleep 1
@@ -339,7 +339,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/allrice-pg-client"
           for tool in pg_dump pg_restore psql; do
-            printf '#!/bin/sh\nexec docker compose --project-name allrice-dev --file compose.dev.yaml exec -T -e PGDATABASE -e PGUSER -e PGPASSWORD postgres %s "$@"\n' "$tool" > "$RUNNER_TEMP/allrice-pg-client/$tool"
+            printf '#!/bin/sh\nexec docker compose --project-name allrice40-dev --file compose.dev.yaml exec -T -e PGDATABASE -e PGUSER -e PGPASSWORD postgres %s "$@"\n' "$tool" > "$RUNNER_TEMP/allrice-pg-client/$tool"
             chmod +x "$RUNNER_TEMP/allrice-pg-client/$tool"
           done
           PATH="$RUNNER_TEMP/allrice-pg-client:$PATH" node scripts/ci-integration-tests.mjs run -- --maxWorkers=1 packages/database/src/function-search-path.integration.test.ts

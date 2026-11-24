@@ -15,21 +15,22 @@ import { parse } from 'yaml';
 import { gates, summarize } from './nightly-ci-summary.mjs';
 
 const sha = 'a'.repeat(40);
-const repository = 'semiok/allrice';
+const repository = 'semiok/allrice-vm';
+const repositoryId = 1469490636;
 function fixture() {
   const trigger = {
     id: 42,
     head_sha: sha,
     run_attempt: 1,
-    html_url: 'https://github.com/semiok/allrice/actions/runs/42',
+    html_url: 'https://github.com/semiok/allrice-vm/actions/runs/42',
     event: 'schedule',
     head_branch: 'main',
     path: '.github/workflows/ci.yml',
-    head_repository: { full_name: repository },
+    head_repository: { full_name: repository, id: repositoryId },
   };
   const run = {
     ...trigger,
-    repository: { full_name: repository, id: 12 },
+    repository: { full_name: repository, id: repositoryId },
     name: 'CI',
     status: 'completed',
     conclusion: 'success',
@@ -60,7 +61,7 @@ function fixture() {
           version: 1,
           scope: 'allrice.repository-nightly-ci.v1',
           repository,
-          repositoryId: 12,
+          repositoryId,
           workflowRunId: 42,
           runAttempt: 1,
           job: gate,
@@ -117,6 +118,15 @@ it('reports success only for the original four successful jobs and complete exac
     headSha: sha,
     failedTests: [],
     firstFailureUrl: null,
+  });
+});
+
+it('rejects an original attempt from the old repository ID', () => {
+  const data = fixture();
+  data.run.repository.id = 1323769790;
+  expect(summarize(data)).toMatchObject({
+    status: 'failure',
+    evidenceComplete: false,
   });
 });
 
@@ -410,7 +420,7 @@ it.each([
             : mode === 'digest'
               ? 'sha256:wrong'
               : 'sha256:' + createHash('sha256').update(bytes).digest('hex'),
-        workflow_run: { id: 42, repository_id: 12, head_sha: sha },
+        workflow_run: { id: 42, repository_id: repositoryId, head_sha: sha },
       };
     });
     writeFileSync(
@@ -454,6 +464,7 @@ it.each([
           PATH: `${join(root, 'bin')}:${process.env.PATH}`,
           GITHUB_EVENT_PATH: join(root, 'event.json'),
           GITHUB_REPOSITORY: repository,
+          GITHUB_REPOSITORY_ID: String(repositoryId),
           FAIL_API: mode === 'api' ? '1' : '0',
           FAIL_LOGS: mode === 'logs-api' ? '1' : '0',
         },

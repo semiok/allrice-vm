@@ -6,11 +6,11 @@
 // files, memories, knowledge, company assets, workflows and schedules are deliberately
 // not carried over. Idempotent: a later run brings the target in line with the source.
 //
-// Run it from a checkout of this repository (it is not installed into ~/allrice-dev/bin):
+// Run it from a checkout of this repository (it is not installed into ~/allrice40-dev/bin):
 //   node scripts/m1/rebuild-blueplant.mjs --port <webPort> --source-host <ssh host> --source-db <db>
 //   node scripts/m1/rebuild-blueplant.mjs --port <webPort> --source-local --source-db <db>
 //        [--company BluePlant] [--assign "Office 文档助手"] [--skip-users admin]
-//        [--target-db allrice_dev] [--env ~/allrice-dev/.env]
+//        [--target-db allrice40_dev] [--env ~/allrice40-dev/.env]
 //
 // The source is only read, in read-only transactions. Password hashes travel as COPY
 // data from the source psql to the target psql and are never printed or put into SQL
@@ -41,14 +41,14 @@ const company = args.company ?? 'BluePlant';
 const sourceDb = args['source-db'];
 const sourceHost = args['source-host'] ?? null;
 const sourceLocal = args['source-local'] === true;
-const targetDb = args['target-db'] ?? 'allrice_dev';
+const targetDb = args['target-db'] ?? 'allrice40_dev';
 const skipUsers = new Set(
   (args['skip-users'] ?? 'admin').split(',').filter(Boolean),
 );
 const extraAssign = (args.assign ?? 'Office 文档助手')
   .split(',')
   .filter(Boolean);
-const envPath = args.env ?? `${home}/allrice-dev/.env`;
+const envPath = args.env ?? `${home}/allrice40-dev/.env`;
 const DB_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const SSH_HOST = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/;
 if (!port || !sourceDb || sourceLocal === Boolean(sourceHost)) {
@@ -172,7 +172,7 @@ function psql(which, sql, { quiet = false } = {}) {
   ];
   const [cmd, argv, extraEnv] =
     which === 'target'
-      ? ['psql', ['-h', '127.0.0.1', ...base], {}]
+      ? ['psql', ['-h', '127.0.0.1', '-p', '5434', ...base], {}]
       : sourceHost
         ? [
             'ssh',

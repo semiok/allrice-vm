@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import m5_result
 import wake_runtime as runtime
 
 HEARTBEAT = None
@@ -189,22 +190,28 @@ CI_CONCLUSIONS = {'success', 'failure', 'cancelled', 'timed_out', 'action_requir
                   'neutral', 'skipped', 'stale', 'startup_failure'}
 
 
-def ci_target(command):
+def ci_target(command, repository=None, interval=None):
     """Recognize the documented direct watch invocation; never guess a run/repo."""
     if Path(command[0]).name != 'gh' or command[1:3] != ['run', 'watch']:
         return None
     parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
     parser.add_argument('run', type=int)
-    parser.add_argument('--repo', '-R', required=True)
+    parser.add_argument('--repo', '-R')
     parser.add_argument('--exit-status', action='store_true')
-    parser.add_argument('--interval', '-i', type=int, default=60)
+    parser.add_argument('--interval', '-i', type=int)
     parser.add_argument('--compact', action='store_true')
     try:
         target, extra = parser.parse_known_args(command[3:])
     except (argparse.ArgumentError, SystemExit) as error:
         raise ValueError('CI wait requires gh run watch RUN --repo OWNER/REPO --exit-status') from error
+    if repository and target.repo and repository != target.repo:
+        raise ValueError('top-level --repo conflicts with the gh watch repository')
+    if interval is not None and target.interval is not None and interval != target.interval:
+        raise ValueError('top-level --interval conflicts with the gh watch interval')
+    target.repo = repository or target.repo
+    target.interval = interval if interval is not None else (target.interval if target.interval is not None else 60)
     if (extra or target.run <= 0 or not target.exit_status or target.interval <= 0
-            or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', target.repo)):
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', target.repo or '')):
         raise ValueError('ambiguous CI watch arguments; use a fixed run ID and OWNER/REPO')
     if target.interval < 30:
         raise ValueError('CI watch interval must be at least 30 seconds (default: 60)')
@@ -375,14 +382,29 @@ def verify_m5(run, state):
         if not match or int(match[2]) > 255:
             return None
         path = Path(match[3])
-        root = (Path.home() / 'allrice-dev/qa/m5-test').resolve()
+        root = (runtime.base() / 'qa/m5-test').resolve()
         if (not path.is_absolute() or path.is_symlink() or path.resolve().parent != root
                 or not re.fullmatch(r'[0-9]{8}-[0-9]{6}-[0-9a-f]{8}-%s\.log' % state['commandPid'], path.name)
-                or path.stat().st_mtime < state['commandStartedEpoch']
-                or tail_text(path).splitlines()[-1] != closing):
+                or path.stat().st_mtime < state['commandStartedEpoch']):
+            return None
+        lines = m5_result.tail_lines(path)
+        if lines[-1] != closing or int(match[2]) != state['commandExitCode']:
+            return None
+        with path.open('rb') as stream:
+            first = stream.read(256).decode('utf-8', errors='replace').splitlines()[0]
+        header = m5_result.HEADER.fullmatch(first)
+        if not header or path.stem.split('-')[2] != header[1][:8]:
+            return None
+        runner_exit = m5_result.result_exit(lines[:-1], match[1], path.stem, header[1])
+        exit_code = int(match[2])
+        if runner_exit != exit_code and not (
+                runner_exit == 0 and exit_code == 5
+                and f"m5-test: could not fetch Codex's report and patch from {match[1].lower()}" in lines):
             return None
         return dict(status='completed', conclusion='%s exit %s' % (match[1], match[2]),
-                    exitCode=int(match[2]), host=match[1], resultFile=str(path))
+                    exitCode=exit_code, host=match[1], resultFile=str(path),
+                    repository=m5_result.REPOSITORY, repositoryId=m5_result.REPOSITORY_ID,
+                    commit=header[1], run=path.stem)
     except (OSError, IndexError, KeyError, ValueError):
         return None
 
@@ -476,7 +498,7 @@ def supervise(args, run, state, lock_fd, lock_path):
 
 def launch(args):
     os.umask(0o077)
-    base = Path.home() / 'allrice-dev'
+    base = runtime.base()
     try:
         allowed = allowed_threads(base / 'wake-when.threads')
     except (ValueError, OSError):
@@ -489,7 +511,9 @@ def launch(args):
         raise ValueError('label must contain 1-200 printable characters')
     if not args.command:
         raise ValueError('a foreground blocking command is required after --')
-    args.ci = ci_target(args.command)
+    args.ci = ci_target(args.command, getattr(args, 'repo', None), getattr(args, 'interval', None))
+    if not args.ci and (getattr(args, 'repo', None) or getattr(args, 'interval', None) is not None):
+        raise ValueError('--repo and --interval are for a direct gh run watch command')
     args.m5 = Path(args.command[0]).name == 'm5-test'
     args.deploy = Path(args.command[0]).name == 'deploy-dev'
     if bool(args.terminal_file) != bool(args.terminal_id):
@@ -563,6 +587,8 @@ def main():
     parser.add_argument('--thread', required=True, help='approved Codex session UUID')
     parser.add_argument('--label', required=True, help='globally unique active wait label')
     parser.add_argument('--timeout', type=seconds, default=10800, help='maximum command wait (default: 3h)')
+    parser.add_argument('--repo', help='explicit CI OWNER/REPO (or put --repo in gh run watch)')
+    parser.add_argument('--interval', type=int, help='CI watch interval in seconds (default: 60; minimum: 30)')
     parser.add_argument('--terminal-file', type=Path, help='new per-task JSON receipt from the task owner')
     parser.add_argument('--terminal-id', help='expected task ID in the terminal receipt')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='-- foreground-command args...')

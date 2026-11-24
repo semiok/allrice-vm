@@ -142,7 +142,7 @@ export function PlatformRepositoryCredentialPanel() {
         {settings?.configured ? '已配置' : settings ? '未配置' : '读取中'}
       </summary>
       <p className={css.meta}>
-        用于把已验证的修复候选提交到 semiok/allrice，并读取该 PR
+        用于把已验证的修复候选提交到 semiok/allrice-vm，并读取该 PR
         的构建与测试结果。每位平台管理员单独配置自己的授权。
       </p>
       {settings && (
@@ -157,8 +157,8 @@ export function PlatformRepositoryCredentialPanel() {
         </AdminStatus>
       )}
       <p className={css.meta}>
-        在 GitHub 创建细粒度令牌，仅选择 semiok/allrice。需要 Contents 与 Pull
-        requests 的读写权限，以及 Actions、Checks 与
+        在 GitHub 创建细粒度令牌，仅选择 semiok/allrice-vm。需要 Contents 与
+        Pull requests 的读写权限，以及 Actions、Checks 与
         Administration（分支保护）的只读权限。
       </p>
       <a

@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process';
 import { mkdir, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { stagePersonVmConfiguration } from './stage-person-vm-config.mjs';
-import { resolveServiceBuildRoot } from './prepare-identity-root.mjs';
+import { resolveServiceBuildSource } from './prepare-identity-root.mjs';
 import { prepareServiceBuildManifest } from '../../packages/database/dist/service-build-identity.js';
 import {
   measureDshNativeArtifact,
@@ -19,25 +18,17 @@ const option = (key) => {
 const configArgs = args.filter((s) => s.startsWith('--person-vm-config='));
 if (args.length !== 2 + configArgs.length || configArgs.length > 1)
   throw Error('DEV_BUILD_PREPARATION_ARGUMENT');
-const root = await resolveServiceBuildRoot(option('--root')),
-  sourceSha = option('--release-sha');
-const git = (...values) =>
-  execFileSync('git', values, { cwd: root, encoding: 'utf8' }).trim();
-if (
-  git('rev-parse', 'HEAD') !== sourceSha ||
-  git('status', '--porcelain=v1', '--untracked-files=normal')
-)
-  throw Error('DEV_BUILD_SOURCE_NOT_CLEAN');
+const source = await resolveServiceBuildSource(
+  option('--root'),
+  option('--release-sha'),
+);
+const { root, sourceSha } = source;
 if (configArgs.length)
   await stagePersonVmConfiguration(
     root,
     configArgs[0].slice('--person-vm-config='.length),
   );
-const manifest = await prepareServiceBuildManifest({
-  root,
-  sourceSha,
-  sourceTree: git('rev-parse', 'HEAD^{tree}'),
-});
+const manifest = await prepareServiceBuildManifest(source);
 const nativeArtifact = await measureDshNativeArtifact(root, undefined, {
   schemaVersion: 2,
 });
@@ -59,6 +50,8 @@ await rename(temp, target);
 await rename(nativeTemp, nativeTarget);
 console.log(
   JSON.stringify({
+    repository: manifest.repository,
+    repositoryId: manifest.repositoryId,
     sourceSha,
     sourceTree: manifest.sourceTree,
     manifestDigest: manifest.manifestDigest,

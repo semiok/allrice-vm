@@ -3,7 +3,7 @@
 # repository root; how to run and drill it: docs/runbooks/m1-monitor.md). Python 3.9
 # standard library only: launchd starts it with /usr/bin/python3 and an empty PATH.
 #
-#   monitor run [--config <file>]                   one round of checks (launchd: every 5 minutes)
+#   monitor run [--config <file>]                   one round of checks (launchd: every 4 minutes)
 #   monitor peer [--config <file>]                  huihuimac side: is M1 alive, is it reachable from outside
 #   monitor daily [--config <file>]                 send the daily report now (rounds send it once a day)
 #   monitor failures [--json] [--config <file>]     failed runs of the last 24 hours by error code: new, increased
@@ -12,6 +12,7 @@
 #   monitor test-alert [--config <file>]            send one test message
 #   monitor launchd install|remove [--peer] [--config <file>]
 #   monitor ingest-incidents [--config <file>]      write incidents the peer sends on stdin (over SSH)
+#   run/peer/status/test-alert/launchd/ingest-incidents --drill --config <file>: isolated rehearsal
 #
 # Every check returns findings keyed by what it watches. A key that turns bad opens an
 # alert; while it stays bad only an escalation or a reminder (hourly when critical) goes
@@ -41,10 +42,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+from service_target import DEV_DATABASE, DEV_PORTS, canonical, database_matches, ready_identity, service_config
 SYS_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 RANK = {'ok': 0, 'warning': 1, 'critical': 2}
+DRILL_ROOT = Path('allrice40-dev/monitor-drills')
+DRILL_PEER_ROOT = Path('.local/state/allrice40-monitor-peer-drills')
+DRILL_LABEL = 'ai.bplabs.allrice40-dev-monitor-drill-'
 ICON = {'warning': '🟠', 'critical': '🔴', 'ok': '✅'}
 WORD = {'warning': '警告', 'critical': '严重'}
 
@@ -61,27 +68,27 @@ COMMON = {
     'confirmSeconds': 20,
     'roundTimeoutSeconds': 240,
     'intervalSeconds': 300,
-    'runbooks': 'https://github.com/semiok/allrice/blob/main/docs/runbooks/',
+    'runbooks': 'https://github.com/semiok/allrice-vm/blob/main/docs/runbooks/',
     'launchdLabel': None,
     'checks': None,  # run only these checks (names below); None = all
     'skipChecks': [],
 }
 M1 = dict(
     COMMON,
-    name='AllRice M1 Dev',
+    name='AllRice 4.0 M1 Dev',
     # Every 4 minutes: first look + the 20-second re-check + delivery stays under the
     # 10-minute target also for alerts that need two looks (a flapping key, the peer).
     intervalSeconds=240,
-    stateDir='~/allrice-dev/monitor',
-    envFile='~/allrice-dev/.env',
-    webPlist='~/Library/LaunchAgents/ai.bplabs.allrice-dev-web.plist',
-    workerPlist='~/Library/LaunchAgents/ai.bplabs.allrice-dev-worker.plist',
-    deployLock='~/allrice-dev/.local/deploy.lock',
-    deployInflight='~/allrice-dev/qa/deploy-inflight',
+    stateDir='~/allrice40-dev/monitor',
+    envFile='~/allrice40-dev/.env',
+    webPlist='~/Library/LaunchAgents/ai.bplabs.allrice40-dev-web.plist',
+    workerPlist='~/Library/LaunchAgents/ai.bplabs.allrice40-dev-worker.plist',
+    deployLock='~/allrice40-dev/.local/deploy.lock',
+    deployInflight='~/allrice40-dev/qa/deploy-inflight',
     deployGraceMinutes=45,
     psql='/opt/homebrew/bin/psql',
     peerSsh='huihuimac',
-    peerHeartbeat='.local/state/allrice-monitor-peer/heartbeat.json',
+    peerHeartbeat='.local/state/allrice40-monitor-peer/heartbeat.json',
     peerStaleMinutes=4,  # the peer starts a round every minute and writes its heartbeat then
     peerUnfinishedMinutes=4,
     peerTelegramStuckMinutes=3,  # the peer sends every minute: three failed rounds
@@ -92,16 +99,13 @@ M1 = dict(
     incidentDatabaseUrl=None,
     webUrl=None,
     workerUrl=None,
-    publicUrl=None,
+    publicUrl='https://allrice.bplabs.xyz',
     # component checks
-    tunnelLabel='ai.bplabs.allrice-m1-tunnel',
-    tunnelMetrics=['http://127.0.0.1:%d/ready' % p for p in range(20241, 20246)],
-    # The other hostnames the tunnel serves for the same Web (~/.cloudflared/allrice-m1.yml,
-    # moved over at the 10-26 cutover, MET-216): probed like publicUrl, each its own alert.
-    # allrice-dsh is the server Rice Bridge pairs with (AllRicePairingServerURL); its root
-    # redirects to allrice-admin, so a path it serves itself is probed.
-    extraPublicUrls=['https://allrice.bplabs.xyz', 'https://allrice-admin.bplabs.xyz',
-                     'https://allrice-dsh.bplabs.xyz/api/health/ready'],
+    tunnelLabel='ai.bplabs.allrice40-dev-tunnel',
+    tunnelMetrics=['http://127.0.0.1:20246/ready'],
+    # Approved 4.0 hostnames. Routing and the isolated tunnel are configured only
+    # after deployment authorization; do not reuse the 3.x Bridge hostname.
+    extraPublicUrls=['https://allrice-admin.bplabs.xyz'],
     docker='/opt/homebrew/bin/docker',
     officeContainer='allrice-office-renderer',
     vmWatchdog='allrice-cloud-watchdog',
@@ -116,8 +120,8 @@ M1 = dict(
     # The Worker keeps a DSH process per used conversation until it restarts (about
     # 100-180 MB each), so the count only grows between deploys.
     dshWarnProcesses=30,
-    backupLog='~/allrice-backups/logs/backup.log',
-    backupLabel='ai.bplabs.allrice-dev-backup',
+    backupLog='~/allrice40-backups/logs/backup.log',
+    backupLabel='ai.bplabs.allrice40-dev-backup',
     backupWarnHours=26,
     backupCriticalHours=50,
     subscriptionStaleMinutes=30,
@@ -146,17 +150,17 @@ M1 = dict(
         'failure_baseline_days': 7, 'failure_increase_min': 3, 'failure_increase_ratio': 2,
         'online_wait_warn_pct': 80, 'online_wait_critical_pct': 95,  # monitor quota alert convention; never execution limits
     },
-    pgLog='/opt/homebrew/var/log/postgresql@17.log',  # log_line_prefix '%m [%p] %d ' names the database
+    pgLog='~/allrice40-dev/.local/postgres/server.log',  # log_line_prefix '%m [%p] %d ' names the database
 )
 PEER = dict(
     COMMON,
     name='AllRice 看门（huihuimac）',
-    stateDir='~/.local/state/allrice-monitor-peer',
-    telegramEnv='~/.config/allrice-monitor/telegram.env',
+    stateDir='~/.local/state/allrice40-monitor-peer',
+    telegramEnv='~/.config/allrice40-monitor/telegram.env',
     m1Ssh='m1',
-    m1Heartbeat='allrice-dev/monitor/heartbeat.json',
-    m1DeployLock='allrice-dev/.local/deploy.lock',
-    m1Monitor='allrice-dev/bin/monitor',  # writes this side's incidents into M1's table
+    m1Heartbeat='allrice40-dev/monitor/heartbeat.json',
+    m1DeployLock='allrice40-dev/.local/deploy.lock',
+    m1Monitor='allrice40-dev/bin/monitor',  # writes this side's incidents into M1's table
     m1MonitorConfig=None,
     # M1 starts a round every 4 minutes and writes its heartbeat then: 6 minutes stale plus
     # one peer interval keeps "M1 monitor stopped" under 10 minutes.
@@ -186,7 +190,11 @@ def expand(path):
 def run(cmd, timeout=20, env=None, stdin=None):
     """(exit code, stdout, stderr); 124 on timeout, 127 when it cannot start."""
     full = dict(os.environ, PATH=SYS_PATH)
-    full.update(env or {})
+    for key, value in (env or {}).items():
+        if value is None:
+            full.pop(key, None)
+        else:
+            full[key] = value
     try:
         kw = {'input': stdin} if stdin is not None else {'stdin': subprocess.DEVNULL}
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=full, **kw)
@@ -197,14 +205,21 @@ def run(cmd, timeout=20, env=None, stdin=None):
         return 127, '', str(err)
 
 
-def opener(proxy):
-    """None: urllib's own choice (macOS system proxy settings); "": direct; else that proxy."""
-    if proxy is None:
-        return urllib.request.build_opener()
-    return urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {}))
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def opener(proxy, *, redirects=True):
+    """None uses the system proxy; an empty string is direct."""
+    handlers = [] if redirects else [NoRedirect()]
+    if proxy is not None:
+        handlers.append(urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {}))
+    return urllib.request.build_opener(*handlers)
 
 
 LOCAL = opener('')
+LOCAL_READY = opener('', redirects=False)
 
 
 def http_get(url, timeout=10, via=LOCAL):
@@ -284,12 +299,25 @@ def env_file(path):
     return out
 
 
-def derive_m1(cfg):
+def derive_m1(cfg, *, formal=True):
     """Fill what was left empty from the shared-Dev launchd files and .env."""
     web, worker = plist_of(cfg['webPlist']), plist_of(cfg['workerPlist'])
+    if formal:
+        for role, plist in (('web', web), ('worker', worker)):
+            label, port = 'ai.bplabs.allrice40-dev-' + role, DEV_PORTS[role]
+            port_key = 'ALLRICE_' + role.upper() + '_PORT'
+            valid = service_config(plist, label, port_key, str(port), DEV_DATABASE, HERE)
+            cfg[role + 'Identity'] = valid['identity'] if valid else None
+            cfg[role + 'Label'] = label if valid else None
+            cfg[role + 'Url'] = 'http://127.0.0.1:%s' % port if valid else None
+            if not valid:
+                if role == 'web':
+                    web = None
+                else:
+                    worker = None
     wenv = (web or {}).get('EnvironmentVariables', {})
     kenv = (worker or {}).get('EnvironmentVariables', {})
-    dotenv = env_file(cfg['envFile'])
+    dotenv = env_file('~/allrice40-dev/.env' if formal else cfg['envFile'])
     args = (worker or {}).get('ProgramArguments') or [None]
     if args[0] and os.path.basename(args[0]) == 'with-env': args = args[2:]
     fill = {
@@ -313,9 +341,84 @@ def derive_m1(cfg):
     for k, v in fill.items():
         if cfg.get(k) is None:
             cfg[k] = v
+    if formal:
+        # Use the verified Worker's actual launch DSN. A missing or foreign
+        # plist must not turn a fallback .env/monitor override into a write target.
+        for key in ('databaseUrl', 'release', 'node', 'colima', 'colimaProfile', 'officeUrl', 'cloudArchitecture'):
+            cfg[key] = fill[key]
+        cfg['databaseUrl'] = kenv.get('DATABASE_URL')
+        override = cfg.get('incidentDatabaseUrl')
+        cfg['incidentDatabaseUrl'] = ((override or cfg['databaseUrl']) if cfg['databaseUrl'] and
+                                      (not override or database_matches(override)) else None)
+        return cfg
     if cfg.get('incidentDatabaseUrl') is None:
         cfg['incidentDatabaseUrl'] = cfg['databaseUrl']
     return cfg
+
+
+def configure_drill(cfg, peer):
+    """Keep the timer, checkpoint and sink of a rehearsal separate from Dev."""
+    home = Path.home().resolve()
+    state = Path(cfg['stateDir'])
+    tag = state.name
+    config = Path(cfg['configFile']).absolute()
+    if not (state.parent == home / (DRILL_PEER_ROOT if peer else DRILL_ROOT)
+            and canonical(state) and config == state / 'config.json' and canonical(config)
+            and re.fullmatch(r'[a-z][a-z0-9-]{0,30}', tag)):
+        sys.exit('monitor --drill requires --config and a dedicated monitor drill state directory')
+    credentials = Path(cfg['telegramEnv'])
+    if peer and credentials == Path(expand(PEER['telegramEnv'])):
+        credentials = state / 'telegram.env'
+    if credentials.parent != state or not canonical(credentials):
+        sys.exit('monitor --drill requires a Telegram configuration inside its state directory')
+    cfg.update(drill=True, drillTag=tag, configFile=str(config), label='演练', telegramEnv=str(credentials),
+               launchdLabel=DRILL_LABEL + tag + ('-peer' if peer else ''))
+    allowed = ('m1', 'monitor') if peer else ('postgres', 'sandbox_vm', 'images', 'disk', 'peer', 'monitor')
+    if cfg['checks'] is None:
+        cfg['checks'] = list(allowed)
+    elif not isinstance(cfg['checks'], list) or any(check not in allowed for check in cfg['checks']):
+        sys.exit('monitor --drill: checks must target the rehearsal')
+    if peer:
+        cfg['m1Heartbeat'] = str(DRILL_ROOT / tag / 'heartbeat.json')
+        cfg['m1DeployLock'] = str(DRILL_ROOT / tag / 'deploy.lock')
+        cfg['m1MonitorConfig'] = str(DRILL_ROOT / tag / 'config.json')
+        cfg['m1Monitor'] = PEER['m1Monitor']
+        return
+    dsn = cfg['incidentDatabaseUrl']
+    try:
+        target = urllib.parse.urlsplit(dsn)
+        port = target.port
+        database = 'allrice40_monitor_drill_' + tag.replace('-', '_')
+        valid = port not in (None, 5432, 5434) and database_matches(dsn, database, port)
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        sys.exit('monitor --drill requires the dedicated loopback drill database on a test port')
+    cfg.update(databaseUrl=dsn, publicUrl=None, extraPublicUrls=[], images={},
+               deployLock=str(state / 'deploy.lock'), peerHeartbeat=str(DRILL_PEER_ROOT / tag / 'heartbeat.json'))
+
+
+def configure_formal(cfg):
+    """A formal command must not consume a drill checkpoint or manage its timer."""
+    home = Path.home().resolve()
+    roots = (home / DRILL_ROOT, home / DRILL_PEER_ROOT)
+    paths = [Path(path).absolute() for path in (cfg['stateDir'], cfg['configFile']) if path]
+    if (cfg.get('drill') or cfg.get('drillTag') or cfg.get('label') == '演练'
+            or (cfg.get('launchdLabel') or '').startswith(DRILL_LABEL)
+            or any(path.is_relative_to(root) or path.resolve().is_relative_to(root.resolve())
+                   for path in paths for root in roots)):
+        sys.exit('monitor: drill state, configuration and timers require --drill')
+    cfg.update(drill=False, drillTag=None)
+
+
+def status_command(cfg, peer):
+    command = ('/usr/bin/python3 ~/.local/share/allrice40-monitor/monitor status --peer' if peer else
+               '~/allrice40-dev/bin/monitor status')
+    if cfg.get('configFile'):
+        command += ' --config ' + shlex.quote(cfg['configFile'])
+    if cfg.get('drill'):
+        command += ' --drill'
+    return command
 
 
 def finding(key, severity, title, detail='', runbook='', step=''):
@@ -326,6 +429,41 @@ def unknown(key, title=''):
     """A key the check cannot judge this round (no evidence either way): an open alert
     stays open and nothing new opens."""
     return finding(key, 'unknown', title)
+
+
+def checkpoint_for_target(cfg, peer, state):
+    if not isinstance(state, dict):
+        raise CheckError('monitor state is not an object')
+    tag = cfg.get('drillTag')
+    target = {'tag': tag, 'role': 'peer' if peer else 'm1'} if tag else None
+    if 'drillTarget' in state:
+        if state['drillTarget'] != target:
+            raise CheckError('monitor state belongs to a different target')
+        return state
+
+    if state:
+        rows, messages = state.get('incidentOutbox', []), state.get('outbox', [])
+        if not isinstance(rows, list) or not isinstance(messages, list):
+            raise CheckError('monitor state has an invalid outbox')
+        metadata = [row.get('metadata') if isinstance(row, dict) else None for row in rows]
+        drill_rows = [isinstance(m, dict) and (m.get('label') == '演练' or 'drill' in m) for m in metadata]
+        drill_messages = [isinstance(message, str) and re.match(r'^\S+ \[演练\] ', message) for message in messages]
+        heartbeat = read_json(os.path.join(cfg['stateDir'], 'heartbeat.json'), {})
+        drill_heartbeat = isinstance(heartbeat, dict) and heartbeat.get('label') == '演练'
+        if target:
+            # Legacy drills had the label but no tag. Only the validated drill
+            # command may adopt its old checkpoint and retain its event IDs.
+            if (not cfg.get('drill') or not (drill_heartbeat or rows or messages)
+                    or not all(drill_rows) or not all(drill_messages)
+                    or any(m.get('source') != 'allrice-monitor' or 'drill' in m for m in metadata)):
+                raise CheckError('monitor state belongs to a different target')
+            for m in metadata:
+                m['drill'] = tag
+        elif drill_heartbeat or any(drill_rows) or any(drill_messages):
+            raise CheckError('monitor state belongs to a different target')
+    if target:
+        state['drillTarget'] = target
+    return state
 
 
 class Round:
@@ -346,7 +484,9 @@ class Round:
                 if recover:  # keep the unreadable file for a person, and say so
                     self.state_lost = '%s.corrupt-%d' % (self.state_file, self.now)
                     os.replace(self.state_file, self.state_lost)
-                    self.state = {'stateLost': self.state_lost}
+        self.state = checkpoint_for_target(cfg, peer, self.state)
+        if self.state_lost:
+            self.state['stateLost'] = self.state_lost
         self.facts, self.progress = {}, None
 
     def save(self):
@@ -373,7 +513,8 @@ def psql(cfg, sql, url=None, variables=None, timeout=30, readonly=True):
     for k, v in (variables or {}).items():
         cmd += ['-v', '%s=%s' % (k, v)]
     opts = '-c statement_timeout=15000' + (' -c default_transaction_read_only=on' if readonly else '')
-    env.update(PGCONNECT_TIMEOUT='5', PGAPPNAME='allrice-monitor', PGOPTIONS=opts)
+    env.update(PGCONNECT_TIMEOUT='5', PGAPPNAME='allrice-monitor', PGOPTIONS=opts,
+               PGHOSTADDR=None, PGSERVICE=None, PGSERVICEFILE=None)
     rc, out, err = run(cmd, timeout, env, sql)
     if rc:
         raise CheckError(short(err or 'psql exit %d' % rc))
@@ -521,14 +662,17 @@ def compose(r, events):
 def incident(r, kind, severity, f, alert, incident_id=None, event=None):
     if not r.cfg.get('incidents'):
         return
-    r.state.setdefault('incidentOutbox', []).append({
+    row = {
         'id': incident_id or str(uuid.uuid4()), 'kind': kind, 'severity': severity,
         'detailCode': 'monitor.' + f['key'], 'createdAt': time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(r.now)),
         'metadata': {'source': 'allrice-monitor', 'monitor': r.cfg['name'], 'label': r.cfg['label'], 'host': socket.gethostname(),
                      'event': event, 'title': alert['title'], 'detail': f['detail'] or alert.get('detail', ''),
                      'runbook': alert.get('runbook', ''), 'alertId': alert['incidentId'], 'since': int(alert['since']),
                      'durationSeconds': int(r.now - alert['since'])},
-    })
+    }
+    if r.cfg.get('drillTag'):
+        row['metadata']['drill'] = r.cfg['drillTag']
+    r.state.setdefault('incidentOutbox', []).append(row)
 
 
 INSERT_INCIDENTS = """
@@ -539,13 +683,38 @@ on conflict (id) do nothing;
 """
 
 
-def flush_incidents(r):
-    """Write queued incidents; on failure keep them (bounded) for the next round."""
+def incident_mode_matches(cfg, row):
+    metadata = row.get('metadata') if isinstance(row, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    drill = cfg.get('drillTag')
+    if drill:
+        return metadata.get('drill') == drill and metadata.get('label') == '演练'
+    return 'drill' not in metadata and metadata.get('label') != '演练'
+
+
+def incident_failure(r, error):
+    r.state['incidentError'] = {'at': r.now, 'error': error}
+    r.state.setdefault('incidentFailingSince', r.now)
+
+
+def pending_incidents(r):
     box = r.state.get('incidentOutbox', [])
+    if not box or not r.cfg['incidents']:
+        return []
+    if not all(incident_mode_matches(r.cfg, row) for row in box):
+        incident_failure(r, 'incident outbox belongs to a different monitor target')
+        return []
     if len(box) > 200:
         r.state['incidentDropped'] = r.state.get('incidentDropped', 0) + len(box) - 200
         box = box[-200:]
     r.state['incidentOutbox'] = box
+    return box
+
+
+def flush_incidents(r):
+    """Write queued incidents; on failure keep them (bounded) for the next round."""
+    box = pending_incidents(r)
     if not box:
         return
     try:
@@ -553,8 +722,7 @@ def flush_incidents(r):
         r.state['incidentOutbox'] = []
         r.state['incidentError'] = None
     except CheckError as err:
-        r.state['incidentError'] = {'at': r.now, 'error': str(err)}
-        r.state.setdefault('incidentFailingSince', r.now)
+        incident_failure(r, str(err))
     else:
         r.state.pop('incidentFailingSince', None)
 
@@ -562,21 +730,18 @@ def flush_incidents(r):
 def flush_incidents_remote(r):
     """The huihuimac side has no database: its incidents go to M1's table through the
     monitor installed there (`monitor ingest-incidents`), as soon as M1 answers again."""
-    box = r.state.get('incidentOutbox', [])
-    if len(box) > 200:
-        r.state['incidentDropped'] = r.state.get('incidentDropped', 0) + len(box) - 200
-        box = box[-200:]
-    r.state['incidentOutbox'] = box
+    box = pending_incidents(r)
     if not box:
         return
     cmd = '/usr/bin/python3 %s ingest-incidents' % shlex.quote(r.cfg['m1Monitor'])
     if r.cfg.get('m1MonitorConfig'):
         cmd += ' --config ' + shlex.quote(r.cfg['m1MonitorConfig'])
+    if r.cfg.get('drill'):
+        cmd += ' --drill'
     rc, _, err = run(['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', r.cfg['m1Ssh'], cmd], 60,
                      stdin=json.dumps(box, ensure_ascii=False))
     if rc:
-        r.state['incidentError'] = {'at': r.now, 'error': 'ingest on %s failed (exit %d): %s' % (r.cfg['m1Ssh'], rc, short(err, 200))}
-        r.state.setdefault('incidentFailingSince', r.now)
+        incident_failure(r, 'ingest on %s failed (exit %d): %s' % (r.cfg['m1Ssh'], rc, short(err, 200)))
     else:
         r.state['incidentOutbox'], r.state['incidentError'] = [], None
         r.state.pop('incidentFailingSince', None)
@@ -590,7 +755,14 @@ def ingest_incidents(cfg, stream):
         and isinstance(i.get('metadata'), dict) and re.match(r'^[0-9a-f-]{36}$', str(i.get('id', ''))) for i in rows)
     if not ok:
         sys.exit('ingest-incidents: expected a JSON list of monitor incidents')
-    psql(cfg, INSERT_INCIDENTS, cfg['incidentDatabaseUrl'], {'rows': json.dumps(rows, ensure_ascii=False)}, readonly=False)
+    if not all(incident_mode_matches(cfg, row) for row in rows):
+        sys.exit('ingest-incidents: events belong to a different monitor target')
+    if not cfg['incidents'] or not cfg['incidentDatabaseUrl']:
+        sys.exit('ingest-incidents: no verified incident delivery target')
+    try:
+        psql(cfg, INSERT_INCIDENTS, cfg['incidentDatabaseUrl'], {'rows': json.dumps(rows, ensure_ascii=False)}, readonly=False)
+    except CheckError as err:
+        sys.exit('ingest-incidents: ' + str(err))
     print('ingested %d' % len(rows))
 
 
@@ -684,9 +856,9 @@ def job_info(label):
     return ('running' if pid else 'loaded'), int(runs.group(1)) if runs else None, last.group(1).strip() if last else None
 
 
-def ready(url, timeout=8):
+def ready(url, timeout=8, target_opener=LOCAL):
     """(document when ready, why not, the document anyway when it answered with one)."""
-    code, body = http_get(url, timeout)
+    code, body = http_get(url, timeout, target_opener)
     try:
         doc = json.loads(body) if code else None
     except ValueError:
@@ -734,8 +906,9 @@ def deploying(r):
 def check_deploy(r):
     if not os.path.exists(expand(r.cfg['deployInflight'])) or deploying(r):
         return [finding('deploy', 'ok', '部署中断未恢复')]
-    return [finding('deploy', 'critical', '部署中断未恢复', '%s 还在，但没有部署在进行：上一次部署被强行中止，Dev 可能停在半途' % r.cfg['deployInflight'],
-                    'm1-worker-crash.md', '~/allrice-dev/bin/deploy-dev --status（恢复由发布负责人 deploy-dev --release-manager --recover）')]
+    detail = ('%s 还在，上一次部署被中止。发布负责人可执行 '
+              '~/allrice40-dev/bin/deploy-dev --release-manager --recover' % r.cfg['deployInflight'])
+    return [finding('deploy', 'critical', '部署中断未恢复', detail, 'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status')]
 
 
 def check_service(r, role):
@@ -744,11 +917,14 @@ def check_service(r, role):
         return None
     path = '/api/health/ready' if role == 'web' else '/health/ready'
     title = 'Web 不可用' if role == 'web' else 'Worker 不可用'
-    step = '~/allrice-dev/bin/deploy-dev --status; tail -50 ~/Library/Logs/allrice-dev-%s.err.log' % role
+    step = '~/allrice40-dev/bin/deploy-dev --status; tail -50 ~/Library/Logs/allrice40-dev-%s.err.log' % role
     if not label or not base:
         return [finding(role, 'warning', title + '（读不到配置）', 'launchd 文件 %s 缺失或不完整' % r.cfg[role + 'Plist'], 'm1-worker-crash.md', step)]
     state, _, last = job_info(label)
-    doc, why, answer = ready(base + path)
+    doc, why, answer = ready(base + path, target_opener=LOCAL_READY)
+    expected = r.cfg.get(role + 'Identity')
+    if doc and expected and not ready_identity(doc, role, expected):
+        doc, why = None, '未报告此 4.0 发布的就绪身份'
     if doc:
         r.facts[role] = doc
         return [finding(role, 'ok', title)] + ([finding('worker_stuck', 'ok', 'Worker 定时控制器卡住，要重启 Worker')] if role == 'worker' else [])
@@ -766,7 +942,7 @@ def check_service(r, role):
             ctl = (answer or {}).get('nativeOnceControl' if 'once' in stuck else 'nativeRecurringControl') or {}
             out.append(finding('worker_stuck', 'critical', 'Worker 定时控制器卡住，要重启 Worker', '%s；控制器 %s，lastFault %s' % (
                 stuck, ctl.get('state'), short(json.dumps(ctl.get('lastFault'), ensure_ascii=False), 160)), 'm1-worker-crash.md#定时控制器卡住',
-                '发布负责人：~/allrice-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/%s' % label))
+                '发布负责人：~/allrice40-dev/bin/deploy-lock run worker-restart -- /bin/launchctl kickstart -k gui/$(id -u)/%s' % label))
         elif answer is not None:
             out.append(finding('worker_stuck', 'ok', 'Worker 定时控制器卡住，要重启 Worker'))
     return out
@@ -788,7 +964,7 @@ def check_versions(r):
     if a == b:
         return [finding('versions', 'ok', 'Web 与 Worker 版本不一致')]
     return [finding('versions', 'warning', 'Web 与 Worker 版本不一致', 'Web %s，Worker %s' % ((a or '?')[:8], (b or '?')[:8]),
-                    'm1-worker-crash.md', '~/allrice-dev/bin/deploy-dev --status')]
+                    'm1-worker-crash.md', '~/allrice40-dev/bin/deploy-dev --status')]
 
 
 def check_scheduler(r):
@@ -885,7 +1061,7 @@ def check_scheduler_takeover(r):
             problems.append('%s 已 cold %s，分区 %s %s%s' % (name, ago(since), part, '，'.join(why), '，定时任务不会触发' if bad == 'critical' else ''))
             sev = max(sev, bad, key=RANK.get)
     return [finding('scheduler_takeover', sev, '定时控制器接管不了分区', '；'.join(problems), 'm1-schedule-not-fired.md#接管被拒',
-                    '~/allrice-dev/bin/schedule-recover --dev（只读演示；由发布负责人加 --release-manager --execute 恢复）')]
+                    '~/allrice40-dev/bin/schedule-recover --dev（只读演示；由发布负责人加 --release-manager --execute 恢复）')]
 
 
 def check_restarts(r):
@@ -925,8 +1101,12 @@ def check_postgres(r):
         r.psql('select 1;', r.cfg['databaseUrl'])
         return [finding('postgres', 'ok', '数据库不可用')]
     except CheckError as err:
+        port, database = 5434, DEV_DATABASE
+        if r.cfg.get('drill'):
+            url = urllib.parse.urlsplit(r.cfg['databaseUrl'])
+            port, database = url.port, url.path[1:]
         return [finding('postgres', 'critical', '数据库不可用', str(err), 'm1-database.md',
-                        '/opt/homebrew/bin/pg_isready -h 127.0.0.1; /opt/homebrew/bin/brew services list | grep postgres')]
+                        '/opt/homebrew/bin/pg_isready -h 127.0.0.1 -p %s -d %s' % (port, database))]
 
 
 def check_sandbox_vm(r):
@@ -936,7 +1116,7 @@ def check_sandbox_vm(r):
     out, colima = [], r.cfg['colima'] or '/opt/homebrew/bin/colima'
     main = r.cfg['colimaProfile']
     r.facts['vmOk'] = False
-    if not main:
+    if not main and not r.cfg.get('drill'):
         out.append(finding('sandbox_vm:config', 'warning', '沙箱 VM 读不到配置', 'Worker 的 launchd 文件里没有 ALLRICE_CLOUD_PROFILE', 'm1-sandbox-vm.md', ''))
     planned = deploying(r)
     if main and planned:
@@ -1043,7 +1223,7 @@ def check_subscription(r):
     count; an unreadable quota is unknown, which keeps an open quota alert as it is, and
     alerts by itself only once it has lasted subscriptionStaleMinutes."""
     rows = json.loads(r.psql(SUBSCRIPTION_SQL, r.cfg['databaseUrl']) or '[]')
-    step = '后台「模型与订阅」查看授权与额度；psql 查 allrice_provider_status'
+    step = '后台「模型与订阅」查看授权与额度。查 allrice_provider_status 时连接 127.0.0.1:5434/allrice40_dev'
     if not rows:
         return [finding('subscription', 'critical', '模型订阅不可用', '没有启用的 Codex 订阅槽位', 'm1-model-subscription.md', step)]
     auth, auth_sev, quota, quota_sev, judged, auth_unsure, quota_unsure = [], 'ok', [], 'ok', False, False, False
@@ -1377,7 +1557,7 @@ def check_model_authorization(r):
     if state.get('gap'):
         issues.append(state['gap']['reason'] + '；历史计数不完整，需新有效到期版本及完整安静窗口')
     data = finding('model_authorization_data', 'warning' if issues else 'ok', '模型授权无法判断',
-                   '；'.join(issues), 'm1-model-subscription.md', 'monitor status 查看未知原因，核对授权文件与 Worker 日志可读性')
+                   '；'.join(issues), 'm1-model-subscription.md', status_command(r.cfg, r.peer))
     data['noRepeat'] = True
     expiry_phase = None if expires is None or expires / 1000 - r.now > 72 * 3600 \
         else 24 if expires / 1000 - r.now <= 24 * 3600 else 72
@@ -1445,12 +1625,22 @@ PUBLIC_PROBE_SECONDS = 15
 def probe_public(r, url, key='public_entry', where='M1 本机', title='公网入口不可达'):
     if not url:
         return [finding(key, 'warning', title + '（未配置地址）', '', 'm1-tunnel.md', '')]
+    ready_url = urllib.parse.urljoin(url, '/api/health/ready')
     start = time.time()
-    code, body = http_get(url, PUBLIC_PROBE_SECONDS, opener(r.cfg.get('publicProxy')))
+    code, body = http_get(ready_url, PUBLIC_PROBE_SECONDS, opener(r.cfg.get('publicProxy'), redirects=False))
     took = time.time() - start
-    ok = code == 200 and took < PUBLIC_PROBE_SECONDS
-    return [finding(key, 'ok' if ok else 'critical', title, '从%s访问 %s：%s（%.1f 秒）' % (where, url, code or short(body, 120), took),
-                    'm1-tunnel.md', 'curl -sS -o /dev/null -w "%%{http_code}\\n" %s' % url)]
+    verified = False
+    if code == 200:
+        try:
+            verified = ready_identity(json.loads(body), 'web')
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass
+    ok = verified and took < PUBLIC_PROBE_SECONDS
+    outcome = code or short(body, 120)
+    if code == 200 and not verified:
+        outcome = '200，缺少 4.0 Web 的就绪身份'
+    return [finding(key, 'ok' if ok else 'critical', title, '从%s访问 %s：%s（%.1f 秒）' % (where, ready_url, outcome, took),
+                    'm1-tunnel.md', 'curl -sS %s' % ready_url)]
 
 
 def check_public_entry(r):
@@ -1495,7 +1685,7 @@ def check_disk(r):
         r.facts.setdefault('disks', {})[d['path']] = free
         out.append(finding('disk:' + d['path'], sev, '磁盘余量不足（%s）' % d['path'],
                            '剩 %s GiB（警告线 %s GiB，严重线 %s GiB）' % ('%.1f' % free if free >= 10 else '%.2f' % free, d['warnFreeGiB'], d['criticalFreeGiB']),
-                           'm1-disk-space.md', 'df -h %s; du -sh ~/allrice-* ~/Library/Caches 2>/dev/null | sort -h | tail' % shlex.quote(path)))
+                           'm1-disk-space.md', 'df -h %s; du -sh ~/allrice40-dev ~/allrice40-dev-releases ~/allrice40-worktrees ~/allrice40-backups ~/Library/Caches 2>/dev/null | sort -h | tail' % shlex.quote(path)))
     return out
 
 
@@ -1536,7 +1726,7 @@ def check_backup(r):
     """The last successful run (backup.log) and how the last run ended (launchd's exit
     code), so a failed 04:00 run alerts with the next round, not a day later."""
     path, last = expand(r.cfg['backupLog']), None
-    step = 'tail -20 ~/allrice-backups/logs/backup.err.log; ls -la ~/allrice-backups/db | tail -3'
+    step = 'tail -20 ~/allrice40-backups/logs/backup.err.log; ls -la ~/allrice40-backups/db | tail -3'
     try:
         with open(path, errors='replace') as f:
             for line in f.readlines()[-100:]:
@@ -1605,7 +1795,9 @@ def judge_heartbeat(r, hb, keys, titles, stale, unfinished, stuck, severity, run
 def check_peer(r):
     """The huihuimac watchdog: without it nobody would notice M1 itself going down."""
     hb, err, _, _ = read_remote_heartbeat(r.cfg['peerSsh'], r.cfg['peerHeartbeat'])
-    step = 'ssh %s "launchctl print gui/\\$(id -u)/ai.bplabs.allrice-monitor-peer | head -20"' % r.cfg['peerSsh']
+    tag = r.cfg.get('drillTag')
+    label = DRILL_LABEL + tag + '-peer' if tag else 'ai.bplabs.allrice40-dev-monitor-peer'
+    step = 'ssh %s %s' % (shlex.quote(r.cfg['peerSsh']), shlex.quote('launchctl print gui/$(id -u)/' + label + ' | head -20'))
     if not hb:
         return [finding('peer', 'warning', 'huihuimac 看门失效', err + '；M1 整机故障时将没人报警', 'm1-monitor.md', step)]
     r.facts['peer'] = hb
@@ -1616,16 +1808,16 @@ def check_peer(r):
 def check_monitor(r):
     """The monitor's own delivery: alerts that cannot reach the incidents table."""
     since, dropped = r.state.get('incidentFailingSince'), r.state.get('incidentDropped', 0)
-    if not since or r.now - since < 1800:
+    if not r.cfg['incidents'] or not since or r.now - since < 1800:
         return [finding('monitor', 'ok', '告警写不进事件表')]
     err = (r.state.get('incidentError') or {}).get('error', '')
     return [finding('monitor', 'warning', '告警写不进事件表', '已 %s，积压 %d 条%s：%s' % (
         ago(r.now - since), len(r.state.get('incidentOutbox', [])), '（另有 %d 条超出上限已丢弃）' % dropped if dropped else '', err),
-        'm1-monitor.md', 'monitor status')]
+        'm1-monitor.md', status_command(r.cfg, r.peer))]
 
 
 # ---------- business checks (SQL, read-only) ----------
-# Each query is one SELECT on allrice_dev; thresholds come from the config key "business"
+# Each query is one SELECT on allrice40_dev; thresholds come from the config key "business"
 # as psql variables. The state semantics behind every query (which column is the
 # heartbeat, how a schedule proves it fired, where "unknown outcome" lives) are written
 # up with code references in docs/runbooks/m1-monitor.md#业务巡检. Queue, stuck and
@@ -1914,7 +2106,7 @@ select coalesce(json_agg(g order by g.today desc, g.code), '[]') as groups from 
   from f group by code having count(*) filter (where today) > 0) g"""
 
 BUSINESS_RUNBOOK = 'm1-monitor.md#业务巡检'
-SQL_STEP = 'psql 查 allrice_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
+SQL_STEP = '连接 127.0.0.1:5434/allrice40_dev（SQL 见 scripts/m1/monitor 的 SQL_%s）'
 
 
 def biz(r, sql):
@@ -2299,7 +2491,7 @@ def run_checks(r, checks):
         except Exception as err:  # a bug in one check must not stop the others or the round
             results[name] = None
             text = str(err) if isinstance(err, CheckError) else '%s: %s' % (type(err).__name__, short(err, 200))
-            errors[name] = finding('check:' + name, 'warning', '检查 %s 本身出错' % name, text, 'm1-monitor.md', 'monitor status')
+            errors[name] = finding('check:' + name, 'warning', '检查 %s 本身出错' % name, text, 'm1-monitor.md', status_command(r.cfg, r.peer))
         p['current'] = None
 
     def bad(name):
@@ -2420,11 +2612,11 @@ def do_round(cfg, peer):
         error = 'round timed out after %ss in check %s' % (cfg['roundTimeoutSeconds'], stuck)
         findings, ran = collect_checks(r) if r.progress else ([], set())
         findings.append(finding('monitor_round', 'critical', '监控本轮超时', '检查 %s 卡住，%s 秒没跑完；其余检查的结果照常报告' % (
-            stuck, cfg['roundTimeoutSeconds']), 'm1-monitor.md', 'monitor status'))
+            stuck, cfg['roundTimeoutSeconds']), 'm1-monitor.md', status_command(cfg, peer)))
     lost = r.state.pop('stateLost', None)
     findings.append(finding('monitor_state', 'warning' if lost else 'ok', '监控状态文件损坏',
                             '读不出来，已另存为 %s；之前的待发通知和告警状态丢了，已有的故障会重新报一次' % lost,
-                            'm1-monitor.md', 'monitor status'))
+                            'm1-monitor.md', status_command(cfg, peer)))
     preparation_state = r.state
     signal.alarm(90)  # delivery has its own timeouts; this only bounds a hung write
     try:
@@ -2436,7 +2628,7 @@ def do_round(cfg, peer):
         else:
             flush_incidents(r)
         deliver(r, [])
-        if not peer and daily_due(r):
+        if not peer and not cfg.get('drill') and daily_due(r):
             send_daily(r)
         r.state['lastRound'] = {'at': r.now, 'seconds': round(time.time() - start, 1), 'error': error}
         r.state['rounds'] = [t for t in r.state.get('rounds', []) if r.now - t < 86400] + [r.now]
@@ -2529,7 +2721,10 @@ def check_m1(r):
     cannot be reached only m1_reachable is judged: its heartbeat is unknown, not stale."""
     cfg = r.cfg
     hb, err, reachable, holders = read_remote_heartbeat(cfg['m1Ssh'], cfg['m1Heartbeat'], cfg['m1DeployLock'])
-    step = 'ssh %s "~/allrice-dev/bin/monitor status"' % cfg['m1Ssh']
+    command = '~/allrice40-dev/bin/monitor status'
+    if cfg.get('drill'):
+        command += ' --drill --config ' + shlex.quote(cfg['m1MonitorConfig'])
+    step = 'ssh %s %s' % (cfg['m1Ssh'], shlex.quote(command))
     out = [finding('m1_reachable', 'ok' if reachable else 'critical', 'M1 连不上', err + '（整机宕机、断网或 Tailscale 断开）',
                    'm1-monitor.md', 'tailscale status; ssh -v %s true' % cfg['m1Ssh'])]
     if not reachable:
@@ -2565,7 +2760,30 @@ PEER_CHECKS = [
 
 
 def launchd(cfg, action, peer):
-    label = cfg['launchdLabel'] or ('ai.bplabs.allrice-monitor-peer' if peer else 'ai.bplabs.allrice-dev-monitor')
+    if action == 'install':
+        path = os.path.join(cfg['stateDir'], 'state.json')
+        try:
+            try:
+                with open(path) as file:
+                    state = json.load(file)
+            except FileNotFoundError:
+                if os.path.lexists(path):
+                    raise
+                state = {}
+            checkpoint_for_target(cfg, peer, state)
+            for key, kind in (('drillTarget', dict), ('alerts', dict), ('telegram', dict),
+                              ('opens', dict), ('outbox', list), ('incidentOutbox', list),
+                              ('history', list), ('rounds', list)):
+                if key in state and not isinstance(state[key], kind):
+                    raise CheckError('monitor state has an invalid ' + key)
+            if any(not isinstance(alert, dict) or 'severity' not in alert for alert in state.get('alerts', {}).values()):
+                raise CheckError('monitor state has an invalid alert')
+            if state.get('lastRound') is not None and not isinstance(state['lastRound'], dict):
+                raise CheckError('monitor state has an invalid lastRound')
+        except (OSError, ValueError, CheckError) as err:
+            sys.exit('monitor: cannot use checkpoint %s: %s' % (path, err))
+        os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
+    label = cfg['launchdLabel'] or ('ai.bplabs.allrice40-dev-monitor-peer' if peer else 'ai.bplabs.allrice40-dev-monitor')
     path = expand('~/Library/LaunchAgents/%s.plist' % label)
     domain = 'gui/%d' % os.getuid()
     run(['/bin/launchctl', 'bootout', '%s/%s' % (domain, label)], 30)
@@ -2581,6 +2799,8 @@ def launchd(cfg, action, peer):
     args = ['/usr/bin/python3', os.path.abspath(sys.argv[0]), 'peer' if peer else 'run']
     if cfg['configFile']:
         args += ['--config', cfg['configFile']]
+    if cfg.get('drill'):
+        args += ['--drill']
     log = os.path.join(cfg['stateDir'], 'monitor.log')
     with open(path + '.tmp', 'wb') as f:
         plistlib.dump({'Label': label, 'ProgramArguments': args, 'StartInterval': cfg['intervalSeconds'], 'RunAtLoad': True,
@@ -2612,14 +2832,24 @@ def main(argv):
     p.add_argument('action', nargs='?', choices=['install', 'remove'])
     p.add_argument('--config')
     p.add_argument('--peer', action='store_true')
+    p.add_argument('--drill', action='store_true')
     p.add_argument('--dry-run', action='store_true', help='run/peer/daily: print what would be sent; send and store nothing')
     p.add_argument('--json', action='store_true', help='failures/online-waits: the snapshot as JSON')
     a = p.parse_args(argv)
     peer = a.command == 'peer' or a.peer
+    if a.command == 'ingest-incidents' and (peer or a.dry_run):
+        p.error('ingest-incidents requires the verified local 4.0 target')
+    if a.drill and (not a.config or a.command not in ('run', 'peer', 'status', 'test-alert', 'launchd', 'ingest-incidents')):
+        p.error('--drill requires --config for run, peer, status, test-alert, launchd or ingest-incidents')
     cfg = load_config(a.config, peer)
-    os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
-    if not peer:
-        derive_m1(cfg)
+    if a.drill:
+        configure_drill(cfg, peer)
+    else:
+        configure_formal(cfg)
+        if not peer:
+            derive_m1(cfg, formal=not (a.dry_run and a.command in ('run','daily')))
+    if a.command != 'launchd':
+        os.makedirs(cfg['stateDir'], mode=0o700, exist_ok=True)
     if a.command in ('run', 'peer') and a.dry_run:
         r = Round(cfg, peer)
         findings, ran = run_checks(r, PEER_CHECKS if peer else M1_CHECKS)

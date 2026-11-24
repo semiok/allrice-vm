@@ -369,7 +369,7 @@ export function PlatformRepositoryPublications({
             <p>
               <a
                 href={
-                  'https://github.com/semiok/allrice/actions/runs/' +
+                  'https://github.com/semiok/allrice-vm/actions/runs/' +
                   current.ci.workflowRunId
                 }
                 target="_blank"

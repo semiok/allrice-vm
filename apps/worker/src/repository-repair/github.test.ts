@@ -132,7 +132,7 @@ describe('fixed private GitHub transport boundaries', () => {
     const transport = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
-        ok({ id: 1323769790, full_name: 'semiok/allrice' }),
+        ok({ id: 1469490636, full_name: 'semiok/allrice-vm' }),
       )
       .mockResolvedValueOnce(
         ok({ ref: 'refs/heads/main', object: { sha: 'a'.repeat(40) } }),
@@ -143,8 +143,8 @@ describe('fixed private GitHub transport boundaries', () => {
       transport,
     );
     expect(await client.repository()).toEqual({
-      id: 1323769790,
-      fullName: 'semiok/allrice',
+      id: 1469490636,
+      fullName: 'semiok/allrice-vm',
     });
     expect(await client.main()).toBe('a'.repeat(40));
     expect(gate).toHaveBeenCalledTimes(2);
@@ -187,7 +187,7 @@ describe('fixed private GitHub transport boundaries', () => {
   it('bounds response bodies and rejects a different repository or malformed object', async () => {
     const transport = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(ok({ id: 5, full_name: 'semiok/allrice' }))
+      .mockResolvedValueOnce(ok({ id: 5, full_name: 'semiok/allrice-vm' }))
       .mockResolvedValueOnce(
         new Response('x'.repeat(2_000_001), { status: 200 }),
       );
@@ -214,7 +214,7 @@ describe('fixed private GitHub transport boundaries', () => {
       await treeRequest(client, endpoint);
       const [url, init] = transport.mock.calls[0]!;
       expect(String(url)).toBe(
-        'https://api.github.com/repos/semiok/allrice/git/trees' +
+        'https://api.github.com/repos/semiok/allrice-vm/git/trees' +
           (endpoint === 'create'
             ? ''
             : '/' +
@@ -251,7 +251,7 @@ describe('fixed private GitHub transport boundaries', () => {
       ...treeBlob,
       path: `d${i % 2048}/${'雪'.repeat(60)}-${i}.ts`,
       url:
-        'https://api.github.com/repos/semiok/allrice/git/blobs/' +
+        'https://api.github.com/repos/semiok/allrice-vm/git/blobs/' +
         'b'.repeat(40),
       size: 1,
     }));
@@ -316,7 +316,7 @@ describe('fixed private GitHub transport boundaries', () => {
     },
   );
   it('retains the 2 MB ordinary response cap and 100 KB request cap with valid JSON', async () => {
-    const row = { id: 1323769790, full_name: 'semiok/allrice' };
+    const row = { id: 1469490636, full_name: 'semiok/allrice-vm' };
     const { client, transport } = responseFixture(row, 2_000_000);
     transport.mockResolvedValueOnce(streamed(row, 2_000_001));
     expect(await client.repository()).toEqual({

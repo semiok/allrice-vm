@@ -10,6 +10,8 @@ import type { ServiceBuildIdentity } from './service-build-identity.ts';
 const identity: ServiceBuildIdentity = {
   version: 1,
   environment: 'dev',
+  repository: 'semiok/allrice-vm',
+  repositoryId: 1469490636,
   service: 'worker',
   mode: 'production',
   sourceSha: 'a'.repeat(40),

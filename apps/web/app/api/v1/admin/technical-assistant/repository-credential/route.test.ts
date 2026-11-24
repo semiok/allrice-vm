@@ -38,8 +38,8 @@ describe('platform repository credential API ingress and secret-free responses',
     expect((await PUT(write('a'.repeat(2049)))).status).toBe(413);
     expect(mocks.update).not.toHaveBeenCalled();
     mocks.get.mockResolvedValue({
-      repositoryId: 1323769790,
-      repository: 'semiok/allrice',
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
       revision: 0,
       configured: false,
       state: 'not_configured',
@@ -56,8 +56,8 @@ describe('platform repository credential API ingress and secret-free responses',
     mocks.update.mockRejectedValue(new QueueError('conflict'));
     expect((await PUT(write('{}'))).status).toBe(409);
     mocks.get.mockResolvedValue({
-      repositoryId: 1323769790,
-      repository: 'semiok/allrice',
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
       revision: 0,
       configured: false,
       state: 'not_configured',

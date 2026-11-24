@@ -15,6 +15,8 @@ export const gates = [
   'tenant-workbench-browser',
   'compose-smoke',
 ];
+const nightlyRepository = 'semiok/allrice-vm';
+const nightlyRepositoryId = 1469490636;
 const collectionGates = gates.filter((gate) => gate !== 'compose-smoke');
 const save = (path, data) =>
   writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
@@ -76,10 +78,14 @@ export function summarize({
   const problems = [...errors];
   const runUrl = `${trigger.html_url}/attempts/1`;
   const validRun =
+    repository === nightlyRepository &&
+    trigger.head_repository?.id === nightlyRepositoryId &&
     run?.id === trigger.id &&
     run?.run_attempt === 1 &&
     run?.repository?.full_name === repository &&
+    run?.repository?.id === nightlyRepositoryId &&
     run?.head_repository?.full_name === repository &&
+    run?.head_repository?.id === nightlyRepositoryId &&
     run?.head_sha === trigger.head_sha &&
     run?.head_branch === 'main' &&
     run?.event === 'schedule' &&
@@ -342,16 +348,24 @@ export function main() {
   const data = { repository, trigger, originals: [], logs: [], errors: [] };
   try {
     if (
+      repository !== nightlyRepository ||
+      Number(process.env.GITHUB_REPOSITORY_ID) !== nightlyRepositoryId ||
       event.action !== 'completed' ||
       trigger.event !== 'schedule' ||
       trigger.head_branch !== 'main' ||
       trigger.head_repository?.full_name !== repository ||
+      trigger.head_repository?.id !== nightlyRepositoryId ||
       trigger.path !== '.github/workflows/ci.yml' ||
       !Number.isSafeInteger(trigger.id)
     )
       throw Error('Unexpected workflow_run source');
     const base = `repos/${repository}/actions/runs/${trigger.id}`;
     data.run = api(`${base}/attempts/1`);
+    if (
+      data.run.repository?.id !== nightlyRepositoryId ||
+      data.run.head_repository?.id !== nightlyRepositoryId
+    )
+      throw Error('Unexpected original attempt repository');
     data.jobs = pages(`${base}/attempts/1/jobs`, 'jobs');
     save(resolve(directory, 'source-api.json'), {
       run: data.run,

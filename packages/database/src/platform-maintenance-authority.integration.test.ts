@@ -5,6 +5,7 @@ import {
   readAcceptedRepositorySource,
 } from './platform-repository-publication-authority.ts';
 import { readRepositoryAction } from './platform-repository-publication-ledger.ts';
+import { RepositoryPublicationRemoteSchema } from './platform-repository-publication-contracts.ts';
 import { repositoryCandidate } from './platform-repository-source.ts';
 import {
   maintenanceCompiledProfileId,
@@ -221,8 +222,8 @@ suite('immutable report-bound maintenance authority', () => {
             String(url).endsWith('/user')
               ? { id: 901, login: 'rice-maintenance' }
               : {
-                  id: 1323769790,
-                  full_name: 'semiok/allrice',
+                  id: 1469490636,
+                  full_name: 'semiok/allrice-vm',
                   permissions: { push: true },
                 },
           )) as typeof fetch,
@@ -275,7 +276,7 @@ suite('immutable report-bound maintenance authority', () => {
     baseline = RepositoryBaselineSchema.parse({
       version: 1,
       id: randomUUID(),
-      repositoryId: 'semiok/allrice',
+      repositoryId: 'semiok/allrice-vm',
       sourceSha: 'a'.repeat(40),
       gitTree: 'b'.repeat(40),
       sourceDigest: repositoryMaterialDigest(files),
@@ -429,6 +430,35 @@ suite('immutable report-bound maintenance authority', () => {
       },
     };
   }
+  it('leaves old defect rows intact when the new repository constraint refuses them', async () => {
+    const migration = await readFile(
+      new URL(
+        '../migrations/0255_platform_maintenance_repository_identity.sql',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    await fixture.db.begin(async (tx) => {
+      await tx`create temporary table allrice_platform_maintenance_defects (
+        repository_id bigint not null check (repository_id = 1323769790)
+      ) on commit drop`;
+      await tx`set local search_path to pg_temp`;
+      await tx`insert into allrice_platform_maintenance_defects (repository_id) values (1323769790)`;
+      await expect(
+        tx.savepoint(async (ddl) => {
+          await ddl.unsafe(migration);
+        }),
+      ).rejects.toMatchObject({ code: '23514' });
+      const [row] =
+        await tx`select count(*)::int as count from allrice_platform_maintenance_defects where repository_id=1323769790`;
+      expect(row?.count).toBe(1);
+      await expect(
+        tx.savepoint(async (write) => {
+          await write`insert into allrice_platform_maintenance_defects (repository_id) values (1469490636)`;
+        }),
+      ).rejects.toMatchObject({ code: '23514' });
+    });
+  });
   it('binds current central source independently of installed SHA; rejects forged mappings/oracles and incomplete probes', async () => {
     const i = await install(),
       r = await report(i);
@@ -447,6 +477,12 @@ suite('immutable report-bound maintenance authority', () => {
     const d = await recordMaintenanceDiagnosis(r.reportId, proof);
     expect(d.targetSha).toBe('a'.repeat(40));
     expect(d.defectId).not.toBeNull();
+    const [defect] =
+      await fixture.db`select repository_id from allrice_platform_maintenance_defects where id=${d.defectId}`;
+    expect(String(defect?.repository_id)).toBe('1469490636');
+    await expect(
+      fixture.db`update allrice_platform_maintenance_defects set repository_id=1323769790 where id=${d.defectId}`,
+    ).rejects.toMatchObject({ code: '23514' });
     expect((await recordMaintenanceDiagnosis(r.reportId, proof)).id).toBe(d.id);
     await expect(
       getMaintenanceReportAuthority(other, r.reportId),
@@ -1396,8 +1432,24 @@ suite('immutable report-bound maintenance authority', () => {
     expect((await repositoryRequestGate(lease, 'POST')).token).toMatch(
       /^github_pat_/,
     );
+    const publicationUrl = 'https://github.com/semiok/allrice-vm/pull/312';
+    const published = RepositoryPublicationRemoteSchema.parse({
+      repositoryId: 1469490636,
+      repository: 'semiok/allrice-vm',
+      branch: 'allrice/repairs/' + p.publicationId,
+      number: 312,
+      url: publicationUrl,
+      headSha: 'd'.repeat(40),
+      tree: 'e'.repeat(40),
+      baseSha: 'a'.repeat(40),
+    });
+    await fixture.db`update allrice_platform_repository_publications
+      set remote=${fixture.db.json(published)} where id=${p.publicationId}`;
     const shown = await getMaintenanceReportAuthority(admin, receipt.reportId);
-    expect(shown.grants[0]!.publication?.id).toBe(p.publicationId);
+    expect(shown.grants[0]!.publication).toMatchObject({
+      id: p.publicationId,
+      url: publicationUrl,
+    });
     await revokeMaintenanceGrant(admin, grant.id);
     await expect(repositoryRequestGate(lease, 'POST')).rejects.toThrow();
     expect((await repositoryRequestGate(lease, 'GET')).token).toMatch(
@@ -1436,8 +1488,8 @@ suite('immutable report-bound maintenance authority', () => {
             String(url).endsWith('/user')
               ? { id: 901, login: 'rice-maintenance' }
               : {
-                  id: 1323769790,
-                  full_name: 'semiok/allrice',
+                  id: 1469490636,
+                  full_name: 'semiok/allrice-vm',
                   permissions: { push: true },
                 },
           )) as typeof fetch,

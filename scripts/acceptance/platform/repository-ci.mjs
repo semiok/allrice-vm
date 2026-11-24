@@ -138,8 +138,8 @@ if (mode === 'finish') {
   const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')),
     pr = event.pull_request;
   if (
-    process.env.GITHUB_REPOSITORY !== 'semiok/allrice' ||
-    Number(process.env.GITHUB_REPOSITORY_ID) !== 1323769790
+    process.env.GITHUB_REPOSITORY !== 'semiok/allrice-vm' ||
+    Number(process.env.GITHUB_REPOSITORY_ID) !== 1469490636
   )
     throw Error('CI_WRONG_REPOSITORY');
   result = {
@@ -149,8 +149,8 @@ if (mode === 'finish') {
       process.env.GITHUB_EVENT_NAME === 'schedule'
         ? 'allrice.repository-nightly-ci.v1'
         : 'allrice.repository-ci.v1',
-    repositoryId: 1323769790,
-    repository: 'semiok/allrice',
+    repositoryId: 1469490636,
+    repository: 'semiok/allrice-vm',
     workflowPath: '.github/workflows/ci.yml',
     workflowBlob: current.workflowBlob,
     workflowRunId: Number(process.env.GITHUB_RUN_ID),

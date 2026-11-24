@@ -35,7 +35,7 @@ Worker 新增完整 `[M5] Handler failed` 系统记录，且 `code` 为 `DSH_PI_
 ## 第一步：看是哪种
 
 ```bash
-/opt/homebrew/bin/psql -h 127.0.0.1 -At allrice_dev -c "
+/opt/homebrew/bin/psql -h 127.0.0.1 -p 5434 -At allrice40_dev -c "
   select s.slot, s.label, s.enabled, p.status, p.detail_code, p.checked_at, p.subscription_quota
   from allrice_codex_subscriptions s
   left join allrice_provider_status p on p.provider = 'codex' and p.subscription_slot = s.slot
@@ -60,9 +60,9 @@ Worker 新增完整 `[M5] Handler failed` 系统记录，且 `code` 为 `DSH_PI_
 `subscription` / `quota` 在启用槽位显示 `connected`、额度正常后按其原规则恢复；`model_authorization` 必须满足上面的到期版本前移和完整安静窗口，读取未知时保持原故障。需要验证真实对话时，经发布负责人安排冒烟测试：
 
 ```bash
-~/allrice-dev/bin/smoke-test --dev --only chat
+~/allrice40-dev/bin/smoke-test --dev --only chat
 ```
 
 ## 谁来做
 
-改订阅槽位、重新授权都要用户确认；改 `allrice_dev` 里的数据只由发布负责人做（AGENTS.md 第 9 节）。
+改订阅槽位、重新授权都要用户确认；改 `allrice40_dev` 里的数据只由发布负责人做（AGENTS.md 第 9 节）。

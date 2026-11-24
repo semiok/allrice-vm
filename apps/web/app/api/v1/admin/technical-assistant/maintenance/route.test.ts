@@ -61,7 +61,7 @@ describe('maintenance routes', () => {
     mocks.authorize.mockResolvedValue({ diagnoses: [], grants: [] });
     mocks.control.mockResolvedValue({ diagnoses: [], grants: [] });
     const bot = {
-      repository: 'semiok/allrice',
+      repository: 'semiok/allrice-vm',
       revision: 0,
       configured: false,
       state: 'not_configured',

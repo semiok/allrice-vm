@@ -1,3 +1,4 @@
+import { PlatformRepositoryPullUrlSchema } from './platform-repository-credential-contracts.ts';
 import { z } from 'zod';
 import { ChecksumSchema, UuidSchema } from '@allrice/contracts';
 import {
@@ -85,9 +86,7 @@ export const RepositoryMergePreflightSchema = z
     pull: z
       .object({
         number: z.number().int().positive(),
-        url: z
-          .string()
-          .regex(/^https:\/\/github\.com\/semiok\/allrice\/pull\/[1-9]\d*$/),
+        url: PlatformRepositoryPullUrlSchema,
         headSha: RepositoryGitShaSchema,
         baseSha: RepositoryGitShaSchema,
         draft: z.boolean(),

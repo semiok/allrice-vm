@@ -67,7 +67,7 @@ function fixture() {
   const baseline = RepositoryBaselineSchema.parse({
     version: 1,
     id: randomUUID(),
-    repositoryId: 'semiok/allrice',
+    repositoryId: 'semiok/allrice-vm',
     sourceSha: '1'.repeat(40),
     gitTree: '2'.repeat(40),
     sourceDigest: repositoryMaterialDigest(archive.files),

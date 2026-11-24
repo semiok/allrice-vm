@@ -1,8 +1,12 @@
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { resolveServiceBuildRoot } from './prepare-identity-root.mjs';
+import {
+  resolveServiceBuildRoot,
+  resolveServiceBuildSource,
+} from './prepare-identity-root.mjs';
 
 let directory: string;
 let home: string;
@@ -16,8 +20,8 @@ afterEach(async () => {
 });
 
 it.each([
-  'allrice-dev-releases/203d4532',
-  'allrice-worktrees/met-218-qa-build-identity',
+  'allrice40-dev-releases/203d4532',
+  'allrice40-worktrees/met-218-qa-build-identity',
   'allrice-qa/met-218-check/release',
   `allrice-qa/${'a'.repeat(31)}/release`,
 ])(
@@ -30,8 +34,8 @@ it.each([
 );
 
 it.each([
-  'allrice-dev-releases/203d4532/nested',
-  'allrice-worktrees/task/nested',
+  'allrice40-dev-releases/203d4532/nested',
+  'allrice40-worktrees/task/nested',
   'allrice-qa/met-218-check',
   'allrice-qa/release',
   'allrice-qa/met-218-check/other',
@@ -41,6 +45,8 @@ it.each([
   'allrice-qa/task_name/release',
   `allrice-qa/${'a'.repeat(32)}/release`,
   'uncontrolled/task/release',
+  'allrice-dev-releases/old-release',
+  'allrice-worktrees/old-task',
 ])(
   'rejects roots outside the supported directory and task boundaries: %s',
   async (path) => {
@@ -71,3 +77,50 @@ it.each(['task', 'release'])(
     );
   },
 );
+
+it('seals only a clean checkout of the canonical new repository', async () => {
+  const repo = join(home, 'allrice40-repo');
+  const foreign = join(home, 'allrice40-worktrees/foreign');
+  const allowed = join(home, 'allrice40-dev-releases/allowed');
+  const origin = 'https://github.com/semiok/allrice-vm.git';
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  await mkdir(repo);
+  git(repo, 'init', '-q');
+  git(
+    repo,
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.test',
+    'commit',
+    '-qm',
+    'fixture',
+    '--allow-empty',
+  );
+  git(repo, 'remote', 'add', 'origin', origin);
+  const head = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'worktree', 'add', '-q', '--detach', allowed, head);
+  git(repo, 'clone', '-q', repo, foreign);
+  git(foreign, 'remote', 'set-url', 'origin', origin);
+  await expect(
+    resolveServiceBuildSource(allowed, head, home),
+  ).resolves.toMatchObject({
+    root: allowed,
+    sourceSha: head,
+    sourceTree: git(repo, 'rev-parse', 'HEAD^{tree}'),
+  });
+  await expect(resolveServiceBuildSource(foreign, head, home)).rejects.toThrow(
+    'DEV_BUILD_REPOSITORY_NOT_ALLOWED',
+  );
+  git(
+    repo,
+    'remote',
+    'set-url',
+    'origin',
+    'https://github.com/semiok/allrice.git',
+  );
+  await expect(resolveServiceBuildSource(allowed, head, home)).rejects.toThrow(
+    'DEV_BUILD_REPOSITORY_NOT_ALLOWED',
+  );
+});

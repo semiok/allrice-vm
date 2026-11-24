@@ -11,10 +11,12 @@
 # After `up`: open http://localhost:<webPort> on M1 and log in with the account in
 # ~/allrice-qa/<task>/creds.json (also used by: smoke-test --instance <task>).
 set -euo pipefail
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE
 BIN=$(cd "$(dirname "$0")" && pwd -P); . "$BIN/lib.sh"
-QA="$HOME/allrice-qa"; REPO="$HOME/allrice-repo"
+QA="$HOME/allrice-qa"; REPO="$HOME/allrice40-repo"
 NODE_BIN="$HOME/.local/opt/node-22.23.2/bin"
 export PATH="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PGPORT=5434
 MAX_INSTANCES=3
 UID_=$(id -u)
 LEASE="$BIN/qa-lease.py"
@@ -23,7 +25,7 @@ ALLOCATED_TASK=""
 die() { echo "qa-instance: $*" >&2; exit 1; }
 say() { echo "[qa-instance] $*"; }
 valid_task() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "task name must match [a-z0-9-], max 31 chars: $1"; }
-db_name() { echo "allrice_qa_${1//-/_}"; }
+db_name() { echo "allrice40_qa_${1//-/_}"; }
 label() { echo "ai.bplabs.allrice-qa-$1-$2"; }
 instances() { ls -1d "$QA"/*/instance.json 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null || true; }
 port_busy() { port_open "$1"; }
@@ -37,9 +39,12 @@ lease = runpy.run_path(helper)
 now = time.time()
 old = json.load(open(p)) if os.path.exists(p) else {}
 lease['write'](p, {'task': task, 'ref': ref, 'sha': sha, 'webPort': int(web), 'workerPort': int(worker), 'database': db,
+           'repository': 'semiok/allrice-vm', 'repositoryId': 1469490636,
            'nativeArtifactId': art or None, 'cloudExecution': False, 'setup': state,
-           'owner': owner, 'card': card, 'createdAt': old.get('createdAt', lease['stamp'](now)),
-           'expiresAt': old.get('expiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)})
+           'owner': owner, 'card': card,
+           # The old allocator requires createdAt to renew, and expiresAt to reclaim.
+           'repositoryCreatedAt': old.get('repositoryCreatedAt', lease['stamp'](now)),
+           'repositoryExpiresAt': old.get('repositoryExpiresAt', lease['stamp'](now + int(ttl))), 'updatedAt': lease['stamp'](now)})
 PY
 }
 
@@ -68,6 +73,7 @@ cmd_list() {
 
 cmd_renew() {
   local task=$1 ttl=6h; shift
+  qa_owned "$QA/$task/instance.json" || die "instance $task does not belong to semiok/allrice-vm"
   if [ $# -gt 0 ]; then
     [ $# -eq 2 ] && [ "$1" = --ttl ] || die 'usage: qa-instance renew <task> [--ttl 6h]'
     ttl=$2
@@ -80,13 +86,15 @@ cmd_renew() {
 reclaim_one() {
   local candidate
   for candidate in $(instances); do
+    qa_owned "$QA/$candidate/instance.json" || continue
     /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || continue
     if (
       exec 9>>"$QA/.task-$candidate.lock"
       flock_fd 9 0 || exit 1
+      qa_owned "$QA/$candidate/instance.json" || exit 1
       /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || exit 1
       local archived
-      archived=$(/usr/bin/python3 "$LEASE" archive "$QA/$candidate/instance.json" "$HOME/allrice-dev/qa/codex/qa-reclaimed") || exit 2
+      archived=$(/usr/bin/python3 "$LEASE" archive "$QA/$candidate/instance.json" "$HOME/allrice40-dev/qa/codex/qa-reclaimed") || exit 2
       # A process may have appeared while logs were being archived.
       /usr/bin/python3 "$LEASE" reclaimable "$QA/$candidate/instance.json" || exit 1
       say "reclaiming $candidate; archive=$archived" >&2
@@ -99,6 +107,7 @@ reclaim_one() {
 
 cmd_down() {
   local task=$1; valid_task "$task"
+  qa_owned "$QA/$task/instance.json" || die "instance $task does not belong to semiok/allrice-vm (legacy/unknown instances need their owning tools)"
   local dir="$QA/$task" db; db=$(db_name "$task")
   [ -d "$dir" ] || say "no instance directory for $task (cleaning leftovers anyway)"
   stop_services "$task" || die "services of $task did not stop within 90s; database and files left in place"
@@ -147,7 +156,7 @@ cmd_alloc() {
   echo "$web $worker"
 }
 
-# A branch name may exist locally (task worktrees live in ~/allrice-repo) and on origin.
+# A branch name may exist locally (task worktrees live in ~/allrice40-repo) and on origin.
 # Use whichever is newer; refuse when they have diverged. Anything else: rev-parse.
 resolve_ref() {
   local ref=$1 l r
@@ -179,6 +188,7 @@ cmd_up() {
   local dir="$QA/$task" db; db=$(db_name "$task")
   [ ! -e "$dir/instance.json" ] || die "instance $task already exists (qa-instance down $task first)"
 
+  dev_plist_pair || die "refusing a mismatched Dev configuration"
   # Other sessions may fetch at the same moment; a ref-lock collision just needs a retry.
   git -C "$REPO" fetch -q origin 2>/dev/null || { sleep 2; git -C "$REPO" fetch -q origin; }
   local sha
@@ -216,39 +226,40 @@ cmd_up() {
   ( cd "$dir/release" && node scripts/dev-release/prepare-identity.mjs --root="$dir/release" --release-sha="$sha" ) \
     >> "$dir/logs/build.log" 2>&1 || die "build identity preparation failed, see $dir/logs/build.log"
 
-  psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
-  createdb -h 127.0.0.1 "$db"
-
   /usr/bin/python3 - "$task" "$dir" "$db" "$web" "$worker" "$sha" "$artifact" "$(dev_plist web)" "$(dev_plist worker)" <<'PY'
-import json, os, plistlib, re, sys, uuid
+import json, os, plistlib, re, shlex, sys, uuid
 task, d, db, web, worker, sha, art, web_src, worker_src = sys.argv[1:]
 def retired_setting(key):
     return key in ('ALLRICE_DSH_NEW_ROOT_ARTIFACT_ID', 'ALLRICE_CHECKED_DELIVERY_ARTIFACT_IDS') or key.startswith(('ALLRICE_DSH_RETAINED_', 'ALLRICE_DSH_ORIGIN_READER_'))
 home = os.path.expanduser('~'); rel = f'{d}/release'; L = f'{d}/.local'
 for sub in ('storage', 'executions', 'dsh-runtime', 'native-once-control', 'native-recurring-control', 'project-preview'):
     os.makedirs(f'{L}/{sub}', mode=0o700, exist_ok=True); os.chmod(f'{L}/{sub}', 0o700)
-dburl = f'postgres://{os.environ.get("USER","snow")}@127.0.0.1:5432/{db}'
-# .env: shared Dev values with this instance's database, ports and storage.
-out = []
-for line in open(f'{home}/allrice-dev/.env').read().splitlines():
-    key = re.match(r'^\s*(?:export\s+)?([A-Z0-9_]+)\s*=', line)
-    if key and retired_setting(key[1]): continue
-    m = re.match(r'^([A-Z0-9_]+)=(.*)$', line)
-    if not m: out.append(line); continue
-    k, v = m.groups()
-    v = {'DATABASE_URL': dburl, 'ALLRICE_WEB_PORT': web, 'ALLRICE_WORKER_PORT': worker,
-         'ALLRICE_STORAGE_ROOT': f'{L}/storage'}.get(k, v)
-    out.append(f'{k}={v}')
-open(f'{d}/.env', 'w').write('\n'.join(out) + '\n'); os.chmod(f'{d}/.env', 0o600)
+dburl = f'postgres://{os.environ.get("USER","snow")}@127.0.0.1:5434/{db}'
+worker_url = f'http://127.0.0.1:{worker}'
 once = {'artifactId': art, 'profileId': 'allrice-once-control-v1', 'storageId': f'allrice-qa-{task}-once-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-once-control'}
 rec = {'artifactId': art, 'profileId': 'allrice-recurring-control-v1', 'storageId': f'allrice-qa-{task}-recurring-{uuid.uuid4().hex[:8]}', 'stateRoot': f'{L}/native-recurring-control'}
-common = {
-    'DATABASE_URL': dburl, 'ALLRICE_RELEASE_SHA': sha,
-    'ALLRICE_DSH_NATIVE_ARTIFACT_ID': art,
+overrides = {
+    'DATABASE_URL': dburl, 'ALLRICE_WEB_PORT': web, 'ALLRICE_WORKER_PORT': worker,
+    'ALLRICE_WORKER_INTERNAL_URL': worker_url, 'ALLRICE_STORAGE_ROOT': f'{L}/storage',
     'ALLRICE_NATIVE_ONCE_REFERENCE': json.dumps(once, separators=(',', ':')),
     'ALLRICE_NATIVE_RECURRING_REFERENCE': json.dumps(rec, separators=(',', ':')),
+}
+# .env: shared Dev values with this instance's database, ports and storage.
+out = []
+for line in open(f'{home}/allrice40-dev/.env').read().splitlines():
+    key = re.match(r'^\s*(?:export\s+)?([A-Z0-9_]+)\s*=', line)
+    if key and (retired_setting(key[1]) or key[1] in overrides): continue
+    out.append(line)
+out.extend(f'{key}={shlex.quote(value)}' for key,value in overrides.items())
+open(f'{d}/.env', 'w').write('\n'.join(out) + '\n'); os.chmod(f'{d}/.env', 0o600)
+common = {
+    **overrides,
+    'ALLRICE_RELEASE_SHA': sha,
+    'ALLRICE_DSH_NATIVE_ARTIFACT_ID': art,
     'ALLRICE_DSH_CORDIS_CONFIG': f'{rel}/apps/worker/dsh/allrice-restricted.cordis.yml',
-    'ALLRICE_DSH_RUNTIME_ROOT': f'{L}/dsh-runtime', 'ALLRICE_STORAGE_ROOT': f'{L}/storage',
+    'ALLRICE_DSH_RUNTIME_ROOT': f'{L}/dsh-runtime',
+    'ALLRICE_EXECUTION_ROOT': f'{L}/executions',
+    'ALLRICE_DSH_PLATFORM_HOME': f'{home}/allrice40-dev/.local/dsh-platform',
     'ALLRICE_CLOUD_PREVIEW_SOCKET': f'{L}/project-preview/p.sock',
     'ALLRICE_TECHNICAL_WEB_HEALTH_URL': f'http://127.0.0.1:{web}/api/health/ready',
     'ALLRICE_TECHNICAL_WORKER_HEALTH_URL': f'http://127.0.0.1:{worker}/health/ready',
@@ -264,9 +275,7 @@ for role, source in (('web', web_src), ('worker', worker_src)):
         if retired_setting(key):
             del env[key]
     env.update(common)
-    if role == 'web': env['ALLRICE_WEB_PORT'] = web
-    else:
-        env.update({'ALLRICE_WORKER_PORT': worker, 'ALLRICE_EXECUTION_ROOT': f'{L}/executions', 'ALLRICE_WORKER_CONCURRENCY': '2'})
+    if role == 'worker': env['ALLRICE_WORKER_CONCURRENCY'] = '2'
     args = src['ProgramArguments']
     node = args[2] if os.path.basename(args[0]) == 'with-env' else args[0]
     script = f'{rel}/apps/web/server.mjs' if role == 'web' else f'{rel}/apps/worker/dist/index.js'
@@ -275,21 +284,26 @@ for role, source in (('web', web_src), ('worker', worker_src)):
              'EnvironmentVariables': env, 'KeepAlive': True, 'RunAtLoad': False, 'ExitTimeOut': 60,
              'WorkingDirectory': f'{rel}/apps/web' if role == 'web' else rel,
              'StandardOutPath': f'{d}/logs/{role}.log', 'StandardErrorPath': f'{d}/logs/{role}.err.log'}
-    p = f'{home}/Library/LaunchAgents/{label}.plist'
-    plistlib.dump(plist, open(p, 'wb')); os.chmod(p, 0o600)
     plistlib.dump(plist, open(f'{d}/{role}.plist', 'wb')); os.chmod(f'{d}/{role}.plist', 0o600)
 PY
+  service_plist_config "$dir/web.plist" "$(label "$task" web)" ALLRICE_WEB_PORT "$web" "$db" "worker-port=$worker" || die 'invalid QA Web configuration'
+  service_plist_config "$dir/worker.plist" "$(label "$task" worker)" ALLRICE_WORKER_PORT "$worker" "$db" || die 'invalid QA Worker configuration'
+
+  psql -h 127.0.0.1 -d postgres -Atc "select 1 from pg_database where datname='$db'" | grep -q 1 && die "database $db already exists"
+  createdb -h 127.0.0.1 "$db"
 
   say "preparing database"
-  ( cd "$dir/release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5432/$db" && pnpm db:prepare ) \
+  ( cd "$dir/release" && set -a && source "$dir/.env" && set +a && export DATABASE_URL="postgres://$USER@127.0.0.1:5434/$db" && pnpm db:prepare ) \
     > "$dir/logs/db-prepare.log" 2>&1 || die "db:prepare failed, see $dir/logs/db-prepare.log"
   # Same Codex subscription slot as the shared Dev (one row may be enabled at a time).
-  local slot; slot=$(psql -h 127.0.0.1 -d allrice_dev -Atc "select slot from allrice_codex_subscriptions where enabled limit 1")
+  local slot; slot=$(psql -h 127.0.0.1 -d allrice40_dev -Atc "select slot from allrice_codex_subscriptions where enabled limit 1")
   psql -h 127.0.0.1 -d "$db" -q -v ON_ERROR_STOP=1 -c "begin; update allrice_codex_subscriptions set enabled=false where enabled; ${slot:+update allrice_codex_subscriptions set enabled=true where slot=$slot;} commit;" >/dev/null
 
   say "starting services"
   for role in worker web; do
-    launchctl bootstrap "gui/$UID_" "$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"
+    local launch_plist="$HOME/Library/LaunchAgents/$(label "$task" "$role").plist"
+    cp -p "$dir/$role.plist" "$launch_plist"
+    launchctl bootstrap "gui/$UID_" "$launch_plist"
     launchctl kickstart "gui/$UID_/$(label "$task" "$role")"
   done
   local ok=0
