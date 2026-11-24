@@ -27,7 +27,10 @@ import {
   createSession,
   authenticateSession,
 } from '../../../../packages/database/src/identity.ts';
-import { employeeManifest } from '../../../../packages/database/src/employees/employee-config.ts';
+import {
+  employeeManifest,
+  employeeManifestChecksum,
+} from '../../../../packages/database/src/employees/employee-config.ts';
 import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src/employees/employee-instances.ts';
 import {
   claimReferenceProcessing,
@@ -309,7 +312,7 @@ suite(
       await f.db`insert into allrice_employees(id,organization_id,workspace_id,employee_key,name)
       values(${employeeId},${p.organizationId},${p.workspaceId},'panels','Panels')`;
       await f.db`insert into allrice_employee_versions(id,organization_id,workspace_id,employee_id,version,name,model,system_prompt,capabilities,config_checksum,manifest,provider_snapshot)
-      values(${versionId},${p.organizationId},${p.workspaceId},${employeeId},1,'Panels',${manifest.provider.model},${manifest.systemPrompt},${f.db.json(manifest.capabilities)},${'sha256:' + 'a'.repeat(64)},${f.db.json(manifest)},${f.db.json(manifest.provider)})`;
+      values(${versionId},${p.organizationId},${p.workspaceId},${employeeId},1,'Panels',${manifest.provider.model},${manifest.systemPrompt},${f.db.json(manifest.capabilities)},${employeeManifestChecksum(manifest)},${f.db.json(manifest)},${f.db.json(manifest.provider)})`;
       await f.db`insert into allrice_employee_assignments(id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
       values(${assignmentId},${p.organizationId},${p.workspaceId},${employeeId},${versionId},${p.user.id})`;
       await ensureGeneralEmployeeInstance(f.db, assignmentId);
