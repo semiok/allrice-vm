@@ -23050,6 +23050,10 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
     'scope-changed',
     'unlisted',
     'terminal',
+    'retired image 409',
+    'current image 409',
+    'stale sidebar 401',
+    'current sidebar 401',
   ] as const)(
     'projects real plugin %s receipts into the authorized host sidebar without changing the selected chat',
     async (kind) => {
@@ -23072,7 +23076,12 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       const { page } = f,
         changed = kind === 'scope-changed',
         unlisted = kind === 'unlisted',
-        terminal = kind === 'terminal';
+        rejected = kind === 'retired image 409' || kind === 'current image 409',
+        image = kind === 'image' || rejected,
+        sidebarExpired =
+          kind === 'stale sidebar 401' || kind === 'current sidebar 401',
+        terminal = kind === 'terminal' || sidebarExpired;
+      const rejection = '旧文章已更新，请刷新记录版本';
       const sessionId = unlisted ? id(7401) : A,
         runId = id(7400);
       const topic = {
@@ -23139,10 +23148,17 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       let accepted: Record<string, unknown> | undefined,
         receipt: Record<string, unknown> | undefined;
       let release = () => {},
-        list = () => {};
+        list = () => {},
+        releaseSidebar = () => {};
       const gate = new Promise<void>((done) => {
         release = done;
       });
+      const generationResponse = () =>
+        page.waitForResponse(
+          (response) =>
+            response.request().method() === 'POST' &&
+            new URL(response.url()).pathname.endsWith('/brand-media'),
+        );
       await page.route(
         (url) =>
           url.pathname === `/api/v1/employee-instances/${id(7)}/brand-media`,
@@ -23185,6 +23201,20 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
           });
           expect(body).not.toHaveProperty('deliveryMode');
           accepted = body;
+          if (rejected) {
+            await gate;
+            return route.fulfill({
+              status: 409,
+              json: {
+                error: {
+                  code: 'CONFLICT',
+                  message: rejection,
+                  requestId: id(7403),
+                  retryable: false,
+                },
+              },
+            });
+          }
           receipt = {
             run: snapshot,
             sessionId,
@@ -23231,9 +23261,9 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
             .getByRole('dialog', { name: '写正文', exact: true })
             .getByRole('button', { name: '开始写', exact: true })
             .click();
-        } else if (kind === 'article' || kind === 'image') {
+        } else if (kind === 'article' || image) {
           await brand.getByRole('tab', { name: '文章库', exact: true }).click();
-          if (kind === 'image') {
+          if (image) {
             await brand
               .getByRole('button', { name: '＋ 加配图', exact: true })
               .click();
@@ -23267,6 +23297,16 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
             .click();
         }
         await expect.poll(() => !!accepted).toBe(true);
+        if (kind === 'current image 409') {
+          const response = generationResponse();
+          release();
+          expect((await response).status()).toBe(409);
+          await page
+            .getByRole('dialog', { name: '加配图', exact: true })
+            .getByText(rejection, { exact: true })
+            .waitFor();
+          return;
+        }
         await page.keyboard.press('Escape');
         await page.locator(`[data-row-key="session:${B}"]`).click();
         await expect
@@ -23306,13 +23346,119 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
         }
         await page.evaluate(() => new Promise(requestAnimationFrame));
         const reads = f.state.sessionListRequests;
-        const response = page.waitForResponse(
-          (value) =>
-            value.request().method() === 'POST' &&
-            new URL(value.url()).pathname.endsWith('/brand-media'),
-        );
+        let sidebarCaptured = false;
+        const loginRequests: string[] = [];
+        if (sidebarExpired) {
+          list();
+          f.state.sessionListDelay = null;
+          const sidebarGate = new Promise<void>((done) => {
+            releaseSidebar = done;
+          });
+          await page.route(
+            (url) =>
+              url.pathname === '/api/v1/sessions' &&
+              url.searchParams.get('workspaceId') === workspace,
+            async (route) => {
+              if (sidebarCaptured || route.request().method() !== 'GET')
+                return route.fallback();
+              sidebarCaptured = true;
+              await sidebarGate;
+              return route.fulfill({
+                status: 401,
+                json: { error: { message: '登录已过期' } },
+              });
+            },
+          );
+          await page.route(
+            (url) => url.pathname === '/login',
+            (route) => {
+              loginRequests.push(new URL(route.request().url()).search);
+              return route.fulfill({ contentType: 'text/html', body: '登录' });
+            },
+          );
+        }
+        const response = generationResponse();
         release();
-        await (await response).finished();
+        const generation = await response;
+        await generation.finished();
+        if (kind === 'retired image 409') {
+          expect(generation.status()).toBe(409);
+          await page.evaluate(
+            () =>
+              new Promise<void>((done) =>
+                requestAnimationFrame(() =>
+                  requestAnimationFrame(() => done()),
+                ),
+              ),
+          );
+          const hidden = page.locator('[data-brand-media-host]');
+          expect(
+            await hidden.getByText(rejection, { exact: true }).count(),
+          ).toBe(0);
+          expect(await hidden.locator('[role="alert"]').count()).toBe(0);
+          expect(await hidden.getAttribute('data-open')).toBe('false');
+          expect(await input.inputValue()).toBe('B的草稿保留');
+          expect(f.state.sessionListRequests).toBe(reads);
+          return;
+        }
+        if (sidebarExpired) {
+          expect(generation.status()).toBe(200);
+          await expect.poll(() => sidebarCaptured).toBe(true);
+          if (kind === 'stale sidebar 401') {
+            f.state.employeeDetailStatus = 403;
+            f.state.viewer = id(999);
+            f.state.workspace = id(998);
+            const newer = page.waitForResponse((response) => {
+              const url = new URL(response.url());
+              return (
+                url.pathname === '/api/v1/sessions' &&
+                url.searchParams.get('workspaceId') === id(998)
+              );
+            });
+            await page
+              .getByRole('button', { name: '查看Rice详情', exact: true })
+              .click();
+            await (await newer).finished();
+            await page
+              .getByRole('dialog', { name: /员工详情/ })
+              .getByRole('button', { name: '关闭', exact: true })
+              .click();
+          }
+          const expired = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return (
+              response.status() === 401 &&
+              url.pathname === '/api/v1/sessions' &&
+              url.searchParams.get('workspaceId') === workspace
+            );
+          });
+          releaseSidebar();
+          await expired;
+          if (kind === 'current sidebar 401') {
+            await page.waitForURL(
+              (url) =>
+                url.pathname === '/login' &&
+                url.searchParams.get('next') === '/chatflow',
+            );
+            expect(loginRequests).toEqual(['?next=/chatflow']);
+          } else {
+            await page
+              .evaluate(
+                () =>
+                  new Promise<void>((done) =>
+                    requestAnimationFrame(() =>
+                      requestAnimationFrame(() => done()),
+                    ),
+                  ),
+              )
+              .catch((cause: unknown) => {
+                if (!loginRequests.length) throw cause;
+              });
+            expect(loginRequests).toEqual([]);
+            expect(new URL(page.url()).pathname).toBe('/');
+          }
+          return;
+        }
         const a = page.locator(`[data-row-key="session:${A}"]`);
         if (!changed)
           await expect
@@ -23354,6 +23500,7 @@ suite('MET-147 UX01-A full tenant workbench (synthetic HTTP, no model)', () => {
       } finally {
         release();
         list();
+        releaseSidebar();
         await f.close();
       }
     },

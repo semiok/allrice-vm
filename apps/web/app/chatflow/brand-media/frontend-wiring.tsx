@@ -105,6 +105,11 @@ const runsSchema = z.object({
     }),
   ),
 });
+const generateReceiptSchema = z.object({
+  run: RunSnapshotSchema,
+  invocation: BrandMediaInvocationSchema,
+  userMessage: z.object({ sessionId: z.uuid() }),
+});
 export type BrandMediaRun = z.infer<typeof runsSchema>['runs'][number];
 export const runActive = (run: { run: Pick<BrandMediaRun['run'], 'status'> }) =>
   !['succeeded', 'failed', 'canceled', 'needs_attention'].includes(
@@ -445,26 +450,24 @@ function brandMediaOperations(
       return response.result;
     },
     generate: async (intent: Scoped<BrandMediaGenerateInput>) => {
-      const result = z
-        .object({
-          run: RunSnapshotSchema,
-          invocation: BrandMediaInvocationSchema,
-          userMessage: z.object({ sessionId: z.uuid() }),
-        })
-        .parse(
-          await readOrWriteModule(
-            '',
-            {
-              method: 'POST',
-              body: JSON.stringify({
-                ...intent,
-                workspaceId: scope.workspaceId,
-                instanceId: scope.instanceId,
-              }),
-            },
-            { keepHostReceipt: !!onAccepted },
-          ),
-        );
+      const result = await readOrWriteModule(
+        '',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ...intent,
+            workspaceId: scope.workspaceId,
+            instanceId: scope.instanceId,
+          }),
+        },
+        { keepHostReceipt: !!onAccepted },
+      )
+        .then((receipt) => generateReceiptSchema.parse(receipt))
+        .catch((cause: unknown) => {
+          // A retired visit can leave a receipt for the host, but receives only cancellation on failure.
+          access?.signal.throwIfAborted();
+          throw cause;
+        });
       // The host can reconcile an accepted write after its panel retires.
       const { id, status } = result.run;
       onAccepted?.(result.userMessage.sessionId, { id, status });

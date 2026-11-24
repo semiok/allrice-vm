@@ -39,10 +39,12 @@ const receipt = () => ({
 describe('brand-media scoped access', () => {
   function deferred<T>() {
     let resolve!: (value: T) => void;
-    const promise = new Promise<T>((done) => {
+    let reject!: (cause: Error) => void;
+    const promise = new Promise<T>((done, fail) => {
       resolve = done;
+      reject = fail;
     });
-    return { promise, resolve };
+    return { promise, resolve, reject };
   }
   const denied = (
     status = 403,
@@ -91,8 +93,8 @@ describe('brand-media scoped access', () => {
     };
   }
 
-  it.each([200, 401])(
-    'settles a generating visit retired before the host receipt (%i)',
+  it.each([200, 401, 409, 'invalid receipt', 'network'] as const)(
+    'settles a generating visit retired before the host receipt (%s)',
     async (status) => {
       const late = deferred<Response>();
       const fetch = vi.fn(() => late.promise);
@@ -147,27 +149,43 @@ describe('brand-media scoped access', () => {
         expect.objectContaining({ method: 'POST', signal: undefined }),
       );
       lifetime.abort();
-      late.resolve(
-        status === 200
-          ? Response.json({
-              run,
-              invocation: {
-                module: {
-                  organizationId,
-                  workspaceId,
-                  ownerId,
-                  instanceId,
-                  release: brandMediaRelease,
-                  revision: 1,
-                  enabledAt: at,
-                  revokedAt: null,
-                },
-                intent: { ...input, workspaceId, instanceId },
+      if (status === 'network') late.reject(new TypeError('迟到的请求错误'));
+      else if (status === 'invalid receipt') late.resolve(Response.json({}));
+      else if (status === 409)
+        late.resolve(
+          Response.json(
+            {
+              error: {
+                code: 'CONFLICT',
+                message: '记录已更新',
+                requestId: id(11),
+                retryable: false,
               },
-              userMessage: { sessionId: input.sessionId },
-            })
-          : new Response(null, { status }),
-      );
+            },
+            { status },
+          ),
+        );
+      else if (status === 401) late.resolve(new Response(null, { status }));
+      else
+        late.resolve(
+          Response.json({
+            run,
+            invocation: {
+              module: {
+                organizationId,
+                workspaceId,
+                ownerId,
+                instanceId,
+                release: brandMediaRelease,
+                revision: 1,
+                enabledAt: at,
+                revokedAt: null,
+              },
+              intent: { ...input, workspaceId, instanceId },
+            },
+            userMessage: { sessionId: input.sessionId },
+          }),
+        );
       await settled;
       if (status === 200)
         expect(accepted).toHaveBeenCalledExactlyOnceWith(input.sessionId, {
@@ -183,6 +201,31 @@ describe('brand-media scoped access', () => {
       expect(fetch).toHaveBeenCalledOnce();
     },
   );
+
+  it('expires the current generating visit before decoding an unauthorized response', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 401 }));
+    vi.stubGlobal('fetch', fetch);
+    const accepted = vi.fn();
+    const { client, lifetime, revoke, hide } = panelClient(accepted);
+    const result = client.generate({
+      operation: 'candidates',
+      requestId: id(7),
+      direction: '当前访次的合成选题',
+      references: [],
+    });
+    const failure = await result.catch((cause: unknown) => cause);
+    expect(failure).toMatchObject({
+      name: 'Error',
+      message: '登录已过期，请重新登录',
+    });
+    expect(failure).toBe(lifetime.signal.reason);
+    expect(revoke).toHaveBeenCalledExactlyOnceWith(failure);
+    expect(hide).not.toHaveBeenCalled();
+    expect(accepted).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
 
   it('fences an already requested body on the module-only denial without waiting for another read', async () => {
     const late = deferred<Response>();

@@ -97,7 +97,10 @@ export function Images({
     try {
       await run();
     } catch (cause) {
-      if (owner === lifetime.current)
+      if (
+        owner === lifetime.current &&
+        !(cause instanceof DOMException && cause.name === 'AbortError')
+      )
         setError(
           cause instanceof Error
             ? cause.message
