@@ -303,6 +303,16 @@ class PrincipalService extends TypertRemoteService {
         throw Error('PRINCIPAL_JOIN_UNKNOWN');
     });
   }
+  /** Internal Cordis consumer of the installed native graph revision. The
+   * existing private stream reports withdrawal before any scope join. */
+  observeProfileGraph(source: {
+    onGraphChanged(listener: () => void): () => void;
+  }) {
+    return source.onGraphChanged(() => {
+      for (const scope of this.scopes.values())
+        void scope.close().catch(() => {});
+    });
+  }
   private raw(endpoint: (typeof endpoints)[number]) {
     if (this.stopped) throw closed();
     const invocation = this.ctx.invocation;

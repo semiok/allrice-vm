@@ -327,6 +327,42 @@ export async function openNativeWebOwner(input: {
           }),
         );
       },
+      /** Exact rc.2 static plugin combo roots. This never forwards a guest
+       * URL, filesystem path, normal API request or browser authority. */
+      readImmutableBundleFor(
+        context: RequestContext,
+        reference: string,
+        requestSignal: AbortSignal,
+      ) {
+        const current = AbortSignal.any([signal, requestSignal]);
+        return own(
+          Promise.resolve().then(async () => {
+            current.throwIfAborted();
+            if (
+              !ready ||
+              closing ||
+              !/^plugins\/\?\?(?:[@a-z\d._/-]+(?:,[@a-z\d._/-]+)*)&rev=[a-f\d]+$/i.test(
+                reference,
+              )
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const url = new URL(reference, input.launch.auth.origin);
+            if (url.pathname !== '/plugins/' || url.hash)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            await input.vm.assertCurrentBinding(context, binding, current);
+            const reply = await transport.fetch(url, {
+              method: 'GET',
+              redirect: 'error',
+              signal: current,
+            });
+            if (!reply.ok) throw new PersonVmError('RUNTIME_NOT_READY');
+            const data = new Uint8Array(await reply.arrayBuffer());
+            await input.vm.assertCurrentBinding(context, binding, current);
+            current.throwIfAborted();
+            return data;
+          }),
+        );
+      },
       /** Running Host catalog only; never startup readiness or a browser grant.
        * Native modelCatalog has zero arguments and no wire cancellation slot. */
       readModelCatalogFor(context: RequestContext, requestSignal: AbortSignal) {

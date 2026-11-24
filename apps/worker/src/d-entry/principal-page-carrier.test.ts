@@ -38,7 +38,13 @@ afterEach(async () => {
 const sessionToken = 'original_session_token_for_page';
 const otherToken = 'different_session_of_same_person';
 
-async function fixture(release?: { directory: string; graph: unknown }) {
+type ProfileProof = {
+  directory: string;
+  graph: unknown;
+  read(reference: string, signal: AbortSignal): Promise<Uint8Array>;
+};
+
+async function fixture(release?: ProfileProof) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
   const host = await hostFixture({
@@ -76,6 +82,7 @@ async function fixture(release?: { directory: string; graph: unknown }) {
           signal.throwIfAborted();
           return release.graph;
         },
+        readImmutableBundle: release.read,
       },
     });
   const otherSession = { ...f.context, sessionId: randomUUID() };
@@ -415,9 +422,14 @@ it(
     });
     await writeFile(join(directory, 'artifact.json'), JSON.stringify(raw));
     const graph = DEntryProfileGraphSchema.parse(raw.profile.graph);
+    const read = (reference: string, signal: AbortSignal) => {
+      const file = raw.profile.files.find(
+        (row: { reference: string }) => row.reference === reference,
+      );
+      if (!file) throw Error('Named release proof missing');
+      return readFile(join(directory, file.path), { signal });
+    };
     const source = new AbortController().signal;
-    // Report the first immutable release diagnostic before entering the HTTP
-    // boundary, which deliberately exposes only a generic dependency status.
     await holdReleasedProfile(
       directory,
       {
@@ -425,12 +437,13 @@ it(
         async readImmutableGraph() {
           return graph;
         },
+        readImmutableBundle: read,
       },
       source,
     );
     // This runs the released app profile builder and actual non-owner Cordis
     // Peer. Only the VM receipt/current PostgreSQL lease is fixture-owned.
-    const f = await fixture({ directory, graph });
+    const f = await fixture({ directory, graph, read });
     const { peer, receive, scopeId } = await open(f);
     const address = await f.publish('bootstrap', scopeId, {}, 'document');
     expect(address.status).toBe(200);
@@ -614,7 +627,7 @@ it(
     closePage(second.peer);
     expect(await second.receive()).toMatchObject({ value: { type: 'closed' } });
 
-    const withdrawn = await fixture({ directory, graph });
+    const withdrawn = await fixture({ directory, graph, read });
     const live = await open(withdrawn);
     const watching = await withdrawn.publish('events', live.scopeId, {
       bindingRef: withdrawn.owner.bindingRef,

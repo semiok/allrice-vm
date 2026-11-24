@@ -62,6 +62,11 @@ function fixture() {
         throw new DEntryNativeUnavailable();
       },
     ),
+    readImmutableBundleFor: vi.fn<NativeWebOwner['readImmutableBundleFor']>(
+      async () => {
+        throw new DEntryNativeUnavailable();
+      },
+    ),
     readModelCatalogFor: vi.fn<NativeWebOwner['readModelCatalogFor']>(
       async () => {
         throw new DEntryNativeUnavailable();

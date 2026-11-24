@@ -51,6 +51,11 @@ export type PublishedNativeCatalog = Readonly<{
       context: RequestContext,
       signal: AbortSignal,
     ): Promise<unknown>;
+    readImmutableBundleFor?(
+      context: RequestContext,
+      reference: string,
+      signal: AbortSignal,
+    ): Promise<Uint8Array>;
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
@@ -171,23 +176,37 @@ export function createDEntryNativeCatalogPort(input: {
           owner.owner.revoked,
         ]);
         const readGraph = owner.owner.readImmutableGraphFor?.bind(owner.owner);
+        const readBundle = owner.owner.readImmutableBundleFor?.bind(
+          owner.owner,
+        );
         return Object.freeze({
           receipt: view.receipt,
-          ...(readGraph && {
-            fixedProfile: {
-              revoked,
-              readImmutableGraph(reading: AbortSignal) {
-                return own(async () => {
-                  const who = context;
-                  const active = AbortSignal.any([reading, revoked]);
-                  await current(who, active);
-                  const graph = await readGraph(who, active);
-                  await current(who, active);
-                  return graph;
-                });
+          ...(readGraph &&
+            readBundle && {
+              fixedProfile: {
+                revoked,
+                readImmutableGraph(reading: AbortSignal) {
+                  return own(async () => {
+                    const who = context;
+                    const active = AbortSignal.any([reading, revoked]);
+                    await current(who, active);
+                    const graph = await readGraph(who, active);
+                    await current(who, active);
+                    return graph;
+                  });
+                },
+                readImmutableBundle(reference: string, reading: AbortSignal) {
+                  return own(async () => {
+                    const who = context;
+                    const active = AbortSignal.any([reading, revoked]);
+                    await current(who, active);
+                    const bytes = await readBundle(who, reference, active);
+                    await current(who, active);
+                    return bytes;
+                  });
+                },
               },
-            },
-          }),
+            }),
           endpoint: view.endpoint,
           bindingRef: view.bindingRef,
           revoked,

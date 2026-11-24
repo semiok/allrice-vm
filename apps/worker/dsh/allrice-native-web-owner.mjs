@@ -3,11 +3,20 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const name = 'allrice-native-web-owner';
-export const inject = ['connection', 'webServer'];
+export const inject = [
+  'connection',
+  'webServer',
+  'clientModules',
+  'allricePrincipal',
+];
 
 /** Native local login only. This file never establishes an AllRice principal. */
 export async function apply(ctx, config) {
   const { artifactPath, nonce, baseUrl } = config;
+  ctx.effect(
+    () => ctx.allricePrincipal.observeProfileGraph(ctx.clientModules),
+    'allrice native profile graph lifetime',
+  );
   const temporary = `${artifactPath}.${randomUUID()}.tmp`;
   const owned = ctx.effect(async () => {
     await mkdir(dirname(artifactPath), { recursive: true, mode: 0o700 });
