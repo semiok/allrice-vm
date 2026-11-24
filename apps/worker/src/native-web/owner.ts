@@ -289,6 +289,44 @@ export async function openNativeWebOwner(input: {
           input.vm.assertCurrentBinding(context, binding, current),
         );
       },
+      /** The existing native index supplies the running Host's own graph.
+       * The release publisher independently verifies its complete code graph and
+       * new document bytes. The native index is never forwarded or executed. */
+      readImmutableGraphFor(
+        context: RequestContext,
+        requestSignal: AbortSignal,
+      ) {
+        const current = AbortSignal.any([signal, requestSignal]);
+        return own(
+          Promise.resolve().then(async () => {
+            current.throwIfAborted();
+            if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
+            await input.vm.assertCurrentBinding(context, binding, current);
+            const response = await transport.fetch(
+              new URL('/', input.launch.auth.origin),
+              { method: 'GET', redirect: 'error', signal: current },
+            );
+            if (
+              !response.ok ||
+              !response.headers.get('content-type')?.includes('text/html')
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const html = await response.text();
+            // renderIndexInjections uses exact global assignment with JSON; any
+            // ambiguity, changed rendering contract or missing graph fails closed.
+            const rows = [
+              ...html.matchAll(
+                /<script>globalThis\["__DSH_BOOT__"\] = ([^<]+)<\/script>/g,
+              ),
+            ];
+            if (rows.length !== 1) throw new PersonVmError('RUNTIME_NOT_READY');
+            const graph: unknown = JSON.parse(rows[0]![1]!);
+            await input.vm.assertCurrentBinding(context, binding, current);
+            current.throwIfAborted();
+            return graph;
+          }),
+        );
+      },
       /** Running Host catalog only; never startup readiness or a browser grant.
        * Native modelCatalog has zero arguments and no wire cancellation slot. */
       readModelCatalogFor(context: RequestContext, requestSignal: AbortSignal) {

@@ -155,21 +155,25 @@ export function createDEntryProfile(
         );
         const { organizationId, scopeId, ...selection } = base;
         const token = dEntryBearer(request);
-        const exact =
-          operation === 'bootstrap'
-            ? bootstrapQuery.parse(query)
-            : operation === 'events'
-              ? eventsQuery.parse(query)
-              : mode === 'static'
-                ? staticQuery.parse(query)
-                : assetQuery.parse(query);
+        if (operation === 'bootstrap') bootstrapQuery.parse(query);
+        const events =
+          operation === 'events' ? eventsQuery.parse(query) : undefined;
+        const staticFile =
+          operation === 'assets' && mode === 'static'
+            ? staticQuery.parse(query)
+            : undefined;
+        const bundle =
+          operation === 'assets' && mode !== 'static'
+            ? assetQuery.parse(query)
+            : undefined;
+        const bindingRequest = events ?? staticFile ?? bundle;
         await pages.borrow(
           token,
           { organizationId, selection },
           scopeId,
           signal,
           async (page, active) => {
-            if ('bindingRef' in exact && exact.bindingRef !== page.bindingRef)
+            if (bindingRequest && bindingRequest.bindingRef !== page.bindingRef)
               throw new DataAccessError('not_found');
             const held = await publication(page, active);
             const { release } = held;
@@ -193,9 +197,28 @@ export function createDEntryProfile(
               if (held.bootstrap !== 'available') throw new ProfileBusy();
               held.bootstrap = 'sending';
               try {
-                const baseline = page.scope.opened.baseline;
-                if (baseline.owner !== false)
+                const iterator = page.scope
+                  .stream(
+                    {
+                      scopeId,
+                      endpoint: 'remoteAccess/follow',
+                      args: {},
+                    },
+                    active,
+                  )
+                  [Symbol.asyncIterator]();
+                const first = await iterator
+                  .next()
+                  .finally(() => iterator.return?.());
+                if (
+                  first.done ||
+                  first.value.scopeId !== scopeId ||
+                  first.value.value.type !== 'baseline' ||
+                  !('owner' in first.value.value) ||
+                  first.value.value.owner !== false
+                )
                   throw new DEntryNativeUnavailable();
+                const baseline = first.value.value;
                 const body = DEntryProfileBootstrapSchema.parse({
                   version: 1,
                   scopeReference: { scopeId },
@@ -244,17 +267,17 @@ export function createDEntryProfile(
 
             let asset: Awaited<ReturnType<Release['readStatic']>>;
             try {
-              if ('path' in exact) {
+              if (staticFile) {
                 if (
-                  exact.manifestSha256 !== release.manifestSha256 ||
-                  exact.graphRev !== release.graph.rev
+                  staticFile.manifestSha256 !== release.manifestSha256 ||
+                  staticFile.graphRev !== release.graph.rev
                 )
                   throw new DataAccessError('not_found');
-                asset = await release.readStatic(exact.path, active);
-              } else if ('reference' in exact) {
+                asset = await release.readStatic(staticFile.path, active);
+              } else if (bundle) {
                 asset = await release.readReference(
-                  exact.reference,
-                  exact.revision,
+                  bundle.reference,
+                  bundle.revision,
                   active,
                 );
               } else throw new DataAccessError('not_found');

@@ -47,6 +47,10 @@ export type PublishedNativeCatalog = Readonly<{
       issue: DEntryPrincipalIssue,
       signal: AbortSignal,
     ): DEntryPrincipalActivity;
+    readImmutableGraphFor?(
+      context: RequestContext,
+      signal: AbortSignal,
+    ): Promise<unknown>;
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
@@ -166,8 +170,24 @@ export function createDEntryNativeCatalogPort(input: {
           owner.revoked,
           owner.owner.revoked,
         ]);
+        const readGraph = owner.owner.readImmutableGraphFor?.bind(owner.owner);
         return Object.freeze({
           receipt: view.receipt,
+          ...(readGraph && {
+            fixedProfile: {
+              revoked,
+              readImmutableGraph(reading: AbortSignal) {
+                return own(async () => {
+                  const who = context;
+                  const active = AbortSignal.any([reading, revoked]);
+                  await current(who, active);
+                  const graph = await readGraph(who, active);
+                  await current(who, active);
+                  return graph;
+                });
+              },
+            },
+          }),
           endpoint: view.endpoint,
           bindingRef: view.bindingRef,
           revoked,
