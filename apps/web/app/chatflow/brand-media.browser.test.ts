@@ -3314,6 +3314,91 @@ suite('MET-224 main-area brand media text workflow', () => {
     },
   );
 
+  it.each(['unavailable', 'empty', 'pin removed', 'sibling removed'] as const)(
+    'keeps the original download decision after a %s Run projection changes',
+    async (outcome) => {
+      const run = recovery('article');
+      const main = run.deliveries[0]!;
+      const sibling = {
+        ...main,
+        file: { ...file, objectId: id(82), versionId: id(83) },
+      };
+      run.deliveries.push(sibling);
+      const f = await fixture({ runs: [run] });
+      const { page } = f;
+      const path = `/api/v1/files/${file.objectId}/download`;
+      const expected = '不可直接改写的正文\n第二段';
+      const deliveries = panel(page).getByRole('button', {
+        name: '查看本次正文成果',
+        exact: true,
+      });
+      const continuouslyAllowed = outcome === 'sibling removed';
+      const applyRuns = async (runs: Recovery[]) => {
+        f.state.runs = runs;
+        const response = page.waitForResponse((value) =>
+          brandView(new URL(value.url()), 'runs'),
+        );
+        await page.evaluate(() => window.dispatchEvent(new Event('online')));
+        expect(await (await response).json()).toEqual({ runs });
+      };
+      const finishDownload = () =>
+        page.evaluate(() =>
+          window.dispatchEvent(new Event('finish-body-delivery')),
+        );
+      try {
+        await f.open();
+        await panel(page).getByRole('tab', { name: '文章库' }).click();
+        await expect
+          .poll(() => page.getByLabel('文章正文').textContent())
+          .toBe(expected);
+        await expect.poll(() => deliveries.count()).toBe(2);
+        await holdBodyDelivery(page, path);
+        await deliveries.first().press('Enter');
+        await page.locator('body[data-delivery-headers="200"]').waitFor();
+
+        const changed = {
+          unavailable: [{ ...run, unavailable: true, deliveries: [] }],
+          empty: [],
+          'pin removed': [{ ...run, deliveries: [sibling] }],
+          'sibling removed': [{ ...run, deliveries: [main] }],
+        }[outcome];
+        await applyRuns(changed);
+        await expect
+          .poll(() => deliveries.count())
+          .toBe(changed[0]?.deliveries.length ?? 0);
+        if (!continuouslyAllowed) {
+          await applyRuns([run]);
+          await expect.poll(() => deliveries.count()).toBe(2);
+        }
+
+        let saved = continuouslyAllowed
+          ? page.waitForEvent('download')
+          : undefined;
+        await finishDownload();
+        await page
+          .locator(`body[data-delivery-bytes="${Buffer.byteLength(expected)}"]`)
+          .waitFor();
+        if (!saved) {
+          expect(
+            await page.locator('body').getAttribute('data-delivery-save'),
+          ).toBeNull();
+          const request = page.waitForRequest(
+            (value) => new URL(value.url()).pathname === path,
+          );
+          saved = page.waitForEvent('download');
+          await deliveries.first().press('Enter');
+          expect((await request).method()).toBe('GET');
+        }
+        const download = await saved;
+        expect(download.suggestedFilename()).toBe('allrice-export');
+        expect(await readFile((await download.path())!, 'utf8')).toBe(expected);
+      } finally {
+        await finishDownload();
+        await f.close();
+      }
+    },
+  );
+
   it('keeps only independently authorized Run deliveries while article detail is refused', async () => {
     const stored = article();
     stored.references = [

@@ -259,9 +259,15 @@ function BrandMediaPanelContent({
     [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
   const projectedRuns = useRef(runs);
+  const pendingSaves = useRef(new Set<(runs: BrandMediaRun[]) => boolean>());
   const publishRuns = useCallback((update: SetStateAction<BrandMediaRun[]>) => {
     const next =
       typeof update === 'function' ? update(projectedRuns.current) : update;
+    const saves = pendingSaves.current;
+    // A save keeps its registration only while each projection authorizes it.
+    for (const allowedIn of saves) {
+      if (!allowedIn(next)) saves.delete(allowedIn);
+    }
     // A pending file save can finish before React renders this same snapshot.
     projectedRuns.current = next;
     setRenderedRuns(next);
@@ -839,18 +845,21 @@ function BrandMediaPanelContent({
   ) => {
     const key = articleBodyKey(articleId, file);
     const observed = readDenials.current.version;
-    const current = () => {
-      const run = findArticleRun(projectedRuns.current, articleId);
+    const allowedIn = (runs: BrandMediaRun[]) => {
+      const run = findArticleRun(runs, articleId);
       return (
         run?.run.id === runId &&
         !run.unavailable &&
-        pinAllowedSince(articleId, observed, file) &&
         run.deliveries.some(
           ({ file }) => articleBodyKey(articleId, file) === key,
         )
       );
     };
-    if (!current()) return;
+    if (!allowedIn(projectedRuns.current)) return;
+    const saves = pendingSaves.current;
+    saves.add(allowedIn);
+    const current = () =>
+      saves.has(allowedIn) && pinAllowedSince(articleId, observed, file);
     const fail = beginAction();
     try {
       await client.download(file.objectId, 'delivery', {
@@ -865,6 +874,8 @@ function BrandMediaPanelContent({
             ? cause.message
             : '正文文件暂时不可读，请重新核对权限。',
         );
+    } finally {
+      saves.delete(allowedIn);
     }
   };
   // The Run read authorizes its own deliveries when the article body is gone.
