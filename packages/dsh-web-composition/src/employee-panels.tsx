@@ -82,22 +82,49 @@ function useOwner(binding: EmployeePanelsBinding, sessionId: SessionIdOf) {
   return useSyncExternalStore(subscribe, read, read);
 }
 
-/** Exported render seam uses the real components; it is not another panel UI. */
-export function EmployeePanelContent({
-  ctx,
-  binding,
-  sessionId,
-  snapshot,
-  signal,
-  kind,
-}: {
+type EmployeePanelContentProps = {
   ctx: Context;
   binding: EmployeePanelsBinding;
   sessionId: SessionIdOf;
   snapshot: EmployeePanelsSnapshot;
   signal: AbortSignal;
   kind: EmployeePanelKind;
+};
+
+type PublicationActions = {
+  edit(
+    target: ReferencePublicationTarget,
+    options?: ReferencePublicationOptions,
+  ): void;
+  createdMaterial?: { sourceId: string; revisionId: string };
+};
+
+/** Exported render seam uses the real components. */
+export function EmployeePanelContent(props: EmployeePanelContentProps) {
+  const { kind, snapshot } = props;
+  if (kind === 'materials' || kind === 'files') {
+    const data = snapshot[kind];
+    if (snapshot.publicationManagement && data.viewerId && data.dataClient)
+      return (
+        <EmployeePublicationPanel
+          {...props}
+          kind={kind}
+          viewerId={data.viewerId}
+        />
+      );
+  }
+  return employeePanelView(props);
+}
+
+function EmployeePublicationPanel({
+  viewerId,
+  ...props
+}: Omit<EmployeePanelContentProps, 'kind'> & {
+  kind: 'materials' | 'files';
+  viewerId: string;
 }) {
+  const { binding, kind, signal, snapshot } = props;
+  const { workspaceId, headers, dataClient } = snapshot[kind];
   const [publication, setPublication] = useState<{
     target: ReferencePublicationTarget;
     options?: ReferencePublicationOptions;
@@ -107,6 +134,61 @@ export function EmployeePanelContent({
     sourceId: string;
     revisionId: string;
   }>();
+  return (
+    <>
+      {employeePanelView(props, {
+        createdMaterial,
+        edit(target, options) {
+          setNotice('');
+          setPublication({ target, options });
+        },
+      })}
+      {publication && (
+        <Suspense fallback={null}>
+          <ReferencePublicationDialog
+            workspaceId={workspaceId}
+            viewerId={viewerId}
+            headers={headers}
+            dataClient={dataClient}
+            target={publication.target}
+            options={publication.options}
+            onClose={() => setPublication(null)}
+            onSaved={(saved) => {
+              if (signal.aborted || binding.signal.aborted) return;
+              if (publication.target.kind === 'upload' && saved.revisionId)
+                setCreatedMaterial({
+                  sourceId: saved.sourceId,
+                  revisionId: saved.revisionId,
+                });
+              setPublication(null);
+              setNotice(publicationNotices[publication.target.kind]);
+              window.dispatchEvent(
+                new Event('allrice:workbench-files-changed'),
+              );
+            }}
+          />
+        </Suspense>
+      )}
+      {notice && (
+        <div className={publicationCss.toast} role="status">
+          {notice}
+        </div>
+      )}
+    </>
+  );
+}
+
+function employeePanelView(
+  {
+    binding,
+    ctx,
+    kind,
+    sessionId,
+    signal,
+    snapshot,
+  }: EmployeePanelContentProps,
+  publication?: PublicationActions,
+) {
   const current = () => {
     assertEmployeePanelSession(ctx, sessionId);
     assertEmployeePanelsCurrent(binding, sessionId, snapshot, signal);
@@ -117,112 +199,68 @@ export function EmployeePanelContent({
     current();
     insertEmployeePanelReference(binding, sessionId, snapshot, signal, value);
   };
+  const edit = (
+    target: ReferencePublicationTarget,
+    options?: ReferencePublicationOptions,
+  ) => {
+    current();
+    publication?.edit(target, options);
+  };
   switch (kind) {
-    case 'materials':
-    case 'files': {
-      const props = kind === 'materials' ? snapshot.materials : snapshot.files;
-      const manages = !!(
-        snapshot.publicationManagement &&
-        props.viewerId &&
-        props.dataClient
-      );
-      const edit = (
-        target: ReferencePublicationTarget,
-        options?: ReferencePublicationOptions,
-      ) => {
-        current();
-        setNotice('');
-        setPublication({ target, options });
-      };
-      const publish: typeof snapshot.files.onPublish = manages
-        ? (file) => edit({ kind: 'file', file })
-        : snapshot.files.onPublish;
-      const materialProps = guardEmployeePanelProps(
-        snapshot.materials,
-        current,
-      );
-      const fileProps = guardEmployeePanelProps(snapshot.files, current);
+    case 'materials': {
+      const props = guardEmployeePanelProps(snapshot.materials, current);
       return (
-        <>
-          {kind === 'materials' ? (
-            <EnterpriseMaterialsPanel
-              {...materialProps}
-              active
-              readOnly={
-                snapshot.materials.readOnly || !binding.port.useReference
-              }
-              initialReference={
-                createdMaterial ?? materialProps.initialReference
-              }
-              onUse={reference}
-              onUpload={
-                manages
-                  ? (options) => edit({ kind: 'upload' }, options)
-                  : materialProps.onUpload
-              }
-              onManage={
-                manages
-                  ? (reference, kind, options) =>
-                      edit({ kind, reference }, options)
-                  : materialProps.onManage
-              }
-            />
-          ) : snapshot.filePreview ? (
-            <WorkbenchDeliverablePreview
-              scope={snapshot.scopeKey}
-              viewerId={fileProps.viewerId}
-              objectId={snapshot.filePreview.objectId}
-              workspaceId={fileProps.workspaceId}
-              tenantHeaders={fileProps.headers}
-              dataClient={fileProps.dataClient}
-              active
-              onBack={() => {
-                current();
-                snapshot.filePreview?.close();
-              }}
-              onPublish={manages ? publish : undefined}
-            />
-          ) : (
-            <WorkbenchFilesPanel
-              {...fileProps}
-              active
-              readOnly={snapshot.files.readOnly || !binding.port.useReference}
-              onUse={reference}
-              onPublish={manages ? publish : fileProps.onPublish}
-            />
-          )}
-          {publication && manages && props.viewerId && (
-            <Suspense fallback={null}>
-              <ReferencePublicationDialog
-                workspaceId={props.workspaceId}
-                viewerId={props.viewerId}
-                headers={props.headers}
-                dataClient={props.dataClient}
-                target={publication.target}
-                options={publication.options}
-                onClose={() => setPublication(null)}
-                onSaved={(saved) => {
-                  if (signal.aborted || binding.signal.aborted) return;
-                  if (publication.target.kind === 'upload' && saved.revisionId)
-                    setCreatedMaterial({
-                      sourceId: saved.sourceId,
-                      revisionId: saved.revisionId,
-                    });
-                  setPublication(null);
-                  setNotice(publicationNotices[publication.target.kind]);
-                  window.dispatchEvent(
-                    new Event('allrice:workbench-files-changed'),
-                  );
-                }}
-              />
-            </Suspense>
-          )}
-          {notice && (
-            <div className={publicationCss.toast} role="status">
-              {notice}
-            </div>
-          )}
-        </>
+        <EnterpriseMaterialsPanel
+          {...props}
+          active
+          readOnly={snapshot.materials.readOnly || !binding.port.useReference}
+          initialReference={
+            publication?.createdMaterial ?? props.initialReference
+          }
+          onUse={reference}
+          onUpload={
+            publication
+              ? (options) => edit({ kind: 'upload' }, options)
+              : props.onUpload
+          }
+          onManage={
+            publication
+              ? (reference, kind, options) => edit({ kind, reference }, options)
+              : props.onManage
+          }
+        />
+      );
+    }
+    case 'files': {
+      const props = guardEmployeePanelProps(snapshot.files, current);
+      const publish: typeof props.onPublish = publication
+        ? (file) => edit({ kind: 'file', file })
+        : props.onPublish;
+      if (snapshot.filePreview)
+        return (
+          <WorkbenchDeliverablePreview
+            scope={snapshot.scopeKey}
+            viewerId={props.viewerId}
+            objectId={snapshot.filePreview.objectId}
+            workspaceId={props.workspaceId}
+            tenantHeaders={props.headers}
+            dataClient={props.dataClient}
+            active
+            onBack={() => {
+              current();
+              snapshot.filePreview?.close();
+            }}
+            onPublish={publication ? publish : undefined}
+          />
+        );
+      return (
+        <WorkbenchFilesPanel
+          {...props}
+          active
+          readOnly={snapshot.files.readOnly || !binding.port.useReference}
+          onUse={reference}
+          onPublish={publish}
+        />
       );
     }
     case 'experience':

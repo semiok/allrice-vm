@@ -92,6 +92,7 @@ files:
     - apps/web/server/project-preview.test.mjs
     - scripts/m1/smoke-reply.browser.test.mjs
   browser+db:
+    - apps/web/lib/d-entry/employee-panels-http.integration.test.ts
     - apps/web/app/chatflow/candidate-memory.browser.test.ts
     - apps/web/app/chatflow/reference-library.browser.test.ts
     - apps/web/app/chatflow/reference-publication-dialog.browser.test.ts
@@ -114,7 +115,6 @@ files:
     - apps/worker/test/allrice-mcp-deliverable-read.integration.test.ts
     - apps/web/lib/execution/model-failure-api.integration.test.ts
     - apps/web/lib/brand-media.integration.test.ts
-    - apps/web/lib/d-entry/employee-panels-http.integration.test.ts
     - apps/web/lib/reference-publications.integration.test.ts
     - apps/web/lib/reference-search.integration.test.ts
     - apps/web/lib/reference-input.integration.test.ts

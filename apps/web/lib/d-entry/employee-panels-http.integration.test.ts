@@ -1,10 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
+import type { Browser } from '../../../worker/node_modules/playwright-core/index.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import {
   DataAccessError,
+  createChatSession,
   updateDEntryReleasePolicy,
   type BuiltinModuleId,
 } from '@allrice/database';
@@ -34,6 +37,7 @@ import {
   EmployeePanelsWriteUnknownError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
+import { GET as readWorkspace } from '../../app/api/v1/workspace/route';
 
 // Next's request-local Cookie carrier is replaced, not authentication. The
 // real production session adapter, opaque token and current DB readers run.
@@ -63,6 +67,12 @@ suite(
     let server: ReturnType<typeof createServer>, base: string;
     let handlers: ReturnType<typeof createEmployeePanelsHandlers>;
     const running = new Set<Promise<void>>();
+    const fixtureAssets = new Map<string, Uint8Array>();
+    let fixtureDocument: string | undefined;
+    let dropPublishReply = false;
+    const publishWrites: string[] = [];
+    const receiptReads: string[] = [];
+
     const routeNames: Record<
       string,
       keyof ReturnType<typeof createEmployeePanelsHandlers>
@@ -137,7 +147,34 @@ suite(
               ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
               signal: stop.signal,
             });
-            const pieces = new URL(request.url).pathname.split('/').slice(5);
+            const url = new URL(request.url);
+            const asset = fixtureAssets.get(url.pathname);
+            if (asset) {
+              outgoing.writeHead(200, {
+                'content-type': url.pathname.endsWith('.css')
+                  ? 'text/css'
+                  : 'application/javascript',
+              });
+              outgoing.end(asset);
+              return;
+            }
+            if (url.pathname === '/fixture/panels' && fixtureDocument) {
+              outgoing.writeHead(200, {
+                'content-type': 'text/html; charset=utf-8',
+              });
+              outgoing.end(fixtureDocument);
+              return;
+            }
+            if (url.pathname === '/api/v1/workspace' && fixtureDocument) {
+              const response = await readWorkspace(request);
+              outgoing.writeHead(
+                response.status,
+                Object.fromEntries(response.headers),
+              );
+              outgoing.end(await response.text());
+              return;
+            }
+            const pieces = url.pathname.split('/').slice(5);
             const panelEmployeeInstanceId = pieces.shift()!;
             const parts = pieces.map((part, index) =>
               index === 2 &&
@@ -175,6 +212,20 @@ suite(
             const response = await handlers[name](request, {
               params: Promise.resolve(params),
             });
+            if (fixtureDocument && name === 'readWriteReceipt')
+              receiptReads.push(params.requestId!);
+            if (fixtureDocument && name === 'publish') {
+              const { requestId } = JSON.parse(
+                Buffer.concat(chunks).toString('utf8'),
+              );
+              publishWrites.push(requestId);
+              if (dropPublishReply && response.ok) {
+                dropPublishReply = false;
+                await response.body?.cancel();
+                outgoing.destroy();
+                return;
+              }
+            }
             outgoing.writeHead(
               response.status,
               Object.fromEntries(response.headers),
@@ -333,6 +384,141 @@ suite(
         init,
       );
     }
+    it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
+      'runs the product panel with the original Cookie through favorite, publication and original receipt',
+      { timeout: 45_000 },
+      async () => {
+        const p = await person();
+        await release(p);
+        const session = await createChatSession(p.context, p.selection, {
+          executionGeneration: '4.0',
+        });
+        const input = uploadInput(p, '浏览器本人交付.txt');
+        const original = await p.client.uploadDeliverable(input, signal());
+        const require = createRequire(import.meta.url);
+        const { build } = createRequire(require.resolve('tsx'))('esbuild');
+        const output = await build({
+          absWorkingDir: process.cwd(),
+          entryPoints: ['apps/web/test/employee-panel-live-page.tsx'],
+          outdir: '/unused-live-panel',
+          bundle: true,
+          splitting: true,
+          write: false,
+          platform: 'browser',
+          format: 'esm',
+          jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+            '.svg': 'dataurl',
+          },
+          define: { 'process.env.NODE_ENV': '"production"' },
+        });
+        for (const item of output.outputFiles as {
+          path: string;
+          contents: Uint8Array;
+        }[])
+          fixtureAssets.set(
+            '/fixture/assets/' + item.path.split('/').at(-1),
+            item.contents,
+          );
+        fixtureDocument = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture/assets/employee-panel-live-page.css"><div id="app" data-organization-id="${p.context.organizationId}" data-viewer-id="${p.context.actor.id}" data-workspace-id="${p.selection.workspaceId}" data-employee-instance-id="${p.selection.employeeInstanceId}" data-thread-id="${session.id}" data-scope-id="${randomUUID()}" data-native-session-id="test-dock"></div><script type="module" src="/fixture/assets/employee-panel-live-page.js"></script>`;
+        let browser: Browser | undefined;
+        try {
+          browser =
+            await require('../../../worker/node_modules/playwright-core').chromium.launch(
+              {
+                executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE,
+              },
+            );
+          const context = await browser!.newContext({
+            reducedMotion: 'reduce',
+          });
+          await context.addCookies([
+            { name: 'allrice_session', value: p.login.token, url: base },
+          ]);
+          const page = await context.newPage();
+          await page.goto(base + '/fixture/panels');
+          const files = page.getByRole('region', { name: '交付成果' });
+          await files
+            .getByRole('combobox', { name: '按员工筛选' })
+            .selectOption('');
+          await files
+            .getByRole('button', { name: '我的上传', exact: true })
+            .click();
+          const options = files.getByRole('button', {
+            name: '文件选项 ' + input.fileName,
+          });
+          await options.click();
+          await page
+            .getByRole('menuitem', { name: '收藏', exact: true })
+            .click();
+          await files.getByLabel('已收藏').waitFor();
+          expect(
+            (
+              await p.client.listDeliverables(
+                { workspaceId: p.selection.workspaceId, category: 'favorite' },
+                signal(),
+              )
+            ).files.map((file) => file.objectId),
+          ).toEqual([original.objectId]);
+
+          async function openPublication() {
+            await options.click();
+            await page
+              .getByRole('menuitem', { name: '添加为企业资料', exact: true })
+              .click();
+          }
+          await openPublication();
+          const dialog = page.getByRole('dialog', { name: '添加为企业资料' });
+          dropPublishReply = true;
+          await dialog
+            .getByRole('button', { name: '确认', exact: true })
+            .click();
+          await dialog
+            .getByText('发布结果待核，请按原请求核对。', { exact: true })
+            .waitFor();
+          await dialog
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
+          await openPublication();
+          await page
+            .getByText('已添加为企业资料', { exact: true })
+            .filter({ visible: true })
+            .first()
+            .waitFor();
+          await dialog.waitFor({ state: 'hidden' });
+          expect(publishWrites).toHaveLength(1);
+          expect(receiptReads).toEqual([publishWrites[0]]);
+          const recorded = await p.client.readWriteReceipt(
+            {
+              workspaceId: p.selection.workspaceId,
+              requestId: publishWrites[0]!,
+              operation: 'publish-file',
+            },
+            signal(),
+          );
+          expect(recorded).toMatchObject({ status: 'recorded', ready: true });
+          const catalog = await p.client.listDeliverables(
+            {
+              workspaceId: p.selection.workspaceId,
+              objectId: original.objectId,
+            },
+            signal(),
+          );
+          expect(catalog.files[0]?.publication).toMatchObject({
+            audience: { scope: 'personal' },
+          });
+          await context.close();
+        } finally {
+          await browser?.close();
+          fixtureDocument = undefined;
+          fixtureAssets.clear();
+          dropPublishReply = false;
+        }
+      },
+    );
     it('uploads independent same-name files, favorites all employees, publishes a fixed copy and rejects its exact selection after revoke without B/MCP/VM', async () => {
       const p = await person();
       await release(p);
