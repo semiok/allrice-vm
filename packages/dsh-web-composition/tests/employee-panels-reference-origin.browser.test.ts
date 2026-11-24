@@ -60,6 +60,7 @@ const settle = (page: Page) =>
   );
 const sha = (bytes: string | Buffer) =>
   createHash('sha256').update(bytes).digest('hex');
+const viewportControlStyle = 'html { scrollbar-gutter: auto }';
 
 const referenceDocumentGeometry = (page: Page) =>
   page.evaluate(() => {
@@ -253,6 +254,14 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
     let native: Page | undefined, reference: Page | undefined;
     let owner: Awaited<ReturnType<typeof referenceHost>> | undefined;
     let viewportControl: Awaited<ReturnType<Page['addStyleTag']>> | undefined;
+    let archived:
+      | {
+          value: Awaited<ReturnType<typeof snapshot>>;
+          document: Awaited<ReturnType<typeof referenceDocumentGeometry>>;
+          frame: Buffer;
+        }
+      | undefined;
+    const viewportEvidence = 'reference-viewport-control';
     let start: Awaited<ReturnType<typeof capture>> | undefined,
       original: Awaited<ReturnType<typeof capture>> | undefined;
     let zero: Awaited<ReturnType<typeof capture>> | undefined,
@@ -489,15 +498,25 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
         await document.fonts.ready;
       });
       await settle(reference);
-      const archived = await snapshot(reference);
-      assertCausalSampling(archived);
+      const archivedValue = await snapshot(reference);
       const documentBefore = await referenceDocumentGeometry(reference);
-      const viewportEvidence = join(out, 'reference-viewport-control');
-      await mkdir(viewportEvidence);
+      await mkdir(join(out, viewportEvidence));
       const archivedFrame = await reference.screenshot({
-        path: join(viewportEvidence, 'archived-origin-frame.png'),
+        path: join(out, viewportEvidence, 'archived-origin-frame.png'),
         fullPage: true,
       });
+      archived = {
+        value: archivedValue,
+        document: documentBefore,
+        frame: archivedFrame,
+      };
+      await save(join(viewportEvidence, 'archived.json'), {
+        archivedHtmlSha256: sha(html),
+        archivedFrameSha256: sha(archivedFrame),
+        document: documentBefore,
+        snapshot: archivedValue,
+      });
+      assertCausalSampling(archivedValue);
       // The archived document reserves room for a classic scrollbar even
       // when headless Chrome does not paint one. The reference experiment
       // needs the native slot's exact viewport coordinates and all five hits.
@@ -510,18 +529,24 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
           scrollPosition: { x: 0, y: 0 },
         });
         viewportControl = await reference.addStyleTag({
-          content: 'html { scrollbar-gutter: auto }',
+          content: viewportControlStyle,
         });
         await settle(reference);
       }
       const documentAfter = await referenceDocumentGeometry(reference);
+      await save(join(viewportEvidence, 'before-placement.json'), {
+        css: viewportControl
+          ? await viewportControl.evaluate((style) => style.textContent)
+          : null,
+        document: documentAfter,
+        snapshot: await snapshot(reference),
+      });
       expect(documentAfter).toEqual({
         ...documentBefore,
         width: documentBefore.viewportWidth,
         gutter: viewportControl ? 'auto' : documentBefore.gutter,
       });
       original = await capture(reference, 'reference-original');
-      assertCausalInvariant(archived, original.value);
       const viewportPixels = compareSidebarPixels(
         archivedFrame,
         original.frame,
@@ -529,11 +554,13 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
       const viewportBytesMatch = sha(archivedFrame) === sha(original.frame);
       await save('reference-viewport-control.json', {
         archivedHtmlSha256: sha(html),
+        appliedStyle: viewportControl ? viewportControlStyle : null,
         documentBefore,
         documentAfter,
         viewportPixels,
         viewportBytesMatch,
       });
+      assertCausalInvariant(archivedValue, original.value);
       expect(
         viewportPixels.changedPixels,
         'reference original full frame',
@@ -643,14 +670,36 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
           await viewportControl.evaluate((style) => style.remove());
           await viewportControl.dispose();
         }
-        if (owner && reference && original) {
+        if (reference && archived) {
           await settle(reference);
+          const documentRestored = await referenceDocumentGeometry(reference);
+          const restoredValue = await snapshot(reference);
+          await save(join(viewportEvidence, 'restored.json'), {
+            document: documentRestored,
+            snapshot: restoredValue,
+          });
+          expect(documentRestored, 'archived viewport geometry').toEqual(
+            archived.document,
+          );
+          assertCausalInvariant(archived.value, restoredValue);
+        }
+        if (owner && reference && original && archived) {
           const restored = await capture(reference, 'reference-restored');
           assertCausalInvariant(original.value, restored.value);
-          await save(
-            'reference-restored-control.json',
-            unchanged(original, restored, 'reference exact detach'),
+          const archivedPixels = compareSidebarPixels(
+            archived.frame,
+            restored.frame,
           );
+          const archivedBytesMatch = archived.frame.equals(restored.frame);
+          expect(archivedPixels.changedPixels, 'archived full frame').toBe(0);
+          expect(archivedBytesMatch, 'archived frame exact PNG bytes').toBe(
+            true,
+          );
+          await save('reference-restored-control.json', {
+            ...unchanged(original, restored, 'reference exact detach'),
+            archivedPixels,
+            archivedBytesMatch,
+          });
         }
       } catch (error) {
         valid = false;
@@ -748,6 +797,10 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
         originEffect,
         measuredScope:
           'One 1440/light/list/experience panel; existing discrete sampling validity only. No whole-domain visibility, other79 pairs or product fix is proved.',
+        referenceViewport: {
+          appliedStyle: viewportControl ? viewportControlStyle : null,
+          evidence: archived ? viewportEvidence : null,
+        },
         nativeNeverWrappedOrMoved: true,
         phases,
         captures,

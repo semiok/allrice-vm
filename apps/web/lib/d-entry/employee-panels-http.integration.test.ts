@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type {
   Browser,
   Locator,
+  Page,
   Response as BrowserResponse,
 } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
@@ -556,6 +557,71 @@ suite(
               },
             };
           }
+          async function retryReceiptWithKeyboard(
+            view: Page,
+            retry: Locator,
+            requestId: string,
+            nextControl: Locator,
+          ) {
+            await retry.waitFor();
+            const node = await retry.elementHandle();
+            if (!node) throw Error('Receipt retry control is missing');
+            const controlState = () =>
+              node.evaluate((element) => ({
+                focused: document.activeElement === element,
+                busy: element.getAttribute('aria-busy'),
+                disabled: element.getAttribute('aria-disabled'),
+                label: element.textContent?.trim(),
+              }));
+            await retry.focus();
+            const read = holdReceipt(requestId, 'beforeReply');
+            let response: BrowserResponse;
+            try {
+              [response] = await Promise.all([
+                view.waitForResponse(receiptResponse(requestId), {
+                  timeout: 5000,
+                }),
+                (async () => {
+                  try {
+                    await view.keyboard.press('Enter');
+                    await read.arrived();
+                    await expect.poll(controlState).toEqual({
+                      focused: true,
+                      busy: 'true',
+                      disabled: 'true',
+                      label: '正在核对…',
+                    });
+                    await view.keyboard.press('Enter');
+                  } finally {
+                    read.release();
+                  }
+                })(),
+              ]);
+              await read.assertFinished(response);
+            } finally {
+              read.close();
+            }
+            await expect.poll(controlState).toEqual({
+              focused: true,
+              busy: null,
+              disabled: 'true',
+              label: '核对结束',
+            });
+            await view.keyboard.press('Tab');
+            await expect
+              .poll(() =>
+                nextControl.evaluate(
+                  (element) =>
+                    document.activeElement === element &&
+                    element.getClientRects().length > 0,
+                ),
+              )
+              .toBe(true);
+            await view
+              .getByRole('button', { name: '核对结束', exact: true })
+              .waitFor({ state: 'detached' });
+            return response;
+          }
           await page.goto(base + '/fixture/panels');
           const files = page.getByRole('region', { name: '交付成果' });
           await files
@@ -658,91 +724,83 @@ suite(
             .getByText('发布结果待核，请按原请求核对。', { exact: true })
             .waitFor({ timeout: 5000 });
           const publishedId = publishWrites[0]!;
-          expect(publishWrites).toEqual([publishedId]);
-          const publishedRecord = page.getByRole('button', {
-            name: '核对原添加为企业资料 ' + original.objectId,
-            exact: true,
-          });
-          unavailableOriginalReceipt = publishedId;
-          const [unavailableReceipt] = await Promise.all([
-            page.waitForResponse(receiptResponse(publishedId), {
-              timeout: 5000,
+          // Chromium gives the new same-origin tab the opener's exact session
+          // storage. Its document has no in-memory knowledge of the receipt.
+          const [coldPage] = await Promise.all([
+            page.waitForEvent('popup'),
+            page.evaluate(() => {
+              window.open('about:blank', '_blank');
             }),
-            dialog.getByRole('button', { name: '取消', exact: true }).click(),
           ]);
-          await dialog.waitFor({ state: 'hidden' });
-          expect(unavailableReceipt.status()).toBe(503);
-          expect(await unavailableReceipt.finished()).toBeNull();
-          expect(receiptReads).toEqual([]);
-          expect(await publishedRecord.isVisible()).toBe(false);
-          const retry = page.getByRole('button', {
-            name: '重试核对',
-            exact: true,
-          });
-          await retry.waitFor();
-          const retryNode = await retry.elementHandle();
-          await retry.focus();
-          const readBack = holdReceipt(publishedId, 'beforeReply');
           try {
-            const [confirmed] = await Promise.all([
-              page.waitForResponse(receiptResponse(publishedId), {
+            expect(await coldPage.opener()).toBe(page);
+            unavailableOriginalReceipt = publishedId;
+            const [unavailableReceipt] = await Promise.all([
+              coldPage.waitForResponse(receiptResponse(publishedId), {
                 timeout: 5000,
               }),
-              (async () => {
-                try {
-                  await page.keyboard.press('Enter');
-                  await readBack.arrived();
-                  await expect
-                    .poll(() =>
-                      retryNode?.evaluate((node) => ({
-                        focused: document.activeElement === node,
-                        busy: node.getAttribute('aria-busy'),
-                        disabled: node.getAttribute('aria-disabled'),
-                        label: node.textContent?.trim(),
-                      })),
-                    )
-                    .toEqual({
-                      focused: true,
-                      busy: 'true',
-                      disabled: 'true',
-                      label: '正在核对…',
-                    });
-                  await page.keyboard.press('Enter');
-                  expect(await publishedRecord.isVisible()).toBe(false);
-                } finally {
-                  readBack.release();
-                }
-              })(),
+              coldPage.goto(base + '/fixture/panels'),
             ]);
-            await readBack.assertFinished(confirmed);
+            expect(unavailableReceipt.status()).toBe(503);
+            expect(await unavailableReceipt.finished()).toBeNull();
+            expect(receiptReads).toEqual([]);
+            expect(
+              await coldPage
+                .getByRole('button', {
+                  name: '核对原添加为企业资料 ' + original.objectId,
+                  exact: true,
+                })
+                .isVisible(),
+            ).toBe(false);
+            const confirmed = await retryReceiptWithKeyboard(
+              coldPage,
+              coldPage.getByRole('button', {
+                name: '重试核对',
+                exact: true,
+              }),
+              publishedId,
+              coldPage
+                .getByRole('region', { name: '交付成果' })
+                .getByRole('combobox', { name: '按员工筛选' }),
+            );
             expect(confirmed.status()).toBe(200);
             expect(await confirmed.json()).toMatchObject({
               requestId: publishedId,
+              operation: 'publish-file',
               status: 'recorded',
               ready: true,
             });
+            await coldPage
+              .getByRole('status')
+              .filter({
+                hasText: '原添加为企业资料已完成。 ' + original.objectId,
+              })
+              .waitFor();
+            expect(receiptReads).toEqual([publishedId]);
+            expect(publishWrites).toEqual([publishedId]);
+            console.info('publication-receipt-fixture-ready-retry', {
+              requestId: publishedId,
+              unavailable: unavailableReceipt.status(),
+              confirmed: confirmed.status(),
+              readCount: receiptReads.length,
+              publishCount: publishWrites.length,
+            });
           } finally {
-            readBack.close();
+            unavailableOriginalReceipt = undefined;
+            await coldPage.close();
           }
-          await page
-            .getByRole('status')
-            .filter({
-              hasText: '原添加为企业资料已完成。 ' + original.objectId,
-            })
+          await dialog
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
+          await openPublication();
+          await dialog
+            .getByText('原添加为企业资料已完成。', { exact: true })
             .waitFor();
-          const retryEnded = page.getByRole('button', {
-            name: '核对结束',
-            exact: true,
-          });
-          await retryEnded.waitFor();
-          expect(
-            await retryNode?.evaluate(
-              (node) => document.activeElement === node,
-            ),
-          ).toBe(true);
-          await page.keyboard.press('Tab');
-          await retryEnded.waitFor({ state: 'detached' });
-          expect(receiptReads).toEqual([publishedId]);
+          await dialog
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
+          await dialog.waitFor({ state: 'hidden' });
+          expect(receiptReads).toEqual([publishedId, publishedId]);
           expect(publishWrites).toEqual([publishedId]);
           const recorded = await p.client.readWriteReceipt(
             {
@@ -1454,9 +1512,11 @@ suite(
             await material.getByText(independentId.slice(0, 8)).count(),
           ).toBe(0);
           const beforeModalRetry = receiptReads.length;
-          const modalRetryResult = await checkReceipt(
+          const modalRetryResult = await retryReceiptWithKeyboard(
+            page,
             modalRetry,
             independentId,
+            material.getByRole('button', { name: '关闭', exact: true }),
           );
           expect(modalRetryResult.status()).toBe(200);
           expect(await modalRetryResult.json()).toMatchObject({
