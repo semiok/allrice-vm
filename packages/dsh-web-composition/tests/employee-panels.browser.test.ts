@@ -483,25 +483,30 @@ suite('installed native employee panels with synthetic business owner', () => {
     const launcher = entries.getByRole('button', {
       name: new RegExp(`^${labels[kind]}(?:，|$)`),
     });
-    // Native narrow presentation covers the Conversation header. Return via
-    // its real chrome before clicking the next original AllRice entry.
-    const exposed =
-      (await launcher.isVisible()) &&
-      (await launcher.evaluate((node) => {
-        const rect = node.getBoundingClientRect();
-        const top = document.elementFromPoint(
-          rect.x + rect.width / 2,
-          rect.y + rect.height / 2,
-        );
-        return top !== null && node.contains(top);
-      }));
-    if (!exposed) {
-      await page
-        .getByRole('button', { name: '收起右侧边栏', exact: true })
-        .click();
-      await entries.waitFor({ state: 'visible' });
+    let entry = launcher;
+    if (page.viewportSize()!.width <= 760) {
+      // The compact native header exposes only its right-bar control. The
+      // guide supplies the same actions inside the authorized native pane.
+      const expand = page.getByRole('button', {
+        name: '打开右侧边栏',
+        exact: true,
+      });
+      if (await expand.isVisible()) await expand.click();
+      entry = page.getByRole('button').filter({
+        has: page
+          .locator('strong')
+          .filter({ hasText: new RegExp(`^${labels[kind]}$`) }),
+      });
+      if (!(await entry.isVisible())) {
+        const guide = page.getByRole('tab', { name: /^开始/ });
+        if (await guide.isVisible()) await guide.click();
+        else
+          await page
+            .getByRole('button', { name: '新标签页', exact: true })
+            .click();
+      }
     }
-    await Promise.all([catalogResponse(page, kind, state), launcher.click()]);
+    await Promise.all([catalogResponse(page, kind, state), entry.click()]);
     await body(page, kind).waitFor({ state: 'visible' });
     await page.waitForFunction(
       (kind) =>
@@ -714,6 +719,16 @@ suite('installed native employee panels with synthetic business owner', () => {
     expect(
       await entries.getByRole('button', { name: '能力', exact: true }).count(),
     ).toBe(1);
+  });
+
+  it('opens all four original entries through the native compact guide', async () => {
+    await page.setViewportSize({ width: 390, height: 1000 });
+    expect(await page.getByLabel('工作台入口').isVisible()).toBe(false);
+    for (const kind of kinds) {
+      await open(kind);
+      expect((await evidence()).expanded).toBe(true);
+      expect(await body(page, kind).count()).toBe(1);
+    }
   });
 
   it('keeps enterprise ＋ and uses actual native insertion acceptance and stale-span refusal', async () => {
