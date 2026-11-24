@@ -29,7 +29,8 @@ import {
 import {
   assertPlacementAncestors,
   classifyNativePlacementEffect,
-  placementRootIdentity,
+  nativeRightbarClassSuffix,
+  placementMountIdentity,
 } from './employee-panels-native-placement';
 
 const suite =
@@ -132,173 +133,194 @@ async function dismissInitialNativeCatalog(page: Page, out: string) {
   );
 }
 
-// Own a positioning stylesheet on the existing app root. Keep the actual
-// native nodes, their layout ancestry and the unread badge mounted throughout.
+// Own a positioning stylesheet on the rightbar column of the released shell.
+// The existing mount, its content and adjacent native chrome stay in place in
+// the DOM. Only the sidebar box is positioned by the two test mechanisms.
 async function nativeHost(page: Page, offset: { x: number; y: number }) {
-  return page.evaluateHandle((offset) => {
-    const panel = document.querySelector('section[aria-label="Rice · 记忆"]');
-    const surface = panel?.parentElement;
-    const roots = document.querySelectorAll<HTMLElement>('body > #root');
-    const app = roots[0];
-    if (!panel || !surface || roots.length !== 1 || !app?.contains(surface))
-      throw Error('Missing isolated native application root');
-    const parent = document.body,
-      next = app.nextSibling;
-    const sheets = [...document.adoptedStyleSheets];
-    const sheet = new CSSStyleSheet();
-    let mode: 'identity' | 'transform' | 'layout' = 'identity';
-    let expectedCss = '';
-    const inputs = () => ({
-      app: app.getAttribute('style'),
-      surface: surface.getAttribute('style'),
-    });
-    const position = () => {
-      const style = getComputedStyle(app);
-      return {
-        display: style.display,
-        position: style.position,
-        left: style.left,
-        top: style.top,
-        transform: style.transform,
-      };
-    };
-    const original = inputs(),
-      initial = position();
-    const sameNodes = () => {
+  return page.evaluateHandle(
+    ({ offset, selector }) => {
+      const panel = document.querySelector('section[aria-label="Rice · 记忆"]');
+      const surface = panel?.parentElement;
+      const mounts = document.querySelectorAll<HTMLElement>(selector);
+      const mount = mounts[0];
+      const badge = document.querySelector(
+        'button[aria-label="交付成果，5 项新增"]',
+      );
       if (
-        panel.parentElement !== surface ||
-        !app.contains(surface) ||
-        app.parentNode !== parent ||
-        app.nextSibling !== next ||
-        document.querySelector('body > #root') !== app ||
-        JSON.stringify(inputs()) !== JSON.stringify(original)
+        !panel ||
+        !surface ||
+        mounts.length !== 1 ||
+        !mount?.contains(surface) ||
+        !badge ||
+        mount.contains(badge)
       )
-        throw Error('Native identity, ancestry or inline style changed');
-    };
-    const sameSheets = (attached: boolean) => {
-      const expected = attached ? [...sheets, sheet] : sheets;
-      const current = document.adoptedStyleSheets;
-      if (
-        expected.length !== current.length ||
-        expected.some((value, index) => current[index] !== value)
-      )
-        throw Error('Native placement stylesheet ownership changed');
-    };
-    const measure = () => {
-      const rect = (node: Element) => {
-        const { x, y, width, height } = node.getBoundingClientRect();
-        return { x, y, width, height };
+        throw Error('Missing native sidebar mount or adjacent unread control');
+      const parent = mount.parentNode,
+        next = mount.nextSibling;
+      const sheets = [...document.adoptedStyleSheets];
+      const sheet = new CSSStyleSheet();
+      let mode: 'identity' | 'transform' | 'layout' = 'identity';
+      let expectedCss = '';
+      const inputs = () => ({
+        mount: mount.getAttribute('style'),
+        surface: surface.getAttribute('style'),
+      });
+      const position = () => {
+        const style = getComputedStyle(mount);
+        return {
+          display: style.display,
+          position: style.position,
+          left: style.left,
+          top: style.top,
+          transform: style.transform,
+        };
       };
-      const clipMetrics = [];
-      for (
-        let node: HTMLElement | null = panel.parentElement;
-        node;
-        node = node.parentElement
-      )
-        clipMetrics.push({
-          tag: node.tagName,
-          className: node.getAttribute('class'),
-          placementRoot: node === app,
-          rect: rect(node),
-          clientLeft: node.clientLeft,
-          clientTop: node.clientTop,
-          clientWidth: node.clientWidth,
-          clientHeight: node.clientHeight,
-          scrollLeft: node.scrollLeft,
-          scrollTop: node.scrollTop,
-          scrollWidth: node.scrollWidth,
-          scrollHeight: node.scrollHeight,
-          offsetWidth: node.offsetWidth,
-          offsetHeight: node.offsetHeight,
-        });
-      const scroll = document.scrollingElement,
-        viewport = window.visualViewport;
-      return {
-        clipMetrics,
-        document: {
-          innerWidth,
-          innerHeight,
-          scrollX,
-          scrollY,
-          scrollWidth: scroll?.scrollWidth,
-          scrollHeight: scroll?.scrollHeight,
-          clientWidth: document.documentElement.clientWidth,
-          clientHeight: document.documentElement.clientHeight,
-          viewport: viewport && {
-            width: viewport.width,
-            height: viewport.height,
-            offsetLeft: viewport.offsetLeft,
-            offsetTop: viewport.offsetTop,
-            pageLeft: viewport.pageLeft,
-            pageTop: viewport.pageTop,
-            scale: viewport.scale,
+      const original = inputs(),
+        initial = position();
+      const sameNodes = () => {
+        if (
+          panel.parentElement !== surface ||
+          !mount.contains(surface) ||
+          mount.parentNode !== parent ||
+          mount.nextSibling !== next ||
+          document.querySelector(selector) !== mount ||
+          !badge.isConnected ||
+          mount.contains(badge) ||
+          JSON.stringify(inputs()) !== JSON.stringify(original)
+        )
+          throw Error('Native identity, ancestry or inline style changed');
+      };
+      const sameSheets = (attached: boolean) => {
+        const expected = attached ? [...sheets, sheet] : sheets;
+        const current = document.adoptedStyleSheets;
+        if (
+          expected.length !== current.length ||
+          expected.some((value, index) => current[index] !== value)
+        )
+          throw Error('Native placement stylesheet ownership changed');
+      };
+      const measure = () => {
+        const rect = (node: Element) => {
+          const { x, y, width, height } = node.getBoundingClientRect();
+          return { x, y, width, height };
+        };
+        const clipMetrics = [];
+        for (
+          let node: HTMLElement | null = panel.parentElement;
+          node;
+          node = node.parentElement
+        )
+          clipMetrics.push({
+            tag: node.tagName,
+            className: node.getAttribute('class'),
+            placementMount: node === mount,
+            rect: rect(node),
+            clientLeft: node.clientLeft,
+            clientTop: node.clientTop,
+            clientWidth: node.clientWidth,
+            clientHeight: node.clientHeight,
+            scrollLeft: node.scrollLeft,
+            scrollTop: node.scrollTop,
+            scrollWidth: node.scrollWidth,
+            scrollHeight: node.scrollHeight,
+            offsetWidth: node.offsetWidth,
+            offsetHeight: node.offsetHeight,
+          });
+        const scroll = document.scrollingElement,
+          viewport = window.visualViewport;
+        return {
+          clipMetrics,
+          document: {
+            innerWidth,
+            innerHeight,
+            scrollX,
+            scrollY,
+            scrollWidth: scroll?.scrollWidth,
+            scrollHeight: scroll?.scrollHeight,
+            clientWidth: document.documentElement.clientWidth,
+            clientHeight: document.documentElement.clientHeight,
+            viewport: viewport && {
+              width: viewport.width,
+              height: viewport.height,
+              offsetLeft: viewport.offsetLeft,
+              offsetTop: viewport.offsetTop,
+              pageLeft: viewport.pageLeft,
+              pageTop: viewport.pageTop,
+              scale: viewport.scale,
+            },
           },
+        };
+      };
+      let attached = false;
+      const inspect = () => {
+        sameNodes();
+        sameSheets(true);
+        const css = Array.from(sheet.cssRules, (rule) => rule.cssText).join(
+          '\n',
+        );
+        const placement = position();
+        const x = mode === 'layout' ? offset.x : 0;
+        const y = mode === 'layout' ? offset.y : 0;
+        const tx = mode === 'transform' ? offset.x : 0;
+        const ty = mode === 'transform' ? offset.y : 0;
+        const expected =
+          mode === 'identity'
+            ? initial
+            : {
+                ...initial,
+                position: 'relative',
+                left: `${x}px`,
+                top: `${y}px`,
+                transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
+              };
+        if (
+          css !== expectedCss ||
+          JSON.stringify(placement) !== JSON.stringify(expected)
+        )
+          throw Error('Owned placement does not equal the declared mechanism');
+        return { mode, offset, original, css, placement, metrics: measure() };
+      };
+      return {
+        attach() {
+          sameNodes();
+          sameSheets(false);
+          document.adoptedStyleSheets = [...sheets, sheet];
+          attached = true;
+          return inspect();
+        },
+        place(value: 'transform' | 'layout') {
+          inspect();
+          const x = value === 'layout' ? offset.x : 0;
+          const y = value === 'layout' ? offset.y : 0;
+          const tx = value === 'transform' ? offset.x : 0;
+          const ty = value === 'transform' ? offset.y : 0;
+          sheet.replaceSync(
+            `${selector} { position: relative; left: ${x}px; top: ${y}px; transform: translate(${tx}px, ${ty}px); }`,
+          );
+          expectedCss = sheet.cssRules[0]!.cssText;
+          mode = value;
+          return inspect();
+        },
+        inspect,
+        restore() {
+          if (attached) {
+            sameSheets(true);
+            document.adoptedStyleSheets = sheets;
+            attached = false;
+          }
+          sameNodes();
+          sameSheets(false);
+          if (JSON.stringify(position()) !== JSON.stringify(initial))
+            throw Error('Native sidebar positioning did not restore');
+          return { restored: true, original, actual: inputs() };
         },
       };
-    };
-    let attached = false;
-    const inspect = () => {
-      sameNodes();
-      sameSheets(true);
-      const css = Array.from(sheet.cssRules, (rule) => rule.cssText).join('\n');
-      const placement = position();
-      const x = mode === 'layout' ? offset.x : 0;
-      const y = mode === 'layout' ? offset.y : 0;
-      const tx = mode === 'transform' ? offset.x : 0;
-      const ty = mode === 'transform' ? offset.y : 0;
-      const expected =
-        mode === 'identity'
-          ? initial
-          : {
-              ...initial,
-              position: 'relative',
-              left: `${x}px`,
-              top: `${y}px`,
-              transform: `matrix(1, 0, 0, 1, ${tx}, ${ty})`,
-            };
-      if (
-        css !== expectedCss ||
-        JSON.stringify(placement) !== JSON.stringify(expected)
-      )
-        throw Error('Owned placement does not equal the declared mechanism');
-      return { mode, offset, original, css, placement, metrics: measure() };
-    };
-    return {
-      attach() {
-        sameNodes();
-        sameSheets(false);
-        document.adoptedStyleSheets = [...sheets, sheet];
-        attached = true;
-        return inspect();
-      },
-      place(value: 'transform' | 'layout') {
-        inspect();
-        const x = value === 'layout' ? offset.x : 0;
-        const y = value === 'layout' ? offset.y : 0;
-        const tx = value === 'transform' ? offset.x : 0;
-        const ty = value === 'transform' ? offset.y : 0;
-        sheet.replaceSync(
-          `body > #root { position: relative; left: ${x}px; top: ${y}px; transform: translate(${tx}px, ${ty}px); }`,
-        );
-        expectedCss = sheet.cssRules[0]!.cssText;
-        mode = value;
-        return inspect();
-      },
-      inspect,
-      restore() {
-        if (attached) {
-          sameSheets(true);
-          document.adoptedStyleSheets = sheets;
-          attached = false;
-        }
-        sameNodes();
-        sameSheets(false);
-        if (JSON.stringify(position()) !== JSON.stringify(initial))
-          throw Error('Native app positioning did not restore');
-        return { restored: true, original, actual: inputs() };
-      },
-    };
-  }, offset);
+    },
+    {
+      offset,
+      selector: `body > #root [class$="${nativeRightbarClassSuffix}"]`,
+    },
+  );
 }
 
 suite(
@@ -712,7 +734,7 @@ suite(
         await settle(native);
         baseline = await capture(native, 'native-attached', true);
         assertCausalInvariant(original.value, baseline.value);
-        placementIdentity = placementRootIdentity(
+        placementIdentity = placementMountIdentity(
           original.value,
           baseline.value,
         );
@@ -727,6 +749,7 @@ suite(
         ] as const) {
           await owner.evaluate((handle, mode) => handle.place(mode), mode);
           await settle(native);
+          expect(await unreadDeliveryBadge.isVisible()).toBe(true);
           const current = await capture(native, label, true);
           expect(current.value.root).toEqual({ ...nativeRoot, x: 0, y: 0 });
           assertCausalInvariant(baseline.value, current.value, offset);

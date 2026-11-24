@@ -73,20 +73,21 @@ const fail = (message: string): never => {
   throw Error('Invalid native placement experiment: ' + message);
 };
 
-// The empty stylesheet must leave the existing app and all its ancestors exact.
-export function placementRootIdentity(
+export const nativeRightbarClassSuffix = '_rightbarCol';
+
+// The empty stylesheet must leave the native mount and its ancestry exact.
+export function placementMountIdentity(
   before: PanelsCausalSnapshot,
   attached: PanelsCausalSnapshot,
 ) {
   if (!same(before.ancestors, attached.ancestors))
     fail('ancestor identity, geometry or paint changed during attachment');
-  const body = before.ancestors.find((node) => node.tag === 'BODY');
-  const roots = before.ancestors.filter(
-    (node) => node.parentIdentity === body?.identity,
+  const mounts = before.ancestors.filter((node) =>
+    node.className?.endsWith(nativeRightbarClassSuffix),
   );
-  if (!body || roots.length !== 1 || roots[0]!.tag !== 'DIV')
-    fail('native application root identity missing');
-  return roots[0]!.identity;
+  if (mounts.length !== 1 || mounts[0]!.tag !== 'DIV')
+    fail('native sidebar mount identity missing');
+  return mounts[0]!.identity;
 }
 
 /** Fixed viewport coordinates: only this host's known transform matrix differs.

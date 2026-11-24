@@ -3,7 +3,7 @@ import type { PanelsCausalSnapshot } from './employee-panels-causal-dom';
 import {
   assertPlacementAncestors,
   classifyNativePlacementEffect,
-  placementRootIdentity,
+  placementMountIdentity,
 } from './employee-panels-native-placement';
 
 const pixels = (a: number | null, b = a) => ({
@@ -92,12 +92,17 @@ const node = (identity: number, parentIdentity: number | null) => ({
 });
 const snapshot = (ancestors: unknown[]) =>
   ({ ancestors }) as PanelsCausalSnapshot;
-const before = () => snapshot([node(1, 3), { ...node(3, null), tag: 'BODY' }]);
+const before = () =>
+  snapshot([
+    { ...node(1, 2), className: 'dsh_rightbarCol' },
+    node(2, 3),
+    { ...node(3, null), tag: 'BODY' },
+  ]);
 const placed = before;
 const offset = { x: -793, y: -38 };
 describe('D actual ancestor controls', () => {
-  it('retains the original native app as the only controlled ancestor', () => {
-    expect(placementRootIdentity(before(), before())).toBe(1);
+  it('retains the original sidebar mount as the only controlled ancestor', () => {
+    expect(placementMountIdentity(before(), before())).toBe(1);
   });
   it('rejects replacement, extra ancestors or attachment geometry changes', () => {
     const replacement = before(),
@@ -107,11 +112,11 @@ describe('D actual ancestor controls', () => {
     extra.ancestors.push(node(9, null) as never);
     deformed.ancestors[0]!.rect.width++;
     for (const value of [replacement, extra, deformed])
-      expect(() => placementRootIdentity(before(), value)).toThrow(
+      expect(() => placementMountIdentity(before(), value)).toThrow(
         'Invalid native placement',
       );
   });
-  it('permits only the measured app matrix at fixed boxes', () => {
+  it('permits only the measured sidebar matrix at fixed boxes', () => {
     const a = placed(),
       b = placed();
     a.ancestors[0]!.styles.transform = 'matrix(1, 0, 0, 1, -793, -38)';
