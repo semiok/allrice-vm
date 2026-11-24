@@ -183,7 +183,7 @@ class Scope implements Projection {
   private detach = () => {};
   private unregister?: TypertDisposer;
   private readonly catalogQueue = new Set<() => void>();
-  private catalogRunning = false;
+  private catalogReading?: Promise<void>;
   private refreshQueue = Promise.resolve();
   private refreshGeneration = 0;
   constructor(
@@ -265,20 +265,21 @@ class Scope implements Projection {
       const start = () => {
         this.catalogQueue.delete(start);
         signal.removeEventListener('abort', cancel);
-        this.catalogRunning = true;
-        void Promise.resolve()
-          .then(read)
-          .then(resolve, reject)
-          .finally(() => {
-            this.catalogRunning = false;
-            this.catalogQueue.values().next().value?.();
-          });
+        const work = Promise.resolve().then(read);
+        this.catalogReading = work;
+        void work.then(resolve, reject).finally(() => {
+          this.catalogReading = undefined;
+          this.catalogQueue.values().next().value?.();
+        });
       };
-      if (this.catalogRunning) {
+      if (this.catalogReading) {
         this.catalogQueue.add(start);
         signal.addEventListener('abort', cancel, { once: true });
       } else start();
     });
+  }
+  joinActiveRead() {
+    return this.catalogReading;
   }
   refresh(signal = this.abort.signal) {
     const pageRefresh = signal === this.abort.signal;
@@ -847,7 +848,11 @@ class PrincipalService extends TypertRemoteService {
       close: () => {
         if (closing) return closing;
         closing = Promise.resolve().then(async () => {
-          await Promise.allSettled([setup, pending]);
+          await Promise.allSettled([
+            setup,
+            pending,
+            scope.abort.signal.aborted ? scope.joinActiveRead() : undefined,
+          ]);
           const returns = await Promise.allSettled([
             Promise.resolve().then(async () => {
               await iterator?.return?.();
