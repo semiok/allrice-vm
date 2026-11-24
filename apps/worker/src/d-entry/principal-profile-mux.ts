@@ -390,12 +390,20 @@ export function createDEntryPageMux(
           )
             throw new SyntaxError('Entry selectors must be unique');
           const {
-            carrier: _,
             organizationId,
             scopeId,
-            ...selection
+            workspaceId,
+            employeeInstanceId,
+            threadId,
           } = DEntryPageMuxQuerySchema.parse(Object.fromEntries(searchParams));
-          const input = { organizationId, selection };
+          const input = {
+            organizationId,
+            selection: {
+              workspaceId,
+              employeeInstanceId,
+              ...(threadId && { threadId }),
+            },
+          };
           const token = dEntryBearer(request);
           const accept = async () => {
             connected.throwIfAborted();

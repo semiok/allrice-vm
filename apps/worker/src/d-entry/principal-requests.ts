@@ -24,6 +24,7 @@ import {
   resolveDEntryNativeResource,
   sameDEntryVmBinding,
 } from './native-owner.js';
+import type { DEntryFixedProfileSource } from './released-profile.js';
 
 type Selection = { organizationId: string; selection: DEntrySelectionInput };
 export type DEntryPageDependencies = DEntryHttpDependencies & {
@@ -55,7 +56,7 @@ function sameSelection(a: DEntrySelectionInput, b: DEntrySelectionInput) {
 export type DEntryPageHandle = Readonly<{
   scope: DEntryPrincipalControlScope;
   bindingRef: string;
-  fixedProfile?: import('./released-profile.js').DEntryFixedProfileSource;
+  fixedProfile?: DEntryFixedProfileSource;
   identity: DEntryIdentity;
   root: DEntryHistoryRootPin;
   signal: AbortSignal;

@@ -26,7 +26,7 @@ import { createDEntryPageRequests } from './principal-requests.js';
 import { createDEntryProfile } from './profile.js';
 import { holdReleasedProfile } from './released-profile.js';
 import {
-  DEntryPageOpenedSchema,
+  type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
   DEntrySelectionInputSchema,
@@ -143,7 +143,9 @@ async function fixture(release?: ProfileProof) {
   });
   const web = createServer();
   const origin = await listen(web);
-  const probe = vi.fn(async (target: string | URL, _init: RequestInit) => {
+  const probe = vi.fn<
+    (target: string | URL, init: RequestInit) => Promise<Response>
+  >(async (target) => {
     const requested = new URL(target);
     expect(requested.pathname).toBe('/api/v1/d-entry/identity');
     return Response.json({

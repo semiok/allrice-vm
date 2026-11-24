@@ -4,7 +4,10 @@ import {
   DEntryNativeOwnerRequestSchema,
   DEntryPageRpcRequestSchema,
 } from '@allrice/contracts';
-import type { DEntryScopedUnaryCall } from '@allrice/d-entry-principal/types';
+import type {
+  DEntryPrincipalControlScope,
+  DEntryScopedUnaryCall,
+} from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { rpcIdSchema } from '@deepseek-ai/dsh-client-connection';
@@ -29,11 +32,7 @@ const reply = (rpcId: string, result: object) => ({
 
 function encodeResult(
   rpcId: string,
-  result: Awaited<
-    ReturnType<
-      import('@allrice/d-entry-principal/types').DEntryPrincipalControlScope['invoke']
-    >
-  >,
+  result: Awaited<ReturnType<DEntryPrincipalControlScope['invoke']>>,
 ) {
   const parts = new FormData();
   const attachments: {

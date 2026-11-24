@@ -181,7 +181,9 @@ export function installEmployeeProductOwner(ctx: Context) {
       let previous: Set<string> | null = null;
       try {
         previous = unreadKeys(localStorage.getItem(storageKey));
-      } catch {}
+      } catch {
+        // Browser storage can be unavailable. The file list still opens.
+      }
       const common = {
         ownerKey,
         viewerId,
@@ -215,7 +217,9 @@ export function installEmployeeProductOwner(ctx: Context) {
                 storageKey,
                 JSON.stringify(keys.slice(-2000)),
               );
-            } catch {}
+            } catch {
+              // The active page can still clear its unread count.
+            }
             const now = panels.getSnapshot();
             if (now?.filesUnread) panels.update({ ...now, filesUnread: 0 });
           },

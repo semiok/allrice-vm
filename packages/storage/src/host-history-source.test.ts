@@ -7,6 +7,7 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
+import type * as PromiseFs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -28,7 +29,7 @@ import {
 const roots: string[] = [];
 const syncHooks = vi.hoisted(() => new Map<string, () => unknown>());
 vi.mock('node:fs/promises', async (load) => {
-  const fs = await load<typeof import('node:fs/promises')>();
+  const fs = await load<typeof PromiseFs>();
   return {
     ...fs,
     open: async (...args: Parameters<typeof fs.open>) => {

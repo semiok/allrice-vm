@@ -7,6 +7,8 @@ import {
 } from './[...publicationPath]/route';
 import EntryPage from '../page';
 import { DataAccessError } from '@allrice/database';
+import type * as NativeWorker from '../../../../lib/d-entry/native-worker';
+import type * as SessionIdentity from '../../../../lib/identity/session';
 
 const authenticated = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
@@ -17,15 +19,11 @@ vi.mock('next/headers', () => ({
   }),
 }));
 vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
-  ...(await importOriginal<
-    typeof import('../../../../lib/d-entry/native-worker')
-  >()),
+  ...(await importOriginal<typeof NativeWorker>()),
   requestDEntryProfile: profileRequest,
 }));
 vi.mock('../../../../lib/identity/session', async (importOriginal) => ({
-  ...(await importOriginal<
-    typeof import('../../../../lib/identity/session')
-  >()),
+  ...(await importOriginal<typeof SessionIdentity>()),
   requireRequestContext: authenticated,
 }));
 vi.mock('../../../../lib/d-entry/identity', () => ({

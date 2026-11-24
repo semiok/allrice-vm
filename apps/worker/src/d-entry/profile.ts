@@ -369,16 +369,15 @@ export function createDEntryProfile(
                   200,
                   async () => {
                     await verify();
-                    const iterator = page.scope
-                      .stream(
-                        {
-                          scopeId,
-                          endpoint: 'remoteAccess/follow',
-                          args: {},
-                        },
-                        active,
-                      )
-                      [Symbol.asyncIterator]();
+                    const access = page.scope.stream(
+                      {
+                        scopeId,
+                        endpoint: 'remoteAccess/follow',
+                        args: {},
+                      },
+                      active,
+                    );
+                    const iterator = access[Symbol.asyncIterator]();
                     const first = await iterator
                       .next()
                       .finally(() => iterator.return?.());
