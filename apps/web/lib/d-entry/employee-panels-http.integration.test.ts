@@ -10,6 +10,9 @@ import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import {
   DataAccessError,
   createChatSession,
+  ensureDEntryNativeRoot,
+  readDEntryEmployeeDirectory,
+  requireDEntryNativeIdentity,
   updateDEntryReleasePolicy,
   type BuiltinModuleId,
 } from '@allrice/database';
@@ -43,7 +46,6 @@ import {
   EmployeePanelsWriteRejectedError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
-import { GET as readWorkspace } from '../../app/api/v1/workspace/route';
 
 // Next's request-local Cookie carrier is replaced, not authentication. The
 // real production session adapter, opaque token and current DB readers run.
@@ -172,15 +174,6 @@ suite(
                 'content-type': 'text/html; charset=utf-8',
               });
               outgoing.end(fixtureDocument);
-              return;
-            }
-            if (url.pathname === '/api/v1/workspace' && fixtureDocument) {
-              const response = await readWorkspace(request);
-              outgoing.writeHead(
-                response.status,
-                Object.fromEntries(response.headers),
-              );
-              outgoing.end(await response.text());
               return;
             }
             const pieces = url.pathname.split('/').slice(5);
@@ -357,6 +350,31 @@ suite(
       on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
     }
     const signal = () => new AbortController().signal;
+    async function bindDirectoryThread(
+      p: Awaited<ReturnType<typeof person>>,
+      threadId: string,
+    ) {
+      const selection = { ...p.selection, threadId };
+      const identity = await requireDEntryNativeIdentity(p.context, selection);
+      const host = {
+        binding: {
+          organizationId: identity.organizationId,
+          personId: identity.personId,
+          vmId: 'fixture-pinned-vm',
+          instanceId: 'fixture-born-instance',
+          leaseEpoch: 1,
+        },
+        bindingRef: 'fixture-native-dock-binding',
+        rosterDigest: 'fixture-enrolled-roster',
+      };
+      await ensureDEntryNativeRoot(p.context, selection, identity, {
+        operationId: randomUUID(),
+        host,
+        signal: signal(),
+        create: async () => ({ host, nativeSessionId: 'fixture-' + threadId }),
+      });
+      return selection;
+    }
     function uploadInput(
       p: Awaited<ReturnType<typeof person>>,
       name = '同名.txt',
@@ -405,6 +423,12 @@ suite(
         const session = await createChatSession(p.context, p.selection, {
           executionGeneration: '4.0',
         });
+        const selectedThread = await bindDirectoryThread(p, session.id);
+        const directory = await readDEntryEmployeeDirectory(
+          p.context,
+          selectedThread,
+          signal(),
+        );
         const input = uploadInput(p, '浏览器本人交付.txt');
         const original = await p.client.uploadDeliverable(input, signal());
         const require = createRequire(import.meta.url);
@@ -437,7 +461,7 @@ suite(
             '/fixture/assets/' + item.path.split('/').at(-1),
             item.contents,
           );
-        fixtureDocument = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture/assets/employee-panel-live-page.css"><div id="app" data-organization-id="${p.context.organizationId}" data-viewer-id="${p.context.actor.id}" data-workspace-id="${p.selection.workspaceId}" data-employee-instance-id="${p.selection.employeeInstanceId}" data-thread-id="${session.id}" data-scope-id="${randomUUID()}" data-native-session-id="test-dock"></div><script type="module" src="/fixture/assets/employee-panel-live-page.js"></script>`;
+        fixtureDocument = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/fixture/assets/employee-panel-live-page.css"><div id="app" data-organization-id="${p.context.organizationId}" data-viewer-id="${p.context.actor.id}" data-workspace-id="${p.selection.workspaceId}" data-employee-instance-id="${p.selection.employeeInstanceId}" data-thread-id="${session.id}" data-scope-id="${randomUUID()}" data-native-session-id="test-dock"></div><script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory).replaceAll('<', '\\u003c')}</script><script type="module" src="/fixture/assets/employee-panel-live-page.js"></script>`;
         let browser: Browser | undefined;
         let restoreStoragePut: (() => void) | undefined;
         try {
@@ -1373,6 +1397,65 @@ suite(
       expect(
         await f.db`select id from allrice_chat_sessions where owner_id=${p.context.actor.id}`,
       ).toHaveLength(0);
+    });
+    it('selects only authenticated current 4.0 threads across the private directory cursor', async () => {
+      const p = await person();
+      const legacy = await createChatSession(p.context, p.selection);
+      await release(p);
+      const create = () =>
+        createChatSession(p.context, p.selection, {
+          executionGeneration: '4.0',
+        });
+      const chosen = await create();
+      const selection = await bindDirectoryThread(p, chosen.id);
+      const expected = [chosen.id];
+      for (let index = 0; index < 51; index++) {
+        const session = await create();
+        await bindDirectoryThread(p, session.id);
+        expected.push(session.id);
+      }
+      const unbound = await create();
+      const archived = await create();
+      await bindDirectoryThread(p, archived.id);
+      await f.db`update allrice_chat_sessions set archived_at=now() where id=${archived.id}`;
+      const rows =
+        () => f.db`select id,execution_generation,d_entry_native_root,archived_at
+        from allrice_chat_sessions where owner_id=${p.context.actor.id} order by id`;
+      const before = await rows();
+      const directory = await readDEntryEmployeeDirectory(
+        p.context,
+        selection,
+        signal(),
+      );
+      expect(directory.viewerId).toBe(p.context.actor.id);
+      expect(directory.employees.map(({ instanceId }) => instanceId)).toEqual([
+        p.selection.employeeInstanceId,
+      ]);
+      expect(directory.sessions.map(({ id }) => id).sort()).toEqual(
+        expected.sort(),
+      );
+      expect(directory.sessions.map(({ id }) => id)).not.toContain(legacy.id);
+      expect(directory.sessions.map(({ id }) => id)).not.toContain(unbound.id);
+      expect(directory.sessions.map(({ id }) => id)).not.toContain(archived.id);
+      await expect(
+        readDEntryEmployeeDirectory(
+          p.context,
+          { ...selection, threadId: legacy.id },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await expect(
+        readDEntryEmployeeDirectory(
+          p.context,
+          { ...selection, employeeInstanceId: randomUUID() },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await release();
+      await expect(
+        readDEntryEmployeeDirectory(p.context, selection, signal()),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      expect(await rows()).toEqual(before);
     });
     it('requires real Cookie, same-origin writes and matching viewer without changing stored files', async () => {
       const p = await person();

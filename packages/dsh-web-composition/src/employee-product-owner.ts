@@ -89,24 +89,32 @@ export function installEmployeeProductOwner(ctx: Context) {
     );
   });
 
-  const workspaceTask = fetch(
-    '/api/v1/workspace?' +
-      new URLSearchParams({ workspaceId: selection.workspaceId }),
-    {
-      credentials: 'same-origin',
-      headers: requestHeaders,
-      signal,
-      cache: 'no-store',
-    },
-  ).then(async (response) => {
-    if (!response.ok) throw Error('Employee catalog unavailable');
-    const { workspace } = (await response.json()) as { workspace: Workspace };
+  const workspaceTask = Promise.resolve().then(() => {
+    const embedded = document.getElementById(
+      'allrice-employee-directory',
+    )?.textContent;
+    if (!embedded) throw Error('Employee catalog unavailable');
+    const directory = JSON.parse(embedded) as Pick<
+      Workspace,
+      'organizationId' | 'workspaceId' | 'viewerId' | 'employees' | 'sessions'
+    >;
+    const workspace: Workspace = {
+      ...directory,
+      employeeProfiles: [],
+      sessionModels: [],
+      canAdminister: false,
+    };
     signal.throwIfAborted();
     if (
       workspace.viewerId !== viewerId ||
       workspace.organizationId !== organizationId ||
       workspace.workspaceId !== selection.workspaceId ||
-      !employeeChoice(workspace, selection.employeeInstanceId)
+      !employeeChoice(workspace, selection.employeeInstanceId) ||
+      !workspace.sessions.some(
+        (thread) =>
+          thread.id === threadId &&
+          sessionEmployeeKey(thread) === selection.employeeInstanceId,
+      )
     )
       throw Error('Employee catalog changed');
     return workspace;

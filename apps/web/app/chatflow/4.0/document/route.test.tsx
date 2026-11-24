@@ -9,10 +9,16 @@ import EntryPage from '../page';
 import { DataAccessError } from '@allrice/database';
 import type * as NativeWorker from '../../../../lib/d-entry/native-worker';
 import type * as SessionIdentity from '../../../../lib/identity/session';
+import type * as Database from '@allrice/database';
 
 const authenticated = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
+const directory = vi.hoisted(() => vi.fn());
+vi.mock('@allrice/database', async (load) => ({
+  ...(await load<typeof Database>()),
+  readDEntryEmployeeDirectory: directory,
+}));
 vi.mock('next/headers', () => ({
   cookies: async () => ({
     get: () => ({ value: 'unit-test-original-session-cookie' }),
@@ -48,6 +54,7 @@ beforeEach(() => {
   authenticated.mockReset();
   historyIdentity.mockReset();
   profileRequest.mockReset();
+  directory.mockReset();
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
@@ -140,6 +147,7 @@ it('preserves invalid empty/duplicate values on the page for the document parser
 
 it('requires the issued scope in the document address and leaves the two exact native HTTP routes denied', async () => {
   const scopeId = '00000000-0000-4000-8000-000000000003';
+  const threadId = '00000000-0000-4000-8000-000000000006';
   authenticated.mockResolvedValue({
     actor: { type: 'user', id: '00000000-0000-4000-8000-000000000004' },
     organizationId: '00000000-0000-4000-8000-000000000005',
@@ -152,7 +160,13 @@ it('requires the issued scope in the document address and leaves the two exact n
   profileRequest.mockImplementation(async () =>
     Response.json({ ...claims, nativeSessionId: 'real-native-root' }),
   );
-  const entry = await GET(request(query + '&scopeId=' + scopeId));
+  directory.mockResolvedValue({
+    sessions: [{ id: threadId, title: '</script><script>unexpected</script>' }],
+    employees: [],
+  });
+  const entry = await GET(
+    request(query + '&scopeId=' + scopeId + '&threadId=' + threadId),
+  );
   expect(entry.status).toBe(307);
   const location = entry.headers.get('location')!;
   const parts = location.split('/').slice(4);
@@ -160,7 +174,7 @@ it('requires the issued scope in the document address and leaves the two exact n
     scopeId,
     selection.workspaceId,
     selection.employeeInstanceId,
-    '_',
+    threadId,
     claims.bindingRef,
     claims.graphRev,
     claims.manifestSha256,
@@ -185,6 +199,17 @@ it('requires the issued scope in the document address and leaves the two exact n
   const html = await doc.text();
   expect(html).toContain('data-native-session-id="real-native-root"');
   expect(html).toContain('/managed/employee-web-entry.js');
+  expect(html).toContain(
+    'id="allrice-employee-directory" type="application/json"',
+  );
+  expect(html).not.toContain('<script>unexpected</script>');
+  expect(directory).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      actor: expect.objectContaining({ type: 'user' }),
+    }),
+    { ...selection, threadId },
+    expect.any(AbortSignal),
+  );
   expect((await call('api/file?path=%2Ftest')).status).toBe(403);
   expect((await call('api/session/uploadFileBinary', 'POST')).status).toBe(403);
   expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([

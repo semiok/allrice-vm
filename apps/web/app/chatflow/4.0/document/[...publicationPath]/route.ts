@@ -1,4 +1,7 @@
-import { DataAccessError } from '@allrice/database';
+import {
+  DataAccessError,
+  readDEntryEmployeeDirectory,
+} from '@allrice/database';
 import { apiProblem } from '../../../../../lib/api-error-response';
 import {
   profileAddress,
@@ -44,6 +47,12 @@ export async function GET(request: Request, { params }: Params) {
     const tenant = input.context.organizationId;
     if (input.context.actor.type !== 'user')
       throw new DataAccessError('not_found');
+    const directory = await readDEntryEmployeeDirectory(
+      input.context,
+      selection,
+      request.signal,
+    );
+    const directoryJson = JSON.stringify(directory).replaceAll('<', '\\u003c');
     const attributes = [
       ['scope-id', scopeId],
       ['binding-ref', bindingRef],
@@ -57,7 +66,7 @@ export async function GET(request: Request, { params }: Params) {
     ]
       .map(([key, value]) => `data-${key}="${escapeAttribute(value!)}"`)
       .join(' ');
-    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><link rel="stylesheet" href="assets/index-BxpfOGf3.css"><link rel="stylesheet" href="assets/vendor-DV2921Zo.css"><link rel="stylesheet" href="${assets}/managed/employee-web-entry.css"></head><body><div id="app" ${attributes}></div><script type="module" src="${assets}/managed/employee-web-entry.js"></script></body></html>`;
+    const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><link rel="stylesheet" href="assets/index-BxpfOGf3.css"><link rel="stylesheet" href="assets/vendor-DV2921Zo.css"><link rel="stylesheet" href="${assets}/managed/employee-web-entry.css"></head><body><div id="app" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script><script type="module" src="${assets}/managed/employee-web-entry.js"></script></body></html>`;
     return new Response(html, {
       headers: {
         'content-type': 'text/html; charset=utf-8',
