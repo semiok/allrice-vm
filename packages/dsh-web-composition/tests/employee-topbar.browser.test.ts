@@ -1,0 +1,489 @@
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Locator,
+  type Page,
+} from 'playwright-core';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from 'vitest';
+import { startInstalledProfile } from './installed-profile';
+import { writeEmployeePanelsFixture } from './employee-panels-fixture';
+import {
+  createSyntheticPanelsData,
+  panelsClock,
+} from './fixtures/employee-panels/data';
+import type { PanelsIntegration } from './fixtures/employee-panels/client';
+import { childPaneBrowserCases } from './child-pane.browser-cases';
+
+declare global {
+  interface Window {
+    __allriceCompositionTest?: {
+      openSession: (id: string) => void;
+      setTheme: (mode: 'light' | 'dark') => void;
+    };
+  }
+}
+
+const suite =
+  process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
+    ? describe
+    : describe.skip;
+const labels = ['交付成果', '企业资料', '记忆', '能力'];
+const descriptions = [
+  '员工交付的文件和你在对话中上传的文件',
+  '公司、部门和你自己可用的参考资料',
+  '员工记住的你的偏好和工作习惯',
+  '打开这位员工的业务工作台',
+];
+const kinds = ['files', 'materials', 'experience', 'workflow'];
+const session = 'session-00000000-0000-4000-8000-000000000036';
+const shortTitle = '销售复盘';
+const longTitle =
+  '核对销售记录并计算合计，整理每个部门本季度交付成果和工作参考资料';
+const settle = (page: Page) =>
+  page.evaluate(
+    () =>
+      new Promise<void>((done) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => done())),
+      ),
+  );
+
+suite('installed employee topbar and native Start', () => {
+  let browser: Browser, context: BrowserContext, page: Page;
+  let host: Awaited<ReturnType<typeof startInstalledProfile>>;
+  let artifacts: string;
+  const runtimeErrors: string[] = [];
+  const command = <K extends keyof PanelsIntegration>(
+    name: K,
+    ...args: Parameters<PanelsIntegration[K]>
+  ) =>
+    page.evaluate(
+      ({ name, args }) => {
+        const fn = window.__allricePanelsIntegration![name] as (
+          ...values: unknown[]
+        ) => unknown;
+        return fn(...args);
+      },
+      { name, args },
+    );
+  const right = () =>
+    page.locator(
+      `[data-sidebar-right-session="${session}"][data-sidebar-right-panel]`,
+    );
+  // Native closable tabs include their close button in the accessible name.
+  const tab = (title: string) =>
+    right()
+      .getByRole('tab')
+      .filter({ has: page.getByText(title, { exact: true }) });
+  const entries = () => page.locator('[aria-label="工作台入口"]');
+  const title = (text: string) =>
+    page
+      .getByRole('navigation', { name: '会话层级', exact: true })
+      .getByText(text, { exact: true });
+  const catalog = () =>
+    page.getByRole('button', { name: '1 个子智能体', exact: true });
+  const corner = () =>
+    page.getByRole('button', { name: '打开右侧边栏', exact: true });
+  const collapse = () =>
+    right().getByRole('button', { name: '收起右侧边栏', exact: true }).click();
+  const openStart = async () => {
+    await corner().click();
+    await tab('开始').waitFor();
+    await right().getByText(descriptions[0]!, { exact: true }).waitFor();
+  };
+  const card = (label: string) =>
+    right()
+      .getByRole('button')
+      .filter({
+        has: page.locator('strong').getByText(label, { exact: true }),
+      });
+  const reachable = async (control: Locator, label: string) => {
+    expect(await control.isVisible(), `${label} must remain visible`).toBe(
+      true,
+    );
+    // DOM visibility alone does not detect a native pane covering the header.
+    expect(
+      await control.evaluate((node) => {
+        const box = node.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          box.x + box.width / 2,
+          box.y + box.height / 2,
+        );
+        return hit !== null && node.contains(hit);
+      }),
+      `${label} must remain pointer-reachable`,
+    ).toBe(true);
+  };
+  const fourVisible = async () => {
+    for (const label of labels)
+      await reachable(
+        entries().getByRole('button', {
+          name: new RegExp(`^${label}(?:，|$)`),
+        }),
+        label,
+      );
+  };
+  const fourHidden = async () => {
+    expect(await entries().isVisible()).toBe(false);
+    expect(await entries().getByRole('button').count()).toBe(0);
+  };
+  const nativeHeader = async (text: string, width: number) => {
+    const current = title(text);
+    await current.waitFor();
+    await reachable(current, '原生标题');
+    await reachable(catalog(), '原生子智能体目录');
+    await reachable(corner(), '原生侧栏总开关');
+    const titleBox = (await current.boundingBox())!,
+      countBox = (await catalog().boundingBox())!,
+      cornerBox = (await corner().boundingBox())!;
+    expect(titleBox.x).toBeGreaterThanOrEqual(0);
+    expect(titleBox.x + titleBox.width).toBeLessThanOrEqual(countBox.x);
+    expect(countBox.x + countBox.width).toBeLessThanOrEqual(cornerBox.x);
+    expect(cornerBox.x + cornerBox.width).toBeLessThanOrEqual(width);
+    expect(
+      await page
+        .locator('header')
+        .filter({ has: current })
+        .getByRole('button')
+        .last()
+        .getAttribute('aria-label'),
+    ).toBe('打开右侧边栏');
+  };
+  const shot = async (name: string) => {
+    await settle(page);
+    await page.screenshot({
+      path: join(artifacts, `${name}.png`),
+      fullPage: true,
+    });
+  };
+
+  beforeAll(async () => {
+    const parent = resolve(
+      process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR ??
+        join(tmpdir(), 'allrice-composition-evidence'),
+    );
+    await mkdir(parent, { recursive: true });
+    artifacts = await mkdtemp(join(parent, 'employee-topbar-'));
+    console.info(`Installed employee topbar evidence: ${artifacts}`);
+    host = await startInstalledProfile(
+      await writeEmployeePanelsFixture(artifacts),
+    );
+    browser = await chromium.launch({
+      headless: true,
+      ...(process.env.ALLRICE_BROWSER_EXECUTABLE
+        ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
+        : {}),
+    });
+    await writeFile(
+      join(artifacts, 'identity.json'),
+      JSON.stringify(
+        {
+          browser: browser.version(),
+          node: process.version,
+          nativeVersion: '0.2.1-rc.2',
+          dpr: 1,
+          clock: panelsClock,
+          reducedMotion: 'reduce',
+          fixture:
+            'existing synthetic panels owner; native installed Host/registry/child history',
+          authenticatedHost: 'not exercised; MET-271 remains a separate gate',
+          productSha256: createHash('sha256')
+            .update(
+              await readFile(new URL('../dist/client.js', import.meta.url)),
+            )
+            .digest('hex'),
+        },
+        null,
+        2,
+      ),
+    );
+  }, 180_000);
+  beforeEach(async () => {
+    context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+      deviceScaleFactor: 1,
+      reducedMotion: 'reduce',
+      timezoneId: 'UTC',
+    });
+    await context.addInitScript((clock) => {
+      Date.now = () => Date.parse(clock);
+      // The reviewed child helper uses this older fixture name. Delegate only
+      // to the existing owner public navigation; no product/store replacement.
+      Object.defineProperty(window, '__allriceCompositionTest', {
+        configurable: true,
+        get: () =>
+          window.__allricePanelsIntegration
+            ? {
+                openSession: (id: string) =>
+                  window.__allricePanelsIntegration!.openSession(
+                    id as Parameters<PanelsIntegration['openSession']>[0],
+                  ),
+                setTheme: (mode: 'light' | 'dark') =>
+                  window.__allricePanelsIntegration!.setTheme(mode),
+              }
+            : undefined,
+      });
+    }, panelsClock);
+    page = await context.newPage();
+    page.setDefaultTimeout(15_000);
+    page.on('pageerror', (error) => runtimeErrors.push(error.message));
+    await page.route('**/api/v1/**', async (route) => {
+      const request = route.request(),
+        url = new URL(request.url());
+      if (request.method() !== 'GET') {
+        await route.fulfill({
+          status: 403,
+          json: { error: { code: 'SYNTHETIC_READ_ONLY' } },
+        });
+        return;
+      }
+      const data = createSyntheticPanelsData('list');
+      if (url.pathname === '/api/v1/references/publications')
+        await route.fulfill({ json: data.catalog });
+      else if (url.pathname === '/api/v1/workbench/files')
+        await route.fulfill({ json: data.files });
+      else
+        await route.fulfill({
+          status: 404,
+          json: { error: { code: 'SYNTHETIC_NOT_PROVIDED' } },
+        });
+    });
+    await page.goto(host.authUrl);
+    const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
+    await proceed
+      .waitFor({ state: 'visible', timeout: 5000 })
+      .catch(() => undefined);
+    if (await proceed.isVisible()) await proceed.click();
+    await page.waitForFunction(
+      () =>
+        window.__allricePanelsIntegration?.evidence().nativeInputReady &&
+        !!document.querySelector('[aria-label="工作台入口"]'),
+    );
+    await command('clearInput');
+  });
+  afterEach(async (test) => {
+    if (test.task.result?.state === 'fail') {
+      const id = test.task.id.replace(/\W/g, '-');
+      await shot(`first-failure-${id}`);
+      await writeFile(
+        join(artifacts, `first-failure-${id}.json`),
+        JSON.stringify(
+          {
+            test: test.task.name,
+            errors: runtimeErrors,
+            evidence: await command('evidence').catch(String),
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    await context?.close();
+    await writeFile(
+      join(artifacts, 'runtime-errors.json'),
+      JSON.stringify(runtimeErrors, null, 2),
+    );
+  });
+  afterAll(async () => {
+    try {
+      await browser?.close();
+    } finally {
+      await host?.close();
+    }
+  });
+
+  for (const width of [1440, 390])
+    for (const theme of ['light', 'dark'] as const) {
+      it(`keeps controls in native order, opens Start, switches panels and returns closed ${width} ${theme}`, async () => {
+        const mobile = width <= 760;
+        await page.setViewportSize({ width, height: 1000 });
+        await command('setTheme', theme);
+        await settle(page);
+        await command('renameSession', shortTitle);
+        await nativeHeader(shortTitle, width);
+        const shortMetrics = await title(shortTitle).evaluate((node) => ({
+          clientWidth: node.clientWidth,
+          scrollWidth: node.scrollWidth,
+        }));
+        expect(shortMetrics.scrollWidth).toBeLessThanOrEqual(
+          shortMetrics.clientWidth,
+        );
+        // Exercise native log-backed title projection, never patch title DOM.
+        // The Host may truncate input; exact matching follows its accepted title.
+        const renamed = await page.evaluate(
+          (value) => window.__allricePanelsIntegration!.renameSession(value),
+          longTitle,
+        );
+        if (!renamed.ok)
+          throw Error(`Native title rename failed: ${renamed.error.code}`);
+        const acceptedLongTitle = renamed.value.title;
+        await nativeHeader(acceptedLongTitle, width);
+        const longMetrics = await title(acceptedLongTitle).evaluate((node) => {
+          const style = getComputedStyle(node);
+          return {
+            clientWidth: node.clientWidth,
+            scrollWidth: node.scrollWidth,
+            overflow: style.overflowX,
+            textOverflow: style.textOverflow,
+            whiteSpace: style.whiteSpace,
+          };
+        });
+        expect(longMetrics).toMatchObject({
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        });
+        expect(longMetrics.clientWidth).toBeGreaterThan(0);
+        expect(longMetrics.scrollWidth).toBeGreaterThan(
+          longMetrics.clientWidth,
+        );
+        await command('renameSession', shortTitle);
+        await nativeHeader(shortTitle, width);
+        await writeFile(
+          join(artifacts, `title-geometry-${width}-${theme}.json`),
+          JSON.stringify({ shortMetrics, longMetrics }, null, 2),
+        );
+        expect(await page.getByText('标准模式', { exact: true }).count()).toBe(
+          0,
+        );
+        if (mobile) await fourHidden();
+        else {
+          await fourVisible();
+          const launchers = entries().getByRole('button');
+          expect((await launchers.all()).length).toBe(4);
+          expect(
+            (
+              await launchers.evaluateAll((nodes) =>
+                nodes.map((node) => node.getAttribute('aria-label')),
+              )
+            ).map((label) => label?.split('，')[0]),
+          ).toEqual(labels);
+          const countBox = (await catalog().boundingBox())!,
+            firstBox = (await launchers.first().boundingBox())!,
+            lastBox = (await launchers.last().boundingBox())!,
+            cornerBox = (await corner().boundingBox())!;
+          expect(countBox.x + countBox.width).toBeLessThanOrEqual(firstBox.x);
+          expect(lastBox.x + lastBox.width).toBeLessThanOrEqual(cornerBox.x);
+        }
+        await catalog().click();
+        const tree = page.getByRole('tree', { name: '子智能体会话' });
+        await tree.waitFor();
+        await page.keyboard.press('Escape');
+        await tree.waitFor({ state: 'hidden' });
+        await shot(`topbar-closed-${width}-${theme}`);
+        await openStart();
+        const cards = right()
+          .getByRole('button')
+          .filter({ has: page.locator('strong') });
+        expect(await cards.locator('strong').allTextContents()).toEqual(labels);
+        expect(await cards.locator('small').allTextContents()).toEqual(
+          descriptions,
+        );
+        for (const description of descriptions)
+          expect(
+            await right().getByText(description, { exact: true }).isVisible(),
+          ).toBe(true);
+        expect(
+          await page.getByRole('button', { name: /新建终端/ }).count(),
+        ).toBe(0);
+        await shot(`start-${width}-${theme}`);
+        for (const [index, kind] of kinds.entries()) {
+          if (index > 0) {
+            await collapse();
+            await openStart();
+          }
+          await card(labels[index]!).click();
+          await page.waitForFunction(
+            (kind) =>
+              window.__allricePanelsIntegration!.evidence().activeKind ===
+              `allrice-employee-panels.${kind}`,
+            kind,
+          );
+          await tab(labels[index]!).waitFor();
+          if (index === 0) await shot(`topbar-open-${width}-${theme}`);
+        }
+        expect(
+          await right()
+            .getByRole('button', { name: '分栏', exact: true })
+            .count(),
+        ).toBe(1);
+        expect(await right().locator('[data-sidebar-right-mode]').count()).toBe(
+          1,
+        );
+        expect(
+          await right()
+            .getByRole('button', { name: '收起右侧边栏', exact: true })
+            .count(),
+        ).toBe(1);
+        if (mobile) await fourHidden();
+        else {
+          await fourVisible();
+          for (const [index, kind] of kinds.entries()) {
+            await entries()
+              .getByRole('button', {
+                name: new RegExp(`^${labels[index]}(?:，|$)`),
+              })
+              .click();
+            await page.waitForFunction(
+              (kind) =>
+                window.__allricePanelsIntegration!.evidence().activeKind ===
+                `allrice-employee-panels.${kind}`,
+              kind,
+            );
+            await fourVisible();
+          }
+        }
+        await collapse();
+        if (mobile) {
+          await fourHidden();
+          await nativeHeader(shortTitle, width);
+        } else await fourVisible();
+        await openStart(); // Reopening after a selected business tab must be Start.
+        await collapse();
+        expect(
+          await page.evaluate(
+            () => document.documentElement.scrollWidth > innerWidth,
+          ),
+        ).toBe(false);
+        expect(runtimeErrors).toEqual([]);
+      });
+    }
+
+  it('preserves the native catalog trailing arrow and opens the same read-only right child', async () => {
+    await page
+      .getByRole('button', { name: '1 个子智能体', exact: true })
+      .click();
+    const tree = page.getByRole('tree', { name: '子智能体会话' });
+    await tree.getByRole('button', { name: /在侧边栏打开/ }).click();
+    const child = page.locator('[data-sidebar-chat]');
+    await child
+      .getByRole('status')
+      .filter({ hasText: '只读会话 · 由主员工安排后续工作' })
+      .waitFor();
+    expect(
+      await child
+        .locator('textarea:visible,[contenteditable=true]:visible')
+        .count(),
+    ).toBe(0);
+    await page.getByRole('tab', { name: /复核三条销售记录/ }).waitFor();
+    expect(
+      await page
+        .locator(`[data-conversation-session="${session}"]`)
+        .isVisible(),
+    ).toBe(true);
+  });
+
+  childPaneBrowserCases(() => page);
+});

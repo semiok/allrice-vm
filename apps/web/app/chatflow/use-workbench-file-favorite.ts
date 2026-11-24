@@ -1,15 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { UuidSchema } from '@allrice/contracts';
-import { z } from 'zod';
-import { workbenchJson } from '../../lib/chatflow/workbench-model';
-
-const resultSchema = z.object({
-  viewerId: UuidSchema,
-  objectId: UuidSchema,
-  favorite: z.boolean(),
-});
+import type { EmployeePanelDataClient } from '../../lib/chatflow/employee-panel-data';
+import { useEmployeePanelData } from './use-employee-panel-data';
 
 /** A personal preference; the server independently checks the current actor and file. */
 export function useWorkbenchFileFavorite(props: {
@@ -18,27 +11,34 @@ export function useWorkbenchFileFavorite(props: {
   workspaceId: string;
   headers: Record<string, string>;
   active: boolean;
+  dataClient?: EmployeePanelDataClient;
 }) {
+  const data = useEmployeePanelData(props);
   const key = `${props.ownerKey}/${props.workspaceId}/${props.viewerId ?? ''}`;
-  const current = useRef(key);
-  current.current = key;
+  const current = useRef({ key, data });
+  current.current = { key, data };
   const request = useRef<{
     key: string;
+    data: EmployeePanelDataClient;
     controller: AbortController;
   } | null>(null);
   const epoch = useRef(0);
-  const [state, setState] = useState({ key, using: '', error: '' });
+  const [state, setState] = useState({ key, data, using: '', error: '' });
   useEffect(() => {
     const controller =
-      request.current?.key === key && !request.current.controller.signal.aborted
+      request.current?.key === key &&
+      request.current.data === data &&
+      !request.current.controller.signal.aborted
         ? request.current.controller
         : new AbortController();
-    request.current = { key, controller };
-    setState((prior) =>
-      prior.key === key ? prior : { key, using: '', error: '' },
-    );
-    return () => controller.abort();
-  }, [key]);
+    request.current = { key, data, controller };
+    ++epoch.current;
+    setState({ key, data, using: '', error: '' });
+    return () => {
+      ++epoch.current;
+      controller.abort();
+    };
+  }, [key, data]);
   useEffect(() => {
     if (!props.active)
       setState((prior) =>
@@ -49,40 +49,46 @@ export function useWorkbenchFileFavorite(props: {
     if (!props.active || !props.viewerId) return;
     const controller =
         request.current?.key === key &&
+        request.current.data === data &&
         !request.current.controller.signal.aborted
           ? request.current.controller
           : new AbortController(),
       generation = ++epoch.current;
-    request.current = { key, controller };
-    setState({ key, using: objectId, error: '' });
+    request.current = { key, data, controller };
+    setState({ key, data, using: objectId, error: '' });
     try {
-      const result = resultSchema.parse(
-        await workbenchJson(
-          `/api/v1/workbench/files/${objectId}/favorite?workspaceId=${encodeURIComponent(props.workspaceId)}`,
-          { ...props.headers, 'X-AllRice-Expected-Viewer-Id': props.viewerId },
-          {
-            method: 'PUT',
-            body: JSON.stringify({ favorite }),
-            signal: controller.signal,
-          },
-        ),
+      const result = await data.favorite(
+        {
+          workspaceId: props.workspaceId,
+          objectId,
+          body: { favorite },
+        },
+        controller.signal,
       );
-      if (controller.signal.aborted || current.current !== key) return;
+      if (
+        controller.signal.aborted ||
+        current.current.key !== key ||
+        current.current.data !== data
+      )
+        return;
       if (
         result.viewerId !== props.viewerId ||
         result.objectId !== objectId ||
         result.favorite !== favorite
       )
         throw Error('操作未完成，请重试。');
-      if (generation === epoch.current) setState({ key, using: '', error: '' });
+      if (generation === epoch.current)
+        setState({ key, data, using: '', error: '' });
     } catch (cause) {
       if (
         !controller.signal.aborted &&
-        current.current === key &&
+        current.current.key === key &&
+        current.current.data === data &&
         generation === epoch.current
       )
         setState({
           key,
+          data,
           using: '',
           error:
             cause instanceof Error ? cause.message : '操作未完成，请重试。',
@@ -90,13 +96,17 @@ export function useWorkbenchFileFavorite(props: {
     } finally {
       // Hiding a retained panel does not cancel an accepted server write.
       // Re-read current metadata even when a newer local action owns busy/error.
-      if (!controller.signal.aborted && current.current === key)
+      if (
+        !controller.signal.aborted &&
+        current.current.key === key &&
+        current.current.data === data
+      )
         window.dispatchEvent(new Event('allrice:workbench-files-changed'));
     }
   }
   return {
-    using: state.key === key ? state.using : '',
-    error: state.key === key ? state.error : '',
+    using: state.key === key && state.data === data ? state.using : '',
+    error: state.key === key && state.data === data ? state.error : '',
     disabled: !props.viewerId || !props.active,
     setFavorite,
   };

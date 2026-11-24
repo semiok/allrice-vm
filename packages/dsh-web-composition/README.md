@@ -1,0 +1,356 @@
+# AllRice employee Web composition
+
+This DSH `0.2.1-rc.2` package supplies the M1-13 employee presentation and an
+independent `allrice-web` profile. It does not switch the active 3.x entry.
+The original runtime owners retain Host authority and rollout. MET282's product
+page/bootstrap scope is described below; it does not supply those authorities.
+
+M1-14 additionally exports `bindEmployeeSidebar(ctx, port)` from the native
+client module and `EmployeeClientNavigation` from `./employee-client`. The
+authenticated owner must provide the live employee/thread/archive projection
+and real create/details/navigation/settings commands. The independent cold
+profile disables native `ui-sidebar` (its Host entry is a no-op), so AllRice can
+be the first declarer of `sidebar.settings`. There is no fallback column before
+the real owner binds its port; this intermediate profile must not be activated
+as the employee entry until that owner is installed. No transport or SSO mount
+is installed by this package.
+
+The new sidebar reuses the existing AllRice Frame/View/settings button and
+the existing 0.1.1-derived `dsh-upstream` styles/Rows already in the repository;
+these are not new rc.2 source copies or private package CSS imports. The 3.x
+wrappers keep their existing SSE/subagent readers and settings page. The native
+bundle imports only the shared presentation. Automation opens the native
+`schedules` panel. The sidebar renders its authorized `sidebar.settings` child;
+native General keeps the only settings shell/store, modal and shortcut. The
+public launcher renderer supplies the same AllRice button without a second row
+wrapper, through Workflow's scope/unload guarded `renderLauncher` option. The 3.x
+`SidebarSettingsTrigger` retains its existing row and default behavior.
+
+The client artifact composes the Workflow settings contribution with
+`notifications: false` and exports `bindEmployeeSettings(ctx, port)`. Its
+authoritative port/options types are available through the type-only public
+`@allrice/dsh-web-composition/settings-types` export. This is a module-table
+plugin, not a directly imported ESM UI module. The authenticated owner supplies
+the real old account/computer/work/linked-app surfaces and existing preference
+reader/writer; no default or product fixture port exists. The original 3.x
+entry remains active and unchanged. The five installed settings browser cases
+are called by `settings-integration.browser.test.ts` using an explicitly synthetic
+business owner/account. That suite installs the real product and native Host,
+Renderer and SettingsRoot; it does not establish migration of the old 3.x business
+surfaces or production preferences. Browser execution remains pending.
+
+M1-15 also composes the four original AllRice panels through the native
+`conversation.session.header.actions` and `sidebar.right.pane.tab` registries.
+The module-table facade exports `bindEmployeePanels(ctx, port, resolveData?)`;
+`bindEmployeePanelsData` is the same guarded entry. Without a data resolver,
+materials/files receive explicit rejecting clients and never use legacy HTTP.
+The authenticated owner must supply the formal browser/BFF client; Host ports
+are not browser transports. Dispose the returned Cordis fork with that owner's
+lifetime. The separate historical test fixture explicitly opts into the legacy
+client for its existing 3.x server; standalone 3.x components remain compatible. Native
+Conversation and right-sidebar modules are explicit client dependencies. There
+is no default business owner, replacement Dock, or management-main fallback.
+Files use the existing owner-provided unread count; the other three badges keep
+their existing zero values. An unknown files count hides the entries.
+
+The session header shades only the native `agent-preset` display entry. Native
+preset selection/settings, permission services and execution modes remain owned
+by DSH. The final native subagent catalog stays at order 10, followed by the
+files/materials/memory/capabilities launchers at order 20. The fixed MET-278 child
+contribution is bundled once with the native React instance; both catalog open
+gestures use the same native read-only right-pane resource.
+
+The corner reuses the native sidebar expand component, store, locale and
+shortcut injection, routing its open gesture through public `openTab('guide')`.
+The native guide tab hosts the existing `WorkbenchStart` cards with the four
+employee descriptions. Card selection replaces that guide through its own
+native tab action; the native multi-tab strip, add, split, fullscreen and close
+controls retain their owners. At the existing employee mobile breakpoint
+(max-width: 760px), only the AllRice business-launcher container is hidden;
+the native title, subagent catalog and sidebar corner remain intact. Mobile
+uses the same four Start cards, while desktop launchers remain visible. Native
+title ellipsis and narrow/fullscreen pane behavior retain their owners.
+
+The employee profile disables both `ui-sidebar-terminal` and the separate Host
+`terminal-controller`, so interactive terminals are closed at the server as
+well as absent from Start. This does not disable Agent shell tools or change
+their permissions. There is no developer-role authority in this composition
+to re-enable the terminal service. Any future debug opt-in must use the
+authenticated owner's existing permission contract; a browser preference alone
+cannot grant it. This profile does not establish denial by the active 3.x
+workbench-terminal endpoints or the authenticated MET-271 Host.
+
+Panels props are derived from actual app `ComponentProps` in
+`src/employee-panels-port.ts`. That is a **monorepo source type boundary**, not a
+standalone packed DTO/SDK. The tarball exposes the runtime binder, and deliberately
+does not advertise a `panels-types` export whose app-source imports would be
+unresolvable outside this repository. The authenticated owner must supply the
+actual BFF/resource-version/reference/main bindings described in
+`docs/development/allrice-employee-panels.md` in the repository.
+
+`employee-panels.browser.test.ts` is a separately installed synthetic owner
+fixture for the real public binder and native registry/input/main. It compares
+real panel content against fixed rev2 source at 1440/390 in both themes and
+normal/empty/loading/denied/long-name states. The synthetic route responses and
+native input acceptance are not authenticated BFF/MCP, submit-time codec, model,
+or production business evidence. Browser execution and visual review remain
+pending; the settings teardown issue remains a separate blocking gate.
+
+The employee profile excludes the native manager UI packages for model,
+agent-loop, plugin inventory/management, shell, subagent, web search and supplier
+account settings. Three inserted `allrice-*-host` Loader entries use the package's
+public `./host/*` re-exports of the original models, account and plugin-manager
+Host plugins, with their native Config schemas and defaults. Native
+client-modules does not discover browser faces from package subpaths. The public
+`typert-loader.packages` option retains the probe's native Remote artifact. The
+other six settings UI packages have no-op Host entries. Native General/settings
+and execution/Host services remain. This does not revoke API permissions.
+
+The independent cold profile uses native defaults for these three Host entries.
+An owner using non-default values must configure the new Host entry ids; this
+package supplies no migration of disabled UI-entry configuration.
+
+The root owner must abort actual HTTP/WS/resources, release native session
+references and await Client/Cordis disposal before creating another key. The
+port deliberately supplies no URL, namespace shortcut, token or default route.
+`dispose()` preserves and rejects a recorded cleanup failure, including a late
+root returned after cancellation; repeated disposal does not retry destruction.
+Full module/ownership and recovery contracts are in
+[`allrice-employee-sidebar.md`](../../docs/development/allrice-employee-sidebar.md).
+
+The bundle disables Trajectory and both Open In plugins, selects Chinese,
+and initializes compact chat usage presentation. The client shades only the
+session-log-download header utility, permission/model selectors, and the two
+usage/activity dock pills. Host log export, model/permission services,
+accounting, account usage, and native subagent catalog tokens remain intact.
+Process folding, tool details, questions, documents, and the composer use the
+native implementation.
+
+The native General `performance-usage` setting can override the initial
+`compact` preference. M1-17 owns whether employees see that settings entry,
+following SETTINGS-MAP. The Usage/Cache dock cells stay shaded independently.
+
+The theme layer maps the existing AllRice secondary/tertiary text colors.
+Dark colors come from native static palette tokens; other aliases, font
+families, sizes, and the user's light/dark/system preference remain native.
+Removing the plugin disposes its slot contributions and theme layer.
+
+## Build and install
+
+From the repository root:
+
+```sh
+pnpm --filter @allrice/dsh-web-composition build
+pnpm --filter @allrice/dsh-web-composition pack --pack-destination /absolute/output
+```
+
+Create an independent `$DSH_HOME/profiles/allrice-web` directory and copy
+`profiles/allrice-web/package.json` into it. Install the resulting local tarball
+there with the profile's pinned pnpm 10.33.3:
+`pnpm add /absolute/output/allrice-dsh-web-composition-0.1.0.tgz`.
+The Host's same-generation DSH installation supplies the base and Web bundles.
+Launch that installation with `dsh --profile allrice-web --no-open`; the
+authentication/routing owner supplies its normal host arguments and identity.
+This package never creates a HOME, copies credentials, chooses a port, selects
+a session, or sends a model request.
+
+## Public contract and ownership
+
+Host exports `apply`; the browser artifact exposes Cordis `inject`/`apply`.
+The public `./host/plugin-manager`, `./host/settings-account` and
+`./host/settings-models` exports only re-export the corresponding native Host
+plugins. Their new Host-only entry ids are declared in `cordis.patch.yml`.
+Public assets are `./cordis.patch.yml`, `./profile`, and `./package.json`.
+There is no business service, MCP tool, database, event projection, admin route,
+or new permission configuration. Profile removal follows native composition;
+UI hiding does not revoke an API permission.
+
+## Verification
+
+`pnpm --filter @allrice/dsh-web-composition typecheck` and `lint` check the
+package sources. `pnpm exec vitest run packages/dsh-web-composition/tests/composition.test.ts`
+checks the public composition contract and disposal. The opt-in installed-profile
+browser suite uses `ALLRICE_RUN_BROWSER_INTEGRATION=1`; its self-contained
+histories are test data and are excluded from the packed product.
+
+`cold-profile.test.ts` uses the released public module loader, actual profile
+composition, Cordis/SlotRegistry and native General/schedule artifacts. It checks
+first child ownership, unique shell/shortcut, unload/rebuild and retained panel
+registration. It uses an explicit CSS-resource sink and the public Layout
+controller with a slot-contract fixture; it does not mount a Host, native DOM
+presenter, browser, authenticated business owner or real preference storage.
+`public-client.test.ts` checks the distributable type contract, built factory
+exports and preserved old settings row. Resource-approved installed/browser
+verification remains required.
+
+`settings-integration.browser.test.ts` is registered as a complete browser file
+in the existing CI collector. It calls all five Workflow cases, plus checks the
+unique real settings shell, native open-state feedback, public Cordis disposal
+and reapplication of the actual installed composition fiber, stale actions and
+binding stability when SettingsRoot recreates onboarding/shortcut owner props.
+The synthetic owner publishes native `settingsOpen` only when its value changes;
+disposing a launcher binding does not fabricate a close transition. A 1440/390
+light/dark screenshot case uses fixed time, DPR1 and reduced motion, writing to
+the retained evidence directory. These are test ports only, excluded from the
+packed product. They do not implement the missing authenticated business owner.
+
+```sh
+ALLRICE_RUN_BROWSER_INTEGRATION=1 pnpm exec node scripts/ci-integration-tests.mjs run -- --maxWorkers=1 packages/dsh-web-composition/tests/settings-integration.browser.test.ts
+```
+
+The suite owns one isolated credential-free Host and Chromium and cleans both
+up. Its generated Host token is used only for its real native login. It retains
+first-failure JSON/screenshots and never reads real credentials, sends a model
+request, mutates a real account or uses shared Dev/Prod.
+
+```sh
+ALLRICE_RUN_BROWSER_INTEGRATION=1 pnpm exec vitest run packages/dsh-web-composition/tests/installed-profile.browser.test.ts --maxWorkers=1
+```
+
+The browser suite builds and installs a real tarball into a disposable profile,
+uses native persistence to replay static histories, and checks native process
+disclosure, draft retention, an answered question record, and a delivered
+Markdown file's sidebar preview. It does not test question timing/admission,
+editing or authenticated product routing. It closes its browser/Host and removes
+its own temporary profile, including any native Web-generated token document.
+It never reads or copies credential files and makes no model request.
+
+The default Host comes from this package's locked DSH development dependency.
+`ALLRICE_DSH_WEB_HOST_ANCHOR` may explicitly point to an already installed
+same-generation Host's package.json; no local QA path is built in.
+`ALLRICE_BROWSER_EXECUTABLE` can select an existing Chromium executable, as in
+the repository's M5 runner. No browser is downloaded by this suite.
+`ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR` optionally selects the evidence parent.
+The sidebar suite otherwise uses a fresh directory under
+`os.tmpdir()/allrice-composition-evidence`, prints its absolute location, and
+retains it after browser/credential-root cleanup. It includes original failure
+screenshots/JSON, source identities and replay pages; it contains no Host tokens.
+
+`employee-sidebar.browser.test.ts` also compiles the actual 3.x `ChatSidebar`
+and imported AllRice app/UI/contracts sources from fixed base
+`d8f6ed3fa01bdd6e5d72e55702eb703e5e670d00` using `git show`. The baseline and
+native side share `tests/fixtures/sidebar-data.mjs`, time, dimensions and themes.
+It writes `legacy-base-entry.html`, hashed `legacy-base-sources.json`, and
+1440/390 light/dark preview/expanded images. Current shared-Frame images are
+supplementary container comparisons, never labeled pre-extraction baselines.
+Its synthetic sidebar owner binds `bindEmployeeSettings`, waits for the committed
+native launcher, clicks the real AllRice settings button, verifies and closes the
+native settings modal, then continues the existing sidebar command assertions.
+This is launcher integration coverage, not authenticated business migration.
+CI fetches only the exact base object if its shallow checkout lacks it and
+uploads the suite's evidence through the existing integration collector.
+Source-archive runners may instead set the test-only
+`ALLRICE_SIDEBAR_BASELINE_ARTIFACT_DIR` to this generator's prepared HTML/source
+manifest directory. The helper checks HTML/data hashes and all three pinned old
+entry hashes before copying the artifact; source preparation still supplies its
+recorded provenance. It fails on mismatch and never substitutes current UI.
+
+A controlled owner mode wires real sidebar clicks through the exported
+navigation class to actual isolated Cordis roots, native SessionReference
+retain/release, and a cancellable ReadableStream. It checks same-key reuse,
+employee/revision changes, late creation/UI and denied admission. This mode
+does not call native openSession: a real Web Client/HTTP/WS/multi-Host mount is
+still missing, and the evidence explicitly distinguishes those unbound parts.
+
+## Known gap
+
+The M1-14 entry is a **partial delivery**. Native drafts persist as
+`dsh.conversation.${sessionId}` in the current origin's localStorage. Same-origin
+roots with equal native IDs therefore share drafts; remountKey does not isolate
+that storage. A real create owner still needs an authenticated, verifiable
+storage-context/official namespace solution. A caller-supplied namespace string
+is not sufficient. No new domain or authentication bypass is selected here.
+Different-origin synthetic Host tests are not approval of production routing.
+
+Native draft attachments belong to a retained Session input scope. Native
+navigation releases the old main-view reference; with no other owner, the last
+release disposes that scope and its attachments even within the same Host.
+The browser coverage keeps the positive attachment assertion under an explicit
+test-owned native reference and also checks loss after final release; it does
+not supply the missing production owner or finish the attachment-retention
+requirement. Reading anchors live in a ui-chat root-local Map. Same-root
+restoration has browser coverage written;
+cross-root attachment restoration has no public re-admission port. A legitimate
+owner holding full `ChatViewSlotProps` can wrap its public `chatScroll` read/save
+with trusted person/employee/profile/session/remount scope and canonical native
+`ChatScrollPosition`; that thin UI adapter is publicly expressible but not yet
+bound or tested here. No DOM sampling, copied ChatView or ledger mutation is
+used. Absence of a standalone decorator does not prove this adaptation impossible.
+Old upload
+receipts are never copied across employee revision/binding changes. The new
+browser suite records these boundaries but has not yet been run for this
+candidate; it is not evidence of formal SSO or complete employee migration.
+
+The build uses the fixed rc.2 Web shell's public module-table baseline for
+`@deepseek-ai/dsh-client-ui-primitives` and `zod`, as native chat/conversation do.
+It does not inline another Shiki/KaTeX/font copy. With the real four panels, the
+client artifact is about 1.30 MB uncompressed (450 KB sidebar JS + 61 KB CSS,
+8.6 KB settings JS + 0.5 KB CSS, and 711 KB panels JS + 62 KB CSS, plus wrapper).
+`dist/build-stats.json` records exact current sizes; build guards
+reject accidental markdown/font inputs. The earlier 6.24 MB candidate duplicated
+these shared modules. Startup/transfer impact remains unmeasured, and native
+chatting/menus/theme regression still awaits the resource-approved browser run.
+No private atom import, hash-named shell asset import, upstream patch or extra
+asset route is used. A future shell must retain these baseline public modules.
+
+The native ContextMeter has no independent slot or visibility configuration.
+`conversation.input.activity` hides it only by entering an expanded activity,
+which also hides the native + command/attachment control and other accessories.
+This package keeps the meter and those interactions. An independent upstream
+ContextMeter slot/config is required to finish hiding employee chat usage.
+No private CSS, fake projection/activity state, or composer takeover is used.
+
+## Formal panel HTTP owner binding (MET-282)
+
+The installed client now exports `bindEmployeePanelsHttp(ctx, panelsPort,
+resolve, { fetch? })`. It installs the existing guarded binder with the formal
+`createEmployeePanelsHttpResolver`; its HTTP lifetime follows the Cordis owner.
+`resolve(nativeSessionId, snapshot)` must come from the real authenticated owner
+and current catalog and return `{ selection, viewerId }` or `null`. Selection is
+`{ workspaceId, employeeInstanceId, threadId? }`; a native Session address and
+old panel headers never supply this mapping. Missing selection remains unbound,
+with no HTTP request or legacy fallback. The original default binder still
+requires an explicit resolver and is fail closed.
+
+The same client exports the formal `readEmployeePanelsWriteReceipt` and
+`EmployeePanelsWriteUnknownError` unchanged. Keep the original operation,
+requestId, input and action sourceId after an uncertain write. A qualified owner
+may read that exact receipt with its current selection and lifetime signal;
+this is GET only and never replays a write or replaces its key. Unknown is not
+proof of no commit, and recorded/ready=false is not completed bytes. The helper
+is an owner seam, not a new automatic UI retry policy.
+
+The imported BFF source is `4ab89126b1306936787df031aab9e1e7087538ed`. These
+exports do not install a production authenticated owner/catalog, enable the
+default-off rollout, or establish Cookie/storage acceptance. Native independent
+intake is still unbound: ordinary `uploadDeliverable` returns an objectId, never
+a native Attachment or file-upload receipt. No new upload UI or producer is
+introduced here; the approved panels, native slots and toolbar stay unchanged.
+
+## Product bootstrap: first slice
+
+The real `/chatflow/4.0` page owns one same-origin native document. Its document
+handler reuses the original Request/Cookie authentication and strict selection
+schema. This baseline lacks the formal history identity and the F1/F2 runtime
+carrier. It therefore returns canonical 401/400/503 JSON with private/no-store
+and never emits executable HTML. Neither query input nor headers can install a
+fixture owner. The existing `/chatflow` and default-off policy are unchanged;
+ordinary management does not request execute, native-owner or VM prewarm.
+
+`pnpm --filter @allrice/dsh-web-composition build:web-entry /absolute/fresh-directory`
+builds the contribution from this checkout, inventories the official public
+frontend dist, compiles the public AppWebEntry kernel, and collects the real
+profile's graph/bundles in a disposable credential-free loopback Host using the
+released profile launcher. The output directory must be fresh so a failed build
+cannot mix new bytes with an old manifest. Build Host access/preferences are
+excluded from the release data. Artifact success is code inventory, not a
+production principal, graph/events authority, cold scope or application-ready
+receipt. All these runtime sources remain explicitly null.
+
+The kernel's UI lifetime owns one run promise and records its public onFailure
+result. Close cancels/settles its readiness, joins injection/startup and actual
+caller cleanup, then awaits public dispose. Failed cleanup remains unknown;
+there is no timeout-as-closed or automatic retry. The real document does not load
+this kernel until the original runtime producers exist. Cross-frame navigation,
+real product-owner installation and positive browser acceptance remain later
+integration work. No private browser Context is read or passed across frames.

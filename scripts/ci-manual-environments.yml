@@ -78,6 +78,14 @@ files:
     - apps/worker/test/project-runtime.integration.test.ts
     - packages/browser-control/src/local-preview.integration.test.ts
   browser:
+    - packages/dsh-web-composition/tests/installed-profile.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-sidebar.browser.test.ts
+    - packages/dsh-web-composition/tests/settings-integration.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-causal-probe.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-reference-origin.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-native-placement.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-topbar.browser.test.ts
     - apps/web/app/chatflow/brand-media.browser.test.ts
     - apps/web/app/chatflow/brand-content-panel.test.tsx
     - scripts/test-proxy.browser.test.mjs

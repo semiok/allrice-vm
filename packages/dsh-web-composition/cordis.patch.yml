@@ -1,0 +1,57 @@
+- insert:
+    - id: allrice-web-composition
+      name: '@allrice/dsh-web-composition'
+    - id: allrice-settings-models-host
+      name: '@allrice/dsh-web-composition/host/settings-models'
+    - id: allrice-settings-account-host
+      name: '@allrice/dsh-web-composition/host/settings-account'
+    - id: allrice-plugin-manager-host
+      name: '@allrice/dsh-web-composition/host/plugin-manager'
+# Its Host entry is a no-op. The AllRice column is the cold-profile child owner;
+# native settings-general continues to own the actual settings shell.
+- id: ui-sidebar
+  disabled: true
+# Interactive user terminals are a separate Host API from Agent shell tools.
+# The employee profile has no developer-role authority to re-enable this API.
+- id: terminal-controller
+  disabled: true
+- id: ui-sidebar-terminal
+  disabled: true
+# Employee settings retain native General and all execution/Host services.
+# The inserted Host-only entries reuse native Config defaults and behavior;
+# native client-modules skips package subpaths. Retain the probe's Typert face.
+- id: typert-loader
+  config:
+    packages:
+      - '@deepseek-ai/dsh-client-ui-plugin-manager'
+- id: ui-settings-models
+  disabled: true
+# These six disabled settings UI entries have native no-op Host halves.
+- id: ui-settings-agent-loop
+  disabled: true
+- id: ui-settings-plugins
+  disabled: true
+- id: ui-settings-plugin-inventory
+  disabled: true
+- id: ui-settings-shell
+  disabled: true
+- id: ui-settings-subagent
+  disabled: true
+- id: ui-settings-web-search
+  disabled: true
+- id: ui-settings-account
+  disabled: true
+- id: ui-plugin-manager
+  disabled: true
+- id: ui-trajectory
+  disabled: true
+- id: open-in-app
+  disabled: true
+- id: ui-open-in-app
+  disabled: true
+- id: locale
+  config:
+    preference: zh
+- id: ui-chat
+  config:
+    performanceUsage: compact
