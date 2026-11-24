@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import type { Browser } from 'playwright-core';
+import type { Browser, Response as BrowserResponse } from 'playwright-core';
 import { randomUUID, createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
@@ -793,6 +793,56 @@ suite(
             ),
           ).toMatchObject({ status: 'recorded', ready: false });
           expect(referenceWrites).toBe(0);
+
+          await material
+            .getByRole('button', { name: '取消', exact: true })
+            .click();
+          await material.waitFor({ state: 'hidden' });
+          const pendingPublication = page.getByRole('button', {
+            name: '核对原发布 ' + pendingId,
+            exact: true,
+          });
+          await pendingPublication.waitFor();
+          const receiptRequest = (response: BrowserResponse) =>
+            response.request().method() === 'GET' &&
+            new URL(response.url()).pathname.endsWith(
+              '/write-receipts/' + pendingId,
+            );
+          const readsBeforeUnknown = receiptReads.length;
+          const [unknown] = await Promise.all([
+            page.waitForResponse(receiptRequest),
+            pendingPublication.click(),
+          ]);
+          expect(unknown.status()).toBe(200);
+          expect(await unknown.json()).toMatchObject({
+            requestId: pendingId,
+            status: 'recorded',
+            ready: false,
+          });
+          await page
+            .getByRole('status')
+            .filter({ hasText: '发布结果待核，请按原请求核对。' })
+            .waitFor();
+          expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
+
+          await authorizeFixturePlatformAdministrator(f.db, p.context.actor.id);
+          await updateDEntryReleasePolicy(p.context, {
+            revision: 'fixture-browser-receipt-withdrawal',
+            defaultGeneration: '3.x',
+            selections: [],
+          });
+          const readsBeforeDenial = receiptReads.length;
+          const [denied] = await Promise.all([
+            page.waitForResponse(receiptRequest),
+            pendingPublication.click(),
+          ]);
+          expect(denied.status()).toBe(403);
+          await pendingPublication.waitFor({ state: 'detached', timeout: 5000 });
+          expect(await page.getByText(pendingId, { exact: false }).count()).toBe(
+            0,
+          );
+          expect(receiptReads.slice(readsBeforeDenial)).toEqual([pendingId]);
+          expect(publishWrites).toHaveLength(3);
           await context.close();
         } finally {
           await browser?.close();
