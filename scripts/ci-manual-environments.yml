@@ -44,6 +44,7 @@ files:
     - apps/worker/src/native-web/composition.test.ts
     - packages/person-vm/src/native-web-auth.test.ts
     - apps/worker/src/native-web/owner.test.ts
+    - apps/worker/src/native-web/owner.sealed-profile.integration.test.ts
     - apps/worker/src/native-web/transport.test.ts
     - apps/web/server/native-subagent-follow.test.mjs
     - apps/worker/dsh/allrice-native-accounting.test.mjs

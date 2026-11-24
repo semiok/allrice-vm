@@ -16,6 +16,7 @@ import {
 import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve } from 'node:path';
 import process from 'node:process';
+import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { promisify } from 'node:util';
 import { build } from 'esbuild';
@@ -25,6 +26,20 @@ const packageRoot = fileURLToPath(new URL('./', import.meta.url));
 const workspace = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(import.meta.url);
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const guestInputs = [
+  'profiles/allrice-web/package.json',
+  'package.json',
+  'cordis.patch.yml',
+  'index.mjs',
+  'host/settings-models.mjs',
+  'host/settings-account.mjs',
+  'host/plugin-manager.mjs',
+];
+const diagnostics = [
+  'kernel-inputs.json',
+  'profile-startup.log',
+  'profile-code.json',
+];
 
 /** @type {import('esbuild').BuildOptions} */
 export const employeeWebKernelOptions = {
@@ -283,15 +298,7 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     files.push({ path: output, bytes: bytes.length, sha256: sha256(bytes) });
   }
   await emit('allrice/client.js', compiled);
-  for (const pathname of [
-    'profiles/allrice-web/package.json',
-    'package.json',
-    'cordis.patch.yml',
-    'index.mjs',
-    'host/settings-models.mjs',
-    'host/settings-account.mjs',
-    'host/plugin-manager.mjs',
-  ])
+  for (const pathname of guestInputs)
     await emit(
       'guest/' + pathname,
       await readFile(join(packageRoot, pathname)),
@@ -392,6 +399,12 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
     },
     nativeRelease: { name: native.name, version: native.version },
     files,
+    diagnostics: await Promise.all(
+      diagnostics.map(async (path) => {
+        const bytes = await readFile(join(outputDirectory, path));
+        return { path, bytes: bytes.length, sha256: sha256(bytes) };
+      }),
+    ),
     // Full-profile bundle graph and the managed entry are separate proof items.
     profile,
     managedEntry: 'managed/employee-web-entry.js',
@@ -419,15 +432,18 @@ export async function buildEmployeeWebArtifact(outputDirectory) {
 /** The Worker release seal inventories real files under dist. A sealed
  * release directory must never be overwritten after it is available. */
 export async function prepareEmployeeWebServiceArtifact(directory, head) {
+  let current;
   try {
-    const existing = JSON.parse(
-      await readFile(join(directory, 'artifact.json'), 'utf8'),
-    );
-    if (existing.source?.head !== head || existing.source.dirty)
-      throw Error('Employee Web artifact belongs to another source');
-    return existing;
+    current = await readFile(join(directory, 'artifact.json'), 'utf8');
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
+  }
+  if (current !== undefined) {
+    const existing = JSON.parse(current);
+    if (existing.source?.head !== head || existing.source.dirty !== false)
+      throw Error('Employee Web artifact belongs to another source');
+    await verifyEmployeeWebArtifact(directory, existing);
+    return existing;
   }
   const stage = await mkdtemp(join(dirname(directory), '.employee-web-'));
   try {
@@ -439,6 +455,98 @@ export async function prepareEmployeeWebServiceArtifact(directory, head) {
     return manifest;
   } finally {
     await rm(stage, { recursive: true, force: true });
+  }
+}
+
+async function verifyEmployeeWebArtifact(directory, artifact) {
+  const native = await publicNativeFiles();
+  if (
+    artifact.format !== 1 ||
+    artifact.status !== 'code-artifacts-only' ||
+    !isDeepStrictEqual(artifact.nativeRelease, {
+      name: native.name,
+      version: native.version,
+    }) ||
+    !Array.isArray(artifact.files) ||
+    artifact.managedEntry !== 'managed/employee-web-entry.js' ||
+    artifact.profile?.sourceBuiltClient !== true ||
+    !isDeepStrictEqual(
+      artifact.diagnostics?.map(({ path }) => path),
+      diagnostics,
+    )
+  )
+    throw Error('Employee Web artifact manifest is incomplete');
+  const fingerprints = new Map();
+  for (const row of [...artifact.files, ...artifact.diagnostics]) {
+    if (
+      typeof row.path !== 'string' ||
+      !/^[A-Za-z0-9._+/-]+$/.test(row.path) ||
+      row.path
+        .split('/')
+        .some((part) => !part || part === '.' || part === '..') ||
+      !Number.isInteger(row.bytes) ||
+      row.bytes < 0 ||
+      !/^[0-9a-f]{64}$/.test(row.sha256) ||
+      fingerprints.has(row.path)
+    )
+      throw Error('Invalid Employee Web artifact fingerprint');
+    fingerprints.set(row.path, {
+      path: row.path,
+      bytes: row.bytes,
+      sha256: row.sha256,
+    });
+  }
+  const profile = artifact.profile;
+  const references = new Map(
+    profile.files.map((file) => [file.reference, file]),
+  );
+  if (references.size !== profile.files.length)
+    throw Error('Duplicate Employee Web profile references');
+  for (const { url } of [...profile.graph.entries, ...profile.graph.batches])
+    if (!references.has(url))
+      throw Error('Employee Web artifact profile is incomplete');
+  for (const name of [
+    ...guestInputs.map((path) => 'guest/' + path),
+    ...native.files.map(({ output }) => output),
+    'allrice/client.js',
+    'managed/employee-web-entry.js',
+    'managed/employee-web-entry.css',
+    ...profile.files.map(({ path, bytes, sha256: digest }) => {
+      if (
+        !isDeepStrictEqual(fingerprints.get(path), {
+          path,
+          bytes,
+          sha256: digest,
+        })
+      )
+        throw Error('Employee Web asset fingerprint differs from its profile');
+      return path;
+    }),
+  ])
+    if (!fingerprints.has(name))
+      throw Error('Missing Employee Web artifact file: ' + name);
+  const observed = new Set();
+  async function visit(path = '') {
+    for (const entry of await readdir(join(directory, path), {
+      withFileTypes: true,
+    })) {
+      const child = path ? path + '/' + entry.name : entry.name;
+      if (entry.isDirectory()) await visit(child);
+      else if (
+        !entry.isFile() ||
+        (child !== 'artifact.json' && !fingerprints.has(child))
+      )
+        throw Error('Unexpected Employee Web artifact file: ' + child);
+      else observed.add(child);
+    }
+  }
+  await visit();
+  for (const [path, proof] of fingerprints) {
+    if (!observed.has(path))
+      throw Error('Missing Employee Web artifact file: ' + path);
+    const bytes = await readFile(join(directory, path));
+    if (bytes.length !== proof.bytes || sha256(bytes) !== proof.sha256)
+      throw Error('Employee Web artifact bytes changed: ' + path);
   }
 }
 

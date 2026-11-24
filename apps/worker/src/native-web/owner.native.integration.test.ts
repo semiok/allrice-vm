@@ -1,22 +1,9 @@
-import { execFileSync, spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import {
-  access,
-  mkdir,
-  mkdtemp,
-  readFile,
-  rm,
-  writeFile,
-} from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { createServer } from 'node:net';
-import { dirname, join, resolve } from 'node:path';
+import { rm } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
-import {
-  DEntryProfileGraphSchema,
-  type RequestContext,
-} from '@allrice/contracts';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
@@ -25,24 +12,12 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
 import {
-  holdReleasedProfile,
-  readReleasedGuestProfile,
-} from '../d-entry/released-profile.js';
-import {
   PersonVmError,
-  nativeWebAuthArtifact,
   type PersonVmBootstrapScope,
   type PersonVmManagedJob,
-  type PersonVmPort,
 } from '@allrice/person-vm';
-import {
-  NATIVE_WEB_AUTH_READER,
-  parseNativeWebAuth,
-} from '../../../../packages/person-vm/src/native-web-auth.ts';
-import { runCommand } from '../../../../packages/person-vm/src/process.ts';
-import { prepareNativeWebLaunch } from './launch.js';
-import { openNativeWebOwner } from './owner.js';
 import * as NativeTransport from './transport.js';
+import { setupNativeWebFixture } from './owner.native.fixture.js';
 
 // Actual published rc.2 entry, not a fixture protocol server. Its complete
 // compatible-OS package tree must be provisioned separately and recorded.
@@ -70,286 +45,14 @@ afterEach(async () => {
   const failure = joined.find((result) => result.status === 'rejected');
   if (failure?.status === 'rejected') throw failure.reason;
 });
-async function setup(
+function setup(
   prepareScope?: (
     scope: PersonVmBootstrapScope,
     lifetime: AbortController,
   ) => void,
-  installedCli = cli,
 ) {
-  if (!installedCli) throw Error('The exact rc.2 CLI is required');
-  expect(
-    createHash('sha256')
-      .update(await readFile(installedCli))
-      .digest('hex'),
-  ).toBe('80112efe368efb1a39720c7ada0af00442e5131fb2744edaaff8a3e8bb499e6f');
-  const pkg = JSON.parse(
-    await readFile(resolve(dirname(installedCli), '../package.json'), 'utf8'),
-  );
-  expect(pkg).toMatchObject({
-    name: '@deepseek-ai/dsh',
-    version: '0.2.1-rc.2',
-  });
-  const root = await mkdtemp('/tmp/ar-native-web-');
-  roots.push(root);
-  const release = join(root, 'sealed-worker-profile');
-  const producer = await import(
-    new URL(
-      '../../../../packages/dsh-web-composition/build-web-entry.mjs',
-      import.meta.url,
-    ).href
-  );
-  const head = execFileSync('git', ['rev-parse', 'HEAD'], {
-    encoding: 'utf8',
-  }).trim();
-  await producer.prepareEmployeeWebServiceArtifact(release, head);
-  const artifact = await readFile(join(release, 'artifact.json'));
-  const seal = Object.freeze({
-    directory: release,
-    manifestSha256: createHash('sha256').update(artifact).digest('hex'),
-  });
-  const releaseSignal = new AbortController().signal;
-  const profile = await readReleasedGuestProfile(seal, releaseSignal);
-  const dshHome = join(root, 'dsh');
-  await expect(access(dshHome)).rejects.toMatchObject({ code: 'ENOENT' });
-  const server = createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((done) => server.close(() => done()));
-  const binding = {
-    vmId: randomUUID(),
-    instanceId: randomUUID(),
-    personId: randomUUID(),
-    organizationId: randomUUID(),
-    leaseEpoch: 1,
-  };
-  // Test-owned endpoint facts; no production roster or authority is manufactured.
-  const principalProfile = {
-    workspaceId: randomUUID(),
-    employeeInstanceId: randomUUID(),
-    employeeRevision: 1,
-    employeeVersionId: randomUUID(),
-  };
-  const launch = await prepareNativeWebLaunch(
-    {
-      origin: `http://127.0.0.1:${port}/`,
-      publicUrl: `http://127.0.0.1:${port}/`,
-      guestAddress: '127.0.0.1',
-      guestPort: port,
-      dshHome,
-      agentsHome: join(root, 'agents'),
-      workdir: root,
-      cliPath: installedCli,
-      startupTimeoutMs: 10000,
-      principalProfile,
-    },
-    binding,
-    profile,
-  );
-  for (const file of launch.files) {
-    await mkdir(dirname(file.path), { recursive: true });
-    await writeFile(file.path, file.contents, { mode: file.mode });
-  }
-  const startup = new AbortController(),
-    lifetime = new AbortController();
-  let kills = 0,
-    waitSignal: AbortSignal | undefined,
-    job!: PersonVmManagedJob,
-    exited!: Promise<{ exitCode: number; timedOut: boolean }>,
-    child!: ReturnType<typeof spawn>;
-  const scope: PersonVmBootstrapScope = {
-    binding,
-    signal: startup.signal,
-    assertCurrent: async () => {
-      if (startup.signal.aborted) throw new PersonVmError('LEASE_LOST');
-    },
-    async launch(command) {
-      child = spawn(process.execPath, [...command.args], {
-        cwd: root,
-        env: {
-          PATH: dirname(process.execPath),
-          HOME: root,
-          ...command.env,
-          DO_NOT_TRACK: '1',
-          NPM_CONFIG_OFFLINE: 'true',
-        },
-        stdio: 'ignore',
-      });
-      exited = new Promise<{ exitCode: number; timedOut: boolean }>(
-        (done, reject) => {
-          child.once('error', reject);
-          child.once('close', (code) =>
-            done({ exitCode: code ?? 137, timedOut: false }),
-          );
-        },
-      );
-      async function wait(signal: AbortSignal) {
-        waitSignal ??= signal; // Observe the public managed wait's actual abort.
-        signal.throwIfAborted();
-        let abort!: () => void;
-        try {
-          return await Promise.race([
-            exited,
-            new Promise<never>((_, reject) => {
-              abort = () => reject(signal.reason);
-              signal.addEventListener('abort', abort, { once: true });
-            }),
-          ]);
-        } finally {
-          signal.removeEventListener('abort', abort);
-        }
-      }
-      job = {
-        binding,
-        jobId: randomUUID(),
-        wait,
-        cancelAndWait: async (signal) => {
-          kills++;
-          child.kill('SIGKILL');
-          return wait(signal);
-        },
-      };
-      cleanup.push(async () => {
-        child.kill('SIGKILL');
-        await exited;
-      });
-      return job;
-    },
-    async readNativeWebAuth(request) {
-      const file = nativeWebAuthArtifact(request);
-      const text = await runCommand({
-        executable: process.execPath,
-        args: ['-e', NATIVE_WEB_AUTH_READER, file.path, String(file.maxBytes)],
-        env: { PATH: dirname(process.execPath), HOME: root },
-        signal: AbortSignal.any([
-          startup.signal,
-          AbortSignal.timeout(request.timeoutMs),
-        ]),
-      });
-      return parseNativeWebAuth(text, request);
-    },
-  };
-  const context: RequestContext = {
-    requestId: randomUUID(),
-    sessionId: randomUUID(),
-    actor: { type: 'user', id: binding.personId },
-    organizationId: binding.organizationId,
-    workspaceId: principalProfile.workspaceId,
-    memberships: [],
-    authenticatedAt: new Date().toISOString(),
-  };
-  const current = vi.fn<PersonVmPort['assertCurrentBinding']>(async () => {});
-  prepareScope?.(scope, lifetime);
-  const owner = await openNativeWebOwner({
-    scope,
-    launch,
-    context,
-    vm: { assertCurrentBinding: current },
-    lifetime: lifetime.signal,
-    cleanupTimeoutMs: 5000,
-  });
-  let expectedCloseFailure: unknown;
-  cleanup.push(async () => {
-    if (expectedCloseFailure === undefined) await owner.close();
-    else await expect(owner.close()).rejects.toBe(expectedCloseFailure);
-  });
-  return {
-    owner,
-    seal,
-    launch,
-    expectCloseFailure(error: unknown) {
-      expectedCloseFailure = error;
-    },
-    principalProfile,
-    startup,
-    lifetime,
-    child,
-    current,
-    context,
-    exited,
-    job,
-    waitSignal: () => waitSignal!,
-    kills: () => kills,
-  };
+  return setupNativeWebFixture(cli, roots, cleanup, prepareScope);
 }
-
-it(
-  'boots the Worker-sealed AllRice web profile in an initially absent employee DSH_HOME',
-  {
-    timeout: 30_000,
-  },
-  async () => {
-    const install = createRequire(
-      new URL(
-        '../../../../packages/dsh-web-composition/package.json',
-        import.meta.url,
-      ),
-    );
-    const installed = dirname(install.resolve('@deepseek-ai/dsh/package.json'));
-    const f = await setup(undefined, join(installed, 'lib/bin.js'));
-    const active = new AbortController().signal;
-    expect(f.launch.command.args.slice(1, 3)).toEqual([
-      '--profile',
-      'allrice-web',
-    ]);
-    expect(f.owner.controlReady()).toBe(true);
-    const built = JSON.parse(
-      await readFile(join(f.seal.directory, 'artifact.json'), 'utf8'),
-    );
-    const expected = DEntryProfileGraphSchema.parse(built.profile.graph);
-    const native = DEntryProfileGraphSchema.parse(
-      await f.owner.readImmutableGraphFor(f.context, active),
-    );
-    const ids = native.entries.map(({ id }) => id);
-    const sealedIds = expected.entries.map(({ id }) => id);
-    expect({
-      missing: sealedIds.filter((id) => !ids.includes(id)),
-      extra: ids.filter((id) => !sealedIds.includes(id)),
-      release: native.release,
-    }).toEqual({ missing: [], extra: [], release: expected.release });
-    const proof = await holdReleasedProfile(
-      f.seal.directory,
-      {
-        revoked: f.owner.revoked,
-        readImmutableGraph: (signal) =>
-          f.owner.readImmutableGraphFor(f.context, signal),
-        readImmutableBundle: (reference, bytes, signal) =>
-          f.owner.readImmutableBundleFor(f.context, reference, bytes, signal),
-      },
-      active,
-      f.seal.manifestSha256,
-    );
-    expect(
-      proof.graph.entries.some(
-        ({ id }) => id === '@allrice/dsh-web-composition',
-      ),
-    ).toBe(true);
-    expect(
-      proof.graph.entries.some(
-        ({ id }) => id === '@deepseek-ai/dsh-client-hmr',
-      ),
-    ).toBe(false);
-    expect(proof.graph).toEqual(native);
-    const guestManifest = f.launch.files.find(({ path }) =>
-      path.endsWith('/profiles/allrice-web/package.json'),
-    );
-    expect(JSON.parse(guestManifest!.contents).dsh.profile.bundles).toEqual([
-      '@deepseek-ai/dsh-base',
-      '@deepseek-ai/dsh-web-app',
-      '@allrice/dsh-web-composition',
-    ]);
-    await writeFile(
-      join(f.seal.directory, 'guest/cordis.patch.yml'),
-      '#tampered\n',
-    );
-    await expect(readReleasedGuestProfile(f.seal, active)).rejects.toThrow(
-      'D entry native owner is not bound',
-    );
-    await f.owner.close();
-    expect(f.kills()).toBe(1);
-  },
-);
 
 it.skipIf(!cli)(
   '真实rc.2产物交换API Cookie→认证list/control baseline；scope结束不杀长期job，close实际join',

@@ -2,6 +2,7 @@ import {
   request,
   Agent,
   type ClientRequest,
+  type IncomingHttpHeaders,
   type IncomingMessage,
 } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -11,6 +12,8 @@ import type {
   RpcFetch,
 } from '@deepseek-ai/dsh-client-connection/client';
 import { PersonVmError } from '@allrice/person-vm';
+
+export const nativeIndexByteLimit = 1024 * 1024;
 
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(
@@ -172,21 +175,26 @@ export function nativeWebTransport(
       }
     });
   const fetch: RpcFetch = (input, init) => requestResponse(input, init, 'api');
-  /** Profile attestation already holds the sealed length. Limit the actual
-   * response stream and keep ownership through physical cancellation. */
-  async function readExact(
+  /** Each finite proof reads only its own bounded response and keeps
+   * ownership through physical shutdown. */
+  async function readOwned(
     input: URL,
-    bytes: number,
     caller: AbortSignal,
-  ): Promise<Uint8Array> {
+    bounds: {
+      maxBytes: number;
+      exact?: number;
+      credential: 'none' | 'index';
+      accepts(response: IncomingMessage): boolean;
+    },
+  ): Promise<{ data: Buffer; headers: IncomingHttpHeaders }> {
     const active = AbortSignal.any([signal, caller]);
     active.throwIfAborted();
-    if (!Number.isSafeInteger(bytes) || bytes < 1)
-      throw new PersonVmError('PROVIDER_FAILED');
-    const data = Buffer.allocUnsafe(bytes);
+    const fixed =
+      bounds.exact === undefined ? undefined : Buffer.allocUnsafe(bounds.exact);
+    const chunks: Buffer[] = [];
     return new Promise((resolve, reject) => {
       let received = 0;
-      let complete = false;
+      let complete: IncomingHttpHeaders | undefined;
       let failure: { reason: unknown } | undefined;
       let physicalClose: Promise<void> | undefined;
       // This agent owns exactly this request, even when the request dies
@@ -211,10 +219,12 @@ export function nativeWebTransport(
           response.once('error', fail);
           const declared = response.headers['content-length'];
           if (
-            response.statusCode !== 200 ||
+            !bounds.accepts(response) ||
             (declared !== undefined &&
               /^\d+$/.test(declared) &&
-              BigInt(declared) !== BigInt(bytes))
+              (bounds.exact === undefined
+                ? BigInt(declared) > BigInt(bounds.maxBytes)
+                : BigInt(declared) !== BigInt(bounds.exact)))
           ) {
             fail();
             response.destroy();
@@ -222,33 +232,57 @@ export function nativeWebTransport(
           }
           response.on('data', (chunk: Buffer) => {
             if (failure) return;
-            if (chunk.length > data.length - received) {
+            if (chunk.length > bounds.maxBytes - received) {
               fail();
               response.destroy();
               return;
             }
-            received += chunk.copy(data, received);
+            if (fixed) chunk.copy(fixed, received);
+            else chunks.push(chunk);
+            received += chunk.length;
           });
           response.once('end', () => {
-            complete = received === data.length;
-            if (!complete) fail();
+            if (bounds.exact !== undefined && received !== bounds.exact) fail();
+            else complete = response.headers;
           });
         },
         connection,
-        'none',
+        bounds.credential,
       );
       call.on('error', fail);
       call.once('close', () => {
         void (async () => {
           await physicalClose;
           connection.destroy();
-          if (!complete || active.aborted) fail();
+          if (active.aborted) fail();
           if (failure) reject(failure.reason);
-          else resolve(data);
+          else if (!complete) reject(new PersonVmError('PROVIDER_FAILED'));
+          else
+            resolve({
+              data: fixed ?? Buffer.concat(chunks, received),
+              headers: complete,
+            });
         })();
       });
       send();
     });
+  }
+  async function readExact(
+    input: URL,
+    bytes: number,
+    caller: AbortSignal,
+  ): Promise<Uint8Array> {
+    AbortSignal.any([signal, caller]).throwIfAborted();
+    if (!Number.isSafeInteger(bytes) || bytes < 1)
+      throw new PersonVmError('PROVIDER_FAILED');
+    return (
+      await readOwned(input, caller, {
+        maxBytes: bytes,
+        exact: bytes,
+        credential: 'none',
+        accepts: ({ statusCode }) => statusCode === 200,
+      })
+    ).data;
   }
   return {
     fetch,
@@ -270,27 +304,27 @@ export function nativeWebTransport(
     async authenticateIndex(authenticatedUrl: string) {
       const url = target(authenticatedUrl);
       if (url.pathname !== '/') throw new PersonVmError('PROVIDER_FAILED');
-      const response = await requestResponse(
-        url,
-        { method: 'GET', redirect: 'manual' },
-        'none',
-      );
-      const values = response.headers.getSetCookie();
-      if (
-        response.status !== 303 ||
-        response.headers.get('location') !== './' ||
-        values.length !== 1
-      )
-        throw new PersonVmError('PROVIDER_FAILED');
-      indexCookie = values[0]!.split(';', 1)[0]!;
+      const response = await readOwned(url, signal, {
+        maxBytes: 4096,
+        credential: 'none',
+        accepts: ({ statusCode, headers }) =>
+          statusCode === 303 &&
+          headers.location === './' &&
+          headers['set-cookie']?.length === 1,
+      });
+      indexCookie = response.headers['set-cookie']![0]!.split(';', 1)[0]!;
     },
-    readIndex(signal: AbortSignal) {
+    async readIndex(signal: AbortSignal) {
       if (!indexCookie) throw new PersonVmError('PROVIDER_FAILED');
-      return requestResponse(
-        new URL('/', origin),
-        { method: 'GET', redirect: 'error', signal },
-        'index',
-      );
+      const { data } = await readOwned(new URL('/', origin), signal, {
+        maxBytes: nativeIndexByteLimit,
+        credential: 'index',
+        accepts: ({ statusCode, headers }) =>
+          statusCode === 200 &&
+          headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() ===
+            'text/html',
+      });
+      return data.toString('utf8');
     },
     createWebSocket(input: string): ConnectionWebSocket {
       const url = new URL(input);

@@ -5,7 +5,7 @@ import type { Duplex } from 'node:stream';
 import type { Socket } from 'node:net';
 import WebSocket from 'ws';
 import { afterEach, expect, it, vi } from 'vitest';
-import { nativeWebTransport } from './transport.js';
+import { nativeIndexByteLimit, nativeWebTransport } from './transport.js';
 
 const cleanup: (() => Promise<void>)[] = [];
 function latch<T = void>() {
@@ -76,7 +76,10 @@ it('keeps the native index exchange private and separate from API and resource r
         location: './',
         'set-cookie': 'fixture-index=browser; HttpOnly',
       });
-    } else response.write('abc');
+    } else {
+      if (pathname === '/') response.setHeader('content-type', 'text/html');
+      response.write('abc');
+    }
     response.end();
   });
   server.listen(0, '127.0.0.1');
@@ -92,7 +95,7 @@ it('keeps the native index exchange private and separate from API and resource r
   const nativeLaunch = origin + '/?token=fixture-only';
   await transport.authenticate(nativeLaunch);
   await transport.authenticateIndex(nativeLaunch);
-  expect(await (await transport.readIndex(active)).text()).toBe('abc');
+  expect(await transport.readIndex(active)).toBe('abc');
   expect(
     await (await transport.fetch(origin + '/api', { method: 'GET' })).text(),
   ).toBe('abc');
@@ -109,6 +112,111 @@ it('keeps the native index exchange private and separate from API and resource r
     ['/plugins/', undefined],
   ]);
 });
+
+it.each([
+  'status',
+  'media',
+  'announced bytes',
+  'received bytes',
+  'cancel',
+] as const)(
+  'closes and joins only the authenticated index with invalid %s',
+  async (cause) => {
+    const first = latch<ServerResponse>();
+    const second = latch<ServerResponse>();
+    const browserCookies: (string | undefined)[] = [];
+    const server = createServer((request, response) => {
+      browserCookies.push(request.headers.cookie);
+      if (request.url === '/?token=index') {
+        response
+          .writeHead(303, {
+            location: './',
+            'set-cookie': 'fixture-index=browser; HttpOnly',
+          })
+          .end();
+      } else if (browserCookies.length === 2) first.resolve(response);
+      else second.resolve(response);
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const transport = nativeWebTransport(
+      origin,
+      new AbortController().signal,
+      () => {},
+    );
+    cleanup.push(async () => {
+      await transport.close();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    });
+    await transport.authenticateIndex(origin + '/?token=index');
+    const sockets: Duplex[] = [];
+    const create = Agent.prototype.createConnection;
+    vi.spyOn(Agent.prototype, 'createConnection').mockImplementation(function (
+      this: Agent,
+      ...args: Parameters<Agent['createConnection']>
+    ) {
+      const socket = create.apply(this, args);
+      if (socket) sockets.push(socket);
+      return socket;
+    });
+    const parsingFirst = parsedPrefix(
+      cause === 'received bytes' ? nativeIndexByteLimit : 3,
+    );
+    const parsingSecond = parsedPrefix(3);
+    watchClient((_request, event, [response]) => {
+      if (event !== 'response' || !(response instanceof IncomingMessage))
+        return;
+      if (response.headers['x-fixture-index'] === 'A')
+        parsingFirst.observe(response);
+      else parsingSecond.observe(response);
+    });
+    const cancellation = new AbortController();
+    const canceled = Error('Only the first verified native index was canceled');
+    const bad = transport.readIndex(cancellation.signal);
+    void bad.catch(() => {});
+    const a = await first.promise;
+    const good = transport.readIndex(new AbortController().signal);
+    const b = await second.promise;
+    b.writeHead(200, { 'content-type': 'text/html', 'x-fixture-index': 'B' });
+    b.write('abc');
+    expect(await parsingSecond.promise).toBe(3);
+    const [firstSocket, secondSocket] = sockets;
+    expect(firstSocket?.closed).toBe(false);
+    expect(secondSocket?.closed).toBe(false);
+    a.writeHead(cause === 'status' ? 503 : 200, {
+      'content-type': cause === 'media' ? 'application/json' : 'text/html',
+      'x-fixture-index': 'A',
+      ...(cause === 'announced bytes' && {
+        'content-length': nativeIndexByteLimit + 1,
+      }),
+    });
+    a.flushHeaders();
+    if (cause === 'received bytes') {
+      a.write(Buffer.alloc(nativeIndexByteLimit, 'x'));
+      expect(await parsingFirst.promise).toBe(nativeIndexByteLimit);
+      expect(firstSocket?.destroyed).toBe(false);
+      a.write('!');
+    } else if (cause === 'cancel') {
+      a.write('one');
+      expect(await parsingFirst.promise).toBe(3);
+      cancellation.abort(canceled);
+    }
+    if (cause === 'cancel') await expect(bad).rejects.toBe(canceled);
+    else await expect(bad).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(firstSocket?.closed).toBe(true);
+    expect(secondSocket?.closed).toBe(false);
+    b.end('def');
+    expect(await good).toBe('abcdef');
+    expect(secondSocket?.closed).toBe(true);
+    expect(browserCookies).toEqual([
+      undefined,
+      'fixture-index=browser',
+      'fixture-index=browser',
+    ]);
+  },
+);
 
 it('bounds actual streamed profile bytes and joins the socket of an oversized response before rejecting', async () => {
   const reply = latch<ServerResponse>();

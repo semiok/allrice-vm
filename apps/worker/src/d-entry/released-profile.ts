@@ -386,7 +386,7 @@ export async function holdReleasedProfile(
     bootInjections.filter((row) => row.kind === 'global').length !== 1 ||
     bootInjections.filter(
       (row) => row.kind === 'script-src' || row.kind === 'script-preload',
-    ).length !== graph.batches.length
+    ).length !== sealedGraph.batches.length
   )
     throw new DEntryNativeUnavailable();
   for (const pathname of [

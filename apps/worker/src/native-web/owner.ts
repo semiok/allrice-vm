@@ -303,13 +303,7 @@ export async function openNativeWebOwner(input: {
             current.throwIfAborted();
             if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const response = await transport.readIndex(current);
-            if (
-              !response.ok ||
-              !response.headers.get('content-type')?.includes('text/html')
-            )
-              throw new PersonVmError('RUNTIME_NOT_READY');
-            const html = await response.text();
+            const html = await transport.readIndex(current);
             // renderIndexInjections uses exact global assignment with JSON; any
             // ambiguity, changed rendering contract or missing graph fails closed.
             const rows = [
