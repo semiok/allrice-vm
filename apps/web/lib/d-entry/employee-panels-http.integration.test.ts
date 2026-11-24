@@ -515,6 +515,27 @@ suite(
           await context.addCookies([
             { name: 'allrice_session', value: p.login.token, url: base },
           ]);
+          const publicationPath = `/api/v1/d-entry/panels/${p.selection.employeeInstanceId}/materials/publications`;
+          const browserPublicationAttempts: (string | null)[] = [];
+          context.on('request', (request) => {
+            const url = new URL(request.url());
+            if (
+              request.method() !== 'POST' ||
+              url.origin !== base ||
+              (url.pathname !== publicationPath &&
+                !url.pathname.startsWith(publicationPath + '/'))
+            )
+              return;
+            let requestId: string | null = null;
+            try {
+              requestId =
+                (request.postDataJSON() as { requestId: string } | null)
+                  ?.requestId ?? null;
+            } catch {
+              // A malformed attempt still counts before any response.
+            }
+            browserPublicationAttempts.push(requestId);
+          });
           const page = await context.newPage();
           const receiptPath = (requestId: string) =>
             '/write-receipts/' + requestId;
@@ -789,6 +810,7 @@ suite(
             unavailableOriginalReceipt = undefined;
             await coldPage.close();
           }
+          expect(browserPublicationAttempts).toEqual([publishedId]);
           await dialog
             .getByRole('button', { name: '取消', exact: true })
             .click();
@@ -802,6 +824,11 @@ suite(
           await dialog.waitFor({ state: 'hidden' });
           expect(receiptReads).toEqual([publishedId, publishedId]);
           expect(publishWrites).toEqual([publishedId]);
+          expect(browserPublicationAttempts).toEqual([publishedId]);
+          console.info('publication-receipt-fixture-initial-posts', {
+            browserAttempts: browserPublicationAttempts.length,
+            confirmedWrites: publishWrites.length,
+          });
           const recorded = await p.client.readWriteReceipt(
             {
               workspaceId: p.selection.workspaceId,
@@ -1041,22 +1068,13 @@ suite(
           );
           expect(independentId).not.toBe(pendingId);
           expect(publishWrites).toHaveLength(3);
+          // The context event observes even the request stopped before the handler.
+          expect(browserPublicationAttempts.at(-1)).toBe(independentId);
           console.info('publication-receipt-fixture-keys', {
             A: pendingId,
             C: independentId,
           });
-          const observedPosts: string[] = [];
-          page.on('request', (request) => {
-            if (
-              request.method() === 'POST' &&
-              new URL(request.url()).pathname.includes(
-                '/materials/publications',
-              )
-            )
-              observedPosts.push(
-                (request.postDataJSON() as { requestId: string }).requestId,
-              );
-          });
+          const postCheckpoint = browserPublicationAttempts.length;
           const waiting = '发布结果待核，请按原请求核对。';
           const formWaiting = material
             .getByRole('alert')
@@ -1415,7 +1433,7 @@ suite(
             .toBe(true);
           expect(await sideWaiting.count()).toBe(1);
           expect(publishWrites).toHaveLength(3);
-          expect(observedPosts).toEqual([]);
+          expect(browserPublicationAttempts.slice(postCheckpoint)).toEqual([]);
 
           await restore('fixture-original-publication-completes');
           expect((await enterWithA(returnToMaterials)).status()).toBe(200);
@@ -1524,7 +1542,9 @@ suite(
             status: 'unknown',
           });
           expect(receiptReads.slice(beforeModalRetry)).toEqual([independentId]);
-          expect(observedPosts).toEqual([currentFormId]);
+          expect(browserPublicationAttempts.slice(postCheckpoint)).toEqual([
+            currentFormId,
+          ]);
           expect(publishWrites).toHaveLength(3);
           await page.unrouteAll({ behavior: 'wait' });
           console.info('publication-receipt-fixture-handoff', {

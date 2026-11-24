@@ -674,32 +674,39 @@ suite('diagnostic-only reverse reference origin; no acceptance claim', () => {
           await settle(reference);
           const documentRestored = await referenceDocumentGeometry(reference);
           const restoredValue = await snapshot(reference);
+          const restoredFrame = await reference.screenshot({
+            path: join(out, viewportEvidence, 'restored-origin-frame.png'),
+            fullPage: true,
+          });
+          const archivedPixels = compareSidebarPixels(
+            archived.frame,
+            restoredFrame,
+          );
+          const archivedBytesMatch = archived.frame.equals(restoredFrame);
           await save(join(viewportEvidence, 'restored.json'), {
             document: documentRestored,
             snapshot: restoredValue,
+            frameSha256: sha(restoredFrame),
+            archivedPixels,
+            archivedBytesMatch,
           });
-          expect(documentRestored, 'archived viewport geometry').toEqual(
-            archived.document,
-          );
-          assertCausalInvariant(archived.value, restoredValue);
-        }
-        if (owner && reference && original && archived) {
-          const restored = await capture(reference, 'reference-restored');
-          assertCausalInvariant(original.value, restored.value);
-          const archivedPixels = compareSidebarPixels(
-            archived.frame,
-            restored.frame,
-          );
-          const archivedBytesMatch = archived.frame.equals(restored.frame);
           expect(archivedPixels.changedPixels, 'archived full frame').toBe(0);
           expect(archivedBytesMatch, 'archived frame exact PNG bytes').toBe(
             true,
           );
-          await save('reference-restored-control.json', {
-            ...unchanged(original, restored, 'reference exact detach'),
-            archivedPixels,
-            archivedBytesMatch,
-          });
+          expect(documentRestored, 'archived viewport geometry').toEqual(
+            archived.document,
+          );
+          assertCausalInvariant(archived.value, restoredValue);
+          if (owner && original) {
+            const restored = await capture(reference, 'reference-restored');
+            assertCausalInvariant(original.value, restored.value);
+            await save('reference-restored-control.json', {
+              ...unchanged(original, restored, 'reference exact detach'),
+              archivedPixels,
+              archivedBytesMatch,
+            });
+          }
         }
       } catch (error) {
         valid = false;
