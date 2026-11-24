@@ -87,6 +87,13 @@ suite(
     const running = new Set<Promise<void>>();
     const fixtureAssets = new Map<string, Uint8Array>();
     let fixtureDocument: string | undefined;
+    let receiptGate:
+      | {
+          requestId: string;
+          beforeRead?(): Promise<void>;
+          beforeReply?(): Promise<void>;
+        }
+      | undefined;
     let dropPublishReply = false;
     let incompleteReply: ServerResponse | undefined;
     const publishWrites: string[] = [];
@@ -222,6 +229,12 @@ suite(
               if (part === ':objectId') params.objectId = pieces[index];
               if (part === ':requestId') params.requestId = pieces[index];
             });
+            const gate =
+              name === 'readWriteReceipt' &&
+              receiptGate?.requestId === params.requestId
+                ? receiptGate
+                : undefined;
+            await gate?.beforeRead?.();
             const response = await handlers[name](request, {
               params: Promise.resolve(params),
             });
@@ -229,6 +242,7 @@ suite(
               referenceWrites++;
             if (fixtureDocument && name === 'readWriteReceipt')
               receiptReads.push(params.requestId!);
+            await gate?.beforeReply?.();
             if (
               fixtureDocument &&
               (name === 'publish' || name === 'changePublication')
@@ -683,26 +697,28 @@ suite(
           expect(
             await f.db`select status from allrice_knowledge_sources where id=${sourceId}`,
           ).toEqual([{ status: 'archived' }]);
-          await page.reload();
-          await materials();
-          await sourceMenu.waitFor({ state: 'detached' });
           const retained = page.getByRole('button', {
             name: '核对原撤销 ' + sourceId,
           });
-          await retained.waitFor();
-          await page.evaluate(() => {
+          await page.addInitScript((sourceId) => {
             const remove = Storage.prototype.removeItem;
             Storage.prototype.removeItem = function (key) {
-              if (key.startsWith('allrice:publication-receipts:v2:'))
+              const prefix = 'allrice:publication-receipts:v2:';
+              if (
+                key.startsWith(prefix) &&
+                JSON.parse(key.slice(prefix.length)).at(-1) === sourceId
+              )
                 throw new DOMException(
                   'Storage cleanup is unavailable',
                   'QuotaExceededError',
                 );
               remove.call(this, key);
             };
-          });
+          }, sourceId);
           const previousReceipts = receiptReads.length;
-          await retained.click();
+          await page.reload();
+          await materials();
+          await sourceMenu.waitFor({ state: 'detached' });
           await page
             .getByRole('status')
             .filter({ hasText: '原撤销已完成。 ' + sourceId })
@@ -841,6 +857,10 @@ suite(
           );
           expect(independentId).not.toBe(pendingId);
           expect(publishWrites).toHaveLength(3);
+          console.info('publication-receipt-fixture-keys', {
+            A: pendingId,
+            C: independentId,
+          });
           const observedPosts: string[] = [];
           page.on('request', (request) => {
             if (
@@ -920,20 +940,22 @@ suite(
           const readCache = (key: string) =>
             page.evaluate((key) => sessionStorage.getItem(key), key);
           const originalCache = await readCache(cacheKey);
-          await page.evaluate((marker) => {
-            const set = Storage.prototype.setItem;
-            let failOnce = true;
-            Storage.prototype.setItem = function (key, value) {
-              if (key === marker && failOnce) {
-                failOnce = false;
-                throw new DOMException(
-                  'Denial write failed',
-                  'QuotaExceededError',
-                );
-              }
-              set.call(this, key, value);
-            };
-          }, marker);
+          const failNextDenialWrite = () =>
+            page.evaluate((marker) => {
+              const set = Storage.prototype.setItem;
+              let failOnce = true;
+              Storage.prototype.setItem = function (key, value) {
+                if (key === marker && failOnce) {
+                  failOnce = false;
+                  throw new DOMException(
+                    'Denial write failed',
+                    'QuotaExceededError',
+                  );
+                }
+                set.call(this, key, value);
+              };
+            }, marker);
+          await failNextDenialWrite();
           await withdraw('fixture-open-dialog-receipt-withdrawal');
           const readsBeforeOpenDenial = receiptReads.length;
           const deniedInDialog = await checkReceipt(
@@ -991,39 +1013,59 @@ suite(
             ]);
             return response;
           }
+          function holdReceipt(
+            requestId: string,
+            phase: 'beforeRead' | 'beforeReply',
+          ) {
+            let releaseRequest!: () => void;
+            let admitted = 0;
+            let resumed = 0;
+            const held = new Promise<void>((resolve) => {
+              releaseRequest = resolve;
+            });
+            receiptGate = {
+              requestId,
+              async [phase]() {
+                admitted++;
+                await held;
+                resumed++;
+              },
+            };
+            return {
+              arrived: () =>
+                expect.poll(() => admitted, { timeout: 5000 }).toBe(1),
+              release: releaseRequest,
+              async assertFinished(response: BrowserResponse) {
+                expect(admitted).toBe(1);
+                expect(resumed).toBe(1);
+                expect(await response.finished()).toBeNull();
+              },
+              close() {
+                receiptGate = undefined;
+                releaseRequest();
+              },
+            };
+          }
           async function enterWithAOnHold(
             enter: () => Promise<void>,
             whileHeld: () => Promise<void>,
           ) {
-            let releaseRequest!: () => void;
-            const held = new Promise<void>((resolve) => {
-              releaseRequest = resolve;
-            });
-            await page.route(
-              receiptRoute(pendingId),
-              async (route) => {
-                await held;
-                await route.continue();
-              },
-              { times: 1 },
-            );
-            const request = page.waitForRequest(
-              (request) =>
-                request.method() === 'GET' &&
-                new URL(request.url()).pathname.endsWith(
-                  receiptPath(pendingId),
-                ),
-              { timeout: 5000 },
-            );
-            return enterWithA(async () => {
-              try {
-                await enter();
-                await request;
-                await whileHeld();
-              } finally {
-                releaseRequest();
-              }
-            });
+            const gate = holdReceipt(pendingId, 'beforeRead');
+            try {
+              const response = await enterWithA(async () => {
+                try {
+                  await enter();
+                  await gate.arrived();
+                  await whileHeld();
+                } finally {
+                  gate.release();
+                }
+              });
+              await gate.assertFinished(response);
+              return response;
+            } finally {
+              gate.close();
+            }
           }
           const beforeClose = receiptReads.length;
           const deniedAfterClose = await enterWithAOnHold(
@@ -1058,18 +1100,6 @@ suite(
           expect(await readCache(cacheKey)).toBe(originalCache);
           await onlyIndependentVisible();
 
-          // Mount from a fresh JS heap before entering the still-denied case.
-          await restore('fixture-receipt-fresh-heap-bootstrap');
-          await page.reload();
-          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
-          await withdraw('fixture-receipt-fresh-heap-withdrawal');
-          const deniedAfterReload = await enterWithAOnHold(
-            materials,
-            onlyIndependentVisible,
-          );
-          expect(deniedAfterReload.status()).toBe(403);
-          await onlyIndependentVisible();
-
           async function returnToMaterials() {
             await page
               .getByRole('navigation', { name: '面板' })
@@ -1077,6 +1107,46 @@ suite(
               .click();
             await materials();
           }
+          await restore('fixture-receipt-before-hard-refresh');
+          expect((await enterWithA(returnToMaterials)).status()).toBe(200);
+          await pendingPublication.waitFor();
+          await expect.poll(() => readCache(marker)).toBeNull();
+          await failNextDenialWrite();
+          await withdraw('fixture-receipt-unpersisted-denial');
+          expect(
+            (await checkReceipt(pendingPublication, pendingId)).status(),
+          ).toBe(403);
+          await pendingPublication.waitFor({
+            state: 'detached',
+            timeout: 5000,
+          });
+          expect(await readCache(marker)).toBeNull();
+
+          // Reload from only the v2 records. Give C its own authorized response
+          // while A is held before its read, then withdraw and let A through.
+          await restore('fixture-receipt-fresh-heap-bootstrap');
+          await page.reload();
+          await files.getByRole('combobox', { name: '按员工筛选' }).waitFor();
+          expect(await readCache(marker)).toBeNull();
+          const [freshC, deniedAfterReload] = await Promise.all([
+            page.waitForResponse(receiptResponse(independentId), {
+              timeout: 5000,
+            }),
+            enterWithAOnHold(materials, async () => {
+              await onlyIndependentVisible();
+              await withdraw('fixture-receipt-fresh-heap-withdrawal');
+              await onlyIndependentVisible();
+            }),
+          ]);
+          expect(freshC.status()).toBe(200);
+          expect(await freshC.json()).toMatchObject({
+            requestId: independentId,
+            status: 'unknown',
+          });
+          expect(deniedAfterReload.status()).toBe(403);
+          await expect.poll(() => readCache(marker)).toBe('1');
+          await onlyIndependentVisible();
+
           const deniedAfterSwitch = await enterWithA(returnToMaterials);
           expect(deniedAfterSwitch.status()).toBe(403);
           await onlyIndependentVisible();
@@ -1127,21 +1197,55 @@ suite(
           await expect.poll(() => sideWaiting.count()).toBe(2);
           expect(receiptReads.slice(readsBeforeUnknown)).toEqual([pendingId]);
 
-          await withdraw('fixture-browser-receipt-withdrawal');
-          const readsBeforeDenial = receiptReads.length;
-          const denied = await checkReceipt(pendingPublication, pendingId);
-          expect(denied.status()).toBe(403);
-          await pendingPublication.waitFor({
-            state: 'detached',
-            timeout: 5000,
-          });
+          const lateIndependent = holdReceipt(independentId, 'beforeReply');
+          try {
+            const [approvedBeforeWithdrawal] = await Promise.all([
+              page.waitForResponse(receiptResponse(independentId), {
+                timeout: 5000,
+              }),
+              (async () => {
+                try {
+                  await independentPublication.click();
+                  await lateIndependent.arrived();
+                  expect(receiptReads.at(-1)).toBe(independentId);
+                  await withdraw('fixture-browser-receipt-withdrawal');
+                  const readsBeforeDenial = receiptReads.length;
+                  const denied = await checkReceipt(
+                    pendingPublication,
+                    pendingId,
+                  );
+                  expect(denied.status()).toBe(403);
+                  await pendingPublication.waitFor({
+                    state: 'detached',
+                    timeout: 5000,
+                  });
+                  expect(receiptReads.slice(readsBeforeDenial)).toEqual([
+                    pendingId,
+                  ]);
+                  expect(await independentPublication.isVisible()).toBe(true);
+                  expect(await independentPublication.isDisabled()).toBe(true);
+                } finally {
+                  lateIndependent.release();
+                }
+              })(),
+            ]);
+            await lateIndependent.assertFinished(approvedBeforeWithdrawal);
+            expect(approvedBeforeWithdrawal.status()).toBe(200);
+            expect(await approvedBeforeWithdrawal.json()).toMatchObject({
+              requestId: independentId,
+              status: 'unknown',
+            });
+          } finally {
+            lateIndependent.close();
+          }
           expect(
             await page.getByText(pendingId, { exact: false }).count(),
           ).toBe(0);
           expect(await independentPublication.isVisible()).toBe(true);
-          expect(await independentPublication.isEnabled()).toBe(true);
+          await expect
+            .poll(() => independentPublication.isEnabled())
+            .toBe(true);
           expect(await sideWaiting.count()).toBe(1);
-          expect(receiptReads.slice(readsBeforeDenial)).toEqual([pendingId]);
           expect(publishWrites).toHaveLength(3);
           expect(observedPosts).toEqual([]);
 
@@ -1197,6 +1301,20 @@ suite(
           expect(await sideWaiting.count()).toBe(1);
           expect(observedPosts).toEqual([currentFormId]);
           expect(publishWrites).toHaveLength(3);
+          await page.unrouteAll({ behavior: 'wait' });
+          console.info('publication-receipt-fixture-handoff', {
+            A: pendingId,
+            C: independentId,
+            afterClose: deniedAfterClose.status(),
+            afterReload: {
+              A: deniedAfterReload.status(),
+              C: freshC.status(),
+            },
+            heldOriginalReadsFinished: 3,
+            delayedReply: { A: 403, C: 200 },
+            originalRequestsRepeated: 0,
+            serverPublicationWrites: publishWrites.length,
+          });
           await context.close();
         } finally {
           await browser?.close();

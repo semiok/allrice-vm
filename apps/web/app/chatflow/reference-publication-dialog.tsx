@@ -73,8 +73,9 @@ type PublicationReceipt = z.infer<typeof receiptSchema>;
 const receiptList = z.array(receiptSchema);
 type ReceiptOutcome = NonNullable<PublicationReceipt['outcome']>;
 type ReceiptCheckStage = 'checking' | 'waiting' | 'settled' | 'unavailable';
+type PublicationReceiptAccess = 'issued' | 'verified' | 'denied';
 const settledPublications = new Map<string, ReceiptOutcome>();
-const publicationAccess = new Map<string, boolean>();
+const publicationAccess = new Map<string, PublicationReceiptAccess>();
 const publicationRecordKey = (key: string, requestId: string) =>
   key + '/' + requestId;
 const receiptPrefix = 'allrice:publication-receipts:v2:';
@@ -123,19 +124,27 @@ function restorePublications(key: string | undefined) {
     return [];
   }
 }
-function publicationReceiptUnavailable(
+function readPublicationReceiptAccess(
   key: string | undefined,
   receipt: PublicationReceipt,
 ) {
-  if (!key) return false;
+  if (!key) return;
   const id = publicationRecordKey(key, receipt.requestId);
   const current = publicationAccess.get(id);
   if (current !== undefined) return current;
   try {
-    return sessionStorage.getItem(receiptDenialPrefix + id) === '1';
+    if (sessionStorage.getItem(receiptDenialPrefix + id) === '1')
+      return 'denied';
   } catch {
-    return false;
+    // A restored receipt still needs its own read in this document.
   }
+}
+function canShowPublicationReceipt(
+  key: string | undefined,
+  receipt: PublicationReceipt,
+) {
+  const access = readPublicationReceiptAccess(key, receipt);
+  return access === 'issued' || access === 'verified';
 }
 function setPublicationReceiptUnavailable(
   key: string,
@@ -143,7 +152,7 @@ function setPublicationReceiptUnavailable(
   unavailable: boolean,
 ) {
   const id = publicationRecordKey(key, receipt.requestId);
-  publicationAccess.set(id, unavailable);
+  publicationAccess.set(id, unavailable ? 'denied' : 'verified');
   try {
     // Keep the receipt record readable by v2 clients. Reconcile the stored
     // denial on every definite response so transient storage errors can heal.
@@ -294,7 +303,7 @@ export function ReferencePublicationPending({
         stage: 'waiting',
         message: waitingForReceipt,
       };
-      if (!publicationReceiptUnavailable(key, receipt))
+      if (canShowPublicationReceipt(key, receipt))
         note({
           stage: 'checking',
           message: '正在核对' + action + '…',
@@ -332,7 +341,7 @@ export function ReferencePublicationPending({
             delete next[id];
             return next;
           });
-        } else if (!publicationReceiptUnavailable(key, receipt)) {
+        } else if (canShowPublicationReceipt(key, receipt)) {
           note(waiting);
         }
       } finally {
@@ -397,9 +406,9 @@ export function ReferencePublicationPending({
     const controller = new AbortController();
     const currentSignal = AbortSignal.any([signal, controller.signal]);
     entrySignal.current = currentSignal;
-    // A fresh entry can recover a denied receipt only through its original GET.
+    // Restore each unknown or denied selector through its own original GET.
     for (const record of found) {
-      if (publicationReceiptUnavailable(record.key, record.receipt))
+      if (!canShowPublicationReceipt(record.key, record.receipt))
         void reconcile(record, currentSignal);
     }
     return () => {
@@ -420,7 +429,7 @@ export function ReferencePublicationPending({
 
   const hidden = new Set(
     records
-      .filter(({ key, receipt }) => publicationReceiptUnavailable(key, receipt))
+      .filter(({ key, receipt }) => !canShowPublicationReceipt(key, receipt))
       .map(({ id }) => id),
   );
   const visibleNotes = Object.entries(notes).filter(
@@ -574,7 +583,8 @@ function PublicationForm({
         setReceiptNotes((prior) => ({
           ...prior,
           [value.requestId]:
-            keepUnavailable && publicationReceiptUnavailable(receiptKey, value)
+            keepUnavailable &&
+            readPublicationReceiptAccess(receiptKey, value) === 'denied'
               ? { stage: 'unavailable', message: unavailableReceipt }
               : { stage, message },
         }));
@@ -776,6 +786,10 @@ function PublicationForm({
         } catch {
           throw new ReceiptStorageUnavailable();
         }
+        publicationAccess.set(
+          publicationRecordKey(receiptKey, requestId),
+          'issued',
+        );
         issued = record;
       } else requestIds.current.set(intentDigest, requestId);
       const saved = reference
@@ -840,8 +854,8 @@ function PublicationForm({
   }
 
   const shownError = error?.message || download.error || available.error;
-  const visibleReceipts = receipts.filter(
-    (receipt) => !publicationReceiptUnavailable(receiptKey, receipt),
+  const visibleReceipts = receipts.filter((receipt) =>
+    canShowPublicationReceipt(receiptKey, receipt),
   );
   return (
     <DshDialog
@@ -1023,7 +1037,8 @@ function PublicationForm({
       )}
       {Object.entries(receiptNotes).map(([id, note]) => (
         <p className={css.description} role="status" key={id}>
-          {note.stage !== 'unavailable' &&
+          {(note.stage === 'settled' ||
+            visibleReceipts.some((receipt) => receipt.requestId === id)) &&
             Object.keys(receiptNotes).length > 1 &&
             id.slice(0, 8) + ' · '}
           {note.message}
