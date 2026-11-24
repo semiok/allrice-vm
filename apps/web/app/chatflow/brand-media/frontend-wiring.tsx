@@ -115,6 +115,8 @@ export const runActive = (run: { run: Pick<BrandMediaRun['run'], 'status'> }) =>
   !['succeeded', 'failed', 'canceled', 'needs_attention'].includes(
     run.run.status,
   );
+export const isAbortError = (cause: unknown) =>
+  cause instanceof DOMException && cause.name === 'AbortError';
 async function moduleRequestId(
   scope: BrandMediaClientScope,
   operation: string,

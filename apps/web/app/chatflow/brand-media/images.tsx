@@ -15,6 +15,7 @@ import {
   imageRequestId,
   retryRequestId,
   runActive,
+  isAbortError,
   ui,
   type BrandMediaClient,
   type BrandMediaRun,
@@ -97,10 +98,7 @@ export function Images({
     try {
       await run();
     } catch (cause) {
-      if (
-        owner === lifetime.current &&
-        !(cause instanceof DOMException && cause.name === 'AbortError')
-      )
+      if (owner === lifetime.current && !isAbortError(cause))
         setError(
           cause instanceof Error
             ? cause.message

@@ -28,6 +28,7 @@ import {
   ReferenceChips,
   ui,
   runActive,
+  isAbortError,
   candidateRequestId,
   retryRequestId,
   imageRequestId,
@@ -861,7 +862,9 @@ function BrandMediaPanelContent({
       .then((requestId) =>
         generate({ ...intent, requestId, sessionId: row.sessionId }),
       )
-      .catch((cause) => fail(cause.message))
+      .catch((cause) => {
+        if (!isAbortError(cause)) fail(cause.message);
+      })
       .finally(() => setBusy(false));
   };
   const openArticle = (article: BrandMediaArticle) => {
@@ -1875,6 +1878,7 @@ function GenerationForm({
       if (form.kind === 'article') setText('');
       onStarted();
     } catch (cause) {
+      if (isAbortError(cause)) return;
       setError(
         cause instanceof Error ? cause.message : '请求失败，请重试同一次生成。',
       );
