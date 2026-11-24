@@ -678,6 +678,11 @@ class PrincipalService extends TypertRemoteService {
       const endpoint = events
         ? REMOTE_EVENT_STREAM_ENDPOINT
         : z.string().parse(raw.endpoint);
+      if (endpoint === 'remoteAccess/follow') {
+        // The new stream's baseline is a current catalog read even when the
+        // native change hint for a withdrawn child has not arrived yet.
+        await scope.refresh();
+      }
       const payload = events ? REMOTE_EVENT_STREAM_PAYLOAD : { args: raw.args };
       const open = () => {
         active.throwIfAborted();
