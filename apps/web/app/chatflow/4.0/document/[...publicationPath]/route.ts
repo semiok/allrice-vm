@@ -30,18 +30,15 @@ export async function GET(request: Request, { params }: Params) {
       request,
       (await params).publicationPath,
     );
-    if (target.path === 'native/api/file') return unavailable();
-    if (new URL(request.url).search) throw new DataAccessError('not_found');
     const input = await profileInput(request, target.selection);
+    if (target.path === 'native/api/file') {
+      await qualifyDocument(input, target);
+      return unavailable();
+    }
+    if (new URL(request.url).search) throw new DataAccessError('not_found');
     if (target.path !== 'native/index.html')
       return await profileStaticFile(input, target, target.path);
-    const address = await profileAddress(input, target.scopeId);
-    if (
-      target.bindingRef !== address.bindingRef ||
-      target.manifestSha256 !== address.manifestSha256 ||
-      target.graphRev !== address.graphRev
-    )
-      throw new DataAccessError('not_found');
+    const address = await qualifyDocument(input, target);
     const assets = profileDirectory('static', address);
     const { scopeId, bindingRef, graphRev, selection } = address;
     const tenant = input.context.organizationId;
@@ -81,10 +78,28 @@ export async function POST(request: Request, { params }: Params) {
       request,
       (await params).publicationPath,
     );
-    if (target.path === 'native/api/session/uploadFileBinary')
-      return unavailable();
-    throw new DataAccessError('not_found');
+    if (target.path !== 'native/api/session/uploadFileBinary')
+      throw new DataAccessError('not_found');
+    await qualifyDocument(
+      await profileInput(request, target.selection),
+      target,
+    );
+    return unavailable();
   } catch (error) {
     return dEntryErrorResponse(error);
   }
+}
+
+async function qualifyDocument(
+  input: Awaited<ReturnType<typeof profileInput>>,
+  target: ReturnType<typeof readProfileDirectory>,
+) {
+  const address = await profileAddress(input, target.scopeId);
+  if (
+    target.bindingRef !== address.bindingRef ||
+    target.manifestSha256 !== address.manifestSha256 ||
+    target.graphRev !== address.graphRev
+  )
+    throw new DataAccessError('not_found');
+  return address;
 }
