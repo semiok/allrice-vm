@@ -474,9 +474,13 @@ it(
 
     async function blockedAsset() {
       const serverResponse = deferred<ServerResponse>();
-      f.worker.once('request', (_request, response) =>
-        serverResponse.resolve(response),
-      );
+      let finished = false;
+      f.worker.once('request', (_request, response) => {
+        response.once('finish', () => {
+          finished = true;
+        });
+        serverResponse.resolve(response);
+      });
       const url = f.profileUrl('assets', scopeId, {
         bindingRef: f.owner.bindingRef,
         graphRev: target.graphRev,
@@ -497,7 +501,12 @@ it(
       expect(paused.statusCode).toBe(200);
       const response = await serverResponse.promise;
       expect(response.writableFinished).toBe(false);
-      return { request, response, closed: once(response, 'close') };
+      return {
+        request,
+        response,
+        closed: once(response, 'close'),
+        didFinish: () => finished,
+      };
     }
     const cancelled = await blockedAsset();
     cancelled.request.destroy();
@@ -528,7 +537,7 @@ it(
     f.profileSource.abort(Error('The native profile source was retired'));
     await backpressured.closed;
     expect(backpressured.response.destroyed).toBe(true);
-    expect(backpressured.response.writableFinished).toBe(false);
+    expect(backpressured.didFinish()).toBe(false);
     expect(await receive()).toMatchObject({
       type: 'error',
       streamId: 'life',
