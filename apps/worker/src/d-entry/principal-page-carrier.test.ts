@@ -25,6 +25,7 @@ import { createDEntryPageRequests } from './principal-requests.js';
 import { createDEntryProfile } from './profile.js';
 import { holdReleasedProfile } from './released-profile.js';
 import {
+  DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
@@ -522,7 +523,16 @@ it.skipIf(!process.env.ALLRICE_BROWSER_EXECUTABLE)(
       async ({ identity, selection }) => {
         const { openNativePageCarrier } = (
           window as unknown as {
-            DEntryCarrier: typeof import('../../../web/lib/d-entry/page-carrier');
+            DEntryCarrier: {
+              openNativePageCarrier(
+                original: typeof identity,
+                selectors: typeof selection,
+                revoked: () => void,
+              ): {
+                ready: Promise<ReturnType<typeof DEntryPageOpenedSchema.parse>>;
+                close(): Promise<void>;
+              };
+            };
           }
         ).DEntryCarrier;
         let revoked = false;
