@@ -333,7 +333,7 @@ it.each([
                 throw new RemoteError(
                   'gateway/service-unavailable',
                   'native access feed failed',
-                  {},
+                  { endpoint: 'remoteAccess/follow' },
                 );
               return;
             }
