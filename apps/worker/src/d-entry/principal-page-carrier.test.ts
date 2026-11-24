@@ -1,11 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { on, once } from 'node:events';
-import { createServer } from 'node:http';
+import { createServer, get, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
@@ -184,12 +184,10 @@ async function fixture(release?: { directory: string; graph: unknown }) {
         ...extra,
       }),
     });
-  function publish(
+  function profileUrl(
     kind: 'bootstrap' | 'assets' | 'events',
     scopeId: string,
     selectors: Record<string, string> = {},
-    mode?: 'document' | 'static',
-    signal?: AbortSignal,
   ) {
     const url = new URL('/internal/d-entry/profile/' + kind, workerOrigin);
     url.search = new URLSearchParams({
@@ -198,6 +196,16 @@ async function fixture(release?: { directory: string; graph: unknown }) {
       scopeId,
       ...selectors,
     }).toString();
+    return url;
+  }
+  function publish(
+    kind: 'bootstrap' | 'assets' | 'events',
+    scopeId: string,
+    selectors: Record<string, string> = {},
+    mode?: 'document' | 'static',
+    signal?: AbortSignal,
+  ) {
+    const url = profileUrl(kind, scopeId, selectors);
     return fetch(url, {
       signal,
       headers: {
@@ -214,6 +222,8 @@ async function fixture(release?: { directory: string; graph: unknown }) {
     probe,
     publish,
     profileSource,
+    profileUrl,
+    worker,
     web,
     origin,
   };
@@ -394,6 +404,15 @@ it(
     const raw = JSON.parse(
       await readFile(join(directory, 'artifact.json'), 'utf8'),
     );
+    const largeAsset = 'managed/transfer-ownership-test.js';
+    const largeBytes = Buffer.alloc(12 * 1024 * 1024, 32);
+    await writeFile(join(directory, largeAsset), largeBytes);
+    raw.files.push({
+      path: largeAsset,
+      bytes: largeBytes.length,
+      sha256: createHash('sha256').update(largeBytes).digest('hex'),
+    });
+    await writeFile(join(directory, 'artifact.json'), JSON.stringify(raw));
     const graph = DEntryProfileGraphSchema.parse(raw.profile.graph);
     const source = new AbortController().signal;
     // Report the first immutable release diagnostic before entering the HTTP
@@ -453,6 +472,39 @@ it(
     expect(bad.status).toBe(404);
     await bad.body?.cancel();
 
+    async function blockedAsset() {
+      const serverResponse = deferred<ServerResponse>();
+      f.worker.once('request', (_request, response) =>
+        serverResponse.resolve(response),
+      );
+      const url = f.profileUrl('assets', scopeId, {
+        bindingRef: f.owner.bindingRef,
+        graphRev: target.graphRev,
+        manifestSha256: target.manifestSha256,
+        path: largeAsset,
+      });
+      const request = get(url, {
+        headers: {
+          authorization: 'Bearer ' + sessionToken,
+          'x-allrice-profile-request': 'static',
+        },
+      });
+      request.on('error', () => {});
+      closes.push(async () => request.destroy());
+      const [paused] = await once(request, 'response');
+      paused.on('error', () => {});
+      paused.pause();
+      expect(paused.statusCode).toBe(200);
+      const response = await serverResponse.promise;
+      expect(response.writableFinished).toBe(false);
+      return { request, response, closed: once(response, 'close') };
+    }
+    const cancelled = await blockedAsset();
+    cancelled.request.destroy();
+    await cancelled.closed;
+    expect((await f.invoke(scopeId)).status).toBe(200);
+    const backpressured = await blockedAsset();
+
     const keep = new AbortController();
     closes.push(async () => keep.abort());
     const events = await f.publish(
@@ -474,6 +526,9 @@ it(
     await clash.body?.cancel();
     const pending = expect(reader.read()).rejects.toThrow();
     f.profileSource.abort(Error('The native profile source was retired'));
+    await backpressured.closed;
+    expect(backpressured.response.destroyed).toBe(true);
+    expect(backpressured.response.writableFinished).toBe(false);
     expect(await receive()).toMatchObject({
       type: 'error',
       streamId: 'life',

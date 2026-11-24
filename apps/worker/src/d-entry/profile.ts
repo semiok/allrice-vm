@@ -89,18 +89,39 @@ export function createDEntryProfile(
     return current;
   }
 
-  async function json(
+  async function send(
     response: ServerResponse,
-    value: unknown,
     signal: AbortSignal,
+    headers: Record<string, string>,
+    write: () => void,
   ) {
     signal.throwIfAborted();
-    response.writeHead(200, {
-      'content-type': 'application/json',
-      'cache-control': 'private, no-store',
-    });
-    response.end(JSON.stringify(value));
-    await finished(response, { cleanup: true });
+    const stop = () => {
+      if (!response.writableFinished) response.destroy();
+    };
+    signal.addEventListener('abort', stop, { once: true });
+    const done = finished(response, { cleanup: true });
+    try {
+      signal.throwIfAborted();
+      response.writeHead(200, {
+        'cache-control': 'private, no-store',
+        ...headers,
+      });
+      write();
+      await done;
+    } catch (error) {
+      stop();
+      await done.catch(() => {});
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', stop);
+    }
+  }
+
+  function json(response: ServerResponse, value: unknown, signal: AbortSignal) {
+    return send(response, signal, { 'content-type': 'application/json' }, () =>
+      response.end(JSON.stringify(value)),
+    );
   }
 
   function service(request: IncomingMessage, response: ServerResponse) {
@@ -253,22 +274,18 @@ export function createDEntryProfile(
             if (operation === 'events') {
               if (held.events) throw new ProfileBusy();
               held.events = true;
-              const abort = () => response.destroy();
               try {
                 await page.assertCurrent(active);
-                active.throwIfAborted();
-                response.writeHead(200, {
-                  'content-type': 'text/event-stream; charset=utf-8',
-                  'cache-control': 'private, no-store',
-                });
-                active.addEventListener('abort', abort, { once: true });
-                response.write(
-                  `data: ${JSON.stringify({ type: 'graph', graph: release.graph })}\n\n`,
+                await send(
+                  response,
+                  active,
+                  { 'content-type': 'text/event-stream; charset=utf-8' },
+                  () =>
+                    response.write(
+                      `data: ${JSON.stringify({ type: 'graph', graph: release.graph })}\n\n`,
+                    ),
                 );
-                // The certified graph is fixed for this source lifetime.
-                await finished(response, { cleanup: true });
               } finally {
-                active.removeEventListener('abort', abort);
                 held.events = false;
               }
               return;
@@ -296,15 +313,16 @@ export function createDEntryProfile(
               throw error;
             }
             await page.assertCurrent(active);
-            active.throwIfAborted();
-            response.writeHead(200, {
-              'content-type': asset.media,
-              'content-length': asset.data.byteLength,
-              'cache-control': 'private, no-store',
-              'x-content-type-options': 'nosniff',
-            });
-            response.end(asset.data);
-            await finished(response, { cleanup: true });
+            await send(
+              response,
+              active,
+              {
+                'content-type': asset.media,
+                'content-length': String(asset.data.byteLength),
+                'x-content-type-options': 'nosniff',
+              },
+              () => response.end(asset.data),
+            );
           },
         );
       } catch (error) {
