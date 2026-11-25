@@ -2,6 +2,11 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createDshGatewayProvider } from '@allrice/model-gateway';
 import {
+  AttachmentId,
+  ImageVariantId,
+  type ImageAttachmentRef,
+} from '@deepseek-ai/dsh-attachment';
+import {
   closeServer,
   gatewayFixture,
   listen,
@@ -140,9 +145,20 @@ it('does not enable the route without a grant from the managed store', async () 
   ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
 });
 
-it('refreshes an expired managed Codex grant and meters the fixed SSE route through the production runtime', async () => {
+it('refreshes an expired managed Codex grant and meters an image-capable SSE request through the production runtime', async () => {
   await saveSyntheticGrant(0);
   const nativeFetch = globalThis.fetch;
+  const png =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+  const data = Buffer.from(png, 'base64');
+  const image = {
+    attachmentId: AttachmentId('fixture-image'),
+    mediaType: 'image/png' as const,
+    width: 1,
+    height: 1,
+    bytes: data.length,
+  };
+  let outboundImage = false;
   const sse = await responsesFixture({ codex: true });
   const access = [
     'fixture',
@@ -170,29 +186,62 @@ it('refreshes an expired managed Codex grant and meters the fixed SSE route thro
   });
   const oauth = await listen(refresh);
   const used: string[] = [];
-  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
-    if (!(input instanceof Request)) return nativeFetch(input, init);
-    const target = {
-      'https://auth.openai.com/oauth/token': oauth,
-      'https://chatgpt.com/backend-api/codex/responses': sse.url,
-    }[input.url];
-    if (!target) return nativeFetch(input, init);
-    used.push(input.url);
-    const wire = {
-      ...init,
-      method: input.method,
-      headers: input.headers,
-      signal: input.signal,
-    };
-    return nativeFetch(target, wire);
-  });
+  vi.stubGlobal(
+    'fetch',
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!(input instanceof Request)) return nativeFetch(input, init);
+      const target = {
+        'https://auth.openai.com/oauth/token': oauth,
+        'https://chatgpt.com/backend-api/codex/responses': sse.url,
+      }[input.url];
+      if (!target) return nativeFetch(input, init);
+      used.push(input.url);
+      if (target === sse.url) {
+        const body = await input.text();
+        outboundImage =
+          body.includes('"type":"input_image"') && body.includes(png);
+      }
+      const wire = {
+        ...init,
+        method: input.method,
+        headers: input.headers,
+        signal: input.signal,
+      };
+      return nativeFetch(target, wire);
+    },
+  );
+  const selected = modelBinding();
+  const readImage = vi.fn(
+    async (
+      binding: typeof selected,
+      ref: ImageAttachmentRef,
+      target: { width: number; height: number; maxBytes: number } | null,
+      signal: AbortSignal,
+    ) => {
+      expect(binding.vm).toEqual(selected.vm);
+      expect(binding.native.sessionId).toBe(selected.native.sessionId);
+      expect(ref).toEqual(image);
+      expect(target).toMatchObject({ width: 1, height: 1 });
+      expect(signal.aborted).toBe(false);
+      return {
+        ...image,
+        variantId: ImageVariantId('fixture-variant'),
+        attachment: image,
+        data,
+        depth: 'uchar' as const,
+        space: 'srgb' as const,
+        hasAlpha: false,
+      };
+    },
+  );
   const host = await createProductionCodexRuntime(
     controller().signal,
     'fixture-production-codex',
+    readImage,
   );
   const gateway = await gatewayFixture({
     binding: {
-      ...modelBinding(),
+      ...selected,
       provider: host.route.provider,
       model: host.route.model,
     },
@@ -201,10 +250,24 @@ it('refreshes an expired managed Codex grant and meters the fixed SSE route thro
       host.route,
       host.transport.fetchOwned,
       host.transport.beforeDispatch,
+      host.scopeStream,
     ),
   });
   try {
-    const chunks = await gateway.collect();
+    const chunks = await gateway.collect({
+      ...gateway.input(),
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Synthetic picture' },
+            { type: 'image', attachment: image },
+          ],
+        },
+      ],
+    });
+    expect(outboundImage).toBe(true);
+    expect(readImage).toHaveBeenCalledOnce();
     expect(chunks.at(-1)).toMatchObject({
       type: 'finish',
       reason: { kind: 'stop' },

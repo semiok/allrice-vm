@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import type { Context } from '@deepseek-ai/cordis';
 import AttachmentStore, {
   ImageVariantId,
   type ImageAttachmentLimits,
@@ -12,6 +13,7 @@ import type { StreamChunk } from '@deepseek-ai/dsh-llm';
 import {
   ModelGatewayError,
   type ModelCallBinding,
+  type DshGatewayStreamScope,
 } from '@allrice/model-gateway';
 
 export type ReadProductionModelImage = (
@@ -23,7 +25,10 @@ export type ReadProductionModelImage = (
 
 /** PiAi needs DSH's attachment service even with an authorized original
  * reference. Host resolves only this call's native session, never a path. */
-export function createProductionModelImages(read: ReadProductionModelImage) {
+export function createProductionModelImages(read: ReadProductionModelImage): {
+  plugin: new (ctx: Context) => AttachmentStore;
+  stream: DshGatewayStreamScope;
+} {
   const operations = new AsyncLocalStorage<{
     binding: ModelCallBinding;
     signal: AbortSignal;
