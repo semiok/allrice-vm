@@ -66,7 +66,11 @@ export type ResolvedDEntryNativeOwner = Readonly<{
   revoked: AbortSignal;
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;
-  readSessions(signal: AbortSignal): Promise<RemoteResult<SessionListValue>>;
+  /** The optional witness reports a settled check that never dispatched. */
+  readSessions(
+    signal: AbortSignal,
+    notDispatched?: () => void,
+  ): Promise<RemoteResult<SessionListValue>>;
   /** Actual same-Host issuer. Acquisition does not start I/O; run opens the
    * fixed generated control scope. No browser-provided principal or grants. */
   acquirePrincipal(
@@ -85,13 +89,6 @@ export interface DEntryNativeOwnerPort {
 export class DEntryNativeUnavailable extends Error {
   constructor() {
     super('D entry native owner is not bound');
-  }
-}
-
-/** The producing owner joined its checks and never dispatched the read. */
-export class DEntryCatalogReadNotDispatched extends Error {
-  constructor(readonly reason: unknown) {
-    super('Native catalog read ended before dispatch', { cause: reason });
   }
 }
 

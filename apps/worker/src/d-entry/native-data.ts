@@ -11,7 +11,6 @@ import type {
   DEntryOwnedActivity,
 } from '@allrice/database';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
-import { DEntryCatalogReadNotDispatched } from './native-owner.js';
 import {
   assertDEntryPrincipalIssueForOwner,
   createDEntryPrincipalChildren,
@@ -128,7 +127,7 @@ export function ownDEntryCatalog(
         acquire: (active) => owner.acquirePrincipal(context, issue, active),
       });
     },
-    readSessions(caller) {
+    readSessions(caller, notDispatched) {
       const current = AbortSignal.any([
         signal,
         caller,
@@ -137,8 +136,14 @@ export function ownDEntryCatalog(
       ]);
       current.throwIfAborted();
       let read: ReturnType<ResolvedDEntryNativeOwner['readSessions']>;
+      let joinedBeforeDispatch = false;
       try {
-        read = Promise.resolve(owner.readSessions(current));
+        read = Promise.resolve(
+          owner.readSessions(current, () => {
+            joinedBeforeDispatch = true;
+            notDispatched?.();
+          }),
+        );
       } catch (error) {
         read = Promise.reject(error);
       }
@@ -147,14 +152,10 @@ export function ownDEntryCatalog(
         () => reads.delete(read),
         (error) => {
           reads.delete(read);
-          if (!(error instanceof DEntryCatalogReadNotDispatched))
-            failures.push(error);
+          if (!joinedBeforeDispatch) failures.push(error);
         },
       );
-      return read.catch((error: unknown) => {
-        if (error instanceof DEntryCatalogReadNotDispatched) throw error.reason;
-        throw error;
-      });
+      return read;
     },
   };
   return {

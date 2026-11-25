@@ -12,7 +12,6 @@ import type {
   DEntryPrincipalIssue,
 } from '@allrice/d-entry-principal/types';
 import {
-  DEntryCatalogReadNotDispatched,
   DEntryNativeUnavailable,
   dEntryOwnerViewSchema,
   installDEntryNativeOwnerPort,
@@ -238,25 +237,21 @@ export function createDEntryNativeCatalogPort(input: {
               acquire: (active) => owner.owner.acquirePrincipal(issue, active),
             });
           },
-          readSessions(reading: AbortSignal) {
+          readSessions(reading: AbortSignal, notDispatched?: () => void) {
             return own(async () => {
               const who = context;
               const active = AbortSignal.any([reading, revoked]);
               try {
                 await current(who, active);
               } catch (error) {
-                throw new DEntryCatalogReadNotDispatched(error);
+                notDispatched?.();
+                throw error;
               }
-              let notDispatched = false;
-              const result = await owner.owner
-                .readSessionsFor(who, active, () => {
-                  notDispatched = true;
-                })
-                .catch((error: unknown) => {
-                  if (notDispatched)
-                    throw new DEntryCatalogReadNotDispatched(error);
-                  throw error;
-                });
+              const result = await owner.owner.readSessionsFor(
+                who,
+                active,
+                notDispatched,
+              );
               await current(who, active);
               return result;
             });
