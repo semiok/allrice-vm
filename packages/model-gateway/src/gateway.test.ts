@@ -658,7 +658,33 @@ describe.sequential(
         ).resolves.toBeUndefined();
         await expect(f.gateway.close()).rejects.toBeInstanceOf(AggregateError);
         expect(globalThis.fetch).toBe(meteredFetch);
-        await f.gateway.reconcileOwner(f.binding.context, ownerId, caller);
+        const maintenance = new AbortController();
+        const persisted = f.store.reconcileOwner.bind(f.store);
+        const persisting = deferred();
+        const settleLedger = deferred();
+        vi.spyOn(f.store, 'reconcileOwner').mockImplementationOnce(
+          async (id, evidence) => {
+            persisting.resolve();
+            await settleLedger.promise;
+            return persisted(id, evidence);
+          },
+        );
+        const recovery = f.gateway.reconcileOwner(
+          f.binding.context,
+          ownerId,
+          maintenance.signal,
+        );
+        await persisting.promise;
+        maintenance.abort();
+        try {
+          expect(globalThis.fetch).toBe(meteredFetch);
+          await expect(f.gateway.close()).rejects.toBeInstanceOf(
+            AggregateError,
+          );
+        } finally {
+          settleLedger.resolve();
+          await expect(recovery).resolves.toBeTypeOf('number');
+        }
         await expect(f.gateway.close()).resolves.toBeUndefined();
         expect(globalThis.fetch).toBe(originalFetch);
       } finally {
