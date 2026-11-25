@@ -736,25 +736,57 @@ class DeployDevMigrations(unittest.TestCase):
         candidate = self.release(sha=sha)
         config = os.path.join(self.home, 'allrice40-dev/config/person-vm-host.json')
         identity_args = os.path.join(self.tmp, 'identity-args')
-        for configured in (False, True):
-            with self.subTest(configured=configured):
-                if configured:
+        seed = os.path.join(self.tmp, 'private-config-seed')
+        write(seed, '{"private_fixture":"not logged"}', 0o600)
+        os.makedirs(os.path.dirname(config))
+        for timing in ('absent', 'before build', 'during build'):
+            with self.subTest(timing=timing):
+                build_stubs = stubs
+                if timing == 'before build':
                     write(config, '{"private_fixture":"not logged"}', 0o600)
+                elif timing == 'during build':
+                    build_stubs += 'pnpm() { [ "$1" != install ] || cp -p "$CONFIG_SEED" "$CONFIG"; }; '
                 result = self.run_dd(
-                    stubs + 'deploy --skip-smoke',
+                    build_stubs + 'deploy --skip-smoke',
                     FILES + ARCHIVED, CONTRACT='row:1', CANDIDATE=candidate,
                     ART='sha256:' + 'c' * 64, SMOKE=smoke, IDENTITY_ARGS_FILE=identity_args,
+                    CONFIG=config, CONFIG_SEED=seed,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 with open(identity_args) as f:
                     args = f.read().splitlines()
                 release = self.read_plist(self.live_plist('worker'))['WorkingDirectory']
                 expected = ['scripts/dev-release/prepare-identity.mjs', '--root=' + release, '--release-sha=' + sha]
-                if configured:
+                if timing != 'absent':
                     expected.append('--person-vm-config=' + config)
+                    os.unlink(config)
                 self.assertEqual(args, expected)
                 self.remove_deploy_build()
                 self.seed_legacy_plists()
+
+    def test_deploy_stops_if_config_disappears_or_becomes_unsafe_during_build(self):
+        stubs, smoke = self.successful_deploy_stubs()
+        candidate = self.release(sha='b' * 40)
+        config = os.path.join(self.home, 'allrice40-dev/config/person-vm-host.json')
+        write(config, '{}', 0o600)
+        identity_args = os.path.join(self.tmp, 'identity-args')
+        for mutation, error in (
+            ('unlink "$CONFIG"', 'required person VM host configuration is missing'),
+            ('printf "{}" > "$CONFIG" && chmod 644 "$CONFIG"', 'mode 0600 (no symlinks)'),
+        ):
+            with self.subTest(mutation=mutation):
+                result = self.run_dd(
+                    stubs + 'pnpm() { [ "$1" != install ] || { ' + mutation + '; }; }; deploy --skip-smoke',
+                    FILES + ARCHIVED, CONTRACT='row:1', CANDIDATE=candidate,
+                    ART='sha256:' + 'c' * 64, SMOKE=smoke, IDENTITY_ARGS_FILE=identity_args,
+                    CONFIG=config,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(error, result.stderr)
+                self.assertFalse(os.path.exists(identity_args))
+                self.assertNotIn('STOPPED:', result.stdout)
+                self.assertEqual(self.read_plist(self.live_plist('worker'))['WorkingDirectory'], self.initial_release)
+                self.remove_deploy_build()
 
     def test_deploy_requires_person_vm_host_configuration_when_requested(self):
         result = self.run_dd(
@@ -770,10 +802,21 @@ class DeployDevMigrations(unittest.TestCase):
         target = os.path.join(self.tmp, 'valid-person-vm-host.json')
         write(target, '{}', 0o600)
         os.makedirs(os.path.dirname(config))
-        for kind in ('wrong mode', 'symlink', 'dangling symlink', 'directory'):
+        owner_probe = os.path.join(self.tmp, 'python-for-foreign-owner')
+        write(owner_probe, '#!' + sys.executable + '\n'
+              'import os,sys\n'
+              'sys.argv = sys.argv[1:]\n'
+              'uid = os.getuid()\n'
+              'os.getuid = lambda: uid + 1\n'
+              'exec(sys.stdin.read())\n', 0o755)
+        for kind in ('wrong mode', 'wrong owner', 'symlink', 'dangling symlink', 'directory'):
             with self.subTest(kind=kind):
+                python_override = ''
                 if kind == 'wrong mode':
                     write(config, '{}', 0o644)
+                elif kind == 'wrong owner':
+                    write(config, '{}', 0o600)
+                    python_override = 'M1_PY="$OWNER_PROBE"; '
                 elif kind == 'symlink':
                     os.symlink(target, config)
                 elif kind == 'dangling symlink':
@@ -781,8 +824,8 @@ class DeployDevMigrations(unittest.TestCase):
                 else:
                     os.mkdir(config, 0o700)
                 result = self.run_dd(
-                    'git() { echo UNEXPECTED_GIT; return 91; }; deploy',
-                    FILES + ARCHIVED,
+                    python_override + 'git() { echo UNEXPECTED_GIT; return 91; }; deploy',
+                    FILES + ARCHIVED, OWNER_PROBE=owner_probe,
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('mode 0600 (no symlinks)', result.stderr)

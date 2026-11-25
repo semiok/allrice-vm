@@ -479,7 +479,9 @@ except FileNotFoundError:
     sys.exit(0)
 except OSError:
     sys.exit(f'{path}: cannot inspect person VM host configuration')
-if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o600:
+if (not stat.S_ISREG(entry.st_mode)
+        or entry.st_uid != os.getuid()
+        or stat.S_IMODE(entry.st_mode) != 0o600):
     sys.exit(f'{path}: expected a regular person VM host configuration owned by the current user with mode 0600 (no symlinks)')
 print(f'--person-vm-config={path}')
 PY
@@ -494,6 +496,7 @@ deploy() {
     *) die "unknown option $1" 2 ;; esac; done
   local vm_config_arg
   vm_config_arg=$(person_vm_config_arg "$require_vm_config") || die "person VM host configuration check failed. Dev untouched." 2
+  if [ -n "$vm_config_arg" ]; then require_vm_config=1; fi
   local t0; t0=$(date +%s)
   ! lock_held "$LOCK" || die "a deploy is in progress ($("$BIN/deploy-lock" status)); stop and retry later" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run $DEPLOY_COMMAND --release-manager --recover first"
@@ -520,6 +523,10 @@ deploy() {
   local art
   art=$(cd "$rel" && node apps/worker/scripts/prepare-native-artifact.mjs --root="$PWD" 2>>"$BLOG" | tail -1 | "$M1_PY" -c 'import json,sys;print(json.load(sys.stdin)["artifactId"])') \
     || { log_deploy kind failed phase artifact sha "$sha" log "$BLOG"; die "native artifact preparation failed; see $BLOG (Dev untouched)"; }
+  # The operator may supply the file while the build runs. Refuse if a
+  # previously selected file disappears instead of sealing without it.
+  vm_config_arg=$(person_vm_config_arg "$require_vm_config") \
+    || { log_deploy kind failed phase identity sha "$sha" log "$BLOG"; die "person VM host configuration check failed. Dev untouched." 2; }
   ( cd "$rel" || exit 1
     set -- --root="$rel" --release-sha="$sha"
     if [ -n "$vm_config_arg" ]; then set -- "$@" "$vm_config_arg"; fi
