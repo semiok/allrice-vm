@@ -301,10 +301,26 @@ async function runStreams(
         }
         await check();
         for await (const item of page.scope.stream(call, child)) {
-          await check();
-          child.throwIfAborted();
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
+          if (frame.endpoint === 'remoteAccess/follow') {
+            const { value } = item;
+            const grants =
+              value.type === 'baseline' && 'owner' in value && !value.owner
+                ? value.grants
+                : value.type === 'upsert' && 'grant' in value
+                  ? [value.grant]
+                  : undefined;
+            if (!grants && value.type !== 'remove') throw denied();
+            const sessionIds = grants?.map(({ resource }) => {
+              if (resource.kind !== 'session') throw denied();
+              return String(resource.id);
+            });
+            // A remove must still reach the client after the child has left
+            // the catalogue. Only frames granting access require child proof.
+            await page.assertCurrent(child, sessionIds);
+          } else await check();
+          child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
         child.throwIfAborted();

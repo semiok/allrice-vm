@@ -47,7 +47,7 @@ MET-279 cold-profile 接线：独立 profile 停用 Host apply 为 noop 的 ui-s
 
 `dispose()` 必须保留已发生的 teardownFailure 并 reject，包括取消后迟到根的销毁失败；重复 dispose 不重试关闭，不把“active 已清空”视为销毁成功。对应单测保留同一失败对象与全部 cleanup 的实际调用次数。
 
-**存储上下文是 create owner 尚未满足的前提。** remountKey 只是根生命周期标识，不是 localStorage 安全命名空间；传一个客户端 namespace 字符串不构成隔离。正式 owner 须发布可核对的浏览器存储隔离/原生公开 namespace 方案，且与认证、person/employee/profile/binding 对应。本票不自行选新域名、改认证或覆盖 `window.localStorage`。未绑定的 create 不能用于正式员工入口。
+**正式 D 文档的草稿存储。** 用户批准在受管同源 iframe 启动前为 rc.2 Conversation 设置存储范围。已认领的文档使用服务器核过的组织、本人、工作区、员工和线程标识，原生会话 ID 仍按 DSH 的真实值使用。新的 page scope 和当前 VM 绑定不参与持久键，同一身份重开可恢复草稿。受管文档仅映射 Conversation 的草稿/视图 key，旧裸 key 保留并不参与恢复。其他页面的 Storage、原生对话宽度偏好与其他无关 key 和 sessionStorage 沿用浏览器行为。无有效身份或存储适配安装验证失败时，受管文档在编辑器启动前关闭。该适配约束正常受管文档的原生存取，同源脚本的浏览器权限仍由同源策略决定。
 
 ## 草稿、附件、阅读位置：真实边界
 
@@ -55,7 +55,7 @@ MET-279 cold-profile 接线：独立 profile 停用 Host apply 为 noop 的 ui-s
 
 | 能力     | 同原生根内切线程                                                                                                                                                                                                                                                          | 销毁/重建根或跨 Host                                                                                                                                                                                                                                              |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 草稿     | 公开声明 persisted；新用例经真实 editor + `conversation.input.for(binding.ctx).state` 验证，待运行                                                                                                                                                                        | 原生 key 是 `dsh.conversation.${sessionId}`，同 origin 同 ID 会共享；新用例明确断言此负向事实并保存 JSON，待运行。不同测试 origin 的隔离不等于正式 AllRice 路由已批准                                                                                             |
+| 草稿     | 公开声明 persisted；新用例经真实 editor + `conversation.input.for(binding.ctx).state` 验证，待运行                                                                                                                                                                        | 原生独立入口沿用 `dsh.conversation.${sessionId}`。原 same-origin 负例保留。受管 D 文档按上文绑定原生草稿、视图键及相关存储事件                                                                                                                                    |
 | 附件     | 同 Host 不等于同 Session scope。`uiWorkspace` 切换会释放旧 `mainView` 引用；最后引用归零时销毁 input shell 并释放附件。用例保留真实 picker/附件为 1 的正向断言，但仅在显式原生 retain 下成立，并补验 release 后重新打开为 0；此 retain 仅属夹具，不证明产品保留需求已交付 | 原生描述为 runtime-only；新根没有旧 File/receipt ownership。没有公开跨根恢复/重新准入接口，本票不拷旧 upload receipt 或伪装成功；同员工 revision/binding 变化也不能复用旧 receipt                                                                                 |
 | 阅读位置 | `ChatViewSlotProps.chatScroll` 公开 read/save；原生根内使用原生 anchor；新用例真实 wheel + 实际 viewport 恢复，待运行                                                                                                                                                     | 原生默认 Map 随根销毁。持有完整 ChatViewSlotProps 的合法 owner 可包装公开 read/save，以可信 person/employee/profile/session/remount scope 保存 canonical ChatScrollPosition；公开合同支持，但本票 owner 未绑定、跨根未实测。不能因缺独立 decorator 判定绝对不可能 |
 
@@ -63,6 +63,7 @@ MET-279 cold-profile 接线：独立 profile 停用 Host apply 为 noop 的 ui-s
 
 - ui-conversation `lib/types/client/contract/views.d.ts:19-21` 声明 draft persisted；`lib/client.js:4426,4438,4471,4488` 定义 `dsh.conversation` 和 session suffix。
 - client-store `lib/index.js:112-123,151-152` 直接读写当前 window localStorage、按 scopeKey 后缀持久化，无根存储 namespace 注入。
+- MET-225 本片的正式 D 定制项为受管 iframe 的 Conversation 草稿/视图存储范围。保留原生数据和 hydrate 流程，由现有 Web 文档提供可信身份，以浏览器 Storage 的同一对象读写隔离后的键。
 - ui-conversation `lib/types/client/service.d.ts:114-124` 声明 runtime-only 附件及上传 service owner；这不能推导 SessionInput 附件在 scope 释放后恢复。rc.2 官方 `ui-workspace/src/client/navigation.ts:506-527` 释放旧主视图引用，`session-controller/src/client/sessions/service.ts:543-562,586-594` 在计数归零时撤销 scope；`ui-conversation/src/client/input/hub.ts:144-164` 随 scope 调用 shell.dispose 并 releaseDraftAttachment。公开 `InputState.attachmentIds` 同样注明 runtime-only。
 - ui-chat `lib/types/client/contract/slots.d.ts:232-269` 导出 `ChatScrollPosition` 与 read/save；`lib/client.js:13116,13259-13265` 为根内 Map。
 

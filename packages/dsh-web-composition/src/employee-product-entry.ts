@@ -1,13 +1,14 @@
 import { applyIndexInjections } from '@deepseek-ai/dsh-client-web';
-import { nativeProfileDocument } from '../../../apps/web/lib/d-entry/profile-browser';
+import {
+  nativeProfileDocument,
+  readEmployeeDocument,
+} from '../../../apps/web/lib/d-entry/profile-browser';
+import { installEmployeeDraftStorage } from './employee-draft-storage';
 import {
   startEmployeeWebEntry,
   type EmployeeWebEntryClose,
 } from './employee-web-entry';
-import {
-  pageCompletion,
-  pageStartupFailed,
-} from '../../../apps/web/lib/d-entry/page-messages';
+import { pageStartupFailed } from '../../../apps/web/lib/d-entry/page-messages';
 
 const container = document.getElementById('app');
 const scope = globalThis as typeof globalThis & {
@@ -25,13 +26,16 @@ const scopeId = initial?.scopeId ?? container?.dataset.scopeId;
 const fail = () =>
   parent.postMessage({ type: pageStartupFailed, scopeId }, location.origin);
 if (initial && !initial.claim()) initial.finish('closed');
-else if (container) boot(container);
+else if (initial && container) boot(container, initial);
 else {
   fail();
   initial?.finish('closed');
 }
 
-function boot(container: HTMLElement) {
+function boot(
+  container: HTMLElement,
+  documentOwner: NonNullable<typeof initial>,
+) {
   let profile: ReturnType<typeof nativeProfileDocument> | undefined;
   let entry: ReturnType<typeof startEmployeeWebEntry> | undefined;
   let closing = false;
@@ -47,17 +51,12 @@ function boot(container: HTMLElement) {
         });
     const finish = (state: EmployeeWebEntryClose['state']) => {
       window.removeEventListener('pagehide', close);
-      initial?.signal.removeEventListener('abort', close);
+      documentOwner.signal.removeEventListener('abort', close);
       if (scope.__DSH_TRANSPORT__ === profile?.transport)
         delete scope.__DSH_TRANSPORT__;
       if (scope.__ALLRICE_D_ENTRY_LIFETIME__ === profile?.signal)
         delete scope.__ALLRICE_D_ENTRY_LIFETIME__;
-      if (initial) initial.finish(state);
-      else
-        parent.postMessage(
-          { type: pageCompletion, scopeId, state },
-          location.origin,
-        );
+      documentOwner.finish(state);
     };
     void joined.then(
       ({ state }) => finish(state),
@@ -65,6 +64,11 @@ function boot(container: HTMLElement) {
     );
   }
   try {
+    documentOwner.signal.throwIfAborted();
+    const identity = readEmployeeDocument(container.dataset);
+    if (identity.scopeId !== documentOwner.scopeId)
+      throw Error('Employee document scope is unavailable');
+    installEmployeeDraftStorage(identity);
     const document = nativeProfileDocument(container, close);
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
@@ -78,7 +82,7 @@ function boot(container: HTMLElement) {
       cleanup: document.close,
     });
     window.addEventListener('pagehide', close, { once: true });
-    initial?.signal.addEventListener('abort', close, { once: true });
+    documentOwner.signal.addEventListener('abort', close, { once: true });
     void entry.started.then((result) => {
       if (result.state !== 'failed') return;
       fail();

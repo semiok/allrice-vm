@@ -365,16 +365,32 @@ export function EmployeePanelsHeader({
   binding: EmployeePanelsBinding;
 }) {
   const snapshot = useOwner(binding, sessionId);
-  return snapshot && snapshot.filesUnread !== null ? (
+  const filesUnread = useEmployeePanelsUnread(snapshot);
+  return snapshot ? (
     <div className={`${css.surface} ${css.header}`}>
       <EmployeePanelsEntries
         ctx={ctx}
         binding={binding}
         sessionId={sessionId}
         snapshot={snapshot}
+        filesUnread={filesUnread}
       />
     </div>
   ) : null;
+}
+
+const noUnreadSubscription = () => () => undefined;
+
+export function useEmployeePanelsUnread(
+  snapshot: EmployeePanelsSnapshot | null,
+) {
+  const source = snapshot?.filesUnreadSource;
+  const read = source?.getSnapshot ?? (() => snapshot?.filesUnread ?? null);
+  return useSyncExternalStore(
+    source?.subscribe ?? noUnreadSubscription,
+    read,
+    read,
+  );
 }
 
 /** Four launchers reuse the approved view; native panes own selection state. */
@@ -383,17 +399,18 @@ export function EmployeePanelsEntries({
   binding,
   sessionId,
   snapshot,
+  filesUnread = snapshot.filesUnread,
 }: {
   ctx: Context;
   binding: EmployeePanelsBinding;
   sessionId: SessionIdOf;
   snapshot: EmployeePanelsSnapshot;
+  filesUnread?: number | null;
 }) {
-  if (!snapshot || snapshot.filesUnread === null) return null;
   return (
     <WorkbenchEntries
       counts={{
-        files: snapshot.filesUnread,
+        files: filesUnread ?? 0,
         materials: 0,
         experience: 0,
         workflow: 0,

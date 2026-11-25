@@ -10,18 +10,28 @@ import { DataAccessError } from '@allrice/database';
 import type * as NativeWorker from '../../../../lib/d-entry/native-worker';
 import type * as SessionIdentity from '../../../../lib/identity/session';
 import type * as Database from '@allrice/database';
+import {
+  buildProfileFixture,
+  closePage,
+  closes,
+  fixture,
+  open,
+  sessionToken,
+} from '../../../../../worker/src/d-entry/principal-page-carrier.fixture';
+import { deferred } from '../../../../../../packages/d-entry-principal/test/host-fixture';
 
 const authenticated = vi.hoisted(() => vi.fn());
 const historyIdentity = vi.hoisted(() => vi.fn());
 const profileRequest = vi.hoisted(() => vi.fn());
 const directory = vi.hoisted(() => vi.fn());
+const cookie = vi.hoisted(() => ({ value: '' }));
 vi.mock('@allrice/database', async (load) => ({
   ...(await load<typeof Database>()),
   readDEntryEmployeeDirectory: directory,
 }));
 vi.mock('next/headers', () => ({
   cookies: async () => ({
-    get: () => ({ value: 'unit-test-original-session-cookie' }),
+    get: () => cookie,
   }),
 }));
 vi.mock('../../../../lib/d-entry/native-worker', async (importOriginal) => ({
@@ -55,6 +65,7 @@ beforeEach(() => {
   historyIdentity.mockReset();
   profileRequest.mockReset();
   directory.mockReset();
+  cookie.value = 'unit-test-original-session-cookie';
   authenticated.mockResolvedValue({ actor: { type: 'user', id: 'actor' } });
 });
 
@@ -228,5 +239,94 @@ it('requires the issued scope in the document address and leaves the two exact n
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
+    ['bootstrap', { scopeId }, 'document'],
   ]);
 });
+
+it(
+  'refuses HTML when the actual original Worker carrier closes during the directory read',
+  { timeout: 30_000 },
+  async () => {
+    const release = await buildProfileFixture();
+    const worker = await fixture(release);
+    const issued = await open(worker);
+    const neighbor = await open(worker);
+    const readDirectory = deferred<AbortSignal>();
+    const finishDirectory = deferred();
+    closes.push(async () => finishDirectory.resolve());
+    directory.mockImplementationOnce(async (_context, _selection, signal) => {
+      readDirectory.resolve(signal);
+      await finishDirectory.promise;
+      return {
+        employees: [{ name: 'private employee from directory' }],
+        sessions: [{ title: 'private session from directory' }],
+      };
+    });
+    authenticated.mockResolvedValue(worker.context);
+    historyIdentity.mockResolvedValue(worker.identity);
+    cookie.value = sessionToken;
+    const native = await vi.importActual<typeof NativeWorker>(
+      '../../../../lib/d-entry/native-worker',
+    );
+    profileRequest.mockImplementation(native.requestDEntryProfile);
+    const query = new URLSearchParams({
+      ...worker.selection,
+      scopeId: issued.scopeId,
+    });
+    const outer = await GET(request(query.toString()));
+    expect(outer.status).toBe(307);
+    const location = new URL(
+      outer.headers.get('location')!,
+      'https://allrice.test',
+    );
+    const definitive = new Request(location, {
+      headers: { cookie: 'allrice_session=' + sessionToken },
+    });
+    const pending = documentAsset(definitive, {
+      params: Promise.resolve({
+        publicationPath: location.pathname.split('/').slice(4),
+      }),
+    });
+    try {
+      await Promise.race([
+        readDirectory.promise,
+        pending.then((output) => {
+          throw Error(
+            'Directory did not hold the HTTP request: ' + output.status,
+          );
+        }),
+      ]);
+      closePage(issued.peer);
+      expect(await issued.receive()).toMatchObject({
+        value: { type: 'closed' },
+      });
+      expect(await issued.receive()).toEqual({ type: 'end', streamId: 'life' });
+      expect(definitive.signal.aborted).toBe(false);
+    } finally {
+      finishDirectory.resolve();
+    }
+    const denied = await pending;
+    expect(denied.status).toBe(404);
+    expect(denied.headers.get('content-type')).toContain('application/json');
+    expect(await denied.text()).not.toMatch(
+      /private employee|private session|<script/,
+    );
+    expect(profileRequest).toHaveBeenCalledTimes(3);
+    expect(
+      profileRequest.mock.calls.every(
+        ([input]) =>
+          input.token === sessionToken &&
+          input.context.sessionId === worker.context.sessionId &&
+          input.selection.threadId === worker.selection.threadId,
+      ),
+    ).toBe(true);
+    const other = await worker.publish(
+      'bootstrap',
+      neighbor.scopeId,
+      {},
+      'document',
+    );
+    expect(other.status).toBe(200);
+    await other.json();
+  },
+);

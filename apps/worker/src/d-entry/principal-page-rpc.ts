@@ -1,4 +1,4 @@
-import { finished } from 'node:stream/promises';
+import { on } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEntryNativeOwnerRequestSchema,
@@ -20,6 +20,7 @@ import {
   sendDEntryHttpProblem,
   type DEntryHttpDependencies,
 } from './http.js';
+import { createDEntryHttpReplies } from './http-replies.js';
 import { authorizeDEntryNativeInvocation } from './native-invocation.js';
 import { pageRemoteFailure } from './principal-profile-mux.js';
 import type { createDEntryPageRequests } from './principal-requests.js';
@@ -65,14 +66,26 @@ const requestSchema = DEntryPageRpcRequestSchema.extend({
 async function readRequest(request: IncomingMessage, signal: AbortSignal) {
   const chunks: Buffer[] = [];
   let length = 0;
-  for await (const chunk of request) {
-    signal.throwIfAborted();
-    length += chunk.length;
-    // Same full HTTP body limit as the original rc.2 Connection bridge.
-    if (length > 300 * 1024 * 1024)
-      throw new SyntaxError('Invalid entry request');
-    chunks.push(Buffer.from(chunk));
+  try {
+    for await (const [chunk] of on(request, 'data', {
+      signal,
+      close: ['end'],
+      highWaterMark: 1,
+      lowWaterMark: 1,
+    })) {
+      signal.throwIfAborted();
+      length += chunk.length;
+      // Same full HTTP body limit as the original rc.2 Connection bridge.
+      if (length > 300 * 1024 * 1024)
+        throw new SyntaxError('Invalid entry request');
+      chunks.push(Buffer.from(chunk));
+    }
+  } finally {
+    // Discard any remaining body when input is rejected. An incomplete
+    // pipelined request does not own the socket carrying its neighbor.
+    if (!request.complete && !request.destroyed) request.resume();
   }
+  signal.throwIfAborted();
   return requestSchema.parse(
     JSON.parse(Buffer.concat(chunks).toString('utf8')),
   );
@@ -83,28 +96,15 @@ export function createDEntryPageRpc(
   authenticate: DEntryHttpDependencies['authenticate'],
   serviceSignal: AbortSignal,
 ) {
-  const running = new Set<Promise<boolean>>();
+  const replies = createDEntryHttpReplies(serviceSignal);
   const path = '/internal/d-entry/native-rpc';
-  const lifetime = new AbortController();
-  let closing: Promise<void> | undefined;
   return {
     handle(request: IncomingMessage, response: ServerResponse) {
-      if (request.url?.split('?')[0] !== path) return Promise.resolve(false);
+      if (request.url?.split('?')[0] !== path || replies.signal.aborted)
+        return Promise.resolve(false);
       const { searchParams } = new URL(request.url, 'http://worker.invalid');
       if (!searchParams.has('carrier')) return Promise.resolve(false);
-      const operation = Promise.resolve().then(async () => {
-        const abort = new AbortController();
-        const disconnected = () => abort.abort();
-        response.once('close', disconnected);
-        const signal = AbortSignal.any([
-          lifetime.signal,
-          serviceSignal,
-          abort.signal,
-        ]);
-        const stopRead = () => {
-          if (!request.complete) request.destroy();
-        };
-        signal.addEventListener('abort', stopRead, { once: true });
+      return replies.handle(request, response, async (signal, writeOwned) => {
         try {
           signal.throwIfAborted();
           if (request.method !== 'POST' || request.headers.origin)
@@ -155,42 +155,43 @@ export function createDEntryPageRpc(
                 );
               }
               const bytes = Buffer.from(await native.arrayBuffer());
-              await page.assertCurrent(active);
-              const next = await authorize();
-              if (
-                next.resource.bindingRef !== invocation.resource.bindingRef ||
-                next.resource.parentNativeSessionId !==
-                  invocation.resource.parentNativeSessionId
-              )
-                throw new DataAccessError('authorization_denied');
-              active.throwIfAborted();
-              response.writeHead(native.status, {
-                'content-type': native.headers.get('content-type')!,
-                'cache-control': 'private, no-store',
-              });
-              response.end(bytes);
-              await finished(response, { signal: active, cleanup: true });
+              await writeOwned(
+                active,
+                () =>
+                  response
+                    .writeHead(native.status, {
+                      'content-type': native.headers.get('content-type')!,
+                      'content-length': String(bytes.length),
+                      'cache-control': 'private, no-store',
+                    })
+                    .end(bytes),
+                async () => {
+                  await page.assertCurrent(active);
+                  const next = await authorize();
+                  if (
+                    next.resource.bindingRef !==
+                      invocation.resource.bindingRef ||
+                    next.resource.parentNativeSessionId !==
+                      invocation.resource.parentNativeSessionId
+                  )
+                    throw new DataAccessError('authorization_denied');
+                },
+              );
+            },
+            async (error, active) => {
+              await writeOwned(active, () =>
+                sendDEntryHttpProblem(response, error),
+              );
             },
           );
         } catch (error) {
-          sendDEntryHttpProblem(response, error);
-        } finally {
-          response.off('close', disconnected);
-          signal.removeEventListener('abort', stopRead);
+          await writeOwned(signal, () =>
+            sendDEntryHttpProblem(response, error),
+          );
         }
         return true;
       });
-      running.add(operation);
-      void operation.then(
-        () => running.delete(operation),
-        () => running.delete(operation),
-      );
-      return operation;
     },
-    close() {
-      if (closing) return closing;
-      lifetime.abort();
-      return (closing = Promise.allSettled([...running]).then(() => {}));
-    },
+    close: replies.close,
   };
 }

@@ -1,10 +1,14 @@
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 import { join } from 'node:path';
 import {
   chromium,
   type Browser,
   type BrowserContext,
+  type Frame,
   type Page,
 } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -369,14 +373,41 @@ suite('real AllRice sidebar in installed native profiles', () => {
       const path = new URL(request.url()).pathname;
       if (path.startsWith('/api/v1/')) legacyRequests.push(path);
     });
-    await view.goto(host.authUrl);
+    // Use the public launch-token exchange with the BrowserContext's Cookie
+    // jar, then load the native application once with that established Cookie.
+    const authenticated = await view.context().request.get(host.authUrl, {
+      timeout: 15_000,
+    });
+    try {
+      expect(authenticated.status()).toBe(200);
+      expect(new URL(authenticated.url()).origin).toBe(host.origin);
+    } finally {
+      await authenticated.dispose();
+    }
+    await view.goto(host.origin, { waitUntil: 'commit' });
     const proceed = view.getByRole('button', { name: /^(Continue|继续)$/ });
     await proceed
       .waitFor({ state: 'visible', timeout: 5000 })
       .catch(() => undefined);
     if (await proceed.isVisible()) await proceed.click();
-    await view.goto(host.origin);
-    await view.waitForFunction(() => !!window.__allriceSidebarTest);
+    try {
+      await view.waitForFunction(() => !!window.__allriceSidebarTest);
+    } catch (error) {
+      console.info('Native sidebar startup did not activate', {
+        document: new URL(view.url()).pathname,
+        bootStatus: await view
+          .locator('body')
+          .innerText({ timeout: 1000 })
+          .then((value) =>
+            value.replace(/token=[^\s]+/g, 'token=[redacted]').slice(0, 900),
+          )
+          .catch(() => ''),
+        pageErrors: errors.map((value) =>
+          value.replace(/token=[^\s]+/g, 'token=[redacted]'),
+        ),
+      });
+      throw error;
+    }
     await view
       .getByText('请核对三条销售记录，计算合计，并简要说明结果。', {
         exact: true,
@@ -938,6 +969,262 @@ suite('real AllRice sidebar in installed native profiles', () => {
       await sameOrigin.close();
     }
     await editor.fill('');
+  }, 60_000);
+
+  it('isolates the real native draft and view across same-origin roots and restores each on new documents', async () => {
+    const topic = {
+      scopeId: randomUUID(),
+      organizationId: randomUUID(),
+      viewerId: randomUUID(),
+      selection: {
+        workspaceId: randomUUID(),
+        employeeInstanceId: randomUUID(),
+        threadId: randomUUID(),
+      },
+      nativeSessionId: processSession,
+    };
+    const scopes = {
+      a: topic,
+      reopened: { ...topic, scopeId: randomUUID() },
+      employee: {
+        ...topic,
+        selection: { ...topic.selection, employeeInstanceId: randomUUID() },
+      },
+      organization: { ...topic, organizationId: randomUUID() },
+      viewer: { ...topic, viewerId: randomUUID() },
+      workspace: {
+        ...topic,
+        selection: { ...topic.selection, workspaceId: randomUUID() },
+      },
+      thread: {
+        ...topic,
+        selection: { ...topic.selection, threadId: randomUUID() },
+      },
+    };
+    const compiled = await build({
+      stdin: {
+        contents: `
+          import { installEmployeeDraftStorage } from '../src/employee-draft-storage';
+          if (window !== parent) {
+            const name = new URL(location.href).searchParams.get('draft-case');
+            const owner = ${JSON.stringify(scopes)}[name];
+            if (owner) installEmployeeDraftStorage(owner);
+          }
+        `,
+        resolveDir: fileURLToPath(new URL('.', import.meta.url)),
+        loader: 'ts',
+      },
+      bundle: true,
+      platform: 'browser',
+      format: 'iife',
+      write: false,
+    });
+    const isolated = await browser.newContext();
+    try {
+      const carrier = await isolated.newPage();
+      const host = hosts[0]!;
+      await open(carrier, host);
+      const key = 'dsh.conversation.' + processSession;
+      const old = JSON.stringify({
+        draft: '未归属的旧草稿',
+        view: 'legacy-view',
+      });
+      await carrier.evaluate(
+        ({ key, old }) => {
+          localStorage.setItem(key, old);
+          localStorage.setItem('dsh.conversation.contentWidth', '740');
+        },
+        { key, old },
+      );
+      await isolated.addInitScript({ content: compiled.outputFiles[0]!.text });
+      const root = (name: keyof typeof scopes) =>
+        host.origin + '/?draft-case=' + name;
+      const wrapper = host.origin + '/allrice-draft-test';
+      await carrier.route(wrapper, (route) =>
+        route.fulfill({
+          contentType: 'text/html',
+          body: `<!doctype html><iframe name="a" src="${root('a')}"></iframe><iframe name="b" src="${root('employee')}"></iframe>`,
+        }),
+      );
+      await carrier.goto(wrapper, { waitUntil: 'commit' });
+      for (const name of ['a', 'b']) {
+        await carrier
+          .frameLocator('iframe[name=' + name + ']')
+          .locator('textarea:visible,[contenteditable=true]:visible')
+          .first()
+          .waitFor();
+      }
+      const a = carrier.frame({ name: 'a' })!,
+        b = carrier.frame({ name: 'b' })!;
+      expect(new URL(a.url()).origin).toBe(new URL(b.url()).origin);
+      const editor = (frame: Frame) =>
+        frame
+          .locator('textarea:visible,[contenteditable=true]:visible')
+          .first();
+      const input = async (frame: Frame) => {
+        await frame.waitForFunction(() => !!window.__allriceSidebarTest);
+        return frame.evaluate(() => window.__allriceSidebarTest!.nativeInput());
+      };
+      const storedConversation = (frame: Frame) =>
+        frame.evaluate((key) => {
+          const saved = JSON.parse(localStorage.getItem(key) ?? 'null') as {
+            draft?: string | { text: string };
+            view?: string | null;
+          } | null;
+          return {
+            draft:
+              typeof saved?.draft === 'string'
+                ? saved.draft
+                : (saved?.draft?.text ?? ''),
+            view: saved?.view ?? null,
+          };
+        }, key);
+      expect((await input(a)).draft).toBe('');
+      expect((await input(b)).draft).toBe('');
+      const observed: {
+        key: string | null;
+        value: string | null;
+        area: string;
+        real: boolean;
+      }[] = [];
+      await carrier.exposeFunction(
+        'observeDraftStorageEvent',
+        (event: (typeof observed)[number]) => observed.push(event),
+      );
+      await b.evaluate(() =>
+        window.addEventListener('storage', (event) => {
+          void (
+            window as unknown as {
+              observeDraftStorageEvent(value: unknown): Promise<void>;
+            }
+          ).observeDraftStorageEvent({
+            key: event.key,
+            value: event.newValue,
+            area:
+              event.storageArea === localStorage
+                ? 'local'
+                : event.storageArea === sessionStorage
+                  ? 'session'
+                  : 'other',
+            real: event.isTrusted,
+          });
+        }),
+      );
+
+      await editor(a).fill('员工 A 新草稿');
+      await a.waitForFunction(
+        (key) => localStorage.getItem(key)?.includes('员工 A 新草稿'),
+        key,
+      );
+      await a.evaluate((key) => {
+        const stored = JSON.parse(localStorage.getItem(key)!);
+        localStorage.setItem(key, JSON.stringify({ ...stored, view: 'chat' }));
+        sessionStorage.setItem(key, 'session storage stays native');
+        localStorage.setItem(
+          'dsh.conversation.contentWidth',
+          'legacy-width-value',
+        );
+        localStorage.setItem('unrelated-native-storage', 'same-origin-event');
+      }, key);
+      await expect
+        .poll(() => observed)
+        .toEqual([
+          {
+            key,
+            value: 'session storage stays native',
+            area: 'session',
+            real: true,
+          },
+          {
+            key: 'dsh.conversation.contentWidth',
+            value: 'legacy-width-value',
+            area: 'local',
+            real: true,
+          },
+          {
+            key: 'unrelated-native-storage',
+            value: 'same-origin-event',
+            area: 'local',
+            real: true,
+          },
+        ]);
+      expect(await storedConversation(b)).toEqual({ draft: '', view: null });
+      expect(
+        await b.evaluate(() =>
+          localStorage.getItem('dsh.conversation.contentWidth'),
+        ),
+      ).toBe('legacy-width-value');
+      expect(
+        await carrier.evaluate(
+          (key) => ({
+            bare: localStorage.getItem(key),
+            width: localStorage.getItem('dsh.conversation.contentWidth'),
+            unrelated: localStorage.getItem('unrelated-native-storage'),
+            session: sessionStorage.getItem(key),
+          }),
+          key,
+        ),
+      ).toEqual({
+        bare: old,
+        width: 'legacy-width-value',
+        unrelated: 'same-origin-event',
+        session: 'session storage stays native',
+      });
+
+      await editor(b).fill('员工 B 独立草稿');
+      await b.waitForFunction(
+        (key) => localStorage.getItem(key)?.includes('员工 B 独立草稿'),
+        key,
+      );
+      for (const name of [
+        'organization',
+        'viewer',
+        'workspace',
+        'thread',
+      ] as const) {
+        await b.goto(root(name));
+        expect((await input(b)).draft).toBe('');
+        expect(await storedConversation(b)).toEqual({ draft: '', view: null });
+      }
+      await a.goto(root('reopened'));
+      expect((await input(a)).draft).toBe('员工 A 新草稿');
+      expect(await storedConversation(a)).toEqual({
+        draft: '员工 A 新草稿',
+        view: 'chat',
+      });
+      await b.goto(root('employee'));
+      expect((await input(b)).draft).toBe('员工 B 独立草稿');
+      await a.evaluate((key) => localStorage.removeItem(key), key);
+      await a.goto(root('reopened'));
+      expect((await input(a)).draft).toBe('');
+      expect((await input(b)).draft).toBe('员工 B 独立草稿');
+      expect(
+        await carrier.evaluate((key) => localStorage.getItem(key), key),
+      ).toBe(old);
+      await writeFile(
+        join(artifacts, 'managed-native-drafts.json'),
+        JSON.stringify(
+          {
+            origin: new URL(a.url()).origin,
+            nativeSessionId: processSession,
+            unaffiliatedBareValueRetained: true,
+            sameIdentityReopened: true,
+            isolated: [
+              'employee',
+              'organization',
+              'viewer',
+              'workspace',
+              'thread',
+            ],
+            ordinaryStorageEvents: observed,
+          },
+          null,
+          2,
+        ),
+      );
+    } finally {
+      await isolated.close();
+    }
   }, 60_000);
 
   it('uses the native reading anchor for same-Host session switches', async () => {

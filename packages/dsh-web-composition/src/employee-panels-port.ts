@@ -36,6 +36,11 @@ export interface EmployeePanelsSnapshot {
   readonly scopeKey: string;
   /** Existing files-unread semantics. null means unknown, not successful zero. */
   readonly filesUnread: number | null;
+  /** Presentation updates may arrive while the authenticated data owner is held. */
+  readonly filesUnreadSource?: {
+    getSnapshot(): number | null;
+    subscribe(listener: () => void): () => void;
+  };
   readonly publicationManagement?: ReferencePublicationScope;
   readonly materials: Omit<Materials, 'active' | 'onUse'>;
   readonly files: Omit<Files, 'active' | 'onUse'>;

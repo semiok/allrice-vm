@@ -10,7 +10,12 @@ import type { SessionIdOf } from '@deepseek-ai/dsh-client-ui-slots';
 import { Context } from '@deepseek-ai/cordis';
 import { useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
-import { EmployeePanelContent } from '../../../src/employee-panels';
+import {
+  EmployeePanelContent,
+  EmployeePanelsEntries,
+  useEmployeePanelsUnread,
+} from '../../../src/employee-panels';
+import { employeePanelKinds } from '../../../src/employee-panels-model';
 import { installEmployeeProductOwner } from '../../../src/employee-product-owner';
 
 const container = document.getElementById('app')!;
@@ -18,26 +23,41 @@ const sessionId = container.dataset.nativeSessionId as SessionIdOf;
 const lifetime = new AbortController();
 Object.assign(globalThis, { __ALLRICE_D_ENTRY_LIFETIME__: lifetime.signal });
 const ctx = new Context();
+let openPanel: ((kind: 'files' | 'materials') => void) | undefined;
 // The independent BFF is exercised without starting a VM. Give the real
 // panel the same mounted-session value that its native Dock supplies.
 ctx.provide('sidebarRight', {
   mounted: { getSnapshot: () => sessionId },
+  isExpanded: () => true,
+  openTab(id: string) {
+    if (id === employeePanelKinds.files) openPanel?.('files');
+    if (id === employeePanelKinds.materials) openPanel?.('materials');
+  },
 } as unknown as Context['sidebarRight']);
 const root = createRoot(container);
 ctx.inject(['allriceEmployeePanels'], (scope) => {
   const binding = scope.allriceEmployeePanels;
   function App() {
     const [kind, setKind] = useState<'materials' | 'files'>('files');
+    openPanel = setKind;
     const snapshot = useSyncExternalStore(
       (listener) => binding.port.subscribe(sessionId, listener),
       () => binding.port.getSnapshot(sessionId),
     );
+    const filesUnread = useEmployeePanelsUnread(snapshot);
     return (
       <main aria-label="资料成果">
-        <nav aria-label="面板">
-          <button onClick={() => setKind('files')}>交付成果</button>
-          <button onClick={() => setKind('materials')}>企业资料</button>
-        </nav>
+        {snapshot && (
+          <nav aria-label="面板" data-unread={filesUnread ?? 'unknown'}>
+            <EmployeePanelsEntries
+              ctx={scope}
+              binding={binding}
+              sessionId={sessionId}
+              snapshot={snapshot}
+              filesUnread={filesUnread}
+            />
+          </nav>
+        )}
         {snapshot && (
           <EmployeePanelContent
             key={kind}

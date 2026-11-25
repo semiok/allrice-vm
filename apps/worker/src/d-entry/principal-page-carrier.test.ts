@@ -253,6 +253,339 @@ it.each(['EOF', 'socket error'] as const)(
   },
 );
 
+function holdSocket(response: ServerResponse) {
+  const socket = response.socket!;
+  const close = socket.destroy.bind(socket);
+  const fenced = deferred();
+  const release = deferred();
+  const hold = vi.spyOn(socket, 'destroy').mockImplementation((error) => {
+    fenced.resolve();
+    void release.promise.then(() => close(error));
+    return socket;
+  });
+  closes.push(async () => {
+    hold.mockRestore();
+    release.resolve();
+  });
+  return { fenced: fenced.promise, release, closed: once(socket, 'close') };
+}
+
+const rpcPath = '/internal/d-entry/native-rpc?carrier=page';
+
+function writePageRpc(client: Socket, body: string, connection = 'keep-alive') {
+  client.write(
+    `POST ${rpcPath} HTTP/1.1\r\nHost: 127.0.0.1\r\nauthorization: Bearer ${sessionToken}\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: ${connection}\r\n\r\n${body}`,
+  );
+}
+
+it(
+  'writes only an empty denial for a revoked queued RPC and keeps its HTTP neighbors',
+  { timeout: 30_000 },
+  async () => {
+    const f = await fixture();
+    const page = await open(f);
+    const neighbor = await open(f);
+    const waiting = deferred<ServerResponse>();
+    const headArrived = deferred<ServerResponse>();
+    let watched = false;
+    const observe = (request: IncomingMessage, response: ServerResponse) => {
+      if (request.url === '/fixture-before-profile')
+        headArrived.resolve(response);
+      if (request.url !== rpcPath || watched) return;
+      watched = true;
+      const writeHead = response.writeHead;
+      const early = vi
+        .spyOn(response, 'writeHead')
+        .mockImplementation((...args: Parameters<typeof writeHead>) => {
+          waiting.reject(
+            Error('Queued RPC wrote before it owned the response'),
+          );
+          return Reflect.apply(writeHead, response, args) as ServerResponse;
+        });
+      function listen(event: string | symbol) {
+        if (event !== 'socket') return;
+        response.off('newListener', listen);
+        early.mockRestore();
+        waiting.resolve(response);
+      }
+      response.on('newListener', listen);
+    };
+    f.worker.prependListener('request', observe);
+    closes.push(async () => f.worker.off('request', observe));
+    const { address, port } = f.worker.address() as AddressInfo;
+    const client = createConnection({ host: address, port });
+    const closed = once(client, 'close');
+    void closed.catch(() => {});
+    const wire = observeProfileWire(client);
+    closes.push(async () => {
+      client.destroy();
+      await closed.catch(() => {});
+      await wire.dispose();
+    });
+    await once(client, 'connect');
+    client.write(
+      'GET /fixture-before-profile HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n',
+    );
+    const firstHeaders = await wire.head(200);
+    const head = await headArrived.promise;
+
+    writePageRpc(client, f.rpcBody(page.scopeId, { rpcId: 'revoked-rpc' }));
+    const queued = await waiting.promise;
+    expect(queued.socket).toBeNull();
+    expect(queued.headersSent).toBe(false);
+    expect(f.host.catalog.pages).toHaveLength(1);
+    const terminal = page.receive();
+    closePage(page.peer);
+    expect(await terminal).toMatchObject({ value: { type: 'closed' } });
+    expect(await page.receive()).toEqual({ type: 'end', streamId: 'life' });
+    expect(queued.writableFinished).toBe(false);
+    expect(head.writableEnded).toBe(false);
+    expect(client.destroyed).toBe(false);
+
+    writePageRpc(
+      client,
+      f.rpcBody(neighbor.scopeId, { rpcId: 'neighbor-rpc' }),
+      'close',
+    );
+    head.end(' finished');
+    expect((await wire.body(firstHeaders)).toString()).toBe(
+      'unrelated handler still running finished',
+    );
+    const refused = await wire.head(404);
+    expect(refused.get('content-length')).toBe('0');
+    expect(await wire.body(refused)).toHaveLength(0);
+    expect(
+      JSON.parse((await wire.body(await wire.head(200))).toString()),
+    ).toEqual({
+      type: 'server-response',
+      rpcId: 'neighbor-rpc',
+      result: { ok: true, value: { records: [], hasMore: false } },
+    });
+    await wire.expectEnd();
+    await closed;
+    expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+  },
+);
+
+it(
+  'keeps page close pending until a backpressured native RPC physically closes',
+  { timeout: 30_000 },
+  async () => {
+    const f = await fixture();
+    const page = await open(f);
+    const neighbor = await open(f);
+    f.host.catalog.pageRecords = [
+      {
+        type: 'event',
+        event: {
+          type: 'fixture-response-bytes',
+          seq: 1,
+          time: 1,
+          data: 'synthetic private response'.repeat(400_000),
+          ignorable: true,
+        },
+      },
+    ];
+    const submitted = deferred<ServerResponse>();
+    const observe = (request: IncomingMessage, response: ServerResponse) => {
+      if (request.url !== rpcPath) return;
+      f.worker.off('request', observe);
+      const end = response.end;
+      const wrapped = vi
+        .spyOn(response, 'end')
+        .mockImplementation((...args: Parameters<typeof end>) => {
+          wrapped.mockRestore();
+          const result = Reflect.apply(end, response, args) as ServerResponse;
+          submitted.resolve(response);
+          return result;
+        });
+    };
+    f.worker.prependListener('request', observe);
+    closes.push(async () => f.worker.off('request', observe));
+    const { address, port } = f.worker.address() as AddressInfo;
+    const client = createConnection({ host: address, port });
+    // Keep the real peer paused so the kernel cannot accept the complete reply.
+    client.pause();
+    const closed = once(client, 'close');
+    void closed.catch(() => {});
+    closes.push(async () => {
+      client.destroy();
+      await closed.catch(() => {});
+    });
+    await once(client, 'connect');
+    writePageRpc(
+      client,
+      f.rpcBody(page.scopeId, { rpcId: 'backpressured-rpc' }),
+    );
+    const response = await Promise.race([
+      submitted.promise,
+      closed.then(() => {
+        throw Error('RPC socket ended before submitting the result');
+      }),
+    ]);
+    expect(response.statusCode).toBe(200);
+    expect(response.writableEnded).toBe(true);
+    expect(response.writableFinished).toBe(false);
+    expect(response.socket!.writableLength).toBeGreaterThan(0);
+    const held = holdSocket(response);
+    f.host.catalog.pageRecords = [];
+    let delivered = false;
+    const terminal = page.receive().then((frame) => {
+      delivered = true;
+      return frame;
+    });
+
+    try {
+      closePage(page.peer);
+      await Promise.race([
+        held.fenced,
+        terminal.then(() => {
+          throw Error('Page terminated while RPC output was still live');
+        }),
+      ]);
+      expect(page.revoked.aborted).toBe(true);
+      expect((await f.invoke(page.scopeId)).status).toBe(404);
+      expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+      expect(delivered).toBe(false);
+      expect(response.socket!.closed).toBe(false);
+    } finally {
+      held.release.resolve();
+    }
+    await held.closed;
+    expect(await terminal).toMatchObject({ value: { type: 'closed' } });
+    expect(await page.receive()).toEqual({ type: 'end', streamId: 'life' });
+    expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+  },
+);
+
+it.each(['baseline', 'upsert', 'remove'] as const)(
+  'checks live resource grants for %s while the original Mux keeps its page',
+  { timeout: 30_000 },
+  async (type) => {
+    const f = await fixture();
+    const child = summary('child', 'root');
+    const namesChild = (frame: unknown) =>
+      JSON.stringify(frame)?.includes('"id":"child"');
+    if (type === 'upsert')
+      f.host.catalog.items = f.host.catalog.items.filter(
+        (row) => row.sessionId !== child.sessionId,
+      );
+    const life = await open(f);
+    const sibling = await open(f);
+    const peer = f.connect(life.scopeId);
+    await once(peer, 'open');
+    const receive = messages(peer);
+    const checkEntered = deferred();
+    const releaseCheck = deferred();
+    closes.push(async () => releaseCheck.resolve());
+    let held = false;
+    let checking = false;
+    let observed: unknown;
+    const wire = f.host.host.typertGateway.wireStream;
+    const openNative = wire.open.bind(wire);
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await openNative(...args);
+      if (args[0] !== 'remoteAccess/follow') return source;
+      return {
+        async *[Symbol.asyncIterator]() {
+          for await (const item of source) {
+            if (
+              !held &&
+              item &&
+              typeof item === 'object' &&
+              'type' in item &&
+              item.type === type &&
+              namesChild(item)
+            ) {
+              held = true;
+              observed = item;
+              vi.mocked(f.owner.readSessions).mockImplementation(async () => {
+                if (!checking) {
+                  checking = true;
+                  checkEntered.resolve();
+                  await releaseCheck.promise;
+                }
+                return {
+                  ok: true,
+                  value: {
+                    items: f.host.catalog.items.filter(
+                      (row) => row.sessionId !== child.sessionId,
+                    ),
+                  },
+                };
+              });
+            }
+            yield item;
+          }
+        },
+      };
+    });
+    send(peer, {
+      type: 'open',
+      streamId: 'access',
+      endpoint: 'remoteAccess/follow',
+      payload: { args: {} },
+    });
+    if (type !== 'baseline') {
+      const baseline = await receive('access');
+      expect(baseline).toMatchObject({
+        type: 'item',
+        value: { type: 'baseline', owner: false },
+      });
+      if (type === 'upsert') {
+        expect(JSON.stringify(baseline)).not.toContain('"id":"child"');
+        f.host.catalog.items.push(child);
+        f.host.host.emit('api-session/added', child);
+      } else {
+        expect(JSON.stringify(baseline)).toContain('"id":"child"');
+        f.host.catalog.items = f.host.catalog.items.filter(
+          (row) => row.sessionId !== child.sessionId,
+        );
+        f.host.host.emit('api-session/removed', child.sessionId);
+      }
+    }
+
+    let delivered = false;
+    const next = (async () => {
+      while (true) {
+        const frame = await receive('access');
+        if (frame.type !== 'item' || namesChild(frame.value)) {
+          delivered = true;
+          return frame;
+        }
+      }
+    })();
+    try {
+      await Promise.race([
+        checkEntered.promise,
+        next.then(() => {
+          throw Error(
+            'Mux sent its frame before checking the resource catalog',
+          );
+        }),
+      ]);
+      expect(observed).toMatchObject({ type });
+      expect(namesChild(observed)).toBe(true);
+      expect(delivered).toBe(false);
+    } finally {
+      releaseCheck.resolve();
+    }
+    if (type === 'remove') {
+      expect(await next).toMatchObject({
+        type: 'item',
+        value: { type: 'remove', resource: { kind: 'session', id: 'child' } },
+      });
+    } else {
+      expect(await next).toMatchObject({
+        type: 'error',
+        error: { code: 'gateway/forbidden' },
+      });
+    }
+    expect((await f.invoke(life.scopeId)).status).toBe(200);
+    expect((await f.invoke(sibling.scopeId)).status).toBe(200);
+  },
+);
+
 it('issues only once, borrows the same actual native Peer for unary and stream and joins before closed/end', async () => {
   const f = await fixture();
   const life = await open(f);
@@ -1634,22 +1967,6 @@ it(
         await closed;
       }
       return { responses, remaining, disconnect, endFromWorker };
-    }
-    function holdSocket(response: ServerResponse) {
-      const socket = response.socket!;
-      const close = socket.destroy.bind(socket);
-      const fenced = deferred();
-      const release = deferred();
-      const hold = vi.spyOn(socket, 'destroy').mockImplementation((error) => {
-        fenced.resolve();
-        void release.promise.then(() => close(error));
-        return socket;
-      });
-      closes.push(async () => {
-        hold.mockRestore();
-        release.resolve();
-      });
-      return { fenced: fenced.promise, release, closed: once(socket, 'close') };
     }
   },
 );

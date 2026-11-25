@@ -326,6 +326,22 @@ export async function fixture(release?: ProfileProof) {
     clients.push(client);
     return client;
   };
+  const rpcBody = (scopeId: string, extra: object = {}) =>
+    JSON.stringify({
+      ...f.body,
+      scopeId,
+      rpcId: '',
+      endpoint: 'session/page',
+      payload: {
+        args: {
+          request: {
+            address: { kind: 'session', sessionId: 'root' },
+            throughSeq: 0,
+          },
+        },
+      },
+      ...extra,
+    });
   const invoke = (scopeId: string, token = sessionToken, extra: object = {}) =>
     fetch(workerOrigin + '/internal/d-entry/native-rpc?carrier=page', {
       method: 'POST',
@@ -333,21 +349,7 @@ export async function fixture(release?: ProfileProof) {
         authorization: 'Bearer ' + token,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({
-        ...f.body,
-        scopeId,
-        rpcId: '',
-        endpoint: 'session/page',
-        payload: {
-          args: {
-            request: {
-              address: { kind: 'session', sessionId: 'root' },
-              throughSeq: 0,
-            },
-          },
-        },
-        ...extra,
-      }),
+      body: rpcBody(scopeId, extra),
     });
   const invokeThread = (scopeId: string, threadId: string) =>
     invoke(scopeId, sessionToken, {
@@ -396,6 +398,7 @@ export async function fixture(release?: ProfileProof) {
     host,
     connect,
     invoke,
+    rpcBody,
     probe,
     publish,
     registerThread,

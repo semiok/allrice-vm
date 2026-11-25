@@ -179,9 +179,12 @@ it.skipIf(!browserExecutable)(
       | 'document'
       | 'redirect'
       | 'claimed-sync'
+      | 'draft-storage'
+      | 'draft-key-collision'
       | 'claimed-async'
       | undefined;
     const directoryQueries: string[] = [];
+    const bootstrapScopes: string[] = [];
     const knownScopes = new Map<string, string>();
     const graph = DEntryProfileGraphSchema.parse({
       rev: 'test-graph',
@@ -249,6 +252,12 @@ it.skipIf(!browserExecutable)(
           'employee-instance-id': f.identity.employeeInstanceId,
           'organization-id': f.identity.organizationId,
           'viewer-id': f.identity.personId,
+          'native-session-id':
+            mode === 'draft-key-collision'
+              ? 'contentWidth'
+              : thread === f.selection.threadId
+                ? 'root'
+                : 'root-' + thread,
           'binding-ref': f.owner.bindingRef,
           'graph-rev': graph.rev,
         };
@@ -257,7 +266,7 @@ it.skipIf(!browserExecutable)(
           .join(' ');
         return send(
           'text/html',
-          `<!doctype html><head><script data-scope-id="${scope}">${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
+          `<!doctype html><head><script data-scope-id="${scope}">${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : mode === 'draft-storage' ? '<script>Object.defineProperty(Storage.prototype,"getItem",{value:Storage.prototype.getItem,writable:false,configurable:false})</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
         );
       }
       if (url.pathname.startsWith('/chatflow/4.0/document/'))
@@ -265,6 +274,7 @@ it.skipIf(!browserExecutable)(
           .writeHead(503, { 'content-type': 'application/json' })
           .end('{}');
       if (url.pathname === '/api/v1/d-entry/profile/bootstrap') {
+        bootstrapScopes.push(url.searchParams.get('scopeId')!);
         if (
           startup === 'claimed-async' &&
           knownScopes.get(url.searchParams.get('scopeId')!) ===
@@ -449,6 +459,8 @@ it.skipIf(!browserExecutable)(
       'document',
       'redirect',
       'claimed-sync',
+      'draft-storage',
+      'draft-key-collision',
       'claimed-async',
     ] as const) {
       startup = phase;
@@ -485,6 +497,15 @@ it.skipIf(!browserExecutable)(
         await expect
           .poll(async () => (await f.invoke(scopeId)).status)
           .toBe(404);
+        if (phase === 'draft-storage' || phase === 'draft-key-collision') {
+          expect(bootstrapScopes).not.toContain(scopeId);
+          const refused = page
+            .frames()
+            .find((frame) => frame.url().includes(scopeId));
+          expect(
+            await refused!.locator('textarea,[contenteditable=true]').count(),
+          ).toBe(0);
+        }
         if (phase !== 'pending-elements') await select(page, next);
         await issued(page, next.threadId, scopeId);
       } finally {

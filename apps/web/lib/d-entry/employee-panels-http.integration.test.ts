@@ -643,8 +643,94 @@ suite(
               .waitFor({ state: 'detached' });
             return response;
           }
+          let deliverablesUnavailable = true;
+          let gateUnreadPreflight: (() => Promise<void>) | undefined;
+          const refusedFilters: (string | null)[] = [];
+          const deliverablePath = publicationPath.replace(
+            '/materials/publications',
+            '/deliverables',
+          );
+          await page.route('**' + deliverablePath + '?*', async (route) => {
+            const request = new URL(route.request().url());
+            const isList = route.request().method() === 'GET';
+            if (isList && !request.searchParams.has('employeeInstanceId')) {
+              const gate = gateUnreadPreflight;
+              gateUnreadPreflight = undefined;
+              await gate?.();
+            }
+            if (!deliverablesUnavailable || !isList) {
+              await route.continue();
+              return;
+            }
+            const original = await route.fetch({ maxRetries: 0 });
+            expect(original.status()).toBe(200); // Original Cookie and PostgreSQL checked.
+            refusedFilters.push(request.searchParams.get('employeeInstanceId'));
+            await route.fulfill({
+              status: 503,
+              contentType: 'application/json',
+              body: JSON.stringify({
+                error: {
+                  code: 'DEPENDENCY_UNAVAILABLE',
+                  message: '交付成果暂时不可用',
+                  requestId: randomUUID(),
+                  retryable: true,
+                },
+              }),
+            });
+          });
           await page.goto(base + '/fixture/panels');
           const files = page.getByRole('region', { name: '交付成果' });
+          await files
+            .getByRole('alert')
+            .filter({ hasText: '交付成果暂时不可用' })
+            .waitFor();
+          const launchers = page.getByRole('navigation', { name: '面板' });
+          expect(await launchers.getAttribute('data-unread')).toBe('unknown');
+          const materialsRead = page.waitForResponse(
+            (response) =>
+              response.request().method() === 'GET' &&
+              new URL(response.url()).pathname ===
+                publicationPath.replace('/publications', ''),
+          );
+          await launchers
+            .getByRole('button', { name: '企业资料', exact: true })
+            .click();
+          const materialsReply = await materialsRead;
+          expect(materialsReply.status()).toBe(200);
+          expect(await materialsReply.finished()).toBeNull();
+          await page
+            .getByRole('region', { name: '企业资料' })
+            .getByRole('heading', { name: '还没有企业资料' })
+            .waitFor();
+          expect(refusedFilters).toContain(null); // Page's independent unread preflight.
+          expect(refusedFilters).toContain(p.selection.employeeInstanceId);
+          await launchers
+            .getByRole('button', { name: '交付成果', exact: true })
+            .click();
+          await files
+            .getByRole('alert')
+            .filter({ hasText: '交付成果暂时不可用' })
+            .waitFor();
+          deliverablesUnavailable = false;
+          await files
+            .getByRole('button', { name: '重新加载', exact: true })
+            .click();
+          await files
+            .getByRole('alert')
+            .filter({ hasText: '交付成果暂时不可用' })
+            .waitFor({ state: 'detached' });
+          await expect
+            .poll(() => launchers.getAttribute('data-unread'))
+            .toBe('0');
+          console.info('employee-panel-independent-directory', {
+            initialUnread: 'unknown',
+            unreadPreflightRefused: refusedFilters.includes(null),
+            filePanelRefused: refusedFilters.includes(
+              p.selection.employeeInstanceId,
+            ),
+            materialsStatus: materialsReply.status(),
+            filePanelRecovered: true,
+          });
           await files
             .getByRole('combobox', { name: '按员工筛选' })
             .selectOption('');
@@ -926,8 +1012,40 @@ suite(
             };
           }, sourceId);
           const previousReceipts = receiptReads.length;
-          await page.reload();
-          await materials();
+          const ongoingReceipt = holdReceipt(withdrawnId, 'beforeReply');
+          let allowUnread!: () => void;
+          let enteredUnread!: () => void;
+          const unreadEntered = new Promise<void>((resolve) => {
+            enteredUnread = resolve;
+          });
+          const unreadReleased = new Promise<void>((resolve) => {
+            allowUnread = resolve;
+          });
+          gateUnreadPreflight = () => {
+            enteredUnread();
+            return unreadReleased;
+          };
+          const receiptWire = page.waitForResponse(
+            receiptResponse(withdrawnId),
+          );
+          void receiptWire.catch(() => {});
+          try {
+            await page.reload();
+            await materials();
+            await ongoingReceipt.arrived();
+            await unreadEntered;
+            expect(await launchers.getAttribute('data-unread')).toBe('unknown');
+            allowUnread();
+            await expect
+              .poll(() => launchers.getAttribute('data-unread'))
+              .not.toBe('unknown');
+            ongoingReceipt.release();
+            await ongoingReceipt.assertFinished(await receiptWire);
+          } finally {
+            gateUnreadPreflight = undefined;
+            allowUnread();
+            ongoingReceipt.close();
+          }
           await sourceMenu.waitFor({ state: 'detached' });
           await page
             .getByRole('status')

@@ -356,7 +356,7 @@ describe('real components and original header behavior', () => {
     expect(native).toContain('2 项新增');
   });
 
-  it('keeps files unread and the other three zero, refusing unknown counts and absent snapshots', () => {
+  it('shows launchers without an unknown unread badge and refuses absent or ended ownership', () => {
     const { ctx } = setup();
     const owner = syntheticPanelsOwner();
     const render = () =>
@@ -366,7 +366,11 @@ describe('real components and original header behavior', () => {
     expect(render()).toContain('2 项新增');
     const snapshot = owner.snapshot();
     owner.publish({ ...snapshot, filesUnread: null });
-    expect(render()).toBe('');
+    const unknownUnread = render();
+    expect(unknownUnread).toContain('aria-label="交付成果"');
+    expect(unknownUnread).toContain('aria-label="企业资料"');
+    expect(unknownUnread).not.toContain('项新增');
+    expect((unknownUnread.match(/type="button"/g) ?? []).length).toBe(4);
     owner.publish(null);
     expect(render()).toBe('');
     owner.publish({ ...snapshot, filesUnread: 0 });

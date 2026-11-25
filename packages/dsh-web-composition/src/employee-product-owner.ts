@@ -175,23 +175,49 @@ export function installEmployeeProductOwner(ctx: Context) {
     'allrice:workbench-read:v1:' +
     [organizationId, selection.workspaceId, viewerId].join('/') +
     '/files';
-  void Promise.all([
-    workspaceTask,
-    filesClient.listDeliverables(
-      { workspaceId: selection.workspaceId },
-      signal,
-    ),
-  ])
-    .then(async ([workspace, catalog]) => {
+  void workspaceTask
+    .then(async (workspace) => {
       signal.throwIfAborted();
       const employee = employeeChoice(workspace, selection.employeeInstanceId);
       if (!employee) return;
-      const keys = catalog.files.map((file) => file.objectId);
-      let previous: Set<string> | null = null;
-      try {
-        previous = unreadKeys(localStorage.getItem(storageKey));
-      } catch {
-        // Browser storage can be unavailable. The file list still opens.
+      const unread = position<number>();
+      let keys: string[] | undefined;
+      let firstRead = false;
+      let unreadRequest: Promise<void> | undefined;
+      function remember(seen: string[]) {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(seen.slice(-2000)));
+        } catch {
+          // The active page can still clear its unread count.
+        }
+      }
+      function refreshUnread() {
+        if (signal!.aborted || keys || unreadRequest) return;
+        unreadRequest = filesClient
+          .listDeliverables({ workspaceId: selection.workspaceId }, signal!)
+          .then((catalog) => {
+            if (signal!.aborted) return;
+            keys = catalog.files.map((file) => file.objectId);
+            let previous: Set<string> | null = null;
+            try {
+              previous = unreadKeys(localStorage.getItem(storageKey));
+            } catch {
+              // Browser storage can be unavailable. The file list still opens.
+            }
+            if (firstRead || !previous) remember(keys);
+            unread.update(
+              !firstRead && previous
+                ? keys.filter((key) => !previous.has(key)).length
+                : 0,
+            );
+          })
+          .catch(() => {
+            // The optional unread preflight does not own either panel.
+            // The deliverables panel presents its own live result and retry.
+          })
+          .finally(() => {
+            unreadRequest = undefined;
+          });
       }
       const common = {
         ownerKey,
@@ -207,9 +233,8 @@ export function installEmployeeProductOwner(ctx: Context) {
           employeeInstanceId: selection.employeeInstanceId,
           threadId,
         },
-        filesUnread: previous
-          ? keys.filter((key) => !previous.has(key)).length
-          : 0,
+        filesUnread: null,
+        filesUnreadSource: unread,
         materials: { ...common, readOnly: true },
         files: {
           ...common,
@@ -219,18 +244,14 @@ export function installEmployeeProductOwner(ctx: Context) {
             id: selection.employeeInstanceId,
             name: employee.currentVersion.manifest.name,
           },
-          employees: catalog.employees,
           onRead() {
-            try {
-              localStorage.setItem(
-                storageKey,
-                JSON.stringify(keys.slice(-2000)),
-              );
-            } catch {
-              // The active page can still clear its unread count.
-            }
-            const now = panels.getSnapshot();
-            if (now?.filesUnread) panels.update({ ...now, filesUnread: 0 });
+            if (signal!.aborted) return;
+            firstRead = true;
+            if (keys) {
+              remember(keys);
+              if (unread.getSnapshot() !== 0) unread.update(0);
+            } else if (unreadRequest) void unreadRequest.then(refreshUnread);
+            else refreshUnread();
           },
           onOpen(file) {
             const current = panels.getSnapshot();
@@ -249,7 +270,6 @@ export function installEmployeeProductOwner(ctx: Context) {
           },
         },
       };
-      if (!previous) initial.files.onRead?.();
       panels.update(initial);
       await bindEmployeePanelsHttp(
         ctx,
@@ -265,6 +285,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             ? { selection, viewerId }
             : null,
       );
+      refreshUnread();
     })
     .catch(() => {});
 }

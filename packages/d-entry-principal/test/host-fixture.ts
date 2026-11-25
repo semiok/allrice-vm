@@ -149,6 +149,7 @@ class Catalog extends TypertRemoteService {
   beforeFollow?: () => Promise<void>;
   afterFollowSnapshot?: () => Promise<void>;
   afterFollow?: () => Promise<void>;
+  pageRecords: SessionPage['records'] = [];
   readonly pages: PeerScope[] = [];
   readonly follows: PeerScope[] = [];
   constructor(ctx: Context) {
@@ -174,7 +175,7 @@ class Catalog extends TypertRemoteService {
     const invocation = this.ctx.invocation;
     if (!invocation) throw Error('fixture native invocation missing');
     this.pages.push(invocation.peer);
-    return { records: [], hasMore: false };
+    return { records: this.pageRecords, hasMore: false };
   }
   @Remote({
     mode: 'stream',

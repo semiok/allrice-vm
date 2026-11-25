@@ -68,6 +68,12 @@ export async function GET(request: Request, { params }: Params) {
       .map(([key, value]) => `data-${key}="${escapeAttribute(value!)}"`)
       .join(' ');
     const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>员工工作区</title><script data-scope-id="${escapeAttribute(scopeId)}">${initialDocumentLifecycle}</script><link rel="stylesheet" data-allrice-document-asset="style" href="assets/index-BxpfOGf3.css"><link rel="stylesheet" data-allrice-document-asset="style" href="assets/vendor-DV2921Zo.css"><link rel="stylesheet" data-allrice-document-asset="style" href="${assets}/managed/employee-web-entry.css"></head><body><div id="app" ${attributes}></div><script id="allrice-employee-directory" type="application/json">${directoryJson}</script><script type="module" data-allrice-document-asset="entry" src="${assets}/managed/employee-web-entry.js"></script></body></html>`;
+    // The SQL directory does not own the long-lived Worker carrier. Carry
+    // the original request back across that boundary after the database read.
+    const current = await qualifyDocument(input, target);
+    if (current.nativeSessionId !== address.nativeSessionId)
+      throw new DataAccessError('not_found');
+    request.signal.throwIfAborted();
     return new Response(html, {
       headers: {
         'content-type': 'text/html; charset=utf-8',
