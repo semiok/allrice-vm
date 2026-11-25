@@ -149,7 +149,7 @@ it('uses each current Session RC, full readonly roster and exact original public
   expect(f.native.readSessionsFor).toHaveBeenCalledExactlyOnceWith(
     current,
     expect.any(AbortSignal),
-    expect.any(Function),
+    undefined,
   );
   expect(f.native.readSessions).not.toHaveBeenCalled();
   expect(
