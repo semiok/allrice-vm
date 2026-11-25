@@ -220,7 +220,24 @@ export function createModelGateway(options: {
   const revoked = new Set<string>();
   // The request callback may finish without proving the underlying join.
   // Keep the failure after it leaves the active set, scoped to its VM epoch.
-  const unconfirmedJoins = new Map<string, ModelGatewayError>();
+  const unconfirmedJoins = new Map<
+    string,
+    { binding: PersonVmBinding; failures: ModelGatewayError[] }
+  >();
+  function incompleteJoin(record: {
+    binding: PersonVmBinding;
+    failures: ModelGatewayError[];
+  }) {
+    return Object.assign(
+      new ModelGatewayError('LEDGER_UNAVAILABLE', {
+        cause: new AggregateError(
+          record.failures,
+          'Model transport join unconfirmed',
+        ),
+      }),
+      { binding: record.binding },
+    );
+  }
   return {
     admission: options.admission.participant,
     async handle(request, response, bindingInput, hostSignal) {
@@ -452,7 +469,13 @@ export function createModelGateway(options: {
                       )
                     : joinFailure,
               });
-              if (!unconfirmedJoins.has(key)) unconfirmedJoins.set(key, error);
+              const previous = unconfirmedJoins.get(key);
+              if (previous) previous.failures.push(error);
+              else
+                unconfirmedJoins.set(key, {
+                  binding: Object.freeze(binding.vm),
+                  failures: [error],
+                });
               throw error;
             }
             return operationFailed
@@ -509,10 +532,12 @@ export function createModelGateway(options: {
         entry.controller.abort(new Error('model_gateway_binding_revoked'));
       await Promise.all(entries.map((entry) => entry.done));
       const incomplete = unconfirmedJoins.get(key);
-      if (incomplete) throw incomplete;
+      if (incomplete) throw incompleteJoin(incomplete);
     },
     async reconcileOwner(context, ownerId, signal) {
       signal.throwIfAborted();
+      const recoveringClosedOwner =
+        ownerId === options.ownerId && closed && active.size === 0;
       const evidence = await options.authority.confirmOwnerStopped(
         context,
         ownerId,
@@ -521,19 +546,30 @@ export function createModelGateway(options: {
       signal.throwIfAborted();
       if (!evidence.evidenceRef.trim())
         throw new ModelGatewayError('AUTHORIZATION_DENIED');
-      return options.store.reconcileOwner(ownerId, evidence.evidenceRef);
+      const released = await options.store.reconcileOwner(
+        ownerId,
+        evidence.evidenceRef,
+      );
+      signal.throwIfAborted();
+      if (recoveringClosedOwner && active.size === 0) {
+        unconfirmedJoins.clear();
+        uninstall();
+      }
+      return released;
     },
     async close() {
       closed = true;
       for (const entry of active)
         entry.controller.abort(new Error('model_gateway_closed'));
       await Promise.all([...active].map((entry) => entry.done));
-      uninstall();
       if (unconfirmedJoins.size)
+        // A detached provider can still inherit a stopped metered scope. Keep
+        // its fence installed until this exact closed owner is recovered.
         throw new AggregateError(
-          [...unconfirmedJoins.values()],
+          [...unconfirmedJoins.values()].map(incompleteJoin),
           'Model gateway join unconfirmed',
         );
+      uninstall();
     },
     ledger: {
       async summarize(context, signal) {

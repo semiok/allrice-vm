@@ -672,6 +672,7 @@ export async function gatewayFixture(options: {
   binding?: ModelCallBinding;
   authority?: ModelGatewayAuthority;
   admission?: FixtureAdmission;
+  ownerId?: string;
   nextBinding?: (index: number) => ModelCallBinding;
 }) {
   const store = options.store ?? new FixtureStore();
@@ -697,7 +698,7 @@ export async function gatewayFixture(options: {
     },
   };
   const gateway = createModelGateway({
-    ownerId: randomUUID(),
+    ownerId: options.ownerId ?? randomUUID(),
     authority,
     store,
     provider: options.provider,

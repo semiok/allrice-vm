@@ -1,7 +1,8 @@
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
 import { rm, stat } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { IncomingMessage, ServerResponse } from 'node:http';
+import { Socket } from 'node:net';
 import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
@@ -486,8 +487,9 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   );
   if (!model?.resolve) throw Error('Missing registered model service');
   const headers = { 'x-synthetic-call': 'lookup-only' };
-  const request = { headers } as IncomingMessage;
-  const response = {} as ServerResponse;
+  const request = new IncomingMessage(new Socket());
+  request.headers = headers;
+  const response = new ServerResponse(request);
   const call: Model.ModelCallBinding = {
     context,
     vm: binding,
