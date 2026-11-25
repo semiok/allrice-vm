@@ -145,3 +145,48 @@ it('reports the current stop attempt only to an authorized local operator', asyn
     code: 'ENOENT',
   });
 });
+
+it('joins authentication for a disconnected client before releasing the maintenance socket', async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const recover = vi.fn(async () => 0);
+  const socket = await openProductionRecoverySocket({
+    async authenticate() {
+      entered.resolve();
+      await release.promise;
+      return null;
+    },
+    recover,
+    pending: () => true,
+  });
+  const client = request({
+    socketPath: socket.path,
+    path: '/recover',
+    method: 'POST',
+    headers: { authorization: 'Bearer synthetic-session' },
+  });
+  const disconnected = Promise.withResolvers<void>();
+  client.once('error', () => {});
+  client.once('close', disconnected.resolve);
+  client.end();
+  let settled = false;
+  try {
+    await entered.promise;
+    client.destroy();
+    await disconnected.promise;
+    const closing = socket.close().then(() => {
+      settled = true;
+    });
+    // The kernel can close the client connection while its authority work
+    // is behind the barrier. Verify the socket owner is still alive.
+    await stat(dirname(socket.path));
+    expect(settled).toBe(false);
+    release.resolve();
+    await closing;
+    expect(recover).not.toHaveBeenCalled();
+  } finally {
+    client.destroy();
+    release.resolve();
+    await socket.close();
+  }
+});

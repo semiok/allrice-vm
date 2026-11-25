@@ -479,9 +479,10 @@ export async function recoverProductionPersonVmModelOwner(
   if (result.state !== 'installed')
     throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
   const released = await result.host.recoverModelOwner(context, signal);
-  if (stopping) {
+  if (stopping && !shutdownStatus) {
     // The original drain closed its other owners before deciding whether the
-    // shared pool can end. Do not close that pool ahead of its remaining tasks.
+    // shared pool can end. With a stop receipt, the socket owns this request
+    // until it returns and the Worker owns pool closure.
     await shutdownTask?.catch(() => {});
     if (!shutdownStatus && !result.host.modelOwnerMaintenancePending())
       await closeDatabase();

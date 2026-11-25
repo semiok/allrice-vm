@@ -30,6 +30,7 @@ export async function openProductionRecoverySocket(input: {
   // Keep the path short enough for Unix sockets on Darwin.
   const directory = await mkdtemp(join(tmpdir(), 'ar-recovery-'));
   const path = join(directory, 'owner');
+  const requests = new Set<Promise<void>>();
   const server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
     const recovery = request.method === 'POST' && request.url === '/recover';
     const shutdown =
@@ -59,7 +60,7 @@ export async function openProductionRecoverySocket(input: {
         })
         .end(value && JSON.stringify(value));
     }
-    void (async () => {
+    const work = (async () => {
       const context = token
         ? await (shutdown
             ? shutdown.authenticate(token)
@@ -79,11 +80,13 @@ export async function openProductionRecoverySocket(input: {
         const released = await input.recover(context, disconnected.signal);
         writeStatus(200, { released });
       }
-    })()
-      .catch(() => writeStatus(shutdown ? 403 : 409))
-      .finally(() => {
-        if (!input.pending()) void close().catch(() => {});
-      });
+    })().catch(() => writeStatus(shutdown ? 403 : 409));
+    requests.add(work);
+    function settled() {
+      requests.delete(work);
+      if (!input.pending()) void close().catch(() => {});
+    }
+    void work.then(settled, settled);
   });
   server.on('connect', (_request, socket) => socket.destroy());
   server.on('upgrade', (_request, socket) => socket.destroy());
@@ -94,7 +97,12 @@ export async function openProductionRecoverySocket(input: {
         if (error && server.listening) reject(error);
         else resolve();
       });
-    }).then(() => rmdir(directory)));
+    }).then(async () => {
+      // A disconnected client can release its socket while authentication or
+      // recovery still owns database work. The pool must outlive both.
+      await Promise.allSettled([...requests]);
+      await rmdir(directory);
+    }));
   }
   try {
     await chmod(directory, 0o700);
