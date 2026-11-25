@@ -18,6 +18,7 @@ import {
   type NativeWebConfiguration,
   type NativeWebGuestProfile,
   type NativeWebLaunch,
+  type NativeWebModelAdapter,
 } from './launch.js';
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
@@ -27,6 +28,7 @@ type StartingEditorProof = (
     binding: PersonVmBinding;
     endpoint: Endpoint;
     context: RequestContext;
+    modelAdapterId?: string;
     profile: Parameters<
       Parameters<NativeWebOwner['verifyStartingEditor']>[2]
     >[0];
@@ -97,6 +99,12 @@ export function createAssignedNativeWebStartup(input: {
   const pending = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
   let editorProof: StartingEditorProof | undefined;
+  let modelAdapter:
+    | ((
+        binding: PersonVmBinding,
+        signal: AbortSignal,
+      ) => Promise<NativeWebModelAdapter>)
+    | undefined;
   function track<T>(work: () => Promise<T>) {
     const operation = Promise.resolve().then(work);
     pending.add(operation);
@@ -144,6 +152,14 @@ export function createAssignedNativeWebStartup(input: {
   input.lifetime.addEventListener('abort', abort, { once: true });
   if (input.lifetime.aborted) abort();
   return {
+    installModelAdapter(resolve: NonNullable<typeof modelAdapter>) {
+      lifetime.throwIfAborted();
+      if (closing || modelAdapter) throw new PersonVmError('RUNTIME_NOT_READY');
+      modelAdapter = resolve;
+      return () => {
+        if (modelAdapter === resolve) modelAdapter = undefined;
+      };
+    },
     installStartingEditorProof(proof: StartingEditorProof) {
       lifetime.throwIfAborted();
       if (closing || editorProof) throw new PersonVmError('RUNTIME_NOT_READY');
@@ -170,6 +186,7 @@ export function createAssignedNativeWebStartup(input: {
             })
           : undefined;
         const profile = await input.readEmployeeProfile(signal);
+        const model = await modelAdapter?.(binding, signal);
         current(binding, web);
         signal.throwIfAborted();
         const launches = await Promise.all(
@@ -194,6 +211,7 @@ export function createAssignedNativeWebStartup(input: {
               binding,
               profile,
               commandMemory,
+              model,
             );
           }),
         );
@@ -270,12 +288,13 @@ export function createAssignedNativeWebStartup(input: {
               const proof = await owner.verifyStartingEditor(
                 scope,
                 signal,
-                (profile, readModels, active) =>
+                (profile, readModels, active, modelAdapterId) =>
                   prove(
                     {
                       binding: receipt.binding,
                       endpoint,
                       context: web.context,
+                      modelAdapterId,
                       profile,
                       readModels,
                     },
@@ -426,17 +445,18 @@ export function createAssignedNativeWebStartup(input: {
         const active = AbortSignal.any([caller, selected.revoked]);
         active.throwIfAborted();
         const previous = group.verifiedEmployees.get(employeeInstanceId);
-        if (previous && !previous.aborted) return previous;
+        if (previous && !previous.aborted && !modelAdapter) return previous;
 
         const proof = await selected.owner.verifyRunningEditor(
           context,
           active,
-          (profile, readModels, signal) =>
+          (profile, readModels, signal, modelAdapterId) =>
             prove(
               {
                 binding: selected.receipt.binding,
                 endpoint: selected.endpoint,
                 context,
+                modelAdapterId,
                 profile,
                 readModels,
               },

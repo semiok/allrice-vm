@@ -38,6 +38,7 @@ type EditorEvidence<T> = (
   profile: DEntryFixedProfileSource,
   models: () => Promise<{ ok: true; value: ModelCatalog }>,
   signal: AbortSignal,
+  modelAdapterId?: string,
 ) => Promise<T>;
 
 /** Real public Node control owner for one already published native Web job.
@@ -65,6 +66,7 @@ export async function openNativeWebOwner(input: {
   // Business cancellation fences calls; the separate carrier survives to carry
   // typed close/closed/end until normal cleanup, actual loss or exact stop.
   const signal = AbortSignal.any([input.lifetime, stale.signal]);
+  let installedModelAdapter: string | undefined;
   let ready = false,
     closing: Promise<void> | undefined,
     hostClosing: Promise<void> | undefined;
@@ -322,6 +324,7 @@ export async function openNativeWebOwner(input: {
             };
           }),
         active,
+        installedModelAdapter,
       ),
     );
   }
@@ -351,6 +354,9 @@ export async function openNativeWebOwner(input: {
     );
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    if (auth.modelAdapterId !== input.launch.auth.modelAdapterId)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    installedModelAdapter = auth.modelAdapterId;
     await setup(() => transport.authenticate(auth.authenticatedUrl));
     await setup(() => transport.authenticateIndex(auth.authenticatedUrl));
     await setup(() => root.plugin(TypertRegistry));
@@ -393,6 +399,7 @@ export async function openNativeWebOwner(input: {
     return Object.freeze({
       binding,
       revoked: signal,
+      modelAdapterId: installedModelAdapter,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
       verifyStartingEditor<T>(

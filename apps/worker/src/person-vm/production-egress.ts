@@ -242,10 +242,7 @@ export function createProductionEgressInstallation(
       signal.throwIfAborted();
     },
   };
-  const memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'] = async (
-    binding,
-    signal,
-  ) => {
+  async function readAccess(binding: PersonVmBinding, signal: AbortSignal) {
     check(signal);
     const entry = entries.get(keyOf(binding));
     if (!entry?.ready) throw unavailable();
@@ -285,6 +282,25 @@ export function createProductionEgressInstallation(
           !/^[A-Za-z0-9_-]+$/.test(access.capability)
         )
           throw unavailable();
+        signal.throwIfAborted();
+        if (!entry.ready || entries.get(entry.key) !== entry)
+          throw unavailable();
+        return access;
+      },
+      entry,
+    );
+  }
+  const memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'] = async (
+    binding,
+    signal,
+  ) => {
+    const access = await readAccess(binding, signal);
+    const entry = entries.get(keyOf(binding));
+    if (!entry?.ready) throw unavailable();
+    return own(
+      signal,
+      async (signal) => {
+        const url = new URL(access.origin);
         const plan = await createVmMemoryGuestPlan({
           ...loaded.configuration.memory,
           dshCommandMemory:
@@ -350,5 +366,5 @@ export function createProductionEgressInstallation(
         throw new AggregateError(errors, 'EGRESS_CLEANUP_INCOMPLETE');
     })());
   }
-  return Object.freeze({ provisioner, memoryGuestPlan, close });
+  return Object.freeze({ provisioner, memoryGuestPlan, readAccess, close });
 }

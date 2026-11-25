@@ -87,6 +87,13 @@ export type GatewayFetchClassification = Readonly<{
   protocol: 'openai-chat-completions' | 'openai-responses' | 'opaque';
 }>;
 export interface GatewayProvider {
+  /** Optional exact Host-owned transport. Only the gateway calls it after it
+   * has committed the metered attempt. No Guest data selects the dispatcher. */
+  fetchOwned?: (
+    fetch: typeof globalThis.fetch,
+    request: Request,
+    init: RequestInit,
+  ) => Promise<Response>;
   /** Inject an HTTP-fetch provider. Native loader configuration MUST pin SSE;
    * WebSocket or a separate SDK transport cannot bypass this host meter.
    * Model/refresh endpoints must accept one-shot request bodies (native POST).

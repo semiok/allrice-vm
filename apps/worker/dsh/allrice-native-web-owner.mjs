@@ -16,6 +16,7 @@ export const inject = [
   'loader',
   'clientModules',
   'allricePrincipal',
+  'llm',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
@@ -172,7 +173,8 @@ export async function unloadNativeWebOwner(fiber) {
 
 /** Native local login only. This file never establishes an AllRice principal. */
 export function apply(ctx, config) {
-  const { artifactPath, nonce, baseUrl, commandMemoryPlugin } = config;
+  const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
+    config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -186,17 +188,21 @@ export function apply(ctx, config) {
   let publicationFailure;
   let stagingCleanupFailure;
   let commandMemory;
+  let registeredModel;
   let published = false;
   let retiring = false;
   const stop = () => {
     retiring = true;
     lifetime.abort(canceled);
+    registeredModel?.dispose();
+    registeredModel = undefined;
   };
   const sameConfig = (value) =>
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
     value?.baseUrl === baseUrl &&
-    value?.commandMemoryPlugin === commandMemoryPlugin;
+    value?.commandMemoryPlugin === commandMemoryPlugin &&
+    JSON.stringify(value?.modelAdapter) === JSON.stringify(modelAdapter);
   const entry = fiber.entry;
   const current = () =>
     !retiring &&
@@ -205,6 +211,7 @@ export function apply(ctx, config) {
     (!commandMemory ||
       (original(ctx.get('subprocess')) === commandMemory.subprocess &&
         original(ctx.get('sandbox')) === commandMemory.sandbox)) &&
+    (!registeredModel || original(ctx.get('llm')) === registeredModel.llm) &&
     providers.every(([name, provider, value]) => {
       const live = ctx.get(name);
       return provider.uid !== null && live != null && original(live) === value;
@@ -324,6 +331,51 @@ export function apply(ctx, config) {
       }
     }
     if (!current()) return;
+    if (modelAdapter !== undefined) {
+      publicationStage = 'model';
+      const llm = ctx.get('llm');
+      const { registerManagedGatewayAdapter } = await import(
+        modelAdapter.entry
+      );
+      if (!current()) return;
+      const { id, origin, capability, provider, model, modelInfo } =
+        modelAdapter;
+      if (!/^[a-f0-9]{64}$/.test(id))
+        throw Error('Native managed model binding is invalid');
+      const endpoint = new URL('/v1/reference', origin);
+      const dispose = registerManagedGatewayAdapter(ctx.llm, {
+        origin,
+        capability,
+        route: {
+          provider,
+          model,
+          modelInfo,
+          lifetime: signal,
+          async resolveCallReference(selection, active) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              redirect: 'error',
+              signal: active,
+              headers: {
+                authorization: 'Bearer ' + capability,
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify(selection),
+            });
+            if (!response.ok) {
+              await response.body?.cancel();
+              throw Error('Native managed model call was denied');
+            }
+            return (await response.json()).reference;
+          },
+        },
+      });
+      registeredModel = { dispose, llm: original(llm), id };
+      const models = await ctx.llm.listModels(provider);
+      if (models.length !== 1 || models[0].id !== model)
+        throw Error('Native managed model was not registered');
+    }
+    if (!current()) return;
     publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;
@@ -337,6 +389,7 @@ export function apply(ctx, config) {
         JSON.stringify({
           v: 1,
           nonce,
+          modelAdapterId: registeredModel?.id,
           authenticatedUrl: ctx.connection.authenticatedUrl(baseUrl),
         }),
         { flag: 'wx', mode: 0o600 },

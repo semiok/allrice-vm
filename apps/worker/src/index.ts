@@ -1,3 +1,5 @@
+import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
+import { createProductionPersonVmSources } from './person-vm/production-sources.js';
 import { installDshCloseObservationIdentity } from './harness/dsh-close-observer.js';
 import { observeDshWorkerCloseIdentity } from './harness/dsh-worker-close-identity.js';
 import { processNextReference } from './reference-processing.js';
@@ -439,10 +441,11 @@ function refreshDshRuntimeInventory() {
 }
 
 const httpAborter = new AbortController();
-// Required runtime/egress/ingress producers are not fabricated at bootstrap.
-// A missing source leaves the native ports uninstalled and management intact.
 const personVmHost = createProductionPersonVmHost({
   lifetime: httpAborter.signal,
+  sources: createProductionPersonVmSources(
+    createProductionNativeModelExecution(),
+  ),
 }).then(
   (host) => ({ state: 'installed' as const, host }),
   (error: unknown) => {

@@ -46,7 +46,11 @@ export function createProductionEgressAuthority(input: {
   input.lifetime.throwIfAborted();
   const resolved = new WeakMap<
     RequestContext,
-    { call: ModelCallBinding; signal: AbortSignal } | null
+    {
+      call: ModelCallBinding;
+      signal: AbortSignal;
+      route: 'model' | 'model-reference';
+    } | null
   >();
 
   const authority: EgressAuthority = {
@@ -59,7 +63,7 @@ export function createProductionEgressAuthority(input: {
       input.lifetime.throwIfAborted();
       signal.throwIfAborted();
       const request = resolved.get(context);
-      if (routeId !== 'model' || !request || request.signal !== signal)
+      if (!request || request.route !== routeId || request.signal !== signal)
         throw denied();
       resolved.set(context, null);
       const { call } = request;
@@ -153,7 +157,11 @@ export function createProductionEgressAuthority(input: {
     /** Register the private clone owned by ManagedHostService.resolve. Gateway
      * passes its exact context and service signal to allow before dispatch.
      * The weak association carries no permit and is consumed before I/O. */
-    bindModelCall(call: ModelCallBinding, signal: AbortSignal) {
+    bindModelCall(
+      call: ModelCallBinding,
+      signal: AbortSignal,
+      route: 'model' | 'model-reference' = 'model',
+    ) {
       input.lifetime.throwIfAborted();
       signal.throwIfAborted();
       const { context } = call;
@@ -178,7 +186,7 @@ export function createProductionEgressAuthority(input: {
       Object.freeze(call.execution);
       Object.freeze(call.native);
       Object.freeze(call);
-      resolved.set(context, { call, signal });
+      resolved.set(context, { call, signal, route });
     },
   });
 }

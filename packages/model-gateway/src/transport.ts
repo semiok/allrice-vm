@@ -234,7 +234,9 @@ export function createMeteredTransport(options: {
         // Redirects are disabled in request; hidden 421 replay is disabled by
         // the one-shot body. Each later SDK fetch gets its own durable attempt.
         const response = await nativeClose.run(() =>
-          nativeFetch(request, dispatchInit),
+          options.provider.fetchOwned
+            ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
+            : nativeFetch(request, dispatchInit),
         );
         status = response.status;
         if (!response.body) {

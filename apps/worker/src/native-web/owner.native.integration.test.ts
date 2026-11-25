@@ -99,6 +99,49 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
+  'registers the sealed Host model in the actual rc.2 profile and attests the same adapter in authenticated control',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const route = {
+      origin: 'http://127.0.0.1:1',
+      capability: 'a'.repeat(43),
+      provider: 'openai-codex',
+      model: 'fixture-codex',
+      modelInfo: {
+        provider: 'openai-codex',
+        id: 'fixture-codex',
+        name: 'fixture-codex',
+      },
+    };
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      route,
+    );
+    expect(f.owner.modelAdapterId).toMatch(/^[a-f0-9]{64}$/);
+    await f.owner.verifyStartingEditor(
+      f.scope,
+      new AbortController().signal,
+      async (_profile, readModels, _active, installed) => {
+        const catalog = await readModels();
+        expect(installed).toBe(f.owner.modelAdapterId);
+        expect(catalog.value.default).toMatchObject({
+          provider: route.provider,
+          model: route.model,
+        });
+        expect(catalog.value.routableProviders).toContain(route.provider);
+        expect(catalog.value.failures).not.toContainEqual(
+          expect.objectContaining({ id: route.provider }),
+        );
+      },
+    );
+  },
+);
+
+it.skipIf(!cli)(
   '真实rc.2旧exact kill失败memo不能冒join；确认child停止后实际host退役可重新收束',
   { tags: [tag], timeout: 30000 },
   async () => {

@@ -51,6 +51,7 @@ export type ResolveProductionDEntrySendRoute = (
     context: RequestContext;
     identity: DEntryIdentity;
     binding: PersonVmBinding;
+    modelAdapterId?: string;
   }>,
   signal: AbortSignal,
 ) => Promise<
@@ -81,6 +82,12 @@ export function installProductionDEntrySource(input: {
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
+  observeModelSelection?(selection: {
+    context: RequestContext;
+    identity: DEntryIdentity;
+    binding: PersonVmBinding;
+    revoked: AbortSignal;
+  }): void;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -194,6 +201,12 @@ export function installProductionDEntrySource(input: {
         )
           denied();
         owners.set(owner, { context: scope, identity: expected });
+        input.observeModelSelection?.({
+          context: scope,
+          identity: expected,
+          binding,
+          revoked,
+        });
         return {
           context: scope,
           binding,
@@ -313,7 +326,10 @@ export function installProductionDEntrySource(input: {
     },
   };
   const uninstallProof = input.startup.installStartingEditorProof(
-    ({ binding, endpoint, context, profile, readModels }, signal) =>
+    (
+      { binding, endpoint, context, modelAdapterId, profile, readModels },
+      signal,
+    ) =>
       own(signal, async (active) => {
         const expected: DEntryIdentity = {
           organizationId: binding.organizationId,
@@ -349,7 +365,7 @@ export function installProductionDEntrySource(input: {
         );
         const models = await readModels();
         const route = await input.resolveSendRoute(
-          { context: scope, identity, binding },
+          { context: scope, identity, binding, modelAdapterId },
           active,
         );
         if (

@@ -4,6 +4,9 @@ import {
   type ModelGatewayAuthority,
 } from '@allrice/model-gateway';
 import type { PersonVmRuntimePort } from '@allrice/person-vm';
+import type { ManagedHostService } from '@allrice/egress-gateway';
+import type { ModelCallBinding } from '@allrice/model-gateway';
+import type { NativeModelSelection } from './production-native-model-execution.js';
 import {
   installProductionDEntrySource,
   type ResolveProductionDEntrySendRoute,
@@ -37,10 +40,17 @@ export interface ProductionNativeModelExecution {
     input: {
       route: CodexRuntime['route'];
       routeRevoked: AbortSignal;
+      modelInfo: CodexRuntime['modelInfo'];
+      assertRouteCurrent: CodexRuntime['assertCurrent'];
+      confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
+      bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
+    observeModelSelection?(selection: NativeModelSelection): void;
+    references?: ManagedHostService;
+    redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
   }>;
@@ -53,7 +63,10 @@ export function createProductionPersonVmSources(
     async bind(host) {
       const { lifetime, startup, admission } = host;
       lifetime.throwIfAborted();
-      const codex = await createProductionCodexRuntime(lifetime);
+      const codex = await createProductionCodexRuntime(
+        lifetime,
+        host.modelOwnerId,
+      );
       const authority = execution.authority;
       const calls = createNativeModelCallReferences(authority, codex.revoked);
       let native:
@@ -61,23 +74,29 @@ export function createProductionPersonVmSources(
         | undefined;
       let entry: ReturnType<typeof installProductionDEntrySource> | undefined;
       try {
-        native = await execution.attach(host, {
-          route: codex.route,
-          routeRevoked: codex.revoked,
-          issueCall: calls.issue,
-        });
-        const owned = native;
-        lifetime.throwIfAborted();
         const egress = createProductionEgressAuthority({
           startup,
           modelAuthority: authority,
           modelRoute: codex.route,
           lifetime,
         });
+        native = await execution.attach(host, {
+          route: codex.route,
+          routeRevoked: codex.revoked,
+          modelInfo: codex.modelInfo,
+          assertRouteCurrent: codex.assertCurrent,
+          confirmTransportStopped: codex.confirmTransportStopped,
+          bindReference: (call, signal) =>
+            egress.bindModelCall(call, signal, 'model-reference'),
+          issueCall: calls.issue,
+        });
+        const owned = native;
+        lifetime.throwIfAborted();
         entry = installProductionDEntrySource({
           startup,
           admission,
           lifetime,
+          observeModelSelection: owned.observeModelSelection,
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);
             await codex.assertCurrent(active);
@@ -123,13 +142,20 @@ export function createProductionPersonVmSources(
             authority: egress.authority,
             bindModelCall: egress.bindModelCall,
             policy: { routes: [] },
+            services: owned.references ? [owned.references] : [],
             close: codex.close,
           },
           model: {
             authority,
             llm: codex.llm,
             route: codex.route,
-            resolveCall: calls.resolveCall,
+            transport: codex.transport,
+            async resolveCall(headers, binding, signal) {
+              await codex.assertCurrent(signal);
+              const call = await calls.resolveCall(headers, binding, signal);
+              owned.redeem?.(call, signal);
+              return call;
+            },
           },
         };
       } catch (error) {

@@ -5,11 +5,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
 const state = vi.hoisted(() => ({
-  subscription: vi.fn<() => Promise<1 | 2>>(),
+  subscription: vi.fn<() => Promise<{ slot: 1 | 2; revision: string }[]>>(),
   home: '',
 }));
 vi.mock('@allrice/database', () => ({
-  requireEnabledCodexSubscription: state.subscription,
+  getDatabase: () => state.subscription,
 }));
 vi.mock('../codex-subscription-home.js', () => ({
   codexSubscriptionHome: () => state.home,
@@ -18,7 +18,9 @@ const controller = () => new AbortController();
 
 beforeEach(async () => {
   state.home = await mkdtemp(join(tmpdir(), 'allrice-codex-host-fixture-'));
-  state.subscription.mockReset().mockResolvedValue(1);
+  state.subscription
+    .mockReset()
+    .mockResolvedValue([{ slot: 1, revision: '1' }]);
   vi.stubEnv('ALLRICE_DSH_CODEX_MODEL', 'gpt-6.1-sol');
 });
 afterEach(async () => {
@@ -49,7 +51,10 @@ it('loads the pinned native model route from a stored subscription without makin
   await saveSyntheticGrant();
   const external = vi.fn<typeof fetch>();
   vi.stubGlobal('fetch', external);
-  const host = await createProductionCodexRuntime(controller().signal);
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'test-owner',
+  );
   try {
     expect(host.route).toMatchObject({
       provider: 'openai-codex',
@@ -80,9 +85,12 @@ it('loads the pinned native model route from a stored subscription without makin
   }
 });
 
-it('accepts only the exact metered POST destinations and revokes a stale subscription owner', async () => {
+it('accepts only metered POST destinations and revokes an old owner after switching away and back', async () => {
   await saveSyntheticGrant();
-  const host = await createProductionCodexRuntime(controller().signal);
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'test-owner',
+  );
   try {
     const model = 'https://chatgpt.com/backend-api/codex/responses';
     expect(host.route.classify(model, { method: 'POST' })).toEqual({
@@ -103,12 +111,12 @@ it('accepts only the exact metered POST destinations and revokes a stale subscri
     expect(
       host.route.classify(model.replace('https:', 'http:'), { method: 'POST' }),
     ).toBeNull();
-    state.subscription.mockResolvedValue(2);
+    state.subscription.mockResolvedValue([{ slot: 1, revision: '3' }]);
     await expect(host.assertCurrent()).rejects.toMatchObject({
       code: 'AUTHORIZATION_DENIED',
     });
     expect(host.revoked.aborted).toBe(true);
-    state.subscription.mockResolvedValue(1);
+    state.subscription.mockResolvedValue([{ slot: 1, revision: '1' }]);
     await expect(host.assertCurrent()).rejects.toMatchObject({
       code: 'AUTHORIZATION_DENIED',
     });
@@ -119,6 +127,6 @@ it('accepts only the exact metered POST destinations and revokes a stale subscri
 
 it('does not enable the route without a grant from the managed store', async () => {
   await expect(
-    createProductionCodexRuntime(controller().signal),
+    createProductionCodexRuntime(controller().signal, 'test-owner'),
   ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
 });

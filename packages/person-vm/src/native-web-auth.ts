@@ -7,8 +7,12 @@ export type PersonVmNativeWebAuthRequest = Readonly<{
   nonce: string;
   origin: string;
   timeoutMs: number;
+  modelAdapterId?: string;
 }>;
-export type PersonVmNativeWebAuth = Readonly<{ authenticatedUrl: string }>;
+export type PersonVmNativeWebAuth = Readonly<{
+  authenticatedUrl: string;
+  modelAdapterId?: string;
+}>;
 
 export function nativeWebAuthArtifact(request: PersonVmNativeWebAuthRequest) {
   let origin: URL;
@@ -30,7 +34,9 @@ export function nativeWebAuthArtifact(request: PersonVmNativeWebAuthRequest) {
     !origin.port ||
     origin.href !== `${origin.origin}/` ||
     !Number.isSafeInteger(request.timeoutMs) ||
-    request.timeoutMs <= 0
+    request.timeoutMs <= 0 ||
+    (request.modelAdapterId !== undefined &&
+      !/^[0-9a-f]{64}$/.test(request.modelAdapterId))
   )
     throw new PersonVmError('PROVIDER_FAILED');
   // rc.2 BrowserAuth encodes 32 random bytes as unpadded base64url (43 bytes).
@@ -39,6 +45,7 @@ export function nativeWebAuthArtifact(request: PersonVmNativeWebAuthRequest) {
       JSON.stringify({
         v: 1,
         nonce: request.nonce,
+        modelAdapterId: request.modelAdapterId,
         authenticatedUrl: `${origin.origin}/?token=${'a'.repeat(43)}`,
       }),
     ) + 1;
@@ -59,10 +66,15 @@ export function parseNativeWebAuth(
       v?: unknown;
       nonce?: unknown;
       authenticatedUrl?: unknown;
+      modelAdapterId?: unknown;
     };
     if (
       !value ||
-      Object.keys(value).sort().join(',') !== 'authenticatedUrl,nonce,v' ||
+      Object.keys(value).sort().join(',') !==
+        (request.modelAdapterId === undefined
+          ? 'authenticatedUrl,nonce,v'
+          : 'authenticatedUrl,modelAdapterId,nonce,v') ||
+      value.modelAdapterId !== request.modelAdapterId ||
       value.v !== 1 ||
       value.nonce !== request.nonce ||
       typeof value.authenticatedUrl !== 'string'
@@ -79,7 +91,12 @@ export function parseNativeWebAuth(
       !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('token') ?? '')
     )
       throw new Error();
-    return Object.freeze({ authenticatedUrl: url.href });
+    return Object.freeze({
+      authenticatedUrl: url.href,
+      ...(request.modelAdapterId === undefined
+        ? {}
+        : { modelAdapterId: request.modelAdapterId }),
+    });
   } catch {
     throw new PersonVmError('PROVIDER_FAILED');
   } // Never retain secret input in errors.

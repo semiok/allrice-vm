@@ -9,6 +9,7 @@ import {
   type ModelCallBinding,
   type ModelGatewayAuthority,
   type ModelGatewayPort,
+  type GatewayProvider,
 } from '@allrice/model-gateway';
 import {
   createEgressGateway,
@@ -74,6 +75,7 @@ export type ProductionPersonVmHostSources = Readonly<{
     providers: Providers;
     current: Current;
     lifetime: AbortSignal;
+    modelOwnerId: string;
   }): Promise<{
     runtime: Pick<PersonVmRuntimePort, 'readiness' | 'activity'> & {
       /** Fence observations and join their actual work/subscriptions. */
@@ -94,6 +96,10 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: ModelGatewayAuthority;
       llm: Parameters<typeof createDshGatewayProvider>[0];
       route: Parameters<typeof createDshGatewayProvider>[1];
+      transport?: Readonly<{
+        fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
+        close(): Promise<void>;
+      }>;
       /** Resolve the current trusted native call. Host request metadata may
        * be used to find a registration; it cannot authorize that registration. */
       resolveCall(
@@ -138,6 +144,8 @@ export function createProductionPersonVmHost(input: {
   });
   const pending = new Set<Promise<unknown>>();
   const receipts = new Set<PersonVmEgressReceipt>();
+  const ownedVms = new Map<string, PersonVmBinding>();
+  let personVm: PersonVmService | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation: unknown[] = [];
   const independentCloseFailures: unknown[] = [];
@@ -207,7 +215,9 @@ export function createProductionPersonVmHost(input: {
       return own(async () => {
         const active = AbortSignal.any([signal, lifetime]);
         active.throwIfAborted();
-        const receipt = await requireGateway()
+        const gateway = requireGateway();
+        ownedVms.set(binding.personId, Object.freeze({ ...binding }));
+        const receipt = await gateway
           .prepare(binding, preparation, active)
           .catch((error: unknown) => {
             // The gateway preserves a failed prepare plus failed retirement
@@ -291,7 +301,6 @@ export function createProductionPersonVmHost(input: {
       await settle([
         ...(installation ? [() => installation.close()] : []),
         ...(authorityOwner ? [() => authorityOwner.close()] : []),
-        ...(startupOwner ? [() => startupOwner.close()] : []),
         ...(sourceOwner ? [() => sourceOwner.runtime.close()] : []),
         ...[...nativeSubscriptions].map(
           (subscription) => () => subscription.close(),
@@ -303,15 +312,30 @@ export function createProductionPersonVmHost(input: {
           (subscription) => () => subscription.close(),
         ),
       );
+      const vmOwner = personVm;
+      await settle(
+        vmOwner
+          ? [...ownedVms.values()].map((binding) => async () => {
+              await vmOwner.shutdownOwned(binding);
+              ownedVms.delete(binding.personId);
+            })
+          : [],
+      );
+      if (startupOwner) await settle([() => startupOwner.close()]);
       const receiptFailures = await retireReceipts();
+      // Guest stop does not prove that a separate upstream transport stopped.
       // Join the model gateway before closing the provider it uses.
-      // No VM stop/delete or assertion of guest termination is made here.
       const modelOwner = model;
       const modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
       if (modelFailures.length)
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
+      await settle(
+        sourceOwner?.model.transport
+          ? [() => sourceOwner.model.transport!.close()]
+          : [],
+      );
       const providerOwner = providers;
       await settle([
         ...(sourceOwner && !modelRecovery
@@ -440,6 +464,7 @@ export function createProductionPersonVmHost(input: {
         egress,
         ...providers.configuration.lifecycle,
       });
+      personVm = vm;
       const { native, web } = providers.configuration;
       startup = createAssignedNativeWebStartup({
         vm,
@@ -516,6 +541,7 @@ export function createProductionPersonVmHost(input: {
         current,
         providers,
         lifetime,
+        modelOwnerId,
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
@@ -524,7 +550,11 @@ export function createProductionPersonVmHost(input: {
       const modelOwner = createModelGateway({
         ownerId: modelOwnerId,
         authority: modelSource.authority,
-        provider: createDshGatewayProvider(modelSource.llm, modelRoute),
+        provider: createDshGatewayProvider(
+          modelSource.llm,
+          modelRoute,
+          modelSource.transport?.fetchOwned,
+        ),
         store: createPostgresModelGatewayStore(trustedDatabase),
         admission: {
           boundary: admission,

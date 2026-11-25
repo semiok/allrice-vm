@@ -796,6 +796,23 @@ export class PersonVmService
     await lease.save(row);
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
+  /** Internal Worker shutdown after its ingress and selection owners are fenced.
+   * Only the exact epoch previously prepared by that Host can be stopped here.
+   * The lease and physical readback are shared with the ordinary lifecycle. */
+  async shutdownOwned(binding: PersonVmBinding) {
+    await this.options.store.withLease(
+      binding.personId,
+      { now: this.now, ttlMs: this.options.leaseTtlMs },
+      async (lease) => {
+        const row = lease.row;
+        if (!row?.instanceId || !sameVmBinding(binding, bindingOf(row)))
+          throw new PersonVmError('LEASE_LOST');
+        if (row.phase === 'stopped' && !row.egressReceipt) return;
+        await lease.guard();
+        await this.cleanup(row, lease, 'stop');
+      },
+    );
+  }
   async stop(context: RequestContext, signal: AbortSignal) {
     return this.leased(context, 'stop', signal, (lease, _identity, current) =>
       this.stopOwned(context, lease, current),

@@ -1,7 +1,8 @@
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError } from './native-llm.ts';
 import type {
   GenerateOptions,
   LlmRuntime,
+  LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import {
@@ -14,6 +15,8 @@ import {
 type ManagedGuestModelCall = {
   readonly provider: string;
   readonly model: string;
+  readonly modelInfo?: LlmResolvedModelInfo;
+  readonly lifetime?: AbortSignal;
   /** The authorized native invocation delivers a reference for this call
    * before the adapter sends its first request. The adapter never mints one. */
   resolveCallReference(
@@ -44,9 +47,11 @@ export function createDshGatewayProvider(
       init?: RequestInit,
     ): GatewayFetchClassification | null;
   },
+  fetchOwned?: GatewayProvider['fetchOwned'],
 ): GatewayProvider {
   return {
     classify: route.classify,
+    fetchOwned,
     async *stream(binding, input, signal) {
       if (
         binding.provider !== route.provider ||
@@ -93,10 +98,34 @@ export class GatewayLlmAdapter extends LlmAdapter {
   ) {
     super();
   }
+  override async listModels(provider: string) {
+    const route = this.managed;
+    if (!route || route.provider !== provider)
+      return super.listModels(provider);
+    route.lifetime?.throwIfAborted();
+    return [await this.resolveModel(provider, route.model)];
+  }
+  override async resolveModel(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ) {
+    const route = this.managed;
+    if (!route) return super.resolveModel(provider, model, signal);
+    signal?.throwIfAborted();
+    route.lifetime?.throwIfAborted();
+    if (route.provider !== provider || route.model !== model)
+      throw new ModelGatewayError('BINDING_INVALID');
+    return route.modelInfo ?? super.resolveModel(provider, model, signal);
+  }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     let reference: string | undefined;
+    const signal =
+      options.signal && this.managed?.lifetime
+        ? AbortSignal.any([options.signal, this.managed.lifetime])
+        : options.signal;
     if (this.managed) {
-      const { provider, model, sessionId, signal } = options;
+      const { provider, model, sessionId } = options;
       if (
         provider !== this.managed.provider ||
         model !== this.managed.model ||
@@ -126,7 +155,7 @@ export class GatewayLlmAdapter extends LlmAdapter {
     } = options;
     const response = await fetch(this.endpoint, {
       method: 'POST',
-      signal: options.signal,
+      signal,
       redirect: 'error',
       headers: {
         'content-type': 'application/json',
@@ -150,10 +179,12 @@ export class GatewayLlmAdapter extends LlmAdapter {
         purpose,
       }),
     });
-    if (!response.body)
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
       throw new LlmError('Host gateway returned no stream', 'TRANSPORT', {
         status: response.status,
       });
+    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -161,7 +192,7 @@ export class GatewayLlmAdapter extends LlmAdapter {
     let exhausted = false;
     try {
       for (;;) {
-        options.signal?.throwIfAborted();
+        signal?.throwIfAborted();
         const result = await reader.read();
         if (result.done) {
           exhausted = true;

@@ -1,11 +1,12 @@
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
-import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
+import Llm, { ReasoningEffortId, type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
-import { requireEnabledCodexSubscription } from '@allrice/database';
+import { getDatabase } from '@allrice/database';
 import {
   ModelGatewayError,
+  createOwnedModelTransport,
   withGatewayAuthTransaction,
   type GatewayFetchClassification,
 } from '@allrice/model-gateway';
@@ -13,6 +14,31 @@ import { codexSubscriptionHome } from '../codex-subscription-home.js';
 
 const provider = 'openai-codex';
 const credential = PiAi.recordKeyFor(provider);
+
+async function readSelectedSubscription() {
+  const [selected] = await getDatabase()<{ slot: 1 | 2; revision: string }[]>`
+    select slot, extract(epoch from updated_at)::text as revision
+    from allrice_codex_subscriptions where enabled
+  `;
+  if (!selected) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+  return selected;
+}
+
+export function managedCodexModel(model: string) {
+  if (!['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model))
+    return { id: model };
+  return {
+    id: model,
+    contextWindow: 272000,
+    input: ['text', 'image'] as ('text' | 'image')[],
+    reasoningEfforts: {
+      low: 'low' as const,
+      medium: 'medium' as const,
+      high: 'high' as const,
+      xhigh: 'xhigh' as const,
+    },
+  };
+}
 
 class MeteredCodexCredentials extends LocalCredentials {
   override modifyRecord(
@@ -43,9 +69,12 @@ function classify(
 
 /** Host-only owner for the same subscription that the admin authorization
  * broker maintains. A change of slot never retargets this route generation. */
-export async function createProductionCodexRuntime(lifetime: AbortSignal) {
+export async function createProductionCodexRuntime(
+  lifetime: AbortSignal,
+  ownerId: string,
+) {
   lifetime.throwIfAborted();
-  const slot = await requireEnabledCodexSubscription();
+  const selection = await readSelectedSubscription();
   lifetime.throwIfAborted();
   const model =
     process.env.ALLRICE_DSH_CODEX_MODEL ??
@@ -53,6 +82,24 @@ export async function createProductionCodexRuntime(lifetime: AbortSignal) {
     'gpt-6.1-sol';
   if (!model || model.trim() !== model)
     throw new ModelGatewayError('BINDING_INVALID');
+  const modelMetadata = managedCodexModel(model);
+  const modelInfo = {
+    id: model,
+    name: model,
+    provider,
+    ...(modelMetadata.contextWindow
+      ? {
+          context: { contextWindow: modelMetadata.contextWindow },
+          inputModalities: modelMetadata.input,
+          reasoning: {
+            efforts: Object.keys(modelMetadata.reasoningEfforts).map((id) => ({
+              id: ReasoningEffortId(id),
+              name: id,
+            })),
+          },
+        }
+      : {}),
+  };
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
@@ -70,7 +117,7 @@ export async function createProductionCodexRuntime(lifetime: AbortSignal) {
   async function assertCurrent(signal?: AbortSignal) {
     const active = signal ? AbortSignal.any([signal, revoked]) : revoked;
     active.throwIfAborted();
-    const selected = await requireEnabledCodexSubscription().catch(
+    const selected = await readSelectedSubscription().catch(
       (error: unknown) => {
         stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
         throw error;
@@ -79,7 +126,12 @@ export async function createProductionCodexRuntime(lifetime: AbortSignal) {
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
     active.throwIfAborted();
-    if (selected !== slot || !record.configured || record.kind !== 'grant') {
+    if (
+      selected.slot !== selection.slot ||
+      selected.revision !== selection.revision ||
+      !record.configured ||
+      record.kind !== 'grant'
+    ) {
       stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
       active.throwIfAborted();
     }
@@ -88,13 +140,16 @@ export async function createProductionCodexRuntime(lifetime: AbortSignal) {
     await host.plugin(Llm).await();
     await host
       .plugin(MeteredCodexCredentials, {
-        path: join(codexSubscriptionHome(slot), '.credentials.yaml'),
+        path: join(codexSubscriptionHome(selection.slot), '.credentials.yaml'),
       })
       .await();
     await host
       .plugin(PiAi, {
         providers: {
-          [provider]: { transport: 'sse', models: [{ id: model }] },
+          [provider]: {
+            transport: 'sse',
+            models: [modelMetadata],
+          },
         },
       })
       .await();
@@ -127,5 +182,21 @@ export async function createProductionCodexRuntime(lifetime: AbortSignal) {
       };
     },
   };
-  return Object.freeze({ llm, route, revoked, assertCurrent, close });
+  const transport = createOwnedModelTransport(ownerId);
+  return Object.freeze({
+    llm,
+    route,
+    modelInfo,
+    revoked,
+    assertCurrent,
+    transport,
+    confirmTransportStopped: transport.stoppedEvidence,
+    async close() {
+      try {
+        await transport.close();
+      } finally {
+        await close();
+      }
+    },
+  });
 }
