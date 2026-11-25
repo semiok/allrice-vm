@@ -33,7 +33,7 @@ function fixture() {
   const lifetime = new AbortController();
   const guest = new AbortController();
   const codex = new AbortController();
-  const issued = modelBinding();
+  const issued = { ...modelBinding(), provider: 'openai-codex' as const };
   const workspaceId = randomUUID();
   issued.context.workspaceId = workspaceId;
   const candidate = {
