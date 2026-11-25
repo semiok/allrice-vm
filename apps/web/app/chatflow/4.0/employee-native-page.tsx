@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
+  type DEntrySelectionInput,
 } from '@allrice/contracts';
 import {
   openNativePageCarrier,
@@ -40,6 +41,11 @@ type Status =
 const entryWaitMs = 5 * 60_000;
 const closingNoticeMs = 10_000;
 
+type EntryWarmup = {
+  lifetime: AbortController;
+  result: Promise<void>;
+};
+
 async function waitForVisibleEntry(signal: AbortSignal) {
   signal.throwIfAborted();
   if (!document.hidden) return;
@@ -75,6 +81,7 @@ export function EmployeeNativePage({
   const [activation, setActivation] = useState<{
     query: string;
     confirmedQuery?: string;
+    warmup?: EntryWarmup;
   }>({ query });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
@@ -84,7 +91,11 @@ export function EmployeeNativePage({
   const cancel = useRef<(() => void) | undefined>(undefined);
   const resume = useRef<(() => void) | undefined>(undefined);
   const nextQuery = useRef(query);
-  nextQuery.current = query;
+  const lastPropQuery = useRef(query);
+  if (lastPropQuery.current !== query) {
+    lastPropQuery.current = query;
+    nextQuery.current = query;
+  }
 
   useEffect(() => {
     if (initialUnavailable || (prepare && !activeQuery)) {
@@ -96,7 +107,7 @@ export function EmployeeNativePage({
         if (replace.current === changeSelection) replace.current = undefined;
       };
     }
-    const lifetime = new AbortController();
+    const lifetime = activation.warmup?.lifetime ?? new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
     let navigating = false;
@@ -104,6 +115,8 @@ export function EmployeeNativePage({
     let documentStarted = false;
     let remoteRevoked = false;
     let selectedQuery = activation.confirmedQuery;
+    let selectedEmployee: DEntrySelectionInput | undefined;
+    let nextWarmup: EntryWarmup | undefined;
     let timer: number | undefined;
     let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
@@ -290,17 +303,43 @@ export function EmployeeNativePage({
         );
         if (prepare && !next.data.threadId)
           params.set('new', crypto.randomUUID());
+        if (
+          prepare &&
+          !document.hidden &&
+          location.pathname === '/chatflow/4.0' &&
+          selectedEmployee?.workspaceId === next.data.workspaceId &&
+          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
+        ) {
+          // A navigation from this verified employee can start qualification
+          // for the selected thread while the old page joins its transport.
+          // This request has no page-carrier or thread-creation side effect.
+          const lifetime = new AbortController();
+          const result = prewarmEmployeeEntry(next.data, lifetime.signal);
+          void result.catch(() => {}); // the next activation reports the result
+          nextWarmup = { lifetime, result };
+        }
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
         // work independently and keep the frame until both report back.
         void retire().then((closed) => {
-          if (replace.current !== applyQuery) return;
+          if (replace.current !== applyQuery || detached) return;
+          const warmup = nextWarmup;
+          nextWarmup = undefined;
           if (closed) {
-            if (nextQuery.current !== activeQuery)
+            if (nextQuery.current !== activeQuery) {
+              warmup?.lifetime.abort();
               setActivation({ query: nextQuery.current });
-            else location.assign('/chatflow/4.0?' + params);
-          } else if (prepare) setStatus('unknown');
-          else setFailed(true);
+            } else if (warmup) {
+              const query = params.toString();
+              nextQuery.current = query;
+              history.pushState(null, '', '/chatflow/4.0?' + query);
+              setActivation({ query, warmup });
+            } else location.assign('/chatflow/4.0?' + params);
+          } else {
+            warmup?.lifetime.abort();
+            if (prepare) setStatus('unknown');
+            else setFailed(true);
+          }
         });
       }
     };
@@ -308,6 +347,7 @@ export function EmployeeNativePage({
     const leaving = () => {
       if (detached) return;
       detached = true;
+      nextWarmup?.lifetime.abort();
       lifetime.abort();
       send(pageRevoked);
       if (prepare && carrier?.dispatched && !scopeId)
@@ -315,6 +355,12 @@ export function EmployeeNativePage({
       else void close();
     };
     window.addEventListener('pagehide', leaving);
+    const restoreQuery = () => {
+      if (location.pathname !== '/chatflow/4.0') return;
+      nextQuery.current = location.search.slice(1);
+      if (nextQuery.current !== activeQuery) applyQuery();
+    };
+    window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
       employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
     );
@@ -326,7 +372,8 @@ export function EmployeeNativePage({
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
           timer = window.setTimeout(() => finish('failed'), entryWaitMs);
-          await prewarmEmployeeEntry(selection, lifetime.signal);
+          await (activation.warmup?.result ??
+            prewarmEmployeeEntry(selection, lifetime.signal));
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -372,6 +419,7 @@ export function EmployeeNativePage({
       scopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
       if (navigating) return;
+      selectedEmployee = selection;
       params.set('scopeId', issued.scopeId);
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
@@ -397,6 +445,7 @@ export function EmployeeNativePage({
       resume.current = undefined;
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', leaving);
+      window.removeEventListener('popstate', restoreQuery);
     };
   }, [activation, activeQuery, prepare, initialUnavailable]);
 

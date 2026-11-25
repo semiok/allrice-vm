@@ -430,6 +430,27 @@ it('lets the existing lease recover an orphaned starting epoch without sharing i
   expect(f.start).toHaveBeenCalledTimes(1);
 });
 
+it('preserves a successful new epoch when the prior running epoch stops before dispatch', async () => {
+  const f = fixture(true);
+  const { context, identity } = f.base;
+  await f.runPrewarm(context, { trigger: 'page' }, signal());
+  const old = (await f.h.store.read(identity.personId))!;
+  f.vm.mockImplementationOnce(async (...args) => {
+    f.h.states.set(old.vmId, 'stopped');
+    await f.h.service.stop(context, signal());
+    return f.runPrewarm(...args);
+  });
+  await expect(
+    f.assembly.port.prewarm(context, identity, 'page', signal(), signal()),
+  ).resolves.toBeUndefined();
+  expect(await f.h.store.read(identity.personId)).toMatchObject({
+    phase: 'running',
+    leaseEpoch: old.leaseEpoch + 1,
+  });
+  expect(f.start).toHaveBeenCalledTimes(2);
+  expect(f.readCoordination).toHaveBeenCalledTimes(2);
+});
+
 it('current authority rejects before any VM call, and post-start denial does not stop shared running work', async () => {
   const f = fixture();
   authority.identity.mockRejectedValueOnce(

@@ -227,10 +227,33 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      const oldDocument = page.frameLocator('iframe').locator('body');
+      expect(
+        await oldDocument.evaluate(() =>
+          (
+            window as unknown as {
+              __ALLRICE_EMPLOYEE_DOCUMENT__: { claim(): boolean };
+            }
+          ).__ALLRICE_EMPLOYEE_DOCUMENT__.claim(),
+        ),
+      ).toBe(true);
       await page
         .frameLocator('iframe')
         .getByRole('button', { name: '新建对话' })
         .click();
+      await expect.poll(() => warmCalls.length).toBe(5);
+      expect(births).toEqual([{ selection: employee }]);
+      expect(documents).toEqual([f.selection.threadId]);
+      expect(new URL(page.url()).searchParams.get('threadId')).toBe(
+        f.selection.threadId,
+      );
+      await oldDocument.evaluate(() => {
+        (
+          window as unknown as {
+            __ALLRICE_EMPLOYEE_DOCUMENT__: { finish(state: 'closed'): void };
+          }
+        ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed');
+      });
       await page.waitForURL((url) => url.searchParams.has('new'));
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);

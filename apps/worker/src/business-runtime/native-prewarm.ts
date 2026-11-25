@@ -42,7 +42,11 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
       if (selectDEntryGeneration(policy, identity) !== '4.0')
         throw new DataAccessError('authorization_denied');
       const [snapshot] = await sql<
-        { vm: VmStampRow | null; grants: string[] }[]
+        {
+          vm: VmStampRow | null;
+          grants: string[];
+          employeeGrant: string | null;
+        }[]
       >`
       select (select row_to_json(stamp) from (
         select vm_id as "vmId", instance_id as "instanceId", phase,
@@ -53,14 +57,21 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
         where m.user_id=${identity.personId} and m.organization_id=${identity.organizationId}
           and m.active and m.role in ('admin','member')
           and (m.workspace_id is null or m.workspace_id=${identity.workspaceId})
-        order by m.id) as grants`;
-      const { vm, grants } = snapshot!;
+        order by m.id) as grants,
+      (select i.xmin::text || ':' || a.id::text || ':' || a.xmin::text
+        from allrice_employee_instances i
+        join allrice_employee_assignments a on a.id=i.assignment_id
+        where i.id=${identity.employeeInstanceId} and i.owner_id=${identity.personId}
+          and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
+          and i.archived_at is null and a.active) as "employeeGrant"`;
+      const { vm, grants, employeeGrant } = snapshot!;
       return {
         // Tuple versions partition reuse across a revoke/regrant even if the
         // restored membership has the same role. They never grant authority.
-        authorityRevision: grants.length
-          ? JSON.stringify([policy.revision, grants])
-          : null,
+        authorityRevision:
+          grants.length && employeeGrant
+            ? JSON.stringify([policy.revision, grants, employeeGrant])
+            : null,
         vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
       };
     },
@@ -84,28 +95,29 @@ function compatible(a: Generation, b: Generation) {
   );
 }
 
-function completedGeneration(
+function matchingGeneration(
   stamp: Coordination,
   revision: string,
   result: PersonVmView,
   target: Generation,
 ) {
+  if (stamp.authorityRevision !== revision)
+    throw new PersonVmError('LEASE_LOST');
   if (
-    stamp.authorityRevision !== revision ||
     stamp.vm?.phase !== 'running' ||
     !stamp.vm.instanceId ||
     !result.ready ||
     result.vmId !== stamp.vm.vmId ||
     !compatible(target, stamp.vm)
   )
-    throw new PersonVmError('LEASE_LOST');
+    return;
   return stamp.vm;
 }
 
 type Flight = {
   target: Generation;
   join(revoked: AbortSignal): void;
-  work: Promise<PersonVmView>;
+  work: Promise<{ result: PersonVmView; generation: Generation | undefined }>;
 };
 
 function prewarmKey(
@@ -154,7 +166,10 @@ export function createDEntryNativePrewarmPort(input: {
     starting: boolean;
     revoked: AbortSignal;
     start: (signal: AbortSignal) => Promise<PersonVmView>;
-    confirm(result: PersonVmView, flight: Flight): Promise<Generation>;
+    confirm(
+      result: PersonVmView,
+      flight: Flight,
+    ): Promise<Generation | undefined>;
   }) {
     const group = flights.get(key) ?? new Set<Flight>();
     for (const flight of group) {
@@ -166,7 +181,7 @@ export function createDEntryNativePrewarmPort(input: {
         leaseEpoch: target.leaseEpoch,
       };
       flight.join(revoked);
-      return flight;
+      return { flight, started: false };
     }
     // An unowned starting row may need takeover under the existing lease.
     // The takeover can advance the epoch, so its observed binding is not a
@@ -179,9 +194,9 @@ export function createDEntryNativePrewarmPort(input: {
       physical.throwIfAborted();
       const result = await start(physical);
       physical.throwIfAborted();
-      flight.target = await confirm(result, flight);
+      const generation = await confirm(result, flight);
       physical.throwIfAborted();
-      return result;
+      return { result, generation };
     });
     const flight: Flight = {
       target,
@@ -210,7 +225,7 @@ export function createDEntryNativePrewarmPort(input: {
       if (!group.size && flights.get(key) === group) flights.delete(key);
     };
     void work.then(settled, settled);
-    return flight;
+    return { flight, started: true };
   }
   const port: DEntryNativePrewarmPort = {
     prewarm(context, identity, trigger, caller, revoked) {
@@ -258,7 +273,7 @@ export function createDEntryNativePrewarmPort(input: {
         const target = stamp && targetGeneration(stamp.vm);
         const start = (signal: AbortSignal) =>
           input.prewarmCurrent(context, identity, { trigger }, signal);
-        const flight =
+        const ticket =
           read && revision && target
             ? shared({
                 key: prewarmKey(context, identity, revision),
@@ -267,7 +282,7 @@ export function createDEntryNativePrewarmPort(input: {
                 revoked,
                 start,
                 async confirm(result, flight) {
-                  return completedGeneration(
+                  return matchingGeneration(
                     await read(identity),
                     revision,
                     result,
@@ -276,8 +291,15 @@ export function createDEntryNativePrewarmPort(input: {
                 },
               })
             : undefined;
-        const result = await (flight?.work ??
-          start(AbortSignal.any([input.lifetime, revoked])));
+        const warmed = await ticket?.flight.work;
+        // A lifecycle transition may outrun the read used to reserve a flight.
+        // The initiator already used the real lease; a waiter must qualify
+        // its own operation if the successful start belonged to another epoch.
+        if (ticket && !ticket.started && !warmed?.generation) await current();
+        const result =
+          warmed && (ticket?.started || warmed.generation)
+            ? warmed.result
+            : await start(AbortSignal.any([input.lifetime, revoked]));
         await current();
         if (
           result.personId !== identity.personId ||
@@ -285,13 +307,18 @@ export function createDEntryNativePrewarmPort(input: {
         )
           throw new DataAccessError('authorization_denied');
         const proof = await prove?.(context, identity, active);
-        if (flight && read && revision)
-          completedGeneration(
+        if (
+          warmed?.generation &&
+          read &&
+          revision &&
+          !matchingGeneration(
             await read(identity),
             revision,
             result,
-            flight.target,
-          );
+            warmed.generation,
+          )
+        )
+          throw new PersonVmError('LEASE_LOST');
         active.throwIfAborted();
         return proof;
       });
