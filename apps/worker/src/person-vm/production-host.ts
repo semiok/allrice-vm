@@ -448,10 +448,8 @@ export function createProductionPersonVmHost(input: {
         admissionOwner: 'service',
         async resolve(request, binding, signal) {
           signal.throwIfAborted();
-          const call = await modelSource.resolveCall(
-            request.headers,
-            binding,
-            signal,
+          const call = structuredClone(
+            await modelSource.resolveCall(request.headers, binding, signal),
           );
           signal.throwIfAborted();
           if (
@@ -464,7 +462,12 @@ export function createProductionPersonVmHost(input: {
           )
             throw new EgressError('DENIED');
           // Egress checks this call's actual current context before dispatch.
-          // The gateway reauthorizes the complete native call on every attempt.
+          // Freeze the shared context across policy and the actual dispatch.
+          Object.freeze(call.context.actor);
+          for (const membership of call.context.memberships)
+            Object.freeze(membership);
+          Object.freeze(call.context.memberships);
+          Object.freeze(call.context);
           return {
             context: call.context,
             dispatch: (response, active) =>

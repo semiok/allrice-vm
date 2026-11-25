@@ -528,17 +528,24 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
     ...call,
     context: { ...context, sessionId: randomUUID(), workspaceId: randomUUID() },
   };
+  const expected = structuredClone(next);
   resolveCall.mockResolvedValueOnce(next);
   value.model.handle.mockResolvedValueOnce(undefined);
   const operation = await model.resolve(request, binding, active);
-  expect(operation.context).toBe(next.context);
   expect(resolveCall).toHaveBeenLastCalledWith(headers, binding, active);
   expect(value.model.handle).not.toHaveBeenCalled();
+  next.context.workspaceId = randomUUID();
+  next.context.sessionId = randomUUID();
+  next.execution.executionId = randomUUID();
+  expect(operation.context).not.toBe(next.context);
+  expect(operation.context).toEqual(expected.context);
+  expect(Object.isFrozen(operation.context.actor)).toBe(true);
+  expect(Object.isFrozen(operation.context.memberships)).toBe(true);
   await operation.dispatch(response, active);
   expect(value.model.handle).toHaveBeenCalledExactlyOnceWith(
     request,
     response,
-    next,
+    expected,
     active,
   );
   expect(value.model.handle).toHaveBeenCalledTimes(1);
