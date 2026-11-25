@@ -2,6 +2,10 @@ import type { PersonVmManagedProbeJob } from './native-command-observer.ts';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, posix } from 'node:path';
 import { PersonVmError } from './contract.ts';
+import {
+  DSH_SANDBOX_ROOT,
+  prepareDshSandbox,
+} from './dsh-sandbox-bootstrap.ts';
 import type {
   PersonVmBootstrapScope,
   PersonVmGuestCommand,
@@ -248,7 +252,7 @@ export async function bootstrapMicrosandbox(input: {
   name: string;
   cleanupTimeoutMs: number;
   readonlyCommandMemoryDirectory?: string;
-  dshSandbox?: Readonly<{ guestDirectory: string; sandboxBin: string }>;
+  dshSandbox?: Readonly<{ guestDirectory: string; sha256: string }>;
   command: NativeCommand;
 }): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>> {
   const { scope, name, command } = input;
@@ -268,6 +272,13 @@ export async function bootstrapMicrosandbox(input: {
   commandInput(plan.initialize);
   commandInput({ executable: plan.launcher, args: [], env: plan.env });
   const controls = input.readonlyCommandMemoryDirectory;
+  const sandbox = input.dshSandbox;
+  if (
+    sandbox &&
+    (!/^\/opt\/allrice\/dsh\/[a-f0-9]{64}$/.test(sandbox.guestDirectory) ||
+      !/^[a-f0-9]{64}$/.test(sandbox.sha256))
+  )
+    throw new PersonVmError('PROVIDER_FAILED');
   if (
     plan.initialize.executable !== 'node' ||
     (controls
@@ -363,6 +374,11 @@ export async function bootstrapMicrosandbox(input: {
         ? { ...plan.initialize, executable: '/usr/local/bin/node' }
         : plan.initialize,
     );
+    if (sandbox)
+      await run({
+        executable: '/usr/local/bin/node',
+        args: ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
+      });
   } finally {
     await rm(stage, { recursive: true, force: true });
   }
@@ -400,7 +416,6 @@ export async function bootstrapMicrosandbox(input: {
       )
         throw new PersonVmError('PROVIDER_FAILED');
       const env = { ...spec.env, ...plan.env };
-      const sandbox = input.dshSandbox;
       if (
         sandbox &&
         spec.executable === 'node' &&
@@ -408,7 +423,8 @@ export async function bootstrapMicrosandbox(input: {
       ) {
         // rc.2's native provider resolves and functionally probes bwrap from
         // the DSH process PATH. No command or model environment can supply it.
-        env.PATH = sandbox.sandboxBin + ':' + BASE_IMAGE_PATH;
+        env.PATH =
+          posix.join(DSH_SANDBOX_ROOT, sandbox.sha256) + ':' + BASE_IMAGE_PATH;
       }
       return spawn({
         executable: plan.launcher,

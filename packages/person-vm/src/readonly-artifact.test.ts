@@ -259,7 +259,7 @@ it('accepts only the sealed, exclusively occupied read-only sandbox directory an
     verifyReadonlyDshDirectory(f.c, image, signal()),
   ).resolves.toEqual({
     descriptorSha256: f.c.sealedManifestSha256,
-    sandboxBin: f.c.guestDirectory + '/sandbox-bin',
+    sandboxSha256: sandboxBackend.sha256,
   });
   await f.changeSeal(
     { sandboxBackend: { ...sandboxBackend, path: 'node_modules/bwrap' } },

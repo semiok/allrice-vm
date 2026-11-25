@@ -334,7 +334,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       running,
       this.options.readonlyCommandMemoryDirectory,
     );
-    return artifact.value?.sandboxBin;
+    return artifact.value?.sandboxSha256;
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
     // Both reads can overlap under the same owner. Join the native CLI even
@@ -579,9 +579,9 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const controls = this.options.readonlyCommandMemoryDirectory;
     // Earlier artifacts need no added native inspection. An enabled backend
     // must come from the exact active read-only mount for this binding.
-    let sandboxBin: string | undefined;
+    let sandboxSha256: string | undefined;
     if (controls) {
-      sandboxBin = await this.assertArtifact(scope.binding, scope.signal);
+      sandboxSha256 = await this.assertArtifact(scope.binding, scope.signal);
     } else if (
       readonly &&
       (
@@ -590,9 +590,9 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
           this.options.image,
           scope.signal,
         )
-      ).sandboxBin
+      ).sandboxSha256
     ) {
-      sandboxBin = await this.assertArtifact(scope.binding, scope.signal);
+      sandboxSha256 = await this.assertArtifact(scope.binding, scope.signal);
     }
     return bootstrapMicrosandbox({
       scope,
@@ -601,8 +601,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       stagingRoot: paths.userHome,
       readonlyCommandMemoryDirectory: controls?.guestDirectory,
       ...(readonly &&
-        sandboxBin && {
-          dshSandbox: { guestDirectory: readonly.guestDirectory, sandboxBin },
+        sandboxSha256 && {
+          dshSandbox: {
+            guestDirectory: readonly.guestDirectory,
+            sha256: sandboxSha256,
+          },
         }),
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,
       command: (args, signal, readNonzeroExit) =>

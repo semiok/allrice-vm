@@ -194,7 +194,7 @@ export async function verifyReadonlyCommandMemoryDirectory(
 
 /** The sandbox executable is the only payload leaf read during verification.
  * The artifact publisher owns the full tree and the Debian provenance checks. */
-async function verifiedSandboxBin(
+async function verifiedSandboxSha256(
   directory: ReadonlyDshDirectory,
   value: unknown,
   signal: AbortSignal,
@@ -234,7 +234,7 @@ async function verifiedSandboxBin(
     0o555,
   );
   if (hash(executable) !== backend.sha256) invalid();
-  return directory.guestDirectory + '/' + SANDBOX_BIN_DIRECTORY;
+  return backend.sha256;
 }
 
 /** M1 and its sole publisher are trusted. Compare sealed bytes and the tree
@@ -272,11 +272,11 @@ export async function verifyReadonlyDshDirectory(
       !digest(descriptor.gateSha256)
     )
       invalid();
-    const sandboxBin = Object.hasOwn(descriptor, 'sandboxBackend')
-      ? await verifiedSandboxBin(c, descriptor.sandboxBackend, signal)
+    const sandboxSha256 = Object.hasOwn(descriptor, 'sandboxBackend')
+      ? await verifiedSandboxSha256(c, descriptor.sandboxBackend, signal)
       : undefined;
     signal.throwIfAborted();
-    return { descriptorSha256: sealedHash, sandboxBin };
+    return { descriptorSha256: sealedHash, sandboxSha256 };
   } catch {
     invalid();
   }

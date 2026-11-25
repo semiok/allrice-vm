@@ -19,6 +19,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  DSH_SANDBOX_ROOT,
+  prepareDshSandbox,
+} from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { PERSON_VM_MEMORY_MIB } from './contract.ts';
 import { runCommand } from './process.ts';
@@ -109,7 +113,7 @@ else if(a[0]==='exec'){
  }
  if(!a.includes('--detach')||!a.includes('--no-stdin')||!a.includes('--no-tty'))process.exit(42);
  const id=require('node:crypto').randomUUID(),cmd=a.slice(a.indexOf('--')+1),init=cmd.includes('/work/memory/init.cjs');
- (v.jobs??={})[id]={cmd,code:init&&mode==='init-error'?23:0};save();
+ (v.jobs??={})[id]={cmd,code:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0};save();
  if(!(init&&mode.startsWith('lost-id')))console.log(id);
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
@@ -657,6 +661,24 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       const launches = calls.filter((args) => args[0] === 'exec');
       const dsh = launches.find((args) => args.at(-1) === cli);
       const otherNode = launches.find((args) => args.at(-1) === other);
+      const staged = launches.filter((args) =>
+        args.includes(prepareDshSandbox),
+      );
+      const sha = createHash('sha256')
+        .update('synthetic runner fixture')
+        .digest('hex');
+      expect(staged).toHaveLength(withSandbox ? 1 : 0);
+      if (withSandbox) {
+        expect(staged[0]!.slice(-4)).toEqual([
+          '-e',
+          prepareDshSandbox,
+          c.guestDirectory,
+          sha,
+        ]);
+        expect(launches.indexOf(staged[0]!)).toBeLessThan(
+          launches.indexOf(dsh!),
+        );
+      }
       const readPath = (args?: string[]) =>
         args?.filter(
           (arg, index) =>
@@ -665,8 +687,10 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(readPath(dsh)).toEqual([
         withSandbox
           ? 'PATH=' +
-            c.guestDirectory +
-            '/sandbox-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+            DSH_SANDBOX_ROOT +
+            '/' +
+            sha +
+            ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
           : 'PATH=/work/caller-path',
       ]);
       expect(readPath(otherNode)).toEqual(['PATH=/work/caller-path']);
@@ -677,6 +701,17 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toBe(true);
     },
   );
+  it('rejects DSH startup and stops the VM when sandbox staging fails', async () => {
+    const c = await readonlyFixture(true);
+    const f = await bootstrapFixture('sandbox-stage-error', c);
+    await expect(
+      f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    const calls = await f.calls();
+    expect(calls.some((args) => args.includes(prepareDshSandbox))).toBe(true);
+    expect(calls.some((args) => args.includes('native-dsh'))).toBe(false);
+    expect(calls.some((args) => args[0] === 'stop')).toBe(true);
+  });
   it('source qualification失败不pull/create/start；真实prepare/status和失败detach仍可收敛', async () => {
     const c = await readonlyFixture();
     await chmod(dirname(c.hostDirectory), 0o755);
