@@ -824,6 +824,7 @@ it('retires a real unpublished egress binding in maintenance before releasing it
   });
   expect(value.host.modelOwnerMaintenancePending()).toBe(true);
 
+  const beforeRecovery = vi.mocked(providers.native.stop).mock.calls.length;
   value.model.reconcileOwner.mockResolvedValue(0);
   await expect(
     value.host.recoverModelOwner(context, signal()),
@@ -833,6 +834,7 @@ it('retires a real unpublished egress binding in maintenance before releasing it
   expect(providers.disk.detach).not.toHaveBeenCalled();
   expect(value.host.modelOwnerMaintenancePending()).toBe(true);
 
+  expect(providers.native.stop).toHaveBeenCalledTimes(beforeRecovery);
   vi.mocked(provisioner.remove).mockResolvedValue(undefined);
   await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
     0,
@@ -863,6 +865,30 @@ it('does not hold the mount or maintenance for an installation error whose rollb
   await expect(vm.start(context, signal())).rejects.toMatchObject({
     code: 'PROVIDER_FAILED',
   });
+  expect(providers.disk.detach).toHaveBeenCalledOnce();
+  await expect(value.host.close()).resolves.toBeUndefined();
+  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+});
+
+it('rolls back an unpublished egress listener with a live cleanup signal after start cancellation', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const cancellation = new AbortController();
+  const provisioner = providers.egressInstallation.provisioner;
+  vi.mocked(provisioner.install).mockImplementationOnce(async () => {
+    cancellation.abort(new PersonVmError('RUNTIME_NOT_READY'));
+  });
+  vi.mocked(provisioner.remove).mockImplementationOnce(
+    async (_binding, cleanupSignal) => {
+      cleanupSignal.throwIfAborted();
+    },
+  );
+
+  await expect(vm.start(context, cancellation.signal)).rejects.toMatchObject({
+    code: 'RUNTIME_NOT_READY',
+  });
+  expect(provisioner.remove).toHaveBeenCalledOnce();
   expect(providers.disk.detach).toHaveBeenCalledOnce();
   await expect(value.host.close()).resolves.toBeUndefined();
   expect(value.host.modelOwnerMaintenancePending()).toBe(false);
@@ -901,10 +927,23 @@ it.each(['later epoch', 'replacement VM', 'deleted'] as const)(
           previous.vmId = randomUUID();
           previous.instanceId = null;
           previous.leaseEpoch = 0;
+          previous.nativeCreated = false;
           previous.phase = 'starting';
         } else {
           previous.leaseEpoch++;
           previous.instanceId = randomUUID();
+          previous.gatewayPorts = [41236];
+          previous.egressReceipt = {
+            binding: {
+              vmId: previous.vmId,
+              personId: previous.personId,
+              organizationId: previous.organizationId,
+              instanceId: previous.instanceId,
+              leaseEpoch: previous.leaseEpoch,
+            },
+            bindingId: randomUUID(),
+            gatewayPorts: [41236],
+          };
           previous.phase = 'running';
         }
         await lease.save(previous);

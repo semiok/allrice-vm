@@ -338,11 +338,15 @@ export function createProductionPersonVmHost(input: {
     if (retired && sameVmBinding(retired.binding, binding))
       retiredReceipts.delete(binding.personId);
   }
-  function stopOwnedVms() {
+  function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
     const vm = personVm;
     if (!vm) return Promise.resolve([]);
+    const targets = [...ownedVms.values()].filter(
+      ({ binding }) =>
+        !deferUnconfirmedEgress || !hasUnconfirmedPreparation(binding),
+    );
     return collectFailures(
-      [...ownedVms.values()].map(({ binding, stopNative }) => async () => {
+      targets.map(({ binding, stopNative }) => async () => {
         await vm.shutdownOwned(binding, stopNative);
         ownedVms.delete(binding.personId);
       }),
@@ -475,7 +479,7 @@ export function createProductionPersonVmHost(input: {
       // Once the stop proof has been accepted, join cleanup even if the
       // maintenance request disconnects or the Worker lifetime has ended.
       const prepareFailures = await retireFailedPreparations();
-      const vmFailures = await stopOwnedVms();
+      const vmFailures = await stopOwnedVms({ deferUnconfirmedEgress: true });
       const receiptFailures = await retireReceipts();
       const providerOwner = providers;
       const installationFailures = providerOwner
@@ -750,8 +754,11 @@ export function createProductionPersonVmHost(input: {
       };
       // The same shared boundary owns all egress calls. Sources may never
       // replace it or supply a different VM/store/connection factory.
+      const vmCleanupTimeoutMs =
+        providers.configuration.lifecycle.cleanupTimeoutMs;
       gateway = createEgressGateway({
         vm,
+        prepareRollbackSignal: () => AbortSignal.timeout(vmCleanupTimeoutMs),
         admission,
         authority: egressSource.authority,
         policy: egressSource.policy,

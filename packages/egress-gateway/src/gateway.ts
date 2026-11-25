@@ -127,6 +127,7 @@ export function createEgressGateway(
     provisioner: EgressProvisioner;
     services?: readonly ManagedHostService[];
     lifetime?: AbortSignal;
+    prepareRollbackSignal?: () => AbortSignal;
   },
 ) {
   const states = new Map<string, BindingState>();
@@ -598,7 +599,7 @@ export function createEgressGateway(
           return receipt;
         } catch (error) {
           try {
-            await retire(state, signal);
+            await retire(state, options.prepareRollbackSignal?.() ?? signal);
           } catch (cleanup) {
             state.rollbackPending = true;
             throw new EgressPrepareRollbackError(error, cleanup);
