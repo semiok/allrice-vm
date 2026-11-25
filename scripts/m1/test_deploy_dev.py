@@ -721,11 +721,76 @@ class DeployDevMigrations(unittest.TestCase):
         stubs = (
             'df() { printf "h\\nx x x 100\\n"; }; resolve_ref() { echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }; '
             'git() { [ "$3 $4" != "worktree add" ] || { mkdir -p "$(dirname "$7")" && cp -R "$CANDIDATE" "$7"; }; }; pnpm() { :; }; '
-            'node() { case "$1" in apps/*) printf \'{"artifactId":"%s"}\\n\' "$ART" ;; scripts/*) : ;; *) command node "$@" ;; esac; }; '
+            'node() { case "$1" in apps/*) printf \'{"artifactId":"%s"}\\n\' "$ART" ;; '
+            'scripts/dev-release/prepare-identity.mjs) '
+            '[ -z "${IDENTITY_ARGS_FILE:-}" ] || printf "%s\\n" "$@" > "$IDENTITY_ARGS_FILE" ;; '
+            'scripts/*) : ;; *) command node "$@" ;; esac; }; '
             'precheck() { echo PRECHECK; }; take_lock() { :; }; stop_job() { echo STOPPED:$2; }; '
             'worker_boot() { :; }; report_after_stop() { :; }; prune_releases() { :; }; '
             'start_job() { [ -f "$2" ] && echo STARTED:$1; }; wait_ready() { echo READY:$2; }; BIN=$SMOKE; ')
         return stubs, smoke
+
+    def test_deploy_seals_optional_person_vm_host_configuration(self):
+        stubs, smoke = self.successful_deploy_stubs()
+        sha = 'b' * 40
+        candidate = self.release(sha=sha)
+        config = os.path.join(self.home, 'allrice40-dev/config/person-vm-host.json')
+        identity_args = os.path.join(self.tmp, 'identity-args')
+        for configured in (False, True):
+            with self.subTest(configured=configured):
+                if configured:
+                    write(config, '{"private_fixture":"not logged"}', 0o600)
+                result = self.run_dd(
+                    stubs + 'deploy --skip-smoke',
+                    FILES + ARCHIVED, CONTRACT='row:1', CANDIDATE=candidate,
+                    ART='sha256:' + 'c' * 64, SMOKE=smoke, IDENTITY_ARGS_FILE=identity_args,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with open(identity_args) as f:
+                    args = f.read().splitlines()
+                release = self.read_plist(self.live_plist('worker'))['WorkingDirectory']
+                expected = ['scripts/dev-release/prepare-identity.mjs', '--root=' + release, '--release-sha=' + sha]
+                if configured:
+                    expected.append('--person-vm-config=' + config)
+                self.assertEqual(args, expected)
+                self.remove_deploy_build()
+                self.seed_legacy_plists()
+
+    def test_deploy_requires_person_vm_host_configuration_when_requested(self):
+        result = self.run_dd(
+            'git() { echo UNEXPECTED_GIT; return 91; }; deploy --require-person-vm-config',
+            FILES + ARCHIVED,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('required person VM host configuration is missing', result.stderr)
+        self.assertNotIn('UNEXPECTED_GIT', result.stdout)
+
+    def test_deploy_rejects_unsafe_person_vm_host_configuration_before_build(self):
+        config = os.path.join(self.home, 'allrice40-dev/config/person-vm-host.json')
+        target = os.path.join(self.tmp, 'valid-person-vm-host.json')
+        write(target, '{}', 0o600)
+        os.makedirs(os.path.dirname(config))
+        for kind in ('wrong mode', 'symlink', 'dangling symlink', 'directory'):
+            with self.subTest(kind=kind):
+                if kind == 'wrong mode':
+                    write(config, '{}', 0o644)
+                elif kind == 'symlink':
+                    os.symlink(target, config)
+                elif kind == 'dangling symlink':
+                    os.symlink(target + '.missing', config)
+                else:
+                    os.mkdir(config, 0o700)
+                result = self.run_dd(
+                    'git() { echo UNEXPECTED_GIT; return 91; }; deploy',
+                    FILES + ARCHIVED,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('mode 0600 (no symlinks)', result.stderr)
+                self.assertNotIn('UNEXPECTED_GIT', result.stdout)
+                if kind == 'directory':
+                    os.rmdir(config)
+                else:
+                    os.unlink(config)
 
     def test_successful_deploy_and_forward_fix_rewrite_plists_and_run_smoke(self):
         stubs, smoke = self.successful_deploy_stubs()
