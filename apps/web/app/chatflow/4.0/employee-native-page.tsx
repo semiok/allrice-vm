@@ -22,6 +22,7 @@ import {
   EmployeeEntryError,
   employeeEntryQuery,
   prepareEmployeeEntry,
+  prewarmEmployeeEntry,
 } from '../../../lib/d-entry/entry-client';
 import styles from './employee-native-page.module.css';
 
@@ -38,6 +39,22 @@ type Status =
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
 const closingNoticeMs = 10_000;
+
+async function waitForVisibleEntry(signal: AbortSignal) {
+  signal.throwIfAborted();
+  if (!document.hidden) return;
+  await new Promise<void>((resolve, reject) => {
+    const visible = () => {
+      if (document.hidden) return;
+      document.removeEventListener('visibilitychange', visible);
+      signal.removeEventListener('abort', abort);
+      resolve();
+    };
+    const abort = () => reject(signal.reason);
+    document.addEventListener('visibilitychange', visible, { signal });
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
 
 export function EmployeeNativePage({
   query,
@@ -298,15 +315,29 @@ export function EmployeeNativePage({
       else void close();
     };
     window.addEventListener('pagehide', leaving);
-    if (prepare) timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+    const parsedEntry = Promise.resolve().then(() =>
+      employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
+    );
+    // The rendered shell owns this one request. The existing POST qualifies
+    // the exact selection before starting a VM; no background request lends
+    // its result to another activation, cookie session, or page carrier.
+    const prewarming = prepare
+      ? parsedEntry.then(async ({ selection }) => {
+          await waitForVisibleEntry(lifetime.signal);
+          lifetime.signal.throwIfAborted();
+          timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+          await prewarmEmployeeEntry(selection, lifetime.signal);
+        })
+      : undefined;
+    void prewarming?.catch(() => {}); // setup reports the same rejection.
     const setup = async () => {
-      const entry = employeeEntryQuery(
-        activation.confirmedQuery ?? activeQuery,
-        prepare,
-      );
+      const entry = await parsedEntry;
       const selection = prepare
-        ? await prepareEmployeeEntry(entry, lifetime.signal, () =>
-            setStatus('opening'),
+        ? await prepareEmployeeEntry(
+            entry,
+            lifetime.signal,
+            () => setStatus('opening'),
+            prewarming,
           )
         : entry.selection;
       const { params } = entry;

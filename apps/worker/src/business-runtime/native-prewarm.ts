@@ -1,9 +1,20 @@
-import { sameDEntryIdentity } from '@allrice/contracts';
+import {
+  sameDEntryIdentity,
+  selectDEntryGeneration,
+  type DEntryIdentity,
+  type RequestContext,
+} from '@allrice/contracts';
 import {
   DataAccessError,
+  getDatabase,
+  readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
 } from '@allrice/database';
-import { PersonVmError, type PersonVmPort } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmPort,
+  type PersonVmView,
+} from '@allrice/person-vm';
 import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js';
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
@@ -13,17 +24,172 @@ import {
 } from '../d-entry/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 
+type Generation = {
+  vmId: string | null;
+  instanceId: string | null;
+  leaseEpoch: number;
+};
+type VmStamp = Generation & { phase: PersonVmView['phase'] };
+type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string | number };
+type Coordination = { policyRevision: string; vm: VmStamp | null };
+type ReadCoordination = (identity: DEntryIdentity) => Promise<Coordination>;
+
+async function readCurrentCoordination(identity: DEntryIdentity) {
+  const sql = getDatabase();
+  const [policy, [vm]] = await Promise.all([
+    readDEntryReleasePolicy(sql),
+    sql<VmStampRow[]>`select vm_id as "vmId", instance_id as "instanceId", phase,
+      lease_epoch as "leaseEpoch" from person_virtual_machines
+      where person_id=${identity.personId} and organization_id=${identity.organizationId}`,
+  ]);
+  if (selectDEntryGeneration(policy, identity) !== '4.0')
+    throw new DataAccessError('authorization_denied');
+  return {
+    policyRevision: policy.revision,
+    vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
+  };
+}
+
+function targetGeneration(vm: VmStamp | null): Generation | undefined {
+  if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
+  if (vm.phase === 'deleted' || !Number.isSafeInteger(vm.leaseEpoch)) return;
+  if (vm.phase === 'running' || (vm.phase === 'starting' && vm.instanceId))
+    return vm;
+  // A retained or as-yet-unstarted VM advances exactly one epoch on start.
+  if (!Number.isSafeInteger(vm.leaseEpoch + 1)) return;
+  return { vmId: vm.vmId, instanceId: null, leaseEpoch: vm.leaseEpoch + 1 };
+}
+
+function compatible(a: Generation, b: Generation) {
+  return (
+    a.leaseEpoch === b.leaseEpoch &&
+    (!a.vmId || !b.vmId || a.vmId === b.vmId) &&
+    (!a.instanceId || !b.instanceId || a.instanceId === b.instanceId)
+  );
+}
+
+function completedGeneration(
+  stamp: Coordination,
+  revision: string,
+  result: PersonVmView,
+  target: Generation,
+) {
+  if (
+    stamp.policyRevision !== revision ||
+    stamp.vm?.phase !== 'running' ||
+    !stamp.vm.instanceId ||
+    !result.ready ||
+    result.vmId !== stamp.vm.vmId ||
+    !compatible(target, stamp.vm)
+  )
+    throw new PersonVmError('LEASE_LOST');
+  return stamp.vm;
+}
+
+type Flight = {
+  target: Generation;
+  join(revoked: AbortSignal): void;
+  work: Promise<PersonVmView>;
+};
+
+function prewarmKey(
+  context: RequestContext,
+  identity: DEntryIdentity,
+  revision: string,
+) {
+  return JSON.stringify([
+    context.sessionId,
+    context.workspaceId,
+    identity.personId,
+    identity.organizationId,
+    identity.workspaceId,
+    identity.employeeInstanceId,
+    identity.employeeRevision,
+    identity.employeeVersionId,
+    identity.threadId,
+    revision,
+  ]);
+}
+
 /** Consume the existing VM lifecycle; no completed-result or authority cache. */
 export function createDEntryNativePrewarmPort(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
+  readCoordination?: ReadCoordination;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
   const admission = AbortSignal.any([input.lifetime, stopped.signal]);
   const pending = new Set<Promise<AbortSignal | undefined>>();
+  const flights = new Map<string, Set<Flight>>();
   let closing: Promise<void> | undefined;
+
+  function shared({
+    key,
+    target,
+    revoked,
+    start,
+    confirm,
+  }: {
+    key: string;
+    target: Generation;
+    revoked: AbortSignal;
+    start: (signal: AbortSignal) => Promise<PersonVmView>;
+    confirm(result: PersonVmView, flight: Flight): Promise<Generation>;
+  }) {
+    const group = flights.get(key) ?? new Set<Flight>();
+    for (const flight of group) {
+      if (!compatible(flight.target, target)) continue;
+      // A later waiter may already know which physical start was published.
+      flight.target = {
+        vmId: flight.target.vmId ?? target.vmId,
+        instanceId: flight.target.instanceId ?? target.instanceId,
+        leaseEpoch: target.leaseEpoch,
+      };
+      flight.join(revoked);
+      return flight;
+    }
+    const lost = new AbortController();
+    const watchers = new Map<AbortSignal, () => void>();
+    const physical = AbortSignal.any([input.lifetime, lost.signal]);
+    const work = Promise.resolve().then(async () => {
+      physical.throwIfAborted();
+      const result = await start(physical);
+      physical.throwIfAborted();
+      flight.target = await confirm(result, flight);
+      physical.throwIfAborted();
+      return result;
+    });
+    const flight: Flight = {
+      target,
+      work,
+      join(signal) {
+        if (watchers.has(signal)) return;
+        const check = () => {
+          if ([...watchers.keys()].every((entry) => entry.aborted)) {
+            // A permanently revoked operation cannot accept another waiter.
+            group.delete(flight);
+            lost.abort(signal.reason);
+          }
+        };
+        watchers.set(signal, check);
+        signal.addEventListener('abort', check, { once: true });
+        if (signal.aborted) check();
+      },
+    };
+    group.add(flight);
+    flights.set(key, group);
+    flight.join(revoked);
+    const settled = () => {
+      for (const [signal, check] of watchers)
+        signal.removeEventListener('abort', check);
+      group.delete(flight);
+      if (!group.size && flights.get(key) === group) flights.delete(key);
+    };
+    void work.then(settled, settled);
+    return flight;
+  }
   const port: DEntryNativePrewarmPort = {
     prewarm(context, identity, trigger, caller, revoked) {
       if (admission.aborted) return Promise.reject(admission.reason);
@@ -63,19 +229,47 @@ export function createDEntryNativePrewarmPort(input: {
         // Browser disconnect/uninstallation cannot kill shared running work.
         // Genuine authority revocation still fences this physical operation.
         active.throwIfAborted();
-        const result = await input.prewarmCurrent(
-          context,
-          identity,
-          { trigger },
-          AbortSignal.any([input.lifetime, revoked]),
-        );
+        const read = input.readCoordination;
+        const stamp = await read?.(identity);
+        active.throwIfAborted();
+        const target = stamp && targetGeneration(stamp.vm);
+        const start = (signal: AbortSignal) =>
+          input.prewarmCurrent(context, identity, { trigger }, signal);
+        const flight =
+          read && stamp && target
+            ? shared({
+                key: prewarmKey(context, identity, stamp.policyRevision),
+                target,
+                revoked,
+                start,
+                async confirm(result, flight) {
+                  return completedGeneration(
+                    await read(identity),
+                    stamp.policyRevision,
+                    result,
+                    flight.target,
+                  );
+                },
+              })
+            : undefined;
+        const result = await (flight?.work ??
+          start(AbortSignal.any([input.lifetime, revoked])));
         await current();
         if (
           result.personId !== identity.personId ||
           result.organizationId !== identity.organizationId
         )
           throw new DataAccessError('authorization_denied');
-        return await prove?.(context, identity, active);
+        const proof = await prove?.(context, identity, active);
+        if (flight && read && stamp)
+          completedGeneration(
+            await read(identity),
+            stamp.policyRevision,
+            result,
+            flight.target,
+          );
+        active.throwIfAborted();
+        return proof;
       });
       pending.add(task);
       void task.then(
@@ -101,6 +295,7 @@ export function installDEntryNativePrewarm(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
+  readCoordination?: ReadCoordination;
 }) {
   const assembly = createDEntryNativePrewarmPort(input);
   let uninstall: () => void;
@@ -140,6 +335,7 @@ export function installAssignedDEntryNativeRuntime(
     prewarm = installDEntryNativePrewarm({
       ...input,
       requireEditorProof: true,
+      readCoordination: readCurrentCoordination,
     });
   } catch (error) {
     void catalog.close();

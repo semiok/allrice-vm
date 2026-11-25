@@ -145,9 +145,27 @@ suite('4.0 browser cold entry', () => {
         { name: 'allrice_session', value: sessionToken, url: f.origin },
       ]);
       const page = await context.newPage();
+      await page.addInitScript(() => {
+        if (window.top === window && !sessionStorage.getItem('entry-visible'))
+          Object.defineProperty(document, 'hidden', {
+            configurable: true,
+            value: true,
+          });
+      });
       await page.goto(
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
+      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await page.evaluate(
+        () => new Promise((painted) => requestAnimationFrame(painted)),
+      );
+      expect(warmCalls).toEqual([]);
+      await page.evaluate(() => {
+        sessionStorage.setItem('entry-visible', '1');
+        Object.defineProperty(document, 'hidden', { value: false });
+        document.dispatchEvent(new Event('visibilitychange'));
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
       await page
         .getByRole('alert')
         .getByRole('heading', { name: '暂时无法打开工作台' })

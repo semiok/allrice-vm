@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { employeeEntryQuery, prepareEmployeeEntry } from './entry-client';
+import {
+  employeeEntryQuery,
+  prepareEmployeeEntry,
+  prewarmEmployeeEntry,
+} from './entry-client';
 
 const selection = {
   workspaceId: randomUUID(),
@@ -57,3 +61,28 @@ it('cannot dispatch creation after cancellation even if the HTTP prewarm resolve
   expect(opening).not.toHaveBeenCalled();
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+
+it.each([204, 403, 503])(
+  'consumes the activation’s original prewarm response %i without posting again',
+  async (status) => {
+    const input = employeeEntryQuery(query + '&threadId=' + randomUUID(), true);
+    const { promise, resolve } = Promise.withResolvers<Response>();
+    const fetch = vi.fn(() => promise);
+    vi.stubGlobal('fetch', fetch);
+    const signal = new AbortController().signal;
+    const opening = vi.fn();
+    const background = prewarmEmployeeEntry(input.selection, signal);
+    const entry = prepareEmployeeEntry(input, signal, opening, background);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(opening).not.toHaveBeenCalled();
+    resolve(new Response(null, { status }));
+    if (status === 204) {
+      await expect(entry).resolves.toEqual(input.selection);
+      expect(opening).toHaveBeenCalledOnce();
+    } else {
+      await expect(entry).rejects.toMatchObject({ status });
+      expect(opening).not.toHaveBeenCalled();
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
+  },
+);

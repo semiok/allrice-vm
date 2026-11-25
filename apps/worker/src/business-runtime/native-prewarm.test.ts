@@ -36,7 +36,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.resetAllMocks();
 });
-function fixture() {
+function fixture(coordinated = false) {
   // Actual lifecycle service with synthetic disk/native/runtime providers only.
   // No production installation, Host process, VM or performance claim.
   const base = nativeEntryFixture(),
@@ -50,9 +50,14 @@ function fixture() {
   // Explicit fixture adapter; production must use the shared H1 authority owner.
   const prewarmCurrent: CurrentSelectionPrewarm = (...args) =>
     h.service.prewarm(args[0], args[2], args[3]);
+  const readCoordination = vi.fn(async () => ({
+    policyRevision: 'release-1',
+    vm: await h.store.read(base.identity.personId),
+  }));
   const assembly = createDEntryNativePrewarmPort({
     prewarmCurrent,
     lifetime: lifetime.signal,
+    ...(coordinated && { readCoordination }),
   });
   cleanups.push(assembly.close);
   return {
@@ -65,6 +70,7 @@ function fixture() {
     stop,
     assembly,
     prewarmCurrent,
+    readCoordination,
   };
 }
 const signal = () => new AbortController().signal;
@@ -254,6 +260,123 @@ it('concurrent page/input cannot acquire a second lifecycle owner, and later val
   expect(f.start).toHaveBeenCalledTimes(1);
   expect(f.h.log.filter((item) => item === 'native:create')).toHaveLength(1);
   expect(f.stop).not.toHaveBeenCalled();
+});
+
+it('joins a later request on the published starting epoch and proves readiness for each valid waiter', async () => {
+  const f = fixture(true);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const original = f.start.getMockImplementation()!;
+  const leader = new AbortController();
+  const follower = { ...f.base.context, requestId: randomUUID() };
+  const prove = vi.fn(async () => signal());
+  cleanups.push(async () => {
+    release.resolve();
+  });
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady: prove,
+  });
+  cleanups.push(async () => uninstall());
+  f.start.mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return original(...args);
+  });
+  const prewarm = (
+    context: typeof f.base.context,
+    trigger: 'page' | 'input',
+    revoked: AbortSignal,
+  ) =>
+    f.assembly.port.prewarm(
+      context,
+      f.base.identity,
+      trigger,
+      signal(),
+      revoked,
+    );
+  const first = prewarm(f.base.context, 'page', leader.signal);
+  const outcomes = Promise.allSettled([first]);
+  await entered.promise;
+  let second: Promise<AbortSignal | void> | undefined;
+  try {
+    expect(await f.h.store.read(f.base.identity.personId)).toMatchObject({
+      phase: 'starting',
+      leaseEpoch: 1,
+    });
+    second = prewarm(follower, 'input', signal());
+    void second.catch(() => {});
+    await vi.waitFor(() => expect(f.readCoordination).toHaveBeenCalledTimes(2));
+    expect(f.vm).toHaveBeenCalledTimes(1);
+    leader.abort(new DataAccessError('authorization_denied'));
+    expect(f.vm.mock.calls[0]![2].aborted).toBe(false);
+  } finally {
+    release.resolve();
+    await outcomes;
+    await second?.catch(() => {});
+  }
+  await expect(first).rejects.toBe(leader.signal.reason);
+  await expect(second).resolves.toBeInstanceOf(AbortSignal);
+  expect(f.vm).toHaveBeenCalledTimes(1);
+  expect(f.start).toHaveBeenCalledTimes(1);
+  expect(prove).toHaveBeenCalledExactlyOnceWith(
+    follower,
+    f.base.identity,
+    expect.any(AbortSignal),
+  );
+  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it('does not reuse completed work or share prewarm across login sessions', async () => {
+  const f = fixture(true);
+  const started = deferred<void>();
+  const release = deferred<void>();
+  f.vm.mockImplementationOnce(async (...args) => {
+    started.resolve();
+    await release.promise;
+    return f.runPrewarm(...args);
+  });
+  const run = (context = f.base.context) =>
+    f.assembly.port.prewarm(
+      context,
+      f.base.identity,
+      'page',
+      signal(),
+      signal(),
+    );
+  const first = run();
+  void first.catch(() => {});
+  await started.promise;
+  try {
+    await run({ ...f.base.context, sessionId: randomUUID() });
+    expect(f.vm).toHaveBeenCalledTimes(2);
+  } finally {
+    release.resolve();
+    await first;
+  }
+  await run();
+  expect(f.vm).toHaveBeenCalledTimes(3);
+  expect(f.start).toHaveBeenCalledTimes(1);
+});
+
+it('fails closed if the policy revision changes before confirming a shared result', async () => {
+  const f = fixture(true);
+  f.readCoordination.mockImplementationOnce(async () => ({
+    policyRevision: 'pending',
+    vm: null,
+  }));
+  const run = () =>
+    f.assembly.port.prewarm(
+      f.base.context,
+      f.base.identity,
+      'page',
+      signal(),
+      signal(),
+    );
+  await expect(run()).rejects.toMatchObject({ code: 'LEASE_LOST' });
+  await expect(run()).resolves.toBeUndefined();
+  expect(f.vm).toHaveBeenCalledTimes(2);
+  expect(f.start).toHaveBeenCalledTimes(1);
 });
 
 it('current authority rejects before any VM call, and post-start denial does not stop shared running work', async () => {
