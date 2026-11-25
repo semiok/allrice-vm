@@ -132,20 +132,21 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     opened: (page: DEntryPageHandle) => Promise<void>,
     revoked: (reason: unknown) => void,
   ) {
-    // A viewer must never start a Host to make a missing live/cold source exist.
+    // The explicit editor open may bind a new root on an existing Host.
+    // This path never starts a VM to make a missing cold source exist.
     const original = await history(token, input, signal);
     if (!input.selection.threadId) throw new DEntryNativeUnavailable();
     const existing = await deps.historyRoot(original.context, input.selection);
     signal.throwIfAborted();
-    if (!existing || !sameDEntryIdentity(existing.identity, original.identity))
-      throw new DEntryNativeUnavailable();
-    const pin = existing;
     const data = deps.data();
-    if (!data) throw new DEntryNativeUnavailable();
+    if (!data || (!existing && !data.prepareEditorRoot))
+      throw new DEntryNativeUnavailable();
+    if (existing && !sameDEntryIdentity(existing.identity, original.identity))
+      throw denied();
     const auth = await currentDEntryRequest(deps, token, input, signal);
     if (
       auth.context.sessionId !== original.context.sessionId ||
-      !sameDEntryIdentity(auth.identity, pin.identity)
+      !sameDEntryIdentity(auth.identity, original.identity)
     )
       throw denied();
     const authority = await deps.watch(
@@ -163,20 +164,42 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         active,
       );
       if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
-      if (pin.vmId !== current.view.receipt.binding.vmId) throw denied();
-      async function assertCurrent(caller: AbortSignal) {
+      async function assertHost(caller: AbortSignal) {
         const next = await currentDEntryRequest(deps, token, input, caller);
         if (
           next.context.sessionId !== auth.context.sessionId ||
           !sameDEntryIdentity(auth.identity, next.identity)
         )
           throw denied();
-        const root = await deps.root(next.context, input.selection);
-        if (!sameRoot(root, pin)) throw denied();
         await current.owner.assertCurrent(next.context, caller);
         if (current.owner.bindingRef !== current.view.bindingRef)
           throw denied();
         if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
+        caller.throwIfAborted();
+        return next.context;
+      }
+      let root = existing;
+      if (!root) {
+        if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
+        root = await data.prepareEditorRoot({
+          ...auth,
+          owner: current.owner,
+          async assertCurrent(caller) {
+            await assertHost(caller);
+          },
+          signal: current.signal,
+        });
+      }
+      const pin = root;
+      if (
+        !sameDEntryIdentity(pin.identity, auth.identity) ||
+        pin.vmId !== current.view.receipt.binding.vmId
+      )
+        throw denied();
+      async function assertCurrent(caller: AbortSignal) {
+        const next = await assertHost(caller);
+        const root = await deps.root(next, input.selection);
+        if (!sameRoot(root, pin)) throw denied();
         caller.throwIfAborted();
       }
       const operationId = randomUUID();
@@ -439,12 +462,15 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       signal: AbortSignal,
     ) {
       const auth = await history(token, input, signal);
-      if (
-        !input.selection.threadId ||
-        !deps.data() ||
-        !(await deps.historyRoot(auth.context, input.selection))
-      )
+      const data = deps.data();
+      if (!input.selection.threadId || !data)
         throw new DEntryNativeUnavailable();
+      const root = await deps.historyRoot(auth.context, input.selection);
+      if (!root) {
+        if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
+        // Qualification only. Opening the socket alone never creates a root.
+        await currentDEntryRequest(deps, token, input, signal);
+      }
       signal.throwIfAborted();
     },
     own,

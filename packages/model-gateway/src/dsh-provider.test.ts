@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
-import { GatewayLlmAdapter } from './dsh-provider.ts';
+import Llm, {
+  type GenerateOptions,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm';
+import { Context } from '@deepseek-ai/cordis';
+import {
+  GatewayLlmAdapter,
+  registerManagedGatewayAdapter,
+} from './dsh-provider.ts';
+import { createNativeModelCallReferences } from './native-call-reference.ts';
+import { MODEL_CALL_REFERENCE_HEADER } from './contract.ts';
+import { modelBinding } from './gateway.fixture.ts';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -102,4 +112,131 @@ describe('guest adapter VM-local egress capability (synthetic fetch only)', () =
       });
     },
   );
+});
+
+it('registers a managed native DSH route and redeems the exact host call once', async () => {
+  const ctx = new Context();
+  const fiber = ctx.plugin(Llm);
+  await fiber;
+  const controller = new AbortController();
+  const binding = modelBinding();
+  const expected = structuredClone(binding);
+  const call = new AbortController();
+  const authority = { assertCall: vi.fn(async () => {}) };
+  const refs = createNativeModelCallReferences(authority, controller.signal);
+  const ref = await refs.issue(binding, call.signal);
+  binding.context.sessionId = 'changed-after-issue';
+
+  const resolve = vi.fn(async () => ref);
+  const request = vi.fn<typeof fetch>(async (_url, init) => {
+    const header = new Headers(init?.headers).get(MODEL_CALL_REFERENCE_HEADER);
+    expect(header).toBe(ref);
+    expect(String(init?.body)).not.toContain(ref);
+    expect(String(init?.body)).not.toContain(expected.execution.runId);
+    await expect(
+      refs.resolveCall(
+        { [MODEL_CALL_REFERENCE_HEADER]: ref },
+        { ...expected.vm, leaseEpoch: expected.vm.leaseEpoch + 1 },
+        call.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    await expect(
+      refs.resolveCall(
+        { [MODEL_CALL_REFERENCE_HEADER]: ref },
+        expected.vm,
+        call.signal,
+      ),
+    ).resolves.toEqual(expected);
+    return new Response(
+      chunks.map((chunk) => JSON.stringify(chunk)).join('\n') + '\n',
+    );
+  });
+  vi.stubGlobal('fetch', request);
+  try {
+    const route = { provider: 'host-gateway', model: 'fixture-model' };
+    registerManagedGatewayAdapter(ctx.llm, {
+      origin: 'http://127.0.0.1:12345',
+      capability: 'a'.repeat(43),
+      route: { ...route, resolveCallReference: resolve },
+    });
+    const options = input();
+    const selected = await ctx.llm.prepareCall(
+      {
+        ...route,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens,
+      },
+      call.signal,
+    );
+    const sessionId = expected.native.sessionId as GenerateOptions['sessionId'];
+    const received = [];
+    for await (const chunk of selected.stream({
+      ...options,
+      ...selected.config,
+      sessionId,
+    }))
+      received.push(chunk);
+    expect(received).toEqual(chunks);
+    expect(resolve).toHaveBeenCalledWith(
+      { ...route, sessionId },
+      expect.any(AbortSignal),
+    );
+    expect(authority.assertCall).toHaveBeenCalledExactlyOnceWith(
+      expected,
+      expect.any(AbortSignal),
+    );
+    expect(request).toHaveBeenCalledTimes(1);
+    await expect(
+      refs.resolveCall(
+        { [MODEL_CALL_REFERENCE_HEADER]: ref },
+        expected.vm,
+        call.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  } finally {
+    controller.abort();
+    await fiber.dispose();
+  }
+});
+
+it('refuses guessed and revoked references and does not fetch without an exact selection', async () => {
+  const lifetime = new AbortController();
+  const call = new AbortController();
+  const binding = modelBinding();
+  const refs = createNativeModelCallReferences(
+    { assertCall: async () => {} },
+    lifetime.signal,
+  );
+  const issued = await refs.issue(binding, call.signal);
+  call.abort();
+  for (const ref of [issued, 'a'.repeat(43), [issued, issued], undefined])
+    await expect(
+      refs.resolveCall(
+        { [MODEL_CALL_REFERENCE_HEADER]: ref },
+        binding.vm,
+        lifetime.signal,
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+
+  const fetch = vi.fn();
+  vi.stubGlobal('fetch', fetch);
+  const resolveCallReference = vi.fn(async () => '');
+  const adapter = new GatewayLlmAdapter(endpoint, 'synthetic', {
+    provider: 'host-gateway',
+    model: 'fixture-model',
+    resolveCallReference,
+  });
+  await expect(collect(adapter, input())).rejects.toMatchObject({
+    code: 'BINDING_INVALID',
+  });
+  expect(resolveCallReference).not.toHaveBeenCalled();
+  await expect(
+    collect(adapter, {
+      ...input(),
+      sessionId: binding.native.sessionId as GenerateOptions['sessionId'],
+    }),
+  ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+  expect(resolveCallReference).toHaveBeenCalledTimes(1);
+  expect(fetch).not.toHaveBeenCalled();
+  lifetime.abort();
 });

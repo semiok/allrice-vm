@@ -589,6 +589,7 @@ export async function setupNativeWebFixture(
   }
   return {
     owner,
+    scope,
     seal,
     launch,
     async observedProfilePatch() {

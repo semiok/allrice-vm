@@ -112,7 +112,8 @@ export function createDEntryMuxHandler(
           signal,
         );
         const data = deps.data();
-        if (!data || !current.owner.controlReady())
+        const acquireMux = data?.acquireMux?.bind(data);
+        if (!data || !acquireMux || !current.owner.controlReady())
           throw new DEntryNativeUnavailable();
         const assertCurrent = async (active: AbortSignal) => {
           const next = await currentDEntryRequest(deps, token, input, active);
@@ -205,7 +206,7 @@ export function createDEntryMuxHandler(
                   throw error;
                 }));
             try {
-              native = data.acquireMux(
+              native = acquireMux(
                 {
                   owner: current.owner,
                   async serve(channel, transferSignal) {

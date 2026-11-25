@@ -16,7 +16,10 @@ import { DEntryPageMuxQuerySchema } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import { authorizeDEntryNativeInvocation } from './native-invocation.js';
-import { DEntryNativeUnavailable } from './native-owner.js';
+import {
+  DEntryNativeRootRejected,
+  DEntryNativeUnavailable,
+} from './native-owner.js';
 import {
   type DEntryPageHandle,
   type createDEntryPageRequests,
@@ -28,6 +31,12 @@ type Frame = ReturnType<typeof parseRemoteStreamClientMessage>;
 type Send = (value: RemoteStreamServerMessage) => Promise<void>;
 
 export function pageRemoteFailure(error: unknown) {
+  if (error instanceof DEntryNativeRootRejected)
+    return {
+      code: 'gateway/unavailable',
+      message: 'ENTRY_ACTION_UNAVAILABLE',
+      details: {},
+    };
   if (error instanceof RemoteError)
     return { code: error.code, message: error.message, details: error.details };
   if (

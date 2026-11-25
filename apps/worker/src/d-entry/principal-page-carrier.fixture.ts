@@ -78,7 +78,7 @@ export async function buildProfileFixture(): Promise<ProfileProof> {
   };
 }
 
-export async function fixture(release?: ProfileProof) {
+export async function fixture(release?: ProfileProof, newRoot = false) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
   const host = await hostFixture({
@@ -192,15 +192,22 @@ export async function fixture(release?: ProfileProof) {
       rootNativeSessionId: roots.get(identity.threadId!)!,
     };
   };
+  let pinned = !newRoot;
+  const prepareEditorRoot = vi.fn(async () => {
+    pinned = true;
+    return selectedRoot(f.context, f.selection);
+  });
   const pages = createDEntryPageRequests({
     ...f.deps,
+    ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
     authenticate,
     async identity(_context, selection) {
       return selectionIdentity(selection);
     },
     root: selectedRoot,
     historyIdentity,
-    historyRoot: selectedRoot,
+    historyRoot: (...args) =>
+      pinned ? selectedRoot(...args) : Promise.resolve(null),
   });
   const pageSignals = new Map<string, AbortSignal>();
   const mux = createDEntryPageMux(
@@ -411,6 +418,7 @@ export async function fixture(release?: ProfileProof) {
   }
   return {
     ...f,
+    prepareEditorRoot,
     host,
     connect,
     invoke,

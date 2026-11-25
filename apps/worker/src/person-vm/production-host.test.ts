@@ -40,7 +40,10 @@ const io = vi.hoisted(() => ({
     vi.fn<
       (
         options: Parameters<typeof Model.createModelGateway>[0],
-      ) => Pick<Model.ModelGatewayPort, 'handle' | 'revoke' | 'close'>
+      ) => Pick<
+        Model.ModelGatewayPort,
+        'handle' | 'revoke' | 'reconcileOwner' | 'close'
+      >
     >(),
   authority: vi.fn<() => PersonVmAuthority | undefined>(),
   installation:
@@ -165,6 +168,7 @@ function fixture() {
       // No model/read route is exercised by this inert construction fixture.
       // This is not a production model-disabled adapter or send-ready proof.
       policy: { routes: [] },
+      bindModelCall: vi.fn(),
       close: vi.fn(async () => {}),
     },
     model: {
@@ -202,6 +206,11 @@ function fixture() {
     revoke: vi.fn<Model.ModelGatewayPort['revoke']>(async () => {
       throw Error('no model should exist in this construction fixture');
     }),
+    reconcileOwner: vi.fn<Model.ModelGatewayPort['reconcileOwner']>(
+      async () => {
+        throw Error('no model recovery in this fixture');
+      },
+    ),
     close: vi.fn(async () => {}),
   };
   io.model.mockReturnValue(model);
@@ -523,6 +532,7 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
     );
   }
   expect(value.model.handle).not.toHaveBeenCalled();
+  expect(value.bound.egress.bindModelCall).not.toHaveBeenCalled();
 
   const next = {
     ...call,
@@ -539,6 +549,13 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   next.execution.executionId = randomUUID();
   expect(operation.context).not.toBe(next.context);
   expect(operation.context).toEqual(expected.context);
+  expect(value.bound.egress.bindModelCall).toHaveBeenCalledExactlyOnceWith(
+    expected,
+    active,
+  );
+  const policyBinding = vi.mocked(value.bound.egress.bindModelCall!).mock
+    .calls[0]![0];
+  expect(operation.context).toBe(policyBinding.context);
   expect(Object.isFrozen(operation.context.actor)).toBe(true);
   expect(Object.isFrozen(operation.context.memberships)).toBe(true);
   await operation.dispatch(response, active);
@@ -832,6 +849,128 @@ it('retains the provider owner when the model gateway cannot prove its join', as
   expect(value.model.close).toHaveBeenCalledTimes(1);
   expect(value.bound.egress.close).not.toHaveBeenCalled();
   expectUninstalled();
+});
+
+it('authenticates recovery on the same closed owner and joins deferred provider cleanup', async () => {
+  const value = fixture();
+  const unknown = Error('unconfirmed model transport');
+  const denied = Error('no exact owner stop proof');
+  const context = nativeEntryFixture().context;
+  const owner = new AbortController();
+  const host = await createProductionPersonVmHost({
+    sources: value.sources,
+    lifetime: owner.signal,
+  });
+  const ownerId = io.model.mock.calls[0]![0].ownerId;
+  await expect(host.recoverModelOwner(context, signal())).rejects.toMatchObject(
+    {
+      code: 'MODEL_RECOVERY_UNAVAILABLE',
+    },
+  );
+  value.model.close.mockRejectedValueOnce(unknown);
+  owner.abort();
+  const first = host.close();
+  await expect(first).rejects.toMatchObject({ errors: [unknown] });
+
+  value.model.reconcileOwner.mockRejectedValueOnce(denied);
+  await expect(host.recoverModelOwner(context, signal())).rejects.toBe(denied);
+  expect(value.bound.egress.close).not.toHaveBeenCalled();
+
+  const entered = gate(),
+    join = gate(),
+    recovery = new AbortController();
+  value.model.reconcileOwner.mockImplementationOnce(async (_context, id) => {
+    expect(id).toBe(ownerId);
+    return 1;
+  });
+  vi.mocked(value.bound.egress.close).mockImplementationOnce(async () => {
+    entered.release();
+    await join.promise;
+  });
+  let recovered = false;
+  const pending = host
+    .recoverModelOwner(context, recovery.signal)
+    .then((count) => {
+      recovered = true;
+      return count;
+    });
+  await entered.promise;
+  recovery.abort();
+  try {
+    expect(recovered).toBe(false);
+    expect(value.model.reconcileOwner).toHaveBeenLastCalledWith(
+      context,
+      ownerId,
+      recovery.signal,
+    );
+    await expect(
+      host.recoverModelOwner(context, signal()),
+    ).rejects.toMatchObject({
+      code: 'MODEL_RECOVERY_UNAVAILABLE',
+    });
+  } finally {
+    join.release();
+    await pending;
+  }
+  await expect(pending).resolves.toBe(1);
+  await expect(host.close()).resolves.toBeUndefined();
+  await expect(first).rejects.toMatchObject({ errors: [unknown] });
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
+  expectUninstalled();
+});
+
+it('model recovery does not clear unrelated Host close failures', async () => {
+  const value = fixture();
+  const transport = Error('unconfirmed model transport');
+  const observation = Error('unconfirmed runtime observations');
+  value.model.close.mockRejectedValueOnce(transport);
+  vi.mocked(value.bound.runtime.close).mockRejectedValueOnce(observation);
+  const host = await createProductionPersonVmHost({
+    sources: value.sources,
+    lifetime: signal(),
+  });
+  await expect(host.close()).rejects.toMatchObject({
+    errors: [observation, transport],
+  });
+  value.model.reconcileOwner.mockResolvedValueOnce(1);
+  await expect(
+    host.recoverModelOwner(nativeEntryFixture().context, signal()),
+  ).rejects.toMatchObject({ errors: [observation] });
+  await expect(host.close()).rejects.toMatchObject({ errors: [observation] });
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
+  expectUninstalled();
+});
+
+it('rechecks authority when resuming provider cleanup after model recovery', async () => {
+  const value = fixture();
+  const transport = Error('unconfirmed model transport');
+  const provider = Error('provider close failed');
+  const denied = Error('later operator proof refused');
+  const context = nativeEntryFixture().context;
+  value.model.close.mockRejectedValueOnce(transport);
+  vi.mocked(value.bound.egress.close).mockRejectedValueOnce(provider);
+  const host = await createProductionPersonVmHost({
+    sources: value.sources,
+    lifetime: signal(),
+  });
+  const original = host.close();
+  await expect(original).rejects.toMatchObject({ errors: [transport] });
+  value.model.reconcileOwner.mockResolvedValueOnce(2);
+  await expect(host.recoverModelOwner(context, signal())).rejects.toMatchObject(
+    {
+      errors: [provider],
+    },
+  );
+  await expect(host.close()).rejects.toMatchObject({ errors: [provider] });
+  value.model.reconcileOwner.mockRejectedValueOnce(denied);
+  await expect(host.recoverModelOwner(context, signal())).rejects.toBe(denied);
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
+
+  value.model.reconcileOwner.mockResolvedValueOnce(0);
+  await expect(host.recoverModelOwner(context, signal())).resolves.toBe(2);
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(2);
+  await expect(host.close()).resolves.toBeUndefined();
+  await expect(original).rejects.toMatchObject({ errors: [transport] });
 });
 
 it('runtime close drives cancellation of an outstanding native observation and the Host joins its real outcome', async () => {

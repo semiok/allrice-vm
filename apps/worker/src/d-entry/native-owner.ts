@@ -66,7 +66,11 @@ export type ResolvedDEntryNativeOwner = Readonly<{
   revoked: AbortSignal;
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;
-  readSessions(signal: AbortSignal): Promise<RemoteResult<SessionListValue>>;
+  /** The optional witness reports a settled check that never dispatched. */
+  readSessions(
+    signal: AbortSignal,
+    notDispatched?: () => void,
+  ): Promise<RemoteResult<SessionListValue>>;
   /** Actual same-Host issuer. Acquisition does not start I/O; run opens the
    * fixed generated control scope. No browser-provided principal or grants. */
   acquirePrincipal(
@@ -87,6 +91,9 @@ export class DEntryNativeUnavailable extends Error {
     super('D entry native owner is not bound');
   }
 }
+
+/** The native editor root RPC returned a verified, joined failure reply. */
+export class DEntryNativeRootRejected extends DEntryNativeUnavailable {}
 
 // Composition registration only. No map of people/leases/authority, no fallback
 // provider, no new listener, and never populated by a browser request.

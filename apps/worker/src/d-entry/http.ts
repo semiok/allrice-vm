@@ -252,7 +252,7 @@ export function createDEntryHttpHandler(
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
       if (prewarmRequest) {
-        await deps.prewarm.prewarm(
+        const proof = await deps.prewarm.prewarm(
           auth.context,
           auth.identity,
           prewarmRequest.trigger,
@@ -263,6 +263,7 @@ export function createDEntryHttpHandler(
         if (!sameDEntryIdentity(auth.identity, next.identity))
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
+        if (proof?.aborted) throw new DEntryNativeUnavailable();
         response.writeHead(200, {
           'content-type': 'application/json',
           'cache-control': 'no-store',
@@ -302,7 +303,8 @@ export function createDEntryHttpHandler(
         // Control readiness is only a necessary transport prerequisite. It
         // never grants editor/send readiness or substitutes for the real
         // complete-envelope resolver/admission owner below.
-        if (!data || !current.owner.controlReady())
+        const acquireRpc = data?.acquireRpc?.bind(data);
+        if (!data || !current.owner.controlReady() || (rpc && !acquireRpc))
           throw new DEntryNativeUnavailable();
         const parsed = parsedRpc;
         const pin = creatingRoot
@@ -482,9 +484,9 @@ export function createDEntryHttpHandler(
                     );
                 },
               };
-            } else if (parsed) {
+            } else if (parsed && acquireRpc) {
               try {
-                activity = data.acquireRpc(
+                activity = acquireRpc(
                   {
                     owner: current.owner,
                     invocation: parsed,

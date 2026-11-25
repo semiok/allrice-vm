@@ -550,11 +550,15 @@ export function createModelGateway(options: {
         ownerId,
         evidence.evidenceRef,
       );
-      signal.throwIfAborted();
       if (recoveringClosedOwner && active.size === 0) {
+        // The stop proof was accepted before beginning the durable write.
+        // Once it commits, carry the count and finish the local fence even
+        // if the maintenance caller canceled while the ledger was settling.
         unconfirmedJoins.clear();
         uninstall();
+        return released;
       }
+      signal.throwIfAborted();
       return released;
     },
     async close() {

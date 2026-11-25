@@ -3,6 +3,7 @@ import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js
 import { afterEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
 import { DataAccessError } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 import { harness } from '../../../../packages/person-vm/src/test-support.ts';
 import {
   deferred,
@@ -13,6 +14,7 @@ import {
   dEntryNativePrewarmPort,
   installDEntryNativePrewarmPort,
 } from '../d-entry/native-prewarm.js';
+import { installDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
   dEntryNativeOwnerPort,
   DEntryNativeUnavailable,
@@ -103,6 +105,117 @@ it('page then input uses each current RC and the same running VM without another
     { trigger: 'input' },
   ]);
   expect(f.stop).not.toHaveBeenCalled();
+});
+
+it('requires proof for this employee before acknowledging prewarm on a running VM', async () => {
+  const f = fixture();
+  const assertEditorReady = vi.fn(async () => {
+    throw new DEntryNativeUnavailable();
+  });
+  const inputs = [
+    f.base.context,
+    f.base.identity,
+    'page',
+    signal(),
+    f.lifetime.signal,
+  ] as const;
+  await f.assembly.port.prewarm(...inputs);
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady,
+  });
+  try {
+    await expect(f.assembly.port.prewarm(...inputs)).rejects.toBeInstanceOf(
+      DEntryNativeUnavailable,
+    );
+    expect(assertEditorReady).toHaveBeenCalledWith(
+      f.base.context,
+      f.base.identity,
+      expect.any(AbortSignal),
+    );
+    expect(f.start).toHaveBeenCalledTimes(1);
+    expect(f.stop).not.toHaveBeenCalled();
+  } finally {
+    uninstall();
+  }
+});
+
+it('production prewarm requires the data owner and establishes the running route before lifecycle reuse', async () => {
+  const f = fixture();
+  const route = new AbortController();
+  const proof = vi.fn(async () => route.signal);
+  const prewarmCurrent = vi.fn<CurrentSelectionPrewarm>((...args) => {
+    expect(proof).toHaveBeenCalledTimes(1);
+    return f.prewarmCurrent(...args);
+  });
+  const production = createDEntryNativePrewarmPort({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+  });
+  cleanups.push(production.close);
+  const args = [
+    f.base.context,
+    f.base.identity,
+    'page',
+    signal(),
+    f.lifetime.signal,
+  ] as const;
+  await expect(production.port.prewarm(...args)).rejects.toBeInstanceOf(
+    DEntryNativeUnavailable,
+  );
+  expect(prewarmCurrent).not.toHaveBeenCalled();
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady: proof,
+  });
+  try {
+    await expect(production.port.prewarm(...args)).resolves.toBe(route.signal);
+    expect(proof).toHaveBeenCalledTimes(2);
+  } finally {
+    uninstall();
+  }
+});
+
+it('does not dispatch cold prewarm if the caller disconnects while verifying the current Host', async () => {
+  const f = fixture();
+  const caller = new AbortController();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const prewarmCurrent = vi.fn(f.prewarmCurrent);
+  const production = createDEntryNativePrewarmPort({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+  });
+  cleanups.push(production.close);
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    async assertEditorReady() {
+      entered.resolve();
+      await release.promise;
+      throw new PersonVmError('NOT_FOUND');
+    },
+  });
+  try {
+    const result = production.port
+      .prewarm(
+        f.base.context,
+        f.base.identity,
+        'page',
+        caller.signal,
+        f.lifetime.signal,
+      )
+      .catch((error: unknown) => error);
+    await entered.promise;
+    caller.abort();
+    release.resolve();
+    expect(await result).toBe(caller.signal.reason);
+    expect(prewarmCurrent).not.toHaveBeenCalled();
+  } finally {
+    release.resolve();
+    uninstall();
+  }
 });
 
 it('concurrent page/input cannot acquire a second lifecycle owner, and later valid input reuses the completed epoch', async () => {
@@ -321,6 +434,33 @@ it('the real Worker listener requires current release eligibility and the instal
   expect((await server.request()).status).toBe(503);
   expect((await server.request('native-root')).status).toBe(503);
   expect(f.start).toHaveBeenCalledTimes(1);
+});
+
+it('rejects the prewarm reply if the model route retires during final HTTP qualification', async () => {
+  const f = fixture();
+  const route = new AbortController();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: { prewarm: async () => route.signal },
+  });
+  cleanups.push(server.close);
+  f.base.deps.identity
+    .mockResolvedValueOnce(f.base.identity)
+    .mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return f.base.identity;
+    });
+  const request = server.request('native-prewarm', {
+    ...f.base.body,
+    trigger: 'page',
+  });
+  await entered.promise;
+  route.abort();
+  release.resolve();
+  expect((await request).status).toBe(503);
 });
 
 it('browser disconnect through real HTTP does not cancel shared physical startup or close its authority watcher early', async () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import type { RequestContext } from '@allrice/contracts';
 import { createDedicatedDatabase, getDatabase } from '@allrice/database';
 import {
   createModelGateway,
@@ -49,7 +50,10 @@ type Admission = ReturnType<PersonVmService['createAdmissionHost']>;
 type Current = ReturnType<typeof createProductionPersonVmAuthority>;
 
 export class ProductionPersonVmHostUnavailable extends Error {
-  constructor(readonly code: 'HOST_SOURCES_UNAVAILABLE' | 'HOST_CLOSED') {
+  constructor(
+    readonly code:
+      'HOST_SOURCES_UNAVAILABLE' | 'HOST_CLOSED' | 'MODEL_RECOVERY_UNAVAILABLE',
+  ) {
     super(code);
     this.name = 'ProductionPersonVmHostUnavailable';
   }
@@ -80,6 +84,9 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: EgressAuthority;
       policy: EgressPolicy;
       services?: readonly ManagedHostService[];
+      /** Register the exact private request context used by the model route
+       * before EgressAuthority.allow receives it with the same signal. */
+      bindModelCall?(call: ModelCallBinding, signal: AbortSignal): void;
       /** Host upstream transport/credentials stay owned by sources. */
       close(): Promise<void>;
     };
@@ -99,13 +106,23 @@ export type ProductionPersonVmHostSources = Readonly<{
 }>;
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
+export interface ProductionPersonVmHost {
+  close(): Promise<void>;
+  /** Trusted in-process maintenance only. The model authority verifies the
+   * operator and independent proof of stopping this exact owner. */
+  recoverModelOwner(
+    context: RequestContext,
+    signal: AbortSignal,
+  ): Promise<number>;
+}
+
 /** Real inert construction and narrow-port installation. Required authorities
  * must already have formal producers; missing ones leave ALL ports uninstalled.
  * This does not start a VM, create an execution or acquire a business permit. */
 export function createProductionPersonVmHost(input: {
   lifetime: AbortSignal;
   sources?: ProductionPersonVmHostSources;
-}): Promise<{ close(): Promise<void> }> {
+}): Promise<ProductionPersonVmHost> {
   if (!input.sources)
     return Promise.reject(
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
@@ -123,6 +140,12 @@ export function createProductionPersonVmHost(input: {
   const receipts = new Set<PersonVmEgressReceipt>();
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation: unknown[] = [];
+  const independentCloseFailures: unknown[] = [];
+  const modelOwnerId = randomUUID();
+  let modelRecovery:
+    { providerJoined: boolean; releasedAttempts: number } | undefined;
+  let recovering = false;
+  let recoveredClose: { error: AggregateError | null } | undefined;
   let providers: Providers | undefined,
     current: Current | undefined,
     startup: Startup | undefined,
@@ -228,19 +251,37 @@ export function createProductionPersonVmHost(input: {
       });
     },
   };
+  async function collectFailures(tasks: (() => Promise<unknown>)[]) {
+    const results = await Promise.allSettled(
+      tasks.map((task) => Promise.resolve().then(task)),
+    );
+    return results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+  }
+  function retireReceipts() {
+    if (!gateway || !providers) return Promise.resolve([]);
+    const cleanup = AbortSignal.timeout(
+      providers.configuration.lifecycle.cleanupTimeoutMs,
+    );
+    return collectFailures(
+      [...receipts].map(
+        (receipt) => () => egress.revoke(receipt, 'failure', cleanup),
+      ),
+    );
+  }
   function close(): Promise<void> {
+    if (recoveredClose)
+      return recoveredClose.error
+        ? Promise.reject(recoveredClose.error)
+        : Promise.resolve();
     if (closing) return closing;
     closing = Promise.resolve().then(async () => {
       // Construction may be held in real I/O. Join it before taking the owner
       // snapshot; a late returned source must never escape rollback.
       await prepared;
-      const errors: unknown[] = [];
       async function settle(tasks: (() => Promise<unknown>)[]) {
-        const results = await Promise.allSettled(
-          tasks.map((task) => Promise.resolve().then(task)),
-        );
-        for (const result of results)
-          if (result.status === 'rejected') errors.push(result.reason);
+        independentCloseFailures.push(...(await collectFailures(tasks)));
       }
       // Each close fences its own ingress synchronously and joins owned work.
       const installation = installed,
@@ -262,38 +303,31 @@ export function createProductionPersonVmHost(input: {
           (subscription) => () => subscription.close(),
         ),
       );
-      if (gateway && providers) {
-        const cleanup = AbortSignal.timeout(
-          providers.configuration.lifecycle.cleanupTimeoutMs,
-        );
-        await settle(
-          [...receipts].map(
-            (receipt) => () => egress.revoke(receipt, 'failure', cleanup),
-          ),
-        );
-      }
+      const receiptFailures = await retireReceipts();
       // Join the model gateway before closing the provider it uses.
       // No VM stop/delete or assertion of guest termination is made here.
       const modelOwner = model;
-      let modelJoined = !modelOwner;
-      if (modelOwner)
-        await settle([
-          async () => {
-            await modelOwner.close();
-            modelJoined = true;
-          },
-        ]);
+      const modelFailures = modelOwner
+        ? await collectFailures([() => modelOwner.close()])
+        : [];
+      if (modelFailures.length)
+        modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       const providerOwner = providers;
       await settle([
-        ...(sourceOwner && modelJoined
+        ...(sourceOwner && !modelRecovery
           ? [() => sourceOwner.egress.close()]
           : []),
         ...(providerOwner
           ? [() => providerOwner.egressInstallation.close()]
           : []),
       ]);
-      errors.push(...uncertainPreparation);
       input.lifetime.removeEventListener('abort', aborted);
+      const errors = [
+        ...independentCloseFailures,
+        ...uncertainPreparation,
+        ...receiptFailures,
+        ...modelFailures,
+      ];
       if (errors.length)
         throw new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE');
     });
@@ -303,6 +337,62 @@ export function createProductionPersonVmHost(input: {
   const aborted = () => {
     void close().catch(() => {});
   };
+  async function recoverModelOwner(
+    context: RequestContext,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const originalClose = closing;
+    const modelOwner = model;
+    const sourceOwner = bound;
+    if (!originalClose || !modelOwner || !sourceOwner || recovering)
+      throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
+    // Set synchronously: a concurrent request cannot borrow this operator's
+    // credential check or trigger a second provider close.
+    recovering = true;
+    try {
+      await originalClose.catch(() => {});
+      signal.throwIfAborted();
+      const recovery = modelRecovery;
+      if (!recovery)
+        throw new ProductionPersonVmHostUnavailable(
+          'MODEL_RECOVERY_UNAVAILABLE',
+        );
+      recovery.releasedAttempts += await modelOwner.reconcileOwner(
+        context,
+        modelOwnerId,
+        signal,
+      );
+      await modelOwner.close();
+      // Once the stop proof has been accepted, join cleanup even if the
+      // maintenance request disconnects or the Worker lifetime has ended.
+      const receiptFailures = await retireReceipts();
+      const sourceFailures = recovery.providerJoined
+        ? []
+        : await collectFailures([
+            async () => {
+              await sourceOwner.egress.close();
+              recovery.providerJoined = true;
+            },
+          ]);
+      const errors = [
+        ...independentCloseFailures,
+        ...uncertainPreparation,
+        ...receiptFailures,
+        ...sourceFailures,
+      ];
+      if (!receiptFailures.length && !sourceFailures.length)
+        modelRecovery = undefined;
+      const error = errors.length
+        ? new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE')
+        : null;
+      recoveredClose = { error };
+      if (error) throw error;
+      return recovery.releasedAttempts;
+    } finally {
+      recovering = false;
+    }
+  }
   input.lifetime.addEventListener('abort', aborted, { once: true });
   const construction = (async () => {
     try {
@@ -429,9 +519,10 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
+      const egressSource = bound.egress;
       const modelRoute = Object.freeze({ ...modelSource.route });
       const modelOwner = createModelGateway({
-        ownerId: randomUUID(),
+        ownerId: modelOwnerId,
         authority: modelSource.authority,
         provider: createDshGatewayProvider(modelSource.llm, modelRoute),
         store: createPostgresModelGatewayStore(trustedDatabase),
@@ -468,6 +559,10 @@ export function createProductionPersonVmHost(input: {
             Object.freeze(membership);
           Object.freeze(call.context.memberships);
           Object.freeze(call.context);
+          Object.freeze(call.vm);
+          Object.freeze(call.execution);
+          Object.freeze(call.native);
+          egressSource.bindModelCall?.(Object.freeze(call), signal);
           return {
             context: call.context,
             dispatch: (response, active) =>
@@ -480,15 +575,15 @@ export function createProductionPersonVmHost(input: {
       gateway = createEgressGateway({
         vm,
         admission,
-        authority: bound.egress.authority,
-        policy: bound.egress.policy,
+        authority: egressSource.authority,
+        policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
           active.throwIfAborted();
         },
-        services: [...(bound.egress.services ?? []), modelService],
+        services: [...(egressSource.services ?? []), modelService],
         provisioner: providers.egressInstallation.provisioner,
       });
       lifetime.throwIfAborted();
@@ -499,7 +594,7 @@ export function createProductionPersonVmHost(input: {
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
       });
       lifetime.throwIfAborted();
-      return Object.freeze({ close });
+      return Object.freeze({ close, recoverModelOwner });
     } finally {
       finishConstruction();
     }
