@@ -162,7 +162,7 @@ export async function readPage(
       // branches. The dedicated page is closed after this capture.
       for (const other of element.ownerDocument.querySelectorAll('*')) {
         if (element.contains(other) || other.contains(element)) continue;
-        if (other instanceof HTMLElement || other instanceof SVGElement)
+        if ('style' in other)
           other.style.setProperty('opacity', '0', 'important');
       }
     }, marker);
