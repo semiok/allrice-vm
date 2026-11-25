@@ -156,6 +156,7 @@ export function createProductionPersonVmHost(input: {
   });
   const pending = new Set<Promise<unknown>>();
   const receipts = new Set<PersonVmEgressReceipt>();
+  const retiredReceipts = new Map<string, PersonVmEgressReceipt>();
   const ownedVms = new Map<
     string,
     { binding: PersonVmBinding; stopNative: boolean }
@@ -225,6 +226,19 @@ export function createProductionPersonVmHost(input: {
     active.throwIfAborted();
     return result.value;
   }
+  function sameReceipt(
+    left: PersonVmEgressReceipt,
+    right: PersonVmEgressReceipt,
+  ) {
+    return (
+      left.bindingId === right.bindingId &&
+      sameVmBinding(left.binding, right.binding) &&
+      left.gatewayPorts.length === right.gatewayPorts.length &&
+      left.gatewayPorts.every(
+        (port, index) => port === right.gatewayPorts[index],
+      )
+    );
+  }
   const egress: PersonVmEgressPort = {
     prepare(binding, preparation, signal) {
       return own(async () => {
@@ -262,16 +276,11 @@ export function createProductionPersonVmHost(input: {
         await requireGateway().revoke(receipt, reason, signal);
         // The service freezes fresh copies before saving and cleanup. Remove
         // only this exact value after actual revoke succeeds, never a new epoch.
-        for (const retained of receipts)
-          if (
-            retained.bindingId === receipt.bindingId &&
-            sameVmBinding(retained.binding, receipt.binding) &&
-            retained.gatewayPorts.length === receipt.gatewayPorts.length &&
-            retained.gatewayPorts.every(
-              (port, index) => port === receipt.gatewayPorts[index],
-            )
-          )
-            receipts.delete(retained);
+        for (const retained of receipts) {
+          if (!sameReceipt(retained, receipt)) continue;
+          receipts.delete(retained);
+          retiredReceipts.set(retained.binding.personId, retained);
+        }
       });
     },
   };
@@ -533,6 +542,21 @@ export function createProductionPersonVmHost(input: {
             binding: Object.freeze({ ...binding }),
             stopNative: false,
           });
+        },
+        observeOwnedStop(binding) {
+          const entry = ownedVms.get(binding.personId);
+          if (entry && sameVmBinding(entry.binding, binding))
+            ownedVms.delete(binding.personId);
+          const retired = retiredReceipts.get(binding.personId);
+          if (retired && sameVmBinding(retired.binding, binding))
+            retiredReceipts.delete(binding.personId);
+        },
+        ownsEgressReceipt(receipt) {
+          const retired = retiredReceipts.get(receipt.binding.personId);
+          if (retired && sameReceipt(retired, receipt)) return true;
+          for (const retained of receipts)
+            if (sameReceipt(retained, receipt)) return true;
+          return false;
         },
         hasUnconfirmedEgress(binding) {
           for (const pending of uncertainPreparation.keys())

@@ -95,6 +95,8 @@ export class PersonVmService
       observeOwnedStart?: (binding: PersonVmBinding) => void;
       /** A retained epoch may acquire a mount without owning its native job. */
       observeOwnedMount?: (binding: PersonVmBinding) => void;
+      observeOwnedStop?: (binding: PersonVmBinding) => void;
+      ownsEgressReceipt?: (receipt: PersonVmEgressReceipt) => boolean;
       hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
@@ -812,6 +814,7 @@ export class PersonVmService
     row.phase = failed ? 'failed' : 'stopped';
     await lease.save(row);
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (row.instanceId) this.options.observeOwnedStop?.(bindingOf(row));
   }
   /** Internal Worker shutdown after its ingress and selection owners are fenced.
    * Only the exact epoch previously prepared by that Host can be stopped here.
@@ -828,6 +831,13 @@ export class PersonVmService
         const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
         await guard();
         if (!stopNative) {
+          if (
+            row.egressReceipt &&
+            !this.options.ownsEgressReceipt?.(
+              this.receipt(binding, row.egressReceipt),
+            )
+          )
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
           const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
           await this.mounted(row, signal, lease);
           const state = await this.options.native.status(binding, signal);

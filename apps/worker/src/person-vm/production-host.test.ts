@@ -747,6 +747,51 @@ it('retains the mount of an older epoch without stopping its unowned native job'
   expect(value.host.modelOwnerMaintenancePending()).toBe(false);
 });
 
+it('preserves an older receipt when this process cannot prove its egress owner', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const row = await value.memory.read(context.actor.id);
+  if (!row) throw Error('missing setup VM');
+  const binding = {
+    vmId: row.vmId,
+    personId: row.personId,
+    organizationId: row.organizationId,
+    instanceId: randomUUID(),
+    leaseEpoch: 3,
+  };
+  const receipt = { binding, gatewayPorts: [41235], bindingId: randomUUID() };
+  value.memory.rows.set(context.actor.id, {
+    ...row,
+    ...binding,
+    phase: 'failed',
+    nativeCreated: true,
+    egressReceipt: receipt,
+  });
+
+  const status = vi.mocked(providers.native.status);
+  status.mockRejectedValueOnce(Error('synthetic retained VM status failure'));
+  await expect(vm.start(context, signal())).rejects.toThrow(
+    'synthetic retained VM status failure',
+  );
+  status.mockResolvedValue('stopped');
+  const closeFixture = cleanup.pop()!;
+  const original = value.host.close();
+  cleanup.push(async () => {
+    await closeFixture().catch(() => {});
+  });
+  await expect(original).rejects.toMatchObject({
+    errors: [expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' })],
+  });
+  expect(value.revoke).not.toHaveBeenCalled();
+  expect(providers.native.stop).not.toHaveBeenCalled();
+  expect(providers.disk.detach).not.toHaveBeenCalled();
+  expect((await value.memory.read(context.actor.id))?.egressReceipt).toEqual(
+    receipt,
+  );
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+});
+
 it('retains the exact mount when egress preparation fails without returning a receipt', async () => {
   const value = await receiptFixture();
   const { vm, providers } = value.input();
