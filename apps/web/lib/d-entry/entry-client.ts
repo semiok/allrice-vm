@@ -29,35 +29,49 @@ export function employeeEntryQuery(query: string, prepare: boolean) {
   return { params, selection: selection.data, operationId: operation.data };
 }
 
+function postEmployeeEntry(path: string, data: object, signal: AbortSignal) {
+  signal.throwIfAborted();
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(data),
+    signal,
+    cache: 'no-store',
+    credentials: 'same-origin',
+    redirect: 'error',
+  });
+}
+
+export async function prewarmEmployeeEntry(
+  selection: DEntrySelectionInput,
+  signal: AbortSignal,
+) {
+  const warm = await postEmployeeEntry(
+    '/api/v1/d-entry/native-prewarm',
+    { selection, trigger: 'page' },
+    signal,
+  );
+  signal.throwIfAborted();
+  if (warm.status !== 204) throw new EmployeeEntryError(warm.status);
+}
+
 export async function prepareEmployeeEntry(
   input: ReturnType<typeof employeeEntryQuery>,
   signal: AbortSignal,
   opening: () => void,
+  prewarming?: Promise<void>,
 ) {
   const { selection, operationId } = input;
-  const post = (path: string, data: object) =>
-    fetch(path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(data),
-      signal,
-      cache: 'no-store',
-      credentials: 'same-origin',
-      redirect: 'error',
-    });
-  const warm = await post('/api/v1/d-entry/native-prewarm', {
-    selection,
-    trigger: 'page',
-  });
-  if (warm.status !== 204) throw new EmployeeEntryError(warm.status);
+  await (prewarming ?? prewarmEmployeeEntry(selection, signal));
   signal.throwIfAborted();
   opening();
   if (selection.threadId) return selection;
 
-  const response = await post('/api/v1/sessions?entry=4.0', {
-    selection,
-    operationId,
-  });
+  const response = await postEmployeeEntry(
+    '/api/v1/sessions?entry=4.0',
+    { selection, operationId },
+    signal,
+  );
   if (!response.ok) throw new EmployeeEntryError(response.status);
   const next: DEntrySelectionInput = DEntrySelectionInputSchema.parse(
     await response.json(),

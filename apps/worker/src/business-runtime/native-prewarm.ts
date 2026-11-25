@@ -1,9 +1,20 @@
-import { sameDEntryIdentity } from '@allrice/contracts';
+import {
+  sameDEntryIdentity,
+  selectDEntryGeneration,
+  type DEntryIdentity,
+  type RequestContext,
+} from '@allrice/contracts';
 import {
   DataAccessError,
+  getDatabase,
+  readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
 } from '@allrice/database';
-import { PersonVmError, type PersonVmPort } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmPort,
+  type PersonVmView,
+} from '@allrice/person-vm';
 import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js';
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
@@ -13,17 +24,226 @@ import {
 } from '../d-entry/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 
+type Generation = {
+  vmId: string | null;
+  instanceId: string | null;
+  leaseEpoch: number;
+};
+type VmStamp = Generation & { phase: PersonVmView['phase'] };
+type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
+type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
+type ReadCoordination = (identity: DEntryIdentity) => Promise<Coordination>;
+
+const readCurrentCoordination: ReadCoordination = (identity) =>
+  getDatabase().begin(
+    'isolation level repeatable read read only',
+    async (sql) => {
+      const policy = await readDEntryReleasePolicy(sql);
+      if (selectDEntryGeneration(policy, identity) !== '4.0')
+        throw new DataAccessError('authorization_denied');
+      const [snapshot] = await sql<
+        {
+          vm: VmStampRow | null;
+          grants: string[];
+          employeeGrant: string | null;
+          threadGrant: string | null;
+        }[]
+      >`
+      select (select row_to_json(stamp) from (
+        select vm_id as "vmId", instance_id as "instanceId", phase,
+          lease_epoch::text as "leaseEpoch" from person_virtual_machines
+        where person_id=${identity.personId} and organization_id=${identity.organizationId}
+      ) stamp) as vm,
+      array(select m.id::text || ':' || m.xmin::text from allrice_memberships m
+        where m.user_id=${identity.personId} and m.organization_id=${identity.organizationId}
+          and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=${identity.workspaceId})
+        order by m.id) as grants,
+      (select concat_ws(':', i.xmin, a.id, a.xmin, e.xmin, w.xmin, o.xmin, u.xmin,
+          array(select d.id::text || ':' || d.xmin::text from allrice_platform_employee_tenant_assignments d
+            where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
+              and d.tenant_employee_id=a.employee_id order by d.id))
+        from allrice_employee_instances i
+        join allrice_employee_assignments a on a.id=i.assignment_id
+        join allrice_employees e on e.id=a.employee_id and e.status='active'
+        join allrice_workspaces w on w.id=i.workspace_id and w.organization_id=i.organization_id and w.archived_at is null
+        join allrice_organizations o on o.id=i.organization_id and o.archived_at is null
+        join allrice_users u on u.id=i.owner_id and u.status='active'
+        where i.id=${identity.employeeInstanceId} and i.owner_id=${identity.personId}
+          and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
+          and i.archived_at is null and a.active) as "employeeGrant",
+      case when ${identity.threadId}::uuid is null then 'employee'
+      else (select c.xmin::text from allrice_chat_sessions c
+        where c.id=${identity.threadId} and c.owner_id=${identity.personId}
+          and c.organization_id=${identity.organizationId} and c.workspace_id=${identity.workspaceId}
+          and c.archived_at is null) end as "threadGrant"`;
+      const { vm, grants, employeeGrant, threadGrant } = snapshot!;
+      return {
+        // Tuple versions partition reuse across a revoke/regrant even if the
+        // restored membership has the same role. They never grant authority.
+        authorityRevision:
+          grants.length && employeeGrant && threadGrant
+            ? JSON.stringify([
+                policy.revision,
+                grants,
+                employeeGrant,
+                threadGrant,
+              ])
+            : null,
+        vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
+      };
+    },
+  );
+
+function targetGeneration(vm: VmStamp | null): Generation | undefined {
+  if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
+  if (vm.phase === 'deleted' || !Number.isSafeInteger(vm.leaseEpoch)) return;
+  if (vm.phase === 'running' || (vm.phase === 'starting' && vm.instanceId))
+    return vm;
+  // A retained or as-yet-unstarted VM advances exactly one epoch on start.
+  if (!Number.isSafeInteger(vm.leaseEpoch + 1)) return;
+  return { vmId: vm.vmId, instanceId: null, leaseEpoch: vm.leaseEpoch + 1 };
+}
+
+function compatible(a: Generation, b: Generation) {
+  return (
+    a.leaseEpoch === b.leaseEpoch &&
+    (!a.vmId || !b.vmId || a.vmId === b.vmId) &&
+    (!a.instanceId || !b.instanceId || a.instanceId === b.instanceId)
+  );
+}
+
+function matchingGeneration(
+  stamp: Coordination,
+  revision: string,
+  result: PersonVmView,
+  target: Generation,
+) {
+  if (
+    stamp.authorityRevision !== revision ||
+    stamp.vm?.phase !== 'running' ||
+    !stamp.vm.instanceId ||
+    !result.ready ||
+    result.vmId !== stamp.vm.vmId ||
+    !compatible(target, stamp.vm)
+  )
+    return;
+  return stamp.vm;
+}
+
+type Flight = {
+  target: Generation;
+  join(revoked: AbortSignal): void;
+  work: Promise<{ result: PersonVmView; generation: Generation | undefined }>;
+};
+
+function prewarmKey(
+  context: RequestContext,
+  identity: DEntryIdentity,
+  revision: string,
+) {
+  return JSON.stringify([
+    context.sessionId,
+    context.workspaceId,
+    identity.personId,
+    identity.organizationId,
+    identity.workspaceId,
+    identity.employeeInstanceId,
+    identity.employeeRevision,
+    identity.employeeVersionId,
+    identity.threadId,
+    revision,
+  ]);
+}
+
 /** Consume the existing VM lifecycle; no completed-result or authority cache. */
 export function createDEntryNativePrewarmPort(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
+  readCoordination?: ReadCoordination;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
   const admission = AbortSignal.any([input.lifetime, stopped.signal]);
   const pending = new Set<Promise<AbortSignal | undefined>>();
+  const flights = new Map<string, Set<Flight>>();
   let closing: Promise<void> | undefined;
+
+  function shared({
+    key,
+    target,
+    starting,
+    revoked,
+    start,
+    confirm,
+  }: {
+    key: string;
+    target: Generation;
+    starting: boolean;
+    revoked: AbortSignal;
+    start: (signal: AbortSignal) => Promise<PersonVmView>;
+    confirm(
+      result: PersonVmView,
+      flight: Flight,
+    ): Promise<Generation | undefined>;
+  }) {
+    const group = flights.get(key) ?? new Set<Flight>();
+    for (const flight of group) {
+      if (!compatible(flight.target, target)) continue;
+      // A later waiter may already know which physical start was published.
+      flight.target = {
+        vmId: flight.target.vmId ?? target.vmId,
+        instanceId: flight.target.instanceId ?? target.instanceId,
+        leaseEpoch: target.leaseEpoch,
+      };
+      flight.join(revoked);
+      return { flight, started: false };
+    }
+    // An unowned starting row may need takeover under the existing lease.
+    // The takeover can advance the epoch, so its observed binding is not a
+    // reliable key for a new shared operation.
+    if (starting) return;
+    const lost = new AbortController();
+    const watchers = new Map<AbortSignal, () => void>();
+    const physical = AbortSignal.any([input.lifetime, lost.signal]);
+    const work = Promise.resolve().then(async () => {
+      physical.throwIfAborted();
+      const result = await start(physical);
+      physical.throwIfAborted();
+      const generation = await confirm(result, flight);
+      physical.throwIfAborted();
+      return { result, generation };
+    });
+    const flight: Flight = {
+      target,
+      work,
+      join(signal) {
+        if (watchers.has(signal)) return;
+        const check = () => {
+          if ([...watchers.keys()].every((entry) => entry.aborted)) {
+            // A permanently revoked operation cannot accept another waiter.
+            group.delete(flight);
+            lost.abort(signal.reason);
+          }
+        };
+        watchers.set(signal, check);
+        signal.addEventListener('abort', check, { once: true });
+        if (signal.aborted) check();
+      },
+    };
+    group.add(flight);
+    flights.set(key, group);
+    flight.join(revoked);
+    const settled = () => {
+      for (const [signal, check] of watchers)
+        signal.removeEventListener('abort', check);
+      group.delete(flight);
+      if (!group.size && flights.get(key) === group) flights.delete(key);
+    };
+    void work.then(settled, settled);
+    return { flight, started: true };
+  }
   const port: DEntryNativePrewarmPort = {
     prewarm(context, identity, trigger, caller, revoked) {
       if (admission.aborted) return Promise.reject(admission.reason);
@@ -63,19 +283,82 @@ export function createDEntryNativePrewarmPort(input: {
         // Browser disconnect/uninstallation cannot kill shared running work.
         // Genuine authority revocation still fences this physical operation.
         active.throwIfAborted();
-        const result = await input.prewarmCurrent(
-          context,
-          identity,
-          { trigger },
-          AbortSignal.any([input.lifetime, revoked]),
-        );
-        await current();
-        if (
-          result.personId !== identity.personId ||
-          result.organizationId !== identity.organizationId
-        )
-          throw new DataAccessError('authorization_denied');
-        return await prove?.(context, identity, active);
+        const read = input.readCoordination;
+        const stamp = await read?.(identity);
+        active.throwIfAborted();
+        const revision = stamp?.authorityRevision;
+        const target = stamp && targetGeneration(stamp.vm);
+        const start = (signal: AbortSignal) =>
+          input.prewarmCurrent(context, identity, { trigger }, signal);
+        const ticket =
+          read && revision && target
+            ? shared({
+                key: prewarmKey(context, identity, revision),
+                target,
+                starting: stamp?.vm?.phase === 'starting',
+                revoked,
+                start,
+                async confirm(result, flight) {
+                  return matchingGeneration(
+                    await read(identity),
+                    revision,
+                    result,
+                    flight.target,
+                  );
+                },
+              })
+            : undefined;
+        const warmed = ticket && (await ticket.flight.work);
+        async function qualify(result: PersonVmView, generation?: Generation) {
+          await current();
+          if (
+            result.personId !== identity.personId ||
+            result.organizationId !== identity.organizationId
+          )
+            throw new DataAccessError('authorization_denied');
+          const sameGeneration = async () =>
+            !generation ||
+            !read ||
+            !revision ||
+            Boolean(
+              matchingGeneration(
+                await read(identity),
+                revision,
+                result,
+                generation,
+              ),
+            );
+          let proof: AbortSignal | undefined;
+          try {
+            proof = await prove?.(context, identity, active);
+          } catch (error) {
+            active.throwIfAborted();
+            const missingOwner =
+              error instanceof DEntryNativeUnavailable ||
+              (error instanceof PersonVmError &&
+                [
+                  'NOT_FOUND',
+                  'LEASE_CONFLICT',
+                  'LEASE_LOST',
+                  'RUNTIME_NOT_READY',
+                ].includes(error.code));
+            if (missingOwner && !(await sameGeneration())) return;
+            throw error;
+          }
+          if (!(await sameGeneration())) return;
+          active.throwIfAborted();
+          return { proof };
+        }
+        if (warmed && (ticket?.started || warmed.generation)) {
+          const qualified = await qualify(warmed.result, warmed.generation);
+          if (qualified) return qualified.proof;
+        }
+        // A transition can outrun the reservation or a caller's editor proof.
+        // Use the original lease path when the shared epoch no longer matches.
+        if (ticket) await current();
+        active.throwIfAborted();
+        const own = await start(AbortSignal.any([input.lifetime, revoked]));
+        return (await qualify(own))?.proof;
       });
       pending.add(task);
       void task.then(
@@ -101,6 +384,7 @@ export function installDEntryNativePrewarm(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
+  readCoordination?: ReadCoordination;
 }) {
   const assembly = createDEntryNativePrewarmPort(input);
   let uninstall: () => void;
@@ -140,6 +424,7 @@ export function installAssignedDEntryNativeRuntime(
     prewarm = installDEntryNativePrewarm({
       ...input,
       requireEditorProof: true,
+      readCoordination: readCurrentCoordination,
     });
   } catch (error) {
     void catalog.close();

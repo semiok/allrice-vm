@@ -56,6 +56,8 @@ suite('4.0 browser cold entry', () => {
         });
       const firstRetry = deferred<ServerResponse>();
       const retryClosed = deferred<void>();
+      const supersededWarmup = deferred<ServerResponse>();
+      const supersededClosed = deferred<void>();
       let opening = false;
       const allowOpening = deferred<void>();
       const warmCalls: unknown[] = [],
@@ -73,10 +75,16 @@ suite('4.0 browser cold entry', () => {
             .end(body);
         if (address.pathname === '/api/v1/d-entry/native-prewarm') {
           warmCalls.push(await readJson(request));
-          if (warmCalls.length === 1) return response.writeHead(503).end();
+          if (warmCalls.length === 1 || warmCalls.length === 6)
+            return response.writeHead(503).end();
           if (warmCalls.length === 2) {
             response.once('close', () => retryClosed.resolve());
             firstRetry.resolve(response);
+            return;
+          }
+          if (warmCalls.length === 8) {
+            response.once('close', () => supersededClosed.resolve());
+            supersededWarmup.resolve(response);
             return;
           }
           return response.writeHead(204).end();
@@ -145,9 +153,27 @@ suite('4.0 browser cold entry', () => {
         { name: 'allrice_session', value: sessionToken, url: f.origin },
       ]);
       const page = await context.newPage();
+      await page.addInitScript(() => {
+        if (window.top === window && !sessionStorage.getItem('entry-visible'))
+          Object.defineProperty(document, 'hidden', {
+            configurable: true,
+            value: true,
+          });
+      });
       await page.goto(
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
+      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await page.evaluate(
+        () => new Promise((painted) => requestAnimationFrame(painted)),
+      );
+      expect(warmCalls).toEqual([]);
+      await page.evaluate(() => {
+        sessionStorage.setItem('entry-visible', '1');
+        Object.defineProperty(document, 'hidden', { value: false });
+        document.dispatchEvent(new Event('visibilitychange'));
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
       await page
         .getByRole('alert')
         .getByRole('heading', { name: '暂时无法打开工作台' })
@@ -209,10 +235,35 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      const oldDocument = page.frameLocator('iframe').locator('body');
+      const claim = () =>
+        oldDocument.evaluate(() =>
+          (
+            window as unknown as {
+              __ALLRICE_EMPLOYEE_DOCUMENT__: { claim(): boolean };
+            }
+          ).__ALLRICE_EMPLOYEE_DOCUMENT__.claim(),
+        );
+      const finish = () =>
+        oldDocument.evaluate(() => {
+          (
+            window as unknown as {
+              __ALLRICE_EMPLOYEE_DOCUMENT__: { finish(state: 'closed'): void };
+            }
+          ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed');
+        });
+      expect(await claim()).toBe(true);
       await page
         .frameLocator('iframe')
         .getByRole('button', { name: '新建对话' })
         .click();
+      await expect.poll(() => warmCalls.length).toBe(5);
+      expect(births).toEqual([{ selection: employee }]);
+      expect(documents).toEqual([f.selection.threadId]);
+      expect(new URL(page.url()).searchParams.get('threadId')).toBe(
+        f.selection.threadId,
+      );
+      await finish();
       await page.waitForURL((url) => url.searchParams.has('new'));
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);
@@ -231,6 +282,48 @@ suite('4.0 browser cold entry', () => {
         ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
+
+      await page
+        .frameLocator('iframe')
+        .getByRole('button', { name: '新建对话' })
+        .click();
+      await page
+        .getByRole('alert')
+        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .waitFor();
+      expect(births).toHaveLength(2);
+      await page.evaluate(() => history.back());
+      await page.waitForURL((url) => url.searchParams.get('threadId') === next);
+      await showEditor(next);
+      expect(births).toHaveLength(2);
+      expect(warmCalls.slice(5)).toEqual([
+        { selection: employee, trigger: 'page' },
+        { selection: { ...employee, threadId: next }, trigger: 'page' },
+      ]);
+
+      expect(await claim()).toBe(true);
+      try {
+        await page
+          .frameLocator('iframe')
+          .getByRole('button', { name: '新建对话' })
+          .click();
+        const waiting = await supersededWarmup.promise;
+        await page.evaluate(() => history.back());
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await supersededClosed.promise;
+        expect(waiting.writableFinished).toBe(false);
+        expect(births).toHaveLength(2);
+      } finally {
+        await finish();
+      }
+      await showEditor(f.selection.threadId);
+      expect(warmCalls.slice(7)).toEqual([
+        { selection: employee, trigger: 'page' },
+        { selection: f.selection, trigger: 'page' },
+      ]);
+      expect(births).toHaveLength(2);
     },
   );
 });
