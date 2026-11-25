@@ -8,6 +8,7 @@ import type {
 import {
   isModelCallReference,
   MODEL_CALL_REFERENCE_HEADER,
+  MODEL_CALL_RECIPIENT_HEADER,
   MODEL_GATEWAY_CONTRACT_VERSION,
   ModelGatewayError,
 } from './contract.ts';
@@ -27,7 +28,9 @@ type ManagedGuestModelCall = {
     }>,
     signal: AbortSignal,
     purpose?: GenerateOptions['purpose'],
-  ): Promise<string | { reference: string; release(): void }>;
+  ): Promise<
+    string | { reference: string; recipient?: string; release(): void }
+  >;
 };
 import type {
   GatewayFetchClassification,
@@ -133,6 +136,7 @@ export class GatewayLlmAdapter extends LlmAdapter {
   }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     let reference: string | undefined;
+    let recipient: string | undefined;
     const signal =
       options.signal && this.managed?.lifetime
         ? AbortSignal.any([options.signal, this.managed.lifetime])
@@ -158,12 +162,15 @@ export class GatewayLlmAdapter extends LlmAdapter {
             )
           : await this.managed.resolveCallReference(selection, signal);
         reference = typeof issued === 'string' ? issued : issued.reference;
-        if (typeof issued !== 'string') release = issued.release;
+        if (typeof issued !== 'string') {
+          release = issued.release;
+          recipient = issued.recipient;
+        }
         signal.throwIfAborted();
         if (!isModelCallReference(reference))
           throw new ModelGatewayError('BINDING_INVALID');
       }
-      yield* this.streamRequest(options, signal, reference);
+      yield* this.streamRequest(options, signal, reference, recipient);
     } finally {
       release?.();
     }
@@ -172,6 +179,7 @@ export class GatewayLlmAdapter extends LlmAdapter {
     options: GenerateOptions,
     signal: AbortSignal | undefined,
     reference: string | undefined,
+    recipient: string | undefined,
   ): AsyncIterable<StreamChunk> {
     const {
       messages,
@@ -194,6 +202,7 @@ export class GatewayLlmAdapter extends LlmAdapter {
         ...(reference === undefined
           ? {}
           : { [MODEL_CALL_REFERENCE_HEADER]: reference }),
+        ...(recipient ? { [MODEL_CALL_RECIPIENT_HEADER]: recipient } : {}),
         ...(this.egressCapability === undefined
           ? {}
           : { authorization: 'Bearer ' + this.egressCapability }),

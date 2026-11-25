@@ -1,5 +1,6 @@
 import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
 import { createProductionPersonVmSources } from './person-vm/production-sources.js';
+import { openProductionRecoverySocket } from './person-vm/production-recovery-socket.js';
 import type { RequestContext } from '@allrice/contracts';
 import { installDshCloseObservationIdentity } from './harness/dsh-close-observer.js';
 import { observeDshWorkerCloseIdentity } from './harness/dsh-worker-close-identity.js';
@@ -1069,16 +1070,55 @@ function shutdown(signal: string) {
   return shutdownTask;
 }
 
+let recoveryEndpoint:
+  ReturnType<typeof openProductionRecoverySocket> | undefined;
+let shutdownProbe: Promise<void> | undefined;
 const stopWorker = (signal: string) => {
-  void shutdown(signal).catch((error) => {
-    console.error('[M5] shutdown incomplete; resource closure unconfirmed', {
-      failedStages:
-        error instanceof WorkerShutdownError
-          ? error.failures.map(({ name }) => name)
-          : ['shutdown_setup'],
+  if (shutdownProbe) return;
+  shutdownProbe = (async () => {
+    const result = await personVmHost;
+    try {
+      if (result.state === 'installed')
+        await result.host.assertWorkerShutdownSafe(AbortSignal.timeout(5000));
+    } catch {
+      console.warn(
+        '[MET-273] worker stop deferred; native owner is not safe to retire',
+      );
+      return;
+    }
+    await shutdown(signal);
+  })()
+    .catch(async (error) => {
+      console.error('[M5] shutdown incomplete; resource closure unconfirmed', {
+        failedStages:
+          error instanceof WorkerShutdownError
+            ? error.failures.map(({ name }) => name)
+            : ['shutdown_setup'],
+      });
+      process.exitCode = 1;
+      const result = await personVmHost;
+      if (
+        result.state !== 'installed' ||
+        !result.host.modelOwnerMaintenancePending()
+      )
+        return;
+      try {
+        const recovery = await (recoveryEndpoint ??=
+          openProductionRecoverySocket({
+            authenticate: dEntryHttpDefaults.authenticate,
+            recover: recoverProductionPersonVmModelOwner,
+            pending: () => result.host.modelOwnerMaintenancePending(),
+          }));
+        console.info('[MET-273] authorized local recovery socket', {
+          path: recovery.path,
+        });
+      } catch {
+        console.error('[MET-273] local recovery socket unavailable');
+      }
+    })
+    .finally(() => {
+      shutdownProbe = undefined;
     });
-    process.exitCode = 1;
-  });
 };
 process.on('SIGINT', () => stopWorker('SIGINT'));
 process.on('SIGTERM', () => stopWorker('SIGTERM'));

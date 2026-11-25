@@ -99,6 +99,7 @@ export function createAssignedNativeWebStartup(input: {
   const pending = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
   let editorProof: StartingEditorProof | undefined;
+  let beforePrompt: Parameters<typeof openNativeWebOwner>[0]['beforePrompt'];
   let modelAdapter:
     | ((
         binding: PersonVmBinding,
@@ -152,6 +153,14 @@ export function createAssignedNativeWebStartup(input: {
   input.lifetime.addEventListener('abort', abort, { once: true });
   if (input.lifetime.aborted) abort();
   return {
+    installModelPromptObserver(observe: NonNullable<typeof beforePrompt>) {
+      lifetime.throwIfAborted();
+      if (closing || beforePrompt) throw new PersonVmError('RUNTIME_NOT_READY');
+      beforePrompt = observe;
+      return () => {
+        if (beforePrompt === observe) beforePrompt = undefined;
+      };
+    },
     installModelAdapter(resolve: NonNullable<typeof modelAdapter>) {
       lifetime.throwIfAborted();
       if (closing || modelAdapter) throw new PersonVmError('RUNTIME_NOT_READY');
@@ -281,6 +290,18 @@ export function createAssignedNativeWebStartup(input: {
               vm: input.vm,
               lifetime,
               cleanupTimeoutMs: input.cleanupTimeoutMs,
+              ...(modelAdapter
+                ? {
+                    async beforePrompt(
+                      request: Parameters<NonNullable<typeof beforePrompt>>[0],
+                      active: AbortSignal,
+                    ) {
+                      if (!beforePrompt)
+                        throw new PersonVmError('RUNTIME_NOT_READY');
+                      await beforePrompt(request, active);
+                    },
+                  }
+                : {}),
             });
             const endpoint = receipt.endpoints[index]!;
             group.owners.set(endpoint.employeeInstanceId, owner);
@@ -543,6 +564,9 @@ export function createAssignedNativeWebStartup(input: {
     'memoryGuestPlan' | 'start' | 'retireAfterNativeStop'
   > & {
     installModelAdapter(resolve: NonNullable<typeof modelAdapter>): () => void;
+    installModelPromptObserver(
+      observe: NonNullable<typeof beforePrompt>,
+    ): () => void;
     installStartingEditorProof(proof: StartingEditorProof): () => void;
     assertVerifiedEditor(
       binding: PersonVmBinding,

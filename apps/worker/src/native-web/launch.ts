@@ -171,7 +171,7 @@ export async function prepareNativeWebLaunch(
   const principalSource = await readDEntryPrincipalHostArtifact();
   const plugin = `${directory}/owner.mjs`,
     patch = `${directory}/owner.patch.json`;
-  const source = await readFile(
+  const ownerSource = await readFile(
     new URL(
       modelAdapter
         ? '../../dist/guest-native-web-owner.mjs'
@@ -180,11 +180,27 @@ export async function prepareNativeWebLaunch(
     ),
     'utf8',
   );
+  const modelOwner = `${directory}/owner-with-model.mjs`;
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
     files: Object.freeze([
-      { path: plugin, contents: source, mode: 0o600 },
+      { path: plugin, contents: ownerSource, mode: 0o600 },
+      ...(modelAdapter
+        ? [
+            {
+              path: modelOwner,
+              mode: 0o600,
+              contents: `import { applyNativeWebOwner } from './owner.mjs';
+import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+export { inject, name } from './owner.mjs';
+export function apply(ctx, config) {
+  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter);
+}
+`,
+            },
+          ]
+        : []),
       ...modelFiles,
       { path: principalPlugin, contents: principalSource, mode: 0o600 },
       {
@@ -213,7 +229,7 @@ export async function prepareNativeWebLaunch(
               },
               {
                 id: 'allrice-native-web-owner',
-                name: `file://${plugin}`,
+                name: `file://${modelAdapter ? modelOwner : plugin}`,
                 config: {
                   artifactPath: artifact.path,
                   nonce: auth.nonce,
@@ -223,7 +239,6 @@ export async function prepareNativeWebLaunch(
                         modelAdapter: {
                           ...modelAdapter,
                           id: auth.modelAdapterId,
-                          entry: `file://${modelDirectory}/dsh-provider.js`,
                         },
                       }
                     : {}),

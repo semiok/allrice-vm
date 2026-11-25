@@ -41,7 +41,7 @@ export interface ProductionNativeModelExecution {
     input: {
       route: CodexRuntime['route'];
       routeRevoked: AbortSignal;
-      modelInfo: CodexRuntime['modelInfo'];
+      readModelInfo: CodexRuntime['readModelInfo'];
       assertRouteCurrent: CodexRuntime['assertCurrent'];
       confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
@@ -93,7 +93,7 @@ export function createProductionPersonVmSources(
         native = await execution.attach(host, {
           route: codex.route,
           routeRevoked: codex.revoked,
-          modelInfo: codex.modelInfo,
+          readModelInfo: codex.readModelInfo,
           assertRouteCurrent: codex.assertCurrent,
           confirmTransportStopped: codex.confirmTransportStopped,
           bindReference: (call, signal) =>
@@ -109,10 +109,11 @@ export function createProductionPersonVmSources(
           observeModelSelection: owned.observeModelSelection,
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);
-            await codex.assertCurrent(active);
+            const generation = await codex.assertCurrent(active);
             const guest = await owned.resolveSendRoute(input, active);
             await codex.assertCurrent(active);
             active.throwIfAborted();
+            generation.throwIfAborted();
             guest.revoked.throwIfAborted();
             if (
               guest.provider !== codex.route.provider ||
@@ -122,11 +123,7 @@ export function createProductionPersonVmSources(
             return {
               provider: guest.provider,
               model: guest.model,
-              revoked: AbortSignal.any([
-                guest.revoked,
-                codex.revoked,
-                lifetime,
-              ]),
+              revoked: AbortSignal.any([guest.revoked, generation, lifetime]),
             };
           },
         });

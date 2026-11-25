@@ -73,63 +73,36 @@ function classify(
 
 /** Host-only owner for the same subscription that the admin authorization
  * broker maintains. A change of slot never retargets this route generation. */
-export async function createProductionCodexRuntime(
+async function openCodexGeneration(
   lifetime: AbortSignal,
-  ownerId: string,
-  readModelImage?: ReadProductionModelImage,
+  selection: Awaited<ReturnType<typeof readSelectedSubscription>>,
+  model: string,
+  images: ReturnType<typeof createProductionModelImages> | undefined,
 ) {
   lifetime.throwIfAborted();
-  const selection = await readSelectedSubscription();
-  lifetime.throwIfAborted();
-  const model =
-    process.env.ALLRICE_DSH_CODEX_MODEL ??
-    process.env.ALLRICE_CODEX_MODEL ??
-    'gpt-6.1-sol';
-  if (!model || model.trim() !== model)
-    throw new ModelGatewayError('BINDING_INVALID');
   const modelMetadata = managedCodexModel(model);
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
-  const route = Object.freeze({
-    provider,
-    model,
-    transport: 'sse' as const,
-    classify,
-  });
   let closing: Promise<void> | undefined;
   function close() {
     stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
     return (closing ??= host.fiber.dispose());
   }
-  async function assertSelectedGeneration(signal?: AbortSignal) {
-    const active = signal ? AbortSignal.any([signal, revoked]) : revoked;
-    active.throwIfAborted();
-    const selected = await readSelectedSubscription().catch(
-      (error: unknown) => {
-        stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
-        throw error;
-      },
-    );
-    if (
-      selected.slot !== selection.slot ||
-      selected.revision !== selection.revision
-    )
-      stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
-    active.throwIfAborted();
-  }
-  async function assertCurrent(signal?: AbortSignal) {
-    const active = signal ? AbortSignal.any([signal, revoked]) : revoked;
+  async function assertCurrent(signal: AbortSignal) {
+    const active = AbortSignal.any([signal, revoked]);
     active.throwIfAborted();
     const record = await host.credentials.describeRecord(credential);
-    if (!record.configured || record.kind !== 'grant')
-      stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
-    await assertSelectedGeneration(active);
+    const current = await readSelectedSubscription();
+    active.throwIfAborted();
+    if (
+      !record.configured ||
+      record.kind !== 'grant' ||
+      current.slot !== selection.slot ||
+      current.revision !== selection.revision
+    )
+      throw new ModelGatewayError('AUTHORIZATION_DENIED');
   }
-  const images = readModelImage
-    ? createProductionModelImages(readModelImage)
-    : undefined;
-  let modelInfo: Awaited<ReturnType<LlmRuntime['resolveModelInfo']>>;
   try {
     await host.plugin(Llm).await();
     if (images) await host.plugin(images.plugin).await();
@@ -141,15 +114,20 @@ export async function createProductionCodexRuntime(
     await host
       .plugin(PiAi, {
         providers: {
-          [provider]: {
-            transport: 'sse',
-            models: [modelMetadata],
-          },
+          [provider]: { transport: 'sse', models: [modelMetadata] },
         },
       })
       .await();
-    modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
-    await assertCurrent();
+    const modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
+    await assertCurrent(revoked);
+    return {
+      selection,
+      revoked,
+      close,
+      modelInfo,
+      llm: host.llm,
+      assertCurrent,
+    };
   } catch (error) {
     try {
       await close();
@@ -158,13 +136,82 @@ export async function createProductionCodexRuntime(
     }
     throw error;
   }
+}
+
+export async function createProductionCodexRuntime(
+  lifetime: AbortSignal,
+  ownerId: string,
+  readModelImage?: ReadProductionModelImage,
+) {
+  lifetime.throwIfAborted();
+  const model =
+    process.env.ALLRICE_DSH_CODEX_MODEL ??
+    process.env.ALLRICE_CODEX_MODEL ??
+    'gpt-6.1-sol';
+  if (!model || model.trim() !== model)
+    throw new ModelGatewayError('BINDING_INVALID');
+  const stopped = new AbortController();
+  const revoked = AbortSignal.any([lifetime, stopped.signal]);
+  const route = Object.freeze({
+    provider,
+    model,
+    transport: 'sse' as const,
+    classify,
+  });
+  const images = readModelImage
+    ? createProductionModelImages(readModelImage)
+    : undefined;
+  const transport = createOwnedModelTransport(ownerId);
+  let generation: Awaited<ReturnType<typeof openCodexGeneration>> | undefined;
+  let operations = Promise.resolve();
+  let closing: Promise<void> | undefined;
+
+  async function current(signal: AbortSignal = revoked) {
+    const active = AbortSignal.any([signal, revoked]);
+    const task = operations.then(async () => {
+      active.throwIfAborted();
+      try {
+        if (generation && !generation.revoked.aborted) {
+          // A failed read invalidates exactly the generation whose current
+          // authority could not be established. A later request may reopen.
+          await generation.assertCurrent(active);
+          return generation;
+        }
+        const selection = await readSelectedSubscription();
+        active.throwIfAborted();
+        generation = await openCodexGeneration(
+          revoked,
+          selection,
+          model,
+          images,
+        );
+        active.throwIfAborted();
+        return generation;
+      } catch (error) {
+        if (active.aborted && !revoked.aborted) throw error;
+        if (generation) {
+          await generation.close();
+          generation = undefined;
+        }
+        throw error;
+      }
+    });
+    operations = task.then(
+      () => {},
+      () => {},
+    );
+    return task;
+  }
   const llm: Pick<LlmRuntime, 'prepareCall'> = {
     async prepareCall(config, signal) {
       if (config.provider !== provider || config.model !== model)
         throw new ModelGatewayError('BINDING_INVALID');
-      await assertCurrent(signal);
-      const operation = signal ? AbortSignal.any([signal, revoked]) : revoked;
-      const prepared = await host.llm.prepareCall(config, operation);
+      const selected = await current(signal);
+      const operation = AbortSignal.any([
+        selected.revoked,
+        ...(signal ? [signal] : []),
+      ]);
+      const prepared = await selected.llm.prepareCall(config, operation);
       operation.throwIfAborted();
       return {
         ...prepared,
@@ -172,28 +219,48 @@ export async function createProductionCodexRuntime(
           const active = options.signal
             ? AbortSignal.any([operation, options.signal])
             : operation;
-          await assertCurrent(active);
+          await current(active);
+          active.throwIfAborted();
           yield* prepared.stream({ ...options, signal: active });
         },
       };
     },
   };
-  const transport = createOwnedModelTransport(ownerId);
   return Object.freeze({
     llm,
     route,
-    modelInfo,
+    async readModelInfo(signal: AbortSignal) {
+      return (await current(signal)).modelInfo;
+    },
     scopeStream: images?.stream,
     revoked,
-    assertCurrent,
-    transport: { ...transport, beforeDispatch: assertSelectedGeneration },
+    async assertCurrent(signal?: AbortSignal) {
+      const selected = await current(signal);
+      signal?.throwIfAborted();
+      selected.revoked.throwIfAborted();
+      return selected.revoked;
+    },
+    transport: {
+      ...transport,
+      async beforeDispatch(signal: AbortSignal) {
+        await current(signal);
+        signal.throwIfAborted();
+      },
+    },
     confirmTransportStopped: transport.stoppedEvidence,
-    async close() {
-      try {
-        await transport.close();
-      } finally {
-        await close();
-      }
+    close() {
+      if (closing) return closing;
+      stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
+      return (closing = Promise.allSettled([
+        transport.close(),
+        operations.then(() => generation?.close()),
+      ]).then((results) => {
+        const failures = results.flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        );
+        if (failures.length)
+          throw new AggregateError(failures, 'CODEX_RUNTIME_CLOSE_UNKNOWN');
+      }));
     },
   });
 }

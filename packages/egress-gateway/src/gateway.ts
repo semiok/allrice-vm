@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { finished } from 'node:stream/promises';
@@ -130,6 +131,9 @@ export function createEgressGateway(
     prepareRollbackSignal?: () => AbortSignal;
   },
 ) {
+  // HTTP requests belong to the Host that created this gateway, independent
+  // of the short-lived authorization scope that later prepares an endpoint.
+  const runHostRequest = AsyncLocalStorage.snapshot();
   const states = new Map<string, BindingState>();
   const lanes = new Map<string, Promise<unknown>>();
   const routes = new Map(
@@ -457,7 +461,7 @@ export function createEgressGateway(
         // Epoch tombstone retained even on preparation failure; delayed prepare cannot revive it.
         states.set(binding.vmId, state);
         state.server.on('request', (req, res) => {
-          const operation = (async () => {
+          const operation = runHostRequest(async () => {
             const disconnect = new AbortController();
             res.once('close', () => disconnect.abort());
             const requestSignal = options.lifetime
@@ -553,7 +557,7 @@ export function createEgressGateway(
                 AbortSignal.any([disconnect.signal, state.controller.signal]),
               );
             }
-          })();
+          });
           state.inflight.add(operation);
           void operation
             .finally(() => state.inflight.delete(operation))

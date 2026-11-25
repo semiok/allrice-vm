@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { request } from 'node:http';
 import {
   createAssistantMessage,
   createToolResultMessage,
@@ -36,6 +37,35 @@ async function setup(
   cleanup.push(() => gateway.close());
   return { upstream, native, ...gateway };
 }
+it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
+  const f = await setup();
+  const status = await new Promise<number | undefined>((resolve, reject) => {
+    const outgoing = request(
+      f.url + '/v1/stream',
+      {
+        method: 'POST',
+        headers: {
+          'x-allrice-model-contract': '1',
+          'transfer-encoding': 'chunked',
+        },
+      },
+      (response) => {
+        response.resume();
+        response.once('end', () => {
+          resolve(response.statusCode);
+          outgoing.destroy();
+        });
+      },
+    );
+    outgoing.once('error', reject);
+    // Keep the upload open. The response must arrive at the byte limit.
+    const chunk = Buffer.alloc(1024 * 1024, 32);
+    for (let i = 0; i < 9; i++) outgoing.write(chunk);
+  });
+  expect(status).toBe(413);
+  expect(f.upstream.requests).toHaveLength(0);
+  expect(f.store.rows.size).toBe(0);
+});
 const finish = (chunks: StreamChunk[]) =>
   chunks.findLast((chunk) => chunk.type === 'finish');
 

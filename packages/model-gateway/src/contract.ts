@@ -15,6 +15,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 export const MODEL_GATEWAY_CONTRACT_VERSION = 1 as const;
 export const MODEL_STREAMS_PER_PERSON = 8 as const;
 export const MODEL_CALL_REFERENCE_HEADER = 'x-allrice-model-call-reference';
+export const MODEL_CALL_RECIPIENT_HEADER = 'x-allrice-model-call-recipient';
 export const isModelCallReference = (value: unknown): value is string =>
   typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 
@@ -49,6 +50,9 @@ export interface ModelGatewayAuthority {
   /** Current membership, managed VM epoch, employee release, root/child tree,
    * Run/call and exact route. Never authorize by parsing this shape alone. */
   assertCall(binding: ModelCallBinding, signal: AbortSignal): Promise<void>;
+  /** Trusted continuously watched exact call evidence, established at redeem.
+   * A caller without a watcher retains the full authority check on delivery. */
+  deliverySignal?(binding: ModelCallBinding): AbortSignal;
   authorizeUsage(
     context: RequestContext,
     signal: AbortSignal,
@@ -199,6 +203,12 @@ export interface ModelGatewayPort {
     binding: ModelCallBinding,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Host-only reference issuance uses the same gateway participant and drain. */
+  issueReference?<T>(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+    issue: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T>;
   /** Host revocation is active cancellation; resolves after actual owned drain. */
   revoke(binding: PersonVmBinding): Promise<void>;
   reconcileOwner(
@@ -213,6 +223,7 @@ export type ModelGatewayErrorCode =
   | 'AUTHORIZATION_DENIED'
   | 'BINDING_INVALID'
   | 'INVALID_INPUT'
+  | 'INPUT_TOO_LARGE'
   | 'DUPLICATE_CALL'
   | 'ADMISSION_CLOSED'
   | 'EXECUTION_REBIND_REQUIRED'

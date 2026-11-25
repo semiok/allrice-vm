@@ -212,6 +212,14 @@ async function readManagedImage(scope, request, value, owned) {
 }
 
 export function apply(ctx, config) {
+  return applyNativeWebOwner(ctx, config);
+}
+
+export function applyNativeWebOwner(
+  ctx,
+  config,
+  registerManagedGatewayAdapter,
+) {
   const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
     config;
   const { fiber } = ctx;
@@ -377,9 +385,8 @@ export function apply(ctx, config) {
     if (!current()) return;
     if (modelAdapter !== undefined) {
       publicationStage = 'model';
-      const { registerManagedGatewayAdapter } = await import(
-        modelAdapter.entry
-      );
+      if (typeof registerManagedGatewayAdapter !== 'function')
+        throw Error('Native managed model module is unavailable');
       if (!current()) return;
       const { id, origin, capability, provider, model, modelInfo } =
         modelAdapter;
@@ -414,8 +421,11 @@ export function apply(ctx, config) {
               if (!found || found.signal.aborted)
                 return new globalThis.Response(null, { status: 404 });
               const headers = { 'cache-control': 'no-store' };
-              if (value.action === undefined && value.purpose !== 'assistant')
-                return globalThis.Response.json({ id: found.id }, { headers });
+              if (value.action === undefined)
+                return globalThis.Response.json(
+                  { id: found.id, recipient: found.recipient },
+                  { headers },
+                );
               if (
                 value.action !== 'read-image' ||
                 (value.purpose !== 'assistant' && value.attemptId !== found.id)
@@ -447,7 +457,11 @@ export function apply(ctx, config) {
                 ]);
                 if (modelCalls.has(key))
                   throw Error('Concurrent native model ownership is ambiguous');
-                const owned = { id: randomUUID(), signal: active };
+                const owned = {
+                  id: randomUUID(),
+                  recipient: randomBytes(32).toString('base64url'),
+                  signal: active,
+                };
                 modelCalls.set(key, owned);
                 const release = () => {
                   active.removeEventListener('abort', release);
@@ -468,7 +482,11 @@ export function apply(ctx, config) {
                       authorization: 'Bearer ' + capability,
                       'content-type': 'application/json',
                     },
-                    body: JSON.stringify(selection),
+                    body: JSON.stringify({
+                      ...selection,
+                      adapterId: id,
+                      recipient: owned.recipient,
+                    }),
                   });
                   if (!response.ok) {
                     await response.body?.cancel();
@@ -476,6 +494,7 @@ export function apply(ctx, config) {
                   }
                   return {
                     reference: (await response.json()).reference,
+                    recipient: owned.recipient,
                     release,
                   };
                 } catch (error) {

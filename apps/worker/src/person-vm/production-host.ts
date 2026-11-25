@@ -85,6 +85,11 @@ export type ProductionPersonVmHostSources = Readonly<{
     lifetime: AbortSignal;
     modelOwnerId: string;
     reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
+    issueReference<T>(
+      call: ModelCallBinding,
+      signal: AbortSignal,
+      issue: (active: AbortSignal) => Promise<T>,
+    ): Promise<T>;
   }): Promise<{
     runtime: Pick<PersonVmRuntimePort, 'readiness' | 'activity'> & {
       /** Fence observations and join their actual work/subscriptions. */
@@ -125,6 +130,7 @@ export type ProductionPersonVmHostSources = Readonly<{
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
 export interface ProductionPersonVmHost {
+  assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
   /** Trusted in-process maintenance only. The model authority verifies the
@@ -695,6 +701,13 @@ export function createProductionPersonVmHost(input: {
         providers,
         lifetime,
         modelOwnerId,
+        async issueReference(call, signal, issue) {
+          if (!model?.issueReference)
+            throw new ProductionPersonVmHostUnavailable(
+              'HOST_SOURCES_UNAVAILABLE',
+            );
+          return model.issueReference(call, signal, issue);
+        },
         async reserveNativeModelCall(call) {
           if (!storeModel.reserveNativeCall)
             throw new Error('MODEL_CALL_AUTHORIZATION_STORE_UNAVAILABLE');
@@ -791,6 +804,11 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       return Object.freeze({
+        async assertWorkerShutdownSafe(signal: AbortSignal) {
+          for (const { binding, stopNative } of ownedVms.values()) {
+            if (stopNative) await vm.assertWorkerShutdownSafe(binding, signal);
+          }
+        },
         close,
         recoverModelOwner,
         modelOwnerMaintenancePending: () =>

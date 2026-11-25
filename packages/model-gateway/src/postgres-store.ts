@@ -204,13 +204,17 @@ export function createPostgresModelGatewayStore(
     },
     async tryStartAttempt(attempt) {
       return db.begin(async (tx) => {
-        // Same global person key across gateways, tenants, Runs and native children.
-        await tx`select pg_advisory_xact_lock(hashtextextended(${`model-gateway:${attempt.personId}`},0))`;
         const [call] = await tx<
-          { person_id: string }[]
-        >`select person_id from allrice_model_gateway_calls where id=${attempt.callId}`;
+          { person_id: string; provider: string }[]
+        >`select person_id, binding->>'provider' as provider from allrice_model_gateway_calls where id=${attempt.callId}`;
         if (!call || call.person_id !== attempt.personId)
           throw new ModelGatewayError('BINDING_INVALID');
+        // Shared with the admin selection transaction. An admitted intent
+        // blocks a slot switch, including an independently joined refresh.
+        if (call.provider === 'openai-codex')
+          await tx`select pg_advisory_xact_lock_shared(8182)`;
+        // Same global person key across gateways, tenants, Runs and native children.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`model-gateway:${attempt.personId}`},0))`;
         let slot: number | null = null;
         if (attempt.kind === 'model') {
           const [free] = await tx<

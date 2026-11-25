@@ -163,6 +163,7 @@ export function decodeProductionModelImage(
   const image = imageWire.parse(parsed);
   if (
     !sameImage(image.attachment, ref) ||
+    image.bytes > target.maxBytes ||
     image.width > Math.min(target.width, ref.width) ||
     image.height > Math.min(target.height, ref.height)
   )

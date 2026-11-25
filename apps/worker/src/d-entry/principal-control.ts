@@ -11,6 +11,7 @@ import {
   type DEntryPrincipalControlScope,
   type DEntryPrincipalIssue,
   type DEntryScopedStreamFrame,
+  type DEntryScopedUnaryCall,
   type ScopeFrame,
 } from '@allrice/d-entry-principal/types';
 
@@ -176,6 +177,10 @@ export function createDEntryPrincipalControl(
     acquire(
       value: DEntryPrincipalIssue,
       caller: AbortSignal,
+      beforeInvoke?: (
+        call: DEntryScopedUnaryCall,
+        signal: AbortSignal,
+      ) => Promise<void>,
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -256,6 +261,12 @@ export function createDEntryPrincipalControl(
                 if (call.scopeId !== issue.scopeId)
                   throw Error('PRINCIPAL_SCOPE_MISMATCH');
                 const task = Promise.resolve().then(async () => {
+                  business.throwIfAborted();
+                  active.throwIfAborted();
+                  await beforeInvoke?.(
+                    call,
+                    AbortSignal.any([active, business]),
+                  );
                   business.throwIfAborted();
                   active.throwIfAborted();
                   const result = await TYPERT_REMOTE.methods[

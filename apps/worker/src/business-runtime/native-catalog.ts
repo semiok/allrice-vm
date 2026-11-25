@@ -45,6 +45,7 @@ export type PublishedNativeCatalog = Readonly<{
     acquirePrincipal(
       issue: DEntryPrincipalIssue,
       signal: AbortSignal,
+      context?: RequestContext,
     ): DEntryPrincipalActivity;
     readImmutableGraphFor?(
       context: RequestContext,
@@ -234,7 +235,8 @@ export function createDEntryNativeCatalogPort(input: {
               async assertCurrent(active) {
                 await current(who, active);
               },
-              acquire: (active) => owner.owner.acquirePrincipal(issue, active),
+              acquire: (active) =>
+                owner.owner.acquirePrincipal(issue, active, who),
             });
           },
           readSessions(reading: AbortSignal, notDispatched?: () => void) {

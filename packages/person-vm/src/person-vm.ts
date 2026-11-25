@@ -699,6 +699,50 @@ export class PersonVmService
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    const identity = await this.identity(context, 'start', signal);
+    const row = await this.options.store.read(identity.personId);
+    if (row) this.checkOrganization(row, identity.organizationId);
+    if (row?.phase === 'running') {
+      const binding = bindingOf(row);
+      if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
+      const roster = await this.webRoster(context, signal);
+      if (roster) {
+        if (
+          roster.personId !== row.personId ||
+          roster.organizationId !== row.organizationId
+        )
+          throw new PersonVmError('AUTHORIZATION_DENIED');
+        if (!this.options.native.prepareWebEndpoints)
+          throw new PersonVmError('RUNTIME_NOT_READY');
+        const endpoints = await this.options.native.prepareWebEndpoints(
+          binding,
+          roster,
+          signal,
+          { runningOnly: true },
+        );
+        if (
+          !sameVmBinding(endpoints.binding, binding) ||
+          endpoints.rosterDigest !== roster.digest
+        )
+          throw new PersonVmError('LEASE_LOST');
+      }
+      await this.ready(row, signal);
+      if (
+        roster &&
+        (await this.webRoster(context, signal))?.digest !== roster.digest
+      )
+        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+      const confirmed = await this.identity(context, 'start', signal);
+      if (
+        confirmed.personId !== row.personId ||
+        confirmed.organizationId !== row.organizationId
+      )
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      await this.assertCurrentBinding(context, binding, signal);
+      signal.throwIfAborted();
+      return view(row, true);
+    }
+
     await this.create(context, signal);
     return this.start(context, signal);
   }
@@ -830,6 +874,30 @@ export class PersonVmService
     await lease.save(row);
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (row.instanceId) this.options.observeOwnedStop?.(bindingOf(row));
+  }
+  /** A shutdown probe is read-only. Unknown native activity leaves the
+   * process and its current owners alive for a later stop attempt. */
+  async assertWorkerShutdownSafe(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const row = await this.options.store.read(binding.personId);
+    signal.throwIfAborted();
+    if (!row || row.organizationId !== binding.organizationId)
+      throw new PersonVmError('LEASE_LOST');
+    if (row.vmId !== binding.vmId || row.leaseEpoch > binding.leaseEpoch)
+      return;
+    if (!row.instanceId || !sameVmBinding(binding, bindingOf(row)))
+      throw new PersonVmError('LEASE_LOST');
+    if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
+    if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
+    const state = await this.options.native.status(binding, signal);
+    signal.throwIfAborted();
+    // Production has no public VM-wide autonomous freeze/drain witness.
+    // A running VM remains with its current owner, even after SIGTERM.
+    if (state !== 'stopped' && state !== 'absent')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
   }
   /** Internal Worker shutdown after its ingress and selection owners are fenced.
    * Only the exact epoch previously prepared by that Host can be stopped here.

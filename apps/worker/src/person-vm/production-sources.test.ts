@@ -59,7 +59,11 @@ function fixture() {
   io.codex.mockResolvedValue({
     revoked: codex.signal,
     route,
-    modelInfo: { id: route.model, name: route.model, provider: route.provider },
+    readModelInfo: vi.fn(async () => ({
+      id: route.model,
+      name: route.model,
+      provider: route.provider,
+    })),
     scopeStream: undefined,
     transport: {
       fetchOwned: vi.fn(),
@@ -68,7 +72,10 @@ function fixture() {
       beforeDispatch: vi.fn(),
     },
     confirmTransportStopped: vi.fn(),
-    assertCurrent: vi.fn(async (signal) => signal?.throwIfAborted()),
+    assertCurrent: vi.fn(async (signal) => {
+      signal?.throwIfAborted();
+      return codex.signal;
+    }),
     llm: { prepareCall: vi.fn() },
     close: codexClose,
   });

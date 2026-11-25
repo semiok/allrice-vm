@@ -126,24 +126,45 @@ it('accepts only metered POST destinations and revokes an old owner after switch
     expect(
       host.route.classify(model.replace('https:', 'http:'), { method: 'POST' }),
     ).toBeNull();
-    state.subscription.mockResolvedValue([{ slot: 1, revision: '3' }]);
+    const old = await host.assertCurrent();
+    state.subscription.mockResolvedValue([{ slot: 2, revision: '3' }]);
     await expect(host.assertCurrent()).rejects.toMatchObject({
       code: 'AUTHORIZATION_DENIED',
     });
-    expect(host.revoked.aborted).toBe(true);
-    state.subscription.mockResolvedValue([{ slot: 1, revision: '1' }]);
-    await expect(host.assertCurrent()).rejects.toMatchObject({
-      code: 'AUTHORIZATION_DENIED',
-    });
+    expect(old.aborted).toBe(true);
+    expect(host.revoked.aborted).toBe(false);
+    const current = await host.assertCurrent();
+    expect(current).not.toBe(old);
+    expect(current.aborted).toBe(false);
+    state.subscription.mockRejectedValueOnce(Error('synthetic SQL failure'));
+    await expect(host.assertCurrent()).rejects.toThrow('synthetic SQL failure');
+    expect(current.aborted).toBe(true);
+    const recovered = await host.assertCurrent();
+    expect(recovered.aborted).toBe(false);
   } finally {
     await host.close();
   }
 });
 
 it('does not enable the route without a grant from the managed store', async () => {
-  await expect(
-    createProductionCodexRuntime(controller().signal, 'test-owner'),
-  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  state.subscription.mockResolvedValue([]);
+  const host = await createProductionCodexRuntime(
+    controller().signal,
+    'test-owner',
+  );
+  try {
+    await expect(host.assertCurrent()).rejects.toMatchObject({
+      code: 'AUTHORIZATION_DENIED',
+    });
+    state.subscription.mockResolvedValue([{ slot: 1, revision: '1' }]);
+    await expect(host.assertCurrent()).rejects.toMatchObject({
+      code: 'AUTHORIZATION_DENIED',
+    });
+    await saveSyntheticGrant();
+    expect((await host.assertCurrent()).aborted).toBe(false);
+  } finally {
+    await host.close();
+  }
 });
 
 it('refreshes an expired managed Codex grant and meters an image-capable SSE request through the production runtime', async () => {

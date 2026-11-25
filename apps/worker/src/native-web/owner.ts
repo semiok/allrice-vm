@@ -100,6 +100,47 @@ export function readNativeModelAttempt(
   return null;
 }
 
+// Accepted native user events refer to the original public prompt request.
+// No identity is read from the text or from a selected browser tab.
+export function readNativeAttemptPromptIds(
+  snapshot: Pick<Extract<SessionFollowFrame, { type: 'snapshot' }>, 'records'>,
+  attempt: { turn: number | null; cursor: number },
+) {
+  const records = snapshot.records.map(({ event }) => event);
+  const start = records.findLast(
+    (event) =>
+      event.type === 'turn/start' &&
+      event.seq <= attempt.cursor &&
+      (attempt.turn === null ||
+        (event.data as { turn?: unknown })?.turn === attempt.turn),
+  );
+  const ids = new Set<string>();
+  for (const event of records) {
+    if (!start || event.seq <= start.seq || event.seq > attempt.cursor)
+      continue;
+    const data = event.data as
+      | {
+          source?: { kind?: unknown; rpcId?: unknown };
+          inserted?: { source?: { kind?: unknown; rpcId?: unknown } }[];
+        }
+      | undefined;
+    const messages =
+      event.type === 'user/message'
+        ? [data]
+        : event.type === 'agent/inbox/spliced' && Array.isArray(data?.inserted)
+          ? data.inserted
+          : [];
+    for (const message of messages) {
+      if (
+        message?.source?.kind === 'user' &&
+        typeof message.source.rpcId === 'string'
+      )
+        ids.add(message.source.rpcId);
+    }
+  }
+  return [...ids];
+}
+
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
 export async function openNativeWebOwner(input: {
@@ -109,6 +150,16 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
+  beforePrompt?(
+    input: {
+      binding: PersonVmBinding;
+      adapterId: string;
+      context: RequestContext;
+      issue: DEntryPrincipalIssue;
+      requestId: string;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -525,12 +576,33 @@ export async function openNativeWebOwner(input: {
       acquirePrincipal(
         issue: DEntryPrincipalIssue,
         requestSignal: AbortSignal,
+        context?: RequestContext,
       ) {
         if (!ready || closing || signal.aborted)
           throw new PersonVmError('RUNTIME_NOT_READY');
         return principals.acquire(
           issue,
           AbortSignal.any([requestSignal, signal]),
+          async (call, active) => {
+            if (call.endpoint !== 'session/prompt' || !input.beforePrompt)
+              return;
+            if (
+              !context ||
+              !installedModelAdapter ||
+              call.args.request.sessionId !== issue.root.nativeSessionId
+            )
+              throw new PersonVmError('AUTHORIZATION_DENIED');
+            await input.beforePrompt(
+              {
+                binding,
+                adapterId: installedModelAdapter,
+                context,
+                issue,
+                requestId: call.args.request.requestId,
+              },
+              active,
+            );
+          },
         );
       },
       readSessions(requestSignal: AbortSignal) {
@@ -623,7 +695,8 @@ export async function openNativeWebOwner(input: {
               .parse({
                 request: {
                   address,
-                  maxMessages: kind === 'assistant' ? 1 : 4,
+                  maxMessages: 32,
+                  turnWindow: { minMessages: 1, minTurns: 1 },
                   assistantStream: true,
                 },
               });
@@ -637,7 +710,13 @@ export async function openNativeWebOwner(input: {
               if (snapshot.type !== 'snapshot')
                 throw new PersonVmError('RUNTIME_NOT_READY');
               const attempt = readNativeModelAttempt(snapshot, kind);
-              if (!attempt || kind === 'assistant') return attempt;
+              if (!attempt) return null;
+              if (!installedModelAdapter)
+                return {
+                  ...attempt,
+                  recipient: undefined,
+                  promptIds: [] as string[],
+                };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
                   adapterId: installedModelAdapter,
@@ -650,11 +729,24 @@ export async function openNativeWebOwner(input: {
                 active,
               );
               if (!proof) return null;
-              const value = JSON.parse(proof) as { id?: unknown };
+              const value = JSON.parse(proof) as {
+                id?: unknown;
+                recipient?: unknown;
+              };
               const id = UuidSchema.safeParse(value?.id);
-              if (!id.success || Object.keys(value).length !== 1)
+              if (
+                !id.success ||
+                typeof value.recipient !== 'string' ||
+                !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
+                Object.keys(value).length !== 2
+              )
                 throw new PersonVmError('PROVIDER_FAILED');
-              return { ...attempt, id: id.data };
+              return {
+                ...attempt,
+                id: kind === 'assistant' ? attempt.id : id.data,
+                recipient: value.recipient,
+                promptIds: readNativeAttemptPromptIds(snapshot, attempt),
+              };
             } finally {
               // Dispose this logical read on its original carrier. The
               // shared owner still owns actual socket close at retirement.

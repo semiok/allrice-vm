@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { admissionFixture } from './admission.fixture.ts';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:net';
@@ -48,6 +49,7 @@ async function fixture(
   extra: Partial<Parameters<typeof createEgressGateway>[0]> = {},
   remove: (binding: PersonVmBinding) => Promise<void> = async () => {},
   allocate = false,
+  runPrepare: <T>(work: () => Promise<T>) => Promise<T> = (work) => work(),
 ) {
   const port = allocate ? 0 : await freePort();
   let access: GuestEgressAccess | undefined;
@@ -109,10 +111,8 @@ async function fixture(
     provisioner,
     ...extra,
   });
-  let receipt = await gateway.prepare(
-    binding,
-    { gatewayPorts: [], mount },
-    signal(),
+  let receipt = await runPrepare(() =>
+    gateway.prepare(binding, { gatewayPorts: [], mount }, signal()),
   );
   cleanup.push(() => gateway.revoke(receipt, 'stop', signal()));
   return {
@@ -153,6 +153,30 @@ async function fixture(
 }
 
 describe('trusted VM HTTP egress (VM and identity owners are explicit fixtures)', () => {
+  it('accepts real listener requests after the short prepare scope has ended', async () => {
+    const prewarm = new AsyncLocalStorage<AbortSignal>();
+    const stopped = new AbortController();
+    const allow = vi.fn(async () => {
+      expect(prewarm.getStore()).toBeUndefined();
+    });
+    const f = await fixture(
+      {
+        authority: {
+          allow,
+          context: async () =>
+            ({ actor: { id: 'person-a' } }) as RequestContext,
+        },
+      },
+      undefined,
+      true,
+      (work) => prewarm.run(stopped.signal, work),
+    );
+    stopped.abort();
+    const response = await f.read();
+    expect(response.status).toBe(200);
+    await response.json();
+    expect(allow).toHaveBeenCalledTimes(2);
+  });
   it('reads market data via the authenticated real HTTP entry and checks present authority twice', async () => {
     const f = await fixture();
     const response = await f.read();

@@ -79,7 +79,14 @@ export async function selectCodexSubscription(
       if (current === selection.enabledSlot) return { enabledSlot: current };
       const [busy] = await tx<{ busy: boolean }[]>`select
         exists(select 1 from allrice_jobs where status not in ('succeeded','failed','dead_letter','canceled'))
-        or exists(select 1 from allrice_platform_employee_test_runs where status in ('queued','running')) as busy`;
+        or exists(select 1 from allrice_platform_employee_test_runs where status in ('queued','running'))
+        or exists(
+          select 1 from allrice_model_gateway_attempts a
+          join allrice_model_gateway_calls c on c.id=a.call_id
+          where c.binding->>'provider'='openai-codex'
+            and (a.closed_at is null
+              or (a.receipt->>'outcome'='unknown' and a.recovery_evidence_ref is null))
+        ) as busy`;
       if (busy?.busy) throw new CodexSubscriptionError('busy');
       if (selection.enabledSlot !== null) {
         const [ready] = await tx`select 1 from allrice_provider_status
