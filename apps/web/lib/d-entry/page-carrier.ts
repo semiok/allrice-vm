@@ -170,6 +170,9 @@ export function openNativePageCarrier(
   );
   return {
     ready: ready.promise,
+    get dispatched() {
+      return dispatched;
+    },
     close() {
       if (!requested && !complete) {
         requested = true;

@@ -13,8 +13,7 @@ export default async function EmployeeNativeEntryPage({
 }) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(await searchParams)) {
-    // Preserve duplicates/unknown keys for the authenticated document's strict
-    // parser. The page neither resolves identity nor silently repairs input.
+    // Preserve duplicates and unknown keys for the strict entry parser.
     for (const item of Array.isArray(value)
       ? value
       : value === undefined
@@ -29,15 +28,21 @@ export default async function EmployeeNativeEntryPage({
       }),
     );
     if (!context) redirect('/login?next=%2Fchatflow%2F4.0');
-    const selection = await findDEntryEmployee(context);
-    if (selection)
-      return (
-        <EmployeeNativePage
-          query={new URLSearchParams(selection).toString()}
-          prepare
-        />
-      );
-    return <EmployeeNativePage query="" prepare />;
+    const result = await findDEntryEmployee(context).then(
+      (selection) => ({ selection, unavailable: false }),
+      () => ({ selection: null, unavailable: true }),
+    );
+    return (
+      <EmployeeNativePage
+        query={
+          result.selection
+            ? new URLSearchParams(result.selection).toString()
+            : ''
+        }
+        initialUnavailable={result.unavailable}
+        prepare
+      />
+    );
   }
   return <EmployeeNativePage query={query.toString()} prepare />;
 }

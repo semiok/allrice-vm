@@ -176,6 +176,11 @@ suite('4.0 browser cold entry', () => {
       } finally {
         allowOpening.resolve();
       }
+      await expect
+        .poll(() => page.getByRole('button', { name: '继续' }).isEnabled())
+        .toBe(true);
+      expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+      expect(documents).toEqual([]);
       await page.getByRole('button', { name: '继续' }).click();
       async function showEditor(threadId: string) {
         await page.getByRole('heading', { name: '正在打开对话' }).waitFor();

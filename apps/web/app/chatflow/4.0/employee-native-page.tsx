@@ -41,14 +41,18 @@ const closingNoticeMs = 10_000;
 export function EmployeeNativePage({
   query,
   prepare = false,
+  initialUnavailable = false,
 }: {
   query: string;
   prepare?: boolean;
+  initialUnavailable?: boolean;
 }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
-  const [status, setStatus] = useState<Status>('warming');
+  const [status, setStatus] = useState<Status>(
+    initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
+  );
   const [settled, setSettled] = useState(false);
   const [activation, setActivation] = useState({ query });
   const activeQuery = activation.query;
@@ -61,6 +65,15 @@ export function EmployeeNativePage({
   nextQuery.current = query;
 
   useEffect(() => {
+    if (initialUnavailable || (prepare && !activeQuery)) {
+      setStatus(initialUnavailable ? 'failed' : 'denied');
+      setSettled(true);
+      const changeSelection = () => setActivation({ query: nextQuery.current });
+      replace.current = changeSelection;
+      return () => {
+        if (replace.current === changeSelection) replace.current = undefined;
+      };
+    }
     const lifetime = new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
@@ -101,6 +114,10 @@ export function EmployeeNativePage({
         // A render change keeps the old iframe and its authenticated sender
         // attached until both halves have settled.
         if (!mounted || !frame.current) {
+          // A dispatched open can be creating the irreversible native root.
+          // Stop taking its result into the UI, then close after it settles.
+          if (prepare && carrier?.dispatched)
+            await carrier.ready.catch(() => {});
           lifetime.abort();
           const [remote] = await Promise.all([close(), setting]);
           return remote !== 'unknown';
@@ -303,6 +320,7 @@ export function EmployeeNativePage({
       const issued = (await carrier.ready).scopeReference;
       scopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
+      if (navigating) return;
       params.set('scopeId', issued.scopeId);
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
@@ -329,7 +347,7 @@ export function EmployeeNativePage({
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', leaving);
     };
-  }, [activation, activeQuery, prepare]);
+  }, [activation, activeQuery, prepare, initialUnavailable]);
 
   useEffect(() => {
     if (nextQuery.current !== activeQuery) replace.current?.();
@@ -358,9 +376,12 @@ export function EmployeeNativePage({
       {prepare && status !== 'ready' && (
         <EntryStatus
           status={status}
-          settled={settled}
+          settled={initialUnavailable || settled}
           stop={() => cancel.current?.()}
-          retry={() => setActivation({ query: nextQuery.current })}
+          retry={() => {
+            if (initialUnavailable) location.reload();
+            else setActivation({ query: nextQuery.current });
+          }}
         />
       )}
       {!prepare && failed && <p role="alert">当前入口暂不可用</p>}

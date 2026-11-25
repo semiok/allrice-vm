@@ -1868,6 +1868,9 @@ suite(
         });
         const active = await rows();
         expect(active).toHaveLength(3);
+        const [audit] = await fixture.db`select count(*)::int as count
+          from allrice_audit_events where actor_id=${f.user} and resource_id=${id} and action='session.create'`;
+        expect(audit?.count).toBe(1);
         expect(
           active.filter(
             ({ execution_generation }) => execution_generation === '4.0',
