@@ -3,6 +3,7 @@ import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js
 import { afterEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
 import { DataAccessError } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 import { harness } from '../../../../packages/person-vm/src/test-support.ts';
 import {
   deferred,
@@ -172,6 +173,47 @@ it('production prewarm requires the data owner and establishes the running route
     await expect(production.port.prewarm(...args)).resolves.toBe(route.signal);
     expect(proof).toHaveBeenCalledTimes(2);
   } finally {
+    uninstall();
+  }
+});
+
+it('does not dispatch cold prewarm if the caller disconnects while verifying the current Host', async () => {
+  const f = fixture();
+  const caller = new AbortController();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const prewarmCurrent = vi.fn(f.prewarmCurrent);
+  const production = createDEntryNativePrewarmPort({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+  });
+  cleanups.push(production.close);
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    async assertEditorReady() {
+      entered.resolve();
+      await release.promise;
+      throw new PersonVmError('NOT_FOUND');
+    },
+  });
+  try {
+    const result = production.port
+      .prewarm(
+        f.base.context,
+        f.base.identity,
+        'page',
+        caller.signal,
+        f.lifetime.signal,
+      )
+      .catch((error: unknown) => error);
+    await entered.promise;
+    caller.abort();
+    release.resolve();
+    expect(await result).toBe(caller.signal.reason);
+    expect(prewarmCurrent).not.toHaveBeenCalled();
+  } finally {
+    release.resolve();
     uninstall();
   }
 });

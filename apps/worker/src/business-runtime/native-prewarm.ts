@@ -62,6 +62,7 @@ export function createDEntryNativePrewarmPort(input: {
         }
         // Browser disconnect/uninstallation cannot kill shared running work.
         // Genuine authority revocation still fences this physical operation.
+        active.throwIfAborted();
         const result = await input.prewarmCurrent(
           context,
           identity,
