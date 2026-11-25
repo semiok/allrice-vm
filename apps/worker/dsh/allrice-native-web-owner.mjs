@@ -963,13 +963,18 @@ export function applyNativeWebOwner(
           const delegations = observeDelegatedInputs(scope);
           const promptFacts = observeNativePrompts(scope, signal);
           const terminalAttestations = createNativeRunTerminalAttestations();
-          const liveSession = (sessionId) => {
-            const session = original(scope.sessions.get(sessionId));
-            const agent = original(scope.agents.get(sessionId));
-            return session && original(agent?.session) === session
-              ? session
-              : null;
-          };
+          const currentSession = (sessionId) =>
+            original(scope.sessions.get(sessionId));
+          scope.on(
+            'session/created',
+            (session) => terminalAttestations.attach(original(session)),
+            { global: true },
+          );
+          scope.on(
+            'session/disposed',
+            (session) => terminalAttestations.detach(original(session)),
+            { global: true },
+          );
           scope.on(
             'session/event',
             (subject, event) => {
@@ -979,7 +984,7 @@ export function applyNativeWebOwner(
               )
                 return;
               const session = original(subject);
-              if (liveSession(session.id) === session)
+              if (currentSession(session.id) === session)
                 terminalAttestations.observe(session, event);
             },
             { global: true },
@@ -1021,17 +1026,19 @@ export function applyNativeWebOwner(
               )
                 return new globalThis.Response(null, { status: 404 });
               if (value.action === 'read-run-terminal') {
-                const session = liveSession(value.sessionId);
                 const persistence = scope.get('sessionPersistence');
                 const terminal = await terminalAttestations.read(
-                  session,
+                  () => currentSession(value.sessionId),
                   persistence,
                   value,
                   globalThis.AbortSignal.any([request.signal, signal]),
                 );
                 return terminal &&
                   current() &&
-                  liveSession(value.sessionId) === session &&
+                  terminalAttestations.hasCurrent(
+                    value.sessionId,
+                    currentSession(value.sessionId),
+                  ) &&
                   original(scope.get('sessionPersistence')) ===
                     original(persistence)
                   ? globalThis.Response.json(terminal, {

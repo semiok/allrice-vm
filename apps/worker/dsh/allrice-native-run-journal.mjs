@@ -246,16 +246,37 @@ export async function readPersistedRunTerminal(
 }
 
 /** One observer per managed native owner. Only attached SessionStore events
- * reach observe. Persistence is a second copy of the witnessed facts. */
+ * reach observe. A matching disposal can retain a completed receipt, while a
+ * replacement invalidates it for the rest of this Guest owner's lifetime. */
 export function createNativeRunTerminalAttestations() {
   const sessions = new Map();
   const receipts = new Map();
+  function matches(state, current) {
+    return (
+      !!state &&
+      (state.detached
+        ? !current
+        : !!current && state.session.deref() === current)
+    );
+  }
   return {
+    hasCurrent(sessionId, current) {
+      return matches(sessions.get(sessionId), current);
+    },
+    attach(session) {
+      const state = sessions.get(session.id);
+      if (state && (state.detached || state.session.deref() !== session))
+        sessions.set(session.id, null);
+    },
+    detach(session) {
+      const state = sessions.get(session.id);
+      if (state?.session.deref() === session) state.detached = true;
+    },
     observe(session, event) {
       const { id } = session;
       let state = sessions.get(id);
       if (state === null) return;
-      if (state && state.session.deref() !== session) {
+      if (state && (state.detached || state.session.deref() !== session)) {
         // A restored session can reuse its id and old turn numbers. Keep
         // this denial for the life of the owner, even after receipt eviction.
         sessions.set(id, null);
@@ -273,7 +294,13 @@ export function createNativeRunTerminalAttestations() {
       if (type === 'turn/start') {
         if (!state) {
           if (sessions.size >= 1024) return;
-          state = { session: new WeakRef(session), turn: 0, start: null };
+          state = {
+            session: new WeakRef(session),
+            parentSessionId: session.header.parentSession ?? null,
+            detached: false,
+            turn: 0,
+            start: null,
+          };
           sessions.set(id, state);
         }
         if (state.start !== null || turn <= state.turn) {
@@ -294,19 +321,23 @@ export function createNativeRunTerminalAttestations() {
       receipts.set(JSON.stringify([id, turn]), { start, end });
       if (receipts.size > 2048) receipts.delete(receipts.keys().next().value);
     },
-    async read(session, persistence, selection, active) {
+    async read(currentSession, persistence, selection, active) {
       const { sessionId, turn, cursor, purpose, parentSessionId } = selection;
+      const state = sessions.get(sessionId);
       if (
-        !session ||
-        session.id !== sessionId ||
-        (session.header.parentSession ?? null) !== (parentSessionId ?? null) ||
+        !state ||
+        state.parentSessionId !== (parentSessionId ?? null) ||
         !Number.isSafeInteger(turn) ||
         turn < 1 ||
         (purpose !== 'assistant' && purpose !== 'compaction')
       )
         return null;
-      const state = sessions.get(sessionId);
-      if (state?.session.deref() !== session) return null;
+      const sameSession = () => {
+        return (
+          sessions.get(sessionId) === state && matches(state, currentSession())
+        );
+      };
+      if (!sameSession()) return null;
       const receipt = receipts.get(JSON.stringify([sessionId, turn]));
       if (!receipt || cursor <= receipt.start || cursor >= receipt.end.sequence)
         return null;
@@ -318,7 +349,7 @@ export function createNativeRunTerminalAttestations() {
       );
       active.throwIfAborted();
       const { end } = receipt;
-      return sessions.get(sessionId) === state &&
+      return sameSession() &&
         stored?.sessionId === end.sessionId &&
         stored.turn === end.turn &&
         stored.sequence === end.sequence &&

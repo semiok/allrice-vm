@@ -213,6 +213,12 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
     });
     const detach = sessions.enter(session);
     const attested = createNativeRunTerminalAttestations();
+    ctx.on('session/created', (subject) => attested.attach(subject), {
+      global: true,
+    });
+    ctx.on('session/disposed', (subject) => attested.detach(subject), {
+      global: true,
+    });
     ctx.on(
       'session/event',
       (subject, event) => {
@@ -221,8 +227,10 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       },
       { global: true },
     );
+    const current = () => sessions.get(session.id);
     let rows: SessionEvent[];
     try {
+      sessions.announce(session);
       rows = appendTurn(
         session,
         1,
@@ -236,7 +244,7 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       const selected = { ...selection, cursor: rows[2]!.seq };
       const active = new AbortController().signal;
       const read = (receipts = attested) =>
-        receipts.read(session, native, selected, active);
+        receipts.read(current, native, selected, active);
 
       expect(await read()).toBeNull();
       const journal = await writeAndRead(native, session, rows);
@@ -272,7 +280,7 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       expect(await read(wrongStart)).toBeNull();
       expect(
         await attested.read(
-          session,
+          current,
           native,
           { ...selected, turn: null, purpose: 'session-title' },
           active,
@@ -282,17 +290,28 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       detach();
     }
 
+    const selected = { ...selection, cursor: rows[2]!.seq };
+    const active = new AbortController().signal;
+    const expected = findDEntryNativeRunTerminal(selected, {
+      header: session.header,
+      events: rows,
+      inheritedEventCount: session.inheritedEventCount,
+    });
+    expect(expected).not.toBeNull();
+    expect(await attested.read(current, native, selected, active)).toEqual(
+      expected,
+    );
     const replacement = sessions.prepare(SessionId(sessionId), {
       meta: { cwd: root },
     });
-    attested.observe(replacement, rows[0]);
-    attested.observe(replacement, rows.at(-1));
-    const selected = { ...selection, cursor: rows[2]!.seq };
-    const active = new AbortController().signal;
-    expect(
-      await attested.read(replacement, native, selected, active),
-    ).toBeNull();
-    expect(await attested.read(session, native, selected, active)).toBeNull();
+    const detachReplacement = sessions.enter(replacement);
+    try {
+      expect(await attested.read(current, native, selected, active)).toBeNull();
+      sessions.announce(replacement);
+    } finally {
+      detachReplacement();
+    }
+    expect(await attested.read(current, native, selected, active)).toBeNull();
   } finally {
     await ctx.fiber.dispose();
     await rm(root, { recursive: true, force: true });
