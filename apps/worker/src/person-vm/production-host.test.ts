@@ -5,6 +5,7 @@ import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
 import type * as Egress from '@allrice/egress-gateway';
+import type * as Model from '@allrice/model-gateway';
 import {
   ApfsPersonVmDisk,
   MicrosandboxPersonVm,
@@ -33,6 +34,12 @@ const io = vi.hoisted(() => ({
   read: vi.fn(),
   database: vi.fn(),
   dedicated: vi.fn(),
+  model:
+    vi.fn<
+      (
+        options: Parameters<typeof Model.createModelGateway>[0],
+      ) => Pick<Model.ModelGatewayPort, 'handle' | 'revoke' | 'close'>
+    >(),
   authority: vi.fn<() => PersonVmAuthority | undefined>(),
   installation:
     vi.fn<
@@ -85,6 +92,10 @@ vi.mock('@allrice/database', async (original) => ({
   ...(await original<typeof Database>()),
   getDatabase: io.database,
   createDedicatedDatabase: io.dedicated,
+}));
+vi.mock('@allrice/model-gateway', async (original) => ({
+  ...(await original<typeof Model>()),
+  createModelGateway: io.model,
 }));
 vi.mock('@allrice/egress-gateway', async (original) => {
   const actual = await original<typeof Egress>();
@@ -152,19 +163,47 @@ function fixture() {
       // No model/read route is exercised by this inert construction fixture.
       // This is not a production model-disabled adapter or send-ready proof.
       policy: { routes: [] },
-      transport: {
-        read: vi.fn(async () => {
-          throw Error('no transport should start during construction');
-        }),
-      },
-      revokeModel: vi.fn(async () => {
-        throw Error('no model should exist in this construction fixture');
-      }),
       close: vi.fn(async () => {}),
     },
+    model: {
+      authority: {
+        assertCall: vi.fn(async () => {
+          throw Error('no model call in this fixture');
+        }),
+        authorizeUsage: vi.fn(async () => {
+          throw Error('no model usage in this fixture');
+        }),
+        confirmOwnerStopped: vi.fn(async () => {
+          throw Error('no model recovery in this fixture');
+        }),
+      },
+      llm: {
+        prepareCall: vi.fn(async () => {
+          throw Error('no model dispatch in this fixture');
+        }),
+      },
+      route: {
+        provider: 'synthetic-provider',
+        model: 'synthetic-model',
+        transport: 'sse',
+        classify: vi.fn(() => null),
+      },
+      resolveCall: vi.fn(async () => {
+        throw Error('no model call in this fixture');
+      }),
+    },
   };
+  const model = {
+    handle: vi.fn(async () => {
+      throw Error('no model dispatch in this fixture');
+    }),
+    revoke: vi.fn<Model.ModelGatewayPort['revoke']>(async () => {
+      throw Error('no model should exist in this construction fixture');
+    }),
+    close: vi.fn(async () => {}),
+  };
+  io.model.mockReturnValue(model);
   const sources: ProductionPersonVmHostSources = {
-    publicUrl: vi.fn(() => 'https://synthetic.example.test/employee/'),
     bind: vi.fn(async (value: BindInput) => {
       input = value;
       return bound;
@@ -173,6 +212,7 @@ function fixture() {
   return {
     sources,
     bound,
+    model,
     input: () => {
       if (!input) throw Error('source was not bound');
       return input;
@@ -195,7 +235,7 @@ async function receiptFixture() {
     entry = nativeEntryFixture(),
     value = fixture();
   io.authority.mockReturnValue(physical.options.authority);
-  value.bound.egress.revokeModel = vi.fn(async () => {});
+  value.model.revoke = vi.fn(async () => {});
   const opened = await open(value),
     input = opened.input(),
     gateway = io.gateway.mock.calls[0]?.[1];
@@ -376,8 +416,6 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   });
   expect(value.bound.runtime.readiness).not.toHaveBeenCalled();
   expect(value.bound.runtime.activity).not.toHaveBeenCalled();
-  expect(value.bound.egress.transport.read).not.toHaveBeenCalled();
-  expect(value.sources.publicUrl).not.toHaveBeenCalled();
   expect(() =>
     actual.startup.owner(
       {
@@ -400,11 +438,33 @@ it('an egress source cannot substitute another VM or shared admission boundary',
   });
   const actual = (await open(value)).input();
   expect(io.gateway).toHaveBeenCalledTimes(1);
+  expect(io.model).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      authority: value.bound.model.authority,
+      provider: expect.objectContaining({
+        classify: value.bound.model.route.classify,
+      }),
+      store: expect.objectContaining({ claimCall: expect.any(Function) }),
+      admission: {
+        boundary: actual.admission,
+        participant: expect.objectContaining({ participant: 'gateway' }),
+      },
+    }),
+  );
   expect(io.gateway.mock.calls[0]?.[0]).toMatchObject({
     vm: actual.vm,
     admission: actual.admission,
     authority: value.bound.egress.authority,
-    revokeModel: value.bound.egress.revokeModel,
+    revokeModel: expect.any(Function),
+    services: [
+      {
+        id: 'model',
+        path: '/v1/stream',
+        method: 'POST',
+        admissionOwner: 'service',
+        handle: expect.any(Function),
+      },
+    ],
     provisioner: actual.providers.egressInstallation.provisioner,
   });
 });
@@ -428,13 +488,13 @@ it('actual service cleanup revokes a copied receipt once and Host.close does not
   ).toBeNull();
   await value.host.close();
   expect(value.revoke).toHaveBeenCalledTimes(1);
-  expect(value.bound.egress.revokeModel).toHaveBeenCalledTimes(1);
+  expect(value.model.revoke).toHaveBeenCalledTimes(1);
 });
 
 it('a failed actual service revoke retains the receipt for the real Host.close retry', async () => {
   const value = await receiptFixture(),
     modelFailure = Error('synthetic first model drain failure');
-  vi.mocked(value.bound.egress.revokeModel).mockRejectedValueOnce(modelFailure);
+  vi.mocked(value.model.revoke).mockRejectedValueOnce(modelFailure);
   await expect(
     value.input().vm.start(value.entry.context, signal()),
   ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
@@ -448,7 +508,7 @@ it('a failed actual service revoke retains the receipt for the real Host.close r
   expect(value.revoke.mock.calls[1]![0]).toEqual(
     value.revoke.mock.calls[0]![0],
   );
-  expect(value.bound.egress.revokeModel).toHaveBeenCalledTimes(2);
+  expect(value.model.revoke).toHaveBeenCalledTimes(2);
 });
 
 it('a stale persisted service receipt cannot remove a retained newer epoch from Host cleanup', async () => {
@@ -461,12 +521,10 @@ it('a stale persisted service receipt cannot remove a retained newer epoch from 
   if (!old) throw Error('actual service did not persist its first epoch');
   const oldReceipt = await value.prepare.mock.results[0]!.value;
   let failNew = true;
-  vi.mocked(value.bound.egress.revokeModel).mockImplementation(
-    async (binding) => {
-      if (binding.leaseEpoch > old.leaseEpoch && failNew)
-        throw Error('synthetic new epoch drain failure');
-    },
-  );
+  vi.mocked(value.model.revoke).mockImplementation(async (binding) => {
+    if (binding.leaseEpoch > old.leaseEpoch && failNew)
+      throw Error('synthetic new epoch drain failure');
+  });
   await expect(vm.start(context, signal())).rejects.toMatchObject({
     code: 'CLEANUP_INCOMPLETE',
   });
@@ -669,7 +727,11 @@ it('close fences the native ports and joins source work; repeated close has one 
     released.release();
     await outcome;
     expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
-    expect(value.bound.egress.revokeModel).not.toHaveBeenCalled();
+    expect(value.model.close).toHaveBeenCalledTimes(1);
+    expect(value.model.close.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(value.bound.egress.close).mock.invocationCallOrder[0]!,
+    );
+    expect(value.model.revoke).not.toHaveBeenCalled();
   } finally {
     released.release();
     await outcome;

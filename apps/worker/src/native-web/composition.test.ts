@@ -22,6 +22,7 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from './composition.js';
+import { dEntryNativePublicUrl } from './launch.js';
 const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
@@ -38,10 +39,13 @@ function latch() {
   });
   return { promise, resolve };
 }
-function fixture(commandMemory?: {
-  controls: ReadonlyCommandMemoryDirectory;
-  readonlyDshDirectory: string;
-}) {
+function fixture(
+  commandMemory?: {
+    controls: ReadonlyCommandMemoryDirectory;
+    readonlyDshDirectory: string;
+  },
+  publicOrigin?: string,
+) {
   const binding = {
     vmId: randomUUID(),
     instanceId: randomUUID(),
@@ -102,7 +106,9 @@ function fixture(commandMemory?: {
       guestAddress: '10.0.0.2',
       startupTimeoutMs: 3000,
       publicUrl: (endpoint) =>
-        `https://native.example.test/e/${endpoint.employeeInstanceId}/`,
+        publicOrigin
+          ? dEntryNativePublicUrl(publicOrigin, endpoint)
+          : `https://native.example.test/e/${endpoint.employeeInstanceId}/`,
     },
   });
   const scope = {
@@ -155,9 +161,7 @@ it('实际DB producer直接绑定service roster，取消仍等待已发SQL结束
 });
 it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐个接收绑定，control不冒充editor ready', async () => {
   const f = fixture(),
-    owners = f.web.receipt.endpoints.map(() => ({
-      close: vi.fn(async () => {}),
-    }));
+    owners = f.web.receipt.endpoints.map(() => catalogOwner());
   owners.forEach((owner) => open.mockResolvedValueOnce(owner));
   const plan = await f.service.memoryGuestPlan(
     f.binding,
@@ -211,6 +215,19 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       owners[index],
     );
   }
+  expect(() =>
+    f.service.assertAuthenticatedGroup(f.binding, signal()),
+  ).not.toThrow();
+  expect(() =>
+    f.service.assertAuthenticatedGroup(
+      { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+      signal(),
+    ),
+  ).toThrow('RUNTIME_NOT_READY');
+  owners[1]!.controlReady.mockReturnValue(false);
+  expect(() => f.service.assertAuthenticatedGroup(f.binding, signal())).toThrow(
+    'RUNTIME_NOT_READY',
+  );
   expect(f.service).not.toHaveProperty('readiness');
   f.startup.abort();
   expect(owners[0]!.close).not.toHaveBeenCalled();
@@ -222,6 +239,32 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     f.service.owner(f.binding, f.web.receipt.endpoints[0]!.employeeInstanceId),
   ).toThrow();
 });
+it('launches each employee with an authenticated Web entry locator on the sealed origin', async () => {
+  const origin = 'https://employees.example.test';
+  const f = fixture(undefined, origin);
+  const owners = f.web.receipt.endpoints.map(() => catalogOwner());
+  owners.forEach((owner) => open.mockResolvedValueOnce(owner));
+  try {
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web);
+    await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
+    for (const [index, endpoint] of f.web.receipt.endpoints.entries()) {
+      const { args } = open.mock.calls[index]![0].launch.command;
+      const url = new URL(args[args.indexOf('--public-url') + 1]);
+      expect(url.origin).toBe(origin);
+      expect(url.pathname).toBe('/chatflow/4.0');
+      expect([...url.searchParams]).toEqual([
+        ['workspaceId', endpoint.workspaceId],
+        ['employeeInstanceId', endpoint.employeeInstanceId],
+      ]);
+      expect(args).toContain(url.host);
+      expect(url.port).toBe('');
+    }
+    expect(open).toHaveBeenCalledTimes(2);
+  } finally {
+    await f.service.close();
+  }
+});
+
 it('stages the existing governed Bash overlay for every employee from the same protected plan', async () => {
   const sha256 = 'a'.repeat(64);
   const controls = {
@@ -327,6 +370,8 @@ it('close与未settle的真实owner启动竞态：先关新准入，再等待晚
     joined = latch(),
     closeEntered = latch();
   const owner = {
+    revoked: new AbortController().signal,
+    controlReady: () => true,
     close: vi.fn(async () => {
       closeEntered.resolve();
       await joined.promise;
@@ -451,6 +496,8 @@ it.each(['readiness', 'save'] as const)(
       },
     );
     const owners = Array.from({ length: 4 }, () => ({
+      revoked: new AbortController().signal,
+      controlReady: () => true,
       close: vi.fn(async () => {}),
       retireAfterNativeStop: retired,
     }));
