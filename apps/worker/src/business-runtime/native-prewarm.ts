@@ -38,7 +38,9 @@ async function readCurrentCoordination(identity: DEntryIdentity) {
   const sql = getDatabase();
   const [policy, [vm]] = await Promise.all([
     readDEntryReleasePolicy(sql),
-    sql<VmStampRow[]>`select vm_id as "vmId", instance_id as "instanceId", phase,
+    sql<
+      VmStampRow[]
+    >`select vm_id as "vmId", instance_id as "instanceId", phase,
       lease_epoch as "leaseEpoch" from person_virtual_machines
       where person_id=${identity.personId} and organization_id=${identity.organizationId}`,
   ]);
