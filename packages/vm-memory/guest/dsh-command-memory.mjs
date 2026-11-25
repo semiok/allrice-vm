@@ -4,10 +4,11 @@ import { addAbortListener } from 'node:events';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 export const name = 'allrice-person-vm-command-memory';
-export const inject = ['tools', 'shellEnv', 'sandboxPolicy'];
+export const inject = ['tools', 'shellEnv'];
 
 export const commandMemoryReady = Symbol.for(
   'allrice.person-vm-command-memory.ready',
@@ -101,6 +102,45 @@ function trustedEntrypoints(config) {
       readonlyDshDirectory,
       require.resolve('@deepseek-ai/dsh-subprocess-local'),
     ),
+    sandbox: verify(
+      readonlyDshDirectory,
+      require.resolve('@deepseek-ai/dsh-sandbox-local'),
+    ),
+  };
+}
+
+/** Validate the policy the native executor actually passes to confinement. */
+export function protectCommandMemorySandbox(
+  LocalSandboxProvider,
+  isManagedCommand,
+) {
+  return class extends LocalSandboxProvider {
+    confine(argv, policy, signal) {
+      if (!isManagedCommand() || policy.mode !== 'workspace-write')
+        return super.confine(argv, policy, signal);
+      const workspaceRoot = realpathSync(policy.workspaceRoot);
+      if (
+        workspaceRoot === '/' ||
+        [
+          state,
+          '/opt/allrice',
+          '/usr',
+          '/bin',
+          '/etc',
+          '/lib',
+          '/lib64',
+          '/sys/fs/cgroup',
+          '/proc',
+        ].some(
+          (path) =>
+            workspaceRoot === path ||
+            workspaceRoot.startsWith(path + '/') ||
+            path.startsWith(workspaceRoot + '/'),
+        )
+      )
+        invalidTrust();
+      return super.confine(argv, { ...policy, workspaceRoot }, signal);
+    }
   };
 }
 
@@ -165,8 +205,22 @@ export function createCommandMemoryPresentation(ctx) {
  * the tool returns. Disposal shares the same attempt and bounds its own wait. */
 export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
   const owned = new Set();
-  const cgroupObservation = new AbortController();
+  const cgroupObservation = new globalThis.AbortController();
   let closing;
+
+  function presentIfOom(attempt, evidence) {
+    try {
+      if (
+        evidence?.receipt &&
+        BigInt(evidence.after.oomKill) >
+          BigInt(evidence.receipt.baseline.oomKill)
+      ) {
+        attempt.onOom();
+      }
+    } catch {
+      // Presentation must preserve the native outcome and cleanup.
+    }
+  }
 
   async function release(attempt, signal) {
     let outcome = null;
@@ -187,7 +241,10 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
     } catch {
       evidence = { error: 'command-memory-cleanup-unconfirmed' };
     }
-    if (released) owned.delete(attempt);
+    if (released) {
+      owned.delete(attempt);
+      if (attempt.joined) presentIfOom(attempt, evidence);
+    }
     report({
       ...attempt.call,
       jobId: attempt.jobId,
@@ -211,19 +268,14 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
     },
     track(attempt, onOom) {
       owned.add(attempt);
+      attempt.onOom = onOom;
       attempt.completed =
         attempt.handle?.done.then(
           (outcome) => {
             try {
-              const evidence = attempt.owner.observe();
-              if (
-                evidence?.receipt &&
-                BigInt(evidence.after.oomKill) >
-                  BigInt(evidence.receipt.baseline.oomKill)
-              )
-                onOom();
+              presentIfOom(attempt, attempt.owner.observe());
             } catch {
-              // Evidence is optional for presentation; the native outcome stays intact.
+              // Early observations are optional. The final release may prove OOM.
             }
             return outcome;
           },
@@ -233,7 +285,7 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
     },
     close() {
       return (closing ??= Promise.resolve().then(async () => {
-        const signal = AbortSignal.timeout(cleanupTimeoutMs);
+        const signal = globalThis.AbortSignal.timeout(cleanupTimeoutMs);
         const attempts = [...owned];
         const drained = Promise.allSettled(
           attempts.map(async (attempt) => {
@@ -264,10 +316,12 @@ export function createCommandMemoryCleanup(cleanupTimeoutMs, report) {
 }
 
 export async function apply(ctx, config) {
-  const { require, subprocess } = trustedEntrypoints(config);
-  const { LocalSubprocessRuntime } = await import(
-    pathToFileURL(subprocess).href
-  );
+  const { require, subprocess, sandbox } = trustedEntrypoints(config);
+  const [{ LocalSubprocessRuntime }, { LocalSandboxProvider }] =
+    await Promise.all([
+      import(pathToFileURL(subprocess).href),
+      import(pathToFileURL(sandbox).href),
+    ]);
   const prepare = require(config.writer);
   if (typeof prepare !== 'function')
     throw new Error('COMMAND_MEMORY_VERIFIER_UNAVAILABLE');
@@ -295,33 +349,6 @@ export async function apply(ctx, config) {
       const dispatch = active.getStore();
       if (dispatch?.exec.token !== exec.token)
         throw new Error('COMMAND_MEMORY_DISPATCH_UNCONFIRMED');
-      const policy = ctx.sandboxPolicy.resolve(
-        exec.agent && { session: exec.agent.session },
-      );
-      const mode = exec.arguments?.sandbox_permissions ?? policy.mode;
-      if (mode === 'workspace-write') {
-        const workspace = realpathSync(policy.workspaceRoot);
-        if (
-          workspace === '/' ||
-          [
-            state,
-            '/opt/allrice',
-            '/usr',
-            '/bin',
-            '/etc',
-            '/lib',
-            '/lib64',
-            '/sys/fs/cgroup',
-            '/proc',
-          ].some(
-            (path) =>
-              workspace === path ||
-              workspace.startsWith(path + '/') ||
-              path.startsWith(workspace + '/'),
-          )
-        )
-          invalidTrust();
-      }
       dispatch.attempt = { ref: randomUUID(), jobId: null };
       return { [marker]: dispatch.attempt.ref };
     },
@@ -388,5 +415,12 @@ export async function apply(ctx, config) {
     }
   })(ctx);
 
+  ctx.plugin(
+    protectCommandMemorySandbox(
+      LocalSandboxProvider,
+      () => active.getStore()?.attempt !== undefined,
+    ),
+    {},
+  );
   ctx.effect(() => cleanup.close, 'join person VM command observation');
 }

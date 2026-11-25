@@ -773,6 +773,11 @@ describe.sequential(
       );
       expect(createPersonVmDshCommandMemoryPatch(plan, input)).toMatchObject([
         {
+          id: 'sandbox',
+          name: '@deepseek-ai/dsh-sandbox-local',
+          disabled: true,
+        },
+        {
           id: 'subprocess',
           name: '@deepseek-ai/dsh-subprocess-local',
           disabled: true,

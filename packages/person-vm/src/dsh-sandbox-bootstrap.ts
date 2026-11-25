@@ -1,5 +1,9 @@
 export const DSH_SANDBOX_ROOT = '/usr/local/lib/allrice-sandbox';
 
+// agentd prepends its scripts directory to the environment it receives.
+// Replace PATH inside the guest, then exec the fixed Node binary in place.
+export const launchDshSandbox = 'PATH="$1"; export PATH; shift; exec "$@"';
+
 /** Run inside the VM over the existing managed bootstrap job protocol. */
 export const prepareDshSandbox = String.raw`
 const fs = require('node:fs');
@@ -58,29 +62,29 @@ directory(base, true);
 const destination = base + '/' + sha256;
 directory(destination, true);
 const target = destination + '/bwrap';
+const entries = fs.readdirSync(destination);
+if (entries.length > 0 && (entries.length !== 1 || entries[0] !== 'bwrap'))
+  throw Error('untrusted-dsh-sandbox-directory-entries');
+if (entries.length === 1) readVerified(target, true);
+
+// Publish a fresh inode every time. The cache's existing bytes and mode
+// cannot establish the absence of extended attributes such as file capabilities.
+const staging = fs.mkdtempSync(base + '/.bwrap-');
+const temp = staging + '/bwrap';
 try {
-  readVerified(target, true);
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-  const staging = fs.mkdtempSync(destination + '/.bwrap-');
-  const temp = staging + '/bwrap';
+  const fd = fs.openSync(temp, 'wx', 0o600);
   try {
-    const fd = fs.openSync(temp, 'wx', 0o600);
-    try {
-      fs.writeFileSync(fd, bytes);
-      fs.fchmodSync(fd, 0o555);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    // Atomic publication without exposing a target with two hard links if
-    // the guest stops between publication and temporary-file cleanup.
-    fs.renameSync(temp, target);
+    fs.writeFileSync(fd, bytes);
+    fs.fchmodSync(fd, 0o555);
+    fs.fsyncSync(fd);
   } finally {
-    try { fs.unlinkSync(temp); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    finally { fs.rmdirSync(staging); }
+    fs.closeSync(fd);
   }
-  readVerified(target, true);
+  fs.renameSync(temp, target);
+} finally {
+  try { fs.unlinkSync(temp); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  finally { fs.rmdirSync(staging); }
 }
+readVerified(target, true);
 `;

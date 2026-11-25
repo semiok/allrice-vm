@@ -260,6 +260,11 @@ export function createPersonVmDshCommandMemoryPatch(
     throw new Error('invalid_dsh_command_memory_patch');
   return [
     {
+      id: 'sandbox',
+      name: '@deepseek-ai/dsh-sandbox-local',
+      disabled: true,
+    },
+    {
       id: 'subprocess',
       name: '@deepseek-ai/dsh-subprocess-local',
       disabled: true,

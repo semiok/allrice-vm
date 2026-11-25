@@ -206,7 +206,10 @@ function guest() {
         name === 'node:fs' ? fs : name === 'node:path' ? { posix } : undefined,
     };
     if (readAdmittedPid) {
-      const { pid: _pid, ...roots } = request;
+      const roots: Omit<typeof request, 'pid'> & { pid?: number } = {
+        ...request,
+      };
+      delete roots.pid;
       const data = runInNewContext(
         `${PERSON_VM_COMMAND_MEMORY_VERIFIER}\nverifyCommandMemoryReceipt(cfg, phase, true)`,
         { ...context, cfg: roots, phase },

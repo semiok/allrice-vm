@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -6,6 +7,7 @@ import { runInNewContext } from 'node:vm';
 import { afterEach, expect, test } from 'vitest';
 import {
   DSH_SANDBOX_ROOT,
+  launchDshSandbox,
   prepareDshSandbox,
 } from './dsh-sandbox-bootstrap.ts';
 
@@ -68,7 +70,7 @@ function setup() {
   return { run, input, root, base, destination, final, observed };
 }
 
-test('records the source mount and atomically stages and reuses the exact readonly executable', () => {
+test('records the source mount and stages verified bytes on a fresh executable inode', () => {
   const f = setup();
   f.run();
   expect(JSON.parse(f.observed[0]!)).toEqual({
@@ -83,7 +85,9 @@ test('records the source mount and atomically stages and reuses the exact readon
   expect(fs.lstatSync(dirname(f.final)).mode & 0o7777).toBe(0o755);
   expect(fs.readdirSync(f.destination)).toEqual(['bwrap']);
   f.run();
-  expect(fs.lstatSync(f.final).ino).toBe(stat.ino);
+  // Filesystem capability attributes are associated with the old inode.
+  expect(fs.lstatSync(f.final).ino).not.toBe(stat.ino);
+  expect(fs.readFileSync(f.final)).toEqual(bytes);
 });
 
 test('requires a readonly source mount and a verified source before touching the destination', () => {
@@ -108,4 +112,41 @@ test('refuses a redirected or replaced executable at the destination', () => {
   fs.writeFileSync(f.final, 'tampered', { mode: 0o555 });
   expect(() => f.run()).toThrow('dsh-sandbox-digest-mismatch');
   expect(fs.readFileSync(f.final, 'utf8')).toBe('tampered');
+});
+
+test('refuses extra programs in a retained PATH directory', () => {
+  const f = setup();
+  f.run();
+  const old = fs.lstatSync(f.final);
+  fs.writeFileSync(join(f.destination, 'node'), '#!/bin/sh\nexit 1\n', {
+    mode: 0o555,
+  });
+  expect(() => f.run()).toThrow('untrusted-dsh-sandbox-directory-entries');
+  expect(fs.lstatSync(f.final).ino).toBe(old.ino);
+});
+
+test('sets the actual Node process PATH after the agentd environment prefix', () => {
+  const f = setup();
+  f.run();
+  const prefix = join(f.root, 'agentd-scripts');
+  fs.mkdirSync(prefix);
+  fs.writeFileSync(join(prefix, 'bwrap'), '#!/bin/sh\nexit 1\n', {
+    mode: 0o555,
+  });
+  const path = f.destination + ':/usr/bin:/bin';
+  const result = spawnSync(
+    '/bin/sh',
+    [
+      '-c',
+      launchDshSandbox,
+      'allrice-dsh',
+      path,
+      process.execPath,
+      '-e',
+      "const check = require('node:child_process').spawnSync('/bin/sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' }); console.log(JSON.stringify([process.env.PATH, check.stdout.trim()]));",
+    ],
+    { encoding: 'utf8', env: { PATH: prefix + ':' + path } },
+  );
+  expect(result.status).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual([path, f.final]);
 });

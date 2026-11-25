@@ -3,9 +3,10 @@ import { expect, it, vi } from 'vitest';
 import {
   createCommandMemoryCleanup,
   createCommandMemoryPresentation,
+  protectCommandMemorySandbox,
 } from './dsh-command-memory.mjs';
 
-function observation(cleanupTimeoutMs = 500) {
+function observation(cleanupTimeoutMs = 500, mark = () => {}) {
   const done = Promise.withResolvers();
   const quiescent = Promise.withResolvers();
   const reported = Promise.withResolvers();
@@ -26,7 +27,7 @@ function observation(cleanupTimeoutMs = 500) {
       evidence: { childReleased: true },
     })),
   };
-  const onOom = vi.fn();
+  const onOom = vi.fn(mark);
   const attempt = {
     handle: native,
     owner,
@@ -109,7 +110,7 @@ it('shares memcg observation after native join with disposal and releases it onc
   f.quiescent.resolve(true);
   await vi.waitFor(() =>
     expect(f.owner.release).toHaveBeenCalledExactlyOnceWith(
-      expect.any(AbortSignal),
+      expect.any(globalThis.AbortSignal),
       true,
     ),
   );
@@ -136,7 +137,7 @@ it('releases a reservation without certifying join when no native handle was cre
     released: true,
   });
   expect(release).toHaveBeenCalledExactlyOnceWith(
-    expect.any(AbortSignal),
+    expect.any(globalThis.AbortSignal),
     false,
   );
   await cleanup.close();
@@ -293,3 +294,86 @@ it.each(['remove', 'dispose'])(
     expect(await f.present(input, result)).toEqual({ kind: 'accept' });
   },
 );
+
+it('presents a late joined descendant OOM in the retained job without changing the direct exit', async () => {
+  const view = presentation();
+  const f = observation(500, view.mark);
+  const counters = (oomKill) => ({
+    receipt: { baseline: { oomKill: '0' } },
+    after: { oomKill },
+  });
+  const output = {
+    isError: false,
+    value: { job: view.job },
+    content: [{ type: 'text', text: 'native status: completed' }],
+  };
+  const read = () => view.present({ ...view.exec, name: 'job_output' }, output);
+  f.owner.observe.mockReturnValue(counters('0'));
+  f.owner.release.mockReturnValue({ released: true, evidence: counters('1') });
+  f.done.resolve(f.outcome);
+  await vi.waitFor(() => expect(f.native.waitForExit).toHaveBeenCalledOnce());
+  expect(await read()).toEqual({ kind: 'accept' });
+  f.quiescent.resolve(true);
+  expect(await f.reported.promise).toMatchObject({
+    outcome: f.outcome,
+    released: true,
+  });
+  expect((await read()).content[0].text).toMatch(
+    /OOM[^\n]*\nnative status: completed/,
+  );
+  expect(f.onOom).toHaveBeenCalledOnce();
+  await f.cleanup.close();
+});
+
+it.each([
+  ['workspace-write', 'read-only', true],
+  ['read-only', 'workspace-write', false],
+])(
+  'guards the %s native policy independently of a later session change to %s',
+  async (mode, later, rejected) => {
+    const raw = vi.fn();
+    const Provider = protectCommandMemorySandbox(
+      class {
+        confine(...args) {
+          return raw(...args);
+        }
+      },
+      () => true,
+    );
+    const provider = new Provider();
+    const session = { policy: { mode, workspaceRoot: '/' } };
+    const nativeSnapshot = session.policy;
+    const ready = Promise.withResolvers();
+    const pending = ready.promise.then(() =>
+      provider.confine(['/bin/true'], nativeSnapshot),
+    );
+    session.policy = { ...session.policy, mode: later };
+    ready.resolve();
+    if (rejected) {
+      await expect(pending).rejects.toThrow('COMMAND_MEMORY_TRUST_UNCONFIRMED');
+      expect(raw).not.toHaveBeenCalled();
+    } else {
+      await pending;
+      expect(raw).toHaveBeenCalledExactlyOnceWith(
+        ['/bin/true'],
+        nativeSnapshot,
+        undefined,
+      );
+    }
+  },
+);
+
+it('leaves other native confinement consumers on the original provider semantics', () => {
+  const raw = vi.fn();
+  const Provider = protectCommandMemorySandbox(
+    class {
+      confine(...args) {
+        return raw(...args);
+      }
+    },
+    () => false,
+  );
+  const policy = { mode: 'workspace-write', workspaceRoot: '/' };
+  new Provider().confine(['/bin/true'], policy);
+  expect(raw).toHaveBeenCalledExactlyOnceWith(['/bin/true'], policy, undefined);
+});

@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, posix } from 'node:path';
 import { PersonVmError } from './contract.ts';
 import {
   DSH_SANDBOX_ROOT,
+  launchDshSandbox,
   prepareDshSandbox,
 } from './dsh-sandbox-bootstrap.ts';
 import type {
@@ -416,19 +417,26 @@ export async function bootstrapMicrosandbox(input: {
       )
         throw new PersonVmError('PROVIDER_FAILED');
       const env = { ...spec.env, ...plan.env };
+      let argv = [spec.executable, ...spec.args];
       if (
         sandbox &&
         spec.executable === 'node' &&
         spec.args[0] === posix.join(sandbox.guestDirectory, DSH_CLI)
       ) {
-        // rc.2's native provider resolves and functionally probes bwrap from
-        // the DSH process PATH. No command or model environment can supply it.
-        env.PATH =
-          posix.join(DSH_SANDBOX_ROOT, sandbox.sha256) + ':' + BASE_IMAGE_PATH;
+        env.PATH = BASE_IMAGE_PATH;
+        argv = [
+          '/bin/sh',
+          '-c',
+          launchDshSandbox,
+          'allrice-dsh',
+          posix.join(DSH_SANDBOX_ROOT, sandbox.sha256) + ':' + BASE_IMAGE_PATH,
+          '/usr/local/bin/node',
+          ...spec.args,
+        ];
       }
       return spawn({
         executable: plan.launcher,
-        args: [spec.executable, ...spec.args],
+        args: argv,
         env,
         ...(spec.workdir ? { workdir: spec.workdir } : {}),
       });

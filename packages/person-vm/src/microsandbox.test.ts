@@ -21,6 +21,7 @@ import { once } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DSH_SANDBOX_ROOT,
+  launchDshSandbox,
   prepareDshSandbox,
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
@@ -686,13 +687,23 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         );
       expect(readPath(dsh)).toEqual([
         withSandbox
-          ? 'PATH=' +
-            DSH_SANDBOX_ROOT +
-            '/' +
-            sha +
-            ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+          ? 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
           : 'PATH=/work/caller-path',
       ]);
+      if (withSandbox) {
+        expect(dsh?.slice(-7)).toEqual([
+          '/bin/sh',
+          '-c',
+          launchDshSandbox,
+          'allrice-dsh',
+          DSH_SANDBOX_ROOT +
+            '/' +
+            sha +
+            ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+          '/usr/local/bin/node',
+          cli,
+        ]);
+      }
       expect(readPath(otherNode)).toEqual(['PATH=/work/caller-path']);
       expect(
         launches
