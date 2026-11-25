@@ -164,6 +164,38 @@ function affects(
   return true;
 }
 
+function affectsRoster(change: Change, identity: DEntryIdentity) {
+  const { table, id, organizationId, personId } = change;
+  switch (table) {
+    case 'allrice_settings': // The trigger publishes only d_entry_rollout_policy.
+      return true;
+    case 'allrice_users':
+      return id === identity.personId;
+    case 'allrice_organizations':
+      return id === identity.organizationId;
+    case 'allrice_workspaces':
+    case 'allrice_platform_employee_tenant_assignments':
+    case 'allrice_employee_version_sources':
+    case 'allrice_employees':
+      return organizationId === identity.organizationId;
+    case 'allrice_memberships':
+    case 'allrice_employee_assignments':
+    case 'allrice_employee_instances':
+      // Whole VM rosters cover eligible sibling workspaces. Bulk insertion
+      // hints can identify the workspace without a single affected person.
+      return (
+        organizationId === identity.organizationId &&
+        (!personId || personId === identity.personId)
+      );
+    case 'allrice_platform_employee_revisions':
+      // These rows are platform-wide. Their current sources are rechecked
+      // with each affected roster because the change has no tenant column.
+      return true;
+    default:
+      return false;
+  }
+}
+
 export type DEntryAuthoritySubscription = Readonly<{
   revoked: AbortSignal;
   readonly expiresAt: string;
@@ -208,7 +240,7 @@ async function watchDEntryAuthority(
   let expiresAt = '';
   let checks = Promise.resolve();
   const invalidate = (error: unknown) => abort.abort(error);
-  const recheck = async () => {
+  const recheck = async (roster: boolean) => {
     if (stopped) return;
     revoked.throwIfAborted();
     const identity =
@@ -236,7 +268,7 @@ async function watchDEntryAuthority(
     if (!session || !sameDEntryIdentity(identity, expected))
       throw new DataAccessError('authorization_denied');
     schema = session.schema;
-    await nativeChecks?.verifyRoster(revoked);
+    if (roster) await nativeChecks?.verifyRoster(revoked);
     revoked.throwIfAborted();
     expiresAt = session.expires_at.toISOString();
     if (timer) clearTimeout(timer);
@@ -253,8 +285,21 @@ async function watchDEntryAuthority(
     };
     expire();
   };
-  const enqueue = () => {
-    if (!stopped) checks = checks.then(recheck).catch(invalidate);
+  let authorityPending = false;
+  let rosterPending = false;
+  const enqueue = (roster: boolean) => {
+    if (stopped) return;
+    rosterPending ||= roster;
+    if (authorityPending) return;
+    authorityPending = true;
+    checks = checks
+      .then(async () => {
+        authorityPending = false;
+        const recheckRoster = rosterPending;
+        rosterPending = false;
+        await recheck(recheckRoster);
+      })
+      .catch(invalidate);
   };
   let bindingPending = false;
   const enqueueBinding = () => {
@@ -297,24 +342,15 @@ async function watchDEntryAuthority(
           }
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
           // current SQL decides, including a permission change during setup.
-          if (
-            (!schema || change.schema === schema) &&
-            (affects(change, context, expected) ||
-              (nativeChecks &&
-                !['allrice_chat_sessions', 'allrice_sessions'].includes(
-                  change.table,
-                ) &&
-                (!change.organizationId ||
-                  change.organizationId === expected.organizationId) &&
-                (!change.personId || change.personId === expected.personId)))
-          )
-            enqueue();
+          if (schema && change.schema !== schema) return;
+          const roster = !!nativeChecks && affectsRoster(change, expected);
+          if (roster || affects(change, context, expected)) enqueue(roster);
         },
         lost: invalidate,
       },
       revoked,
     );
-    enqueue();
+    enqueue(!!nativeChecks);
     await joinChecks();
     revoked.throwIfAborted();
     return {
@@ -333,7 +369,7 @@ async function watchDEntryAuthority(
         active.throwIfAborted();
         revoked.throwIfAborted();
         if (stopped) throw new DataAccessError('authorization_denied');
-        enqueue();
+        enqueue(!!nativeChecks);
         await joinChecks();
         active.throwIfAborted();
         revoked.throwIfAborted();

@@ -185,6 +185,95 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
     }
   });
 
+  it('coalesces genuine roster changes and scopes login, user and thread hints before taking roster locks', async () => {
+    const signal = new AbortController().signal;
+    const source = feed();
+    const verifyRoster = vi.fn(async () => {});
+    const verifyBinding = vi.fn(async () => {});
+    const watch = await watchDEntryNativeRosterAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      { verifyRoster, verifyBinding },
+      source,
+    );
+    const client = state.clients[0]!;
+    const change = (value: Record<string, string | null>) =>
+      client.emit('notification', {
+        channel: 'allrice_d_entry_authority',
+        payload: JSON.stringify({
+          schema: 'isolated',
+          id: null,
+          personId: null,
+          organizationId: null,
+          workspaceId: null,
+          ...value,
+        }),
+      });
+    try {
+      change({ table: 'allrice_users', id: randomUUID() });
+      change({ table: 'allrice_organizations', id: randomUUID() });
+      change({
+        table: 'allrice_employee_instances',
+        id: identity.employeeInstanceId,
+        personId: identity.personId,
+        schema: 'other',
+      });
+      change({
+        table: 'allrice_sessions',
+        id: randomUUID(),
+        personId: identity.personId,
+      });
+      change({
+        table: 'allrice_chat_sessions',
+        id: randomUUID(),
+        personId: identity.personId,
+        organizationId: identity.organizationId,
+        workspaceId: identity.workspaceId,
+      });
+      await watch.assertObserved(signal);
+      expect(state.identity).toHaveBeenCalledTimes(1);
+      expect(verifyRoster).toHaveBeenCalledTimes(1);
+
+      for (let i = 0; i < 8; i++)
+        change({
+          table: 'allrice_sessions',
+          id: context.sessionId,
+          personId: identity.personId,
+        });
+      await watch.assertObserved(signal);
+      expect(state.identity).toHaveBeenCalledTimes(2);
+      expect(verifyRoster).toHaveBeenCalledTimes(1);
+
+      for (let i = 0; i < 8; i++)
+        change({
+          table: 'allrice_employee_instances',
+          id: randomUUID(),
+          personId: identity.personId,
+          organizationId: identity.organizationId,
+          workspaceId: randomUUID(),
+        });
+      await watch.assertObserved(signal);
+      expect(state.identity).toHaveBeenCalledTimes(3);
+      expect(verifyRoster).toHaveBeenCalledTimes(2);
+      expect(verifyBinding).not.toHaveBeenCalled();
+
+      verifyRoster.mockRejectedValueOnce(Error('sibling cohort withdrew'));
+      change({ table: 'allrice_settings' });
+      await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'sibling cohort withdrew',
+      );
+      expect(watch.revoked.reason).toMatchObject({
+        message: 'sibling cohort withdrew',
+      });
+      expect(state.identity).toHaveBeenCalledTimes(4);
+      expect(verifyRoster).toHaveBeenCalledTimes(3);
+    } finally {
+      await watch.close();
+    }
+  });
+
   it.each(['native', 'history'] as const)(
     'LISTENs before rechecking and joins an in-flight notification recheck when closing the subscription (%s)',
     async (access) => {

@@ -25,6 +25,33 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 const unknown = (cause?: unknown) => Error('PRINCIPAL_JOIN_UNKNOWN', { cause });
+
+export type PrincipalInvocationObservation = Readonly<{
+  undispatched(): Promise<void>;
+  accepted(): void;
+  unknown(): void;
+}>;
+
+export function isCertainNativePromptRejection(
+  call: DEntryScopedUnaryCall,
+  code: string,
+) {
+  if (call.endpoint !== 'session/prompt') return false;
+  if (code === 'gateway/bad-request') {
+    // rc.2's prompt rejects this exact shape before resolving an Agent or
+    // checking duplicates. This gateway code alone proves nothing.
+    return call.args.request.content.every(
+      (part) => part.type === 'text' && part.text.trim().length === 0,
+    );
+  }
+  return [
+    'session/invalid-time-zone',
+    'session/attachment-invalid',
+    'session/model-unavailable',
+    'session/not-found',
+    'session/writer-held',
+  ].includes(code);
+}
 /** One reader for a native duplex handle. One-item handoff applies backpressure;
  * close discards business delivery but keeps consuming exact closed/end. */
 class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
@@ -180,7 +207,7 @@ export function createDEntryPrincipalControl(
       beforeInvoke?: (
         call: DEntryScopedUnaryCall,
         signal: AbortSignal,
-      ) => Promise<(() => Promise<void>) | undefined>,
+      ) => Promise<PrincipalInvocationObservation | undefined>,
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -263,7 +290,7 @@ export function createDEntryPrincipalControl(
                 const task = Promise.resolve().then(async () => {
                   business.throwIfAborted();
                   active.throwIfAborted();
-                  const undispatched = await beforeInvoke?.(
+                  const observation = await beforeInvoke?.(
                     call,
                     AbortSignal.any([active, business]),
                   );
@@ -271,41 +298,47 @@ export function createDEntryPrincipalControl(
                     business.throwIfAborted();
                     active.throwIfAborted();
                   } catch (error) {
-                    await undispatched?.();
+                    await observation?.undispatched();
                     throw error;
                   }
-                  const result = await TYPERT_REMOTE.methods[
-                    'allricePrincipal/invokeScoped'
-                  ].invoke(
-                    root.remote,
-                    { call },
-                    AbortSignal.any([active, business]),
-                  );
-                  if (!result.ok) {
-                    // These native prompt errors are raised before inbox
-                    // acceptance. An ambiguous carrier error keeps its scope.
-                    const code = result.error?.code;
-                    if (
-                      call.endpoint === 'session/prompt' &&
-                      [
-                        'session/invalid-time-zone',
-                        'session/attachment-invalid',
-                        'session/model-unavailable',
-                      ].includes(String(code))
-                    )
-                      await undispatched?.();
-                    throw result.error;
+                  let known = false;
+                  try {
+                    const result = await TYPERT_REMOTE.methods[
+                      'allricePrincipal/invokeScoped'
+                    ].invoke(
+                      root.remote,
+                      { call },
+                      AbortSignal.any([active, business]),
+                    );
+                    if (!result.ok) {
+                      // These rc.2 prompt-specific failures precede inbox
+                      // admission. Generic gateway failures prove no outcome.
+                      if (
+                        isCertainNativePromptRejection(
+                          call,
+                          String(result.error?.code),
+                        )
+                      ) {
+                        known = true;
+                        await observation?.undispatched();
+                      }
+                      throw result.error;
+                    }
+                    const value = TYPERT_REMOTE.methods[
+                      'allricePrincipal/invokeScoped'
+                    ].result
+                      .create()
+                      .parse(result.value);
+                    if (value.endpoint !== call.endpoint)
+                      throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+                    known = true;
+                    observation?.accepted();
+                    business.throwIfAborted();
+                    active.throwIfAborted();
+                    return value;
+                  } finally {
+                    if (!known) observation?.unknown();
                   }
-                  business.throwIfAborted();
-                  active.throwIfAborted();
-                  const value = TYPERT_REMOTE.methods[
-                    'allricePrincipal/invokeScoped'
-                  ].result
-                    .create()
-                    .parse(result.value);
-                  if (value.endpoint !== call.endpoint)
-                    throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
-                  return value;
                 });
                 operations.add(task);
                 void task.then(

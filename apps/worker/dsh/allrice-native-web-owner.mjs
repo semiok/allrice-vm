@@ -341,6 +341,179 @@ function delegatedPromptIds(sessions, sessionId) {
   return [];
 }
 
+/** Carry only the inbox facts for an exact scoped prompt through the existing
+ * authenticated owner transport. A waiter is registered before dispatch. */
+export function observeNativePrompts(scope, lifetime) {
+  const observers = new Map();
+  const sources = new Map();
+  const turns = new WeakMap();
+  const headers = {
+    'cache-control': 'no-store',
+    'content-type': 'text/plain; charset=utf-8',
+  };
+  const encoder = new TextEncoder();
+  const sourceKey = (root, principal, requestId) =>
+    JSON.stringify([root, principal, requestId]);
+  const pending = (agent) => [...agent.inbox.nextTurn, ...agent.inbox.nextStep];
+  function messageKey(agent, message) {
+    const { source } = message;
+    const session = agent.session;
+    if (
+      session.header.parentSession ||
+      session.header.isSeeded ||
+      source?.kind !== 'user' ||
+      typeof source.rpcId !== 'string' ||
+      source.principal?.kind !== 'allrice-d-entry'
+    )
+      return undefined;
+    return sourceKey(session.id, source.principal.scopeId, source.rpcId);
+  }
+  const matches = (agent, message) =>
+    sources.get(messageKey(agent, message)) ?? [];
+  scope.on(
+    'agent/inbox/inserted',
+    ({ agent, message }) => {
+      for (const observer of matches(agent, message)) {
+        if (observer.existing.has(message.id) || observer.itemId) continue;
+        observer.itemId = message.id;
+        observer.send('inserted');
+      }
+    },
+    { global: true },
+  );
+  scope.on(
+    'agent/inbox/claimed',
+    ({ agent, message, turn }) => {
+      for (const observer of matches(agent, message)) {
+        if (observer.itemId !== message.id || observer.turn !== undefined)
+          continue;
+        observer.turn = turn;
+        const session = original(agent.session);
+        let active = turns.get(session);
+        if (!active) turns.set(session, (active = new Map()));
+        let claimed = active.get(turn);
+        if (!claimed) active.set(turn, (claimed = new Set()));
+        claimed.add(observer);
+        observer.unclaim = () => {
+          claimed.delete(observer);
+          if (claimed.size === 0) active.delete(turn);
+        };
+        observer.send('claimed');
+      }
+    },
+    { global: true },
+  );
+  scope.on(
+    'agent/inbox/discarded',
+    ({ agent, message }) => {
+      for (const observer of matches(agent, message)) {
+        if (observer.itemId !== message.id) continue;
+        // rc.2 queue edit replaces in place. Queue steer removes and immediately
+        // reinserts the same occurrence in its synchronous native command.
+        queueMicrotask(() => {
+          if (!observers.has(observer.id) || observer.turn !== undefined)
+            return;
+          try {
+            if (!pending(agent).some((item) => item.id === message.id))
+              observer.finish('discarded');
+          } catch {
+            observer.finish(); // Loss of the inbox source cannot prove discard.
+          }
+        });
+      }
+    },
+    { global: true },
+  );
+  scope.on(
+    'session/event',
+    (session, event) => {
+      if (event.type !== 'turn/end') return;
+      for (const observer of turns
+        .get(original(session))
+        ?.get(event.data.turn) ?? [])
+        observer.finish('ended');
+    },
+    { global: true },
+  );
+  return (value, request, peer) => {
+    const notFound = () => new globalThis.Response(null, { status: 404 });
+    if (
+      peer.principal.kind !== 'owner' ||
+      peer.interactions !== 'none' ||
+      typeof value?.id !== 'string' ||
+      value.id.length !== 36 ||
+      typeof value.sessionId !== 'string' ||
+      typeof value.scopeId !== 'string' ||
+      value.scopeId.length !== 36 ||
+      typeof value.requestId !== 'string'
+    )
+      return notFound();
+    const { id, sessionId, scopeId, requestId } = value;
+    const key = sourceKey(sessionId, scopeId, requestId);
+    if (value.action === 'prompt-outcome') {
+      const observer = observers.get(id);
+      return observer?.key === key
+        ? globalThis.Response.json(
+            { inserted: observer.itemId !== undefined },
+            { headers: { 'cache-control': 'no-store' } },
+          )
+        : notFound();
+    }
+    if (observers.has(id)) return notFound();
+    const signal = globalThis.AbortSignal.any([request.signal, lifetime]);
+    signal.throwIfAborted();
+    const agent = scope.agents.get(sessionId);
+    const existing = new Set(
+      agent
+        ? pending(agent)
+            .filter((message) => messageKey(agent, message) === key)
+            .map(({ id }) => id)
+        : [],
+    );
+    for (const observer of sources.get(key) ?? []) {
+      if (observer.itemId) existing.add(observer.itemId);
+    }
+    let close;
+    const body = new ReadableStream({
+      start(controller) {
+        const send = (type) => controller.enqueue(encoder.encode(`${type}\n`));
+        let group = sources.get(key);
+        if (!group) sources.set(key, (group = new Set()));
+        close = () => {
+          if (!observers.delete(id)) return false;
+          signal.removeEventListener('abort', abort);
+          group.delete(observer);
+          if (group.size === 0) sources.delete(key);
+          observer.unclaim?.();
+          return true;
+        };
+        const abort = () => {
+          if (close()) controller.close();
+        };
+        const observer = {
+          id,
+          key,
+          existing,
+          send,
+          finish(type) {
+            if (!close()) return;
+            if (type) send(type);
+            controller.close();
+          },
+        };
+        observers.set(id, observer);
+        group.add(observer);
+        signal.addEventListener('abort', abort, { once: true });
+        send('ready');
+      },
+      cancel() {
+        close?.();
+      },
+    });
+    return new globalThis.Response(body, { headers });
+  };
+}
+
 // Bind continuations when the live native inbox accepts and then claims the
 // exact relayed message. The recorded sender is an actual DSH Agent, and
 // the recipient cannot borrow a parent's earlier turn after sender movement.
@@ -599,21 +772,29 @@ export function applyNativeWebOwner(
           'attachments',
           'sessions',
           'sessionQuery',
+          'agents',
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
           const delegateOrigins = observeDelegatedInputs(scope);
+          const promptFacts = observeNativePrompts(scope, signal);
           scope.connection.fetch.register({
             // Native exact Fetch routes are delivered only to the authenticated
             // owner Peer. This path is consumed by the managed Host transport.
             path: '/api/allrice-managed-model/current',
             methods: ['POST'],
             requestBody: 'buffered',
-            async fetch(request) {
+            async fetch(request, peer) {
               if (!current())
                 return new globalThis.Response(null, { status: 404 });
               const value = await request.json();
+              if (
+                value?.adapterId === id &&
+                (value.action === 'observe-prompt' ||
+                  value.action === 'prompt-outcome')
+              )
+                return promptFacts(value, request, peer);
               if (
                 value?.adapterId !== id ||
                 typeof value?.sessionId !== 'string' ||

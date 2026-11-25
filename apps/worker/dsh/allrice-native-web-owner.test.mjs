@@ -1,5 +1,10 @@
 import { expect, it } from 'vitest';
-import { readRootPromptOrigins } from './allrice-native-web-owner.mjs';
+import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import {
+  observeNativePrompts,
+  readRootPromptOrigins,
+} from './allrice-native-web-owner.mjs';
 
 it('keeps the admitted prompt of a long turn and excludes queued and future input', () => {
   const user = (rpcId) => ({ source: { kind: 'user', rpcId } });
@@ -39,4 +44,122 @@ it('uses the native title source sequence after a later turn has started', () =>
     turn: 1,
     ids: ['first'],
   });
+});
+
+function promptFixture() {
+  const events = new EventEmitter();
+  const agent = {
+    session: { id: 'root', header: {} },
+    inbox: { nextTurn: [], nextStep: [] },
+  };
+  const lifetime = new AbortController();
+  const peer = { principal: { kind: 'owner' }, interactions: 'none' };
+  const request = { signal: new AbortController().signal };
+  const observe = observeNativePrompts(
+    {
+      on: events.on.bind(events),
+      agents: { get: () => agent },
+    },
+    lifetime.signal,
+  );
+  const issue = (scopeId = randomUUID(), requestId = randomUUID()) => ({
+    id: randomUUID(),
+    sessionId: agent.session.id,
+    scopeId,
+    requestId,
+  });
+  const open = (value) =>
+    observe(
+      { ...value, action: 'observe-prompt' },
+      request,
+      peer,
+    ).body.getReader();
+  const outcome = (value) =>
+    observe({ ...value, action: 'prompt-outcome' }, request, peer).json();
+  const message = ({ scopeId, requestId }) => ({
+    id: randomUUID(),
+    source: {
+      kind: 'user',
+      rpcId: requestId,
+      principal: { kind: 'allrice-d-entry', scopeId },
+    },
+  });
+  const emit = (type, message, turn) =>
+    events.emit(`agent/inbox/${type}`, { agent, message, turn });
+  const end = (turn) =>
+    events.emit('session/event', agent.session, {
+      type: 'turn/end',
+      data: { turn },
+    });
+  const next = async (reader) =>
+    new TextDecoder().decode((await reader.read()).value).trim();
+  return { agent, emit, end, issue, message, next, open, outcome, lifetime };
+}
+
+it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
+  const f = promptFixture();
+  const active = f.issue(),
+    queued = f.issue(active.scopeId);
+  const running = f.open(active),
+    waiting = f.open(queued);
+  try {
+    expect(await f.next(running)).toBe('ready');
+    expect(await f.next(waiting)).toBe('ready');
+    const first = f.message(active),
+      second = f.message(queued);
+    f.emit('inserted', first);
+    f.emit('claimed', first, 7);
+    f.agent.inbox.nextTurn = [second];
+    f.emit('inserted', second);
+    expect(await f.next(running)).toBe('inserted');
+    expect(await f.next(running)).toBe('claimed');
+    expect(await f.next(waiting)).toBe('inserted');
+    f.emit('discarded', second);
+    f.emit('inserted', { ...second });
+    f.agent.inbox.nextTurn = [];
+    f.agent.inbox.nextStep = [second];
+    f.emit('discarded', second);
+    f.emit('inserted', second);
+    await Promise.resolve();
+    expect(await f.outcome(queued)).toEqual({ inserted: true });
+    f.agent.inbox.nextStep = [];
+    f.emit('discarded', second);
+    expect(await f.next(waiting)).toBe('discarded');
+    expect((await waiting.read()).done).toBe(true);
+    f.end(8);
+    f.end(7);
+    expect(await f.next(running)).toBe('ended');
+    expect((await running.read()).done).toBe(true);
+  } finally {
+    f.lifetime.abort();
+  }
+});
+
+it('does not adopt a pending retry occurrence or another principal using the same request ID', async () => {
+  const f = promptFixture();
+  const original = f.issue();
+  const item = f.message(original);
+  f.agent.inbox.nextTurn = [item];
+  const retry = f.issue(original.scopeId, original.requestId);
+  const other = f.issue(randomUUID(), original.requestId);
+  const waiting = f.open(retry),
+    different = f.open(other);
+  try {
+    expect(await f.next(waiting)).toBe('ready');
+    expect(await f.next(different)).toBe('ready');
+    f.emit('discarded', item);
+    f.emit('inserted', item);
+    expect(await f.outcome(retry)).toEqual({ inserted: false });
+    expect(await f.outcome(other)).toEqual({ inserted: false });
+    const newItem = f.message(other);
+    f.emit('inserted', newItem);
+    f.emit('claimed', newItem, 1);
+    f.end(1);
+    expect(await f.next(different)).toBe('inserted');
+    expect(await f.next(different)).toBe('claimed');
+    expect(await f.next(different)).toBe('ended');
+    expect(await f.outcome(retry)).toEqual({ inserted: false });
+  } finally {
+    f.lifetime.abort();
+  }
 });

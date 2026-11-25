@@ -9,7 +9,10 @@ import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
-import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
+import {
+  createDEntryPrincipalControl,
+  type PrincipalInvocationObservation,
+} from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import type {
@@ -32,6 +35,10 @@ import type {
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import {
+  observeNativePrompt,
+  type NativePromptObservation,
+} from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
 
@@ -117,9 +124,10 @@ export async function openNativeWebOwner(input: {
       issue: DEntryPrincipalIssue;
       requestId: string;
       mode: 'queue' | 'steer';
+      observe(signal: AbortSignal): NativePromptObservation;
     },
     signal: AbortSignal,
-  ): Promise<() => Promise<void>>;
+  ): Promise<PrincipalInvocationObservation>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -552,14 +560,31 @@ export async function openNativeWebOwner(input: {
               call.args.request.sessionId !== issue.root.nativeSessionId
             )
               throw new PersonVmError('AUTHORIZATION_DENIED');
+            const adapterId = installedModelAdapter;
+            const requestId = call.args.request.requestId;
             return input.beforePrompt(
               {
                 binding,
-                adapterId: installedModelAdapter,
+                adapterId,
                 context,
                 issue,
-                requestId: call.args.request.requestId,
+                requestId,
                 mode: call.args.request.mode,
+                observe(current) {
+                  const observed = observeNativePrompt(
+                    transport,
+                    {
+                      adapterId,
+                      sessionId: issue.root.nativeSessionId,
+                      scopeId: issue.scopeId,
+                      requestId,
+                    },
+                    AbortSignal.any([signal, current]),
+                    input.launch.auth.timeoutMs,
+                  );
+                  own(observed.settled);
+                  return observed;
+                },
               },
               active,
             );
