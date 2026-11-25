@@ -12,11 +12,17 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
+import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { seedPublicImageCache } from './image-cache.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
+
+vi.mock('node:fs/promises', async (original) => {
+  const filesystem = await original<typeof Filesystem>();
+  return { ...filesystem, writeFile: vi.fn(filesystem.writeFile) };
+});
 
 const roots: string[] = [];
 const hash = (contents: Buffer | string) =>
@@ -285,9 +291,14 @@ describe('sealed public OCI cache', () => {
     await link(staged, linked);
     const { ino: inode, nlink } = await lstat(linked);
     expect(nlink).toBe(2);
+    const stagedWrites = vi.mocked(writeFile);
+    stagedWrites.mockClear();
 
     await seedPublicImageCache(f.source, f.image, a.native, active());
 
+    // The cache has four entries. Reuse the installed layer without allocating
+    // a second copy, so retry needs only the space for the other three.
+    expect(stagedWrites).toHaveBeenCalledTimes(3);
     expect(await lstat(linked)).toMatchObject({ ino: inode, nlink: 1 });
     await expect(lstat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(join(a.cache, blobPath), 'utf8')).toBe(blob);

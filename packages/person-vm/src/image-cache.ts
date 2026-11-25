@@ -315,10 +315,11 @@ async function verifyFile(
   path: string,
   expected: CacheFile,
   signal: AbortSignal,
+  sealed: boolean,
   destination?: string,
 ) {
   signal.throwIfAborted();
-  const { file, stat } = await checkedFile(path, destination !== undefined);
+  const { file, stat } = await checkedFile(path, sealed);
   try {
     if (stat.size !== expected.bytes) invalid();
     const hash = createHash('sha256');
@@ -357,13 +358,19 @@ async function verifyFile(
   }
 }
 
-async function privateCacheDirectory(path: string) {
-  try {
-    await mkdir(path, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+async function privateCacheDirectory(path: string, create: boolean) {
+  if (create) {
+    try {
+      await mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
   }
-  const stat = await lstat(path);
+  const stat = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+    if (!create && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!stat) return false;
   if (
     !stat.isDirectory() ||
     stat.uid !== process.getuid?.() ||
@@ -371,6 +378,7 @@ async function privateCacheDirectory(path: string) {
     (await realpath(path)) !== path
   )
     invalid();
+  return true;
 }
 
 async function discardInterruptedStages(root: string, signal: AbortSignal) {
@@ -408,29 +416,50 @@ export async function seedPublicImageCache(
       invalid();
     const files = await readSeed(input, image, signal);
     await discardInterruptedStages(root, signal);
+    const cache = join(root, 'cache');
+    const directories = [
+      cache,
+      ...sourceDirectories.map((name) => join(cache, name)),
+    ];
+    const existingDirectories = new Set<string>();
+    for (const path of directories) {
+      if (await privateCacheDirectory(path, false))
+        existingDirectories.add(path);
+    }
     const stage = await mkdtemp(join(root, '.public-oci-'));
     try {
-      const staged = new Map<string, string>();
+      const staged = new Map<string, { path: string; entry: CacheFile }>();
       for (const [name, entry] of files) {
-        const path = join(stage, String(staged.size));
-        await verifyFile(join(input.directory, name), entry, signal, path);
-        staged.set(name, path);
-      }
-      const cache = join(root, 'cache');
-      await privateCacheDirectory(cache);
-      for (const directory of sourceDirectories)
-        await privateCacheDirectory(join(cache, directory));
-      // No overwrite of old private cache files. Link only from the private
-      // staging directory, never from the shared source. Until every entry
-      // is available, the caller cannot issue a native create.
-      for (const [name, entry] of files) {
-        signal.throwIfAborted();
         const destination = join(cache, name);
+        let exists = false;
+        if (existingDirectories.has(dirname(destination))) {
+          try {
+            await verifyFile(destination, entry, signal, false);
+            exists = true;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+        }
+        const path = exists ? undefined : join(stage, String(staged.size));
+        await verifyFile(
+          join(input.directory, name),
+          entry,
+          signal,
+          true,
+          path,
+        );
+        if (path !== undefined) staged.set(destination, { path, entry });
+      }
+      for (const path of directories) await privateCacheDirectory(path, true);
+      // Link only from private staging. An already verified private entry
+      // needs no second copy, including after an interrupted partial install.
+      for (const [destination, { path, entry }] of staged) {
+        signal.throwIfAborted();
         try {
-          await link(staged.get(name)!, destination);
+          await link(path, destination);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-          await verifyFile(destination, entry, signal);
+          await verifyFile(destination, entry, signal, false);
         }
       }
     } finally {
