@@ -311,6 +311,7 @@ async function receiptFixture() {
   });
   vi.spyOn(provisioner, 'install').mockResolvedValue(undefined);
   vi.spyOn(provisioner, 'remove').mockResolvedValue(undefined);
+  const prepareNormally = gateway.prepare.bind(gateway);
   const prepare = vi.spyOn(gateway, 'prepare'),
     revoke = vi.spyOn(gateway, 'revoke');
   await input.vm.create(entry.context, signal());
@@ -320,6 +321,7 @@ async function receiptFixture() {
     entry,
     gateway,
     prepare,
+    prepareNormally,
     revoke,
     prepareWeb,
     startFailure,
@@ -598,9 +600,8 @@ it('passes a late cancelled egress receipt to service cleanup before detach', as
   const { vm, providers } = value.input();
   const context = value.entry.context;
   const controller = new AbortController();
-  const prepareNormally = value.prepare.getMockImplementation()!;
   value.prepare.mockImplementationOnce(async (...args) => {
-    const receipt = await prepareNormally(...args);
+    const receipt = await value.prepareNormally(...args);
     controller.abort(new PersonVmError('RUNTIME_NOT_READY'));
     return receipt;
   });
