@@ -148,7 +148,11 @@ suite(
             throw Error('Model must resolve the actual call login');
           },
           async allow(current, _binding, route, signal) {
-            expect(current).toEqual(callContext);
+            expect(current.sessionId).toBe(callContext.sessionId);
+            expect(current).toEqual(
+              calls.find((call) => call.context.requestId === current.requestId)
+                ?.context,
+            );
             expect(route).toBe('model');
             await allow?.(signal);
           },
@@ -387,7 +391,12 @@ suite(
         signal.throwIfAborted();
       });
       const request = f.post(undefined, new AbortController().signal);
-      await entered.promise;
+      expect(
+        await Promise.race([
+          entered.promise.then(() => true),
+          request.then(() => false),
+        ]),
+      ).toBe(true);
       cancel.abort();
       await stopped.promise;
       await request;
