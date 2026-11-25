@@ -224,9 +224,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           requireLiveAgent: true,
           signal: active,
         });
+        if (!('nativeAddress' in resource) || !resource.nativeAddress)
+          return reject();
         const attempt = await profile.owner.readNativeAttemptFor(
           context,
-          sessionId,
+          resource.nativeAddress,
           active,
           kind,
         );
@@ -449,7 +451,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               target,
               active,
             );
-            await input.assertRouteCurrent(active);
+            await readAuthorizedCall(call, active);
             active.throwIfAborted();
             return image;
           });

@@ -348,6 +348,7 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
     signal: new AbortController().signal,
     root: pin,
     requireRunning: true,
+    requireLiveAgent: true,
   };
   state(false, true);
   await expect(resolveDEntryNativeResource(modelRequest)).rejects.toMatchObject(
@@ -364,5 +365,11 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
     threadId: identity.threadId,
     parentNativeSessionId: root,
     nativeSessionId: id,
+    nativeAddress: {
+      kind: 'subagent',
+      parentSessionId: root,
+      childSessionId: id,
+      mode: 'unknown',
+    },
   });
 });

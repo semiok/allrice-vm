@@ -258,7 +258,7 @@ it.skipIf(!cli)(
           provider: 'openai-codex',
           id: 'fixture-codex',
           name: 'fixture-codex',
-          input: ['text', 'image'],
+          inputModalities: ['text', 'image'],
         },
       },
     );
@@ -270,7 +270,7 @@ it.skipIf(!cli)(
     readAttempt.resolve(async (requested, kind) => {
       const attempt = await f.owner.readNativeAttemptFor(
         f.context,
-        requested,
+        { kind: 'session', sessionId: SessionId(requested) },
         signal,
         kind,
       );

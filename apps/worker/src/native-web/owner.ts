@@ -15,6 +15,7 @@ import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import type {
   ModelCatalog,
   SessionFollowFrame,
+  SessionAddress,
   SessionCreateRequest,
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import {
@@ -603,7 +604,7 @@ export async function openNativeWebOwner(input: {
       },
       readNativeAttemptFor(
         context: RequestContext,
-        nativeSessionId: string,
+        address: SessionAddress,
         caller: AbortSignal,
         kind: NativeModelAttemptKind = 'assistant',
       ) {
@@ -621,7 +622,7 @@ export async function openNativeWebOwner(input: {
               .create()
               .parse({
                 request: {
-                  address: { kind: 'session', sessionId: nativeSessionId },
+                  address,
                   maxMessages: kind === 'assistant' ? 1 : 4,
                   assistantStream: true,
                 },
@@ -640,7 +641,10 @@ export async function openNativeWebOwner(input: {
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
                   adapterId: installedModelAdapter,
-                  sessionId: nativeSessionId,
+                  sessionId:
+                    address.kind === 'session'
+                      ? address.sessionId
+                      : address.childSessionId,
                   purpose: kind,
                 }),
                 active,

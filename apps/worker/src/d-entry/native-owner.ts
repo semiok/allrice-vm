@@ -12,7 +12,10 @@ import {
 } from '@allrice/contracts';
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
-import type { SessionListValue } from '@deepseek-ai/dsh-api-session-controller/types';
+import type {
+  SessionAddress,
+  SessionListValue,
+} from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { DataAccessError, getDEntryNativeRootPin } from '@allrice/database';
 
@@ -252,7 +255,7 @@ export async function resolveDEntryNativeResource(input: {
   const grants = input.checkGrants;
   if (grants)
     grants.checked(grants.nativeSessionIds.every((id) => !!lineage(id)));
-  return DEntryNativeResourceFactsSchema.parse({
+  const facts = DEntryNativeResourceFactsSchema.parse({
     organizationId: identity.organizationId,
     personId: identity.personId,
     employeeInstanceId: identity.employeeInstanceId,
@@ -262,4 +265,18 @@ export async function resolveDEntryNativeResource(input: {
     parentNativeSessionId: resource.parent,
     bindingRef: owner.bindingRef,
   });
+  if (!input.requireLiveAgent || !currentSession) return facts;
+  let nativeAddress: SessionAddress;
+  if (currentSession.origin === 'subagent') {
+    if (!currentSession.parentSessionId) return deny();
+    nativeAddress = {
+      kind: 'subagent',
+      parentSessionId: currentSession.parentSessionId,
+      childSessionId: currentSession.sessionId,
+      mode: 'unknown',
+    };
+  } else {
+    nativeAddress = { kind: 'session', sessionId: currentSession.sessionId };
+  }
+  return { ...facts, nativeAddress };
 }
