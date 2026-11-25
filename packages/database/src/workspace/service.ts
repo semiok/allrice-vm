@@ -386,7 +386,7 @@ export async function ensureDefaultEmployee(
     `;
     const version = versions[0];
     if (!version) throw new Error('published Rice version is missing');
-    await transaction`
+    const [changed] = await transaction<{ user_id: string }[]>`
       insert into allrice_employee_assignments (
         organization_id, workspace_id, employee_id, employee_version_id,
         user_id, is_default, active
@@ -416,12 +416,18 @@ export async function ensureDefaultEmployee(
           else allrice_employee_assignments.employee_version_id
         end,
         updated_at = now() where allrice_employee_assignments.selection_mode<>'exclude'
+      returning user_id
     `;
-    await notifyNativeRosterInsert(
-      transaction,
-      'allrice_employee_assignments',
-      { organizationId: context.organizationId, workspaceId, personId: userId },
-    );
+    if (changed)
+      await notifyNativeRosterInsert(
+        transaction,
+        'allrice_employee_assignments',
+        {
+          organizationId: context.organizationId,
+          workspaceId,
+          personId: changed.user_id,
+        },
+      );
     const rows = await transaction<AssignmentRow[]>`
       select
         a.id as assignment_id, a.employee_id, a.employee_version_id,

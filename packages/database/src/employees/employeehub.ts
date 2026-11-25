@@ -1,4 +1,7 @@
-import { notifyNativeRosterInsert } from './native-roster-notification.ts';
+import {
+  notifyNativeRosterInsert,
+  notifyNativeRosterInserts,
+} from './native-roster-notification.ts';
 import { brandMediaTools, type BrandMediaInvocation } from '@allrice/contracts';
 import {
   freezeEmployeeMemoryIndexV2,
@@ -935,8 +938,9 @@ export async function manageEmployeeAssignments(
       '管理员已移除本人的 AI 员工',
       context,
     );
+    const affectedPeople: string[] = [];
     for (const assignedUserId of userIds) {
-      await transaction`
+      const [assigned] = await transaction<{ user_id: string }[]>`
         insert into allrice_employee_assignments (
           organization_id, workspace_id, employee_id, employee_version_id,
           user_id, is_default, active, assigned_by, assigned_at, selection_mode
@@ -949,14 +953,16 @@ export async function manageEmployeeAssignments(
         do update set employee_version_id = excluded.employee_version_id,
           active = true, selection_mode='include', assigned_by = excluded.assigned_by,
           assigned_at = excluded.assigned_at, updated_at = now()
+        returning user_id
       `;
+      if (assigned) affectedPeople.push(assigned.user_id);
     }
-    if (userIds.length)
-      await notifyNativeRosterInsert(
-        transaction,
-        'allrice_employee_assignments',
-        { organizationId: context.organizationId, workspaceId },
-      );
+    await notifyNativeRosterInserts(
+      transaction,
+      'allrice_employee_assignments',
+      { organizationId: context.organizationId, workspaceId },
+      affectedPeople,
+    );
     await transaction`
       update allrice_chat_sessions session
       set employee_version_id = assignment.employee_version_id

@@ -39,7 +39,10 @@ import {
 import { randomUUID } from 'node:crypto';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { EmployeeInstanceProfileSchema } from '@allrice/contracts';
+import {
+  DefaultPartnerProfile,
+  EmployeeInstanceProfileSchema,
+} from '@allrice/contracts';
 import * as client from '../core/client.ts';
 import * as queue from '../execution/queue.ts';
 import * as accessCancellation from './employee-access-cancellation.ts';
@@ -95,6 +98,7 @@ import {
   listHistoricalEmployeeInstances,
 } from './employee-instances.ts';
 import {
+  createEmployee,
   manageEmployeeAssignments,
   updateEmployeeStatus,
 } from './employeehub.ts';
@@ -279,6 +283,69 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
       expect(current.digest).not.toBe(existing.digest);
       expect(current.entries).toContainEqual(
         expect.objectContaining({ employeeInstanceId: created.id }),
+      );
+    } finally {
+      await subscription.unlisten();
+    }
+  });
+  it('publishes exact affected people for inherited and explicitly managed employee assignments', async () => {
+    const f = await setup();
+    vi.stubEnv(
+      'ALLRICE_PLATFORM_ADMIN_EMAILS',
+      `${f.admin.user.email},${f.a.user.email}`,
+    );
+    const created = await createEmployee(f.a.context, {
+      workspaceId: f.a.workspaceId,
+      name: 'Explicit employee assignment',
+      description: 'Synthetic roster notification regression',
+      partnerProfile: DefaultPartnerProfile,
+    });
+    const [current] = await fixture.db<{ schema: string; slug: string }[]>`
+      select current_schema() as schema, slug from allrice_organizations where id=${f.a.organizationId}`;
+    if (!current) throw Error('missing synthetic organization');
+    const personIds: (string | null)[] = [];
+    const subscription = await fixture.db.listen(
+      'allrice_d_entry_authority',
+      (payload) => {
+        const notice = JSON.parse(payload);
+        if (
+          notice.schema === current.schema &&
+          notice.organizationId === f.a.organizationId &&
+          notice.workspaceId === f.a.workspaceId &&
+          notice.table === 'allrice_employee_assignments' &&
+          notice.id === null
+        )
+          personIds.push(notice.personId);
+      },
+    );
+    try {
+      // Real membership provisioning synchronizes the existing deployment and
+      // has just one newly affected person among the existing workspace members.
+      const newcomer = await principal(current.slug);
+      expect(
+        await fixture.db`
+        select id from allrice_employee_assignments
+        where user_id=${newcomer.user.id} and employee_id=${f.assignment.employeeId} and active`,
+      ).toHaveLength(1);
+      await vi.waitFor(() => expect(personIds).toEqual([newcomer.user.id]));
+
+      personIds.length = 0;
+      // The explicit assignment touches a current owner and adds a new member.
+      // The other active person in this workspace has no assignment to this employee.
+      await manageEmployeeAssignments(f.a.context, {
+        workspaceId: f.a.workspaceId,
+        employeeId: created.employeeId,
+        userIds: [f.a.user.id, f.b.user.id],
+      });
+      expect(
+        await fixture.db`
+        select user_id from allrice_employee_assignments
+        where employee_id=${created.employeeId} and active`,
+      ).toHaveLength(2);
+      await vi.waitFor(() =>
+        expect(personIds.toSorted()).toEqual(
+          [f.a.user.id, f.b.user.id].toSorted(),
+        ),
       );
     } finally {
       await subscription.unlisten();

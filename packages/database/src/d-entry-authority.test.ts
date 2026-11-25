@@ -215,6 +215,12 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
       change({ table: 'allrice_users', id: randomUUID() });
       change({ table: 'allrice_organizations', id: randomUUID() });
       change({
+        table: 'allrice_employee_assignments',
+        personId: randomUUID(),
+        organizationId: identity.organizationId,
+        workspaceId: identity.workspaceId,
+      });
+      change({
         table: 'allrice_employee_instances',
         id: identity.employeeInstanceId,
         personId: identity.personId,

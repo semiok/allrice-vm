@@ -181,8 +181,8 @@ function affectsRoster(change: Change, identity: DEntryIdentity) {
     case 'allrice_memberships':
     case 'allrice_employee_assignments':
     case 'allrice_employee_instances':
-      // Whole VM rosters cover eligible sibling workspaces. Bulk insertion
-      // hints can identify the workspace without a single affected person.
+      // Whole VM rosters cover eligible sibling workspaces. Older writers may
+      // publish only the workspace during a deployment overlap.
       return (
         organizationId === identity.organizationId &&
         (!personId || personId === identity.personId)
