@@ -718,6 +718,12 @@ suite('installed native employee panels with synthetic business owner', () => {
     expect((await evidence()).ownerBound).toBe(true);
     expect(await entries.getByRole('button').count()).toBe(4);
     expect(await files.locator('span[aria-hidden="true"]').count()).toBe(0);
+    await files.click();
+    await body(page, 'files').waitFor({ state: 'visible' });
+    await entries
+      .getByRole('button', { name: '企业资料', exact: true })
+      .click();
+    await body(page, 'materials').waitFor({ state: 'visible' });
     await command('unknownFiles', false);
     await entries
       .getByRole('button', { name: '交付成果，5 项新增', exact: true })

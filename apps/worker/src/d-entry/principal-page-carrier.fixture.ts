@@ -102,14 +102,21 @@ export async function fixture(release?: ProfileProof) {
   };
   closes.push(() => host.close());
   const service = new AbortController();
+  // Like native-web/owner, keep the guest cleanup transport alive when
+  // Worker HTTP admission and its owned connections are stopped.
+  const carrier = new AbortController();
   const control = createDEntryPrincipalControl(host.node, {
-    carrier: service.signal,
+    carrier: carrier.signal,
     cleanupTimeoutMs: 3000,
   });
   let controlCloseChecked = false;
-  closes.push(() =>
-    controlCloseChecked ? control.drainLocal() : control.close(),
-  );
+  closes.push(async () => {
+    try {
+      await (controlCloseChecked ? control.drainLocal() : control.close());
+    } finally {
+      carrier.abort();
+    }
+  });
   const profileObserved = vi.fn<(part: 'item' | 'terminal') => void>();
   vi.mocked(f.owner.acquirePrincipal).mockImplementation((_, input, active) => {
     const activity = control.acquire(input, active);
@@ -276,9 +283,18 @@ export async function fixture(release?: ProfileProof) {
   const workerOrigin = await listen(worker);
   vi.stubEnv('ALLRICE_WORKER_INTERNAL_URL', workerOrigin);
   closes.push(async () => {
-    await Promise.all([mux.close(), rpc.close(), profile.close()]);
+    const handlers = [mux.close(), rpc.close(), profile.close()];
+    service.abort();
+    const stopped = new Promise<void>((resolve, reject) =>
+      worker.close((error) => (error ? reject(error) : resolve())),
+    );
     worker.closeAllConnections();
-    await new Promise<void>((resolve) => worker.close(() => resolve()));
+    const results = await Promise.allSettled([...handlers, stopped]);
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length)
+      throw new AggregateError(failures, 'Worker fixture shutdown failed');
   });
   const web = createServer();
   const origin = await listen(web);

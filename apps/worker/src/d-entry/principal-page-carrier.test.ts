@@ -400,12 +400,16 @@ it.each(['full reply', 'peer disconnect'] as const)(
       if (serverSocket) {
         if (request.socket !== serverSocket) return;
         f.worker.off('request', observe);
-        response.once('socket', () => {
-          vi.mocked(f.owner.assertCurrent).mockImplementationOnce(async () => {
-            successorChecking.resolve();
-            await allowSuccessor.promise;
+        if (outcome === 'full reply') {
+          response.once('socket', () => {
+            vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+              async () => {
+                successorChecking.resolve();
+                await allowSuccessor.promise;
+              },
+            );
           });
-        });
+        }
         function queued(event: string | symbol) {
           if (event !== 'socket') return;
           response.off('newListener', queued);
