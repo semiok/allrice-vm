@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { modelBinding } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
-import type { ResolveProductionDEntrySendRoute } from './production-dentry-source.js';
+import type {
+  installProductionDEntrySource,
+  ResolveProductionDEntrySendRoute,
+} from './production-dentry-source.js';
+import type { createProductionEgressAuthority } from './production-egress-authority.js';
 import type { createProductionCodexRuntime as loadCodexRuntime } from './production-codex-runtime.js';
 import {
   createProductionPersonVmSources,
@@ -11,14 +15,8 @@ import {
 
 const io = vi.hoisted(() => ({
   codex: vi.fn<typeof loadCodexRuntime>(),
-  entry:
-    vi.fn<
-      typeof import('./production-dentry-source.js').installProductionDEntrySource
-    >(),
-  egress:
-    vi.fn<
-      typeof import('./production-egress-authority.js').createProductionEgressAuthority
-    >(),
+  entry: vi.fn<typeof installProductionDEntrySource>(),
+  egress: vi.fn<typeof createProductionEgressAuthority>(),
 }));
 vi.mock('./production-codex-runtime.js', () => ({
   createProductionCodexRuntime: io.codex,
