@@ -293,7 +293,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     const c = this.options.readonlyDshDirectory;
     if (!c) return;
-    const descriptorSha256 = await verifyReadonlyDshDirectory(
+    const artifact = await verifyReadonlyDshDirectory(
       c,
       this.options.image,
       signal,
@@ -308,9 +308,10 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       c,
       create,
       signal,
-      descriptorSha256,
+      artifact.descriptorSha256,
       controls,
     );
+    return artifact;
   }
   private async assertArtifact(
     binding: PersonVmBinding,
@@ -333,6 +334,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       running,
       this.options.readonlyCommandMemoryDirectory,
     );
+    return artifact.value?.sandboxBin;
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
     // Both reads can overlap under the same owner. Join the native CLI even
@@ -573,15 +575,35 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   async bootstrap(scope: PersonVmStartingScope, plan: PersonVmMemoryGuestPlan) {
     const paths = this.homes.get(scope.binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
-    if (this.options.readonlyCommandMemoryDirectory)
-      await this.assertArtifact(scope.binding, scope.signal);
+    const readonly = this.options.readonlyDshDirectory;
+    const controls = this.options.readonlyCommandMemoryDirectory;
+    // Earlier artifacts need no added native inspection. An enabled backend
+    // must come from the exact active read-only mount for this binding.
+    let sandboxBin: string | undefined;
+    if (controls) {
+      sandboxBin = await this.assertArtifact(scope.binding, scope.signal);
+    } else if (
+      readonly &&
+      (
+        await verifyReadonlyDshDirectory(
+          readonly,
+          this.options.image,
+          scope.signal,
+        )
+      ).sandboxBin
+    ) {
+      sandboxBin = await this.assertArtifact(scope.binding, scope.signal);
+    }
     return bootstrapMicrosandbox({
       scope,
       plan,
       name: this.name(scope.binding),
       stagingRoot: paths.userHome,
-      readonlyCommandMemoryDirectory:
-        this.options.readonlyCommandMemoryDirectory?.guestDirectory,
+      readonlyCommandMemoryDirectory: controls?.guestDirectory,
+      ...(readonly &&
+        sandboxBin && {
+          dshSandbox: { guestDirectory: readonly.guestDirectory, sandboxBin },
+        }),
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,
       command: (args, signal, readNonzeroExit) =>
         this.command(scope.binding, args, signal, readNonzeroExit),

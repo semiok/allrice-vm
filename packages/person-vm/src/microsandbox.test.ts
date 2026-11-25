@@ -200,7 +200,7 @@ save();
 
 const readonlyImage =
   'docker.io/library/node@sha256:af0bb4bf5b7318e3269417a7684a9e116c3c22eaf05382578b0d0d33de597ad2';
-async function readonlyFixture() {
+async function readonlyFixture(withSandbox = false) {
   const root = await directory(),
     artifactSha256 = createHash('sha256')
       .update('synthetic archive')
@@ -222,6 +222,13 @@ async function readonlyFixture() {
   });
   for (const name of bins)
     await symlink('../code.js', join(hostDirectory, 'node_modules/.bin', name));
+  const sandboxCode = 'synthetic runner fixture';
+  if (withSandbox) {
+    const bin = join(hostDirectory, 'sandbox-bin');
+    await mkdir(bin, { mode: 0o700 });
+    await writeFile(join(bin, 'bwrap'), sandboxCode, { mode: 0o555 });
+    await chmod(bin, 0o555);
+  }
   const files = [
     { path: 'node_modules', kind: 'directory', mode: 0o755 },
     { path: 'node_modules/.bin', kind: 'directory', mode: 0o755 },
@@ -268,6 +275,18 @@ async function readonlyFixture() {
     nodeVersion: '22.23.2',
     publisherSha256: 'a'.repeat(64),
     gateSha256: 'b'.repeat(64),
+    ...(withSandbox && {
+      sandboxBackend: {
+        kind: 'bubblewrap',
+        path: 'sandbox-bin/bwrap',
+        mode: 0o555,
+        architecture: 'arm64',
+        packageVersion: '0.8.0-2+deb12u1',
+        packageSha256:
+          'd044ba1d7961d835669035fcd1e11121f1dc960a1a2e1c6489a93ea44e083557',
+        sha256: createHash('sha256').update(sandboxCode).digest('hex'),
+      },
+    }),
   });
   await writeFile(c.descriptorPath, descriptor, { mode: 0o444 });
   await chmod(release, 0o555);
@@ -612,6 +631,52 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     await f.native.stop(binding, signal());
     expect(await f.native.status(binding, signal())).toBe('stopped');
   });
+  it.each([false, true])(
+    'passes only a verified bundled runner to the exact native DSH process (bundle present = %s)',
+    async (withSandbox) => {
+      const c = await readonlyFixture(withSandbox);
+      const f = await bootstrapFixture('ok', c);
+      const cli =
+        c.guestDirectory + '/node_modules/@deepseek-ai/dsh/lib/bin.js';
+      const other = '/work/other.cjs';
+      f.h.runtime.start = async (_binding, _signal, scope) => {
+        for (const path of [cli, other]) {
+          const job = await scope.launch({
+            executable: 'node',
+            args: [path],
+            env: { DSH_HOME: '/work/employee-a', PATH: '/work/caller-path' },
+          });
+          expect(await job.wait(signal())).toEqual({
+            exitCode: 0,
+            timedOut: false,
+          });
+        }
+      };
+      await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
+      const calls = await f.calls();
+      const launches = calls.filter((args) => args[0] === 'exec');
+      const dsh = launches.find((args) => args.at(-1) === cli);
+      const otherNode = launches.find((args) => args.at(-1) === other);
+      const readPath = (args?: string[]) =>
+        args?.filter(
+          (arg, index) =>
+            args[index - 1] === '--env' && arg.startsWith('PATH='),
+        );
+      expect(readPath(dsh)).toEqual([
+        withSandbox
+          ? 'PATH=' +
+            c.guestDirectory +
+            '/sandbox-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+          : 'PATH=/work/caller-path',
+      ]);
+      expect(readPath(otherNode)).toEqual(['PATH=/work/caller-path']);
+      expect(
+        launches
+          .filter((args) => args !== dsh && args !== otherNode)
+          .every((args) => readPath(args)?.length === 0),
+      ).toBe(true);
+    },
+  );
   it('source qualification失败不pull/create/start；真实prepare/status和失败detach仍可收敛', async () => {
     const c = await readonlyFixture();
     await chmod(dirname(c.hostDirectory), 0o755);

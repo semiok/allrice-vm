@@ -18,6 +18,10 @@ import {
 } from './native-web-auth.ts';
 import { COMMAND_MEMORY_STATE_ROOT } from './readonly-artifact.ts';
 
+const BASE_IMAGE_PATH =
+  '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+const DSH_CLI = 'node_modules/@deepseek-ai/dsh/lib/bin.js';
+
 const prepareCommandMemoryState = String.raw`
 const fs = require('node:fs');
 const state = process.argv[1];
@@ -244,6 +248,7 @@ export async function bootstrapMicrosandbox(input: {
   name: string;
   cleanupTimeoutMs: number;
   readonlyCommandMemoryDirectory?: string;
+  dshSandbox?: Readonly<{ guestDirectory: string; sandboxBin: string }>;
   command: NativeCommand;
 }): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>> {
   const { scope, name, command } = input;
@@ -394,10 +399,21 @@ export async function bootstrapMicrosandbox(input: {
         )
       )
         throw new PersonVmError('PROVIDER_FAILED');
+      const env = { ...spec.env, ...plan.env };
+      const sandbox = input.dshSandbox;
+      if (
+        sandbox &&
+        spec.executable === 'node' &&
+        spec.args[0] === posix.join(sandbox.guestDirectory, DSH_CLI)
+      ) {
+        // rc.2's native provider resolves and functionally probes bwrap from
+        // the DSH process PATH. No command or model environment can supply it.
+        env.PATH = sandbox.sandboxBin + ':' + BASE_IMAGE_PATH;
+      }
       return spawn({
         executable: plan.launcher,
         args: [spec.executable, ...spec.args],
-        env: { ...spec.env, ...plan.env },
+        env,
         ...(spec.workdir ? { workdir: spec.workdir } : {}),
       });
     },
