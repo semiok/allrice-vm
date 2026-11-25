@@ -514,12 +514,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         }
       }
       const uninstallPrompt = host.startup.installModelPromptObserver(
-        (
-          { binding, adapterId, context, issue, requestId, mode, observe },
-          signal,
-        ) =>
+        (request, signal) =>
           run(signal, async (active) => {
             active.throwIfAborted();
+            const { binding, adapterId, context, issue } = request;
             const { identity } = issue;
             if (issue.access !== 'execute' || !identity.threadId)
               return reject();
@@ -540,6 +538,67 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               root.rootOriginDigest !== issue.root.rootOriginDigest
             )
               return reject();
+            const authorityKey = JSON.stringify([
+              adapterId,
+              profile.owner.nativeInstanceId,
+              profile.bindingRef,
+              profile.receipt.rosterDigest,
+              binding.vmId,
+              binding.instanceId,
+              binding.leaseEpoch,
+              binding.organizationId,
+              binding.personId,
+              identity.organizationId,
+              identity.workspaceId,
+              identity.personId,
+              identity.employeeInstanceId,
+              identity.employeeRevision,
+              identity.employeeVersionId,
+              identity.threadId,
+              root.rootNativeSessionId,
+              root.rootBindingRef,
+              root.rootOriginDigest,
+              context.sessionId,
+            ]);
+            async function assertWakeOwner(current: AbortSignal) {
+              const wake = await profile.owner.readNativeRootWakeFor(
+                context,
+                root.rootNativeSessionId,
+                current,
+              );
+              if (wake.kind === 'clear') return;
+              const claimed =
+                wake.kind === 'delegated' &&
+                findPromptContributors(
+                  adapterId,
+                  root.rootNativeSessionId,
+                  binding,
+                  wake.promptIds,
+                );
+              if (!claimed || claimed.first.authorityKey !== authorityKey)
+                throw new PersonVmError('VM_ACTIVE');
+              await Promise.all(
+                claimed.contributors.map((member) =>
+                  member.assertClaimed(current),
+                ),
+              );
+            }
+            if (request.endpoint === 'session/updateQueue') {
+              const current = AbortSignal.any([active, profile.revoked]);
+              current.throwIfAborted();
+              if (
+                conflictingLogin(adapterId, root.rootNativeSessionId, context)
+              )
+                throw new PersonVmError('VM_ACTIVE');
+              await assertWakeOwner(current);
+              current.throwIfAborted();
+              if (
+                conflictingLogin(adapterId, root.rootNativeSessionId, context)
+              )
+                throw new PersonVmError('VM_ACTIVE');
+              return;
+            }
+            const { requestId, mode, observe } = request;
             const requestKey = promptKey(
               adapterId,
               root.rootNativeSessionId,
@@ -584,28 +643,6 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 active,
               );
               const route = await input.assertRouteCurrent(active);
-              const authorityKey = JSON.stringify([
-                adapterId,
-                profile.owner.nativeInstanceId,
-                profile.bindingRef,
-                profile.receipt.rosterDigest,
-                binding.vmId,
-                binding.instanceId,
-                binding.leaseEpoch,
-                binding.organizationId,
-                binding.personId,
-                identity.organizationId,
-                identity.workspaceId,
-                identity.personId,
-                identity.employeeInstanceId,
-                identity.employeeRevision,
-                identity.employeeVersionId,
-                identity.threadId,
-                root.rootNativeSessionId,
-                root.rootBindingRef,
-                root.rootOriginDigest,
-                context.sessionId,
-              ]);
               const authority = acquirePromptWatch(authorityKey, (watching) =>
                 watchDEntryNativeRosterAuthority(
                   context,
@@ -707,30 +744,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   // Loss of the carrier proves neither discard nor turn end.
                 });
               await waitForPromptFact(observation.ready, admission);
-              if (mode === 'steer') {
-                const wake = await profile.owner.readNativeRootWakeFor(
-                  context,
-                  scope.root,
-                  admission,
-                );
-                if (wake.kind !== 'clear') {
-                  const claimed =
-                    wake.kind === 'delegated' &&
-                    findPromptContributors(
-                      adapterId,
-                      scope.root,
-                      binding,
-                      wake.promptIds,
-                    );
-                  if (!claimed || claimed.first.authorityKey !== authorityKey)
-                    throw new PersonVmError('VM_ACTIVE');
-                  await Promise.all(
-                    claimed.contributors.map((member) =>
-                      member.assertClaimed(admission),
-                    ),
-                  );
-                }
-              }
+              if (mode === 'steer') await assertWakeOwner(admission);
               admission.throwIfAborted();
               return {
                 async undispatched() {

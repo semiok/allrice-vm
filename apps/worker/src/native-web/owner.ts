@@ -140,12 +140,17 @@ export async function openNativeWebOwner(input: {
       adapterId: string;
       context: RequestContext;
       issue: DEntryPrincipalIssue;
-      requestId: string;
-      mode: 'queue' | 'steer';
-      observe(signal: AbortSignal): NativePromptObservation;
-    },
+    } & (
+      | {
+          endpoint: 'session/prompt';
+          requestId: string;
+          mode: 'queue' | 'steer';
+          observe(signal: AbortSignal): NativePromptObservation;
+        }
+      | { endpoint: 'session/updateQueue' }
+    ),
     signal: AbortSignal,
-  ): Promise<PrincipalInvocationObservation>;
+  ): Promise<PrincipalInvocationObservation | undefined>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -570,7 +575,11 @@ export async function openNativeWebOwner(input: {
           issue,
           AbortSignal.any([requestSignal, signal]),
           async (call, active) => {
-            if (call.endpoint !== 'session/prompt' || !input.beforePrompt)
+            if (
+              !input.beforePrompt ||
+              (call.endpoint !== 'session/prompt' &&
+                call.endpoint !== 'session/updateQueue')
+            )
               return;
             if (
               !context ||
@@ -579,13 +588,17 @@ export async function openNativeWebOwner(input: {
             )
               throw new PersonVmError('AUTHORIZATION_DENIED');
             const adapterId = installedModelAdapter;
+            const write = { binding, adapterId, context, issue };
+            if (call.endpoint === 'session/updateQueue')
+              return input.beforePrompt(
+                { ...write, endpoint: call.endpoint },
+                active,
+              );
             const requestId = call.args.request.requestId;
             return input.beforePrompt(
               {
-                binding,
-                adapterId,
-                context,
-                issue,
+                ...write,
+                endpoint: call.endpoint,
                 requestId,
                 mode: call.args.request.mode,
                 observe(current) {

@@ -119,6 +119,7 @@ it.skipIf(!cli)(
     const observing = new AbortController();
     const accepted = new Map<string, Promise<boolean>[]>();
     const observations = new Map<string, NativePromptObservation[]>();
+    let promptLogin: string | undefined;
     let assistantReferences = 0;
     const server = createServer((request, response) => {
       void (async () => {
@@ -169,7 +170,14 @@ it.skipIf(!cli)(
           inputModalities: ['text'],
         },
       },
-      async ({ requestId, observe }) => {
+      async (request) => {
+        if (request.endpoint === 'session/updateQueue') {
+          if (request.context.sessionId !== promptLogin)
+            throw new PersonVmError('VM_ACTIVE');
+          return;
+        }
+        promptLogin ??= request.context.sessionId;
+        const { requestId, observe } = request;
         const observation = observe(observing.signal);
         const group = observations.get(requestId) ?? [];
         group.push(observation);
@@ -262,11 +270,15 @@ it.skipIf(!cli)(
         typeof item.id !== 'string'
       )
         throw Error('Native inbox item ID unavailable');
-      expect(
-        await scope.invoke(
+      const updateQueue = (
+        target: typeof scope,
+        scopeId: string,
+        action: unknown,
+      ) =>
+        target.invoke(
           {
             endpoint: 'session/updateQueue',
-            scopeId: issue.scopeId,
+            scopeId,
             args: NATIVE_REMOTE.methods['session/updateQueue']
               .input({ strict: true })
               .create()
@@ -274,12 +286,47 @@ it.skipIf(!cli)(
                 request: {
                   sessionId,
                   itemId: item.id,
-                  action: { kind: 'remove' },
+                  action,
                 },
               }),
           },
           signal,
-        ),
+        );
+      const otherIssue = { ...issue, scopeId: randomUUID() };
+      const other = f.owner.acquirePrincipal(otherIssue, signal, {
+        ...f.context,
+        sessionId: randomUUID(),
+      });
+      try {
+        const otherScope = await other.run(signal);
+        for (const action of [
+          {
+            kind: 'edit',
+            content: [{ type: 'text', text: 'Different login' }],
+          },
+          { kind: 'remove' },
+          { kind: 'steer' },
+        ]) {
+          await expect(
+            updateQueue(otherScope, otherIssue.scopeId, action),
+          ).rejects.toHaveProperty('code', 'VM_ACTIVE');
+        }
+        const unchanged = await scope.invoke(
+          {
+            endpoint: 'session/projections',
+            scopeId: issue.scopeId,
+            args: { request: { sessionId } },
+          },
+          signal,
+        );
+        expect(unchanged).toMatchObject({
+          value: { values: { inbox: { 'next-turn': [item] } } },
+        });
+      } finally {
+        await other.close();
+      }
+      expect(
+        await updateQueue(scope, issue.scopeId, { kind: 'remove' }),
       ).toEqual({ endpoint: 'session/updateQueue', value: { accepted: true } });
       await expect(
         waitForPromptFact(observations.get(queuedId)![0]!.settled, signal),

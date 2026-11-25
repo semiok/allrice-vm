@@ -137,14 +137,15 @@ async function setup() {
   );
   return {
     readRootWake,
-    admit(
+    async admit(
       context: RequestContext,
       requestId: string,
       native: ReturnType<typeof nativeFacts>,
       mode: 'queue' | 'steer' = 'queue',
     ) {
-      return observed(
+      const result = await observed(
         {
+          endpoint: 'session/prompt',
           binding,
           adapterId: 'adapter',
           context,
@@ -152,6 +153,20 @@ async function setup() {
           requestId,
           mode,
           observe: () => native.observation,
+        },
+        lifetime.signal,
+      );
+      if (!result) throw Error('prompt observation unavailable');
+      return result;
+    },
+    updateQueue(context: RequestContext) {
+      return observed(
+        {
+          endpoint: 'session/updateQueue',
+          binding,
+          adapterId: 'adapter',
+          context,
+          issue,
         },
         lifetime.signal,
       );
@@ -208,6 +223,7 @@ it('frees only a certain pre-dispatch failure and keeps a carrier-unknown prompt
     expect(rejected.observation.close).toHaveBeenCalledOnce();
     const unknown = nativeFacts();
     (await f.admit(b, 'same-id', unknown, 'steer')).unknown();
+    await expect(f.updateQueue(a)).rejects.toMatchObject({ code: 'VM_ACTIVE' });
     await expect(
       f.admit(a, 'other', nativeFacts(), 'steer'),
     ).rejects.toMatchObject({ code: 'VM_ACTIVE' });
@@ -221,6 +237,49 @@ it('frees only a certain pre-dispatch failure and keeps a carrier-unknown prompt
     await retry.closed;
     expect(unknown.observation.close).not.toHaveBeenCalled();
   } finally {
+    await f.close();
+  }
+});
+
+it('only lets the current queue login mutate the native root while it has pending work', async () => {
+  const f = await setup();
+  try {
+    const a = login(),
+      b = login();
+    const native = nativeFacts();
+    const prompt = await f.admit(a, 'pending', native);
+    await expect(f.updateQueue(b)).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+    expect(f.readRootWake).not.toHaveBeenCalled();
+    native.insert();
+    prompt.accepted();
+    await expect(f.updateQueue(a)).resolves.toBeUndefined();
+    await expect(f.updateQueue(b)).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+    expect(f.readRootWake).toHaveBeenCalledOnce();
+    native.settle('discarded');
+    await native.closed;
+    await expect(f.updateQueue(b)).resolves.toBeUndefined();
+  } finally {
+    await f.close();
+  }
+});
+
+it('checks for a new cross-login queue occupant after the native wake read', async () => {
+  const f = await setup();
+  const reading = deferredPromptFact<void>();
+  const wake = deferredPromptFact<RootWake>();
+  f.readRootWake.mockImplementationOnce(() => {
+    reading.resolve();
+    return wake.promise;
+  });
+  try {
+    const update = f.updateQueue(login());
+    await reading.promise;
+    const other = await f.admit(login(), 'pending-during-read', nativeFacts());
+    wake.resolve({ kind: 'clear' });
+    await expect(update).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+    await other.undispatched();
+  } finally {
+    wake.resolve({ kind: 'clear' });
     await f.close();
   }
 });
@@ -250,10 +309,14 @@ describe('native delegated execution', () => {
         code: 'VM_ACTIVE',
       });
       expect(otherSteer.observation.close).toHaveBeenCalledOnce();
+      await expect(f.updateQueue(b)).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
+      await expect(f.updateQueue(a)).resolves.toBeUndefined();
       await (
         await f.admit(a, 'same-login', nativeFacts(), 'steer')
       ).undispatched();
-      expect(original.observation.assertClaimed).toHaveBeenCalledOnce();
+      expect(original.observation.assertClaimed).toHaveBeenCalledTimes(2);
 
       f.readRootWake.mockResolvedValue({ kind: 'unproven' });
       await expect(
@@ -261,7 +324,11 @@ describe('native delegated execution', () => {
       ).rejects.toMatchObject({
         code: 'VM_ACTIVE',
       });
+      await expect(f.updateQueue(b)).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
       f.readRootWake.mockResolvedValue({ kind: 'clear' });
+      await expect(f.updateQueue(b)).resolves.toBeUndefined();
       await (
         await f.admit(b, 'after-end', nativeFacts(), 'steer')
       ).undispatched();
