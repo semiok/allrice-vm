@@ -78,6 +78,11 @@ describe('Worker shutdown ownership and dependency drain', () => {
       'cloud_services',
       'harness',
     ]);
+    expect(p.input.closeDatabase).toHaveBeenCalledExactlyOnceWith([
+      'producer_roots',
+      'cloud_services',
+      'harness',
+    ]);
     expect(p.order).toEqual([
       'inventory',
       'readback',

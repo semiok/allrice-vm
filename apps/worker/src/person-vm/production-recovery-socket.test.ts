@@ -65,3 +65,83 @@ it('keeps the exact maintenance owner reachable over a private Unix socket until
     code: 'ENOENT',
   });
 });
+
+it('reports the current stop attempt only to an authorized local operator', async () => {
+  const context = modelBinding().context;
+  const recover = vi.fn(async () => 0);
+  const authenticate = vi.fn(async () => context);
+  const authenticateOperator = vi.fn(async (token: string) =>
+    token === 'synthetic-platform-session' ? context : null,
+  );
+  const authorize = vi.fn(async () => undefined);
+  const status = {
+    bootId: 'worker-boot',
+    pid: 123,
+    attemptId: 'requested-stop',
+    state: 'deferred',
+    reason: 'VM_ACTIVE',
+  } as const;
+  const socket = await openProductionRecoverySocket({
+    authenticate,
+    recover,
+    pending: () => true,
+    shutdown: {
+      authenticate: authenticateOperator,
+      authorize,
+      status: () => status,
+    },
+  });
+  function read(token: string, origin?: string) {
+    return new Promise<{ code?: number; body: string; cache?: string }>(
+      (resolve, reject) => {
+        const req = request(
+          {
+            socketPath: socket.path,
+            path: '/shutdown-status',
+            method: 'GET',
+            headers: {
+              authorization: 'Bearer ' + token,
+              ...(origin && { origin }),
+            },
+          },
+          (response) => {
+            response.setEncoding('utf8');
+            let body = '';
+            response.on('data', (chunk: string) => {
+              body += chunk;
+            });
+            response.on('end', () =>
+              resolve({
+                code: response.statusCode,
+                cache: response.headers['cache-control'],
+                body,
+              }),
+            );
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      },
+    );
+  }
+  try {
+    expect(
+      (await read('synthetic-platform-session', 'https://browser.invalid'))
+        .code,
+    ).toBe(404);
+    expect((await read('synthetic-employee')).code).toBe(401);
+    authorize.mockRejectedValueOnce(Error('platform authority withdrawn'));
+    expect((await read('synthetic-platform-session')).code).toBe(403);
+    const result = await read('synthetic-platform-session');
+    expect(result).toMatchObject({ code: 200, cache: 'no-store' });
+    expect(JSON.parse(result.body)).toEqual(status);
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(authorize).toHaveBeenCalledTimes(2);
+  } finally {
+    await socket.close();
+  }
+  await expect(stat(dirname(socket.path))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+});
