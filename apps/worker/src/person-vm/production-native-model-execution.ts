@@ -5,6 +5,7 @@ import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import {
   DataAccessError,
   IdentityError,
+  getDEntryHistoryRootPin,
   requireCurrentPlatformAdmin,
   requireCurrentWorkspaceWriteAuthority,
 } from '@allrice/database';
@@ -128,7 +129,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         stopped.signal,
         input.routeRevoked,
       ]);
-      const selected = new Map<string, NativeModelSelection>();
+      const selected = new Map<
+        string,
+        {
+          scope: NativeModelSelection;
+          unlink(): void;
+        }
+      >();
       const calls = new Map<
         string,
         {
@@ -201,6 +208,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           identity,
           owner: current.owner,
           nativeSessionId: sessionId,
+          requireRunning: true,
           signal: active,
         });
         profile.revoked.throwIfAborted();
@@ -227,6 +235,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             resource.parentNativeSessionId !== call.native.parentSessionId ||
             resource.threadId !== call.allriceThreadRef ||
             resource.bindingRef !== profile.bindingRef ||
+            profile.owner.nativeInstanceId !== call.native.instanceId ||
             profile.owner.modelAdapterId !== call.native.profile
           )
             return reject();
@@ -250,7 +259,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             let matched:
               | { scope: NativeModelSelection; call: ModelCallBinding }
               | undefined;
-            for (const scope of selected.values()) {
+            for (const { scope } of selected.values()) {
               if (
                 scope.revoked.aborted ||
                 !sameVmBinding(scope.binding, binding)
@@ -283,7 +292,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   employeeRelease: scope.identity.employeeVersionId,
                   allriceThreadRef: resource.threadId,
                   native: {
-                    instanceId: binding.instanceId,
+                    instanceId: profile.owner.nativeInstanceId,
                     profile: profile.owner.modelAdapterId!,
                     sessionId: resource.nativeSessionId,
                     rootSessionId: resource.rootNativeSessionId,
@@ -357,9 +366,19 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         assertCall,
         confirmStopped: input.confirmTransportStopped,
         references,
-        observeModelSelection(scope) {
-          if (live.aborted || scope.revoked.aborted || !scope.identity.threadId)
-            return;
+        async observeModelSelection(scope, signal) {
+          if (!scope.identity.threadId) return;
+          const active = AbortSignal.any([live, signal, scope.revoked]);
+          active.throwIfAborted();
+          const pin = await getDEntryHistoryRootPin(scope.context, {
+            workspaceId: scope.identity.workspaceId,
+            employeeInstanceId: scope.identity.employeeInstanceId,
+            threadId: scope.identity.threadId,
+          });
+          active.throwIfAborted();
+          // Editor-root creation also uses the normal admission hook. It may
+          // register a model scope only after a real committed root exists.
+          if (!pin || pin.vmId !== scope.binding.vmId) return;
           const key = JSON.stringify([
             scope.binding.vmId,
             scope.binding.leaseEpoch,
@@ -367,14 +386,15 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             scope.identity.employeeInstanceId,
             scope.identity.threadId,
           ]);
-          selected.set(key, scope);
-          scope.revoked.addEventListener(
-            'abort',
-            () => {
-              if (selected.get(key) === scope) selected.delete(key);
-            },
-            { once: true },
-          );
+          const remove = () => {
+            if (selected.get(key)?.scope === scope) selected.delete(key);
+          };
+          selected.get(key)?.unlink();
+          selected.set(key, {
+            scope,
+            unlink: () => scope.revoked.removeEventListener('abort', remove),
+          });
+          scope.revoked.addEventListener('abort', remove, { once: true });
         },
         redeem(call, signal) {
           const entry = calls.get(call.native.callId);
@@ -424,6 +444,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           stopped.abort();
           uninstall();
           return (closing = Promise.allSettled([...operations]).then(() => {
+            for (const selection of selected.values()) selection.unlink();
             selected.clear();
           }));
         },

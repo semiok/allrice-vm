@@ -400,6 +400,7 @@ export async function openNativeWebOwner(input: {
       binding,
       revoked: signal,
       modelAdapterId: installedModelAdapter,
+      nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
       verifyStartingEditor<T>(

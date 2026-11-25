@@ -172,6 +172,7 @@ export async function resolveDEntryNativeResource(input: {
   owner: ResolvedDEntryNativeOwner;
   signal: AbortSignal;
   root?: typeof getDEntryNativeRootPin;
+  requireRunning?: boolean;
   checkGrants?: {
     nativeSessionIds: readonly string[];
     checked(current: boolean): void;
@@ -223,7 +224,13 @@ export async function resolveDEntryNativeResource(input: {
     return { parent };
   }
   const resource = lineage(nativeSessionId);
-  if (!resource) return deny();
+  const currentSession = entries.get(nativeSessionId);
+  if (
+    !resource ||
+    (input.requireRunning &&
+      (!currentSession?.agentAvailable || !currentSession.running))
+  )
+    return deny();
   // Re-read the actual business pin after the native read so a replacement
   // cannot turn a stale catalog into current resource authority.
   const after = await (input.root ?? getDEntryNativeRootPin)(

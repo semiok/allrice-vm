@@ -82,12 +82,15 @@ export function installProductionDEntrySource(input: {
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
-  observeModelSelection?(selection: {
-    context: RequestContext;
-    identity: DEntryIdentity;
-    binding: PersonVmBinding;
-    revoked: AbortSignal;
-  }): void;
+  observeModelSelection?(
+    selection: {
+      context: RequestContext;
+      identity: DEntryIdentity;
+      binding: PersonVmBinding;
+      revoked: AbortSignal;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -201,12 +204,15 @@ export function installProductionDEntrySource(input: {
         )
           denied();
         owners.set(owner, { context: scope, identity: expected });
-        input.observeModelSelection?.({
-          context: scope,
-          identity: expected,
-          binding,
-          revoked,
-        });
+        await input.observeModelSelection?.(
+          {
+            context: scope,
+            identity: expected,
+            binding,
+            revoked,
+          },
+          active,
+        );
         return {
           context: scope,
           binding,

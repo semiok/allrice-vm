@@ -44,6 +44,8 @@ import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
+import { ProductionHostConfigurationUnavailable } from './production-config.js';
+import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -53,7 +55,10 @@ type Current = ReturnType<typeof createProductionPersonVmAuthority>;
 export class ProductionPersonVmHostUnavailable extends Error {
   constructor(
     readonly code:
-      'HOST_SOURCES_UNAVAILABLE' | 'HOST_CLOSED' | 'MODEL_RECOVERY_UNAVAILABLE',
+      | 'HOST_SOURCES_UNAVAILABLE'
+      | 'HOST_CONFIGURATION_UNAVAILABLE'
+      | 'HOST_CLOSED'
+      | 'MODEL_RECOVERY_UNAVAILABLE',
   ) {
     super(code);
     this.name = 'ProductionPersonVmHostUnavailable';
@@ -638,6 +643,13 @@ export function createProductionPersonVmHost(input: {
         'PERSON_VM_HOST_CONSTRUCTION_FAILED',
       );
     }
+    if (
+      primary instanceof ProductionHostConfigurationUnavailable ||
+      primary instanceof ProductionPersonVmArtifactsUnavailable
+    )
+      throw new ProductionPersonVmHostUnavailable(
+        'HOST_CONFIGURATION_UNAVAILABLE',
+      );
     throw primary;
   });
 }

@@ -538,6 +538,7 @@ export function createAssignedNativeWebStartup(input: {
     PersonVmRuntimePort,
     'memoryGuestPlan' | 'start' | 'retireAfterNativeStop'
   > & {
+    installModelAdapter(resolve: NonNullable<typeof modelAdapter>): () => void;
     installStartingEditorProof(proof: StartingEditorProof): () => void;
     assertVerifiedEditor(
       binding: PersonVmBinding,

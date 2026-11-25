@@ -48,7 +48,10 @@ export interface ProductionNativeModelExecution {
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
-    observeModelSelection?(selection: NativeModelSelection): void;
+    observeModelSelection?(
+      selection: NativeModelSelection,
+      signal: AbortSignal,
+    ): Promise<void>;
     references?: ManagedHostService;
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
