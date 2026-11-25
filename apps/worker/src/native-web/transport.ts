@@ -183,8 +183,9 @@ export function nativeWebTransport(
     bounds: {
       maxBytes: number;
       exact?: number;
-      credential: 'none' | 'index';
+      credential: 'none' | 'index' | 'api';
       accepts(response: IncomingMessage): boolean;
+      body?: string;
     },
   ): Promise<{ data: Buffer; headers: IncomingHttpHeaders }> {
     const active = AbortSignal.any([signal, caller]);
@@ -214,7 +215,17 @@ export function nativeWebTransport(
       };
       const { call, send } = prepareRequest(
         input,
-        { method: 'GET', headers: { connection: 'close' }, signal: active },
+        {
+          method: bounds.body === undefined ? 'GET' : 'POST',
+          headers: {
+            connection: 'close',
+            ...(bounds.body !== undefined && {
+              'content-type': 'application/json',
+            }),
+          },
+          body: bounds.body,
+          signal: active,
+        },
         (response) => {
           response.once('error', fail);
           const declared = response.headers['content-length'];
@@ -287,6 +298,23 @@ export function nativeWebTransport(
   return {
     fetch,
     readExact,
+    async createRoot(body: string, caller: AbortSignal) {
+      if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
+      const { data } = await readOwned(
+        new URL('api/session/create', origin),
+        caller,
+        {
+          maxBytes: 16 * 1024,
+          credential: 'api',
+          body,
+          accepts: ({ statusCode, headers }) =>
+            statusCode === 200 &&
+            headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() ===
+              'application/json',
+        },
+      );
+      return data.toString('utf8');
+    },
     async authenticate(authenticatedUrl: string) {
       const url = target(authenticatedUrl);
       url.pathname = '/connect';

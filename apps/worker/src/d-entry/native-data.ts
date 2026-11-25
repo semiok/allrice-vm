@@ -7,6 +7,7 @@ import type {
 import type {
   DEntryAdmissionOwner,
   DEntryAdmissionPorts,
+  DEntryHistoryRootPin,
   DEntryOwnedActivity,
 } from '@allrice/database';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
@@ -30,6 +31,15 @@ export type DEntryNativeMuxChannel = Readonly<{
  * the shared native job. */
 export interface DEntryNativeDataPort {
   admission: DEntryAdmissionPorts;
+  /** Explicit editor open on a current running Host. The database owns the
+   * durable claim and native root. Read-only discovery never calls this. */
+  prepareEditorRoot?(input: {
+    context: RequestContext;
+    identity: DEntryIdentity;
+    owner: ResolvedDEntryNativeOwner;
+    assertCurrent(signal: AbortSignal): Promise<void>;
+    signal: AbortSignal;
+  }): Promise<DEntryHistoryRootPin>;
   resolveAdmissionOwner(input: {
     context: RequestContext;
     identity: DEntryIdentity;

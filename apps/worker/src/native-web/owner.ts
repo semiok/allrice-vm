@@ -1,5 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
+import {
+  clientRequestSchema,
+  serverResponseSchema,
+} from '@deepseek-ai/dsh-client-connection';
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
@@ -8,6 +13,7 @@ import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import type { RequestContext } from '@allrice/contracts';
 import type { SessionCreateRequest } from '@deepseek-ai/dsh-api-session-controller/types';
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   PersonVmError,
   sameVmBinding,
@@ -18,6 +24,12 @@ import {
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
+
+export class NativeRootJoinUnknown extends Error {
+  constructor(cause: unknown) {
+    super('NATIVE_ROOT_JOIN_UNKNOWN', { cause });
+  }
+}
 
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
@@ -348,7 +360,49 @@ export async function openNativeWebOwner(input: {
         return readCurrent(
           caller,
           (active) => input.vm.assertCurrentBinding(context, binding, active),
-          () => root.remote.session.create(request),
+          async () => {
+            const method = TYPERT_REMOTE.methods['session/create'];
+            const args = method
+              .input({ strict: true })
+              .create()
+              .parse({ request });
+            const rpcId = randomUUID();
+            const body = JSON.stringify(
+              clientRequestSchema.parse({
+                type: 'client-request',
+                method: 'session/create',
+                rpcId,
+                payload: { args },
+              }),
+            );
+            // rc.2 create has no native cancellation slot. Let a dispatched
+            // create settle independently of page cancellation. The scoped
+            // transport confirms the matching reply AND physical HTTP close.
+            const result = await (async () => {
+              try {
+                const wire = await transport.createRoot(
+                  body,
+                  AbortSignal.timeout(input.cleanupTimeoutMs),
+                );
+                const reply = serverResponseSchema.parse(JSON.parse(wire));
+                if (reply.rpcId !== rpcId)
+                  throw new PersonVmError('PROVIDER_FAILED');
+                return reply.result;
+              } catch (error) {
+                throw new NativeRootJoinUnknown(error);
+              }
+            })();
+            if (!result.ok)
+              throw new RemoteError(
+                result.error.code,
+                result.error.message,
+                result.error.details,
+              );
+            return {
+              ok: true as const,
+              value: method.result.create().parse(result.value),
+            };
+          },
         );
       },
       acquirePrincipal(

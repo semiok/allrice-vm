@@ -5,6 +5,7 @@ import type * as Database from '@allrice/database';
 import { afterEach, expect, it, vi } from 'vitest';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import type { ResolvedDEntryNativeOwner } from '../d-entry/native-owner.js';
+import { NativeRootJoinUnknown } from '../native-web/owner.js';
 import { installProductionDEntrySource } from './production-dentry-source.js';
 
 const { current, policy, profile } = vi.hoisted(() => ({
@@ -72,7 +73,11 @@ function fixture() {
   const assertCurrent = vi.fn(async () => {});
   profile.mockResolvedValue({ assertCurrent });
   current.mockResolvedValue(identity);
-  policy.mockResolvedValue({ defaultGeneration: '4.0', selections: [] });
+  policy.mockResolvedValue({
+    revision: 'fixture',
+    defaultGeneration: '4.0',
+    selections: [],
+  });
   const readModels = vi.fn<Parameters<Proof>[0]['readModels']>(async () => ({
     ok: true,
     value: {
@@ -194,7 +199,11 @@ it('publishes exact-generation readiness only after same Host artifact, native m
 
 it('requires rollout authority, a routable exact model and a current employee after all async evidence', async () => {
   const f = fixture();
-  policy.mockResolvedValueOnce({ defaultGeneration: '3.x', selections: [] });
+  policy.mockResolvedValueOnce({
+    revision: 'fixture-history',
+    defaultGeneration: '3.x',
+    selections: [],
+  });
   expect(await f.prove()).toBe(false);
   expect(f.readModels).not.toHaveBeenCalled();
   f.resolveSendRoute.mockResolvedValueOnce({ ...f.route, model: 'different' });
@@ -255,4 +264,24 @@ it('binds the same entry participant and keeps native root creation inert until 
   }
   expect(f.port.acquireRpc).toBeUndefined();
   expect(f.port.acquireMux).toBeUndefined();
+});
+
+it('does not release admission on an unconfirmed native root outcome', async () => {
+  const f = fixture();
+  await f.prove();
+  await f.port.resolveAdmissionOwner({
+    context: f.context,
+    identity: { ...f.identity, threadId: randomUUID() },
+    owner: f.owner,
+    operationId: randomUUID(),
+    signal: f.signal,
+  });
+  const unknown = new NativeRootJoinUnknown(Error('broken native wire'));
+  f.host.createRootFor.mockRejectedValueOnce(unknown);
+  const activity = f.port.acquireRoot(
+    { owner: f.owner, request: {} },
+    f.signal,
+  );
+  await expect(activity.run(f.signal)).rejects.toBe(unknown);
+  await expect(activity.close()).rejects.toBe(unknown);
 });

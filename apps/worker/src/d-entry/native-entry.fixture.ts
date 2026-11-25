@@ -191,7 +191,7 @@ export function nativeEntryFixture(preset?: {
       .create()
       .parse({ sessionId: 'dsh-created-by-host' }),
   }));
-  const data: Required<DEntryNativeDataPort> = {
+  const data: Required<Omit<DEntryNativeDataPort, 'prepareEditorRoot'>> = {
     admission,
     resolveAdmissionOwner: vi.fn(async (input) => ({
       context,

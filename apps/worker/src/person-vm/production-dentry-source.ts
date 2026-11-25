@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   sameDEntryIdentity,
   selectDEntryGeneration,
@@ -6,8 +7,10 @@ import {
 } from '@allrice/contracts';
 import {
   DataAccessError,
+  ensureDEntryNativeRoot,
   readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
+  runDEntryAdmittedActivity,
 } from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import {
@@ -18,6 +21,7 @@ import {
   type PersonVmService,
 } from '@allrice/person-vm';
 import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
+import { NativeRootJoinUnknown } from '../native-web/owner.js';
 import {
   installDEntryNativeDataPort,
   type DEntryNativeDataPort,
@@ -170,6 +174,70 @@ export function installProductionDEntrySource(input: {
         };
       });
     },
+    async prepareEditorRoot({
+      context,
+      identity,
+      owner,
+      assertCurrent,
+      signal,
+    }) {
+      const operationId = randomUUID();
+      const admitted = await port.resolveAdmissionOwner({
+        context,
+        identity,
+        owner,
+        operationId,
+        signal,
+      });
+      const selection = {
+        workspaceId: identity.workspaceId,
+        employeeInstanceId: identity.employeeInstanceId,
+        threadId: identity.threadId,
+      };
+      const host = {
+        binding: admitted.binding,
+        bindingRef: owner.bindingRef,
+        rosterDigest: owner.receipt.rosterDigest,
+      };
+      return runDEntryAdmittedActivity(
+        {
+          ports: port.admission,
+          signal,
+          owner: {
+            ...admitted,
+            async assertCurrent(active) {
+              await assertCurrent(active);
+              await admitted.assertCurrent(active);
+            },
+          },
+        },
+        (active) => {
+          const native = port.acquireRoot({ owner, request: {} }, active);
+          let pin: ReturnType<typeof ensureDEntryNativeRoot> | undefined;
+          return {
+            run(running) {
+              pin = ensureDEntryNativeRoot(context, selection, identity, {
+                operationId,
+                host,
+                signal: running,
+                async create(creating) {
+                  await assertCurrent(creating);
+                  const result = await native.run(creating);
+                  if (!result.ok) throw result.error;
+                  await assertCurrent(creating);
+                  return { nativeSessionId: result.value.sessionId, host };
+                },
+              });
+              return pin;
+            },
+            async close() {
+              const [joined] = await Promise.allSettled([native.close(), pin]);
+              if (joined.status === 'rejected') throw joined.reason;
+            },
+          };
+        },
+      );
+    },
     acquireRoot({ owner, request }, signal) {
       const stop = new AbortController();
       const scope = AbortSignal.any([owner.revoked, signal, stop.signal]);
@@ -205,7 +273,9 @@ export function installProductionDEntrySource(input: {
         },
         async close() {
           stop.abort();
-          await Promise.allSettled([task]);
+          await task?.catch((error: unknown) => {
+            if (error instanceof NativeRootJoinUnknown) throw error;
+          });
         },
       };
     },
