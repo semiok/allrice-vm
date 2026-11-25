@@ -1,13 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
-import { beforeEach, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deferredPromptFact,
   type NativePromptObservation,
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
-import { createProductionNativeModelExecution } from './production-native-model-execution.js';
+import {
+  createProductionNativeModelExecution,
+  nativeRunExecutionIds,
+  readNativePromptContributors,
+} from './production-native-model-execution.js';
 
 const mocks = vi.hoisted(() => ({ pin: vi.fn(), watch: vi.fn() }));
 vi.mock('@allrice/database', () => ({
@@ -210,4 +214,103 @@ it('frees only a certain pre-dispatch failure and keeps a carrier-unknown prompt
   } finally {
     await f.close();
   }
+});
+
+describe('native delegated execution', () => {
+  it('keeps an ended native source without occupying the queue and reuses its login authority watch', async () => {
+    const f = await setup();
+    try {
+      const context = login();
+      const original = nativeFacts();
+      const send = await f.admit(context, 'origin', original);
+      original.insert();
+      send.accepted();
+      original.settle('ended');
+      await Promise.resolve();
+
+      const next = nativeFacts();
+      const sameLogin = await f.admit(context, 'second', next);
+      expect(mocks.watch).toHaveBeenCalledTimes(1);
+      expect(original.observation.close).not.toHaveBeenCalled();
+      await sameLogin.undispatched();
+
+      const other = await f.admit(
+        login(),
+        'another-login',
+        nativeFacts(),
+        'steer',
+      );
+      expect(mocks.watch).toHaveBeenCalledTimes(2);
+      expect(original.observation.close).not.toHaveBeenCalled();
+      await other.undispatched();
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('requires every contributing request to retain the same exact authorization', () => {
+    const logout = new AbortController();
+    const authority = {
+      authorityKey: 'thread-owner-login',
+      revoked: logout.signal,
+    };
+    const contributors = new Map([
+      ['original', authority],
+      ['same-login', { ...authority }],
+      [
+        'different-login',
+        {
+          authorityKey: 'thread-owner-other-login',
+          revoked: new AbortController().signal,
+        },
+      ],
+    ]);
+    const read = (id: string) => contributors.get(id);
+
+    expect(
+      readNativePromptContributors(['original', 'same-login'], read)?.first,
+    ).toBe(authority);
+    expect(
+      readNativePromptContributors(['original', 'different-login'], read),
+    ).toBeNull();
+    expect(
+      readNativePromptContributors(['missing', 'same-login'], read),
+    ).toBeNull();
+    logout.abort();
+    expect(readNativePromptContributors(['original'], read)).toBeNull();
+    expect(
+      readNativePromptContributors(['different-login'], read),
+    ).not.toBeNull();
+  });
+
+  it('keeps the originating human Run, child turn, and idle parent wakeup distinct', () => {
+    const ids = new Map<string, string>();
+    const attempt = { kind: 'assistant' as const, id: 'attempt-1' };
+    const main = (sourceTurn: number, delegated: boolean) =>
+      nativeRunExecutionIds(ids, 'original-run', {
+        ...attempt,
+        sessionId: 'root',
+        sourceTurn,
+        delegated,
+      });
+    const child = (sourceTurn: number, id = attempt.id) =>
+      nativeRunExecutionIds(ids, 'original-run', {
+        ...attempt,
+        id,
+        sessionId: 'child',
+        sourceTurn,
+        delegated: true,
+      });
+    const original = main(1, false);
+    const background = child(1);
+    const wakeup = main(2, true);
+    expect(original.runId).toBe('original-run');
+    expect(new Set([original.runId, background.runId, wakeup.runId]).size).toBe(
+      3,
+    );
+    expect(child(1)).toEqual(background);
+    expect(child(1, 'attempt-2')).toMatchObject({ runId: background.runId });
+    expect(child(1, 'attempt-2').executionId).not.toBe(background.executionId);
+    expect(child(2).runId).not.toBe(background.runId);
+  });
 });

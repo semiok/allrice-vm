@@ -213,14 +213,30 @@ async function readManagedImage(scope, request, value, owned) {
   return { ...image, data: Buffer.from(image.data).toString('base64') };
 }
 
-// The controller's follow window is for display. Read all admitted input
-// from the live journal at the exact cursor of the authenticated attempt.
-export function readRootPromptOrigins(events, cursor, turn, purpose) {
+function nativeOriginInput(source) {
+  return ['user', 'agent-message', 'subagent-settled'].includes(source?.kind);
+}
+
+function nativePromptId(source) {
+  return source?.kind === 'user' && typeof source.rpcId === 'string'
+    ? source.rpcId
+    : null;
+}
+
+// The controller's follow window is for display. Read admitted input from the
+// live journal at the exact cursor of the authenticated attempt.
+export function readPromptOrigins(
+  events,
+  cursor,
+  turn,
+  purpose,
+  readDelegated = () => null,
+  ownFrom = 0,
+) {
   const addPrompt = (event, ids) => {
     if (event?.type !== 'user/message') return;
-    const source = event.data.source;
-    if (source?.kind === 'user' && typeof source.rpcId === 'string')
-      ids.add(source.rpcId);
+    const id = nativePromptId(event.data.source);
+    if (id !== null) ids.add(id);
   };
   if (purpose === 'session-title') {
     const request = events[cursor];
@@ -244,27 +260,49 @@ export function readRootPromptOrigins(events, cursor, turn, purpose) {
             (event) => event.seq < seq && event.type === 'turn/start',
           )?.data.turn ?? null;
     }
-    return sourceTurn === null ? null : { turn: sourceTurn, ids: [...ids] };
+    return sourceTurn === null
+      ? null
+      : { turn: sourceTurn, ids: [...ids], delegated: false, inherited: [] };
   }
   const start = events.findLast(
     (event) =>
+      event.seq >= ownFrom &&
       event.seq <= cursor &&
       event.type === 'turn/start' &&
-      (turn === null || event.data.turn === turn),
+      event.data.turn === turn,
   );
   if (!start) return null;
   const ids = new Set();
-  for (const event of events.slice(start.seq + 1, cursor + 1))
-    addPrompt(event, ids);
-  return { turn: start.data.turn, ids: [...ids] };
+  const inherited = new Set();
+  let delegated = false;
+  for (let seq = start.seq + 1; seq <= cursor; seq++) {
+    const event = events[seq];
+    if (event.type === 'turn/end' || event.type === 'turn/start') return null;
+    if (event.type !== 'user/message' || !nativeOriginInput(event.data.source))
+      continue;
+    const id = nativePromptId(event.data.source);
+    if (id !== null) {
+      ids.add(id);
+      continue;
+    }
+    const source = readDelegated(event, turn);
+    if (!source?.length) return null;
+    if (!ids.size) delegated = true;
+    for (const promptId of source) {
+      inherited.add(promptId);
+      ids.add(promptId);
+    }
+  }
+  return { turn, ids: [...ids], delegated, inherited: [...inherited] };
 }
 
-async function observeRootPromptOrigins(
+async function observePromptOrigins(
   scope,
-  id,
+  live,
   cursor,
   turn,
   purpose,
+  delegations,
   signal,
 ) {
   if (
@@ -273,74 +311,42 @@ async function observeRootPromptOrigins(
     !(turn === null || Number.isSafeInteger(turn))
   )
     return null;
-  const live = scope.sessions.get(id);
-  if (!live || live.header.parentSession || live.header.isSeeded) return null;
-  const observed = await scope.sessionQuery.observeSession(id, { signal });
+  const { id, header } = live;
+  const root = delegations.root(live);
+  if (!root || (header.parentSession && purpose === 'session-title'))
+    return null;
+  const observed = await scope.sessionQuery.observeSession(id, {
+    signal,
+    projectionMode: 'none',
+  });
   try {
     signal.throwIfAborted();
     if (
       observed.source !== 'live' ||
-      scope.sessions.get(id) !== live ||
+      delegations.root(live) !== root ||
       observed.header.id !== id ||
       observed.cursor < cursor
     )
       return null;
-    const origin = readRootPromptOrigins(
+    const origin = readPromptOrigins(
       observed.events,
       cursor,
       turn,
       purpose,
+      (event, sourceTurn) =>
+        delegations.claimed(live, event.data, sourceTurn)?.ids,
+      observed.inheritedEventCount,
     );
-    return origin?.ids.length > 0 && origin.ids.length <= 64 ? origin : null;
+    return origin?.ids.length > 0 && origin.ids.length <= 64
+      ? {
+          ...origin,
+          rootSessionId: root.id,
+          delegated: !!header.parentSession || origin.delegated,
+        }
+      : null;
   } finally {
     observed[Symbol.dispose]();
   }
-}
-
-// DSH publishes a child's durable catalog entry on its exact parent before
-// running the initial delegated prompt. Continuing a child in a later turn
-// needs its own accepted-input source and cannot reuse its creation event.
-function delegatedPromptIds(sessions, sessionId) {
-  let child = sessions.get(sessionId);
-  if (!child?.header.parentSession) return [];
-  const seen = new Set([sessionId]);
-  while (child.header.parentSession) {
-    const parent = sessions.get(child.header.parentSession);
-    if (!parent || seen.has(parent.id)) return [];
-    seen.add(parent.id);
-    const events = parent.snapshotEvents();
-    const catalog = events.filter(
-      (event) =>
-        event.type === 'subagent/catalog' &&
-        event.data.childId === child.id &&
-        event.data.childCreatedAt === child.header.createdAt &&
-        event.data.version === 0,
-    );
-    if (catalog.length !== 1) return [];
-    const edge = catalog[0];
-    const start = events.findLast(
-      (event) => event.type === 'turn/start' && event.seq < edge.seq,
-    );
-    if (
-      !start ||
-      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
-    )
-      return [];
-    if (parent.header.parentSession) {
-      child = parent;
-      continue;
-    }
-    const result = new Set();
-    for (const event of events) {
-      if (event.seq <= start.seq || event.seq > edge.seq) continue;
-      if (event.type !== 'user/message') continue;
-      const source = event.data.source;
-      if (source?.kind === 'user' && typeof source.rpcId === 'string')
-        result.add(source.rpcId);
-    }
-    return [...result];
-  }
-  return [];
 }
 
 /** Carry only the inbox facts for an exact scoped prompt through the existing
@@ -514,73 +520,222 @@ export function observeNativePrompts(scope, lifetime) {
   };
 }
 
-// Bind continuations when the live native inbox accepts and then claims the
-// exact relayed message. The recorded sender is an actual DSH Agent, and
-// the recipient cannot borrow a parent's earlier turn after sender movement.
-function observeDelegatedInputs(scope) {
-  const inserted = new WeakMap();
-  const claimed = new WeakMap();
-  function currentPromptIds(session) {
-    const events = session.snapshotEvents();
-    const start = events.findLast((event) => event.type === 'turn/start');
-    if (
-      !start ||
-      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
-    )
-      return [];
-    if (session.header.parentSession) {
-      const proof = claimed.get(session);
-      return proof?.turn === start.data.turn
-        ? [...proof.ids]
-        : delegatedPromptIds(scope.sessions, session.id);
-    }
-    const ids = new Set();
-    for (const event of events) {
-      if (event.seq <= start.seq || event.type !== 'user/message') continue;
-      const source = event.data.source;
-      if (source?.kind === 'user' && typeof source.rpcId === 'string')
-        ids.add(source.rpcId);
-    }
-    return [...ids];
+// Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
+export function observeDelegatedInputs(scope) {
+  const turns = new WeakMap();
+  const inboxes = new WeakMap();
+  const activations = new Map();
+  const global = { global: true };
+
+  function liveAgent(id) {
+    const agent = original(scope.agents.get(id));
+    return agent && original(scope.sessions.get(id)) === original(agent.session)
+      ? agent
+      : null;
   }
-  scope.on('agent/inbox/inserted', ({ agent, message }) => {
-    const child = agent.session;
-    const source = message.source;
-    if (
-      source?.kind !== 'agent-message' ||
-      source.form !== 'relay' ||
-      source.senderSessionId !== child.header.parentSession
-    )
-      return;
-    const parent = scope.sessions.get(source.senderSessionId);
-    if (!parent) return;
-    let messages = inserted.get(child);
-    if (!messages) {
-      messages = new Map();
-      inserted.set(child, messages);
+
+  function root(session) {
+    const seen = new Set();
+    let agent = liveAgent(session.id);
+    if (original(agent?.session) !== original(session)) return null;
+    while (agent.session.header.parentSession) {
+      if (seen.has(agent)) return null;
+      seen.add(agent);
+      const activation = activations.get(agent.id);
+      if (
+        activation?.child !== agent ||
+        liveAgent(activation.parent.id) !== activation.parent
+      )
+        return null;
+      agent = activation.parent;
     }
-    messages.set(message.id, currentPromptIds(parent));
-  });
-  scope.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-    const session = agent.session;
-    const messages = inserted.get(session);
-    const proof = messages?.get(message.id);
-    if (!proof) return;
-    messages.delete(message.id);
-    let state = claimed.get(session);
-    if (state?.turn !== turn) {
-      state = { turn, ids: new Set() };
-      claimed.set(session, state);
+    return agent.session.header.isSeeded ? null : original(agent.session);
+  }
+
+  function collect(session, inputs) {
+    const owner = root(session);
+    if (!owner || !inputs?.length) return null;
+    const ids = new Set();
+    for (const input of inputs) {
+      if (input?.root !== owner) return null;
+      for (const id of input.ids) ids.add(id);
     }
-    for (const id of proof) state.ids.add(id);
-  });
-  scope.on('agent/inbox/discarded', ({ agent, message }) => {
-    inserted.get(agent.session)?.delete(message.id);
-  });
-  return (sessionId) => {
-    const session = scope.sessions.get(sessionId);
-    return session?.header.parentSession ? currentPromptIds(session) : [];
-  };
+    return { root: owner, ids: [...ids] };
+  }
+
+  function currentOrigin(session) {
+    return collect(session, turns.get(original(session))?.inputs);
+  }
+
+  function claimed(session, message, turn) {
+    const state = turns.get(original(session));
+    const record = state?.turn === turn && state.claimed.get(message.id);
+    const { source } = message;
+    return record &&
+      record.source.kind === source.kind &&
+      record.source.form === source.form &&
+      record.source.senderSessionId === source.senderSessionId &&
+      record.source.rpcId === source.rpcId &&
+      record.origin?.root === root(session)
+      ? record.origin
+      : null;
+  }
+
+  scope.on(
+    'subagent/start',
+    ({ id, runId, local }) => {
+      if (!local) return;
+      const child = liveAgent(id);
+      const parentId = child?.session.header.parentSession;
+      const parent = parentId && liveAgent(parentId);
+      if (!parent || !scope.agents.isOwnedBy(id, parent)) return;
+      activations.set(id, { runId, parent, child, inputs: [] });
+    },
+    global,
+  );
+  scope.on(
+    'agent/disposed',
+    ({ agent: subject }) => {
+      const agent = original(subject);
+      const activation = activations.get(agent.id);
+      if (activation?.child === agent) activation.disposed = true;
+    },
+    global,
+  );
+  scope.on(
+    'subagent/end',
+    ({ id, runId, local }) => {
+      const activation = activations.get(id);
+      if (!local || activation?.runId !== runId) return;
+      const { notice, parent } = activation;
+      if (notice && liveAgent(parent.id) === parent)
+        notice.origin = collect(parent.session, activation.inputs);
+      activations.delete(id);
+    },
+    global,
+  );
+  scope.on(
+    'agent/inbox/inserted',
+    ({ agent: subject, message }) => {
+      const agent = original(subject);
+      const session = original(agent.session);
+      if (liveAgent(agent.id) !== agent) return;
+      const { source } = message;
+      const recipient = activations.get(agent.id);
+      const record = { source, origin: null };
+      if (recipient?.child === agent && !recipient.receivedInput) {
+        recipient.receivedInput = true;
+        if (source?.kind === 'user' && source.rpcId === undefined)
+          recipient.initial = record;
+      }
+      if (source?.kind === 'agent-message' && source.form === 'relay') {
+        const sender = liveAgent(source.senderSessionId);
+        const senderActivation = activations.get(source.senderSessionId);
+        if (
+          sender &&
+          ((recipient?.child === agent && recipient.parent === sender) ||
+            (senderActivation?.child === sender &&
+              senderActivation.parent === agent))
+        )
+          record.origin = currentOrigin(sender.session);
+      } else if (
+        source?.kind === 'subagent-settled' &&
+        source.form === 'notice'
+      ) {
+        const sender = activations.get(source.senderSessionId);
+        if (sender?.disposed && sender.parent === agent && !sender.notice)
+          sender.notice = record;
+      }
+      if (
+        record !== recipient?.initial &&
+        source?.kind !== 'agent-message' &&
+        source?.kind !== 'subagent-settled'
+      )
+        return;
+      let inbox = inboxes.get(session);
+      if (!inbox) {
+        inbox = new Map();
+        inboxes.set(session, inbox);
+      }
+      inbox.set(message.id, record);
+    },
+    global,
+  );
+  scope.on(
+    'agent/inbox/claimed',
+    ({ agent, message, turn }) => {
+      const session = original(agent.session);
+      const inbox = inboxes.get(session);
+      const record = inbox?.get(message.id);
+      if (!record) return;
+      inbox.delete(message.id);
+      const state = turns.get(session);
+      if (state?.turn === turn) state.claimed.set(message.id, record);
+    },
+    global,
+  );
+  scope.on(
+    'agent/inbox/discarded',
+    ({ agent, message }) => {
+      inboxes.get(original(agent.session))?.delete(message.id);
+    },
+    global,
+  );
+  scope.on(
+    'session/event',
+    (subject, event) => {
+      const session = original(subject);
+      const agent = liveAgent(session.id);
+      if (original(agent?.session) !== session) return;
+      if (event.type === 'turn/start') {
+        turns.set(session, {
+          turn: event.data.turn,
+          claimed: new Map(),
+          inputs: [],
+        });
+        return;
+      }
+      const state = turns.get(session);
+      if (!state) return;
+      if (event.type === 'turn/end') {
+        if (event.data.turn === state.turn) turns.delete(session);
+        return;
+      }
+      if (event.type === 'subagent/catalog') {
+        // rc.2 appends its v0 catalog edge synchronously after accepting the
+        // first child inbox message. A later, untagged input has no such edge.
+        const { childId, childCreatedAt, mode, version } = event.data;
+        const activation = activations.get(childId);
+        if (
+          version === 0 &&
+          mode === 'continuable' &&
+          activation?.parent === agent &&
+          activation.child.session.header.createdAt === childCreatedAt &&
+          liveAgent(childId) === activation.child &&
+          activation.initial
+        ) {
+          activation.initial.origin = currentOrigin(session);
+          activation.initial = undefined;
+        }
+        return;
+      }
+      if (
+        event.type !== 'user/message' ||
+        !nativeOriginInput(event.data.source)
+      )
+        return;
+      const id = nativePromptId(event.data.source);
+      const origin =
+        id === null
+          ? claimed(session, event.data, state.turn)
+          : { root: root(session), ids: [id] };
+      state.inputs.push(origin);
+      const activation = activations.get(agent.id);
+      if (activation?.child === agent) activation.inputs.push(origin);
+    },
+    global,
+  );
+  return { root, claimed };
 }
 
 export function apply(ctx, config) {
@@ -770,14 +925,14 @@ export function applyNativeWebOwner(
           'connection',
           'sessionController',
           'attachments',
+          'agents',
           'sessions',
           'sessionQuery',
-          'agents',
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
-          const delegateOrigins = observeDelegatedInputs(scope);
+          const delegations = observeDelegatedInputs(scope);
           const promptFacts = observeNativePrompts(scope, signal);
           scope.connection.fetch.register({
             // Native exact Fetch routes are delivered only to the authenticated
@@ -810,30 +965,26 @@ export function applyNativeWebOwner(
                 return new globalThis.Response(null, { status: 404 });
               const headers = { 'cache-control': 'no-store' };
               if (value.action === undefined) {
-                const session = scope.sessions.get(value.sessionId);
-                if (!session)
-                  return new globalThis.Response(null, { status: 404 });
-                const origin = session.header.parentSession
-                  ? null
-                  : await observeRootPromptOrigins(
-                      scope,
-                      value.sessionId,
-                      value.cursor,
-                      value.turn,
-                      value.purpose,
-                      globalThis.AbortSignal.any([
-                        found.signal,
-                        request.signal,
-                      ]),
-                    );
-                if (!session.header.parentSession && !origin)
+                const origin = await observePromptOrigins(
+                  scope,
+                  found.session,
+                  value.cursor,
+                  value.turn,
+                  value.purpose,
+                  delegations,
+                  globalThis.AbortSignal.any([found.signal, request.signal]),
+                );
+                if (!origin)
                   return new globalThis.Response(null, { status: 404 });
                 return globalThis.Response.json(
                   {
                     id: found.id,
                     recipient: found.recipient,
-                    sourceTurn: origin?.turn ?? null,
-                    promptIds: origin?.ids ?? found.delegatedPromptIds,
+                    rootSessionId: origin.rootSessionId,
+                    sourceTurn: origin.turn,
+                    promptIds: origin.ids,
+                    delegated: origin.delegated,
+                    delegatedPromptIds: origin.inherited,
                   },
                   { headers },
                 );
@@ -869,10 +1020,13 @@ export function applyNativeWebOwner(
                 ]);
                 if (modelCalls.has(key))
                   throw Error('Concurrent native model ownership is ambiguous');
+                const session = scope.sessions.get(selection.sessionId);
+                if (!session)
+                  throw Error('Native model session is unavailable');
                 const owned = {
                   id: randomUUID(),
                   recipient: randomBytes(32).toString('base64url'),
-                  delegatedPromptIds: delegateOrigins(selection.sessionId),
+                  session,
                   signal: active,
                 };
                 modelCalls.set(key, owned);

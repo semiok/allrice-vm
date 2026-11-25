@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import {
@@ -12,6 +12,7 @@ import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
@@ -291,6 +292,201 @@ it.skipIf(!cli)(
       releaseModel.resolve();
       await activity.close();
     }
+  },
+);
+
+it.skipIf(!cli)(
+  'proves a continuable child after the parent ends and both native wakeups on the idle parent',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const rootReady = deferred<{
+      id: string;
+      owner: Awaited<ReturnType<typeof setup>>['owner'];
+      context: Awaited<ReturnType<typeof setup>>['context'];
+    }>();
+    const rootEnded = deferred();
+    const relayEnded = deferred();
+    const finished = deferred();
+    for (const ready of [rootReady, rootEnded, relayEnded, finished])
+      void ready.promise.catch(() => {});
+    const signal = AbortSignal.timeout(25000);
+    const capability = 'a'.repeat(43);
+    const requestId = randomUUID();
+    const attempts = new Map<string, number>();
+    const refs = new Map<
+      string,
+      { session: string; ordinal: number; title: boolean }
+    >();
+    const turns: number[] = [];
+    const server = createServer((request, response) => {
+      void (async () => {
+        const { id: root, owner, context } = await rootReady.promise;
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        expect(request.headers.authorization).toBe('Bearer ' + capability);
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        const title = request.url === '/v1/reference/session-title';
+        if (request.url === '/v1/reference' || title) {
+          const session = String(payload.sessionId);
+          const isRoot = session === root;
+          const address: SessionAddress = isRoot
+            ? { kind: 'session', sessionId: SessionId(root) }
+            : {
+                kind: 'subagent',
+                parentSessionId: SessionId(root),
+                childSessionId: SessionId(session),
+                mode: 'continuable',
+              };
+          const ordinal = title ? 0 : (attempts.get(session) ?? 0) + 1;
+          if (!title) attempts.set(session, ordinal);
+          if (!isRoot) await (ordinal === 1 ? rootEnded : relayEnded).promise;
+          const proof = await owner.readNativeAttemptFor(
+            context,
+            address,
+            signal,
+            title ? 'session-title' : 'assistant',
+          );
+          expect(proof).toMatchObject({
+            recipient: payload.recipient,
+            rootSessionId: root,
+            promptIds: [requestId],
+            delegated: !isRoot || ordinal >= 3,
+          });
+          if (isRoot && !title) {
+            turns.push(proof!.turn!);
+            if (ordinal >= 2) {
+              expect(ordinal).toBeLessThanOrEqual(4);
+              const joined =
+                ordinal === 2
+                  ? rootEnded
+                  : ordinal === 3
+                    ? relayEnded
+                    : finished;
+              void owner
+                .waitNativeTurnEnd(context, address, proof!.turn!, signal)
+                .then((end) => {
+                  expect(end.reason).toBe('completed');
+                  joined.resolve();
+                })
+                .catch(joined.reject);
+            }
+          }
+          const reference = randomBytes(32).toString('base64url');
+          refs.set(reference, { session, ordinal, title });
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        const entry = refs.get(
+          String(request.headers['x-allrice-model-call-reference']),
+        );
+        if (!entry)
+          throw Error('The native adapter did not redeem its reference');
+        const { session, ordinal, title: isTitle } = entry;
+        const tool = isTitle
+          ? null
+          : session === root && ordinal === 1
+            ? {
+                name: 'subagent',
+                args: {
+                  description: 'Read a small catalog',
+                  prompt: 'Report when the catalog is ready.',
+                },
+              }
+            : session !== root && ordinal === 1
+              ? {
+                  name: 'send_message',
+                  args: { agent_id: root, message: 'The catalog is ready.' },
+                }
+              : null;
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          [
+            tool
+              ? {
+                  type: 'tool-call-delta',
+                  index: 0,
+                  id: randomUUID(),
+                  name: tool.name,
+                  argumentsDelta: JSON.stringify(tool.args),
+                }
+              : { type: 'text-delta', index: 0, text: 'Catalog checked.' },
+            { type: 'finish', reason: { kind: tool ? 'tool-calls' : 'stop' } },
+          ]
+            .map((chunk) => JSON.stringify(chunk) + '\n')
+            .join(''),
+        );
+      })().catch((error: unknown) => {
+        response.destroy();
+        rootEnded.reject(error);
+        relayEnded.reject(error);
+        finished.reject(error);
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => (transport = create(...args)),
+    );
+    const { owner, context } = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin,
+        capability,
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+        },
+      },
+    );
+    const created = await owner.createRootFor(context, {}, signal);
+    if (!created.ok || !transport)
+      throw Error('Native owner fixture did not start');
+    const sessionId = created.value.sessionId;
+    rootReady.resolve({ id: sessionId, owner, context });
+    const response = await transport.fetch('api/session/prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method: 'session/prompt',
+        payload: {
+          args: {
+            request: {
+              sessionId,
+              requestId,
+              content: [
+                {
+                  type: 'text',
+                  text: 'Have a background agent check the catalog and tell me when it reports back.',
+                },
+              ],
+              mode: 'queue',
+            },
+          },
+        },
+      }),
+    });
+    expect(
+      serverResponseSchema.parse(await response.json()).result,
+    ).toMatchObject({
+      ok: true,
+      value: { accepted: true },
+    });
+    await finished.promise;
+    expect(turns).toEqual([1, 1, 2, 3]);
+    expect([...attempts.values()].sort()).toEqual([2, 4]);
   },
 );
 

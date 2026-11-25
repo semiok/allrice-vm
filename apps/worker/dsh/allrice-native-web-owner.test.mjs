@@ -3,8 +3,9 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import {
+  observeDelegatedInputs,
   observeNativePrompts,
-  readRootPromptOrigins,
+  readPromptOrigins,
 } from './allrice-native-web-owner.mjs';
 
 it('keeps the admitted prompt of a long turn and excludes queued and future input', () => {
@@ -20,9 +21,11 @@ it('keeps the admitted prompt of a long turn and excludes queued and future inpu
     { type: 'user/message', data: user('future') },
   ].map((event, seq) => ({ ...event, seq }));
 
-  expect(readRootPromptOrigins(events, events.length - 2, 2)).toEqual({
+  expect(readPromptOrigins(events, events.length - 2, 2)).toEqual({
     turn: 2,
     ids: ['current'],
+    delegated: false,
+    inherited: [],
   });
 });
 
@@ -41,11 +44,234 @@ it('uses the native title source sequence after a later turn has started', () =>
     },
     { type: 'session/title-llm-request', data: { messageSeqs: [1] } },
   ].map((event, seq) => ({ ...event, seq }));
-  expect(readRootPromptOrigins(events, 5, null, 'session-title')).toEqual({
+  expect(readPromptOrigins(events, 5, null, 'session-title')).toEqual({
     turn: 1,
     ids: ['first'],
+    delegated: false,
+    inherited: [],
   });
 });
+
+function fixture() {
+  const callbacks = new Map();
+  const agents = new Map();
+  const sessions = new Map();
+  const delegations = observeDelegatedInputs({
+    on: (name, callback) => callbacks.set(name, callback),
+    sessions,
+    agents: {
+      get: (id) => agents.get(id),
+      isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+    },
+  });
+  function emit(name, payload) {
+    callbacks.get(name)(payload);
+  }
+  function agent(id, parent) {
+    const session = {
+      id,
+      header: { parentSession: parent?.id, createdAt: Date.now() },
+      events: [],
+    };
+    const value = { id, session, parent };
+    agents.set(id, value);
+    sessions.set(id, session);
+    return value;
+  }
+  function append(agent, type, data) {
+    const { session } = agent;
+    const seq = session.events.length;
+    const event = { seq, type, data };
+    session.events.push(event);
+    callbacks.get('session/event')(session, event);
+  }
+  function input(agent, message, turn) {
+    emit('agent/inbox/inserted', { agent, message });
+    emit('agent/inbox/claimed', { agent, message, turn });
+    append(agent, 'user/message', message);
+  }
+  function openRoot(root, turn, rpcId) {
+    append(root, 'turn/start', { turn });
+    input(root, { id: rpcId, source: { kind: 'user', rpcId } }, turn);
+  }
+  function createChild(root, id) {
+    const child = agent(id, root);
+    emit('subagent/start', { id, runId: 'activation', local: true });
+    const message = { id: 'initial', source: { kind: 'user' } };
+    emit('agent/inbox/inserted', { agent: child, message });
+    append(child, 'turn/start', { turn: 1 });
+    emit('agent/inbox/claimed', { agent: child, message, turn: 1 });
+    // rc.2 writes the parent's catalog edge after accepting the child inbox.
+    append(root, 'subagent/catalog', {
+      version: 0,
+      mode: 'continuable',
+      childId: id,
+      childCreatedAt: child.session.header.createdAt,
+    });
+    append(child, 'user/message', message);
+    return child;
+  }
+  function proof(agent, turn, cursor = agent.session.events.length - 1) {
+    return readPromptOrigins(
+      agent.session.events,
+      cursor,
+      turn,
+      'assistant',
+      (event, number) =>
+        delegations.claimed(agent.session, event.data, number)?.ids,
+    );
+  }
+  function dispose(agent) {
+    agents.delete(agent.id);
+    sessions.delete(agent.id);
+    emit('agent/disposed', { agent });
+  }
+  return {
+    agent,
+    append,
+    claimed: delegations.claimed,
+    createChild,
+    dispose,
+    emit,
+    input,
+    openRoot,
+    proof,
+  };
+}
+
+const relay = (id, sender) => ({
+  id,
+  source: { kind: 'agent-message', form: 'relay', senderSessionId: sender.id },
+});
+
+it('proves a continuable child at its own turn after both original and newer parent turns end', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'origin');
+  const child = f.createChild(root, 'child');
+  f.append(root, 'turn/end', { turn: 1 });
+  f.openRoot(root, 2, 'different-login');
+  f.append(root, 'turn/end', { turn: 2 });
+
+  expect(f.proof(child, 1)).toEqual({
+    turn: 1,
+    ids: ['origin'],
+    delegated: true,
+    inherited: ['origin'],
+  });
+
+  const message = relay('to-idle-parent', child);
+  f.emit('agent/inbox/inserted', { agent: root, message });
+  f.append(root, 'turn/start', { turn: 3 });
+  f.emit('agent/inbox/claimed', { agent: root, message, turn: 3 });
+  expect(f.proof(root, 3)?.ids).toEqual([]);
+  f.append(root, 'user/message', message);
+  expect(f.proof(root, 3)).toEqual({
+    turn: 3,
+    ids: ['origin'],
+    delegated: true,
+    inherited: ['origin'],
+  });
+  expect(message.source).toEqual({
+    kind: 'agent-message',
+    form: 'relay',
+    senderSessionId: 'child',
+  });
+});
+
+it('binds an inbox relay to its accepted sender origin when the child resumes later', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'first');
+  const original = f.createChild(root, 'child');
+  f.append(original, 'turn/end', { turn: 1 });
+  f.dispose(original);
+  f.emit('subagent/end', { id: original.id, runId: 'activation', local: true });
+  f.append(root, 'turn/end', { turn: 1 });
+  f.openRoot(root, 2, 'continuation');
+
+  const child = f.agent(original.id, root);
+  Object.assign(child.session, original.session);
+  f.emit('subagent/start', { id: child.id, runId: 'resume', local: true });
+  const message = relay('to-child', root);
+  f.emit('agent/inbox/inserted', { agent: child, message });
+  f.append(root, 'turn/end', { turn: 2 });
+  f.openRoot(root, 3, 'future-input');
+  f.append(child, 'turn/start', { turn: 2 });
+  f.emit('agent/inbox/claimed', { agent: child, message, turn: 2 });
+  f.append(child, 'user/message', message);
+  expect(f.proof(child, 2)).toEqual({
+    turn: 2,
+    ids: ['continuation'],
+    delegated: true,
+    inherited: ['continuation'],
+  });
+
+  f.append(child, 'turn/end', { turn: 2 });
+  f.append(child, 'turn/start', { turn: 3 });
+  f.input(child, { id: 'later', source: { kind: 'user' } }, 3);
+  expect(f.proof(child, 3)).toBeNull();
+});
+
+it('allows a settlement notice only after its paired native activation ends', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'origin');
+  const child = f.createChild(root, 'child');
+  f.append(root, 'turn/end', { turn: 1 });
+  f.append(child, 'turn/end', { turn: 1 });
+  f.dispose(child);
+  const notice = {
+    id: 'settlement',
+    source: {
+      kind: 'subagent-settled',
+      form: 'notice',
+      senderSessionId: child.id,
+    },
+  };
+  f.emit('agent/inbox/inserted', { agent: root, message: notice });
+  f.append(root, 'turn/start', { turn: 2 });
+  f.emit('agent/inbox/claimed', { agent: root, message: notice, turn: 2 });
+  f.emit('subagent/end', { id: child.id, runId: 'unknown', local: true });
+  expect(f.claimed(root.session, notice, 2)).toBeNull();
+  f.emit('subagent/end', { id: child.id, runId: 'activation', local: true });
+  f.append(root, 'user/message', notice);
+  expect(f.proof(root, 2)).toEqual({
+    turn: 2,
+    ids: ['origin'],
+    delegated: true,
+    inherited: ['origin'],
+  });
+  f.append(root, 'turn/end', { turn: 2 });
+  f.append(root, 'turn/start', { turn: 3 });
+  f.append(root, 'user/message', notice);
+  expect(f.proof(root, 3)).toBeNull();
+});
+
+it.each(['unclaimed', 'discarded', 'unrelated'])(
+  'rejects a %s relay even in a real prompt turn',
+  (kind) => {
+    const f = fixture();
+    const root = f.agent('root');
+    const otherRoot = f.agent('other-root');
+    f.openRoot(root, 1, 'authorized');
+    f.openRoot(otherRoot, 1, 'unrelated');
+    const child = f.createChild(
+      kind === 'unrelated' ? otherRoot : root,
+      'child',
+    );
+    const message = relay('input', child);
+    f.emit('agent/inbox/inserted', { agent: root, message });
+    if (kind === 'discarded')
+      f.emit('agent/inbox/discarded', { agent: root, message });
+    if (kind !== 'unclaimed')
+      f.emit('agent/inbox/claimed', { agent: root, message, turn: 1 });
+    const before = root.session.events.length - 1;
+    f.append(root, 'user/message', message);
+    expect(f.proof(root, 1, before)?.ids).toEqual(['authorized']);
+    expect(f.proof(root, 1)).toBeNull();
+  },
+);
 
 function promptFixture() {
   const events = new EventEmitter();

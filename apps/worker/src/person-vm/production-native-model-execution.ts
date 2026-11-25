@@ -50,6 +50,7 @@ type PromptOwner = NativeModelSelection &
     requestId: string;
     adapterId: string;
     root: string;
+    authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
     assertClaimed(signal: AbortSignal): Promise<void>;
   }>;
@@ -57,10 +58,54 @@ type PromptOwner = NativeModelSelection &
 const promptKey = (adapterId: string, root: string, requestId: string) =>
   JSON.stringify([adapterId, root, requestId]);
 
+export function readNativePromptContributors<
+  T extends Pick<PromptOwner, 'authorityKey' | 'revoked'>,
+>(ids: readonly string[], read: (id: string) => T | undefined) {
+  const first = read(ids[0]!);
+  if (!first || first.revoked.aborted) return null;
+  const contributors = [first];
+  for (const id of ids.slice(1)) {
+    const next = read(id);
+    if (
+      !next ||
+      next.revoked.aborted ||
+      next.authorityKey !== first.authorityKey
+    )
+      return null;
+    contributors.push(next);
+  }
+  return { first, contributors };
+}
+
+export function nativeRunExecutionIds(
+  executions: Map<string, string>,
+  originalRunId: string,
+  attempt: {
+    sessionId: string;
+    sourceTurn: number;
+    delegated: boolean;
+    kind: NativeModelAttemptKind;
+    id: string;
+  },
+) {
+  const { sessionId, sourceTurn, delegated, kind, id } = attempt;
+  const runKey = JSON.stringify(['turn', sessionId, sourceTurn]);
+  const runId = delegated
+    ? (executions.get(runKey) ?? randomUUID())
+    : originalRunId;
+  if (delegated) executions.set(runKey, runId);
+  const executionKey = JSON.stringify([runId, kind, id]);
+  const executionId = executions.get(executionKey) ?? randomUUID();
+  executions.set(executionKey, executionId);
+  return { runId, executionId };
+}
+
 async function persistExecution(
   call: ModelCallBinding,
   prompt: PromptOwner,
   contributingRequestIds: readonly string[],
+  directRequestIds: readonly string[],
+  delegated: boolean,
   signal: AbortSignal,
 ) {
   const { context, vm, native, execution } = call;
@@ -74,7 +119,7 @@ async function persistExecution(
     return reject();
   const runSource = {
     generation: '4.0',
-    source: 'dsh-native-prompt',
+    source: delegated ? 'dsh-native-delegation' : 'dsh-native-prompt',
     threadId: call.allriceThreadRef,
     employeeInstanceId: call.employeeInstanceId,
     employeeRelease: call.employeeRelease,
@@ -98,6 +143,7 @@ async function persistExecution(
     cursor: native.attemptCursor!,
     turn: native.attemptTurn ?? null,
     contributingRequestIds,
+    ...(delegated && directRequestIds.length ? { directRequestIds } : {}),
   };
   signal.throwIfAborted();
   await getDatabase().begin(async (tx) => {
@@ -319,12 +365,57 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           route: AbortSignal;
           delivery?: AbortSignal;
           persisted?: boolean;
+          delegated: boolean;
+          promptIds: readonly string[];
+          delegatedPromptIds: readonly string[];
         }
       >();
       const operations = new Set<Promise<unknown>>();
       const executions = new WeakMap<PromptOwner, Map<string, string>>();
+      const rootExecutions = new WeakMap<
+        PromptOwner,
+        ModelCallBinding['execution']
+      >();
       const trackedTurns = new WeakMap<PromptOwner, Set<PromptOwner>>();
       const endedPrompts = new WeakSet<PromptOwner>();
+      const promptWatches = new Map<
+        string,
+        {
+          stop: AbortController;
+          ready: ReturnType<typeof watchDEntryNativeRosterAuthority>;
+          count: number;
+        }
+      >();
+      function acquirePromptWatch(
+        key: string,
+        create: (
+          signal: AbortSignal,
+        ) => ReturnType<typeof watchDEntryNativeRosterAuthority>,
+      ) {
+        let entry = promptWatches.get(key);
+        if (!entry) {
+          const stop = new AbortController();
+          entry = { stop, ready: create(stop.signal), count: 0 };
+          promptWatches.set(key, entry);
+        }
+        entry.count++;
+        const watch = entry;
+        let released = false;
+        return {
+          ready: watch.ready,
+          async release() {
+            if (released) return;
+            released = true;
+            if (--watch.count !== 0) return;
+            promptWatches.delete(key);
+            watch.stop.abort();
+            await watch.ready.then(
+              (ready) => ready.close(),
+              () => {},
+            );
+          },
+        };
+      }
       let promptChange = new AbortController();
       function notifyPromptChange() {
         const was = promptChange;
@@ -356,7 +447,6 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           for (const member of members) endedPrompts.add(member);
           endedPrompts.add(prompt);
           notifyPromptChange();
-          await releaseFinishedPrompts(prompt.adapterId, prompt.root);
         }).catch(() => {
           // A lost observation is not a fabricated Run terminal.
           trackedTurns.delete(prompt);
@@ -392,24 +482,6 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         } finally {
           operations.delete(joined);
         }
-      }
-      async function releaseFinishedPrompts(adapterId: string, root: string) {
-        const scopes = [...selected].filter(
-          ([, entry]) =>
-            entry.scope.adapterId === adapterId && entry.scope.root === root,
-        );
-        const latest = scopes.findLast(([, entry]) =>
-          entry.observation.inserted(),
-        )?.[0];
-        await Promise.all(
-          scopes.map(([key, { scope }]) =>
-            key !== latest &&
-            endedPrompts.has(scope) &&
-            !Array.from(calls.values()).some((entry) => entry.scope === scope)
-              ? forgetPrompt(key)
-              : undefined,
-          ),
-        );
       }
       function conflictingLogin(
         adapterId: string,
@@ -515,46 +587,73 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 active,
               );
               const route = await input.assertRouteCurrent(active);
-              const watching = AbortSignal.any([
-                live,
+              const authorityKey = JSON.stringify([
+                adapterId,
+                profile.owner.nativeInstanceId,
+                profile.bindingRef,
+                profile.receipt.rosterDigest,
+                binding.vmId,
+                binding.instanceId,
+                binding.leaseEpoch,
+                binding.organizationId,
+                binding.personId,
+                identity.organizationId,
+                identity.workspaceId,
+                identity.personId,
+                identity.employeeInstanceId,
+                identity.employeeRevision,
+                identity.employeeVersionId,
+                identity.threadId,
+                root.rootNativeSessionId,
+                root.rootBindingRef,
+                root.rootOriginDigest,
+                context.sessionId,
+              ]);
+              const authority = acquirePromptWatch(authorityKey, (watching) =>
+                watchDEntryNativeRosterAuthority(
+                  context,
+                  {
+                    workspaceId: identity.workspaceId,
+                    employeeInstanceId: identity.employeeInstanceId,
+                    threadId: identity.threadId,
+                  },
+                  identity,
+                  AbortSignal.any([live, route, profile.revoked, watching]),
+                  {
+                    verifyBinding: (current) =>
+                      host.vm.assertCurrentBinding(context, binding, current),
+                    async verifyRoster(current) {
+                      const observed = await currentDEntryNativeOwner(
+                        dEntryNativeOwnerPort,
+                        context,
+                        identity,
+                        current,
+                      );
+                      if (
+                        !sameVmBinding(
+                          observed.view.receipt.binding,
+                          binding,
+                        ) ||
+                        observed.view.bindingRef !== profile.bindingRef ||
+                        observed.view.receipt.rosterDigest !==
+                          profile.receipt.rosterDigest
+                      )
+                        return reject();
+                    },
+                  },
+                ),
+              );
+              retireUndispatched = async () => {
+                close.abort();
+                await authority.release();
+              };
+              const watch = await authority.ready;
+              const revoked = AbortSignal.any([
+                watch.revoked,
                 route,
                 profile.revoked,
                 close.signal,
               ]);
-              const watch = await watchDEntryNativeRosterAuthority(
-                context,
-                {
-                  workspaceId: identity.workspaceId,
-                  employeeInstanceId: identity.employeeInstanceId,
-                  threadId: identity.threadId,
-                },
-                identity,
-                watching,
-                {
-                  verifyBinding: (current) =>
-                    host.vm.assertCurrentBinding(context, binding, current),
-                  async verifyRoster(current) {
-                    const observed = await currentDEntryNativeOwner(
-                      dEntryNativeOwnerPort,
-                      context,
-                      identity,
-                      current,
-                    );
-                    if (
-                      !sameVmBinding(observed.view.receipt.binding, binding) ||
-                      observed.view.bindingRef !== profile.bindingRef ||
-                      observed.view.receipt.rosterDigest !==
-                        profile.receipt.rosterDigest
-                    )
-                      return reject();
-                  },
-                },
-              );
-              retireUndispatched = async () => {
-                close.abort();
-                await watch.close();
-              };
-              const revoked = AbortSignal.any([watch.revoked, watching]);
               const admission = AbortSignal.any([active, revoked]);
               while (
                 conflictingLogin(adapterId, root.rootNativeSessionId, context)
@@ -574,6 +673,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 binding,
                 adapterId,
                 root: root.rootNativeSessionId,
+                authorityKey,
                 revoked,
                 requestId,
                 assertObserved: watch.assertObserved,
@@ -591,7 +691,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 unknown: false,
                 async join() {
                   revoked.removeEventListener('abort', retire);
-                  await Promise.all([observation.close(), watch.close()]);
+                  await Promise.all([observation.close(), authority.release()]);
                 },
               };
               selected.set(key, entry);
@@ -601,9 +701,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 .then(async (outcome) => {
                   if (selected.get(key) !== entry) return;
                   if (outcome === 'discarded') return forgetPrompt(key);
+                  // An ended prompt loses its queue occupancy. Keep its exact
+                  // claimed source under the shared authority for native descendants.
                   endedPrompts.add(scope);
                   notifyPromptChange();
-                  await releaseFinishedPrompts(adapterId, scope.root);
                 })
                 .catch(() => {
                   // Loss of the carrier proves neither discard nor turn end.
@@ -704,6 +805,54 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         if (!attempt) return reject();
         return { resource, profile, attempt };
       }
+      async function assertDelegatedOrigins(
+        scope: PromptOwner,
+        contributing: readonly PromptOwner[],
+        call: ModelCallBinding,
+        signal: AbortSignal,
+      ) {
+        const checked = new Map<
+          string,
+          Awaited<ReturnType<typeof readDEntryNativeExecution>>
+        >();
+        for (const member of contributing) {
+          const ids = rootExecutions.get(member);
+          if (!ids) return reject();
+          let original = checked.get(ids.executionId);
+          if (!original) {
+            original = await readDEntryNativeExecution(
+              scope.context,
+              ids,
+              signal,
+            );
+            checked.set(ids.executionId, original);
+          }
+          const { prompt, attempt } = original;
+          if (
+            (prompt.source !== 'dsh-native-prompt' &&
+              !(
+                'directRequestIds' in attempt &&
+                Array.isArray(attempt.directRequestIds) &&
+                attempt.directRequestIds.includes(member.requestId)
+              )) ||
+            prompt.rootSessionId !== scope.root ||
+            prompt.loginSessionId !== scope.context.sessionId ||
+            prompt.threadId !== call.allriceThreadRef ||
+            prompt.employeeInstanceId !== scope.identity.employeeInstanceId ||
+            prompt.employeeRelease !== scope.identity.employeeVersionId ||
+            prompt.vmId !== call.vm.vmId ||
+            prompt.adapterId !== scope.adapterId ||
+            attempt.nativeInstanceId !== call.native.instanceId ||
+            attempt.vmInstanceId !== call.vm.instanceId ||
+            attempt.leaseEpoch !== call.vm.leaseEpoch ||
+            attempt.sessionId !== scope.root ||
+            attempt.parentSessionId !== null ||
+            attempt.kind !== 'assistant' ||
+            !attempt.contributingRequestIds.includes(member.requestId)
+          )
+            return reject();
+        }
+      }
       async function readAuthorizedCall(
         call: ModelCallBinding,
         signal: AbortSignal,
@@ -729,6 +878,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             attempt.id !== call.native.attemptId ||
             attempt.turn !== call.native.attemptTurn ||
             attempt.cursor !== call.native.attemptCursor ||
+            attempt.rootSessionId !== call.native.rootSessionId ||
+            attempt.delegated !== owned.delegated ||
+            JSON.stringify(attempt.promptIds) !==
+              JSON.stringify(owned.promptIds) ||
+            JSON.stringify(attempt.delegatedPromptIds) !==
+              JSON.stringify(owned.delegatedPromptIds) ||
             resource.rootNativeSessionId !== call.native.rootSessionId ||
             resource.parentNativeSessionId !== call.native.parentSessionId ||
             resource.threadId !== call.allriceThreadRef ||
@@ -770,24 +925,30 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   call: ModelCallBinding;
                   owner: ReturnType<typeof host.startup.catalog>['owner'];
                   address: SessionAddress;
-                  order: number;
-                  sourceTurn: number | null;
+                  sourceTurn: number;
+                  coalesced: readonly PromptOwner[];
+                  delegated: boolean;
                   promptIds: readonly string[];
+                  delegatedPromptIds: readonly string[];
                 }
               | undefined;
-            const coalesced: PromptOwner[] = [];
-            for (const [key, { scope }] of selected) {
+            const checked = new Set<string>();
+            for (const [key, { scope: probe }] of selected) {
               if (
-                scope.adapterId !== wanted.adapterId ||
-                !sameVmBinding(scope.binding, binding)
+                probe.adapterId !== wanted.adapterId ||
+                !sameVmBinding(probe.binding, binding)
               )
                 continue;
-              if (scope.revoked.aborted) {
+              if (probe.revoked.aborted) {
                 await forgetPrompt(key);
                 continue;
               }
+              // Every admitted prompt in this authority scope shares the same
+              // current subject and exact owner. Only native proof selects IDs.
+              if (checked.has(probe.authorityKey)) continue;
+              checked.add(probe.authorityKey);
               const resolved = await resolveSession(
-                scope,
+                probe,
                 wanted.sessionId,
                 kind,
                 active,
@@ -800,13 +961,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   // another root. Recheck this candidate's own selector before
                   // removing its prompt authority.
                   const keySelection = {
-                    workspaceId: scope.identity.workspaceId,
-                    employeeInstanceId: scope.identity.employeeInstanceId,
-                    threadId: scope.identity.threadId,
+                    workspaceId: probe.identity.workspaceId,
+                    employeeInstanceId: probe.identity.employeeInstanceId,
+                    threadId: probe.identity.threadId,
                   };
                   try {
                     await requireDEntryNativeIdentity(
-                      scope.context,
+                      probe.context,
                       keySelection,
                     );
                   } catch (identityError) {
@@ -815,12 +976,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       identityError.code === 'not_found'
                     )
                       await forgetPrompt(key);
-                    else if (!scope.revoked.aborted) throw identityError;
+                    else if (!probe.revoked.aborted) throw identityError;
                   }
                   return null;
                 }
                 if (
-                  scope.revoked.aborted ||
+                  probe.revoked.aborted ||
                   (error instanceof DataAccessError &&
                     error.code === 'authorization_denied') ||
                   (error instanceof IdentityError &&
@@ -833,8 +994,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               const { resource, profile, attempt } = resolved;
               if (
                 profile.owner.modelAdapterId !== wanted.adapterId ||
-                resource.rootNativeSessionId !== scope.root ||
-                !attempt.promptIds.includes(scope.requestId) ||
+                resource.rootNativeSessionId !== probe.root ||
+                attempt.rootSessionId !== probe.root ||
+                attempt.sourceTurn === null ||
                 !attempt.recipient ||
                 !timingSafeEqual(
                   Buffer.from(attempt.recipient),
@@ -842,47 +1004,74 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 )
               )
                 continue;
-              try {
-                await scope.assertClaimed(active);
-              } catch {
-                active.throwIfAborted();
-                continue;
+              const candidates = new Map<
+                string,
+                Array<{
+                  scope: PromptOwner;
+                  observation: NativePromptObservation;
+                }>
+              >();
+              const requested = new Set(attempt.promptIds);
+              for (const entry of selected.values()) {
+                const { scope } = entry;
+                if (
+                  scope.root !== probe.root ||
+                  scope.adapterId !== wanted.adapterId ||
+                  !sameVmBinding(scope.binding, binding) ||
+                  scope.revoked.aborted ||
+                  !requested.has(scope.requestId)
+                )
+                  continue;
+                const choices = candidates.get(scope.requestId) ?? [];
+                choices.push(entry);
+                candidates.set(scope.requestId, choices);
               }
+              const proven = readNativePromptContributors(
+                attempt.promptIds,
+                (id) => {
+                  const choices = candidates.get(id) ?? [];
+                  const inserted = choices.filter(({ observation }) =>
+                    observation.inserted(),
+                  );
+                  // DSH can return an accepted idempotent replay. Only the
+                  // original occurrence's native claim carries execution authority.
+                  const actual = inserted.length ? inserted : choices;
+                  return actual.length === 1 ? actual[0]!.scope : undefined;
+                },
+              );
+              if (!proven) return reject();
+              const { first: scope, contributors: coalesced } = proven;
+              if (scope.authorityKey !== probe.authorityKey) continue;
+              await Promise.all(
+                coalesced.map((member) => member.assertClaimed(active)),
+              );
               let scopeExecutions = executions.get(scope);
               if (!scopeExecutions) {
                 scopeExecutions = new Map();
                 executions.set(scope, scopeExecutions);
               }
-              const executionKey = JSON.stringify([
-                resource.nativeSessionId,
-                kind,
-                attempt.id,
-              ]);
-              const executionId =
-                scopeExecutions.get(executionKey) ?? randomUUID();
-              scopeExecutions.set(executionKey, executionId);
-              const order = attempt.promptIds.indexOf(scope.requestId);
-              if (
-                matched &&
-                matched.scope.context.sessionId !== scope.context.sessionId
-              )
-                return reject();
-              coalesced.push(scope);
-              if (matched && matched.order < order) continue;
+              const execution = nativeRunExecutionIds(
+                scopeExecutions,
+                scope.runId,
+                {
+                  ...attempt,
+                  sessionId: resource.nativeSessionId,
+                  sourceTurn: attempt.sourceTurn,
+                },
+              );
               matched = {
                 scope,
                 owner: profile.owner,
                 address: resource.nativeAddress!,
-                order,
                 sourceTurn: attempt.sourceTurn,
+                coalesced,
                 promptIds: attempt.promptIds,
+                delegated: attempt.delegated,
+                delegatedPromptIds: attempt.delegatedPromptIds,
                 call: {
                   context: structuredClone(scope.context),
                   vm: binding,
-                  execution: {
-                    runId: scope.runId,
-                    executionId,
-                  },
+                  execution,
                   employeeInstanceId: scope.identity.employeeInstanceId,
                   employeeRelease: scope.identity.employeeVersionId,
                   allriceThreadRef: resource.threadId,
@@ -905,20 +1094,19 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   model: wanted.model,
                 },
               };
+              break;
             }
-            if (
-              !matched ||
-              matched.promptIds.some(
-                (id) => !coalesced.some((scope) => scope.requestId === id),
-              )
-            )
-              return reject();
+            if (!matched) return reject();
             const {
               scope,
               call,
               owner: profileOwner,
               address,
               sourceTurn,
+              coalesced,
+              promptIds,
+              delegated,
+              delegatedPromptIds,
             } = matched;
             const callId = call.native.callId;
             const deadline = AbortSignal.timeout(30_000);
@@ -930,9 +1118,6 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             ]);
             const revoke = () => {
               calls.delete(callId);
-              void releaseFinishedPrompts(scope.adapterId, scope.root).catch(
-                () => {},
-              );
             };
             const entry: NonNullable<ReturnType<typeof calls.get>> = {
               scope,
@@ -941,6 +1126,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               revoke,
               redeemed: false,
               route,
+              delegated,
+              promptIds,
+              delegatedPromptIds,
             };
             calls.set(callId, entry);
             effective.addEventListener('abort', revoke, { once: true });
@@ -963,18 +1151,35 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       call,
                       authorization,
                       async (admitted) => {
+                        const inherited = new Set(delegatedPromptIds);
+                        const direct = coalesced.filter(
+                          (member) => !inherited.has(member.requestId),
+                        );
+                        await assertDelegatedOrigins(
+                          scope,
+                          coalesced.filter((member) =>
+                            inherited.has(member.requestId),
+                          ),
+                          call,
+                          admitted,
+                        );
                         await persistExecution(
                           call,
                           scope,
                           coalesced.map((member) => member.requestId).sort(),
+                          direct.map((member) => member.requestId).sort(),
+                          delegated,
                           admitted,
                         );
                         entry.persisted = true;
                         await assertPersistedExecution(call, admitted);
                         if (
-                          sourceTurn !== null &&
-                          call.native.parentSessionId === null
+                          kind === 'assistant' &&
+                          !call.native.parentSessionId
                         )
+                          for (const member of direct)
+                            rootExecutions.set(member, call.execution);
+                        if (!delegated)
                           trackTurn(
                             scope,
                             profileOwner,

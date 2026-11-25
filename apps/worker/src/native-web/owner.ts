@@ -703,6 +703,9 @@ export async function openNativeWebOwner(input: {
                   recipient: undefined,
                   promptIds: [] as string[],
                   sourceTurn: null,
+                  rootSessionId: null,
+                  delegated: false,
+                  delegatedPromptIds: [] as string[],
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -723,30 +726,50 @@ export async function openNativeWebOwner(input: {
                 recipient?: unknown;
                 sourceTurn?: unknown;
                 promptIds?: unknown;
+                rootSessionId?: unknown;
+                delegated?: unknown;
+                delegatedPromptIds?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
+              const { promptIds, delegatedPromptIds } = value ?? {};
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
                 !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
-                Object.keys(value).length !== 4 ||
-                (address.kind === 'session'
-                  ? !Number.isSafeInteger(value.sourceTurn) ||
-                    (attempt.turn !== null && value.sourceTurn !== attempt.turn)
-                  : value.sourceTurn !== null) ||
-                !Array.isArray(value.promptIds) ||
-                value.promptIds.length > 64 ||
-                value.promptIds.some(
-                  (id) => typeof id !== 'string' || id.length > 256,
-                )
+                Object.keys(value).length !== 7 ||
+                !Number.isSafeInteger(value.sourceTurn) ||
+                (attempt.turn !== null && value.sourceTurn !== attempt.turn) ||
+                typeof value.rootSessionId !== 'string' ||
+                !value.rootSessionId ||
+                value.rootSessionId.length > 256 ||
+                (address.kind === 'session' &&
+                  value.rootSessionId !== address.sessionId) ||
+                typeof value.delegated !== 'boolean' ||
+                (address.kind === 'subagent' && !value.delegated) ||
+                !Array.isArray(promptIds) ||
+                promptIds.length === 0 ||
+                promptIds.length > 64 ||
+                promptIds.some(
+                  (id) => typeof id !== 'string' || !id || id.length > 256,
+                ) ||
+                new Set(promptIds).size !== promptIds.length ||
+                !Array.isArray(delegatedPromptIds) ||
+                delegatedPromptIds.length > promptIds.length ||
+                delegatedPromptIds.some((id) => !promptIds.includes(id)) ||
+                new Set(delegatedPromptIds).size !==
+                  delegatedPromptIds.length ||
+                (value.delegated && delegatedPromptIds.length === 0)
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {
                 ...attempt,
                 id: kind === 'assistant' ? attempt.id : id.data,
                 recipient: value.recipient,
-                sourceTurn: value.sourceTurn as number | null,
-                promptIds: value.promptIds as string[],
+                sourceTurn: value.sourceTurn as number,
+                rootSessionId: value.rootSessionId,
+                delegated: value.delegated,
+                delegatedPromptIds: delegatedPromptIds as string[],
+                promptIds: promptIds as string[],
               };
             } finally {
               // Dispose this logical read on its original carrier. The
