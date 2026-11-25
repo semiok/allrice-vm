@@ -16,7 +16,6 @@ export const inject = [
   'loader',
   'clientModules',
   'allricePrincipal',
-  'llm',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
@@ -189,6 +188,7 @@ export function apply(ctx, config) {
   let stagingCleanupFailure;
   let commandMemory;
   let registeredModel;
+  let modelFiber;
   let published = false;
   let retiring = false;
   const stop = () => {
@@ -228,6 +228,9 @@ export function apply(ctx, config) {
     async retire() {
       stop();
       await publishing?.catch(() => {});
+      const [modelCleanup] = await Promise.allSettled([
+        Promise.resolve().then(() => modelFiber?.dispose()),
+      ]);
       try {
         if (published) await rm(artifactPath, { force: true });
       } catch (error) {
@@ -238,6 +241,7 @@ export function apply(ctx, config) {
           );
         throw error;
       }
+      if (modelCleanup.status === 'rejected') throw modelCleanup.reason;
       if (stagingCleanupFailure) throw stagingCleanupFailure.error;
     },
   });
@@ -333,7 +337,6 @@ export function apply(ctx, config) {
     if (!current()) return;
     if (modelAdapter !== undefined) {
       publicationStage = 'model';
-      const llm = ctx.get('llm');
       const { registerManagedGatewayAdapter } = await import(
         modelAdapter.entry
       );
@@ -343,37 +346,48 @@ export function apply(ctx, config) {
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       const endpoint = new URL('/v1/reference', origin);
-      const dispose = registerManagedGatewayAdapter(ctx.llm, {
-        origin,
-        capability,
-        route: {
-          provider,
-          model,
-          modelInfo,
-          lifetime: signal,
-          async resolveCallReference(selection, active) {
-            const response = await globalThis.fetch(endpoint, {
-              method: 'POST',
-              redirect: 'error',
-              signal: active,
-              headers: {
-                authorization: 'Bearer ' + capability,
-                'content-type': 'application/json',
-              },
-              body: JSON.stringify(selection),
-            });
-            if (!response.ok) {
-              await response.body?.cancel();
-              throw Error('Native managed model call was denied');
-            }
-            return (await response.json()).reference;
+      modelFiber = ctx.inject(['llm'], async (scope) => {
+        if (!current()) return;
+        const dispose = registerManagedGatewayAdapter(scope.llm, {
+          origin,
+          capability,
+          route: {
+            provider,
+            model,
+            modelInfo,
+            lifetime: signal,
+            async resolveCallReference(selection, active) {
+              const response = await globalThis.fetch(endpoint, {
+                method: 'POST',
+                redirect: 'error',
+                signal: active,
+                headers: {
+                  authorization: 'Bearer ' + capability,
+                  'content-type': 'application/json',
+                },
+                body: JSON.stringify(selection),
+              });
+              if (!response.ok) {
+                await response.body?.cancel();
+                throw Error('Native managed model call was denied');
+              }
+              return (await response.json()).reference;
+            },
           },
-        },
+        });
+        registeredModel = { dispose, llm: original(scope.llm), id };
+        const models = await scope.llm.listModels(provider);
+        if (models.length !== 1 || models[0].id !== model)
+          throw Error('Native managed model was not registered');
       });
-      registeredModel = { dispose, llm: original(llm), id };
-      const models = await ctx.llm.listModels(provider);
-      if (models.length !== 1 || models[0].id !== model)
-        throw Error('Native managed model was not registered');
+      if (
+        !(await waitWhileOwned(signal, (ready, reject) => {
+          void Promise.resolve(modelFiber).then(ready, reject);
+        }))
+      )
+        return;
+      if (!registeredModel)
+        throw Error('Native managed model was not installed');
     }
     if (!current()) return;
     publicationStage = 'mux';

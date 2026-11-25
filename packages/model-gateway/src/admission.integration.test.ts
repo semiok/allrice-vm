@@ -113,7 +113,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
     },
   };
   it('durably authorizes an exact live native call before its one-shot wire claim', async () => {
-    const store = createPostgresModelGatewayStore(sql('native-call-binding'));
+    const store = createPostgresModelGatewayStore(sql('grant'));
     const base = modelBinding();
     const binding = {
       ...base,
