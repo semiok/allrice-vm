@@ -14,7 +14,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PERSON_VM_COMMAND_MEMORY_PROGRAM } from '@allrice/person-vm';
+import { PERSON_VM_COMMAND_MEMORY_VERIFIER } from '@allrice/person-vm';
 import {
   VM_MEMORY_PHASE4_REFERENCE_POLICY,
   VM_PHYSICAL_MEMORY_BYTES,
@@ -22,12 +22,17 @@ import {
 import type * as Platform from '@allrice/contracts';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { GuestMemorySample, VmMemoryPolicy } from './contract.ts';
-import { createVmMemoryGuestPlan as createPlan } from './guest-config.ts';
+import {
+  createPersonVmDshCommandMemoryPatch,
+  createVmMemoryGuestPlan as createPlan,
+  readPersonVmDshCommandMemoryControls,
+} from './guest-config.ts';
 
 // Explicit historical policy is a fixture choice, never a production fallback.
 const createVmMemoryGuestPlan = (input: {
   persistentDirectory: string;
   commandReceipt?: Parameters<typeof createPlan>[0]['commandReceipt'];
+  dshCommandMemory?: Parameters<typeof createPlan>[0]['dshCommandMemory'];
 }) =>
   createPlan({
     ...input,
@@ -675,9 +680,9 @@ describe.sequential(
         file.path.endsWith('/command-observer.cjs'),
       )!;
       expect(writer.mode).toBe(0o700);
-      expect(writer.contents.endsWith(PERSON_VM_COMMAND_MEMORY_PROGRAM)).toBe(
-        true,
-      );
+      expect(
+        writer.contents.startsWith(PERSON_VM_COMMAND_MEMORY_VERIFIER),
+      ).toBe(true);
       expect(plan.env).toMatchObject({
         ALLRICE_MEMORY_RECEIPT_NODE: '/fixed-node/bin/node',
         ALLRICE_MEMORY_RECEIPT_WRITER:
@@ -705,6 +710,102 @@ describe.sequential(
             commandReceipt,
           }),
         ).rejects.toThrow('invalid_command_receipt_configuration');
+    });
+
+    it('uses the same snapshotted receipt paths for config and launch across staging reads', async () => {
+      const commandReceipt = {
+        nodeExecutable: '/fixed-node/bin/node',
+        receiptDirectory: '/fixture/encrypted/receipts',
+      };
+      const creating = createVmMemoryGuestPlan({
+        persistentDirectory: '/fixture/encrypted',
+        commandReceipt,
+      });
+      commandReceipt.nodeExecutable = '/changed/bin/node';
+      commandReceipt.receiptDirectory = '/changed/receipts';
+      const plan = await creating;
+      expect(plan.env.ALLRICE_MEMORY_RECEIPT_NODE).toBe('/fixed-node/bin/node');
+      const config = plan.files.find(
+        (file) => file.path === plan.initialize.args[1],
+      )!;
+      expect(JSON.parse(config.contents).receiptDirectory).toBe(
+        '/fixture/encrypted/receipts',
+      );
+      expect(plan.env.ALLRICE_MEMORY_RECEIPT_DIRECTORY).toBe(
+        '/fixture/encrypted/receipts',
+      );
+    });
+
+    it('binds the native overlay to the separate sealed program and keeps write state out of the workspace', async () => {
+      const artifact = await readPersonVmDshCommandMemoryControls();
+      expect(artifact.files.map((file) => file.name)).toEqual([
+        'bash-env.sh',
+        'command-observer.cjs',
+        'dsh-command-memory.mjs',
+        'initialize.cjs',
+        'launch-dsh.sh',
+        'sample.cjs',
+      ]);
+      const controls = {
+        hostDirectory: `/fixture/release/${artifact.sha256}`,
+        guestDirectory: artifact.guestDirectory,
+        sha256: artifact.sha256,
+      };
+      const plan = await createVmMemoryGuestPlan({
+        persistentDirectory: '/work',
+        dshCommandMemory: controls,
+      });
+      const readonlyDshDirectory = `/opt/allrice/dsh/${'a'.repeat(64)}`;
+      const input = {
+        cliPath: `${readonlyDshDirectory}/cli.mjs`,
+        cleanupTimeoutMs: 10000,
+        controls,
+        readonlyDshDirectory,
+      };
+      expect(plan.files.map(({ path, mode }) => [path, mode])).toEqual([
+        ['/run/allrice-command-memory/config.json', 0o600],
+      ]);
+      expect(plan.initialize.args[0]).toBe(
+        `${artifact.guestDirectory}/initialize.cjs`,
+      );
+      expect(plan.env.ALLRICE_MEMORY_RECEIPT_DIRECTORY).toBe(
+        '/run/allrice-command-memory/receipts',
+      );
+      expect(createPersonVmDshCommandMemoryPatch(plan, input)).toMatchObject([
+        {
+          id: 'sandbox',
+          name: '@deepseek-ai/dsh-sandbox-local',
+          disabled: true,
+        },
+        {
+          id: 'subprocess',
+          name: '@deepseek-ai/dsh-subprocess-local',
+          disabled: true,
+        },
+        {
+          insert: [
+            {
+              name: `file://${artifact.guestDirectory}/dsh-command-memory.mjs`,
+              config: {
+                controlDirectory: artifact.guestDirectory,
+                readonlyDshDirectory,
+              },
+            },
+          ],
+        },
+      ]);
+      expect(() =>
+        createPersonVmDshCommandMemoryPatch(plan, {
+          ...input,
+          cliPath: '/work/bin.js',
+        }),
+      ).toThrow('invalid_dsh_command_memory_patch');
+      expect(() =>
+        createPersonVmDshCommandMemoryPatch(
+          { ...plan, env: { ...plan.env, BASH_ENV: '/work/bash-env.sh' } },
+          input,
+        ),
+      ).toThrow('invalid_dsh_command_memory_patch');
     });
 
     it.each(['canonical', 'symlink', 'not-directory'] as const)(
