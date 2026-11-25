@@ -396,6 +396,46 @@ describe('private production Host configuration', () => {
     },
   );
 
+  it.each([
+    { label: 'sealed public generation', accepted: true },
+    { label: 'non-public registry', accepted: false },
+    { label: 'noncanonical generation path', accepted: false },
+    { label: 'mismatched manifest pin', accepted: false },
+    { label: 'private disk overlap', accepted: false },
+  ])('validates an optional OCI cache: $label', async ({ label, accepted }) => {
+    const config = value();
+    const publicImageCache = {
+      directory: join(root, 'artifacts', 'oci', hash),
+      manifestSha256: hash,
+    };
+    if (label === 'noncanonical generation path')
+      publicImageCache.directory = root + '/artifacts/../artifacts/oci/' + hash;
+    if (label === 'mismatched manifest pin')
+      publicImageCache.manifestSha256 = '2'.repeat(64);
+    if (label === 'private disk overlap')
+      publicImageCache.directory = join(config.disk.root, hash);
+    await seal({
+      ...config,
+      native: {
+        ...config.native,
+        image:
+          label === 'non-public registry'
+            ? config.native.image
+            : `docker.io/library/node@sha256:${hash}`,
+        publicImageCache,
+      },
+    });
+    const loaded = readProductionHostConfiguration(signal());
+    if (accepted)
+      expect((await loaded).configuration.native.publicImageCache).toEqual(
+        publicImageCache,
+      );
+    else
+      await expect(loaded).rejects.toBeInstanceOf(
+        ProductionHostConfigurationUnavailable,
+      );
+  });
+
   it('rejects a measured guest physical policy that differs from the platform cap without overwriting it', async () => {
     const input = value();
     input.memory.policy.physicalBytes = 3 * 1024 ** 3;

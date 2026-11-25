@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile, realpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
-import { isAbsolute, join, normalize, posix, sep } from 'node:path';
+import { basename, isAbsolute, join, normalize, posix, sep } from 'node:path';
 import {
   readServiceBuildIdentity,
   ServiceBuildManifestSchema,
@@ -78,11 +78,24 @@ const configuration = z
           })
           .strict()
           .transform(checkedReadonlyCommandMemoryDirectory),
+        publicImageCache: z
+          .object({ directory: absolute, manifestSha256: bareHash })
+          .strict()
+          .refine(
+            ({ directory, manifestSha256 }) =>
+              basename(directory) === manifestSha256,
+          )
+          .optional(),
         rootDiskGiB: positive,
         socketRoot: absolute,
         jobCleanupTimeoutMs: positive,
       })
-      .strict(),
+      .strict()
+      .refine(
+        ({ image, publicImageCache }) =>
+          !publicImageCache ||
+          /^docker\.io\/library\/node@sha256:[a-f0-9]{64}$/.test(image),
+      ),
     disk: z
       .object({ root: absolute, keyRoot: absolute, capacityGiB: positive })
       .strict(),
@@ -167,6 +180,9 @@ const configuration = z
       value.disk.root,
       value.disk.keyRoot,
       value.native.socketRoot,
+      ...(value.native.publicImageCache
+        ? [value.native.publicImageCache.directory]
+        : []),
     ];
     if (
       value.memory.policy.physicalBytes !==

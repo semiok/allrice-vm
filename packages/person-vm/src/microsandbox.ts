@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { lstat, open, readlink, symlink, writeFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
   PERSON_VM_MEMORY_MIB,
@@ -8,6 +8,11 @@ import {
   type PersonVmEgressReceipt,
 } from './contract.ts';
 import { privateDirectory } from './encrypted-disk.ts';
+import {
+  checkedPublicImageCache,
+  seedPublicImageCache,
+  type PublicImageCache,
+} from './image-cache.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 import {
   bootstrapMicrosandbox,
@@ -126,6 +131,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       image: string;
       readonlyDshDirectory?: ReadonlyDshDirectory;
       readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
+      publicImageCache?: PublicImageCache;
       rootDiskGiB: number;
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
@@ -149,6 +155,14 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
               checkedReadonlyCommandMemoryDirectory(
                 options.readonlyCommandMemoryDirectory,
               ),
+          }
+        : {}),
+      ...(options.publicImageCache
+        ? {
+            publicImageCache: checkedPublicImageCache(
+              options.publicImageCache,
+              options.image,
+            ),
           }
         : {}),
     };
@@ -553,19 +567,25 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
     web?: PersonVmWebEndpointReceipt,
   ) {
-    if (web) {
-      const paths = this.homes.get(binding.vmId);
-      if (!paths) throw new PersonVmError('PROVIDER_FAILED');
-      await assertPreparedWebEndpoints(paths.home, binding, web);
-    }
+    const paths = this.homes.get(binding.vmId);
+    if (!paths) throw new PersonVmError('PROVIDER_FAILED');
+    if (web) await assertPreparedWebEndpoints(paths.home, binding, web);
     if ((await this.status(binding, signal)) !== 'absent')
       throw new PersonVmError('PROVIDER_FAILED');
     await this.artifact(binding, signal, true);
-    await this.command(
-      binding,
-      ['pull', this.options.image, '--materialize', 'flat', '--quiet'],
-      signal,
-    );
+    if (this.options.publicImageCache)
+      await seedPublicImageCache(
+        this.options.publicImageCache,
+        this.options.image,
+        join(dirname(paths.config), 'microsandbox'),
+        signal,
+      );
+    else
+      await this.command(
+        binding,
+        ['pull', this.options.image, '--materialize', 'flat', '--quiet'],
+        signal,
+      );
     const args = [
       'create',
       this.options.image,
