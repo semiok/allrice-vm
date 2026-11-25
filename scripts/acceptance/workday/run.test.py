@@ -51,6 +51,16 @@ def bff_http(responses):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_read_only_bff_uses_approved_origin_despite_ambient_proxy(self):
+        with bff_http([(200, {'origin': 'approved'})]) as (origin, seen), bff_http(
+                [(200, {'origin': 'proxy'})]) as (proxy, forwarded), patch.dict(
+                os.environ, {'http_proxy': proxy, 'no_proxy': ''}, clear=True):
+            payload = workday.dev_json(origin, '/api/v1/d-entry/identity', {},
+                                       'synthetic-session', 1)
+            self.assertEqual(payload, {'origin': 'approved'})
+            self.assertEqual(seen, [('GET', '/api/v1/d-entry/identity')])
+            self.assertEqual(forwarded, [])
+
     def test_original_twenty_cases_and_full_user_journey_are_preserved(self):
         cases = json.loads((ROOT / 'cases.json').read_text())
         self.assertEqual(len(cases), 20)

@@ -48,7 +48,7 @@ python3 scripts/acceptance/workday/run.py --mode fixture --config /absolute/fixt
 - `gates.met267/node4/deployment/personalRollout/readAuthorization`：相应真实批准/门禁原件引用。字符串只是证据引用，不创造批准。
 - `requestTimeoutSeconds`：此次QA只读请求的显式预算；需要浏览器时另给 `driverTimeoutSeconds/cleanupTimeoutSeconds`。
 
-只调用已核实的两个现有公开BFF：`GET /api/v1/d-entry/identity`、语义只读的 `POST /api/v1/d-entry/native-owner`。不跟随HTTP重定向，不保存响应头/任意错误体。实际服务器identity必须匹配配置，native-owner必须返回同identity的 `4.0` mount，3.x或缺源均不能填绿。controlReady仅是discovery，`editorReady/canSend`始终标not-verified；不会发送prompt或启动VM。
+只调用已核实的两个现有公开 BFF：`GET /api/v1/d-entry/identity`、语义只读的 `POST /api/v1/d-entry/native-owner`。请求直接访问核定 origin，禁用环境代理和 HTTP 重定向。实际服务器 identity 必须匹配配置，native-owner 必须返回同 identity 的 `4.0` mount。controlReady 仅记录入口发现，`editorReady/canSend` 保留待验。
 
 请求前已经明确缺失的来源、授权或门禁前置仍可 `Unavailable/skipped`，不发请求。实际发出请求后，所有HTTP错误均为 failed/退出1，记入对应身份/员工步骤并说明具体原因未确定；`503 + error.code=DEPENDENCY_UNAVAILABLE` 也不能证明生产缺源，因为现有BFF同样以此表示fetch、解析或未知上游异常。仅保存固定endpoint、status和白名单code，服务器message/header/body不入报告；不新增缺源豁免或产品接口。
 

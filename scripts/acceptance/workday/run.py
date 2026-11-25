@@ -300,8 +300,9 @@ def dev_json(origin, route, selection, token, timeout, post=False):
     else:
         route += '?' + urllib.parse.urlencode(selection)
     request = urllib.request.Request(origin + route, data=data, headers=headers)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
     try:
-        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             if response.status != 200:
                 raise DevHttpProblem(endpoint, response.status, 'UNRECOGNIZED')
             return json.loads(response.read())
