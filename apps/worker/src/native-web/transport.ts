@@ -310,7 +310,7 @@ export function nativeWebTransport(
         {
           maxBytes: image
             ? Math.ceil((20 * 1024 * 1024 * 4) / 3) + 16_384
-            : 128,
+            : 24 * 1024,
           credential: 'api',
           body,
           accepts: ({ statusCode }) => statusCode === 200 || statusCode === 404,

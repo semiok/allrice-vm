@@ -263,65 +263,70 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         await prompt.join();
       }
       const uninstallPrompt = host.startup.installModelPromptObserver(
-        async ({ binding, adapterId, context, issue, requestId }, signal) => {
-          const active = AbortSignal.any([live, signal]);
-          active.throwIfAborted();
-          const { identity } = issue;
-          if (issue.access !== 'execute' || !identity.threadId) return reject();
-          const profile = host.startup.catalog(
-            binding,
-            identity.employeeInstanceId,
-          );
-          if (profile.owner.modelAdapterId !== adapterId) return reject();
-          const root = await getDEntryNativeRootPin(context, {
-            workspaceId: identity.workspaceId,
-            employeeInstanceId: identity.employeeInstanceId,
-            threadId: identity.threadId,
-          });
-          if (
-            root.vmId !== binding.vmId ||
-            root.rootNativeSessionId !== issue.root.nativeSessionId ||
-            root.rootBindingRef !== issue.root.rootBindingRef ||
-            root.rootOriginDigest !== issue.root.rootOriginDigest
-          )
-            return reject();
-          const key = promptKey(adapterId, root.rootNativeSessionId, requestId);
-          if (selected.has(key)) return reject();
-          const route = await input.assertRouteCurrent(active);
-          const close = new AbortController();
-          const watching = AbortSignal.any([
-            live,
-            route,
-            profile.revoked,
-            close.signal,
-          ]);
-          const watch = await watchDEntryNativeAuthority(
-            context,
-            {
+        ({ binding, adapterId, context, issue, requestId }, signal) =>
+          run(signal, async (active) => {
+            active.throwIfAborted();
+            const { identity } = issue;
+            if (issue.access !== 'execute' || !identity.threadId)
+              return reject();
+            const profile = host.startup.catalog(
+              binding,
+              identity.employeeInstanceId,
+            );
+            if (profile.owner.modelAdapterId !== adapterId) return reject();
+            const root = await getDEntryNativeRootPin(context, {
               workspaceId: identity.workspaceId,
               employeeInstanceId: identity.employeeInstanceId,
               threadId: identity.threadId,
-            },
-            identity,
-            watching,
-          );
-          const scope: PromptOwner = Object.freeze({
-            context: structuredClone(context),
-            identity,
-            binding,
-            adapterId,
-            root: root.rootNativeSessionId,
-            revoked: AbortSignal.any([watch.revoked, watching]),
-            requestId,
-            runId: randomUUID(),
-          });
-          if (active.aborted || scope.revoked.aborted || selected.has(key)) {
-            close.abort();
-            await watch.close();
-            return reject();
-          }
-          selected.set(key, { scope, stop: close, join: watch.close });
-        },
+            });
+            if (
+              root.vmId !== binding.vmId ||
+              root.rootNativeSessionId !== issue.root.nativeSessionId ||
+              root.rootBindingRef !== issue.root.rootBindingRef ||
+              root.rootOriginDigest !== issue.root.rootOriginDigest
+            )
+              return reject();
+            const key = promptKey(
+              adapterId,
+              root.rootNativeSessionId,
+              requestId,
+            );
+            if (selected.has(key)) return reject();
+            const route = await input.assertRouteCurrent(active);
+            const close = new AbortController();
+            const watching = AbortSignal.any([
+              live,
+              route,
+              profile.revoked,
+              close.signal,
+            ]);
+            const watch = await watchDEntryNativeAuthority(
+              context,
+              {
+                workspaceId: identity.workspaceId,
+                employeeInstanceId: identity.employeeInstanceId,
+                threadId: identity.threadId,
+              },
+              identity,
+              watching,
+            );
+            const scope: PromptOwner = Object.freeze({
+              context: structuredClone(context),
+              identity,
+              binding,
+              adapterId,
+              root: root.rootNativeSessionId,
+              revoked: AbortSignal.any([watch.revoked, watching]),
+              requestId,
+              runId: randomUUID(),
+            });
+            if (active.aborted || scope.revoked.aborted || selected.has(key)) {
+              close.abort();
+              await watch.close();
+              return reject();
+            }
+            selected.set(key, { scope, stop: close, join: watch.close });
+          }),
       );
       function run<T>(
         signal: AbortSignal,

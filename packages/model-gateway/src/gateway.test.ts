@@ -13,6 +13,7 @@ import {
   closeServer,
   deferred,
   FixtureStore,
+  FixtureAdmission,
   freshCall,
   gatewayFixture,
   modelBinding,
@@ -66,6 +67,25 @@ it('rejects a chunked oversized request without waiting for EOF or dispatching u
   expect(f.upstream.requests).toHaveLength(0);
   expect(f.store.rows.size).toBe(0);
 });
+it('frozen gateway grants no reference and durable issuance waits for real activation', async () => {
+  const f = await setup();
+  const admission = new FixtureAdmission();
+  const g = await gatewayFixture({ provider: f.native.provider, admission });
+  cleanup.push(() => g.close());
+  const fence = { binding: g.binding.vm, freezeId: 'synthetic', version: '1' };
+  await admission.participant.freeze(fence, new AbortController().signal);
+  const caller = new AbortController();
+  const issue = vi.fn(async () => 'synthetic-reference');
+  const reference = g.gateway.issueReference!(g.binding, caller.signal, issue);
+  void reference.catch(() => {});
+  await admission.deferred.promise;
+  expect(issue).not.toHaveBeenCalled();
+  caller.abort();
+  await expect(reference).rejects.toBeDefined();
+  expect(issue).not.toHaveBeenCalled();
+  expect(admission.records.size).toBe(0);
+});
+
 const finish = (chunks: StreamChunk[]) =>
   chunks.findLast((chunk) => chunk.type === 'finish');
 

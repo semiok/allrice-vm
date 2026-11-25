@@ -219,6 +219,16 @@ export class GatewayLlmAdapter extends LlmAdapter {
         purpose,
       }),
     });
+    if (response.status === 413) {
+      await response.body?.cancel();
+      throw new LlmError(
+        'Model request exceeds the maximum input size',
+        'INPUT_TOO_LARGE',
+        {
+          status: 413,
+        },
+      );
+    }
     if (!response.body)
       throw new LlmError('Host gateway returned no stream', 'TRANSPORT', {
         status: response.status,

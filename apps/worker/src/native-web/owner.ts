@@ -732,20 +732,29 @@ export async function openNativeWebOwner(input: {
               const value = JSON.parse(proof) as {
                 id?: unknown;
                 recipient?: unknown;
+                delegatedPromptIds?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
                 !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
-                Object.keys(value).length !== 2
+                Object.keys(value).length !== 3 ||
+                !Array.isArray(value.delegatedPromptIds) ||
+                value.delegatedPromptIds.length > 64 ||
+                value.delegatedPromptIds.some(
+                  (id) => typeof id !== 'string' || id.length > 256,
+                )
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {
                 ...attempt,
                 id: kind === 'assistant' ? attempt.id : id.data,
                 recipient: value.recipient,
-                promptIds: readNativeAttemptPromptIds(snapshot, attempt),
+                promptIds:
+                  address.kind === 'session'
+                    ? readNativeAttemptPromptIds(snapshot, attempt)
+                    : (value.delegatedPromptIds as string[]),
               };
             } finally {
               // Dispose this logical read on its original carrier. The

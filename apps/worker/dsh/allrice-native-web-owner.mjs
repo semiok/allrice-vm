@@ -211,6 +211,60 @@ async function readManagedImage(scope, request, value, owned) {
   return { ...image, data: Buffer.from(image.data).toString('base64') };
 }
 
+// DSH publishes a child's durable catalog entry on its exact parent before
+// running the initial delegated prompt. Continuing a child in a later turn
+// needs its own accepted-input source and cannot reuse its creation event.
+function delegatedPromptIds(sessions, sessionId) {
+  let child = sessions.get(sessionId);
+  if (!child?.header.parentSession) return [];
+  const seen = new Set([sessionId]);
+  while (child.header.parentSession) {
+    const parent = sessions.get(child.header.parentSession);
+    if (!parent || seen.has(parent.id)) return [];
+    seen.add(parent.id);
+    const events = parent.snapshotEvents();
+    const catalog = events.filter(
+      (event) =>
+        event.type === 'subagent/catalog' &&
+        event.data.childId === child.id &&
+        event.data.childCreatedAt === child.header.createdAt &&
+        event.data.version === 0,
+    );
+    if (catalog.length !== 1) return [];
+    const edge = catalog[0];
+    const start = events.findLast(
+      (event) => event.type === 'turn/start' && event.seq < edge.seq,
+    );
+    if (
+      !start ||
+      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
+    )
+      return [];
+    if (parent.header.parentSession) {
+      child = parent;
+      continue;
+    }
+    const result = new Set();
+    for (const event of events) {
+      if (event.seq <= start.seq || event.seq > edge.seq) continue;
+      const messages =
+        event.type === 'user/message'
+          ? [event.data]
+          : event.type === 'agent/inbox/spliced'
+            ? event.data.inserted
+            : [];
+      for (const message of messages)
+        if (
+          message?.source?.kind === 'user' &&
+          typeof message.source.rpcId === 'string'
+        )
+          result.add(message.source.rpcId);
+    }
+    return [...result];
+  }
+  return [];
+}
+
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config);
 }
@@ -393,7 +447,7 @@ export function applyNativeWebOwner(
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       modelFiber = ctx.inject(
-        ['llm', 'connection', 'sessionController', 'attachments'],
+        ['llm', 'connection', 'sessionController', 'attachments', 'sessions'],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
@@ -423,7 +477,11 @@ export function applyNativeWebOwner(
               const headers = { 'cache-control': 'no-store' };
               if (value.action === undefined)
                 return globalThis.Response.json(
-                  { id: found.id, recipient: found.recipient },
+                  {
+                    id: found.id,
+                    recipient: found.recipient,
+                    delegatedPromptIds: found.delegatedPromptIds,
+                  },
                   { headers },
                 );
               if (
@@ -460,6 +518,10 @@ export function applyNativeWebOwner(
                 const owned = {
                   id: randomUUID(),
                   recipient: randomBytes(32).toString('base64url'),
+                  delegatedPromptIds: delegatedPromptIds(
+                    scope.sessions,
+                    selection.sessionId,
+                  ),
                   signal: active,
                 };
                 modelCalls.set(key, owned);
