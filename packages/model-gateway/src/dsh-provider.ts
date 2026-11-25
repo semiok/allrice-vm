@@ -5,9 +5,26 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm';
 import {
+  isModelCallReference,
+  MODEL_CALL_REFERENCE_HEADER,
   MODEL_GATEWAY_CONTRACT_VERSION,
   ModelGatewayError,
 } from './contract.ts';
+
+type ManagedGuestModelCall = {
+  readonly provider: string;
+  readonly model: string;
+  /** The authorized native invocation delivers a reference for this call
+   * before the adapter sends its first request. The adapter never mints one. */
+  resolveCallReference(
+    selection: Readonly<{
+      provider: string;
+      model: string;
+      sessionId: NonNullable<GenerateOptions['sessionId']>;
+    }>,
+    signal: AbortSignal,
+  ): Promise<string>;
+};
 import type {
   GatewayFetchClassification,
   GatewayProvider,
@@ -72,10 +89,30 @@ export class GatewayLlmAdapter extends LlmAdapter {
   constructor(
     private readonly endpoint: string,
     private readonly egressCapability?: string,
+    private readonly managed?: ManagedGuestModelCall,
   ) {
     super();
   }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    let reference: string | undefined;
+    if (this.managed) {
+      const { provider, model, sessionId, signal } = options;
+      if (
+        provider !== this.managed.provider ||
+        model !== this.managed.model ||
+        !sessionId ||
+        !signal
+      )
+        throw new ModelGatewayError('BINDING_INVALID');
+      signal.throwIfAborted();
+      reference = await this.managed.resolveCallReference(
+        { provider, model, sessionId },
+        signal,
+      );
+      signal.throwIfAborted();
+      if (!isModelCallReference(reference))
+        throw new ModelGatewayError('BINDING_INVALID');
+    }
     const {
       messages,
       system,
@@ -94,6 +131,9 @@ export class GatewayLlmAdapter extends LlmAdapter {
       headers: {
         'content-type': 'application/json',
         'x-allrice-model-contract': String(MODEL_GATEWAY_CONTRACT_VERSION),
+        ...(reference === undefined
+          ? {}
+          : { [MODEL_CALL_REFERENCE_HEADER]: reference }),
         ...(this.egressCapability === undefined
           ? {}
           : { authorization: 'Bearer ' + this.egressCapability }),
@@ -164,4 +204,34 @@ export class GatewayLlmAdapter extends LlmAdapter {
       reader.releaseLock();
     }
   }
+}
+
+/** Called from the guest's sealed profile in its Cordis fiber. Reuse the
+ * native adapter registration with one managed route and no upstream secret. */
+export function registerManagedGatewayAdapter(
+  llm: Pick<LlmRuntime, 'registerAdapter'>,
+  config: {
+    readonly origin: string;
+    readonly capability: string;
+    readonly route: ManagedGuestModelCall;
+  },
+) {
+  const origin = new URL(config.origin);
+  if (
+    origin.origin !== config.origin ||
+    origin.protocol !== 'http:' ||
+    origin.username ||
+    origin.password ||
+    !isModelCallReference(config.capability)
+  )
+    throw new ModelGatewayError('BINDING_INVALID');
+  const route = Object.freeze({ ...config.route });
+  return llm.registerAdapter(
+    [route.provider],
+    new GatewayLlmAdapter(
+      new URL('/v1/stream', origin).href,
+      config.capability,
+      route,
+    ),
+  );
 }

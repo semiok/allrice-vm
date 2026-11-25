@@ -13,6 +13,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export const MODEL_GATEWAY_CONTRACT_VERSION = 1 as const;
 export const MODEL_STREAMS_PER_PERSON = 8 as const;
+export const MODEL_CALL_REFERENCE_HEADER = 'x-allrice-model-call-reference';
+export const isModelCallReference = (value: unknown): value is string =>
+  typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 
 /** HOST ONLY. Shapes do not authenticate. The authority must resolve every
  * field from its managed connection/current identity/native descriptor owner. */
