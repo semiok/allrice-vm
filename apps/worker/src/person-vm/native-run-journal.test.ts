@@ -13,6 +13,7 @@ import {
   SessionSeq,
   SESSION_FORMAT_VERSION,
   type SessionEvent,
+  type SessionHeader,
 } from '@deepseek-ai/dsh-session';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { AgentMessageSource } from '@deepseek-ai/dsh-subagent';
@@ -197,7 +198,7 @@ it('matches a derived turn only inside its physical child or root-wake bracket',
     const native = ctx.get('sessionPersistence') as SessionPersistence;
     const parentId = SessionId('session-' + randomUUID());
     const childId = SessionId('session-' + randomUUID());
-    const header = {
+    const header: SessionHeader = {
       version: SESSION_FORMAT_VERSION,
       id: parentId,
       cwd: root,
