@@ -159,10 +159,22 @@ it('registers a managed native DSH route and redeems the exact host call once', 
       capability: 'a'.repeat(43),
       route: { ...route, resolveCallReference: resolve },
     });
-    const selected = await ctx.llm.prepareCall(route, call.signal);
+    const options = input();
+    const selected = await ctx.llm.prepareCall(
+      {
+        ...route,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens,
+      },
+      call.signal,
+    );
     const sessionId = expected.native.sessionId as GenerateOptions['sessionId'];
     const received = [];
-    for await (const chunk of selected.stream({ ...input(), sessionId }))
+    for await (const chunk of selected.stream({
+      ...options,
+      ...selected.config,
+      sessionId,
+    }))
       received.push(chunk);
     expect(received).toEqual(chunks);
     expect(resolve).toHaveBeenCalledWith(
