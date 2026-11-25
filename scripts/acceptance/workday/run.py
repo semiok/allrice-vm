@@ -212,11 +212,16 @@ def native_fixture(config, output):
     actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if actual != expected:
         raise ValueError('fixture source HEAD differs from fixed fixtureSha')
+    top = subprocess.check_output(['git', '-C', str(source), 'rev-parse', '--show-toplevel'],
+                                  text=True).strip()
+    if Path(top).resolve() != source:
+        raise ValueError('fixture source must be a Git worktree root')
     remote = subprocess.run(['git', '-C', str(source), 'remote', 'get-url', 'origin'],
                             check=False, capture_output=True, text=True)
     if remote.returncode != 0 or remote.stdout.strip().removesuffix('.git') not in FIXTURE_REMOTES:
         raise ValueError('fixture source origin must be semiok/allrice-vm')
-    if subprocess.run(['git', '-C', str(source), 'diff', '--quiet', 'HEAD'], check=False).returncode != 0:
+    if subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain',
+                                 '--untracked-files=all'], text=True).strip():
         raise ValueError('fixture source tree differs from fixed HEAD')
     tracked = subprocess.check_output(['git', '-C', str(source), 'show', f'{actual}:{FIXTURE_FILE}'])
     if hashlib.sha256(tracked).hexdigest() != sha(fixture):

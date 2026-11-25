@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 // Finite projections only: Playwright messages can contain selectors, URLs,
 // page text or credentials. Never persist arbitrary exception messages/logs.
 const messages = {
@@ -93,13 +95,18 @@ export function readOnlyPageRoute(origin, recipe) {
     }
     // Continuing a browser request would allow Playwright redirect hops
     // without returning through the route handler.
-    const response = await route.fetch({ maxRedirects: 0 });
+    let response;
     try {
+      response = await route.fetch({ maxRedirects: 0 });
       if (response.status() >= 300 && response.status() < 400)
         await route.abort('blockedbyclient');
       else await route.fulfill({ response });
+    } catch {
+      // Report a failed resource to Chromium without leaking the private
+      // Playwright call log when a fetch rejects or the page is closing.
+      await route.abort('failed').catch(() => {});
     } finally {
-      await response.dispose();
+      await response?.dispose().catch(() => {});
     }
   };
 }
@@ -146,7 +153,27 @@ export async function readPage(
     stage = 'scope';
     await assertScope(scope);
     stage = 'capture';
-    const image = await scope.screenshot();
+    // A locator screenshot crops the composited page. Hide sibling and portal
+    // layers so their pixels do not enter the authorized rectangle.
+    const marker = 'data-workday-capture-' + randomUUID();
+    await scope.evaluate((element, name) => {
+      element.setAttribute(name, '');
+      // Preserve the layout and override inline visibility on off-scope
+      // branches. The dedicated page is closed after this capture.
+      for (const other of element.ownerDocument.querySelectorAll('*')) {
+        if (element.contains(other) || other.contains(element)) continue;
+        if (other instanceof HTMLElement || other instanceof SVGElement)
+          other.style.setProperty('opacity', '0', 'important');
+      }
+    }, marker);
+    const target = scope.and(page.locator(`[${marker}]`));
+    const outside = `:not([${marker}], [${marker}] *)`;
+    const image = await target.screenshot({
+      style: `${outside}, ${outside}::before, ${outside}::after, ${outside}::backdrop {
+        visibility: hidden !important;
+      }
+      [${marker}] { visibility: visible !important; }`,
+    });
     stage = 'identity-after-capture';
     await identity();
     stage = 'scope';

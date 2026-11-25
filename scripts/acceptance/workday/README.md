@@ -69,7 +69,7 @@ python3 scripts/acceptance/workday/run.py --mode fixture --config /absolute/fixt
 }
 ```
 
-owner 补齐实际路由和定位器后，浏览器才执行对应检查。它使用 Worker 已锁定的 `playwright-core` 和临时 context。文档、Next 静态资源及明确列出的只读 API 可发 GET/HEAD。请求不跟随重定向，其他页面请求、WebSocket、service worker 与下载均被拦截。截图只截取授权容器，在采集前后复核身份、4.0 代际、原 bindingRef 和容器范围，通过后才写 PNG。
+owner 补齐实际路由和定位器后，浏览器才执行对应检查。它使用 Worker 已锁定的 `playwright-core` 和临时 context。文档、Next 静态资源及明确列出的只读 API 可发 GET/HEAD。请求不跟随重定向，其他页面请求、WebSocket、service worker 与下载均被拦截。截图只保留授权容器，采集时隐藏容器外的叠层。采集前后复核身份、4.0 代际、原 bindingRef 和容器范围，通过后才写 PNG。
 
 失败保留阶段、有限错误分类、受控 HTTP 状态和无截图原因，截图失败另记 `captureFailure`。报告采用有限的错误投影。注入页面回归用于核对诊断与授权边界。
 

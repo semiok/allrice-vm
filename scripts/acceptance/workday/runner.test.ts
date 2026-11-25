@@ -30,6 +30,14 @@ function pageFixture() {
   const scope = {
     first: () => scope,
     filter: vi.fn(() => scope),
+    and: vi.fn(() => scope),
+    evaluate:
+      vi.fn<
+        (
+          fn: (node: Element, name: string) => void,
+          name: string,
+        ) => Promise<void>
+      >(),
     locator: vi.fn(() => locator),
     getByText: vi.fn(() => locator),
     count: vi.fn(async () => 1),
@@ -156,6 +164,11 @@ it('persists only the scoped image after verifying identity and the marker again
     exact: true,
   });
   expect(authorized.options.identity).toHaveBeenCalledTimes(3);
+  const marker = authorized.scope.evaluate.mock.calls.at(0)?.[1];
+  expect(marker).toMatch(/^data-workday-capture-/);
+  expect(authorized.scope.screenshot).toHaveBeenCalledExactlyOnceWith({
+    style: expect.stringContaining(`:not([${marker}], [${marker}] *)`),
+  });
   expect(authorized.options.saveScreenshot).toHaveBeenCalledExactlyOnceWith(
     Buffer.from('synthetic-unit-only'),
   );
@@ -190,7 +203,10 @@ it('fetches only the approved document, static resources and exact read APIs wit
     [origin + '/api/v1/workspace?employee=fixture', false, 'POST', 200, false],
     ['https://outside.invalid/_next/static/chunk.js', false, 'GET', 200, false],
   ] as const) {
-    const response = { status: () => responseCode, dispose: vi.fn() };
+    const response = {
+      status: () => responseCode,
+      dispose: vi.fn(async () => {}),
+    };
     const route = {
       request: () => ({
         url: () => url,
@@ -210,4 +226,22 @@ it('fetches only the approved document, static resources and exact read APIs wit
       expect(route.fulfill).toHaveBeenCalledExactlyOnceWith({ response });
     else expect(route.abort).toHaveBeenCalledExactlyOnceWith('blockedbyclient');
   }
+});
+
+it('aborts a failed approved fetch without escaping the private route error', async () => {
+  const origin = 'https://fixture.invalid';
+  const handler = readOnlyPageRoute(origin, { path: '/readonly' });
+  const route = {
+    request: () => ({
+      url: () => origin + '/readonly',
+      isNavigationRequest: () => true,
+      method: () => 'GET',
+    }),
+    fetch: vi.fn().mockRejectedValue(new Error('private request data')),
+    abort: vi.fn(async () => {}),
+    fulfill: vi.fn(),
+  };
+  await handler(route);
+  expect(route.abort).toHaveBeenCalledExactlyOnceWith('failed');
+  expect(route.fulfill).not.toHaveBeenCalled();
 });

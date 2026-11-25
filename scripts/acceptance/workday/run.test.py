@@ -296,6 +296,10 @@ class RunnerTests(unittest.TestCase):
             fixture_sha = 'a' * 40
 
             def git(args, **kwargs):
+                if args[-1] == '--show-toplevel':
+                    return str(source)
+                if args[-1] == '--untracked-files=all':
+                    return ''
                 return fixture.read_bytes() if args[-1].endswith(workday.FIXTURE_FILE) else fixture_sha
             with patch.object(workday, 'REPO', root), patch.object(subprocess, 'check_output', side_effect=git), patch.object(
                     subprocess, 'run', return_value=subprocess.CompletedProcess(
@@ -311,12 +315,25 @@ class RunnerTests(unittest.TestCase):
             fixture.parent.mkdir(parents=True)
             fixture.write_text('// old checkout with the same commit')
             fixture_sha = 'a' * 40
-            with patch.object(subprocess, 'check_output', return_value=fixture_sha), patch.object(
+            with patch.object(subprocess, 'check_output', side_effect=[fixture_sha, temp]), patch.object(
                     subprocess, 'run', return_value=subprocess.CompletedProcess(
                         [], 0, stdout='https://github.com/semiok/allrice.git')), patch.object(
                     workday, 'child') as driver:
                 with self.assertRaisesRegex(ValueError, 'source origin must be semiok/allrice-vm'):
                     workday.native_fixture({'fixtureSource': temp, 'fixtureSha': fixture_sha}, root)
+                driver.assert_not_called()
+
+    def test_native_fixture_rejects_a_nested_copy_that_borrows_parent_git_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'mirror'
+            fixture = source / workday.FIXTURE_FILE
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text('// nested untracked fixture mirror')
+            fixture_sha = 'a' * 40
+            with patch.object(subprocess, 'check_output', side_effect=[fixture_sha, temp]), patch.object(
+                    workday, 'child') as driver:
+                with self.assertRaisesRegex(ValueError, 'source must be a Git worktree root'):
+                    workday.native_fixture({'fixtureSource': str(source), 'fixtureSha': fixture_sha}, Path(temp))
                 driver.assert_not_called()
 
     def test_cold_history_does_not_run_the_live_owner_recipe(self):
