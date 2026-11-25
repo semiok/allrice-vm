@@ -741,6 +741,7 @@ export class PersonVmService
     reason: 'stop' | 'failure' | 'takeover' | 'delete',
   ) {
     let failed = false;
+    let egressJoined = true;
     if (row.egressReceipt) {
       try {
         if (!this.options.egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
@@ -752,6 +753,7 @@ export class PersonVmService
         row.egressReceipt = null;
       } catch {
         failed = true;
+        egressJoined = false;
       }
     }
     let stopped = false;
@@ -786,11 +788,12 @@ export class PersonVmService
             AbortSignal.timeout(this.options.cleanupTimeoutMs),
           );
         }
-        // A confirmed VM stop does not prove its host runtime I/O has joined.
-        await this.options.disk.detach(
-          { vmId: row.vmId, tier: row.diskTier },
-          AbortSignal.timeout(this.options.cleanupTimeoutMs),
-        );
+        // Keep the exact mount available to finish staged egress cleanup.
+        if (egressJoined)
+          await this.options.disk.detach(
+            { vmId: row.vmId, tier: row.diskTier },
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
       } catch {
         failed = true;
       }

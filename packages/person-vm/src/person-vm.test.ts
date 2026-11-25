@@ -709,6 +709,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
   it('stop先撤资格；revoke失败仍执行stop，停止不明不detach', async () => {
     const h = harness(),
       { rc, binding } = await running(h);
+    const revoke = h.egress.revoke;
     h.egress.revoke = async () => {
       h.log.push('egress:revoke-failed');
       throw new PersonVmError('EGRESS_UNAVAILABLE');
@@ -721,6 +722,13 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       h.log.indexOf('native:stop'),
     );
     expect(h.states.get(binding.vmId)).toBe('stopped');
+    expect(h.mounts.has(binding.vmId)).toBe(true);
+    expect(h.log).not.toContain('disk:detach');
+    h.egress.revoke = revoke;
+    await expect(h.service.stop(rc, signal())).resolves.toMatchObject({
+      phase: 'stopped',
+    });
+    expect(h.mounts.has(binding.vmId)).toBe(false);
     const h2 = harness(),
       running2 = await running(h2);
     h2.states.set(running2.binding.vmId, 'stopped');
