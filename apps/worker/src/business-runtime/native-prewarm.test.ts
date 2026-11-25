@@ -327,37 +327,45 @@ it('joins a later request on the published starting epoch and proves readiness f
   expect(f.stop).not.toHaveBeenCalled();
 });
 
-it('does not reuse completed work or share prewarm across login sessions', async () => {
-  const f = fixture(true);
-  const started = deferred<void>();
-  const release = deferred<void>();
-  f.vm.mockImplementationOnce(async (...args) => {
-    started.resolve();
-    await release.promise;
-    return f.runPrewarm(...args);
-  });
-  const run = (context = f.base.context) =>
-    f.assembly.port.prewarm(
-      context,
-      f.base.identity,
-      'page',
-      signal(),
-      signal(),
-    );
-  const first = run();
-  void first.catch(() => {});
-  await started.promise;
-  try {
-    await run({ ...f.base.context, sessionId: randomUUID() });
-    expect(f.vm).toHaveBeenCalledTimes(2);
-  } finally {
-    release.resolve();
-    await first;
-  }
-  await run();
-  expect(f.vm).toHaveBeenCalledTimes(3);
-  expect(f.start).toHaveBeenCalledTimes(1);
-});
+it.each(['login', 'employee'])(
+  'does not reuse completed prewarm work or share in-flight work across a different %s',
+  async (difference) => {
+    const f = fixture(true);
+    const started = deferred<void>();
+    const release = deferred<void>();
+    f.vm.mockImplementationOnce(async (...args) => {
+      started.resolve();
+      await release.promise;
+      return f.runPrewarm(...args);
+    });
+    authority.identity.mockImplementation(async (_context, selection) => ({
+      ...f.base.identity,
+      employeeInstanceId: selection.employeeInstanceId,
+    }));
+    const run = (context = f.base.context, identity = f.base.identity) =>
+      f.assembly.port.prewarm(context, identity, 'page', signal(), signal());
+    const first = run();
+    void first.catch(() => {});
+    await started.promise;
+    try {
+      const context = { ...f.base.context, requestId: randomUUID() };
+      if (difference === 'login')
+        await run({ ...context, sessionId: randomUUID() });
+      else
+        await run(context, {
+          ...f.base.identity,
+          employeeInstanceId: randomUUID(),
+        });
+      expect(f.vm).toHaveBeenCalledTimes(2);
+    } finally {
+      release.resolve();
+      await first;
+    }
+    await run();
+    expect(f.vm).toHaveBeenCalledTimes(3);
+    expect(f.start).toHaveBeenCalledTimes(1);
+  },
+);
 
 it('fails closed if the policy revision changes before confirming a shared result', async () => {
   const f = fixture(true);
@@ -376,6 +384,33 @@ it('fails closed if the policy revision changes before confirming a shared resul
   await expect(run()).rejects.toMatchObject({ code: 'LEASE_LOST' });
   await expect(run()).resolves.toBeUndefined();
   expect(f.vm).toHaveBeenCalledTimes(2);
+  expect(f.start).toHaveBeenCalledTimes(1);
+});
+
+it('lets the existing lease recover an orphaned starting epoch without sharing its stale binding', async () => {
+  const f = fixture(true);
+  const { context, identity } = f.base;
+  await f.h.service.create(context, signal());
+  const oldInstanceId = randomUUID();
+  await f.h.store.withLease(
+    identity.personId,
+    { now: f.h.now, ttlMs: f.h.options.leaseTtlMs },
+    async ({ row, save }) => {
+      await save({
+        ...row!,
+        phase: 'starting',
+        instanceId: oldInstanceId,
+        leaseEpoch: 3,
+      });
+    },
+  );
+  await expect(
+    f.assembly.port.prewarm(context, identity, 'page', signal(), signal()),
+  ).resolves.toBeUndefined();
+  const running = await f.h.store.read(identity.personId);
+  expect(running).toMatchObject({ phase: 'running', leaseEpoch: 4 });
+  expect(running?.instanceId).not.toBe(oldInstanceId);
+  expect(f.readCoordination).toHaveBeenCalledTimes(1);
   expect(f.start).toHaveBeenCalledTimes(1);
 });
 

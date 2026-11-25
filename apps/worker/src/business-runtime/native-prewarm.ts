@@ -99,6 +99,18 @@ function prewarmKey(
   identity: DEntryIdentity,
   revision: string,
 ) {
+  // These freshly authenticated snapshots only partition reuse. The original
+  // watcher and the live database checks still decide whether each caller has
+  // authority, including when the snapshot never sees a transient change.
+  const memberships = context.memberships
+    .filter(
+      (entry) =>
+        entry.organizationId === identity.organizationId &&
+        (entry.workspaceId === null ||
+          entry.workspaceId === identity.workspaceId),
+    )
+    .map((entry) => [entry.id, entry.workspaceId, entry.role, entry.active])
+    .sort();
   return JSON.stringify([
     context.sessionId,
     context.workspaceId,
@@ -110,6 +122,7 @@ function prewarmKey(
     identity.employeeVersionId,
     identity.threadId,
     revision,
+    memberships,
   ]);
 }
 
@@ -130,12 +143,14 @@ export function createDEntryNativePrewarmPort(input: {
   function shared({
     key,
     target,
+    starting,
     revoked,
     start,
     confirm,
   }: {
     key: string;
     target: Generation;
+    starting: boolean;
     revoked: AbortSignal;
     start: (signal: AbortSignal) => Promise<PersonVmView>;
     confirm(result: PersonVmView, flight: Flight): Promise<Generation>;
@@ -152,6 +167,10 @@ export function createDEntryNativePrewarmPort(input: {
       flight.join(revoked);
       return flight;
     }
+    // An unowned starting row may need takeover under the existing lease.
+    // The takeover can advance the epoch, so its observed binding is not a
+    // reliable key for a new shared operation.
+    if (starting) return;
     const lost = new AbortController();
     const watchers = new Map<AbortSignal, () => void>();
     const physical = AbortSignal.any([input.lifetime, lost.signal]);
@@ -242,6 +261,7 @@ export function createDEntryNativePrewarmPort(input: {
             ? shared({
                 key: prewarmKey(context, identity, stamp.policyRevision),
                 target,
+                starting: stamp.vm?.phase === 'starting',
                 revoked,
                 start,
                 async confirm(result, flight) {

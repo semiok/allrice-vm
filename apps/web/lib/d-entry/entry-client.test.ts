@@ -66,7 +66,10 @@ it.each([204, 403, 503])(
   'consumes the activation’s original prewarm response %i without posting again',
   async (status) => {
     const input = employeeEntryQuery(query + '&threadId=' + randomUUID(), true);
-    const { promise, resolve } = Promise.withResolvers<Response>();
+    let respond!: (response: Response) => void;
+    const promise = new Promise<Response>((resolve) => {
+      respond = resolve;
+    });
     const fetch = vi.fn(() => promise);
     vi.stubGlobal('fetch', fetch);
     const signal = new AbortController().signal;
@@ -75,7 +78,7 @@ it.each([204, 403, 503])(
     const entry = prepareEmployeeEntry(input, signal, opening, background);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(opening).not.toHaveBeenCalled();
-    resolve(new Response(null, { status }));
+    respond(new Response(null, { status }));
     if (status === 204) {
       await expect(entry).resolves.toEqual(input.selection);
       expect(opening).toHaveBeenCalledOnce();
