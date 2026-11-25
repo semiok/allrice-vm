@@ -70,7 +70,7 @@ audit:
   apps/rice-bridge/src/local-mcp-supervisor.ts#embedded: Embedded child program/IPC; outside root configuration inventory.
   apps/rice-bridge/src/local-service-supervisor.ts#embedded: Embedded child program/IPC; outside root configuration inventory.
   packages/contracts/src/project-resolution-script.ts#embedded: Generated project-resolution child program; outside root configuration inventory.
-  packages/vm-memory/src/guest-config.ts#embedded: Existing guest command-observer receipt reads only staged memory coordinates and the command execution reference; not host configuration or an enable source.
+  packages/vm-memory/src/guest-config.ts#embedded: Embedded guest receipt verifier reads staged memory coordinates, the command execution reference and the per-command DSH dispatch marker. These are guest runtime inputs.
   packages/project-runtime/src/project-service-supervisor.ts#embedded: Embedded project child program/IPC; outside root configuration inventory.
   packages/project-runtime/src/project-supervisor.ts#embedded: Embedded project child program/IPC; outside root configuration inventory.
   apps/web/server/portal-hosts.mjs#whole: Environment forwarded to configuredPortalEntries with the literal names declared above.
@@ -98,5 +98,5 @@ auditSources:
   packages/database/src/bootstrap-identity.ts: 1257cdfbc66c5c6038a5f780871a1f653663581a0584a96336cd8b188b9dcaf5
   packages/project-runtime/src/project-service-supervisor.ts: 1ce6b79bcadabceb4b9bf47cb5ce809fe580d3dfc542d22a769f1d57d83223d0
   packages/project-runtime/src/project-supervisor.ts: 7a832d1e0d549be9568485816708d6e274d1fa0bfe0b3544ac6f01e0603b73f2
-  packages/vm-memory/src/guest-config.ts: 58f03b5493c1f492d2b23d088102f4372449da16fcf27ae6b7e0ad551c160af1
+  packages/vm-memory/src/guest-config.ts: 20b39ac76bada9fbc920b5a300bcc063885bed5f056f4d572eb56094d727e9ad
   scripts/dev-environment.mjs: e9daa5931b43ea6c4db01bb91a6295e0caf4000e2682635205b666525efe19d3

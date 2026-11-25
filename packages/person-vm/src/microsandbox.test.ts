@@ -19,6 +19,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  DSH_SANDBOX_ROOT,
+  launchDshSandbox,
+  prepareDshSandbox,
+} from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { PERSON_VM_MEMORY_MIB } from './contract.ts';
 import { runCommand } from './process.ts';
@@ -109,7 +114,7 @@ else if(a[0]==='exec'){
  }
  if(!a.includes('--detach')||!a.includes('--no-stdin')||!a.includes('--no-tty'))process.exit(42);
  const id=require('node:crypto').randomUUID(),cmd=a.slice(a.indexOf('--')+1),init=cmd.includes('/work/memory/init.cjs');
- (v.jobs??={})[id]={cmd,code:init&&mode==='init-error'?23:0};save();
+ (v.jobs??={})[id]={cmd,code:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0};save();
  if(!(init&&mode.startsWith('lost-id')))console.log(id);
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
@@ -200,7 +205,7 @@ save();
 
 const readonlyImage =
   'docker.io/library/node@sha256:af0bb4bf5b7318e3269417a7684a9e116c3c22eaf05382578b0d0d33de597ad2';
-async function readonlyFixture() {
+async function readonlyFixture(withSandbox = false) {
   const root = await directory(),
     artifactSha256 = createHash('sha256')
       .update('synthetic archive')
@@ -222,6 +227,13 @@ async function readonlyFixture() {
   });
   for (const name of bins)
     await symlink('../code.js', join(hostDirectory, 'node_modules/.bin', name));
+  const sandboxCode = 'synthetic runner fixture';
+  if (withSandbox) {
+    const bin = join(hostDirectory, 'sandbox-bin');
+    await mkdir(bin, { mode: 0o700 });
+    await writeFile(join(bin, 'bwrap'), sandboxCode, { mode: 0o555 });
+    await chmod(bin, 0o555);
+  }
   const files = [
     { path: 'node_modules', kind: 'directory', mode: 0o755 },
     { path: 'node_modules/.bin', kind: 'directory', mode: 0o755 },
@@ -268,6 +280,18 @@ async function readonlyFixture() {
     nodeVersion: '22.23.2',
     publisherSha256: 'a'.repeat(64),
     gateSha256: 'b'.repeat(64),
+    ...(withSandbox && {
+      sandboxBackend: {
+        kind: 'bubblewrap',
+        path: 'sandbox-bin/bwrap',
+        mode: 0o555,
+        architecture: 'arm64',
+        packageVersion: '0.8.0-2+deb12u1',
+        packageSha256:
+          'd044ba1d7961d835669035fcd1e11121f1dc960a1a2e1c6489a93ea44e083557',
+        sha256: createHash('sha256').update(sandboxCode).digest('hex'),
+      },
+    }),
   });
   await writeFile(c.descriptorPath, descriptor, { mode: 0o444 });
   await chmod(release, 0o555);
@@ -278,6 +302,83 @@ async function readonlyFixture() {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  function pendingRead<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((resolveRead, rejectRead) => {
+      resolve = resolveRead;
+      reject = rejectRead;
+    });
+    return { promise, resolve, reject };
+  }
+
+  it.each(['startup', 'web endpoint'] as const)(
+    'joins both independent %s reads after one fails',
+    async (phase) => {
+      const mount = await directory();
+      const readonlyDshDirectory = await readonlyFixture();
+      const binding = {
+        vmId: randomUUID(),
+        personId: randomUUID(),
+        organizationId: randomUUID(),
+        instanceId: randomUUID(),
+        leaseEpoch: 1,
+      };
+      const metadata = pendingRead<void>();
+      const inspect = pendingRead<string>();
+      const runner = vi.fn(async (command: Parameters<typeof runCommand>[0]) =>
+        command.args[0] === 'inspect' ? inspect.promise : 'microsandbox 0.7.16',
+      );
+      const native = new MicrosandboxPersonVm({
+        binary: '/b',
+        libkrunfw: '/fw',
+        agentd: '/agentd',
+        image: readonlyImage,
+        readonlyDshDirectory,
+        rootDiskGiB: 20,
+        socketRoot: await socketDirectory(),
+        runner,
+      });
+      await native.prepare(binding, mount, signal());
+      const artifact = vi
+        .spyOn(native as unknown as { artifact(): Promise<void> }, 'artifact')
+        .mockImplementation(() => metadata.promise);
+      let settled = false;
+      const operation = (
+        phase === 'startup'
+          ? native.start(binding, signal())
+          : native.assertWebEndpoints(
+              { binding, endpoints: [], rosterDigest: '' },
+              signal(),
+            )
+      )
+        .catch((error: unknown) => error)
+        .finally(() => {
+          settled = true;
+        });
+      const firstFailure = new Error('read failure');
+      try {
+        expect(artifact).toHaveBeenCalledOnce();
+        expect(runner.mock.calls.map(([call]) => call.args[0])).toEqual([
+          '--version',
+          'inspect',
+        ]);
+        if (phase === 'startup') metadata.reject(firstFailure);
+        else inspect.reject(firstFailure);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+      } finally {
+        metadata.resolve();
+        inspect.resolve('{}');
+        await operation;
+      }
+      expect(await operation).toBe(firstFailure);
+      expect(runner.mock.calls.some(([call]) => call.args[0] === 'start')).toBe(
+        false,
+      );
+    },
+  );
+
   const readerConfiguration = {
     nodeExecutable: '/fixed-node/bin/node',
     cgroupRoot: '/sys/fs/cgroup',
@@ -534,6 +635,93 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     // Source loss must not gate stop/status or physical cleanup.
     await f.native.stop(binding, signal());
     expect(await f.native.status(binding, signal())).toBe('stopped');
+  });
+  it.each([false, true])(
+    'passes only a verified bundled runner to the exact native DSH process (bundle present = %s)',
+    async (withSandbox) => {
+      const c = await readonlyFixture(withSandbox);
+      const f = await bootstrapFixture('ok', c);
+      const cli =
+        c.guestDirectory + '/node_modules/@deepseek-ai/dsh/lib/bin.js';
+      const other = '/work/other.cjs';
+      f.h.runtime.start = async (_binding, _signal, scope) => {
+        for (const path of [cli, other]) {
+          const job = await scope.launch({
+            executable: 'node',
+            args: [path],
+            env: { DSH_HOME: '/work/employee-a', PATH: '/work/caller-path' },
+          });
+          expect(await job.wait(signal())).toEqual({
+            exitCode: 0,
+            timedOut: false,
+          });
+        }
+      };
+      await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
+      const calls = await f.calls();
+      const launches = calls.filter((args) => args[0] === 'exec');
+      const dsh = launches.find((args) => args.at(-1) === cli);
+      const otherNode = launches.find((args) => args.at(-1) === other);
+      const staged = launches.filter((args) =>
+        args.includes(prepareDshSandbox),
+      );
+      const sha = createHash('sha256')
+        .update('synthetic runner fixture')
+        .digest('hex');
+      expect(staged).toHaveLength(withSandbox ? 1 : 0);
+      if (withSandbox) {
+        expect(staged[0]!.slice(-4)).toEqual([
+          '-e',
+          prepareDshSandbox,
+          c.guestDirectory,
+          sha,
+        ]);
+        expect(launches.indexOf(staged[0]!)).toBeLessThan(
+          launches.indexOf(dsh!),
+        );
+      }
+      const readPath = (args?: string[]) =>
+        args?.filter(
+          (arg, index) =>
+            args[index - 1] === '--env' && arg.startsWith('PATH='),
+        );
+      expect(readPath(dsh)).toEqual([
+        withSandbox
+          ? 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+          : 'PATH=/work/caller-path',
+      ]);
+      if (withSandbox) {
+        expect(dsh?.slice(-7)).toEqual([
+          '/bin/sh',
+          '-c',
+          launchDshSandbox,
+          'allrice-dsh',
+          DSH_SANDBOX_ROOT +
+            '/' +
+            sha +
+            ':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+          '/usr/local/bin/node',
+          cli,
+        ]);
+      }
+      expect(readPath(otherNode)).toEqual(['PATH=/work/caller-path']);
+      expect(
+        launches
+          .filter((args) => args !== dsh && args !== otherNode)
+          .every((args) => readPath(args)?.length === 0),
+      ).toBe(true);
+    },
+  );
+  it('rejects DSH startup and stops the VM when sandbox staging fails', async () => {
+    const c = await readonlyFixture(true);
+    const f = await bootstrapFixture('sandbox-stage-error', c);
+    await expect(
+      f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    const calls = await f.calls();
+    expect(calls.some((args) => args.includes(prepareDshSandbox))).toBe(true);
+    expect(calls.some((args) => args.includes('native-dsh'))).toBe(false);
+    expect(calls.some((args) => args[0] === 'stop')).toBe(true);
   });
   it('source qualification失败不pull/create/start；真实prepare/status和失败detach仍可收敛', async () => {
     const c = await readonlyFixture();

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   chmod,
   lstat,
@@ -17,8 +18,11 @@ import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import {
   assertReadonlyArtifactInspection,
+  COMMAND_MEMORY_CONTROL_FILES,
   checkedReadonlyDshDirectory,
+  hashCommandMemoryControlFiles,
   readonlyArtifactReference,
+  verifyReadonlyCommandMemoryDirectory,
   verifyReadonlyDshDirectory,
   type ReadonlyDshDirectory,
 } from './readonly-artifact.ts';
@@ -128,12 +132,90 @@ function inspection(c: ReadonlyDshDirectory) {
   };
 }
 
+async function controlFixture(root: string) {
+  const files = new Map(
+    COMMAND_MEMORY_CONTROL_FILES.map((name) => [name, Buffer.from(name)]),
+  );
+  const sha256 = hashCommandMemoryControlFiles(files);
+  const controls = {
+    sha256,
+    hostDirectory: join(root, sha256),
+    guestDirectory: `/opt/allrice/command-memory/${sha256}`,
+  };
+  await mkdir(controls.hostDirectory, { mode: 0o700 });
+  for (const name of COMMAND_MEMORY_CONTROL_FILES) {
+    const path = join(controls.hostDirectory, name);
+    await writeFile(path, files.get(name)!);
+    await chmod(path, name === 'launch-dsh.sh' ? 0o555 : 0o444);
+  }
+  return controls;
+}
+
+it('rejects a non-regular control artifact with no writer waiting on the pipe', async () => {
+  const { root } = await fixture();
+  const controls = await controlFixture(root);
+  const guard = join(controls.hostDirectory, 'bash-env.sh');
+  await rm(guard);
+  execFileSync('/usr/bin/mkfifo', [guard]);
+  await chmod(guard, 0o444);
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('requires the independently sealed control bytes and an exact active read-only mount beside DSH', async () => {
+  const f = await fixture();
+  const controls = await controlFixture(f.root);
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).resolves.toBeUndefined();
+  const snapshot = inspection(f.c);
+  for (const settings of [snapshot.config, snapshot.active_config])
+    settings.mounts.push({
+      ...settings.mounts[0]!,
+      host: controls.hostDirectory,
+      guest: controls.guestDirectory,
+    });
+  expect(() =>
+    assertReadonlyArtifactInspection(
+      snapshot,
+      snapshot.name,
+      f.c,
+      true,
+      controls,
+    ),
+  ).not.toThrow();
+  expect(() =>
+    assertReadonlyArtifactInspection(snapshot, snapshot.name, f.c, true),
+  ).toThrow('PROVIDER_FAILED');
+  snapshot.active_config.mounts[1]!.options = {
+    ...snapshot.active_config.mounts[1]!.options,
+    readonly: false,
+  };
+  expect(() =>
+    assertReadonlyArtifactInspection(
+      snapshot,
+      snapshot.name,
+      f.c,
+      true,
+      controls,
+    ),
+  ).toThrow('PROVIDER_FAILED');
+  const guard = join(controls.hostDirectory, 'bash-env.sh');
+  await chmod(guard, 0o600);
+  await writeFile(guard, 'changed');
+  await chmod(guard, 0o444);
+  await expect(
+    verifyReadonlyCommandMemoryDirectory(controls, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
 it('trusted release pins sealed bytes and tree version; config is frozen and all16 links stay public', async () => {
   const { c } = await fixture(),
     config = checkedReadonlyDshDirectory(c);
   await expect(
     verifyReadonlyDshDirectory(config, image, signal()),
-  ).resolves.toBe(c.sealedManifestSha256);
+  ).resolves.toEqual({ descriptorSha256: c.sealedManifestSha256 });
   expect(Object.isFrozen(config)).toBe(true);
   c.hostDirectory = '/different';
   expect(config.hostDirectory).not.toBe(c.hostDirectory);
@@ -147,9 +229,67 @@ it('runtime hashes only sealed manifest; trusted published payload and original 
   // Deliberate host-only fixture mutation establishes the scope: guest readonly is a separate native enforcement test.
   await chmod(join(f.c.hostDirectory, 'node_modules/code.js'), 0o000);
   await chmod(join(dirname(f.c.hostDirectory), 'manifest.json'), 0o000);
-  await expect(verifyReadonlyDshDirectory(f.c, image, signal())).resolves.toBe(
-    f.c.sealedManifestSha256,
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).resolves.toEqual({ descriptorSha256: f.c.sealedManifestSha256 });
+});
+it('accepts only the sealed, exclusively occupied read-only sandbox directory and pinned executable', async () => {
+  const f = await fixture();
+  const hostBin = join(f.c.hostDirectory, 'sandbox-bin');
+  const bwrap = join(hostBin, 'bwrap');
+  const bytes = 'synthetic verified runner';
+  await chmod(f.c.hostDirectory, 0o700);
+  await mkdir(hostBin, { mode: 0o700 });
+  await writeFile(bwrap, bytes, { mode: 0o555 });
+  await chmod(hostBin, 0o555);
+  await chmod(f.c.hostDirectory, 0o555);
+  const sandboxBackend = {
+    kind: 'bubblewrap',
+    path: 'sandbox-bin/bwrap',
+    mode: 0o555,
+    architecture: 'arm64',
+    packageVersion: '0.8.0-2+deb12u1',
+    packageSha256:
+      'd044ba1d7961d835669035fcd1e11121f1dc960a1a2e1c6489a93ea44e083557',
+    sha256: sha(bytes),
+  };
+
+  await f.changeSeal({ sandboxBackend }, true);
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).resolves.toEqual({
+    descriptorSha256: f.c.sealedManifestSha256,
+    sandboxSha256: sandboxBackend.sha256,
+  });
+  await f.changeSeal(
+    { sandboxBackend: { ...sandboxBackend, path: 'node_modules/bwrap' } },
+    true,
   );
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  await f.changeSeal({ sandboxBackend }, true);
+  await chmod(bwrap, 0o444);
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  await chmod(bwrap, 0o755);
+  await writeFile(bwrap, 'modified fixture bytes');
+  await chmod(bwrap, 0o555);
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  await chmod(bwrap, 0o755);
+  await writeFile(bwrap, bytes);
+  await chmod(bwrap, 0o555);
+  await chmod(hostBin, 0o755);
+  await writeFile(join(hostBin, 'node'), 'unexpected executable', {
+    mode: 0o555,
+  });
+  await chmod(hostBin, 0o555);
+  await expect(
+    verifyReadonlyDshDirectory(f.c, image, signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
 it('sealed-byte hash and tree hash have independent trusted expectations; version drift cannot self-authorize', async () => {
   for (const mutate of [

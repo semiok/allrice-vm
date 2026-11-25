@@ -32,6 +32,18 @@ if [ "${ALLRICE_MEMORY_EXECUTION_REF+x}" = x ]; then
 elif [ -n "${ALLRICE_MEMORY_MANAGED_RECEIPT_REF:-}" ]; then
   allrice_memory_fail
 fi
+if [ "${ALLRICE_MEMORY_DSH_DISPATCH:-0}" = 1 ]; then
+  [ "$allrice_memory_receipt" = 1 ] || allrice_memory_fail
+  [[ "$ALLRICE_MEMORY_EXECUTION_REF" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || allrice_memory_fail
+  allrice_memory_child="$ALLRICE_MEMORY_COMMANDS_GROUP/command-$ALLRICE_MEMORY_EXECUTION_REF"
+  allrice_memory_native_path=$PATH
+  PATH=/usr/local/bin:/usr/bin:/bin
+  allrice_memory_initial=$(awk -F: '$1=="0" && $2=="" {print $3}' "$ALLRICE_MEMORY_PROC_ROOT/$$/cgroup") || allrice_memory_fail
+  if [ "$allrice_memory_initial" != "${ALLRICE_MEMORY_DSH_GROUP#"$ALLRICE_MEMORY_CGROUP_ROOT"}" ]; then
+    printf 'COMMAND_MEMORY_NATIVE_SCOPE_UNSUPPORTED: 当前原生命令进程范围不支持内存保护，本次命令未执行\n' >&2
+    exit 75
+  fi
+fi
 allrice_memory_receipt_phase() {
   "$ALLRICE_MEMORY_RECEIPT_NODE" "$ALLRICE_MEMORY_RECEIPT_WRITER" "$$" "$1" >/dev/null
 }
@@ -115,3 +127,7 @@ export ALLRICE_MEMORY_MANAGED_START="$allrice_memory_start"
 export ALLRICE_MEMORY_MANAGED_CHILD="$allrice_memory_child"
 export ALLRICE_MEMORY_OOM_BASELINE="$allrice_memory_oom_before"
 export ALLRICE_MEMORY_LOCAL_BASELINE="$allrice_memory_local_before"
+if [ "${ALLRICE_MEMORY_DSH_DISPATCH:-0}" = 1 ]; then
+  PATH=$allrice_memory_native_path
+  unset allrice_memory_native_path
+fi
