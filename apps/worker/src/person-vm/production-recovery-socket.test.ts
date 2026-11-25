@@ -2,7 +2,10 @@ import { stat } from 'node:fs/promises';
 import { request } from 'node:http';
 import { dirname } from 'node:path';
 import { expect, it, vi } from 'vitest';
-import { modelBinding } from '../../../../packages/model-gateway/src/gateway.fixture.js';
+import {
+  deferred,
+  modelBinding,
+} from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { openProductionRecoverySocket } from './production-recovery-socket.js';
 
 it('keeps the exact maintenance owner reachable over a private Unix socket until authorized completion', async () => {
@@ -64,4 +67,129 @@ it('keeps the exact maintenance owner reachable over a private Unix socket until
   await expect(stat(dirname(socket.path))).rejects.toMatchObject({
     code: 'ENOENT',
   });
+});
+
+it('reports the current stop attempt only to an authorized local operator', async () => {
+  const context = modelBinding().context;
+  const recover = vi.fn(async () => 0);
+  const authenticate = vi.fn(async () => context);
+  const authenticateOperator = vi.fn(async (token: string) =>
+    token === 'synthetic-platform-session' ? context : null,
+  );
+  const authorize = vi.fn(async () => undefined);
+  const status = {
+    bootId: 'worker-boot',
+    pid: 123,
+    attemptId: 'requested-stop',
+    state: 'deferred',
+    reason: 'VM_ACTIVE',
+  } as const;
+  const socket = await openProductionRecoverySocket({
+    authenticate,
+    recover,
+    pending: () => true,
+    shutdown: {
+      authenticate: authenticateOperator,
+      authorize,
+      status: () => status,
+    },
+  });
+  function read(token: string, origin?: string) {
+    return new Promise<{ code?: number; body: string; cache?: string }>(
+      (resolve, reject) => {
+        const req = request(
+          {
+            socketPath: socket.path,
+            path: '/shutdown-status',
+            method: 'GET',
+            headers: {
+              authorization: 'Bearer ' + token,
+              ...(origin && { origin }),
+            },
+          },
+          (response) => {
+            response.setEncoding('utf8');
+            let body = '';
+            response.on('data', (chunk: string) => {
+              body += chunk;
+            });
+            response.on('end', () =>
+              resolve({
+                code: response.statusCode,
+                cache: response.headers['cache-control'],
+                body,
+              }),
+            );
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      },
+    );
+  }
+  try {
+    expect(
+      (await read('synthetic-platform-session', 'https://browser.invalid'))
+        .code,
+    ).toBe(404);
+    expect((await read('synthetic-employee')).code).toBe(401);
+    authorize.mockRejectedValueOnce(Error('platform authority withdrawn'));
+    expect((await read('synthetic-platform-session')).code).toBe(403);
+    const result = await read('synthetic-platform-session');
+    expect(result).toMatchObject({ code: 200, cache: 'no-store' });
+    expect(JSON.parse(result.body)).toEqual(status);
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(authorize).toHaveBeenCalledTimes(2);
+  } finally {
+    await socket.close();
+  }
+  await expect(stat(dirname(socket.path))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+});
+
+it('joins authentication for a disconnected client before releasing the maintenance socket', async () => {
+  const entered = deferred();
+  const release = deferred();
+  const recover = vi.fn(async () => 0);
+  const socket = await openProductionRecoverySocket({
+    async authenticate() {
+      entered.resolve();
+      await release.promise;
+      return null;
+    },
+    recover,
+    pending: () => true,
+  });
+  const client = request({
+    socketPath: socket.path,
+    path: '/recover',
+    method: 'POST',
+    headers: { authorization: 'Bearer synthetic-session' },
+  });
+  const disconnected = deferred();
+  client.once('error', () => {});
+  client.once('close', disconnected.resolve);
+  client.end();
+  let settled = false;
+  try {
+    await entered.promise;
+    client.destroy();
+    await disconnected.promise;
+    const closing = socket.close().then(() => {
+      settled = true;
+    });
+    // The kernel can close the client connection while its authority work
+    // is behind the barrier. Verify the socket owner is still alive.
+    await stat(dirname(socket.path));
+    expect(settled).toBe(false);
+    release.resolve();
+    await closing;
+    expect(recover).not.toHaveBeenCalled();
+  } finally {
+    client.destroy();
+    release.resolve();
+    await socket.close();
+  }
 });

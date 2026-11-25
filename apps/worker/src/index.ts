@@ -1,6 +1,10 @@
 import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
 import { createProductionPersonVmSources } from './person-vm/production-sources.js';
-import { openProductionRecoverySocket } from './person-vm/production-recovery-socket.js';
+import {
+  openProductionRecoverySocket,
+  type ProductionShutdownStatus,
+} from './person-vm/production-recovery-socket.js';
+import { PersonVmError } from '@allrice/person-vm';
 import type { RequestContext } from '@allrice/contracts';
 import { installDshCloseObservationIdentity } from './harness/dsh-close-observer.js';
 import { observeDshWorkerCloseIdentity } from './harness/dsh-worker-close-identity.js';
@@ -35,6 +39,7 @@ import { createWorkerCurrentBusinessRuntime } from './business-runtime/current-p
 import {
   createProductionPersonVmHost,
   ProductionPersonVmHostUnavailable,
+  type ProductionPersonVmHost,
 } from './person-vm/production-host.js';
 import { createWorkerReadinessResponder } from './worker-readiness.js';
 
@@ -45,6 +50,8 @@ import {
   makeHealthResponse,
 } from '@allrice/contracts';
 import {
+  authenticatePlatformSession,
+  requireCurrentPlatformAdmin,
   runMaintenanceExecutionTick,
   processFolderTriggerEvents,
   claimNextJob,
@@ -85,6 +92,7 @@ import { configuredDshNativeLaunch } from './harness/dsh/runtime-pool.js';
 import { fileURLToPath } from 'node:url';
 import { closeHarnessAdapters, getHarnessRouter } from './harness/router.js';
 import {
+  canFinishWorkerAfterModelRecovery,
   closeWorkerResources,
   startWorkerShutdownTask,
   WorkerShutdownError,
@@ -472,11 +480,32 @@ export async function recoverProductionPersonVmModelOwner(
   if (result.state !== 'installed')
     throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
   const released = await result.host.recoverModelOwner(context, signal);
-  if (stopping) {
-    // The original drain closed its other owners before deciding whether the
-    // shared pool can end. Do not close that pool ahead of its remaining tasks.
-    await shutdownTask?.catch(() => {});
-    if (!result.host.modelOwnerMaintenancePending()) await closeDatabase();
+  const receipt = shutdownStatus;
+  if (
+    stopping &&
+    receipt?.state === 'drain-failed' &&
+    !result.host.modelOwnerMaintenancePending() &&
+    canFinishWorkerAfterModelRecovery(
+      await shutdownTask?.catch((error: unknown) => error),
+    )
+  ) {
+    shutdownStatus = undefined;
+    const endpoint = recoveryEndpoint;
+    // This request owns the socket until it returns. Join it outside the
+    // handler before closing the pool shared by other maintenance requests.
+    void (async () => {
+      try {
+        if (endpoint) await (await endpoint).close();
+        if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
+        await closeDatabase();
+        process.exitCode = 0;
+      } catch {
+        shutdownStatus = receipt;
+        if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
+        console.error('[MET-273] Worker closure after recovery is unconfirmed');
+        await keepLocalShutdownMaintenance(result.host);
+      }
+    })();
   }
   return released;
 }
@@ -1053,15 +1082,18 @@ function shutdown(signal: string) {
         }
       },
       removeCapabilities: () => removeWorkerCapabilities(workerId),
-      closeDatabase: async () => {
+      closeDatabase: async (failedStages) => {
         const result = await personVmHost;
         if (
           result.state === 'installed' &&
-          result.host.modelOwnerMaintenancePending()
+          (failedStages.length || result.host.modelOwnerMaintenancePending())
         )
-          throw new ProductionPersonVmHostUnavailable(
-            'MODEL_RECOVERY_UNAVAILABLE',
-          );
+          throw new Error('WORKER_SHUTDOWN_MAINTENANCE_RETAINED');
+        const endpoint = recoveryEndpoint;
+        if (endpoint) {
+          await (await endpoint).close();
+          if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
+        }
         await closeDatabase();
       },
     });
@@ -1072,19 +1104,54 @@ function shutdown(signal: string) {
 
 let recoveryEndpoint:
   ReturnType<typeof openProductionRecoverySocket> | undefined;
+let shutdownStatus: ProductionShutdownStatus | undefined;
 let shutdownProbe: Promise<void> | undefined;
+async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
+  if (recoveryEndpoint) return;
+  const listening = (recoveryEndpoint = openProductionRecoverySocket({
+    authenticate: dEntryHttpDefaults.authenticate,
+    recover: recoverProductionPersonVmModelOwner,
+    pending: () =>
+      shutdownStatus !== undefined || host.modelOwnerMaintenancePending(),
+    shutdown: {
+      authenticate: authenticatePlatformSession,
+      authorize: (context) =>
+        requireCurrentPlatformAdmin(context, undefined, false),
+      status: () => shutdownStatus,
+    },
+  }));
+  try {
+    const recovery = await listening;
+    console.info('[MET-273] authorized local maintenance socket', {
+      path: recovery.path,
+    });
+  } catch {
+    if (recoveryEndpoint === listening) recoveryEndpoint = undefined;
+    console.error('[MET-273] local maintenance socket unavailable');
+  }
+}
 const stopWorker = (signal: string) => {
-  if (shutdownProbe) return;
+  if (shutdownProbe || stopping) return;
+  const attempt = {
+    bootId: startup.bootId,
+    pid: process.pid,
+    attemptId: randomUUID(),
+  };
   shutdownProbe = (async () => {
     const result = await personVmHost;
-    try {
-      if (result.state === 'installed')
+    if (result.state === 'installed') {
+      shutdownStatus = { ...attempt, state: 'checking' };
+      try {
         await result.host.assertWorkerShutdownSafe(AbortSignal.timeout(5000));
-    } catch {
-      console.warn(
-        '[MET-273] worker stop deferred; native owner is not safe to retire',
-      );
-      return;
+      } catch (error) {
+        const reason =
+          error instanceof PersonVmError ? error.code : 'PRECHECK_UNCONFIRMED';
+        shutdownStatus = { ...attempt, state: 'deferred', reason };
+        console.warn('[MET-273] worker stop deferred', shutdownStatus);
+        await keepLocalShutdownMaintenance(result.host);
+        return;
+      }
+      shutdownStatus = { ...attempt, state: 'draining' };
     }
     await shutdown(signal);
   })()
@@ -1097,24 +1164,13 @@ const stopWorker = (signal: string) => {
       });
       process.exitCode = 1;
       const result = await personVmHost;
-      if (
-        result.state !== 'installed' ||
-        !result.host.modelOwnerMaintenancePending()
-      )
-        return;
-      const listening = (recoveryEndpoint ??= openProductionRecoverySocket({
-        authenticate: dEntryHttpDefaults.authenticate,
-        recover: recoverProductionPersonVmModelOwner,
-        pending: () => result.host.modelOwnerMaintenancePending(),
-      }));
-      try {
-        const recovery = await listening;
-        console.info('[MET-273] authorized local recovery socket', {
-          path: recovery.path,
-        });
-      } catch {
-        if (recoveryEndpoint === listening) recoveryEndpoint = undefined;
-        console.error('[MET-273] local recovery socket unavailable');
+      if (result.state === 'installed') {
+        shutdownStatus = {
+          ...attempt,
+          state: 'drain-failed',
+          reason: 'WORKER_SHUTDOWN_UNCONFIRMED',
+        };
+        await keepLocalShutdownMaintenance(result.host);
       }
     })
     .finally(() => {

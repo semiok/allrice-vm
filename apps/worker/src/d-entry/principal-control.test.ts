@@ -8,7 +8,11 @@ import {
   summary,
   observeNativeFollow,
 } from '../../../../packages/d-entry-principal/test/host-fixture.js';
-import { createDEntryPrincipalControl } from './principal-control.js';
+import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
+import {
+  createDEntryPrincipalControl,
+  isCertainNativePromptRejection,
+} from './principal-control.js';
 
 type Fixture = Awaited<ReturnType<typeof hostFixture>>;
 const fixtures: Fixture[] = [];
@@ -25,6 +29,42 @@ async function setup(timeout = 1000) {
   });
   return { ...fixture, carrier, control };
 }
+
+it('releases a certain rc.2 blank prompt rejection without using a generic gateway code as proof', () => {
+  const call = (text: string) => ({
+    endpoint: 'session/prompt' as const,
+    scopeId: randomUUID(),
+    args: Native.methods['session/prompt']
+      .input({ strict: true })
+      .create()
+      .parse({
+        request: {
+          sessionId: 'root',
+          requestId: randomUUID(),
+          mode: 'queue',
+          content: [{ type: 'text', text }],
+        },
+      }),
+  });
+  expect(
+    isCertainNativePromptRejection(call(' \n\t '), 'gateway/bad-request'),
+  ).toBe(true);
+  expect(
+    isCertainNativePromptRejection(call('送出消息'), 'gateway/bad-request'),
+  ).toBe(false);
+  expect(
+    isCertainNativePromptRejection(call('送出消息'), 'session/not-found'),
+  ).toBe(true);
+  expect(
+    isCertainNativePromptRejection(call('送出消息'), 'session/writer-held'),
+  ).toBe(true);
+  expect(
+    isCertainNativePromptRejection(call('送出消息'), 'session/agent-busy'),
+  ).toBe(false);
+  expect(
+    isCertainNativePromptRejection(call(' \n\t '), 'gateway/cancelled'),
+  ).toBe(false);
+});
 
 describe('Node control uses the real generated issuer over the same native Peer carrier', () => {
   it('acquires inertly, then opens a real non-owner baseline, dispatches and closes its real child streams', async () => {

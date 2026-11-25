@@ -142,6 +142,10 @@ import type postgres from 'postgres';
 
 import { DataAccessError } from '../data.ts';
 import { getDatabase } from '../core/client.ts';
+import {
+  mapDEntryNativeRunEvent,
+  readDEntryNativeRunSnapshot,
+} from '../d-entry-native-execution.ts';
 import { wakeNativeQuestionWaits } from '../task-native-wait.ts';
 import { notifyJobReady } from './queue-ready.ts';
 import { resumeManagedMcpConnections } from '../mcp-managed-connections.ts';
@@ -1830,6 +1834,23 @@ export async function getRun(
   return mapPublicRunSnapshot(row);
 }
 
+/** Shared detail and event reader. Operations requiring a Job use getRun. */
+export async function getRunForRead(
+  context: RequestContext,
+  workspaceIdInput: string,
+  runId: string,
+) {
+  const workspaceId = await resolveWorkspaceId(context, workspaceIdInput);
+  const row = await selectRunJob(context.organizationId, workspaceId, runId);
+  if (row) {
+    authorizeRun(context, row);
+    return mapPublicRunSnapshot(row);
+  }
+  const native = await readDEntryNativeRunSnapshot(context, workspaceId, runId);
+  if (!native) throw new QueueError('not_found');
+  return native;
+}
+
 async function mapPublicRunSnapshot(row: RunJobRow) {
   const failure = await readTerminalModelFailure(
     getDatabase(),
@@ -1851,7 +1872,7 @@ export async function listRunEvents(
   runId: string,
   afterSequence = -1,
 ) {
-  const run = await getRun(context, workspaceIdInput, runId);
+  const run = await getRunForRead(context, workspaceIdInput, runId);
   if (!Number.isInteger(afterSequence) || afterSequence < -1) {
     throw new QueueError('cursor_invalid');
   }
@@ -1864,7 +1885,9 @@ export async function listRunEvents(
       and sequence > ${afterSequence}
     order by sequence
   `;
-  return rows.map(mapEvent);
+  return 'generation' in run
+    ? rows.map((row) => mapDEntryNativeRunEvent(row, run.threadId))
+    : rows.map(mapEvent);
 }
 
 export async function cancelRun(

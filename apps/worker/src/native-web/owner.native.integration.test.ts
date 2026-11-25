@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import {
@@ -12,6 +12,7 @@ import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
@@ -27,6 +28,10 @@ import {
 } from '@allrice/person-vm';
 import * as NativeTransport from './transport.js';
 import { setupNativeWebFixture } from './owner.native.fixture.js';
+import {
+  waitForPromptFact,
+  type NativePromptObservation,
+} from './prompt-observation.js';
 
 // Actual published rc.2 entry, not a fixture protocol server. Its complete
 // compatible-OS package tree must be provisioned separately and recorded.
@@ -102,6 +107,455 @@ it.skipIf(!cli)(
     expect(f.owner.controlReady()).toBe(false);
     expect(f.kills()).toBe(1);
     expect(f.child.exitCode !== null || f.child.signalCode !== null).toBe(true);
+  },
+);
+
+it.skipIf(!cli)(
+  'observes the actual rc.2 scoped prompt, native idempotent receipt, and exact queued remove',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const firstModel = deferred(),
+      releaseModel = deferred();
+    const observing = new AbortController();
+    const accepted = new Map<string, Promise<boolean>[]>();
+    const observations = new Map<string, NativePromptObservation[]>();
+    let promptLogin: string | undefined;
+    let assistantReferences = 0;
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        if (request.url?.startsWith('/v1/reference')) {
+          if (request.url === '/v1/reference') assistantReferences++;
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference: 'r'.repeat(43) }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        if (payload.purpose !== 'session-title') {
+          firstModel.resolve();
+          await releaseModel.promise;
+        }
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          JSON.stringify({ type: 'finish', reason: { kind: 'stop' } }) + '\n',
+        );
+      })().catch((error: unknown) => {
+        firstModel.reject(error);
+        response.destroy();
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(async () => {
+      observing.abort();
+      releaseModel.resolve();
+      await closeServer(server);
+    });
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin,
+        capability: 'q'.repeat(43),
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+          inputModalities: ['text'],
+        },
+      },
+      async (request) => {
+        if (request.endpoint === 'session/updateQueue') {
+          if (request.context.sessionId !== promptLogin)
+            throw new PersonVmError('VM_ACTIVE');
+          return;
+        }
+        promptLogin ??= request.context.sessionId;
+        const { requestId, observe } = request;
+        const observation = observe(observing.signal);
+        const group = observations.get(requestId) ?? [];
+        group.push(observation);
+        observations.set(requestId, group);
+        await observation.ready;
+        return {
+          undispatched: () => observation.close(),
+          accepted() {
+            const replies = accepted.get(requestId) ?? [];
+            replies.push(observation.confirmedReplay());
+            accepted.set(requestId, replies);
+          },
+          unknown() {},
+        };
+      },
+    );
+    const signal = AbortSignal.timeout(15000);
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    if (!created.ok) throw Error('Native root unavailable');
+    const sessionId = created.value.sessionId;
+    const issue: DEntryPrincipalIssue = {
+      scopeId: randomUUID(),
+      access: 'execute',
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
+      },
+      root: {
+        nativeSessionId: sessionId,
+        rootOriginDigest: 'manual-test-native-create-only',
+        rootBindingRef: 'manual-test-no-sql-permit',
+      },
+    };
+    const activity = f.owner.acquirePrincipal(issue, signal, f.context);
+    const scope = await activity.run(signal);
+    const prompt = (requestId: string, text: string) =>
+      scope.invoke(
+        {
+          endpoint: 'session/prompt',
+          scopeId: issue.scopeId,
+          args: NATIVE_REMOTE.methods['session/prompt']
+            .input({ strict: true })
+            .create()
+            .parse({
+              request: {
+                sessionId,
+                requestId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+              },
+            }),
+        },
+        signal,
+      );
+    try {
+      const firstId = randomUUID(),
+        queuedId = randomUUID();
+      const receipt = { endpoint: 'session/prompt', value: { accepted: true } };
+      expect(await prompt(firstId, 'Native active turn')).toEqual(receipt);
+      await waitForPromptFact(firstModel.promise, signal);
+      await observations.get(firstId)![0]!.assertClaimed(signal);
+
+      expect(await prompt(queuedId, 'Native pending occurrence')).toEqual(
+        receipt,
+      );
+      expect(
+        await prompt(queuedId, 'Native replay of that occurrence'),
+      ).toEqual(receipt);
+      expect(await Promise.all(accepted.get(queuedId)!)).toEqual([false, true]);
+      await observations.get(queuedId)![1]!.close();
+      const view = await scope.invoke(
+        {
+          endpoint: 'session/projections',
+          scopeId: issue.scopeId,
+          args: { request: { sessionId } },
+        },
+        signal,
+      );
+      if (view.endpoint !== 'session/projections' || !view.value)
+        throw Error('Native inbox projection unavailable');
+      const pending = view.value.values.inbox?.['next-turn'];
+      expect(pending).toHaveLength(1);
+      const item = pending?.[0];
+      if (
+        !item ||
+        typeof item !== 'object' ||
+        !('id' in item) ||
+        typeof item.id !== 'string'
+      )
+        throw Error('Native inbox item ID unavailable');
+      const updateQueue = (
+        target: typeof scope,
+        scopeId: string,
+        action: unknown,
+      ) =>
+        target.invoke(
+          {
+            endpoint: 'session/updateQueue',
+            scopeId,
+            args: NATIVE_REMOTE.methods['session/updateQueue']
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  sessionId,
+                  itemId: item.id,
+                  action,
+                },
+              }),
+          },
+          signal,
+        );
+      const otherIssue = { ...issue, scopeId: randomUUID() };
+      const other = f.owner.acquirePrincipal(otherIssue, signal, {
+        ...f.context,
+        sessionId: randomUUID(),
+      });
+      try {
+        const otherScope = await other.run(signal);
+        for (const action of [
+          {
+            kind: 'edit',
+            content: [{ type: 'text', text: 'Different login' }],
+          },
+          { kind: 'remove' },
+          { kind: 'steer' },
+        ]) {
+          await expect(
+            updateQueue(otherScope, otherIssue.scopeId, action),
+          ).rejects.toHaveProperty('code', 'VM_ACTIVE');
+        }
+        const unchanged = await scope.invoke(
+          {
+            endpoint: 'session/projections',
+            scopeId: issue.scopeId,
+            args: { request: { sessionId } },
+          },
+          signal,
+        );
+        expect(unchanged).toMatchObject({
+          value: { values: { inbox: { 'next-turn': [item] } } },
+        });
+      } finally {
+        await other.close();
+      }
+      expect(
+        await updateQueue(scope, issue.scopeId, { kind: 'remove' }),
+      ).toEqual({ endpoint: 'session/updateQueue', value: { accepted: true } });
+      await expect(
+        waitForPromptFact(observations.get(queuedId)![0]!.settled, signal),
+      ).resolves.toBe('discarded');
+      await expect(prompt(randomUUID(), ' \n ')).rejects.toHaveProperty(
+        'code',
+        'gateway/bad-request',
+      );
+      releaseModel.resolve();
+      await expect(
+        waitForPromptFact(observations.get(firstId)![0]!.settled, signal),
+      ).resolves.toBe('ended');
+      expect(assistantReferences).toBe(1);
+    } finally {
+      observing.abort();
+      releaseModel.resolve();
+      await activity.close();
+    }
+  },
+);
+
+it.skipIf(!cli)(
+  'proves a continuable child after the parent ends and both native wakeups on the idle parent',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const rootReady = deferred<{
+      id: string;
+      owner: Awaited<ReturnType<typeof setup>>['owner'];
+      context: Awaited<ReturnType<typeof setup>>['context'];
+    }>();
+    const rootEnded = deferred();
+    const relayEnded = deferred();
+    const finished = deferred();
+    for (const ready of [rootReady, rootEnded, relayEnded, finished])
+      void ready.promise.catch(() => {});
+    const signal = AbortSignal.timeout(25000);
+    const capability = 'a'.repeat(43);
+    const requestId = randomUUID();
+    const attempts = new Map<string, number>();
+    const refs = new Map<
+      string,
+      { session: string; ordinal: number; title: boolean }
+    >();
+    const turns: number[] = [];
+    const server = createServer((request, response) => {
+      void (async () => {
+        const { id: root, owner, context } = await rootReady.promise;
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        expect(request.headers.authorization).toBe('Bearer ' + capability);
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        const title = request.url === '/v1/reference/session-title';
+        if (request.url === '/v1/reference' || title) {
+          const session = String(payload.sessionId);
+          const isRoot = session === root;
+          const address: SessionAddress = isRoot
+            ? { kind: 'session', sessionId: SessionId(root) }
+            : {
+                kind: 'subagent',
+                parentSessionId: SessionId(root),
+                childSessionId: SessionId(session),
+                mode: 'continuable',
+              };
+          const ordinal = title ? 0 : (attempts.get(session) ?? 0) + 1;
+          if (!title) attempts.set(session, ordinal);
+          if (!isRoot) await (ordinal === 1 ? rootEnded : relayEnded).promise;
+          const proof = await owner.readNativeAttemptFor(
+            context,
+            address,
+            signal,
+            title ? 'session-title' : 'assistant',
+          );
+          expect(proof).toMatchObject({
+            recipient: payload.recipient,
+            rootSessionId: root,
+            promptIds: [requestId],
+            delegated: !isRoot || ordinal >= 3,
+          });
+          if (isRoot && !title) {
+            expect(
+              await owner.readNativeRootWakeFor(context, root, signal),
+            ).toEqual(
+              ordinal >= 3
+                ? {
+                    kind: 'delegated',
+                    turn: proof!.turn!,
+                    promptIds: [requestId],
+                  }
+                : { kind: 'clear' },
+            );
+            turns.push(proof!.turn!);
+            if (ordinal >= 2) {
+              expect(ordinal).toBeLessThanOrEqual(4);
+              const joined =
+                ordinal === 2
+                  ? rootEnded
+                  : ordinal === 3
+                    ? relayEnded
+                    : finished;
+              void owner
+                .waitNativeTurnEnd(context, address, proof!.turn!, signal)
+                .then((end) => {
+                  expect(end.reason).toBe('completed');
+                  joined.resolve();
+                })
+                .catch(joined.reject);
+            }
+          }
+          const reference = randomBytes(32).toString('base64url');
+          refs.set(reference, { session, ordinal, title });
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        const entry = refs.get(
+          String(request.headers['x-allrice-model-call-reference']),
+        );
+        if (!entry)
+          throw Error('The native adapter did not redeem its reference');
+        const { session, ordinal, title: isTitle } = entry;
+        const tool = isTitle
+          ? null
+          : session === root && ordinal === 1
+            ? {
+                name: 'subagent',
+                args: {
+                  description: 'Read a small catalog',
+                  prompt: 'Report when the catalog is ready.',
+                },
+              }
+            : session !== root && ordinal === 1
+              ? {
+                  name: 'send_message',
+                  args: { agent_id: root, message: 'The catalog is ready.' },
+                }
+              : null;
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          [
+            tool
+              ? {
+                  type: 'tool-call-delta',
+                  index: 0,
+                  id: randomUUID(),
+                  name: tool.name,
+                  argumentsDelta: JSON.stringify(tool.args),
+                }
+              : { type: 'text-delta', index: 0, text: 'Catalog checked.' },
+            { type: 'finish', reason: { kind: tool ? 'tool-calls' : 'stop' } },
+          ]
+            .map((chunk) => JSON.stringify(chunk) + '\n')
+            .join(''),
+        );
+      })().catch((error: unknown) => {
+        response.destroy();
+        rootEnded.reject(error);
+        relayEnded.reject(error);
+        finished.reject(error);
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => (transport = create(...args)),
+    );
+    const { owner, context } = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin,
+        capability,
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+        },
+      },
+    );
+    const created = await owner.createRootFor(context, {}, signal);
+    if (!created.ok || !transport)
+      throw Error('Native owner fixture did not start');
+    const sessionId = created.value.sessionId;
+    rootReady.resolve({ id: sessionId, owner, context });
+    const response = await transport.fetch('api/session/prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method: 'session/prompt',
+        payload: {
+          args: {
+            request: {
+              sessionId,
+              requestId,
+              content: [
+                {
+                  type: 'text',
+                  text: 'Have a background agent check the catalog and tell me when it reports back.',
+                },
+              ],
+              mode: 'queue',
+            },
+          },
+        },
+      }),
+    });
+    expect(
+      serverResponseSchema.parse(await response.json()).result,
+    ).toMatchObject({
+      ok: true,
+      value: { accepted: true },
+    });
+    await finished.promise;
+    expect(
+      await owner.readNativeRootWakeFor(context, sessionId, signal),
+    ).toEqual({
+      kind: 'clear',
+    });
+    expect(turns).toEqual([1, 1, 2, 3]);
+    expect([...attempts.values()].sort()).toEqual([2, 4]);
   },
 );
 
@@ -276,6 +730,9 @@ it.skipIf(!cli)(
     if (!created.ok || !transport)
       throw Error('Native owner fixture did not start');
     const sessionId = created.value.sessionId;
+    let journalRead:
+      Parameters<typeof f.owner.readPersistedRunTerminalFor>[0] | undefined;
+    const guard = async (active: AbortSignal) => active.throwIfAborted();
     readAttempt.resolve(async (requested, kind) => {
       const attempt = await f.owner.readNativeAttemptFor(
         f.context,
@@ -291,6 +748,16 @@ it.skipIf(!cli)(
       if (kind === 'assistant') {
         expect(attempt.promptIds).toContain(nativePrompt);
         expect(attempt.turn).toBeGreaterThan(0);
+        journalRead = {
+          sessionId: requested,
+          nativeRequestId: nativePrompt,
+          purpose: kind,
+          cursor: attempt.cursor,
+          turn: attempt.turn,
+        };
+        expect(
+          await f.owner.readPersistedRunTerminalFor(journalRead, guard, signal),
+        ).toBeNull();
         turnEnd = f.owner.waitNativeTurnEnd(
           f.context,
           { kind: 'session', sessionId: SessionId(requested) },
@@ -363,10 +830,23 @@ it.skipIf(!cli)(
     });
     await Promise.all([primary.promise, title.promise]);
     expect(turnEnd).toBeDefined();
-    expect(await turnEnd).toMatchObject({
+    const appended = await turnEnd;
+    expect(appended).toMatchObject({
       sequence: expect.any(Number),
       reason: 'completed',
     });
+    expect(journalRead).toBeDefined();
+    await expect
+      .poll(
+        () => f.owner.readPersistedRunTerminalFor(journalRead!, guard, signal),
+        { timeout: 5000 },
+      )
+      .toMatchObject({
+        ...appended,
+        sessionId,
+        turn: journalRead!.turn,
+        occurredAt: expect.any(String),
+      });
     for (const fact of Object.values(facts))
       expect(fact).toEqual({
         redeemed: true,

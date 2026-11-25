@@ -7,6 +7,8 @@ import {
   type PersonVmView,
   type PersonVmHoldKind,
 } from './contract.ts';
+import type { PersonDisk } from './encrypted-disk.ts';
+import type { PersonVmStartingScope } from './guest-bootstrap.ts';
 
 export type VmHold = {
   id: string;
@@ -207,15 +209,7 @@ export function bindingOf(row: VmRecord): PersonVmBinding {
   });
 }
 
-async function assertAdmissionOpen(
-  session: VmSqlSession,
-  personId: string,
-  generationChange = false,
-) {
-  const [row] = await session.query(
-    () => session.client`
-    select * from person_virtual_machines where person_id=${personId}`,
-  );
+function assertAdmissionStateOpen(row?: postgres.Row) {
   // Existing 0247 fixtures remain usable; admission composition requires 0250.
   const state = row?.admission_state as
     | {
@@ -233,6 +227,18 @@ async function assertAdmissionOpen(
         !['none', 'confirmed'].includes(state.round.stop)))
   )
     throw new PersonVmError('LEASE_CONFLICT');
+}
+
+async function assertAdmissionOpen(
+  session: VmSqlSession,
+  personId: string,
+  generationChange = false,
+) {
+  const [row] = await session.query(
+    () => session.client`
+    select * from person_virtual_machines where person_id=${personId}`,
+  );
+  assertAdmissionStateOpen(row);
   if (generationChange && row && 'admission_state' in row) {
     const [accepted] = await session.query(
       () => session.client`
@@ -267,6 +273,120 @@ export class PostgresPersonVmStore implements PersonVmStore {
       return row ? fromRow(row) : null;
     } finally {
       await session.end();
+    }
+  }
+
+  /** Claim the existing physical lease, without admitting a business
+   * operation or replacing the previous holder. The token remains a fence if
+   * the PG connection closes before the exact guest probe has joined. */
+  async withRetainedReadLease<T>(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    work: (
+      scope: PersonVmStartingScope & Readonly<{ leaseOwner: string }>,
+      disk: PersonDisk,
+    ) => Promise<T>,
+    mayClaim: () => boolean = () => true,
+  ): Promise<T> {
+    signal.throwIfAborted();
+    const exact = Object.freeze({ ...binding });
+    const session = new VmSqlSession(this.openSql());
+    const sql = session.client;
+    const leaseOwner = randomUUID();
+    const scopeEnded = new AbortController();
+    const active = AbortSignal.any([signal, session.signal, scopeEnded.signal]);
+    let lockHeld = false;
+    let cleanupUnknown = false;
+    const select = (
+      db: postgres.Sql | postgres.TransactionSql,
+      lock: boolean,
+    ) => db`select *
+      from person_virtual_machines where person_id=${exact.personId}
+        and organization_id=${exact.organizationId} and vm_id=${exact.vmId}
+        and instance_id=${exact.instanceId} and lease_epoch=${exact.leaseEpoch}
+      ${lock ? db`for update` : db``}`;
+    function readTier(
+      row: postgres.Row | undefined,
+      owner: string | null,
+    ): PersonDisk['tier'] {
+      if (
+        !row ||
+        row.phase !== 'running' ||
+        !row.disk_retained ||
+        !row.native_created ||
+        row.lease_owner !== owner ||
+        (row.disk_tier !== 'warm' && row.disk_tier !== 'cold')
+      )
+        throw new PersonVmError('LEASE_LOST');
+      return row.disk_tier;
+    }
+    try {
+      const [lock] = await session.query(
+        () =>
+          sql`select pg_try_advisory_lock(hashtextextended(${'person-vm:' + exact.personId},0)) as locked`,
+      );
+      if (!lock?.locked) throw new PersonVmError('LEASE_CONFLICT');
+      lockHeld = true;
+      const tier = await session.query(() =>
+        sql.begin(async (tx) => {
+          active.throwIfAborted();
+          const [row] = await select(tx, true);
+          const diskTier = readTier(row, null);
+          if (!row || !('admission_state' in row))
+            throw new PersonVmError('PROVIDER_FAILED');
+          assertAdmissionStateOpen(row);
+          if (!Array.isArray(row.holds) || row.holds.length)
+            throw new PersonVmError('VM_ACTIVE');
+          const [permits] = await tx`select exists (
+          select 1 from person_vm_admission_permits
+          where person_id=${exact.personId} and disposition<>'deferred'
+        ) as busy`;
+          if (permits?.busy !== false) throw new PersonVmError('VM_ACTIVE');
+          active.throwIfAborted();
+          if (!mayClaim()) throw new PersonVmError('VM_ACTIVE');
+          await tx`update person_virtual_machines
+          set lease_owner=${leaseOwner}, lease_expires_at=clock_timestamp() + interval '30 seconds'
+          where person_id=${exact.personId}`;
+          return diskTier;
+        }),
+      );
+      const scope = Object.freeze({
+        binding: exact,
+        leaseOwner,
+        signal: active,
+        async assertCurrent() {
+          active.throwIfAborted();
+          const [row] = await session.query(() => select(sql, false));
+          active.throwIfAborted();
+          if (readTier(row, leaseOwner) !== tier)
+            throw new PersonVmError('LEASE_LOST');
+        },
+      });
+      await scope.assertCurrent();
+      const result = await work(
+        scope,
+        Object.freeze({ vmId: exact.vmId, tier }),
+      );
+      await scope.assertCurrent();
+      return result;
+    } catch (error) {
+      cleanupUnknown =
+        error instanceof PersonVmError && error.code === 'CLEANUP_INCOMPLETE';
+      throw error;
+    } finally {
+      scopeEnded.abort();
+      try {
+        if (lockHeld && !cleanupUnknown && !session.connectionFailure)
+          await session.query(
+            () => sql`update person_virtual_machines
+            set lease_owner=null, lease_expires_at=null
+            where person_id=${exact.personId} and lease_owner=${leaseOwner}`,
+          );
+      } finally {
+        if (lockHeld && !cleanupUnknown && session.connectionFailure)
+          this.settledOrphans.set(leaseOwner, exact.personId);
+        await session.end();
+      }
     }
   }
   async withLease<T>(

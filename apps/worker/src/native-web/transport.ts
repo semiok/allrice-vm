@@ -186,6 +186,7 @@ export function nativeWebTransport(
       credential: 'none' | 'index' | 'api';
       accepts(response: IncomingMessage): boolean;
       body?: string;
+      onChunk?(chunk: Buffer): void;
     },
   ): Promise<{ data: Buffer; headers: IncomingHttpHeaders }> {
     const active = AbortSignal.any([signal, caller]);
@@ -251,6 +252,12 @@ export function nativeWebTransport(
             if (fixed) chunk.copy(fixed, received);
             else chunks.push(chunk);
             received += chunk.length;
+            try {
+              bounds.onChunk?.(chunk);
+            } catch (reason) {
+              failure = { reason };
+              response.destroy();
+            }
           });
           response.once('end', () => {
             if (bounds.exact !== undefined && received !== bounds.exact) fail();
@@ -302,6 +309,7 @@ export function nativeWebTransport(
       body: string,
       caller: AbortSignal,
       image = false,
+      onChunk?: (chunk: Buffer) => void,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
@@ -313,7 +321,12 @@ export function nativeWebTransport(
             : 24 * 1024,
           credential: 'api',
           body,
-          accepts: ({ statusCode }) => statusCode === 200 || statusCode === 404,
+          onChunk,
+          accepts: ({ statusCode, headers }) =>
+            onChunk
+              ? statusCode === 200 &&
+                headers['content-type'] === 'text/plain; charset=utf-8'
+              : statusCode === 200 || statusCode === 404,
         },
       );
       return data.length ? data.toString('utf8') : null;

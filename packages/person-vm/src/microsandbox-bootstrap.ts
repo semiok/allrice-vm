@@ -84,6 +84,7 @@ export async function spawnMicrosandboxManagedProbe(
     scope: PersonVmStartingScope;
     name: string;
     cleanupTimeoutMs: number;
+    executionTimeoutSeconds?: number;
     command: NativeCommand;
   },
   commandSpec: PersonVmGuestCommand,
@@ -130,6 +131,14 @@ async function spawnMicrosandboxJob(
   await scope.assertCurrent();
   scope.signal.throwIfAborted();
   const args = ['exec', name, '--detach', '--no-stdin', '--no-tty'];
+  if (input.executionTimeoutSeconds !== undefined) {
+    if (
+      !Number.isSafeInteger(input.executionTimeoutSeconds) ||
+      input.executionTimeoutSeconds < 1
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+    args.push('--timeout', `${input.executionTimeoutSeconds}s`);
+  }
   for (const [key, value] of Object.entries(commandSpec.env ?? {}))
     args.push('--env', `${key}=${value}`);
   if (commandSpec.workdir) args.push('--workdir', commandSpec.workdir);

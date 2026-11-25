@@ -9,7 +9,7 @@ import {
 import {
   DataAccessError,
   QueueError,
-  getRun,
+  getRunForRead,
   getDatabase,
   listRunEvents,
   subscribeChatFlowWakeups,
@@ -148,7 +148,11 @@ async function streamEvents(input: {
         sequence = event.sequence;
         incrementChatFlowMetric('eventsDelivered');
       }
-      const run = await getRun(input.context, input.workspaceId, input.runId);
+      const run = await getRunForRead(
+        input.context,
+        input.workspaceId,
+        input.runId,
+      );
       const nextEvents = await listRunEvents(
         input.context,
         input.workspaceId,
@@ -198,7 +202,7 @@ export async function GET(
     const workspaceId = new URL(request.url).searchParams.get('workspaceId');
     if (!workspaceId) throw new DataAccessError('not_found');
     const { id } = await route.params;
-    await getRun(context, workspaceId, id);
+    await getRunForRead(context, workspaceId, id);
     const lastEventId = request.headers.get('last-event-id');
     let afterSequence = -1;
     if (lastEventId) {

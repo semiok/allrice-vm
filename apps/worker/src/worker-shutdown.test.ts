@@ -1,9 +1,26 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  canFinishWorkerAfterModelRecovery,
   closeWorkerResources,
   startWorkerShutdownTask,
   WorkerShutdownError,
 } from './worker-shutdown.js';
+
+it('releases the maintenance pool only when the failed Host was the remaining owner', () => {
+  const failure = new Error('outstanding cleanup');
+  const shutdown = (...names: string[]) =>
+    new WorkerShutdownError(names.map((name) => ({ name, error: failure })));
+  expect(
+    canFinishWorkerAfterModelRecovery(shutdown('person_vm_host', 'database')),
+  ).toBe(true);
+  expect(
+    canFinishWorkerAfterModelRecovery(
+      shutdown('person_vm_host', 'harness', 'database'),
+    ),
+  ).toBe(false);
+  expect(canFinishWorkerAfterModelRecovery(shutdown('database'))).toBe(false);
+  expect(canFinishWorkerAfterModelRecovery(failure)).toBe(false);
+});
 
 const deferred = () => {
   let resolve!: () => void, reject!: (error: unknown) => void;
@@ -74,6 +91,11 @@ describe('Worker shutdown ownership and dependency drain', () => {
     const error = await closeWorkerResources(p.input).catch((value) => value);
     expect(error).toBeInstanceOf(WorkerShutdownError);
     expect(error.failures.map((f: { name: string }) => f.name)).toEqual([
+      'producer_roots',
+      'cloud_services',
+      'harness',
+    ]);
+    expect(p.input.closeDatabase).toHaveBeenCalledExactlyOnceWith([
       'producer_roots',
       'cloud_services',
       'harness',

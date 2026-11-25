@@ -1,17 +1,21 @@
 import type { RequestContext, RunEvent } from '@allrice/contracts';
 import { describe, expect, it, vi } from 'vitest';
 
-const { chatFlowRealtimeEnabled, getRequestContext, getRun, listRunEvents } =
-  vi.hoisted(() => ({
-    chatFlowRealtimeEnabled: vi.fn(),
-    getRequestContext: vi.fn(),
-    getRun: vi.fn(),
-    listRunEvents: vi.fn(),
-  }));
+const {
+  chatFlowRealtimeEnabled,
+  getRequestContext,
+  getRunForRead,
+  listRunEvents,
+} = vi.hoisted(() => ({
+  chatFlowRealtimeEnabled: vi.fn(),
+  getRequestContext: vi.fn(),
+  getRunForRead: vi.fn(),
+  listRunEvents: vi.fn(),
+}));
 
 vi.mock(import('@allrice/database'), async (importOriginal) => ({
   ...(await importOriginal()),
-  getRun,
+  getRunForRead,
   listRunEvents,
 }));
 
@@ -24,6 +28,7 @@ vi.mock('../../../../../../lib/chatflow/rollout', () => ({
 }));
 
 import { GET } from './route';
+import { GET as getDetail } from '../route';
 
 const ids = {
   conversation: '44444444-4444-4444-8444-444444444444',
@@ -81,7 +86,7 @@ describe('GET /api/v1/runs/:id/events', () => {
   it('replays a terminal event after Last-Event-ID using the v3 SSE contract', async () => {
     getRequestContext.mockResolvedValue(context);
     chatFlowRealtimeEnabled.mockReturnValue(false);
-    getRun.mockResolvedValue({ status: 'succeeded' });
+    getRunForRead.mockResolvedValue({ status: 'succeeded' });
     listRunEvents.mockResolvedValueOnce([replayedEvent]).mockResolvedValue([]);
 
     const response = await GET(
@@ -147,5 +152,57 @@ describe('GET /api/v1/runs/:id/events', () => {
         '',
       ].join('\n'),
     );
+  });
+  it('reads a 4.0 Run without a Job and returns its events on the same cursor', async () => {
+    getRequestContext.mockResolvedValue(context);
+    chatFlowRealtimeEnabled.mockReturnValue(false);
+    const run = {
+      id: ids.run,
+      status: 'succeeded',
+      generation: '4.0',
+      threadId: ids.conversation,
+      completedAt: occurredAt,
+    };
+    getRunForRead.mockResolvedValue(run);
+    const receipt = {
+      executionId: ids.event,
+      source: 'dsh',
+      executionGeneration: '4.0',
+      conversationId: ids.conversation,
+      nativeSequence: 23,
+      reason: 'completed',
+    };
+    listRunEvents.mockResolvedValueOnce([
+      { ...replayedEvent, payload: receipt },
+    ]);
+    const route = { params: Promise.resolve({ id: ids.run }) };
+    const url = `http://localhost/api/v1/runs/${ids.run}`;
+    const detail = await getDetail(
+      new Request(`${url}?workspaceId=${ids.workspace}`),
+      route,
+    );
+    expect(detail.status).toBe(200);
+    expect(await detail.json()).toEqual({ run });
+
+    const response = await GET(
+      new Request(`${url}/events?workspaceId=${ids.workspace}&format=json`, {
+        headers: { 'last-event-id': `${ids.run}:0` },
+      }),
+      route,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      events: [
+        {
+          runId: ids.run,
+          eventId: ids.event,
+          cursor: `${ids.run}:1`,
+          conversationId: ids.conversation,
+          harness: 'dsh',
+          type: 'run.succeeded',
+          payload: receipt,
+        },
+      ],
+    });
   });
 });

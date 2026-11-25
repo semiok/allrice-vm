@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
@@ -9,9 +10,13 @@ import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
-import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
+import {
+  createDEntryPrincipalControl,
+  type PrincipalInvocationObservation,
+} from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
+import { DEntryNativeTurnEndSchema } from '@allrice/database';
 import type {
   ModelCatalog,
   SessionFollowFrame,
@@ -32,6 +37,10 @@ import type {
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import {
+  observeNativePrompt,
+  type NativePromptObservation,
+} from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
 
@@ -50,6 +59,22 @@ type EditorEvidence<T> = (
 
 export type NativeModelAttemptKind =
   'assistant' | 'compaction' | 'session-title';
+
+const nativeRootWake = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('clear') }).strict(),
+  z.object({ kind: z.literal('unproven') }).strict(),
+  z
+    .object({
+      kind: z.literal('delegated'),
+      turn: z.number().int().positive(),
+      promptIds: z
+        .array(z.string().min(1).max(256))
+        .min(1)
+        .max(64)
+        .refine((ids) => new Set(ids).size === ids.length),
+    })
+    .strict(),
+]);
 
 export function readNativeModelAttempt(
   snapshot: Pick<
@@ -115,11 +140,17 @@ export async function openNativeWebOwner(input: {
       adapterId: string;
       context: RequestContext;
       issue: DEntryPrincipalIssue;
-      requestId: string;
-      mode: 'queue' | 'steer';
-    },
+    } & (
+      | {
+          endpoint: 'session/prompt';
+          requestId: string;
+          mode: 'queue' | 'steer';
+          observe(signal: AbortSignal): NativePromptObservation;
+        }
+      | { endpoint: 'session/updateQueue' }
+    ),
     signal: AbortSignal,
-  ): Promise<() => Promise<void>>;
+  ): Promise<PrincipalInvocationObservation | undefined>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -544,7 +575,11 @@ export async function openNativeWebOwner(input: {
           issue,
           AbortSignal.any([requestSignal, signal]),
           async (call, active) => {
-            if (call.endpoint !== 'session/prompt' || !input.beforePrompt)
+            if (
+              !input.beforePrompt ||
+              (call.endpoint !== 'session/prompt' &&
+                call.endpoint !== 'session/updateQueue')
+            )
               return;
             if (
               !context ||
@@ -552,14 +587,35 @@ export async function openNativeWebOwner(input: {
               call.args.request.sessionId !== issue.root.nativeSessionId
             )
               throw new PersonVmError('AUTHORIZATION_DENIED');
+            const adapterId = installedModelAdapter;
+            const write = { binding, adapterId, context, issue };
+            if (call.endpoint === 'session/updateQueue')
+              return input.beforePrompt(
+                { ...write, endpoint: call.endpoint },
+                active,
+              );
+            const requestId = call.args.request.requestId;
             return input.beforePrompt(
               {
-                binding,
-                adapterId: installedModelAdapter,
-                context,
-                issue,
-                requestId: call.args.request.requestId,
+                ...write,
+                endpoint: call.endpoint,
+                requestId,
                 mode: call.args.request.mode,
+                observe(current) {
+                  const observed = observeNativePrompt(
+                    transport,
+                    {
+                      adapterId,
+                      sessionId: issue.root.nativeSessionId,
+                      scopeId: issue.scopeId,
+                      requestId,
+                    },
+                    AbortSignal.any([signal, current]),
+                    input.launch.auth.timeoutMs,
+                  );
+                  own(observed.settled);
+                  return observed;
+                },
               },
               active,
             );
@@ -635,6 +691,36 @@ export async function openNativeWebOwner(input: {
           }),
         );
       },
+      readNativeRootWakeFor(
+        context: RequestContext,
+        sessionId: string,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const proof = await transport.readManagedModelProof(
+              JSON.stringify({
+                action: 'read-root-wake',
+                adapterId: installedModelAdapter,
+                sessionId,
+              }),
+              active,
+            );
+            if (!proof) throw new PersonVmError('PROVIDER_FAILED');
+            const wake = nativeRootWake.safeParse(JSON.parse(proof));
+            if (!wake.success) throw new PersonVmError('PROVIDER_FAILED');
+            return wake.data;
+          },
+        );
+      },
       readNativeAttemptFor(
         context: RequestContext,
         address: SessionAddress,
@@ -678,6 +764,9 @@ export async function openNativeWebOwner(input: {
                   recipient: undefined,
                   promptIds: [] as string[],
                   sourceTurn: null,
+                  rootSessionId: null,
+                  delegated: false,
+                  delegatedPromptIds: [] as string[],
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -698,30 +787,50 @@ export async function openNativeWebOwner(input: {
                 recipient?: unknown;
                 sourceTurn?: unknown;
                 promptIds?: unknown;
+                rootSessionId?: unknown;
+                delegated?: unknown;
+                delegatedPromptIds?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
+              const { promptIds, delegatedPromptIds } = value ?? {};
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
                 !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
-                Object.keys(value).length !== 4 ||
-                (address.kind === 'session'
-                  ? !Number.isSafeInteger(value.sourceTurn) ||
-                    (attempt.turn !== null && value.sourceTurn !== attempt.turn)
-                  : value.sourceTurn !== null) ||
-                !Array.isArray(value.promptIds) ||
-                value.promptIds.length > 64 ||
-                value.promptIds.some(
-                  (id) => typeof id !== 'string' || id.length > 256,
-                )
+                Object.keys(value).length !== 7 ||
+                !Number.isSafeInteger(value.sourceTurn) ||
+                (attempt.turn !== null && value.sourceTurn !== attempt.turn) ||
+                typeof value.rootSessionId !== 'string' ||
+                !value.rootSessionId ||
+                value.rootSessionId.length > 256 ||
+                (address.kind === 'session' &&
+                  value.rootSessionId !== address.sessionId) ||
+                typeof value.delegated !== 'boolean' ||
+                (address.kind === 'subagent' && !value.delegated) ||
+                !Array.isArray(promptIds) ||
+                promptIds.length === 0 ||
+                promptIds.length > 64 ||
+                promptIds.some(
+                  (id) => typeof id !== 'string' || !id || id.length > 256,
+                ) ||
+                new Set(promptIds).size !== promptIds.length ||
+                !Array.isArray(delegatedPromptIds) ||
+                delegatedPromptIds.length > promptIds.length ||
+                delegatedPromptIds.some((id) => !promptIds.includes(id)) ||
+                new Set(delegatedPromptIds).size !==
+                  delegatedPromptIds.length ||
+                (value.delegated && delegatedPromptIds.length === 0)
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {
                 ...attempt,
                 id: kind === 'assistant' ? attempt.id : id.data,
                 recipient: value.recipient,
-                sourceTurn: value.sourceTurn as number | null,
-                promptIds: value.promptIds as string[],
+                sourceTurn: value.sourceTurn as number,
+                rootSessionId: value.rootSessionId,
+                delegated: value.delegated,
+                delegatedPromptIds: delegatedPromptIds as string[],
+                promptIds: promptIds as string[],
               };
             } finally {
               // Dispose this logical read on its original carrier. The
@@ -787,6 +896,41 @@ export async function openNativeWebOwner(input: {
             }
           },
         );
+      },
+      readPersistedRunTerminalFor(
+        selection: {
+          sessionId: string;
+          nativeRequestId: string;
+          purpose: NativeModelAttemptKind;
+          cursor: number;
+          turn: number | null;
+          delegated?: boolean;
+          parentSessionId?: string | null;
+        },
+        assertCurrent: (active: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, async (active) => {
+          if (!installedModelAdapter)
+            throw new PersonVmError('RUNTIME_NOT_READY');
+          const wire = await transport.readManagedModelProof(
+            JSON.stringify({
+              ...selection,
+              action: 'read-run-terminal',
+              adapterId: installedModelAdapter,
+            }),
+            active,
+          );
+          if (!wire) return null;
+          const end = DEntryNativeTurnEndSchema.parse(JSON.parse(wire));
+          if (end.sessionId !== selection.sessionId)
+            throw new PersonVmError('PROVIDER_FAILED');
+          return end;
+        });
       },
       readManagedModelImageFor(
         context: RequestContext,

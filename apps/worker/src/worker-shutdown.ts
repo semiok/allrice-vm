@@ -26,6 +26,18 @@ export class WorkerShutdownError extends AggregateError {
   }
 }
 
+/** A successful Host recovery can resolve its own failure and release the
+ * pool held for that recovery. Other failed Worker owners still need proof. */
+export function canFinishWorkerAfterModelRecovery(error: unknown) {
+  return (
+    error instanceof WorkerShutdownError &&
+    error.failures.some(({ name }) => name === 'person_vm_host') &&
+    error.failures.every(
+      ({ name }) => name === 'person_vm_host' || name === 'database',
+    )
+  );
+}
+
 /** This drains existing owners; it neither kills processes nor invents a new
  * lifecycle. Dependent stages stay ordered even when a prior stage rejects. */
 export async function closeWorkerResources(input: {
@@ -36,7 +48,7 @@ export async function closeWorkerResources(input: {
   waitForInventory(): Promise<unknown>;
   verifyRuntimeClosure(): Promise<unknown>;
   removeCapabilities(): Promise<unknown>;
-  closeDatabase(): Promise<unknown>;
+  closeDatabase(failedStages: readonly string[]): Promise<unknown>;
 }) {
   const failures: { name: string; error: unknown }[] = [];
   async function settle(tasks: readonly WorkerShutdownTask[]) {
@@ -61,6 +73,11 @@ export async function closeWorkerResources(input: {
   await settle([
     { name: 'worker_capabilities', run: input.removeCapabilities },
   ]);
-  await settle([{ name: 'database', run: input.closeDatabase }]);
+  await settle([
+    {
+      name: 'database',
+      run: () => input.closeDatabase(failures.map(({ name }) => name)),
+    },
+  ]);
   if (failures.length) throw new WorkerShutdownError(failures);
 }
