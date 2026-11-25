@@ -4,6 +4,7 @@
 #
 #   deploy-dev --release-manager [--ref <ref>] [--force] [--skip-smoke] [--force-snapshot]
 #                                                        build, check, switch, restart, smoke
+#              [--require-person-vm-config]             refuse if the private Host file is missing
 #   deploy-dev --release-manager --rollback [<release-dir>]   back to the release before the current one
 #   deploy-dev --release-manager --recover                    restore after a deploy that could not finish
 #   deploy-dev --status        configured vs running version, journal contract, rollback check, lock, recent deploys
@@ -466,12 +467,36 @@ rollback() { # [release-dir]
   say "rolled back; Dev runs ${sha:0:8}"
 }
 
+person_vm_config_arg() {
+  "$M1_PY" - "$HOME/allrice40-dev/config/person-vm-host.json" "$1" <<'PY'
+import os, stat, sys
+path, required = sys.argv[1:]
+try:
+    entry = os.lstat(path)
+except FileNotFoundError:
+    if required == '1':
+        sys.exit(f'{path}: required person VM host configuration is missing')
+    sys.exit(0)
+except OSError:
+    sys.exit(f'{path}: cannot inspect person VM host configuration')
+if (not stat.S_ISREG(entry.st_mode)
+        or entry.st_uid != os.getuid()
+        or stat.S_IMODE(entry.st_mode) != 0o600):
+    sys.exit(f'{path}: expected a regular person VM host configuration owned by the current user with mode 0600 (no symlinks)')
+print(f'--person-vm-config={path}')
+PY
+}
+
 deploy() {
-  local ref=origin/main force=0 smoke=1 snap=0
+  local ref=origin/main force=0 smoke=1 snap=0 require_vm_config=0
   while [ $# -gt 0 ]; do case "$1" in
     --ref) ref=${2:?}; shift 2 ;; --force) force=1; shift ;; --skip-smoke) smoke=0; shift ;;
     --force-snapshot) snap=1; shift ;;
+    --require-person-vm-config) require_vm_config=1; shift ;;
     *) die "unknown option $1" 2 ;; esac; done
+  local vm_config_arg
+  vm_config_arg=$(person_vm_config_arg "$require_vm_config") || die "person VM host configuration check failed. Dev untouched." 2
+  if [ -n "$vm_config_arg" ]; then require_vm_config=1; fi
   local t0; t0=$(date +%s)
   ! lock_held "$LOCK" || die "a deploy is in progress ($("$BIN/deploy-lock" status)); stop and retry later" 3
   [ ! -e "$INFLIGHT" ] || die "an earlier deploy did not finish; run $DEPLOY_COMMAND --release-manager --recover first"
@@ -498,7 +523,15 @@ deploy() {
   local art
   art=$(cd "$rel" && node apps/worker/scripts/prepare-native-artifact.mjs --root="$PWD" 2>>"$BLOG" | tail -1 | "$M1_PY" -c 'import json,sys;print(json.load(sys.stdin)["artifactId"])') \
     || { log_deploy kind failed phase artifact sha "$sha" log "$BLOG"; die "native artifact preparation failed; see $BLOG (Dev untouched)"; }
-  ( cd "$rel" && node scripts/dev-release/prepare-identity.mjs --root="$rel" --release-sha="$sha" ) >> "$BLOG" 2>&1 \
+  # The operator may supply the file while the build runs. Refuse if a
+  # previously selected file disappears instead of sealing without it.
+  vm_config_arg=$(person_vm_config_arg "$require_vm_config") \
+    || { log_deploy kind failed phase identity sha "$sha" log "$BLOG"; die "person VM host configuration check failed. Dev untouched." 2; }
+  ( cd "$rel" || exit 1
+    set -- --root="$rel" --release-sha="$sha"
+    if [ -n "$vm_config_arg" ]; then set -- "$@" "$vm_config_arg"; fi
+    node scripts/dev-release/prepare-identity.mjs "$@"
+  ) >> "$BLOG" 2>&1 \
     || { log_deploy kind failed phase identity sha "$sha" log "$BLOG"; die "build identity failed; see $BLOG (Dev untouched). Versions before PR #533 cannot seal identity on M1."; }
   dev_release_config "$rel" "$sha" || die "refusing an invalid 4.0 release" 2
   say "built in $(( $(date +%s) - t0 ))s; native artifact ${art:7:12}… ($([ "$art" = "$cur_art" ] && echo unchanged || echo CHANGED))"
@@ -582,6 +615,6 @@ case "${1:-}" in
   --status) status ;;
   --rollback) need_rm; shift; rollback "${1:-}" ;;
   --recover) need_rm; recover ;;
-  -h|--help) sed -n 2,33p "$0" ;;
+  -h|--help) sed -n 2,34p "$0" ;;
   *) need_rm; deploy "$@" ;;
 esac
