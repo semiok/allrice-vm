@@ -339,12 +339,17 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const c = this.options.readonlyDshDirectory;
     if (!c) return;
     if (!home) throw new PersonVmError('PROVIDER_FAILED');
-    const disk = await selectedReadonlyRuntimeDisk(
+    const selectedDisk = await selectedReadonlyRuntimeDisk(
       home,
       this.options.readonlyDshRuntimeDisk,
       create,
       signal,
     );
+    const replaceAbsentDisk =
+      create && selectedDisk?.provision === 'directory'
+        ? selectedDisk
+        : undefined;
+    const disk = replaceAbsentDisk ? undefined : selectedDisk;
     const artifact = disk
       ? await this.verifyRuntimeDisk(disk, c, this.options.image, signal)
       : {
@@ -362,6 +367,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       artifact.descriptorSha256,
       controls,
       disk,
+      replaceAbsentDisk,
     );
     return { ...artifact, disk };
   }

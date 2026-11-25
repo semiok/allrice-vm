@@ -1,5 +1,13 @@
 import { constants, type BigIntStats } from 'node:fs';
-import { lstat, open, readdir, realpath } from 'node:fs/promises';
+import {
+  lstat,
+  mkdtemp,
+  open,
+  readdir,
+  realpath,
+  rename,
+  rm,
+} from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { PersonVmError, type PersonVmBinding } from './contract.ts';
@@ -464,31 +472,46 @@ export async function readonlyArtifactReference(
   descriptorSha256: string,
   controls?: ReadonlyCommandMemoryDirectory,
   disk?: ReadonlyDshRuntimeDisk,
+  replaceAbsentDisk?: ReadonlyDshRuntimeDisk,
 ) {
   signal.throwIfAborted();
   if (!digest(descriptorSha256)) invalid();
   const path = join(home, 'allrice-readonly-dsh.json');
-  const value = {
-    version: 2,
-    vmId: binding.vmId,
-    personId: binding.personId,
-    ...c,
-    descriptorSha256,
-    ...(controls ? { commandMemorySha256: controls.sha256 } : {}),
-    ...(disk
-      ? {
-          runtimeDiskPath: disk.diskPath,
-          runtimeDiskSha256: disk.diskSha256,
-          runtimeCandidatePath: disk.candidatePath,
-          runtimeCandidateSha256: disk.candidateSha256,
-        }
-      : {}),
-  };
-  if (create) {
+  function reference(runtimeDisk?: ReadonlyDshRuntimeDisk) {
+    return {
+      version: 2,
+      vmId: binding.vmId,
+      personId: binding.personId,
+      ...c,
+      descriptorSha256,
+      ...(controls ? { commandMemorySha256: controls.sha256 } : {}),
+      ...(runtimeDisk
+        ? {
+            runtimeDiskPath: runtimeDisk.diskPath,
+            runtimeDiskSha256: runtimeDisk.diskSha256,
+            runtimeCandidatePath: runtimeDisk.candidatePath,
+            runtimeCandidateSha256: runtimeDisk.candidateSha256,
+          }
+        : {}),
+    };
+  }
+  type Reference = ReturnType<typeof reference>;
+  async function check(expected: Reference) {
+    const raw = await metadataFile(path, MANIFEST_BYTES, signal);
+    const saved = object(JSON.parse(raw.toString('utf8')));
+    keys(saved, Object.keys(expected));
+    for (const [key, value] of Object.entries(expected))
+      if (saved[key] !== value) invalid();
+  }
+  async function write(
+    target: string,
+    value: Reference,
+    allowExisting = false,
+  ) {
     let fd;
     try {
       fd = await open(
-        path,
+        target,
         constants.O_WRONLY |
           constants.O_CREAT |
           constants.O_EXCL |
@@ -496,32 +519,50 @@ export async function readonlyArtifactReference(
         0o600,
       );
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') invalid();
+      if (allowExisting && (error as NodeJS.ErrnoException).code === 'EEXIST')
+        return false;
+      throw error;
     }
-    if (fd) {
-      try {
-        await fd.writeFile(JSON.stringify(value));
-        await fd.sync();
-      } finally {
-        await fd.close();
-      }
-      const directory = await open(
-        home,
-        constants.O_RDONLY | constants.O_DIRECTORY,
-      );
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+    try {
+      await fd.writeFile(JSON.stringify(value));
+      await fd.sync();
+    } finally {
+      await fd.close();
+    }
+    return true;
+  }
+  async function syncHome() {
+    const directory = await open(
+      home,
+      constants.O_RDONLY | constants.O_DIRECTORY,
+    );
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
     }
   }
   try {
-    const raw = await metadataFile(path, MANIFEST_BYTES, signal),
-      saved = object(JSON.parse(raw.toString('utf8')));
-    keys(saved, Object.keys(value));
-    for (const [key, expected] of Object.entries(value))
-      if (saved[key] !== expected) invalid();
+    if (replaceAbsentDisk) {
+      if (!create || disk || replaceAbsentDisk.provision !== 'directory')
+        invalid();
+      // Create proved native absence under the VM owner. Only an exact,
+      // earlier provisioning reference may be replaced before dispatch.
+      await check(reference(replaceAbsentDisk));
+      const stage = await mkdtemp(join(home, '.dsh-ref-'));
+      try {
+        const staged = join(stage, 'reference');
+        await write(staged, reference());
+        signal.throwIfAborted();
+        await rename(staged, path);
+        await syncHome();
+      } finally {
+        await rm(stage, { recursive: true, force: true });
+      }
+    } else if (create && (await write(path, reference(disk), true))) {
+      await syncHome();
+    }
+    await check(reference(disk));
   } catch {
     invalid();
   }

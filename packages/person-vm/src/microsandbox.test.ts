@@ -91,7 +91,9 @@ fs.appendFileSync(p.join(home,'calls.jsonl'),JSON.stringify(a)+'\\n');
 function save(){fs.writeFileSync(f,JSON.stringify(v));}
 if(a[0]==='--version')console.log('microsandbox 0.7.16');
 else if(a[0]==='list')console.log(JSON.stringify(v.name?[{name:v.name,status:v.status}]:[]));
-else if(a[0]==='pull'){}
+else if(a[0]==='pull'){
+ if(mode==='pull-fails-once'&&!v.pullFailed){v.pullFailed=true;save();process.exit(45);}
+}
 else if(a[0]==='create'){
  v.name=a[a.indexOf('--name')+1];v.status='Running';
  v.mounts=a.flatMap((arg,i)=>arg==='--mount-dir'?[a[i+1].split(':')]:[]).map(([host,guest,ro])=>({type:'Bind',host,guest,options:{readonly:ro==='ro',noexec:false,nosuid:false,nodev:false},stat_virtualization:'strict',host_permissions:'private',follow_root_symlinks:false,quota_mib:null}));
@@ -1889,7 +1891,7 @@ fs.writeFileSync(f,JSON.stringify(v));
   });
 });
 
-it('uses the sealed block transport and keeps its original reference after switching new VM provisioning back to directories', async () => {
+it('keeps the mounted disk on retained VMs and rolls back an absent VM to directory provisioning', async () => {
   const dsh = await readonlyFixture();
   const signed = (input: string) =>
     createHash('sha256').update(input).digest('hex');
@@ -2037,4 +2039,41 @@ it('uses the sealed block transport and keeps its original reference after switc
   await retained.start(binding, signal());
   await retained.stop(binding, signal());
   expect((await f.calls()).filter(([op]) => op === 'create')).toHaveLength(1);
+
+  const absent = await bootstrapFixture('pull-fails-once', dsh, undefined, {
+    readonlyDshRuntimeDisk: disk,
+    readonlyCommandMemoryDirectory: controls,
+  });
+  const fresh = { ...binding, vmId: randomUUID() };
+  await absent.native.prepare(fresh, absent.mount, signal());
+  await expect(
+    absent.native.create(fresh, currentReceipt(fresh), signal()),
+  ).rejects.toThrow();
+  expect(await absent.native.status(fresh, signal())).toBe('absent');
+  const referenceFile = join(
+    absent.mount,
+    'microsandbox/allrice-readonly-dsh.json',
+  );
+  expect(JSON.parse(await readFile(referenceFile, 'utf8'))).toMatchObject({
+    runtimeDiskSha256: diskSha256,
+  });
+  const fallback = absent.reloadNative({ ...disk, provision: 'directory' });
+  await fallback.prepare(fresh, absent.mount, signal());
+  await fallback.create(fresh, currentReceipt(fresh), signal());
+  const createDirectory = (await absent.calls()).find(
+    ([op]) => op === 'create',
+  )!;
+  expect(createDirectory).not.toContain('--mount-disk');
+  expect(createDirectory).toEqual(
+    expect.arrayContaining([
+      '--mount-dir',
+      dsh.hostDirectory + ':' + dsh.guestDirectory + ':ro',
+      '--mount-dir',
+      controls.hostDirectory + ':' + controls.guestDirectory + ':ro',
+    ]),
+  );
+  expect(JSON.parse(await readFile(referenceFile, 'utf8'))).not.toHaveProperty(
+    'runtimeDiskSha256',
+  );
+  await fallback.stop(fresh, signal());
 });
