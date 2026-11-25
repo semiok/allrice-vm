@@ -79,7 +79,15 @@ export function nativeCallKey(binding: ModelCallBinding): string {
         binding.vm.leaseEpoch,
         binding.native.instanceId,
         binding.native.sessionId,
-        binding.native.callId,
+        binding.native.attemptId
+          ? [
+              'native-attempt',
+              binding.native.attemptKind,
+              binding.native.attemptId,
+              binding.native.attemptTurn,
+              binding.native.attemptCursor,
+            ]
+          : binding.native.callId,
       ]),
     )
     .digest('hex');
@@ -93,14 +101,44 @@ export function createPostgresModelGatewayStore(
   const json = (value: unknown) =>
     db.json(JSON.parse(JSON.stringify(value)) as postgres.JSONValue);
   return {
+    async reserveNativeCall(binding) {
+      if (
+        !binding.native.attemptId ||
+        !binding.native.attemptKind ||
+        (binding.native.attemptTurn !== null &&
+          !Number.isSafeInteger(binding.native.attemptTurn)) ||
+        !Number.isSafeInteger(binding.native.attemptCursor) ||
+        binding.executionGeneration !== '4.0'
+      )
+        throw new ModelGatewayError('BINDING_INVALID');
+      const key = nativeCallKey(binding) + ':authority';
+      const identity = json(binding);
+      const digest = createHash('sha256')
+        .update(JSON.stringify(binding))
+        .digest('hex');
+      const rows = await db<{ id: string }[]>`
+        insert into allrice_model_gateway_calls
+          (id,native_key,person_id,organization_id,binding,request_digest)
+        values(${randomUUID()},${key},${binding.vm.personId},${binding.vm.organizationId},
+          ${identity},${digest}) on conflict(native_key) do nothing returning id
+      `;
+      if (!rows.length) throw new ModelGatewayError('DUPLICATE_CALL');
+    },
     async claimCall(binding, requestDigest) {
       const id = randomUUID();
-      const rows = await db<
-        { id: string }[]
-      >`insert into allrice_model_gateway_calls
-        (id,native_key,person_id,organization_id,binding,request_digest)
-        values(${id},${nativeCallKey(binding)},${binding.vm.personId},${binding.vm.organizationId},
-          ${json(binding)},${requestDigest}) on conflict(native_key) do nothing returning id`;
+      const key = nativeCallKey(binding);
+      const identity = json(binding);
+      const rows = await db<{ id: string }[]>`
+        insert into allrice_model_gateway_calls
+          (id,native_key,person_id,organization_id,binding,request_digest)
+        select ${id},${key},${binding.vm.personId},${binding.vm.organizationId},
+          ${identity},${requestDigest}
+        where ${!binding.native.attemptId} or exists (
+          select 1 from allrice_model_gateway_calls
+          where native_key=${key + ':authority'} and binding=${identity}
+        )
+        on conflict(native_key) do nothing returning id
+      `;
       if (!rows.length) throw new ModelGatewayError('DUPLICATE_CALL');
       return id;
     },
@@ -166,13 +204,17 @@ export function createPostgresModelGatewayStore(
     },
     async tryStartAttempt(attempt) {
       return db.begin(async (tx) => {
-        // Same global person key across gateways, tenants, Runs and native children.
-        await tx`select pg_advisory_xact_lock(hashtextextended(${`model-gateway:${attempt.personId}`},0))`;
         const [call] = await tx<
-          { person_id: string }[]
-        >`select person_id from allrice_model_gateway_calls where id=${attempt.callId}`;
+          { person_id: string; provider: string }[]
+        >`select person_id, binding->>'provider' as provider from allrice_model_gateway_calls where id=${attempt.callId}`;
         if (!call || call.person_id !== attempt.personId)
           throw new ModelGatewayError('BINDING_INVALID');
+        // Shared with the admin selection transaction. An admitted intent
+        // blocks a slot switch, including an independently joined refresh.
+        if (call.provider === 'openai-codex')
+          await tx`select pg_advisory_xact_lock_shared(8182)`;
+        // Same global person key across gateways, tenants, Runs and native children.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`model-gateway:${attempt.personId}`},0))`;
         let slot: number | null = null;
         if (attempt.kind === 'model') {
           const [free] = await tx<

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import type { RequestContext } from '@allrice/contracts';
 import { createDedicatedDatabase, getDatabase } from '@allrice/database';
 import {
   createModelGateway,
@@ -8,12 +9,15 @@ import {
   type ModelCallBinding,
   type ModelGatewayAuthority,
   type ModelGatewayPort,
+  type GatewayProvider,
+  type DshGatewayStreamScope,
 } from '@allrice/model-gateway';
 import {
   createEgressGateway,
   createPublicHttpsTransport,
   type EgressAuthority,
   EgressError,
+  EgressPrepareRollbackError,
   type EgressPolicy,
   type ManagedHostService,
 } from '@allrice/egress-gateway';
@@ -42,6 +46,8 @@ import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
+import { ProductionHostConfigurationUnavailable } from './production-config.js';
+import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -49,7 +55,14 @@ type Admission = ReturnType<PersonVmService['createAdmissionHost']>;
 type Current = ReturnType<typeof createProductionPersonVmAuthority>;
 
 export class ProductionPersonVmHostUnavailable extends Error {
-  constructor(readonly code: 'HOST_SOURCES_UNAVAILABLE' | 'HOST_CLOSED') {
+  constructor(
+    readonly code:
+      | 'HOST_SOURCES_UNAVAILABLE'
+      | 'HOST_CONFIGURATION_UNAVAILABLE'
+      | 'PERSON_VM_ARTIFACTS_UNAVAILABLE'
+      | 'HOST_CLOSED'
+      | 'MODEL_RECOVERY_UNAVAILABLE',
+  ) {
     super(code);
     this.name = 'ProductionPersonVmHostUnavailable';
   }
@@ -70,6 +83,13 @@ export type ProductionPersonVmHostSources = Readonly<{
     providers: Providers;
     current: Current;
     lifetime: AbortSignal;
+    modelOwnerId: string;
+    reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
+    issueReference<T>(
+      call: ModelCallBinding,
+      signal: AbortSignal,
+      issue: (active: AbortSignal) => Promise<T>,
+    ): Promise<T>;
   }): Promise<{
     runtime: Pick<PersonVmRuntimePort, 'readiness' | 'activity'> & {
       /** Fence observations and join their actual work/subscriptions. */
@@ -80,6 +100,9 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: EgressAuthority;
       policy: EgressPolicy;
       services?: readonly ManagedHostService[];
+      /** Register the exact private request context used by the model route
+       * before EgressAuthority.allow receives it with the same signal. */
+      bindModelCall?(call: ModelCallBinding, signal: AbortSignal): void;
       /** Host upstream transport/credentials stay owned by sources. */
       close(): Promise<void>;
     };
@@ -87,6 +110,13 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: ModelGatewayAuthority;
       llm: Parameters<typeof createDshGatewayProvider>[0];
       route: Parameters<typeof createDshGatewayProvider>[1];
+      scopeStream?: DshGatewayStreamScope;
+      transport?: Readonly<{
+        fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
+        beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
+        close(): Promise<void>;
+        stoppedEvidence(ownerId: string, signal: AbortSignal): Promise<string>;
+      }>;
       /** Resolve the current trusted native call. Host request metadata may
        * be used to find a registration; it cannot authorize that registration. */
       resolveCall(
@@ -99,13 +129,25 @@ export type ProductionPersonVmHostSources = Readonly<{
 }>;
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
+export interface ProductionPersonVmHost {
+  assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
+  close(): Promise<void>;
+  modelOwnerMaintenancePending(): boolean;
+  /** Trusted in-process maintenance only. The model authority verifies the
+   * operator and independent proof of stopping this exact owner. */
+  recoverModelOwner(
+    context: RequestContext,
+    signal: AbortSignal,
+  ): Promise<number>;
+}
+
 /** Real inert construction and narrow-port installation. Required authorities
  * must already have formal producers; missing ones leave ALL ports uninstalled.
  * This does not start a VM, create an execution or acquire a business permit. */
 export function createProductionPersonVmHost(input: {
   lifetime: AbortSignal;
   sources?: ProductionPersonVmHostSources;
-}): Promise<{ close(): Promise<void> }> {
+}): Promise<ProductionPersonVmHost> {
   if (!input.sources)
     return Promise.reject(
       new ProductionPersonVmHostUnavailable('HOST_SOURCES_UNAVAILABLE'),
@@ -121,8 +163,24 @@ export function createProductionPersonVmHost(input: {
   });
   const pending = new Set<Promise<unknown>>();
   const receipts = new Set<PersonVmEgressReceipt>();
+  const retiredReceipts = new Map<string, PersonVmEgressReceipt>();
+  const ownedVms = new Map<
+    string,
+    { binding: PersonVmBinding; stopNative: boolean }
+  >();
+  let personVm: PersonVmService | undefined;
+  let gracefulStop = false;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
-  const uncertainPreparation: unknown[] = [];
+  const uncertainPreparation = new Map<
+    PersonVmBinding,
+    EgressPrepareRollbackError
+  >();
+  const independentCloseFailures: unknown[] = [];
+  const modelOwnerId = randomUUID();
+  let modelRecovery:
+    { providerJoined: boolean; releasedAttempts: number } | undefined;
+  let recovering = false;
+  let recoveredClose: { error: AggregateError | null } | undefined;
   let providers: Providers | undefined,
     current: Current | undefined,
     startup: Startup | undefined,
@@ -179,24 +237,35 @@ export function createProductionPersonVmHost(input: {
     active.throwIfAborted();
     return result.value;
   }
+  function sameReceipt(
+    left: PersonVmEgressReceipt,
+    right: PersonVmEgressReceipt,
+  ) {
+    return (
+      left.bindingId === right.bindingId &&
+      sameVmBinding(left.binding, right.binding) &&
+      left.gatewayPorts.length === right.gatewayPorts.length &&
+      left.gatewayPorts.every(
+        (port, index) => port === right.gatewayPorts[index],
+      )
+    );
+  }
   const egress: PersonVmEgressPort = {
     prepare(binding, preparation, signal) {
       return own(async () => {
         const active = AbortSignal.any([signal, lifetime]);
         active.throwIfAborted();
-        const receipt = await requireGateway()
+        const gateway = requireGateway();
+        const receipt = await gateway
           .prepare(binding, preparation, active)
           .catch((error: unknown) => {
-            // The gateway preserves a failed prepare plus failed retirement
-            // as AggregateError. Without its private receipt no outer owner can
-            // certify that unknown state closed; retain that original failure.
-            if (error instanceof AggregateError)
-              uncertainPreparation.push(error);
+            if (error instanceof EgressPrepareRollbackError)
+              uncertainPreparation.set(binding, error);
             throw error;
           });
-        // Register actual late success before cancellation can discard it.
+        // A late receipt still belongs to the service cleanup. Hand it back
+        // so the service can join egress before detaching its exact mount.
         receipts.add(receipt);
-        active.throwIfAborted();
         return receipt;
       });
     },
@@ -215,32 +284,97 @@ export function createProductionPersonVmHost(input: {
         await requireGateway().revoke(receipt, reason, signal);
         // The service freezes fresh copies before saving and cleanup. Remove
         // only this exact value after actual revoke succeeds, never a new epoch.
-        for (const retained of receipts)
-          if (
-            retained.bindingId === receipt.bindingId &&
-            sameVmBinding(retained.binding, receipt.binding) &&
-            retained.gatewayPorts.length === receipt.gatewayPorts.length &&
-            retained.gatewayPorts.every(
-              (port, index) => port === receipt.gatewayPorts[index],
-            )
-          )
-            receipts.delete(retained);
+        for (const retained of receipts) {
+          if (!sameReceipt(retained, receipt)) continue;
+          receipts.delete(retained);
+          retiredReceipts.set(retained.binding.personId, retained);
+        }
       });
     },
   };
+  async function collectFailures(tasks: (() => Promise<unknown>)[]) {
+    const results = await Promise.allSettled(
+      tasks.map((task) => Promise.resolve().then(task)),
+    );
+    return results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+  }
+  function retireReceipts() {
+    if (!gateway || !providers) return Promise.resolve([]);
+    const cleanup = AbortSignal.timeout(
+      providers.configuration.lifecycle.cleanupTimeoutMs,
+    );
+    return collectFailures(
+      [...receipts].map(
+        (receipt) => () => egress.revoke(receipt, 'failure', cleanup),
+      ),
+    );
+  }
+  function hasUnconfirmedPreparation(binding: PersonVmBinding) {
+    return [...uncertainPreparation.keys()].some((pending) =>
+      sameVmBinding(pending, binding),
+    );
+  }
+  async function retireFailedPreparations() {
+    if (!uncertainPreparation.size || !providers) return [];
+    const signal = AbortSignal.timeout(
+      providers.configuration.lifecycle.cleanupTimeoutMs,
+    );
+    return collectFailures(
+      [...uncertainPreparation.keys()].map((binding) => async () => {
+        await requireGateway().retireFailedPrepare(binding, signal);
+        uncertainPreparation.delete(binding);
+        // The unpublished prepare never reached native create/start. Retain
+        // only the obligation to reconcile its mount and exact local owners.
+        const vm = ownedVms.get(binding.personId);
+        if (vm && sameVmBinding(vm.binding, binding)) vm.stopNative = false;
+      }),
+    );
+  }
+  async function settleSupersededBinding(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    for (const receipt of receipts)
+      if (sameVmBinding(receipt.binding, binding))
+        await egress.revoke(receipt, 'failure', signal);
+    signal.throwIfAborted();
+    if (
+      hasUnconfirmedPreparation(binding) ||
+      requireStartup().hasLocalOwner(binding)
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const retired = retiredReceipts.get(binding.personId);
+    if (retired && sameVmBinding(retired.binding, binding))
+      retiredReceipts.delete(binding.personId);
+  }
+  function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
+    const vm = personVm;
+    if (!vm) return Promise.resolve([]);
+    const targets = [...ownedVms.values()].filter(
+      ({ binding }) =>
+        !deferUnconfirmedEgress || !hasUnconfirmedPreparation(binding),
+    );
+    return collectFailures(
+      targets.map(({ binding, stopNative }) => async () => {
+        await vm.shutdownOwned(binding, gracefulStop ? false : stopNative);
+        ownedVms.delete(binding.personId);
+      }),
+    );
+  }
   function close(): Promise<void> {
+    if (recoveredClose)
+      return recoveredClose.error
+        ? Promise.reject(recoveredClose.error)
+        : Promise.resolve();
     if (closing) return closing;
     closing = Promise.resolve().then(async () => {
       // Construction may be held in real I/O. Join it before taking the owner
       // snapshot; a late returned source must never escape rollback.
       await prepared;
-      const errors: unknown[] = [];
       async function settle(tasks: (() => Promise<unknown>)[]) {
-        const results = await Promise.allSettled(
-          tasks.map((task) => Promise.resolve().then(task)),
-        );
-        for (const result of results)
-          if (result.status === 'rejected') errors.push(result.reason);
+        independentCloseFailures.push(...(await collectFailures(tasks)));
       }
       // Each close fences its own ingress synchronously and joins owned work.
       const installation = installed,
@@ -250,7 +384,6 @@ export function createProductionPersonVmHost(input: {
       await settle([
         ...(installation ? [() => installation.close()] : []),
         ...(authorityOwner ? [() => authorityOwner.close()] : []),
-        ...(startupOwner ? [() => startupOwner.close()] : []),
         ...(sourceOwner ? [() => sourceOwner.runtime.close()] : []),
         ...[...nativeSubscriptions].map(
           (subscription) => () => subscription.close(),
@@ -262,38 +395,62 @@ export function createProductionPersonVmHost(input: {
           (subscription) => () => subscription.close(),
         ),
       );
-      if (gateway && providers) {
+      let vmFailures = await stopOwnedVms();
+      if (startupOwner) await settle([() => startupOwner.close()]);
+      let receiptFailures = await retireReceipts();
+      // Guest stop cannot prove upstream HTTP closure. Keep the ledger
+      // fence until the exact dedicated dispatcher supplies its own proof.
+      const modelOwner = model;
+      let modelFailures = modelOwner
+        ? await collectFailures([() => modelOwner.close()])
+        : [];
+      const transport = sourceOwner?.model.transport;
+      if (transport) await settle([transport.close]);
+      if (transport && modelOwner?.reconcileClosedOwner && providers) {
         const cleanup = AbortSignal.timeout(
           providers.configuration.lifecycle.cleanupTimeoutMs,
         );
-        await settle(
-          [...receipts].map(
-            (receipt) => () => egress.revoke(receipt, 'failure', cleanup),
-          ),
-        );
-      }
-      // Join the model gateway before closing the provider it uses.
-      // No VM stop/delete or assertion of guest termination is made here.
-      const modelOwner = model;
-      let modelJoined = !modelOwner;
-      if (modelOwner)
-        await settle([
-          async () => {
-            await modelOwner.close();
-            modelJoined = true;
-          },
+        const failures = await collectFailures([
+          () => modelOwner.reconcileClosedOwner!(cleanup),
         ]);
+        if (failures.length) modelFailures.push(...failures);
+        else {
+          modelFailures = [];
+          if (vmFailures.length || receiptFailures.length) {
+            // A proven stopped dispatcher can release a receipt that was
+            // blocked by the previously unresolved ledger.
+            vmFailures = await stopOwnedVms();
+            receiptFailures = await retireReceipts();
+          }
+        }
+      }
       const providerOwner = providers;
-      await settle([
-        ...(sourceOwner && modelJoined
-          ? [() => sourceOwner.egress.close()]
-          : []),
-        ...(providerOwner
-          ? [() => providerOwner.egressInstallation.close()]
-          : []),
-      ]);
-      errors.push(...uncertainPreparation);
+      const installationFailures = providerOwner
+        ? await collectFailures([
+            () => providerOwner.egressInstallation.close(),
+          ])
+        : [];
+      // The original pool owns both the model ledger and the physical VM
+      // lease. Keep that maintenance path available when either is unresolved.
+      if (
+        modelFailures.length ||
+        vmFailures.length ||
+        receiptFailures.length ||
+        installationFailures.length ||
+        uncertainPreparation.size
+      )
+        modelRecovery = { providerJoined: false, releasedAttempts: 0 };
+      if (sourceOwner && !modelRecovery)
+        await settle([() => sourceOwner.egress.close()]);
       input.lifetime.removeEventListener('abort', aborted);
+      const errors = [
+        ...independentCloseFailures,
+        ...uncertainPreparation.values(),
+        ...vmFailures,
+        ...receiptFailures,
+        ...installationFailures,
+        ...modelFailures,
+      ];
       if (errors.length)
         throw new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE');
     });
@@ -303,6 +460,80 @@ export function createProductionPersonVmHost(input: {
   const aborted = () => {
     void close().catch(() => {});
   };
+  async function recoverModelOwner(
+    context: RequestContext,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const originalClose = closing;
+    const modelOwner = model;
+    const sourceOwner = bound;
+    if (!originalClose || !modelOwner || !sourceOwner || recovering)
+      throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
+    // Set synchronously: a concurrent request cannot borrow this operator's
+    // credential check or trigger a second provider close.
+    recovering = true;
+    try {
+      await originalClose.catch(() => {});
+      signal.throwIfAborted();
+      const recovery = modelRecovery;
+      if (!recovery)
+        throw new ProductionPersonVmHostUnavailable(
+          'MODEL_RECOVERY_UNAVAILABLE',
+        );
+      recovery.releasedAttempts += await modelOwner.reconcileOwner(
+        context,
+        modelOwnerId,
+        signal,
+      );
+      await modelOwner.close();
+      // Once the stop proof has been accepted, join cleanup even if the
+      // maintenance request disconnects or the Worker lifetime has ended.
+      const prepareFailures = await retireFailedPreparations();
+      const vmFailures = await stopOwnedVms({ deferUnconfirmedEgress: true });
+      const receiptFailures = await retireReceipts();
+      const providerOwner = providers;
+      const installationFailures = providerOwner
+        ? await collectFailures([
+            () => providerOwner.egressInstallation.close(),
+          ])
+        : [];
+      const sourceFailures = recovery.providerJoined
+        ? []
+        : await collectFailures([
+            async () => {
+              await sourceOwner.egress.close();
+              recovery.providerJoined = true;
+            },
+          ]);
+      const errors = [
+        ...independentCloseFailures,
+        ...uncertainPreparation.values(),
+        ...prepareFailures,
+        ...vmFailures,
+        ...receiptFailures,
+        ...installationFailures,
+        ...sourceFailures,
+      ];
+      if (
+        !uncertainPreparation.size &&
+        !prepareFailures.length &&
+        !vmFailures.length &&
+        !receiptFailures.length &&
+        !installationFailures.length &&
+        !sourceFailures.length
+      )
+        modelRecovery = undefined;
+      const error = errors.length
+        ? new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE')
+        : null;
+      recoveredClose = { error };
+      if (error) throw error;
+      return recovery.releasedAttempts;
+    } finally {
+      recovering = false;
+    }
+  }
   input.lifetime.addEventListener('abort', aborted, { once: true });
   const construction = (async () => {
     try {
@@ -314,6 +545,7 @@ export function createProductionPersonVmHost(input: {
       // actual store/admission operation opens its own dedicated SQL client.
       const trustedDatabase = getDatabase();
       const openSql = () => createDedicatedDatabase(trustedDatabase);
+      const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const store = new PostgresPersonVmStore(openSql);
       const runtime: PersonVmRuntimePort = {
         memoryGuestPlan: (...args) => requireStartup().memoryGuestPlan(...args),
@@ -348,8 +580,51 @@ export function createProductionPersonVmHost(input: {
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
+        observeOwnedStart(binding) {
+          ownedVms.set(binding.personId, {
+            binding: Object.freeze({ ...binding }),
+            stopNative: true,
+          });
+        },
+        observeOwnedMount(binding) {
+          const existing = ownedVms.get(binding.personId);
+          if (
+            existing?.binding.vmId === binding.vmId &&
+            existing.binding.leaseEpoch >= binding.leaseEpoch
+          )
+            return;
+          ownedVms.set(binding.personId, {
+            binding: Object.freeze({ ...binding }),
+            stopNative: false,
+          });
+        },
+        observeOwnedStop(binding) {
+          const entry = ownedVms.get(binding.personId);
+          if (entry && sameVmBinding(entry.binding, binding))
+            ownedVms.delete(binding.personId);
+          const retired = retiredReceipts.get(binding.personId);
+          if (retired && sameVmBinding(retired.binding, binding))
+            retiredReceipts.delete(binding.personId);
+        },
+        ownsEgressReceipt(receipt) {
+          const retired = retiredReceipts.get(receipt.binding.personId);
+          if (retired && sameReceipt(retired, receipt)) return true;
+          for (const retained of receipts)
+            if (sameReceipt(retained, receipt)) return true;
+          return false;
+        },
+        hasUnconfirmedEgress(binding) {
+          return [...uncertainPreparation.keys()].some(
+            (pending) =>
+              pending.vmId === binding.vmId &&
+              pending.personId === binding.personId &&
+              pending.organizationId === binding.organizationId,
+          );
+        },
+        settleSupersededBinding,
         ...providers.configuration.lifecycle,
       });
+      personVm = vm;
       const { native, web } = providers.configuration;
       startup = createAssignedNativeWebStartup({
         vm,
@@ -426,18 +701,41 @@ export function createProductionPersonVmHost(input: {
         current,
         providers,
         lifetime,
+        modelOwnerId,
+        async issueReference(call, signal, issue) {
+          if (!model?.issueReference)
+            throw new ProductionPersonVmHostUnavailable(
+              'HOST_SOURCES_UNAVAILABLE',
+            );
+          return model.issueReference(call, signal, issue);
+        },
+        async reserveNativeModelCall(call) {
+          if (!storeModel.reserveNativeCall)
+            throw new Error('MODEL_CALL_AUTHORIZATION_STORE_UNAVAILABLE');
+          await storeModel.reserveNativeCall(call);
+        },
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
+      const egressSource = bound.egress;
       const modelRoute = Object.freeze({ ...modelSource.route });
       const modelOwner = createModelGateway({
-        ownerId: randomUUID(),
+        ownerId: modelOwnerId,
         authority: modelSource.authority,
-        provider: createDshGatewayProvider(modelSource.llm, modelRoute),
-        store: createPostgresModelGatewayStore(trustedDatabase),
+        provider: createDshGatewayProvider(
+          modelSource.llm,
+          modelRoute,
+          modelSource.transport?.fetchOwned,
+          modelSource.transport?.beforeDispatch,
+          modelSource.scopeStream,
+        ),
+        store: storeModel,
+        confirmTransportStopped: modelSource.transport?.stoppedEvidence,
         admission: {
           boundary: admission,
           participant: admission.participant('gateway'),
+          recoverStoppedPermit: (permit, signal) =>
+            admission.recoverStoppedGatewayPermit(permit, signal),
         },
       });
       model = modelOwner;
@@ -468,6 +766,10 @@ export function createProductionPersonVmHost(input: {
             Object.freeze(membership);
           Object.freeze(call.context.memberships);
           Object.freeze(call.context);
+          Object.freeze(call.vm);
+          Object.freeze(call.execution);
+          Object.freeze(call.native);
+          egressSource.bindModelCall?.(Object.freeze(call), signal);
           return {
             context: call.context,
             dispatch: (response, active) =>
@@ -477,18 +779,21 @@ export function createProductionPersonVmHost(input: {
       };
       // The same shared boundary owns all egress calls. Sources may never
       // replace it or supply a different VM/store/connection factory.
+      const vmCleanupTimeoutMs =
+        providers.configuration.lifecycle.cleanupTimeoutMs;
       gateway = createEgressGateway({
         vm,
+        prepareRollbackSignal: () => AbortSignal.timeout(vmCleanupTimeoutMs),
         admission,
-        authority: bound.egress.authority,
-        policy: bound.egress.policy,
+        authority: egressSource.authority,
+        policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
           active.throwIfAborted();
         },
-        services: [...(bound.egress.services ?? []), modelService],
+        services: [...(egressSource.services ?? []), modelService],
         provisioner: providers.egressInstallation.provisioner,
       });
       lifetime.throwIfAborted();
@@ -499,7 +804,24 @@ export function createProductionPersonVmHost(input: {
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
       });
       lifetime.throwIfAborted();
-      return Object.freeze({ close });
+      return Object.freeze({
+        async assertWorkerShutdownSafe(signal: AbortSignal) {
+          if (gracefulStop) return;
+          const reopen = vm.fenceWorkerStartup();
+          try {
+            for (const { binding } of ownedVms.values())
+              await vm.assertWorkerShutdownSafe(binding, signal);
+            gracefulStop = true;
+          } catch (error) {
+            reopen();
+            throw error;
+          }
+        },
+        close,
+        recoverModelOwner,
+        modelOwnerMaintenancePending: () =>
+          modelRecovery !== undefined || uncertainPreparation.size > 0,
+      });
     } finally {
       finishConstruction();
     }
@@ -513,6 +835,14 @@ export function createProductionPersonVmHost(input: {
         'PERSON_VM_HOST_CONSTRUCTION_FAILED',
       );
     }
+    if (primary instanceof ProductionHostConfigurationUnavailable)
+      throw new ProductionPersonVmHostUnavailable(
+        'HOST_CONFIGURATION_UNAVAILABLE',
+      );
+    if (primary instanceof ProductionPersonVmArtifactsUnavailable)
+      throw new ProductionPersonVmHostUnavailable(
+        'PERSON_VM_ARTIFACTS_UNAVAILABLE',
+      );
     throw primary;
   });
 }

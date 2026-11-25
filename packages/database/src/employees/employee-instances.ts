@@ -1,3 +1,4 @@
+import { notifyNativeRosterInsert } from './native-roster-notification.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type postgres from 'postgres';
@@ -733,14 +734,22 @@ export async function ensureGeneralEmployeeInstance(
   sql: Sql,
   assignmentId: string,
 ) {
-  await sql`insert into allrice_employee_instances
+  const [inserted] = await sql<
+    { organization_id: string; workspace_id: string; owner_id: string }[]
+  >`insert into allrice_employee_instances
     (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id)
     select id,organization_id,workspace_id,user_id,id,'general',employee_version_id
     from allrice_employee_assignments where id=${assignmentId}
-    on conflict(id) do nothing`;
+    on conflict(id) do nothing returning organization_id,workspace_id,owner_id`;
   await sql`insert into allrice_employee_instance_revisions(instance_id,revision,profile,operation)
     select id,1,'{}'::jsonb,'create' from allrice_employee_instances where id=${assignmentId}
     on conflict(instance_id,revision) do nothing`;
+  if (inserted)
+    await notifyNativeRosterInsert(sql, 'allrice_employee_instances', {
+      organizationId: inserted.organization_id,
+      workspaceId: inserted.workspace_id,
+      personId: inserted.owner_id,
+    });
 }
 
 async function mapInstances(
@@ -943,6 +952,11 @@ export async function createEmployeeInstance(
     const result = await getEmployeeInstance(scope, id, tx);
     await tx`update allrice_employee_instance_revisions set response=${tx.json(result)} where instance_id=${id} and revision=1`;
     await auditInstance(tx, scope, id, 'create');
+    await notifyNativeRosterInsert(tx, 'allrice_employee_instances', {
+      organizationId: scope.organizationId,
+      workspaceId: scope.workspaceId,
+      personId: actorId(scope),
+    });
     return result;
   });
 }

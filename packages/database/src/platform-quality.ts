@@ -1,3 +1,4 @@
+import { notifyNativeRosterInsert } from './employees/native-roster-notification.ts';
 import type { ResourcePrincipal } from './resource-principal.ts';
 import type postgres from 'postgres';
 import { z } from 'zod';
@@ -234,6 +235,11 @@ export async function ensureQualityEmployee(
       values(${organizationId},${workspaceId},${d.tenant_employee_id},${d.tenant_employee_version_id},${owner},false,true,${owner},'include')
       on conflict(organization_id,workspace_id,user_id,employee_id) do update set selection_mode='include'
       where allrice_employee_assignments.active and allrice_employee_assignments.selection_mode<>'exclude'`;
+    await notifyNativeRosterInsert(tx, 'allrice_employee_assignments', {
+      organizationId,
+      workspaceId,
+      personId: owner,
+    });
     await synchronizeTenantEmployeeAccess(tx, { organizationId, workspaceId });
     const [a] =
       await tx`select id,employee_id,employee_version_id from allrice_employee_assignments where organization_id=${organizationId}

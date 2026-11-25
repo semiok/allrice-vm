@@ -20,6 +20,13 @@ export type {
   ModelGatewayErrorCode,
 } from './contract.ts';
 export { createModelGateway } from './gateway.ts';
-export { createDshGatewayProvider, GatewayLlmAdapter } from './dsh-provider.ts';
+export {
+  createDshGatewayProvider,
+  GatewayLlmAdapter,
+  registerManagedGatewayAdapter,
+} from './dsh-provider.ts';
+export { createNativeModelCallReferences } from './native-call-reference.ts';
 export { createPostgresModelGatewayStore } from './postgres-store.ts';
 export { withGatewayAuthTransaction } from './transport.ts';
+export { createOwnedModelTransport } from './owned-transport.ts';
+export type { DshGatewayStreamScope } from './dsh-provider.ts';

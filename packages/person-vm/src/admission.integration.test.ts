@@ -201,6 +201,36 @@ suite(
         },
       };
     }
+    it('settles an old mount under the real PG lease without touching a peer-started VM', async () => {
+      const h = await setup();
+      const old = h.binding;
+      const leaseOptions = { now: () => new Date(), ttlMs: 5000 };
+      const settled: (typeof old)[] = [];
+      const owner = new PersonVmService({
+        ...h.options,
+        async settleSupersededBinding(binding) {
+          settled.push(binding);
+          await expect(
+            h.peerStore.withLease(old.personId, leaseOptions, async () => {}),
+          ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+        },
+      });
+      h.states.set(old.vmId, 'stopped');
+      await h.peerService.stop(h.rc, signal());
+      await h.peerService.start(h.rc, signal());
+      const current = await h.peerStore.read(old.personId);
+      expect(current).toMatchObject({
+        phase: 'running',
+        leaseEpoch: old.leaseEpoch + 1,
+        egressReceipt: { binding: { leaseEpoch: old.leaseEpoch + 1 } },
+      });
+      const before = [...h.log];
+      await owner.shutdownOwned(old, false);
+      expect(settled).toEqual([old]);
+      expect(await h.peerStore.read(old.personId)).toEqual(current);
+      expect(h.log).toEqual(before);
+    });
+
     async function permit(
       h: Awaited<ReturnType<typeof setup>>,
       participant: 'gateway' | 'entry',

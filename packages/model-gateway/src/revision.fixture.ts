@@ -186,6 +186,7 @@ export async function responsesFixture(
     tools?: boolean;
     holdFailedBody?: boolean;
     failuresBeforeSuccess?: number;
+    onRequestBody?(body: Buffer, contentEncoding: string | undefined): void;
   } = {},
 ) {
   const requests: string[] = [];
@@ -194,7 +195,13 @@ export async function responsesFixture(
   let closedCount = 0;
   const server = createServer((request, response) => {
     void (async () => {
-      for await (const part of request) void part;
+      const body: Buffer[] = [];
+      for await (const part of request)
+        if (options.onRequestBody) body.push(Buffer.from(part));
+      options.onRequestBody?.(
+        Buffer.concat(body),
+        request.headers['content-encoding'],
+      );
       requests.push(request.url!);
       active++;
       response.once('close', () => {
@@ -299,6 +306,7 @@ export async function responsesFixture(
   return {
     provider: native.provider,
     binding: { ...modelBinding(), ...native.route },
+    url,
     requests,
     get active() {
       return active;

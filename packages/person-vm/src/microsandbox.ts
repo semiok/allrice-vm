@@ -78,6 +78,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     roster: PersonVmWebRoster,
     signal: AbortSignal,
+    options?: { runningOnly: true },
   ): Promise<PersonVmWebEndpointReceipt>;
   assertWebEndpoints?(
     receipt: PersonVmWebEndpointReceipt,
@@ -501,10 +502,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     roster: PersonVmWebRoster,
     signal: AbortSignal,
+    options?: { runningOnly: true },
   ) {
     const paths = this.homes.get(binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     const state = await this.status(binding, signal);
+    if (options?.runningOnly && state !== 'running')
+      throw new PersonVmError('RUNTIME_NOT_READY');
     const receipt = await prepareWebEndpoints({
       directory: paths.home,
       binding,

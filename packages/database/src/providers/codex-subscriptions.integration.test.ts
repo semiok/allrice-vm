@@ -145,6 +145,35 @@ suite('Codex slots: isolated PostgreSQL, no credentials or model calls', () => {
       expect(await readEnabledCodexSubscription()).toBe(1);
     },
   );
+  it.each(['model', 'auth-refresh'])(
+    'blocks selection while a 4.0 Codex %s intent is unjoined',
+    async (kind) => {
+      const callId = randomUUID(),
+        attemptId = randomUUID();
+      await db.db`insert into allrice_model_gateway_calls(id,native_key,person_id,organization_id,binding,request_digest)
+      values (${callId},${callId},${f.user},${f.org},${db.db.json({ provider: 'openai-codex', executionGeneration: '4.0' })},'fixture')`;
+      await db.db`insert into allrice_model_gateway_attempts(id,call_id,person_id,owner_id,kind,protocol)
+      values (${attemptId},${callId},${f.user},'fixture',${kind},'opaque')`;
+      try {
+        await expect(
+          selectCodexSubscription(f.reviewer, {
+            enabledSlot: 2,
+            expectedEnabledSlot: 1,
+          }),
+        ).rejects.toMatchObject({ code: 'busy' });
+        await db.db`update allrice_model_gateway_attempts set receipt='{"outcome":"closed"}',closed_at=now() where id=${attemptId}`;
+        await expect(
+          selectCodexSubscription(f.reviewer, {
+            enabledSlot: 2,
+            expectedEnabledSlot: 1,
+          }),
+        ).resolves.toEqual({ enabledSlot: 2 });
+      } finally {
+        await db.db`delete from allrice_model_gateway_attempts where id=${attemptId}`;
+        await db.db`delete from allrice_model_gateway_calls where id=${callId}`;
+      }
+    },
+  );
   it('keeps slot 2 authorization/code/grant independent and never activates on login', async () => {
     await expect(
       startCodexAuthorization(f.reviewer, { subscriptionSlot: 1 }),

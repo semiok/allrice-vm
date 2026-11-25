@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { composeEntries } from '@deepseek-ai/dsh-app-boot';
 import type { PersonVmBootstrapScope } from '@allrice/person-vm';
 import { prepareNativeWebLaunch } from './launch.js';
-import { openNativeWebOwner } from './owner.js';
+import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 
 const binding = {
   vmId: randomUUID(),
@@ -212,4 +212,32 @@ it('启动plan绑定exact host epoch，旧plan不能在新scope dispatch', async
     }),
   ).rejects.toMatchObject({ code: 'LEASE_LOST' });
   expect(scope.launch).not.toHaveBeenCalled();
+});
+
+it('requires the exact current compaction bracket and cannot substitute it for the assistant call', () => {
+  function event(
+    type: string,
+    seq: number,
+    data: { compactionId?: string; turn?: number | null } = {},
+  ) {
+    return { type: 'event' as const, event: { type, seq, time: 1, data } };
+  }
+  const start = event('compaction/start', 8, {
+    compactionId: 'actual-compact',
+    turn: 3,
+  });
+  expect(readNativeModelAttempt({ records: [start] }, 'compaction')).toEqual({
+    kind: 'compaction',
+    id: 'actual-compact',
+    turn: 3,
+    cursor: 8,
+  });
+  expect(readNativeModelAttempt({ records: [start] }, 'assistant')).toBeNull();
+  for (const type of ['session/end-seed', 'compaction/end'])
+    expect(
+      readNativeModelAttempt(
+        { records: [start, event(type, 9)] },
+        'compaction',
+      ),
+    ).toBeNull();
 });

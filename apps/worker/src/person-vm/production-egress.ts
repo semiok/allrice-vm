@@ -8,7 +8,7 @@ import {
   unlink,
   type FileHandle,
 } from 'node:fs/promises';
-import { join, posix } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { EgressError, type EgressProvisioner } from '@allrice/egress-gateway';
 import type { PersonVmBinding, PersonVmRuntimePort } from '@allrice/person-vm';
 import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
@@ -24,6 +24,7 @@ type Entry = {
   path: string;
   created: boolean;
   identity?: Stats;
+  directoryIdentity?: Stats;
   contents: Buffer;
   ready: boolean;
   retirement?: Promise<void>;
@@ -113,7 +114,10 @@ export function createProductionEgressInstallation(
   }
   async function erase(entry: Entry) {
     if (entry.created) {
-      if (!entry.identity) throw unavailable();
+      if (!entry.identity || !entry.directoryIdentity) throw unavailable();
+      const directory = await lstat(dirname(entry.path));
+      if (!directory.isDirectory() || !same(directory, entry.directoryIdentity))
+        throw unavailable();
       const stat = await lstat(entry.path).catch((error) => {
         if (!code(error, 'ENOENT')) throw error;
       });
@@ -127,10 +131,16 @@ export function createProductionEgressInstallation(
   function retire(entry: Entry) {
     entry.ready = false;
     entry.abort.abort(unavailable());
-    return (entry.retirement ??= (async () => {
+    if (entry.retirement) return entry.retirement;
+    const retirement = (async () => {
       await Promise.allSettled([...entry.pending]);
       await erase(entry);
-    })());
+    })();
+    entry.retirement = retirement;
+    void retirement.catch(() => {
+      if (entry.retirement === retirement) entry.retirement = undefined;
+    });
+    return retirement;
   }
   const provisioner: EgressProvisioner = {
     async endpoint(_vmId, ports, signal) {
@@ -193,6 +203,7 @@ export function createProductionEgressInstallation(
               throw unavailable();
             signal.throwIfAborted();
             entry.path = join(directory, `${hash(key)}.json`);
+            entry.directoryIdentity = stat;
             const file = await open(
               entry.path,
               constants.O_WRONLY |
@@ -242,10 +253,7 @@ export function createProductionEgressInstallation(
       signal.throwIfAborted();
     },
   };
-  const memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'] = async (
-    binding,
-    signal,
-  ) => {
+  async function readAccess(binding: PersonVmBinding, signal: AbortSignal) {
     check(signal);
     const entry = entries.get(keyOf(binding));
     if (!entry?.ready) throw unavailable();
@@ -285,6 +293,25 @@ export function createProductionEgressInstallation(
           !/^[A-Za-z0-9_-]+$/.test(access.capability)
         )
           throw unavailable();
+        signal.throwIfAborted();
+        if (!entry.ready || entries.get(entry.key) !== entry)
+          throw unavailable();
+        return access;
+      },
+      entry,
+    );
+  }
+  const memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'] = async (
+    binding,
+    signal,
+  ) => {
+    const access = await readAccess(binding, signal);
+    const entry = entries.get(keyOf(binding));
+    if (!entry?.ready) throw unavailable();
+    return own(
+      signal,
+      async (signal) => {
+        const url = new URL(access.origin);
         const plan = await createVmMemoryGuestPlan({
           ...loaded.configuration.memory,
           dshCommandMemory:
@@ -338,7 +365,8 @@ export function createProductionEgressInstallation(
   };
   function close() {
     closed.abort(unavailable());
-    return (closing ??= (async () => {
+    if (closing) return closing;
+    const closeTask = (async () => {
       await Promise.allSettled([...pending]);
       const results = await Promise.allSettled(
         [...entries.values()].map(retire),
@@ -348,7 +376,12 @@ export function createProductionEgressInstallation(
       );
       if (errors.length)
         throw new AggregateError(errors, 'EGRESS_CLEANUP_INCOMPLETE');
-    })());
+    })();
+    closing = closeTask;
+    void closeTask.catch(() => {
+      if (closing === closeTask) closing = undefined;
+    });
+    return closeTask;
   }
-  return Object.freeze({ provisioner, memoryGuestPlan, close });
+  return Object.freeze({ provisioner, memoryGuestPlan, readAccess, close });
 }

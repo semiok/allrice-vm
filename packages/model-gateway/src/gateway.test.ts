@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { request } from 'node:http';
 import {
   createAssistantMessage,
   createToolResultMessage,
@@ -12,6 +13,7 @@ import {
   closeServer,
   deferred,
   FixtureStore,
+  FixtureAdmission,
   freshCall,
   gatewayFixture,
   modelBinding,
@@ -36,6 +38,68 @@ async function setup(
   cleanup.push(() => gateway.close());
   return { upstream, native, ...gateway };
 }
+it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
+  const f = await setup();
+  const status = await new Promise<number | undefined>((resolve, reject) => {
+    const outgoing = request(
+      f.url + '/v1/stream',
+      {
+        method: 'POST',
+        headers: {
+          'x-allrice-model-contract': '1',
+          'transfer-encoding': 'chunked',
+        },
+      },
+      (response) => {
+        response.once('error', reject);
+        response.resume();
+        response.once('end', () => {
+          resolve(response.statusCode);
+          outgoing.destroy();
+        });
+      },
+    );
+    outgoing.once('error', reject);
+    // Keep the upload open and send only one byte past the cap. Queuing a
+    // whole extra MiB races the required early response against client EPIPE.
+    const chunk = Buffer.alloc(1024 * 1024, 32);
+    let remaining = 8;
+    const write = () => {
+      if (remaining === 0) {
+        outgoing.write(' ');
+        return;
+      }
+      remaining -= 1;
+      outgoing.write(chunk, (error) => {
+        if (error) reject(error);
+        else write();
+      });
+    };
+    write();
+  });
+  expect(status).toBe(413);
+  expect(f.upstream.requests).toHaveLength(0);
+  expect(f.store.rows.size).toBe(0);
+});
+it('frozen gateway grants no reference and durable issuance waits for real activation', async () => {
+  const f = await setup();
+  const admission = new FixtureAdmission();
+  const g = await gatewayFixture({ provider: f.native.provider, admission });
+  cleanup.push(() => g.close());
+  const fence = { binding: g.binding.vm, freezeId: 'synthetic', version: '1' };
+  await admission.participant.freeze(fence, new AbortController().signal);
+  const caller = new AbortController();
+  const issue = vi.fn(async () => 'synthetic-reference');
+  const reference = g.gateway.issueReference!(g.binding, caller.signal, issue);
+  void reference.catch(() => {});
+  await admission.deferred.promise;
+  expect(issue).not.toHaveBeenCalled();
+  caller.abort();
+  await expect(reference).rejects.toBeDefined();
+  expect(issue).not.toHaveBeenCalled();
+  expect(admission.records.size).toBe(0);
+});
+
 const finish = (chunks: StreamChunk[]) =>
   chunks.findLast((chunk) => chunk.type === 'finish');
 
@@ -658,7 +722,46 @@ describe.sequential(
         ).resolves.toBeUndefined();
         await expect(f.gateway.close()).rejects.toBeInstanceOf(AggregateError);
         expect(globalThis.fetch).toBe(meteredFetch);
-        await f.gateway.reconcileOwner(f.binding.context, ownerId, caller);
+        const callId = f.store.calls.keys().next().value;
+        if (!callId) throw new Error('fixture call was not recorded');
+        await expect(
+          f.store.tryStartAttempt({
+            id: randomUUID(),
+            callId,
+            ownerId,
+            personId: f.binding.vm.personId,
+            kind: 'model',
+            protocol: 'openai-responses',
+          }),
+        ).resolves.toBe(true);
+        const maintenance = new AbortController();
+        const persisted = f.store.reconcileOwner.bind(f.store);
+        const persisting = deferred();
+        const settleLedger = deferred();
+        vi.spyOn(f.store, 'reconcileOwner').mockImplementationOnce(
+          async (id, evidence) => {
+            persisting.resolve();
+            await settleLedger.promise;
+            return persisted(id, evidence);
+          },
+        );
+        const recovery = f.gateway.reconcileOwner(
+          f.binding.context,
+          ownerId,
+          maintenance.signal,
+        );
+        await persisting.promise;
+        maintenance.abort();
+        try {
+          expect(globalThis.fetch).toBe(meteredFetch);
+          await expect(f.gateway.close()).rejects.toBeInstanceOf(
+            AggregateError,
+          );
+        } finally {
+          settleLedger.resolve();
+          await expect(recovery).resolves.toBe(1);
+        }
+        expect(f.store.slots.get(f.binding.vm.personId)?.size).toBe(0);
         await expect(f.gateway.close()).resolves.toBeUndefined();
         expect(globalThis.fetch).toBe(originalFetch);
       } finally {

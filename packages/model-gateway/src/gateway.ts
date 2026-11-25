@@ -14,11 +14,17 @@ import type {
   GatewayModelInput,
   GatewayProvider,
 } from './contract.ts';
-import type { PersonVmBinding } from '@allrice/person-vm';
+import type {
+  PersonVmAdmissionPermit,
+  PersonVmBinding,
+} from '@allrice/person-vm';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createMeteredTransport, installScopedFetch } from './transport.ts';
 import { runGatewayAdmission } from './admission.ts';
 
+// Allow long DSH contexts and tool histories on the JSON wire. Images travel
+// as attachment references and resolve separately on the Host.
+const maxModelInputBytes = 8 * 1024 * 1024;
 const inputKeys = [
   'messages',
   'system',
@@ -148,15 +154,25 @@ async function readInput(
   request: IncomingMessage,
   signal: AbortSignal,
 ): Promise<GatewayModelInput> {
+  const length = request.headers['content-length'];
+  if (length && Number(length) > maxModelInputBytes)
+    throw new ModelGatewayError('INPUT_TOO_LARGE');
   const chunks: Buffer[] = [];
+  let bytes = 0;
   const onAbort = () => request.destroy();
   signal.addEventListener('abort', onAbort, { once: true });
   try {
     signal.throwIfAborted();
-    for await (const chunk of request) {
+    // Keep the socket writable on an early exit so the peer receives the 413.
+    for await (const chunk of request.iterator({ destroyOnReturn: false })) {
       signal.throwIfAborted();
-      chunks.push(Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxModelInputBytes)
+        throw new ModelGatewayError('INPUT_TOO_LARGE');
+      chunks.push(buffer);
     }
+    signal.throwIfAborted();
   } finally {
     signal.removeEventListener('abort', onAbort);
   }
@@ -204,6 +220,10 @@ export function createModelGateway(options: {
   store: ModelGatewayStore;
   provider: GatewayProvider;
   admission: ModelGatewayAdmission;
+  confirmTransportStopped?(
+    ownerId: string,
+    signal: AbortSignal,
+  ): Promise<string>;
 }): ModelGatewayPort {
   if (
     !options.ownerId.trim() ||
@@ -220,6 +240,15 @@ export function createModelGateway(options: {
   const revoked = new Set<string>();
   // The request callback may finish without proving the underlying join.
   // Keep the failure after it leaves the active set, scoped to its VM epoch.
+  const unfinishedPermits = new Set<PersonVmAdmissionPermit>();
+  async function releaseStoppedPermits(signal: AbortSignal) {
+    const recover = options.admission.recoverStoppedPermit;
+    if (!recover) return;
+    for (const permit of unfinishedPermits) {
+      await recover(permit, signal);
+      unfinishedPermits.delete(permit);
+    }
+  }
   const unconfirmedJoins = new Map<
     string,
     { binding: PersonVmBinding; failures: ModelGatewayError[] }
@@ -240,9 +269,51 @@ export function createModelGateway(options: {
   }
   return {
     admission: options.admission.participant,
-    async handle(request, response, bindingInput, hostSignal) {
+    async issueReference(binding, hostSignal, issue) {
+      assertBinding(binding);
+      const key = vmKey(binding.vm);
       const controller = new AbortController();
       const signal = AbortSignal.any([hostSignal, controller.signal]);
+      if (closed || revoked.has(key))
+        throw new ModelGatewayError('ADMISSION_CLOSED');
+      const task = runGatewayAdmission(
+        options.admission,
+        binding,
+        `${options.ownerId}:reference:${randomUUID()}`,
+        signal,
+        async (active, activate) => {
+          try {
+            await activate();
+            active.throwIfAborted();
+            await options.authority.assertCall(binding, active);
+            return { ok: true, value: await issue(active) };
+          } catch (error) {
+            return { ok: false, error };
+          }
+        },
+        options.admission.recoverStoppedPermit
+          ? (permit) => {
+              unfinishedPermits.add(permit);
+            }
+          : undefined,
+      );
+      const entry = {
+        key,
+        controller,
+        done: task.then(
+          () => {},
+          () => {},
+        ),
+      };
+      active.add(entry);
+      try {
+        return await task;
+      } finally {
+        active.delete(entry);
+      }
+    },
+    async handle(request, response, bindingInput, hostSignal) {
+      const controller = new AbortController();
       // Detach the immutable admission fact before the first await.
       let binding: ModelCallBinding;
       try {
@@ -253,6 +324,28 @@ export function createModelGateway(options: {
         response.end();
         return;
       }
+      let delivery: AbortSignal | undefined;
+      try {
+        delivery = options.authority.deliverySignal?.(binding);
+      } catch {
+        response.writeHead(403).end();
+        return;
+      }
+      const signal = AbortSignal.any([
+        hostSignal,
+        controller.signal,
+        ...(delivery ? [delivery] : []),
+      ]);
+      const assertDelivery = async (active: AbortSignal) => {
+        active.throwIfAborted();
+        const observed = options.authority.assertDeliveryObserved;
+        if (delivery && observed) {
+          delivery.throwIfAborted();
+          await observed(binding, active);
+          delivery.throwIfAborted();
+          active.throwIfAborted();
+        } else await assertCurrent(active);
+      };
       const key = vmKey(binding.vm);
       let finish!: () => void;
       const entry = {
@@ -301,6 +394,12 @@ export function createModelGateway(options: {
             let operationFailed = false;
             try {
               const input = await readInput(request, signal);
+              const kind = binding.native.attemptKind;
+              if (
+                kind &&
+                input.purpose !== (kind === 'assistant' ? undefined : kind)
+              )
+                throw new ModelGatewayError('BINDING_INVALID');
               const digest =
                 'sha256:' +
                 createHash('sha256')
@@ -329,13 +428,13 @@ export function createModelGateway(options: {
               let terminal:
                 Extract<StreamChunk, { type: 'finish' }> | undefined;
               for (;;) {
-                await assertCurrent(signal);
+                await assertDelivery(signal);
                 const result = await transport.run(() => iterator!.next());
                 if (result.done) {
                   exhausted = true;
                   break;
                 }
-                await assertCurrent(signal);
+                await assertDelivery(signal);
                 if (result.value.type === 'finish') terminal = result.value;
                 // Never forward provider-synthesized zeros, nor announce success
                 // before the actual upstream body and durable receipt have settled.
@@ -482,6 +581,11 @@ export function createModelGateway(options: {
               ? { ok: false, error: operationFailure }
               : { ok: true, value: terminalReply! };
           },
+          options.admission.recoverStoppedPermit
+            ? (permit) => {
+                unfinishedPermits.add(permit);
+              }
+            : undefined,
         );
         await assertCurrent(signal);
         await send(response, terminalReply, signal);
@@ -494,6 +598,10 @@ export function createModelGateway(options: {
           error instanceof ModelGatewayError ? error.code : 'PROVIDER_FAILED';
         const rebind = code === 'EXECUTION_REBIND_REQUIRED';
         if (!response.destroyed) {
+          if (!response.headersSent && code === 'INPUT_TOO_LARGE') {
+            response.writeHead(413, { connection: 'close' }).end();
+            return;
+          }
           if (!response.headersSent)
             response.writeHead(
               rebind
@@ -534,6 +642,25 @@ export function createModelGateway(options: {
       const incomplete = unconfirmedJoins.get(key);
       if (incomplete) throw incompleteJoin(incomplete);
     },
+    async reconcileClosedOwner(signal) {
+      signal.throwIfAborted();
+      if (!closed || active.size || !options.confirmTransportStopped)
+        throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      const evidence = await options.confirmTransportStopped(
+        options.ownerId,
+        signal,
+      );
+      signal.throwIfAborted();
+      if (!evidence.trim()) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      await releaseStoppedPermits(signal);
+      const released = await options.store.reconcileOwner(
+        options.ownerId,
+        evidence,
+      );
+      unconfirmedJoins.clear();
+      uninstall();
+      return released;
+    },
     async reconcileOwner(context, ownerId, signal) {
       signal.throwIfAborted();
       const recoveringClosedOwner =
@@ -546,15 +673,20 @@ export function createModelGateway(options: {
       signal.throwIfAborted();
       if (!evidence.evidenceRef.trim())
         throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      if (recoveringClosedOwner) await releaseStoppedPermits(signal);
       const released = await options.store.reconcileOwner(
         ownerId,
         evidence.evidenceRef,
       );
-      signal.throwIfAborted();
       if (recoveringClosedOwner && active.size === 0) {
+        // The stop proof was accepted before beginning the durable write.
+        // Once it commits, carry the count and finish the local fence even
+        // if the maintenance caller canceled while the ledger was settling.
         unconfirmedJoins.clear();
         uninstall();
+        return released;
       }
+      signal.throwIfAborted();
       return released;
     },
     async close() {

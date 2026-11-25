@@ -12,7 +12,10 @@ import {
 } from '@allrice/contracts';
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
-import type { SessionListValue } from '@deepseek-ai/dsh-api-session-controller/types';
+import type {
+  SessionAddress,
+  SessionListValue,
+} from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { DataAccessError, getDEntryNativeRootPin } from '@allrice/database';
 
@@ -66,7 +69,11 @@ export type ResolvedDEntryNativeOwner = Readonly<{
   revoked: AbortSignal;
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;
-  readSessions(signal: AbortSignal): Promise<RemoteResult<SessionListValue>>;
+  /** The optional witness reports a settled check that never dispatched. */
+  readSessions(
+    signal: AbortSignal,
+    notDispatched?: () => void,
+  ): Promise<RemoteResult<SessionListValue>>;
   /** Actual same-Host issuer. Acquisition does not start I/O; run opens the
    * fixed generated control scope. No browser-provided principal or grants. */
   acquirePrincipal(
@@ -87,6 +94,9 @@ export class DEntryNativeUnavailable extends Error {
     super('D entry native owner is not bound');
   }
 }
+
+/** The native editor root RPC returned a verified, joined failure reply. */
+export class DEntryNativeRootRejected extends DEntryNativeUnavailable {}
 
 // Composition registration only. No map of people/leases/authority, no fallback
 // provider, no new listener, and never populated by a browser request.
@@ -165,6 +175,8 @@ export async function resolveDEntryNativeResource(input: {
   owner: ResolvedDEntryNativeOwner;
   signal: AbortSignal;
   root?: typeof getDEntryNativeRootPin;
+  requireRunning?: boolean;
+  requireLiveAgent?: boolean;
   checkGrants?: {
     nativeSessionIds: readonly string[];
     checked(current: boolean): void;
@@ -216,7 +228,14 @@ export async function resolveDEntryNativeResource(input: {
     return { parent };
   }
   const resource = lineage(nativeSessionId);
-  if (!resource) return deny();
+  const currentSession = entries.get(nativeSessionId);
+  if (
+    !resource ||
+    (input.requireLiveAgent && !currentSession?.agentAvailable) ||
+    (input.requireRunning &&
+      (!currentSession?.agentAvailable || !currentSession.running))
+  )
+    return deny();
   // Re-read the actual business pin after the native read so a replacement
   // cannot turn a stale catalog into current resource authority.
   const after = await (input.root ?? getDEntryNativeRootPin)(
@@ -236,7 +255,7 @@ export async function resolveDEntryNativeResource(input: {
   const grants = input.checkGrants;
   if (grants)
     grants.checked(grants.nativeSessionIds.every((id) => !!lineage(id)));
-  return DEntryNativeResourceFactsSchema.parse({
+  const facts = DEntryNativeResourceFactsSchema.parse({
     organizationId: identity.organizationId,
     personId: identity.personId,
     employeeInstanceId: identity.employeeInstanceId,
@@ -246,4 +265,18 @@ export async function resolveDEntryNativeResource(input: {
     parentNativeSessionId: resource.parent,
     bindingRef: owner.bindingRef,
   });
+  if (!input.requireLiveAgent || !currentSession) return facts;
+  let nativeAddress: SessionAddress;
+  if (currentSession.origin === 'subagent') {
+    if (!currentSession.parentSessionId) return deny();
+    nativeAddress = {
+      kind: 'subagent',
+      parentSessionId: currentSession.parentSessionId,
+      childSessionId: currentSession.sessionId,
+      mode: 'unknown',
+    };
+  } else {
+    nativeAddress = { kind: 'session', sessionId: currentSession.sessionId };
+  }
+  return { ...facts, nativeAddress };
 }

@@ -112,6 +112,53 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       active: new Error('real active listener cleanup injection'),
     },
   };
+  it('durably authorizes an exact live native call before its one-shot wire claim', async () => {
+    const store = createPostgresModelGatewayStore(sql('grant'));
+    const base = modelBinding();
+    const binding = {
+      ...base,
+      executionGeneration: '4.0',
+      native: {
+        ...base.native,
+        attemptId: 'fixture-actual-native-attempt',
+        attemptKind: 'assistant' as const,
+        attemptTurn: 1,
+        attemptCursor: 7,
+      },
+    };
+    await expect(
+      store.claimCall(binding, 'request-digest'),
+    ).rejects.toMatchObject({
+      code: 'DUPLICATE_CALL',
+    });
+    await store.reserveNativeCall!(binding);
+    await expect(store.reserveNativeCall!(binding)).rejects.toMatchObject({
+      code: 'DUPLICATE_CALL',
+    });
+    await expect(
+      store.reserveNativeCall!({
+        ...binding,
+        native: { ...binding.native, callId: randomUUID() },
+      }),
+    ).rejects.toMatchObject({ code: 'DUPLICATE_CALL' });
+
+    await expect(
+      store.claimCall(
+        { ...binding, employeeRelease: 'wrong-release' },
+        'request-digest',
+      ),
+    ).rejects.toMatchObject({
+      code: 'DUPLICATE_CALL',
+    });
+    await expect(store.claimCall(binding, 'request-digest')).resolves.toMatch(
+      /^[a-f0-9-]{36}$/,
+    );
+    await expect(
+      store.claimCall(binding, 'replayed-digest'),
+    ).rejects.toMatchObject({
+      code: 'DUPLICATE_CALL',
+    });
+  });
   function own<T>(promise: Promise<T>) {
     work.add(promise);
     void promise.catch(() => {});

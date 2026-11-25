@@ -503,6 +503,42 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(h.log).not.toContain('native:stop');
     expect(h.log).not.toContain('egress:revoke');
   });
+  it('running page prewarm rechecks readiness without publishing a physical lease', async () => {
+    const h = harness();
+    const { rc, binding } = await running(h);
+    const lease = vi.spyOn(h.store, 'withLease');
+    const ready = await h.service.prewarm(rc, { trigger: 'page' }, signal());
+    expect(ready.ready).toBe(true);
+    expect(lease).not.toHaveBeenCalled();
+    await expect(h.service.resolve(rc, signal())).resolves.toEqual(binding);
+  });
+
+  it('Worker shutdown checks holds and preserves a running owner when coverage is unknown', async () => {
+    const store = new MemoryStore();
+    const h = harness(store);
+    const { rc, binding } = await running(h);
+    const row = store.rows.get(rc.actor.id)!;
+    row.holds.push({
+      id: randomUUID(),
+      operationId: 'approval-1',
+      kind: 'approval',
+    });
+    await expect(
+      h.service.assertWorkerShutdownSafe(binding, signal()),
+    ).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+    row.holds.splice(0);
+    await expect(
+      h.service.assertWorkerShutdownSafe(binding, signal()),
+    ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+    expect(h.log).not.toContain('native:stop');
+    expect(h.log).not.toContain('egress:revoke');
+    expect(h.log).not.toContain('disk:detach');
+    h.states.set(binding.vmId, 'stopped');
+    await expect(
+      h.service.assertWorkerShutdownSafe(binding, signal()),
+    ).resolves.toBeUndefined();
+  });
+
   it('进入员工页和首次输入共用本人的盘/VM，read不会把persisted running冒称ready', async () => {
     const h = harness(),
       rc = context();
@@ -709,6 +745,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
   it('stop先撤资格；revoke失败仍执行stop，停止不明不detach', async () => {
     const h = harness(),
       { rc, binding } = await running(h);
+    const revoke = h.egress.revoke;
     h.egress.revoke = async () => {
       h.log.push('egress:revoke-failed');
       throw new PersonVmError('EGRESS_UNAVAILABLE');
@@ -721,6 +758,13 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       h.log.indexOf('native:stop'),
     );
     expect(h.states.get(binding.vmId)).toBe('stopped');
+    expect(h.mounts.has(binding.vmId)).toBe(true);
+    expect(h.log).not.toContain('disk:detach');
+    h.egress.revoke = revoke;
+    await expect(h.service.stop(rc, signal())).resolves.toMatchObject({
+      phase: 'stopped',
+    });
+    expect(h.mounts.has(binding.vmId)).toBe(false);
     const h2 = harness(),
       running2 = await running(h2);
     h2.states.set(running2.binding.vmId, 'stopped');

@@ -6,7 +6,6 @@ import {
   requireDEntryNativeIdentity,
 } from '@allrice/database';
 import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
-import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
 import { createDEntryPrincipalChildren } from '../d-entry/principal-activity.js';
 import type {
   DEntryPrincipalActivity,
@@ -46,6 +45,7 @@ export type PublishedNativeCatalog = Readonly<{
     acquirePrincipal(
       issue: DEntryPrincipalIssue,
       signal: AbortSignal,
+      context?: RequestContext,
     ): DEntryPrincipalActivity;
     readImmutableGraphFor?(
       context: RequestContext,
@@ -60,6 +60,7 @@ export type PublishedNativeCatalog = Readonly<{
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
+      notDispatched?: () => void,
     ): ReturnType<ResolvedDEntryNativeOwner['readSessions']>;
   }>;
 }>;
@@ -234,15 +235,25 @@ export function createDEntryNativeCatalogPort(input: {
               async assertCurrent(active) {
                 await current(who, active);
               },
-              acquire: (active) => owner.owner.acquirePrincipal(issue, active),
+              acquire: (active) =>
+                owner.owner.acquirePrincipal(issue, active, who),
             });
           },
-          readSessions(reading: AbortSignal) {
+          readSessions(reading: AbortSignal, notDispatched?: () => void) {
             return own(async () => {
               const who = context;
               const active = AbortSignal.any([reading, revoked]);
-              await current(who, active);
-              const result = await owner.owner.readSessionsFor(who, active);
+              try {
+                await current(who, active);
+              } catch (error) {
+                notDispatched?.();
+                throw error;
+              }
+              const result = await owner.owner.readSessionsFor(
+                who,
+                active,
+                notDispatched,
+              );
               await current(who, active);
               return result;
             });
@@ -300,7 +311,7 @@ export function installDEntryNativeCatalog(input: {
  * Production still supplies its real VM/startup owners and lifetime. */
 export function installAssignedDEntryNativeCatalog(input: {
   vm: NativeCatalogHost['vm'];
-  startup: Pick<ReturnType<typeof createAssignedNativeWebStartup>, 'catalog'>;
+  startup: Pick<NativeCatalogHost, 'catalog'>;
   lifetime: AbortSignal;
 }) {
   return installDEntryNativeCatalog({

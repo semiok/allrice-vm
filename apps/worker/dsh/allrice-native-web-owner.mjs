@@ -171,8 +171,256 @@ export async function unloadNativeWebOwner(fiber) {
 }
 
 /** Native local login only. This file never establishes an AllRice principal. */
+async function readManagedImage(scope, request, value, owned) {
+  const { ref, target } = value;
+  const limit = 20 * 1024 * 1024;
+  if (typeof ref?.attachmentId !== 'string' || ref.attachmentId.length > 256)
+    return null;
+  const within = (n, max) => Number.isSafeInteger(n) && n > 0 && n <= max;
+  if (
+    target !== null &&
+    (!within(target?.width, 8192) ||
+      !within(target?.height, 8192) ||
+      !within(target?.maxBytes, limit))
+  )
+    return null;
+  const active = globalThis.AbortSignal.any([request.signal, owned.signal]);
+  active.throwIfAborted();
+  // The native controller proves the attachment actually belongs to this
+  // Session's durable content before the native store derives a variant.
+  const { attachment, data } = await scope.sessionController.attachment({
+    sessionId: value.sessionId,
+    attachmentId: ref.attachmentId,
+  });
+  active.throwIfAborted();
+  if (
+    !within(attachment.bytes, limit) ||
+    !['attachmentId', 'bytes', 'mediaType', 'width', 'height'].every(
+      (key) => attachment[key] === ref[key],
+    )
+  )
+    return null;
+  if (!target) return { ref: attachment, data };
+  const image = await scope.attachments.readImageRequest(
+    attachment,
+    target,
+    active,
+  );
+  active.throwIfAborted();
+  if (!within(image.bytes, limit)) return null;
+  return { ...image, data: Buffer.from(image.data).toString('base64') };
+}
+
+// The controller's follow window is for display. Read all admitted input
+// from the live journal at the exact cursor of the authenticated attempt.
+export function readRootPromptOrigins(events, cursor, turn, purpose) {
+  const addPrompt = (event, ids) => {
+    if (event?.type !== 'user/message') return;
+    const source = event.data.source;
+    if (source?.kind === 'user' && typeof source.rpcId === 'string')
+      ids.add(source.rpcId);
+  };
+  if (purpose === 'session-title') {
+    const request = events[cursor];
+    if (request?.type !== 'session/title-llm-request') return null;
+    const messageSeqs = request.data.messageSeqs;
+    if (
+      !Array.isArray(messageSeqs) ||
+      messageSeqs.some(
+        (seq) => !Number.isSafeInteger(seq) || seq < 0 || seq >= cursor,
+      )
+    )
+      return null;
+    const ids = new Set();
+    let sourceTurn = null;
+    for (const seq of messageSeqs) {
+      const previousSize = ids.size;
+      addPrompt(events[seq], ids);
+      if (ids.size !== previousSize && sourceTurn === null)
+        sourceTurn =
+          events.findLast(
+            (event) => event.seq < seq && event.type === 'turn/start',
+          )?.data.turn ?? null;
+    }
+    return sourceTurn === null ? null : { turn: sourceTurn, ids: [...ids] };
+  }
+  const start = events.findLast(
+    (event) =>
+      event.seq <= cursor &&
+      event.type === 'turn/start' &&
+      (turn === null || event.data.turn === turn),
+  );
+  if (!start) return null;
+  const ids = new Set();
+  for (const event of events.slice(start.seq + 1, cursor + 1))
+    addPrompt(event, ids);
+  return { turn: start.data.turn, ids: [...ids] };
+}
+
+async function observeRootPromptOrigins(
+  scope,
+  id,
+  cursor,
+  turn,
+  purpose,
+  signal,
+) {
+  if (
+    !Number.isSafeInteger(cursor) ||
+    cursor < 0 ||
+    !(turn === null || Number.isSafeInteger(turn))
+  )
+    return null;
+  const live = scope.sessions.get(id);
+  if (!live || live.header.parentSession || live.header.isSeeded) return null;
+  const observed = await scope.sessionQuery.observeSession(id, { signal });
+  try {
+    signal.throwIfAborted();
+    if (
+      observed.source !== 'live' ||
+      scope.sessions.get(id) !== live ||
+      observed.header.id !== id ||
+      observed.cursor < cursor
+    )
+      return null;
+    const origin = readRootPromptOrigins(
+      observed.events,
+      cursor,
+      turn,
+      purpose,
+    );
+    return origin?.ids.length > 0 && origin.ids.length <= 64 ? origin : null;
+  } finally {
+    observed[Symbol.dispose]();
+  }
+}
+
+// DSH publishes a child's durable catalog entry on its exact parent before
+// running the initial delegated prompt. Continuing a child in a later turn
+// needs its own accepted-input source and cannot reuse its creation event.
+function delegatedPromptIds(sessions, sessionId) {
+  let child = sessions.get(sessionId);
+  if (!child?.header.parentSession) return [];
+  const seen = new Set([sessionId]);
+  while (child.header.parentSession) {
+    const parent = sessions.get(child.header.parentSession);
+    if (!parent || seen.has(parent.id)) return [];
+    seen.add(parent.id);
+    const events = parent.snapshotEvents();
+    const catalog = events.filter(
+      (event) =>
+        event.type === 'subagent/catalog' &&
+        event.data.childId === child.id &&
+        event.data.childCreatedAt === child.header.createdAt &&
+        event.data.version === 0,
+    );
+    if (catalog.length !== 1) return [];
+    const edge = catalog[0];
+    const start = events.findLast(
+      (event) => event.type === 'turn/start' && event.seq < edge.seq,
+    );
+    if (
+      !start ||
+      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
+    )
+      return [];
+    if (parent.header.parentSession) {
+      child = parent;
+      continue;
+    }
+    const result = new Set();
+    for (const event of events) {
+      if (event.seq <= start.seq || event.seq > edge.seq) continue;
+      if (event.type !== 'user/message') continue;
+      const source = event.data.source;
+      if (source?.kind === 'user' && typeof source.rpcId === 'string')
+        result.add(source.rpcId);
+    }
+    return [...result];
+  }
+  return [];
+}
+
+// Bind continuations when the live native inbox accepts and then claims the
+// exact relayed message. The recorded sender is an actual DSH Agent, and
+// the recipient cannot borrow a parent's earlier turn after sender movement.
+function observeDelegatedInputs(scope) {
+  const inserted = new WeakMap();
+  const claimed = new WeakMap();
+  function currentPromptIds(session) {
+    const events = session.snapshotEvents();
+    const start = events.findLast((event) => event.type === 'turn/start');
+    if (
+      !start ||
+      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
+    )
+      return [];
+    if (session.header.parentSession) {
+      const proof = claimed.get(session);
+      return proof?.turn === start.data.turn
+        ? [...proof.ids]
+        : delegatedPromptIds(scope.sessions, session.id);
+    }
+    const ids = new Set();
+    for (const event of events) {
+      if (event.seq <= start.seq || event.type !== 'user/message') continue;
+      const source = event.data.source;
+      if (source?.kind === 'user' && typeof source.rpcId === 'string')
+        ids.add(source.rpcId);
+    }
+    return [...ids];
+  }
+  scope.on('agent/inbox/inserted', ({ agent, message }) => {
+    const child = agent.session;
+    const source = message.source;
+    if (
+      source?.kind !== 'agent-message' ||
+      source.form !== 'relay' ||
+      source.senderSessionId !== child.header.parentSession
+    )
+      return;
+    const parent = scope.sessions.get(source.senderSessionId);
+    if (!parent) return;
+    let messages = inserted.get(child);
+    if (!messages) {
+      messages = new Map();
+      inserted.set(child, messages);
+    }
+    messages.set(message.id, currentPromptIds(parent));
+  });
+  scope.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+    const session = agent.session;
+    const messages = inserted.get(session);
+    const proof = messages?.get(message.id);
+    if (!proof) return;
+    messages.delete(message.id);
+    let state = claimed.get(session);
+    if (state?.turn !== turn) {
+      state = { turn, ids: new Set() };
+      claimed.set(session, state);
+    }
+    for (const id of proof) state.ids.add(id);
+  });
+  scope.on('agent/inbox/discarded', ({ agent, message }) => {
+    inserted.get(agent.session)?.delete(message.id);
+  });
+  return (sessionId) => {
+    const session = scope.sessions.get(sessionId);
+    return session?.header.parentSession ? currentPromptIds(session) : [];
+  };
+}
+
 export function apply(ctx, config) {
-  const { artifactPath, nonce, baseUrl, commandMemoryPlugin } = config;
+  return applyNativeWebOwner(ctx, config);
+}
+
+export function applyNativeWebOwner(
+  ctx,
+  config,
+  registerManagedGatewayAdapter,
+) {
+  const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
+    config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -186,17 +434,22 @@ export function apply(ctx, config) {
   let publicationFailure;
   let stagingCleanupFailure;
   let commandMemory;
+  let registeredModel;
+  let modelFiber;
   let published = false;
   let retiring = false;
   const stop = () => {
     retiring = true;
     lifetime.abort(canceled);
+    registeredModel?.dispose();
+    registeredModel = undefined;
   };
   const sameConfig = (value) =>
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
     value?.baseUrl === baseUrl &&
-    value?.commandMemoryPlugin === commandMemoryPlugin;
+    value?.commandMemoryPlugin === commandMemoryPlugin &&
+    JSON.stringify(value?.modelAdapter) === JSON.stringify(modelAdapter);
   const entry = fiber.entry;
   const current = () =>
     !retiring &&
@@ -205,6 +458,7 @@ export function apply(ctx, config) {
     (!commandMemory ||
       (original(ctx.get('subprocess')) === commandMemory.subprocess &&
         original(ctx.get('sandbox')) === commandMemory.sandbox)) &&
+    (!registeredModel || original(ctx.get('llm')) === registeredModel.llm) &&
     providers.every(([name, provider, value]) => {
       const live = ctx.get(name);
       return provider.uid !== null && live != null && original(live) === value;
@@ -221,6 +475,9 @@ export function apply(ctx, config) {
     async retire() {
       stop();
       await publishing?.catch(() => {});
+      const [modelCleanup] = await Promise.allSettled([
+        Promise.resolve().then(() => modelFiber?.dispose()),
+      ]);
       try {
         if (published) await rm(artifactPath, { force: true });
       } catch (error) {
@@ -231,6 +488,7 @@ export function apply(ctx, config) {
           );
         throw error;
       }
+      if (modelCleanup.status === 'rejected') throw modelCleanup.reason;
       if (stagingCleanupFailure) throw stagingCleanupFailure.error;
     },
   });
@@ -324,6 +582,176 @@ export function apply(ctx, config) {
       }
     }
     if (!current()) return;
+    if (modelAdapter !== undefined) {
+      publicationStage = 'model';
+      if (typeof registerManagedGatewayAdapter !== 'function')
+        throw Error('Native managed model module is unavailable');
+      if (!current()) return;
+      const { id, origin, capability, provider, model, modelInfo } =
+        modelAdapter;
+      if (!/^[a-f0-9]{64}$/.test(id))
+        throw Error('Native managed model binding is invalid');
+      modelFiber = ctx.inject(
+        [
+          'llm',
+          'connection',
+          'sessionController',
+          'attachments',
+          'sessions',
+          'sessionQuery',
+        ],
+        async (scope) => {
+          if (!current()) return;
+          const modelCalls = new Map();
+          const delegateOrigins = observeDelegatedInputs(scope);
+          scope.connection.fetch.register({
+            // Native exact Fetch routes are delivered only to the authenticated
+            // owner Peer. This path is consumed by the managed Host transport.
+            path: '/api/allrice-managed-model/current',
+            methods: ['POST'],
+            requestBody: 'buffered',
+            async fetch(request) {
+              if (!current())
+                return new globalThis.Response(null, { status: 404 });
+              const value = await request.json();
+              if (
+                value?.adapterId !== id ||
+                typeof value?.sessionId !== 'string' ||
+                !['assistant', 'compaction', 'session-title'].includes(
+                  value.purpose,
+                )
+              )
+                return new globalThis.Response(null, { status: 404 });
+              const found = modelCalls.get(
+                JSON.stringify([value.sessionId, value.purpose]),
+              );
+              if (!found || found.signal.aborted)
+                return new globalThis.Response(null, { status: 404 });
+              const headers = { 'cache-control': 'no-store' };
+              if (value.action === undefined) {
+                const session = scope.sessions.get(value.sessionId);
+                if (!session)
+                  return new globalThis.Response(null, { status: 404 });
+                const origin = session.header.parentSession
+                  ? null
+                  : await observeRootPromptOrigins(
+                      scope,
+                      value.sessionId,
+                      value.cursor,
+                      value.turn,
+                      value.purpose,
+                      globalThis.AbortSignal.any([
+                        found.signal,
+                        request.signal,
+                      ]),
+                    );
+                if (!session.header.parentSession && !origin)
+                  return new globalThis.Response(null, { status: 404 });
+                return globalThis.Response.json(
+                  {
+                    id: found.id,
+                    recipient: found.recipient,
+                    sourceTurn: origin?.turn ?? null,
+                    promptIds: origin?.ids ?? found.delegatedPromptIds,
+                  },
+                  { headers },
+                );
+              }
+              if (
+                value.action !== 'read-image' ||
+                (value.purpose !== 'assistant' && value.attemptId !== found.id)
+              )
+                return new globalThis.Response(null, { status: 404 });
+              const image = await readManagedImage(
+                scope,
+                request,
+                value,
+                found,
+              );
+              return image
+                ? globalThis.Response.json(image, { headers })
+                : new globalThis.Response(null, { status: 404 });
+            },
+          });
+          const dispose = registerManagedGatewayAdapter(scope.llm, {
+            origin,
+            capability,
+            route: {
+              provider,
+              model,
+              modelInfo,
+              lifetime: signal,
+              async resolveCallReference(selection, active, purpose) {
+                const key = JSON.stringify([
+                  selection.sessionId,
+                  purpose ?? 'assistant',
+                ]);
+                if (modelCalls.has(key))
+                  throw Error('Concurrent native model ownership is ambiguous');
+                const owned = {
+                  id: randomUUID(),
+                  recipient: randomBytes(32).toString('base64url'),
+                  delegatedPromptIds: delegateOrigins(selection.sessionId),
+                  signal: active,
+                };
+                modelCalls.set(key, owned);
+                const release = () => {
+                  active.removeEventListener('abort', release);
+                  if (modelCalls.get(key) === owned) modelCalls.delete(key);
+                };
+                active.addEventListener('abort', release, { once: true });
+                try {
+                  active.throwIfAborted();
+                  const endpoint = new URL(
+                    purpose ? '/v1/reference/' + purpose : '/v1/reference',
+                    origin,
+                  );
+                  const response = await globalThis.fetch(endpoint, {
+                    method: 'POST',
+                    redirect: 'error',
+                    signal: active,
+                    headers: {
+                      authorization: 'Bearer ' + capability,
+                      'content-type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                      ...selection,
+                      adapterId: id,
+                      recipient: owned.recipient,
+                    }),
+                  });
+                  if (!response.ok) {
+                    await response.body?.cancel();
+                    throw Error('Native managed model call was denied');
+                  }
+                  return {
+                    reference: (await response.json()).reference,
+                    recipient: owned.recipient,
+                    release,
+                  };
+                } catch (error) {
+                  release();
+                  throw error;
+                }
+              },
+            },
+          });
+          registeredModel = { dispose, llm: original(scope.llm), id };
+          const models = await scope.llm.listModels(provider);
+          if (models.length !== 1 || models[0].id !== model)
+            throw Error('Native managed model was not registered');
+        },
+      );
+      if (
+        !(await waitWhileOwned(signal, (ready, reject) => {
+          void Promise.resolve(modelFiber).then(ready, reject);
+        }))
+      )
+        return;
+      if (!registeredModel)
+        throw Error('Native managed model was not installed');
+    }
+    if (!current()) return;
     publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;
@@ -337,6 +765,7 @@ export function apply(ctx, config) {
         JSON.stringify({
           v: 1,
           nonce,
+          modelAdapterId: registeredModel?.id,
           authenticatedUrl: ctx.connection.authenticatedUrl(baseUrl),
         }),
         { flag: 'wx', mode: 0o600 },

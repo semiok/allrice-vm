@@ -5,6 +5,7 @@ import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import {
   createDEntryAuthorityFeed,
   watchDEntryNativeAuthority,
+  watchDEntryNativeRosterAuthority,
   watchDEntryHistoryAuthority,
   watchDEntryIdentityAuthority,
   watchDEntryPrincipalAuthority,
@@ -101,6 +102,89 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('settles whole-roster and VM hints before delivery without rereading on quiet frames', async () => {
+    const signal = new AbortController().signal;
+    const source = feed();
+    const verify = vi.fn(async () => {});
+    const binding = vi.fn(async () => {});
+    const watch = await watchDEntryNativeRosterAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      { verifyRoster: verify, verifyBinding: binding },
+      source,
+    );
+    try {
+      await watch.assertObserved(signal);
+      await watch.assertObserved(signal);
+      expect(verify).toHaveBeenCalledTimes(1);
+      const client = state.clients[0]!;
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      await watch.assertObserved(signal);
+      expect(binding).toHaveBeenCalledTimes(1);
+      expect(verify).toHaveBeenCalledTimes(1);
+      verify.mockRejectedValueOnce(Error('published roster no longer current'));
+      client.emit('notification', {
+        channel: 'allrice_d_entry_authority',
+        payload: JSON.stringify({
+          schema: 'isolated',
+          table: 'allrice_employee_instances',
+          id: randomUUID(),
+          organizationId: identity.organizationId,
+          workspaceId: randomUUID(),
+          personId: identity.personId,
+        }),
+      });
+      await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'published roster no longer current',
+      );
+      expect(watch.revoked.aborted).toBe(true);
+    } finally {
+      await watch.close();
+    }
+  });
+
+  it('fences in-flight delivery on an exact VM binding change', async () => {
+    const signal = new AbortController().signal;
+    const verifyBinding = vi.fn(async () => {
+      throw Error('expected VM binding changed');
+    });
+    const watch = await watchDEntryNativeRosterAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      { verifyRoster: vi.fn(async () => {}), verifyBinding },
+      feed(),
+    );
+    try {
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: randomUUID(),
+      });
+      await watch.assertObserved(signal);
+      expect(verifyBinding).not.toHaveBeenCalled();
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'expected VM binding changed',
+      );
+      expect(watch.revoked.aborted).toBe(true);
+    } finally {
+      await watch.close();
+    }
+  });
+
   it.each(['native', 'history'] as const)(
     'LISTENs before rechecking and joins an in-flight notification recheck when closing the subscription (%s)',
     async (access) => {

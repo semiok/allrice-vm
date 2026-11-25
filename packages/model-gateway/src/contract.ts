@@ -6,6 +6,7 @@ import type {
 import type {
   PersonVmAdmissionBoundary,
   PersonVmAdmissionPort,
+  PersonVmAdmissionPermit,
   PersonVmBinding,
 } from '@allrice/person-vm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
@@ -13,6 +14,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export const MODEL_GATEWAY_CONTRACT_VERSION = 1 as const;
 export const MODEL_STREAMS_PER_PERSON = 8 as const;
+export const MODEL_CALL_REFERENCE_HEADER = 'x-allrice-model-call-reference';
+export const MODEL_CALL_RECIPIENT_HEADER = 'x-allrice-model-call-recipient';
+export const isModelCallReference = (value: unknown): value is string =>
+  typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
 
 /** HOST ONLY. Shapes do not authenticate. The authority must resolve every
  * field from its managed connection/current identity/native descriptor owner. */
@@ -30,6 +35,10 @@ export type ModelCallBinding = Readonly<{
     rootSessionId: string;
     parentSessionId: string | null;
     callId: string;
+    attemptId?: string;
+    attemptKind?: 'assistant' | 'compaction' | 'session-title';
+    attemptTurn?: number | null;
+    attemptCursor?: number;
   }>;
   executionGeneration: string;
   gatewayRelease: string;
@@ -41,6 +50,13 @@ export interface ModelGatewayAuthority {
   /** Current membership, managed VM epoch, employee release, root/child tree,
    * Run/call and exact route. Never authorize by parsing this shape alone. */
   assertCall(binding: ModelCallBinding, signal: AbortSignal): Promise<void>;
+  /** Trusted continuously watched exact call evidence, established at redeem.
+   * A caller without a watcher retains the full authority check on delivery. */
+  deliverySignal?(binding: ModelCallBinding): AbortSignal;
+  assertDeliveryObserved?(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   authorizeUsage(
     context: RequestContext,
     signal: AbortSignal,
@@ -64,6 +80,11 @@ export interface ModelGatewayAuthority {
 export type ModelGatewayAdmission = Readonly<{
   boundary: PersonVmAdmissionBoundary;
   participant: PersonVmAdmissionPort;
+  /** Exact local permits only, after this Gateway and its dispatcher stopped. */
+  recoverStoppedPermit?(
+    permit: PersonVmAdmissionPermit,
+    signal: AbortSignal,
+  ): Promise<void>;
 }>;
 
 /** The public DSH vocabulary, without guest-selectable identity or routing. */
@@ -84,6 +105,14 @@ export type GatewayFetchClassification = Readonly<{
   protocol: 'openai-chat-completions' | 'openai-responses' | 'opaque';
 }>;
 export interface GatewayProvider {
+  /** Optional exact Host-owned transport. Only the gateway calls it after it
+   * has committed the metered attempt. No Guest data selects the dispatcher. */
+  assertDispatchCurrent?(signal: AbortSignal): Promise<void>;
+  fetchOwned?: (
+    fetch: typeof globalThis.fetch,
+    request: Request,
+    init: RequestInit,
+  ) => Promise<Response>;
   /** Inject an HTTP-fetch provider. Native loader configuration MUST pin SSE;
    * WebSocket or a separate SDK transport cannot bypass this host meter.
    * Model/refresh endpoints must accept one-shot request bodies (native POST).
@@ -139,6 +168,8 @@ export interface CapacitySubscription {
   close(): Promise<void>;
 }
 export interface ModelGatewayStore {
+  /** Commit exact native authorization before delivering any Guest reference. */
+  reserveNativeCall?(binding: ModelCallBinding): Promise<void>;
   /** Immutable unique native call claim. Duplicate/reconnect never dispatches. */
   claimCall(binding: ModelCallBinding, requestDigest: string): Promise<string>;
   /** Subscribe BEFORE tryStartAttempt, then recheck after each notification. */
@@ -164,6 +195,8 @@ export interface UsageLedgerPort {
   ): Promise<RuntimeRunUsage>;
 }
 export interface ModelGatewayPort {
+  /** Trusted Worker shutdown only; exact dispatcher proof is bound at construction. */
+  reconcileClosedOwner?(signal: AbortSignal): Promise<number>;
   /** Exact freeze/observe/subscribe/thaw protocol owned by the shared host.
    * A gateway-only thaw is not permission to wake, advance epoch or dispatch. */
   readonly admission: PersonVmAdmissionPort;
@@ -174,6 +207,12 @@ export interface ModelGatewayPort {
     binding: ModelCallBinding,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Host-only reference issuance uses the same gateway participant and drain. */
+  issueReference?<T>(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+    issue: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T>;
   /** Host revocation is active cancellation; resolves after actual owned drain. */
   revoke(binding: PersonVmBinding): Promise<void>;
   reconcileOwner(
@@ -188,6 +227,7 @@ export type ModelGatewayErrorCode =
   | 'AUTHORIZATION_DENIED'
   | 'BINDING_INVALID'
   | 'INVALID_INPUT'
+  | 'INPUT_TOO_LARGE'
   | 'DUPLICATE_CALL'
   | 'ADMISSION_CLOSED'
   | 'EXECUTION_REBIND_REQUIRED'

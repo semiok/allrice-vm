@@ -239,6 +239,98 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     f.service.owner(f.binding, f.web.receipt.endpoints[0]!.employeeInstanceId),
   ).toThrow();
 });
+it('holds the bootstrap scope through editor proof and exposes only proved employees in that epoch', async () => {
+  const f = fixture();
+  const proved = f.web.receipt.endpoints[0]!;
+  const skipped = f.web.receipt.endpoints[1]!;
+  const route = new AbortController();
+  const laterRoute = new AbortController();
+  let newlyEnabled = false;
+  const profile = {
+    revoked: f.scope.signal,
+    readImmutableGraph: vi.fn(),
+    readImmutableBundle: vi.fn(),
+  };
+  const readModels = vi.fn();
+  const verifyStartingEditor = vi.fn<NativeWebOwner['verifyStartingEditor']>(
+    async (scope, active, verify) => {
+      expect(scope).toBe(f.scope);
+      return verify(profile, readModels, active);
+    },
+  );
+  open.mockResolvedValue({
+    ...catalogOwner(),
+    verifyStartingEditor,
+    verifyRunningEditor: vi.fn<NativeWebOwner['verifyRunningEditor']>(
+      async (context, active, verify) => {
+        expect(context).toBe(f.web.context);
+        return verify(profile, readModels, active);
+      },
+    ),
+  });
+  const uninstall = f.service.installStartingEditorProof(
+    async ({ endpoint, binding, context }, active) => {
+      expect(binding).toEqual(f.binding);
+      expect(context).toBe(f.web.context);
+      active.throwIfAborted();
+      return endpoint.employeeInstanceId === proved.employeeInstanceId
+        ? route.signal
+        : newlyEnabled
+          ? laterRoute.signal
+          : null;
+    },
+  );
+  try {
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web);
+    await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
+    f.startup.abort();
+    expect(verifyStartingEditor).toHaveBeenCalledTimes(2);
+    expect(() =>
+      f.service.assertVerifiedEditor(
+        f.binding,
+        signal(),
+        proved.employeeInstanceId,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      f.service.assertVerifiedEditor(
+        f.binding,
+        signal(),
+        skipped.employeeInstanceId,
+      ),
+    ).toThrow('RUNTIME_NOT_READY');
+    expect(() =>
+      f.service.assertVerifiedEditor(
+        { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+        signal(),
+      ),
+    ).toThrow('RUNTIME_NOT_READY');
+    route.abort();
+    expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow(
+      'RUNTIME_NOT_READY',
+    );
+    newlyEnabled = true;
+    await expect(
+      f.service.ensureVerifiedEditor(
+        f.web.context,
+        f.binding,
+        skipped.employeeInstanceId,
+        signal(),
+      ),
+    ).resolves.toBe(laterRoute.signal);
+    expect(
+      f.service.assertVerifiedEditor(
+        f.binding,
+        signal(),
+        skipped.employeeInstanceId,
+      ),
+    ).toBe(laterRoute.signal);
+    expect(open).toHaveBeenCalledTimes(2);
+  } finally {
+    uninstall();
+    await f.service.close();
+  }
+});
 it('launches each employee with an authenticated Web entry locator on the sealed origin', async () => {
   const origin = 'https://employees.example.test';
   const f = fixture(undefined, origin);

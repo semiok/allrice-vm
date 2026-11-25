@@ -2,7 +2,7 @@
 import { channel } from 'node:diagnostics_channel';
 import { createServer } from 'node:http';
 import { Socket } from 'node:net';
-import type { Agent } from 'undici-native-proof';
+import type { Agent } from 'undici';
 import type { StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { GatewayProvider } from './contract.ts';
 import { closeServer, deferred, listen } from './gateway.fixture.ts';
@@ -176,7 +176,7 @@ export async function nativeCloseSensitivityFixture(owners: {
   trailers.subscribe(onTrailers);
   origin = await listen(server);
   // Exact test alias, delayed until G12; never install a global dispatcher.
-  const { Agent: NativeAgent } = await import('undici-native-proof');
+  const { Agent: NativeAgent } = await import('undici');
   resources.agent = new NativeAgent({
     connections: 1,
     pipelining: 1,

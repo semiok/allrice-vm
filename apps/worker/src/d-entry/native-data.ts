@@ -7,6 +7,7 @@ import type {
 import type {
   DEntryAdmissionOwner,
   DEntryAdmissionPorts,
+  DEntryHistoryRootPin,
   DEntryOwnedActivity,
 } from '@allrice/database';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
@@ -24,13 +25,26 @@ export type DEntryNativeMuxChannel = Readonly<{
   send(frame: string): Promise<void>;
 }>;
 
-/** 271-owned request adapter requirements, NOT an implemented 273 transport.
- * A trusted composition must provide the real complete envelope resolver and
- * owned handles covering partial init, all children and actual transport join.
- * acquire is synchronous: failure before a handle exists stays unknown. run
- * starts I/O; close actively cancels then joins it. No long-lived job.close. */
+/** The admitted page carrier owns its non-owner RPC and mux transports.
+ * Older standalone carriers require their own explicit transport owners.
+ * Acquire is inert; close cancels and joins the operation without closing
+ * the shared native job. */
 export interface DEntryNativeDataPort {
   admission: DEntryAdmissionPorts;
+  assertEditorReady?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    signal: AbortSignal,
+  ): Promise<AbortSignal>;
+  /** Explicit editor open on a current running Host. The database owns the
+   * durable claim and native root. Read-only discovery never calls this. */
+  prepareEditorRoot?(input: {
+    context: RequestContext;
+    identity: DEntryIdentity;
+    owner: ResolvedDEntryNativeOwner;
+    assertCurrent(signal: AbortSignal): Promise<void>;
+    signal: AbortSignal;
+  }): Promise<DEntryHistoryRootPin>;
   resolveAdmissionOwner(input: {
     context: RequestContext;
     identity: DEntryIdentity;
@@ -38,7 +52,7 @@ export interface DEntryNativeDataPort {
     operationId: string;
     signal: AbortSignal;
   }): Promise<DEntryAdmissionOwner>;
-  acquireRpc(
+  acquireRpc?(
     input: {
       owner: ResolvedDEntryNativeOwner;
       // Parsed generated input only. The adapter calls run ONLY after the
@@ -48,7 +62,7 @@ export interface DEntryNativeDataPort {
     },
     signal: AbortSignal,
   ): DEntryOwnedActivity<void>;
-  acquireMux(
+  acquireMux?(
     input: {
       owner: ResolvedDEntryNativeOwner;
       serve(
@@ -113,7 +127,7 @@ export function ownDEntryCatalog(
         acquire: (active) => owner.acquirePrincipal(context, issue, active),
       });
     },
-    readSessions(caller) {
+    readSessions(caller, notDispatched) {
       const current = AbortSignal.any([
         signal,
         caller,
@@ -122,8 +136,14 @@ export function ownDEntryCatalog(
       ]);
       current.throwIfAborted();
       let read: ReturnType<ResolvedDEntryNativeOwner['readSessions']>;
+      let joinedBeforeDispatch = false;
       try {
-        read = Promise.resolve(owner.readSessions(current));
+        read = Promise.resolve(
+          owner.readSessions(current, () => {
+            joinedBeforeDispatch = true;
+            notDispatched?.();
+          }),
+        );
       } catch (error) {
         read = Promise.reject(error);
       }
@@ -132,7 +152,7 @@ export function ownDEntryCatalog(
         () => reads.delete(read),
         (error) => {
           reads.delete(read);
-          failures.push(error);
+          if (!joinedBeforeDispatch) failures.push(error);
         },
       );
       return read;

@@ -777,6 +777,20 @@ export class PersonVmAdmissionHost
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     await this.releasePermit(permit, owned, signal);
   }
+  /** Process-local recovery after the owning Gateway callbacks and its exact
+   * dispatcher are stopped. Only that Gateway's original handle can settle. */
+  async recoverStoppedGatewayPermit(
+    permit: PersonVmAdmissionPermit,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const owned = this.owned(permit);
+    if (permit.participant !== 'gateway' || !owned.finish || !owned.closing)
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    await owned.finish.catch(() => {});
+    if (owned.pending.size) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    await this.releasePermit(permit, owned, signal);
+  }
   async waitUntilReady(
     context: RequestContext,
     permit: PersonVmAdmissionPermit,

@@ -1,4 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+import type { LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
 import {
   DEntrySelectionInputSchema,
   type DEntryIdentity,
@@ -44,6 +47,45 @@ export type NativeWebLaunch = Readonly<{
   files: PersonVmMemoryGuestPlan['files'];
   command: PersonVmGuestCommand;
 }>;
+export type NativeWebModelAdapter = Readonly<{
+  origin: string;
+  capability: string;
+  provider: string;
+  model: string;
+  modelInfo: LlmResolvedModelInfo;
+}>;
+
+async function managedModelFiles(directory: string, cliPath: string) {
+  const resolve = createRequire(import.meta.url);
+  const dist = dirname(resolve.resolve('@allrice/model-gateway'));
+  const modules = await Promise.all(
+    ['dsh-provider.js', 'contract.js'].map(async (name) => ({
+      path: posix.join(directory, name),
+      contents: await readFile(join(dist, name), 'utf8'),
+      mode: 0o600,
+    })),
+  );
+  return [
+    ...modules,
+    {
+      path: posix.join(directory, 'package.json'),
+      contents: '{"type":"module"}',
+      mode: 0o600,
+    },
+    {
+      path: posix.join(directory, 'native-llm.js'),
+      contents: `import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+const require = createRequire(${JSON.stringify(cliPath)});
+export const { LlmAdapter, LlmError } = await import(
+  pathToFileURL(require.resolve('@deepseek-ai/dsh-llm')).href
+);
+`,
+      mode: 0o600,
+    },
+  ];
+}
+
 export type NativeWebGuestProfile = Awaited<
   ReturnType<typeof readReleasedGuestProfile>
 >;
@@ -69,6 +111,7 @@ export async function prepareNativeWebLaunch(
   binding: PersonVmBinding,
   profile: NativeWebGuestProfile,
   commandMemory?: ReturnType<typeof createPersonVmDshCommandMemoryPatch>,
+  modelAdapter?: NativeWebModelAdapter,
 ): Promise<NativeWebLaunch> {
   let origin: URL, publicUrl: URL;
   try {
@@ -80,6 +123,9 @@ export async function prepareNativeWebLaunch(
   const auth = Object.freeze({
     dshHome: config.dshHome,
     nonce: randomUUID(),
+    ...(modelAdapter
+      ? { modelAdapterId: randomBytes(32).toString('hex') }
+      : {}),
     origin: origin.href,
     timeoutMs: config.startupTimeoutMs,
   });
@@ -117,19 +163,45 @@ export async function prepareNativeWebLaunch(
     )
   )
     throw new PersonVmError('PROVIDER_FAILED');
+  const modelDirectory = posix.join(directory, 'model-gateway');
+  const modelFiles = modelAdapter
+    ? await managedModelFiles(modelDirectory, config.cliPath)
+    : [];
   const principalPlugin = `${directory}/current-principal.mjs`;
   const principalSource = await readDEntryPrincipalHostArtifact();
   const plugin = `${directory}/owner.mjs`,
     patch = `${directory}/owner.patch.json`;
-  const source = await readFile(
-    new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url),
+  const ownerSource = await readFile(
+    new URL(
+      modelAdapter
+        ? '../../dist/guest-native-web-owner.mjs'
+        : '../../dsh/allrice-native-web-owner.mjs',
+      import.meta.url,
+    ),
     'utf8',
   );
+  const modelOwner = `${directory}/owner-with-model.mjs`;
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
     files: Object.freeze([
-      { path: plugin, contents: source, mode: 0o600 },
+      { path: plugin, contents: ownerSource, mode: 0o600 },
+      ...(modelAdapter
+        ? [
+            {
+              path: modelOwner,
+              mode: 0o600,
+              contents: `import { applyNativeWebOwner } from './owner.mjs';
+import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
+export { inject, name } from './owner.mjs';
+export function apply(ctx, config) {
+  return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter);
+}
+`,
+            },
+          ]
+        : []),
+      ...modelFiles,
       { path: principalPlugin, contents: principalSource, mode: 0o600 },
       {
         path: patch,
@@ -157,11 +229,19 @@ export async function prepareNativeWebLaunch(
               },
               {
                 id: 'allrice-native-web-owner',
-                name: `file://${plugin}`,
+                name: `file://${modelAdapter ? modelOwner : plugin}`,
                 config: {
                   artifactPath: artifact.path,
                   nonce: auth.nonce,
                   baseUrl: auth.origin,
+                  ...(modelAdapter
+                    ? {
+                        modelAdapter: {
+                          ...modelAdapter,
+                          id: auth.modelAdapterId,
+                        },
+                      }
+                    : {}),
                   ...(commandMemory
                     ? { commandMemoryPlugin: commandMemory[2].insert[0].name }
                     : {}),
@@ -170,6 +250,18 @@ export async function prepareNativeWebLaunch(
             ],
           },
           ...(commandMemory ?? []),
+          ...(modelAdapter
+            ? [
+                { id: 'llm-pi-ai', disabled: true },
+                {
+                  id: 'agent-default-model',
+                  config: {
+                    provider: modelAdapter.provider,
+                    model: modelAdapter.model,
+                  },
+                },
+              ]
+            : []),
         ]),
         mode: 0o600,
       },

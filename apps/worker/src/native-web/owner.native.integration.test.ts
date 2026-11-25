@@ -1,6 +1,12 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
+import {
+  closeServer,
+  deferred,
+  listen,
+} from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
@@ -9,9 +15,11 @@ import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-con
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
+import { holdReleasedProfile } from '../d-entry/released-profile.js';
 import {
   PersonVmError,
   type PersonVmBootstrapScope,
@@ -61,16 +69,313 @@ it.skipIf(!cli)(
   async () => {
     const f = await setup();
     expect(f.owner.controlReady()).toBe(true);
-    f.startup.abort();
-    expect((await f.owner.readSessions(new AbortController().signal)).ok).toBe(
-      true,
+    const signal = new AbortController().signal;
+    await expect(
+      f.owner.verifyStartingEditor({ ...f.scope }, signal, async () => {}),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    await f.owner.verifyStartingEditor(
+      f.scope,
+      signal,
+      async (source, readModels, active) => {
+        const held = await holdReleasedProfile(
+          f.seal.directory,
+          source,
+          active,
+          f.seal.manifestSha256,
+        );
+        expect(held.graph.entries.length).toBeGreaterThan(0);
+        expect((await readModels()).ok).toBe(true);
+      },
     );
-    expect(f.current).toHaveBeenCalledTimes(2);
+    expect(f.current).not.toHaveBeenCalled();
+    f.startup.abort();
+    await expect(
+      f.owner.verifyStartingEditor(f.scope, signal, async () => {}),
+    ).rejects.toBe(f.startup.signal.reason);
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    expect(created.ok).toBe(true);
+    const sessions = await f.owner.readSessions(signal);
+    expect(sessions.ok).toBe(true);
+    expect(f.current).toHaveBeenCalledTimes(4);
     expect(f.child.exitCode).toBe(null);
     await Promise.all([f.owner.close(), f.owner.close()]);
     expect(f.owner.controlReady()).toBe(false);
     expect(f.kills()).toBe(1);
     expect(f.child.exitCode !== null || f.child.signalCode !== null).toBe(true);
+  },
+);
+
+it.skipIf(!cli)(
+  'registers the sealed Host model in the actual rc.2 profile and attests the same adapter in authenticated control',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const route = {
+      origin: 'http://127.0.0.1:1',
+      capability: 'a'.repeat(43),
+      provider: 'openai-codex',
+      model: 'fixture-codex',
+      modelInfo: {
+        provider: 'openai-codex',
+        id: 'fixture-codex',
+        name: 'fixture-codex',
+      },
+    };
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      route,
+    );
+    expect(f.owner.modelAdapterId).toMatch(/^[a-f0-9]{64}$/);
+    await f.owner.verifyStartingEditor(
+      f.scope,
+      new AbortController().signal,
+      async (_profile, readModels, _active, installed) => {
+        const catalog = await readModels();
+        expect(installed).toBe(f.owner.modelAdapterId);
+        expect(catalog.value.default).toMatchObject({
+          provider: route.provider,
+          model: route.model,
+        });
+        expect(catalog.value.routableProviders).toContain(route.provider);
+        expect(catalog.value.failures).not.toContainEqual(
+          expect.objectContaining({ id: route.provider }),
+        );
+      },
+    );
+  },
+);
+
+it.skipIf(!cli)(
+  'reads live rc.2 attempt proofs and derives an admitted prompt image on the sealed native owner',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const primary = deferred(),
+      title = deferred();
+    void primary.promise.catch(() => {});
+    void title.promise.catch(() => {});
+    const facts = {
+      assistant: { sessionId: '', attemptId: '', redeemed: false },
+      'session-title': { sessionId: '', attemptId: '', redeemed: false },
+    };
+    const recipients = new Map<string, string>();
+    const nativePrompt = randomUUID();
+    let turnEnd: Promise<{ sequence: number; reason: string }> | undefined;
+    const readAttempt =
+      deferred<
+        (session: string, kind: keyof typeof facts) => Promise<string>
+      >();
+    const readImage =
+      deferred<(sessionId: string, ref: ImageAttachmentRef) => Promise<void>>();
+    const png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+    const capability = 'a'.repeat(43);
+    const references = {
+      assistant: 'b'.repeat(43),
+      'session-title': 'c'.repeat(43),
+    };
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        if (request.headers.authorization !== 'Bearer ' + capability)
+          throw Error('Wrong fixture capability');
+        if (
+          request.url === '/v1/reference' ||
+          request.url === '/v1/reference/session-title'
+        ) {
+          const kind =
+            request.url === '/v1/reference' ? 'assistant' : 'session-title';
+          const selection = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+          if (
+            selection.provider !== 'openai-codex' ||
+            selection.model !== 'fixture-codex'
+          )
+            throw Error('Wrong native model selection');
+          expect(selection.adapterId).toMatch(/^[a-f0-9]{64}$/);
+          expect(selection.recipient).toMatch(/^[A-Za-z0-9_-]{43}$/);
+          recipients.set(kind, selection.recipient);
+          facts[kind].sessionId = selection.sessionId;
+          facts[kind].attemptId = await (
+            await readAttempt.promise
+          )(selection.sessionId, kind);
+          if (!facts[kind].attemptId) throw Error('No current attempt present');
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference: references[kind] }));
+          return;
+        }
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        const kind =
+          payload.purpose === 'session-title' ? 'session-title' : 'assistant';
+        if (
+          request.url !== '/v1/stream' ||
+          request.headers['x-allrice-model-call-reference'] !== references[kind]
+        )
+          throw Error('Native adapter did not redeem its reference');
+        expect(request.headers['x-allrice-model-call-recipient']).toBe(
+          recipients.get(kind),
+        );
+        if (kind === 'assistant') {
+          const message = payload.messages.find(
+            (entry: { role: string }) => entry.role === 'user',
+          );
+          const image = message.content.find(
+            (part: { type: string }) => part.type === 'image',
+          );
+          if (!image?.attachment)
+            throw Error('No durable image in native model input');
+          await (
+            await readImage.promise
+          )(facts[kind].sessionId, image.attachment);
+        }
+        facts[kind].redeemed = true;
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          JSON.stringify({ type: 'finish', reason: { kind: 'stop' } }) + '\n',
+        );
+        (kind === 'assistant' ? primary : title).resolve();
+      })().catch((error: unknown) => {
+        response.destroy();
+        primary.reject(error);
+        title.reject(error);
+      });
+    });
+    const browserlessOrigin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        transport = create(...args);
+        return transport;
+      },
+    );
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin: browserlessOrigin,
+        capability,
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+          inputModalities: ['text', 'image'],
+        },
+      },
+    );
+    const signal = new AbortController().signal;
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    if (!created.ok || !transport)
+      throw Error('Native owner fixture did not start');
+    const sessionId = created.value.sessionId;
+    readAttempt.resolve(async (requested, kind) => {
+      const attempt = await f.owner.readNativeAttemptFor(
+        f.context,
+        { kind: 'session', sessionId: SessionId(requested) },
+        signal,
+        kind,
+      );
+      if (!attempt)
+        throw Error(
+          'DSH model attempt did not exist on the authenticated owner',
+        );
+      expect(attempt.recipient).toBe(recipients.get(kind));
+      if (kind === 'assistant') {
+        expect(attempt.promptIds).toContain(nativePrompt);
+        expect(attempt.turn).toBeGreaterThan(0);
+        turnEnd = f.owner.waitNativeTurnEnd(
+          f.context,
+          { kind: 'session', sessionId: SessionId(requested) },
+          attempt.turn!,
+          signal,
+        );
+        void turnEnd.catch(() => {});
+      }
+      return attempt.id;
+    });
+    readImage.resolve(async (requested, ref) => {
+      const read = (
+        reference: ImageAttachmentRef,
+        target: { width: number; height: number; maxBytes: number } | null,
+      ) =>
+        f.owner.readManagedModelImageFor(
+          f.context,
+          {
+            sessionId: requested,
+            kind: 'assistant',
+            id: facts.assistant.attemptId,
+          },
+          reference,
+          target,
+          signal,
+        );
+      await expect(
+        read({ ...ref, width: ref.width + 1 }, null),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const original = await read(ref, null);
+      expect(original.data.byteLength).toBe(ref.bytes);
+      const variant = await read(ref, { width: 1, height: 1, maxBytes: 4096 });
+      expect(variant).toMatchObject({
+        attachment: ref,
+        width: 1,
+        height: 1,
+        variantId: expect.any(String),
+      });
+      expect(variant.data.byteLength).toBeGreaterThan(0);
+    });
+    const method = NATIVE_REMOTE.methods['session/prompt'];
+    const args = method
+      .input({ strict: true })
+      .create()
+      .parse({
+        request: {
+          sessionId,
+          requestId: nativePrompt,
+          content: [
+            { type: 'text', text: 'Synthetic lifecycle test' },
+            { type: 'image', mediaType: 'image/png', data: png },
+          ],
+          mode: 'queue',
+        },
+      });
+    const response = await transport.fetch('api/session/prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method: 'session/prompt',
+        payload: { args },
+      }),
+    });
+    const receipt = serverResponseSchema.parse(await response.json());
+    expect(receipt.result).toMatchObject({
+      ok: true,
+      value: { accepted: true },
+    });
+    await Promise.all([primary.promise, title.promise]);
+    expect(turnEnd).toBeDefined();
+    expect(await turnEnd).toMatchObject({
+      sequence: expect.any(Number),
+      reason: 'completed',
+    });
+    for (const fact of Object.values(facts))
+      expect(fact).toEqual({
+        redeemed: true,
+        sessionId,
+        attemptId: expect.any(String),
+      });
+    expect(facts.assistant.attemptId).not.toBe(
+      facts['session-title'].attemptId,
+    );
   },
 );
 

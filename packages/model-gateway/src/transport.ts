@@ -230,11 +230,17 @@ export function createMeteredTransport(options: {
             }),
           duplex: 'half',
         };
+        // No expensive native ancestry or credential read after this last
+        // selected-generation check, including before an unsent refresh.
+        await options.provider.assertDispatchCurrent?.(requestSignal);
+        requestSignal.throwIfAborted();
         dispatched = true;
         // Redirects are disabled in request; hidden 421 replay is disabled by
         // the one-shot body. Each later SDK fetch gets its own durable attempt.
         const response = await nativeClose.run(() =>
-          nativeFetch(request, dispatchInit),
+          options.provider.fetchOwned
+            ? options.provider.fetchOwned(nativeFetch, request, dispatchInit)
+            : nativeFetch(request, dispatchInit),
         );
         status = response.status;
         if (!response.body) {

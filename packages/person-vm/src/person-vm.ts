@@ -22,6 +22,7 @@ import {
 import { PersonVmAdmissionHost } from './admission-host.ts';
 import {
   checkAdmissionBinding,
+  rowBinding,
   PostgresPersonVmAdmissionStore,
 } from './admission-store.ts';
 import type { PersonVmNativeActivityPort } from './admission-contract.ts';
@@ -74,6 +75,7 @@ export class PersonVmService
   implements PersonVmHostPort, PersonVmAdmissionBindingPort
 {
   private admissionHost?: PersonVmAdmissionHost;
+  private workerDrain = false;
   private admissionShared?: PostgresPersonVmAdmissionStore;
   private readonly now: () => Date;
   private readonly currentLease = new AsyncLocalStorage<{
@@ -91,6 +93,18 @@ export class PersonVmService
       egress?: PersonVmEgressPort;
       runtime?: PersonVmRuntimePort;
       nativeWeb?: PersonVmWebRosterPort;
+      /** Register the exact saved epoch before a start can touch its disk. */
+      observeOwnedStart?: (binding: PersonVmBinding) => void;
+      /** A retained epoch may acquire a mount without owning its native job. */
+      observeOwnedMount?: (binding: PersonVmBinding) => void;
+      observeOwnedStop?: (binding: PersonVmBinding) => void;
+      ownsEgressReceipt?: (receipt: PersonVmEgressReceipt) => boolean;
+      /** An unresolved local egress epoch keeps its shared mount reserved. */
+      hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
+      settleSupersededBinding?: (
+        binding: PersonVmBinding,
+        signal: AbortSignal,
+      ) => Promise<void>;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
       cleanupTimeoutMs: number;
@@ -169,6 +183,8 @@ export class PersonVmService
       action,
       signal,
     );
+    if (this.workerDrain && (action === 'create' || action === 'start'))
+      throw new PersonVmError('RUNTIME_NOT_READY');
     if (
       !UuidSchema.safeParse(identity.personId).success ||
       identity.organizationId !== context.organizationId ||
@@ -392,11 +408,13 @@ export class PersonVmService
   private async mounted(row: VmRecord, signal: AbortSignal, lease: VmLease) {
     if ((await this.reconcileDisk(row, signal, lease)).state !== 'ready')
       throw new PersonVmError('PROVIDER_FAILED');
+    const binding = bindingOf(row);
+    this.options.observeOwnedMount?.(binding);
     const mount = await this.options.disk.attach(
       { vmId: row.vmId, tier: row.diskTier },
       signal,
     );
-    await this.options.native.prepare(bindingOf(row), mount, signal);
+    await this.options.native.prepare(binding, mount, signal);
     return mount;
   }
   private async ready(row: VmRecord, signal: AbortSignal) {
@@ -450,7 +468,10 @@ export class PersonVmService
     lease: VmLease,
     signal: AbortSignal,
   ) {
+    if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const row = this.required(lease.row);
+    if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row)))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (!this.options.egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
     if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
     if (
@@ -499,6 +520,14 @@ export class PersonVmService
     ) {
       if ((await this.takeoverSafe(row, signal, lease)).state !== 'ready')
         throw new PersonVmError('PROVIDER_FAILED');
+      if (
+        row.egressReceipt &&
+        this.options.ownsEgressReceipt &&
+        !this.options.ownsEgressReceipt(
+          this.receipt(bindingOf(row), row.egressReceipt),
+        )
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
       await this.cleanup(row, lease, 'takeover');
     }
     await lease.assertAdmissionOpen(true);
@@ -516,9 +545,10 @@ export class PersonVmService
       result: 'started',
     });
     try {
+      const binding = bindingOf(row);
+      this.options.observeOwnedStart?.(binding);
       signal.throwIfAborted();
       await lease.guard();
-      const binding = bindingOf(row);
       if (row.diskTier === 'cold') {
         await this.options.disk.move(
           { vmId: row.vmId, tier: 'cold' },
@@ -540,6 +570,7 @@ export class PersonVmService
       );
       row.egressReceipt = receipt;
       await lease.save(row);
+      signal.throwIfAborted();
       if (
         row.nativeCreated &&
         JSON.stringify([...receipt.gatewayPorts].sort((a, b) => a - b)) !==
@@ -673,6 +704,50 @@ export class PersonVmService
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    const identity = await this.identity(context, 'start', signal);
+    const row = await this.options.store.read(identity.personId);
+    if (row) this.checkOrganization(row, identity.organizationId);
+    if (row?.phase === 'running') {
+      const binding = bindingOf(row);
+      if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
+      const roster = await this.webRoster(context, signal);
+      if (roster) {
+        if (
+          roster.personId !== row.personId ||
+          roster.organizationId !== row.organizationId
+        )
+          throw new PersonVmError('AUTHORIZATION_DENIED');
+        if (!this.options.native.prepareWebEndpoints)
+          throw new PersonVmError('RUNTIME_NOT_READY');
+        const endpoints = await this.options.native.prepareWebEndpoints(
+          binding,
+          roster,
+          signal,
+          { runningOnly: true },
+        );
+        if (
+          !sameVmBinding(endpoints.binding, binding) ||
+          endpoints.rosterDigest !== roster.digest
+        )
+          throw new PersonVmError('LEASE_LOST');
+      }
+      await this.ready(row, signal);
+      if (
+        roster &&
+        (await this.webRoster(context, signal))?.digest !== roster.digest
+      )
+        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+      const confirmed = await this.identity(context, 'start', signal);
+      if (
+        confirmed.personId !== row.personId ||
+        confirmed.organizationId !== row.organizationId
+      )
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      await this.assertCurrentBinding(context, binding, signal);
+      signal.throwIfAborted();
+      return view(row, true);
+    }
+
     await this.create(context, signal);
     return this.start(context, signal);
   }
@@ -736,8 +811,10 @@ export class PersonVmService
     row: VmRecord,
     lease: VmLease,
     reason: 'stop' | 'failure' | 'takeover' | 'delete',
+    stopNative = true,
   ) {
     let failed = false;
+    let egressJoined = true;
     if (row.egressReceipt) {
       try {
         if (!this.options.egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
@@ -749,7 +826,12 @@ export class PersonVmService
         row.egressReceipt = null;
       } catch {
         failed = true;
+        egressJoined = false;
       }
+    }
+    if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row))) {
+      failed = true;
+      egressJoined = false;
     }
     let stopped = false;
     // Revocation exhausting its budget must not pre-abort the physical stop attempt.
@@ -758,7 +840,7 @@ export class PersonVmService
       if (row.instanceId) {
         await this.mounted(row, signal, lease);
         const binding = bindingOf(row);
-        await this.options.native.stop(binding, signal);
+        if (stopNative) await this.options.native.stop(binding, signal);
         const state = await this.options.native.status(binding, signal);
         stopped = state === 'stopped' || state === 'absent';
         if (state === 'stopped') row.nativeCreated = true; // Native create may have committed before a failed host save/ack.
@@ -783,11 +865,12 @@ export class PersonVmService
             AbortSignal.timeout(this.options.cleanupTimeoutMs),
           );
         }
-        // A confirmed VM stop does not prove its host runtime I/O has joined.
-        await this.options.disk.detach(
-          { vmId: row.vmId, tier: row.diskTier },
-          AbortSignal.timeout(this.options.cleanupTimeoutMs),
-        );
+        // Keep the exact mount available to finish staged egress cleanup.
+        if (egressJoined)
+          await this.options.disk.detach(
+            { vmId: row.vmId, tier: row.diskTier },
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
       } catch {
         failed = true;
       }
@@ -795,6 +878,112 @@ export class PersonVmService
     row.phase = failed ? 'failed' : 'stopped';
     await lease.save(row);
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (row.instanceId) this.options.observeOwnedStop?.(bindingOf(row));
+  }
+  fenceWorkerStartup() {
+    this.workerDrain = true;
+    return () => {
+      this.workerDrain = false;
+    };
+  }
+  /** A shutdown probe is read-only. Unknown native activity leaves the
+   * process and its current owners alive for a later stop attempt. */
+  async assertWorkerShutdownSafe(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const row = await this.options.store.read(binding.personId);
+    signal.throwIfAborted();
+    if (!row || row.organizationId !== binding.organizationId)
+      throw new PersonVmError('LEASE_LOST');
+    if (row.vmId !== binding.vmId || row.leaseEpoch > binding.leaseEpoch)
+      return;
+    if (!row.instanceId || !sameVmBinding(binding, bindingOf(row)))
+      throw new PersonVmError('LEASE_LOST');
+    if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
+    if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
+    const state = await this.options.native.status(binding, signal);
+    signal.throwIfAborted();
+    if (this.admissionShared) {
+      const admission = this.admissionShared;
+      await admission.transaction(
+        binding.personId,
+        signal,
+        async (tx) => {
+          if (!sameVmBinding(rowBinding(tx.row), binding) || tx.row.lease_owner)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if ((tx.row.holds as unknown[]).length)
+            throw new PersonVmError('VM_ACTIVE');
+          for (const participant of ['gateway', 'entry'] as const) {
+            const counts = await admission.counts(tx, participant);
+            if (counts.active || counts.queued)
+              throw new PersonVmError('VM_ACTIVE');
+          }
+        },
+        true,
+      );
+    }
+    // Production has no public VM-wide autonomous freeze/drain witness.
+    // A running VM remains with its current owner, even after SIGTERM.
+    if (state !== 'stopped' && state !== 'absent')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+  }
+  /** Internal Worker shutdown after its ingress and selection owners are fenced.
+   * Only the exact epoch previously prepared by that Host can be stopped here.
+   * The lease and physical readback are shared with the ordinary lifecycle. */
+  async shutdownOwned(binding: PersonVmBinding, stopNative = true) {
+    await this.options.store.withLease(
+      binding.personId,
+      { now: this.now, ttlMs: this.options.leaseTtlMs },
+      async (lease) => {
+        const row = lease.row;
+        if (
+          !row ||
+          row.personId !== binding.personId ||
+          row.organizationId !== binding.organizationId
+        )
+          throw new PersonVmError('LEASE_LOST');
+        const current =
+          row.instanceId !== null && sameVmBinding(binding, bindingOf(row));
+        const superseded =
+          row.vmId !== binding.vmId || row.leaseEpoch > binding.leaseEpoch;
+        const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+        if (
+          (!stopNative && superseded) ||
+          (current && row.phase === 'deleted')
+        ) {
+          await guard();
+          if (!this.options.settleSupersededBinding)
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          await this.options.settleSupersededBinding(
+            binding,
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
+          return;
+        }
+        if (!current) throw new PersonVmError('LEASE_LOST');
+        if (stopNative && row.phase === 'stopped' && !row.egressReceipt) return;
+        await guard();
+        if (!stopNative) {
+          if (
+            row.egressReceipt &&
+            !this.options.ownsEgressReceipt?.(
+              this.receipt(binding, row.egressReceipt),
+            )
+          )
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
+          await this.mounted(row, signal, lease);
+          const state = await this.options.native.status(binding, signal);
+          if (state !== 'stopped' && state !== 'absent')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+        }
+        // Revocation fences business admission, not cleanup of the exact
+        // physical owner already selected under this same exclusive lease.
+        await this.cleanup(row, { ...lease, guard }, 'stop', stopNative);
+      },
+    );
   }
   async stop(context: RequestContext, signal: AbortSignal) {
     return this.leased(context, 'stop', signal, (lease, _identity, current) =>

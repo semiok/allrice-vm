@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { finished } from 'node:stream/promises';
@@ -32,9 +33,16 @@ type BindingState = {
   server: Server;
   inflight: Set<Promise<unknown>>;
   active: boolean;
+  rollbackPending: boolean;
   installedMount: string | null;
   origin: string;
 };
+export class EgressPrepareRollbackError extends AggregateError {
+  constructor(prepare: unknown, rollback: unknown) {
+    super([prepare, rollback], 'EGRESS_PREPARE_FAILED', { cause: prepare });
+    this.name = 'EgressPrepareRollbackError';
+  }
+}
 function close(server: Server) {
   return new Promise<void>((resolve, reject) => {
     server.close((error) =>
@@ -120,8 +128,12 @@ export function createEgressGateway(
     provisioner: EgressProvisioner;
     services?: readonly ManagedHostService[];
     lifetime?: AbortSignal;
+    prepareRollbackSignal?: () => AbortSignal;
   },
 ) {
+  // HTTP requests belong to the Host that created this gateway, independent
+  // of the short-lived authorization scope that later prepares an endpoint.
+  const runHostRequest = AsyncLocalStorage.snapshot();
   const states = new Map<string, BindingState>();
   const lanes = new Map<string, Promise<unknown>>();
   const routes = new Map(
@@ -378,7 +390,12 @@ export function createEgressGateway(
         'EGRESS_CLEANUP_INCOMPLETE',
       );
   }
-  const port: PersonVmEgressPort = {
+  const port: PersonVmEgressPort & {
+    retireFailedPrepare(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): Promise<void>;
+  } = {
     prepare(bindingInput, preparation, signal) {
       const binding = Object.freeze({ ...bindingInput });
       const gatewayPorts = Object.freeze([...preparation.gatewayPorts]);
@@ -387,6 +404,7 @@ export function createEgressGateway(
         signal.throwIfAborted();
         const previous = states.get(binding.vmId);
         if (previous) {
+          if (previous.rollbackPending) throw new EgressError('UNAVAILABLE');
           if (exact(previous.receipt.binding, binding) && previous.active) {
             // An initial empty lease port list may retry before its save ACK.
             // It reuses the actual allocated receipt, never allocates again.
@@ -435,6 +453,7 @@ export function createEgressGateway(
           controller: new AbortController(),
           inflight: new Set(),
           active: false,
+          rollbackPending: false,
           installedMount: null,
           server: createServer(),
           origin: endpoint.guestOrigin,
@@ -442,7 +461,7 @@ export function createEgressGateway(
         // Epoch tombstone retained even on preparation failure; delayed prepare cannot revive it.
         states.set(binding.vmId, state);
         state.server.on('request', (req, res) => {
-          const operation = (async () => {
+          const operation = runHostRequest(async () => {
             const disconnect = new AbortController();
             res.once('close', () => disconnect.abort());
             const requestSignal = options.lifetime
@@ -538,7 +557,7 @@ export function createEgressGateway(
                 AbortSignal.any([disconnect.signal, state.controller.signal]),
               );
             }
-          })();
+          });
           state.inflight.add(operation);
           void operation
             .finally(() => state.inflight.delete(operation))
@@ -585,12 +604,28 @@ export function createEgressGateway(
           return receipt;
         } catch (error) {
           try {
-            await retire(state, signal);
+            await retire(state, options.prepareRollbackSignal?.() ?? signal);
           } catch (cleanup) {
-            throw new AggregateError([error, cleanup], 'EGRESS_PREPARE_FAILED');
+            state.rollbackPending = true;
+            throw new EgressPrepareRollbackError(error, cleanup);
           }
           throw error;
         }
+      });
+    },
+    retireFailedPrepare(binding, signal) {
+      return serial(binding.vmId, async () => {
+        signal.throwIfAborted();
+        const state = states.get(binding.vmId);
+        if (
+          !state ||
+          state.active ||
+          !state.rollbackPending ||
+          !exact(state.receipt.binding, binding)
+        )
+          throw new EgressError('STALE_BINDING');
+        await retire(state, signal);
+        state.rollbackPending = false;
       });
     },
     async assertActive(receipt, signal) {

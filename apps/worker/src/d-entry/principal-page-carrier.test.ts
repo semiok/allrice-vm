@@ -41,6 +41,36 @@ import {
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
 
+it('qualifies a new 4.0 editor without writing on upgrade, then prepares its root once on explicit open', async () => {
+  const f = await fixture(undefined, true);
+  const peer = f.connect();
+  await once(peer, 'open');
+  expect(f.prepareEditorRoot).not.toHaveBeenCalled();
+  const receive = messages(peer);
+  send(peer, {
+    type: 'open',
+    streamId: 'life',
+    endpoint: '$d-entry/page',
+    payload: { args: {} },
+  });
+  expect(await receive()).toMatchObject({
+    type: 'item',
+    value: { type: 'opened' },
+  });
+  expect(f.prepareEditorRoot).toHaveBeenCalledOnce();
+  closePage(peer);
+  expect(await receive()).toMatchObject({
+    type: 'item',
+    value: { type: 'closed' },
+  });
+  expect(await receive()).toMatchObject({ type: 'end' });
+  const next = await open(f);
+  expect(f.prepareEditorRoot).toHaveBeenCalledOnce();
+  closePage(next.peer);
+  await next.receive();
+  await next.receive();
+});
+
 function observeProfileRequest(
   f: Awaited<ReturnType<typeof fixture>>,
   url: URL,

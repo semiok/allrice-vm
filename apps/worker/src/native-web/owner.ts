@@ -1,12 +1,23 @@
+import { randomUUID } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
+import {
+  clientRequestSchema,
+  serverResponseSchema,
+} from '@deepseek-ai/dsh-client-connection';
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
-import type { RequestContext } from '@allrice/contracts';
+import { UuidSchema, type RequestContext } from '@allrice/contracts';
+import type {
+  ModelCatalog,
+  SessionFollowFrame,
+  SessionAddress,
+  SessionCreateRequest,
+} from '@deepseek-ai/dsh-api-session-controller/types';
 import {
   PersonVmError,
   sameVmBinding,
@@ -14,8 +25,80 @@ import {
   type PersonVmBootstrapScope,
   type PersonVmPort,
 } from '@allrice/person-vm';
+import type {
+  ImageAttachmentRef,
+  ImageRequestTarget,
+} from '@deepseek-ai/dsh-attachment';
+import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
+import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
+
+export class NativeRootJoinUnknown extends Error {
+  constructor(cause: unknown) {
+    super('NATIVE_ROOT_JOIN_UNKNOWN', { cause });
+  }
+}
+
+type EditorEvidence<T> = (
+  profile: DEntryFixedProfileSource,
+  models: () => Promise<{ ok: true; value: ModelCatalog }>,
+  signal: AbortSignal,
+  modelAdapterId?: string,
+) => Promise<T>;
+
+export type NativeModelAttemptKind =
+  'assistant' | 'compaction' | 'session-title';
+
+export function readNativeModelAttempt(
+  snapshot: Pick<
+    Extract<SessionFollowFrame, { type: 'snapshot' }>,
+    'records' | 'assistantStream'
+  >,
+  kind: NativeModelAttemptKind,
+) {
+  if (kind === 'assistant') {
+    const attempt = snapshot.assistantStream?.activeAttempt;
+    return attempt
+      ? {
+          kind,
+          id: attempt.attemptId,
+          turn: attempt.turn,
+          cursor: attempt.startedAfterSeq,
+        }
+      : null;
+  }
+  if (kind === 'session-title') {
+    for (const { event } of [...snapshot.records].reverse()) {
+      if (event.type === 'session/end-seed') break;
+      if (event.type === 'session/title-llm-request')
+        return { kind, id: String(event.seq), turn: null, cursor: event.seq };
+    }
+    return null;
+  }
+  // Native automatic and manual compaction own a real journal bracket before
+  // their summarizer enters Llm. A seed cut closes a prior lifecycle.
+  for (const { event } of [...snapshot.records].reverse()) {
+    if (event.type === 'session/end-seed' || event.type === 'compaction/end')
+      break;
+    if (event.type !== 'compaction/start') continue;
+    const data = event.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const { compactionId, turn } = data;
+    if (
+      typeof compactionId !== 'string' ||
+      !compactionId ||
+      !(
+        turn === null ||
+        (typeof turn === 'number' && Number.isSafeInteger(turn))
+      )
+    )
+      return null;
+    return { kind, id: compactionId, turn, cursor: event.seq };
+  }
+  return null;
+}
 
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
@@ -26,6 +109,17 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
+  beforePrompt?(
+    input: {
+      binding: PersonVmBinding;
+      adapterId: string;
+      context: RequestContext;
+      issue: DEntryPrincipalIssue;
+      requestId: string;
+      mode: 'queue' | 'steer';
+    },
+    signal: AbortSignal,
+  ): Promise<() => Promise<void>>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -42,6 +136,7 @@ export async function openNativeWebOwner(input: {
   // Business cancellation fences calls; the separate carrier survives to carry
   // typed close/closed/end until normal cleanup, actual loss or exact stop.
   const signal = AbortSignal.any([input.lifetime, stale.signal]);
+  let installedModelAdapter: string | undefined;
   let ready = false,
     closing: Promise<void> | undefined,
     hostClosing: Promise<void> | undefined;
@@ -174,20 +269,133 @@ export async function openNativeWebOwner(input: {
   function readCurrentSessions(
     requestSignal: AbortSignal,
     assertCurrent: (signal: AbortSignal) => Promise<void>,
+    notDispatched?: () => void,
   ) {
     const current = AbortSignal.any([signal, requestSignal]);
-    if (current.aborted) return Promise.reject(current.reason);
+    if (current.aborted) {
+      notDispatched?.();
+      return Promise.reject(current.reason);
+    }
     // Register before entering either asynchronous guard, including reentrant close.
     return own(
       Promise.resolve().then(async () => {
-        current.throwIfAborted();
-        await assertCurrent(current);
-        current.throwIfAborted();
+        try {
+          current.throwIfAborted();
+          await assertCurrent(current);
+          current.throwIfAborted();
+        } catch (error) {
+          notDispatched?.();
+          throw error;
+        }
         const result = await root.remote.session.list({}, current);
         await assertCurrent(current);
         current.throwIfAborted();
         return result;
       }),
+    );
+  }
+  function readGraph(current: AbortSignal) {
+    return transport.readIndex(current).then((html): unknown => {
+      const rows = [
+        ...html.matchAll(
+          /<script>globalThis\["__DSH_BOOT__"\] = ([^<]+)<\/script>/g,
+        ),
+      ];
+      if (rows.length !== 1) throw new PersonVmError('RUNTIME_NOT_READY');
+      return JSON.parse(rows[0]![1]!);
+    });
+  }
+  function readBundle(
+    reference: string,
+    expectedBytes: number,
+    current: AbortSignal,
+  ) {
+    if (
+      !/^plugins\/\?\?(?:[@a-z\d._/-]+(?:,[@a-z\d._/-]+)*)&rev=[a-f\d]+$/i.test(
+        reference,
+      )
+    )
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    const url = new URL(reference, input.launch.auth.origin);
+    if (url.pathname !== '/plugins/' || url.hash)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    return transport.readExact(url, expectedBytes, current);
+  }
+  function readCurrent<T>(
+    requestSignal: AbortSignal,
+    assertCurrent: (active: AbortSignal) => Promise<void>,
+    read: (active: AbortSignal) => Promise<T>,
+  ) {
+    const current = AbortSignal.any([signal, requestSignal]);
+    return own(
+      Promise.resolve().then(async () => {
+        current.throwIfAborted();
+        if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
+        await assertCurrent(current);
+        current.throwIfAborted();
+        const result = await read(current);
+        await assertCurrent(current);
+        current.throwIfAborted();
+        return result;
+      }),
+    );
+  }
+  async function readSessionReply(
+    endpoint: 'create' | 'modelCatalog',
+    args: object,
+    signal: AbortSignal,
+  ) {
+    const method = 'session/' + endpoint;
+    const rpcId = randomUUID();
+    const body = JSON.stringify(
+      clientRequestSchema.parse({
+        type: 'client-request',
+        method,
+        rpcId,
+        payload: { args },
+      }),
+    );
+    const wire = await transport.readSessionReply(endpoint, body, signal);
+    const reply = serverResponseSchema.parse(JSON.parse(wire));
+    if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
+    return reply.result;
+  }
+  function replyValue(result: Awaited<ReturnType<typeof readSessionReply>>) {
+    if (result.ok) return result.value;
+    throw new PersonVmError('PROVIDER_FAILED');
+  }
+  function verifyEditor<T>(
+    caller: AbortSignal,
+    guard: (signal: AbortSignal) => Promise<void>,
+    verify: EditorEvidence<T>,
+  ) {
+    const current = AbortSignal.any([
+      caller,
+      AbortSignal.timeout(input.launch.auth.timeoutMs),
+    ]);
+    return readCurrent(current, guard, (active) =>
+      verify(
+        {
+          revoked: active,
+          readImmutableGraph: (signal) => readCurrent(signal, guard, readGraph),
+          readImmutableBundle: (reference, bytes, signal) =>
+            readCurrent(signal, guard, (reading) =>
+              readBundle(reference, bytes, reading),
+            ),
+        },
+        () =>
+          readCurrent(active, guard, async (signal) => {
+            const method = TYPERT_REMOTE.methods['session/modelCatalog'];
+            const args = method.input({ strict: true }).create().parse({});
+            const result = await readSessionReply('modelCatalog', args, signal);
+            return {
+              ok: true as const,
+              value: method.result.create().parse(replyValue(result)),
+            };
+          }),
+        active,
+        installedModelAdapter,
+      ),
     );
   }
   try {
@@ -216,6 +424,9 @@ export async function openNativeWebOwner(input: {
     );
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    if (auth.modelAdapterId !== input.launch.auth.modelAdapterId)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    installedModelAdapter = auth.modelAdapterId;
     await setup(() => transport.authenticate(auth.authenticatedUrl));
     await setup(() => transport.authenticateIndex(auth.authenticatedUrl));
     await setup(() => root.plugin(TypertRegistry));
@@ -252,20 +463,107 @@ export async function openNativeWebOwner(input: {
         }
       })(),
     ).catch(() => {});
+    // The bootstrap capability expires normally after the enclosing start
+    // callback. The adopted native job belongs to the Host lifetime from here.
+    input.scope.signal.removeEventListener('abort', aborted);
     return Object.freeze({
       binding,
       revoked: signal,
+      modelAdapterId: installedModelAdapter,
+      nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
+      verifyStartingEditor<T>(
+        startingScope: PersonVmBootstrapScope,
+        caller: AbortSignal,
+        verify: EditorEvidence<T>,
+      ) {
+        if (startingScope !== input.scope)
+          return Promise.reject(new PersonVmError('LEASE_LOST'));
+        return verifyEditor(
+          AbortSignal.any([caller, startingScope.signal]),
+          () => startingScope.assertCurrent(),
+          verify,
+        );
+      },
+      verifyRunningEditor<T>(
+        context: RequestContext,
+        caller: AbortSignal,
+        verify: EditorEvidence<T>,
+      ) {
+        return verifyEditor(
+          caller,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          verify,
+        );
+      },
+      createRootFor(
+        context: RequestContext,
+        request: SessionCreateRequest,
+        caller: AbortSignal,
+      ) {
+        return readCurrent(
+          caller,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async () => {
+            const method = TYPERT_REMOTE.methods['session/create'];
+            const args = method
+              .input({ strict: true })
+              .create()
+              .parse({ request });
+            // rc.2 create has no native cancellation slot. Let a dispatched
+            // create settle independently of page cancellation. The scoped
+            // transport confirms the matching reply AND physical HTTP close.
+            const result = await readSessionReply(
+              'create',
+              args,
+              AbortSignal.timeout(input.cleanupTimeoutMs),
+            ).catch((error: unknown) => {
+              throw new NativeRootJoinUnknown(error);
+            });
+            if (!result.ok) throw new DEntryNativeRootRejected();
+            try {
+              return {
+                ok: true as const,
+                value: method.result.create().parse(result.value),
+              };
+            } catch (error) {
+              throw new NativeRootJoinUnknown(error);
+            }
+          },
+        );
+      },
       acquirePrincipal(
         issue: DEntryPrincipalIssue,
         requestSignal: AbortSignal,
+        context?: RequestContext,
       ) {
         if (!ready || closing || signal.aborted)
           throw new PersonVmError('RUNTIME_NOT_READY');
         return principals.acquire(
           issue,
           AbortSignal.any([requestSignal, signal]),
+          async (call, active) => {
+            if (call.endpoint !== 'session/prompt' || !input.beforePrompt)
+              return;
+            if (
+              !context ||
+              !installedModelAdapter ||
+              call.args.request.sessionId !== issue.root.nativeSessionId
+            )
+              throw new PersonVmError('AUTHORIZATION_DENIED');
+            return input.beforePrompt(
+              {
+                binding,
+                adapterId: installedModelAdapter,
+                context,
+                issue,
+                requestId: call.args.request.requestId,
+                mode: call.args.request.mode,
+              },
+              active,
+            );
+          },
         );
       },
       readSessions(requestSignal: AbortSignal) {
@@ -285,9 +583,15 @@ export async function openNativeWebOwner(input: {
         return readCurrentSessions(requestSignal, assertCurrent);
       },
       /** Request denial does not certify loss of this shared native owner. */
-      readSessionsFor(context: RequestContext, requestSignal: AbortSignal) {
-        return readCurrentSessions(requestSignal, (current) =>
-          input.vm.assertCurrentBinding(context, binding, current),
+      readSessionsFor(
+        context: RequestContext,
+        requestSignal: AbortSignal,
+        notDispatched?: () => void,
+      ) {
+        return readCurrentSessions(
+          requestSignal,
+          (current) => input.vm.assertCurrentBinding(context, binding, current),
+          notDispatched,
         );
       },
       /** The existing native index supplies the running Host's own graph.
@@ -303,16 +607,7 @@ export async function openNativeWebOwner(input: {
             current.throwIfAborted();
             if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const html = await transport.readIndex(current);
-            // renderIndexInjections uses exact global assignment with JSON; any
-            // ambiguity, changed rendering contract or missing graph fails closed.
-            const rows = [
-              ...html.matchAll(
-                /<script>globalThis\["__DSH_BOOT__"\] = ([^<]+)<\/script>/g,
-              ),
-            ];
-            if (rows.length !== 1) throw new PersonVmError('RUNTIME_NOT_READY');
-            const graph: unknown = JSON.parse(rows[0]![1]!);
+            const graph = await readGraph(current);
             await input.vm.assertCurrentBinding(context, binding, current);
             current.throwIfAborted();
             return graph;
@@ -331,23 +626,205 @@ export async function openNativeWebOwner(input: {
         return own(
           Promise.resolve().then(async () => {
             current.throwIfAborted();
-            if (
-              !ready ||
-              closing ||
-              !/^plugins\/\?\?(?:[@a-z\d._/-]+(?:,[@a-z\d._/-]+)*)&rev=[a-f\d]+$/i.test(
-                reference,
-              )
-            )
-              throw new PersonVmError('RUNTIME_NOT_READY');
-            const url = new URL(reference, input.launch.auth.origin);
-            if (url.pathname !== '/plugins/' || url.hash)
-              throw new PersonVmError('RUNTIME_NOT_READY');
+            if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const data = await transport.readExact(url, expectedBytes, current);
+            const data = await readBundle(reference, expectedBytes, current);
             await input.vm.assertCurrentBinding(context, binding, current);
             current.throwIfAborted();
             return data;
           }),
+        );
+      },
+      readNativeAttemptFor(
+        context: RequestContext,
+        address: SessionAddress,
+        caller: AbortSignal,
+        kind: NativeModelAttemptKind = 'assistant',
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            const protocol = TYPERT_REMOTE.methods['session/follow'];
+            const { request } = protocol
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  address,
+                  maxMessages: 32,
+                  turnWindow: { minMessages: 1, minTurns: 1 },
+                  assistantStream: true,
+                },
+              });
+            const follow = root.remote.session.follow(request, active);
+            const frames = follow[Symbol.asyncIterator]();
+            try {
+              const first = await frames.next();
+              active.throwIfAborted();
+              if (first.done) throw new PersonVmError('RUNTIME_NOT_READY');
+              const snapshot = protocol.result.create().parse(first.value);
+              if (snapshot.type !== 'snapshot')
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              const attempt = readNativeModelAttempt(snapshot, kind);
+              if (!attempt) return null;
+              if (!installedModelAdapter)
+                return {
+                  ...attempt,
+                  recipient: undefined,
+                  promptIds: [] as string[],
+                  sourceTurn: null,
+                };
+              const proof = await transport.readManagedModelProof(
+                JSON.stringify({
+                  adapterId: installedModelAdapter,
+                  sessionId:
+                    address.kind === 'session'
+                      ? address.sessionId
+                      : address.childSessionId,
+                  purpose: kind,
+                  cursor: attempt.cursor,
+                  turn: attempt.turn,
+                }),
+                active,
+              );
+              if (!proof) return null;
+              const value = JSON.parse(proof) as {
+                id?: unknown;
+                recipient?: unknown;
+                sourceTurn?: unknown;
+                promptIds?: unknown;
+              };
+              const id = UuidSchema.safeParse(value?.id);
+              if (
+                !id.success ||
+                typeof value.recipient !== 'string' ||
+                !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
+                Object.keys(value).length !== 4 ||
+                (address.kind === 'session'
+                  ? !Number.isSafeInteger(value.sourceTurn) ||
+                    (attempt.turn !== null && value.sourceTurn !== attempt.turn)
+                  : value.sourceTurn !== null) ||
+                !Array.isArray(value.promptIds) ||
+                value.promptIds.length > 64 ||
+                value.promptIds.some(
+                  (id) => typeof id !== 'string' || id.length > 256,
+                )
+              )
+                throw new PersonVmError('PROVIDER_FAILED');
+              return {
+                ...attempt,
+                id: kind === 'assistant' ? attempt.id : id.data,
+                recipient: value.recipient,
+                sourceTurn: value.sourceTurn as number | null,
+                promptIds: value.promptIds as string[],
+              };
+            } finally {
+              // Dispose this logical read on its original carrier. The
+              // shared owner still owns actual socket close at retirement.
+              follow.dispose();
+              await frames.return?.();
+            }
+          },
+        );
+      },
+      waitNativeTurnEnd(
+        context: RequestContext,
+        address: SessionAddress,
+        turn: number,
+        caller: AbortSignal,
+      ) {
+        return readCurrent(
+          caller,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            const protocol = TYPERT_REMOTE.methods['session/follow'];
+            const { request } = protocol
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  address,
+                  maxMessages: 32,
+                  turnWindow: { minMessages: 1, minTurns: 1 },
+                },
+              });
+            const follow = root.remote.session.follow(request, active);
+            const frames = follow[Symbol.asyncIterator]();
+            try {
+              for (;;) {
+                const next = await frames.next();
+                active.throwIfAborted();
+                if (next.done) throw new PersonVmError('RUNTIME_NOT_READY');
+                const frame = protocol.result.create().parse(next.value);
+                const events =
+                  frame.type === 'snapshot'
+                    ? frame.records.map(({ event }) => event)
+                    : frame.type === 'event'
+                      ? [frame.event]
+                      : [];
+                for (const event of events) {
+                  if (event.type !== 'turn/end') continue;
+                  const data = event.data as {
+                    turn?: unknown;
+                    reason?: { kind?: unknown };
+                  } | null;
+                  if (
+                    data?.turn !== turn ||
+                    typeof data.reason?.kind !== 'string'
+                  )
+                    continue;
+                  return { sequence: event.seq, reason: data.reason.kind };
+                }
+              }
+            } finally {
+              follow.dispose();
+              await frames.return?.();
+            }
+          },
+        );
+      },
+      readManagedModelImageFor(
+        context: RequestContext,
+        attempt: {
+          sessionId: string;
+          kind: NativeModelAttemptKind;
+          id: string;
+        },
+        ref: ImageAttachmentRef,
+        target: ImageRequestTarget | null,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const result = await transport.readManagedModelProof(
+              JSON.stringify({
+                action: 'read-image',
+                adapterId: installedModelAdapter,
+                sessionId: attempt.sessionId,
+                purpose: attempt.kind,
+                attemptId: attempt.id,
+                ref,
+                target,
+              }),
+              active,
+              true,
+            );
+            active.throwIfAborted();
+            return decodeProductionModelImage(result, ref, target);
+          },
         );
       },
       /** Running Host catalog only; never startup readiness or a browser grant.

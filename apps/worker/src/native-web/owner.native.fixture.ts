@@ -35,7 +35,11 @@ import {
   parseNativeWebAuth,
 } from '../../../../packages/person-vm/src/native-web-auth.ts';
 import { runCommand } from '../../../../packages/person-vm/src/process.ts';
-import { prepareNativeWebLaunch, type NativeWebLaunch } from './launch.js';
+import {
+  prepareNativeWebLaunch,
+  type NativeWebLaunch,
+  type NativeWebModelAdapter,
+} from './launch.js';
 import { openNativeWebOwner } from './owner.js';
 
 async function releaseNativeStartup(
@@ -108,6 +112,7 @@ async function isolatedCli(root: string, installedCli: string) {
       specifier.split('/').slice(0, 2).join('/'),
     ),
   );
+  dependencies.add('@deepseek-ai/dsh-llm');
   for (const dependency of dependencies) {
     expect(dependency).toMatch(/^@deepseek-ai\/[a-z0-9-]+$/);
     const destination = join(modules, dependency);
@@ -143,6 +148,7 @@ export async function setupNativeWebFixture(
     resetProbe?: boolean;
     onPublicationDiagnostic?: (text: string) => void;
   },
+  managedModel?: NativeWebModelAdapter,
 ) {
   const isolateProfile = isolated !== undefined;
   if (!installedCli) throw Error('The exact rc.2 CLI is required');
@@ -214,7 +220,13 @@ export async function setupNativeWebFixture(
     startupTimeoutMs: 10000,
     principalProfile,
   };
-  const launch = await prepareNativeWebLaunch(configuration, binding, profile);
+  const launch = await prepareNativeWebLaunch(
+    configuration,
+    binding,
+    profile,
+    undefined,
+    managedModel,
+  );
   const bootGate = join(root, 'native-startup-gate.mjs');
   const eventPrefix = join(root, 'native-startup');
   const readerTrace = join(root, 'trace-native-reader.mjs');
@@ -589,6 +601,7 @@ export async function setupNativeWebFixture(
   }
   return {
     owner,
+    scope,
     seal,
     launch,
     async observedProfilePatch() {

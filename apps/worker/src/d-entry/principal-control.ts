@@ -11,6 +11,7 @@ import {
   type DEntryPrincipalControlScope,
   type DEntryPrincipalIssue,
   type DEntryScopedStreamFrame,
+  type DEntryScopedUnaryCall,
   type ScopeFrame,
 } from '@allrice/d-entry-principal/types';
 
@@ -176,6 +177,10 @@ export function createDEntryPrincipalControl(
     acquire(
       value: DEntryPrincipalIssue,
       caller: AbortSignal,
+      beforeInvoke?: (
+        call: DEntryScopedUnaryCall,
+        signal: AbortSignal,
+      ) => Promise<(() => Promise<void>) | undefined>,
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -258,6 +263,17 @@ export function createDEntryPrincipalControl(
                 const task = Promise.resolve().then(async () => {
                   business.throwIfAborted();
                   active.throwIfAborted();
+                  const undispatched = await beforeInvoke?.(
+                    call,
+                    AbortSignal.any([active, business]),
+                  );
+                  try {
+                    business.throwIfAborted();
+                    active.throwIfAborted();
+                  } catch (error) {
+                    await undispatched?.();
+                    throw error;
+                  }
                   const result = await TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].invoke(
@@ -265,9 +281,23 @@ export function createDEntryPrincipalControl(
                     { call },
                     AbortSignal.any([active, business]),
                   );
+                  if (!result.ok) {
+                    // These native prompt errors are raised before inbox
+                    // acceptance. An ambiguous carrier error keeps its scope.
+                    const code = result.error?.code;
+                    if (
+                      call.endpoint === 'session/prompt' &&
+                      [
+                        'session/invalid-time-zone',
+                        'session/attachment-invalid',
+                        'session/model-unavailable',
+                      ].includes(String(code))
+                    )
+                      await undispatched?.();
+                    throw result.error;
+                  }
                   business.throwIfAborted();
                   active.throwIfAborted();
-                  if (!result.ok) throw result.error;
                   const value = TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].result

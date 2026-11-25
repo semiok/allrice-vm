@@ -1,3 +1,4 @@
+import { notifyNativeRosterInsert } from '../employees/native-roster-notification.ts';
 import {
   BrandMediaInvocationSchema,
   type BrandMediaInvocation,
@@ -416,6 +417,11 @@ export async function ensureDefaultEmployee(
         end,
         updated_at = now() where allrice_employee_assignments.selection_mode<>'exclude'
     `;
+    await notifyNativeRosterInsert(
+      transaction,
+      'allrice_employee_assignments',
+      { organizationId: context.organizationId, workspaceId, personId: userId },
+    );
     const rows = await transaction<AssignmentRow[]>`
       select
         a.id as assignment_id, a.employee_id, a.employee_version_id,

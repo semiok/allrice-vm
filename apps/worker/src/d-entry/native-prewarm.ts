@@ -9,7 +9,7 @@ export interface DEntryNativePrewarmPort {
     trigger: 'page' | 'input',
     signal: AbortSignal,
     revoked: AbortSignal,
-  ): Promise<void>;
+  ): Promise<AbortSignal | void>;
 }
 
 let installed: DEntryNativePrewarmPort | undefined;
