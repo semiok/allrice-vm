@@ -16,7 +16,7 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from '@deepseek-ai/dsh-session';
-import { createUserMessage, type SessionRequestId } from '@deepseek-ai/dsh-llm';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { AgentMessageSource } from '@deepseek-ai/dsh-subagent';
 import { expect, it } from 'vitest';
 // @ts-expect-error The fixed guest plugin is copied as JavaScript.
@@ -29,6 +29,10 @@ const {
 } = runJournal;
 
 const sessionId = 'session-00000000-0000-4000-8000-000000000036';
+type SessionRequestId = Extract<
+  NonNullable<Parameters<typeof createUserMessage>[0]['source']>,
+  { kind: 'user'; rpcId: string }
+>['rpcId'];
 const selection = {
   sessionId,
   nativeRequestId: '76621b92-7b25-47a0-8d6c-c958f957bfd8',
