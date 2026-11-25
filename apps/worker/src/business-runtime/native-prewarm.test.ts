@@ -43,6 +43,7 @@ function fixture(coordinated = false) {
     h = harness(),
     lifetime = new AbortController(),
     runPrewarm = h.service.prewarm.bind(h.service),
+    runStart = h.runtime.start.bind(h.runtime),
     vm = vi.spyOn(h.service, 'prewarm'),
     start = vi.spyOn(h.runtime, 'start'),
     stop = vi.spyOn(h.native, 'stop');
@@ -51,7 +52,7 @@ function fixture(coordinated = false) {
   const prewarmCurrent: CurrentSelectionPrewarm = (...args) =>
     h.service.prewarm(args[0], args[2], args[3]);
   const readCoordination = vi.fn(async () => ({
-    policyRevision: 'release-1',
+    authorityRevision: 'release-1',
     vm: await h.store.read(base.identity.personId),
   }));
   const assembly = createDEntryNativePrewarmPort({
@@ -65,6 +66,7 @@ function fixture(coordinated = false) {
     h,
     lifetime,
     runPrewarm,
+    runStart,
     vm,
     start,
     stop,
@@ -262,70 +264,84 @@ it('concurrent page/input cannot acquire a second lifecycle owner, and later val
   expect(f.stop).not.toHaveBeenCalled();
 });
 
-it('joins a later request on the published starting epoch and proves readiness for each valid waiter', async () => {
-  const f = fixture(true);
-  const entered = deferred<void>();
-  const release = deferred<void>();
-  const original = f.start.getMockImplementation()!;
-  const leader = new AbortController();
-  const follower = { ...f.base.context, requestId: randomUUID() };
-  const prove = vi.fn(async () => signal());
-  cleanups.push(async () => {
-    release.resolve();
-  });
-  const uninstall = installDEntryNativeDataPort({
-    ...f.base.data,
-    assertEditorReady: prove,
-  });
-  cleanups.push(async () => uninstall());
-  f.start.mockImplementationOnce(async (...args) => {
-    entered.resolve();
-    await release.promise;
-    return original(...args);
-  });
-  const prewarm = (
-    context: typeof f.base.context,
-    trigger: 'page' | 'input',
-    revoked: AbortSignal,
-  ) =>
-    f.assembly.port.prewarm(
-      context,
-      f.base.identity,
-      trigger,
-      signal(),
-      revoked,
-    );
-  const first = prewarm(f.base.context, 'page', leader.signal);
-  const outcomes = Promise.allSettled([first]);
-  await entered.promise;
-  let second: Promise<AbortSignal | void> | undefined;
-  try {
-    expect(await f.h.store.read(f.base.identity.personId)).toMatchObject({
-      phase: 'starting',
-      leaseEpoch: 1,
+it.each(['completes', 'disconnects', 'loses authority'])(
+  'joins the published starting epoch and proves each waiting request when the leader %s',
+  async (leaderOutcome) => {
+    const f = fixture(true);
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const caller = new AbortController(),
+      revoked = new AbortController();
+    const cancelled = leaderOutcome === 'disconnects' ? caller : revoked;
+    const follower = { ...f.base.context, requestId: randomUUID() };
+    const prove = vi.fn(async (context: typeof f.base.context) => {
+      expect(context.sessionId).toBe(f.base.context.sessionId);
+      return signal();
     });
-    second = prewarm(follower, 'input', signal());
-    void second.catch(() => {});
-    await vi.waitFor(() => expect(f.readCoordination).toHaveBeenCalledTimes(2));
+    cleanups.push(async () => release.resolve());
+    const uninstall = installDEntryNativeDataPort({
+      ...f.base.data,
+      assertEditorReady: prove,
+    });
+    cleanups.push(async () => uninstall());
+    f.start.mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return f.runStart(...args);
+    });
+    const first = f.assembly.port.prewarm(
+      f.base.context,
+      f.base.identity,
+      'page',
+      caller.signal,
+      revoked.signal,
+    );
+    const outcomes = Promise.allSettled([first]);
+    await entered.promise;
+    let second: Promise<AbortSignal | void> | undefined;
+    try {
+      expect(await f.h.store.read(f.base.identity.personId)).toMatchObject({
+        phase: 'starting',
+        leaseEpoch: 1,
+      });
+      second = f.assembly.port.prewarm(
+        follower,
+        f.base.identity,
+        'input',
+        signal(),
+        signal(),
+      );
+      void second.catch(() => {});
+      await vi.waitFor(() =>
+        expect(f.readCoordination).toHaveBeenCalledTimes(2),
+      );
+      await f.readCoordination.mock.results[1]!.value;
+      expect(f.vm).toHaveBeenCalledTimes(1);
+      if (leaderOutcome !== 'completes') cancelled.abort(Error(leaderOutcome));
+      expect(f.vm.mock.calls[0]![2].aborted).toBe(false);
+    } finally {
+      release.resolve();
+      await outcomes;
+      await second?.catch(() => {});
+    }
+    await expect(second).resolves.toBeInstanceOf(AbortSignal);
+    if (leaderOutcome === 'completes') {
+      expect(await first).toBeInstanceOf(AbortSignal);
+      expect(await first).not.toBe(await second);
+    } else await expect(first).rejects.toBe(cancelled.signal.reason);
     expect(f.vm).toHaveBeenCalledTimes(1);
-    leader.abort(new DataAccessError('authorization_denied'));
-    expect(f.vm.mock.calls[0]![2].aborted).toBe(false);
-  } finally {
-    release.resolve();
-    await outcomes;
-    await second?.catch(() => {});
-  }
-  await expect(first).rejects.toBe(leader.signal.reason);
-  await expect(second).resolves.toBeInstanceOf(AbortSignal);
-  expect(f.vm).toHaveBeenCalledTimes(1);
-  expect(f.start).toHaveBeenCalledTimes(1);
-  expect(prove).toHaveBeenCalledExactlyOnceWith(
-    follower,
-    f.base.identity,
-    expect.any(AbortSignal),
-  );
-  expect(f.stop).not.toHaveBeenCalled();
-});
+    expect(f.start).toHaveBeenCalledTimes(1);
+    const provedRequests = prove.mock.calls
+      .map(([context]) => context.requestId)
+      .sort();
+    const expectedRequests =
+      leaderOutcome === 'completes'
+        ? [f.base.context.requestId, follower.requestId]
+        : [follower.requestId];
+    expect(provedRequests).toEqual(expectedRequests.sort());
+    expect(f.stop).not.toHaveBeenCalled();
+  },
+);
 
 it.each(['login', 'employee'])(
   'does not reuse completed prewarm work or share in-flight work across a different %s',
@@ -367,10 +383,10 @@ it.each(['login', 'employee'])(
   },
 );
 
-it('fails closed if the policy revision changes before confirming a shared result', async () => {
+it('fails closed if a newer authority revision replaces the flight revision before confirmation', async () => {
   const f = fixture(true);
   f.readCoordination.mockImplementationOnce(async () => ({
-    policyRevision: 'pending',
+    authorityRevision: 'pending',
     vm: null,
   }));
   const run = () =>

@@ -30,27 +30,41 @@ type Generation = {
   leaseEpoch: number;
 };
 type VmStamp = Generation & { phase: PersonVmView['phase'] };
-type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string | number };
-type Coordination = { policyRevision: string; vm: VmStamp | null };
+type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
+type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
 type ReadCoordination = (identity: DEntryIdentity) => Promise<Coordination>;
 
-async function readCurrentCoordination(identity: DEntryIdentity) {
-  const sql = getDatabase();
-  const [policy, [vm]] = await Promise.all([
-    readDEntryReleasePolicy(sql),
-    sql<
-      VmStampRow[]
-    >`select vm_id as "vmId", instance_id as "instanceId", phase,
-      lease_epoch as "leaseEpoch" from person_virtual_machines
-      where person_id=${identity.personId} and organization_id=${identity.organizationId}`,
-  ]);
-  if (selectDEntryGeneration(policy, identity) !== '4.0')
-    throw new DataAccessError('authorization_denied');
-  return {
-    policyRevision: policy.revision,
-    vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
-  };
-}
+const readCurrentCoordination: ReadCoordination = (identity) =>
+  getDatabase().begin(
+    'isolation level repeatable read read only',
+    async (sql) => {
+      const policy = await readDEntryReleasePolicy(sql);
+      if (selectDEntryGeneration(policy, identity) !== '4.0')
+        throw new DataAccessError('authorization_denied');
+      const [snapshot] = await sql<
+        { vm: VmStampRow | null; grants: string[] }[]
+      >`
+      select (select row_to_json(stamp) from (
+        select vm_id as "vmId", instance_id as "instanceId", phase,
+          lease_epoch::text as "leaseEpoch" from person_virtual_machines
+        where person_id=${identity.personId} and organization_id=${identity.organizationId}
+      ) stamp) as vm,
+      array(select m.id::text || ':' || m.xmin::text from allrice_memberships m
+        where m.user_id=${identity.personId} and m.organization_id=${identity.organizationId}
+          and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=${identity.workspaceId})
+        order by m.id) as grants`;
+      const { vm, grants } = snapshot!;
+      return {
+        // Tuple versions partition reuse across a revoke/regrant even if the
+        // restored membership has the same role. They never grant authority.
+        authorityRevision: grants.length
+          ? JSON.stringify([policy.revision, grants])
+          : null,
+        vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
+      };
+    },
+  );
 
 function targetGeneration(vm: VmStamp | null): Generation | undefined {
   if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
@@ -77,7 +91,7 @@ function completedGeneration(
   target: Generation,
 ) {
   if (
-    stamp.policyRevision !== revision ||
+    stamp.authorityRevision !== revision ||
     stamp.vm?.phase !== 'running' ||
     !stamp.vm.instanceId ||
     !result.ready ||
@@ -99,18 +113,6 @@ function prewarmKey(
   identity: DEntryIdentity,
   revision: string,
 ) {
-  // These freshly authenticated snapshots only partition reuse. The original
-  // watcher and the live database checks still decide whether each caller has
-  // authority, including when the snapshot never sees a transient change.
-  const memberships = context.memberships
-    .filter(
-      (entry) =>
-        entry.organizationId === identity.organizationId &&
-        (entry.workspaceId === null ||
-          entry.workspaceId === identity.workspaceId),
-    )
-    .map((entry) => [entry.id, entry.workspaceId, entry.role, entry.active])
-    .sort();
   return JSON.stringify([
     context.sessionId,
     context.workspaceId,
@@ -122,7 +124,6 @@ function prewarmKey(
     identity.employeeVersionId,
     identity.threadId,
     revision,
-    memberships,
   ]);
 }
 
@@ -253,21 +254,22 @@ export function createDEntryNativePrewarmPort(input: {
         const read = input.readCoordination;
         const stamp = await read?.(identity);
         active.throwIfAborted();
+        const revision = stamp?.authorityRevision;
         const target = stamp && targetGeneration(stamp.vm);
         const start = (signal: AbortSignal) =>
           input.prewarmCurrent(context, identity, { trigger }, signal);
         const flight =
-          read && stamp && target
+          read && revision && target
             ? shared({
-                key: prewarmKey(context, identity, stamp.policyRevision),
+                key: prewarmKey(context, identity, revision),
                 target,
-                starting: stamp.vm?.phase === 'starting',
+                starting: stamp?.vm?.phase === 'starting',
                 revoked,
                 start,
                 async confirm(result, flight) {
                   return completedGeneration(
                     await read(identity),
-                    stamp.policyRevision,
+                    revision,
                     result,
                     flight.target,
                   );
@@ -283,10 +285,10 @@ export function createDEntryNativePrewarmPort(input: {
         )
           throw new DataAccessError('authorization_denied');
         const proof = await prove?.(context, identity, active);
-        if (flight && read && stamp)
+        if (flight && read && revision)
           completedGeneration(
             await read(identity),
-            stamp.policyRevision,
+            revision,
             result,
             flight.target,
           );
