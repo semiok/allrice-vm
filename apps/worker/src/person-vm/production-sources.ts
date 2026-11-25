@@ -124,7 +124,10 @@ export function createProductionPersonVmSources(
         lifetime.throwIfAborted();
         return {
           runtime: {
-            readiness: installed.readiness,
+            async readiness(binding, signal) {
+              await codex.assertCurrent(signal);
+              return installed.readiness(binding, signal);
+            },
             activity: owned.activity.bind(owned),
             async close() {
               const failures = await closeSources([

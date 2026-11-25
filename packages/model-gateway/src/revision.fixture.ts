@@ -299,6 +299,7 @@ export async function responsesFixture(
   return {
     provider: native.provider,
     binding: { ...modelBinding(), ...native.route },
+    url,
     requests,
     get active() {
       return active;

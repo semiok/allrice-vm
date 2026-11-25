@@ -179,12 +179,10 @@ export class GatewayLlmAdapter extends LlmAdapter {
         purpose,
       }),
     });
-    if (!response.ok || !response.body) {
-      await response.body?.cancel();
+    if (!response.body)
       throw new LlmError('Host gateway returned no stream', 'TRANSPORT', {
         status: response.status,
       });
-    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
