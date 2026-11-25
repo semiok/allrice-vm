@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:net';
 import type { RequestContext } from '@allrice/contracts';
 import type { PersonVmBinding } from '@allrice/person-vm';
-import { createEgressGateway } from './gateway.js';
+import { createEgressGateway, EgressPrepareRollbackError } from './gateway.js';
 import { createOkxMarketRoutes, createPackageMirrorRoutes } from './routes.js';
 import {
   EgressError,
@@ -46,7 +46,7 @@ async function freePort() {
 }
 async function fixture(
   extra: Partial<Parameters<typeof createEgressGateway>[0]> = {},
-  remove: () => Promise<void> = async () => {},
+  remove: (binding: PersonVmBinding) => Promise<void> = async () => {},
   allocate = false,
 ) {
   const port = allocate ? 0 : await freePort();
@@ -384,6 +384,74 @@ describe('trusted VM HTTP egress (VM and identity owners are explicit fixtures)'
     );
     fail = false;
   });
+  it('retires only the original unpublished binding after its rollback failed', async () => {
+    const f = await fixture();
+    const next = { ...binding, instanceId: 'instance-b', leaseEpoch: 2 };
+    const install = Error('installation failed');
+    const drain = Error('rollback failed');
+    await expect(
+      f.gateway.retireFailedPrepare(binding, signal()),
+    ).rejects.toMatchObject({
+      code: 'STALE_BINDING',
+    });
+    await expect(
+      f.gateway.assertActive(f.receipt, signal()),
+    ).resolves.toBeUndefined();
+    f.provisioner.install.mockRejectedValueOnce(install);
+    f.provisioner.remove.mockImplementation(
+      async (removed?: PersonVmBinding) => {
+        if (removed?.leaseEpoch === next.leaseEpoch) throw drain;
+      },
+    );
+    await expect(
+      f.gateway.prepare(next, { mount: f.mount, gatewayPorts: [] }, signal()),
+    ).rejects.toMatchObject({
+      name: 'EgressPrepareRollbackError',
+      errors: [install, expect.objectContaining({ errors: [drain] })],
+    });
+    f.provisioner.remove.mockClear();
+    await expect(
+      f.gateway.retireFailedPrepare(binding, signal()),
+    ).rejects.toMatchObject({
+      code: 'STALE_BINDING',
+    });
+    expect(f.provisioner.remove).not.toHaveBeenCalled();
+    await expect(f.gateway.retireFailedPrepare(next, signal())).rejects.toThrow(
+      'EGRESS_CLEANUP_INCOMPLETE',
+    );
+    f.provisioner.remove.mockResolvedValue(undefined);
+    await f.gateway.retireFailedPrepare(next, signal());
+    expect(f.provisioner.remove).toHaveBeenLastCalledWith(
+      next,
+      expect.any(AbortSignal),
+    );
+    await expect(
+      f.gateway.retireFailedPrepare(next, signal()),
+    ).rejects.toMatchObject({
+      code: 'STALE_BINDING',
+    });
+  });
+
+  it('returns the original installation AggregateError when rollback has joined', async () => {
+    const f = await fixture();
+    const next = { ...binding, instanceId: 'instance-b', leaseEpoch: 2 };
+    const install = new AggregateError(
+      [Error('write failure')],
+      'EGRESS_INSTALL_FAILED',
+    );
+    f.provisioner.install.mockRejectedValueOnce(install);
+    const failure = await f.gateway
+      .prepare(next, { mount: f.mount, gatewayPorts: [] }, signal())
+      .catch((error: unknown) => error);
+    expect(failure).toBe(install);
+    expect(failure).not.toBeInstanceOf(EgressPrepareRollbackError);
+    await expect(
+      f.gateway.retireFailedPrepare(next, signal()),
+    ).rejects.toMatchObject({
+      code: 'STALE_BINDING',
+    });
+  });
+
   it('terminates a failed native stream without writing a second response or hanging drain', async () => {
     let cancelled!: () => void;
     const cancellation = new Promise<void>((resolve) => {

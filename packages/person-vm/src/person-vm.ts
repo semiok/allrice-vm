@@ -98,6 +98,10 @@ export class PersonVmService
       observeOwnedStop?: (binding: PersonVmBinding) => void;
       ownsEgressReceipt?: (receipt: PersonVmEgressReceipt) => boolean;
       hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
+      settleSupersededBinding?: (
+        binding: PersonVmBinding,
+        signal: AbortSignal,
+      ) => Promise<void>;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
       cleanupTimeoutMs: number;
@@ -833,10 +837,32 @@ export class PersonVmService
       { now: this.now, ttlMs: this.options.leaseTtlMs },
       async (lease) => {
         const row = lease.row;
-        if (!row?.instanceId || !sameVmBinding(binding, bindingOf(row)))
+        if (
+          !row ||
+          row.personId !== binding.personId ||
+          row.organizationId !== binding.organizationId
+        )
           throw new PersonVmError('LEASE_LOST');
-        if (stopNative && row.phase === 'stopped' && !row.egressReceipt) return;
+        const current =
+          row.instanceId !== null && sameVmBinding(binding, bindingOf(row));
+        const superseded =
+          row.vmId !== binding.vmId || row.leaseEpoch > binding.leaseEpoch;
         const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+        if (
+          (!stopNative && superseded) ||
+          (current && row.phase === 'deleted')
+        ) {
+          await guard();
+          if (!this.options.settleSupersededBinding)
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          await this.options.settleSupersededBinding(
+            binding,
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
+          return;
+        }
+        if (!current) throw new PersonVmError('LEASE_LOST');
+        if (stopNative && row.phase === 'stopped' && !row.egressReceipt) return;
         await guard();
         if (!stopNative) {
           if (

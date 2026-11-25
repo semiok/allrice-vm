@@ -511,6 +511,10 @@ export function createAssignedNativeWebStartup(input: {
         owner,
       });
     },
+    hasLocalOwner(binding: PersonVmBinding) {
+      const group = running.get(binding.vmId);
+      return group !== undefined && sameVmBinding(group.binding, binding);
+    },
     /** Host catalog resource only. Its read method still rechecks VM authority.
      * It supplies no editor/send proof, native ancestry pin or browser credential. */
     owner(binding: PersonVmBinding, employeeInstanceId: string) {
@@ -559,6 +563,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       employeeInstanceId: string,
     ): AssignedNativeWebCatalog;
+    hasLocalOwner(binding: PersonVmBinding): boolean;
     owner(
       binding: PersonVmBinding,
       employeeInstanceId: string,

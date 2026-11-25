@@ -32,9 +32,16 @@ type BindingState = {
   server: Server;
   inflight: Set<Promise<unknown>>;
   active: boolean;
+  rollbackPending: boolean;
   installedMount: string | null;
   origin: string;
 };
+export class EgressPrepareRollbackError extends AggregateError {
+  constructor(prepare: unknown, rollback: unknown) {
+    super([prepare, rollback], 'EGRESS_PREPARE_FAILED', { cause: prepare });
+    this.name = 'EgressPrepareRollbackError';
+  }
+}
 function close(server: Server) {
   return new Promise<void>((resolve, reject) => {
     server.close((error) =>
@@ -378,7 +385,12 @@ export function createEgressGateway(
         'EGRESS_CLEANUP_INCOMPLETE',
       );
   }
-  const port: PersonVmEgressPort = {
+  const port: PersonVmEgressPort & {
+    retireFailedPrepare(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): Promise<void>;
+  } = {
     prepare(bindingInput, preparation, signal) {
       const binding = Object.freeze({ ...bindingInput });
       const gatewayPorts = Object.freeze([...preparation.gatewayPorts]);
@@ -435,6 +447,7 @@ export function createEgressGateway(
           controller: new AbortController(),
           inflight: new Set(),
           active: false,
+          rollbackPending: false,
           installedMount: null,
           server: createServer(),
           origin: endpoint.guestOrigin,
@@ -587,10 +600,26 @@ export function createEgressGateway(
           try {
             await retire(state, signal);
           } catch (cleanup) {
-            throw new AggregateError([error, cleanup], 'EGRESS_PREPARE_FAILED');
+            state.rollbackPending = true;
+            throw new EgressPrepareRollbackError(error, cleanup);
           }
           throw error;
         }
+      });
+    },
+    retireFailedPrepare(binding, signal) {
+      return serial(binding.vmId, async () => {
+        signal.throwIfAborted();
+        const state = states.get(binding.vmId);
+        if (
+          !state ||
+          state.active ||
+          !state.rollbackPending ||
+          !exact(state.receipt.binding, binding)
+        )
+          throw new EgressError('STALE_BINDING');
+        await retire(state, signal);
+        state.rollbackPending = false;
       });
     },
     async assertActive(receipt, signal) {

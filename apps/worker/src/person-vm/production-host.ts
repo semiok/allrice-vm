@@ -17,6 +17,7 @@ import {
   createPublicHttpsTransport,
   type EgressAuthority,
   EgressError,
+  EgressPrepareRollbackError,
   type EgressPolicy,
   type ManagedHostService,
 } from '@allrice/egress-gateway';
@@ -163,7 +164,10 @@ export function createProductionPersonVmHost(input: {
   >();
   let personVm: PersonVmService | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
-  const uncertainPreparation = new Map<PersonVmBinding, unknown>();
+  const uncertainPreparation = new Map<
+    PersonVmBinding,
+    EgressPrepareRollbackError
+  >();
   const independentCloseFailures: unknown[] = [];
   const modelOwnerId = randomUUID();
   let modelRecovery:
@@ -248,10 +252,7 @@ export function createProductionPersonVmHost(input: {
         const receipt = await gateway
           .prepare(binding, preparation, active)
           .catch((error: unknown) => {
-            // The gateway preserves a failed prepare plus failed retirement
-            // as AggregateError. Without its private receipt no outer owner can
-            // certify that unknown state closed; retain that original failure.
-            if (error instanceof AggregateError)
+            if (error instanceof EgressPrepareRollbackError)
               uncertainPreparation.set(binding, error);
             throw error;
           });
@@ -302,6 +303,40 @@ export function createProductionPersonVmHost(input: {
         (receipt) => () => egress.revoke(receipt, 'failure', cleanup),
       ),
     );
+  }
+  function hasUnconfirmedPreparation(binding: PersonVmBinding) {
+    return [...uncertainPreparation.keys()].some((pending) =>
+      sameVmBinding(pending, binding),
+    );
+  }
+  async function retireFailedPreparations() {
+    if (!uncertainPreparation.size || !providers) return [];
+    const signal = AbortSignal.timeout(
+      providers.configuration.lifecycle.cleanupTimeoutMs,
+    );
+    return collectFailures(
+      [...uncertainPreparation.keys()].map((binding) => async () => {
+        await requireGateway().retireFailedPrepare(binding, signal);
+        uncertainPreparation.delete(binding);
+      }),
+    );
+  }
+  async function settleSupersededBinding(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    for (const receipt of receipts)
+      if (sameVmBinding(receipt.binding, binding))
+        await egress.revoke(receipt, 'failure', signal);
+    signal.throwIfAborted();
+    if (
+      hasUnconfirmedPreparation(binding) ||
+      requireStartup().hasLocalOwner(binding)
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const retired = retiredReceipts.get(binding.personId);
+    if (retired && sameVmBinding(retired.binding, binding))
+      retiredReceipts.delete(binding.personId);
   }
   function stopOwnedVms() {
     const vm = personVm;
@@ -386,7 +421,8 @@ export function createProductionPersonVmHost(input: {
         modelFailures.length ||
         vmFailures.length ||
         receiptFailures.length ||
-        installationFailures.length
+        installationFailures.length ||
+        uncertainPreparation.size
       )
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       if (sourceOwner && !modelRecovery)
@@ -438,6 +474,7 @@ export function createProductionPersonVmHost(input: {
       await modelOwner.close();
       // Once the stop proof has been accepted, join cleanup even if the
       // maintenance request disconnects or the Worker lifetime has ended.
+      const prepareFailures = await retireFailedPreparations();
       const vmFailures = await stopOwnedVms();
       const receiptFailures = await retireReceipts();
       const providerOwner = providers;
@@ -457,12 +494,15 @@ export function createProductionPersonVmHost(input: {
       const errors = [
         ...independentCloseFailures,
         ...uncertainPreparation.values(),
+        ...prepareFailures,
         ...vmFailures,
         ...receiptFailures,
         ...installationFailures,
         ...sourceFailures,
       ];
       if (
+        !uncertainPreparation.size &&
+        !prepareFailures.length &&
         !vmFailures.length &&
         !receiptFailures.length &&
         !installationFailures.length &&
@@ -558,11 +598,8 @@ export function createProductionPersonVmHost(input: {
             if (sameReceipt(retained, receipt)) return true;
           return false;
         },
-        hasUnconfirmedEgress(binding) {
-          for (const pending of uncertainPreparation.keys())
-            if (sameVmBinding(pending, binding)) return true;
-          return false;
-        },
+        hasUnconfirmedEgress: hasUnconfirmedPreparation,
+        settleSupersededBinding,
         ...providers.configuration.lifecycle,
       });
       personVm = vm;
