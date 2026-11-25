@@ -703,6 +703,7 @@ export function createProductionPersonVmHost(input: {
         store,
         disk: providers.disk,
         native: providers.native,
+        hasLocalOwner: startup.hasLocalOwner,
         cliPath: web.cliPath,
         readonlyGuestDirectory: native.readonlyDshDirectory.guestDirectory,
       });

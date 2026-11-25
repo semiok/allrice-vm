@@ -1,9 +1,26 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  canFinishWorkerAfterModelRecovery,
   closeWorkerResources,
   startWorkerShutdownTask,
   WorkerShutdownError,
 } from './worker-shutdown.js';
+
+it('releases the maintenance pool only when the failed Host was the remaining owner', () => {
+  const failure = new Error('outstanding cleanup');
+  const shutdown = (...names: string[]) =>
+    new WorkerShutdownError(names.map((name) => ({ name, error: failure })));
+  expect(
+    canFinishWorkerAfterModelRecovery(shutdown('person_vm_host', 'database')),
+  ).toBe(true);
+  expect(
+    canFinishWorkerAfterModelRecovery(
+      shutdown('person_vm_host', 'harness', 'database'),
+    ),
+  ).toBe(false);
+  expect(canFinishWorkerAfterModelRecovery(shutdown('database'))).toBe(false);
+  expect(canFinishWorkerAfterModelRecovery(failure)).toBe(false);
+});
 
 const deferred = () => {
   let resolve!: () => void, reject!: (error: unknown) => void;

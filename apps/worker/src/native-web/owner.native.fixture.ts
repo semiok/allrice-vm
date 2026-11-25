@@ -578,6 +578,7 @@ export async function setupNativeWebFixture(
     cleanupTimeoutMs: 5000,
     beforePrompt,
   }).catch(async (error: unknown) => {
+    if (!isolateProfile) throw error;
     const patchRead = await access(tracePath).then(
       () => true,
       () => false,

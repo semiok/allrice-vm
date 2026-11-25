@@ -99,12 +99,7 @@ export async function reconcileNativeRunTerminals(
       const { scope, after } = retained;
       const haveLocalOwner = startup
         .runJournalOwners()
-        .some(
-          (location) =>
-            location.receipt.binding.vmId === scope.vmId &&
-            location.endpoint.employeeInstanceId === scope.employeeInstanceId &&
-            location.endpoint.employeeVersionId === scope.employeeRelease,
-        );
+        .some((location) => location.receipt.binding.vmId === scope.vmId);
       const page = haveLocalOwner
         ? null
         : await listDEntryNativeRunCandidates(scope, after, 4).catch(

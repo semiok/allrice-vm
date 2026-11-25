@@ -246,19 +246,25 @@ suite(
       const entered = latch(),
         observedLoss = latch(),
         finish = latch();
+      let physicalError: unknown;
       const result = own(
         store.withRetainedReadLease(h.binding, signal(), async (scope) => {
-          scope.signal.addEventListener('abort', observedLoss.resolve, {
-            once: true,
-          });
+          scope.signal.addEventListener(
+            'abort',
+            () => {
+              physicalError = scope.signal.reason;
+              observedLoss.resolve();
+            },
+            {
+              once: true,
+            },
+          );
           entered.resolve();
           await finish.promise;
           scope.signal.throwIfAborted();
         }),
       );
-      const rejected = expect(result).rejects.toMatchObject({
-        code: 'LEASE_LOST',
-      });
+      const rejected = result.catch((error: unknown) => error);
       await Promise.race([entered.promise, result]);
       const connection = h.physical.names.at(-1);
       const [backend] =
@@ -277,7 +283,10 @@ suite(
         ),
       ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
       finish.resolve();
-      await rejected;
+      expect(await rejected).toBe(physicalError);
+      expect(physicalError).toMatchObject({
+        message: 'VM_STORE_CONNECTION_LOST',
+      });
     });
     it('settles an old mount under the real PG lease without touching a peer-started VM', async () => {
       const h = await setup();

@@ -26,6 +26,18 @@ export class WorkerShutdownError extends AggregateError {
   }
 }
 
+/** A successful Host recovery can resolve its own failure and release the
+ * pool held for that recovery. Other failed Worker owners still need proof. */
+export function canFinishWorkerAfterModelRecovery(error: unknown) {
+  return (
+    error instanceof WorkerShutdownError &&
+    error.failures.some(({ name }) => name === 'person_vm_host') &&
+    error.failures.every(
+      ({ name }) => name === 'person_vm_host' || name === 'database',
+    )
+  );
+}
+
 /** This drains existing owners; it neither kills processes nor invents a new
  * lifecycle. Dependent stages stay ordered even when a prior stage rejects. */
 export async function closeWorkerResources(input: {

@@ -59,7 +59,10 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function fixture(options?: { cliPath?: string }) {
+function fixture(options?: {
+  cliPath?: string;
+  hasLocalOwner?: () => boolean;
+}) {
   const owner: DEntryNativeRunJournalOwner = {
     organizationId: randomUUID(),
     workspaceId: randomUUID(),
@@ -135,10 +138,11 @@ function fixture(options?: { cliPath?: string }) {
   let diskReads = 0;
 
   const store: Inputs['store'] = {
-    async withRetainedReadLease(bound, signal, work) {
+    async withRetainedReadLease(bound, signal, work, mayClaim) {
       expect(bound).toEqual(binding);
       expect(signal).toBe(caller.signal);
       expect(holding).toBe(false);
+      if (!mayClaim?.()) throw new Error('existing VM owner');
       holding = true;
       log.push('lease');
       try {
@@ -193,11 +197,12 @@ function fixture(options?: { cliPath?: string }) {
     log.push('scope');
     return true;
   });
-  io.publish.mockImplementation(async (run, terminal, signal) => {
+  io.publish.mockImplementation(async (run, terminal, signal, authority) => {
     expect(holding).toBe(true);
     expect(run).toBe(candidate);
     expect(terminal).toEqual(end);
     expect(signal).toBe(active);
+    expect(authority).toEqual({ owner, leaseOwner });
     log.push('publish');
     return true;
   });
@@ -206,6 +211,7 @@ function fixture(options?: { cliPath?: string }) {
     store,
     disk,
     native,
+    hasLocalOwner: options?.hasLocalOwner ?? (() => false),
     cliPath,
     readonlyGuestDirectory,
   });
@@ -234,11 +240,12 @@ it('uses the fixed Worker artifact and waits for the original Run write before r
   const f = fixture();
   const receipt = deferred<boolean>();
   const entered = deferred<void>();
-  io.publish.mockImplementation(async (run, end, active) => {
+  io.publish.mockImplementation(async (run, end, active, authority) => {
     expect(f.holding()).toBe(true);
     expect(run).toBe(f.candidate);
     expect(end).toEqual(f.end);
     expect(active).toBe(f.active);
+    expect(authority).toEqual({ owner: f.owner, leaseOwner: f.leaseOwner });
     f.log.push('publish');
     entered.resolve();
     const applied = await receipt.promise;
@@ -370,5 +377,19 @@ it('rejects a CLI outside the verified DSH directory before a lease or artifact 
   await expect(f.run()).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
   expect(f.log).toEqual([]);
   expect(io.artifact).not.toHaveBeenCalled();
+  expect(io.publish).not.toHaveBeenCalled();
+});
+
+it('does not take a read lease if another profile on the physical VM is owned', async () => {
+  const existing = fixture({ hasLocalOwner: () => true });
+  await expect(existing.run()).resolves.toBe(false);
+  expect(existing.log).toEqual([]);
+  expect(io.artifact).not.toHaveBeenCalled();
+
+  const duringClaim = fixture({
+    hasLocalOwner: vi.fn().mockReturnValueOnce(false).mockReturnValue(true),
+  });
+  await expect(duringClaim.run()).rejects.toThrow('existing VM owner');
+  expect(duringClaim.log).toEqual([]);
   expect(io.publish).not.toHaveBeenCalled();
 });

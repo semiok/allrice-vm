@@ -40,6 +40,7 @@ export function createRetainedNativeRunReconciler(input: {
   store: Pick<PostgresPersonVmStore, 'withRetainedReadLease'>;
   disk: Pick<ApfsPersonVmDisk, 'verifyAttachedMount'>;
   native: Pick<MicrosandboxPersonVm, 'readAttachedProbe'>;
+  hasLocalOwner(binding: PersonVmBinding): boolean;
   cliPath: string;
   readonlyGuestDirectory: string;
 }) {
@@ -50,6 +51,14 @@ export function createRetainedNativeRunReconciler(input: {
     signal: AbortSignal,
   ) => {
     signal.throwIfAborted();
+    const binding: PersonVmBinding = {
+      vmId: owner.vmId,
+      personId: owner.personId,
+      organizationId: owner.organizationId,
+      instanceId: owner.vmInstanceId,
+      leaseEpoch: owner.leaseEpoch,
+    };
+    if (input.hasLocalOwner(binding)) return false;
     if (!input.cliPath.startsWith(input.readonlyGuestDirectory + '/'))
       throw new PersonVmError('PROVIDER_FAILED');
     probeSource ??= readFile(
@@ -61,13 +70,6 @@ export function createRetainedNativeRunReconciler(input: {
     });
     const program = await probeSource;
     signal.throwIfAborted();
-    const binding: PersonVmBinding = {
-      vmId: owner.vmId,
-      personId: owner.personId,
-      organizationId: owner.organizationId,
-      instanceId: owner.vmInstanceId,
-      leaseEpoch: owner.leaseEpoch,
-    };
     return input.store.withRetainedReadLease(
       binding,
       signal,
@@ -121,6 +123,7 @@ export function createRetainedNativeRunReconciler(input: {
           leaseOwner: lease.leaseOwner,
         });
       },
+      () => !input.hasLocalOwner(binding),
     );
   };
 }

@@ -170,7 +170,12 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   );
   expect(plan.initialize).toBe(f.memory.initialize);
   expect(plan.launcher).toBe(f.memory.launcher);
-  expect(plan.files).toHaveLength(1 + 4 * f.web.receipt.endpoints.length);
+  expect(plan.files).toHaveLength(1 + 5 * f.web.receipt.endpoints.length);
+  expect(
+    plan.files.filter(({ path }) =>
+      path.endsWith('/allrice-native-run-journal.mjs'),
+    ),
+  ).toHaveLength(f.web.receipt.endpoints.length);
   await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
   expect(f.memoryGuestPlan).toHaveBeenCalledTimes(1);
   expect(open).toHaveBeenCalledTimes(2);

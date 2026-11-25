@@ -286,6 +286,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
       scope: PersonVmStartingScope & Readonly<{ leaseOwner: string }>,
       disk: PersonDisk,
     ) => Promise<T>,
+    mayClaim: () => boolean = () => true,
   ): Promise<T> {
     signal.throwIfAborted();
     const exact = Object.freeze({ ...binding });
@@ -342,6 +343,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         ) as busy`;
           if (permits?.busy !== false) throw new PersonVmError('VM_ACTIVE');
           active.throwIfAborted();
+          if (!mayClaim()) throw new PersonVmError('VM_ACTIVE');
           await tx`update person_virtual_machines
           set lease_owner=${leaseOwner}, lease_expires_at=clock_timestamp() + interval '30 seconds'
           where person_id=${exact.personId}`;

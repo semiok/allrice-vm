@@ -92,6 +92,7 @@ import { configuredDshNativeLaunch } from './harness/dsh/runtime-pool.js';
 import { fileURLToPath } from 'node:url';
 import { closeHarnessAdapters, getHarnessRouter } from './harness/router.js';
 import {
+  canFinishWorkerAfterModelRecovery,
   closeWorkerResources,
   startWorkerShutdownTask,
   WorkerShutdownError,
@@ -479,13 +480,32 @@ export async function recoverProductionPersonVmModelOwner(
   if (result.state !== 'installed')
     throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
   const released = await result.host.recoverModelOwner(context, signal);
-  if (stopping && !shutdownStatus) {
-    // The original drain closed its other owners before deciding whether the
-    // shared pool can end. With a stop receipt, the socket owns this request
-    // until it returns and the Worker owns pool closure.
-    await shutdownTask?.catch(() => {});
-    if (!shutdownStatus && !result.host.modelOwnerMaintenancePending())
-      await closeDatabase();
+  const receipt = shutdownStatus;
+  if (
+    stopping &&
+    receipt?.state === 'drain-failed' &&
+    !result.host.modelOwnerMaintenancePending() &&
+    canFinishWorkerAfterModelRecovery(
+      await shutdownTask?.catch((error: unknown) => error),
+    )
+  ) {
+    shutdownStatus = undefined;
+    const endpoint = recoveryEndpoint;
+    // This request owns the socket until it returns. Join it outside the
+    // handler before closing the pool shared by other maintenance requests.
+    void (async () => {
+      try {
+        if (endpoint) await (await endpoint).close();
+        if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
+        await closeDatabase();
+        process.exitCode = 0;
+      } catch {
+        shutdownStatus = receipt;
+        if (recoveryEndpoint === endpoint) recoveryEndpoint = undefined;
+        console.error('[MET-273] Worker closure after recovery is unconfirmed');
+        await keepLocalShutdownMaintenance(result.host);
+      }
+    })();
   }
   return released;
 }
