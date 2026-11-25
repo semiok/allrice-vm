@@ -240,3 +240,31 @@ it('refuses guessed and revoked references and does not fetch without an exact s
   expect(fetch).not.toHaveBeenCalled();
   lifetime.abort();
 });
+
+it('binds the one-use reference to its exact adapter response recipient', async () => {
+  const controller = new AbortController();
+  const binding = modelBinding();
+  const refs = createNativeModelCallReferences(
+    { assertCall: async () => {} },
+    controller.signal,
+  );
+  const recipient = 'a'.repeat(43);
+  const reference = await refs.issue(binding, controller.signal, recipient);
+  const headers = {
+    [MODEL_CALL_REFERENCE_HEADER]: reference,
+    'x-allrice-model-call-recipient': recipient,
+  };
+  await expect(
+    refs.resolveCall(
+      { ...headers, 'x-allrice-model-call-recipient': 'b'.repeat(43) },
+      binding.vm,
+      controller.signal,
+    ),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  await expect(
+    refs.resolveCall(headers, binding.vm, controller.signal),
+  ).resolves.toEqual(binding);
+  await expect(
+    refs.resolveCall(headers, binding.vm, controller.signal),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+});

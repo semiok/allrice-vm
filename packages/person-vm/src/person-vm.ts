@@ -22,6 +22,7 @@ import {
 import { PersonVmAdmissionHost } from './admission-host.ts';
 import {
   checkAdmissionBinding,
+  rowBinding,
   PostgresPersonVmAdmissionStore,
 } from './admission-store.ts';
 import type { PersonVmNativeActivityPort } from './admission-contract.ts';
@@ -74,6 +75,7 @@ export class PersonVmService
   implements PersonVmHostPort, PersonVmAdmissionBindingPort
 {
   private admissionHost?: PersonVmAdmissionHost;
+  private workerDrain = false;
   private admissionShared?: PostgresPersonVmAdmissionStore;
   private readonly now: () => Date;
   private readonly currentLease = new AsyncLocalStorage<{
@@ -181,6 +183,8 @@ export class PersonVmService
       action,
       signal,
     );
+    if (this.workerDrain && (action === 'create' || action === 'start'))
+      throw new PersonVmError('RUNTIME_NOT_READY');
     if (
       !UuidSchema.safeParse(identity.personId).success ||
       identity.organizationId !== context.organizationId ||
@@ -464,6 +468,7 @@ export class PersonVmService
     lease: VmLease,
     signal: AbortSignal,
   ) {
+    if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const row = this.required(lease.row);
     if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row)))
       throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -875,6 +880,12 @@ export class PersonVmService
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (row.instanceId) this.options.observeOwnedStop?.(bindingOf(row));
   }
+  fenceWorkerStartup() {
+    this.workerDrain = true;
+    return () => {
+      this.workerDrain = false;
+    };
+  }
   /** A shutdown probe is read-only. Unknown native activity leaves the
    * process and its current owners alive for a later stop attempt. */
   async assertWorkerShutdownSafe(
@@ -894,6 +905,25 @@ export class PersonVmService
     if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
     const state = await this.options.native.status(binding, signal);
     signal.throwIfAborted();
+    if (this.admissionShared) {
+      const admission = this.admissionShared;
+      await admission.transaction(
+        binding.personId,
+        signal,
+        async (tx) => {
+          if (!sameVmBinding(rowBinding(tx.row), binding) || tx.row.lease_owner)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if ((tx.row.holds as unknown[]).length)
+            throw new PersonVmError('VM_ACTIVE');
+          for (const participant of ['gateway', 'entry'] as const) {
+            const counts = await admission.counts(tx, participant);
+            if (counts.active || counts.queued)
+              throw new PersonVmError('VM_ACTIVE');
+          }
+        },
+        true,
+      );
+    }
     // Production has no public VM-wide autonomous freeze/drain witness.
     // A running VM remains with its current owner, even after SIGTERM.
     if (state !== 'stopped' && state !== 'absent')

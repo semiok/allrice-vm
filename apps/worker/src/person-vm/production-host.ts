@@ -169,6 +169,7 @@ export function createProductionPersonVmHost(input: {
     { binding: PersonVmBinding; stopNative: boolean }
   >();
   let personVm: PersonVmService | undefined;
+  let gracefulStop = false;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
     PersonVmBinding,
@@ -357,7 +358,7 @@ export function createProductionPersonVmHost(input: {
     );
     return collectFailures(
       targets.map(({ binding, stopNative }) => async () => {
-        await vm.shutdownOwned(binding, stopNative);
+        await vm.shutdownOwned(binding, gracefulStop ? false : stopNative);
         ownedVms.delete(binding.personId);
       }),
     );
@@ -805,8 +806,15 @@ export function createProductionPersonVmHost(input: {
       lifetime.throwIfAborted();
       return Object.freeze({
         async assertWorkerShutdownSafe(signal: AbortSignal) {
-          for (const { binding, stopNative } of ownedVms.values()) {
-            if (stopNative) await vm.assertWorkerShutdownSafe(binding, signal);
+          if (gracefulStop) return;
+          const reopen = vm.fenceWorkerStartup();
+          try {
+            for (const { binding } of ownedVms.values())
+              await vm.assertWorkerShutdownSafe(binding, signal);
+            gracefulStop = true;
+          } catch (error) {
+            reopen();
+            throw error;
           }
         },
         close,

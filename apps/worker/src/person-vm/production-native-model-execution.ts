@@ -296,7 +296,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           ]);
           const watch = await watchDEntryNativeAuthority(
             context,
-            identity,
+            {
+              workspaceId: identity.workspaceId,
+              employeeInstanceId: identity.employeeInstanceId,
+              threadId: identity.threadId,
+            },
             identity,
             watching,
           );
