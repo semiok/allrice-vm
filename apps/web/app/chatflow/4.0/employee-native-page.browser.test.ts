@@ -68,7 +68,9 @@ suite('4.0 browser cold entry', () => {
             .writeHead(200, { 'content-type': 'application/json' })
             .end(JSON.stringify(body));
         const html = (body: string) =>
-          response.writeHead(200, { 'content-type': 'text/html' }).end(body);
+          response
+            .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            .end(body);
         if (address.pathname === '/api/v1/d-entry/native-prewarm') {
           warmCalls.push(await readJson(request));
           if (warmCalls.length === 1) return response.writeHead(503).end();
