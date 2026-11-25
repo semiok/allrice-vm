@@ -93,6 +93,8 @@ export class PersonVmService
       nativeWeb?: PersonVmWebRosterPort;
       /** Register the exact saved epoch before a start can touch its disk. */
       observeOwnedStart?: (binding: PersonVmBinding) => void;
+      /** A retained epoch may acquire a mount without owning its native job. */
+      observeOwnedMount?: (binding: PersonVmBinding) => void;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
       cleanupTimeoutMs: number;
@@ -394,11 +396,13 @@ export class PersonVmService
   private async mounted(row: VmRecord, signal: AbortSignal, lease: VmLease) {
     if ((await this.reconcileDisk(row, signal, lease)).state !== 'ready')
       throw new PersonVmError('PROVIDER_FAILED');
+    const binding = bindingOf(row);
+    this.options.observeOwnedMount?.(binding);
     const mount = await this.options.disk.attach(
       { vmId: row.vmId, tier: row.diskTier },
       signal,
     );
-    await this.options.native.prepare(bindingOf(row), mount, signal);
+    await this.options.native.prepare(binding, mount, signal);
     return mount;
   }
   private async ready(row: VmRecord, signal: AbortSignal) {
@@ -740,6 +744,7 @@ export class PersonVmService
     row: VmRecord,
     lease: VmLease,
     reason: 'stop' | 'failure' | 'takeover' | 'delete',
+    stopNative = true,
   ) {
     let failed = false;
     let egressJoined = true;
@@ -764,7 +769,7 @@ export class PersonVmService
       if (row.instanceId) {
         await this.mounted(row, signal, lease);
         const binding = bindingOf(row);
-        await this.options.native.stop(binding, signal);
+        if (stopNative) await this.options.native.stop(binding, signal);
         const state = await this.options.native.status(binding, signal);
         stopped = state === 'stopped' || state === 'absent';
         if (state === 'stopped') row.nativeCreated = true; // Native create may have committed before a failed host save/ack.
@@ -806,7 +811,7 @@ export class PersonVmService
   /** Internal Worker shutdown after its ingress and selection owners are fenced.
    * Only the exact epoch previously prepared by that Host can be stopped here.
    * The lease and physical readback are shared with the ordinary lifecycle. */
-  async shutdownOwned(binding: PersonVmBinding) {
+  async shutdownOwned(binding: PersonVmBinding, stopNative = true) {
     await this.options.store.withLease(
       binding.personId,
       { now: this.now, ttlMs: this.options.leaseTtlMs },
@@ -814,12 +819,19 @@ export class PersonVmService
         const row = lease.row;
         if (!row?.instanceId || !sameVmBinding(binding, bindingOf(row)))
           throw new PersonVmError('LEASE_LOST');
-        if (row.phase === 'stopped' && !row.egressReceipt) return;
+        if (stopNative && row.phase === 'stopped' && !row.egressReceipt) return;
         const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
         await guard();
+        if (!stopNative) {
+          const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
+          await this.mounted(row, signal, lease);
+          const state = await this.options.native.status(binding, signal);
+          if (state !== 'stopped' && state !== 'absent')
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+        }
         // Revocation fences business admission, not cleanup of the exact
         // physical owner already selected under this same exclusive lease.
-        await this.cleanup(row, { ...lease, guard }, 'stop');
+        await this.cleanup(row, { ...lease, guard }, 'stop', stopNative);
       },
     );
   }

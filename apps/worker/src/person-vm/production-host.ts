@@ -156,7 +156,10 @@ export function createProductionPersonVmHost(input: {
   });
   const pending = new Set<Promise<unknown>>();
   const receipts = new Set<PersonVmEgressReceipt>();
-  const ownedVms = new Map<string, PersonVmBinding>();
+  const ownedVms = new Map<
+    string,
+    { binding: PersonVmBinding; stopNative: boolean }
+  >();
   let personVm: PersonVmService | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation: unknown[] = [];
@@ -295,8 +298,8 @@ export function createProductionPersonVmHost(input: {
     const vm = personVm;
     if (!vm) return Promise.resolve([]);
     return collectFailures(
-      [...ownedVms.values()].map((binding) => async () => {
-        await vm.shutdownOwned(binding);
+      [...ownedVms.values()].map(({ binding, stopNative }) => async () => {
+        await vm.shutdownOwned(binding, stopNative);
         ownedVms.delete(binding.personId);
       }),
     );
@@ -514,7 +517,22 @@ export function createProductionPersonVmHost(input: {
         runtime,
         egress,
         observeOwnedStart(binding) {
-          ownedVms.set(binding.personId, Object.freeze({ ...binding }));
+          ownedVms.set(binding.personId, {
+            binding: Object.freeze({ ...binding }),
+            stopNative: true,
+          });
+        },
+        observeOwnedMount(binding) {
+          const existing = ownedVms.get(binding.personId);
+          if (
+            existing?.binding.vmId === binding.vmId &&
+            existing.binding.leaseEpoch >= binding.leaseEpoch
+          )
+            return;
+          ownedVms.set(binding.personId, {
+            binding: Object.freeze({ ...binding }),
+            stopNative: false,
+          });
         },
         ...providers.configuration.lifecycle,
       });

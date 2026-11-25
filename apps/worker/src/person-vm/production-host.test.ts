@@ -708,6 +708,44 @@ it('tracks a start that fails at disk attach before egress preparation', async (
   await expect(value.host.close()).resolves.toBeUndefined();
 });
 
+it('retains the mount of an older epoch without stopping its unowned native job', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const row = await value.memory.read(context.actor.id);
+  if (!row) throw Error('missing setup VM');
+  value.memory.rows.set(context.actor.id, {
+    ...row,
+    phase: 'failed',
+    instanceId: randomUUID(),
+    nativeCreated: true,
+    leaseEpoch: 3,
+  });
+
+  const status = vi.mocked(providers.native.status);
+  status.mockRejectedValueOnce(Error('synthetic retained VM status failure'));
+  await expect(vm.start(context, signal())).rejects.toThrow(
+    'synthetic retained VM status failure',
+  );
+  expect(providers.disk.attach).toHaveBeenCalled();
+  expect(value.prepare).not.toHaveBeenCalled();
+  status.mockResolvedValue('running');
+  await expect(value.host.close()).rejects.toMatchObject({
+    errors: [expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' })],
+  });
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+  expect(providers.native.stop).not.toHaveBeenCalled();
+  expect(providers.disk.detach).not.toHaveBeenCalled();
+
+  status.mockResolvedValue('stopped');
+  await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
+    0,
+  );
+  expect(providers.native.stop).not.toHaveBeenCalled();
+  expect(providers.disk.detach).toHaveBeenCalledOnce();
+  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+});
+
 it('a stale persisted service receipt cannot remove a retained newer epoch from Host cleanup', async () => {
   const value = await receiptFixture(),
     vm = value.input().vm,
