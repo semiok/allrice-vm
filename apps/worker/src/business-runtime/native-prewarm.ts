@@ -119,9 +119,8 @@ function matchingGeneration(
   result: PersonVmView,
   target: Generation,
 ) {
-  if (stamp.authorityRevision !== revision)
-    throw new PersonVmError('LEASE_LOST');
   if (
+    stamp.authorityRevision !== revision ||
     stamp.vm?.phase !== 'running' ||
     !stamp.vm.instanceId ||
     !result.ready ||
@@ -317,19 +316,36 @@ export function createDEntryNativePrewarmPort(input: {
             result.organizationId !== identity.organizationId
           )
             throw new DataAccessError('authorization_denied');
-          const proof = await prove?.(context, identity, active);
-          if (
-            generation &&
-            read &&
-            revision &&
-            !matchingGeneration(
-              await read(identity),
-              revision,
-              result,
-              generation,
-            )
-          )
-            return;
+          const sameGeneration = async () =>
+            !generation ||
+            !read ||
+            !revision ||
+            Boolean(
+              matchingGeneration(
+                await read(identity),
+                revision,
+                result,
+                generation,
+              ),
+            );
+          let proof: AbortSignal | undefined;
+          try {
+            proof = await prove?.(context, identity, active);
+          } catch (error) {
+            active.throwIfAborted();
+            const missingOwner =
+              error instanceof DEntryNativeUnavailable ||
+              (error instanceof PersonVmError &&
+                [
+                  'NOT_FOUND',
+                  'LEASE_CONFLICT',
+                  'LEASE_LOST',
+                  'RUNTIME_NOT_READY',
+                ].includes(error.code));
+            if (missingOwner && !(await sameGeneration())) return;
+            throw error;
+          }
+          if (!(await sameGeneration())) return;
           active.throwIfAborted();
           return { proof };
         }

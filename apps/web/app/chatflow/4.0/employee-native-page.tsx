@@ -44,6 +44,7 @@ const closingNoticeMs = 10_000;
 type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
+  expiresAt: number;
 };
 
 async function waitForVisibleEntry(signal: AbortSignal) {
@@ -330,9 +331,16 @@ export function EmployeeNativePage({
           // for the selected thread while the old page joins its transport.
           // This request has no page-carrier or thread-creation side effect.
           const lifetime = new AbortController();
-          const result = prewarmEmployeeEntry(next.data, lifetime.signal);
+          const expiresAt = performance.now() + entryWaitMs;
+          const result = prewarmEmployeeEntry(
+            next.data,
+            AbortSignal.any([
+              lifetime.signal,
+              AbortSignal.timeout(entryWaitMs),
+            ]),
+          );
           void result.catch(() => {}); // the next activation reports the result
-          nextWarmup = { lifetime, result };
+          nextWarmup = { lifetime, result, expiresAt };
         }
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
@@ -387,7 +395,11 @@ export function EmployeeNativePage({
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
-          timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+          const remaining = activation.warmup
+            ? activation.warmup.expiresAt - performance.now()
+            : entryWaitMs;
+          if (remaining <= 0) throw new EmployeeEntryError(503);
+          timer = window.setTimeout(() => finish('failed'), remaining);
           await (activation.warmup?.result ??
             prewarmEmployeeEntry(selection, lifetime.signal));
         })

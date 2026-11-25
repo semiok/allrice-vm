@@ -383,12 +383,20 @@ it.each(['login', 'employee'])(
   },
 );
 
-it('fails closed if a newer authority revision replaces the flight revision before confirmation', async () => {
+it('requalifies a waiter through the existing lease after the shared authority version changes', async () => {
   const f = fixture(true);
-  f.readCoordination.mockImplementationOnce(async () => ({
-    authorityRevision: 'pending',
-    vm: null,
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  let authorityRevision = 'grant-1';
+  f.readCoordination.mockImplementation(async () => ({
+    authorityRevision,
+    vm: await f.h.store.read(f.base.identity.personId),
   }));
+  f.vm.mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return f.runPrewarm(...args);
+  });
   const run = () =>
     f.assembly.port.prewarm(
       f.base.context,
@@ -397,8 +405,21 @@ it('fails closed if a newer authority revision replaces the flight revision befo
       signal(),
       signal(),
     );
-  await expect(run()).rejects.toMatchObject({ code: 'LEASE_LOST' });
-  await expect(run()).resolves.toBeUndefined();
+  const first = run();
+  void first.catch(() => {});
+  await entered.promise;
+  const second = run();
+  const outcomes = Promise.all([first, second]);
+  void outcomes.catch(() => {});
+  try {
+    await vi.waitFor(() => expect(f.readCoordination).toHaveBeenCalledTimes(2));
+    await f.readCoordination.mock.results[1]!.value;
+    expect(f.vm).toHaveBeenCalledTimes(1);
+    authorityRevision = 'grant-2';
+  } finally {
+    release.resolve();
+    await expect(outcomes).resolves.toEqual([undefined, undefined]);
+  }
   expect(f.vm).toHaveBeenCalledTimes(2);
   expect(f.start).toHaveBeenCalledTimes(1);
 });
@@ -461,7 +482,7 @@ it('falls back to the existing lease if a ready shared epoch changes during the 
     .mockImplementationOnce(async () => {
       f.h.states.set(old.vmId, 'stopped');
       await f.h.service.stop(context, signal());
-      return signal();
+      throw new PersonVmError('NOT_FOUND');
     });
   const uninstall = installDEntryNativeDataPort({
     ...f.base.data,
