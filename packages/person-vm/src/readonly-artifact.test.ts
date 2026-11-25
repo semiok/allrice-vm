@@ -20,11 +20,15 @@ import {
   assertReadonlyArtifactInspection,
   COMMAND_MEMORY_CONTROL_FILES,
   checkedReadonlyDshDirectory,
+  checkedReadonlyDshRuntimeDisk,
+  createReadonlyDshDiskVerifier,
   hashCommandMemoryControlFiles,
   readonlyArtifactReference,
+  selectedReadonlyRuntimeDisk,
   verifyReadonlyCommandMemoryDirectory,
   verifyReadonlyDshDirectory,
   type ReadonlyDshDirectory,
+  type ReadonlyDshRuntimeDisk,
 } from './readonly-artifact.ts';
 
 const image =
@@ -495,4 +499,180 @@ it('real public inspect desired/active readonly fields are all required; no lega
       false,
     ),
   ).toThrow('PROVIDER_FAILED');
+});
+
+async function diskFixture(root: string, c: ReadonlyDshDirectory) {
+  const content = 'test-only disk image bytes';
+  const diskSha256 = sha(content);
+  const generation = join(root, diskSha256);
+  const diskPath = join(generation, 'runtime.ext4');
+  const candidatePath = join(generation, 'candidate.json');
+  await mkdir(generation, { mode: 0o700 });
+  await writeFile(diskPath, content, { mode: 0o444 });
+  const loader = {
+    interpreter: '/lib/ld-linux-aarch64.so.1',
+    needed: ['libc.so.6'],
+  };
+  const receipt = {
+    schemaVersion: 1,
+    platform: 'linux/arm64',
+    source: {
+      baseImage: image,
+      nodeVersion: '22.23.2',
+      dshVersion: '0.2.1-rc.2',
+      artifactSha256: c.artifactSha256,
+      manifestSha256: c.manifestSha256,
+      treeSha256: c.treeSha256,
+      descriptorSha256: c.sealedManifestSha256,
+      bubblewrapVersion: '0.8.0-2+deb12u1',
+      bubblewrapDebSha256:
+        'd044ba1d7961d835669035fcd1e11121f1dc960a1a2e1c6489a93ea44e083557',
+      bubblewrapElfSha256: sha('sealed bwrap'),
+      cli: 'node_modules/@deepseek-ai/dsh/lib/bin.js',
+      lock: 'package-lock.json',
+    },
+    cliSha256: sha('sealed cli'),
+    lockSha256: sha('sealed lock'),
+    guestDirectory: c.guestDirectory,
+    disk: {
+      sha256: diskSha256,
+      bytes: Buffer.byteLength(content),
+      format: 'raw/ext4',
+      e2fsprogs: '1.47.4',
+    },
+    abi: { 'sandbox-bin/bwrap': loader, 'usr/local/bin/node': loader },
+  };
+  const contents = JSON.stringify(receipt);
+  await writeFile(candidatePath, contents, { mode: 0o444 });
+  const disk = checkedReadonlyDshRuntimeDisk({
+    diskPath,
+    diskSha256,
+    candidatePath,
+    candidateSha256: sha(contents),
+    provision: 'disk',
+  });
+  return { disk, content, receipt };
+}
+
+it('validates the exact disk receipt, OCI base and bytes, and detects changes after a cache hit', async () => {
+  const f = await fixture();
+  const { disk, content, receipt } = await diskFixture(f.root, f.c);
+  const verify = createReadonlyDshDiskVerifier();
+  const check = () => verify(disk, f.c, image, signal());
+  await expect(check()).resolves.toEqual({
+    descriptorSha256: f.c.sealedManifestSha256,
+    sandboxSha256: receipt.source.bubblewrapElfSha256,
+    cliSha256: receipt.cliSha256,
+  });
+  await expect(check()).resolves.toMatchObject({
+    cliSha256: receipt.cliSha256,
+  });
+  await expect(
+    verify(disk, f.c, image.replace('docker.io', 'example.test'), signal()),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  await expect(
+    verify(
+      { ...disk, candidateSha256: sha('unapproved') },
+      f.c,
+      image,
+      signal(),
+    ),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  await chmod(disk.diskPath, 0o600);
+  await writeFile(disk.diskPath, content.replace('test', 'fake'));
+  await chmod(disk.diskPath, 0o444);
+  await expect(check()).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+});
+
+it('pins the existing VM mode and command-memory mount across provisioning changes', async () => {
+  const f = await fixture();
+  const controls = await controlFixture(f.root);
+  const { disk } = await diskFixture(f.root, f.c);
+  const oldHome = join(f.root, 'old');
+  const newHome = join(f.root, 'new');
+  await mkdir(oldHome, { mode: 0o700 });
+  await mkdir(newHome, { mode: 0o700 });
+  const binding = {
+    vmId: randomUUID(),
+    personId: randomUUID(),
+    organizationId: randomUUID(),
+    instanceId: randomUUID(),
+    leaseEpoch: 1,
+  };
+  const storeRef = (home: string, selected?: ReadonlyDshRuntimeDisk) =>
+    readonlyArtifactReference(
+      home,
+      binding,
+      f.c,
+      true,
+      signal(),
+      f.c.sealedManifestSha256,
+      controls,
+      selected,
+    );
+  await storeRef(oldHome);
+  await expect(
+    selectedReadonlyRuntimeDisk(oldHome, disk, false, signal()),
+  ).resolves.toBeUndefined();
+  await expect(
+    selectedReadonlyRuntimeDisk(newHome, disk, true, signal()),
+  ).resolves.toBe(disk);
+  await storeRef(newHome, disk);
+  const reverted = { ...disk, provision: 'directory' as const };
+  await expect(
+    selectedReadonlyRuntimeDisk(newHome, reverted, false, signal()),
+  ).resolves.toBe(reverted);
+  await expect(storeRef(newHome, reverted)).resolves.toBeUndefined();
+  await expect(storeRef(newHome)).rejects.toMatchObject({
+    code: 'PROVIDER_FAILED',
+  });
+  await expect(
+    readonlyArtifactReference(
+      newHome,
+      { ...binding, personId: randomUUID() },
+      f.c,
+      false,
+      signal(),
+      f.c.sealedManifestSha256,
+      controls,
+      disk,
+    ),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+
+  const snapshot = inspection(f.c);
+  const mounts = [
+    {
+      type: 'DiskImage',
+      format: 'Raw',
+      fstype: 'ext4',
+      host: disk.diskPath,
+      guest: f.c.guestDirectory,
+      options: { readonly: true, noexec: false, nosuid: false, nodev: false },
+    },
+    {
+      ...snapshot.config.mounts[0],
+      host: controls.hostDirectory,
+      guest: controls.guestDirectory,
+    },
+  ];
+  const result = {
+    ...snapshot,
+    config: { mounts },
+    active_config: { mounts: structuredClone(mounts) },
+  };
+  const assert = () =>
+    assertReadonlyArtifactInspection(
+      result,
+      result.name,
+      f.c,
+      true,
+      controls,
+      disk,
+    );
+  expect(assert).not.toThrow();
+  result.active_config.mounts[0]!.options!.readonly = false;
+  expect(assert).toThrow('PROVIDER_FAILED');
+  result.active_config.mounts[0]!.options!.readonly = true;
+  result.active_config.mounts.push(mounts[0]!);
+  expect(assert).toThrow('PROVIDER_FAILED');
 });

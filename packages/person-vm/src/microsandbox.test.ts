@@ -23,13 +23,19 @@ import {
   DSH_SANDBOX_ROOT,
   launchDshSandbox,
   prepareDshSandbox,
+  verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { PERSON_VM_MEMORY_MIB } from './contract.ts';
 import { runCommand } from './process.ts';
 import { context, currentReceipt, harness, signal } from './test-support.ts';
 import { PersonVmService } from './person-vm.ts';
-import type { ReadonlyDshDirectory } from './readonly-artifact.ts';
+import {
+  COMMAND_MEMORY_CONTROL_FILES,
+  hashCommandMemoryControlFiles,
+  type ReadonlyDshDirectory,
+  type ReadonlyDshRuntimeDisk,
+} from './readonly-artifact.ts';
 import type { PersonVmMemoryGuestPlan } from './guest-bootstrap.ts';
 import type { PersonVmWebRoster, PersonVmWebStartup } from './web-endpoints.ts';
 import { PERSON_VM_GUEST_CONTROL_READER } from './native-resource.ts';
@@ -67,6 +73,10 @@ async function bootstrapFixture(
   mode = 'ok',
   readonlyDshDirectory?: ReadonlyDshDirectory,
   jobCleanupTimeoutMs?: number,
+  artifacts?: Pick<
+    ConstructorParameters<typeof MicrosandboxPersonVm>[0],
+    'readonlyDshRuntimeDisk' | 'readonlyCommandMemoryDirectory'
+  >,
 ) {
   const root = await directory(),
     mount = join(root, 'mount');
@@ -85,6 +95,7 @@ else if(a[0]==='pull'){}
 else if(a[0]==='create'){
  v.name=a[a.indexOf('--name')+1];v.status='Running';
  v.mounts=a.flatMap((arg,i)=>arg==='--mount-dir'?[a[i+1].split(':')]:[]).map(([host,guest,ro])=>({type:'Bind',host,guest,options:{readonly:ro==='ro',noexec:false,nosuid:false,nodev:false},stat_virtualization:'strict',host_permissions:'private',follow_root_symlinks:false,quota_mib:null}));
+ v.mounts.push(...a.flatMap((arg,i)=>arg==='--mount-disk'?[a[i+1].split(':')]:[]).map(([host,guest,opts])=>({type:'DiskImage',host,guest,format:'Raw',fstype:'ext4',options:{readonly:opts==='format=raw,fstype=ext4,ro',noexec:false,nosuid:false,nodev:false}})));
  v.ports=a.flatMap((arg,i)=>arg==='-p'?[a[i+1].split(':')]:[]).map(([host_bind,h,g])=>({host_bind,host_port:Number(h),guest_port:Number(g),protocol:'tcp'}));
 }
 else if(a[0]==='inspect'){
@@ -152,6 +163,7 @@ save();
     jobCleanupTimeoutMs,
     rootDiskGiB: 20,
     socketRoot: await socketDirectory(),
+    ...artifacts,
   };
   const native = new MicrosandboxPersonVm(nativeOptions);
   const h = harness(),
@@ -196,7 +208,11 @@ save();
   return {
     h,
     native,
-    reloadNative: () => new MicrosandboxPersonVm(nativeOptions),
+    reloadNative: (disk?: ReadonlyDshRuntimeDisk) =>
+      new MicrosandboxPersonVm({
+        ...nativeOptions,
+        ...(disk && { readonlyDshRuntimeDisk: disk }),
+      }),
     rc,
     service,
     mount,
@@ -1871,4 +1887,154 @@ fs.writeFileSync(f,JSON.stringify(v));
     await expect(command).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
     expect(() => process.kill(pid!, 0)).toThrow();
   });
+});
+
+it('uses the sealed block transport and keeps its original reference after switching new VM provisioning back to directories', async () => {
+  const dsh = await readonlyFixture();
+  const signed = (input: string) =>
+    createHash('sha256').update(input).digest('hex');
+  const diskBytes = 'synthetic sealed raw ext4 disk';
+  const diskSha256 = signed(diskBytes);
+  const root = await directory();
+  const generation = join(root, diskSha256);
+  const diskPath = join(generation, 'runtime.ext4');
+  const candidatePath = join(generation, 'candidate.json');
+  const cliSha256 = signed('synthetic CLI');
+  const bwrapSha256 = signed('synthetic bwrap');
+  const abi = {
+    interpreter: '/lib/ld-linux-aarch64.so.1',
+    needed: ['libc.so.6'],
+  };
+  const receipt = JSON.stringify({
+    schemaVersion: 1,
+    platform: 'linux/arm64',
+    source: {
+      baseImage: readonlyImage,
+      dshVersion: '0.2.1-rc.2',
+      nodeVersion: '22.23.2',
+      artifactSha256: dsh.artifactSha256,
+      manifestSha256: dsh.manifestSha256,
+      treeSha256: dsh.treeSha256,
+      descriptorSha256: dsh.sealedManifestSha256,
+      bubblewrapVersion: '0.8.0-2+deb12u1',
+      bubblewrapDebSha256:
+        'd044ba1d7961d835669035fcd1e11121f1dc960a1a2e1c6489a93ea44e083557',
+      bubblewrapElfSha256: bwrapSha256,
+      cli: 'node_modules/@deepseek-ai/dsh/lib/bin.js',
+      lock: 'package-lock.json',
+    },
+    cliSha256,
+    lockSha256: signed('package-lock.json'),
+    guestDirectory: dsh.guestDirectory,
+    abi: { 'sandbox-bin/bwrap': abi, 'usr/local/bin/node': abi },
+    disk: {
+      sha256: diskSha256,
+      format: 'raw/ext4',
+      bytes: Buffer.byteLength(diskBytes),
+      e2fsprogs: '1.47.4',
+    },
+  });
+  await mkdir(generation, { mode: 0o700 });
+  await writeFile(diskPath, diskBytes, { mode: 0o444 });
+  await writeFile(candidatePath, receipt, { mode: 0o444 });
+  const disk = {
+    diskPath,
+    diskSha256,
+    candidatePath,
+    candidateSha256: signed(receipt),
+    provision: 'disk' as const,
+  };
+  const files = new Map(
+    COMMAND_MEMORY_CONTROL_FILES.map((name) => [name, Buffer.from(name)]),
+  );
+  const controlsSha = hashCommandMemoryControlFiles(files);
+  const controls = {
+    hostDirectory: join(root, controlsSha),
+    guestDirectory: '/opt/allrice/command-memory/' + controlsSha,
+    sha256: controlsSha,
+  };
+  await mkdir(controls.hostDirectory, { mode: 0o700 });
+  for (const [name, bytes] of files)
+    await writeFile(join(controls.hostDirectory, name), bytes, {
+      mode: name === 'launch-dsh.sh' ? 0o555 : 0o444,
+    });
+  const f = await bootstrapFixture('ok', dsh, undefined, {
+    readonlyDshRuntimeDisk: disk,
+    readonlyCommandMemoryDirectory: controls,
+  });
+  const cli = dsh.guestDirectory + '/node_modules/@deepseek-ai/dsh/lib/bin.js';
+  const commandConfig = '/run/allrice-command-memory/config.json';
+  f.h.runtime.memoryGuestPlan = async () => ({
+    files: [{ path: commandConfig, contents: '{}', mode: 0o600 }],
+    initialize: {
+      executable: 'node',
+      args: [controls.guestDirectory + '/initialize.cjs', commandConfig],
+    },
+    launcher: controls.guestDirectory + '/launch-dsh.sh',
+    env: {
+      BASH_ENV: controls.guestDirectory + '/bash-env.sh',
+      ALLRICE_MEMORY_RECEIPT_WRITER:
+        controls.guestDirectory + '/command-observer.cjs',
+      ALLRICE_MEMORY_RECEIPT_DIRECTORY: '/run/allrice-command-memory/receipts',
+      ALLRICE_MEMORY_RECEIPT_NODE: '/usr/local/bin/node',
+    },
+  });
+  f.h.runtime.start = async (_binding, _signal, scope) => {
+    const job = await scope.launch({
+      executable: 'node',
+      args: [cli],
+      env: { PATH: '/work/caller-path' },
+    });
+    expect(await job.wait(signal())).toEqual({ exitCode: 0, timedOut: false });
+  };
+  await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
+  const calls = await f.calls();
+  const create = calls.find(([op]) => op === 'create');
+  expect(create).toEqual(
+    expect.arrayContaining([
+      '--mount-disk',
+      diskPath + ':' + dsh.guestDirectory + ':format=raw,fstype=ext4,ro',
+      '--mount-dir',
+      controls.hostDirectory + ':' + controls.guestDirectory + ':ro',
+    ]),
+  );
+  expect(create?.filter((v) => v === '--mount-dir')).toHaveLength(1);
+  expect(calls.some((args) => args.includes(prepareDshSandbox))).toBe(false);
+  expect(calls.some((args) => args.includes(verifyDshRuntimeDisk))).toBe(true);
+  const dshLaunch = calls.find((args) => args.at(-1) === cli);
+  expect(dshLaunch?.slice(-7)).toEqual([
+    '/bin/sh',
+    '-c',
+    launchDshSandbox,
+    'allrice-dsh',
+    dsh.guestDirectory +
+      '/sandbox-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    '/usr/local/bin/node',
+    cli,
+  ]);
+  expect(dshLaunch).toContain(controls.guestDirectory + '/launch-dsh.sh');
+
+  const reference = JSON.parse(
+    await readFile(
+      join(f.mount, 'microsandbox/allrice-readonly-dsh.json'),
+      'utf8',
+    ),
+  );
+  const binding = {
+    vmId: reference.vmId,
+    personId: reference.personId,
+    organizationId: randomUUID(),
+    instanceId: randomUUID(),
+    leaseEpoch: 2,
+  };
+  expect(reference).toMatchObject({
+    runtimeDiskSha256: diskSha256,
+    commandMemorySha256: controlsSha,
+  });
+  await f.native.stop(binding, signal());
+  const retained = f.reloadNative({ ...disk, provision: 'directory' });
+  await retained.prepare(binding, f.mount, signal());
+  await retained.start(binding, signal());
+  await retained.stop(binding, signal());
+  expect((await f.calls()).filter(([op]) => op === 'create')).toHaveLength(1);
 });

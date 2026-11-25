@@ -436,6 +436,58 @@ describe('private production Host configuration', () => {
       );
   });
 
+  it.each([
+    'disk',
+    'directory',
+    'unsafe-layout',
+    'wrong-cli',
+    'without-controls',
+  ] as const)(
+    'reads only an explicitly sealed runtime disk configuration (%s)',
+    async (mode) => {
+      const config = value();
+      const generation = join(root, 'published', hash);
+      const disk = {
+        diskPath: join(generation, 'runtime.ext4'),
+        diskSha256: hash,
+        candidatePath: join(
+          mode === 'unsafe-layout' ? config.disk.root : generation,
+          'candidate.json',
+        ),
+        candidateSha256: '2'.repeat(64),
+        provision: mode === 'directory' ? 'directory' : 'disk',
+      };
+      await seal({
+        ...config,
+        native: {
+          ...config.native,
+          readonlyDshRuntimeDisk: disk,
+          readonlyCommandMemoryDirectory:
+            mode === 'without-controls'
+              ? undefined
+              : config.native.readonlyCommandMemoryDirectory,
+        },
+        web: {
+          ...config.web,
+          cliPath:
+            config.native.readonlyDshDirectory.guestDirectory +
+            (mode === 'wrong-cli'
+              ? '/other.mjs'
+              : '/node_modules/@deepseek-ai/dsh/lib/bin.js'),
+        },
+      });
+      const result = readProductionHostConfiguration(signal());
+      if (mode === 'disk' || mode === 'directory')
+        expect(
+          (await result).configuration.native.readonlyDshRuntimeDisk,
+        ).toEqual(disk);
+      else
+        await expect(result).rejects.toBeInstanceOf(
+          ProductionHostConfigurationUnavailable,
+        );
+    },
+  );
+
   it('rejects a measured guest physical policy that differs from the platform cap without overwriting it', async () => {
     const input = value();
     input.memory.policy.physicalBytes = 3 * 1024 ** 3;

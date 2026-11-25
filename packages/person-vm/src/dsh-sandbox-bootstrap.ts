@@ -88,3 +88,47 @@ try {
 }
 readVerified(target, true);
 `;
+
+/** Verify the active block mount in the guest without writing to it. The
+ * publisher and sealed disk checksum authenticate the underlying image. */
+export const verifyDshRuntimeDisk = String.raw`
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const [source, bwrapSha256, cliSha256] = process.argv.slice(1);
+if (!/^\/opt\/allrice\/dsh\/[a-f0-9]{64}$/.test(source) ||
+    ![bwrapSha256, cliSha256].every(hash => /^[a-f0-9]{64}$/.test(hash)))
+  throw Error('invalid-dsh-runtime-disk-input');
+
+const mounts = fs.readFileSync('/proc/self/mountinfo', 'utf8').trim().split('\n')
+  .map(line => line.split(' - ').map(part => part.split(' ')));
+const matching = mounts.filter(([local]) =>
+  local[4] === source || local[4]?.startsWith(source + '/'));
+if (matching.length !== 1) throw Error('untrusted-dsh-runtime-disk-mount');
+const [local, filesystem] = matching[0];
+const options = local[5]?.split(',');
+if (local[4] !== source || local[3] !== '/' || !options?.includes('ro') ||
+    options.includes('noexec') || filesystem?.[0] !== 'ext4' ||
+    !/^\/dev\/vd[a-z]+$/.test(filesystem[1]) ||
+    !filesystem[2]?.split(',').includes('ro') ||
+    fs.realpathSync(source) !== source)
+  throw Error('untrusted-dsh-runtime-disk-mount');
+
+const device = fs.statSync(source).dev;
+function verify(path, expected) {
+  if (fs.realpathSync(path) !== path) throw Error('untrusted-dsh-runtime-disk-file');
+  const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== 0 || stat.nlink !== 1 || stat.dev !== device ||
+        (stat.mode & 0o7777) !== 0o555 || stat.size <= 0 || stat.size > 4 * 1024 * 1024)
+      throw Error('untrusted-dsh-runtime-disk-file');
+    const bytes = fs.readFileSync(fd);
+    if (bytes.length !== stat.size || crypto.createHash('sha256').update(bytes).digest('hex') !== expected)
+      throw Error('dsh-runtime-disk-digest-mismatch');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+verify(source + '/sandbox-bin/bwrap', bwrapSha256);
+verify(source + '/node_modules/@deepseek-ai/dsh/lib/bin.js', cliSha256);
+`;

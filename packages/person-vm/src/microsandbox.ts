@@ -27,11 +27,15 @@ import {
   assertReadonlyArtifactInspection,
   checkedReadonlyCommandMemoryDirectory,
   checkedReadonlyDshDirectory,
+  checkedReadonlyDshRuntimeDisk,
+  createReadonlyDshDiskVerifier,
   readonlyArtifactReference,
+  selectedReadonlyRuntimeDisk,
   verifyReadonlyCommandMemoryDirectory,
   verifyReadonlyDshDirectory,
   type ReadonlyCommandMemoryDirectory,
   type ReadonlyDshDirectory,
+  type ReadonlyDshRuntimeDisk,
 } from './readonly-artifact.ts';
 import type {
   PersonVmGuestBootstrapPort,
@@ -123,6 +127,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   private readonly run: CommandRunner;
   private readonly memoryMiB: number;
   private readonly homes = new Map<string, NativePaths>();
+  private readonly verifyRuntimeDisk = createReadonlyDshDiskVerifier();
   constructor(
     private readonly options: {
       binary: string;
@@ -130,6 +135,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       agentd: string;
       image: string;
       readonlyDshDirectory?: ReadonlyDshDirectory;
+      readonlyDshRuntimeDisk?: ReadonlyDshRuntimeDisk;
       readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
       publicImageCache?: PublicImageCache;
       rootDiskGiB: number;
@@ -146,6 +152,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         ? {
             readonlyDshDirectory: checkedReadonlyDshDirectory(
               options.readonlyDshDirectory,
+            ),
+          }
+        : {}),
+      ...(options.readonlyDshRuntimeDisk
+        ? {
+            readonlyDshRuntimeDisk: checkedReadonlyDshRuntimeDisk(
+              options.readonlyDshRuntimeDisk,
             ),
           }
         : {}),
@@ -181,6 +194,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       !/^.+@sha256:[a-f0-9]{64}$/.test(options.image) ||
       (options.readonlyCommandMemoryDirectory &&
         !options.readonlyDshDirectory) ||
+      (options.readonlyDshRuntimeDisk &&
+        !options.readonlyCommandMemoryDirectory) ||
       !Number.isSafeInteger(this.memoryMiB) ||
       this.memoryMiB <= 0 ||
       !Number.isSafeInteger(this.memoryMiB * 1024 ** 2) ||
@@ -319,28 +334,36 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     create = false,
+    home = this.homes.get(binding.vmId)?.home,
   ) {
     const c = this.options.readonlyDshDirectory;
     if (!c) return;
-    const artifact = await verifyReadonlyDshDirectory(
-      c,
-      this.options.image,
+    if (!home) throw new PersonVmError('PROVIDER_FAILED');
+    const disk = await selectedReadonlyRuntimeDisk(
+      home,
+      this.options.readonlyDshRuntimeDisk,
+      create,
       signal,
     );
+    const artifact = disk
+      ? await this.verifyRuntimeDisk(disk, c, this.options.image, signal)
+      : {
+          ...(await verifyReadonlyDshDirectory(c, this.options.image, signal)),
+          cliSha256: undefined,
+        };
     const controls = this.options.readonlyCommandMemoryDirectory;
     if (controls) await verifyReadonlyCommandMemoryDirectory(controls, signal);
-    const paths = this.homes.get(binding.vmId);
-    if (!paths) throw new PersonVmError('PROVIDER_FAILED');
     await readonlyArtifactReference(
-      paths.home,
+      home,
       binding,
       c,
       create,
       signal,
       artifact.descriptorSha256,
       controls,
+      disk,
     );
-    return artifact;
+    return { ...artifact, disk };
   }
   private async assertArtifact(
     binding: PersonVmBinding,
@@ -364,6 +387,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         c,
         running,
         this.options.readonlyCommandMemoryDirectory,
+        artifact.value?.disk,
       );
     if (web)
       assertWebEndpointInspection(
@@ -372,7 +396,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         web,
         true,
       );
-    return artifact.value?.sandboxSha256;
+    return artifact.value;
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
     // Both reads can overlap under the same owner. Join the native CLI even
@@ -486,21 +510,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       await config.close();
     }
     const directory = this.options.readonlyDshDirectory;
-    if (!directory) throw new PersonVmError('PROVIDER_FAILED');
-    const artifact = await verifyReadonlyDshDirectory(
-      directory,
-      this.options.image,
-      signal,
-    );
-    await readonlyArtifactReference(
-      home,
-      binding,
-      directory,
-      false,
-      signal,
-      artifact.descriptorSha256,
-      this.options.readonlyCommandMemoryDirectory,
-    );
+    const artifact = await this.artifact(binding, signal, false, home);
+    if (!directory || !artifact) throw new PersonVmError('PROVIDER_FAILED');
     const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
       this.runWithPaths(paths, args, active, nonzero);
     const name = this.name(binding);
@@ -515,6 +526,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       directory,
       true,
       this.options.readonlyCommandMemoryDirectory,
+      artifact.disk,
     );
     const cleanupTimeoutMs = this.options.jobCleanupTimeoutMs ?? 10_000;
     const job = await spawnMicrosandboxManagedProbe(
@@ -572,7 +584,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (web) await assertPreparedWebEndpoints(paths.home, binding, web);
     if ((await this.status(binding, signal)) !== 'absent')
       throw new PersonVmError('PROVIDER_FAILED');
-    await this.artifact(binding, signal, true);
+    const artifact = await this.artifact(binding, signal, true);
     if (this.options.publicImageCache)
       await seedPublicImageCache(
         this.options.publicImageCache,
@@ -610,11 +622,19 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       '--workdir',
       '/work',
     ];
-    if (this.options.readonlyDshDirectory)
-      args.push(
-        '--mount-dir',
-        `${this.options.readonlyDshDirectory.hostDirectory}:${this.options.readonlyDshDirectory.guestDirectory}:ro`,
-      );
+    const directory = this.options.readonlyDshDirectory;
+    if (directory) {
+      if (artifact?.disk)
+        args.push(
+          '--mount-disk',
+          `${artifact.disk.diskPath}:${directory.guestDirectory}:format=raw,fstype=ext4,ro`,
+        );
+      else
+        args.push(
+          '--mount-dir',
+          `${directory.hostDirectory}:${directory.guestDirectory}:ro`,
+        );
+    }
     const controls = this.options.readonlyCommandMemoryDirectory;
     if (controls)
       args.push(
@@ -689,6 +709,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         this.options.readonlyDshDirectory,
         true,
         this.options.readonlyCommandMemoryDirectory,
+        artifact.value?.disk,
       );
     assertWebEndpointInspection(
       inspection.value,
@@ -731,9 +752,9 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const controls = this.options.readonlyCommandMemoryDirectory;
     // Earlier artifacts need no added native inspection. An enabled backend
     // must come from the exact active read-only mount for this binding.
-    let sandboxSha256: string | undefined;
+    let artifact: Awaited<ReturnType<MicrosandboxPersonVm['assertArtifact']>>;
     if (controls) {
-      sandboxSha256 = await this.assertArtifact(scope.binding, scope.signal);
+      artifact = await this.assertArtifact(scope.binding, scope.signal);
     } else if (
       readonly &&
       (
@@ -744,7 +765,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         )
       ).sandboxSha256
     ) {
-      sandboxSha256 = await this.assertArtifact(scope.binding, scope.signal);
+      artifact = await this.assertArtifact(scope.binding, scope.signal);
     }
     return bootstrapMicrosandbox({
       scope,
@@ -753,10 +774,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       stagingRoot: paths.userHome,
       readonlyCommandMemoryDirectory: controls?.guestDirectory,
       ...(readonly &&
-        sandboxSha256 && {
+        artifact?.sandboxSha256 && {
           dshSandbox: {
             guestDirectory: readonly.guestDirectory,
-            sha256: sandboxSha256,
+            sha256: artifact.sandboxSha256,
+            cliSha256: artifact.cliSha256,
           },
         }),
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,

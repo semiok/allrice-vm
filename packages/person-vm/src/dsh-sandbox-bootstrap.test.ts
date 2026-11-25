@@ -9,6 +9,7 @@ import {
   DSH_SANDBOX_ROOT,
   launchDshSandbox,
   prepareDshSandbox,
+  verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 
 const require = createRequire(import.meta.url);
@@ -149,4 +150,60 @@ test('sets the actual Node process PATH after the agentd environment prefix', ()
   );
   expect(result.status).toBe(0);
   expect(JSON.parse(result.stdout)).toEqual([path, f.final]);
+});
+
+test('checks the live ext4 mount and verifies both directly executed files', () => {
+  const f = setup();
+  const cli = '/node_modules/@deepseek-ai/dsh/lib/bin.js';
+  const mount =
+    '38 30 254:16 / ' + source + ' ro,relatime - ext4 /dev/vdb ro,norecovery';
+  const verify = (row: string, cliHash = sha256, redirect = false) =>
+    runInNewContext(verifyDshRuntimeDisk, {
+      require: (id: string) =>
+        id !== 'node:fs'
+          ? require(id)
+          : {
+              ...fs,
+              readFileSync: (
+                path: string | number,
+                encoding: BufferEncoding,
+              ) =>
+                path === '/proc/self/mountinfo'
+                  ? row
+                  : fs.readFileSync(path, encoding),
+              openSync: (path: string, flags: number) => {
+                expect(path).toMatch(
+                  new RegExp(
+                    '^' + source + '(/sandbox-bin/bwrap|' + cli + ')$',
+                  ),
+                );
+                return fs.openSync(f.input, flags);
+              },
+              realpathSync: (path: string) =>
+                redirect && path.endsWith(cli) ? f.input : path,
+              statSync: () => fs.statSync(f.input),
+              fstatSync: (fd: number) =>
+                Object.assign(fs.fstatSync(fd), { uid: 0 }),
+            },
+      process: { argv: ['node', source, sha256, cliHash] },
+    });
+  expect(() => verify(mount)).not.toThrow();
+  expect(() => verify(mount.replace('ro,relatime', 'rw,relatime'))).toThrow(
+    'untrusted-dsh-runtime-disk-mount',
+  );
+  expect(() => verify(mount.replace('ro,relatime', 'ro,noexec'))).toThrow(
+    'untrusted-dsh-runtime-disk-mount',
+  );
+  expect(() => verify(mount.replace('ext4', 'virtiofs'))).toThrow(
+    'untrusted-dsh-runtime-disk-mount',
+  );
+  expect(() =>
+    verify(mount + '\n' + mount.replace(source, source + '/sandbox-bin')),
+  ).toThrow('untrusted-dsh-runtime-disk-mount');
+  expect(() => verify(mount, 'b'.repeat(64))).toThrow(
+    'dsh-runtime-disk-digest-mismatch',
+  );
+  expect(() => verify(mount, sha256, true)).toThrow(
+    'untrusted-dsh-runtime-disk-file',
+  );
 });

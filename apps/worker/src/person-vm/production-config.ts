@@ -2,7 +2,15 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile, realpath } from 'node:fs/promises';
 import { isIP } from 'node:net';
-import { basename, isAbsolute, join, normalize, posix, sep } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  posix,
+  sep,
+} from 'node:path';
 import {
   readServiceBuildIdentity,
   ServiceBuildManifestSchema,
@@ -70,6 +78,23 @@ const configuration = z
             treeSha256: bareHash,
           })
           .strict(),
+        readonlyDshRuntimeDisk: z
+          .object({
+            diskPath: absolute,
+            diskSha256: bareHash,
+            candidatePath: absolute,
+            candidateSha256: bareHash,
+            provision: z.enum(['disk', 'directory']),
+          })
+          .strict()
+          .refine(
+            ({ diskPath, diskSha256, candidatePath }) =>
+              !diskPath.includes(':') &&
+              basename(diskPath) === 'runtime.ext4' &&
+              basename(dirname(diskPath)) === diskSha256 &&
+              candidatePath === join(dirname(diskPath), 'candidate.json'),
+          )
+          .optional(),
         readonlyCommandMemoryDirectory: z
           .object({
             hostDirectory: z.string(),
@@ -183,10 +208,17 @@ const configuration = z
       ...(value.native.publicImageCache
         ? [value.native.publicImageCache.directory]
         : []),
+      ...(value.native.readonlyDshRuntimeDisk
+        ? [dirname(value.native.readonlyDshRuntimeDisk.diskPath)]
+        : []),
     ];
     if (
       value.memory.policy.physicalBytes !==
-      readPlatformPersonVmConfiguration().memoryMiB * 1024 ** 2
+        readPlatformPersonVmConfiguration().memoryMiB * 1024 ** 2 ||
+      (value.native.readonlyDshRuntimeDisk &&
+        value.web.cliPath !==
+          value.native.readonlyDshDirectory.guestDirectory +
+            '/node_modules/@deepseek-ai/dsh/lib/bin.js')
     )
       return false;
     return roots.every((root, i) =>
