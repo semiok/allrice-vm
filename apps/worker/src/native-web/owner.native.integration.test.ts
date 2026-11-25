@@ -15,6 +15,7 @@ import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-con
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
@@ -148,7 +149,7 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'reads separate live rc.2 assistant and title attempts before the sealed adapter redeems their references',
+  'reads live rc.2 attempt proofs and derives an admitted prompt image on the sealed native owner',
   { tags: [tag], timeout: 30000 },
   async () => {
     const primary = deferred(),
@@ -163,6 +164,10 @@ it.skipIf(!cli)(
       deferred<
         (session: string, kind: keyof typeof facts) => Promise<string>
       >();
+    const readImage =
+      deferred<(sessionId: string, ref: ImageAttachmentRef) => Promise<void>>();
+    const png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWZ0AAAAASUVORK5CYII=';
     const capability = 'a'.repeat(43);
     const references = {
       assistant: 'b'.repeat(43),
@@ -203,6 +208,19 @@ it.skipIf(!cli)(
           request.headers['x-allrice-model-call-reference'] !== references[kind]
         )
           throw Error('Native adapter did not redeem its reference');
+        if (kind === 'assistant') {
+          const message = payload.messages.find(
+            (entry: { role: string }) => entry.role === 'user',
+          );
+          const image = message.content.find(
+            (part: { type: string }) => part.type === 'image',
+          );
+          if (!image?.attachment)
+            throw Error('No durable image in native model input');
+          await (
+            await readImage.promise
+          )(facts[kind].sessionId, image.attachment);
+        }
         facts[kind].redeemed = true;
         response.writeHead(200, { 'content-type': 'application/x-ndjson' });
         response.end(
@@ -240,6 +258,7 @@ it.skipIf(!cli)(
           provider: 'openai-codex',
           id: 'fixture-codex',
           name: 'fixture-codex',
+          input: ['text', 'image'],
         },
       },
     );
@@ -261,6 +280,36 @@ it.skipIf(!cli)(
         );
       return attempt.id;
     });
+    readImage.resolve(async (requested, ref) => {
+      const read = (
+        reference: ImageAttachmentRef,
+        target: { width: number; height: number; maxBytes: number } | null,
+      ) =>
+        f.owner.readManagedModelImageFor(
+          f.context,
+          {
+            sessionId: requested,
+            kind: 'assistant',
+            id: facts.assistant.attemptId,
+          },
+          reference,
+          target,
+          signal,
+        );
+      await expect(
+        read({ ...ref, width: ref.width + 1 }, null),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const original = await read(ref, null);
+      expect(original.data.byteLength).toBe(ref.bytes);
+      const variant = await read(ref, { width: 1, height: 1, maxBytes: 4096 });
+      expect(variant).toMatchObject({
+        attachment: ref,
+        width: 1,
+        height: 1,
+        variantId: expect.any(String),
+      });
+      expect(variant.data.byteLength).toBeGreaterThan(0);
+    });
     const method = NATIVE_REMOTE.methods['session/prompt'];
     const args = method
       .input({ strict: true })
@@ -269,7 +318,10 @@ it.skipIf(!cli)(
         request: {
           sessionId,
           requestId: randomUUID(),
-          content: [{ type: 'text', text: 'Synthetic lifecycle test' }],
+          content: [
+            { type: 'text', text: 'Synthetic lifecycle test' },
+            { type: 'image', mediaType: 'image/png', data: png },
+          ],
           mode: 'queue',
         },
       });

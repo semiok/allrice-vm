@@ -10,6 +10,10 @@ import {
   withGatewayAuthTransaction,
   type GatewayFetchClassification,
 } from '@allrice/model-gateway';
+import {
+  createProductionModelImages,
+  type ReadProductionModelImage,
+} from './production-model-images.js';
 import { codexSubscriptionHome } from '../codex-subscription-home.js';
 
 const provider = 'openai-codex';
@@ -72,6 +76,7 @@ function classify(
 export async function createProductionCodexRuntime(
   lifetime: AbortSignal,
   ownerId: string,
+  readModelImage?: ReadProductionModelImage,
 ) {
   lifetime.throwIfAborted();
   const selection = await readSelectedSubscription();
@@ -121,9 +126,13 @@ export async function createProductionCodexRuntime(
       stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
     await assertSelectedGeneration(active);
   }
+  const images = readModelImage
+    ? createProductionModelImages(readModelImage)
+    : undefined;
   let modelInfo: Awaited<ReturnType<LlmRuntime['resolveModelInfo']>>;
   try {
     await host.plugin(Llm).await();
+    if (images) await host.plugin(images.plugin).await();
     await host
       .plugin(MeteredCodexCredentials, {
         path: join(codexSubscriptionHome(selection.slot), '.credentials.yaml'),
@@ -174,6 +183,7 @@ export async function createProductionCodexRuntime(
     llm,
     route,
     modelInfo,
+    scopeStream: images?.stream,
     revoked,
     assertCurrent,
     transport: { ...transport, beforeDispatch: assertSelectedGeneration },

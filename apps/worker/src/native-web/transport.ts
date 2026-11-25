@@ -298,13 +298,19 @@ export function nativeWebTransport(
   return {
     fetch,
     readExact,
-    async readManagedModelProof(body: string, caller: AbortSignal) {
+    async readManagedModelProof(
+      body: string,
+      caller: AbortSignal,
+      image = false,
+    ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
         new URL('api/allrice-managed-model/current', origin),
         caller,
         {
-          maxBytes: 128,
+          maxBytes: image
+            ? Math.ceil((20 * 1024 * 1024 * 4) / 3) + 16_384
+            : 128,
           credential: 'api',
           body,
           accepts: ({ statusCode }) => statusCode === 200 || statusCode === 404,

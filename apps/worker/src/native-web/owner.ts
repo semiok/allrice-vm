@@ -24,6 +24,11 @@ import {
   type PersonVmBootstrapScope,
   type PersonVmPort,
 } from '@allrice/person-vm';
+import type {
+  ImageAttachmentRef,
+  ImageRequestTarget,
+} from '@deepseek-ai/dsh-attachment';
+import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
@@ -652,6 +657,45 @@ export async function openNativeWebOwner(input: {
               follow.dispose();
               await frames.return?.();
             }
+          },
+        );
+      },
+      readManagedModelImageFor(
+        context: RequestContext,
+        attempt: {
+          sessionId: string;
+          kind: NativeModelAttemptKind;
+          id: string;
+        },
+        ref: ImageAttachmentRef,
+        target: ImageRequestTarget | null,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const result = await transport.readManagedModelProof(
+              JSON.stringify({
+                action: 'read-image',
+                adapterId: installedModelAdapter,
+                sessionId: attempt.sessionId,
+                purpose: attempt.kind,
+                attemptId: attempt.id,
+                ref,
+                target,
+              }),
+              active,
+              true,
+            );
+            active.throwIfAborted();
+            return decodeProductionModelImage(result, ref, target);
           },
         );
       },

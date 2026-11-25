@@ -60,6 +60,7 @@ function fixture() {
     revoked: codex.signal,
     route,
     modelInfo: { id: route.model, name: route.model, provider: route.provider },
+    scopeStream: undefined,
     transport: {
       fetchOwned: vi.fn(),
       close: vi.fn(),

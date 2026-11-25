@@ -32,7 +32,14 @@ type ManagedGuestModelCall = {
 import type {
   GatewayFetchClassification,
   GatewayProvider,
+  ModelCallBinding,
 } from './contract.ts';
+
+export type DshGatewayStreamScope = (
+  binding: ModelCallBinding,
+  signal: AbortSignal,
+  stream: () => AsyncIterable<StreamChunk>,
+) => AsyncIterable<StreamChunk>;
 
 /** Use the existing host subscription loader's LlmRuntime, including its
  * credentials/refresh implementation. This function never opens credentials.
@@ -50,6 +57,7 @@ export function createDshGatewayProvider(
   },
   fetchOwned?: GatewayProvider['fetchOwned'],
   assertDispatchCurrent?: GatewayProvider['assertDispatchCurrent'],
+  scopeStream?: DshGatewayStreamScope,
 ): GatewayProvider {
   return {
     classify: route.classify,
@@ -79,12 +87,14 @@ export function createDshGatewayProvider(
         },
         signal,
       );
-      yield* prepared.stream({
-        ...input,
-        ...prepared.config,
-        signal,
-        sessionId: binding.native.sessionId as GenerateOptions['sessionId'],
-      });
+      const stream = () =>
+        prepared.stream({
+          ...input,
+          ...prepared.config,
+          signal,
+          sessionId: binding.native.sessionId as GenerateOptions['sessionId'],
+        });
+      yield* scopeStream ? scopeStream(binding, signal, stream) : stream();
     },
   };
 }

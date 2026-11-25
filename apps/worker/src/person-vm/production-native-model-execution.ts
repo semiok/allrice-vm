@@ -235,7 +235,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         if (!attempt) return reject();
         return { resource, profile, attempt };
       }
-      async function assertCall(call: ModelCallBinding, signal: AbortSignal) {
+      async function readAuthorizedCall(
+        call: ModelCallBinding,
+        signal: AbortSignal,
+      ) {
         return run(signal, async (active) => {
           const owned = calls.get(call.native.callId);
           if (
@@ -265,7 +268,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           )
             return reject();
           await input.assertRouteCurrent(active);
+          return { owner: profile.owner, attempt };
         });
+      }
+      async function assertCall(call: ModelCallBinding, signal: AbortSignal) {
+        await readAuthorizedCall(call, signal);
       }
 
       const paths = [
@@ -319,7 +326,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 bySession = new Map();
                 executions.set(profile.owner, bySession);
               }
-              let execution = bySession.get(resource.nativeSessionId);
+              const executionKey = JSON.stringify([
+                resource.nativeSessionId,
+                kind,
+              ]);
+              let execution = bySession.get(executionKey);
               const turn = attempt.turn ?? attempt.cursor;
               if (execution?.turn !== turn) {
                 execution = {
@@ -327,7 +338,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   runId: randomUUID(),
                   executionId: randomUUID(),
                 };
-                bySession.set(resource.nativeSessionId, execution);
+                bySession.set(executionKey, execution);
               }
               if (matched) return reject();
               matched = {
@@ -424,6 +435,25 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const owner: Installed = {
         assertCall,
         confirmStopped: input.confirmTransportStopped,
+        readModelImage(call, ref, target, signal) {
+          return run(signal, async (active) => {
+            const { owner, attempt } = await readAuthorizedCall(call, active);
+            const image = await owner.readManagedModelImageFor(
+              call.context,
+              {
+                sessionId: call.native.sessionId,
+                kind: attempt.kind,
+                id: attempt.id,
+              },
+              ref,
+              target,
+              active,
+            );
+            await input.assertRouteCurrent(active);
+            active.throwIfAborted();
+            return image;
+          });
+        },
         references,
         async observeModelSelection(scope, signal) {
           if (!scope.identity.threadId) return;

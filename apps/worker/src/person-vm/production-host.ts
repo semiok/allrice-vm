@@ -10,6 +10,7 @@ import {
   type ModelGatewayAuthority,
   type ModelGatewayPort,
   type GatewayProvider,
+  type DshGatewayStreamScope,
 } from '@allrice/model-gateway';
 import {
   createEgressGateway,
@@ -103,6 +104,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: ModelGatewayAuthority;
       llm: Parameters<typeof createDshGatewayProvider>[0];
       route: Parameters<typeof createDshGatewayProvider>[1];
+      scopeStream?: DshGatewayStreamScope;
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
@@ -595,6 +597,7 @@ export function createProductionPersonVmHost(input: {
           modelRoute,
           modelSource.transport?.fetchOwned,
           modelSource.transport?.beforeDispatch,
+          modelSource.scopeStream,
         ),
         store: storeModel,
         confirmTransportStopped: modelSource.transport?.stoppedEvidence,

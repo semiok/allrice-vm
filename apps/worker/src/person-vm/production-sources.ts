@@ -6,6 +6,7 @@ import {
 import type { PersonVmRuntimePort } from '@allrice/person-vm';
 import type { ManagedHostService } from '@allrice/egress-gateway';
 import type { ModelCallBinding } from '@allrice/model-gateway';
+import type { ReadProductionModelImage } from './production-model-images.js';
 import type { NativeModelSelection } from './production-native-model-execution.js';
 import {
   installProductionDEntrySource,
@@ -53,6 +54,7 @@ export interface ProductionNativeModelExecution {
       signal: AbortSignal,
     ): Promise<void>;
     references?: readonly ManagedHostService[];
+    readModelImage?: ReadProductionModelImage;
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
@@ -66,15 +68,20 @@ export function createProductionPersonVmSources(
     async bind(host) {
       const { lifetime, startup, admission } = host;
       lifetime.throwIfAborted();
-      const codex = await createProductionCodexRuntime(
-        lifetime,
-        host.modelOwnerId,
-      );
-      const authority = execution.authority;
-      const calls = createNativeModelCallReferences(authority, codex.revoked);
       let native:
         | Awaited<ReturnType<ProductionNativeModelExecution['attach']>>
         | undefined;
+      const codex = await createProductionCodexRuntime(
+        lifetime,
+        host.modelOwnerId,
+        (...args) => {
+          if (!native?.readModelImage)
+            throw new ModelGatewayError('AUTHORIZATION_DENIED');
+          return native.readModelImage(...args);
+        },
+      );
+      const authority = execution.authority;
+      const calls = createNativeModelCallReferences(authority, codex.revoked);
       let entry: ReturnType<typeof installProductionDEntrySource> | undefined;
       try {
         const egress = createProductionEgressAuthority({
@@ -156,6 +163,7 @@ export function createProductionPersonVmSources(
             llm: codex.llm,
             route: codex.route,
             transport: codex.transport,
+            scopeStream: codex.scopeStream,
             async resolveCall(headers, binding, signal) {
               await codex.assertCurrent(signal);
               const call = await calls.resolveCall(headers, binding, signal);

@@ -171,6 +171,46 @@ export async function unloadNativeWebOwner(fiber) {
 }
 
 /** Native local login only. This file never establishes an AllRice principal. */
+async function readManagedImage(scope, request, value, owned) {
+  const { ref, target } = value;
+  const limit = 20 * 1024 * 1024;
+  if (typeof ref?.attachmentId !== 'string' || ref.attachmentId.length > 256)
+    return null;
+  const within = (n, max) => Number.isSafeInteger(n) && n > 0 && n <= max;
+  if (
+    target !== null &&
+    (!within(target?.width, 8192) ||
+      !within(target?.height, 8192) ||
+      !within(target?.maxBytes, limit))
+  )
+    return null;
+  const active = AbortSignal.any([request.signal, owned.signal]);
+  active.throwIfAborted();
+  // The native controller proves the attachment actually belongs to this
+  // Session's durable content before the native store derives a variant.
+  const { attachment, data } = await scope.sessionController.attachment({
+    sessionId: value.sessionId,
+    attachmentId: ref.attachmentId,
+  });
+  active.throwIfAborted();
+  if (
+    !within(attachment.bytes, limit) ||
+    !['attachmentId', 'bytes', 'mediaType', 'width', 'height'].every(
+      (key) => attachment[key] === ref[key],
+    )
+  )
+    return null;
+  if (!target) return { ref: attachment, data };
+  const image = await scope.attachments.readImageRequest(
+    attachment,
+    target,
+    active,
+  );
+  active.throwIfAborted();
+  if (!within(image.bytes, limit)) return null;
+  return { ...image, data: Buffer.from(image.data).toString('base64') };
+}
+
 export function apply(ctx, config) {
   const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
     config;
@@ -345,93 +385,112 @@ export function apply(ctx, config) {
         modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
-      modelFiber = ctx.inject(['llm', 'connection'], async (scope) => {
-        if (!current()) return;
-        const auxiliaryCalls = new Map();
-        scope.connection.fetch.register({
-          // Native exact Fetch routes are delivered only to the authenticated
-          // owner Peer. This path is consumed by the managed Host transport.
-          path: '/api/allrice-managed-model/current',
-          methods: ['POST'],
-          requestBody: 'buffered',
-          async fetch(request) {
-            if (!current())
-              return new globalThis.Response(null, { status: 404 });
-            const value = await request.json();
-            if (
-              value?.adapterId !== id ||
-              typeof value?.sessionId !== 'string' ||
-              !['compaction', 'session-title'].includes(value.purpose)
-            )
-              return new globalThis.Response(null, { status: 404 });
-            const found = auxiliaryCalls.get(
-              JSON.stringify([value.sessionId, value.purpose]),
-            );
-            return found && !found.signal.aborted
-              ? globalThis.Response.json(
-                  { id: found.id },
-                  { headers: { 'cache-control': 'no-store' } },
+      modelFiber = ctx.inject(
+        ['llm', 'connection', 'sessionController', 'attachments'],
+        async (scope) => {
+          if (!current()) return;
+          const modelCalls = new Map();
+          scope.connection.fetch.register({
+            // Native exact Fetch routes are delivered only to the authenticated
+            // owner Peer. This path is consumed by the managed Host transport.
+            path: '/api/allrice-managed-model/current',
+            methods: ['POST'],
+            requestBody: 'buffered',
+            async fetch(request) {
+              if (!current())
+                return new globalThis.Response(null, { status: 404 });
+              const value = await request.json();
+              if (
+                value?.adapterId !== id ||
+                typeof value?.sessionId !== 'string' ||
+                !['assistant', 'compaction', 'session-title'].includes(
+                  value.purpose,
                 )
-              : new globalThis.Response(null, { status: 404 });
-          },
-        });
-        const dispose = registerManagedGatewayAdapter(scope.llm, {
-          origin,
-          capability,
-          route: {
-            provider,
-            model,
-            modelInfo,
-            lifetime: signal,
-            async resolveCallReference(selection, active, purpose) {
-              const key =
-                purpose && JSON.stringify([selection.sessionId, purpose]);
-              if (key && auxiliaryCalls.has(key))
-                throw Error('Concurrent native model ownership is ambiguous');
-              const owned = { id: randomUUID(), signal: active };
-              if (key) auxiliaryCalls.set(key, owned);
-              const release = () => {
-                active.removeEventListener('abort', release);
-                if (key && auxiliaryCalls.get(key) === owned)
-                  auxiliaryCalls.delete(key);
-              };
-              active.addEventListener('abort', release, { once: true });
-              try {
-                active.throwIfAborted();
-                const endpoint = new URL(
-                  purpose ? '/v1/reference/' + purpose : '/v1/reference',
-                  origin,
-                );
-                const response = await globalThis.fetch(endpoint, {
-                  method: 'POST',
-                  redirect: 'error',
-                  signal: active,
-                  headers: {
-                    authorization: 'Bearer ' + capability,
-                    'content-type': 'application/json',
-                  },
-                  body: JSON.stringify(selection),
-                });
-                if (!response.ok) {
-                  await response.body?.cancel();
-                  throw Error('Native managed model call was denied');
-                }
-                return {
-                  reference: (await response.json()).reference,
-                  release,
-                };
-              } catch (error) {
-                release();
-                throw error;
-              }
+              )
+                return new globalThis.Response(null, { status: 404 });
+              const found = modelCalls.get(
+                JSON.stringify([value.sessionId, value.purpose]),
+              );
+              if (!found || found.signal.aborted)
+                return new globalThis.Response(null, { status: 404 });
+              const headers = { 'cache-control': 'no-store' };
+              if (value.action === undefined && value.purpose !== 'assistant')
+                return globalThis.Response.json({ id: found.id }, { headers });
+              if (
+                value.action !== 'read-image' ||
+                (value.purpose !== 'assistant' && value.attemptId !== found.id)
+              )
+                return new globalThis.Response(null, { status: 404 });
+              const image = await readManagedImage(
+                scope,
+                request,
+                value,
+                found,
+              );
+              return image
+                ? globalThis.Response.json(image, { headers })
+                : new globalThis.Response(null, { status: 404 });
             },
-          },
-        });
-        registeredModel = { dispose, llm: original(scope.llm), id };
-        const models = await scope.llm.listModels(provider);
-        if (models.length !== 1 || models[0].id !== model)
-          throw Error('Native managed model was not registered');
-      });
+          });
+          const dispose = registerManagedGatewayAdapter(scope.llm, {
+            origin,
+            capability,
+            route: {
+              provider,
+              model,
+              modelInfo,
+              lifetime: signal,
+              async resolveCallReference(selection, active, purpose) {
+                const key = JSON.stringify([
+                  selection.sessionId,
+                  purpose ?? 'assistant',
+                ]);
+                if (modelCalls.has(key))
+                  throw Error('Concurrent native model ownership is ambiguous');
+                const owned = { id: randomUUID(), signal: active };
+                modelCalls.set(key, owned);
+                const release = () => {
+                  active.removeEventListener('abort', release);
+                  if (modelCalls.get(key) === owned) modelCalls.delete(key);
+                };
+                active.addEventListener('abort', release, { once: true });
+                try {
+                  active.throwIfAborted();
+                  const endpoint = new URL(
+                    purpose ? '/v1/reference/' + purpose : '/v1/reference',
+                    origin,
+                  );
+                  const response = await globalThis.fetch(endpoint, {
+                    method: 'POST',
+                    redirect: 'error',
+                    signal: active,
+                    headers: {
+                      authorization: 'Bearer ' + capability,
+                      'content-type': 'application/json',
+                    },
+                    body: JSON.stringify(selection),
+                  });
+                  if (!response.ok) {
+                    await response.body?.cancel();
+                    throw Error('Native managed model call was denied');
+                  }
+                  return {
+                    reference: (await response.json()).reference,
+                    release,
+                  };
+                } catch (error) {
+                  release();
+                  throw error;
+                }
+              },
+            },
+          });
+          registeredModel = { dispose, llm: original(scope.llm), id };
+          const models = await scope.llm.listModels(provider);
+          if (models.length !== 1 || models[0].id !== model)
+            throw Error('Native managed model was not registered');
+        },
+      );
       if (
         !(await waitWhileOwned(signal, (ready, reject) => {
           void Promise.resolve(modelFiber).then(ready, reject);
