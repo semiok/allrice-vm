@@ -738,6 +738,7 @@ it('retains the mount of an older epoch without stopping its unowned native job'
   expect(providers.disk.detach).not.toHaveBeenCalled();
 
   status.mockResolvedValue('stopped');
+  value.model.reconcileOwner.mockResolvedValueOnce(0);
   await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
     0,
   );
