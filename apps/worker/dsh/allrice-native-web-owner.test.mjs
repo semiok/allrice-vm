@@ -136,6 +136,7 @@ function fixture() {
     input,
     openRoot,
     proof,
+    rootWake: delegations.rootWake,
   };
 }
 
@@ -153,6 +154,7 @@ it('proves a continuable child at its own turn after both original and newer par
   f.openRoot(root, 2, 'different-login');
   f.append(root, 'turn/end', { turn: 2 });
 
+  expect(f.rootWake(root.id)).toEqual({ kind: 'clear' });
   expect(f.proof(child, 1)).toEqual({
     turn: 1,
     ids: ['origin'],
@@ -165,6 +167,11 @@ it('proves a continuable child at its own turn after both original and newer par
   f.append(root, 'turn/start', { turn: 3 });
   f.emit('agent/inbox/claimed', { agent: root, message, turn: 3 });
   expect(f.proof(root, 3)?.ids).toEqual([]);
+  expect(f.rootWake(root.id)).toEqual({
+    kind: 'delegated',
+    turn: 3,
+    promptIds: ['origin'],
+  });
   f.append(root, 'user/message', message);
   expect(f.proof(root, 3)).toEqual({
     turn: 3,
@@ -177,6 +184,10 @@ it('proves a continuable child at its own turn after both original and newer par
     form: 'relay',
     senderSessionId: 'child',
   });
+  f.append(root, 'turn/end', { turn: 2 });
+  expect(f.rootWake(root.id)).toMatchObject({ kind: 'delegated', turn: 3 });
+  f.append(root, 'turn/end', { turn: 3 });
+  expect(f.rootWake(root.id)).toEqual({ kind: 'clear' });
 });
 
 it('binds an inbox relay to its accepted sender origin when the child resumes later', () => {
@@ -234,7 +245,13 @@ it('allows a settlement notice only after its paired native activation ends', ()
   f.emit('agent/inbox/claimed', { agent: root, message: notice, turn: 2 });
   f.emit('subagent/end', { id: child.id, runId: 'unknown', local: true });
   expect(f.claimed(root.session, notice, 2)).toBeNull();
+  expect(f.rootWake(root.id)).toEqual({ kind: 'unproven' });
   f.emit('subagent/end', { id: child.id, runId: 'activation', local: true });
+  expect(f.rootWake(root.id)).toEqual({
+    kind: 'delegated',
+    turn: 2,
+    promptIds: ['origin'],
+  });
   f.append(root, 'user/message', notice);
   expect(f.proof(root, 2)).toEqual({
     turn: 2,
@@ -243,6 +260,7 @@ it('allows a settlement notice only after its paired native activation ends', ()
     inherited: ['origin'],
   });
   f.append(root, 'turn/end', { turn: 2 });
+  expect(f.rootWake(root.id)).toEqual({ kind: 'clear' });
   f.append(root, 'turn/start', { turn: 3 });
   f.append(root, 'user/message', notice);
   expect(f.proof(root, 3)).toBeNull();

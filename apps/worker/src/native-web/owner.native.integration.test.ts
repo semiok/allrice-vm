@@ -359,6 +359,17 @@ it.skipIf(!cli)(
             delegated: !isRoot || ordinal >= 3,
           });
           if (isRoot && !title) {
+            expect(
+              await owner.readNativeRootWakeFor(context, root, signal),
+            ).toEqual(
+              ordinal >= 3
+                ? {
+                    kind: 'delegated',
+                    turn: proof!.turn!,
+                    promptIds: [requestId],
+                  }
+                : { kind: 'clear' },
+            );
             turns.push(proof!.turn!);
             if (ordinal >= 2) {
               expect(ordinal).toBeLessThanOrEqual(4);
@@ -491,6 +502,11 @@ it.skipIf(!cli)(
       value: { accepted: true },
     });
     await finished.promise;
+    expect(
+      await owner.readNativeRootWakeFor(context, sessionId, signal),
+    ).toEqual({
+      kind: 'clear',
+    });
     expect(turns).toEqual([1, 1, 2, 3]);
     expect([...attempts.values()].sort()).toEqual([2, 4]);
   },

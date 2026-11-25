@@ -23,6 +23,11 @@ type Observer = NonNullable<
   Parameters<typeof openNativeWebOwner>[0]['beforePrompt']
 >;
 type Attach = ReturnType<typeof createProductionNativeModelExecution>['attach'];
+type RootWake = Awaited<
+  ReturnType<
+    Awaited<ReturnType<typeof openNativeWebOwner>>['readNativeRootWakeFor']
+  >
+>;
 const identity: DEntryIdentity = {
   organizationId: randomUUID(),
   workspaceId: randomUUID(),
@@ -104,8 +109,11 @@ function nativeFacts() {
 async function setup() {
   const lifetime = new AbortController();
   let observed!: Observer;
+  const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
+    kind: 'clear',
+  }));
   const profile = {
-    owner: { modelAdapterId: 'adapter' },
+    owner: { modelAdapterId: 'adapter', readNativeRootWakeFor: readRootWake },
     bindingRef: 'binding',
     receipt: { rosterDigest: 'roster' },
     revoked: lifetime.signal,
@@ -128,6 +136,7 @@ async function setup() {
     } as unknown as Parameters<Attach>[1],
   );
   return {
+    readRootWake,
     admit(
       context: RequestContext,
       requestId: string,
@@ -217,6 +226,51 @@ it('frees only a certain pre-dispatch failure and keeps a carrier-unknown prompt
 });
 
 describe('native delegated execution', () => {
+  it('fences another login before a wake model reference and releases it after the same native root ends', async () => {
+    const f = await setup();
+    try {
+      const original = nativeFacts();
+      const a = login();
+      const b = login();
+      const admitted = await f.admit(a, 'original', original);
+      original.insert();
+      admitted.accepted();
+      original.settle('ended');
+      await Promise.resolve();
+
+      f.readRootWake.mockResolvedValue({
+        kind: 'delegated',
+        turn: 2,
+        promptIds: ['original'],
+      });
+      const otherSteer = nativeFacts();
+      await expect(
+        f.admit(b, 'foreign', otherSteer, 'steer'),
+      ).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
+      expect(otherSteer.observation.close).toHaveBeenCalledOnce();
+      await (
+        await f.admit(a, 'same-login', nativeFacts(), 'steer')
+      ).undispatched();
+      expect(original.observation.assertClaimed).toHaveBeenCalledOnce();
+
+      f.readRootWake.mockResolvedValue({ kind: 'unproven' });
+      await expect(
+        f.admit(b, 'unknown', nativeFacts(), 'steer'),
+      ).rejects.toMatchObject({
+        code: 'VM_ACTIVE',
+      });
+      f.readRootWake.mockResolvedValue({ kind: 'clear' });
+      await (
+        await f.admit(b, 'after-end', nativeFacts(), 'steer')
+      ).undispatched();
+      expect(original.observation.close).not.toHaveBeenCalled();
+    } finally {
+      await f.close();
+    }
+  });
+
   it('keeps an ended native source without occupying the queue and reuses its login authority watch', async () => {
     const f = await setup();
     try {

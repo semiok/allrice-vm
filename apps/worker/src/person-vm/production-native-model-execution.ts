@@ -441,6 +441,45 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           operations.delete(joined);
         }
       }
+      function findPromptContributors(
+        adapterId: string,
+        root: string,
+        binding: PersonVmBinding,
+        ids: readonly string[],
+      ) {
+        const candidates = new Map<
+          string,
+          Array<{
+            scope: PromptOwner;
+            observation: NativePromptObservation;
+          }>
+        >();
+        const requested = new Set(ids);
+        for (const entry of selected.values()) {
+          const { scope } = entry;
+          if (
+            scope.root !== root ||
+            scope.adapterId !== adapterId ||
+            !sameVmBinding(scope.binding, binding) ||
+            scope.revoked.aborted ||
+            !requested.has(scope.requestId)
+          )
+            continue;
+          const choices = candidates.get(scope.requestId) ?? [];
+          choices.push(entry);
+          candidates.set(scope.requestId, choices);
+        }
+        return readNativePromptContributors(ids, (id) => {
+          const choices = candidates.get(id) ?? [];
+          const inserted = choices.filter(({ observation }) =>
+            observation.inserted(),
+          );
+          // DSH can return an accepted idempotent replay. Only the
+          // original occurrence's native claim carries execution authority.
+          const actual = inserted.length ? inserted : choices;
+          return actual.length === 1 ? actual[0]!.scope : undefined;
+        });
+      }
       function conflictingLogin(
         adapterId: string,
         root: string,
@@ -668,6 +707,30 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   // Loss of the carrier proves neither discard nor turn end.
                 });
               await waitForPromptFact(observation.ready, admission);
+              if (mode === 'steer') {
+                const wake = await profile.owner.readNativeRootWakeFor(
+                  context,
+                  scope.root,
+                  admission,
+                );
+                if (wake.kind !== 'clear') {
+                  const claimed =
+                    wake.kind === 'delegated' &&
+                    findPromptContributors(
+                      adapterId,
+                      scope.root,
+                      binding,
+                      wake.promptIds,
+                    );
+                  if (!claimed || claimed.first.authorityKey !== authorityKey)
+                    throw new PersonVmError('VM_ACTIVE');
+                  await Promise.all(
+                    claimed.contributors.map((member) =>
+                      member.assertClaimed(admission),
+                    ),
+                  );
+                }
+              }
               admission.throwIfAborted();
               return {
                 async undispatched() {
@@ -962,40 +1025,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 )
               )
                 continue;
-              const candidates = new Map<
-                string,
-                Array<{
-                  scope: PromptOwner;
-                  observation: NativePromptObservation;
-                }>
-              >();
-              const requested = new Set(attempt.promptIds);
-              for (const entry of selected.values()) {
-                const { scope } = entry;
-                if (
-                  scope.root !== probe.root ||
-                  scope.adapterId !== wanted.adapterId ||
-                  !sameVmBinding(scope.binding, binding) ||
-                  scope.revoked.aborted ||
-                  !requested.has(scope.requestId)
-                )
-                  continue;
-                const choices = candidates.get(scope.requestId) ?? [];
-                choices.push(entry);
-                candidates.set(scope.requestId, choices);
-              }
-              const proven = readNativePromptContributors(
+              const proven = findPromptContributors(
+                wanted.adapterId,
+                probe.root,
+                binding,
                 attempt.promptIds,
-                (id) => {
-                  const choices = candidates.get(id) ?? [];
-                  const inserted = choices.filter(({ observation }) =>
-                    observation.inserted(),
-                  );
-                  // DSH can return an accepted idempotent replay. Only the
-                  // original occurrence's native claim carries execution authority.
-                  const actual = inserted.length ? inserted : choices;
-                  return actual.length === 1 ? actual[0]!.scope : undefined;
-                },
               );
               if (!proven) return reject();
               const { first: scope, contributors: coalesced } = proven;

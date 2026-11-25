@@ -816,6 +816,26 @@ export function observeDelegatedInputs(scope) {
       : null;
   }
 
+  function rootWake(sessionId) {
+    const agent = liveAgent(sessionId);
+    if (!agent) return { kind: 'clear' };
+    const session = original(agent.session);
+    if (root(session) !== session) return { kind: 'unproven' };
+    const state = turns.get(session);
+    if (!state?.firstInput)
+      return { kind: agent.status === 'running' ? 'unproven' : 'clear' };
+    if (state.firstInput === 'prompt') return { kind: 'clear' };
+    const origin = collect(
+      session,
+      [...state.claimed.values()].map(({ origin }) => origin),
+    );
+    if (!origin || state.unprovenClaim) return { kind: 'unproven' };
+    const promptIds = [...new Set([...origin.ids, ...state.directClaims])];
+    return promptIds.length && promptIds.length <= 64
+      ? { kind: 'delegated', turn: state.turn, promptIds }
+      : { kind: 'unproven' };
+  }
+
   scope.on(
     'subagent/start',
     ({ id, runId, local }) => {
@@ -902,10 +922,16 @@ export function observeDelegatedInputs(scope) {
       const session = original(agent.session);
       const inbox = inboxes.get(session);
       const record = inbox?.get(message.id);
-      if (!record) return;
-      inbox.delete(message.id);
+      inbox?.delete(message.id);
       const state = turns.get(session);
-      if (state?.turn === turn) state.claimed.set(message.id, record);
+      if (state?.turn !== turn) return;
+      if (record) state.claimed.set(message.id, record);
+      if (!session.header.parentSession && nativeOriginInput(message.source)) {
+        const id = nativePromptId(message.source);
+        state.firstInput ??= id === null ? 'delegated' : 'prompt';
+        if (id !== null) state.directClaims.add(id);
+        else if (!record) state.unprovenClaim = true;
+      }
     },
     global,
   );
@@ -927,6 +953,7 @@ export function observeDelegatedInputs(scope) {
           turn: event.data.turn,
           claimed: new Map(),
           inputs: [],
+          directClaims: new Set(),
         });
         return;
       }
@@ -970,7 +997,7 @@ export function observeDelegatedInputs(scope) {
     },
     global,
   );
-  return { root, claimed };
+  return { root, claimed, rootWake };
 }
 
 export function apply(ctx, config) {
@@ -1179,6 +1206,18 @@ export function applyNativeWebOwner(
               if (!current())
                 return new globalThis.Response(null, { status: 404 });
               const value = await request.json();
+              if (
+                value?.adapterId === id &&
+                value.action === 'read-root-wake' &&
+                typeof value.sessionId === 'string' &&
+                value.sessionId.length > 0 &&
+                value.sessionId.length <= 256 &&
+                Object.keys(value).length === 3
+              )
+                return globalThis.Response.json(
+                  delegations.rootWake(value.sessionId),
+                  { headers: { 'cache-control': 'no-store' } },
+                );
               if (
                 value?.adapterId === id &&
                 (value.action === 'observe-prompt' ||

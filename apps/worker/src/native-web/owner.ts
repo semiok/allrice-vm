@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
@@ -58,6 +59,22 @@ type EditorEvidence<T> = (
 
 export type NativeModelAttemptKind =
   'assistant' | 'compaction' | 'session-title';
+
+const nativeRootWake = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('clear') }).strict(),
+  z.object({ kind: z.literal('unproven') }).strict(),
+  z
+    .object({
+      kind: z.literal('delegated'),
+      turn: z.number().int().positive(),
+      promptIds: z
+        .array(z.string().min(1).max(256))
+        .min(1)
+        .max(64)
+        .refine((ids) => new Set(ids).size === ids.length),
+    })
+    .strict(),
+]);
 
 export function readNativeModelAttempt(
   snapshot: Pick<
@@ -659,6 +676,36 @@ export async function openNativeWebOwner(input: {
             current.throwIfAborted();
             return data;
           }),
+        );
+      },
+      readNativeRootWakeFor(
+        context: RequestContext,
+        sessionId: string,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const proof = await transport.readManagedModelProof(
+              JSON.stringify({
+                action: 'read-root-wake',
+                adapterId: installedModelAdapter,
+                sessionId,
+              }),
+              active,
+            );
+            if (!proof) throw new PersonVmError('PROVIDER_FAILED');
+            const wake = nativeRootWake.safeParse(JSON.parse(proof));
+            if (!wake.success) throw new PersonVmError('PROVIDER_FAILED');
+            return wake.data;
+          },
         );
       },
       readNativeAttemptFor(
