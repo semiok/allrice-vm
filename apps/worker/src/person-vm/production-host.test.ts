@@ -8,6 +8,7 @@ import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
 import type * as Egress from '@allrice/egress-gateway';
+import { EgressPrepareRollbackError } from '@allrice/egress-gateway';
 import type * as Model from '@allrice/model-gateway';
 import {
   ApfsPersonVmDisk,
@@ -812,7 +813,7 @@ it('retires a real unpublished egress binding in maintenance before releasing it
   const failed = await value.prepare.mock.results[0]!.value.catch(
     (error: unknown) => error,
   );
-  expect(failed).toBeInstanceOf(Egress.EgressPrepareRollbackError);
+  expect(failed).toBeInstanceOf(EgressPrepareRollbackError);
   const record = await value.memory.read(context.actor.id);
   expect(record).toMatchObject({ phase: 'failed', egressReceipt: null });
   expect(providers.native.stop).toHaveBeenCalled();
