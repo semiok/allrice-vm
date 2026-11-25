@@ -3,7 +3,11 @@ import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { URLSearchParams } from 'node:url';
-import { browserFailure, readPage } from './browser-diagnostics.mjs';
+import {
+  browserFailure,
+  readOnlyPageRoute,
+  readPage,
+} from './browser-diagnostics.mjs';
 
 // Same pinned Worker dependency as the existing browser-qa.fixture.ts. No
 // package install/download, user profile, remote debugging or browser reuse.
@@ -20,9 +24,12 @@ const config = JSON.parse(input);
 const origin = new URL(config.baseUrl).origin;
 const token = process.env.ALLRICE_ACCEPTANCE_SESSION;
 if (!token) throw new Error('Explicit test session required');
+const browserEnv = { ...process.env };
+delete browserEnv.ALLRICE_ACCEPTANCE_SESSION;
 const browser = await chromium.launch({
   headless: true,
   executablePath: config.browserExecutable,
+  env: browserEnv,
 });
 let context;
 const steps = {};
@@ -58,14 +65,10 @@ try {
       secure: origin.startsWith('https:'),
     },
   ]);
-  // No mutation/model/VM endpoint, downloads, external origin or opaque WS.
-  await context.route('**/*', async (route) => {
-    const request = route.request();
-    const url = new URL(request.url());
-    if (url.origin !== origin || !['GET', 'HEAD'].includes(request.method()))
-      await route.abort('blockedbyclient');
-    else await route.continue();
-  });
+  let pageRoute;
+  await context.route('**/*', (route) =>
+    pageRoute ? pageRoute(route) : route.abort('blockedbyclient'),
+  );
   await context.routeWebSocket('**/*', (socket) => socket.close());
   const selection = Object.fromEntries(
     ['workspaceId', 'employeeInstanceId', 'threadId'].map((key) => [
@@ -103,6 +106,7 @@ try {
       throw browserFailure('owner-binding-mismatch');
   }
   for (const [id, recipe] of Object.entries(config.ui)) {
+    pageRoute = readOnlyPageRoute(origin, recipe);
     const page = await context.newPage();
     const screenshot = id.replaceAll('.', '-') + '.png';
     try {
@@ -111,10 +115,12 @@ try {
         employeeInstanceId: config.employeeInstanceId,
         recipe,
         identity,
-        path: join(config.output, screenshot),
+        saveScreenshot: (image) =>
+          writeFile(join(config.output, screenshot), image, { flag: 'wx' }),
         screenshot,
       });
     } finally {
+      pageRoute = undefined;
       await page.close();
     }
   }

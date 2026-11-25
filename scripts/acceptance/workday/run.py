@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[2]
 SESSION_ENV = 'ALLRICE_ACCEPTANCE_SESSION'
 FIXTURE_FILE = 'apps/worker/src/d-entry/native-entry.fixture.ts'
+FIXTURE_REMOTES = {'https://github.com/semiok/allrice-vm',
+                   'git@github.com:semiok/allrice-vm',
+                   'ssh://git@github.com/semiok/allrice-vm'}
 STEPS = [
     ('GATE.release', 'GATE', '固定组合与节点4开验资格', 'release', '最终组合四门/完整M5/迁移与本人开关批准须由发布负责人核验'),
     ('IDENTITY.login', 'IDENTITY', '本人登录身份', '271', '需要显式测试session与当前本人/企业/员工资格'),
@@ -209,6 +212,10 @@ def native_fixture(config, output):
     actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if actual != expected:
         raise ValueError('fixture source HEAD differs from fixed fixtureSha')
+    remote = subprocess.run(['git', '-C', str(source), 'remote', 'get-url', 'origin'],
+                            check=False, capture_output=True, text=True)
+    if remote.returncode != 0 or remote.stdout.strip().removesuffix('.git') not in FIXTURE_REMOTES:
+        raise ValueError('fixture source origin must be semiok/allrice-vm')
     if subprocess.run(['git', '-C', str(source), 'diff', '--quiet', 'HEAD'], check=False).returncode != 0:
         raise ValueError('fixture source tree differs from fixed HEAD')
     tracked = subprocess.check_output(['git', '-C', str(source), 'show', f'{actual}:{FIXTURE_FILE}'])
@@ -347,6 +354,9 @@ def browser_reads(config, output):
     for step, recipe in recipes.items():
         if step not in READ_UI or not isinstance(recipe, dict):
             raise ValueError('only named read-only UI recipes are allowed')
+        # Native owner discovery requires a live VM and cannot prove cold history.
+        if step == 'RECOVERY.cold-history':
+            continue
         if not all(recipe.get(key) for key in ('ownerSource', 'path', 'locator',
                                                'scopeLocator', 'scopeAttribute')):
             continue

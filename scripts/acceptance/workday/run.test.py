@@ -298,9 +298,33 @@ class RunnerTests(unittest.TestCase):
             def git(args, **kwargs):
                 return fixture.read_bytes() if args[-1].endswith(workday.FIXTURE_FILE) else fixture_sha
             with patch.object(workday, 'REPO', root), patch.object(subprocess, 'check_output', side_effect=git), patch.object(
-                    subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), patch.object(workday, 'child', return_value=0):
-                with self.assertRaises(ValueError):
+                    subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 0, stdout='https://github.com/semiok/allrice-vm.git')), patch.object(
+                    workday, 'child', return_value=0):
+                with self.assertRaisesRegex(ValueError, 'cleanup/identity receipt incomplete'):
                     workday.native_fixture({'fixtureSource': str(source), 'fixtureSha': fixture_sha}, root)
+
+    def test_native_fixture_rejects_legacy_repository_even_with_a_matching_pin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = root / workday.FIXTURE_FILE
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text('// old checkout with the same commit')
+            fixture_sha = 'a' * 40
+            with patch.object(subprocess, 'check_output', return_value=fixture_sha), patch.object(
+                    subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 0, stdout='https://github.com/semiok/allrice.git')), patch.object(
+                    workday, 'child') as driver:
+                with self.assertRaisesRegex(ValueError, 'source origin must be semiok/allrice-vm'):
+                    workday.native_fixture({'fixtureSource': temp, 'fixtureSha': fixture_sha}, root)
+                driver.assert_not_called()
+
+    def test_cold_history_does_not_run_the_live_owner_recipe(self):
+        recipe = {'ownerSource': 'synthetic', 'path': '/history', 'locator': 'body',
+                  'scopeLocator': 'body', 'scopeAttribute': 'data-employee'}
+        with tempfile.TemporaryDirectory() as temp, patch.object(workday, 'child') as driver:
+            self.assertEqual(workday.browser_reads({'ui': {'RECOVERY.cold-history': recipe}}, Path(temp)), [])
+            driver.assert_not_called()
 
     def test_browser_primary_and_capture_diagnostics_survive_json_and_html(self):
         config = self.live_config()

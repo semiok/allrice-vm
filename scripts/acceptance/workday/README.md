@@ -52,7 +52,7 @@ python3 scripts/acceptance/workday/run.py --mode fixture --config /absolute/fixt
 
 请求前已经明确缺失的来源、授权或门禁前置仍可 `Unavailable/skipped`，不发请求。实际发出请求后，所有HTTP错误均为 failed/退出1，记入对应身份/员工步骤并说明具体原因未确定；`503 + error.code=DEPENDENCY_UNAVAILABLE` 也不能证明生产缺源，因为现有BFF同样以此表示fetch、解析或未知上游异常。仅保存固定endpoint、status和白名单code，服务器message/header/body不入报告；不新增缺源豁免或产品接口。
 
-只读UI需要 `browserExecutable` 指向已有锁定Chromium以及 `ui` 映射。允许的步骤只有：SUBAGENT.read、REFERENCES.read、DELIVERABLES.read、MEMORY.read、CAPABILITIES.read、APPROVAL.review、RECOVERY.cold-history、ADMIN.runtime/usage/approvals。每项须由D/模块owner给 `ownerSource`（固定source/symbol）、`path`、`locator`、`scopeLocator` 和 `scopeAttribute`；后两者必须对应**实际已有**DOM属性，值等于employeeInstanceId。没有封版locator就保持该项skipped，不自行造data-testid。可选 `text` 做精确可见文本核验，不拿显示文字当权限。
+只读 UI 需要 `browserExecutable` 指向已有锁定 Chromium，并提供 `ui` 映射。自动检查适用于 SUBAGENT.read、REFERENCES.read、DELIVERABLES.read、MEMORY.read、CAPABILITIES.read、APPROVAL.review 和 ADMIN.runtime/usage/approvals。冷历史需要独立的关机状态证据，保留待验。每项由模块 owner 提供 `ownerSource`（固定 source/symbol）、已核只读页面 `path`、内容 `locator`、授权容器 `scopeLocator` 和 `scopeAttribute`。容器必须唯一可见，属性值等于 employeeInstanceId。内容及可选的精确 `text` 都在该容器内核验。页面依赖的已封版只读 API 可通过 `readApiPaths` 声明精确同源路径和查询串。
 
 ```json
 {
@@ -62,15 +62,16 @@ python3 scripts/acceptance/workday/run.py --mode fixture --config /absolute/fixt
       "path": "/owner-supplied-existing-route",
       "locator": "owner-supplied-existing-visible-locator",
       "scopeLocator": "owner-supplied-existing-scope-locator",
-      "scopeAttribute": "owner-supplied-existing-employee-instance-attribute"
+      "scopeAttribute": "owner-supplied-existing-employee-instance-attribute",
+      "readApiPaths": []
     }
   }
 }
 ```
 
-这些是配置字段说明，**不是已存在的产品路由/locator**。当且仅当owner补齐真实值后才能执行。浏览器复用既有Worker `playwright-core`（与browser-qa.fixture.ts同一依赖），仅新建临时context，不接用户浏览器。阻断跨origin、所有页面POST/其他写、opaque WS、service worker与下载；只读页面可以失败，不能因此放开写。每步前后用相同两个只读BFF复查当前身份、4.0代际、原bindingRef及页面员工scope；只用实际 `page.screenshot` 生成PNG。没有截图则给具体原因，不生成占位图、不把rev2示意/旧截图替代。单张只读截图不关闭VISUAL全矩阵。
+owner 补齐实际路由和定位器后，浏览器才执行对应检查。它使用 Worker 已锁定的 `playwright-core` 和临时 context。文档、Next 静态资源及明确列出的只读 API 可发 GET/HEAD。请求不跟随重定向，其他页面请求、WebSocket、service worker 与下载均被拦截。截图只截取授权容器，在采集前后复核身份、4.0 代际、原 bindingRef 和容器范围，通过后才写 PNG。
 
-失败保留阶段、有限错误分类/类型和受控HTTP状态，截图失败另记 `captureFailure` 与无截图原因，不覆盖原首败。Playwright任意message/call log可能含selector、URL query、页面正文或凭据，因此只保存安全投影；不将这些原文放进JSON/HTML。`browser-diagnostics.mjs` 复用同一单页读取路径，注入page回归只证明诊断组合，不生成截图或宣称实际浏览器通过。
+失败保留阶段、有限错误分类、受控 HTTP 状态和无截图原因，截图失败另记 `captureFailure`。报告采用有限的错误投影。注入页面回归用于核对诊断与授权边界。
 
 Dev写入、定时执行、审批/发送、VM开关/破坏、真实模型、空闲20分钟、恢复与性能压测目前没有在本runner装配生产入口，明确skipped到owner。本工具不调用3.x API冒4.0，也不提供任意shell/HTTP/模型adapter。四面板的读/写状态分别记录；不能将只读截图当业务写验收。
 

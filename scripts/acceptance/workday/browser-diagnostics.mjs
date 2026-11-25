@@ -57,32 +57,84 @@ function describe(failure) {
   return `${failure.stage}/${failure.code} ${failure.type}${failure.status === undefined ? '' : ` HTTP ${failure.status}`}: ${failure.message}`;
 }
 
+/** Restrict page traffic to the owner-approved document and exact read APIs. */
+export function readOnlyPageRoute(origin, recipe) {
+  const document = new URL(recipe.path, origin);
+  document.hash = '';
+  const reads = new Set(
+    (recipe.readApiPaths ?? []).map((path) => new URL(path, origin).href),
+  );
+  if (document.origin !== origin || document.pathname.startsWith('/api/'))
+    throw new Error('The approved document must be a same-origin page');
+  for (const href of reads) {
+    const url = new URL(href);
+    if (
+      url.origin !== origin ||
+      !url.pathname.startsWith('/api/v1/') ||
+      url.hash ||
+      url.username ||
+      url.password
+    )
+      throw new Error('Read API paths must be exact same-origin URLs');
+  }
+  return async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const permitted = request.isNavigationRequest()
+      ? url.href === document.href
+      : url.pathname.startsWith('/_next/static/') || reads.has(url.href);
+    if (
+      url.origin !== origin ||
+      !permitted ||
+      !['GET', 'HEAD'].includes(request.method())
+    ) {
+      await route.abort('blockedbyclient');
+      return;
+    }
+    // Continuing a browser request would allow Playwright redirect hops
+    // without returning through the route handler.
+    const response = await route.fetch({ maxRedirects: 0 });
+    try {
+      if (response.status() >= 300 && response.status() < 400)
+        await route.abort('blockedbyclient');
+      else await route.fulfill({ response });
+    } finally {
+      await response.dispose();
+    }
+  };
+}
+
 /** Existing single-page read, extracted so failure/capture composition is tested
  * without launching a browser or presenting injected pages as Dev evidence. */
 export async function readPage(
   page,
-  { origin, employeeInstanceId, recipe, identity, path, screenshot },
+  { origin, employeeInstanceId, recipe, identity, saveScreenshot, screenshot },
 ) {
   let stage = 'identity-before';
+  const assertScope = async (scope) => {
+    if (new URL(page.url()).origin !== origin)
+      throw browserFailure('navigation-origin-mismatch');
+    if (
+      (await scope.count()) !== 1 ||
+      (await scope.getAttribute(recipe.scopeAttribute)) !== employeeInstanceId
+    )
+      throw browserFailure('scope-mismatch');
+  };
   try {
     await identity();
     stage = 'navigation';
     const response = await page.goto(new URL(recipe.path, origin).href);
     if (!response || response.status() !== 200)
       throw browserFailure('navigation-http', response?.status());
-    if (new URL(page.url()).origin !== origin)
-      throw browserFailure('navigation-origin-mismatch');
-    stage = 'locator';
-    await page.locator(recipe.locator).first().waitFor({ state: 'visible' });
     stage = 'scope';
-    const scope = await page
-      .locator(recipe.scopeLocator)
-      .first()
-      .getAttribute(recipe.scopeAttribute);
-    if (scope !== employeeInstanceId) throw browserFailure('scope-mismatch');
+    const scope = page.locator(recipe.scopeLocator).filter({ visible: true });
+    await scope.first().waitFor({ state: 'visible' });
+    await assertScope(scope);
+    stage = 'locator';
+    await scope.locator(recipe.locator).first().waitFor({ state: 'visible' });
     if (recipe.text !== undefined) {
       stage = 'text';
-      await page
+      await scope
         .getByText(recipe.text, { exact: true })
         .first()
         .waitFor({ state: 'visible' });
@@ -91,8 +143,16 @@ export async function readPage(
     await page.evaluate(() => globalThis.document.fonts.ready);
     stage = 'identity-after';
     await identity();
+    stage = 'scope';
+    await assertScope(scope);
     stage = 'capture';
-    await page.screenshot({ path, fullPage: true });
+    const image = await scope.screenshot();
+    stage = 'identity-after-capture';
+    await identity();
+    stage = 'scope';
+    await assertScope(scope);
+    stage = 'capture';
+    await saveScreenshot(image);
     return {
       status: 'passed',
       screenshot,
@@ -101,21 +161,13 @@ export async function readPage(
     };
   } catch (error) {
     const failure = diagnostic(stage, error);
-    let captured = null;
-    let captureFailure = null;
-    try {
-      await page.screenshot({ path, fullPage: true });
-      captured = screenshot;
-    } catch (captureError) {
-      captureFailure = diagnostic('capture', captureError);
-    }
     return {
       status: 'failed',
-      screenshot: captured,
+      screenshot: null,
       failure,
-      captureFailure,
+      captureFailure: stage === 'capture' ? failure : null,
       reason: describe(failure),
-      noScreenshotReason: captured ? null : describe(captureFailure),
+      noScreenshotReason: describe(failure),
     };
   }
 }

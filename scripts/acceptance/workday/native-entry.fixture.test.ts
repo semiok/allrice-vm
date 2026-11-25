@@ -99,6 +99,7 @@ it.skipIf(!process.env.WORKDAY_FIXTURE_SOURCE)(
         await writeFile(
           receipt,
           JSON.stringify({ kind: 'consumer-fixture', closed, steps }) + '\n',
+          { flag: 'wx' },
         );
       }
     }
