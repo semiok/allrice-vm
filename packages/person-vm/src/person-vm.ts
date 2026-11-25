@@ -614,23 +614,22 @@ export class PersonVmService
         web = Object.freeze({ context, receipt: endpoints });
         await lease.guard();
       }
-      const state = await this.options.native.status(binding, signal);
+      const native = this.options.native;
+      const state = await native.status(binding, signal);
+      let checkedWebAfterStart = false;
       if (state === 'absent' && !row.nativeCreated) {
-        if (web)
-          await this.options.native.create(
-            binding,
-            receipt,
-            signal,
-            web.receipt,
-          );
-        else await this.options.native.create(binding, receipt, signal);
+        if (web) await native.create(binding, receipt, signal, web.receipt);
+        else await native.create(binding, receipt, signal);
         row.nativeCreated = true;
         await lease.save(row);
-      } else if (state === 'stopped' && row.nativeCreated)
-        await this.options.native.start(binding, signal);
-      else throw new PersonVmError('PROVIDER_FAILED');
-      if (web)
-        await this.options.native.assertWebEndpoints!(web.receipt, signal);
+      } else if (state === 'stopped' && row.nativeCreated) {
+        if (web && native.startWithWebEndpoints) {
+          await native.startWithWebEndpoints(web.receipt, signal);
+          checkedWebAfterStart = true;
+        } else await native.start(binding, signal);
+      } else throw new PersonVmError('PROVIDER_FAILED');
+      if (web && !checkedWebAfterStart)
+        await native.assertWebEndpoints!(web.receipt, signal);
       await lease.guard();
       const frame = this.currentLease.getStore();
       const assertStarting = async () => {

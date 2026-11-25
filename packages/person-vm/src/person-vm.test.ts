@@ -242,6 +242,22 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     await h.service.start(rc, signal());
     expect(h.log.filter((item) => item === 'native:bootstrap')).toHaveLength(1);
   });
+  it('revocation at the end of plan preparation prevents native bootstrap', async () => {
+    const h = harness(),
+      rc = context();
+    const plan = h.runtime.memoryGuestPlan;
+    h.runtime.memoryGuestPlan = async (...args) => {
+      const value = await plan(...args);
+      h.authorize(false);
+      return value;
+    };
+    await expect(
+      h.service.prewarm(rc, { trigger: 'page' }, signal()),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(h.log).not.toContain('native:bootstrap');
+    expect(h.log).not.toContain('runtime:start');
+    expect(h.mounts.size).toBe(0);
+  });
   it.each(['authority', 'egress'] as const)(
     'starting失去%s后launch零派发，callback捕获拒绝也不得ready',
     async (lost) => {
