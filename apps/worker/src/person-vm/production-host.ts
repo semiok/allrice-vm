@@ -162,7 +162,7 @@ export function createProductionPersonVmHost(input: {
   >();
   let personVm: PersonVmService | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
-  const uncertainPreparation: unknown[] = [];
+  const uncertainPreparation = new Map<PersonVmBinding, unknown>();
   const independentCloseFailures: unknown[] = [];
   const modelOwnerId = randomUUID();
   let modelRecovery:
@@ -238,7 +238,7 @@ export function createProductionPersonVmHost(input: {
             // as AggregateError. Without its private receipt no outer owner can
             // certify that unknown state closed; retain that original failure.
             if (error instanceof AggregateError)
-              uncertainPreparation.push(error);
+              uncertainPreparation.set(binding, error);
             throw error;
           });
         // A late receipt still belongs to the service cleanup. Hand it back
@@ -385,7 +385,7 @@ export function createProductionPersonVmHost(input: {
       input.lifetime.removeEventListener('abort', aborted);
       const errors = [
         ...independentCloseFailures,
-        ...uncertainPreparation,
+        ...uncertainPreparation.values(),
         ...vmFailures,
         ...receiptFailures,
         ...installationFailures,
@@ -447,7 +447,7 @@ export function createProductionPersonVmHost(input: {
           ]);
       const errors = [
         ...independentCloseFailures,
-        ...uncertainPreparation,
+        ...uncertainPreparation.values(),
         ...vmFailures,
         ...receiptFailures,
         ...installationFailures,
@@ -533,6 +533,11 @@ export function createProductionPersonVmHost(input: {
             binding: Object.freeze({ ...binding }),
             stopNative: false,
           });
+        },
+        hasUnconfirmedEgress(binding) {
+          for (const pending of uncertainPreparation.keys())
+            if (sameVmBinding(pending, binding)) return true;
+          return false;
         },
         ...providers.configuration.lifecycle,
       });
@@ -710,7 +715,7 @@ export function createProductionPersonVmHost(input: {
         close,
         recoverModelOwner,
         modelOwnerMaintenancePending: () =>
-          modelRecovery !== undefined || uncertainPreparation.length > 0,
+          modelRecovery !== undefined || uncertainPreparation.size > 0,
       });
     } finally {
       finishConstruction();

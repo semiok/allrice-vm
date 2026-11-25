@@ -95,6 +95,7 @@ export class PersonVmService
       observeOwnedStart?: (binding: PersonVmBinding) => void;
       /** A retained epoch may acquire a mount without owning its native job. */
       observeOwnedMount?: (binding: PersonVmBinding) => void;
+      hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
       cleanupTimeoutMs: number;
@@ -761,6 +762,10 @@ export class PersonVmService
         failed = true;
         egressJoined = false;
       }
+    }
+    if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row))) {
+      failed = true;
+      egressJoined = false;
     }
     let stopped = false;
     // Revocation exhausting its budget must not pre-abort the physical stop attempt.

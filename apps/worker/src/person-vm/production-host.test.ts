@@ -746,6 +746,37 @@ it('retains the mount of an older epoch without stopping its unowned native job'
   expect(value.host.modelOwnerMaintenancePending()).toBe(false);
 });
 
+it('retains the exact mount when egress preparation fails without returning a receipt', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const failed = new AggregateError(
+    [
+      Error('synthetic setup failure'),
+      Error('synthetic unknown egress retirement'),
+    ],
+    'EGRESS_PREPARE_FAILED',
+  );
+  value.prepare.mockRejectedValueOnce(failed);
+  await expect(vm.start(context, signal())).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
+  expect(providers.native.stop).toHaveBeenCalled();
+  expect(providers.disk.detach).not.toHaveBeenCalled();
+  const record = await value.memory.read(context.actor.id);
+  expect(record).toMatchObject({ phase: 'failed', egressReceipt: null });
+
+  const closeFixture = cleanup.pop()!;
+  await expect(value.host.close()).rejects.toMatchObject({
+    errors: expect.arrayContaining([failed]),
+  });
+  cleanup.push(async () => {
+    await closeFixture().catch(() => {});
+  });
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+  expect(providers.disk.detach).not.toHaveBeenCalled();
+});
+
 it('a stale persisted service receipt cannot remove a retained newer epoch from Host cleanup', async () => {
   const value = await receiptFixture(),
     vm = value.input().vm,
