@@ -1,5 +1,5 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
-import { createRequire } from 'node:module';
+import { createRequire, registerHooks } from 'node:module';
 import { stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
@@ -384,30 +384,7 @@ export function createNativeRunTerminalAttestations() {
   };
 }
 
-// Executed only by the Host's fixed managed read probe on an already running
-// retained VM. The CLI is on its verified read-only release mount.
-export async function printRetainedRunTerminal([
-  cli,
-  readonlyRoot,
-  employee,
-  encoded,
-]) {
-  if (
-    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
-      employee,
-    )
-  )
-    throw Error('INVALID_JOURNAL_SCOPE');
-  const root = `/work/.allrice/employees/${employee}/dsh/sessions`;
-  const knownDirectory = await lstat(root).catch((error) => {
-    if (error?.code !== 'ENOENT') throw error;
-    return null;
-  });
-  if (!knownDirectory?.isDirectory() || (await realpath(root)) !== root) {
-    stdout.write('null');
-    return;
-  }
-
+async function loadRetainedRunBackend(cli, readonlyRoot) {
   const sealed = await realpath(readonlyRoot);
   const cliLocation = await realpath(cli);
   if (sealed !== readonlyRoot || !cliLocation.startsWith(sealed + '/'))
@@ -435,10 +412,55 @@ export async function printRetainedRunTerminal([
     createRequire(backendLocation),
     '@deepseek-ai/cordis',
   );
-  const [{ Context }, backend] = await Promise.all([
-    import(pathToFileURL(cordisLocation).href),
-    import(pathToFileURL(backendLocation).href),
+  // Keep these public specifiers visible to the native artifact scanner.
+  // Only this probe's imports use the entries verified on the Guest mount.
+  const entries = new Map([
+    ['@deepseek-ai/cordis', pathToFileURL(cordisLocation).href],
+    [backendId, pathToFileURL(backendLocation).href],
   ]);
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const url =
+        context.parentURL === import.meta.url && entries.get(specifier);
+      return url
+        ? { url, shortCircuit: true }
+        : nextResolve(specifier, context);
+    },
+  });
+  try {
+    const { Context } = await import('@deepseek-ai/cordis');
+    const backend = await import('@deepseek-ai/dsh-session-persistence-jsonl');
+    return { Context, backend };
+  } finally {
+    hooks.deregister();
+  }
+}
+
+// Executed only by the Host's fixed managed read probe on an already running
+// retained VM. The CLI is on its verified read-only release mount.
+export async function printRetainedRunTerminal([
+  cli,
+  readonlyRoot,
+  employee,
+  encoded,
+]) {
+  if (
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
+      employee,
+    )
+  )
+    throw Error('INVALID_JOURNAL_SCOPE');
+  const root = `/work/.allrice/employees/${employee}/dsh/sessions`;
+  const knownDirectory = await lstat(root).catch((error) => {
+    if (error?.code !== 'ENOENT') throw error;
+    return null;
+  });
+  if (!knownDirectory?.isDirectory() || (await realpath(root)) !== root) {
+    stdout.write('null');
+    return;
+  }
+
+  const { Context, backend } = await loadRetainedRunBackend(cli, readonlyRoot);
   const ctx = new Context();
   let end;
   try {

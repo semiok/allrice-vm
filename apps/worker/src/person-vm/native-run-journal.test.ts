@@ -1,7 +1,8 @@
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
@@ -40,6 +41,53 @@ const selection = {
   cursor: 11,
   turn: 1,
 };
+
+it('loads the retained probe backend through the sealed CLI tree from an unrelated cwd', async () => {
+  const workspace = await realpath(new URL('../../../../', import.meta.url));
+  const cli = await realpath(
+    join(
+      workspace,
+      'packages/dsh-web-composition/node_modules/@deepseek-ai/dsh/lib/bin.js',
+    ),
+  );
+  const program = await readFile(
+    new URL('../../dsh/allrice-native-run-journal.mjs', import.meta.url),
+    'utf8',
+  );
+  const root = await mkdtemp(join(tmpdir(), 'allrice-d-entry-probe-'));
+  const run = (readonlyRoot: string) =>
+    spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        program +
+          `
+const { Context, backend } = await loadRetainedRunBackend(...process.argv.slice(1, 3));
+const ctx = new Context();
+try {
+  await ctx.plugin(backend.default ?? backend, { root: process.argv[3] }).await();
+  if (!ctx.get('sessionPersistence')) throw new Error('No native backend');
+} finally {
+  await ctx.fiber.dispose();
+}`,
+        '--',
+        cli,
+        readonlyRoot,
+        root,
+      ],
+      { cwd: root, encoding: 'utf8', timeout: 10_000 },
+    );
+  try {
+    const loaded = run(workspace);
+    expect(loaded.status, loaded.stderr).toBe(0);
+    const escaped = run(dirname(cli));
+    expect(escaped.status).toBe(1);
+    expect(escaped.stderr).toContain('UNVERIFIED_DSH_READER');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('replays the committed DSH Web journal through the rc.2 read handle', async () => {
   const root = await mkdtemp(join(tmpdir(), 'allrice-d-entry-run-journal-'));
