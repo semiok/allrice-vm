@@ -26,8 +26,8 @@ export async function reconcileNativeRunTerminals(
     for (const location of startup.runJournalOwners()) {
       const { owner, endpoint, receipt } = location;
       const { binding } = receipt;
-      const adapterId = owner.modelAdapterId;
-      if (!adapterId || signal.aborted || location.revoked.aborted) continue;
+      if (!owner.modelAdapterId || signal.aborted || location.revoked.aborted)
+        continue;
       const active = AbortSignal.any([signal, location.revoked]);
       const scope = {
         organizationId: binding.organizationId,
@@ -38,8 +38,6 @@ export async function reconcileNativeRunTerminals(
         leaseEpoch: binding.leaseEpoch,
         employeeInstanceId: endpoint.employeeInstanceId,
         employeeRelease: endpoint.employeeVersionId,
-        adapterId,
-        nativeInstanceId: owner.nativeInstanceId,
       };
       const page = await listDEntryNativeRunCandidates(
         scope,

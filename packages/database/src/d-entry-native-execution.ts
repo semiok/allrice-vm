@@ -227,8 +227,6 @@ export type DEntryNativeRunJournalOwner = Readonly<{
   leaseEpoch: number;
   employeeInstanceId: string;
   employeeRelease: string;
-  adapterId: string;
-  nativeInstanceId: string;
 }>;
 
 function matchesRunScope(
@@ -253,9 +251,39 @@ function matchesRunScope(
   );
 }
 
+function belongsToRetainedDisk(
+  execution: DEntryNativeRunCandidate['attempt'],
+  owner: DEntryNativeRunJournalOwner,
+) {
+  return (
+    execution.leaseEpoch < owner.leaseEpoch ||
+    (execution.leaseEpoch === owner.leaseEpoch &&
+      execution.vmInstanceId === owner.vmInstanceId)
+  );
+}
+
+function currentJournalScope(
+  sql: ReturnType<typeof getDatabase>,
+  owner: DEntryNativeRunJournalOwner,
+) {
+  return sql`
+    v.vm_id=${owner.vmId} and v.organization_id=${owner.organizationId}
+    and v.person_id=${owner.personId} and v.instance_id=${owner.vmInstanceId}
+    and v.lease_epoch=${owner.leaseEpoch} and v.phase='running'
+    and v.disk_retained and v.lease_owner is null
+    and t.workspace_id=${owner.workspaceId} and t.execution_generation='4.0'
+    and coalesce(t.employee_instance_id,t.employee_assignment_id)=${owner.employeeInstanceId}
+    and t.d_entry_native_root is not null
+    and t.d_entry_native_root#>>'{host,binding,vmId}'=${owner.vmId}
+    and t.d_entry_native_root#>>'{host,binding,organizationId}'=${owner.organizationId}
+    and t.d_entry_native_root#>>'{host,binding,personId}'=${owner.personId}
+  `;
+}
+
 type ScanCursor = { runId: string; sequence: number };
 
-/** Host-only enumeration for one authenticated employee-profile owner. */
+/** Host-only enumeration for the authenticated owner of the retained disk.
+ * Step instance, adapter and native job are the original execution's facts. */
 export async function listDEntryNativeRunCandidates(
   owner: DEntryNativeRunJournalOwner,
   after?: ScanCursor,
@@ -277,7 +305,14 @@ export async function listDEntryNativeRunCandidates(
       e.id as execution_id, e.sequence, r.execution_spec as prompt, e.payload as attempt
     from allrice_runs r
     join allrice_run_events e on e.run_id=r.id and e.event_type='step.started'
-    where r.organization_id=${owner.organizationId}
+    join person_virtual_machines v on v.person_id=r.owner_id
+      and v.organization_id=r.organization_id
+    join allrice_chat_sessions t on t.organization_id=r.organization_id
+      and t.workspace_id=r.workspace_id and t.owner_id=r.owner_id
+      and t.id::text=r.execution_spec->>'threadId'
+      and t.d_entry_native_root->>'nativeSessionId'=r.execution_spec->>'rootSessionId'
+    where ${currentJournalScope(sql, owner)}
+      and r.organization_id=${owner.organizationId}
       and r.workspace_id=${owner.workspaceId} and r.owner_id=${owner.personId}
       and r.state='running' and r.visibility='private'
       and r.execution_spec @> ${sql.json({
@@ -286,16 +321,9 @@ export async function listDEntryNativeRunCandidates(
         vmId: owner.vmId,
         employeeInstanceId: owner.employeeInstanceId,
         employeeRelease: owner.employeeRelease,
-        adapterId: owner.adapterId,
       })}
       and r.execution_spec->>'source' in ('dsh-native-prompt','dsh-native-delegation')
-      and e.payload @> ${sql.json({
-        source: 'dsh-native-attempt',
-        profile: owner.adapterId,
-        nativeInstanceId: owner.nativeInstanceId,
-        vmInstanceId: owner.vmInstanceId,
-        leaseEpoch: owner.leaseEpoch,
-      })}
+      and e.payload->>'source'='dsh-native-attempt'
       ${after ? sql`and (r.id,e.sequence) > (${after.runId}::uuid,${after.sequence}::integer)` : sql``}
     order by r.id, e.sequence
     limit 64
@@ -307,7 +335,8 @@ export async function listDEntryNativeRunCandidates(
       !source.success ||
       !step.success ||
       source.data.personId !== row.owner_id ||
-      !matchesRunScope(source.data, step.data)
+      !matchesRunScope(source.data, step.data) ||
+      !belongsToRetainedDisk(step.data, owner)
     )
       return [];
     return [
@@ -338,28 +367,25 @@ export async function isDEntryNativeRunJournalCurrent(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const sql = getDatabase();
   const { prompt } = candidate;
+  if (
+    candidate.organizationId !== owner.organizationId ||
+    candidate.workspaceId !== owner.workspaceId ||
+    candidate.ownerId !== owner.personId ||
+    prompt.personId !== owner.personId ||
+    prompt.vmId !== owner.vmId ||
+    prompt.employeeInstanceId !== owner.employeeInstanceId ||
+    prompt.employeeRelease !== owner.employeeRelease ||
+    !belongsToRetainedDisk(candidate.attempt, owner)
+  )
+    return false;
+  const sql = getDatabase();
   const [row] = await sql`
     select 1 from person_virtual_machines v
     join allrice_chat_sessions t on t.id=${prompt.threadId}
       and t.organization_id=v.organization_id and t.owner_id=v.person_id
-    where v.vm_id=${owner.vmId} and v.organization_id=${owner.organizationId}
-      and v.person_id=${owner.personId} and v.instance_id=${owner.vmInstanceId}
-      and v.lease_epoch=${owner.leaseEpoch} and v.phase='running'
-      and v.disk_retained and v.lease_owner is null
-      and t.workspace_id=${owner.workspaceId} and t.execution_generation='4.0'
-      and coalesce(t.employee_instance_id,t.employee_assignment_id)=${owner.employeeInstanceId}
-      and t.d_entry_native_root @> ${sql.json({
-        nativeSessionId: prompt.rootSessionId,
-        host: {
-          binding: {
-            vmId: owner.vmId,
-            organizationId: owner.organizationId,
-            personId: owner.personId,
-          },
-        },
-      })}
+    where ${currentJournalScope(sql, owner)}
+      and t.d_entry_native_root->>'nativeSessionId'=${prompt.rootSessionId}
   `;
   signal.throwIfAborted();
   return !!row;

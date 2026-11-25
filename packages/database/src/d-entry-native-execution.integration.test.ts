@@ -4,12 +4,15 @@ import * as database from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import * as rootPin from './d-entry-native-root.ts';
 import {
+  isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
   publishDEntryNativeRunTerminal,
 } from './d-entry-native-execution.ts';
 import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
 import { authenticateSession, createSession } from './identity.ts';
-import { createRuntimeFixtureDatabase, runFixture } from './runtime.fixture.ts';
+import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
+import { createRunAuthorityFixture } from './run-authority.fixture.ts';
+import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1' ? describe : describe.skip;
@@ -27,9 +30,12 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     await fixture?.close();
   });
 
-  it('retries an atomic failed projection and replays the same scoped Run and execution IDs', async () => {
+  it('recovers an atomic failure through a new owner of the original retained VM and root', async () => {
     const { db } = fixture;
-    const f = await runFixture(db);
+    const f = await createRunAuthorityFixture(db, {
+      configure: false,
+      executionGeneration: '4.0',
+    });
     const { organizationId, workspaceId } = f.task.scope;
     const personId = f.context.actor.id;
     const login = await createSession(personId);
@@ -43,9 +49,9 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     const prompt = {
       generation: '4.0',
       source: 'dsh-native-prompt',
-      threadId: randomUUID(),
-      employeeInstanceId: randomUUID(),
-      employeeRelease: randomUUID(),
+      threadId: f.session,
+      employeeInstanceId: f.assignment,
+      employeeRelease: f.version,
       personId,
       vmId: randomUUID(),
       rootSessionId,
@@ -76,8 +82,32 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       leaseEpoch: attempt.leaseEpoch,
       employeeInstanceId: prompt.employeeInstanceId,
       employeeRelease: prompt.employeeRelease,
-      adapterId: prompt.adapterId,
-      nativeInstanceId: attempt.nativeInstanceId,
+    };
+    const identity = {
+      organizationId,
+      workspaceId,
+      personId,
+      employeeInstanceId: prompt.employeeInstanceId,
+      employeeRevision: 1,
+      employeeVersionId: prompt.employeeRelease,
+      threadId: prompt.threadId,
+    };
+    const originalCreation = {
+      schemaVersion: 1,
+      identity,
+      host: {
+        binding: {
+          organizationId,
+          personId,
+          vmId: owner.vmId,
+          instanceId: owner.vmInstanceId,
+          leaseEpoch: owner.leaseEpoch,
+        },
+        bindingRef: randomUUID(),
+        rosterDigest: 'sha256:' + 'a'.repeat(64),
+      },
+      operationId: randomUUID(),
+      releaseRevision: 'native-run-fixture',
     };
     const readPin = vi
       .spyOn(rootPin, 'getDEntryNativeRootPin')
@@ -85,18 +115,20 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         vmId: prompt.vmId,
         rootNativeSessionId: rootSessionId,
         rootOriginDigest: 'sha256:' + 'a'.repeat(64),
-        rootBindingRef: randomUUID(),
-        identity: {
-          organizationId,
-          workspaceId,
-          personId,
-          employeeInstanceId: prompt.employeeInstanceId,
-          employeeRevision: 1,
-          employeeVersionId: prompt.employeeRelease,
-          threadId: prompt.threadId,
-        },
+        rootBindingRef: originalCreation.operationId,
+        identity,
       });
     await db.begin(async (tx) => {
+      await ensureGeneralEmployeeInstance(tx, f.assignment);
+      await tx`update allrice_chat_sessions
+        set d_entry_native_root_claim=${tx.json(originalCreation)} where id=${f.session}`;
+      await tx`update allrice_chat_sessions
+        set d_entry_native_root=${tx.json({ ...originalCreation, nativeSessionId: rootSessionId })}
+        where id=${f.session}`;
+      await tx`insert into person_virtual_machines
+        (person_id,vm_id,organization_id,phase,disk_tier,native_created,instance_id,lease_epoch,egress_receipt)
+        values (${personId},${owner.vmId},${organizationId},'running','warm',true,
+          ${owner.vmInstanceId},${owner.leaseEpoch},'{}')`;
       await tx`insert into allrice_runs
         (id,organization_id,workspace_id,owner_id,state,execution_spec,started_at)
         values (${runId},${organizationId},${workspaceId},${personId},'running',${tx.json(prompt)},clock_timestamp())`;
@@ -124,6 +156,9 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       occurredAt: new Date().toISOString(),
     };
     const signal = new AbortController().signal;
+    expect(
+      await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
+    ).toBe(true);
     await db.unsafe(`
       create function refuse_native_terminal_fixture() returns trigger
       language plpgsql as $$
@@ -148,14 +183,83 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       await db`drop trigger refuse_native_terminal_fixture on allrice_run_events`;
     }
 
-    const reread = (await listDEntryNativeRunCandidates(owner)).candidates[0]!;
+    const restarted = {
+      ...owner,
+      vmInstanceId: randomUUID(),
+      leaseEpoch: owner.leaseEpoch + 1,
+    };
+    await db`update person_virtual_machines
+      set instance_id=${restarted.vmInstanceId},lease_epoch=${restarted.leaseEpoch}
+      where person_id=${personId}`;
+    expect(
+      await isDEntryNativeRunJournalCurrent(candidate, owner, signal),
+    ).toBe(false);
+    expect(
+      (await listDEntryNativeRunCandidates(owner)).candidates,
+    ).toHaveLength(0);
+    expect(
+      await isDEntryNativeRunJournalCurrent(candidate, restarted, signal),
+    ).toBe(true);
+    expect(
+      await isDEntryNativeRunJournalCurrent(
+        {
+          ...candidate,
+          attempt: { ...candidate.attempt, leaseEpoch: restarted.leaseEpoch },
+        },
+        restarted,
+        signal,
+      ),
+    ).toBe(false);
+    expect(
+      await isDEntryNativeRunJournalCurrent(
+        {
+          ...candidate,
+          attempt: {
+            ...candidate.attempt,
+            leaseEpoch: restarted.leaseEpoch + 1,
+          },
+        },
+        restarted,
+        signal,
+      ),
+    ).toBe(false);
+    expect(
+      await isDEntryNativeRunJournalCurrent(
+        {
+          ...candidate,
+          prompt: { ...candidate.prompt, rootSessionId: 'another-root' },
+        },
+        restarted,
+        signal,
+      ),
+    ).toBe(false);
+    const [reread] = (await listDEntryNativeRunCandidates(restarted))
+      .candidates;
+    expect(reread).toEqual(candidate);
+    // A successor authenticates with its own adapter. The birth provenance
+    // remains the original payload on both the Run and the exact execution.
+    expect(
+      await publishDEntryNativeRunTerminal(
+        {
+          ...reread!,
+          prompt: { ...reread!.prompt, adapterId: 'new-live-adapter' },
+          attempt: {
+            ...reread!.attempt,
+            profile: 'new-live-adapter',
+            nativeInstanceId: randomUUID(),
+          },
+        },
+        terminal,
+        signal,
+      ),
+    ).toBe(false);
     const racing = await Promise.all([
-      publishDEntryNativeRunTerminal(reread, terminal, signal),
-      publishDEntryNativeRunTerminal(reread, terminal, signal),
+      publishDEntryNativeRunTerminal(reread!, terminal, signal),
+      publishDEntryNativeRunTerminal(reread!, terminal, signal),
     ]);
     expect(racing.sort()).toEqual([false, true]);
     expect(
-      (await listDEntryNativeRunCandidates(owner)).candidates,
+      (await listDEntryNativeRunCandidates(restarted)).candidates,
     ).toHaveLength(0);
 
     const persisted = await getRunForRead(context, workspaceId, runId);
