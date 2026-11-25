@@ -16,6 +16,7 @@ import {
 import { getSessionExecutionGeneration } from './workspace/service.ts';
 
 export const dEntryAuthorityChannel = 'allrice_d_entry_authority';
+const personVmAdmissionChannel = 'allrice_person_vm_admission';
 const changeSchema = z.object({
   schema: z.string(),
   table: z.string(),
@@ -55,9 +56,23 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
   client.on('error', lost);
   client.on('end', () => lost(Error('D_ENTRY_AUTHORITY_DISCONNECTED')));
   client.on('notification', (message) => {
-    if (message.channel !== dEntryAuthorityChannel) return;
+    if (
+      message.channel !== dEntryAuthorityChannel &&
+      message.channel !== personVmAdmissionChannel
+    )
+      return;
     try {
-      const change = changeSchema.parse(JSON.parse(message.payload ?? ''));
+      const change =
+        message.channel === dEntryAuthorityChannel
+          ? changeSchema.parse(JSON.parse(message.payload ?? ''))
+          : {
+              schema: '*',
+              table: 'person_virtual_machines',
+              id: null,
+              organizationId: null,
+              workspaceId: null,
+              personId: UuidSchema.parse(message.payload),
+            };
       for (const listener of listeners) listener.changed(change);
     } catch (error) {
       lost(error); // An unparseable authority announcement is not safe to ignore.
@@ -66,6 +81,7 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
   const ready = (async () => {
     await client.connect();
     await client.query(`LISTEN ${dEntryAuthorityChannel}`);
+    await client.query(`LISTEN ${personVmAdmissionChannel}`);
     if (failed) throw unavailable;
   })();
   void ready.catch(lost);
@@ -157,6 +173,9 @@ export type DEntryAuthoritySubscription = Readonly<{
 export type DEntryPrincipalAuthoritySubscription = DEntryAuthoritySubscription &
   Readonly<{ assertCurrent(signal: AbortSignal): Promise<void> }>;
 
+type ObservedAuthority = DEntryPrincipalAuthoritySubscription &
+  Readonly<{ assertObserved(signal: AbortSignal): Promise<void> }>;
+
 /** LISTEN is ready and the callback registered BEFORE this authoritative read.
  * A commit during setup either aborts the registered subscription or is seen
  * by the recheck. Never uses RequestContext's old membership/createdAt as TTL. */
@@ -167,7 +186,8 @@ async function watchDEntryAuthority(
   signal: AbortSignal,
   access: 'native' | 'history' | 'identity',
   feed?: Feed,
-): Promise<DEntryPrincipalAuthoritySubscription> {
+  verifyRoster?: (signal: AbortSignal) => Promise<void>,
+): Promise<ObservedAuthority> {
   const selection = (
     access === 'history'
       ? DEntrySelectionInputSchema.extend({ threadId: UuidSchema })
@@ -212,6 +232,7 @@ async function watchDEntryAuthority(
     if (!session || !sameDEntryIdentity(identity, expected))
       throw new DataAccessError('authorization_denied');
     schema = session.schema;
+    await verifyRoster?.(revoked);
     revoked.throwIfAborted();
     expiresAt = session.expires_at.toISOString();
     if (timer) clearTimeout(timer);
@@ -252,11 +273,23 @@ async function watchDEntryAuthority(
     detach = await source.subscribe(
       {
         changed(change) {
+          if (change.table === 'person_virtual_machines') {
+            if (verifyRoster && change.personId === expected.personId)
+              enqueue();
+            return;
+          }
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
           // current SQL decides, including a permission change during setup.
           if (
             (!schema || change.schema === schema) &&
-            affects(change, context, expected)
+            (affects(change, context, expected) ||
+              (verifyRoster &&
+                !['allrice_chat_sessions', 'allrice_sessions'].includes(
+                  change.table,
+                ) &&
+                (!change.organizationId ||
+                  change.organizationId === expected.organizationId) &&
+                (!change.personId || change.personId === expected.personId)))
           )
             enqueue();
         },
@@ -271,6 +304,13 @@ async function watchDEntryAuthority(
       revoked,
       get expiresAt() {
         return expiresAt;
+      },
+      async assertObserved(active: AbortSignal) {
+        active.throwIfAborted();
+        await joinChecks();
+        active.throwIfAborted();
+        revoked.throwIfAborted();
+        if (stopped) throw new DataAccessError('authorization_denied');
       },
       async assertCurrent(active: AbortSignal) {
         active.throwIfAborted();
@@ -299,6 +339,27 @@ export function watchDEntryNativeAuthority(
   feed?: Feed,
 ): Promise<DEntryAuthoritySubscription> {
   return watchDEntryAuthority(context, input, expected, signal, 'native', feed);
+}
+
+/** Whole VM roster joins the same current-login observation. Notification
+ * coverage includes sibling employees/workspaces, not other chat threads. */
+export function watchDEntryNativeRosterAuthority(
+  context: RequestContext,
+  input: unknown,
+  expected: DEntryIdentity,
+  signal: AbortSignal,
+  verifyRoster: (signal: AbortSignal) => Promise<void>,
+  feed?: Feed,
+) {
+  return watchDEntryAuthority(
+    context,
+    input,
+    expected,
+    signal,
+    'native',
+    feed,
+    verifyRoster,
+  );
 }
 
 /** History-only current identity; close joins this subscription's reads, not

@@ -765,6 +765,62 @@ export async function openNativeWebOwner(input: {
           },
         );
       },
+      waitNativeTurnEnd(
+        context: RequestContext,
+        address: SessionAddress,
+        turn: number,
+        caller: AbortSignal,
+      ) {
+        return readCurrent(
+          caller,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            const protocol = TYPERT_REMOTE.methods['session/follow'];
+            const { request } = protocol
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  address,
+                  maxMessages: 32,
+                  turnWindow: { minMessages: 1, minTurns: 1 },
+                },
+              });
+            const follow = root.remote.session.follow(request, active);
+            const frames = follow[Symbol.asyncIterator]();
+            try {
+              for (;;) {
+                const next = await frames.next();
+                active.throwIfAborted();
+                if (next.done) throw new PersonVmError('RUNTIME_NOT_READY');
+                const frame = protocol.result.create().parse(next.value);
+                const events =
+                  frame.type === 'snapshot'
+                    ? frame.records.map(({ event }) => event)
+                    : frame.type === 'event'
+                      ? [frame.event]
+                      : [];
+                for (const event of events) {
+                  if (event.type !== 'turn/end') continue;
+                  const data = event.data as {
+                    turn?: unknown;
+                    reason?: { kind?: unknown };
+                  } | null;
+                  if (
+                    data?.turn !== turn ||
+                    typeof data.reason?.kind !== 'string'
+                  )
+                    continue;
+                  return { sequence: event.seq, reason: data.reason.kind };
+                }
+              }
+            } finally {
+              follow.dispose();
+              await frames.return?.();
+            }
+          },
+        );
+      },
       readManagedModelImageFor(
         context: RequestContext,
         attempt: {

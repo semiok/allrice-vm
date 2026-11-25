@@ -53,6 +53,10 @@ export interface ModelGatewayAuthority {
   /** Trusted continuously watched exact call evidence, established at redeem.
    * A caller without a watcher retains the full authority check on delivery. */
   deliverySignal?(binding: ModelCallBinding): AbortSignal;
+  assertDeliveryObserved?(
+    binding: ModelCallBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   authorizeUsage(
     context: RequestContext,
     signal: AbortSignal,

@@ -265,6 +265,75 @@ function delegatedPromptIds(sessions, sessionId) {
   return [];
 }
 
+// Bind continuations when the live native inbox accepts and then claims the
+// exact relayed message. The recorded sender is an actual DSH Agent, and
+// the recipient cannot borrow a parent's earlier turn after sender movement.
+function observeDelegatedInputs(scope) {
+  const inserted = new WeakMap();
+  const claimed = new WeakMap();
+  function currentPromptIds(session) {
+    const events = session.snapshotEvents();
+    const start = events.findLast((event) => event.type === 'turn/start');
+    if (
+      !start ||
+      events.some((event) => event.type === 'turn/end' && event.seq > start.seq)
+    )
+      return [];
+    if (session.header.parentSession) {
+      const proof = claimed.get(session);
+      return proof?.turn === start.data.turn
+        ? [...proof.ids]
+        : delegatedPromptIds(scope.sessions, session.id);
+    }
+    const ids = new Set();
+    for (const event of events) {
+      if (event.seq <= start.seq || event.type !== 'user/message') continue;
+      const source = event.data.source;
+      if (source?.kind === 'user' && typeof source.rpcId === 'string')
+        ids.add(source.rpcId);
+    }
+    return [...ids];
+  }
+  scope.on('agent/inbox/inserted', ({ agent, message }) => {
+    const child = agent.session;
+    const source = message.source;
+    if (
+      source?.kind !== 'agent-message' ||
+      source.form !== 'relay' ||
+      source.senderSessionId !== child.header.parentSession
+    )
+      return;
+    const parent = scope.sessions.get(source.senderSessionId);
+    if (!parent) return;
+    let messages = inserted.get(child);
+    if (!messages) {
+      messages = new Map();
+      inserted.set(child, messages);
+    }
+    messages.set(message.id, currentPromptIds(parent));
+  });
+  scope.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+    const session = agent.session;
+    const messages = inserted.get(session);
+    const proof = messages?.get(message.id);
+    if (!proof) return;
+    messages.delete(message.id);
+    let state = claimed.get(session);
+    if (state?.turn !== turn) {
+      state = { turn, ids: new Set() };
+      claimed.set(session, state);
+    }
+    for (const id of proof) state.ids.add(id);
+  });
+  scope.on('agent/inbox/discarded', ({ agent, message }) => {
+    inserted.get(agent.session)?.delete(message.id);
+  });
+  return (sessionId) => {
+    const session = scope.sessions.get(sessionId);
+    return session?.header.parentSession ? currentPromptIds(session) : [];
+  };
+}
+
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config);
 }
@@ -451,6 +520,7 @@ export function applyNativeWebOwner(
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
+          const delegateOrigins = observeDelegatedInputs(scope);
           scope.connection.fetch.register({
             // Native exact Fetch routes are delivered only to the authenticated
             // owner Peer. This path is consumed by the managed Host transport.
@@ -518,10 +588,7 @@ export function applyNativeWebOwner(
                 const owned = {
                   id: randomUUID(),
                   recipient: randomBytes(32).toString('base64url'),
-                  delegatedPromptIds: delegatedPromptIds(
-                    scope.sessions,
-                    selection.sessionId,
-                  ),
+                  delegatedPromptIds: delegateOrigins(selection.sessionId),
                   signal: active,
                 };
                 modelCalls.set(key, owned);

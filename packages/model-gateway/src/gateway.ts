@@ -338,8 +338,13 @@ export function createModelGateway(options: {
       ]);
       const assertDelivery = async (active: AbortSignal) => {
         active.throwIfAborted();
-        if (delivery) delivery.throwIfAborted();
-        else await assertCurrent(active);
+        const observed = options.authority.assertDeliveryObserved;
+        if (delivery && observed) {
+          delivery.throwIfAborted();
+          await observed(binding, active);
+          delivery.throwIfAborted();
+          active.throwIfAborted();
+        } else await assertCurrent(active);
       };
       const key = vmKey(binding.vm);
       let finish!: () => void;

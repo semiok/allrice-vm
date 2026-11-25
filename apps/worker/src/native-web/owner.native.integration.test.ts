@@ -162,6 +162,7 @@ it.skipIf(!cli)(
     };
     const recipients = new Map<string, string>();
     const nativePrompt = randomUUID();
+    let turnEnd: Promise<{ sequence: number; reason: string }> | undefined;
     const readAttempt =
       deferred<
         (session: string, kind: keyof typeof facts) => Promise<string>
@@ -287,8 +288,17 @@ it.skipIf(!cli)(
           'DSH model attempt did not exist on the authenticated owner',
         );
       expect(attempt.recipient).toBe(recipients.get(kind));
-      if (kind === 'assistant')
+      if (kind === 'assistant') {
         expect(attempt.promptIds).toContain(nativePrompt);
+        expect(attempt.turn).toBeGreaterThan(0);
+        turnEnd = f.owner.waitNativeTurnEnd(
+          f.context,
+          { kind: 'session', sessionId: SessionId(requested) },
+          attempt.turn!,
+          signal,
+        );
+        void turnEnd.catch(() => {});
+      }
       return attempt.id;
     });
     readImage.resolve(async (requested, ref) => {
@@ -352,6 +362,11 @@ it.skipIf(!cli)(
       value: { accepted: true },
     });
     await Promise.all([primary.promise, title.promise]);
+    expect(turnEnd).toBeDefined();
+    expect(await turnEnd).toMatchObject({
+      sequence: expect.any(Number),
+      reason: 'completed',
+    });
     for (const fact of Object.values(facts))
       expect(fact).toEqual({
         redeemed: true,

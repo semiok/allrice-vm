@@ -1102,17 +1102,18 @@ const stopWorker = (signal: string) => {
         !result.host.modelOwnerMaintenancePending()
       )
         return;
+      const listening = (recoveryEndpoint ??= openProductionRecoverySocket({
+        authenticate: dEntryHttpDefaults.authenticate,
+        recover: recoverProductionPersonVmModelOwner,
+        pending: () => result.host.modelOwnerMaintenancePending(),
+      }));
       try {
-        const recovery = await (recoveryEndpoint ??=
-          openProductionRecoverySocket({
-            authenticate: dEntryHttpDefaults.authenticate,
-            recover: recoverProductionPersonVmModelOwner,
-            pending: () => result.host.modelOwnerMaintenancePending(),
-          }));
+        const recovery = await listening;
         console.info('[MET-273] authorized local recovery socket', {
           path: recovery.path,
         });
       } catch {
+        if (recoveryEndpoint === listening) recoveryEndpoint = undefined;
         console.error('[MET-273] local recovery socket unavailable');
       }
     })

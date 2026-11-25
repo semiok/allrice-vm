@@ -5,6 +5,7 @@ import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import {
   createDEntryAuthorityFeed,
   watchDEntryNativeAuthority,
+  watchDEntryNativeRosterAuthority,
   watchDEntryHistoryAuthority,
   watchDEntryIdentityAuthority,
   watchDEntryPrincipalAuthority,
@@ -101,6 +102,50 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('settles whole-roster and VM hints before delivery without rereading on quiet frames', async () => {
+    const signal = new AbortController().signal;
+    const source = feed();
+    const verify = vi.fn(async () => {});
+    const watch = await watchDEntryNativeRosterAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      verify,
+      source,
+    );
+    try {
+      await watch.assertObserved(signal);
+      await watch.assertObserved(signal);
+      expect(verify).toHaveBeenCalledTimes(1);
+      const client = state.clients[0]!;
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      await watch.assertObserved(signal);
+      expect(verify).toHaveBeenCalledTimes(2);
+      verify.mockRejectedValueOnce(Error('published roster no longer current'));
+      client.emit('notification', {
+        channel: 'allrice_d_entry_authority',
+        payload: JSON.stringify({
+          schema: 'isolated',
+          table: 'allrice_employee_instances',
+          id: randomUUID(),
+          organizationId: identity.organizationId,
+          workspaceId: randomUUID(),
+          personId: identity.personId,
+        }),
+      });
+      await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'published roster no longer current',
+      );
+      expect(watch.revoked.aborted).toBe(true);
+    } finally {
+      await watch.close();
+    }
+  });
+
   it.each(['native', 'history'] as const)(
     'LISTENs before rechecking and joins an in-flight notification recheck when closing the subscription (%s)',
     async (access) => {
