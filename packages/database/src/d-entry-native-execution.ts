@@ -265,12 +265,14 @@ function belongsToRetainedDisk(
 function currentJournalScope(
   sql: ReturnType<typeof getDatabase>,
   owner: DEntryNativeRunJournalOwner,
+  leaseOwner?: string,
 ) {
   return sql`
     v.vm_id=${owner.vmId} and v.organization_id=${owner.organizationId}
     and v.person_id=${owner.personId} and v.instance_id=${owner.vmInstanceId}
     and v.lease_epoch=${owner.leaseEpoch} and v.phase='running'
-    and v.disk_retained and v.lease_owner is null
+    and v.disk_retained
+    and v.lease_owner is not distinct from ${leaseOwner ?? null}::uuid
     and t.workspace_id=${owner.workspaceId} and t.execution_generation='4.0'
     and coalesce(t.employee_instance_id,t.employee_assignment_id)=${owner.employeeInstanceId}
     and t.d_entry_native_root is not null
@@ -280,6 +282,94 @@ function currentJournalScope(
   `;
 }
 
+// The fixed on-disk employee namespace must still match a current assignment.
+// This projection intentionally has no account session or browser token.
+function retainedJournalProfile(sql: ReturnType<typeof getDatabase>) {
+  return sql`
+    select i.id,i.organization_id,i.workspace_id,i.owner_id,a.employee_version_id
+    from allrice_employee_instances i
+    join allrice_employee_assignments a on a.id=i.assignment_id and a.active
+      and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
+      and a.user_id=i.owner_id
+    join allrice_employees e on e.id=a.employee_id and e.status='active'
+      and e.organization_id=a.organization_id and e.workspace_id=a.workspace_id
+    join allrice_workspaces w on w.id=i.workspace_id and w.archived_at is null
+      and w.organization_id=i.organization_id
+    join allrice_organizations o on o.id=i.organization_id and o.archived_at is null
+    join allrice_users u on u.id=i.owner_id and u.status='active'
+    where i.archived_at is null
+      and exists (
+        select 1 from allrice_memberships m
+        where m.organization_id=i.organization_id and m.user_id=i.owner_id
+          and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=i.workspace_id)
+      )
+      and not exists (
+        select 1 from allrice_platform_employee_tenant_assignments d
+        where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
+          and d.tenant_employee_id=e.id and not d.active
+      )
+  `;
+}
+
+/** Retry selectors from existing Run and VM rows. The actual guest read still
+ * requires the exclusive current lease and an attached running disk. */
+export async function nextRetainedDEntryNativeRunJournalOwner(
+  after?: DEntryNativeRunJournalOwner,
+): Promise<DEntryNativeRunJournalOwner | undefined> {
+  const sql = getDatabase();
+  const [row] = await sql<
+    {
+      organization_id: string;
+      workspace_id: string;
+      person_id: string;
+      vm_id: string;
+      instance_id: string;
+      lease_epoch: number | string;
+      employee_instance_id: string;
+      employee_version_id: string;
+    }[]
+  >`
+    select distinct v.organization_id, t.workspace_id, v.person_id,
+      v.vm_id, v.instance_id, v.lease_epoch, i.id as employee_instance_id,
+      i.employee_version_id
+    from person_virtual_machines v
+    join allrice_chat_sessions t on t.organization_id=v.organization_id
+      and t.owner_id=v.person_id and t.execution_generation='4.0'
+      and t.d_entry_native_root#>>'{host,binding,vmId}'=v.vm_id::text
+    join (${retainedJournalProfile(sql)}) i on i.id=coalesce(t.employee_instance_id,t.employee_assignment_id)
+      and i.organization_id=t.organization_id and i.workspace_id=t.workspace_id and i.owner_id=t.owner_id
+    join allrice_runs r on r.organization_id=t.organization_id and r.workspace_id=t.workspace_id
+      and r.owner_id=t.owner_id and r.state='running' and r.visibility='private'
+      and r.execution_spec->>'generation'='4.0'
+      and r.execution_spec->>'source' in ('dsh-native-prompt','dsh-native-delegation')
+      and r.execution_spec->>'employeeInstanceId'=i.id::text
+      and r.execution_spec->>'employeeRelease'=i.employee_version_id::text
+      and r.execution_spec->>'vmId'=v.vm_id::text
+      and r.execution_spec->>'threadId'=t.id::text
+      and r.execution_spec->>'rootSessionId'=t.d_entry_native_root->>'nativeSessionId'
+    where v.phase='running' and v.disk_retained and v.lease_owner is null and v.holds='[]'
+      and not exists (
+        select 1 from person_vm_admission_permits p
+        where p.person_id=v.person_id and p.disposition<>'deferred'
+      )
+      ${after ? sql`and (v.vm_id,t.workspace_id,i.id) > (${after.vmId}::uuid,${after.workspaceId}::uuid,${after.employeeInstanceId}::uuid)` : sql``}
+    order by v.vm_id,t.workspace_id,i.id
+    limit 1
+  `;
+  if (!row) return undefined;
+  return {
+    organizationId: row.organization_id,
+    workspaceId: row.workspace_id,
+    personId: row.person_id,
+    vmId: row.vm_id,
+    vmInstanceId: row.instance_id,
+    leaseEpoch: Number(row.lease_epoch),
+    employeeInstanceId: row.employee_instance_id,
+    employeeRelease: row.employee_version_id,
+  };
+}
+
 type ScanCursor = { runId: string; sequence: number };
 
 /** Host-only enumeration for the authenticated owner of the retained disk.
@@ -287,6 +377,7 @@ type ScanCursor = { runId: string; sequence: number };
 export async function listDEntryNativeRunCandidates(
   owner: DEntryNativeRunJournalOwner,
   after?: ScanCursor,
+  limit = 64,
 ) {
   const sql = getDatabase();
   const rows = await sql<
@@ -326,7 +417,7 @@ export async function listDEntryNativeRunCandidates(
       and e.payload->>'source'='dsh-native-attempt'
       ${after ? sql`and (r.id,e.sequence) > (${after.runId}::uuid,${after.sequence}::integer)` : sql``}
     order by r.id, e.sequence
-    limit 64
+    limit ${limit}
   `;
   const candidates = rows.flatMap((row): DEntryNativeRunCandidate[] => {
     const source = prompt.safeParse(row.prompt);
@@ -353,7 +444,7 @@ export async function listDEntryNativeRunCandidates(
   });
   const last = rows.at(-1);
   const next =
-    last && rows.length === 64
+    last && rows.length === limit
       ? { runId: last.run_id, sequence: last.sequence }
       : undefined;
   return { candidates, next };
@@ -365,6 +456,7 @@ export async function isDEntryNativeRunJournalCurrent(
   candidate: DEntryNativeRunCandidate,
   owner: DEntryNativeRunJournalOwner,
   signal: AbortSignal,
+  leaseOwner?: string,
 ) {
   signal.throwIfAborted();
   const { prompt } = candidate;
@@ -384,8 +476,18 @@ export async function isDEntryNativeRunJournalCurrent(
     select 1 from person_virtual_machines v
     join allrice_chat_sessions t on t.id=${prompt.threadId}
       and t.organization_id=v.organization_id and t.owner_id=v.person_id
-    where ${currentJournalScope(sql, owner)}
+    where ${currentJournalScope(sql, owner, leaseOwner)}
       and t.d_entry_native_root->>'nativeSessionId'=${prompt.rootSessionId}
+      ${
+        leaseOwner
+          ? sql`and exists (
+        select 1 from (${retainedJournalProfile(sql)}) i
+        where i.id=${owner.employeeInstanceId}
+          and i.organization_id=${owner.organizationId} and i.workspace_id=${owner.workspaceId}
+          and i.owner_id=${owner.personId} and i.employee_version_id=${owner.employeeRelease}
+      )`
+          : sql``
+      }
   `;
   signal.throwIfAborted();
   return !!row;

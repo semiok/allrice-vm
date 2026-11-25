@@ -20,6 +20,7 @@ export {
   DEntryNativeTurnEndSchema,
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
+  nextRetainedDEntryNativeRunJournalOwner,
   publishDEntryNativeRunTerminal,
   readDEntryNativeExecution,
   type DEntryNativeRunCandidate,

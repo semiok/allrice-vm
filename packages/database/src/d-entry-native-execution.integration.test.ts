@@ -6,6 +6,7 @@ import * as rootPin from './d-entry-native-root.ts';
 import {
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
+  nextRetainedDEntryNativeRunJournalOwner,
   publishDEntryNativeRunTerminal,
 } from './d-entry-native-execution.ts';
 import { getRun, getRunForRead, listRunEvents } from './execution/queue.ts';
@@ -236,6 +237,35 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     const [reread] = (await listDEntryNativeRunCandidates(restarted))
       .candidates;
     expect(reread).toEqual(candidate);
+    expect(await nextRetainedDEntryNativeRunJournalOwner()).toEqual(restarted);
+    const leaseOwner = randomUUID();
+    await db`update person_virtual_machines
+      set lease_owner=${leaseOwner},lease_expires_at=clock_timestamp()+interval '1 minute'
+      where person_id=${personId}`;
+    try {
+      expect(
+        await isDEntryNativeRunJournalCurrent(
+          candidate,
+          restarted,
+          signal,
+          leaseOwner,
+        ),
+      ).toBe(true);
+      expect(
+        await isDEntryNativeRunJournalCurrent(
+          candidate,
+          restarted,
+          signal,
+          randomUUID(),
+        ),
+      ).toBe(false);
+      expect(
+        await isDEntryNativeRunJournalCurrent(candidate, restarted, signal),
+      ).toBe(false);
+    } finally {
+      await db`update person_virtual_machines
+        set lease_owner=null,lease_expires_at=null where person_id=${personId}`;
+    }
     // A successor authenticates with its own adapter. The birth provenance
     // remains the original payload on both the Run and the exact execution.
     expect(

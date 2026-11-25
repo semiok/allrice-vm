@@ -8,6 +8,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
 import { TextEncoder } from 'node:util';
+import { readPersistedRunTerminal } from './allrice-native-run-journal.mjs';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -294,241 +295,6 @@ export function readPromptOrigins(
     }
   }
   return { turn, ids: [...ids], delegated, inherited: [...inherited] };
-}
-
-function record(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value
-    : {};
-}
-
-function isPrompt(event, requestId) {
-  if (event.type !== 'user/message') return false;
-  const source = record(record(event.data).source);
-  return source.kind === 'user' && source.rpcId === requestId;
-}
-
-function isWakeMessage(event, sessionId) {
-  if (event.type !== 'user/message') return false;
-  const source = record(record(event.data).source);
-  if (
-    typeof source.senderSessionId !== 'string' ||
-    !source.senderSessionId ||
-    source.senderSessionId === sessionId
-  )
-    return false;
-  return (
-    (source.kind === 'agent-message' && source.form === 'relay') ||
-    (source.kind === 'subagent-settled' &&
-      source.form === 'notice' &&
-      typeof source.summary === 'string')
-  );
-}
-
-function terminalReason(event) {
-  const kind = record(record(event.data).reason).kind;
-  switch (kind) {
-    case 'completed':
-    case 'aborted':
-    case 'interrupted':
-    case 'blocked':
-    case 'error':
-    case 'max-tokens':
-      return kind;
-    default:
-      return null;
-  }
-}
-
-/** Project only a contiguous physical journal returned by native
- * sessionPersistence. session-query can synthesize a cold interrupted tail. */
-export function findDEntryNativeRunTerminal(
-  {
-    sessionId,
-    nativeRequestId,
-    cursor: index,
-    turn: expectedTurn,
-    purpose,
-    delegated = false,
-    parentSessionId = null,
-  },
-  { header, events, inheritedEventCount },
-) {
-  const cursor = events[index];
-  const child = parentSessionId !== null;
-  const matchingHeader = child
-    ? delegated &&
-      header.origin === 'subagent' &&
-      header.parentSession === parentSessionId
-    : !header.isSeeded &&
-      header.parentSession === undefined &&
-      header.origin === undefined &&
-      inheritedEventCount === 0;
-  if (
-    sessionId !== header.id ||
-    !matchingHeader ||
-    !Number.isSafeInteger(inheritedEventCount) ||
-    inheritedEventCount < 0 ||
-    (!header.isSeeded && inheritedEventCount !== 0) ||
-    index < inheritedEventCount ||
-    cursor?.seq !== index
-  )
-    return null;
-
-  let anchor = cursor.seq;
-  if (purpose === 'session-title') {
-    if (delegated || cursor.type !== 'session/title-llm-request') return null;
-    const seqs = record(cursor.data).messageSeqs;
-    if (!Array.isArray(seqs)) return null;
-    const matching = new Set();
-    for (const seq of seqs) {
-      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= cursor.seq)
-        return null;
-      const message = events[seq];
-      if (message?.seq !== seq) return null;
-      if (isPrompt(message, nativeRequestId)) matching.add(seq);
-    }
-    if (matching.size !== 1) return null;
-    anchor = [...matching][0];
-  } else {
-    if (expectedTurn === null) return null;
-    if (purpose === 'compaction') {
-      const data = record(cursor.data);
-      if (
-        cursor.type !== 'compaction/start' ||
-        typeof data.compactionId !== 'string' ||
-        !data.compactionId ||
-        data.turn !== expectedTurn
-      )
-        return null;
-    }
-  }
-
-  let start;
-  // Child scope was established at admission. Its header and own bracket
-  // pin that fact. A root wake also needs an actual adopted native message.
-  let hasInput = child;
-  for (let seq = anchor; seq >= inheritedEventCount; --seq) {
-    const event = events[seq];
-    if (
-      event?.seq !== seq ||
-      event.type === 'turn/end' ||
-      event.type === 'session/end-seed'
-    )
-      return null;
-    if (event.type === 'turn/start') {
-      start = event;
-      break;
-    }
-    if (!hasInput)
-      hasInput = delegated
-        ? isWakeMessage(event, sessionId)
-        : isPrompt(event, nativeRequestId);
-  }
-  const turn = record(start?.data).turn;
-  if (
-    !hasInput ||
-    typeof turn !== 'number' ||
-    !Number.isSafeInteger(turn) ||
-    turn < 1 ||
-    (expectedTurn !== null && turn !== expectedTurn)
-  )
-    return null;
-
-  for (let sequence = anchor + 1; sequence < events.length; ++sequence) {
-    const event = events[sequence];
-    if (
-      event?.seq !== sequence ||
-      event.type === 'turn/start' ||
-      event.type === 'session/end-seed'
-    )
-      return null;
-    if (event.type !== 'turn/end') continue;
-    const reason = terminalReason(event);
-    if (record(event.data).turn !== turn || !reason) return null;
-    const time = new Date(event.time);
-    if (
-      !Number.isSafeInteger(event.time) ||
-      event.time < 0 ||
-      !Number.isFinite(+time)
-    )
-      return null;
-    return {
-      sessionId: header.id,
-      sequence,
-      turn,
-      reason,
-      occurredAt: time.toISOString(),
-    };
-  }
-  return null;
-}
-
-async function readPersistedRunTerminal(
-  scope,
-  request,
-  selection,
-  ownerSignal,
-) {
-  const {
-    sessionId,
-    nativeRequestId,
-    cursor,
-    turn,
-    delegated = false,
-    parentSessionId = null,
-  } = selection;
-  if (
-    sessionId.length === 0 ||
-    sessionId.length > 256 ||
-    typeof nativeRequestId !== 'string' ||
-    nativeRequestId.length === 0 ||
-    nativeRequestId.length > 256 ||
-    !Number.isSafeInteger(cursor) ||
-    cursor < 0 ||
-    !(turn === null || Number.isSafeInteger(turn)) ||
-    typeof delegated !== 'boolean' ||
-    (parentSessionId !== null &&
-      (!delegated ||
-        typeof parentSessionId !== 'string' ||
-        parentSessionId.length === 0 ||
-        parentSessionId.length > 256 ||
-        parentSessionId === sessionId))
-  )
-    return null;
-  const active = globalThis.AbortSignal.any([request.signal, ownerSignal]);
-  const persistence = scope.get('sessionPersistence');
-  active.throwIfAborted();
-  if (!persistence) return null;
-  // The backend reads the physical prefix. The query/follow service can add
-  // a generated interrupted closer when it displays a cold orphaned turn.
-  const stored = await persistence.stat(sessionId, { signal: active });
-  if (
-    !stored ||
-    stored.header.id !== sessionId ||
-    stored.formatStatus !== 'current'
-  )
-    return null;
-  const handle = await persistence.open(sessionId, 'read', { signal: active });
-  try {
-    if (handle.access !== 'read') return null;
-    const { events } = await handle.read(0, undefined, { signal: active });
-    const after = await persistence.stat(sessionId, { signal: active });
-    active.throwIfAborted();
-    if (
-      after?.revision !== stored.revision ||
-      after.formatStatus !== 'current' ||
-      original(scope.get('sessionPersistence')) !== original(persistence)
-    )
-      return null;
-    return findDEntryNativeRunTerminal(selection, {
-      header: handle.header,
-      events,
-      inheritedEventCount: handle.inheritedEventCount,
-    });
-  } finally {
-    await handle.close();
-  }
 }
 
 async function observePromptOrigins(
@@ -1233,13 +999,16 @@ export function applyNativeWebOwner(
               )
                 return new globalThis.Response(null, { status: 404 });
               if (value.action === 'read-run-terminal') {
+                const persistence = scope.get('sessionPersistence');
                 const terminal = await readPersistedRunTerminal(
-                  scope,
-                  request,
+                  persistence,
                   value,
-                  signal,
+                  globalThis.AbortSignal.any([request.signal, signal]),
                 );
-                return terminal && current()
+                return terminal &&
+                  current() &&
+                  original(scope.get('sessionPersistence')) ===
+                    original(persistence)
                   ? globalThis.Response.json(terminal, {
                       headers: { 'cache-control': 'no-store' },
                     })

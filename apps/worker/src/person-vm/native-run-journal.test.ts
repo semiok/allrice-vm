@@ -19,7 +19,9 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { AgentMessageSource } from '@deepseek-ai/dsh-subagent';
 import { expect, it } from 'vitest';
 // @ts-expect-error The fixed guest plugin is copied as JavaScript.
-import { findDEntryNativeRunTerminal } from '../../dsh/allrice-native-web-owner.mjs';
+import * as runJournal from '../../dsh/allrice-native-run-journal.mjs';
+
+const { findDEntryNativeRunTerminal, readPersistedRunTerminal } = runJournal;
 
 const sessionId = 'session-00000000-0000-4000-8000-000000000036';
 const selection = {
@@ -316,6 +318,13 @@ it('matches a derived turn only inside its physical child or root-wake bracket',
       cursor: wake[2]!.seq,
       turn: 2,
     };
+    expect(
+      await readPersistedRunTerminal(
+        native,
+        selectedWake,
+        new AbortController().signal,
+      ),
+    ).toEqual(findDEntryNativeRunTerminal(selectedWake, parentJournal));
     expect(
       findDEntryNativeRunTerminal(selectedWake, parentJournal),
     ).toMatchObject({

@@ -1316,7 +1316,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       };
       installed = owner;
       void run(live, (active) =>
-        reconcileNativeRunTerminals(host.startup, active),
+        reconcileNativeRunTerminals(
+          host.startup,
+          host.reconcileRetainedRun,
+          active,
+        ),
       ).catch(() => {});
       return owner;
     },

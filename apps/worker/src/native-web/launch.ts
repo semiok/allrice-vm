@@ -180,12 +180,26 @@ export async function prepareNativeWebLaunch(
     ),
     'utf8',
   );
+  const journalSource = await readFile(
+    new URL(
+      modelAdapter
+        ? '../../dist/allrice-native-run-journal.mjs'
+        : '../../dsh/allrice-native-run-journal.mjs',
+      import.meta.url,
+    ),
+    'utf8',
+  );
   const modelOwner = `${directory}/owner-with-model.mjs`;
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
     files: Object.freeze([
       { path: plugin, contents: ownerSource, mode: 0o600 },
+      {
+        path: `${directory}/allrice-native-run-journal.mjs`,
+        contents: journalSource,
+        mode: 0o600,
+      },
       ...(modelAdapter
         ? [
             {
