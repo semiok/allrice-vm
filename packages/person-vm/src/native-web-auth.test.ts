@@ -116,3 +116,23 @@ it('实际reader拒绝symlink/超长，不输出其内容；解析错不携带�
     expect(String(failure)).not.toContain('invalid-secret');
   }
 });
+
+it('requires the exact managed model installation ID when staged for this startup', async () => {
+  const f = await fixture();
+  const request = { ...f.request, modelAdapterId: 'a'.repeat(64) };
+  const proof = { ...f.value, modelAdapterId: request.modelAdapterId };
+  expect(parseNativeWebAuth(JSON.stringify(proof), request)).toMatchObject({
+    modelAdapterId: request.modelAdapterId,
+  });
+  expect(() => parseNativeWebAuth(JSON.stringify(f.value), request)).toThrow();
+  expect(() => parseNativeWebAuth(JSON.stringify(proof), f.request)).toThrow();
+  expect(() =>
+    parseNativeWebAuth(
+      JSON.stringify({
+        ...proof,
+        modelAdapterId: 'b'.repeat(64),
+      }),
+      request,
+    ),
+  ).toThrow();
+});

@@ -1,5 +1,6 @@
 import { createProductionNativeModelExecution } from './person-vm/production-native-model-execution.js';
 import { createProductionPersonVmSources } from './person-vm/production-sources.js';
+import type { RequestContext } from '@allrice/contracts';
 import { installDshCloseObservationIdentity } from './harness/dsh-close-observer.js';
 import { observeDshWorkerCloseIdentity } from './harness/dsh-worker-close-identity.js';
 import { processNextReference } from './reference-processing.js';
@@ -458,6 +459,19 @@ const personVmHost = createProductionPersonVmHost({
     return { state: 'uninstalled' as const, error };
   },
 );
+/** Internal maintenance only. The Host checks a current platform administrator
+ * and actual physical proof from its own dedicated upstream dispatcher. */
+export async function recoverProductionPersonVmModelOwner(
+  context: RequestContext,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const result = await personVmHost;
+  signal.throwIfAborted();
+  if (result.state !== 'installed')
+    throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
+  return result.host.recoverModelOwner(context, signal);
+}
 const nativeRunDiagnosticsHttp = createNativeRunDiagnosticsHttpHandler(
   undefined,
   undefined,

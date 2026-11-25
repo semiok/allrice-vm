@@ -808,8 +808,11 @@ export class PersonVmService
         if (!row?.instanceId || !sameVmBinding(binding, bindingOf(row)))
           throw new PersonVmError('LEASE_LOST');
         if (row.phase === 'stopped' && !row.egressReceipt) return;
-        await lease.guard();
-        await this.cleanup(row, lease, 'stop');
+        const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+        await guard();
+        // Revocation fences business admission, not cleanup of the exact
+        // physical owner already selected under this same exclusive lease.
+        await this.cleanup(row, { ...lease, guard }, 'stop');
       },
     );
   }

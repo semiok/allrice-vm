@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
-import Llm, { ReasoningEffortId, type LlmRuntime } from '@deepseek-ai/dsh-llm';
+import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import { getDatabase } from '@allrice/database';
 import {
@@ -83,23 +83,6 @@ export async function createProductionCodexRuntime(
   if (!model || model.trim() !== model)
     throw new ModelGatewayError('BINDING_INVALID');
   const modelMetadata = managedCodexModel(model);
-  const modelInfo = {
-    id: model,
-    name: model,
-    provider,
-    ...(modelMetadata.contextWindow
-      ? {
-          context: { contextWindow: modelMetadata.contextWindow },
-          inputModalities: modelMetadata.input,
-          reasoning: {
-            efforts: Object.keys(modelMetadata.reasoningEfforts).map((id) => ({
-              id: ReasoningEffortId(id),
-              name: id,
-            })),
-          },
-        }
-      : {}),
-  };
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
@@ -136,6 +119,7 @@ export async function createProductionCodexRuntime(
       active.throwIfAborted();
     }
   }
+  let modelInfo: Awaited<ReturnType<LlmRuntime['resolveModelInfo']>>;
   try {
     await host.plugin(Llm).await();
     await host
@@ -153,6 +137,7 @@ export async function createProductionCodexRuntime(
         },
       })
       .await();
+    modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
     await assertCurrent();
   } catch (error) {
     try {

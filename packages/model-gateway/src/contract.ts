@@ -165,6 +165,8 @@ export interface ModelGatewayStore {
   attempts(callId: string): Promise<readonly ModelAttemptReceipt[]>;
   usage(personId: string, organizationId: string): Promise<RuntimeRunUsage>;
   /** Internal owner port; public caller goes through ModelGatewayPort.reconcileOwner. */
+  /** Trusted Worker shutdown only; exact dispatcher proof is bound at construction. */
+  reconcileClosedOwner?(signal: AbortSignal): Promise<number>;
   reconcileOwner(ownerId: string, evidenceRef: string): Promise<number>;
 }
 export interface UsageLedgerPort {

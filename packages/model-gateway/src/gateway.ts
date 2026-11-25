@@ -204,6 +204,10 @@ export function createModelGateway(options: {
   store: ModelGatewayStore;
   provider: GatewayProvider;
   admission: ModelGatewayAdmission;
+  confirmTransportStopped?(
+    ownerId: string,
+    signal: AbortSignal,
+  ): Promise<string>;
 }): ModelGatewayPort {
   if (
     !options.ownerId.trim() ||
@@ -533,6 +537,24 @@ export function createModelGateway(options: {
       await Promise.all(entries.map((entry) => entry.done));
       const incomplete = unconfirmedJoins.get(key);
       if (incomplete) throw incompleteJoin(incomplete);
+    },
+    async reconcileClosedOwner(signal) {
+      signal.throwIfAborted();
+      if (!closed || active.size || !options.confirmTransportStopped)
+        throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      const evidence = await options.confirmTransportStopped(
+        options.ownerId,
+        signal,
+      );
+      signal.throwIfAborted();
+      if (!evidence.trim()) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      const released = await options.store.reconcileOwner(
+        options.ownerId,
+        evidence,
+      );
+      unconfirmedJoins.clear();
+      uninstall();
+      return released;
     },
     async reconcileOwner(context, ownerId, signal) {
       signal.throwIfAborted();

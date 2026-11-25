@@ -4,7 +4,10 @@ import { DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
 import { afterEach, expect, it, vi } from 'vitest';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
-import type { ResolvedDEntryNativeOwner } from '../d-entry/native-owner.js';
+import {
+  resolveDEntryNativeResource,
+  type ResolvedDEntryNativeOwner,
+} from '../d-entry/native-owner.js';
 import { NativeRootJoinUnknown } from '../native-web/owner.js';
 import { installProductionDEntrySource } from './production-dentry-source.js';
 
@@ -296,4 +299,70 @@ it('does not release admission on an unconfirmed native root outcome', async () 
   );
   await expect(activity.run(f.signal)).rejects.toBe(unknown);
   await expect(activity.close()).rejects.toBe(unknown);
+});
+
+it('requires a live DSH agent in the current pinned ancestry before authorizing a model call', async () => {
+  const f = fixture();
+  const identity = { ...f.identity, threadId: randomUUID() };
+  const id = 'current-child';
+  const root = 'current-root';
+  const pin = vi.fn(async () => ({
+    identity,
+    rootNativeSessionId: root,
+    rootOriginDigest: 'sha256:fixture',
+    rootBindingRef: randomUUID(),
+    vmId: f.binding.vmId,
+  }));
+  const persisted = await pin();
+  pin.mockResolvedValue(persisted);
+  function state(running: boolean, agentAvailable: boolean) {
+    f.owner.readSessions.mockResolvedValue({
+      ok: true,
+      value: {
+        items: [
+          {
+            sessionId: root,
+            updatedAt: 1,
+            blank: false,
+            running: false,
+            agentAvailable: true,
+          },
+          {
+            sessionId: id,
+            parentSessionId: root,
+            origin: 'subagent',
+            updatedAt: 2,
+            blank: false,
+            running,
+            agentAvailable,
+          },
+        ],
+      },
+    });
+  }
+  const modelRequest = {
+    context: f.context,
+    identity,
+    owner: f.owner,
+    nativeSessionId: id,
+    signal: new AbortController().signal,
+    root: pin,
+    requireRunning: true,
+  };
+  state(false, true);
+  await expect(resolveDEntryNativeResource(modelRequest)).rejects.toMatchObject(
+    { code: 'authorization_denied' },
+  );
+  state(true, false);
+  await expect(resolveDEntryNativeResource(modelRequest)).rejects.toMatchObject(
+    { code: 'authorization_denied' },
+  );
+  state(true, true);
+  await expect(
+    resolveDEntryNativeResource(modelRequest),
+  ).resolves.toMatchObject({
+    threadId: identity.threadId,
+    parentNativeSessionId: root,
+    nativeSessionId: id,
+  });
 });

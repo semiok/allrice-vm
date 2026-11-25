@@ -60,7 +60,11 @@ function fixture() {
     revoked: codex.signal,
     route,
     modelInfo: { id: route.model, name: route.model, provider: route.provider },
-    transport: { fetchOwned: vi.fn(), close: vi.fn() },
+    transport: {
+      fetchOwned: vi.fn(),
+      close: vi.fn(),
+      stoppedEvidence: vi.fn(),
+    },
     confirmTransportStopped: vi.fn(),
     assertCurrent: vi.fn(async (signal) => signal?.throwIfAborted()),
     llm: { prepareCall: vi.fn() },

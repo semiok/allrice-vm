@@ -46,6 +46,7 @@ export interface VmLease {
   assertAdmissionOpen(generationChange?: boolean): Promise<void>;
   save(row: VmRecord): Promise<void>;
   guard(): Promise<void>;
+  assertPhysicalOwner?(): Promise<void>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
 }
 export interface PersonVmStore {
@@ -300,13 +301,13 @@ export class PostgresPersonVmStore implements PersonVmStore {
           () =>
             sql`update person_virtual_machines set lease_owner=${token},lease_expires_at=${expires()} where person_id=${personId}`,
         );
-      const guard = async () => {
+      const guard = async (requireAdmission = true) => {
         const [current] = await session.query(
           () => sql`update person_virtual_machines set lease_expires_at=${expires()}
           where person_id=${personId} and lease_owner=${token} returning *`,
         );
         if (!current) throw new PersonVmError('LEASE_LOST');
-        if (current.admission_state?.revoked)
+        if (requireAdmission && current.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };
       const lease: VmLease = {
@@ -315,6 +316,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),
         guard,
+        assertPhysicalOwner: () => guard(false),
         save: async (record) => {
           if (record.personId !== personId)
             throw new PersonVmError('LEASE_LOST');

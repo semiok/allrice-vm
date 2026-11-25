@@ -104,6 +104,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         close(): Promise<void>;
+        stoppedEvidence(ownerId: string, signal: AbortSignal): Promise<string>;
       }>;
       /** Resolve the current trusted native call. Host request metadata may
        * be used to find a registration; it cannot authorize that registration. */
@@ -285,6 +286,16 @@ export function createProductionPersonVmHost(input: {
       ),
     );
   }
+  function stopOwnedVms() {
+    const vm = personVm;
+    if (!vm) return Promise.resolve([]);
+    return collectFailures(
+      [...ownedVms.values()].map((binding) => async () => {
+        await vm.shutdownOwned(binding);
+        ownedVms.delete(binding.personId);
+      }),
+    );
+  }
   function close(): Promise<void> {
     if (recoveredClose)
       return recoveredClose.error
@@ -317,30 +328,37 @@ export function createProductionPersonVmHost(input: {
           (subscription) => () => subscription.close(),
         ),
       );
-      const vmOwner = personVm;
-      await settle(
-        vmOwner
-          ? [...ownedVms.values()].map((binding) => async () => {
-              await vmOwner.shutdownOwned(binding);
-              ownedVms.delete(binding.personId);
-            })
-          : [],
-      );
+      let vmFailures = await stopOwnedVms();
       if (startupOwner) await settle([() => startupOwner.close()]);
-      const receiptFailures = await retireReceipts();
-      // Guest stop does not prove that a separate upstream transport stopped.
-      // Join the model gateway before closing the provider it uses.
+      let receiptFailures = await retireReceipts();
+      // Guest stop cannot prove upstream HTTP closure. Keep the ledger
+      // fence until the exact dedicated dispatcher supplies its own proof.
       const modelOwner = model;
-      const modelFailures = modelOwner
+      let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      if (modelFailures.length)
+      const transport = sourceOwner?.model.transport;
+      if (transport) await settle([transport.close]);
+      if (modelFailures.length) {
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
-      await settle(
-        sourceOwner?.model.transport
-          ? [() => sourceOwner.model.transport!.close()]
-          : [],
-      );
+        if (transport && modelOwner?.reconcileClosedOwner && providers) {
+          const cleanup = AbortSignal.timeout(
+            providers.configuration.lifecycle.cleanupTimeoutMs,
+          );
+          const failures = await collectFailures([
+            () => modelOwner.reconcileClosedOwner!(cleanup),
+          ]);
+          if (failures.length) modelFailures.push(...failures);
+          else {
+            modelFailures = [];
+            modelRecovery = undefined;
+            // Previously unknown model join can block receipt retirement.
+            // Recheck the same physical epochs only after ledger reconciliation.
+            vmFailures = await stopOwnedVms();
+            receiptFailures = await retireReceipts();
+          }
+        }
+      }
       const providerOwner = providers;
       await settle([
         ...(sourceOwner && !modelRecovery
@@ -354,6 +372,7 @@ export function createProductionPersonVmHost(input: {
       const errors = [
         ...independentCloseFailures,
         ...uncertainPreparation,
+        ...vmFailures,
         ...receiptFailures,
         ...modelFailures,
       ];
@@ -395,6 +414,7 @@ export function createProductionPersonVmHost(input: {
       await modelOwner.close();
       // Once the stop proof has been accepted, join cleanup even if the
       // maintenance request disconnects or the Worker lifetime has ended.
+      const vmFailures = await stopOwnedVms();
       const receiptFailures = await retireReceipts();
       const sourceFailures = recovery.providerJoined
         ? []
@@ -407,10 +427,15 @@ export function createProductionPersonVmHost(input: {
       const errors = [
         ...independentCloseFailures,
         ...uncertainPreparation,
+        ...vmFailures,
         ...receiptFailures,
         ...sourceFailures,
       ];
-      if (!receiptFailures.length && !sourceFailures.length)
+      if (
+        !vmFailures.length &&
+        !receiptFailures.length &&
+        !sourceFailures.length
+      )
         modelRecovery = undefined;
       const error = errors.length
         ? new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE')
@@ -561,6 +586,7 @@ export function createProductionPersonVmHost(input: {
           modelSource.transport?.fetchOwned,
         ),
         store: createPostgresModelGatewayStore(trustedDatabase),
+        confirmTransportStopped: modelSource.transport?.stoppedEvidence,
         admission: {
           boundary: admission,
           participant: admission.participant('gateway'),
