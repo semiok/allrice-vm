@@ -350,11 +350,13 @@ export async function bootstrapMicrosandbox(input: {
     }
     if (result.exitCode !== 0 || result.timedOut)
       throw new PersonVmError('PROVIDER_FAILED');
-    await scope.assertCurrent();
   }
   await scope.assertCurrent();
   const stage = await mkdtemp(join(input.stagingRoot, 'bootstrap-'));
   try {
+    // Each step has a live fence before its side effects. That fence also
+    // closes the preceding joined step. The final step has its own closing
+    // fence before it can hand the launcher back to the runtime.
     if (controls)
       await run({
         executable: '/usr/local/bin/node',
@@ -377,7 +379,6 @@ export async function bootstrapMicrosandbox(input: {
         ['cp', hostFile, `${name}:${file.path}`, '--quiet'],
         scope.signal,
       );
-      await scope.assertCurrent();
     }
     await run(
       controls
@@ -389,6 +390,7 @@ export async function bootstrapMicrosandbox(input: {
         executable: '/usr/local/bin/node',
         args: ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
       });
+    await scope.assertCurrent();
   } finally {
     await rm(stage, { recursive: true, force: true });
   }

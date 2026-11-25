@@ -103,6 +103,12 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     >,
   ): ReturnType<typeof createPersonVmCommandMemoryObserver>;
   start(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  /** Optional retained-start operation. It must verify both the artifact and
+   * Web endpoints against the same fresh, post-start native inspection. */
+  startWithWebEndpoints?(
+    receipt: PersonVmWebEndpointReceipt,
+    signal: AbortSignal,
+  ): Promise<void>;
   stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   ping(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
 }
@@ -326,9 +332,10 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     running = true,
+    web?: PersonVmWebEndpointReceipt,
   ) {
     const c = this.options.readonlyDshDirectory;
-    if (!c) return;
+    if (!c && !web) return;
     const [artifact, inspection] = await this.inspectWithArtifact(
       binding,
       signal,
@@ -336,13 +343,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if (artifact.status === 'rejected') throw artifact.reason;
     if (inspection.status === 'rejected') throw inspection.reason;
     signal.throwIfAborted();
-    assertReadonlyArtifactInspection(
-      inspection.value,
-      this.name(binding),
-      c,
-      running,
-      this.options.readonlyCommandMemoryDirectory,
-    );
+    if (c)
+      assertReadonlyArtifactInspection(
+        inspection.value,
+        this.name(binding),
+        c,
+        running,
+        this.options.readonlyCommandMemoryDirectory,
+      );
+    if (web)
+      assertWebEndpointInspection(
+        inspection.value,
+        this.name(binding),
+        web,
+        true,
+      );
     return artifact.value?.sandboxSha256;
   }
   private inspectWithArtifact(binding: PersonVmBinding, signal: AbortSignal) {
@@ -662,10 +677,20 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       true,
     );
   }
-  async start(binding: PersonVmBinding, signal: AbortSignal) {
+  private async startNative(binding: PersonVmBinding, signal: AbortSignal) {
     await this.assertArtifact(binding, signal, false);
     await this.command(binding, ['start', this.name(binding)], signal);
+  }
+  async start(binding: PersonVmBinding, signal: AbortSignal) {
+    await this.startNative(binding, signal);
     await this.assertArtifact(binding, signal);
+  }
+  async startWithWebEndpoints(
+    receipt: PersonVmWebEndpointReceipt,
+    signal: AbortSignal,
+  ) {
+    await this.startNative(receipt.binding, signal);
+    await this.assertArtifact(receipt.binding, signal, true, receipt);
   }
   async stop(binding: PersonVmBinding, signal: AbortSignal) {
     const state = await this.status(binding, signal);

@@ -95,12 +95,18 @@ export async function bootstrapPersonVm(input: {
     return operation;
   }
   try {
-    const plan = await track(() =>
-      input.web
-        ? input.runtime.memoryGuestPlan(scope.binding, scope.signal, input.web)
-        : input.runtime.memoryGuestPlan(scope.binding, scope.signal),
-    );
-    const launcher = await track(() => input.native.bootstrap(scope, plan));
+    const launcher = await track(async () => {
+      const plan = input.web
+        ? await input.runtime.memoryGuestPlan(
+            scope.binding,
+            scope.signal,
+            input.web,
+          )
+        : await input.runtime.memoryGuestPlan(scope.binding, scope.signal);
+      // This fence closes the plan read and authorizes the following guest work.
+      await scope.assertCurrent();
+      return input.native.bootstrap(scope, plan);
+    });
     const bootstrapScope = Object.freeze({
       ...scope,
       launch: (command: PersonVmGuestCommand) =>

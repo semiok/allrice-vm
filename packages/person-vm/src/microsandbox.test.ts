@@ -92,15 +92,16 @@ else if(a[0]==='inspect'){
   const id=a[a.indexOf('--job')+1],job=v.jobs[id];
   console.log(JSON.stringify({version:1,id,pid:4242,runtime_boot_id:'fixture-native-boot',state:job.state??'running',exit_code:job.code,timed_out:false}));return;
  }
- const ports=v.ports??[],active=mode.startsWith('web-inspect')?[]:ports;
- const mounts=v.mounts??[],activeMounts=mode==='artifact-inspect-drift'?mounts.map(m=>({...m,options:{...m.options,readonly:false}})):mounts;
+ const ports=v.ports??[],active=(mode.startsWith('web-inspect')||(v.retained&&mode==='retained-web-drift'))?[]:ports;
+ const mounts=v.mounts??[],activeMounts=(mode==='artifact-inspect-drift'||(v.retained&&mode==='retained-mount-drift'))?mounts.map(m=>({...m,options:{...m.options,readonly:false}})):mounts;
  console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports},mounts},active_config:{network:{ports:active},mounts:activeMounts},pending_changes:[]}));
 }
-else if(a[0]==='start')v.status='Running';
+else if(a[0]==='start'){v.retained=true;v.status='Running';}
 else if(a[0]==='stop'){if(!['lost-id-unknown-stop','auth-unknown-stop','web-inspect-unknown-stop'].includes(mode))v.status='Stopped';}
 else if(a[0]==='ping'){if(v.status!=='Running')process.exit(41);}
 else if(a[0]==='cp'){
  const meta=fs.statSync(a[1]);(v.copies??=[]).push({target:a[2],mode:meta.mode&511,contents:fs.readFileSync(a[1],'utf8')});
+ if(mode==='partial-copy'){save();process.exit(45);}
 }
 else if(a[0]==='exec'){
  if(!a.includes('--detach')){
@@ -944,6 +945,74 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(create).not.toContain(`allow:ingress@127.0.0.1/32:tcp:${h}`);
     expect(create[create.indexOf('--net-default') + 1]).toBe('deny');
   });
+  it.each([true, false])(
+    'retained start checks stopped and final ready separately; combined ports and mounts=%s',
+    async (combined) => {
+      const f = await bootstrapFixture('ok', await readonlyFixture());
+      const assigned = roster(f, 1);
+      if (!combined)
+        Object.defineProperty(f.native, 'startWithWebEndpoints', {
+          value: undefined,
+        });
+      const service = new PersonVmService({
+        ...f.h.options,
+        native: f.native,
+        nativeWeb: { prepare: async () => assigned },
+      });
+      expect(
+        (await service.prewarm(f.rc, { trigger: 'page' }, signal())).ready,
+      ).toBe(true);
+      await f.native.stop(await service.resolve(f.rc, signal()), signal());
+      await service.stop(f.rc, signal());
+      const before = (await f.calls()).length;
+      expect((await service.start(f.rc, signal())).ready).toBe(true);
+      const calls = (await f.calls()).slice(before);
+      const verbs = calls.map(([verb]) => verb);
+      const start = verbs.indexOf('start');
+      const bootstrap = verbs.indexOf('exec');
+      expect(start).toBeGreaterThan(0);
+      expect(bootstrap).toBeGreaterThan(start);
+      expect(verbs[start - 1]).toBe('inspect');
+      expect(verbs.slice(start + 1, bootstrap)).toEqual(
+        combined ? ['inspect'] : ['inspect', 'inspect'],
+      );
+      expect(verbs.slice(verbs.lastIndexOf('ping'))).toEqual([
+        'ping',
+        'inspect',
+      ]);
+      expect(verbs).not.toContain('create');
+    },
+  );
+  it.each(['retained-web-drift', 'retained-mount-drift'])(
+    'rejects %s in the shared post-start inspection before any bootstrap',
+    async (mode) => {
+      const f = await bootstrapFixture(mode, await readonlyFixture());
+      const assigned = roster(f, 1);
+      const service = new PersonVmService({
+        ...f.h.options,
+        native: f.native,
+        nativeWeb: { prepare: async () => assigned },
+      });
+      await service.prewarm(f.rc, { trigger: 'page' }, signal());
+      await f.native.stop(await service.resolve(f.rc, signal()), signal());
+      await service.stop(f.rc, signal());
+      const before = (await f.calls()).length;
+      await expect(service.start(f.rc, signal())).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      const verbs = (await f.calls()).slice(before).map(([verb]) => verb);
+      const afterStart = verbs.slice(verbs.indexOf('start') + 1);
+      expect(afterStart[0]).toBe('inspect');
+      expect(afterStart.filter((verb) => verb === 'inspect')).toHaveLength(1);
+      expect(afterStart).not.toContain('exec');
+      expect(afterStart).not.toContain('cp');
+      expect(afterStart).toContain('stop');
+      expect(afterStart.slice(afterStart.indexOf('stop') + 1)).toContain(
+        'list',
+      );
+      expect(f.h.mounts.size).toBe(0);
+    },
+  );
   it.each(['success', 'cancel', 'write-failure'] as const)(
     'reservation真实接入立即关闭，manifest %s后service/lease与原H全部真实join',
     async (mode) => {
@@ -1374,6 +1443,54 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(f.h.mounts.size).toBe(mode === 'lost-id-unknown-stop' ? 1 : 0);
     },
   );
+  it.each([1, 3])(
+    'rechecks current authority after copy %i before sending another file or initializing',
+    async (copies) => {
+      const f = await bootstrapFixture();
+      const authorize = f.h.options.authority.authorize;
+      const plan = f.h.runtime.memoryGuestPlan;
+      f.h.runtime.memoryGuestPlan = async (...args) => {
+        const result = await plan(...args);
+        f.h.options.authority.authorize = async (...input) => {
+          if (
+            (await f.calls()).filter(([verb]) => verb === 'cp').length >= copies
+          )
+            f.h.authorize(false);
+          return authorize(...input);
+        };
+        return result;
+      };
+      await expect(
+        f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const calls = await f.calls();
+      expect(calls.filter(([verb]) => verb === 'cp')).toHaveLength(copies);
+      expect(calls.filter(([verb]) => verb === 'exec')).toHaveLength(1); // only mkdir
+      expect(calls.some(([verb]) => verb === 'stop')).toBe(true);
+      expect(f.h.mounts.size).toBe(0);
+      expect(
+        (await readdir(join(f.mount, 'host-home'))).some((name) =>
+          name.startsWith('bootstrap-'),
+        ),
+      ).toBe(false);
+    },
+  );
+  it('a partial native cp failure never sends the remaining files or initializes', async () => {
+    const f = await bootstrapFixture('partial-copy');
+    await expect(
+      f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    const verbs = (await f.calls()).map(([verb]) => verb);
+    expect(verbs.filter((verb) => verb === 'cp')).toHaveLength(1);
+    expect(verbs.filter((verb) => verb === 'exec')).toHaveLength(1); // only mkdir
+    expect(verbs).toContain('stop');
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      (await readdir(join(f.mount, 'host-home'))).some((name) =>
+        name.startsWith('bootstrap-'),
+      ),
+    ).toBe(false);
+  });
   it('取消正在wait的init：CLI退出后仍exact kill+wait非零JSON；随后native stop/status', async () => {
     const f = await bootstrapFixture('cancel-init'),
       controller = new AbortController();
