@@ -61,6 +61,7 @@ export function openNativePageCarrier(
   let requested = false,
     complete = false,
     dispatched = false,
+    setupCancelled = false,
     gotClosed = false,
     gotEnd = false;
   function send(value: object) {
@@ -104,6 +105,19 @@ export function openNativePageCarrier(
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
       if (frame.streamId !== id) throw Error('Unexpected native page stream');
+      if (setupCancelled) throw Error('Unexpected native page terminal');
+      if (
+        frame.type === 'error' &&
+        requested &&
+        !scopeId &&
+        frame.error.code === 'gateway/cancelled' &&
+        frame.error.message === 'Page closed during setup'
+      ) {
+        // The Worker emits this terminal only after joining the unopened
+        // page operation. Also wait for the actual clean socket close.
+        setupCancelled = true;
+        return;
+      }
       if (frame.type === 'error')
         throw Object.assign(Error(frame.error.message), frame.error);
       if (frame.type === 'end' && requested && gotClosed && !gotEnd) {
@@ -143,7 +157,7 @@ export function openNativePageCarrier(
         joined.resolve();
         return;
       }
-      if (gotEnd && event.wasClean && !failure) {
+      if ((gotEnd || setupCancelled) && event.wasClean && !failure) {
         complete = true;
         joined.resolve();
         return;

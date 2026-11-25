@@ -36,6 +36,7 @@ type Status =
 
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
+const closingNoticeMs = 10_000;
 
 export function EmployeeNativePage({
   query,
@@ -69,6 +70,7 @@ export function EmployeeNativePage({
     let remoteRevoked = false;
     let selectedQuery: string | undefined;
     let timer: number | undefined;
+    let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
@@ -113,10 +115,16 @@ export function EmployeeNativePage({
       navigating = true;
       window.clearTimeout(timer);
       setStatus(status);
+      closingNotice = window.setTimeout(
+        () => setStatus('unknown'),
+        closingNoticeMs,
+      );
       void retire().then((closed) => {
+        window.clearTimeout(closingNotice);
         if (replace.current !== applyQuery) return;
         if (closed) {
           setSource(undefined);
+          setStatus(status);
           setSettled(true);
         } else setStatus('unknown');
       });
@@ -252,6 +260,7 @@ export function EmployeeNativePage({
     window.addEventListener('message', receive);
     const leaving = () => {
       lifetime.abort();
+      send(pageRevoked);
       void close();
     };
     window.addEventListener('pagehide', leaving);
@@ -311,6 +320,7 @@ export function EmployeeNativePage({
     });
     return () => {
       window.clearTimeout(timer);
+      window.clearTimeout(closingNotice);
       lifetime.abort();
       close();
       if (loaded.current === documentLoaded) loaded.current = undefined;

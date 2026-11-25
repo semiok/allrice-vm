@@ -83,13 +83,9 @@ export async function openDEntryThread(
   const personId = context.actor.id;
   signal.throwIfAborted();
   return getDatabase().begin(async (tx) => {
-    // The existing per-user admission lock serializes automatic first entry
-    // across tabs. Explicit New uses the durable operation UUID instead.
-    const principal = await readContentPrincipal(
-      scope,
-      tx,
-      operationId ? true : 'update_user',
-    );
+    // Use the existing per-user admission lock for simultaneous first entry
+    // and explicit fixed-ID retries. Readbacks do not log duplicate creates.
+    const principal = await readContentPrincipal(scope, tx, 'update_user');
     if (!principal?.writable) throw new DataAccessError('authorization_denied');
     const candidate = await getEmployeeInstance(
       scope,
@@ -115,26 +111,28 @@ export async function openDEntryThread(
     if (selectDEntryGeneration(policy, identity) !== '4.0')
       throw new DataAccessError('authorization_denied');
     signal.throwIfAborted();
-    if (!operationId) {
-      const [existing] = await tx<{ id: string }[]>`
+    const [existing] = await tx<{ id: string }[]>`
         select id from allrice_chat_sessions
         where organization_id=${scope.organizationId} and workspace_id=${scope.workspaceId}
           and owner_id=${personId}
           and coalesce(employee_instance_id,employee_assignment_id)=${instance.id}
           and execution_generation='4.0' and archived_at is null and visibility='private'
+          and (${operationId ?? null}::uuid is null or id=${operationId ?? null}::uuid)
         order by pinned_at desc nulls last,updated_at desc,id desc limit 1`;
-      if (existing) return { ...selection, threadId: existing.id };
-    }
-    const session = await createAssignedChatSession(
-      scope,
-      {
-        ...selection,
-        employeeAssignmentId: instance.assignmentId,
-        title: '新建对话',
-      },
-      { executionGeneration: '4.0', sessionId: operationId },
-      tx,
-    );
+    const session =
+      existing ??
+      (await createAssignedChatSession(
+        scope,
+        {
+          ...selection,
+          employeeAssignmentId: instance.assignmentId,
+          title: '新建对话',
+        },
+        { executionGeneration: '4.0', sessionId: operationId },
+        tx,
+      ));
+    if (!(await readContentPrincipal(scope, tx))?.writable)
+      throw new DataAccessError('authorization_denied');
     signal.throwIfAborted();
     return { ...selection, threadId: session.id };
   });

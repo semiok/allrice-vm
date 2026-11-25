@@ -56,6 +56,8 @@ suite('4.0 browser cold entry', () => {
         });
       const firstRetry = deferred<ServerResponse>();
       const retryClosed = deferred<void>();
+      let opening = false;
+      const allowOpening = deferred<void>();
       const warmCalls: unknown[] = [],
         births: unknown[] = [],
         documents: string[] = [];
@@ -157,6 +159,23 @@ suite('4.0 browser cold entry', () => {
       expect(held.writableFinished).toBe(false);
       expect(births).toEqual([]);
       expect(documents).toEqual([]);
+      const watch = f.deps.watch.getMockImplementation()!;
+      f.deps.watch.mockImplementationOnce(async () => {
+        opening = true;
+        await allowOpening.promise;
+        return watch();
+      });
+      try {
+        await page.getByRole('button', { name: '继续' }).click();
+        await expect.poll(() => opening).toBe(true);
+        expect(documents).toEqual([]);
+        await page.getByRole('button', { name: '取消等待' }).click();
+        expect(
+          await page.getByRole('button', { name: '继续' }).isDisabled(),
+        ).toBe(true);
+      } finally {
+        allowOpening.resolve();
+      }
       await page.getByRole('button', { name: '继续' }).click();
       async function showEditor(threadId: string) {
         await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
@@ -197,10 +216,11 @@ suite('4.0 browser cold entry', () => {
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(next);
       expect(births).toEqual([
         { selection: employee },
+        { selection: employee },
         { selection: employee, operationId: next },
       ]);
       expect(warmCalls).toEqual(
-        Array.from({ length: 4 }, () => ({
+        Array.from({ length: 5 }, () => ({
           selection: employee,
           trigger: 'page',
         })),
