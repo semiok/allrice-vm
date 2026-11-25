@@ -363,7 +363,9 @@ export function createProductionPersonVmHost(input: {
           }
         }
       }
-      if (modelFailures.length)
+      // The original pool owns both the model ledger and the physical VM
+      // lease. Keep that maintenance path available when either is unresolved.
+      if (modelFailures.length || vmFailures.length || receiptFailures.length)
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       const providerOwner = providers;
       await settle([
@@ -674,7 +676,8 @@ export function createProductionPersonVmHost(input: {
       return Object.freeze({
         close,
         recoverModelOwner,
-        modelOwnerMaintenancePending: () => modelRecovery !== undefined,
+        modelOwnerMaintenancePending: () =>
+          modelRecovery !== undefined || uncertainPreparation.length > 0,
       });
     } finally {
       finishConstruction();

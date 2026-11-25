@@ -613,6 +613,44 @@ it('a failed actual service revoke retains the receipt for the real Host.close r
   expect(value.model.revoke).toHaveBeenCalledTimes(2);
 });
 
+it('retains maintenance after VM stop is unconfirmed even when model close succeeded', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const stop = vi.mocked(providers.native.stop);
+  const stopNormally = stop.getMockImplementation()!;
+  const detach = vi.mocked(providers.disk.detach);
+  stop.mockRejectedValue(Error('synthetic unconfirmed physical stop'));
+  await expect(vm.start(context, signal())).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
+  const originalClose = value.host.close();
+  await expect(originalClose).rejects.toMatchObject({
+    errors: [expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' })],
+  });
+  expect(value.model.close).toHaveBeenCalledOnce();
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+  expect(detach).not.toHaveBeenCalled();
+  expect(value.bound.egress.close).not.toHaveBeenCalled();
+
+  value.model.reconcileOwner.mockRejectedValueOnce(
+    Error('no exact stop proof'),
+  );
+  await expect(value.host.recoverModelOwner(context, signal())).rejects.toThrow(
+    'no exact stop proof',
+  );
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+
+  stop.mockImplementation(stopNormally);
+  value.model.reconcileOwner.mockResolvedValueOnce(0);
+  await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
+    0,
+  );
+  expect(detach).toHaveBeenCalledOnce();
+  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+  await expect(value.host.close()).resolves.toBeUndefined();
+});
+
 it('a stale persisted service receipt cannot remove a retained newer epoch from Host cleanup', async () => {
   const value = await receiptFixture(),
     vm = value.input().vm,
