@@ -16,7 +16,7 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from '@deepseek-ai/dsh-session';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { createUserMessage, type SessionRequestId } from '@deepseek-ai/dsh-llm';
 import type { AgentMessageSource } from '@deepseek-ai/dsh-subagent';
 import { expect, it } from 'vitest';
 // @ts-expect-error The fixed guest plugin is copied as JavaScript.
@@ -203,6 +203,7 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
     await ctx.plugin(SessionStore).await();
     const native = ctx.get('sessionPersistence') as SessionPersistence;
     const sessions = ctx.get('sessions');
+    if (!sessions) throw new Error('Native SessionStore did not mount');
     const session = sessions.prepare(SessionId(sessionId), {
       meta: { cwd: root },
     });
@@ -221,7 +222,7 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       rows = appendTurn(
         session,
         1,
-        { kind: 'user', rpcId: selection.nativeRequestId },
+        { kind: 'user', rpcId: selection.nativeRequestId as SessionRequestId },
         true,
       );
       const start = rows[0]!;
