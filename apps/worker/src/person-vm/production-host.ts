@@ -57,6 +57,7 @@ export class ProductionPersonVmHostUnavailable extends Error {
     readonly code:
       | 'HOST_SOURCES_UNAVAILABLE'
       | 'HOST_CONFIGURATION_UNAVAILABLE'
+      | 'PERSON_VM_ARTIFACTS_UNAVAILABLE'
       | 'HOST_CLOSED'
       | 'MODEL_RECOVERY_UNAVAILABLE',
   ) {
@@ -680,12 +681,13 @@ export function createProductionPersonVmHost(input: {
         'PERSON_VM_HOST_CONSTRUCTION_FAILED',
       );
     }
-    if (
-      primary instanceof ProductionHostConfigurationUnavailable ||
-      primary instanceof ProductionPersonVmArtifactsUnavailable
-    )
+    if (primary instanceof ProductionHostConfigurationUnavailable)
       throw new ProductionPersonVmHostUnavailable(
         'HOST_CONFIGURATION_UNAVAILABLE',
+      );
+    if (primary instanceof ProductionPersonVmArtifactsUnavailable)
+      throw new ProductionPersonVmHostUnavailable(
+        'PERSON_VM_ARTIFACTS_UNAVAILABLE',
       );
     throw primary;
   });

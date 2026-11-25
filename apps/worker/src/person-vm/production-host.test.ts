@@ -64,7 +64,8 @@ const io = vi.hoisted(() => ({
       ) => void
     >(),
 }));
-vi.mock('./production-config.js', () => ({
+vi.mock('./production-config.js', async (original) => ({
+  ...(await original<typeof import('./production-config.js')>()),
   readProductionHostConfiguration: io.read,
 }));
 vi.mock('./production-authority.js', async (original) => {
@@ -649,7 +650,22 @@ it('a stale persisted service receipt cannot remove a retained newer epoch from 
   ).rejects.toBeInstanceOf(Error); // Failed drain fenced the new state.
   failNew = false;
   const beforeClose = value.revoke.mock.calls.length;
-  await value.host.close();
+  const native = value.input().providers.native;
+  const beforeStop = vi.mocked(native.stop).mock.calls.length;
+  const closeFixture = cleanup.pop()!;
+  const error = await value.host.close().then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  cleanup.push(async () => {
+    await closeFixture().catch((later: unknown) => {
+      if (later !== error) throw later;
+    });
+  });
+  expect(error).toMatchObject({
+    errors: [expect.objectContaining({ code: 'LEASE_LOST' })],
+  });
+  expect(native.stop).toHaveBeenCalledTimes(beforeStop);
   expect(value.revoke).toHaveBeenCalledTimes(beforeClose + 1);
   expect(value.revoke.mock.calls.at(-1)![0]).toEqual(current.egressReceipt);
   expect(value.revoke.mock.calls.at(-1)![0].binding.leaseEpoch).toBe(
