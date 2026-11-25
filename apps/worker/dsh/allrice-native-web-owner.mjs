@@ -352,7 +352,7 @@ export function apply(ctx, config) {
           modelInfo,
           lifetime: signal,
           async resolveCallReference(selection, active) {
-            const response = await fetch(endpoint, {
+            const response = await globalThis.fetch(endpoint, {
               method: 'POST',
               redirect: 'error',
               signal: active,
