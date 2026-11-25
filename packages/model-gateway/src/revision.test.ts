@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import {
   IMAGE_OFFLOAD_REQUIRED_CODE,
@@ -7,9 +8,11 @@ import {
 } from '@deepseek-ai/dsh-llm';
 import type { StreamChunk, ImageBlock } from '@deepseek-ai/dsh-llm';
 import * as ImageOffload from '@deepseek-ai/dsh-compaction-image-offload';
-import type { GatewayProvider } from './contract.ts';
+import { ModelGatewayError, type GatewayProvider } from './contract.ts';
 import {
+  closeServer,
   gatewayFixture,
+  modelBinding,
   nativeFailure,
   upstreamFixture,
 } from './gateway.fixture.ts';
@@ -21,6 +24,90 @@ afterEach(async () => {
 });
 const finish = (chunks: StreamChunk[]) =>
   chunks.findLast((chunk) => chunk.type === 'finish');
+
+async function unknownTransportFixture(
+  endpoint: string,
+  provider: GatewayProvider,
+  respond: () => Promise<Response>,
+) {
+  const original = globalThis.fetch;
+  const transport = new AbortController();
+  const ownerId = randomUUID();
+  const binding = modelBinding();
+  globalThis.fetch = (input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    return url === endpoint ? respond() : original(input, init);
+  };
+  const f = await gatewayFixture({
+    binding,
+    ownerId,
+    provider,
+    authority: {
+      async assertCall(_binding, signal) {
+        signal.throwIfAborted();
+      },
+      async authorizeUsage() {
+        throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      },
+      async confirmOwnerStopped(context, selected, signal) {
+        signal.throwIfAborted();
+        if (
+          selected !== ownerId ||
+          context.requestId !== binding.context.requestId ||
+          !transport.signal.aborted
+        )
+          throw new ModelGatewayError('AUTHORIZATION_DENIED');
+        return { evidenceRef: 'fixture-transport-owner-stopped' };
+      },
+    },
+  }).catch((error: unknown) => {
+    globalThis.fetch = original;
+    throw error;
+  });
+  const meteredFetch = globalThis.fetch;
+  cleanup.push(async () => {
+    try {
+      await f.gateway.close().catch((error: unknown) => {
+        if (
+          !(error instanceof AggregateError) ||
+          error.message !== 'Model gateway join unconfirmed'
+        )
+          throw error;
+      });
+      // Only the fixture can stop its synthetic transport. The rejected
+      // fetch/reader and the gateway's close are insufficient evidence.
+      transport.abort();
+      await f.gateway.reconcileOwner(
+        binding.context,
+        ownerId,
+        new AbortController().signal,
+      );
+      await f.gateway.close();
+    } finally {
+      try {
+        await closeServer(f.server);
+      } finally {
+        globalThis.fetch = original;
+      }
+    }
+  });
+  return {
+    ...f,
+    async assertUnconfirmedClose() {
+      await expect(f.gateway.close()).rejects.toMatchObject({
+        errors: [{ code: 'LEDGER_UNAVAILABLE', binding: binding.vm }],
+      });
+      expect(globalThis.fetch).toBe(meteredFetch);
+      await expect(
+        f.gateway.reconcileOwner(
+          binding.context,
+          ownerId,
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    },
+  };
+}
 
 describe.sequential(
   'MET268 R1: native behavior through the real HTTP gateway',
@@ -255,8 +342,6 @@ describe.sequential(
 
     it('真正关闭未知仍保留slot，但不丢已观察的HTTP/failed/usage事实', async () => {
       const endpoint = 'http://synthetic-unclosed.invalid/v1/stream';
-      const original = globalThis.fetch;
-      let transportActive = true;
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(
@@ -284,16 +369,6 @@ describe.sequential(
       });
       // A hostile/unknown transport counterexample, not an actual network call.
       // Its errored reader cannot prove that the underlying resource stopped.
-      globalThis.fetch = (input, init) => {
-        const url = input instanceof Request ? input.url : String(input);
-        return url === endpoint
-          ? Promise.resolve(new Response(body, { status: 200 }))
-          : original(input, init);
-      };
-      cleanup.push(async () => {
-        transportActive = false;
-        globalThis.fetch = original;
-      });
       const provider: GatewayProvider = {
         classify(input) {
           return String(input) === endpoint
@@ -308,12 +383,13 @@ describe.sequential(
           yield nativeFailure('UNREACHABLE');
         },
       };
-      const f = await gatewayFixture({ provider });
-      cleanup.push(() => f.close());
+      const f = await unknownTransportFixture(endpoint, provider, () =>
+        Promise.resolve(new Response(body, { status: 200 })),
+      );
       expect(finish(await f.collect())).toMatchObject({
         reason: { kind: 'error' },
       });
-      expect(transportActive).toBe(true);
+      await f.assertUnconfirmedClose();
       expect(f.store.slots.get(f.binding.vm.personId)?.size).toBe(1);
       expect(f.admission.records.size).toBe(1);
       expect(f.admission.finished).toHaveLength(0);
@@ -338,20 +414,8 @@ describe.sequential(
 
     it('已dispatch的fetch拒绝但无独立close事实：不把Promise拒绝当真实join', async () => {
       const endpoint = 'http://synthetic-fetch-unclosed.invalid/v1/stream';
-      const original = globalThis.fetch;
       // A synthetic counterexample, not a real socket or a claim of native
       // behavior: the transport rejects while its underlying resource is unknown.
-      globalThis.fetch = (input, init) => {
-        const url = input instanceof Request ? input.url : String(input);
-        return url === endpoint
-          ? Promise.reject(
-              new Error('synthetic fetch rejected without close proof'),
-            )
-          : original(input, init);
-      };
-      cleanup.push(async () => {
-        globalThis.fetch = original;
-      });
       const provider: GatewayProvider = {
         classify(input) {
           return String(input) === endpoint
@@ -363,11 +427,15 @@ describe.sequential(
           yield nativeFailure('UNREACHABLE');
         },
       };
-      const f = await gatewayFixture({ provider });
-      cleanup.push(() => f.close());
+      const f = await unknownTransportFixture(endpoint, provider, () =>
+        Promise.reject(
+          new Error('synthetic fetch rejected without close proof'),
+        ),
+      );
       expect(finish(await f.collect())).toMatchObject({
         reason: { kind: 'error' },
       });
+      await f.assertUnconfirmedClose();
       expect([...f.store.rows.values()]).toMatchObject([
         {
           dispatchObserved: true,
