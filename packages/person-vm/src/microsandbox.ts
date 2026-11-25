@@ -1,4 +1,5 @@
-import { lstat, readlink, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readlink, symlink, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
@@ -29,6 +30,7 @@ import {
 } from './readonly-artifact.ts';
 import type {
   PersonVmGuestBootstrapPort,
+  PersonVmGuestCommand,
   PersonVmMemoryGuestPlan,
   PersonVmStartingScope,
 } from './guest-bootstrap.ts';
@@ -45,6 +47,7 @@ import {
 const CANONICAL_SOCKET_HASH_BYTES = 12;
 const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
+type NativePaths = { home: string; config: string; userHome: string };
 
 function assertSocketHome(home: string) {
   const controlSocket = join(
@@ -108,10 +111,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
 export class MicrosandboxPersonVm implements PersonVmNativePort {
   private readonly run: CommandRunner;
   private readonly memoryMiB: number;
-  private readonly homes = new Map<
-    string,
-    { home: string; config: string; userHome: string }
-  >();
+  private readonly homes = new Map<string, NativePaths>();
   constructor(
     private readonly options: {
       binary: string;
@@ -185,6 +185,14 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     const paths = this.homes.get(binding.vmId);
     if (!paths) throw new PersonVmError('PROVIDER_FAILED');
+    return this.runWithPaths(paths, args, signal, readNonzeroExit);
+  }
+  private runWithPaths(
+    paths: NativePaths,
+    args: string[],
+    signal: AbortSignal,
+    readNonzeroExit = false,
+  ) {
     return this.run({
       executable: this.options.binary,
       args,
@@ -349,6 +357,34 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       ).then((output): unknown => JSON.parse(output)),
     ]);
   }
+  private configurationBytes(home: string, target: string) {
+    return JSON.stringify({
+      version: 1,
+      home,
+      allowed_backends: ['local'],
+      paths: {
+        msb: this.options.binary,
+        libkrunfw: this.options.libkrunfw,
+        agentd: this.options.agentd,
+        ...Object.fromEntries(
+          ['cache', 'sandboxes', 'volumes', 'snapshots', 'logs', 'secrets'].map(
+            (name) => [name, join(name === 'sandboxes' ? target : home, name)],
+          ),
+        ),
+      },
+      sandbox_defaults: {
+        cpus: 2,
+        memory_mib: this.memoryMiB,
+        oci: {
+          root_disk: {
+            kind: 'flat',
+            size_mib: this.options.rootDiskGiB * 1024,
+            clone: 'auto',
+          },
+        },
+      },
+    });
+  }
   async prepare(binding: PersonVmBinding, mount: string, signal: AbortSignal) {
     const home = join(this.options.socketRoot, binding.vmId);
     assertSocketHome(home);
@@ -366,48 +402,113 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       await symlink(target, home, 'dir');
     }
     const config = join(mount, 'msb-config.json');
-    await writeFile(
-      config,
-      JSON.stringify({
-        version: 1,
-        home,
-        allowed_backends: ['local'],
-        paths: {
-          msb: this.options.binary,
-          libkrunfw: this.options.libkrunfw,
-          agentd: this.options.agentd,
-          ...Object.fromEntries(
-            [
-              'cache',
-              'sandboxes',
-              'volumes',
-              'snapshots',
-              'logs',
-              'secrets',
-            ].map((name) => [
-              name,
-              join(name === 'sandboxes' ? target : home, name),
-            ]),
-          ),
-        },
-        sandbox_defaults: {
-          cpus: 2,
-          memory_mib: this.memoryMiB,
-          oci: {
-            root_disk: {
-              kind: 'flat',
-              size_mib: this.options.rootDiskGiB * 1024,
-              clone: 'auto',
-            },
-          },
-        },
-      }),
-      { mode: 0o600 },
-    );
+    await writeFile(config, this.configurationBytes(home, target), {
+      mode: 0o600,
+    });
     this.homes.set(binding.vmId, { home, config, userHome });
     const version = await this.command(binding, ['--version'], signal);
     if (!/\b0\.7\.16\b/.test(version))
       throw new PersonVmError('PROVIDER_FAILED');
+  }
+  /** For a fixed Host-authored read command, inside a physical lease that has
+   * independently verified this already attached disk. Reopen the original
+   * configuration without populating launch ownership or preparing the disk. */
+  async readAttachedProbe(
+    scope: PersonVmStartingScope,
+    mount: string,
+    commandSpec: PersonVmGuestCommand,
+  ) {
+    const { binding, signal } = scope;
+    const home = join(this.options.socketRoot, binding.vmId);
+    const target = join(mount, 'microsandbox');
+    const paths = {
+      home,
+      userHome: join(mount, 'host-home'),
+      config: join(mount, 'msb-config.json'),
+    };
+    assertSocketHome(home);
+    await scope.assertCurrent();
+    signal.throwIfAborted();
+    for (const directory of [this.options.socketRoot, target, paths.userHome]) {
+      const stat = await lstat(directory);
+      if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700)
+        throw new PersonVmError('PROVIDER_FAILED');
+    }
+    if (
+      !(await lstat(home)).isSymbolicLink() ||
+      (await readlink(home)) !== target
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+    const config = await open(
+      paths.config,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    try {
+      const expected = this.configurationBytes(home, target);
+      const stat = await config.stat();
+      if (
+        !stat.isFile() ||
+        (stat.mode & 0o777) !== 0o600 ||
+        stat.size !== Buffer.byteLength(expected) ||
+        (await config.readFile('utf8')) !== expected
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
+    } finally {
+      await config.close();
+    }
+    const directory = this.options.readonlyDshDirectory;
+    if (!directory) throw new PersonVmError('PROVIDER_FAILED');
+    const artifact = await verifyReadonlyDshDirectory(
+      directory,
+      this.options.image,
+      signal,
+    );
+    await readonlyArtifactReference(
+      home,
+      binding,
+      directory,
+      false,
+      signal,
+      artifact.descriptorSha256,
+      this.options.readonlyCommandMemoryDirectory,
+    );
+    const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
+      this.runWithPaths(paths, args, active, nonzero);
+    const name = this.name(binding);
+    const inspect = JSON.parse(
+      await command(['inspect', name, '--format', 'json'], signal),
+    );
+    assertReadonlyArtifactInspection(
+      inspect,
+      name,
+      directory,
+      true,
+      this.options.readonlyCommandMemoryDirectory,
+    );
+    const cleanupTimeoutMs = this.options.jobCleanupTimeoutMs ?? 10_000;
+    const job = await spawnMicrosandboxManagedProbe(
+      { scope, name, cleanupTimeoutMs, executionTimeoutSeconds: 10, command },
+      commandSpec,
+    );
+    let ended = false;
+    try {
+      const result = await job.wait(signal);
+      ended = true;
+      if (result.exitCode || result.timedOut)
+        throw new PersonVmError('PROVIDER_FAILED');
+      return await job.stdout(signal);
+    } catch (error) {
+      if (!ended) {
+        try {
+          await job.cancelAndWait(AbortSignal.timeout(cleanupTimeoutMs));
+        } catch (cleanup) {
+          throw new PersonVmError('CLEANUP_INCOMPLETE', {
+            cause: new AggregateError([error, cleanup]),
+          });
+        }
+      }
+      throw error;
+    }
   }
   async status(binding: PersonVmBinding, signal: AbortSignal) {
     const rows: unknown = JSON.parse(

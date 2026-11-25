@@ -188,6 +188,13 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     signal.throwIfAborted();
     for (const directory of ['', 'warm', 'cold', 'manifests'])
       await privateDirectory(join(this.options.root, directory));
+    return this.inspectExisting(vmId, signal);
+  }
+  private async inspectExisting(
+    vmId: string,
+    signal: AbortSignal,
+  ): Promise<PersonVmDiskInspection> {
+    signal.throwIfAborted();
     const found: { disk: PersonDisk; device: string; inode: string }[] = [];
     for (const tier of ['warm', 'cold'] as const) {
       const disk = { vmId, tier };
@@ -250,6 +257,24 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       return { state: 'unknown' };
     }
     return { state: 'ready', disk: actual.disk };
+  }
+
+  /** An observation only, for an already running VM under its physical lease. */
+  async verifyAttachedMount(disk: PersonDisk, signal: AbortSignal) {
+    const observed = await this.inspectExisting(disk.vmId, signal);
+    if (observed.state !== 'ready' || observed.disk.tier !== disk.tier)
+      return null;
+    const mounts = (await this.info(signal)).images?.filter(
+      (entry) => entry['image-path'] === this.image(disk),
+    );
+    const mount = this.mount(disk);
+    signal.throwIfAborted();
+    return mounts?.length === 1 &&
+      mounts[0]?.['system-entities']?.filter(
+        (entity) => entity['mount-point'] === mount,
+      ).length === 1
+      ? mount
+      : null;
   }
   async create(disk: PersonDisk, signal: AbortSignal) {
     await privateDirectory(this.options.root);

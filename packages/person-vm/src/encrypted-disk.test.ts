@@ -80,7 +80,19 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
       0o600,
     );
     const original = hash(await readFile(image));
-    await disk.attach(ref, signal());
+    expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
+    const mount = await disk.attach(ref, signal());
+    const start = calls.length;
+    expect(await disk.verifyAttachedMount(ref, signal())).toBe(mount);
+    attachments.set(image, join(root, 'different-mount'));
+    expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
+    attachments.set(image, mount);
+    expect(
+      calls
+        .slice(start)
+        .filter((call) => call.executable.endsWith('hdiutil'))
+        .map((call) => call.args[0]),
+    ).toEqual(['imageinfo', 'info', 'imageinfo', 'info']);
     await expect(disk.move(ref, 'cold', signal())).rejects.toMatchObject({
       code: 'CLEANUP_INCOMPLETE',
     });

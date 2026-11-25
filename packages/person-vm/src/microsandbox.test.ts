@@ -119,7 +119,9 @@ else if(a[0]==='exec'){
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
 else if(a[0]==='logs'){
- const id=a[a.indexOf('--job')+1],cmd=v.jobs[id].cmd,config=JSON.parse(cmd[3]);
+ const id=a[a.indexOf('--job')+1],cmd=v.jobs[id].cmd;
+ if(cmd[1]==='journal-read-fixture'){console.log(JSON.stringify({id,s:'stdout',e:null,d:'{"terminal":true}'}));return;}
+ const config=JSON.parse(cmd[3]);
  const childPath=config.commandsGroup+'/command-'+config.pid;
  const output=config.targets?{version:1,scope:'guest-cgroup',groups:config.targets.map(t=>({...t,device:'1',inode:'2',values:['32','64','128']}))}:
  {version:1,childJoined:true,childReleased:true,receipt:{version:1,executionRef:config.executionRef,pid:config.pid,stage:'admitted',child:{path:childPath,device:'1',inode:'2'},beforeMembership:config.dshGroup.slice(config.cgroupRoot.length),admittedMembership:childPath.slice(config.cgroupRoot.length),bootId:'00000000-0000-0000-0000-000000000001',startTicks:'1',baseline:{oom:'0',oomKill:'0'}},after:{oom:'0',oomKill:'0'}};
@@ -138,7 +140,7 @@ save();
 `,
     { mode: 0o700 },
   );
-  const native = new MicrosandboxPersonVm({
+  const nativeOptions = {
     binary,
     libkrunfw: join(root, 'fw'),
     agentd: join(root, 'agentd'),
@@ -149,7 +151,8 @@ save();
     jobCleanupTimeoutMs,
     rootDiskGiB: 20,
     socketRoot: await socketDirectory(),
-  });
+  };
+  const native = new MicrosandboxPersonVm(nativeOptions);
   const h = harness(),
     rc = context(),
     attach = h.disk.attach;
@@ -192,6 +195,7 @@ save();
   return {
     h,
     native,
+    reloadNative: () => new MicrosandboxPersonVm(nativeOptions),
     rc,
     service,
     mount,
@@ -302,6 +306,42 @@ async function readonlyFixture(withSandbox = false) {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  it('reopens only an existing running VM configuration for a bounded detached read after restart', async () => {
+    const f = await bootstrapFixture('ok', await readonlyFixture());
+    await f.service.create(f.rc, signal());
+    await f.service.start(f.rc, signal());
+    const binding = await f.service.resolve(f.rc, signal());
+    const fresh = f.reloadNative();
+    const guard = vi.fn(async () => undefined);
+    const current = { binding, signal: signal(), assertCurrent: guard };
+    const spec = { executable: 'node', args: ['journal-read-fixture'] };
+    const start = (await f.calls()).length;
+    await expect(fresh.readAttachedProbe(current, f.mount, spec)).resolves.toBe(
+      '{"terminal":true}',
+    );
+    expect(guard.mock.calls.length).toBeGreaterThan(1);
+    const reads = (await f.calls()).slice(start);
+    expect(reads.map(([name]) => name)).toEqual([
+      'inspect',
+      'exec',
+      'wait',
+      'logs',
+    ]);
+    expect(reads[1]).toContain('--detach');
+    expect(reads[1]).toContain('10s');
+
+    await f.native.stop(binding, signal());
+    const stopped = (await f.calls()).length;
+    await expect(
+      fresh.readAttachedProbe(current, f.mount, spec),
+    ).rejects.toMatchObject({
+      code: 'PROVIDER_FAILED',
+    });
+    expect((await f.calls()).slice(stopped).map(([name]) => name)).toEqual([
+      'inspect',
+    ]);
+  });
+
   function pendingRead<T>() {
     let resolve!: (value: T) => void;
     let reject!: (reason: unknown) => void;
