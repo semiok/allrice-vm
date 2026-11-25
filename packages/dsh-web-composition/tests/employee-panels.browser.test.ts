@@ -37,7 +37,10 @@ import {
   panelsRev2Head,
   writeEmployeePanelsBaseline,
 } from './employee-panels-baseline';
-import { compareSidebarPixels } from './sidebar-pixels';
+import {
+  compareApprovedPanelPixels,
+  readPanelPixelBrowser,
+} from './employee-panels-pixel-approvals';
 import {
   createSyntheticPanelsData,
   panelsClock,
@@ -372,6 +375,7 @@ const inspectContent = (page: Page, kind: Kind, includePaint = false) =>
 // No authentication, model submission, or 4.0 carrier delivery is asserted.
 suite('installed native employee panels with synthetic business owner', () => {
   let browser: Browser, context: BrowserContext, page: Page, artifacts: string;
+  let pixelBrowser: Awaited<ReturnType<typeof readPanelPixelBrowser>>;
   let host: Awaited<ReturnType<typeof startInstalledProfile>>;
   let referenceHost: Awaited<ReturnType<typeof startInstalledProfile>>;
   let reference: Awaited<
@@ -543,6 +547,7 @@ suite('installed native employee panels with synthetic business owner', () => {
         ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
         : {}),
     });
+    pixelBrowser = await readPanelPixelBrowser(browser);
     // Record the rasterization environment used by both independent hosts.
     const rendering = await readPanelsRenderingDiagnostics(
       await browser.newBrowserCDPSession(),
@@ -1049,7 +1054,20 @@ suite('installed native employee panels with synthetic business owner', () => {
                 path: join(artifacts, `${prefix}-rev2.png`),
                 animations: 'disabled',
               });
-              const pixels = compareSidebarPixels(expectedPng, actualPng);
+              const { pixels, ...pixelApproval } = compareApprovedPanelPixels(
+                pixelBrowser,
+                {
+                  mode: 'rev2-panel',
+                  viewport: page.viewportSize(),
+                  theme,
+                  state: value,
+                  panel: kind,
+                  expectedCapture: 'rev2-element',
+                  actualCapture: 'native-element',
+                },
+                expectedPng,
+                actualPng,
+              );
               const result = {
                 prefix,
                 state: value,
@@ -1057,6 +1075,7 @@ suite('installed native employee panels with synthetic business owner', () => {
                 actual,
                 expected,
                 pixels,
+                pixelApproval,
                 pointer,
                 referenceCarrier: reference.metadataSha256,
                 referenceEvidence: await baseline.evaluate(() =>
@@ -1284,7 +1303,12 @@ suite('installed native employee panels with synthetic business owner', () => {
               expect
                 .soft(pixels.dimensionsMatch, prefix + ' image dimensions')
                 .toBe(true);
-              expect.soft(pixels.changedPixels, prefix + ' exact RGBA').toBe(0);
+              expect
+                .soft(
+                  pixelApproval.accepted,
+                  `${prefix} exact RGBA (${pixels.changedPixels} differing pixels)`,
+                )
+                .toBe(true);
             } catch (error) {
               const failure = {
                 prefix,

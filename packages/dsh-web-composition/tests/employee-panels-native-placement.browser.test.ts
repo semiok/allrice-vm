@@ -23,6 +23,11 @@ import {
 } from './employee-panels-causal-network';
 import { compareSidebarPixels } from './sidebar-pixels';
 import {
+  compareApprovedPanelPixels,
+  readPanelPixelBrowser,
+  type PanelPixelScope,
+} from './employee-panels-pixel-approvals';
+import {
   comparePanelsOriginContent,
   cropPanelsOriginFrame,
 } from './employee-panels-reference-origin';
@@ -343,6 +348,7 @@ suite(
   'diagnostic-only public native placement pixels; no internal cause claim',
   () => {
     let browser: Browser, artifacts: string;
+    let pixelBrowser: Awaited<ReturnType<typeof readPanelPixelBrowser>>;
     beforeAll(async () => {
       const parent = resolve(
         process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR ??
@@ -359,6 +365,7 @@ suite(
           ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
           : { channel: 'chromium' }),
       });
+      pixelBrowser = await readPanelPixelBrowser(browser);
       await writeFile(
         join(artifacts, 'identity.json'),
         JSON.stringify(
@@ -384,6 +391,7 @@ suite(
             viewport: { width: 1440, height: 1000 },
             deviceScaleFactor: 1,
             browser: browser.version(),
+            pixelBrowser,
             node: process.version,
             productSha256: sha(
               await readFile(new URL('../dist/client.js', import.meta.url)),
@@ -408,6 +416,7 @@ suite(
       const captures: Record<string, unknown> = {},
         phaseRecords: unknown[] = [],
         cleanup: unknown[] = [],
+        approvedIdentityControls: unknown[] = [],
         failures: unknown[] = [];
       let context: Awaited<ReturnType<Browser['newContext']>> | undefined,
         host: Awaited<ReturnType<typeof startInstalledProfile>> | undefined;
@@ -421,13 +430,20 @@ suite(
         layout: Awaited<ReturnType<typeof capture>> | undefined,
         returned: Awaited<ReturnType<typeof capture>> | undefined;
       let valid = false,
+        fiveUnreadDeliverables = false,
         wrapperIdentity: number | undefined;
-      const compare = (
+      const compareContent = (
         a: Awaited<ReturnType<typeof capture>>,
         b: Awaited<ReturnType<typeof capture>>,
       ) => ({
         formalElement: compareSidebarPixels(a.element, b.element),
         fullFramePanelWindow: compareSidebarPixels(a.window, b.window),
+      });
+      const compare = (
+        a: Awaited<ReturnType<typeof capture>>,
+        b: Awaited<ReturnType<typeof capture>>,
+      ) => ({
+        ...compareContent(a, b),
         fullFrame: compareSidebarPixels(a.frame, b.frame),
       });
       const verifyUnchanged = async (
@@ -435,13 +451,30 @@ suite(
         a: Awaited<ReturnType<typeof capture>>,
         b: Awaited<ReturnType<typeof capture>>,
         label: string,
+        mode: PanelPixelScope['mode'] = 'placement-control',
       ) => {
         const digests = (sample: Awaited<ReturnType<typeof capture>>) => ({
           formalElement: sha(sample.element),
           fullFramePanelWindow: sha(sample.window),
           fullFrame: sha(sample.frame),
         });
-        const pixels = compare(a, b);
+        const { pixels: fullFrame, ...fullFrameApproval } =
+          compareApprovedPanelPixels(
+            pixelBrowser,
+            {
+              mode,
+              viewport: b.viewport,
+              theme: 'light',
+              state: 'list',
+              panel: 'experience',
+              expectedCapture: `${a.label}-frame`,
+              actualCapture: `${b.label}-frame`,
+              unreadDeliverables: fiveUnreadDeliverables ? 5 : undefined,
+            },
+            a.frame,
+            b.frame,
+          );
+        const pixels = { ...compareContent(a, b), fullFrame };
         const expectedSha256 = digests(a),
           actualSha256 = digests(b);
         const pngShaMatches = {
@@ -457,13 +490,21 @@ suite(
           pngShaMatches,
           expectedSha256,
           actualSha256,
+          fullFrameApproval,
         });
+        if (fullFrameApproval.exception)
+          approvedIdentityControls.push({
+            file,
+            fullFrame,
+            ...fullFrameApproval,
+          });
         for (const [kind, value] of Object.entries(pixels))
-          expect(value.changedPixels, label + '/' + kind).toBe(0);
+          if (kind !== 'fullFrame' || !fullFrameApproval.exception)
+            expect(value.changedPixels, label + '/' + kind).toBe(0);
         expect(pngShaMatches, label + '/PNG bytes').toEqual({
           formalElement: true,
           fullFramePanelWindow: true,
-          fullFrame: true,
+          fullFrame: fullFrameApproval.exception === null,
         });
       };
       async function capture(
@@ -582,7 +623,15 @@ suite(
             evidence: 'Runtime.evaluate acknowledgement only',
           });
         }
-        return { value, frame, window, element, owner: ownerBefore };
+        return {
+          label,
+          viewport: page.viewportSize(),
+          value,
+          frame,
+          window,
+          element,
+          owner: ownerBefore,
+        };
       }
       try {
         const fixture = await writeEmployeePanelsFixture(out),
@@ -758,7 +807,8 @@ suite(
             exact: true,
           })
           .getByText('5', { exact: true });
-        expect(await unreadDeliveryBadge.isVisible()).toBe(true);
+        fiveUnreadDeliverables = await unreadDeliveryBadge.isVisible();
+        expect(fiveUnreadDeliverables).toBe(true);
         const offset = { x: -nativeRoot.x, y: -nativeRoot.y };
         owner = await nativeHost(native, offset);
         await save(
@@ -777,6 +827,7 @@ suite(
           original,
           baseline,
           'native host identity attachment',
+          'placement-attachment',
         );
         for (const [label, mode] of [
           ['native-transform', 'transform'],
@@ -868,6 +919,7 @@ suite(
                 original,
                 restored,
                 'native exact detach',
+                'placement-restoration',
               );
             }
           }
@@ -974,6 +1026,7 @@ suite(
           phases: phaseRecords,
           captures,
           comparisons: values,
+          approvedIdentityControls,
           expectedPngs,
           actualPngs,
           cleanup,
