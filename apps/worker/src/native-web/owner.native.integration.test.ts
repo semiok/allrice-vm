@@ -167,7 +167,7 @@ it.skipIf(!cli)(
     const readImage =
       deferred<(sessionId: string, ref: ImageAttachmentRef) => Promise<void>>();
     const png =
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWZ0AAAAASUVORK5CYII=';
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
     const capability = 'a'.repeat(43);
     const references = {
       assistant: 'b'.repeat(43),

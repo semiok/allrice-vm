@@ -184,7 +184,7 @@ async function readManagedImage(scope, request, value, owned) {
       !within(target?.maxBytes, limit))
   )
     return null;
-  const active = AbortSignal.any([request.signal, owned.signal]);
+  const active = globalThis.AbortSignal.any([request.signal, owned.signal]);
   active.throwIfAborted();
   // The native controller proves the attachment actually belongs to this
   // Session's durable content before the native store derives a variant.
