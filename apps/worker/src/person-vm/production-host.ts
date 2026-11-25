@@ -238,9 +238,9 @@ export function createProductionPersonVmHost(input: {
               uncertainPreparation.push(error);
             throw error;
           });
-        // Register actual late success before cancellation can discard it.
+        // A late receipt still belongs to the service cleanup. Hand it back
+        // so the service can join egress before detaching its exact mount.
         receipts.add(receipt);
-        active.throwIfAborted();
         return receipt;
       });
     },

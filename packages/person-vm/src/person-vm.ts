@@ -543,6 +543,7 @@ export class PersonVmService
       );
       row.egressReceipt = receipt;
       await lease.save(row);
+      signal.throwIfAborted();
       if (
         row.nativeCreated &&
         JSON.stringify([...receipt.gatewayPorts].sort((a, b) => a - b)) !==

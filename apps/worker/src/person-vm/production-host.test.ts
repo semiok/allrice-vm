@@ -593,6 +593,35 @@ it('actual service cleanup revokes a copied receipt once and Host.close does not
   expect(value.model.revoke).toHaveBeenCalledTimes(1);
 });
 
+it('passes a late cancelled egress receipt to service cleanup before detach', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const controller = new AbortController();
+  const prepareNormally = value.prepare.getMockImplementation()!;
+  value.prepare.mockImplementationOnce(async (...args) => {
+    const receipt = await prepareNormally(...args);
+    controller.abort(new PersonVmError('RUNTIME_NOT_READY'));
+    return receipt;
+  });
+
+  await expect(vm.start(context, controller.signal)).rejects.toMatchObject({
+    code: 'RUNTIME_NOT_READY',
+  });
+  expect(value.prepareWeb).not.toHaveBeenCalled();
+  expect(value.revoke).toHaveBeenCalledOnce();
+  const prepared = await value.prepare.mock.results[0]!.value;
+  expect(value.revoke.mock.calls[0]?.[0]).toEqual(prepared);
+  const detach = vi.mocked(providers.disk.detach);
+  expect(detach).toHaveBeenCalledOnce();
+  expect(value.revoke.mock.invocationCallOrder[0]).toBeLessThan(
+    detach.mock.invocationCallOrder[0]!,
+  );
+  expect((await value.memory.read(context.actor.id))?.egressReceipt).toBeNull();
+  await value.host.close();
+  expect(value.revoke).toHaveBeenCalledOnce();
+});
+
 it('a failed actual service revoke retains the receipt for the real Host.close retry', async () => {
   const value = await receiptFixture(),
     modelFailure = Error('synthetic first model drain failure');
