@@ -318,6 +318,10 @@ export function createProductionPersonVmHost(input: {
       [...uncertainPreparation.keys()].map((binding) => async () => {
         await requireGateway().retireFailedPrepare(binding, signal);
         uncertainPreparation.delete(binding);
+        // The unpublished prepare never reached native create/start. Retain
+        // only the obligation to reconcile its mount and exact local owners.
+        const vm = ownedVms.get(binding.personId);
+        if (vm && sameVmBinding(vm.binding, binding)) vm.stopNative = false;
       }),
     );
   }

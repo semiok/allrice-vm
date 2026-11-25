@@ -796,59 +796,85 @@ it('preserves an older receipt when this process cannot prove its egress owner',
   expect(value.host.modelOwnerMaintenancePending()).toBe(true);
 });
 
-it('retires a real unpublished egress binding in maintenance before releasing its mount', async () => {
-  const value = await receiptFixture();
-  const { vm, providers } = value.input();
-  const context = value.entry.context;
-  const provisioner = providers.egressInstallation.provisioner;
-  const retire = vi.spyOn(value.gateway, 'retireFailedPrepare');
-  const install = Error('synthetic setup failure');
-  vi.mocked(provisioner.install).mockRejectedValueOnce(install);
-  vi.mocked(provisioner.remove).mockRejectedValue(
-    Error('synthetic unjoined cleanup'),
-  );
-  await expect(vm.start(context, signal())).rejects.toMatchObject({
-    code: 'CLEANUP_INCOMPLETE',
-  });
-  const failed = await value.prepare.mock.results[0]!.value.catch(
-    (error: unknown) => error,
-  );
-  expect(failed).toBeInstanceOf(EgressPrepareRollbackError);
-  const record = await value.memory.read(context.actor.id);
-  expect(record).toMatchObject({ phase: 'failed', egressReceipt: null });
-  expect(providers.native.stop).toHaveBeenCalled();
-  expect(providers.disk.detach).not.toHaveBeenCalled();
-  const original = value.host.close();
-  await expect(original).rejects.toMatchObject({
-    errors: expect.arrayContaining([failed]),
-  });
-  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+it.each(['original epoch', 'peer epoch'] as const)(
+  'retires a real unpublished egress binding in maintenance with the %s',
+  async (kind) => {
+    const value = await receiptFixture();
+    const { vm, providers } = value.input();
+    const context = value.entry.context;
+    const provisioner = providers.egressInstallation.provisioner;
+    const retire = vi.spyOn(value.gateway, 'retireFailedPrepare');
+    const install = Error('synthetic setup failure');
+    vi.mocked(provisioner.install).mockRejectedValueOnce(install);
+    vi.mocked(provisioner.remove).mockRejectedValue(
+      Error('synthetic unjoined cleanup'),
+    );
+    await expect(vm.start(context, signal())).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    const failed = await value.prepare.mock.results[0]!.value.catch(
+      (error: unknown) => error,
+    );
+    expect(failed).toBeInstanceOf(EgressPrepareRollbackError);
+    const record = await value.memory.read(context.actor.id);
+    expect(record).toMatchObject({ phase: 'failed', egressReceipt: null });
+    expect(providers.native.stop).toHaveBeenCalled();
+    expect(providers.disk.detach).not.toHaveBeenCalled();
+    const original = value.host.close();
+    await expect(original).rejects.toMatchObject({
+      errors: expect.arrayContaining([failed]),
+    });
+    expect(value.host.modelOwnerMaintenancePending()).toBe(true);
 
-  const beforeRecovery = vi.mocked(providers.native.stop).mock.calls.length;
-  value.model.reconcileOwner.mockResolvedValue(0);
-  await expect(
-    value.host.recoverModelOwner(context, signal()),
-  ).rejects.toMatchObject({
-    errors: expect.arrayContaining([failed]),
-  });
-  expect(providers.disk.detach).not.toHaveBeenCalled();
-  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+    const beforeRecovery = vi.mocked(providers.native.stop).mock.calls.length;
+    value.model.reconcileOwner.mockResolvedValue(0);
+    await expect(
+      value.host.recoverModelOwner(context, signal()),
+    ).rejects.toMatchObject({
+      errors: expect.arrayContaining([failed]),
+    });
+    expect(providers.disk.detach).not.toHaveBeenCalled();
+    expect(value.host.modelOwnerMaintenancePending()).toBe(true);
 
-  expect(providers.native.stop).toHaveBeenCalledTimes(beforeRecovery);
-  vi.mocked(provisioner.remove).mockResolvedValue(undefined);
-  await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
-    0,
-  );
-  expect(retire).toHaveBeenCalledTimes(2);
-  expect(retire).toHaveBeenLastCalledWith(
-    value.prepare.mock.calls[0]![0],
-    expect.any(AbortSignal),
-  );
-  expect(providers.disk.detach).toHaveBeenCalledOnce();
-  expect((await value.memory.read(context.actor.id))?.phase).toBe('stopped');
-  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
-  await expect(value.host.close()).resolves.toBeUndefined();
-});
+    expect(providers.native.stop).toHaveBeenCalledTimes(beforeRecovery);
+    vi.mocked(provisioner.remove).mockResolvedValue(undefined);
+    const peer = kind === 'peer epoch';
+    if (peer) {
+      await value.memory.withLease(
+        context.actor.id,
+        { now: () => new Date(), ttlMs: 5000 },
+        async (lease) => {
+          const next = lease.row!;
+          next.instanceId = randomUUID();
+          next.leaseEpoch++;
+          next.phase = 'stopped';
+          await lease.save(next);
+        },
+      );
+    }
+    const before = await value.memory.read(context.actor.id);
+    const statuses = vi.mocked(providers.native.status).mock.calls.length;
+    await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
+      0,
+    );
+    expect(retire).toHaveBeenCalledTimes(2);
+    expect(retire).toHaveBeenLastCalledWith(
+      value.prepare.mock.calls[0]![0],
+      expect.any(AbortSignal),
+    );
+    expect(providers.native.stop).toHaveBeenCalledTimes(beforeRecovery);
+    expect(providers.disk.detach).toHaveBeenCalledTimes(peer ? 0 : 1);
+    const after = await value.memory.read(context.actor.id);
+    if (peer) {
+      expect(after).toEqual(before);
+      expect(providers.native.status).toHaveBeenCalledTimes(statuses);
+    } else {
+      expect(after?.phase).toBe('stopped');
+    }
+    expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+    await expect(value.host.close()).resolves.toBeUndefined();
+  },
+);
 
 it('does not hold the mount or maintenance for an installation error whose rollback joined', async () => {
   const value = await receiptFixture();
