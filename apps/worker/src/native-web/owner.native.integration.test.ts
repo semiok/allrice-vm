@@ -661,6 +661,9 @@ it.skipIf(!cli)(
     if (!created.ok || !transport)
       throw Error('Native owner fixture did not start');
     const sessionId = created.value.sessionId;
+    let journalRead:
+      Parameters<typeof f.owner.readPersistedRunTerminalFor>[0] | undefined;
+    const guard = async (active: AbortSignal) => active.throwIfAborted();
     readAttempt.resolve(async (requested, kind) => {
       const attempt = await f.owner.readNativeAttemptFor(
         f.context,
@@ -676,6 +679,17 @@ it.skipIf(!cli)(
       if (kind === 'assistant') {
         expect(attempt.promptIds).toContain(nativePrompt);
         expect(attempt.turn).toBeGreaterThan(0);
+        journalRead = {
+          sessionId: requested,
+          nativeRequestId: nativePrompt,
+          purpose: kind,
+          attemptId: attempt.id,
+          cursor: attempt.cursor,
+          turn: attempt.turn,
+        };
+        expect(
+          await f.owner.readPersistedRunTerminalFor(journalRead, guard, signal),
+        ).toBeNull();
         turnEnd = f.owner.waitNativeTurnEnd(
           f.context,
           { kind: 'session', sessionId: SessionId(requested) },
@@ -748,10 +762,23 @@ it.skipIf(!cli)(
     });
     await Promise.all([primary.promise, title.promise]);
     expect(turnEnd).toBeDefined();
-    expect(await turnEnd).toMatchObject({
+    const appended = await turnEnd;
+    expect(appended).toMatchObject({
       sequence: expect.any(Number),
       reason: 'completed',
     });
+    expect(journalRead).toBeDefined();
+    await expect
+      .poll(
+        () => f.owner.readPersistedRunTerminalFor(journalRead!, guard, signal),
+        { timeout: 5000 },
+      )
+      .toMatchObject({
+        ...appended,
+        sessionId,
+        turn: journalRead!.turn,
+        occurredAt: expect.any(String),
+      });
     for (const fact of Object.values(facts))
       expect(fact).toEqual({
         redeemed: true,

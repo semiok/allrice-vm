@@ -206,7 +206,7 @@
       "upstreamVersion": "0.2.1-rc.2",
       "kind": "protocol-extension",
       "path": "apps/worker/dsh/allrice-native-web-owner.mjs",
-      "reason": "Host-only local-auth publication through public connection.authenticatedUrl and Cordis lifecycle. The current appReady and loader generation must settle before one credential-free Upgrade confirms the existing native mux on the bound listener. A host-minted nonce and exact predeclared loopback endpoint bind bounded private retrieval to the current VM bootstrap lease. Native Connection, Gateway and SessionController own protocol and control. The Worker joins its own HTTP/WS and exact native job."
+      "reason": "Host-only local-auth publication through public connection.authenticatedUrl and Cordis lifecycle. The current appReady and loader generation must settle before one credential-free Upgrade confirms the existing native mux on the bound listener. A host-minted nonce and exact predeclared loopback endpoint bind bounded private retrieval to the current VM bootstrap lease. Native Connection, Gateway and SessionController own protocol and control. The Worker joins its own HTTP/WS and exact native job. The authenticated employee owner can also read a matching physical turn/end through public SessionPersistence for the existing 4.0 Run ledger; missing storage proof leaves its status untouched."
     },
     {
       "id": "allrice-native-history-source-v1",

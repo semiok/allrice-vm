@@ -15,6 +15,7 @@ import {
 } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
+import { DEntryNativeTurnEndSchema } from '@allrice/database';
 import type {
   ModelCatalog,
   SessionFollowFrame,
@@ -835,6 +836,40 @@ export async function openNativeWebOwner(input: {
             }
           },
         );
+      },
+      readPersistedRunTerminalFor(
+        selection: {
+          sessionId: string;
+          nativeRequestId: string;
+          purpose: NativeModelAttemptKind;
+          attemptId: string;
+          cursor: number;
+          turn: number | null;
+        },
+        assertCurrent: (active: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, async (active) => {
+          if (!installedModelAdapter)
+            throw new PersonVmError('RUNTIME_NOT_READY');
+          const wire = await transport.readManagedModelProof(
+            JSON.stringify({
+              ...selection,
+              action: 'read-run-terminal',
+              adapterId: installedModelAdapter,
+            }),
+            active,
+          );
+          if (!wire) return null;
+          const end = DEntryNativeTurnEndSchema.parse(JSON.parse(wire));
+          if (end.sessionId !== selection.sessionId)
+            throw new PersonVmError('PROVIDER_FAILED');
+          return end;
+        });
       },
       readManagedModelImageFor(
         context: RequestContext,

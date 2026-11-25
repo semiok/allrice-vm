@@ -532,6 +532,20 @@ export function createAssignedNativeWebStartup(input: {
         owner,
       });
     },
+    /** Authenticated owners already present in this Worker. Ledger reads
+     * separately verify the durable scope and never start a profile. */
+    runJournalOwners(): AssignedNativeWebCatalog[] {
+      if (closing || lifetime.aborted) return [];
+      return [...running.values()].flatMap((group) => {
+        if (!group.ready || group.retiring || group.revoked.signal.aborted)
+          return [];
+        return group.receipt.endpoints.flatMap((endpoint) => {
+          const owner = group.owners.get(endpoint.employeeInstanceId);
+          if (!owner?.modelAdapterId || !owner.controlReady()) return [];
+          return [this.catalog(group.binding, endpoint.employeeInstanceId)];
+        });
+      });
+    },
     hasLocalOwner(binding: PersonVmBinding) {
       const group = running.get(binding.vmId);
       return group !== undefined && sameVmBinding(group.binding, binding);
@@ -587,6 +601,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       employeeInstanceId: string,
     ): AssignedNativeWebCatalog;
+    runJournalOwners(): AssignedNativeWebCatalog[];
     hasLocalOwner(binding: PersonVmBinding): boolean;
     owner(
       binding: PersonVmBinding,

@@ -927,6 +927,8 @@ instance/profile、线程配置和导出时机须由MET-273/原生route owner绑
 
 rc.2 的 Web runtime config 整块替换，须同时保留 `openBrowser:false`、可信 `publicUrl`、`surfaceContext:true` 和 `printUrl:false`。v0.7.16 exec 使用整秒参数并保留独立 host 毫秒预算；CLI close 不替代 guest stop/status。Node owner 通过公开 Agent/finishRequest 跟踪 WS 握手的真实 request/socket close，完整读操作含前后现权均纳入关闭 join。
 
+PR #14 的 4.0 Run 补账沿用此 authenticated owner。Guest 用公开 `SessionPersistence.open(id, 'read')` 读取同一版本的物理 journal，并按原 Run 的 prompt 和已记录的 native cursor 匹配 `turn/end`。Host 复核原线程、员工和 VM scope，再原子写入现有 Run 及事件。当前 host-only 读口依赖原 owner，适用于其仍可读取的 PG 暂障。DSH query 冷读合成的 `interrupted` 不进入这条账本。
+
 ## MET273/274：固定cut与宿主committed source
 
 `allrice-native-history-source-v1` 在既有 authenticated Host 上使用公开 `sessionQuery.observeSession`

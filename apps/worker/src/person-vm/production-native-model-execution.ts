@@ -36,6 +36,7 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
+import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 
 type NativeModelSelection = Readonly<{
   context: RequestContext;
@@ -193,43 +194,6 @@ async function assertPersistedExecution(
     (state !== 'running' && call.native.attemptKind !== 'session-title')
   )
     return reject();
-}
-
-async function publishObservedRunEnd(
-  prompt: PromptOwner,
-  turn: number,
-  end: { sequence: number; reason: string },
-) {
-  const state =
-    end.reason === 'completed'
-      ? 'succeeded'
-      : ['aborted', 'interrupted'].includes(end.reason)
-        ? 'canceled'
-        : ['blocked', 'error', 'max-tokens'].includes(end.reason)
-          ? 'failed'
-          : null;
-  if (!state) return;
-  const kind =
-    state === 'succeeded'
-      ? 'run.succeeded'
-      : state === 'canceled'
-        ? 'run.canceled'
-        : 'run.failed';
-  const { context, identity, runId } = prompt;
-  await getDatabase().begin(async (tx) => {
-    const [row] =
-      await tx`update allrice_runs set state=${state},completed_at=clock_timestamp(),updated_at=clock_timestamp()
-      where id=${runId} and organization_id=${identity.organizationId}
-        and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
-        and execution_spec->>'source'='dsh-native-prompt'
-        and execution_spec->>'loginSessionId'=${context.sessionId}
-        and state='running' returning id`;
-    if (!row) return;
-    await tx`insert into allrice_run_events(organization_id,workspace_id,run_id,sequence,event_type,payload)
-      select ${identity.organizationId},${identity.workspaceId},${runId},coalesce(max(sequence)+1,0),${kind},
-        ${tx.json({ source: 'dsh-native-turn-end', sessionId: prompt.root, turn, nativeSequence: end.sequence, reason: end.reason })}
-      from allrice_run_events where run_id=${runId}`;
-  });
 }
 
 const wireSelection = z
@@ -437,13 +401,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         const members = new Set(coalesced);
         trackedTurns.set(prompt, members);
         void run(live, async (active) => {
-          const end = await owner.waitNativeTurnEnd(
-            prompt.context,
-            address,
-            turn,
-            active,
-          );
-          await publishObservedRunEnd(prompt, turn, end);
+          await owner.waitNativeTurnEnd(prompt.context, address, turn, active);
           for (const member of members) endedPrompts.add(member);
           endedPrompts.add(prompt);
           notifyPromptChange();
@@ -1323,6 +1281,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         },
       };
       installed = owner;
+      void run(live, (active) =>
+        reconcileNativeRunTerminals(host.startup, active),
+      ).catch(() => {});
       return owner;
     },
   };

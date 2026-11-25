@@ -16,7 +16,16 @@ export * from './d-entry.ts';
 export * from './d-entry-release-policy.ts';
 export * from './d-entry-admission.ts';
 export * from './d-entry-native-root.ts';
-export { readDEntryNativeExecution } from './d-entry-native-execution.ts';
+export {
+  DEntryNativeTurnEndSchema,
+  isDEntryNativeRunJournalCurrent,
+  listDEntryNativeRunCandidates,
+  publishDEntryNativeRunTerminal,
+  readDEntryNativeExecution,
+  type DEntryNativeRunCandidate,
+  type DEntryNativeRunJournalOwner,
+  type DEntryNativeTurnEnd,
+} from './d-entry-native-execution.ts';
 export * from './d-entry-authority.ts';
 export { requireEmployeePanelsAccess } from './employee-panels-access.ts';
 export { requireCurrentPlatformAdmin } from './platform-authority.ts';

@@ -296,6 +296,195 @@ export function readPromptOrigins(
   return { turn, ids: [...ids], delegated, inherited: [...inherited] };
 }
 
+function record(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function isPrompt(event, requestId) {
+  if (event.type !== 'user/message') return false;
+  const source = record(record(event.data).source);
+  return source.kind === 'user' && source.rpcId === requestId;
+}
+
+function terminalReason(event) {
+  const kind = record(record(event.data).reason).kind;
+  switch (kind) {
+    case 'completed':
+    case 'aborted':
+    case 'interrupted':
+    case 'blocked':
+    case 'error':
+    case 'max-tokens':
+      return kind;
+    default:
+      return null;
+  }
+}
+
+/** Project only a contiguous physical root journal returned by native
+ * sessionPersistence. session-query can synthesize a cold interrupted tail. */
+export function findDEntryNativeRunTerminal(
+  {
+    sessionId,
+    nativeRequestId,
+    cursor: index,
+    turn: expectedTurn,
+    attemptId,
+    purpose,
+  },
+  { header, events },
+) {
+  const cursor = events[index];
+  if (
+    sessionId !== header.id ||
+    header.isSeeded ||
+    header.parentSession !== undefined ||
+    header.origin !== undefined ||
+    cursor?.seq !== index
+  )
+    return null;
+
+  let anchor = cursor.seq;
+  if (purpose === 'session-title') {
+    if (cursor.type !== 'session/title-llm-request') return null;
+    const seqs = record(cursor.data).messageSeqs;
+    if (!Array.isArray(seqs)) return null;
+    const matching = new Set();
+    for (const seq of seqs) {
+      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= cursor.seq)
+        return null;
+      const message = events[seq];
+      if (message?.seq !== seq) return null;
+      if (isPrompt(message, nativeRequestId)) matching.add(seq);
+    }
+    if (matching.size !== 1) return null;
+    anchor = [...matching][0];
+  } else {
+    if (expectedTurn === null) return null;
+    if (purpose === 'compaction') {
+      const data = record(cursor.data);
+      if (
+        cursor.type !== 'compaction/start' ||
+        data.compactionId !== attemptId ||
+        data.turn !== expectedTurn
+      )
+        return null;
+    }
+  }
+
+  let start;
+  let containsPrompt = false;
+  for (let seq = anchor; seq >= 0; --seq) {
+    const event = events[seq];
+    if (
+      event?.seq !== seq ||
+      event.type === 'turn/end' ||
+      event.type === 'session/end-seed'
+    )
+      return null;
+    if (event.type === 'turn/start') {
+      start = event;
+      break;
+    }
+    if (isPrompt(event, nativeRequestId)) containsPrompt = true;
+  }
+  const turn = record(start?.data).turn;
+  if (
+    !containsPrompt ||
+    typeof turn !== 'number' ||
+    !Number.isSafeInteger(turn) ||
+    turn < 1 ||
+    (expectedTurn !== null && turn !== expectedTurn)
+  )
+    return null;
+
+  for (let sequence = anchor + 1; sequence < events.length; ++sequence) {
+    const event = events[sequence];
+    if (
+      event?.seq !== sequence ||
+      event.type === 'turn/start' ||
+      event.type === 'session/end-seed'
+    )
+      return null;
+    if (event.type !== 'turn/end') continue;
+    const reason = terminalReason(event);
+    if (record(event.data).turn !== turn || !reason) return null;
+    const time = new Date(event.time);
+    if (
+      !Number.isSafeInteger(event.time) ||
+      event.time < 0 ||
+      !Number.isFinite(+time)
+    )
+      return null;
+    return {
+      sessionId: header.id,
+      sequence,
+      turn,
+      reason,
+      occurredAt: time.toISOString(),
+    };
+  }
+  return null;
+}
+
+async function readPersistedRunTerminal(
+  scope,
+  request,
+  selection,
+  ownerSignal,
+) {
+  const { sessionId, nativeRequestId, cursor, turn, attemptId } = selection;
+  if (
+    sessionId.length === 0 ||
+    sessionId.length > 256 ||
+    typeof nativeRequestId !== 'string' ||
+    nativeRequestId.length === 0 ||
+    nativeRequestId.length > 256 ||
+    !Number.isSafeInteger(cursor) ||
+    cursor < 0 ||
+    !(turn === null || Number.isSafeInteger(turn)) ||
+    typeof attemptId !== 'string' ||
+    attemptId.length === 0 ||
+    attemptId.length > 512
+  )
+    return null;
+  const active = globalThis.AbortSignal.any([request.signal, ownerSignal]);
+  const persistence = scope.get('sessionPersistence');
+  active.throwIfAborted();
+  if (!persistence) return null;
+  // The backend reads the physical prefix. The query/follow service can add
+  // a generated interrupted closer when it displays a cold orphaned turn.
+  const stored = await persistence.stat(sessionId, { signal: active });
+  if (
+    !stored ||
+    stored.header.id !== sessionId ||
+    stored.formatStatus !== 'current'
+  )
+    return null;
+  const handle = await persistence.open(sessionId, 'read', { signal: active });
+  try {
+    if (handle.access !== 'read' || handle.inheritedEventCount !== 0)
+      return null;
+    const { events } = await handle.read(0, undefined, { signal: active });
+    const after = await persistence.stat(sessionId, { signal: active });
+    active.throwIfAborted();
+    if (
+      after?.revision !== stored.revision ||
+      after.formatStatus !== 'current' ||
+      original(scope.get('sessionPersistence')) !== original(persistence)
+    )
+      return null;
+    return findDEntryNativeRunTerminal(selection, {
+      header: handle.header,
+      events,
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
 async function observePromptOrigins(
   scope,
   live,
@@ -958,6 +1147,19 @@ export function applyNativeWebOwner(
                 )
               )
                 return new globalThis.Response(null, { status: 404 });
+              if (value.action === 'read-run-terminal') {
+                const terminal = await readPersistedRunTerminal(
+                  scope,
+                  request,
+                  value,
+                  signal,
+                );
+                return terminal && current()
+                  ? globalThis.Response.json(terminal, {
+                      headers: { 'cache-control': 'no-store' },
+                    })
+                  : new globalThis.Response(null, { status: 404 });
+              }
               const found = modelCalls.get(
                 JSON.stringify([value.sessionId, value.purpose]),
               );

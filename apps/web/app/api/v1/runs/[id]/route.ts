@@ -1,4 +1,4 @@
-import { DataAccessError, getRun } from '@allrice/database';
+import { DataAccessError, getRunForRead } from '@allrice/database';
 
 import { executionErrorResponse } from '../../../../../lib/execution/responses';
 import { getRequestContext } from '../../../../../lib/identity/session';
@@ -15,7 +15,9 @@ export async function GET(
     const workspaceId = new URL(request.url).searchParams.get('workspaceId');
     if (!workspaceId) throw new DataAccessError('not_found');
     const { id } = await route.params;
-    return Response.json({ run: await getRun(context, workspaceId, id) });
+    return Response.json({
+      run: await getRunForRead(context, workspaceId, id),
+    });
   } catch (error) {
     return executionErrorResponse(error);
   }
