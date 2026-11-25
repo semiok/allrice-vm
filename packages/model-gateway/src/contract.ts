@@ -35,7 +35,7 @@ export type ModelCallBinding = Readonly<{
     parentSessionId: string | null;
     callId: string;
     attemptId?: string;
-    attemptKind?: 'assistant' | 'compaction';
+    attemptKind?: 'assistant' | 'compaction' | 'session-title';
     attemptTurn?: number | null;
     attemptCursor?: number;
   }>;

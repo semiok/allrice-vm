@@ -27,7 +27,7 @@ type ManagedGuestModelCall = {
     }>,
     signal: AbortSignal,
     purpose?: GenerateOptions['purpose'],
-  ): Promise<string>;
+  ): Promise<string | { reference: string; release(): void }>;
 };
 import type {
   GatewayFetchClassification,
@@ -127,28 +127,42 @@ export class GatewayLlmAdapter extends LlmAdapter {
       options.signal && this.managed?.lifetime
         ? AbortSignal.any([options.signal, this.managed.lifetime])
         : options.signal;
-    if (this.managed) {
-      const { provider, model, sessionId } = options;
-      if (
-        provider !== this.managed.provider ||
-        model !== this.managed.model ||
-        !sessionId ||
-        !signal
-      )
-        throw new ModelGatewayError('BINDING_INVALID');
-      signal.throwIfAborted();
-      const selection = { provider, model, sessionId };
-      reference = options.purpose
-        ? await this.managed.resolveCallReference(
-            selection,
-            signal,
-            options.purpose,
-          )
-        : await this.managed.resolveCallReference(selection, signal);
-      signal.throwIfAborted();
-      if (!isModelCallReference(reference))
-        throw new ModelGatewayError('BINDING_INVALID');
+    let release: (() => void) | undefined;
+    try {
+      if (this.managed) {
+        const { provider, model, sessionId } = options;
+        if (
+          provider !== this.managed.provider ||
+          model !== this.managed.model ||
+          !sessionId ||
+          !signal
+        )
+          throw new ModelGatewayError('BINDING_INVALID');
+        signal.throwIfAborted();
+        const selection = { provider, model, sessionId };
+        const issued = options.purpose
+          ? await this.managed.resolveCallReference(
+              selection,
+              signal,
+              options.purpose,
+            )
+          : await this.managed.resolveCallReference(selection, signal);
+        reference = typeof issued === 'string' ? issued : issued.reference;
+        if (typeof issued !== 'string') release = issued.release;
+        signal.throwIfAborted();
+        if (!isModelCallReference(reference))
+          throw new ModelGatewayError('BINDING_INVALID');
+      }
+      yield* this.streamRequest(options, signal, reference);
+    } finally {
+      release?.();
     }
+  }
+  private async *streamRequest(
+    options: GenerateOptions,
+    signal: AbortSignal | undefined,
+    reference: string | undefined,
+  ): AsyncIterable<StreamChunk> {
     const {
       messages,
       system,

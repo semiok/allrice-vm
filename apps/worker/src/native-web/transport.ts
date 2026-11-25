@@ -298,6 +298,20 @@ export function nativeWebTransport(
   return {
     fetch,
     readExact,
+    async readManagedModelProof(body: string, caller: AbortSignal) {
+      if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
+      const { data } = await readOwned(
+        new URL('api/allrice-managed-model/current', origin),
+        caller,
+        {
+          maxBytes: 128,
+          credential: 'api',
+          body,
+          accepts: ({ statusCode }) => statusCode === 200 || statusCode === 404,
+        },
+      );
+      return data.length ? data.toString('utf8') : null;
+    },
     async readSessionReply(
       endpoint: 'create' | 'modelCatalog',
       body: string,

@@ -271,6 +271,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const paths = [
         ['assistant', '/v1/reference'],
         ['compaction', '/v1/reference/compaction'],
+        ['session-title', '/v1/reference/session-title'],
       ] as const;
       const references = paths.map<ManagedHostService>(([kind, path]) => ({
         id: 'model-reference',
@@ -319,7 +320,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 executions.set(profile.owner, bySession);
               }
               let execution = bySession.get(resource.nativeSessionId);
-              const turn = attempt.turn ?? attempt.id;
+              const turn = attempt.turn ?? attempt.cursor;
               if (execution?.turn !== turn) {
                 execution = {
                   turn,

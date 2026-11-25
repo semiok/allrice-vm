@@ -11,7 +11,7 @@ import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
-import type { RequestContext } from '@allrice/contracts';
+import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import type {
   ModelCatalog,
   SessionFollowFrame,
@@ -42,7 +42,8 @@ type EditorEvidence<T> = (
   modelAdapterId?: string,
 ) => Promise<T>;
 
-export type NativeModelAttemptKind = 'assistant' | 'compaction';
+export type NativeModelAttemptKind =
+  'assistant' | 'compaction' | 'session-title';
 
 export function readNativeModelAttempt(
   snapshot: Pick<
@@ -61,6 +62,14 @@ export function readNativeModelAttempt(
           cursor: attempt.startedAfterSeq,
         }
       : null;
+  }
+  if (kind === 'session-title') {
+    for (const { event } of [...snapshot.records].reverse()) {
+      if (event.type === 'session/end-seed') break;
+      if (event.type === 'session/title-llm-request')
+        return { kind, id: String(event.seq), turn: null, cursor: event.seq };
+    }
+    return null;
   }
   // Native automatic and manual compaction own a real journal bracket before
   // their summarizer enters Llm. A seed cut closes a prior lifecycle.
@@ -608,7 +617,7 @@ export async function openNativeWebOwner(input: {
               .parse({
                 request: {
                   address: { kind: 'session', sessionId: nativeSessionId },
-                  maxMessages: 1,
+                  maxMessages: kind === 'assistant' ? 1 : 4,
                   assistantStream: true,
                 },
               });
@@ -621,7 +630,22 @@ export async function openNativeWebOwner(input: {
               const snapshot = protocol.result.create().parse(first.value);
               if (snapshot.type !== 'snapshot')
                 throw new PersonVmError('RUNTIME_NOT_READY');
-              return readNativeModelAttempt(snapshot, kind);
+              const attempt = readNativeModelAttempt(snapshot, kind);
+              if (!attempt || kind === 'assistant') return attempt;
+              const proof = await transport.readManagedModelProof(
+                JSON.stringify({
+                  adapterId: installedModelAdapter,
+                  sessionId: nativeSessionId,
+                  purpose: kind,
+                }),
+                active,
+              );
+              if (!proof) return null;
+              const value = JSON.parse(proof) as { id?: unknown };
+              const id = UuidSchema.safeParse(value?.id);
+              if (!id.success || Object.keys(value).length !== 1)
+                throw new PersonVmError('PROVIDER_FAILED');
+              return { ...attempt, id: id.data };
             } finally {
               // Dispose this logical read on its original carrier. The
               // shared owner still owns actual socket close at retirement.

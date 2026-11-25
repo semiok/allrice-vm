@@ -148,55 +148,71 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'reads the actual running rc.2 attempt while the sealed adapter requests its Host reference',
+  'reads separate live rc.2 assistant and title attempts before the sealed adapter redeems their references',
   { tags: [tag], timeout: 30000 },
   async () => {
-    const wire = deferred();
-    void wire.promise.catch(() => {});
-    const facts: {
-      sessionId?: string;
-      attemptId?: string;
-      redeemed?: boolean;
-    } = {};
-    const readAttempt = deferred<(session: string) => Promise<string>>();
+    const primary = deferred(),
+      title = deferred();
+    void primary.promise.catch(() => {});
+    void title.promise.catch(() => {});
+    const facts = {
+      assistant: { sessionId: '', attemptId: '', redeemed: false },
+      'session-title': { sessionId: '', attemptId: '', redeemed: false },
+    };
+    const readAttempt =
+      deferred<
+        (session: string, kind: keyof typeof facts) => Promise<string>
+      >();
     const capability = 'a'.repeat(43);
-    const reference = 'b'.repeat(43);
+    const references = {
+      assistant: 'b'.repeat(43),
+      'session-title': 'c'.repeat(43),
+    };
     const server = createServer((request, response) => {
       void (async () => {
         const bytes: Buffer[] = [];
         for await (const chunk of request) bytes.push(Buffer.from(chunk));
         if (request.headers.authorization !== 'Bearer ' + capability)
           throw Error('Wrong fixture capability');
-        if (request.url === '/v1/reference') {
+        if (
+          request.url === '/v1/reference' ||
+          request.url === '/v1/reference/session-title'
+        ) {
+          const kind =
+            request.url === '/v1/reference' ? 'assistant' : 'session-title';
           const selection = JSON.parse(Buffer.concat(bytes).toString('utf8'));
           if (
             selection.provider !== 'openai-codex' ||
             selection.model !== 'fixture-codex'
           )
             throw Error('Wrong native model selection');
-          facts.sessionId = selection.sessionId;
-          facts.attemptId = await (
+          facts[kind].sessionId = selection.sessionId;
+          facts[kind].attemptId = await (
             await readAttempt.promise
-          )(selection.sessionId);
-          if (!facts.attemptId) throw Error('No current attempt present');
+          )(selection.sessionId, kind);
+          if (!facts[kind].attemptId) throw Error('No current attempt present');
           response.writeHead(200, { 'content-type': 'application/json' });
-          response.end(JSON.stringify({ reference }));
+          response.end(JSON.stringify({ reference: references[kind] }));
           return;
         }
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        const kind =
+          payload.purpose === 'session-title' ? 'session-title' : 'assistant';
         if (
           request.url !== '/v1/stream' ||
-          request.headers['x-allrice-model-call-reference'] !== reference
+          request.headers['x-allrice-model-call-reference'] !== references[kind]
         )
           throw Error('Native adapter did not redeem its reference');
-        facts.redeemed = true;
+        facts[kind].redeemed = true;
         response.writeHead(200, { 'content-type': 'application/x-ndjson' });
         response.end(
           JSON.stringify({ type: 'finish', reason: { kind: 'stop' } }) + '\n',
         );
-        wire.resolve();
+        (kind === 'assistant' ? primary : title).resolve();
       })().catch((error: unknown) => {
         response.destroy();
-        wire.reject(error);
+        primary.reject(error);
+        title.reject(error);
       });
     });
     const browserlessOrigin = await listen(server);
@@ -232,11 +248,12 @@ it.skipIf(!cli)(
     if (!created.ok || !transport)
       throw Error('Native owner fixture did not start');
     const sessionId = created.value.sessionId;
-    readAttempt.resolve(async (requested) => {
+    readAttempt.resolve(async (requested, kind) => {
       const attempt = await f.owner.readNativeAttemptFor(
         f.context,
         requested,
         signal,
+        kind,
       );
       if (!attempt)
         throw Error(
@@ -271,12 +288,16 @@ it.skipIf(!cli)(
       ok: true,
       value: { accepted: true },
     });
-    await wire.promise;
-    expect(facts).toEqual({
-      redeemed: true,
-      sessionId,
-      attemptId: expect.any(String),
-    });
+    await Promise.all([primary.promise, title.promise]);
+    for (const fact of Object.values(facts))
+      expect(fact).toEqual({
+        redeemed: true,
+        sessionId,
+        attemptId: expect.any(String),
+      });
+    expect(facts.assistant.attemptId).not.toBe(
+      facts['session-title'].attemptId,
+    );
   },
 );
 

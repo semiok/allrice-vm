@@ -345,8 +345,36 @@ export function apply(ctx, config) {
         modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
-      modelFiber = ctx.inject(['llm'], async (scope) => {
+      modelFiber = ctx.inject(['llm', 'connection'], async (scope) => {
         if (!current()) return;
+        const auxiliaryCalls = new Map();
+        scope.connection.fetch.register({
+          // Native exact Fetch routes are delivered only to the authenticated
+          // owner Peer. This path is consumed by the managed Host transport.
+          path: '/api/allrice-managed-model/current',
+          methods: ['POST'],
+          requestBody: 'buffered',
+          async fetch(request) {
+            if (!current())
+              return new globalThis.Response(null, { status: 404 });
+            const value = await request.json();
+            if (
+              value?.adapterId !== id ||
+              typeof value?.sessionId !== 'string' ||
+              !['compaction', 'session-title'].includes(value.purpose)
+            )
+              return new globalThis.Response(null, { status: 404 });
+            const found = auxiliaryCalls.get(
+              JSON.stringify([value.sessionId, value.purpose]),
+            );
+            return found && !found.signal.aborted
+              ? globalThis.Response.json(
+                  { id: found.id },
+                  { headers: { 'cache-control': 'no-store' } },
+                )
+              : new globalThis.Response(null, { status: 404 });
+          },
+        });
         const dispose = registerManagedGatewayAdapter(scope.llm, {
           origin,
           capability,
@@ -356,31 +384,46 @@ export function apply(ctx, config) {
             modelInfo,
             lifetime: signal,
             async resolveCallReference(selection, active, purpose) {
-              // The optional native title plugin has a durable request record
-              // but no live call join marker. Its native fallback remains.
-              if (purpose === 'session-title')
-                throw Error('Native title model ownership is unavailable');
-              const endpoint = new URL(
-                purpose === 'compaction'
-                  ? '/v1/reference/compaction'
-                  : '/v1/reference',
-                origin,
-              );
-              const response = await globalThis.fetch(endpoint, {
-                method: 'POST',
-                redirect: 'error',
-                signal: active,
-                headers: {
-                  authorization: 'Bearer ' + capability,
-                  'content-type': 'application/json',
-                },
-                body: JSON.stringify(selection),
-              });
-              if (!response.ok) {
-                await response.body?.cancel();
-                throw Error('Native managed model call was denied');
+              const key =
+                purpose && JSON.stringify([selection.sessionId, purpose]);
+              if (key && auxiliaryCalls.has(key))
+                throw Error('Concurrent native model ownership is ambiguous');
+              const owned = { id: randomUUID(), signal: active };
+              if (key) auxiliaryCalls.set(key, owned);
+              const release = () => {
+                active.removeEventListener('abort', release);
+                if (key && auxiliaryCalls.get(key) === owned)
+                  auxiliaryCalls.delete(key);
+              };
+              active.addEventListener('abort', release, { once: true });
+              try {
+                active.throwIfAborted();
+                const endpoint = new URL(
+                  purpose ? '/v1/reference/' + purpose : '/v1/reference',
+                  origin,
+                );
+                const response = await globalThis.fetch(endpoint, {
+                  method: 'POST',
+                  redirect: 'error',
+                  signal: active,
+                  headers: {
+                    authorization: 'Bearer ' + capability,
+                    'content-type': 'application/json',
+                  },
+                  body: JSON.stringify(selection),
+                });
+                if (!response.ok) {
+                  await response.body?.cancel();
+                  throw Error('Native managed model call was denied');
+                }
+                return {
+                  reference: (await response.json()).reference,
+                  release,
+                };
+              } catch (error) {
+                release();
+                throw error;
               }
-              return (await response.json()).reference;
             },
           },
         });

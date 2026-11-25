@@ -317,14 +317,12 @@ export function createModelGateway(options: {
             let operationFailed = false;
             try {
               const input = await readInput(request, signal);
+              const kind = binding.native.attemptKind;
               if (
-                (binding.native.attemptKind === 'assistant' &&
-                  input.purpose !== undefined) ||
-                (binding.native.attemptKind === 'compaction' &&
-                  input.purpose !== 'compaction')
+                kind &&
+                input.purpose !== (kind === 'assistant' ? undefined : kind)
               )
                 throw new ModelGatewayError('BINDING_INVALID');
-
               const digest =
                 'sha256:' +
                 createHash('sha256')
