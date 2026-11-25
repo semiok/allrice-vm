@@ -3,7 +3,7 @@ import {
   DataAccessError,
   requireDEntryNativeIdentity,
 } from '@allrice/database';
-import type { PersonVmPort } from '@allrice/person-vm';
+import { PersonVmError, type PersonVmPort } from '@allrice/person-vm';
 import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js';
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
@@ -17,6 +17,7 @@ import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 export function createDEntryNativePrewarmPort(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
+  requireEditorProof?: boolean;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -27,6 +28,9 @@ export function createDEntryNativePrewarmPort(input: {
     prewarm(context, identity, trigger, caller, revoked) {
       if (admission.aborted) return Promise.reject(admission.reason);
       const data = currentDEntryNativeDataPort();
+      const prove = data?.assertEditorReady?.bind(data);
+      if (input.requireEditorProof && !prove)
+        return Promise.reject(new DEntryNativeUnavailable());
       const task = Promise.resolve().then(async () => {
         const active = AbortSignal.any([admission, caller, revoked]);
         const selection = {
@@ -43,6 +47,19 @@ export function createDEntryNativePrewarmPort(input: {
         }
         await current();
         active.throwIfAborted();
+        // Enrol a newly eligible employee on a live Host before the running
+        // branch checks VM-wide readiness. A cold Host follows normal startup.
+        if (input.requireEditorProof && prove) {
+          try {
+            await prove(context, identity, active);
+          } catch (error) {
+            if (
+              !(error instanceof PersonVmError) ||
+              !['NOT_FOUND', 'LEASE_CONFLICT'].includes(error.code)
+            )
+              throw error;
+          }
+        }
         // Browser disconnect/uninstallation cannot kill shared running work.
         // Genuine authority revocation still fences this physical operation.
         const result = await input.prewarmCurrent(
@@ -57,7 +74,7 @@ export function createDEntryNativePrewarmPort(input: {
           result.organizationId !== identity.organizationId
         )
           throw new DataAccessError('authorization_denied');
-        return await data?.assertEditorReady?.(context, identity, active);
+        return await prove?.(context, identity, active);
       });
       pending.add(task);
       void task.then(
@@ -82,6 +99,7 @@ export function createDEntryNativePrewarmPort(input: {
 export function installDEntryNativePrewarm(input: {
   prewarmCurrent: CurrentSelectionPrewarm;
   lifetime: AbortSignal;
+  requireEditorProof?: boolean;
 }) {
   const assembly = createDEntryNativePrewarmPort(input);
   let uninstall: () => void;
@@ -118,7 +136,10 @@ export function installAssignedDEntryNativeRuntime(
   const catalog = installAssignedDEntryNativeCatalog(input);
   let prewarm: ReturnType<typeof installDEntryNativePrewarm>;
   try {
-    prewarm = installDEntryNativePrewarm(input);
+    prewarm = installDEntryNativePrewarm({
+      ...input,
+      requireEditorProof: true,
+    });
   } catch (error) {
     void catalog.close();
     throw error;

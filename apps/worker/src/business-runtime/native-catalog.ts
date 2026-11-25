@@ -245,9 +245,7 @@ export function createDEntryNativeCatalogPort(input: {
               try {
                 await current(who, active);
               } catch (error) {
-                if (active.aborted && Object.is(error, active.reason))
-                  throw new DEntryCatalogReadNotDispatched(error);
-                throw error;
+                throw new DEntryCatalogReadNotDispatched(error);
               }
               let notDispatched = false;
               const result = await owner.owner

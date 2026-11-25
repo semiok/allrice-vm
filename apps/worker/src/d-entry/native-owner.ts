@@ -91,7 +91,7 @@ export class DEntryNativeUnavailable extends Error {
 /** The producing owner joined its checks and never dispatched the read. */
 export class DEntryCatalogReadNotDispatched extends Error {
   constructor(readonly reason: unknown) {
-    super('Native catalog read cancelled before dispatch', { cause: reason });
+    super('Native catalog read ended before dispatch', { cause: reason });
   }
 }
 

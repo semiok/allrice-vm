@@ -139,6 +139,43 @@ it('requires proof for this employee before acknowledging prewarm on a running V
   }
 });
 
+it('production prewarm requires the data owner and establishes the running route before lifecycle reuse', async () => {
+  const f = fixture();
+  const route = new AbortController();
+  const proof = vi.fn(async () => route.signal);
+  const prewarmCurrent = vi.fn<CurrentSelectionPrewarm>((...args) => {
+    expect(proof).toHaveBeenCalledTimes(1);
+    return f.prewarmCurrent(...args);
+  });
+  const production = createDEntryNativePrewarmPort({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+  });
+  cleanups.push(production.close);
+  const args = [
+    f.base.context,
+    f.base.identity,
+    'page',
+    signal(),
+    f.lifetime.signal,
+  ] as const;
+  await expect(production.port.prewarm(...args)).rejects.toBeInstanceOf(
+    DEntryNativeUnavailable,
+  );
+  expect(prewarmCurrent).not.toHaveBeenCalled();
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady: proof,
+  });
+  try {
+    await expect(production.port.prewarm(...args)).resolves.toBe(route.signal);
+    expect(proof).toHaveBeenCalledTimes(2);
+  } finally {
+    uninstall();
+  }
+});
+
 it('concurrent page/input cannot acquire a second lifecycle owner, and later valid input reuses the completed epoch', async () => {
   const f = fixture();
   const results = await Promise.allSettled([

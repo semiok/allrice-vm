@@ -212,8 +212,7 @@ export async function openNativeWebOwner(input: {
           await assertCurrent(current);
           current.throwIfAborted();
         } catch (error) {
-          if (current.aborted && Object.is(error, current.reason))
-            notDispatched?.();
+          notDispatched?.();
           throw error;
         }
         const result = await root.remote.session.list({}, current);
@@ -445,9 +444,11 @@ export async function openNativeWebOwner(input: {
               throw new NativeRootJoinUnknown(error);
             });
             if (!result.ok) throw new DEntryNativeRootRejected();
+            const parsed = method.result.create().safeParse(result.value);
+            if (!parsed.success) throw new NativeRootJoinUnknown(parsed.error);
             return {
               ok: true as const,
-              value: method.result.create().parse(result.value),
+              value: parsed.data,
             };
           },
         );
