@@ -1,0 +1,2 @@
+FROM docker.io/library/node@sha256:af0bb4bf5b7318e3269417a7684a9e116c3c22eaf05382578b0d0d33de597ad2
+COPY --chown=0:0 payload/ /opt/allrice/dsh/24b043342743f063f4dbacdffbf825d7bc82b20d519566ba093215f765286543/
