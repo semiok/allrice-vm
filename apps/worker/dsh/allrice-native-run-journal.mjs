@@ -1,5 +1,6 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 function record(value) {
@@ -247,7 +248,7 @@ export async function printRetainedRunTerminal([
     return null;
   });
   if (!knownDirectory?.isDirectory() || (await realpath(root)) !== root) {
-    process.stdout.write('null');
+    stdout.write('null');
     return;
   }
 
@@ -296,5 +297,5 @@ export async function printRetainedRunTerminal([
   } finally {
     await ctx.fiber.dispose();
   }
-  process.stdout.write(JSON.stringify(end));
+  stdout.write(JSON.stringify(end));
 }

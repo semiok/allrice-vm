@@ -296,7 +296,10 @@ export class PostgresPersonVmStore implements PersonVmStore {
     const active = AbortSignal.any([signal, session.signal, scopeEnded.signal]);
     let lockHeld = false;
     let cleanupUnknown = false;
-    const select = (db: postgres.Sql, lock: boolean) => db`select *
+    const select = (
+      db: postgres.Sql | postgres.TransactionSql,
+      lock: boolean,
+    ) => db`select *
       from person_virtual_machines where person_id=${exact.personId}
         and organization_id=${exact.organizationId} and vm_id=${exact.vmId}
         and instance_id=${exact.instanceId} and lease_epoch=${exact.leaseEpoch}
