@@ -172,7 +172,7 @@ export async function unloadNativeWebOwner(fiber) {
 
 /** Native local login only. This file never establishes an AllRice principal. */
 export function apply(ctx, config) {
-  const { artifactPath, nonce, baseUrl, requireCommandMemory } = config;
+  const { artifactPath, nonce, baseUrl, commandMemoryPlugin } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -196,7 +196,7 @@ export function apply(ctx, config) {
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
     value?.baseUrl === baseUrl &&
-    value?.requireCommandMemory === requireCommandMemory;
+    value?.commandMemoryPlugin === commandMemoryPlugin;
   const entry = fiber.entry;
   const current = () =>
     !retiring &&
@@ -300,18 +300,30 @@ export function apply(ctx, config) {
     )
       return;
     if (!current()) return;
-    if (requireCommandMemory === true) {
-      // rc.2 allows optional entries to fail while Web continues booting.
-      // This profile disables the stock providers and requires the managed pair.
-      const subprocess = original(ctx.get('subprocess'));
-      const sandbox = original(ctx.get('sandbox'));
-      if (
-        subprocess?.[commandMemoryReady] !== true ||
-        typeof sandbox?.confine !== 'function'
-      )
-        throw Error('Native command memory controls are unavailable');
-      commandMemory = { subprocess, sandbox };
+    if (commandMemoryPlugin !== undefined) {
+      // Resolve the active providers through Cordis's actual dependency
+      // snapshot. A persistent profile can contribute other providers.
+      const observed = ctx.inject(['subprocess', 'sandbox'], () => {});
+      try {
+        await observed;
+        const runtime = observed.store?.subprocess;
+        const confinement = observed.store?.sandbox;
+        const subprocess = original(runtime?.value);
+        const sandbox = original(confinement?.value);
+        if (
+          subprocess?.[commandMemoryReady] !== true ||
+          !runtime?.fiber ||
+          runtime.fiber.entry?.options?.name !== commandMemoryPlugin ||
+          confinement?.fiber.parent.fiber !== runtime.fiber ||
+          typeof sandbox?.confine !== 'function'
+        )
+          throw Error('Native command memory controls are unavailable');
+        commandMemory = { subprocess, sandbox };
+      } finally {
+        await observed.dispose();
+      }
     }
+    if (!current()) return;
     publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;

@@ -274,7 +274,9 @@ it('stages the existing governed Bash overlay for every employee from the same p
             { id: 'allrice-current-principal' },
             {
               id: 'allrice-native-web-owner',
-              config: { requireCommandMemory: true },
+              config: {
+                commandMemoryPlugin: `file://${controls.guestDirectory}/dsh-command-memory.mjs`,
+              },
             },
           ],
         },

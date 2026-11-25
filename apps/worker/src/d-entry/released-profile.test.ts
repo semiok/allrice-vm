@@ -110,7 +110,7 @@ async function observerFixture(options?: {
   listenHost?: string;
   commandMemory?: {
     subprocess: 'missing' | 'stock' | 'managed';
-    sandbox: boolean;
+    sandbox: 'missing' | 'owned' | 'unrelated';
   };
 }) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
@@ -157,16 +157,26 @@ async function observerFixture(options?: {
     options?.listenHost,
   );
   const commandMemory = options?.commandMemory;
+  const commandMemoryPlugin =
+    'file:///opt/allrice/command-memory/fixture/dsh-command-memory.mjs';
   const commands =
     commandMemory &&
-    local.host.plugin((ctx: Context) => {
+    local.host.plugin(async (ctx: Context) => {
+      Object.defineProperty(ctx.fiber, 'entry', {
+        value: { options: { name: commandMemoryPlugin } },
+      });
       if (commandMemory.subprocess !== 'missing')
         ctx.provide('subprocess', {
           [Symbol.for('allrice.person-vm-command-memory.ready')]:
             commandMemory.subprocess === 'managed',
         });
-      if (commandMemory.sandbox) ctx.provide('sandbox', { confine() {} });
+      if (commandMemory.sandbox === 'owned')
+        await ctx.plugin((scoped: Context) => {
+          scoped.provide('sandbox', { confine() {} });
+        });
     });
+  if (commandMemory?.sandbox === 'unrelated')
+    local.host.provide('sandbox', { confine() {} });
   if (commands) await commands;
   const callbacks = new Set<() => void>();
   if (options?.graphEvents) {
@@ -188,7 +198,7 @@ async function observerFixture(options?: {
           artifactPath: artifacts,
           nonce,
           baseUrl: web.baseUrl,
-          ...(commandMemory ? { requireCommandMemory: true } : {}),
+          ...(commandMemory ? { commandMemoryPlugin } : {}),
         });
         entered?.();
         return applying;
@@ -270,13 +280,19 @@ it('keeps the nonce private through appReady dispatch, loader settlement and act
   }
 });
 
-it.each(['missing', 'stock', 'no-sandbox'] as const)(
+it.each(['missing', 'stock', 'no-sandbox', 'unrelated-sandbox'] as const)(
   'withholds native auth when the required command memory providers are %s',
   async (missing) => {
     const f = await observerFixture({
       commandMemory: {
-        subprocess: missing === 'no-sandbox' ? 'managed' : missing,
-        sandbox: missing !== 'no-sandbox',
+        subprocess:
+          missing === 'missing' || missing === 'stock' ? missing : 'managed',
+        sandbox:
+          missing === 'no-sandbox'
+            ? 'missing'
+            : missing === 'unrelated-sandbox'
+              ? 'unrelated'
+              : 'owned',
       },
     });
     try {
@@ -300,7 +316,7 @@ it.each(['missing', 'stock', 'no-sandbox'] as const)(
 
 it('retires published native auth if the required command memory providers disappear', async () => {
   const f = await observerFixture({
-    commandMemory: { subprocess: 'managed', sandbox: true },
+    commandMemory: { subprocess: 'managed', sandbox: 'owned' },
   });
   try {
     const active = f.mount('managed-command-memory');
