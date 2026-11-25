@@ -46,10 +46,6 @@ import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
-import {
-  createRetainedNativeRunReconciler,
-  type RetainedNativeRunReconciler,
-} from './retained-native-run-reader.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
 
@@ -88,7 +84,6 @@ export type ProductionPersonVmHostSources = Readonly<{
     current: Current;
     lifetime: AbortSignal;
     modelOwnerId: string;
-    reconcileRetainedRun: RetainedNativeRunReconciler;
     reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
     issueReference<T>(
       call: ModelCallBinding,
@@ -699,14 +694,6 @@ export function createProductionPersonVmHost(input: {
           },
         },
       });
-      const reconcileRetainedRun = createRetainedNativeRunReconciler({
-        store,
-        disk: providers.disk,
-        native: providers.native,
-        hasLocalOwner: startup.hasLocalOwner,
-        cliPath: web.cliPath,
-        readonlyGuestDirectory: native.readonlyDshDirectory.guestDirectory,
-      });
       bound = await sources.bind({
         vm,
         admission,
@@ -715,12 +702,6 @@ export function createProductionPersonVmHost(input: {
         providers,
         lifetime,
         modelOwnerId,
-        reconcileRetainedRun: (candidate, owner, signal) =>
-          own(() =>
-            currentWork(signal, (active) =>
-              reconcileRetainedRun(candidate, owner, active),
-            ),
-          ),
         async issueReference(call, signal, issue) {
           if (!model?.issueReference)
             throw new ProductionPersonVmHostUnavailable(

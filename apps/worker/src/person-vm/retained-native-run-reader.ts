@@ -2,7 +2,6 @@ import { readFile } from 'node:fs/promises';
 import {
   DEntryNativeTurnEndSchema,
   isDEntryNativeRunJournalCurrent,
-  publishDEntryNativeRunTerminal,
   type DEntryNativeRunCandidate,
   type DEntryNativeRunJournalOwner,
 } from '@allrice/database';
@@ -14,10 +13,6 @@ import {
   type PersonVmStartingScope,
   type PostgresPersonVmStore,
 } from '@allrice/person-vm';
-
-export type RetainedNativeRunReconciler = ReturnType<
-  typeof createRetainedNativeRunReconciler
->;
 
 export function dEntryNativeRunJournalSelection({
   attempt,
@@ -34,9 +29,9 @@ export function dEntryNativeRunJournalSelection({
   };
 }
 
-/** Narrow Host-only read on an existing exact VM. The normal lifecycle owns
- * every disk attach, VM start, and profile/login transition. */
-export function createRetainedNativeRunReconciler(input: {
+/** Collect an observation of the physical journal on the existing VM. The
+ * legacy workspace can write the journal, so this is not terminal authority. */
+export function createRetainedNativeRunReader(input: {
   store: Pick<PostgresPersonVmStore, 'withRetainedReadLease'>;
   disk: Pick<ApfsPersonVmDisk, 'verifyAttachedMount'>;
   native: Pick<MicrosandboxPersonVm, 'readAttachedProbe'>;
@@ -58,7 +53,7 @@ export function createRetainedNativeRunReconciler(input: {
       instanceId: owner.vmInstanceId,
       leaseEpoch: owner.leaseEpoch,
     };
-    if (input.hasLocalOwner(binding)) return false;
+    if (input.hasLocalOwner(binding)) return null;
     if (!input.cliPath.startsWith(input.readonlyGuestDirectory + '/'))
       throw new PersonVmError('PROVIDER_FAILED');
     probeSource ??= readFile(
@@ -92,7 +87,7 @@ export function createRetainedNativeRunReconciler(input: {
         });
         await scope.assertCurrent();
         const mount = await input.disk.verifyAttachedMount(disk, scope.signal);
-        if (!mount) return false;
+        if (!mount) return null;
         await scope.assertCurrent();
         const output = await input.native.readAttachedProbe(scope, mount, {
           executable: 'node',
@@ -116,11 +111,9 @@ export function createRetainedNativeRunReconciler(input: {
         if (Buffer.byteLength(output, 'utf8') > 1024)
           throw new PersonVmError('PROVIDER_FAILED');
         const decoded: unknown = JSON.parse(output);
-        if (decoded === null) return false;
-        const end = DEntryNativeTurnEndSchema.parse(decoded);
-        return publishDEntryNativeRunTerminal(candidate, end, scope.signal, {
-          owner,
-          leaseOwner: lease.leaseOwner,
+        if (decoded === null) return null;
+        return Object.freeze({
+          observedTerminal: DEntryNativeTurnEndSchema.parse(decoded),
         });
       },
       () => !input.hasLocalOwner(binding),

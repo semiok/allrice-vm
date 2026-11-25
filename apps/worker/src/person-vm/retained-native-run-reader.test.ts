@@ -6,7 +6,7 @@ import type {
   DEntryNativeTurnEnd,
 } from '@allrice/database';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { createRetainedNativeRunReconciler } from './retained-native-run-reader.js';
+import { createRetainedNativeRunReader } from './retained-native-run-reader.js';
 
 const io = vi.hoisted(() => ({
   artifact: vi.fn(),
@@ -49,7 +49,7 @@ vi.mock(import('@allrice/database'), async (original) => ({
   publishDEntryNativeRunTerminal: io.publish,
 }));
 
-type Inputs = Parameters<typeof createRetainedNativeRunReconciler>[0];
+type Inputs = Parameters<typeof createRetainedNativeRunReader>[0];
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -197,17 +197,7 @@ function fixture(options?: {
     log.push('scope');
     return true;
   });
-  io.publish.mockImplementation(async (run, terminal, signal, authority) => {
-    expect(holding).toBe(true);
-    expect(run).toBe(candidate);
-    expect(terminal).toEqual(end);
-    expect(signal).toBe(active);
-    expect(authority).toEqual({ owner, leaseOwner });
-    log.push('publish');
-    return true;
-  });
-
-  const project = createRetainedNativeRunReconciler({
+  const project = createRetainedNativeRunReader({
     store,
     disk,
     native,
@@ -236,38 +226,24 @@ beforeEach(() => {
   vi.resetAllMocks();
 });
 
-it('uses the fixed Worker artifact and waits for the original Run write before releasing the same lease', async () => {
+it('uses the fixed artifact and returns an observation without writing the Run', async () => {
   const f = fixture();
-  const receipt = deferred<boolean>();
+  const resume = deferred<void>();
   const entered = deferred<void>();
-  io.publish.mockImplementation(async (run, end, active, authority) => {
-    expect(f.holding()).toBe(true);
-    expect(run).toBe(f.candidate);
-    expect(end).toEqual(f.end);
-    expect(active).toBe(f.active);
-    expect(authority).toEqual({ owner: f.owner, leaseOwner: f.leaseOwner });
-    f.log.push('publish');
+  const read = f.native.readAttachedProbe.getMockImplementation()!;
+  f.native.readAttachedProbe.mockImplementationOnce(async (...args) => {
+    const value = await read(...args);
     entered.resolve();
-    const applied = await receipt.promise;
+    await resume.promise;
     expect(f.holding()).toBe(true);
-    f.log.push('ack');
-    return applied;
+    return value;
   });
   const outcome = f.run();
   try {
     await Promise.race([entered.promise, outcome]);
     expect(f.holding()).toBe(true);
     expect(f.active.aborted).toBe(false);
-    expect(f.log).toEqual([
-      'lease',
-      'scope',
-      'disk-before',
-      'scope',
-      'probe',
-      'disk-after',
-      'scope',
-      'publish',
-    ]);
+    expect(f.log).toEqual(['lease', 'scope', 'disk-before', 'scope', 'probe']);
     expect(io.current).toHaveBeenLastCalledWith(
       f.candidate,
       f.owner,
@@ -300,11 +276,12 @@ it('uses the fixed Worker artifact and waits for the original Run write before r
       ],
     });
   } finally {
-    receipt.resolve(true);
+    resume.resolve();
     await outcome;
   }
-  expect(await outcome).toBe(true);
-  expect(f.log.slice(-2)).toEqual(['ack', 'release']);
+  expect(await outcome).toEqual({ observedTerminal: f.end });
+  expect(io.publish).not.toHaveBeenCalled();
+  expect(f.log.slice(-3)).toEqual(['disk-after', 'scope', 'release']);
   expect(f.active.aborted).toBe(true);
   expect(f.holding()).toBe(false);
 });
@@ -312,7 +289,7 @@ it('uses the fixed Worker artifact and waits for the original Run write before r
 it('preserves a missing terminal and lets the exact physical scope retire', async () => {
   const f = fixture();
   f.native.readAttachedProbe.mockResolvedValueOnce('null');
-  await expect(f.run()).resolves.toBe(false);
+  await expect(f.run()).resolves.toBeNull();
   expect(f.disk.verifyAttachedMount).toHaveBeenCalledTimes(2);
   expect(io.publish).not.toHaveBeenCalled();
   expect(f.log.at(-1)).toBe('release');
@@ -321,7 +298,7 @@ it('preserves a missing terminal and lets the exact physical scope retire', asyn
 it('requires an existing mount and refuses to launch on an absent disk', async () => {
   const f = fixture();
   f.disk.verifyAttachedMount.mockResolvedValueOnce(null);
-  await expect(f.run()).resolves.toBe(false);
+  await expect(f.run()).resolves.toBeNull();
   expect(f.native.readAttachedProbe).not.toHaveBeenCalled();
   expect(io.publish).not.toHaveBeenCalled();
   expect(f.holding()).toBe(false);
@@ -382,7 +359,7 @@ it('rejects a CLI outside the verified DSH directory before a lease or artifact 
 
 it('does not take a read lease if another profile on the physical VM is owned', async () => {
   const existing = fixture({ hasLocalOwner: () => true });
-  await expect(existing.run()).resolves.toBe(false);
+  await expect(existing.run()).resolves.toBeNull();
   expect(existing.log).toEqual([]);
   expect(io.artifact).not.toHaveBeenCalled();
 
