@@ -167,9 +167,10 @@ export async function setupNativeWebFixture(
   });
   const root = await mkdtemp('/tmp/ar-native-web-');
   roots.push(root);
-  const cliPath = isolateProfile
-    ? await isolatedCli(root, installedCli)
-    : installedCli;
+  // Give the published CLI the same private runtime package root as the
+  // sealed Guest. A workspace pnpm symlink can otherwise select the builder's
+  // same-name AllRice profile before the fixture's sealed profile.
+  const cliPath = await isolatedCli(root, await realpath(installedCli));
   const release = join(root, 'sealed-worker-profile');
   const producer = await import(
     new URL(
@@ -431,7 +432,7 @@ export async function setupNativeWebFixture(
             DO_NOT_TRACK: '1',
             NPM_CONFIG_OFFLINE: 'true',
           },
-          stdio: isolateProfile ? ['ignore', 'ignore', 'pipe'] : 'ignore',
+          stdio: ['ignore', 'ignore', 'pipe'],
         },
       );
       child.stderr?.setEncoding('utf8');
@@ -577,7 +578,6 @@ export async function setupNativeWebFixture(
     cleanupTimeoutMs: 5000,
     beforePrompt,
   }).catch(async (error: unknown) => {
-    if (!isolateProfile) throw error;
     const patchRead = await access(tracePath).then(
       () => true,
       () => false,
