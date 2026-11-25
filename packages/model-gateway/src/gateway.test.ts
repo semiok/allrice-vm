@@ -634,14 +634,15 @@ describe.sequential(
         ).resolves.toBeUndefined();
         await expect(f.gateway.close()).rejects.toBeInstanceOf(AggregateError);
       } finally {
-        try {
-          await f.gateway.close();
-        } catch (error) {
-          if (!(error instanceof AggregateError)) throw error;
-        } finally {
-          await closeServer(f.server);
-          await Promise.allSettled([collecting]);
-        }
+        await f.gateway
+          .close()
+          .catch((error: unknown) => {
+            if (!(error instanceof AggregateError)) throw error;
+          })
+          .finally(async () => {
+            await closeServer(f.server);
+            await Promise.allSettled([collecting]);
+          });
       }
     });
 
