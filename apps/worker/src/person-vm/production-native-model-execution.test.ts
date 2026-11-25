@@ -118,6 +118,7 @@ async function setup() {
     receipt: { rosterDigest: 'roster' },
     revoked: lifetime.signal,
   };
+  const runJournalOwners = vi.fn(() => []);
   const attached = await createProductionNativeModelExecution().attach(
     {
       lifetime: lifetime.signal,
@@ -128,6 +129,7 @@ async function setup() {
           return () => {};
         },
         catalog: () => profile,
+        runJournalOwners,
       },
     } as unknown as Parameters<Attach>[0],
     {
@@ -137,6 +139,7 @@ async function setup() {
   );
   return {
     readRootWake,
+    runJournalOwners,
     async admit(
       context: RequestContext,
       requestId: string,
@@ -177,6 +180,15 @@ async function setup() {
     },
   };
 }
+
+it('attaches native terminal retry to the current Worker owner', async () => {
+  const f = await setup();
+  try {
+    expect(f.runJournalOwners).toHaveBeenCalledTimes(1);
+  } finally {
+    await f.close();
+  }
+});
 
 it('releases a removed queue occurrence so another login can send after the claimed turn ends', async () => {
   const f = await setup();
