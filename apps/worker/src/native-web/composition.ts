@@ -404,6 +404,59 @@ export function createAssignedNativeWebStartup(input: {
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
     },
+    ensureVerifiedEditor(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      employeeInstanceId: string,
+      caller: AbortSignal,
+    ) {
+      return track(async () => {
+        const group = running.get(binding.vmId);
+        const prove = editorProof;
+        if (
+          !group ||
+          !prove ||
+          group.verifiedBy !== prove ||
+          context.actor.type !== 'user' ||
+          context.actor.id !== binding.personId ||
+          context.organizationId !== binding.organizationId
+        )
+          throw new PersonVmError('RUNTIME_NOT_READY');
+        const selected = this.catalog(binding, employeeInstanceId);
+        const active = AbortSignal.any([caller, selected.revoked]);
+        active.throwIfAborted();
+        const previous = group.verifiedEmployees.get(employeeInstanceId);
+        if (previous && !previous.aborted) return previous;
+
+        const proof = await selected.owner.verifyRunningEditor(
+          context,
+          active,
+          (profile, readModels, signal) =>
+            prove(
+              {
+                binding: selected.receipt.binding,
+                endpoint: selected.endpoint,
+                context,
+                profile,
+                readModels,
+              },
+              signal,
+            ),
+        );
+        active.throwIfAborted();
+        if (
+          !proof ||
+          running.get(binding.vmId) !== group ||
+          editorProof !== prove
+        )
+          throw new PersonVmError('RUNTIME_NOT_READY');
+        proof.throwIfAborted();
+        const enrolled = group.verifiedEmployees.get(employeeInstanceId);
+        if (enrolled && !enrolled.aborted) return enrolled;
+        group.verifiedEmployees.set(employeeInstanceId, proof);
+        return proof;
+      });
+    },
     /** Publish only a completely started, exact group; this never starts a VM. */
     catalog(
       binding: PersonVmBinding,
@@ -471,6 +524,12 @@ export function createAssignedNativeWebStartup(input: {
       signal: AbortSignal,
       employeeInstanceId?: string,
     ): AbortSignal;
+    ensureVerifiedEditor(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      employeeInstanceId: string,
+      signal: AbortSignal,
+    ): Promise<AbortSignal>;
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,

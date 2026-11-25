@@ -149,6 +149,7 @@ it('uses each current Session RC, full readonly roster and exact original public
   expect(f.native.readSessionsFor).toHaveBeenCalledExactlyOnceWith(
     current,
     expect.any(AbortSignal),
+    expect.any(Function),
   );
   expect(f.native.readSessions).not.toHaveBeenCalled();
   expect(
@@ -364,6 +365,29 @@ it.each(['group', 'native'] as const)(
     expect(f.native.readSessionsFor).not.toHaveBeenCalled();
   },
 );
+
+it('joins an interrupted current employee read without marking an undispatched catalog request unknown', async () => {
+  const f = fixture();
+  const owner = await f.resolve();
+  const controller = new AbortController();
+  const catalog = ownDEntryCatalog(owner, controller.signal);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  authority.identity.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return f.base.identity;
+  });
+  const read = catalog.owner.readSessions(new AbortController().signal);
+  const result = read.catch((error: unknown) => error);
+  await entered.promise;
+  controller.abort();
+  const closing = catalog.close();
+  release.resolve();
+  expect(await result).toBe(controller.signal.reason);
+  await expect(closing).resolves.toBeUndefined();
+  expect(f.native.readSessionsFor).not.toHaveBeenCalled();
+});
 
 it('the concrete installer binds real readonly producer calls; catalog installation still leaves root/RPC/resource closed', async () => {
   const f = fixture(),

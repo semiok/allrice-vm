@@ -12,7 +12,10 @@ import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/re
 import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import type { RequestContext } from '@allrice/contracts';
-import type { SessionCreateRequest } from '@deepseek-ai/dsh-api-session-controller/types';
+import type {
+  ModelCatalog,
+  SessionCreateRequest,
+} from '@deepseek-ai/dsh-api-session-controller/types';
 import {
   PersonVmError,
   sameVmBinding,
@@ -23,12 +26,19 @@ import {
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
+import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
 
 export class NativeRootJoinUnknown extends Error {
   constructor(cause: unknown) {
     super('NATIVE_ROOT_JOIN_UNKNOWN', { cause });
   }
 }
+
+type EditorEvidence<T> = (
+  profile: DEntryFixedProfileSource,
+  models: () => Promise<{ ok: true; value: ModelCatalog }>,
+  signal: AbortSignal,
+) => Promise<T>;
 
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
@@ -187,15 +197,25 @@ export async function openNativeWebOwner(input: {
   function readCurrentSessions(
     requestSignal: AbortSignal,
     assertCurrent: (signal: AbortSignal) => Promise<void>,
+    notDispatched?: () => void,
   ) {
     const current = AbortSignal.any([signal, requestSignal]);
-    if (current.aborted) return Promise.reject(current.reason);
+    if (current.aborted) {
+      notDispatched?.();
+      return Promise.reject(current.reason);
+    }
     // Register before entering either asynchronous guard, including reentrant close.
     return own(
       Promise.resolve().then(async () => {
-        current.throwIfAborted();
-        await assertCurrent(current);
-        current.throwIfAborted();
+        try {
+          current.throwIfAborted();
+          await assertCurrent(current);
+          current.throwIfAborted();
+        } catch (error) {
+          if (current.aborted && Object.is(error, current.reason))
+            notDispatched?.();
+          throw error;
+        }
         const result = await root.remote.session.list({}, current);
         await assertCurrent(current);
         current.throwIfAborted();
@@ -273,6 +293,39 @@ export async function openNativeWebOwner(input: {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
+  function verifyEditor<T>(
+    caller: AbortSignal,
+    guard: (signal: AbortSignal) => Promise<void>,
+    verify: EditorEvidence<T>,
+  ) {
+    const current = AbortSignal.any([
+      caller,
+      AbortSignal.timeout(input.launch.auth.timeoutMs),
+    ]);
+    return readCurrent(current, guard, (active) =>
+      verify(
+        {
+          revoked: active,
+          readImmutableGraph: (signal) => readCurrent(signal, guard, readGraph),
+          readImmutableBundle: (reference, bytes, signal) =>
+            readCurrent(signal, guard, (reading) =>
+              readBundle(reference, bytes, reading),
+            ),
+        },
+        () =>
+          readCurrent(active, guard, async (signal) => {
+            const method = TYPERT_REMOTE.methods['session/modelCatalog'];
+            const args = method.input({ strict: true }).create().parse({});
+            const result = await readSessionReply('modelCatalog', args, signal);
+            return {
+              ok: true as const,
+              value: method.result.create().parse(replyValue(result)),
+            };
+          }),
+        active,
+      ),
+    );
+  }
   try {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
@@ -346,47 +399,25 @@ export async function openNativeWebOwner(input: {
       verifyStartingEditor<T>(
         startingScope: PersonVmBootstrapScope,
         caller: AbortSignal,
-        verify: (
-          profile: DEntryFixedProfileSource,
-          models: () => ReturnType<typeof root.remote.session.modelCatalog>,
-          active: AbortSignal,
-        ) => Promise<T>,
+        verify: EditorEvidence<T>,
       ) {
         if (startingScope !== input.scope)
           return Promise.reject(new PersonVmError('LEASE_LOST'));
-        const current = AbortSignal.any([
+        return verifyEditor(
+          AbortSignal.any([caller, startingScope.signal]),
+          () => startingScope.assertCurrent(),
+          verify,
+        );
+      },
+      verifyRunningEditor<T>(
+        context: RequestContext,
+        caller: AbortSignal,
+        verify: EditorEvidence<T>,
+      ) {
+        return verifyEditor(
           caller,
-          startingScope.signal,
-          AbortSignal.timeout(input.launch.auth.timeoutMs),
-        ]);
-        const guard = () => startingScope.assertCurrent();
-        return readCurrent(current, guard, (active) =>
-          verify(
-            {
-              revoked: active,
-              readImmutableGraph: (signal) =>
-                readCurrent(signal, guard, readGraph),
-              readImmutableBundle: (reference, bytes, signal) =>
-                readCurrent(signal, guard, (reading) =>
-                  readBundle(reference, bytes, reading),
-                ),
-            },
-            () =>
-              readCurrent(active, guard, async (signal) => {
-                const method = TYPERT_REMOTE.methods['session/modelCatalog'];
-                const args = method.input({ strict: true }).create().parse({});
-                const result = await readSessionReply(
-                  'modelCatalog',
-                  args,
-                  signal,
-                );
-                return {
-                  ok: true as const,
-                  value: method.result.create().parse(replyValue(result)),
-                };
-              }),
-            active,
-          ),
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          verify,
         );
       },
       createRootFor(
@@ -413,9 +444,10 @@ export async function openNativeWebOwner(input: {
             ).catch((error: unknown) => {
               throw new NativeRootJoinUnknown(error);
             });
+            if (!result.ok) throw new DEntryNativeRootRejected();
             return {
               ok: true as const,
-              value: method.result.create().parse(replyValue(result)),
+              value: method.result.create().parse(result.value),
             };
           },
         );
@@ -448,9 +480,15 @@ export async function openNativeWebOwner(input: {
         return readCurrentSessions(requestSignal, assertCurrent);
       },
       /** Request denial does not certify loss of this shared native owner. */
-      readSessionsFor(context: RequestContext, requestSignal: AbortSignal) {
-        return readCurrentSessions(requestSignal, (current) =>
-          input.vm.assertCurrentBinding(context, binding, current),
+      readSessionsFor(
+        context: RequestContext,
+        requestSignal: AbortSignal,
+        notDispatched?: () => void,
+      ) {
+        return readCurrentSessions(
+          requestSignal,
+          (current) => input.vm.assertCurrentBinding(context, binding, current),
+          notDispatched,
         );
       },
       /** The existing native index supplies the running Host's own graph.

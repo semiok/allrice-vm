@@ -252,7 +252,7 @@ export function createDEntryHttpHandler(
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
       if (prewarmRequest) {
-        await deps.prewarm.prewarm(
+        const proof = await deps.prewarm.prewarm(
           auth.context,
           auth.identity,
           prewarmRequest.trigger,
@@ -263,6 +263,7 @@ export function createDEntryHttpHandler(
         if (!sameDEntryIdentity(auth.identity, next.identity))
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
+        if (proof?.aborted) throw new DEntryNativeUnavailable();
         response.writeHead(200, {
           'content-type': 'application/json',
           'cache-control': 'no-store',

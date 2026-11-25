@@ -357,6 +357,33 @@ it('the real Worker listener requires current release eligibility and the instal
   expect(f.start).toHaveBeenCalledTimes(1);
 });
 
+it('rejects the prewarm reply if the model route retires during final HTTP qualification', async () => {
+  const f = fixture();
+  const route = new AbortController();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: { prewarm: async () => route.signal },
+  });
+  cleanups.push(server.close);
+  f.base.deps.identity
+    .mockResolvedValueOnce(f.base.identity)
+    .mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return f.base.identity;
+    });
+  const request = server.request('native-prewarm', {
+    ...f.base.body,
+    trigger: 'page',
+  });
+  await entered.promise;
+  route.abort();
+  release.resolve();
+  expect((await request).status).toBe(503);
+});
+
 it('browser disconnect through real HTTP does not cancel shared physical startup or close its authority watcher early', async () => {
   const f = fixture(),
     started = deferred<void>(),

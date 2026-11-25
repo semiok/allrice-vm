@@ -88,6 +88,16 @@ export class DEntryNativeUnavailable extends Error {
   }
 }
 
+/** The producing owner joined its checks and never dispatched the read. */
+export class DEntryCatalogReadNotDispatched extends Error {
+  constructor(readonly reason: unknown) {
+    super('Native catalog read cancelled before dispatch', { cause: reason });
+  }
+}
+
+/** The native editor root RPC returned a verified, joined failure reply. */
+export class DEntryNativeRootRejected extends DEntryNativeUnavailable {}
+
 // Composition registration only. No map of people/leases/authority, no fallback
 // provider, no new listener, and never populated by a browser request.
 let installed: DEntryNativeOwnerPort | undefined;

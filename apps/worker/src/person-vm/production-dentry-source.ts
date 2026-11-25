@@ -38,7 +38,10 @@ import {
 
 type Startup = Pick<
   ReturnType<typeof createAssignedNativeWebStartup>,
-  'catalog' | 'installStartingEditorProof' | 'assertVerifiedEditor'
+  | 'catalog'
+  | 'installStartingEditorProof'
+  | 'assertVerifiedEditor'
+  | 'ensureVerifiedEditor'
 >;
 
 /** The managed model owner checks the configured route and its same-generation
@@ -140,11 +143,13 @@ export function installProductionDEntrySource(input: {
           identity,
           active,
         );
-        input.startup.assertVerifiedEditor(
+        const proof = await input.startup.ensureVerifiedEditor(
+          context,
           current.view.receipt.binding,
-          current.signal,
           identity.employeeInstanceId,
+          current.signal,
         );
+        return AbortSignal.any([current.signal, proof]);
       });
     },
     resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
@@ -162,10 +167,11 @@ export function installProductionDEntrySource(input: {
           denied();
         const scope = structuredClone(context);
         const expected = Object.freeze({ ...identity });
-        const route = input.startup.assertVerifiedEditor(
+        const route = await input.startup.ensureVerifiedEditor(
+          scope,
           binding,
-          active,
           expected.employeeInstanceId,
+          active,
         );
         const revoked = AbortSignal.any([lifetime, owner.revoked, route]);
         const assertCurrent = (caller: AbortSignal) =>
@@ -347,7 +353,6 @@ export function installProductionDEntrySource(input: {
           active,
         );
         if (
-          !models.ok ||
           models.value.default.provider !== route.provider ||
           models.value.default.model !== route.model ||
           !models.value.routableProviders.includes(route.provider) ||

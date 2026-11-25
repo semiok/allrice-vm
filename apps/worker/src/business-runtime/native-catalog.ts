@@ -12,6 +12,7 @@ import type {
   DEntryPrincipalIssue,
 } from '@allrice/d-entry-principal/types';
 import {
+  DEntryCatalogReadNotDispatched,
   DEntryNativeUnavailable,
   dEntryOwnerViewSchema,
   installDEntryNativeOwnerPort,
@@ -59,6 +60,7 @@ export type PublishedNativeCatalog = Readonly<{
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
+      notDispatched?: () => void,
     ): ReturnType<ResolvedDEntryNativeOwner['readSessions']>;
   }>;
 }>;
@@ -240,8 +242,23 @@ export function createDEntryNativeCatalogPort(input: {
             return own(async () => {
               const who = context;
               const active = AbortSignal.any([reading, revoked]);
-              await current(who, active);
-              const result = await owner.owner.readSessionsFor(who, active);
+              try {
+                await current(who, active);
+              } catch (error) {
+                if (active.aborted && Object.is(error, active.reason))
+                  throw new DEntryCatalogReadNotDispatched(error);
+                throw error;
+              }
+              let notDispatched = false;
+              const result = await owner.owner
+                .readSessionsFor(who, active, () => {
+                  notDispatched = true;
+                })
+                .catch((error: unknown) => {
+                  if (notDispatched)
+                    throw new DEntryCatalogReadNotDispatched(error);
+                  throw error;
+                });
               await current(who, active);
               return result;
             });

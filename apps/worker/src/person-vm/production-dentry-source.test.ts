@@ -135,6 +135,9 @@ function fixture() {
         throw Error('RUNTIME_NOT_READY');
       return verified;
     },
+    async ensureVerifiedEditor(_context: RequestContext, next: typeof binding) {
+      return this.assertVerifiedEditor(next);
+    },
   };
   const source = installProductionDEntrySource({
     startup: startup as unknown as Input['startup'],

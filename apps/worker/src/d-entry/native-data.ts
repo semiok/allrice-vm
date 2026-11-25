@@ -11,6 +11,7 @@ import type {
   DEntryOwnedActivity,
 } from '@allrice/database';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
+import { DEntryCatalogReadNotDispatched } from './native-owner.js';
 import {
   assertDEntryPrincipalIssueForOwner,
   createDEntryPrincipalChildren,
@@ -35,7 +36,7 @@ export interface DEntryNativeDataPort {
     context: RequestContext,
     identity: DEntryIdentity,
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<AbortSignal>;
   /** Explicit editor open on a current running Host. The database owns the
    * durable claim and native root. Read-only discovery never calls this. */
   prepareEditorRoot?(input: {
@@ -146,10 +147,14 @@ export function ownDEntryCatalog(
         () => reads.delete(read),
         (error) => {
           reads.delete(read);
-          failures.push(error);
+          if (!(error instanceof DEntryCatalogReadNotDispatched))
+            failures.push(error);
         },
       );
-      return read;
+      return read.catch((error: unknown) => {
+        if (error instanceof DEntryCatalogReadNotDispatched) throw error.reason;
+        throw error;
+      });
     },
   };
   return {

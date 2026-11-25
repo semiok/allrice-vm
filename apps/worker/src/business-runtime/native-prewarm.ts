@@ -21,7 +21,7 @@ export function createDEntryNativePrewarmPort(input: {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
   const admission = AbortSignal.any([input.lifetime, stopped.signal]);
-  const pending = new Set<Promise<void>>();
+  const pending = new Set<Promise<AbortSignal | undefined>>();
   let closing: Promise<void> | undefined;
   const port: DEntryNativePrewarmPort = {
     prewarm(context, identity, trigger, caller, revoked) {
@@ -57,7 +57,7 @@ export function createDEntryNativePrewarmPort(input: {
           result.organizationId !== identity.organizationId
         )
           throw new DataAccessError('authorization_denied');
-        await data?.assertEditorReady?.(context, identity, active);
+        return await data?.assertEditorReady?.(context, identity, active);
       });
       pending.add(task);
       void task.then(
