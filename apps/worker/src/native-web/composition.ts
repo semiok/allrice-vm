@@ -7,9 +7,11 @@ import type {
   PersonVmWebEndpointReceipt,
   PersonVmWebStartup,
   PersonVmWebRosterPort,
+  ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
 import { PersonVmError, sameVmBinding } from '@allrice/person-vm';
 import { preparePersonNativeWebRoster } from '@allrice/database';
+import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
   prepareNativeWebLaunch,
   type NativeWebConfiguration,
@@ -41,6 +43,10 @@ export const personNativeWebRoster: PersonVmWebRosterPort = {
 export function createAssignedNativeWebStartup(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'];
+  commandMemory?: Readonly<{
+    controls: ReadonlyCommandMemoryDirectory;
+    readonlyDshDirectory: string;
+  }>;
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
@@ -130,6 +136,13 @@ export function createAssignedNativeWebStartup(input: {
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
+        const commandMemory = input.commandMemory
+          ? createPersonVmDshCommandMemoryPatch(memory, {
+              ...input.commandMemory,
+              cliPath: input.configuration.cliPath,
+              cleanupTimeoutMs: input.cleanupTimeoutMs,
+            })
+          : undefined;
         const profile = await input.readEmployeeProfile(signal);
         current(binding, web);
         signal.throwIfAborted();
@@ -154,6 +167,7 @@ export function createAssignedNativeWebStartup(input: {
               },
               binding,
               profile,
+              commandMemory,
             );
           }),
         );
@@ -230,6 +244,15 @@ export function createAssignedNativeWebStartup(input: {
             signal.throwIfAborted();
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
           }
+          await scope.assertCurrent();
+          signal.throwIfAborted();
+          if (
+            group.retiring ||
+            [...group.owners.values()].some(
+              (owner) => owner.revoked.aborted || !owner.controlReady(),
+            )
+          )
+            throw new PersonVmError('RUNTIME_NOT_READY');
           group.ready = true;
         } catch (error) {
           group.ready = false;
@@ -282,6 +305,25 @@ export function createAssignedNativeWebStartup(input: {
         if (group.retiring === operation) group.retiring = undefined;
       });
       return operation;
+    },
+    /** Authenticated native control for the exact lease, including while the
+     * service is still starting. Editor and send require separate evidence. */
+    assertAuthenticatedGroup(binding: PersonVmBinding, signal: AbortSignal) {
+      lifetime.throwIfAborted();
+      signal.throwIfAborted();
+      const group = running.get(binding.vmId);
+      if (
+        closing ||
+        !group?.ready ||
+        group.retiring ||
+        group.revoked.signal.aborted ||
+        !sameVmBinding(group.binding, binding) ||
+        !group.owners.size ||
+        [...group.owners.values()].some(
+          (owner) => owner.revoked.aborted || !owner.controlReady(),
+        )
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY');
     },
     /** Publish only a completely started, exact group; this never starts a VM. */
     catalog(
@@ -344,6 +386,10 @@ export function createAssignedNativeWebStartup(input: {
     PersonVmRuntimePort,
     'memoryGuestPlan' | 'start' | 'retireAfterNativeStop'
   > & {
+    assertAuthenticatedGroup(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): void;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,

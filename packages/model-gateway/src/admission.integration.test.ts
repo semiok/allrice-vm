@@ -323,6 +323,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
         second?: boolean;
         route?: Pick<ModelCallBinding, 'provider' | 'model'>;
         nativeProof?: NativeLifecycleProof;
+        confirmedNativeStop?: () => boolean;
       } = {},
     ) {
       const issued = new Map<string, ModelCallBinding>();
@@ -341,8 +342,9 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       const participant = (options.second ? hostB : hostA).participant(
         'gateway',
       );
+      const ownerId = randomUUID();
       const gateway = createModelGateway({
-        ownerId: randomUUID(),
+        ownerId,
         store: options.second ? modelB : modelA,
         provider: {
           ...observedProvider,
@@ -370,8 +372,16 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
               organizationId: current.organizationId,
             };
           },
-          async confirmOwnerStopped() {
-            throw new ModelGatewayError('AUTHORIZATION_DENIED');
+          async confirmOwnerStopped(current, selected) {
+            if (
+              current.actor.id !== rc.actor.id ||
+              selected !== ownerId ||
+              !options.confirmedNativeStop?.()
+            )
+              throw new ModelGatewayError('AUTHORIZATION_DENIED');
+            return {
+              evidenceRef: 'fixture-observed-native-return-and-socket-close',
+            };
           },
         },
       });
@@ -409,6 +419,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       const adapter = new GatewayLlmAdapter(address + '/v1/stream');
       return {
         gateway,
+        ownerId,
         trace,
         calls,
         errors,
@@ -932,6 +943,8 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
     closers.push(() => native.close());
     const failure = new Error('provider failed after first native chunk');
     const cleanup = new Error('injected iterator cleanup rejection');
+    const originalFetch = globalThis.fetch;
+    let nativeReturned = false;
     const provider: GatewayProvider = {
       ...native.provider,
       stream(...args) {
@@ -945,6 +958,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
               },
               async return() {
                 await actual.return?.();
+                nativeReturned = true;
                 throw cleanup;
               },
             };
@@ -952,7 +966,11 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
         };
       },
     };
-    const mounted = await f.mount(provider, { route: native.route });
+    const mounted = await f.mount(provider, {
+      route: native.route,
+      confirmedNativeStop: () => nativeReturned && up.active === 0,
+    });
+    const meteredFetch = globalThis.fetch;
     expect(terminal(await mounted.collect())).toMatchObject({
       reason: { kind: 'error', failure: { code: 'LEDGER_UNAVAILABLE' } },
     });
@@ -965,7 +983,24 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
     expect(mounted.trace.finishErrors).toMatchObject([
       { code: 'CLEANUP_INCOMPLETE' },
     ]);
-    // No foreign finish/recover, fake TTL, or private permit deletion follows.
+    await expect(mounted.gateway.revoke(f.binding)).rejects.toMatchObject({
+      code: 'LEDGER_UNAVAILABLE',
+    });
+    await expect(mounted.gateway.close()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ code: 'LEDGER_UNAVAILABLE' })],
+    });
+    expect(globalThis.fetch).toBe(meteredFetch);
+    await mounted.gateway.reconcileOwner(
+      f.base.context,
+      mounted.ownerId,
+      caller.signal,
+    );
+    await expect(mounted.gateway.close()).resolves.toBeUndefined();
+    expect(globalThis.fetch).toBe(originalFetch);
+    // This recovery only covers model transport. The Person VM permit stays unsafe.
+    expect(await f.peer.observe(f.binding, caller.signal)).toMatchObject({
+      active: 1,
+    });
   });
 
   it.each(['queued-only', 'queued-and-active'] as const)(

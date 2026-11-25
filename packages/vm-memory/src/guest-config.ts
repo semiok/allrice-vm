@@ -286,5 +286,5 @@ export function createPersonVmDshCommandMemoryPatch(
         },
       ],
     },
-  ];
+  ] as const;
 }

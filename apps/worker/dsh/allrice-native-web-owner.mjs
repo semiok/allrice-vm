@@ -19,6 +19,7 @@ export const inject = [
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
+const commandMemoryReady = Symbol.for('allrice.person-vm-command-memory.ready');
 const original = (value) => value?.[cordisOriginal] ?? value;
 const publicationCodes = new Set([
   'EACCES',
@@ -171,7 +172,7 @@ export async function unloadNativeWebOwner(fiber) {
 
 /** Native local login only. This file never establishes an AllRice principal. */
 export function apply(ctx, config) {
-  const { artifactPath, nonce, baseUrl } = config;
+  const { artifactPath, nonce, baseUrl, commandMemoryPlugin } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -184,6 +185,7 @@ export function apply(ctx, config) {
   let publishing;
   let publicationFailure;
   let stagingCleanupFailure;
+  let commandMemory;
   let published = false;
   let retiring = false;
   const stop = () => {
@@ -193,12 +195,16 @@ export function apply(ctx, config) {
   const sameConfig = (value) =>
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
-    value?.baseUrl === baseUrl;
+    value?.baseUrl === baseUrl &&
+    value?.commandMemoryPlugin === commandMemoryPlugin;
   const entry = fiber.entry;
   const current = () =>
     !retiring &&
     fiber.uid !== null &&
     (!entry || sameConfig(entry.options.config)) &&
+    (!commandMemory ||
+      (original(ctx.get('subprocess')) === commandMemory.subprocess &&
+        original(ctx.get('sandbox')) === commandMemory.sandbox)) &&
     providers.every(([name, provider, value]) => {
       const live = ctx.get(name);
       return provider.uid !== null && live != null && original(live) === value;
@@ -293,6 +299,30 @@ export function apply(ctx, config) {
       }))
     )
       return;
+    if (!current()) return;
+    if (commandMemoryPlugin !== undefined) {
+      // Resolve the active providers through Cordis's actual dependency
+      // snapshot. A persistent profile can contribute other providers.
+      const observed = ctx.inject(['subprocess', 'sandbox'], () => {});
+      try {
+        await observed;
+        const runtime = observed.store?.subprocess;
+        const confinement = observed.store?.sandbox;
+        const subprocess = original(runtime?.value);
+        const sandbox = original(confinement?.value);
+        if (
+          subprocess?.[commandMemoryReady] !== true ||
+          !runtime?.fiber ||
+          runtime.fiber.entry?.options?.name !== commandMemoryPlugin ||
+          confinement?.fiber.parent.fiber !== runtime.fiber ||
+          typeof sandbox?.confine !== 'function'
+        )
+          throw Error('Native command memory controls are unavailable');
+        commandMemory = { subprocess, sandbox };
+      } finally {
+        await observed.dispose();
+      }
+    }
     if (!current()) return;
     publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);

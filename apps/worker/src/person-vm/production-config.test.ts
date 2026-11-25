@@ -73,6 +73,11 @@ function value() {
         sealedManifestSha256: hash,
         treeSha256: hash,
       },
+      readonlyCommandMemoryDirectory: {
+        hostDirectory: join(root, 'artifacts', hash),
+        guestDirectory: `/opt/allrice/command-memory/${hash}`,
+        sha256: hash,
+      },
       rootDiskGiB: 8,
       socketRoot: join(root, 'private/sockets'),
       jobCleanupTimeoutMs: 10000,
@@ -354,6 +359,43 @@ describe('private production Host configuration', () => {
     expect(result).not.toHaveProperty('verified');
     expect(result).not.toHaveProperty('ready');
   });
+  it.each([
+    { label: 'missing', patch: null },
+    {
+      label: 'noncanonical host path',
+      patch: { hostDirectory: '/release/../' + hash },
+    },
+    {
+      label: 'wrong host directory identity',
+      patch: { hostDirectory: '/release/other' },
+    },
+    {
+      label: 'different guest directory identity',
+      patch: {
+        guestDirectory: '/opt/allrice/command-memory/' + '2'.repeat(64),
+      },
+    },
+    { label: 'noncanonical digest', patch: { sha256: 'F'.repeat(64) } },
+    { label: 'unknown field', patch: { executable: '/tmp/untrusted' } },
+  ])(
+    'rejects $label in the sealed command memory directory',
+    async ({ patch }) => {
+      const config = value();
+      await seal({
+        ...config,
+        native: {
+          ...config.native,
+          readonlyCommandMemoryDirectory: patch
+            ? { ...config.native.readonlyCommandMemoryDirectory, ...patch }
+            : undefined,
+        },
+      });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
+
   it('rejects a measured guest physical policy that differs from the platform cap without overwriting it', async () => {
     const input = value();
     input.memory.policy.physicalBytes = 3 * 1024 ** 3;

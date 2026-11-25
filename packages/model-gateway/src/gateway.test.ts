@@ -9,6 +9,7 @@ import { ModelGatewayError } from './contract.ts';
 import type { GatewayProvider } from './contract.ts';
 import { withGatewayAuthTransaction } from './transport.ts';
 import {
+  closeServer,
   deferred,
   FixtureStore,
   freshCall,
@@ -584,6 +585,99 @@ describe.sequential(
       await f.upstream.closed;
       expect(f.store.slots.get(f.binding.vm.personId)?.size).toBe(0);
       expect(f.upstream.active).toBe(0);
+    });
+
+    it('retains an unconfirmed native join for the exact epoch after its handler finishes', async () => {
+      const entered = deferred();
+      const joinError = new Error('native iterator release unconfirmed');
+      const ownerId = randomUUID();
+      const caller = new AbortController().signal;
+      const originalFetch = globalThis.fetch;
+      let actualIteratorStopped = false;
+      const f = await gatewayFixture({
+        ownerId,
+        authority: {
+          async assertCall(_binding, signal) {
+            signal.throwIfAborted();
+          },
+          async authorizeUsage(context) {
+            return {
+              personId: context.actor.id,
+              organizationId: context.organizationId,
+            };
+          },
+          async confirmOwnerStopped(_context, owner) {
+            if (owner !== ownerId || !actualIteratorStopped)
+              throw new ModelGatewayError('AUTHORIZATION_DENIED');
+            return { evidenceRef: 'fixture-observed-iterator-stopped' };
+          },
+        },
+        provider: {
+          classify: () => null,
+          stream(_binding, _input, signal) {
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  next() {
+                    return new Promise<IteratorResult<StreamChunk>>(
+                      (_resolve, reject) => {
+                        const abort = () => reject(signal.reason);
+                        signal.addEventListener('abort', abort, { once: true });
+                        if (signal.aborted) abort();
+                        entered.resolve();
+                      },
+                    );
+                  },
+                  async return() {
+                    actualIteratorStopped = true;
+                    throw joinError;
+                  },
+                };
+              },
+            };
+          },
+        },
+      });
+      const meteredFetch = globalThis.fetch;
+      const collecting = f.collect();
+      try {
+        await entered.promise;
+        const revoke = f.gateway.revoke(f.binding.vm);
+        await expect(revoke).rejects.toMatchObject({
+          code: 'LEDGER_UNAVAILABLE',
+        });
+        expect(finish(await collecting)).toMatchObject({
+          reason: { kind: 'error' },
+        });
+        await expect(f.gateway.revoke(f.binding.vm)).rejects.toMatchObject({
+          code: 'LEDGER_UNAVAILABLE',
+          binding: f.binding.vm,
+        });
+        await expect(
+          f.gateway.revoke({ ...f.binding.vm, leaseEpoch: 99 }),
+        ).resolves.toBeUndefined();
+        await expect(f.gateway.close()).rejects.toBeInstanceOf(AggregateError);
+        expect(globalThis.fetch).toBe(meteredFetch);
+        await f.gateway.reconcileOwner(f.binding.context, ownerId, caller);
+        await expect(f.gateway.close()).resolves.toBeUndefined();
+        expect(globalThis.fetch).toBe(originalFetch);
+      } finally {
+        await f.gateway
+          .close()
+          .catch((error: unknown) => {
+            if (!(error instanceof AggregateError)) throw error;
+          })
+          .finally(async () => {
+            await closeServer(f.server);
+            await Promise.allSettled([collecting]);
+            if (actualIteratorStopped)
+              await f.gateway.reconcileOwner(
+                f.binding.context,
+                ownerId,
+                caller,
+              );
+          });
+      }
     });
 
     it('ledger提交失败拒绝成功，未知slot保留，guest不能调用恢复释放', async () => {

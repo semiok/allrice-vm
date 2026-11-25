@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import type { DEntryIdentity } from '@allrice/contracts';
+import {
+  DEntrySelectionInputSchema,
+  type DEntryIdentity,
+} from '@allrice/contracts';
 import { readDEntryPrincipalHostArtifact } from '../d-entry/principal-artifact.js';
 import type { readReleasedGuestProfile } from '../d-entry/released-profile.js';
 import { readFile } from 'node:fs/promises';
@@ -13,6 +16,7 @@ import {
   type PersonVmMemoryGuestPlan,
   type PersonVmNativeWebAuthRequest,
 } from '@allrice/person-vm';
+import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -44,10 +48,27 @@ export type NativeWebGuestProfile = Awaited<
   ReturnType<typeof readReleasedGuestProfile>
 >;
 
+/** Public Web entry with selectors only. Its normal login and current identity
+ * checks still authorize the document and native operations. */
+export function dEntryNativePublicUrl(
+  origin: string,
+  endpoint: Pick<DEntryIdentity, 'workspaceId' | 'employeeInstanceId'>,
+) {
+  const selection = DEntrySelectionInputSchema.parse({
+    workspaceId: endpoint.workspaceId,
+    employeeInstanceId: endpoint.employeeInstanceId,
+  });
+  const url = new URL('/chatflow/4.0', origin);
+  url.searchParams.set('workspaceId', selection.workspaceId);
+  url.searchParams.set('employeeInstanceId', selection.employeeInstanceId);
+  return url.href;
+}
+
 export async function prepareNativeWebLaunch(
   config: NativeWebConfiguration,
   binding: PersonVmBinding,
   profile: NativeWebGuestProfile,
+  commandMemory?: ReturnType<typeof createPersonVmDshCommandMemoryPatch>,
 ): Promise<NativeWebLaunch> {
   let origin: URL, publicUrl: URL;
   try {
@@ -72,7 +93,9 @@ export async function prepareNativeWebLaunch(
     !['http:', 'https:'].includes(publicUrl.protocol) ||
     publicUrl.username ||
     publicUrl.password ||
-    publicUrl.search ||
+    (publicUrl.search &&
+      publicUrl.href !==
+        dEntryNativePublicUrl(publicUrl.origin, config.principalProfile)) ||
     publicUrl.hash ||
     [config.agentsHome, config.workdir, config.cliPath].some(
       (path) =>
@@ -139,10 +162,14 @@ export async function prepareNativeWebLaunch(
                   artifactPath: artifact.path,
                   nonce: auth.nonce,
                   baseUrl: auth.origin,
+                  ...(commandMemory
+                    ? { commandMemoryPlugin: commandMemory[2].insert[0].name }
+                    : {}),
                 },
               },
             ],
           },
+          ...(commandMemory ?? []),
         ]),
         mode: 0o600,
       },

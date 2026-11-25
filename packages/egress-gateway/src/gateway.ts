@@ -119,6 +119,7 @@ export function createEgressGateway(
     policy: EgressPolicy;
     provisioner: EgressProvisioner;
     services?: readonly ManagedHostService[];
+    lifetime?: AbortSignal;
   },
 ) {
   const states = new Map<string, BindingState>();
@@ -133,6 +134,8 @@ export function createEgressGateway(
       (service) =>
         !service.id ||
         service.admissionOwner !== 'service' ||
+        (typeof service.handle === 'function') ===
+          (typeof service.resolve === 'function') ||
         !service.path.startsWith('/') ||
         /[?#\\]/.test(service.path) ||
         !['GET', 'POST'].includes(service.method) ||
@@ -442,7 +445,11 @@ export function createEgressGateway(
           const operation = (async () => {
             const disconnect = new AbortController();
             res.once('close', () => disconnect.abort());
+            const requestSignal = options.lifetime
+              ? AbortSignal.any([disconnect.signal, options.lifetime])
+              : disconnect.signal;
             try {
+              requestSignal.throwIfAborted();
               const rawAuth = req.headers.authorization ?? '';
               // pip's netrc uses HTTP Basic; the password is only this VM-local capability.
               const auth = Buffer.from(
@@ -469,13 +476,18 @@ export function createEgressGateway(
               );
               if (service) {
                 const serviceSignal = AbortSignal.any([
-                  disconnect.signal,
+                  requestSignal,
                   state.controller.signal,
                 ]);
-                const context = await options.authority.context(
+                delete req.headers.authorization;
+                const resolved = await service.resolve?.(
+                  req,
                   binding,
                   serviceSignal,
                 );
+                const context = resolved
+                  ? resolved.context
+                  : await options.authority.context(binding, serviceSignal);
                 await options.vm.assertAdmissionBinding(
                   context,
                   binding,
@@ -489,13 +501,15 @@ export function createEgressGateway(
                 );
                 stateFor(receipt);
                 serviceSignal.throwIfAborted();
-                delete req.headers.authorization;
-                await service.handle(
-                  req,
-                  res,
-                  { context, binding },
-                  serviceSignal,
-                );
+                if (resolved) await resolved.dispatch(res, serviceSignal);
+                else if (service.handle)
+                  await service.handle(
+                    req,
+                    res,
+                    { context, binding },
+                    serviceSignal,
+                  );
+                else throw new EgressError('POLICY_INVALID');
                 return;
               }
               if (
@@ -512,7 +526,7 @@ export function createEgressGateway(
                   path: req.url ?? '',
                   body: new Uint8Array(),
                 },
-                disconnect.signal,
+                requestSignal,
                 (response, deliverySignal) =>
                   sendResponse(res, response, deliverySignal),
                 (error, signal) => sendError(res, error, signal),

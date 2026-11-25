@@ -108,6 +108,10 @@ async function observerFixture(options?: {
   manualReady?: boolean;
   beforeLoader?: () => Promise<void>;
   listenHost?: string;
+  commandMemory?: {
+    subprocess: 'missing' | 'stock' | 'managed';
+    sandbox: 'missing' | 'owned' | 'unrelated';
+  };
 }) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
   const local = await hostFixture(issue('execute'), true, null);
@@ -152,6 +156,28 @@ async function observerFixture(options?: {
     options?.manualReady,
     options?.listenHost,
   );
+  const commandMemory = options?.commandMemory;
+  const commandMemoryPlugin =
+    'file:///opt/allrice/command-memory/fixture/dsh-command-memory.mjs';
+  const commands =
+    commandMemory &&
+    local.host.plugin(async (ctx: Context) => {
+      Object.defineProperty(ctx.fiber, 'entry', {
+        value: { options: { name: commandMemoryPlugin } },
+      });
+      if (commandMemory.subprocess !== 'missing')
+        ctx.provide('subprocess', {
+          [Symbol.for('allrice.person-vm-command-memory.ready')]:
+            commandMemory.subprocess === 'managed',
+        });
+      if (commandMemory.sandbox === 'owned')
+        await ctx.plugin((scoped: Context) => {
+          scoped.provide('sandbox', { confine() {} });
+        });
+    });
+  if (commandMemory?.sandbox === 'unrelated')
+    local.host.provide('sandbox', { confine() {} });
+  if (commands) await commands;
   const callbacks = new Set<() => void>();
   if (options?.graphEvents) {
     local.host.provide('clientModules', {
@@ -172,6 +198,7 @@ async function observerFixture(options?: {
           artifactPath: artifacts,
           nonce,
           baseUrl: web.baseUrl,
+          ...(commandMemory ? { commandMemoryPlugin } : {}),
         });
         entered?.();
         return applying;
@@ -182,6 +209,7 @@ async function observerFixture(options?: {
     local,
     owner,
     artifacts,
+    commands,
     mount,
     loader,
     web,
@@ -248,6 +276,60 @@ it('keeps the nonce private through appReady dispatch, loader settlement and act
   } finally {
     settle.resolve();
     register.mockRestore();
+    await f.close();
+  }
+});
+
+it.each(['missing', 'stock', 'no-sandbox', 'unrelated-sandbox'] as const)(
+  'withholds native auth when the required command memory providers are %s',
+  async (missing) => {
+    const f = await observerFixture({
+      commandMemory: {
+        subprocess:
+          missing === 'missing' || missing === 'stock' ? missing : 'managed',
+        sandbox:
+          missing === 'no-sandbox'
+            ? 'missing'
+            : missing === 'unrelated-sandbox'
+              ? 'unrelated'
+              : 'owned',
+      },
+    });
+    try {
+      const active = f.mount('incomplete-command-memory');
+      await active;
+      await expect
+        .poll(() => Reflect.get(f.local.host.allricePrincipal, 'graphObserver'))
+        .toBeUndefined();
+      await expect(f.owner.unloadNativeWebOwner(active)).rejects.toThrow(
+        'Native command memory controls are unavailable',
+      );
+      await expect(readFile(f.artifacts)).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      await expect(f.open()).rejects.toBeDefined();
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+it('retires published native auth if the required command memory providers disappear', async () => {
+  const f = await observerFixture({
+    commandMemory: { subprocess: 'managed', sandbox: 'owned' },
+  });
+  try {
+    const active = f.mount('managed-command-memory');
+    await waitForAuthNonce(f.artifacts, 'managed-command-memory');
+    expect((await f.open()).opened.baseline.owner).toBe(false);
+    if (!f.commands) throw Error('Command memory fixture was not mounted');
+    await f.commands.dispose();
+    await expect
+      .poll(() => readFile(f.artifacts).catch((error) => error.code))
+      .toBe('ENOENT');
+    await expect(f.open()).rejects.toBeDefined();
+    await f.owner.unloadNativeWebOwner(active);
+  } finally {
     await f.close();
   }
 });

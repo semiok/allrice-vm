@@ -121,9 +121,21 @@ it('returns the actual readback guest-plan consumer from the same verified confi
       signal(),
     );
     const plan = await value.memoryGuestPlan(binding, signal());
-    const config = plan.files.find((file) =>
-      file.path.endsWith('/allrice-memory/config.json'),
+    const controls =
+      f.loaded.configuration.native.readonlyCommandMemoryDirectory;
+    const config = plan.files.find(
+      (file) => file.path === '/run/allrice-command-memory/config.json',
     );
+    expect(plan.initialize.args[0]).toBe(
+      controls.guestDirectory + '/initialize.cjs',
+    );
+    expect(plan.launcher).toBe(controls.guestDirectory + '/launch-dsh.sh');
+    expect(plan.env.BASH_ENV).toBe(controls.guestDirectory + '/bash-env.sh');
+    expect(
+      plan.files.some((file) =>
+        file.path.startsWith(controls.guestDirectory + '/'),
+      ),
+    ).toBe(false);
     expect(config).toBeDefined();
     if (!config) throw Error('missing original memory configuration');
     expect(JSON.parse(config.contents).policy).toEqual(

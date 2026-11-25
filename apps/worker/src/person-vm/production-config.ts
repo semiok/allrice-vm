@@ -8,6 +8,7 @@ import {
   ServiceBuildManifestSchema,
 } from '@allrice/database';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
+import { checkedReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
 import { z } from 'zod';
 
 const configPath = '.local/person-vm-host.json';
@@ -69,6 +70,14 @@ const configuration = z
             treeSha256: bareHash,
           })
           .strict(),
+        readonlyCommandMemoryDirectory: z
+          .object({
+            hostDirectory: z.string(),
+            guestDirectory: z.string(),
+            sha256: z.string(),
+          })
+          .strict()
+          .transform(checkedReadonlyCommandMemoryDirectory),
         rootDiskGiB: positive,
         socketRoot: absolute,
         jobCleanupTimeoutMs: positive,

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { verifyReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
 import { readProductionHostConfiguration } from './production-config.js';
 
 export class ProductionPersonVmArtifactsUnavailable extends Error {
@@ -53,6 +54,15 @@ export async function readVerifiedProductionPersonVmInputs(
       signal.throwIfAborted();
       throw new ProductionPersonVmArtifactsUnavailable();
     }
+  }
+  try {
+    await verifyReadonlyCommandMemoryDirectory(
+      loaded.configuration.native.readonlyCommandMemoryDirectory,
+      signal,
+    );
+  } catch {
+    signal.throwIfAborted();
+    throw new ProductionPersonVmArtifactsUnavailable();
   }
   signal.throwIfAborted();
   return loaded;

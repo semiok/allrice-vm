@@ -1,10 +1,20 @@
+import { randomUUID } from 'node:crypto';
+import type { IncomingHttpHeaders } from 'node:http';
 import { createDedicatedDatabase, getDatabase } from '@allrice/database';
 import {
+  createModelGateway,
+  createDshGatewayProvider,
+  createPostgresModelGatewayStore,
+  type ModelCallBinding,
+  type ModelGatewayAuthority,
+  type ModelGatewayPort,
+} from '@allrice/model-gateway';
+import {
   createEgressGateway,
+  createPublicHttpsTransport,
   type EgressAuthority,
-  type EgressDependencies,
+  EgressError,
   type EgressPolicy,
-  type EgressTransport,
   type ManagedHostService,
 } from '@allrice/egress-gateway';
 import {
@@ -18,7 +28,6 @@ import {
   type PersonVmNativeActivityPort,
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
-  type PersonVmWebEndpointReceipt,
 } from '@allrice/person-vm';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
@@ -29,6 +38,7 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from '../native-web/composition.js';
+import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
@@ -53,10 +63,6 @@ export class ProductionPersonVmHostUnavailable extends Error {
  * running-only resolve/assertCurrentBinding self-certification during readiness.
  * No producer is implemented by accepting an object of this shape. */
 export type ProductionPersonVmHostSources = Readonly<{
-  publicUrl(
-    endpoint: PersonVmWebEndpointReceipt['endpoints'][number],
-    binding: PersonVmBinding,
-  ): string;
   bind(input: {
     vm: PersonVmService;
     startup: Startup;
@@ -73,12 +79,21 @@ export type ProductionPersonVmHostSources = Readonly<{
     egress: {
       authority: EgressAuthority;
       policy: EgressPolicy;
-      transport: EgressTransport;
-      /** Actual installed model owner revoke/drain, never an empty callback. */
-      revokeModel: EgressDependencies['revokeModel'];
       services?: readonly ManagedHostService[];
-      /** After gateway revoke/drain, close the real model/route owner. */
+      /** Host upstream transport/credentials stay owned by sources. */
       close(): Promise<void>;
+    };
+    model: {
+      authority: ModelGatewayAuthority;
+      llm: Parameters<typeof createDshGatewayProvider>[0];
+      route: Parameters<typeof createDshGatewayProvider>[1];
+      /** Resolve the current trusted native call. Host request metadata may
+       * be used to find a registration; it cannot authorize that registration. */
+      resolveCall(
+        headers: Readonly<IncomingHttpHeaders>,
+        binding: PersonVmBinding,
+        signal: AbortSignal,
+      ): Promise<ModelCallBinding>;
     };
   }>;
 }>;
@@ -113,6 +128,7 @@ export function createProductionPersonVmHost(input: {
     startup: Startup | undefined,
     bound: BoundSources | undefined,
     gateway: ReturnType<typeof createEgressGateway> | undefined,
+    model: ModelGatewayPort | undefined,
     installed:
       ReturnType<typeof installAssignedDEntryNativeRuntime> | undefined,
     closing: Promise<void> | undefined;
@@ -256,11 +272,22 @@ export function createProductionPersonVmHost(input: {
           ),
         );
       }
-      // Model/source transports close only after all gateway calls revoke/drain.
+      // Join the model gateway before closing the provider it uses.
       // No VM stop/delete or assertion of guest termination is made here.
+      const modelOwner = model;
+      let modelJoined = !modelOwner;
+      if (modelOwner)
+        await settle([
+          async () => {
+            await modelOwner.close();
+            modelJoined = true;
+          },
+        ]);
       const providerOwner = providers;
       await settle([
-        ...(sourceOwner ? [() => sourceOwner.egress.close()] : []),
+        ...(sourceOwner && modelJoined
+          ? [() => sourceOwner.egress.close()]
+          : []),
         ...(providerOwner
           ? [() => providerOwner.egressInstallation.close()]
           : []),
@@ -295,9 +322,16 @@ export function createProductionPersonVmHost(input: {
           requireStartup().retireAfterNativeStop(...args),
         readiness: (binding, signal) =>
           own(() =>
-            currentWork(signal, (active) =>
-              requireRuntime().readiness(binding, active),
-            ),
+            currentWork(signal, async (active) => {
+              const native = requireStartup();
+              native.assertAuthenticatedGroup(binding, active);
+              const readiness = await requireRuntime().readiness(
+                binding,
+                active,
+              );
+              native.assertAuthenticatedGroup(binding, active);
+              return readiness;
+            }),
           ),
         activity: (binding, signal) =>
           own(() =>
@@ -320,6 +354,10 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         memoryGuestPlan: providers.memoryGuestPlan,
+        commandMemory: {
+          controls: native.readonlyCommandMemoryDirectory,
+          readonlyDshDirectory: native.readonlyDshDirectory.guestDirectory,
+        },
         async readEmployeeProfile(active) {
           if (
             !web.cliPath.startsWith(
@@ -334,7 +372,8 @@ export function createProductionPersonVmHost(input: {
         },
         configuration: {
           ...providers.configuration.web,
-          publicUrl: sources.publicUrl,
+          publicUrl: (endpoint) =>
+            dEntryNativePublicUrl(web.publicOrigin, endpoint),
         },
         lifetime,
         cleanupTimeoutMs: providers.configuration.lifecycle.cleanupTimeoutMs,
@@ -389,6 +428,53 @@ export function createProductionPersonVmHost(input: {
         lifetime,
       });
       lifetime.throwIfAborted();
+      const modelSource = bound.model;
+      const modelRoute = Object.freeze({ ...modelSource.route });
+      const modelOwner = createModelGateway({
+        ownerId: randomUUID(),
+        authority: modelSource.authority,
+        provider: createDshGatewayProvider(modelSource.llm, modelRoute),
+        store: createPostgresModelGatewayStore(trustedDatabase),
+        admission: {
+          boundary: admission,
+          participant: admission.participant('gateway'),
+        },
+      });
+      model = modelOwner;
+      const modelService: ManagedHostService = {
+        id: 'model',
+        path: '/v1/stream',
+        method: 'POST',
+        admissionOwner: 'service',
+        async resolve(request, binding, signal) {
+          signal.throwIfAborted();
+          const call = structuredClone(
+            await modelSource.resolveCall(request.headers, binding, signal),
+          );
+          signal.throwIfAborted();
+          if (
+            !sameVmBinding(call.vm, binding) ||
+            call.provider !== modelRoute.provider ||
+            call.model !== modelRoute.model ||
+            call.context.actor.type !== 'user' ||
+            call.context.actor.id !== binding.personId ||
+            call.context.organizationId !== binding.organizationId
+          )
+            throw new EgressError('DENIED');
+          // Egress checks this call's actual current context before dispatch.
+          // Freeze the shared context across policy and the actual dispatch.
+          Object.freeze(call.context.actor);
+          for (const membership of call.context.memberships)
+            Object.freeze(membership);
+          Object.freeze(call.context.memberships);
+          Object.freeze(call.context);
+          return {
+            context: call.context,
+            dispatch: (response, active) =>
+              modelOwner.handle(request, response, call, active),
+          };
+        },
+      };
       // The same shared boundary owns all egress calls. Sources may never
       // replace it or supply a different VM/store/connection factory.
       gateway = createEgressGateway({
@@ -396,9 +482,13 @@ export function createProductionPersonVmHost(input: {
         admission,
         authority: bound.egress.authority,
         policy: bound.egress.policy,
-        transport: bound.egress.transport,
-        revokeModel: bound.egress.revokeModel,
-        services: bound.egress.services,
+        transport: createPublicHttpsTransport(),
+        lifetime,
+        async revokeModel(binding, active) {
+          await modelOwner.revoke(binding);
+          active.throwIfAborted();
+        },
+        services: [...(bound.egress.services ?? []), modelService],
         provisioner: providers.egressInstallation.provisioner,
       });
       lifetime.throwIfAborted();

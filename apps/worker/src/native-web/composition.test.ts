@@ -4,10 +4,14 @@ import type { RequestContext } from '@allrice/contracts';
 import type {
   PersonVmBootstrapScope,
   PersonVmWebStartup,
+  PersonVmMemoryGuestPlan,
   PersonVmStore,
   PersonVmBinding,
+  ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
 import { PersonVmError, PersonVmService } from '@allrice/person-vm';
+import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
+import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { NativeWebOwner } from './owner.js';
 import {
   harness,
@@ -18,6 +22,7 @@ import {
   createAssignedNativeWebStartup,
   personNativeWebRoster,
 } from './composition.js';
+import { dEntryNativePublicUrl } from './launch.js';
 const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
@@ -34,7 +39,13 @@ function latch() {
   });
   return { promise, resolve };
 }
-function fixture() {
+function fixture(
+  commandMemory?: {
+    controls: ReadonlyCommandMemoryDirectory;
+    readonlyDshDirectory: string;
+  },
+  publicOrigin?: string,
+) {
   const binding = {
     vmId: randomUUID(),
     instanceId: randomUUID(),
@@ -76,21 +87,28 @@ function fixture() {
     launcher: '/person/launcher',
     env: {},
   };
-  const memoryGuestPlan = vi.fn(async () => memory);
+  const memoryGuestPlan = vi.fn(
+    async (): Promise<PersonVmMemoryGuestPlan> => memory,
+  );
   const service = createAssignedNativeWebStartup({
     vm: { assertCurrentBinding: vi.fn() },
     memoryGuestPlan,
+    commandMemory,
     readEmployeeProfile: async () => [
       { path: 'package.json', contents: '{"name":"fixture-profile"}' },
     ],
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
     configuration: {
-      cliPath: '/opt/dsh/lib/bin.js',
+      cliPath: commandMemory
+        ? commandMemory.readonlyDshDirectory + '/lib/bin.js'
+        : '/opt/dsh/lib/bin.js',
       guestAddress: '10.0.0.2',
       startupTimeoutMs: 3000,
       publicUrl: (endpoint) =>
-        `https://native.example.test/e/${endpoint.employeeInstanceId}/`,
+        publicOrigin
+          ? dEntryNativePublicUrl(publicOrigin, endpoint)
+          : `https://native.example.test/e/${endpoint.employeeInstanceId}/`,
     },
   });
   const scope = {
@@ -143,9 +161,7 @@ it('实际DB producer直接绑定service roster，取消仍等待已发SQL结束
 });
 it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐个接收绑定，control不冒充editor ready', async () => {
   const f = fixture(),
-    owners = f.web.receipt.endpoints.map(() => ({
-      close: vi.fn(async () => {}),
-    }));
+    owners = f.web.receipt.endpoints.map(() => catalogOwner());
   owners.forEach((owner) => open.mockResolvedValueOnce(owner));
   const plan = await f.service.memoryGuestPlan(
     f.binding,
@@ -199,6 +215,19 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       owners[index],
     );
   }
+  expect(() =>
+    f.service.assertAuthenticatedGroup(f.binding, signal()),
+  ).not.toThrow();
+  expect(() =>
+    f.service.assertAuthenticatedGroup(
+      { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+      signal(),
+    ),
+  ).toThrow('RUNTIME_NOT_READY');
+  owners[1]!.controlReady.mockReturnValue(false);
+  expect(() => f.service.assertAuthenticatedGroup(f.binding, signal())).toThrow(
+    'RUNTIME_NOT_READY',
+  );
   expect(f.service).not.toHaveProperty('readiness');
   f.startup.abort();
   expect(owners[0]!.close).not.toHaveBeenCalled();
@@ -210,6 +239,114 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     f.service.owner(f.binding, f.web.receipt.endpoints[0]!.employeeInstanceId),
   ).toThrow();
 });
+it('launches each employee with an authenticated Web entry locator on the sealed origin', async () => {
+  const origin = 'https://employees.example.test';
+  const f = fixture(undefined, origin);
+  const owners = f.web.receipt.endpoints.map(() => catalogOwner());
+  owners.forEach((owner) => open.mockResolvedValueOnce(owner));
+  try {
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web);
+    await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
+    for (const [index, endpoint] of f.web.receipt.endpoints.entries()) {
+      const { args } = open.mock.calls[index]![0].launch.command;
+      const url = new URL(args[args.indexOf('--public-url') + 1]);
+      expect(url.origin).toBe(origin);
+      expect(url.pathname).toBe('/chatflow/4.0');
+      expect([...url.searchParams]).toEqual([
+        ['workspaceId', endpoint.workspaceId],
+        ['employeeInstanceId', endpoint.employeeInstanceId],
+      ]);
+      expect(args).toContain(url.host);
+      expect(url.port).toBe('');
+    }
+    expect(open).toHaveBeenCalledTimes(2);
+  } finally {
+    await f.service.close();
+  }
+});
+
+it('stages the existing governed Bash overlay for every employee from the same protected plan', async () => {
+  const sha256 = 'a'.repeat(64);
+  const controls = {
+    sha256,
+    hostDirectory: `/release/${sha256}`,
+    guestDirectory: `/opt/allrice/command-memory/${sha256}`,
+  };
+  const readonlyDshDirectory = '/opt/allrice/dsh/' + 'b'.repeat(64);
+  const f = fixture({ controls, readonlyDshDirectory });
+  const platform = readPlatformPersonVmConfiguration();
+  f.memoryGuestPlan.mockImplementation(async () =>
+    createVmMemoryGuestPlan({
+      persistentDirectory: '/work',
+      policyRef: 'fixture',
+      policy: {
+        physicalBytes: platform.memoryMiB * 1024 ** 2,
+        swapBytes: 64,
+        dshLowBytes: 1,
+        dshSwapMaxBytes: 1,
+        commandHighBytes: platform.commandHighBytes,
+        commandMaxBytes: platform.commandMaxBytes,
+        commandSwapMaxBytes: platform.commandSwapMaxBytes,
+        commandOomGroup: 0,
+        dshOomScoreAdj: -1,
+        commandOomScoreAdj: 1,
+      },
+      dshCommandMemory: controls,
+    }),
+  );
+  try {
+    f.memoryGuestPlan.mockResolvedValueOnce(f.memory);
+    await expect(
+      f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web),
+    ).rejects.toThrow('invalid_dsh_command_memory_patch');
+    expect(open).not.toHaveBeenCalled();
+    const plan = await f.service.memoryGuestPlan(
+      f.binding,
+      f.scope.signal,
+      f.web,
+    );
+    const patches = plan.files.filter((file) =>
+      file.path.endsWith('/owner.patch.json'),
+    );
+    expect(patches).toHaveLength(f.web.receipt.endpoints.length);
+    for (const patch of patches) {
+      expect(JSON.parse(patch.contents)).toMatchObject([
+        { id: 'web-runtime' },
+        {
+          insert: [
+            { id: 'allrice-current-principal' },
+            {
+              id: 'allrice-native-web-owner',
+              config: {
+                commandMemoryPlugin: `file://${controls.guestDirectory}/dsh-command-memory.mjs`,
+              },
+            },
+          ],
+        },
+        { id: 'sandbox', disabled: true },
+        { id: 'subprocess', disabled: true },
+        {
+          insert: [
+            {
+              id: 'allrice-person-vm-command-memory',
+              name: `file://${controls.guestDirectory}/dsh-command-memory.mjs`,
+              config: {
+                readonlyDshDirectory,
+                controlDirectory: controls.guestDirectory,
+                guard: plan.env.BASH_ENV,
+                writer: plan.env.ALLRICE_MEMORY_RECEIPT_WRITER,
+              },
+            },
+          ],
+        },
+      ]);
+      expect(patch.contents).not.toContain(controls.hostDirectory);
+    }
+  } finally {
+    await f.service.close();
+  }
+});
+
 it('startup缺真实receipt或当前epoch不匹配时，在memory/native owner副作用前拒绝', async () => {
   const f = fixture();
   await expect(
@@ -233,6 +370,8 @@ it('close与未settle的真实owner启动竞态：先关新准入，再等待晚
     joined = latch(),
     closeEntered = latch();
   const owner = {
+    revoked: new AbortController().signal,
+    controlReady: () => true,
     close: vi.fn(async () => {
       closeEntered.resolve();
       await joined.promise;
@@ -357,6 +496,8 @@ it.each(['readiness', 'save'] as const)(
       },
     );
     const owners = Array.from({ length: 4 }, () => ({
+      revoked: new AbortController().signal,
+      controlReady: () => true,
       close: vi.fn(async () => {}),
       retireAfterNativeStop: retired,
     }));
@@ -421,14 +562,14 @@ it('retire只影响exact五字段组；host join未知保留，显式重试成�
   const f = fixture(),
     unknown = new Error('unknown host join');
   const first = {
-    close: vi.fn(async () => {}),
+    ...catalogOwner(),
     retireAfterNativeStop: vi
       .fn()
       .mockRejectedValueOnce(unknown)
       .mockResolvedValue(undefined),
   };
   const other = {
-    close: vi.fn(async () => {}),
+    ...catalogOwner(),
     retireAfterNativeStop: vi.fn(async () => {}),
   };
   open.mockResolvedValue(first);

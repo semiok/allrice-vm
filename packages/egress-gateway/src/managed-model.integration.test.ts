@@ -81,8 +81,9 @@ suite(
       clients.add(db);
       return db;
     }
-    async function setup() {
+    async function setup(allow?: (signal: AbortSignal) => Promise<void>) {
       const rc = context();
+      const callContext = { ...rc, sessionId: randomUUID() };
       const ports = harness(new PostgresPersonVmStore(open));
       const native = await responsesFixture();
       close.push(() => native.close());
@@ -141,7 +142,21 @@ suite(
             return boundary.admit(...args);
           },
         },
-        authority: { context: async () => rc, allow: async () => {} },
+        lifetime: cancel.signal,
+        authority: {
+          async context() {
+            throw Error('Model must resolve the actual call login');
+          },
+          async allow(current, _binding, route, signal) {
+            expect(current.sessionId).toBe(callContext.sessionId);
+            expect(current).toEqual(
+              calls.find((call) => call.context.requestId === current.requestId)
+                ?.context,
+            );
+            expect(route).toBe('model');
+            await allow?.(signal);
+          },
+        },
         policy: { routes: [] },
         transport: {
           read: async () => {
@@ -157,37 +172,39 @@ suite(
             path: '/v1/stream',
             method: 'POST',
             admissionOwner: 'service',
-            async handle(request, response, trusted, signal) {
+            async resolve(request, vm) {
               expect(request.headers.authorization).toBeUndefined();
-              handled++;
               const call = freshCall({
-                ...modelBinding(
-                  trusted.binding.personId,
-                  trusted.binding.organizationId,
-                ),
-                context: trusted.context,
-                vm: trusted.binding,
+                ...modelBinding(vm.personId, vm.organizationId),
+                context: callContext,
+                vm,
                 provider: native.binding.provider,
                 model: native.binding.model,
               });
               issued.set(call.native.callId, structuredClone(call));
               calls.push(call);
-              // Mutate only the trusted fixture's execution envelope to prove that
-              // local capability does not substitute complete assertCall identity.
-              await modelRef.current!.handle(
-                request,
-                response,
-                invalidIdentity
-                  ? {
-                      ...call,
-                      execution: {
-                        ...call.execution,
-                        executionId: randomUUID(),
-                      },
-                    }
-                  : call,
-                signal,
-              );
+              return {
+                context: call.context,
+                async dispatch(response, signal) {
+                  handled++;
+                  // The fixture changes a single trusted fact to check that
+                  // the gateway still requires the full call association.
+                  await modelRef.current!.handle(
+                    request,
+                    response,
+                    invalidIdentity
+                      ? {
+                          ...call,
+                          execution: {
+                            ...call.execution,
+                            executionId: randomUUID(),
+                          },
+                        }
+                      : call,
+                    signal,
+                  );
+                },
+              };
             },
           },
         ],
@@ -360,6 +377,34 @@ suite(
         expect(f.native.requests).toHaveLength(0);
       },
     );
+    it('cancels actual call policy resolution when the gateway owner closes', async () => {
+      const entered = deferred();
+      const stopped = deferred();
+      const f = await setup(async (signal) => {
+        entered.resolve();
+        await new Promise<void>((resolve) => {
+          const stop = () => resolve();
+          signal.addEventListener('abort', stop, { once: true });
+          if (signal.aborted) stop();
+        });
+        stopped.resolve();
+        signal.throwIfAborted();
+      });
+      const request = f.post(undefined, new AbortController().signal);
+      expect(
+        await Promise.race([
+          entered.promise.then(() => true),
+          request.then(() => false),
+        ]),
+      ).toBe(true);
+      cancel.abort();
+      await stopped.promise;
+      await request;
+      expect(f.handled).toBe(0);
+      expect(f.native.requests).toHaveLength(0);
+      expect(f.permits).toHaveLength(0);
+    });
+
     it('native adapter capability traverses actual gateways, persists raw usage, claims only model permit', async () => {
       const f = await setup();
       const chunks = await f.collect();

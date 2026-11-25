@@ -121,6 +121,9 @@ if (runtimeFeatureEnabled('ALLRICE_CLOUD_RUNNER_ENABLED')) {
 }
 const startup = createWorkerStartupObservation();
 const port = Number(process.env.ALLRICE_WORKER_PORT ?? 3101);
+const listenHost = process.env.ALLRICE_WORKER_HOST?.trim() ?? '0.0.0.0';
+if (!listenHost)
+  throw new Error('ALLRICE_WORKER_HOST must be a listen address');
 function integerSetting(
   name: string,
   fallback: number,
@@ -878,7 +881,7 @@ server.on('upgrade', (request, socket, head) => {
       'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
     );
 });
-server.listen(port, '0.0.0.0', () => {
+server.listen(port, listenHost, () => {
   httpListenObservation.complete();
   startup.mark('http_listening');
   console.info(`[M5] AllRice worker 0.1.0 listening on ${port}`, {
