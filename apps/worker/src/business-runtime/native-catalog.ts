@@ -6,7 +6,6 @@ import {
   requireDEntryNativeIdentity,
 } from '@allrice/database';
 import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
-import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
 import { createDEntryPrincipalChildren } from '../d-entry/principal-activity.js';
 import type {
   DEntryPrincipalActivity,
@@ -300,7 +299,7 @@ export function installDEntryNativeCatalog(input: {
  * Production still supplies its real VM/startup owners and lifetime. */
 export function installAssignedDEntryNativeCatalog(input: {
   vm: NativeCatalogHost['vm'];
-  startup: Pick<ReturnType<typeof createAssignedNativeWebStartup>, 'catalog'>;
+  startup: Pick<NativeCatalogHost, 'catalog'>;
   lifetime: AbortSignal;
 }) {
   return installDEntryNativeCatalog({
