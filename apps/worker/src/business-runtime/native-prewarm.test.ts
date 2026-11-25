@@ -13,6 +13,7 @@ import {
   dEntryNativePrewarmPort,
   installDEntryNativePrewarmPort,
 } from '../d-entry/native-prewarm.js';
+import { installDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
   dEntryNativeOwnerPort,
   DEntryNativeUnavailable,
@@ -103,6 +104,39 @@ it('page then input uses each current RC and the same running VM without another
     { trigger: 'input' },
   ]);
   expect(f.stop).not.toHaveBeenCalled();
+});
+
+it('requires proof for this employee before acknowledging prewarm on a running VM', async () => {
+  const f = fixture();
+  const assertEditorReady = vi.fn(async () => {
+    throw new DEntryNativeUnavailable();
+  });
+  const inputs = [
+    f.base.context,
+    f.base.identity,
+    'page',
+    signal(),
+    f.lifetime.signal,
+  ] as const;
+  await f.assembly.port.prewarm(...inputs);
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady,
+  });
+  try {
+    await expect(f.assembly.port.prewarm(...inputs)).rejects.toBeInstanceOf(
+      DEntryNativeUnavailable,
+    );
+    expect(assertEditorReady).toHaveBeenCalledWith(
+      f.base.context,
+      f.base.identity,
+      expect.any(AbortSignal),
+    );
+    expect(f.start).toHaveBeenCalledTimes(1);
+    expect(f.stop).not.toHaveBeenCalled();
+  } finally {
+    uninstall();
+  }
 });
 
 it('concurrent page/input cannot acquire a second lifecycle owner, and later valid input reuses the completed epoch', async () => {

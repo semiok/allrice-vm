@@ -69,7 +69,11 @@ function fixture() {
     employeeVersionId: endpoint.employeeVersionId,
     threadId: null,
   };
-  const route = { provider: 'managed-test', model: 'fixture' };
+  const route = {
+    provider: 'managed-test',
+    model: 'fixture',
+    revoked: new AbortController().signal,
+  };
   const assertCurrent = vi.fn(async () => {});
   profile.mockResolvedValue({ assertCurrent });
   current.mockResolvedValue(identity);
@@ -111,10 +115,10 @@ function fixture() {
     acquirePrincipal: vi.fn(),
     readSessions: vi.fn(),
   } satisfies ResolvedDEntryNativeOwner;
-  let verified = false;
+  let verified: AbortSignal | null = null;
   let proof!: Proof;
   const uninstallProof = vi.fn(() => {
-    verified = false;
+    verified = null;
   });
   const startup = {
     catalog: vi.fn(() => ({ ...roster, owner: host })),
@@ -123,8 +127,13 @@ function fixture() {
       return uninstallProof;
     },
     assertVerifiedEditor(next: typeof binding) {
-      if (!verified || binding.leaseEpoch !== next.leaseEpoch)
+      if (
+        !verified ||
+        verified.aborted ||
+        binding.leaseEpoch !== next.leaseEpoch
+      )
         throw Error('RUNTIME_NOT_READY');
+      return verified;
     },
   };
   const source = installProductionDEntrySource({
@@ -177,7 +186,7 @@ it('publishes exact-generation readiness only after same Host artifact, native m
   await expect(f.source.readiness(f.binding, f.signal)).rejects.toThrow(
     'RUNTIME_NOT_READY',
   );
-  expect(await f.prove()).toBe(true);
+  expect(await f.prove()).toBe(f.route.revoked);
   expect(f.assertCurrent).toHaveBeenCalledOnce();
   expect(f.resolveSendRoute).toHaveBeenCalledWith(
     { context: f.context, identity: f.identity, binding: f.binding },
@@ -204,7 +213,7 @@ it('requires rollout authority, a routable exact model and a current employee af
     defaultGeneration: '3.x',
     selections: [],
   });
-  expect(await f.prove()).toBe(false);
+  expect(await f.prove()).toBeNull();
   expect(f.readModels).not.toHaveBeenCalled();
   f.resolveSendRoute.mockResolvedValueOnce({ ...f.route, model: 'different' });
   await expect(f.prove()).rejects.toMatchObject({ code: 'RUNTIME_NOT_READY' });

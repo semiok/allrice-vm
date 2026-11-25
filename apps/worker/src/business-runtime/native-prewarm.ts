@@ -6,6 +6,7 @@ import {
 import type { PersonVmPort } from '@allrice/person-vm';
 import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js';
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
+import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
   installDEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
@@ -25,6 +26,7 @@ export function createDEntryNativePrewarmPort(input: {
   const port: DEntryNativePrewarmPort = {
     prewarm(context, identity, trigger, caller, revoked) {
       if (admission.aborted) return Promise.reject(admission.reason);
+      const data = currentDEntryNativeDataPort();
       const task = Promise.resolve().then(async () => {
         const active = AbortSignal.any([admission, caller, revoked]);
         const selection = {
@@ -55,6 +57,7 @@ export function createDEntryNativePrewarmPort(input: {
           result.organizationId !== identity.organizationId
         )
           throw new DataAccessError('authorization_denied');
+        await data?.assertEditorReady?.(context, identity, active);
       });
       pending.add(task);
       void task.then(

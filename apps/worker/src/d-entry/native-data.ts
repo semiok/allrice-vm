@@ -31,6 +31,11 @@ export type DEntryNativeMuxChannel = Readonly<{
  * the shared native job. */
 export interface DEntryNativeDataPort {
   admission: DEntryAdmissionPorts;
+  assertEditorReady?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** Explicit editor open on a current running Host. The database owns the
    * durable claim and native root. Read-only discovery never calls this. */
   prepareEditorRoot?(input: {

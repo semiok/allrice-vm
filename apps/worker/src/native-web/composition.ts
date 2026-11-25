@@ -35,7 +35,7 @@ type StartingEditorProof = (
     >[1];
   }>,
   signal: AbortSignal,
-) => Promise<boolean>;
+) => Promise<AbortSignal | null>;
 export type AssignedNativeWebCatalog = Readonly<{
   receipt: PersonVmWebEndpointReceipt;
   endpoint: Endpoint;
@@ -85,7 +85,7 @@ export function createAssignedNativeWebStartup(input: {
       revoked: AbortController;
       ready: boolean;
       verifiedBy?: StartingEditorProof;
-      verifiedEmployees: Set<string>;
+      verifiedEmployees: Map<string, AbortSignal>;
       owners: Map<string, NativeWebOwner>;
       starting: Promise<void>;
       retiring?: Promise<void>;
@@ -241,7 +241,7 @@ export function createAssignedNativeWebStartup(input: {
           bindingRef: randomUUID(),
           revoked: new AbortController(),
           ready: false,
-          verifiedEmployees: new Set(),
+          verifiedEmployees: new Map(),
           owners: new Map<string, NativeWebOwner>(),
           starting: operation,
           retiring: undefined as Promise<void> | undefined,
@@ -266,9 +266,8 @@ export function createAssignedNativeWebStartup(input: {
             });
             const endpoint = receipt.endpoints[index]!;
             group.owners.set(endpoint.employeeInstanceId, owner);
-            if (
-              prove &&
-              (await owner.verifyStartingEditor(
+            if (prove) {
+              const proof = await owner.verifyStartingEditor(
                 scope,
                 signal,
                 (profile, readModels, active) =>
@@ -282,9 +281,12 @@ export function createAssignedNativeWebStartup(input: {
                     },
                     active,
                   ),
-              ))
-            )
-              group.verifiedEmployees.add(endpoint.employeeInstanceId);
+              );
+              if (proof) {
+                proof.throwIfAborted();
+                group.verifiedEmployees.set(endpoint.employeeInstanceId, proof);
+              }
+            }
             current(binding, web);
             signal.throwIfAborted();
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
@@ -380,6 +382,11 @@ export function createAssignedNativeWebStartup(input: {
     ) {
       const group = running.get(binding.vmId);
       signal.throwIfAborted();
+      const proof = employeeInstanceId
+        ? group?.verifiedEmployees.get(employeeInstanceId)
+        : [...(group?.verifiedEmployees.values() ?? [])].find(
+            (candidate) => !candidate.aborted,
+          );
       if (
         !editorProof ||
         group?.verifiedBy !== editorProof ||
@@ -389,13 +396,13 @@ export function createAssignedNativeWebStartup(input: {
         group.revoked.signal.aborted ||
         closing ||
         lifetime.aborted ||
-        !group.verifiedEmployees.size ||
-        (employeeInstanceId &&
-          !group.verifiedEmployees.has(employeeInstanceId)) ||
+        !proof ||
+        proof.aborted ||
         !group.owners.size ||
         [...group.owners.values()].some((owner) => !owner.controlReady())
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
+      return proof;
     },
     /** Publish only a completely started, exact group; this never starts a VM. */
     catalog(
@@ -463,7 +470,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       signal: AbortSignal,
       employeeInstanceId?: string,
-    ): void;
+    ): AbortSignal;
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,

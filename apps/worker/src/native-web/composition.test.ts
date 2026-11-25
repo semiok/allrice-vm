@@ -243,6 +243,7 @@ it('holds the bootstrap scope through editor proof and exposes only proved emplo
   const f = fixture();
   const proved = f.web.receipt.endpoints[0]!;
   const skipped = f.web.receipt.endpoints[1]!;
+  const route = new AbortController();
   const profile = {
     revoked: f.scope.signal,
     readImmutableGraph: vi.fn(),
@@ -264,7 +265,9 @@ it('holds the bootstrap scope through editor proof and exposes only proved emplo
       expect(binding).toEqual(f.binding);
       expect(context).toBe(f.web.context);
       active.throwIfAborted();
-      return endpoint.employeeInstanceId === proved.employeeInstanceId;
+      return endpoint.employeeInstanceId === proved.employeeInstanceId
+        ? route.signal
+        : null;
     },
   );
   try {
@@ -292,7 +295,7 @@ it('holds the bootstrap scope through editor proof and exposes only proved emplo
         signal(),
       ),
     ).toThrow('RUNTIME_NOT_READY');
-    uninstall();
+    route.abort();
     expect(() => f.service.assertVerifiedEditor(f.binding, signal())).toThrow(
       'RUNTIME_NOT_READY',
     );

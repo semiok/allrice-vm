@@ -26,7 +26,11 @@ import {
   installDEntryNativeDataPort,
   type DEntryNativeDataPort,
 } from '../d-entry/native-data.js';
-import type { ResolvedDEntryNativeOwner } from '../d-entry/native-owner.js';
+import {
+  currentDEntryNativeOwner,
+  dEntryNativeOwnerPort,
+  type ResolvedDEntryNativeOwner,
+} from '../d-entry/native-owner.js';
 import {
   holdReleasedProfile,
   readWorkerEmployeeWebSeal,
@@ -46,7 +50,9 @@ export type ResolveProductionDEntrySendRoute = (
     binding: PersonVmBinding;
   }>,
   signal: AbortSignal,
-) => Promise<Readonly<{ provider: string; model: string }>>;
+) => Promise<
+  Readonly<{ provider: string; model: string; revoked: AbortSignal }>
+>;
 
 function denied(): never {
   throw new DataAccessError('authorization_denied');
@@ -126,6 +132,21 @@ export function installProductionDEntrySource(input: {
       boundary: input.admission,
       participant: input.admission.participant('entry'),
     },
+    assertEditorReady(context, identity, signal) {
+      return own(signal, async (active) => {
+        const current = await currentDEntryNativeOwner(
+          dEntryNativeOwnerPort,
+          context,
+          identity,
+          active,
+        );
+        input.startup.assertVerifiedEditor(
+          current.view.receipt.binding,
+          current.signal,
+          identity.employeeInstanceId,
+        );
+      });
+    },
     resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
@@ -141,7 +162,12 @@ export function installProductionDEntrySource(input: {
           denied();
         const scope = structuredClone(context);
         const expected = Object.freeze({ ...identity });
-        const revoked = AbortSignal.any([lifetime, owner.revoked]);
+        const route = input.startup.assertVerifiedEditor(
+          binding,
+          active,
+          expected.employeeInstanceId,
+        );
+        const revoked = AbortSignal.any([lifetime, owner.revoked, route]);
         const assertCurrent = (caller: AbortSignal) =>
           own(AbortSignal.any([revoked, caller]), async (signal) => {
             await owner.assertCurrent(scope, signal);
@@ -294,7 +320,7 @@ export function installProductionDEntrySource(input: {
         };
         const release = await readDEntryReleasePolicy();
         active.throwIfAborted();
-        if (selectDEntryGeneration(release, expected) !== '4.0') return false;
+        if (selectDEntryGeneration(release, expected) !== '4.0') return null;
         // The native startup roster spans the real current workspaces of this
         // original login. The identity reader rechecks each exact workspace.
         const scope = { ...context, workspaceId: endpoint.workspaceId };
@@ -335,7 +361,8 @@ export function installProductionDEntrySource(input: {
           throw new PersonVmError('RUNTIME_NOT_READY');
         await editor.assertCurrent(active);
         if (!sameDEntryIdentity(identity, await current())) denied();
-        return true;
+        route.revoked.throwIfAborted();
+        return route.revoked;
       }),
   );
   let uninstallData: () => void;
