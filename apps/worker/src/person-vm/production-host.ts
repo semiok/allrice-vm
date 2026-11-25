@@ -599,6 +599,8 @@ export function createProductionPersonVmHost(input: {
         admission: {
           boundary: admission,
           participant: admission.participant('gateway'),
+          recoverStoppedPermit: (permit, signal) =>
+            admission.recoverStoppedGatewayPermit(permit, signal),
         },
       });
       model = modelOwner;

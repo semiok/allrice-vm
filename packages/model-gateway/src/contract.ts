@@ -6,6 +6,7 @@ import type {
 import type {
   PersonVmAdmissionBoundary,
   PersonVmAdmissionPort,
+  PersonVmAdmissionPermit,
   PersonVmBinding,
 } from '@allrice/person-vm';
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm';
@@ -68,6 +69,11 @@ export interface ModelGatewayAuthority {
 export type ModelGatewayAdmission = Readonly<{
   boundary: PersonVmAdmissionBoundary;
   participant: PersonVmAdmissionPort;
+  /** Exact local permits only, after this Gateway and its dispatcher stopped. */
+  recoverStoppedPermit?(
+    permit: PersonVmAdmissionPermit,
+    signal: AbortSignal,
+  ): Promise<void>;
 }>;
 
 /** The public DSH vocabulary, without guest-selectable identity or routing. */

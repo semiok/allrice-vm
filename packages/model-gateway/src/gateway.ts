@@ -14,7 +14,10 @@ import type {
   GatewayModelInput,
   GatewayProvider,
 } from './contract.ts';
-import type { PersonVmBinding } from '@allrice/person-vm';
+import type {
+  PersonVmAdmissionPermit,
+  PersonVmBinding,
+} from '@allrice/person-vm';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createMeteredTransport, installScopedFetch } from './transport.ts';
 import { runGatewayAdmission } from './admission.ts';
@@ -224,6 +227,15 @@ export function createModelGateway(options: {
   const revoked = new Set<string>();
   // The request callback may finish without proving the underlying join.
   // Keep the failure after it leaves the active set, scoped to its VM epoch.
+  const unfinishedPermits = new Set<PersonVmAdmissionPermit>();
+  async function releaseStoppedPermits(signal: AbortSignal) {
+    const recover = options.admission.recoverStoppedPermit;
+    if (!recover) return;
+    for (const permit of unfinishedPermits) {
+      await recover(permit, signal);
+      unfinishedPermits.delete(permit);
+    }
+  }
   const unconfirmedJoins = new Map<
     string,
     { binding: PersonVmBinding; failures: ModelGatewayError[] }
@@ -486,6 +498,11 @@ export function createModelGateway(options: {
               ? { ok: false, error: operationFailure }
               : { ok: true, value: terminalReply! };
           },
+          options.admission.recoverStoppedPermit
+            ? (permit) => {
+                unfinishedPermits.add(permit);
+              }
+            : undefined,
         );
         await assertCurrent(signal);
         await send(response, terminalReply, signal);
@@ -548,6 +565,7 @@ export function createModelGateway(options: {
       );
       signal.throwIfAborted();
       if (!evidence.trim()) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      await releaseStoppedPermits(signal);
       const released = await options.store.reconcileOwner(
         options.ownerId,
         evidence,
@@ -568,6 +586,7 @@ export function createModelGateway(options: {
       signal.throwIfAborted();
       if (!evidence.evidenceRef.trim())
         throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      if (recoveringClosedOwner) await releaseStoppedPermits(signal);
       const released = await options.store.reconcileOwner(
         ownerId,
         evidence.evidenceRef,

@@ -1,5 +1,6 @@
 import { ModelGatewayError } from './contract.ts';
 import type { ModelCallBinding, ModelGatewayAdmission } from './contract.ts';
+import type { PersonVmAdmissionPermit } from '@allrice/person-vm';
 
 /** Consumer-local value, not a wire contract or a new person-vm API. */
 type Outcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
@@ -16,6 +17,7 @@ export async function runGatewayAdmission<T>(
     signal: AbortSignal,
     activate: () => Promise<void>,
   ) => Promise<Outcome<T>>,
+  unfinished?: (permit: PersonVmAdmissionPermit) => void,
 ): Promise<T> {
   const { boundary } = admission;
   const permit = await boundary.admit(
@@ -110,6 +112,7 @@ export async function runGatewayAdmission<T>(
     try {
       await boundary.finish(permit);
     } catch (cleanupError) {
+      unfinished?.(permit);
       cleanupFailed = true;
       cleanupFailure = cleanupError;
     }
