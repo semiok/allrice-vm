@@ -167,6 +167,7 @@ it('persists only the scoped image after verifying identity and the marker again
   const marker = authorized.scope.evaluate.mock.calls.at(0)?.[1];
   expect(marker).toMatch(/^data-workday-capture-/);
   expect(authorized.scope.screenshot).toHaveBeenCalledExactlyOnceWith({
+    animations: 'disabled',
     style: expect.stringContaining(`:not([${marker}], [${marker}] *)`),
   });
   expect(authorized.options.saveScreenshot).toHaveBeenCalledExactlyOnceWith(

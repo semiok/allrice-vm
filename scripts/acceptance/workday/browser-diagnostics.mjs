@@ -160,16 +160,26 @@ export async function readPage(
       element.setAttribute(name, '');
       // Preserve the layout and override inline visibility on off-scope
       // branches. The dedicated page is closed after this capture.
+      const masked = [];
       for (const other of element.ownerDocument.querySelectorAll('*')) {
         if (element.contains(other) || other.contains(element)) continue;
-        if ('style' in other)
-          other.style.setProperty('opacity', '0', 'important');
+        if (!('style' in other)) continue;
+        other.style.setProperty('transition', 'none', 'important');
+        other.style.setProperty('animation', 'none', 'important');
+        other.style.setProperty('opacity', '0', 'important');
+        masked.push(other);
       }
+      const view = element.ownerDocument.defaultView;
+      if (masked.some((other) => view.getComputedStyle(other).opacity !== '0'))
+        throw new Error('Off-scope elements could not be masked');
     }, marker);
     const target = scope.and(page.locator(`[${marker}]`));
     const outside = `:not([${marker}], [${marker}] *)`;
     const image = await target.screenshot({
+      animations: 'disabled',
       style: `${outside}, ${outside}::before, ${outside}::after, ${outside}::backdrop {
+        transition: none !important;
+        animation: none !important;
         visibility: hidden !important;
       }
       [${marker}] { visibility: visible !important; }`,
