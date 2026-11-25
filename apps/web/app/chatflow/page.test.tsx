@@ -65,12 +65,12 @@ describe('ChatFlow server local command capability', () => {
     ).resolves.toHaveProperty('props');
     expect(entry.find).toHaveBeenCalledTimes(2);
   });
-  it('preserves the ordinary workbench if trial discovery is unavailable', async () => {
+  it('shows the trial failure instead of defaulting to the legacy writer when policy is unavailable', async () => {
     entry.host = 'allricevm.bplabs.xyz';
     entry.context.mockResolvedValue({ actor: { id: 'owner' } });
     entry.find.mockRejectedValue(Error('policy unavailable'));
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({}) }),
-    ).resolves.toHaveProperty('props');
+    ).rejects.toThrow('/chatflow/4.0');
   });
 });

@@ -54,13 +54,17 @@ export function EmployeeNativePage({
     initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
   );
   const [settled, setSettled] = useState(false);
-  const [activation, setActivation] = useState({ query });
+  const [activation, setActivation] = useState<{
+    query: string;
+    confirmedQuery?: string;
+  }>({ query });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
     undefined,
   );
   const replace = useRef<(() => void) | undefined>(undefined);
   const cancel = useRef<(() => void) | undefined>(undefined);
+  const resume = useRef<(() => void) | undefined>(undefined);
   const nextQuery = useRef(query);
   nextQuery.current = query;
 
@@ -81,10 +85,11 @@ export function EmployeeNativePage({
     let mounted = false;
     let documentStarted = false;
     let remoteRevoked = false;
-    let selectedQuery: string | undefined;
+    let selectedQuery = activation.confirmedQuery;
     let timer: number | undefined;
     let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
+    let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
     setFailed(false);
@@ -204,6 +209,13 @@ export function EmployeeNativePage({
     };
     replace.current = applyQuery;
     cancel.current = () => finish('cancelled');
+    resume.current = () => {
+      const query = nextQuery.current;
+      setActivation({
+        query,
+        confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+      });
+    };
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -276,14 +288,21 @@ export function EmployeeNativePage({
     };
     window.addEventListener('message', receive);
     const leaving = () => {
+      if (detached) return;
+      detached = true;
       lifetime.abort();
       send(pageRevoked);
-      void close();
+      if (prepare && carrier?.dispatched && !scopeId)
+        void carrier.ready.catch(() => {}).then(close);
+      else void close();
     };
     window.addEventListener('pagehide', leaving);
     if (prepare) timer = window.setTimeout(() => finish('failed'), entryWaitMs);
     const setup = async () => {
-      const entry = employeeEntryQuery(activeQuery, prepare);
+      const entry = employeeEntryQuery(
+        activation.confirmedQuery ?? activeQuery,
+        prepare,
+      );
       const selection = prepare
         ? await prepareEmployeeEntry(entry, lifetime.signal, () =>
             setStatus('opening'),
@@ -339,11 +358,11 @@ export function EmployeeNativePage({
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
-      lifetime.abort();
-      close();
+      leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
       cancel.current = undefined;
+      resume.current = undefined;
       window.removeEventListener('message', receive);
       window.removeEventListener('pagehide', leaving);
     };
@@ -380,7 +399,7 @@ export function EmployeeNativePage({
           stop={() => cancel.current?.()}
           retry={() => {
             if (initialUnavailable) location.reload();
-            else setActivation({ query: nextQuery.current });
+            else resume.current?.();
           }}
         />
       )}

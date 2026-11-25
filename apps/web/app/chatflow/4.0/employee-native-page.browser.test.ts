@@ -223,14 +223,12 @@ suite('4.0 browser cold entry', () => {
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(next);
       expect(births).toEqual([
         { selection: employee },
-        { selection: employee },
         { selection: employee, operationId: next },
       ]);
       expect(warmCalls).toEqual(
-        Array.from({ length: 5 }, () => ({
-          selection: employee,
-          trigger: 'page',
-        })),
+        [employee, employee, employee, f.selection, employee].map(
+          (selection) => ({ selection, trigger: 'page' }),
+        ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
     },

@@ -29,7 +29,10 @@ export default async function ChatFlowPage({
         headers: requestHeaders,
       }),
     );
-    if (context && (await findDEntryEmployee(context).catch(() => null)))
+    if (
+      context &&
+      (await findDEntryEmployee(context).then(Boolean, () => true))
+    )
       redirect('/chatflow/4.0');
   }
   return (
