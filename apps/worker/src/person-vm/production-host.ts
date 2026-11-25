@@ -420,10 +420,11 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
+      const modelRoute = Object.freeze({ ...modelSource.route });
       const modelOwner = createModelGateway({
         ownerId: randomUUID(),
         authority: modelSource.authority,
-        provider: createDshGatewayProvider(modelSource.llm, modelSource.route),
+        provider: createDshGatewayProvider(modelSource.llm, modelRoute),
         store: createPostgresModelGatewayStore(trustedDatabase),
         admission: {
           boundary: admission,
@@ -443,6 +444,8 @@ export function createProductionPersonVmHost(input: {
           const { context, binding } = trusted;
           if (
             !sameVmBinding(call.vm, binding) ||
+            call.provider !== modelRoute.provider ||
+            call.model !== modelRoute.model ||
             context.actor.type !== 'user' ||
             call.context.actor.type !== 'user' ||
             call.context.actor.id !== context.actor.id ||

@@ -1,6 +1,7 @@
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
 import { rm, stat } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
@@ -194,7 +195,7 @@ function fixture() {
     },
   };
   const model = {
-    handle: vi.fn(async () => {
+    handle: vi.fn<Model.ModelGatewayPort['handle']>(async () => {
       throw Error('no model dispatch in this fixture');
     }),
     revoke: vi.fn<Model.ModelGatewayPort['revoke']>(async () => {
@@ -467,6 +468,80 @@ it('an egress source cannot substitute another VM or shared admission boundary',
     ],
     provisioner: actual.providers.egressInstallation.provisioner,
   });
+});
+
+it('dispatches only the trusted model-call resolution for the exact lease and approved route', async () => {
+  const value = await open(),
+    scope = nativeEntryFixture(),
+    vm = value.input().vm;
+  const context = scope.context;
+  const binding = {
+    vmId: randomUUID(),
+    personId: context.actor.id,
+    organizationId: context.organizationId,
+    instanceId: randomUUID(),
+    leaseEpoch: 1,
+  };
+  const model = io.gateway.mock.calls[0]?.[0].services?.find(
+    (service) => service.id === 'model',
+  );
+  if (!model) throw Error('Missing registered model service');
+  const assertAdmission = vi
+    .spyOn(vm, 'assertAdmissionBinding')
+    .mockResolvedValue(undefined);
+  const request = {} as IncomingMessage;
+  const response = {} as ServerResponse;
+  const call: Model.ModelCallBinding = {
+    context,
+    vm: binding,
+    execution: { runId: randomUUID(), executionId: randomUUID() },
+    employeeInstanceId: scope.identity.employeeInstanceId,
+    employeeRelease: scope.identity.employeeVersionId,
+    allriceThreadRef: randomUUID(),
+    native: {
+      instanceId: randomUUID(),
+      profile: 'sealed-test-profile',
+      sessionId: 'root',
+      rootSessionId: 'root',
+      parentSessionId: null,
+      callId: randomUUID(),
+    },
+    executionGeneration: '4.0',
+    gatewayRelease: 'synthetic-gateway-release',
+    provider: value.bound.model.route.provider,
+    model: value.bound.model.route.model,
+  };
+  const resolveCall = vi.mocked(value.bound.model.resolveCall);
+  const active = signal();
+  const trusted = { context, binding };
+  for (const wrong of [
+    { ...call, vm: { ...binding, leaseEpoch: 2 } },
+    { ...call, context: { ...context, sessionId: randomUUID() } },
+    { ...call, model: 'different-route' },
+  ]) {
+    resolveCall.mockResolvedValueOnce(wrong);
+    await expect(
+      model.handle(request, response, trusted, active),
+    ).rejects.toMatchObject({ code: 'DENIED' });
+  }
+  expect(assertAdmission).not.toHaveBeenCalled();
+  expect(value.model.handle).not.toHaveBeenCalled();
+
+  resolveCall.mockResolvedValueOnce(call);
+  value.model.handle.mockResolvedValueOnce(undefined);
+  await model.handle(request, response, trusted, active);
+  expect(resolveCall).toHaveBeenLastCalledWith(request, trusted, active);
+  expect(assertAdmission).toHaveBeenCalledExactlyOnceWith(
+    context,
+    binding,
+    active,
+  );
+  expect(value.model.handle).toHaveBeenCalledExactlyOnceWith(
+    request,
+    response,
+    call,
+    active,
+  );
 });
 
 it('actual service cleanup revokes a copied receipt once and Host.close does not revoke it again', async () => {

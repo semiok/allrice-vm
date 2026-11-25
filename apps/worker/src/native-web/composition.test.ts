@@ -562,14 +562,14 @@ it('retire只影响exact五字段组；host join未知保留，显式重试成�
   const f = fixture(),
     unknown = new Error('unknown host join');
   const first = {
-    close: vi.fn(async () => {}),
+    ...catalogOwner(),
     retireAfterNativeStop: vi
       .fn()
       .mockRejectedValueOnce(unknown)
       .mockResolvedValue(undefined),
   };
   const other = {
-    close: vi.fn(async () => {}),
+    ...catalogOwner(),
     retireAfterNativeStop: vi.fn(async () => {}),
   };
   open.mockResolvedValue(first);
