@@ -651,6 +651,33 @@ it('retains maintenance after VM stop is unconfirmed even when model close succe
   await expect(value.host.close()).resolves.toBeUndefined();
 });
 
+it('tracks a start that fails at disk attach before egress preparation', async () => {
+  const value = await receiptFixture();
+  const { vm, providers } = value.input();
+  const context = value.entry.context;
+  const attach = vi.mocked(providers.disk.attach);
+  const attachNormally = attach.getMockImplementation()!;
+  attach.mockRejectedValue(Error('synthetic attach outcome unconfirmed'));
+  await expect(vm.start(context, signal())).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
+  expect(value.prepare).not.toHaveBeenCalled();
+  await expect(value.host.close()).rejects.toMatchObject({
+    errors: [expect.objectContaining({ code: 'CLEANUP_INCOMPLETE' })],
+  });
+  expect(value.host.modelOwnerMaintenancePending()).toBe(true);
+  expect(providers.disk.detach).not.toHaveBeenCalled();
+
+  attach.mockImplementation(attachNormally);
+  value.model.reconcileOwner.mockResolvedValueOnce(0);
+  await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(
+    0,
+  );
+  expect(providers.disk.detach).toHaveBeenCalledOnce();
+  expect(value.host.modelOwnerMaintenancePending()).toBe(false);
+  await expect(value.host.close()).resolves.toBeUndefined();
+});
+
 it('a stale persisted service receipt cannot remove a retained newer epoch from Host cleanup', async () => {
   const value = await receiptFixture(),
     vm = value.input().vm,

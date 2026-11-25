@@ -228,7 +228,6 @@ export function createProductionPersonVmHost(input: {
         const active = AbortSignal.any([signal, lifetime]);
         active.throwIfAborted();
         const gateway = requireGateway();
-        ownedVms.set(binding.personId, Object.freeze({ ...binding }));
         const receipt = await gateway
           .prepare(binding, preparation, active)
           .catch((error: unknown) => {
@@ -501,6 +500,9 @@ export function createProductionPersonVmHost(input: {
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
+        observeOwnedStart(binding) {
+          ownedVms.set(binding.personId, Object.freeze({ ...binding }));
+        },
         ...providers.configuration.lifecycle,
       });
       personVm = vm;

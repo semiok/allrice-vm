@@ -264,12 +264,13 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
         },
       ],
     });
-    expect(outboundImage).toBe(true);
-    expect(readImage).toHaveBeenCalledOnce();
     expect(chunks.at(-1)).toMatchObject({
       type: 'finish',
       reason: { kind: 'stop' },
     });
+    expect(readImage).toHaveBeenCalledOnce();
+    expect(used).toContain('https://chatgpt.com/backend-api/codex/responses');
+    expect(outboundImage).toBe(true);
     const attempts = [...gateway.store.rows.values()];
     expect(attempts).toMatchObject([
       { kind: 'auth-refresh', httpStatus: 200, outcome: 'closed' },

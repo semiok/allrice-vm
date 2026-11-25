@@ -91,6 +91,8 @@ export class PersonVmService
       egress?: PersonVmEgressPort;
       runtime?: PersonVmRuntimePort;
       nativeWeb?: PersonVmWebRosterPort;
+      /** Register the exact saved epoch before a start can touch its disk. */
+      observeOwnedStart?: (binding: PersonVmBinding) => void;
       leaseTtlMs: number;
       activityMaxAgeMs: number;
       cleanupTimeoutMs: number;
@@ -516,9 +518,10 @@ export class PersonVmService
       result: 'started',
     });
     try {
+      const binding = bindingOf(row);
+      this.options.observeOwnedStart?.(binding);
       signal.throwIfAborted();
       await lease.guard();
-      const binding = bindingOf(row);
       if (row.diskTier === 'cold') {
         await this.options.disk.move(
           { vmId: row.vmId, tier: 'cold' },
