@@ -58,9 +58,16 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
           and m.active and m.role in ('admin','member')
           and (m.workspace_id is null or m.workspace_id=${identity.workspaceId})
         order by m.id) as grants,
-      (select i.xmin::text || ':' || a.id::text || ':' || a.xmin::text
+      (select concat_ws(':', i.xmin, a.id, a.xmin, e.xmin, w.xmin, o.xmin, u.xmin,
+          array(select d.id::text || ':' || d.xmin::text from allrice_platform_employee_tenant_assignments d
+            where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
+              and d.tenant_employee_id=a.employee_id order by d.id))
         from allrice_employee_instances i
         join allrice_employee_assignments a on a.id=i.assignment_id
+        join allrice_employees e on e.id=a.employee_id and e.status='active'
+        join allrice_workspaces w on w.id=i.workspace_id and w.organization_id=i.organization_id and w.archived_at is null
+        join allrice_organizations o on o.id=i.organization_id and o.archived_at is null
+        join allrice_users u on u.id=i.owner_id and u.status='active'
         where i.id=${identity.employeeInstanceId} and i.owner_id=${identity.personId}
           and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
           and i.archived_at is null and a.active) as "employeeGrant"`;
@@ -291,11 +298,12 @@ export function createDEntryNativePrewarmPort(input: {
                 },
               })
             : undefined;
-        const warmed = await ticket?.flight.work;
+        const warmed = ticket && (await ticket.flight.work);
         // A lifecycle transition may outrun the read used to reserve a flight.
         // The initiator already used the real lease; a waiter must qualify
         // its own operation if the successful start belonged to another epoch.
         if (ticket && !ticket.started && !warmed?.generation) await current();
+        active.throwIfAborted();
         const result =
           warmed && (ticket?.started || warmed.generation)
             ? warmed.result

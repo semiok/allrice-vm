@@ -111,6 +111,7 @@ export function EmployeeNativePage({
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
     let navigating = false;
+    let retired = false;
     let mounted = false;
     let documentStarted = false;
     let remoteRevoked = false;
@@ -176,6 +177,11 @@ export function EmployeeNativePage({
         window.clearTimeout(closingNotice);
         if (replace.current !== applyQuery) return;
         if (closed) {
+          retired = true;
+          if (nextQuery.current !== activeQuery) {
+            setActivation({ query: nextQuery.current });
+            return;
+          }
           setSource(undefined);
           setStatus(status);
           setSettled(true);
@@ -228,7 +234,11 @@ export function EmployeeNativePage({
     };
     loaded.current = documentLoaded;
     const applyQuery = () => {
-      if (navigating) return;
+      if (navigating) {
+        if (retired && nextQuery.current !== activeQuery)
+          setActivation({ query: nextQuery.current });
+        return;
+      }
       navigating = true;
       window.clearTimeout(timer);
       void retire().then((closed) => {

@@ -73,7 +73,8 @@ suite('4.0 browser cold entry', () => {
             .end(body);
         if (address.pathname === '/api/v1/d-entry/native-prewarm') {
           warmCalls.push(await readJson(request));
-          if (warmCalls.length === 1) return response.writeHead(503).end();
+          if (warmCalls.length === 1 || warmCalls.length === 6)
+            return response.writeHead(503).end();
           if (warmCalls.length === 2) {
             response.once('close', () => retryClosed.resolve());
             firstRetry.resolve(response);
@@ -272,6 +273,24 @@ suite('4.0 browser cold entry', () => {
         ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
+
+      await page
+        .frameLocator('iframe')
+        .getByRole('button', { name: '新建对话' })
+        .click();
+      await page
+        .getByRole('alert')
+        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .waitFor();
+      expect(births).toHaveLength(2);
+      await page.evaluate(() => history.back());
+      await page.waitForURL((url) => url.searchParams.get('threadId') === next);
+      await showEditor(next);
+      expect(births).toHaveLength(2);
+      expect(warmCalls.slice(5)).toEqual([
+        { selection: employee, trigger: 'page' },
+        { selection: { ...employee, threadId: next }, trigger: 'page' },
+      ]);
     },
   );
 });
