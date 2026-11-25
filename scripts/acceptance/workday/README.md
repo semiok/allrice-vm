@@ -1,6 +1,6 @@
-# 4.0 工作日验收 runner（MET280，L1 测试脚本）
+# 4.0 工作日验收 runner（MET-280）
 
-离目标还差：此脚本能执行本地输入演练、既有原生入口 consumer fixture，以及已授权 Dev 的身份/4.0 discovery/封版只读页面检查；生产 Host/module/B/source/冷历史缺口仍逐项跳过。它不授予开验、部署、开开关、模型、VM或外发授权，不宣称完整工作日通过。真实 MET280 尚未开验。
+此脚本能执行本地输入演练、原生入口 consumer fixture，以及已授权 4.0 Dev 的身份、运行入口发现和封版页面只读检查。其余工作日验收项保留各自的待验证证据与负责人。
 
 `cases.json` 原字节保留准备清单的20项。`run.py` 将其拆为冷/暖、子会话、四面板读/写、定时、外发、空闲继续、关机历史和后台读等步骤。每步含 passed/skipped/failed、原因、owner、来源及截图/无截图原因。fixture 和 Dev 分列，fixture passed 不填 Dev passed；整体永远保留 `acceptanceGranted=false/completeWorkday=false`，本人认可须由人和发布负责人核原件。
 
@@ -16,14 +16,14 @@ python3 scripts/acceptance/workday/run.py --mode fixture --output /absolute/new-
 
 ## 复用真实已有 consumer fixture
 
-273公开可复用的固定源：`52daa9b5b0332ec7bf77cdc5a30f81aeefa9b49f` 的 `apps/worker/src/d-entry/native-entry.fixture.ts`，公开测试符号 `nativeEntryServer/nativeEntryFixture`。它注入合成身份、catalog、permit和RPC数据，没有VM、PG、native job、真实fence或模型。fixture driver 实际创建loopback HTTP server，调用现有HTTP handler读身份/子会话资源、拒子写、原root请求及缺DataPort拒绝，最后await既有HTTP/mux close。不会运行 `owner.native.integration.test.ts` 或启用 `ALLRICE_NATIVE_WEB_TEST_CLI`。
+在 `semiok/allrice-vm` 核定要验证的干净 checkout，使用其完整提交 SHA。273 的 fixture 位于 `apps/worker/src/d-entry/native-entry.fixture.ts`，复用测试符号 `nativeEntryServer/nativeEntryFixture`。它注入合成身份、catalog、permit 和 RPC 数据。fixture driver 创建 loopback HTTP server，验证身份和子会话资源读取、拒绝子会话写入、根会话请求以及缺少 DataPort 时的拒绝，最后等待 HTTP/mux 关闭。
 
 在根会话安排好本任务树已有锁定依赖后，用明确配置调用相同入口（不是安装依赖的指令）：
 
 ```json
 {
   "fixtureSource": "/absolute/read-only/exact-source-worktree",
-  "fixtureSha": "52daa9b5b0332ec7bf77cdc5a30f81aeefa9b49f",
+  "fixtureSha": "<替换为所选 4.0 checkout 的完整 Git SHA>",
   "nodeExecutable": "/absolute/approved/node",
   "driverTimeoutSeconds": 60,
   "cleanupTimeoutSeconds": 10
@@ -34,7 +34,7 @@ python3 scripts/acceptance/workday/run.py --mode fixture --output /absolute/new-
 python3 scripts/acceptance/workday/run.py --mode fixture --config /absolute/fixture-config.json --output /absolute/new-fixture-evidence
 ```
 
-数字是操作者为此QA进程显式选的预算示例，不是产品默认。源HEAD、干净tree、fixture原件与HEAD必须一致；正式并集头可以在owner映射后显式改pin。缺源/依赖 skipped，错pin/driver非零/收尾未确认 failed；没有忽略异常。driver只运行本目录一个测试文件、单worker、无DB/真实Host开关，Vite缓存落证据目录，不改只读source。`native-source.json`记录实际source SHA及fixture SHA256；fixture通过仍不能成为Dev/真实DSH通过。
+如使用 runner 所在的 checkout，省略 `fixtureSource` 即可。源 HEAD 必须与 `fixtureSha` 一致，已跟踪的文件必须干净。缺少显式 SHA 或源文件或依赖时跳过；SHA 格式错误、与 HEAD 不符、driver 失败或收尾未确认时记失败。driver 只运行本目录一个测试文件，使用单个 worker。Vite 缓存落在证据目录。`native-source.json` 记录实际 source SHA 及 fixture SHA256。
 
 ## Dev 默认路径与真实截图
 
@@ -91,7 +91,7 @@ node --check scripts/acceptance/workday/browser-diagnostics.mjs
 node --check scripts/acceptance/workday/fixture.config.mjs
 ```
 
-`runner.test.ts` 由既有默认Vitest自动收集，不依赖开关，调用完整Python标准库回归并测试单页诊断组合。Python的CLI缺源负向显式指定不存在的source路径，因此不会因组合树恰有fixture而误跑driver；另有错pin仍失败且不dispatch的回归。HTTP回归使用自建loopback BFF合成响应和真实HTTP请求，不连Dev。
+`runner.test.ts` 由既有默认 Vitest 自动收集，调用完整 Python 标准库回归并测试单页诊断组合。回归覆盖缺源、组合树含 fixture 时缺显式 SHA、错误 SHA 时拒绝启动 driver。HTTP 回归使用 loopback BFF 合成响应和真实 HTTP 请求。
 
 `native-entry.fixture.test.ts` 是独立手工项，原生tag `manual:WORKDAY_FIXTURE_SOURCE` 在 `scripts/ci-manual-environments.yml` 精确登记。缺source时仍可见skip；显式提供source而缺receipt/cache属于配置失败，不再成为未登记的条件skip。必须先通过本runner的精确source/pin校验，另提供新receipt/cache路径，才用本目录fixture config实跑。自动Python/诊断通过不能替代该HTTP driver实跑。单文件检查示例（由根安排依赖与资源）：
 
@@ -101,6 +101,6 @@ pnpm exec vitest run scripts/acceptance/workday/runner.test.ts --maxWorkers=1
 
 作者只运行标准库离线小测试/语法检查；实际native fixture driver与浏览器由根会话按资源/授权统一安排。负向覆盖escape/脱敏、skip非pass、3.x/错本人、缺生产来源、异常/cleanup、非零exit和首败不覆盖。不为了过门禁修改产品或放宽任何旧断言。
 
-冻结依据：原MET280准备清单20项、FREEZE-ACCEPTANCE-ADDENDUM、AllRice4.0 BOUNDARY-CONTRACT v1.0/MODULE-TEMPLATE v1.0；271 `3dcde507`和273 `52daa9b5`为已核源码参考。缺口来自allrice40-n3-assembly/PRODUCERS，281/283属n4、285属n5，fixture不补这些生产来源。
+验收清单依据 MET-280 准备阶段冻结的 20 项要求和 AllRice 4.0 边界合同 v1.0。
 
 DSH对照：直接复用原生入口的公开协议和既有consumer/browser fixture；不改变Agent Loop、会话、子智能体、定时/审批或生命周期。SaaS新增自补无；本片只有验收编排和单向证据呈现，不新增产品状态或MET225定制。

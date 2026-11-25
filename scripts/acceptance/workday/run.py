@@ -20,35 +20,34 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[2]
 SESSION_ENV = 'ALLRICE_ACCEPTANCE_SESSION'
 FIXTURE_FILE = 'apps/worker/src/d-entry/native-entry.fixture.ts'
-FIXTURE_SHA = '52daa9b5b0332ec7bf77cdc5a30f81aeefa9b49f'
 STEPS = [
     ('GATE.release', 'GATE', '固定组合与节点4开验资格', 'release', '最终组合四门/完整M5/迁移与本人开关批准须由发布负责人核验'),
     ('IDENTITY.login', 'IDENTITY', '本人登录身份', '271', '需要显式测试session与当前本人/企业/员工资格'),
     ('IDENTITY.employee', 'IDENTITY', '选择本人员工及4.0单写者', '271/273', '需要真实4.0 native-owner；3.x/controlReady不等于editorReady/canSend'),
-    ('VM.cold', 'VM', '任务VM冷启动与实际ready', '267/273', '冷启首败0/3、物理hardcap/真实receipt未闭合；只读discovery不启动VM'),
+    ('VM.cold', 'VM', '任务VM冷启动与实际ready', '267/273', '需要真实冷启动、物理hardcap和ready回执；只读discovery不启动VM'),
     ('VM.warm', 'VM', '已预热任务VM与真实ready', '267/273', '需要真实Host/ready时序与当前owner，不能用controlReady替代'),
-    ('CHAT.process', 'CHAT', '原生DSH过程、取消与重连', '273', '生产Host/catalog/current/native-call绑定缺失；本脚本不凭UI文字运行模型'),
+    ('CHAT.process', 'CHAT', '原生DSH过程、取消与重连', '273', '需要实际Host执行、目录现权和native-call回执'),
     ('SUBAGENT.read', 'SUBAGENT', '子智能体原生列表与只读右栏', '278/271', '需要D owner封版路由/locator与真实Session catalog，保持父会话和草稿'),
-    ('SUBAGENT.deny-write', 'SUBAGENT', '服务端拒绝子会话写入', '271', '生产native DataPort未装配；fixture单独检查HTTP拒写，不向Dev子会话试发'),
+    ('SUBAGENT.deny-write', 'SUBAGENT', '服务端拒绝子会话写入', '271', '需要生产native DataPort的拒写证据；fixture单独检查HTTP拒写'),
     ('ATTACHMENT.read', 'ATTACHMENT', '附件上传与实际读取字节', '281/273', '模块许可、精确对象/实际native读取receipt未提供；本地字节不是上传验收'),
-    ('REFERENCES.read', 'REFERENCES', '企业资料面板读/预览/引用', '277/281', 'requireCurrentAccess的企业许可/有效配置生产来源未装配'),
-    ('REFERENCES.write', 'REFERENCES', '企业资料面板授权写入', '281', '当前模块许可/业务写carrier未封版；不得猜3.x管理API为4.0'),
-    ('DELIVERABLES.read', 'DELIVERABLES', '成果面板预览/下载/引用', '277/281', '精确版本/对象权限与真实交付来源未装配'),
-    ('DELIVERABLES.write', 'DELIVERABLES', '成果生成/转企业资料', '281', '实际Office/发布receipt与4.0业务carrier缺失，不以Run成功代交付'),
-    ('MEMORY.read', 'MEMORY', '记忆面板候选/active读取', '277/283', 'current/actual/stored/adopted/storedSource五reader生产assembly为空'),
-    ('MEMORY.write', 'MEMORY', '记忆新增/修改/确认/删除', '283', '真实B/native-call/采用的人类来源/同事务fence缺失，不造写成功'),
-    ('CAPABILITIES.read', 'CAPABILITIES', '能力面板与原生目录', '277/285', '可信Host/current/config和实际dispose生产挂载缺失'),
-    ('CAPABILITIES.write', 'CAPABILITIES', '能力配置与执行时现权', '285', '企业许可/个人配置producer缺失；catalog不能代执行现权'),
-    ('SCHEDULE.native', 'CAPABILITIES', '原生定时创建/执行/记录', '285', '真实Schedule Host/origin/storage/唤醒链未装，不回退3.x scheduler'),
+    ('REFERENCES.read', 'REFERENCES', '企业资料面板读/预览/引用', '277/281', '需要已授权面板入口、企业许可及对象权限证据'),
+    ('REFERENCES.write', 'REFERENCES', '企业资料面板授权写入', '281', '需要当前模块许可和4.0业务写入回执'),
+    ('DELIVERABLES.read', 'DELIVERABLES', '成果面板预览/下载/引用', '277/281', '需要已授权面板入口、精确版本、对象权限与真实交付来源'),
+    ('DELIVERABLES.write', 'DELIVERABLES', '成果生成/转企业资料', '281', '需要实际Office/发布回执及4.0业务写入证据'),
+    ('MEMORY.read', 'MEMORY', '记忆面板候选/active读取', '277/283', '需要已授权面板入口和候选/生效读取证据'),
+    ('MEMORY.write', 'MEMORY', '记忆新增/修改/确认/删除', '283', '需要真实执行、真人来源及同事务现权写入回执'),
+    ('CAPABILITIES.read', 'CAPABILITIES', '能力面板与原生目录', '277/285', '需要已授权面板入口及实际Host目录证据'),
+    ('CAPABILITIES.write', 'CAPABILITIES', '能力配置与执行时现权', '285', '需要企业许可、个人配置及执行时现权的证据'),
+    ('SCHEDULE.native', 'CAPABILITIES', '原生定时创建/执行/记录', '285', '需要真实Schedule Host、触发来源、存储和唤醒回执'),
     ('APPROVAL.review', 'APPROVAL', '可信外发冻结内容与审批记录', '270/279', '仅可读可信冻结目标/正文/附件与后台记录；本任务绝不批准或发送'),
     ('APPROVAL.send', 'APPROVAL', '本人审批及外部接收旁证', '270', '真实审批/外发需要另获本人当次授权，本runner不自动执行'),
     ('VM.idle-continue', 'VM', '真实空闲回收后继续同会话', '267/273', '需要真实20分钟与owner恢复证据；不缩时、不杀用户VM、不重放'),
-    ('RECOVERY.cold-history', 'RECOVERY', '关机历史只读且不起VM', '274', '冷source/config/checkpoint与附件ACL owner未装配，不能用live startup替代'),
-    ('ADMIN.runtime', 'ADMIN', '后台运行状态可读', '279/273', '需要已授权管理员路由与真实运行投影，当前未封版UI locator'),
+    ('RECOVERY.cold-history', 'RECOVERY', '关机历史只读且不起VM', '274', '需要冷态来源、checkpoint、附件权限及未启动VM的证据'),
+    ('ADMIN.runtime', 'ADMIN', '后台运行状态可读', '279/273', '需要已授权的管理员路由、封版UI locator与真实运行投影'),
     ('ADMIN.usage', 'ADMIN', '后台原始用量可读', '279/268', '需要真实上游账本；usage未知必须null，不补0'),
     ('ADMIN.approvals', 'ADMIN', '后台审批记录可读', '279/270', '需要当前权限下真实业务approval/receipt投影'),
     ('INSTRUCTIONS.requests', 'INSTRUCTIONS', '逐父/子实际请求instructions预算', '273/285', '需要固定tokenizer与实际请求hash/四段token，禁止字符估算或均值'),
-    ('EGRESS.boundary', 'EGRESS', '真实出口冻结/重绑定/取消', '269', '真实隔离VM及完整producer同binding/fresh-admit证据缺失，本任务不造压'),
+    ('EGRESS.boundary', 'EGRESS', '真实出口冻结/重绑定/取消', '269', '需要真实隔离VM和同binding/fresh-admit证据'),
     ('MODEL.accounting', 'MODEL', 'OAuth/8路与真实用量/取消', '268', '需要另外授权真实模型与实际上游账本；不运行模型或读取OAuth'),
     ('PERFORMANCE.pairs', 'PERFORMANCE', '冷暖分组AB/BA原始等待', '273/280', '需要同源实际时序与逐对≤1000ms记录，不能从fixture估算'),
     ('VISUAL.matrix', 'VISUAL', 'rev2逐屏亮暗/1440与390对照', '277/278/279', '需要封版页面locator及全部真实运行截图，设计图不是验收截图'),
@@ -198,8 +197,12 @@ def child(args, output, env, config, input_text=None):
 
 
 def native_fixture(config, output):
+    if 'fixtureSha' not in config:
+        raise Unavailable('未配置精确fixtureSha；未启动native fixture')
+    expected = config['fixtureSha']
+    if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{40}', expected):
+        raise ValueError('fixtureSha must be a full Git commit SHA')
     source = Path(config.get('fixtureSource', REPO)).resolve()
-    expected = config.get('fixtureSha', FIXTURE_SHA)
     fixture = source / FIXTURE_FILE
     if not fixture.is_file():
         raise Unavailable('273 nativeEntryFixture未在所选源中；配置fixtureSource及精确fixtureSha，不能拷假producer')

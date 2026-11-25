@@ -239,12 +239,26 @@ class RunnerTests(unittest.TestCase):
     def test_bad_source_is_skipped_not_a_fake_native_fixture_pass(self):
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaises(workday.Unavailable):
-                workday.native_fixture({'fixtureSource': temp}, Path(temp))
+                workday.native_fixture({'fixtureSource': temp, 'fixtureSha': 'a' * 40}, Path(temp))
             (Path(temp) / workday.FIXTURE_FILE).parent.mkdir(parents=True)
             (Path(temp) / workday.FIXTURE_FILE).write_text('// not a source receipt')
             with patch.object(subprocess, 'check_output', return_value='b' * 40):
                 with self.assertRaises(ValueError):
                     workday.native_fixture({'fixtureSource': temp, 'fixtureSha': 'a' * 40}, Path(temp))
+
+    def test_checkout_with_native_fixture_does_not_dispatch_without_explicit_pin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = root / workday.FIXTURE_FILE
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text('// present in the combined checkout')
+            with patch.object(workday, 'REPO', root), patch.object(subprocess, 'check_output') as git, patch.object(workday, 'child') as driver:
+                with self.assertRaisesRegex(workday.Unavailable, 'fixtureSha'):
+                    workday.native_fixture({}, root)
+                with self.assertRaisesRegex(ValueError, 'full Git commit SHA'):
+                    workday.native_fixture({'fixtureSha': 'main'}, root)
+                git.assert_not_called()
+                driver.assert_not_called()
 
     def test_live_ui_writes_unknown_routes_and_fake_screenshots_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -279,12 +293,14 @@ class RunnerTests(unittest.TestCase):
             (root / 'node_modules/vitest').mkdir(parents=True)
             (root / 'node_modules/vitest/vitest.mjs').write_text('')
             workday.write_json(root / 'native-fixture.json', {'kind': 'consumer-fixture', 'closed': False, 'steps': []})
+            fixture_sha = 'a' * 40
+
             def git(args, **kwargs):
-                return fixture.read_bytes() if args[-1].endswith(workday.FIXTURE_FILE) else workday.FIXTURE_SHA
+                return fixture.read_bytes() if args[-1].endswith(workday.FIXTURE_FILE) else fixture_sha
             with patch.object(workday, 'REPO', root), patch.object(subprocess, 'check_output', side_effect=git), patch.object(
                     subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), patch.object(workday, 'child', return_value=0):
                 with self.assertRaises(ValueError):
-                    workday.native_fixture({'fixtureSource': str(source)}, root)
+                    workday.native_fixture({'fixtureSource': str(source), 'fixtureSha': fixture_sha}, root)
 
     def test_browser_primary_and_capture_diagnostics_survive_json_and_html(self):
         config = self.live_config()
@@ -365,7 +381,8 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / 'run'
             config = Path(temp) / 'config.json'
-            config.write_text(json.dumps({'fixtureSource': str(Path(temp) / 'missing-source')}))
+            config.write_text(json.dumps({
+                'fixtureSource': str(Path(temp) / 'missing-source'), 'fixtureSha': 'a' * 40}))
             completed = subprocess.run([sys.executable, str(ROOT / 'run.py'), '--mode', 'fixture',
                                         '--config', str(config), '--output', str(output)], capture_output=True, text=True)
             self.assertEqual(completed.returncode, 2, completed.stderr)
