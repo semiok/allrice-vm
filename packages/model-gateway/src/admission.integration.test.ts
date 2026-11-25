@@ -130,6 +130,13 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       code: 'DUPLICATE_CALL',
     });
     await expect(
+      store.reserveNativeCall!({
+        ...binding,
+        native: { ...binding.native, callId: randomUUID() },
+      }),
+    ).rejects.toMatchObject({ code: 'DUPLICATE_CALL' });
+
+    await expect(
       store.claimCall(
         { ...binding, employeeRelease: 'wrong-release' },
         'request-digest',

@@ -470,7 +470,14 @@ export async function recoverProductionPersonVmModelOwner(
   signal.throwIfAborted();
   if (result.state !== 'installed')
     throw new ProductionPersonVmHostUnavailable('MODEL_RECOVERY_UNAVAILABLE');
-  return result.host.recoverModelOwner(context, signal);
+  const released = await result.host.recoverModelOwner(context, signal);
+  if (stopping) {
+    // The original drain closed its other owners before deciding whether the
+    // shared pool can end. Do not close that pool ahead of its remaining tasks.
+    await shutdownTask?.catch(() => {});
+    if (!result.host.modelOwnerMaintenancePending()) await closeDatabase();
+  }
+  return released;
 }
 const nativeRunDiagnosticsHttp = createNativeRunDiagnosticsHttpHandler(
   undefined,
@@ -1045,7 +1052,17 @@ function shutdown(signal: string) {
         }
       },
       removeCapabilities: () => removeWorkerCapabilities(workerId),
-      closeDatabase,
+      closeDatabase: async () => {
+        const result = await personVmHost;
+        if (
+          result.state === 'installed' &&
+          result.host.modelOwnerMaintenancePending()
+        )
+          throw new ProductionPersonVmHostUnavailable(
+            'MODEL_RECOVERY_UNAVAILABLE',
+          );
+        await closeDatabase();
+      },
     });
     process.exit(0);
   })();

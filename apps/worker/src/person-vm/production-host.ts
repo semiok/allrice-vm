@@ -123,6 +123,7 @@ type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
 export interface ProductionPersonVmHost {
   close(): Promise<void>;
+  modelOwnerMaintenancePending(): boolean;
   /** Trusted in-process maintenance only. The model authority verifies the
    * operator and independent proof of stopping this exact owner. */
   recoverModelOwner(
@@ -667,7 +668,11 @@ export function createProductionPersonVmHost(input: {
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
       });
       lifetime.throwIfAborted();
-      return Object.freeze({ close, recoverModelOwner });
+      return Object.freeze({
+        close,
+        recoverModelOwner,
+        modelOwnerMaintenancePending: () => modelRecovery !== undefined,
+      });
     } finally {
       finishConstruction();
     }

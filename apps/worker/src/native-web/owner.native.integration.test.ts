@@ -158,7 +158,7 @@ it.skipIf(!cli)(
       attemptId?: string;
       redeemed?: boolean;
     } = {};
-    let readAttempt: ((session: string) => Promise<string>) | undefined;
+    const readAttempt = deferred<(session: string) => Promise<string>>();
     const capability = 'a'.repeat(43);
     const reference = 'b'.repeat(43);
     const server = createServer((request, response) => {
@@ -175,7 +175,9 @@ it.skipIf(!cli)(
           )
             throw Error('Wrong native model selection');
           facts.sessionId = selection.sessionId;
-          facts.attemptId = await readAttempt?.(selection.sessionId);
+          facts.attemptId = await (
+            await readAttempt.promise
+          )(selection.sessionId);
           if (!facts.attemptId) throw Error('No current attempt present');
           response.writeHead(200, { 'content-type': 'application/json' });
           response.end(JSON.stringify({ reference }));
@@ -230,7 +232,7 @@ it.skipIf(!cli)(
     if (!created.ok || !transport)
       throw Error('Native owner fixture did not start');
     const sessionId = created.value.sessionId;
-    readAttempt = async (requested) => {
+    readAttempt.resolve(async (requested) => {
       const attempt = await f.owner.readNativeAttemptFor(
         f.context,
         requested,
@@ -241,7 +243,7 @@ it.skipIf(!cli)(
           'DSH model attempt did not exist on the authenticated owner',
         );
       return attempt.id;
-    };
+    });
     const method = NATIVE_REMOTE.methods['session/prompt'];
     const args = method
       .input({ strict: true })

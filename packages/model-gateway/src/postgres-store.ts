@@ -79,7 +79,9 @@ export function nativeCallKey(binding: ModelCallBinding): string {
         binding.vm.leaseEpoch,
         binding.native.instanceId,
         binding.native.sessionId,
-        binding.native.callId,
+        binding.native.attemptId
+          ? ['native-attempt', binding.native.attemptId]
+          : binding.native.callId,
       ]),
     )
     .digest('hex');

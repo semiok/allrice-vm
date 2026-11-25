@@ -1,3 +1,4 @@
+import type * as ProductionConfig from './production-config.js';
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
 import { rm, stat } from 'node:fs/promises';
@@ -65,7 +66,7 @@ const io = vi.hoisted(() => ({
     >(),
 }));
 vi.mock('./production-config.js', async (original) => ({
-  ...(await original<typeof import('./production-config.js')>()),
+  ...(await original<typeof ProductionConfig>()),
   readProductionHostConfiguration: io.read,
 }));
 vi.mock('./production-authority.js', async (original) => {
