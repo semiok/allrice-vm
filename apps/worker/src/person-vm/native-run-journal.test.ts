@@ -331,8 +331,7 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
           { kind: 'user', rpcId: nextRequestId as SessionRequestId },
           true,
         );
-        await writer.append(next);
-        await writer.flush();
+        expect(await sessions.flush(replacement)).toBe(true);
       } finally {
         detachReplacement();
       }
