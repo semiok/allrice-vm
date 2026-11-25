@@ -246,8 +246,8 @@ export async function readPersistedRunTerminal(
 }
 
 /** One observer per managed native owner. Only attached SessionStore events
- * reach observe. A matching disposal can retain a completed receipt, while a
- * replacement invalidates it for the rest of this Guest owner's lifetime. */
+ * reach observe. Disposal may retain a completed receipt. Reactivation keeps
+ * the turn watermark and may attest only a later turn of the new Session. */
 export function createNativeRunTerminalAttestations() {
   const sessions = new Map();
   const receipts = new Map();
@@ -259,13 +259,38 @@ export function createNativeRunTerminalAttestations() {
         : !!current && state.session.deref() === current)
     );
   }
+  function entered(session, turn = 0) {
+    return {
+      session: new WeakRef(session),
+      parentSessionId: session.header.parentSession ?? null,
+      createdAt: session.header.createdAt,
+      origin: session.header.origin,
+      seeded: session.header.isSeeded,
+      detached: false,
+      turn,
+      start: null,
+    };
+  }
   return {
-    hasCurrent(sessionId, current) {
-      return matches(sessions.get(sessionId), current);
+    hasCurrent({ sessionId, turn }, current) {
+      const state = sessions.get(sessionId);
+      const receipt = receipts.get(JSON.stringify([sessionId, turn]));
+      return matches(state, current) && receipt?.state === state;
     },
     attach(session) {
       const state = sessions.get(session.id);
-      if (state && (state.detached || state.session.deref() !== session))
+      if (!state) return;
+      if (state.detached) {
+        const sameHeader =
+          state.parentSessionId === (session.header.parentSession ?? null) &&
+          state.createdAt === session.header.createdAt &&
+          state.origin === session.header.origin &&
+          state.seeded === session.header.isSeeded;
+        sessions.set(
+          session.id,
+          sameHeader ? entered(session, state.turn) : null,
+        );
+      } else if (state.session.deref() !== session)
         sessions.set(session.id, null);
     },
     detach(session) {
@@ -294,13 +319,7 @@ export function createNativeRunTerminalAttestations() {
       if (type === 'turn/start') {
         if (!state) {
           if (sessions.size >= 1024) return;
-          state = {
-            session: new WeakRef(session),
-            parentSessionId: session.header.parentSession ?? null,
-            detached: false,
-            turn: 0,
-            start: null,
-          };
+          state = entered(session);
           sessions.set(id, state);
         }
         if (state.start !== null || turn <= state.turn) {
@@ -318,7 +337,7 @@ export function createNativeRunTerminalAttestations() {
       // Native cold recovery can persist an interrupted closer before it
       // attaches the Session. Fork closers are excluded by turnEnd as well.
       if (!end || end.reason === 'interrupted' || end.sequence <= start) return;
-      receipts.set(JSON.stringify([id, turn]), { start, end });
+      receipts.set(JSON.stringify([id, turn]), { state, start, end });
       if (receipts.size > 2048) receipts.delete(receipts.keys().next().value);
     },
     async read(currentSession, persistence, selection, active) {
@@ -339,7 +358,11 @@ export function createNativeRunTerminalAttestations() {
       };
       if (!sameSession()) return null;
       const receipt = receipts.get(JSON.stringify([sessionId, turn]));
-      if (!receipt || cursor <= receipt.start || cursor >= receipt.end.sequence)
+      if (
+        receipt?.state !== state ||
+        cursor <= receipt.start ||
+        cursor >= receipt.end.sequence
+      )
         return null;
       const stored = await readPersistedRunTerminal(
         persistence,

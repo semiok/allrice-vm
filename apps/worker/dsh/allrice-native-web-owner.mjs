@@ -1036,7 +1036,7 @@ export function applyNativeWebOwner(
                 return terminal &&
                   current() &&
                   terminalAttestations.hasCurrent(
-                    value.sessionId,
+                    value,
                     currentSession(value.sessionId),
                   ) &&
                   original(scope.get('sessionPersistence')) ===

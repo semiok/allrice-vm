@@ -302,16 +302,48 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       expected,
     );
     const replacement = sessions.prepare(SessionId(sessionId), {
-      meta: { cwd: root },
+      meta: session.header,
+      seed: structuredClone(rows),
+      inheritedEventCount: session.inheritedEventCount,
+      eventState: 'detached',
     });
     const detachReplacement = sessions.enter(replacement);
+    const nextRequestId = randomUUID();
+    let next: SessionEvent[];
     try {
       expect(await attested.read(current, native, selected, active)).toBeNull();
       sessions.announce(replacement);
+      expect(await attested.read(current, native, selected, active)).toBeNull();
+      next = appendTurn(
+        replacement,
+        2,
+        { kind: 'user', rpcId: nextRequestId as SessionRequestId },
+        true,
+      );
+      const writer = await native.open(session.id, 'write');
+      try {
+        await writer.append(next);
+        await writer.flush();
+      } finally {
+        await writer.close();
+      }
     } finally {
       detachReplacement();
     }
     expect(await attested.read(current, native, selected, active)).toBeNull();
+    expect(
+      await attested.read(
+        current,
+        native,
+        {
+          ...selected,
+          turn: 2,
+          cursor: next[2]!.seq,
+          nativeRequestId: nextRequestId,
+        },
+        active,
+      ),
+    ).toMatchObject({ sessionId, turn: 2, sequence: next.at(-1)!.seq });
   } finally {
     await ctx.fiber.dispose();
     await rm(root, { recursive: true, force: true });
