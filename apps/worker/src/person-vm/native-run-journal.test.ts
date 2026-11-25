@@ -307,28 +307,37 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
       inheritedEventCount: session.inheritedEventCount,
       eventState: 'detached',
     });
-    const detachReplacement = sessions.enter(replacement);
     const nextRequestId = randomUUID();
     let next: SessionEvent[];
+    const writer = await native.open(session.id, 'write');
     try {
-      expect(await attested.read(current, native, selected, active)).toBeNull();
-      sessions.announce(replacement);
-      expect(await attested.read(current, native, selected, active)).toBeNull();
-      next = appendTurn(
-        replacement,
-        2,
-        { kind: 'user', rpcId: nextRequestId as SessionRequestId },
-        true,
+      // The native resume path persists its unpublished suffix, including
+      // the end-of-seed marker, before it announces the restored Session.
+      await writer.append(
+        replacement.snapshotEvents(SessionLogOffset(rows.length)),
       );
-      const writer = await native.open(session.id, 'write');
+      const detachReplacement = sessions.enter(replacement);
       try {
+        expect(
+          await attested.read(current, native, selected, active),
+        ).toBeNull();
+        sessions.announce(replacement);
+        expect(
+          await attested.read(current, native, selected, active),
+        ).toBeNull();
+        next = appendTurn(
+          replacement,
+          2,
+          { kind: 'user', rpcId: nextRequestId as SessionRequestId },
+          true,
+        );
         await writer.append(next);
         await writer.flush();
       } finally {
-        await writer.close();
+        detachReplacement();
       }
     } finally {
-      detachReplacement();
+      await writer.close();
     }
     expect(await attested.read(current, native, selected, active)).toBeNull();
     expect(
