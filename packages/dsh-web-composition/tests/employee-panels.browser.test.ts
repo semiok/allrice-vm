@@ -1,0 +1,1395 @@
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  writeFile,
+} from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Route,
+} from 'playwright-core';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from 'vitest';
+import {
+  installedFixtureComposition,
+  startInstalledProfile,
+} from './installed-profile';
+import { writeEmployeePanelsFixture } from './employee-panels-fixture';
+import {
+  compareNativePanelsHostBudget,
+  writeEmployeePanelsReferenceCarrier,
+} from './employee-panels-reference-carrier';
+import {
+  panelsRev2Head,
+  writeEmployeePanelsBaseline,
+} from './employee-panels-baseline';
+import {
+  compareApprovedPanelPixels,
+  readPanelPixelBrowser,
+} from './employee-panels-pixel-approvals';
+import {
+  createSyntheticPanelsData,
+  panelsClock,
+  panelStates,
+  type PanelsState,
+} from './fixtures/employee-panels/data';
+import type { PanelsIntegration } from './fixtures/employee-panels/client';
+import type { SessionIdOf } from '@deepseek-ai/dsh-client-ui-slots';
+import {
+  fixtureAbortCode,
+  isPanelsCatalogResponse,
+  observePanelsNetwork,
+  PanelsNetworkErrors,
+} from './employee-panels-network-errors';
+import { readPanelsRenderingDiagnostics } from './employee-panels-rendering-diagnostics';
+import type {} from './fixtures/employee-panels/reference';
+
+const suite =
+  process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
+    ? describe
+    : describe.skip;
+const kinds = ['files', 'materials', 'experience', 'workflow'] as const;
+const names = {
+  files: '交付成果',
+  materials: '企业资料',
+  experience: 'Rice · 记忆',
+  workflow: 'Rice · 能力',
+};
+const labels = {
+  files: '交付成果',
+  materials: '企业资料',
+  experience: '记忆',
+  workflow: '能力',
+};
+const sessions = [
+  'session-00000000-0000-4000-8000-000000000036',
+  'session-00000000-0000-4000-8000-000000000038',
+] as SessionIdOf[];
+type Kind = (typeof kinds)[number];
+const body = (page: Page, kind: Kind) =>
+  page
+    .locator(`section[aria-label="${names[kind]}"]`)
+    .filter({ visible: true });
+const settle = (page: Page) =>
+  page.evaluate(
+    () =>
+      new Promise<void>((done) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => done())),
+      ),
+  );
+const catalogResponse = (page: Page, kind: Kind, state: PanelsState) =>
+  state === 'loading' || (kind !== 'materials' && kind !== 'files')
+    ? Promise.resolve()
+    : page
+        .waitForResponse((response) =>
+          isPanelsCatalogResponse(
+            response.url(),
+            response.request().method(),
+            new URL(page.url()).origin,
+            kind,
+          ),
+        )
+        .then(async (response) => {
+          // Headers alone precede the completed network outcome. A subsequent
+          // native tab cleanup must not cancel the response under inspection.
+          const failure = await response.finished();
+          if (failure) throw failure;
+        });
+const contentReady = async (page: Page, kind: Kind, state: PanelsState) => {
+  const root = body(page, kind);
+  if (state === 'loading') {
+    if (kind === 'materials')
+      await root
+        .getByRole('status', { name: '正在读取企业资料', exact: true })
+        .waitFor({ state: 'visible' });
+    else await root.getByRole('status').waitFor({ state: 'visible' });
+  } else if (state === 'denied') {
+    // Materials keeps its existing generic catalog failure wording.
+    if (kind === 'materials' || kind === 'files') {
+      const alert = root.getByRole('alert');
+      await alert.waitFor({ state: 'visible' });
+      if (kind === 'files')
+        expect(await alert.textContent()).toBe(
+          '当前权限已撤销或不允许此操作。重新加载',
+        );
+    } else
+      await root
+        .getByText('无权访问', { exact: false })
+        .first()
+        .waitFor({ state: 'visible' });
+  } else if (state === 'empty') {
+    await root
+      .getByText(
+        {
+          files: '还没有交付成果',
+          materials: '还没有企业资料',
+          experience: '还没有记忆',
+          workflow: '暂无插件',
+        }[kind],
+        { exact: true },
+      )
+      .waitFor({ state: 'visible' });
+  } else if (kind === 'materials' || kind === 'files') {
+    await root
+      .getByText(
+        createSyntheticPanelsData(state).catalog.references[0]!.fileName,
+        { exact: true },
+      )
+      .first()
+      .waitFor({ state: 'visible' });
+  }
+};
+const inspectContent = (page: Page, kind: Kind, includePaint = false) =>
+  body(page, kind).evaluate((node, includePaint) => {
+    const box = (element: Element) => {
+      const { x, y, width, height } = element.getBoundingClientRect();
+      const s = getComputedStyle(element);
+      return {
+        tag: element.tagName,
+        text: element.textContent?.trim().slice(0, 100),
+        x,
+        y,
+        width,
+        height,
+        display: s.display,
+        position: s.position,
+        styleAttribute: element.getAttribute('style'),
+        referenceCarrier: element.getAttribute('data-panels-reference-carrier'),
+        boxSizing: s.boxSizing,
+        fontFamily: s.fontFamily,
+        fontSize: s.fontSize,
+        fontWeight: s.fontWeight,
+        lineHeight: s.lineHeight,
+        letterSpacing: s.letterSpacing,
+        color: s.color,
+        background: s.backgroundColor,
+        padding: s.padding,
+        border: s.borderWidth,
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight,
+      };
+    };
+    const paintStyle = (s: CSSStyleDeclaration) => ({
+      backgroundColor: s.backgroundColor,
+      backgroundImage: s.backgroundImage,
+      backgroundClip: s.backgroundClip,
+      backgroundOrigin: s.backgroundOrigin,
+      color: s.color,
+      borderRadius: s.borderRadius,
+      borderWidth: s.borderWidth,
+      borderColor: s.borderColor,
+      borderStyle: s.borderStyle,
+      cornerShape: s.getPropertyValue('corner-shape'),
+      cornerToken: s.getPropertyValue('--dsw-corner-shape'),
+      opacity: s.opacity,
+      transform: s.transform,
+      translate: s.translate,
+      scale: s.scale,
+      rotate: s.rotate,
+      filter: s.filter,
+      backdropFilter: s.backdropFilter,
+      willChange: s.willChange,
+      contain: s.contain,
+      isolation: s.isolation,
+      mixBlendMode: s.mixBlendMode,
+      maskImage: s.maskImage,
+      clipPath: s.clipPath,
+      boxShadow: s.boxShadow,
+      colorScheme: s.colorScheme,
+      zoom: s.zoom,
+      fontSmoothing: s.getPropertyValue('-webkit-font-smoothing'),
+      textAutospace: s.getPropertyValue('text-autospace'),
+    });
+    const paintNode = (element: Element) => ({
+      ...box(element),
+      className: element.getAttribute('class'),
+      role: element.getAttribute('role'),
+      label: element.getAttribute('aria-label'),
+      hovered: element.matches(':hover'),
+      focused: element === document.activeElement,
+      paint: paintStyle(getComputedStyle(element)),
+      before: paintStyle(getComputedStyle(element, '::before')),
+      after: paintStyle(getComputedStyle(element, '::after')),
+      animations: element.getAnimations().map((animation) => ({
+        playState: animation.playState,
+        currentTime: animation.currentTime,
+        timing: animation.effect?.getComputedTiming(),
+      })),
+    });
+    const ancestors: ReturnType<typeof paintNode>[] = [];
+    if (includePaint)
+      for (
+        let parent = node.parentElement;
+        parent;
+        parent = parent.parentElement
+      )
+        ancestors.push(paintNode(parent));
+    // Official SidebarRight renders these public DOM markers outside the
+    // contribution wrapper. Read the real pane and its ancestor clip budget;
+    // never infer native room from the replay's copied width/height props.
+    const nativeTab = node.closest(
+      'div[data-sidebar-right-tab][data-sidebar-right-occurrence]',
+    );
+    const nativePanel = nativeTab?.closest('[data-sidebar-right-panel]');
+    const chrome = Object.fromEntries(
+      [nativeTab, nativePanel].flatMap((element, index) =>
+        [
+          'box-sizing',
+          'font-family',
+          'corner-shape',
+          '-webkit-font-smoothing',
+          'text-autospace',
+        ].map((property) => [
+          `${index}:${property}`,
+          element ? getComputedStyle(element).getPropertyValue(property) : null,
+        ]),
+      ),
+    );
+    const available = { x: 0, y: 0, width: innerWidth, height: innerHeight };
+    const clips: { rect: typeof available; css: string[] }[] = [];
+    for (let parent = nativeTab; parent; parent = parent.parentElement) {
+      const s = getComputedStyle(parent);
+      if (s.display === 'contents') continue;
+      const clipX = s.overflowX !== 'visible';
+      const clipY = s.overflowY !== 'visible';
+      if (!clipX && !clipY && s.clipPath === 'none' && s.maskImage === 'none')
+        continue;
+      const bounds = parent.getBoundingClientRect();
+      const rect = {
+        x: bounds.x + parent.clientLeft,
+        y: bounds.y + parent.clientTop,
+        width: parent.clientWidth,
+        height: parent.clientHeight,
+      };
+      clips.push({
+        rect,
+        css: [
+          s.overflowX,
+          s.overflowY,
+          s.clipPath,
+          s.maskImage,
+          s.borderRadius,
+          s.getPropertyValue('corner-shape'),
+          s.transform,
+        ],
+      });
+      const right = Math.min(
+        available.x + available.width,
+        rect.x + rect.width,
+      );
+      const bottom = Math.min(
+        available.y + available.height,
+        rect.y + rect.height,
+      );
+      if (clipX) {
+        available.x = Math.max(available.x, rect.x);
+        available.width = Math.max(0, right - available.x);
+      }
+      if (clipY) {
+        available.y = Math.max(available.y, rect.y);
+        available.height = Math.max(0, bottom - available.y);
+      }
+    }
+    return {
+      root: box(node),
+      parent: box(node.parentElement!),
+      nativeHost: {
+        chrome,
+        tab: nativeTab ? box(nativeTab) : null,
+        panel: nativePanel ? box(nativePanel) : null,
+        available,
+        clips,
+        mode: nativePanel?.getAttribute('data-sidebar-right-panel') ?? null,
+        session:
+          nativePanel?.getAttribute('data-sidebar-right-session') ?? null,
+        open: nativePanel?.hasAttribute('data-sidebar-right-open') ?? false,
+      },
+      elements: [...node.querySelectorAll('h2,p,input,button,strong')]
+        .filter((item) => item.getBoundingClientRect().width > 0)
+        .slice(0, 30)
+        .map(box),
+      viewport: {
+        width: innerWidth,
+        height: innerHeight,
+        dpr: devicePixelRatio,
+      },
+      // Full visible leaves include dots/avatars/skeletons omitted by the
+      // typography sample above. Evidence only; no style/capture mutation.
+      paintEvidence: includePaint
+        ? {
+            ancestors,
+            nodes: [node, ...node.querySelectorAll('*')]
+              .filter((element) => {
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              })
+              .map(paintNode),
+            activeElement: document.activeElement?.tagName,
+            elementAtViewportOrigin: document.elementFromPoint(0, 0)?.tagName,
+            referenceSurface: (() => {
+              const owner = node.closest('[data-panels-reference-document]');
+              const body = node.closest('[data-panels-reference-body]');
+              return owner && body
+                ? {
+                    theme: owner.getAttribute('data-theme'),
+                    framework: owner.getAttribute('data-allrice-framework'),
+                    dark: body.hasAttribute('data-ds-dark-theme'),
+                    rootDisplay: getComputedStyle(owner).display,
+                    bodyDisplay: getComputedStyle(body).display,
+                  }
+                : null;
+            })(),
+            referenceStyle:
+              document
+                .querySelector('style[data-panels-reference-carrier]')
+                ?.getAttribute('data-panels-reference-carrier') ?? null,
+            currentProductStyles: document.querySelectorAll(
+              'style[data-allrice-employee-sidebar]',
+            ).length,
+            framework: document.documentElement.getAttribute(
+              'data-allrice-framework',
+            ),
+            subagentCatalogs: document.querySelectorAll(
+              '[role="tree"][aria-label="子智能体会话"]',
+            ).length,
+          }
+        : undefined,
+    };
+  }, includePaint);
+
+// Real installed product/native renderer, with explicitly synthetic BFF data.
+// No authentication, model submission, or 4.0 carrier delivery is asserted.
+suite('installed native employee panels with synthetic business owner', () => {
+  let browser: Browser, context: BrowserContext, page: Page, artifacts: string;
+  let pixelBrowser: Awaited<ReturnType<typeof readPanelPixelBrowser>>;
+  let host: Awaited<ReturnType<typeof startInstalledProfile>>;
+  let referenceHost: Awaited<ReturnType<typeof startInstalledProfile>>;
+  let reference: Awaited<
+    ReturnType<typeof writeEmployeePanelsReferenceCarrier>
+  >;
+  let state: PanelsState = 'list';
+  type Observation = Awaited<ReturnType<typeof observePanelsNetwork>>;
+  const network = new PanelsNetworkErrors();
+  const observations = new Map<Page, Observation>();
+  const pending: {
+      route: Route;
+      fixture: ReturnType<Observation['fixture']>;
+    }[] = [],
+    requests: { url: string; method: string; state: PanelsState }[] = [];
+  const errors = network.diagnostics;
+  let currentTest: string | null = null;
+  const evidence = () =>
+    page.evaluate(() => window.__allricePanelsIntegration!.evidence());
+  const command = async <K extends keyof PanelsIntegration>(
+    name: K,
+    ...args: Parameters<PanelsIntegration[K]>
+  ) =>
+    page.evaluate(
+      ({ name, args }) => {
+        const fn = window.__allricePanelsIntegration![name] as (
+          ...values: unknown[]
+        ) => unknown;
+        return fn(...args);
+      },
+      { name, args },
+    );
+  const businessRoute = async (route: Route) => {
+    const request = route.request();
+    const url = new URL(request.url()),
+      method = request.method();
+    const observation = observations.get(request.frame().page());
+    if (!observation) throw Error('Missing request observer for fixture page');
+    const fixture = observation.fixture(request);
+    requests.push({ url: url.pathname + url.search, method, state });
+    if (method !== 'GET') {
+      await route.fulfill({
+        status: 403,
+        json: {
+          error: {
+            code: 'SYNTHETIC_READ_ONLY',
+            message: '合成夹具不接受业务写入',
+          },
+        },
+      });
+      return;
+    }
+    if (state === 'loading') {
+      fixture.held = true;
+      pending.push({ route, fixture });
+      return;
+    }
+    if (state === 'denied') {
+      await route.fulfill({
+        status: 403,
+        headers: network.deny(fixture),
+        json: { error: { code: 'FORBIDDEN', message: '无权访问' } },
+      });
+      fixture.completed = true;
+      return;
+    }
+    const data = createSyntheticPanelsData(state);
+    if (url.pathname === '/api/v1/references/publications')
+      await route.fulfill({ json: data.catalog });
+    else if (url.pathname === '/api/v1/workbench/files')
+      await route.fulfill({ json: data.files });
+    else if (url.pathname.endsWith('/selection'))
+      await route.fulfill({
+        json: data.selection(url.pathname.split('/').at(-2)!),
+      });
+    else {
+      await route.fulfill({
+        status: 404,
+        json: {
+          error: {
+            code: 'SYNTHETIC_NOT_PROVIDED',
+            message: '此业务响应未由测试夹具提供',
+          },
+        },
+      });
+    }
+  };
+  const changeState = async (value: PanelsState) => {
+    if (pending.length) {
+      for (const observation of observations.values())
+        await observation.flush();
+      const held = pending.splice(0);
+      network.abort(held.map(({ fixture }) => fixture));
+      for (const { route, fixture } of held) {
+        try {
+          await route.abort(fixtureAbortCode);
+          fixture.completed = true;
+        } catch (error) {
+          network.issues.push(
+            `Loading-exit abort failed for ${fixture.id}: ${String(error)}`,
+          );
+        }
+      }
+    }
+    state = value;
+    await command('setState', value);
+  };
+  const open = async (kind: Kind) => {
+    const entries = page.locator('[aria-label="工作台入口"]');
+    const launcher = entries.getByRole('button', {
+      name: new RegExp(`^${labels[kind]}(?:，|$)`),
+    });
+    let entry = launcher;
+    if (page.viewportSize()!.width <= 760) {
+      // The compact native header exposes only its right-bar control. The
+      // guide supplies the same actions inside the authorized native pane.
+      const expand = page.getByRole('button', {
+        name: '打开右侧边栏',
+        exact: true,
+      });
+      if (await expand.isVisible()) await expand.click();
+      entry = page.getByRole('button').filter({
+        has: page
+          .locator('strong')
+          .filter({ hasText: new RegExp(`^${labels[kind]}$`) }),
+      });
+      if (!(await entry.isVisible())) {
+        const guide = page.getByRole('tab', { name: /^开始/ });
+        if (await guide.isVisible()) await guide.click();
+        else
+          await page
+            .getByRole('button', { name: '新标签页', exact: true })
+            .click();
+      }
+    }
+    await Promise.all([catalogResponse(page, kind, state), entry.click()]);
+    await body(page, kind).waitFor({ state: 'visible' });
+    await page.waitForFunction(
+      (kind) =>
+        window.__allricePanelsIntegration!.evidence().activeKind ===
+        `allrice-employee-panels.${kind}`,
+      kind,
+    );
+    await contentReady(page, kind, state);
+    await settle(page);
+  };
+  beforeAll(async () => {
+    const parent = resolve(
+      process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR ??
+        join(tmpdir(), 'allrice-composition-evidence'),
+    );
+    await mkdir(parent, { recursive: true });
+    artifacts = await mkdtemp(join(parent, 'employee-panels-'));
+    console.info(`Synthetic-owner native panels evidence: ${artifacts}`);
+    // Preserve the historical IIFE/metadata separately. Expected now uses a
+    // new callable executable with its own source/bundle/CSS/manifest identity.
+    await writeEmployeePanelsBaseline(artifacts);
+    reference = await writeEmployeePanelsReferenceCarrier(artifacts);
+    const fixture = await writeEmployeePanelsFixture(artifacts, reference);
+    host = await startInstalledProfile(fixture);
+    // A separate isolated native profile excludes the current AllRice client:
+    // its body-inline token layer would override the original reference globals.
+    referenceHost = await startInstalledProfile(fixture, {
+      referenceOnly: true,
+    });
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--disable-lcd-text', '--disable-gpu'],
+      ...(process.env.ALLRICE_BROWSER_EXECUTABLE
+        ? { executablePath: process.env.ALLRICE_BROWSER_EXECUTABLE }
+        : {}),
+    });
+    pixelBrowser = await readPanelPixelBrowser(browser);
+    // Record the rasterization environment used by both independent hosts.
+    const rendering = await readPanelsRenderingDiagnostics(
+      await browser.newBrowserCDPSession(),
+    );
+    await writeFile(
+      join(artifacts, 'browser-rendering.json'),
+      JSON.stringify(rendering, null, 2),
+    );
+    await writeFile(
+      join(artifacts, 'browser-identity.json'),
+      JSON.stringify(
+        {
+          browser: browser.version(),
+          node: process.version,
+          nativeVersion: '0.2.1-rc.2',
+          dpr: 1,
+          clock: panelsClock,
+          reducedMotion: 'reduce',
+          businessOwner: 'synthetic only; no authenticated BFF/MCP or model',
+          rev2Head: panelsRev2Head,
+          referenceCarrier: {
+            id: reference.id,
+            metadataSha256: reference.metadataSha256,
+            metadata: reference.metadata,
+            profile: installedFixtureComposition(true),
+          },
+          productSha256: createHash('sha256')
+            .update(
+              await readFile(new URL('../dist/client.js', import.meta.url)),
+            )
+            .digest('hex'),
+        },
+        null,
+        2,
+      ),
+    );
+  }, 180_000);
+  beforeEach(async (test) => {
+    currentTest = test.task.name;
+    state = 'list';
+    context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+      deviceScaleFactor: 1,
+      reducedMotion: 'reduce',
+      timezoneId: 'UTC',
+    });
+    await context.addInitScript((clock) => {
+      Date.now = () => Date.parse(clock);
+    }, panelsClock);
+    page = await context.newPage();
+    page.setDefaultTimeout(15_000);
+    observations.set(
+      page,
+      await observePanelsNetwork(
+        page,
+        `native-${observations.size}`,
+        currentTest,
+        network,
+      ),
+    );
+    await page.route('**/api/v1/**', businessRoute);
+    await page.goto(host.authUrl);
+    const proceed = page.getByRole('button', { name: /^(Continue|继续)$/ });
+    await proceed
+      .waitFor({ state: 'visible', timeout: 5000 })
+      .catch(() => undefined);
+    if (await proceed.isVisible()) await proceed.click();
+    await page.waitForFunction(
+      () =>
+        window.__allricePanelsIntegration?.evidence().nativeInputReady &&
+        !!document.querySelector('[aria-label="工作台入口"]'),
+    );
+    await command('clearInput');
+  });
+  afterEach(async (test) => {
+    if (test.task.result?.state === 'fail') {
+      const name = test.task.id.replace(/\W/g, '-');
+      await writeFile(
+        join(artifacts, `first-failure-${name}.json`),
+        JSON.stringify(
+          {
+            test: test.task.name,
+            state,
+            evidence: await evidence().catch(String),
+            errors,
+            requests,
+          },
+          null,
+          2,
+        ),
+      );
+      await page.screenshot({
+        path: join(artifacts, `first-failure-${name}.png`),
+        fullPage: true,
+      });
+    }
+    for (const observation of observations.values()) await observation.flush();
+    await context?.close();
+    pending.length = 0;
+    await writeFile(
+      join(artifacts, 'runtime-errors.json'),
+      JSON.stringify(errors, null, 2),
+    );
+    await writeFile(
+      join(artifacts, 'business-requests.json'),
+      JSON.stringify(requests, null, 2),
+    );
+    await writeFile(
+      join(artifacts, 'network-errors.json'),
+      JSON.stringify(
+        {
+          fixtures: network.fixtures,
+          requests: network.requests,
+          logs: network.logs,
+          audit: network.audit(),
+          referenceCarrier: {
+            id: reference.id,
+            metadataSha256: reference.metadataSha256,
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    currentTest = null;
+  });
+  afterAll(async () => {
+    try {
+      await browser?.close();
+    } finally {
+      try {
+        await referenceHost?.close();
+      } finally {
+        await host?.close();
+      }
+    }
+  });
+
+  it('uses four original entries and native tabs/close without a badge for an unknown unread count', async () => {
+    const entries = page.locator('[aria-label="工作台入口"]');
+    expect(await entries.getByRole('button').count()).toBe(4);
+    expect(
+      await entries
+        .getByRole('button', { name: '交付成果，5 项新增', exact: true })
+        .count(),
+    ).toBe(1);
+    expect(
+      await entries
+        .getByRole('button', { name: '展开工作台', exact: true })
+        .count(),
+    ).toBe(0);
+    await command('unknownFiles', true);
+    const files = entries.getByRole('button', {
+      name: '交付成果',
+      exact: true,
+    });
+    await files.waitFor({ state: 'visible' });
+    expect((await evidence()).ownerBound).toBe(true);
+    expect(await entries.getByRole('button').count()).toBe(4);
+    expect(await files.locator('span[aria-hidden="true"]').count()).toBe(0);
+    for (const kind of kinds) {
+      await open(kind);
+      expect((await evidence()).expanded).toBe(true);
+      expect(await body(page, kind).count()).toBe(1);
+    }
+    await page
+      .getByRole('tab', { name: /能力/ })
+      .getByRole('button', { name: '关闭', exact: true })
+      .click();
+    await body(page, 'workflow').waitFor({ state: 'hidden' });
+    await command('unknownFiles', false);
+    await entries
+      .getByRole('button', { name: '交付成果，5 项新增', exact: true })
+      .waitFor({ state: 'visible' });
+    expect(
+      await entries
+        .getByRole('button', { name: '企业资料', exact: true })
+        .count(),
+    ).toBe(1);
+    expect(
+      await entries.getByRole('button', { name: '记忆', exact: true }).count(),
+    ).toBe(1);
+    expect(
+      await entries.getByRole('button', { name: '能力', exact: true }).count(),
+    ).toBe(1);
+  });
+
+  it('opens all four original entries through the native compact guide', async () => {
+    await page.setViewportSize({ width: 390, height: 1000 });
+    expect(await page.getByLabel('工作台入口').isVisible()).toBe(false);
+    for (const kind of kinds) {
+      await open(kind);
+      expect((await evidence()).expanded).toBe(true);
+      expect(await body(page, kind).count()).toBe(1);
+    }
+  });
+
+  it('keeps enterprise ＋ and uses actual native insertion acceptance and stale-span refusal', async () => {
+    await open('materials');
+    const plus = body(page, 'materials').getByRole('button', {
+      name: '引用到对话',
+      exact: true,
+    });
+    expect(await plus.count()).toBe(5);
+    await plus.first().click();
+    await page.waitForFunction(
+      () =>
+        window.__allricePanelsIntegration!.evidence().accepted === 1 &&
+        window.__allricePanelsIntegration!.input().occurrences.length === 1,
+    );
+    const inserted = await page.evaluate(() =>
+      window.__allricePanelsIntegration!.input(),
+    );
+    expect(inserted.occurrences).toHaveLength(1);
+    expect(inserted.occurrences[0]).toMatchObject({
+      source: 'allrice-synthetic-reference',
+      ref: createSyntheticPanelsData().references[0]!.revisionId,
+    });
+    const received = await evidence();
+    expect(received.lastReference).toMatchObject({
+      sessionId: sessions[0],
+      checksum: createSyntheticPanelsData().references[0]!.checksum,
+    });
+    await command('rejectNextReference');
+    await plus.nth(1).click();
+    await page.waitForFunction(
+      () => window.__allricePanelsIntegration!.evidence().refused === 1,
+    );
+    const refused = await page.evaluate(() =>
+      window.__allricePanelsIntegration!.input(),
+    );
+    expect(refused.occurrences).toHaveLength(1);
+    expect(refused.draftRev).toBeGreaterThan(inserted.draftRev);
+    expect((await evidence()).accepted).toBe(1);
+    await body(page, 'materials')
+      .getByRole('alert')
+      .waitFor({ state: 'visible' });
+  });
+
+  it('rejects detached scope/main intents and disposes/rebinds the explicit owner without duplicate seats', async () => {
+    await open('workflow');
+    await command('setMainMode', 'held');
+    await body(page, 'workflow')
+      .getByRole('button', { name: '品牌内容助手', exact: true })
+      .click();
+    await page.waitForFunction(
+      () => window.__allricePanelsIntegration!.evidence().heldMain,
+    );
+    const previous = (await evidence()).scopeKey;
+    await command('switchScope');
+    await page.waitForFunction(
+      (old) => window.__allricePanelsIntegration!.evidence().scopeKey !== old,
+      previous,
+    );
+    await command('releaseMain');
+    await page.waitForFunction(() =>
+      window
+        .__allricePanelsIntegration!.evidence()
+        .events.some((event) => event.startsWith('main-rejected:')),
+    );
+    expect(
+      await page
+        .locator('section[aria-label="合成能力的实际 native main"]')
+        .count(),
+    ).toBe(0);
+    await command('unload');
+    await page
+      .locator('[aria-label="工作台入口"]')
+      .waitFor({ state: 'hidden' });
+    const disposed = await evidence();
+    expect(disposed.ownerBound).toBe(false);
+    expect(disposed.oldOwnerAborted).toBe(true);
+    expect(disposed.listeners).toBe(0);
+    expect(disposed.panelEntries).toEqual([]);
+    await command('rebind');
+    await page
+      .locator('[aria-label="工作台入口"]')
+      .waitFor({ state: 'visible' });
+    expect((await evidence()).panelEntries).toHaveLength(4);
+    expect(
+      (await evidence()).headerEntries.filter(
+        (id) => id === 'allrice-employee-panels.header',
+      ),
+    ).toHaveLength(1);
+    await command('openSession', sessions[1]!);
+    await page.waitForFunction(
+      (id) => window.__allricePanelsIntegration!.evidence().sessionId === id,
+      sessions[1],
+    );
+    await open('experience');
+    expect((await evidence()).scopeKey).toContain(sessions[1]);
+    await command('available', false);
+    await body(page, 'experience').waitFor({ state: 'hidden' });
+    await page
+      .locator('[aria-label="工作台入口"]')
+      .waitFor({ state: 'hidden' });
+  });
+
+  it('opens only the actually registered capability main and refuses an unknown key', async () => {
+    await open('workflow');
+    await command('setMainMode', 'missing');
+    await body(page, 'workflow')
+      .getByRole('button', { name: '品牌内容助手', exact: true })
+      .click();
+    await page.waitForFunction(() =>
+      window
+        .__allricePanelsIntegration!.evidence()
+        .events.some((event) => event.startsWith('main-rejected:')),
+    );
+    expect(
+      await page
+        .locator('section[aria-label="合成能力的实际 native main"]')
+        .count(),
+    ).toBe(0);
+    expect((await evidence()).registeredMain).toBe(true);
+    await command('setMainMode', 'registered');
+    await body(page, 'workflow')
+      .getByRole('button', { name: '品牌内容助手', exact: true })
+      .click();
+    await page
+      .getByRole('heading', {
+        name: '合成能力 main（仅接线测试）',
+        exact: true,
+      })
+      .waitFor({ state: 'visible' });
+    expect((await evidence()).events).toContain('synthetic-main-selected');
+    await page
+      .getByRole('button', { name: '返回真实原生会话', exact: true })
+      .click();
+    await page
+      .locator('[aria-label="工作台入口"]')
+      .waitFor({ state: 'visible' });
+  });
+
+  for (const width of [1440, 390])
+    for (const theme of ['light', 'dark'] as const) {
+      it(`compares original rev2 content at ${width}/${theme} across all applicable states`, async () => {
+        await page.setViewportSize({ width, height: 1000 });
+        await command('setTheme', theme);
+        // The public native token exchange redirects to './' and drops query
+        // parameters. Mint its real isolated cookie first (no browser JS), then
+        // navigate to a token-free carrier URL with its options intact.
+        const authenticated = await context.request.get(referenceHost.authUrl);
+        await writeFile(
+          join(artifacts, `${width}-${theme}-reference-auth.json`),
+          JSON.stringify(
+            {
+              status: authenticated.status(),
+              origin: new URL(authenticated.url()).origin,
+              method: 'GET',
+              source:
+                'real isolated native launch-token cookie exchange; token/cookie values not retained',
+            },
+            null,
+            2,
+          ),
+        );
+        expect(authenticated.status()).toBe(200);
+        const baseline = await context.newPage();
+        observations.set(
+          baseline,
+          await observePanelsNetwork(
+            baseline,
+            `rev2-${observations.size}`,
+            currentTest,
+            network,
+          ),
+        );
+        await baseline.route('**/api/v1/**', businessRoute);
+        await baseline.setViewportSize({ width, height: 1000 });
+        const comparisons: unknown[] = [];
+        const opened: Kind[] = [];
+        for (const value of panelStates)
+          for (const kind of kinds) {
+            const prefix = `${width}-${theme}-${value}-${kind}`;
+            try {
+              await changeState(value);
+              await open(kind);
+              if (!opened.includes(kind)) opened.push(kind);
+              const budget = await inspectContent(page, kind);
+              const query = new URLSearchParams({
+                kind,
+                state: value,
+                theme,
+                paneWidth: String(budget.parent.width),
+                paneHeight: String(budget.parent.height),
+                allricePanelsReference: reference.id,
+              });
+              const referenceUrl = new URL(referenceHost.origin);
+              for (const [key, value] of query)
+                referenceUrl.searchParams.set(key, value);
+              await Promise.all([
+                catalogResponse(baseline, kind, value),
+                (async () => {
+                  await baseline.goto(referenceUrl.href);
+                  await baseline.waitForFunction(
+                    () =>
+                      !!window.__allricePanelsReference ||
+                      [...document.querySelectorAll('button')].some((button) =>
+                        /^(Continue|继续)$/.test(
+                          button.textContent?.trim() ?? '',
+                        ),
+                      ),
+                  );
+                  const proceed = baseline.getByRole('button', {
+                    name: /^(Continue|继续)$/,
+                  });
+                  if (await proceed.isVisible()) await proceed.click();
+                  await baseline.waitForFunction(
+                    () =>
+                      window.__allricePanelsReference?.evidence()
+                        .retainedReady &&
+                      window.__allricePanelsReference.evidence().sessionId !==
+                        null,
+                  );
+                  // Public native Escape clears the transient child catalog.
+                  // Never delete/hide its DOM or bypass an obstructed click.
+                  const trigger = baseline.getByRole('button', {
+                    name: '1 个子智能体',
+                    exact: true,
+                  });
+                  const initial = {
+                    expanded: await trigger.getAttribute('aria-expanded'),
+                    trees: await baseline
+                      .getByRole('tree', {
+                        name: '子智能体会话',
+                        includeHidden: true,
+                      })
+                      .count(),
+                  };
+                  await writeFile(
+                    join(artifacts, `${prefix}-reference-initial-catalog.json`),
+                    JSON.stringify(initial, null, 2),
+                  );
+                  await trigger.press('Escape');
+                  await baseline
+                    .getByRole('tree', {
+                      name: '子智能体会话',
+                      includeHidden: true,
+                    })
+                    .waitFor({ state: 'detached' });
+                  expect(await trigger.getAttribute('aria-expanded')).toBe(
+                    'false',
+                  );
+                  await baseline.evaluate(
+                    (opened) => window.__allricePanelsReference!.open(opened),
+                    opened,
+                  );
+                })(),
+              ]);
+              await body(baseline, kind).waitFor({ state: 'visible' });
+              await contentReady(baseline, kind, value);
+              const pointer = await (async () => {
+                for (const point of [
+                  { x: Math.floor(width / 2), y: 0 },
+                  { x: 0, y: 0 },
+                  { x: width - 1, y: 0 },
+                ]) {
+                  const controls = await Promise.all(
+                    [page, baseline].map((view) =>
+                      view.evaluate(
+                        ({ point, name }) => {
+                          const root = [
+                            ...document.querySelectorAll('section'),
+                          ].find(
+                            (node) =>
+                              node.getAttribute('aria-label') === name &&
+                              node.getBoundingClientRect().width > 0,
+                          );
+                          const hit = document.elementFromPoint(
+                            point.x,
+                            point.y,
+                          );
+                          return {
+                            neutral:
+                              !!root &&
+                              !!hit &&
+                              !root.contains(hit) &&
+                              !hit.closest(
+                                'button,a,input,select,textarea,[role="button"],[aria-haspopup]',
+                              ),
+                            hit: hit?.tagName,
+                            label: hit?.getAttribute('aria-label'),
+                          };
+                        },
+                        { point, name: names[kind] },
+                      ),
+                    ),
+                  );
+                  if (controls.every((control) => control.neutral))
+                    return { point, controls };
+                }
+                throw Error(
+                  'No shared public neutral pointer point outside both panel contents',
+                );
+              })();
+              await page.mouse.move(pointer.point.x, pointer.point.y);
+              await baseline.mouse.move(pointer.point.x, pointer.point.y);
+              for (const view of [page, baseline]) {
+                await view.evaluate(async () => {
+                  if (document.activeElement instanceof HTMLElement)
+                    document.activeElement.blur();
+                  await document.fonts.ready;
+                });
+                await settle(view);
+              }
+              const actual = await inspectContent(page, kind, true);
+              const expected = await inspectContent(baseline, kind, true);
+              const actualPng = await body(page, kind).screenshot({
+                path: join(artifacts, `${prefix}-native.png`),
+                animations: 'disabled',
+              });
+              const expectedPng = await body(baseline, kind).screenshot({
+                path: join(artifacts, `${prefix}-rev2.png`),
+                animations: 'disabled',
+              });
+              const { pixels, ...pixelApproval } = compareApprovedPanelPixels(
+                pixelBrowser,
+                {
+                  mode: 'rev2-panel',
+                  viewport: page.viewportSize(),
+                  theme,
+                  state: value,
+                  panel: kind,
+                  expectedCapture: 'rev2-element',
+                  actualCapture: 'native-element',
+                },
+                expectedPng,
+                actualPng,
+              );
+              const result = {
+                prefix,
+                state: value,
+                kind,
+                actual,
+                expected,
+                pixels,
+                pixelApproval,
+                pointer,
+                referenceCarrier: reference.metadataSha256,
+                referenceEvidence: await baseline.evaluate(() =>
+                  window.__allricePanelsReference!.evidence(),
+                ),
+              };
+              comparisons.push(result);
+              // Preserve both screenshots, full frames and every detailed geometry
+              // before any width/style/pixel guard; subsequent pairs still execute.
+              await writeFile(
+                join(artifacts, `${prefix}-geometry.json`),
+                JSON.stringify(result, null, 2),
+              );
+              await page.screenshot({
+                path: join(artifacts, `${prefix}-native-frame.png`),
+                fullPage: true,
+              });
+              await baseline.screenshot({
+                path: join(artifacts, `${prefix}-rev2-frame.png`),
+                fullPage: true,
+              });
+              if (kind === 'files') {
+                for (const [view, geometry] of [
+                  [page, actual],
+                  [baseline, expected],
+                ] as const) {
+                  const files = body(view, kind);
+                  const picker = await files
+                    .locator('[data-select-field]')
+                    .boundingBox();
+                  const search = await files
+                    .getByRole('searchbox', { name: '查找文件' })
+                    .boundingBox();
+                  expect
+                    .soft(picker?.width, prefix + ' approved employee picker')
+                    .toBe(126);
+                  expect
+                    .soft(search?.width ?? 0, prefix + ' visible search')
+                    .toBeGreaterThan(0);
+                  expect
+                    .soft(
+                      (search?.x ?? 0) + (search?.width ?? 0),
+                      prefix + ' search fits in the pane',
+                    )
+                    .toBeLessThanOrEqual(geometry.root.x + geometry.root.width);
+                }
+              }
+              // Scoped legacy content must leave the real native chrome,
+              // independent pane/clip budget and actual placement unchanged.
+              expect
+                .soft(
+                  compareNativePanelsHostBudget(
+                    actual.nativeHost,
+                    expected.nativeHost,
+                  ),
+                  prefix + ' independent native pane/clip budget',
+                )
+                .toEqual([]);
+              for (const key of ['x', 'y', 'width', 'height'] as const) {
+                expect
+                  .soft(
+                    Math.abs(actual.parent[key] - expected.parent[key]),
+                    prefix + ' native slot budget ' + key,
+                  )
+                  .toBeLessThanOrEqual(0.5);
+                expect
+                  .soft(
+                    Math.abs(actual.root[key] - budget.root[key]),
+                    prefix + ' actual original placement ' + key,
+                  )
+                  .toBeLessThanOrEqual(0.5);
+              }
+              expect
+                .soft(
+                  expected.paintEvidence!.referenceSurface,
+                  prefix + ' isolated pinned document/body owners',
+                )
+                .toEqual({
+                  theme,
+                  framework: 'v2',
+                  dark: theme === 'dark',
+                  rootDisplay: 'contents',
+                  bodyDisplay: 'contents',
+                });
+              expect
+                .soft(
+                  actual.paintEvidence!.referenceSurface,
+                  prefix + ' no reference owner on actual',
+                )
+                .toBeNull();
+              expect
+                .soft(
+                  actual.paintEvidence!.referenceStyle,
+                  prefix + ' no reference CSS on actual',
+                )
+                .toBeNull();
+              expect
+                .soft(
+                  expected.paintEvidence!.referenceStyle,
+                  prefix + ' reference CSS identity',
+                )
+                .toBe(reference.metadataSha256);
+              expect
+                .soft(
+                  actual.paintEvidence!.currentProductStyles,
+                  prefix + ' installed actual product',
+                )
+                .toBe(1);
+              expect
+                .soft(
+                  expected.paintEvidence!.currentProductStyles,
+                  prefix + ' independent pinned reference',
+                )
+                .toBe(0);
+              expect
+                .soft(actual.parent.referenceCarrier, prefix + ' actual owner')
+                .toBeNull();
+              expect
+                .soft(
+                  expected.parent.referenceCarrier,
+                  prefix + ' pinned reference owner',
+                )
+                .toBe(reference.id);
+              expect
+                .soft(
+                  result.referenceEvidence,
+                  prefix + ' actual reference registration',
+                )
+                .toMatchObject({
+                  carrier: reference.id,
+                  kind,
+                  state: value,
+                  theme,
+                  retainedReady: true,
+                  renderEnabled: true,
+                  sessionId: sessions[0],
+                  activeKind: `allrice-employee-panels.${kind}`,
+                  expanded: true,
+                });
+              for (const side of [actual, expected]) {
+                expect
+                  .soft(
+                    side.paintEvidence!.subagentCatalogs,
+                    prefix + ' transient catalog closed',
+                  )
+                  .toBe(0);
+                expect
+                  .soft(
+                    side.paintEvidence!.nodes.some(
+                      (node) => node.hovered || node.focused,
+                    ),
+                    prefix + ' neutral real pointer/focus',
+                  )
+                  .toBe(false);
+              }
+              expect
+                .soft(
+                  Math.abs(actual.root.width - expected.root.width),
+                  prefix + ' content width',
+                )
+                .toBeLessThanOrEqual(0.5);
+              expect
+                .soft(
+                  Math.abs(actual.root.height - expected.root.height),
+                  prefix + ' content height',
+                )
+                .toBeLessThanOrEqual(0.5);
+              expect
+                .soft(actual.root.x, prefix + ' viewport left')
+                .toBeGreaterThanOrEqual(-0.5);
+              expect
+                .soft(
+                  actual.root.x + actual.root.width,
+                  prefix + ' viewport right',
+                )
+                .toBeLessThanOrEqual(width + 0.5);
+              expect
+                .soft(
+                  actual.elements.map(
+                    ({
+                      tag,
+                      text,
+                      fontFamily,
+                      fontSize,
+                      fontWeight,
+                      lineHeight,
+                      letterSpacing,
+                      color,
+                    }) => ({
+                      tag,
+                      text,
+                      fontFamily,
+                      fontSize,
+                      fontWeight,
+                      lineHeight,
+                      letterSpacing,
+                      color,
+                    }),
+                  ),
+                  prefix + ' typography',
+                )
+                .toEqual(
+                  expected.elements.map(
+                    ({
+                      tag,
+                      text,
+                      fontFamily,
+                      fontSize,
+                      fontWeight,
+                      lineHeight,
+                      letterSpacing,
+                      color,
+                    }) => ({
+                      tag,
+                      text,
+                      fontFamily,
+                      fontSize,
+                      fontWeight,
+                      lineHeight,
+                      letterSpacing,
+                      color,
+                    }),
+                  ),
+                );
+              expect
+                .soft(pixels.dimensionsMatch, prefix + ' image dimensions')
+                .toBe(true);
+              expect
+                .soft(
+                  pixelApproval.accepted,
+                  `${prefix} exact RGBA (${pixels.changedPixels} differing pixels)`,
+                )
+                .toBe(true);
+            } catch (error) {
+              const failure = {
+                prefix,
+                error: String(error),
+                evidence: await evidence().catch(String),
+                referenceOpenedInventory: [...opened],
+                referenceEvidence: await baseline
+                  .evaluate(
+                    () => window.__allricePanelsReference?.evidence() ?? null,
+                  )
+                  .catch(String),
+              };
+              comparisons.push(failure);
+              await writeFile(
+                join(artifacts, `${prefix}-failure.json`),
+                JSON.stringify(failure, null, 2),
+              );
+              await page.screenshot({
+                path: join(artifacts, `${prefix}-native-failure.png`),
+                fullPage: true,
+              });
+              await baseline.screenshot({
+                path: join(artifacts, `${prefix}-rev2-failure.png`),
+                fullPage: true,
+              });
+              expect.soft(false, prefix + ': ' + String(error)).toBe(true);
+            }
+            await appendFile(
+              join(artifacts, `${width}-${theme}-progress.jsonl`),
+              JSON.stringify({ prefix, recorded: comparisons.length }) + '\n',
+            );
+            // Keep completed pairs even if a later preparation step fails.
+            await writeFile(
+              join(artifacts, `${width}-${theme}-comparisons.json`),
+              JSON.stringify(comparisons, null, 2),
+            );
+          }
+        await writeFile(
+          join(artifacts, `${width}-${theme}-comparisons.json`),
+          JSON.stringify(comparisons, null, 2),
+        );
+        expect(comparisons).toHaveLength(panelStates.length * kinds.length);
+        await baseline.close();
+      }, 180_000);
+    }
+
+  it('keeps all native/runtime errors visible for the whole file', async () => {
+    for (const observation of observations.values()) await observation.flush();
+    const audit = network.audit();
+    expect(audit.issues).toEqual([]);
+    expect(audit.unexpectedDiagnostics).toEqual([]);
+    expect(audit.unexpectedLogs).toEqual([]);
+    expect(audit.unexpectedRequests).toEqual([]);
+    // The four visual cases must really exercise denied HTTP and loading aborts.
+    for (const prefix of ['native-', 'rev2-']) {
+      expect(
+        network.fixtures.some(
+          (request) =>
+            request.page.startsWith(prefix) &&
+            request.plan === 'denied' &&
+            request.status === 403,
+        ),
+      ).toBe(true);
+      expect(
+        network.fixtures.some(
+          (request) =>
+            request.page.startsWith(prefix) &&
+            request.plan === 'loading-exit' &&
+            request.failure === 'net::ERR_ABORTED',
+        ),
+      ).toBe(true);
+    }
+  });
+});

@@ -13,6 +13,7 @@ import { preparePersonNativeWebRoster } from '@allrice/database';
 import {
   prepareNativeWebLaunch,
   type NativeWebConfiguration,
+  type NativeWebGuestProfile,
   type NativeWebLaunch,
 } from './launch.js';
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
@@ -40,6 +41,7 @@ export const personNativeWebRoster: PersonVmWebRosterPort = {
 export function createAssignedNativeWebStartup(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'];
+  readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
     'cliPath' | 'guestAddress' | 'startupTimeoutMs'
@@ -128,12 +130,21 @@ export function createAssignedNativeWebStartup(input: {
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
+        const profile = await input.readEmployeeProfile(signal);
+        current(binding, web);
+        signal.throwIfAborted();
         const launches = await Promise.all(
           web.receipt.endpoints.map((endpoint) => {
             const home = `/work/.allrice/employees/${endpoint.employeeInstanceId}`;
             return prepareNativeWebLaunch(
               {
                 ...input.configuration,
+                principalProfile: {
+                  workspaceId: endpoint.workspaceId,
+                  employeeInstanceId: endpoint.employeeInstanceId,
+                  employeeRevision: endpoint.employeeRevision,
+                  employeeVersionId: endpoint.employeeVersionId,
+                },
                 origin: `http://127.0.0.1:${endpoint.hostPort}/`,
                 publicUrl: input.configuration.publicUrl(endpoint, binding),
                 guestPort: endpoint.guestPort,
@@ -142,6 +153,7 @@ export function createAssignedNativeWebStartup(input: {
                 workdir: '/work',
               },
               binding,
+              profile,
             );
           }),
         );

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { TransactionSql } from 'postgres';
 import {
   ContentOwnershipSchema,
   WorkbenchFileSchema,
@@ -6,12 +7,15 @@ import {
   WorkbenchDeliverablesFilterSchema,
   WorkbenchDeliverablesCatalogSchema,
   WorkbenchFileFavoriteSchema,
+  PanelWriteReceiptQuerySchema,
+  PanelWriteReceiptSchema,
   type WorkbenchDeliverable,
   UuidSchema,
   type RequestContext,
   type StorageObject,
   type StoragePort,
   type WorkbenchFile,
+  type AuthorizedDeliverableResource,
 } from '@allrice/contracts';
 import { getDatabase } from './core/client.ts';
 import { lockWorkspaceStorageQuota } from './core/storage-quota.ts';
@@ -38,6 +42,7 @@ import {
 import { assertWorkbenchSession } from './artifact-review.ts';
 import { readOwnedReferencePublications } from './reference-publication-projections.ts';
 import { personalInstanceNameSql } from './employees/employee-instance-policy.ts';
+import { allocateWorkbenchFileName } from './workbench-file-name.ts';
 import {
   readWorkbenchFilePolicy,
   workbenchFileAccess,
@@ -55,6 +60,30 @@ export class WorkbenchFileError extends Error {
 }
 const digest = (value: string | Uint8Array) =>
   `sha256:${createHash('sha256').update(value).digest('hex')}`;
+
+export async function readWorkbenchUploadReceipt(
+  contextInput: RequestContext,
+  input: unknown,
+) {
+  const value = PanelWriteReceiptQuerySchema.parse(input);
+  const context = scoped(contextInput, value.workspaceId);
+  if (value.operation !== 'upload' || !(await readContentPrincipal(context)))
+    throw new DataAccessError('authorization_denied');
+  const [row] =
+    await getDatabase()`select p.object_id,p.upload_digest,(o.state='ready') ready
+    from allrice_workbench_file_policies p join allrice_storage_objects o on o.id=p.object_id
+    where p.organization_id=${context.organizationId} and p.workspace_id=${value.workspaceId}
+      and p.owner_id=${context.actor.id} and o.owner_id=${context.actor.id}
+      and p.upload_request_id=${value.requestId}`;
+  return PanelWriteReceiptSchema.parse({
+    requestId: value.requestId,
+    operation: value.operation,
+    status: row ? 'recorded' : 'unknown',
+    inputDigest: row?.upload_digest ?? null,
+    result: row ? { objectId: row.object_id } : null,
+    ready: row?.ready ?? null,
+  });
+}
 type Facts = {
   id: string;
   organization_id: string;
@@ -196,6 +225,10 @@ export async function uploadWorkbenchFile(
   contextInput: RequestContext,
   input: unknown,
   storage: StoragePort,
+  qualification?: {
+    signal: AbortSignal;
+    current(transaction?: TransactionSql): Promise<void>;
+  },
 ) {
   const value = WorkbenchFileUploadSchema.parse(input),
     context = scoped(contextInput, value.workspaceId);
@@ -221,6 +254,7 @@ export async function uploadWorkbenchFile(
     );
     if (!(await readContentPrincipal(context, tx, true))?.writable)
       throw new DataAccessError('authorization_denied');
+    await qualification?.current(tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${context.organizationId + '/' + context.actor.id + '/' + value.requestId},0))`;
     const [existing] = await tx<
       { object_id: string; upload_digest: string; state: string }[]
@@ -240,6 +274,16 @@ export async function uploadWorkbenchFile(
       };
     }
     const id = randomUUID();
+    const fileName = await allocateWorkbenchFileName(
+      tx,
+      {
+        organizationId: context.organizationId,
+        workspaceId: value.workspaceId,
+        ownerId: context.actor.id,
+      },
+      id,
+      value.fileName,
+    );
     await createStorageMetadata(
       context,
       {
@@ -257,7 +301,7 @@ export async function uploadWorkbenchFile(
     );
     await tx`insert into allrice_workbench_file_policies
       (object_id,organization_id,workspace_id,owner_id,file_name,scope,department_ids,upload_request_id,upload_digest)
-      values (${id},${context.organizationId},${value.workspaceId},${context.actor.id},${value.fileName},'personal','{}',${value.requestId},${requestDigest})`;
+      values (${id},${context.organizationId},${value.workspaceId},${context.actor.id},${fileName},'personal','{}',${value.requestId},${requestDigest})`;
     await auditFile(
       context,
       id,
@@ -277,11 +321,15 @@ export async function uploadWorkbenchFile(
         'invalid_file',
         '该上传已不可继续，请重新发起。',
       );
+    await qualification?.current();
+    qualification?.signal.throwIfAborted();
     await storage.put(
       object(pending),
       new Blob([new Uint8Array(bytes)]).stream(),
     );
+    qualification?.signal.throwIfAborted();
     await db.begin(async (tx) => {
+      await qualification?.current(tx);
       const access = await workbenchFileAccess(
         context,
         prepared.objectId,
@@ -292,6 +340,7 @@ export async function uploadWorkbenchFile(
         throw new DataAccessError('authorization_denied');
       const [current] =
         await tx`select state from allrice_storage_objects where id=${prepared.objectId} for update`;
+      qualification?.signal.throwIfAborted();
       if (current?.state === 'pending')
         await markStorageReady(context, prepared.objectId, tx);
       else if (current?.state !== 'ready')
@@ -307,7 +356,13 @@ async function snapshotFile(
   file: Awaited<ReturnType<typeof readWorkbenchFile>>,
   requestId: string,
   storage: StoragePort,
+  options?: {
+    source: AuthorizedDeliverableResource;
+    signal: AbortSignal;
+    requireCurrentAccess(transaction?: TransactionSql): Promise<void>;
+  },
 ) {
+  await options?.requireCurrentAccess();
   if (file.row.legacy_company_asset_id)
     throw new WorkbenchFileError(
       'invalid_file',
@@ -344,9 +399,21 @@ async function snapshotFile(
       'invalid_file',
       '这个文件超过长期参考的上传容量，请先拆分资料。',
     );
+  if (
+    options &&
+    (options.source.source.objectId !== file.object.id ||
+      options.source.source.checksum !== file.object.checksum ||
+      options.source.sizeBytes !== file.object.sizeBytes)
+  )
+    throw new DataAccessError('not_found');
   const bytes = new Uint8Array(
-    await new Response(await storage.get(file.object)).arrayBuffer(),
+    await new Response(
+      options
+        ? await options.source.open(options.signal)
+        : await storage.get(file.object),
+    ).arrayBuffer(),
   );
+  await options?.requireCurrentAccess();
   if (
     bytes.byteLength !== file.object.sizeBytes ||
     digest(bytes) !== file.object.checksum
@@ -367,16 +434,20 @@ async function snapshotFile(
       contentBase64: Buffer.from(bytes).toString('base64'),
     },
     { originObjectId: file.object.id },
+    options ? { qualification: options } : undefined,
   );
+  await options?.requireCurrentAccess();
   if (!prepared.alreadyReady) {
     await storage.put(
       prepared.object,
       new Blob([new Uint8Array(prepared.bytes)]).stream(),
     );
+    await options?.requireCurrentAccess();
     await completeReferenceUpload(
       context,
       context.workspaceId!,
       prepared.revisionId,
+      options,
     );
   }
   return prepared;
@@ -390,11 +461,18 @@ export async function captureWorkbenchFileReference(
   objectId: string,
   requestId: string,
   storage: StoragePort,
+  options?: {
+    source: AuthorizedDeliverableResource;
+    signal: AbortSignal;
+    requireCurrentAccess(transaction?: TransactionSql): Promise<void>;
+  },
 ) {
   const context = scoped(contextInput, workspaceId);
   UuidSchema.parse(requestId);
-  const file = await readWorkbenchFile(context, objectId);
-  const copy = await snapshotFile(context, file, requestId, storage);
+  const file = options
+    ? await readPersonalWorkbenchFile(context, objectId)
+    : await readWorkbenchFile(context, objectId);
+  const copy = await snapshotFile(context, file, requestId, storage, options);
   const references = await listReferenceRevisions(
     context,
     workspaceId,
@@ -402,7 +480,32 @@ export async function captureWorkbenchFileReference(
   );
   const reference = references.find((r) => r.revisionId === copy.revisionId);
   if (!reference) throw new DataAccessError('not_found');
+  await options?.requireCurrentAccess();
   return reference;
+}
+
+/** Owner primitive for one eligible original, without loading directory
+ * presentation, employee filters or reference-publication projections. */
+export async function readPersonalWorkbenchFile(
+  contextInput: RequestContext,
+  objectIdInput: string,
+) {
+  if (!contextInput.workspaceId)
+    throw new DataAccessError('authorization_denied');
+  const context = scoped(contextInput, contextInput.workspaceId);
+  const objectId = UuidSchema.parse(objectIdInput);
+  const db = getDatabase();
+  const [eligible] = await db<{ id: string }[]>`
+    with ${personalWorkbenchOrigins(db, {
+      organizationId: context.organizationId,
+      workspaceId: context.workspaceId!,
+      ownerId: context.actor.id,
+    })} select id from origins where id=${objectId}`;
+  if (!eligible) throw new DataAccessError('not_found');
+  const file = await readWorkbenchFile(context, objectId);
+  if (file.object.ownerId !== context.actor.id)
+    throw new DataAccessError('not_found');
+  return file;
 }
 
 /** Personal directory only. Keep the shared catalog's audience and latest-series
@@ -543,6 +646,10 @@ export async function setWorkbenchFileFavorite(
   contextInput: RequestContext,
   objectIdInput: string,
   input: unknown,
+  qualification?: {
+    signal: AbortSignal;
+    current(tx: TransactionSql): Promise<void>;
+  },
 ) {
   const value = WorkbenchFileFavoriteSchema.parse(input);
   const context = scoped(contextInput, contextInput.workspaceId!);
@@ -550,6 +657,16 @@ export async function setWorkbenchFileFavorite(
   return getDatabase().begin(async (tx) => {
     if (!(await readContentPrincipal(context, tx, true)))
       throw new DataAccessError('authorization_denied');
+    await qualification?.current(tx);
+    const [locked] = await tx`
+      select id from allrice_storage_objects
+      where id=${objectId} and organization_id=${context.organizationId}
+        and workspace_id=${context.workspaceId!} and owner_id=${context.actor.id}
+        and state='ready' and deleted_at is null
+        and (retention_until is null or retention_until>clock_timestamp())
+      for share
+    `;
+    if (!locked) throw new DataAccessError('not_found');
     const [eligible] = await tx<
       { id: string }[]
     >`with ${personalWorkbenchOrigins(tx, {
@@ -561,6 +678,7 @@ export async function setWorkbenchFileFavorite(
     const file = await readWorkbenchFile(context, objectId, tx);
     if (file.object.ownerId !== context.actor.id)
       throw new DataAccessError('not_found');
+    qualification?.signal.throwIfAborted();
     if (value.favorite)
       await tx`insert into allrice_workbench_file_favorites(organization_id,workspace_id,user_id,object_id)
         values(${context.organizationId},${context.workspaceId!},${context.actor.id},${objectId}) on conflict do nothing`;

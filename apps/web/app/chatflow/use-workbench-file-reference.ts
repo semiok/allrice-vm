@@ -6,20 +6,24 @@ import {
   type ReferenceRevision,
   type WorkbenchFile,
 } from '@allrice/contracts';
-import { workbenchJson } from '../../lib/chatflow/workbench-model';
+import type { EmployeePanelDataClient } from '../../lib/chatflow/employee-panel-data';
+import { useEmployeePanelData } from './use-employee-panel-data';
 
 export type WorkbenchFileReferenceProps = {
   workspaceId: string;
   sessionId: string | null;
   headers: Record<string, string>;
   active: boolean;
+  dataClient?: EmployeePanelDataClient;
   readOnly?: boolean;
-  onUse: (reference: ReferenceRevision) => void;
+  onUse?: (reference: ReferenceRevision) => void;
   onTemplate?: (reference: ReferenceRevision) => void;
 };
 
 /** The existing fixed-snapshot preparation, shared by the list and preview. */
 export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
+  const data = useEmployeePanelData(props);
+  const canUse = props.active && !props.readOnly && !!props.onUse;
   const [using, setUsing] = useState<string | null>(null);
   const [pending, setPending] = useState<{
     fileId: string;
@@ -29,42 +33,42 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
     [notice, setNotice] = useState('');
   const requests = useRef(new Map<string, string>()),
     lifetime = useRef(0);
+  const operation = useRef<AbortController | null>(null);
   useEffect(() => {
     lifetime.current++;
     setUsing(null);
     setPending(null);
     return () => {
       lifetime.current++;
+      operation.current?.abort();
     };
-  }, [props.workspaceId, props.sessionId, props.active, props.readOnly]);
+  }, [props.workspaceId, props.sessionId, canUse, data]);
   useEffect(() => {
-    if (!props.active || !pending) return;
+    if (!canUse || !pending) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      void workbenchJson(
-        '/api/v1/references?' +
-          new URLSearchParams({
+      void data
+        .readPreparedReference(
+          {
             workspaceId: props.workspaceId,
             sourceId: pending.reference.sourceId,
-          }),
-        props.headers,
-        { signal: controller.signal },
-      )
-        .then((raw) => {
-          const references = (raw as { references: unknown[] }).references.map(
-            (value) => ReferenceRevisionSchema.parse(value),
-          );
-          const current = references.find(
-            (value) => value.revisionId === pending.reference.revisionId,
-          );
+            revisionId: pending.reference.revisionId,
+          },
+          controller.signal,
+        )
+        .then((current) => {
           if (controller.signal.aborted) return;
-          if (!current || current.status !== 'active')
+          if (
+            current.sourceId !== pending.reference.sourceId ||
+            current.revisionId !== pending.reference.revisionId ||
+            current.status !== 'active'
+          )
             throw Error('所选文件的访问权限已变化，请重新选择。');
           if (current.processing === 'ready') {
-            if (!props.readOnly) props.onUse(current);
+            props.onUse?.(current);
             setPending(null);
             setUsing(null);
-            setNotice(props.readOnly ? '当前会话已归档。' : '');
+            setNotice('');
           } else if (
             ['failed', 'unsupported', 'uploading'].includes(current.processing)
           ) {
@@ -91,16 +95,9 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [
-    pending,
-    props.active,
-    props.workspaceId,
-    props.headers,
-    props.readOnly,
-    props.onUse,
-  ]);
+  }, [pending, data, canUse, props.workspaceId, props.headers, props.onUse]);
   async function useFile(file: WorkbenchFile) {
-    if (using || props.readOnly || !props.active) return;
+    if (using || !canUse) return;
     if (file.reference?.companyTemplate) {
       props.onTemplate?.(file.reference);
       return;
@@ -109,21 +106,26 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
     setError('');
     setNotice('');
     const generation = lifetime.current;
+    const controller = new AbortController();
+    operation.current = controller;
     try {
       const requestId =
         requests.current.get(file.objectId) ?? crypto.randomUUID();
       requests.current.set(file.objectId, requestId);
-      const raw = await workbenchJson(
-        `/api/v1/workbench/files/${file.objectId}/reference?workspaceId=${props.workspaceId}`,
-        props.headers,
-        { method: 'POST', body: JSON.stringify({ requestId }) },
+      const raw = await data.captureReference(
+        {
+          workspaceId: props.workspaceId,
+          objectId: file.objectId,
+          requestId,
+        },
+        controller.signal,
       );
-      if (generation !== lifetime.current) return;
+      if (controller.signal.aborted || generation !== lifetime.current) return;
       const reference = ReferenceRevisionSchema.parse(
         (raw as { reference: unknown }).reference,
       );
       if (reference.processing === 'ready') {
-        props.onUse(reference);
+        props.onUse?.(reference);
         setUsing(null);
       } else if (['saved', 'processing'].includes(reference.processing))
         setPending({ fileId: file.objectId, reference });
@@ -141,12 +143,15 @@ export function useWorkbenchFileReference(props: WorkbenchFileReferenceProps) {
     }
   }
   return {
+    canUse,
     using,
     pending,
     error,
     notice,
     useFile,
     cancel: () => {
+      lifetime.current++;
+      operation.current?.abort();
       setPending(null);
       setUsing(null);
     },

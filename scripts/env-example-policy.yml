@@ -60,6 +60,8 @@ audit:
   apps/worker/src/harness/dsh-egress-environment.ts#environment[name]: configuredProxy literal argument above.
   apps/worker/src/harness/dsh-native-artifact.ts#env[key]: Retired DSH prefix rejection/ignored legacy settings, never active configuration examples.
   apps/worker/src/index.ts#process.env[name]: integerSetting literal argument above.
+  packages/dsh-web-composition/build.mjs#embedded: esbuild replaces NODE_ENV with the fixed production browser literal.
+  packages/dsh-web-composition/build-web-entry.mjs#embedded: esbuild replaces process.env with empty or fixed browser values; the isolated profile child receives only its explicit env object.
   packages/contracts/src/runtime-feature-flags.ts#environment[name]: Employee flag table and literal runtimeFeatureEnabled callers above.
   packages/contracts/src/runtime-v2/cloud-command-limits.ts#env[definition.env]: cloudCommandRuntimeLimitDefinitions literal env fields above.
   packages/database/src/bootstrap-identity.ts#process.env[name]: required literal argument above; module is never imported.
@@ -91,7 +93,9 @@ auditSources:
   apps/web/server/portal-hosts.mjs: e1aac7dc0735860478e564ff33dc77799452589d35ad4fd7744af5f74cf90901
   apps/worker/src/harness/dsh-egress-environment.ts: 315fc969e7e880f139ea06e3be3c8208e0f411fb6fa760e583bbccb6aefa5594
   apps/worker/src/harness/dsh-native-artifact.ts: ffe6bdf780cf13b1cc40666a5233d2a3e8b18df657195e9492a0bba56f5f71fe
-  apps/worker/src/index.ts: 330a1adb61a0b5fed82a8f8783efc65b9dbbc9d05b275afe8f8a421cd1dc784d
+  apps/worker/src/index.ts: 4e50e4152c28c2d8f6546bf507eb315efa250d21a2176d8da85f9aae8f36a106
+  packages/dsh-web-composition/build.mjs: 56422f0d218971943b05588bcd58a7c4a4e16859eb147e577601fcf58badca88
+  packages/dsh-web-composition/build-web-entry.mjs: e7e6f91349ef04a95186ab686ed8c54615d8d06fff4cdfb39ce77d461b2a7827
   packages/contracts/src/project-resolution-script.ts: d4261249ef18115e6293d804a0d14a770e2c0df5b14a5a6db133444dd76ff9ee
   packages/contracts/src/runtime-feature-flags.ts: 9545293314ee45ed2d42dd9393a50123fad67250c4454346c341d0955bb200f9
   packages/contracts/src/runtime-v2/cloud-command-limits.ts: a6c831b9b3c85c016e88a292cf0c2baf8ff3ebc47d00cdec6bca3dc313b1ad6f

@@ -12,13 +12,19 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   ApiErrorSchema,
+  DeliverableReadInputProjectionSchema,
   ExecutionGenerationSchema,
   MemoryOrdinalInputSchema,
+  ReferenceArchiveListInputSchema,
+  ReferenceArchiveReadInputSchema,
+  ReferenceReadImageInputSchema,
   ReferenceReadInputSchema,
+  ReferenceSearchInputSchema,
   ReferenceSelectionErrorSchema,
   RememberPersonalMemoryInputSchema,
   RequestContextSchema,
   UuidSchema,
+  WorkspaceDocumentReadArgsSchema,
   type DeliveryFormat,
   type ExecutionGeneration,
   type NativeOfficeExportSchema,
@@ -99,9 +105,39 @@ export interface AllriceMcpServices {
     input: AllriceMcpDeliverableInput,
     signal: AbortSignal,
   ): Promise<CallToolResult>;
+  referenceSearch?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof ReferenceSearchInputSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
+  referenceReadImage?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof ReferenceReadImageInputSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
+  referenceArchiveList?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof ReferenceArchiveListInputSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
+  referenceArchiveRead?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof ReferenceArchiveReadInputSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
+  deliverableDocumentRead?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof WorkspaceDocumentReadArgsSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
   memoryRemember?(
     scope: AllriceMcpScope,
     input: z.input<typeof RememberPersonalMemoryInputSchema>,
+    signal: AbortSignal,
+  ): Promise<CallToolResult>;
+  deliverableRead?(
+    scope: AllriceMcpScope,
+    input: z.input<typeof DeliverableReadInputProjectionSchema>,
     signal: AbortSignal,
   ): Promise<CallToolResult>;
 }
@@ -117,8 +153,27 @@ export type AllriceMcpMemoryRead = NonNullable<
 export type AllriceMcpDeliverableCreate = NonNullable<
   AllriceMcpServices['deliverableCreate']
 >;
+/** Optional M2 callbacks, with native SDK results and no business carrier. */
+export type AllriceMcpReferenceSearch = NonNullable<
+  AllriceMcpServices['referenceSearch']
+>;
+export type AllriceMcpReferenceReadImage = NonNullable<
+  AllriceMcpServices['referenceReadImage']
+>;
+export type AllriceMcpReferenceArchiveList = NonNullable<
+  AllriceMcpServices['referenceArchiveList']
+>;
+export type AllriceMcpReferenceArchiveRead = NonNullable<
+  AllriceMcpServices['referenceArchiveRead']
+>;
+export type AllriceMcpDeliverableDocumentRead = NonNullable<
+  AllriceMcpServices['deliverableDocumentRead']
+>;
 export type AllriceMcpMemoryRemember = NonNullable<
   AllriceMcpServices['memoryRemember']
+>;
+export type AllriceMcpDeliverableRead = NonNullable<
+  AllriceMcpServices['deliverableRead']
 >;
 /** Only these existing thrown payloads are validated and disclosed. Native
  * CallToolResult.isError remains the owner's ordinary tool-failure channel. */
@@ -168,6 +223,12 @@ const rememberWireSchema: unknown = JSON.parse(
   JSON.stringify(rememberSourceSchema),
 );
 const rememberSchema = ToolSchema.shape.inputSchema.parse(rememberWireSchema);
+// The strict text/image branches remain intact; MCP requires an object root
+// even when the source contract is a discriminated union.
+const archiveReadSchema = ToolSchema.shape.inputSchema.parse({
+  ...z.toJSONSchema(ReferenceArchiveReadInputSchema, { io: 'input' }),
+  type: 'object',
+});
 const tools: Tool[] = [
   {
     name: 'identity_read',
@@ -202,17 +263,69 @@ const tools: Tool[] = [
     inputSchema: deliverySchema,
   },
   {
+    name: 'reference_search',
+    description: 'Search currently authorized enterprise materials.',
+    inputSchema: z.toJSONSchema(ReferenceSearchInputSchema, {
+      io: 'input',
+    }) as Tool['inputSchema'],
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'reference_read_image',
+    description: 'Read an authorized exact enterprise-material image.',
+    inputSchema: z.toJSONSchema(ReferenceReadImageInputSchema, {
+      io: 'input',
+    }) as Tool['inputSchema'],
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'reference_archive_list',
+    description: 'List the directory of an authorized exact reference archive.',
+    inputSchema: z.toJSONSchema(ReferenceArchiveListInputSchema, {
+      io: 'input',
+    }) as Tool['inputSchema'],
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'reference_archive_read',
+    description: 'Read one member of an authorized exact reference archive.',
+    inputSchema: archiveReadSchema,
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'deliverable_document_read',
+    description: 'Read a currently authorized deliverable document.',
+    inputSchema: z.toJSONSchema(WorkspaceDocumentReadArgsSchema, {
+      io: 'input',
+    }) as Tool['inputSchema'],
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'memory_remember',
     description:
       'Save current human-message content as a candidate requiring confirmation.',
     inputSchema: rememberSchema,
+  },
+  {
+    name: 'deliverable_read',
+    description: 'Read an authorized exact deliverable object and checksum.',
+    inputSchema: ToolSchema.shape.inputSchema.parse(
+      z.toJSONSchema(DeliverableReadInputProjectionSchema, { io: 'input' }),
+    ),
+    annotations: { readOnlyHint: true },
   },
 ];
 const moduleForTool = {
   reference_read: 'enterprise-materials',
   memory_read: 'employee-memory',
   deliverable_create: 'deliverables',
+  reference_search: 'enterprise-materials',
+  reference_read_image: 'enterprise-materials',
+  reference_archive_list: 'enterprise-materials',
+  reference_archive_read: 'enterprise-materials',
+  deliverable_document_read: 'deliverables',
   memory_remember: 'employee-memory',
+  deliverable_read: 'deliverables',
 } as const;
 type BusinessTool = keyof typeof moduleForTool;
 const bindingSchema = z.object({
@@ -343,8 +456,26 @@ export function createAllriceMcpServer(
       case 'deliverable_create':
         bound = !!services.deliverableCreate;
         break;
+      case 'reference_search':
+        bound = !!services.referenceSearch;
+        break;
+      case 'reference_read_image':
+        bound = !!services.referenceReadImage;
+        break;
+      case 'reference_archive_list':
+        bound = !!services.referenceArchiveList;
+        break;
+      case 'reference_archive_read':
+        bound = !!services.referenceArchiveRead;
+        break;
+      case 'deliverable_document_read':
+        bound = !!services.deliverableDocumentRead;
+        break;
       case 'memory_remember':
         bound = !!services.memoryRemember;
+        break;
+      case 'deliverable_read':
+        bound = !!services.deliverableRead;
         break;
     }
     return (
@@ -415,13 +546,49 @@ export function createAllriceMcpServer(
             MemoryOrdinalInputSchema.parse(args),
             signal,
           );
+        } else if (name === 'reference_search') {
+          result = await services!.referenceSearch!(
+            scope,
+            ReferenceSearchInputSchema.parse(args),
+            signal,
+          );
+        } else if (name === 'reference_read_image') {
+          result = await services!.referenceReadImage!(
+            scope,
+            ReferenceReadImageInputSchema.parse(args),
+            signal,
+          );
+        } else if (name === 'reference_archive_list') {
+          result = await services!.referenceArchiveList!(
+            scope,
+            ReferenceArchiveListInputSchema.parse(args),
+            signal,
+          );
+        } else if (name === 'reference_archive_read') {
+          result = await services!.referenceArchiveRead!(
+            scope,
+            ReferenceArchiveReadInputSchema.parse(args),
+            signal,
+          );
+        } else if (name === 'deliverable_document_read') {
+          result = await services!.deliverableDocumentRead!(
+            scope,
+            WorkspaceDocumentReadArgsSchema.parse(args),
+            signal,
+          );
         } else if (name === 'memory_remember') {
           result = await services!.memoryRemember!(
             scope,
             RememberPersonalMemoryInputSchema.parse(args),
             signal,
           );
-        } else {
+        } else if (name === 'deliverable_read') {
+          result = await services!.deliverableRead!(
+            scope,
+            DeliverableReadInputProjectionSchema.parse(args),
+            signal,
+          );
+        } else if (name === 'deliverable_create') {
           const validated = validateDelivery(args);
           if (!validated.valid)
             throw new McpError(
@@ -433,6 +600,8 @@ export function createAllriceMcpServer(
             validated.data,
             signal,
           );
+        } else {
+          throw new McpError(ErrorCode.InvalidParams, 'Invalid tool arguments');
         }
       } catch (error) {
         signal.throwIfAborted();
@@ -445,7 +614,12 @@ export function createAllriceMcpServer(
         const selection = ReferenceSelectionErrorSchema.safeParse(error);
         if (
           selection.success &&
-          (name !== 'reference_read' ||
+          (![
+            'reference_read',
+            'reference_read_image',
+            'reference_archive_list',
+            'reference_archive_read',
+          ].includes(name) ||
             selection.data.error.referenceRevisionIds.some(
               (id) => id !== args.revisionId,
             ))

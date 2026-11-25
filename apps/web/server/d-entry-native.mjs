@@ -5,6 +5,8 @@ import process from 'node:process';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   DEntryMountSchema,
+  DEntryIdentityResultSchema,
+  DEntryPageMuxQuerySchema,
   DEntryNativeOwnerRequestSchema,
 } from '@allrice/contracts';
 import { createPendingWork } from './pending-work.mjs';
@@ -68,28 +70,28 @@ export function createDEntryNativeGateway({
           )
             throw Error('D_ENTRY_ORIGIN');
           const url = new URL(request.url, origin);
-          const allowed = [
-            'organizationId',
-            'workspaceId',
-            'employeeInstanceId',
-            'threadId',
-          ];
+          const page = url.searchParams.has('carrier');
+          if (page) rejection = 400;
           if (
             [...url.searchParams.keys()].some(
-              (key) =>
-                !allowed.includes(key) ||
-                url.searchParams.getAll(key).length !== 1,
+              (key) => url.searchParams.getAll(key).length !== 1,
             )
           )
             throw Error('D_ENTRY_SELECTORS');
-          const { organizationId, ...selection } = Object.fromEntries(
-            url.searchParams,
-          );
-          const input = DEntryNativeOwnerRequestSchema.parse({
-            organizationId,
-            selection,
-          });
-          if (!input.selection.threadId) throw Error('D_ENTRY_THREAD_REQUIRED');
+          const selectors = Object.fromEntries(url.searchParams);
+          const { organizationId, ...selection } = selectors;
+          const input = page
+            ? (() => {
+                const { carrier, organizationId, scopeId, ...selection } =
+                  DEntryPageMuxQuerySchema.parse(selectors);
+                return { carrier, organizationId, selection, scopeId };
+              })()
+            : DEntryNativeOwnerRequestSchema.parse({
+                organizationId,
+                selection,
+              });
+          if (!page && !input.selection.threadId)
+            throw Error('D_ENTRY_THREAD_REQUIRED');
           // This name is the existing Web session cookie (identity/session.ts),
           // not a native Cookie. The actual Web probe and Worker authenticate it.
           rejection = 401;
@@ -104,23 +106,23 @@ export function createDEntryNativeGateway({
           rejection = 503;
           // Only our own Web loopback receives the original browser Cookie;
           // portal and current tenant authentication stays at its normal owner.
-          response = await probe(
-            `http://127.0.0.1:${port}/api/v1/d-entry/native-owner`,
-            {
-              method: 'POST',
-              redirect: 'error',
-              signal: abort.signal,
-              headers: {
-                host: request.headers.host,
-                origin: request.headers.origin,
-                cookie: request.headers.cookie ?? '',
-                'content-type': 'application/json',
-                'x-allrice-organization-id': input.organizationId,
-                'x-allrice-workspace-id': input.selection.workspaceId,
-              },
-              body: JSON.stringify(input.selection),
+          const probeUrl = page
+            ? `/api/v1/d-entry/identity?${new URLSearchParams(input.selection)}`
+            : '/api/v1/d-entry/native-owner';
+          response = await probe(`http://127.0.0.1:${port}${probeUrl}`, {
+            method: page ? 'GET' : 'POST',
+            redirect: 'error',
+            signal: abort.signal,
+            headers: {
+              host: request.headers.host,
+              origin: request.headers.origin,
+              cookie: request.headers.cookie ?? '',
+              'content-type': 'application/json',
+              'x-allrice-organization-id': input.organizationId,
+              'x-allrice-workspace-id': input.selection.workspaceId,
             },
-          );
+            ...(!page && { body: JSON.stringify(input.selection) }),
+          });
           if (!response.ok) {
             const status = [401, 403, 404].includes(response.status)
               ? response.status
@@ -128,15 +130,20 @@ export function createDEntryNativeGateway({
             await rejectHttp(status);
             return;
           }
-          const { mount } = await response.json();
-          const safe = DEntryMountSchema.parse(mount);
+          const result = await response.json();
+          const mount = page
+            ? undefined
+            : DEntryMountSchema.parse(result.mount);
+          const identity =
+            mount?.identity ??
+            DEntryIdentityResultSchema.parse(result).identity;
           if (
-            safe.identity.organizationId !== input.organizationId ||
-            safe.identity.workspaceId !== input.selection.workspaceId ||
-            safe.identity.employeeInstanceId !==
+            identity.organizationId !== input.organizationId ||
+            identity.workspaceId !== input.selection.workspaceId ||
+            identity.employeeInstanceId !==
               input.selection.employeeInstanceId ||
-            safe.identity.threadId !== input.selection.threadId ||
-            safe.executionGeneration !== '4.0'
+            identity.threadId !== (input.selection.threadId ?? null) ||
+            (mount && mount.executionGeneration !== '4.0')
           )
             throw Error('D_ENTRY_BINDING');
           const base = new URL(
@@ -154,8 +161,10 @@ export function createDEntryNativeGateway({
           const target = new URL('/internal/d-entry/native-mux', base);
           target.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
           target.search = new URLSearchParams({
-            organizationId: safe.identity.organizationId,
+            organizationId: identity.organizationId,
             ...input.selection,
+            ...(page && { carrier: 'page' }),
+            ...(input.scopeId && { scopeId: input.scopeId }),
           }).toString();
           abort.signal.throwIfAborted();
           worker = connect(target, {
@@ -167,8 +176,17 @@ export function createDEntryNativeGateway({
           );
           const terminate = () => worker.terminate();
           abort.signal.addEventListener('abort', terminate, { once: true });
-          worker.once('close', stop);
+          // Let an accepted page owner forward its exact closed/end frames
+          // already delivered before the Worker WebSocket close event.
+          if (!page || input.scopeId) worker.once('close', stop);
           worker.on('error', stop);
+          if (page)
+            worker.once('unexpected-response', (_, response) => {
+              if ([400, 401, 403, 404, 503].includes(response.statusCode))
+                rejection = response.statusCode;
+              response.resume();
+              stop();
+            });
           try {
             if (worker.readyState !== WebSocket.OPEN)
               await once(worker, 'open', { signal: abort.signal });
@@ -227,10 +245,17 @@ export function createDEntryNativeGateway({
                 );
               }
             };
-            await Promise.allSettled([
+            const [, downlink] = await Promise.allSettled([
               forward(peer, worker).finally(stop),
               forward(worker, peer).finally(stop),
             ]);
+            if (page && !input.scopeId && downlink.status === 'fulfilled') {
+              // Follow the actual delivered native frames with the normal
+              // browser socket handshake. Terminate would make even an exact
+              // closed/end look like an incomplete local transport.
+              peer.close(1000);
+              await browserClosed;
+            }
           } finally {
             abort.signal.removeEventListener('abort', terminate);
           }

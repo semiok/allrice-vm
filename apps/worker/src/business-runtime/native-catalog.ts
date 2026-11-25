@@ -7,6 +7,11 @@ import {
 } from '@allrice/database';
 import type { PersonVmBinding, PersonVmPort } from '@allrice/person-vm';
 import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
+import { createDEntryPrincipalChildren } from '../d-entry/principal-activity.js';
+import type {
+  DEntryPrincipalActivity,
+  DEntryPrincipalIssue,
+} from '@allrice/d-entry-principal/types';
 import {
   DEntryNativeUnavailable,
   dEntryOwnerViewSchema,
@@ -38,6 +43,20 @@ export type PublishedNativeCatalog = Readonly<{
   owner: Readonly<{
     revoked: AbortSignal;
     controlReady(): boolean;
+    acquirePrincipal(
+      issue: DEntryPrincipalIssue,
+      signal: AbortSignal,
+    ): DEntryPrincipalActivity;
+    readImmutableGraphFor?(
+      context: RequestContext,
+      signal: AbortSignal,
+    ): Promise<unknown>;
+    readImmutableBundleFor?(
+      context: RequestContext,
+      reference: string,
+      expectedBytes: number,
+      signal: AbortSignal,
+    ): Promise<Uint8Array>;
     readSessionsFor(
       context: RequestContext,
       signal: AbortSignal,
@@ -78,6 +97,7 @@ export function createDEntryNativeCatalogPort(input: {
   const stopped = new AbortController();
   const lifetime = AbortSignal.any([input.lifetime, stopped.signal]);
   const pending = new Set<Promise<unknown>>();
+  const principalChildren = createDEntryPrincipalChildren(lifetime);
   let closing: Promise<void> | undefined;
   function own<T>(work: () => Promise<T>): Promise<T> {
     if (lifetime.aborted) return Promise.reject(lifetime.reason);
@@ -156,8 +176,47 @@ export function createDEntryNativeCatalogPort(input: {
           owner.revoked,
           owner.owner.revoked,
         ]);
+        const readGraph = owner.owner.readImmutableGraphFor?.bind(owner.owner);
+        const readBundle = owner.owner.readImmutableBundleFor?.bind(
+          owner.owner,
+        );
         return Object.freeze({
           receipt: view.receipt,
+          ...(readGraph &&
+            readBundle && {
+              fixedProfile: {
+                revoked,
+                readImmutableGraph(reading: AbortSignal) {
+                  return own(async () => {
+                    const who = context;
+                    const active = AbortSignal.any([reading, revoked]);
+                    await current(who, active);
+                    const graph = await readGraph(who, active);
+                    await current(who, active);
+                    return graph;
+                  });
+                },
+                readImmutableBundle(
+                  reference: string,
+                  expectedBytes: number,
+                  reading: AbortSignal,
+                ) {
+                  return own(async () => {
+                    const who = context;
+                    const active = AbortSignal.any([reading, revoked]);
+                    await current(who, active);
+                    const bytes = await readBundle(
+                      who,
+                      reference,
+                      expectedBytes,
+                      active,
+                    );
+                    await current(who, active);
+                    return bytes;
+                  });
+                },
+              },
+            }),
           endpoint: view.endpoint,
           bindingRef: view.bindingRef,
           revoked,
@@ -166,6 +225,16 @@ export function createDEntryNativeCatalogPort(input: {
             return own(async () => {
               await current(who, AbortSignal.any([checking, revoked]));
               context = who;
+            });
+          },
+          acquirePrincipal(who, issue, caller) {
+            if (!sameDEntryIdentity(issue.identity, identity)) deny();
+            return principalChildren.acquire({
+              signal: AbortSignal.any([caller, revoked]),
+              async assertCurrent(active) {
+                await current(who, active);
+              },
+              acquire: (active) => owner.owner.acquirePrincipal(issue, active),
             });
           },
           readSessions(reading: AbortSignal) {
@@ -186,9 +255,15 @@ export function createDEntryNativeCatalogPort(input: {
     port,
     close() {
       if (closing) return closing;
+      // Publish before abort callbacks can reenter this same wrapper.
+      closing = Promise.resolve().then(async () => {
+        const [principals] = await Promise.allSettled([
+          principalChildren.close(),
+          ...pending,
+        ]);
+        if (principals.status === 'rejected') throw principals.reason;
+      });
       stopped.abort(new DEntryNativeUnavailable());
-      // Await actual guards/SQL/native reads; this does not close the shared VM.
-      closing = Promise.allSettled([...pending]).then(() => {});
       return closing;
     },
   };
@@ -205,7 +280,7 @@ export function installDEntryNativeCatalog(input: {
   try {
     uninstall = installDEntryNativeOwnerPort(assembly.port);
   } catch (error) {
-    void assembly.close();
+    void assembly.close().catch(() => {});
     throw error;
   }
   const close = () => {
@@ -214,7 +289,7 @@ export function installDEntryNativeCatalog(input: {
     return assembly.close();
   };
   const abort = () => {
-    void close();
+    void close().catch(() => {});
   };
   input.lifetime.addEventListener('abort', abort, { once: true });
   if (input.lifetime.aborted) abort();

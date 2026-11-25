@@ -54,6 +54,8 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build generated test dependencies
+        run: pnpm build:test-sources
       - name: Read locked browser and runner cache identities
         id: browser-cache-identity
         run: |
@@ -100,15 +102,27 @@ jobs:
           ALLRICE_RUN_BROWSER_INTEGRATION: 1
           ALLRICE_RUN_BRAND_CONTENT_BROWSER: 1
         run: node scripts/ci-integration-tests.mjs run -- --maxWorkers=1 --testTimeout=30000 apps/web/components/admin/admin-shell.browser.test.ts apps/web/components/theme/theme.browser.test.ts packages/ui/src/design-tokens.browser.test.ts apps/web/app/login/auth-submit.browser.test.ts apps/web/app/chatflow/workbench-layout.browser.test.ts apps/web/app/chatflow/native-document-preview.browser.test.ts apps/web/app/chatflow/terminal-workbench.browser.test.ts apps/web/app/chatflow/once-tasks.browser.test.ts apps/web/app/chatflow/recurring-tasks.browser.test.ts apps/web/app/chatflow/automation-tasks.browser.test.ts apps/web/app/chatflow/composer-isolation.browser.test.ts apps/web/app/chatflow/composer-status.browser.test.ts apps/web/app/chatflow/chat-contrast.browser.test.ts apps/web/app/chatflow/plain-copy.browser.test.ts apps/web/app/chatflow/technical-details.browser.test.ts apps/web/app/chatflow/work-process-reading.browser.test.ts apps/web/app/chatflow/local-command-theme.browser.test.ts apps/web/app/chatflow/sidebar-labels.browser.test.ts apps/web/app/chatflow/catalog-contrast.browser.test.ts apps/web/app/chatflow/browser-workspace-panel.browser.test.ts apps/web/app/chatflow/brand-content-panel.test.tsx apps/web/app/workspace/mcp/connected-apps.browser.test.ts apps/web/app/runtime-console/platform-model-settings.browser.test.ts apps/web/app/runtime-console/codex-subscriptions.browser.test.ts apps/web/app/runtime-console/codex-authorization.browser.test.ts apps/web/app/runtime-console/platform-mcp-settings.browser.test.ts apps/web/app/runtime-console/technical-tasks.browser.test.ts apps/web/app/runtime-console/platform-quality.browser.test.ts apps/web/app/runtime-console/platform-quality-evidence.browser.test.ts apps/web/app/runtime-console/platform-repository-repair.browser.test.ts apps/web/app/runtime-console/platform-repository-publications.browser.test.ts apps/web/app/runtime-console/platform-repository-reviews.browser.test.ts apps/web/app/runtime-console/platform-repository-merges.browser.test.ts apps/web/server/project-preview.test.mjs
+      - name: Make the pinned sidebar and approved rev2 panel sources available
+        run: |
+          pinned_sidebar=d8f6ed3fa01bdd6e5d72e55702eb703e5e670d00
+          pinned_panels=4c2e1069e087e645365100850756afe742c35e3d
+          for pinned_source in "$pinned_sidebar" "$pinned_panels"; do
+            git cat-file -e "$pinned_source:apps/web/app/layout.tsx" 2>/dev/null ||
+              git fetch --no-tags --depth=1 origin "$pinned_source"
+            git cat-file -e "$pinned_source:apps/web/app/layout.tsx"
+          done
+          git cat-file -e "$pinned_panels:apps/web/app/chatflow/enterprise-materials-panel.tsx"
       - name: Collect remaining standalone browser integration tests
         env:
           ALLRICE_RUN_BROWSER_INTEGRATION: 1
           ALLRICE_RUN_BRAND_CONTENT_BROWSER: 1
           ALLRICE_TEST_STATIC_BROWSER: 1
           ALLRICE_MANAGED_BROWSER_EXECUTABLE: /opt/google/chrome/chrome
+          ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR: ${{ github.workspace }}/.local/integration-collection/employee-sidebar
         run: |
           test -x "$ALLRICE_MANAGED_BROWSER_EXECUTABLE"
           "$ALLRICE_MANAGED_BROWSER_EXECUTABLE" --version
+          node scripts/ci-integration-tests.mjs run -- --maxWorkers=1 --testTimeout=30000 apps/worker/src/d-entry/principal-page-carrier.browser.test.ts
           node scripts/ci-integration-tests.mjs run browser -- --maxWorkers=1 --testTimeout=30000
       - name: Collect remaining browser and PostgreSQL integration tests
         env:
@@ -184,7 +198,7 @@ jobs:
     # pnpm test alone takes 15-17m, and with typecheck and the production build the
     # job runs 22-25m; at a 25m cap, runs whose every step passed were cancelled
     # (10-26: 40372081746, 40376496547). Speeding up or splitting it: MET-220.
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -230,18 +244,26 @@ jobs:
           BASE: ${{ steps.audit-base.outputs.base }}
         run: node --import tsx scripts/dsh-convergence-gate.ts --base "$BASE"
       - name: Unit-test the M1 monitor (standard-library Python, no services)
-        run: python3 -m unittest discover -s scripts/m1 -p 'test_*.py'
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          printf '%s\n' 'Source status before monitor tests'
+          git status --porcelain=v1 --untracked-files=all
+          python3 -m unittest discover -s scripts/m1 -p 'test_*.py'
       # Native child processes and fsync journals need bounded contention.
       - name: Capture versioned deterministic regression source
         id: native-capture
-        run: pnpm exec tsx scripts/acceptance/platform/quality-scenarios.ts capture --group=native --output=.local/quality/native/capture.json
+        run: |
+          printf '%s\n' 'Source status at native evidence capture'
+          git status --porcelain=v1 --untracked-files=all
+          pnpm exec tsx scripts/acceptance/platform/quality-scenarios.ts capture --group=native --output=.local/quality/native/capture.json
       - name: Run existing tests and retain their original evidence
         id: native-tests
         env:
           ALLRICE_NATIVE_ONCE_PROBE_MODULE_BASE: ${{ github.workspace }}/apps/worker/package.json
           TSX_TSCONFIG_PATH: ${{ github.workspace }}/tsconfig.base.json
         run: |
-          pnpm --filter @allrice/contracts build
+          pnpm build:test-sources
           node --test --test-concurrency=1 scripts/ci-integration-tests.node.test.mjs
           node scripts/ci-integration-tests.mjs run native -- --maxWorkers=2 --outputFile=.local/quality/native/vitest-native.json
       - name: Collect deterministic scenario evidence without rerunning tests
@@ -279,6 +301,8 @@ jobs:
 
   developer-bootstrap:
     runs-on: ubuntu-latest
+    env:
+      ALLRICE_RUN_RETIREMENT_BEFORE_SHA: 9daa017c3ae370a0b63938c2228217ba570af8f2
     # Run 41078519901 attempts 1/2 hit the 50m job cap at the final
     # build/Bridge boundary; all completed test batches passed.
     # Allow ~10m headroom while keeping test deadlines and every gate.
@@ -299,6 +323,22 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Seed the pinned retirement predecessor in the offline fixture store
+        shell: bash
+        run: |
+          store="$(node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            import { isAbsolute } from 'node:path';
+            import { parse } from 'yaml';
+            const { storeDir } = parse(readFileSync('node_modules/.modules.yaml', 'utf8'));
+            if (typeof storeDir !== 'string' || !isAbsolute(storeDir)) process.exit(1);
+            process.stdout.write(storeDir);
+          ")"
+          seed="$(mktemp -d "$RUNNER_TEMP/allrice-retirement-seed.XXXXXX")"
+          trap 'rm -rf -- "$seed"' EXIT
+          git archive "$ALLRICE_RUN_RETIREMENT_BEFORE_SHA" .npmrc package.json pnpm-lock.yaml pnpm-workspace.yaml patches |
+            tar -xf - -C "$seed"
+          pnpm --dir "$seed" fetch --frozen-lockfile --ignore-scripts --store-dir "$store"
       - run: pnpm doctor:ci
       - run: pnpm db:setup
       - name: Check DSH convergence after all migrations (MET-210 #4)

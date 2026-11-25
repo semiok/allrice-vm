@@ -15,8 +15,9 @@ export async function currentNativeRequest(
   request: Request,
   selection: DEntrySelectionInput,
   context: RequestContext,
+  access: 'execute' | 'history' = 'execute',
 ) {
-  const identity = await resolveDEntryIdentity(context, selection, 'execute');
+  const identity = await resolveDEntryIdentity(context, selection, access);
   const token = (await cookies()).get(sessionCookieName)?.value;
   if (!token) throw new DataAccessError('authentication_required');
   return { context, identity, token, selection, signal: request.signal };

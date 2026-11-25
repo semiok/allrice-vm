@@ -45,7 +45,10 @@ import {
   getReferenceFile,
   listReferenceRevisions,
   changeReference,
+  changeReferencePublication,
+  publishReference,
   referenceLibraryOptions,
+  readReferenceWriteReceipt,
 } from './reference-library.ts';
 import {
   claimReferenceProcessing,
@@ -887,6 +890,245 @@ suite(
       await expect(
         f.db`update allrice_knowledge_sources set ownership=${f.db.json({ scope: 'company', organizationId: a.company.organizationId })} where id=${p.sourceId}`,
       ).rejects.toThrow('immutable');
+    });
+    it('binds an action receipt to its submitted workspace and preserves only the original scope for a legacy input', async () => {
+      const a = await setup();
+      const workspaceB = randomUUID();
+      await f.db`insert into allrice_workspaces(id,organization_id,slug,name)
+        values(${workspaceB},${a.company.organizationId},'receipt-b','Receipts B')`;
+      const inB = { ...a.owner, workspaceId: workspaceB };
+      const audience = { scope: 'personal' as const, departmentIds: [] };
+      const storage = runtimeFixtureStorage(f.db);
+      const source = await publishReference(
+        a.owner,
+        {
+          origin: 'upload',
+          workspaceId: a.owner.workspaceId!,
+          requestId: randomUUID(),
+          audience,
+          purpose: 'created in A',
+          fileName: 'receipt.txt',
+          mediaType: 'text/plain',
+          contentBase64: Buffer.from('reference content').toString('base64'),
+        },
+        storage,
+      );
+      const input = {
+        workspaceId: workspaceB,
+        requestId: randomUUID(),
+        expectedRevision: 1,
+        action: 'edit' as const,
+        audience,
+        purpose: 'edited in B',
+      };
+      await changeReferencePublication(inB, source.sourceId, input);
+      const query = {
+        workspaceId: workspaceB,
+        requestId: input.requestId,
+        sourceId: source.sourceId,
+        operation: 'change-publication',
+      };
+      expect(await readReferenceWriteReceipt(inB, query)).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
+      expect(
+        await readReferenceWriteReceipt(a.owner, {
+          ...query,
+          workspaceId: a.owner.workspaceId,
+        }),
+      ).toMatchObject({ status: 'unknown', result: null });
+      expect(
+        await readReferenceWriteReceipt(
+          { ...a.reader, workspaceId: workspaceB },
+          query,
+        ),
+      ).toMatchObject({
+        status: 'unknown',
+        result: null,
+      });
+
+      const prior = randomUUID();
+      await f.db`insert into allrice_knowledge_reference_actions(source_id,actor_id,request_id,input)
+        values(${source.sourceId},${a.owner.actor.id},${prior},${f.db.json({
+          action: 'edit',
+          requestId: prior,
+          expectedRevision: 1,
+          audience,
+          purpose: 'previous input',
+        })})`;
+      expect(
+        await readReferenceWriteReceipt(inB, { ...query, requestId: prior }),
+      ).toMatchObject({
+        status: 'unknown',
+        result: null,
+      });
+      expect(
+        await readReferenceWriteReceipt(a.owner, {
+          ...query,
+          workspaceId: a.owner.workspaceId,
+          requestId: prior,
+        }),
+      ).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
+    });
+    it('reconciles an unchanged legacy action recorded with an uppercase workspace UUID', async () => {
+      const { owner } = await setup();
+      const workspaceId = owner.workspaceId!;
+      const source = await upload(owner);
+      const original = {
+        workspaceId: workspaceId.toUpperCase(),
+        requestId: randomUUID(),
+        expectedRevision: 1,
+        action: 'retry' as const,
+      };
+      // The old route accepts an organization-wide session and stores its
+      // validated request spelling along with the action.
+      expect(original.workspaceId).not.toBe(workspaceId);
+      await changeReference(
+        { ...owner, workspaceId: null },
+        source.sourceId,
+        original,
+      );
+      const [other] =
+        await f.db`insert into allrice_workspaces(organization_id,slug,name)
+        values(${owner.organizationId},'receipt-other','Other receipt workspace') returning id`;
+      const rejected = ['invalid-workspace', null, other!.id as string];
+      const rejectedIds = [];
+      for (const invalidWorkspaceId of rejected) {
+        const requestId = randomUUID();
+        rejectedIds.push(requestId);
+        const input = {
+          ...original,
+          workspaceId: invalidWorkspaceId,
+          requestId,
+        };
+        await f.db`insert into allrice_knowledge_reference_actions(source_id,actor_id,request_id,input)
+          values(${source.sourceId},${owner.actor.id},${requestId},${f.db.json(input)})`;
+      }
+      const rows = () =>
+        f.db`select request_id,input from allrice_knowledge_reference_actions
+          where source_id=${source.sourceId} order by request_id`;
+      const before = await rows();
+      expect(before).toContainEqual({
+        request_id: original.requestId,
+        input: original,
+      });
+      const query = {
+        workspaceId,
+        requestId: original.requestId,
+        sourceId: source.sourceId,
+        operation: 'change-source',
+      };
+      expect(await readReferenceWriteReceipt(owner, query)).toMatchObject({
+        status: 'recorded',
+        result: { sourceId: source.sourceId },
+      });
+      for (const requestId of rejectedIds)
+        expect(
+          await readReferenceWriteReceipt(owner, { ...query, requestId }),
+        ).toMatchObject({ status: 'unknown', result: null });
+      expect(await rows()).toEqual(before);
+    });
+    it('reconciles only the current maintainer own retry key on another publisher source without replay or writes', async () => {
+      for (const scope of ['department', 'company'] as const) {
+        const a = await setup();
+        const maintainer = a.otherReader;
+        if (scope === 'company')
+          await f.db`update allrice_organization_people set content_maintenance_level='company'
+            where organization_id=${a.company.organizationId} and user_id=${maintainer.actor.id}`;
+        const source = await upload(
+          a.owner,
+          input(a.owner, scope, {
+            departmentId: scope === 'department' ? a.other.id : undefined,
+          }),
+        );
+        await f.db`update allrice_knowledge_processing set state='failed',failure='controlled retry'
+          where revision_id=${source.revisionId}`;
+        const requestId = randomUUID();
+        const action = {
+          workspaceId: maintainer.workspaceId!,
+          requestId,
+          expectedRevision: 1,
+          action: 'retry' as const,
+        };
+        await changeReference(maintainer, source.sourceId, action);
+        const query = {
+          workspaceId: maintainer.workspaceId!,
+          requestId,
+          sourceId: source.sourceId,
+          operation: 'change-source' as const,
+        };
+        const before = {
+          actions:
+            await f.db`select * from allrice_knowledge_reference_actions where source_id=${source.sourceId} order by actor_id,request_id`,
+          audits:
+            await f.db`select * from allrice_audit_events where resource_id=${source.sourceId} order by id`,
+          processing:
+            await f.db`select * from allrice_knowledge_processing where revision_id=${source.revisionId}`,
+        };
+        expect(before.actions).toMatchObject([
+          {
+            actor_id: maintainer.actor.id,
+            request_id: requestId,
+            input: action,
+          },
+        ]);
+        expect(before.actions).toHaveLength(1);
+        const receipt = await readReferenceWriteReceipt(maintainer, query);
+        expect(receipt).toEqual({
+          requestId,
+          operation: 'change-source',
+          status: 'recorded',
+          inputDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          result: { sourceId: source.sourceId },
+          ready: null,
+        });
+        expect(await readReferenceWriteReceipt(maintainer, query)).toEqual(
+          receipt,
+        );
+        expect(await readReferenceWriteReceipt(a.owner, query)).toMatchObject({
+          status: 'unknown',
+          result: null,
+        });
+        expect(await readReferenceWriteReceipt(a.reader, query)).toMatchObject({
+          status: 'unknown',
+          result: null,
+        });
+        expect(
+          await readReferenceWriteReceipt(maintainer, {
+            ...query,
+            operation: 'change-publication',
+          }),
+        ).toMatchObject({ status: 'unknown', result: null });
+        expect(
+          await readReferenceWriteReceipt(maintainer, {
+            ...query,
+            requestId: randomUUID(),
+          }),
+        ).toMatchObject({ status: 'unknown', result: null });
+        expect(
+          await readReferenceWriteReceipt(maintainer, {
+            ...query,
+            sourceId: randomUUID(),
+          }),
+        ).toMatchObject({ status: 'unknown', result: null });
+        await f.db`update allrice_organization_people set content_maintenance_level='personal'
+          where organization_id=${a.company.organizationId} and user_id=${maintainer.actor.id}`;
+        await expect(
+          readReferenceWriteReceipt(maintainer, query),
+        ).rejects.toThrow('not_found');
+        expect({
+          actions:
+            await f.db`select * from allrice_knowledge_reference_actions where source_id=${source.sourceId} order by actor_id,request_id`,
+          audits:
+            await f.db`select * from allrice_audit_events where resource_id=${source.sourceId} order by id`,
+          processing:
+            await f.db`select * from allrice_knowledge_processing where revision_id=${source.revisionId}`,
+        }).toEqual(before);
+      }
     });
     it('rechecks current department and active identity instead of trusting cached memberships', async () => {
       const a = await setup(),

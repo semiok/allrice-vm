@@ -52,16 +52,31 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     workdir: '/work/shared',
     cliPath: '/opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js',
     startupTimeoutMs: 5000,
+    principalProfile: {
+      workspaceId: randomUUID(),
+      employeeInstanceId: randomUUID(),
+      employeeRevision: 1,
+      employeeVersionId: randomUUID(),
+    },
   };
-  const a = await prepareNativeWebLaunch(config, binding),
+  const profile = [
+    { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+  ] as const;
+  const a = await prepareNativeWebLaunch(config, binding, profile),
     b = await prepareNativeWebLaunch(
       {
         ...config,
         dshHome: '/work/employee-b/dsh',
+        principalProfile: {
+          ...config.principalProfile,
+          employeeInstanceId: randomUUID(),
+          employeeVersionId: randomUUID(),
+        },
       },
       binding,
+      profile,
     );
-  expect(a.command.args).toContain('--profile');
+  expect(a.command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
   expect(a.command.args).toContain('--no-open');
   expect(a.command.args.indexOf('--patch')).toBeLessThan(
     a.command.args.indexOf('--no-open'),
@@ -73,10 +88,29 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   expect(a.files[0]!.contents).toContain(
     'ctx.connection.authenticatedUrl(baseUrl)',
   );
-  expect(JSON.parse(a.files[1]!.contents)[1].insert[0].name).toContain(
-    '/employee-a/dsh/',
+  const patch = a.files.find((file) => file.path.endsWith('/owner.patch.json'));
+  if (!patch) throw Error('actual native owner patch missing');
+  const entries = JSON.parse(patch.contents);
+  expect(entries[1].insert.map((entry: { id: string }) => entry.id)).toEqual([
+    'allrice-current-principal',
+    'allrice-native-web-owner',
+  ]);
+  expect(entries[1].insert[0]).toEqual({
+    id: 'allrice-current-principal',
+    name: 'file:///work/employee-a/dsh/native-web/current-principal.mjs',
+    config: {
+      profile: config.principalProfile,
+      binding,
+      moduleBase: config.cliPath,
+    },
+  });
+  const plugin = a.files.find((file) =>
+    file.path.endsWith('/current-principal.mjs'),
   );
-  expect(JSON.parse(a.files[1]!.contents)[0]).toEqual({
+  if (!plugin) throw Error('actual sealed principal plugin missing');
+  expect(plugin.mode).toBe(0o600);
+  expect(plugin.contents).toContain('PRINCIPAL_METADATA_INVALID');
+  expect(entries[0]).toEqual({
     id: 'web-runtime',
     config: {
       openBrowser: false,
@@ -103,7 +137,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
         ],
       },
     ],
-    JSON.parse(a.files[1]!.contents),
+    entries,
   ]);
   expect(composed.find((entry) => entry.id === 'web-runtime')?.config).toEqual({
     openBrowser: false,
@@ -115,7 +149,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   expect(JSON.stringify(a)).not.toContain('?token=');
   for (const guestAddress of ['0.0.0.0', '::', 'guest.example.test'])
     await expect(
-      prepareNativeWebLaunch({ ...config, guestAddress }, binding),
+      prepareNativeWebLaunch({ ...config, guestAddress }, binding, profile),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
 

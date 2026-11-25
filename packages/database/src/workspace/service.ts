@@ -729,21 +729,51 @@ function decodeCursor(cursor: string | undefined) {
   }
 }
 
-export async function listChatSessions(
+type ChatSessionPageOptions = {
+  cursor?: string;
+  limit?: number;
+  includeArchived?: boolean;
+  archivedOnly?: boolean;
+  employeeAssignmentId?: string;
+  employeeInstanceId?: string;
+  includeEmployeeGroups?: boolean;
+  query?: string;
+};
+
+export function listChatSessions(
+  context: RequestContext,
+  workspaceId: string,
+  options: ChatSessionPageOptions = {},
+) {
+  return readChatSessionPage(context, workspaceId, options, getDatabase());
+}
+
+/** Private employee profile directory. Filter eligible owned 4.0 work before
+ * the existing SQL cursor, so an intervening 3.x or shared row costs no slot. */
+export function readDEntrySidebarSessionPage(
+  context: RequestContext,
+  workspaceId: string,
+  currentEmployeeIds: readonly string[],
+  cursor: string | undefined,
+  sql: TransactionSql,
+) {
+  return readChatSessionPage(
+    context,
+    workspaceId,
+    { cursor, limit: 50 },
+    sql,
+    currentEmployeeIds,
+  );
+}
+
+async function readChatSessionPage(
   context: RequestContext,
   workspaceIdInput: string,
-  options: {
-    cursor?: string;
-    limit?: number;
-    includeArchived?: boolean;
-    archivedOnly?: boolean;
-    employeeAssignmentId?: string;
-    employeeInstanceId?: string;
-    includeEmployeeGroups?: boolean;
-    query?: string;
-  } = {},
+  options: ChatSessionPageOptions,
+  sql: ReturnType<typeof getDatabase> | TransactionSql,
+  dEntryEmployees?: readonly string[],
 ) {
-  const workspaceId = await resolveWorkspaceId(context, workspaceIdInput);
+  const workspaceId = await resolveWorkspaceId(context, workspaceIdInput, sql);
   const cursor = decodeCursor(options.cursor);
   const employeeAssignmentId = options.employeeAssignmentId
     ? UuidSchema.parse(options.employeeAssignmentId)
@@ -752,7 +782,6 @@ export async function listChatSessions(
     ? UuidSchema.parse(options.employeeInstanceId)
     : null;
   const limit = Math.min(Math.max(options.limit ?? 30, 1), 100);
-  const sql = getDatabase();
   // Bind cursor timestamps as text so postgres.js does not serialize them
   // through Date before PostgreSQL compares the full microsecond value.
   const rows = await sql<
@@ -770,6 +799,15 @@ export async function listChatSessions(
       and (not ${options.archivedOnly ?? false} or archived_at is not null)
       and (${options.query ?? ''} = '' or position(lower(${options.query ?? ''}) in lower(title)) > 0)
       and (owner_id = ${requireUser(context)} or visibility <> 'private')
+      ${
+        dEntryEmployees
+          ? sql`and owner_id=${requireUser(context)}
+             and execution_generation='4.0'
+             and d_entry_native_root->>'nativeSessionId' is not null
+             and coalesce(employee_instance_id,employee_assignment_id)
+               = any(${sql.array([...dEntryEmployees])}::uuid[])`
+          : sql``
+      }
       and (
         ${cursor?.updatedAt ?? null}::text::timestamptz is null
         or (pinned_at is not null and archived_at is null, updated_at, id)

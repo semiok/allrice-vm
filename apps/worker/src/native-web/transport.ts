@@ -1,4 +1,10 @@
-import { request, Agent, type ClientRequest } from 'node:http';
+import {
+  request,
+  Agent,
+  type ClientRequest,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+} from 'node:http';
 import type { Duplex } from 'node:stream';
 import WebSocket from 'ws';
 import type {
@@ -6,6 +12,8 @@ import type {
   RpcFetch,
 } from '@deepseek-ai/dsh-client-connection/client';
 import { PersonVmError } from '@allrice/person-vm';
+
+export const nativeIndexByteLimit = 1024 * 1024;
 
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(
@@ -18,6 +26,7 @@ export function nativeWebTransport(
   const calls = new Set<ClientRequest>();
   const joins = new Set<Promise<void>>();
   let cookie: string | undefined,
+    indexCookie: string | undefined,
     closing = false;
   function joined(promise: Promise<void>) {
     joins.add(promise);
@@ -35,13 +44,21 @@ export function nativeWebTransport(
       ),
     );
   }
-  const agent = new (class extends Agent {
-    override createConnection(...args: Parameters<Agent['createConnection']>) {
-      const socket = super.createConnection(...args);
-      if (socket) socketJoin(socket); // Before ClientRequest's asynchronous assignment.
-      return socket;
-    }
-  })({ keepAlive: false });
+  function newAgent(ownSocket?: (socket: Duplex) => void) {
+    return new (class extends Agent {
+      override createConnection(
+        ...args: Parameters<Agent['createConnection']>
+      ) {
+        const socket = super.createConnection(...args);
+        if (socket) {
+          socketJoin(socket);
+          ownSocket?.(socket);
+        }
+        return socket;
+      }
+    })({ keepAlive: false });
+  }
+  const agent = newAgent();
   function requestJoin(call: ClientRequest) {
     calls.add(call);
     joined(
@@ -66,25 +83,55 @@ export function nativeWebTransport(
       throw new PersonVmError('PROVIDER_FAILED');
     return url;
   }
-  const fetch: RpcFetch = (input, init) =>
+  function prepareRequest(
+    input: string | URL,
+    init: Parameters<RpcFetch>[1],
+    receive: (response: IncomingMessage) => void,
+    connectionPool = agent,
+    credential: 'api' | 'index' | 'none' = 'api',
+  ) {
+    const url = target(input);
+    const headers = new Headers(init.headers);
+    headers.set('host', url.host);
+    headers.set('origin', new URL(origin).origin);
+    headers.delete('cookie');
+    const selected =
+      credential === 'api'
+        ? cookie
+        : credential === 'index'
+          ? indexCookie
+          : undefined;
+    if (selected) headers.set('cookie', selected);
+    const callSignal = init.signal
+      ? AbortSignal.any([signal, init.signal])
+      : signal;
+    // Native Connection unary calls provide their already encoded JSON string.
+    const body = init.body;
+    if (body !== undefined && body !== null && typeof body !== 'string')
+      throw new PersonVmError('PROVIDER_FAILED');
+    const call = request(
+      url,
+      {
+        method: init.method,
+        headers: Object.fromEntries(headers),
+        agent: connectionPool,
+        signal: callSignal,
+      },
+      receive,
+    );
+    requestJoin(call);
+    return { call, send: () => call.end(body) };
+  }
+  const requestResponse = (
+    input: Parameters<RpcFetch>[0],
+    init: Parameters<RpcFetch>[1],
+    credential: 'api' | 'index' | 'none',
+  ): Promise<Response> =>
     new Promise((resolve, reject) => {
       try {
-        const url = target(input);
-        const headers = new Headers(init.headers);
-        headers.set('host', url.host);
-        headers.set('origin', new URL(origin).origin);
-        if (cookie) headers.set('cookie', cookie);
-        const callSignal = init.signal
-          ? AbortSignal.any([signal, init.signal])
-          : signal;
-        const call = request(
-          url,
-          {
-            method: init.method,
-            headers: Object.fromEntries(headers),
-            agent,
-            signal: callSignal,
-          },
+        const { call, send } = prepareRequest(
+          input,
+          init,
           (response) => {
             const chunks: Buffer[] = [];
             response.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -116,28 +163,130 @@ export function nativeWebTransport(
               }
             });
           },
+          agent,
+          credential,
         );
-        requestJoin(call);
         // A closed, unanswered request is not a reply.
         call.once('close', () => reject(new PersonVmError('PROVIDER_FAILED')));
         call.on('error', () => reject(new PersonVmError('PROVIDER_FAILED')));
-        // Native Connection unary calls provide their already encoded JSON string.
-        if (
-          init.body !== undefined &&
-          init.body !== null &&
-          typeof init.body !== 'string'
-        ) {
-          call.destroy();
-          reject(new PersonVmError('PROVIDER_FAILED'));
-          return;
-        }
-        call.end(init.body);
+        send();
       } catch {
         reject(new PersonVmError('PROVIDER_FAILED'));
       }
     });
+  const fetch: RpcFetch = (input, init) => requestResponse(input, init, 'api');
+  /** Each finite proof reads only its own bounded response and keeps
+   * ownership through physical shutdown. */
+  async function readOwned(
+    input: URL,
+    caller: AbortSignal,
+    bounds: {
+      maxBytes: number;
+      exact?: number;
+      credential: 'none' | 'index';
+      accepts(response: IncomingMessage): boolean;
+    },
+  ): Promise<{ data: Buffer; headers: IncomingHttpHeaders }> {
+    const active = AbortSignal.any([signal, caller]);
+    active.throwIfAborted();
+    const fixed =
+      bounds.exact === undefined ? undefined : Buffer.allocUnsafe(bounds.exact);
+    const chunks: Buffer[] = [];
+    return new Promise((resolve, reject) => {
+      let received = 0;
+      let complete: IncomingHttpHeaders | undefined;
+      let failure: { reason: unknown } | undefined;
+      let physicalClose: Promise<void> | undefined;
+      // This agent owns exactly this request, even when the request dies
+      // before Node assigns the already created socket to ClientRequest.
+      const connection = newAgent((socket) => {
+        physicalClose = new Promise<void>((done) => {
+          if (socket.closed) done();
+          else socket.once('close', done);
+        });
+      });
+      const fail = () => {
+        failure ??= {
+          reason: active.aborted
+            ? active.reason
+            : new PersonVmError('PROVIDER_FAILED'),
+        };
+      };
+      const { call, send } = prepareRequest(
+        input,
+        { method: 'GET', headers: { connection: 'close' }, signal: active },
+        (response) => {
+          response.once('error', fail);
+          const declared = response.headers['content-length'];
+          if (
+            !bounds.accepts(response) ||
+            (declared !== undefined &&
+              /^\d+$/.test(declared) &&
+              (bounds.exact === undefined
+                ? BigInt(declared) > BigInt(bounds.maxBytes)
+                : BigInt(declared) !== BigInt(bounds.exact)))
+          ) {
+            fail();
+            response.destroy();
+            return;
+          }
+          response.on('data', (chunk: Buffer) => {
+            if (failure) return;
+            if (chunk.length > bounds.maxBytes - received) {
+              fail();
+              response.destroy();
+              return;
+            }
+            if (fixed) chunk.copy(fixed, received);
+            else chunks.push(chunk);
+            received += chunk.length;
+          });
+          response.once('end', () => {
+            if (bounds.exact !== undefined && received !== bounds.exact) fail();
+            else complete = response.headers;
+          });
+        },
+        connection,
+        bounds.credential,
+      );
+      call.on('error', fail);
+      call.once('close', () => {
+        void (async () => {
+          await physicalClose;
+          connection.destroy();
+          if (active.aborted) fail();
+          if (failure) reject(failure.reason);
+          else if (!complete) reject(new PersonVmError('PROVIDER_FAILED'));
+          else
+            resolve({
+              data: fixed ?? Buffer.concat(chunks, received),
+              headers: complete,
+            });
+        })();
+      });
+      send();
+    });
+  }
+  async function readExact(
+    input: URL,
+    bytes: number,
+    caller: AbortSignal,
+  ): Promise<Uint8Array> {
+    AbortSignal.any([signal, caller]).throwIfAborted();
+    if (!Number.isSafeInteger(bytes) || bytes < 1)
+      throw new PersonVmError('PROVIDER_FAILED');
+    return (
+      await readOwned(input, caller, {
+        maxBytes: bytes,
+        exact: bytes,
+        credential: 'none',
+        accepts: ({ statusCode }) => statusCode === 200,
+      })
+    ).data;
+  }
   return {
     fetch,
+    readExact,
     async authenticate(authenticatedUrl: string) {
       const url = target(authenticatedUrl);
       url.pathname = '/connect';
@@ -151,6 +300,31 @@ export function nativeWebTransport(
       )
         throw new PersonVmError('PROVIDER_FAILED');
       cookie = values[0]!.split(';', 1)[0]!;
+    },
+    async authenticateIndex(authenticatedUrl: string) {
+      const url = target(authenticatedUrl);
+      if (url.pathname !== '/') throw new PersonVmError('PROVIDER_FAILED');
+      const response = await readOwned(url, signal, {
+        maxBytes: 4096,
+        credential: 'none',
+        accepts: ({ statusCode, headers }) =>
+          statusCode === 303 &&
+          headers.location === './' &&
+          headers['set-cookie']?.length === 1,
+      });
+      indexCookie = response.headers['set-cookie']![0]!.split(';', 1)[0]!;
+    },
+    async readIndex(signal: AbortSignal) {
+      if (!indexCookie) throw new PersonVmError('PROVIDER_FAILED');
+      const { data } = await readOwned(new URL('/', origin), signal, {
+        maxBytes: nativeIndexByteLimit,
+        credential: 'index',
+        accepts: ({ statusCode, headers }) =>
+          statusCode === 200 &&
+          headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() ===
+            'text/html',
+      });
+      return data.toString('utf8');
     },
     createWebSocket(input: string): ConnectionWebSocket {
       const url = new URL(input);
@@ -197,6 +371,7 @@ export function nativeWebTransport(
     async close() {
       closing = true;
       cookie = undefined;
+      indexCookie = undefined;
       agent.destroy();
       for (const call of calls) call.destroy();
       for (const socket of sockets) socket.destroy();

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdir, writeFile, rename } from 'node:fs/promises';
+import { lstat, mkdir, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { stagePersonVmConfiguration } from './stage-person-vm-config.mjs';
 import { resolveServiceBuildSource } from './prepare-identity-root.mjs';
@@ -28,6 +28,21 @@ if (configArgs.length)
     root,
     configArgs[0].slice('--person-vm-config='.length),
   );
+const hostConfiguration = await lstat(
+  join(root, '.local/person-vm-host.json'),
+).catch((error) => {
+  if (error?.code !== 'ENOENT') throw error;
+  return undefined;
+});
+if (hostConfiguration) {
+  if (!hostConfiguration.isFile()) throw Error('DEV_BUILD_IDENTITY_INVALID');
+  const { prepareEmployeeWebServiceArtifact } =
+    await import('../../packages/dsh-web-composition/build-web-entry.mjs');
+  await prepareEmployeeWebServiceArtifact(
+    join(root, 'apps/worker/dist/d-entry-web'),
+    sourceSha,
+  );
+}
 const manifest = await prepareServiceBuildManifest(source);
 const nativeArtifact = await measureDshNativeArtifact(root, undefined, {
   schemaVersion: 2,

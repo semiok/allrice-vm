@@ -8,6 +8,7 @@ import type {
   PersonVmBinding,
 } from '@allrice/person-vm';
 import { PersonVmError, PersonVmService } from '@allrice/person-vm';
+import type { NativeWebOwner } from './owner.js';
 import {
   harness,
   MemoryStore,
@@ -79,6 +80,9 @@ function fixture() {
   const service = createAssignedNativeWebStartup({
     vm: { assertCurrentBinding: vi.fn() },
     memoryGuestPlan,
+    readEmployeeProfile: async () => [
+      { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+    ],
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
     configuration: {
@@ -150,7 +154,7 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   );
   expect(plan.initialize).toBe(f.memory.initialize);
   expect(plan.launcher).toBe(f.memory.launcher);
-  expect(plan.files).toHaveLength(1 + 2 * f.web.receipt.endpoints.length);
+  expect(plan.files).toHaveLength(1 + 4 * f.web.receipt.endpoints.length);
   await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
   expect(f.memoryGuestPlan).toHaveBeenCalledTimes(1);
   expect(open).toHaveBeenCalledTimes(2);
@@ -165,6 +169,29 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     expect(input.launch.command.env).toEqual({
       DSH_HOME: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh`,
       DSH_AGENTS_HOME: `/work/.allrice/employees/${endpoint.employeeInstanceId}/agents`,
+    });
+    expect(input.launch.command.args.slice(1, 3)).toEqual([
+      '--profile',
+      'allrice-web',
+    ]);
+    expect(plan.files).toContainEqual({
+      path: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh/profiles/allrice-web/package.json`,
+      contents: '{"name":"fixture-profile"}',
+      mode: 0o600,
+    });
+    const patch = input.launch.files.find((file: { path: string }) =>
+      file.path.endsWith('/owner.patch.json'),
+    );
+    if (!patch) throw Error('real staged native patch missing');
+    expect(JSON.parse(patch.contents)[1].insert[0].config).toEqual({
+      profile: {
+        workspaceId: endpoint.workspaceId,
+        employeeInstanceId: endpoint.employeeInstanceId,
+        employeeRevision: endpoint.employeeRevision,
+        employeeVersionId: endpoint.employeeVersionId,
+      },
+      binding: f.binding,
+      moduleBase: '/opt/dsh/lib/bin.js',
     });
     expect(input.launch.command.workdir).toBe('/work');
     expect(input.lifetime).not.toBe(f.scope.signal);
@@ -473,6 +500,9 @@ function catalogOwner() {
     revoked: revoked.signal,
     controlReady: vi.fn(() => true),
     readSessionsFor: vi.fn(),
+    acquirePrincipal: vi.fn<NativeWebOwner['acquirePrincipal']>(() => {
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    }),
     close: vi.fn(async () => {}),
     retireAfterNativeStop: vi.fn(async () => {}),
   };
@@ -504,6 +534,7 @@ it('完整启动才发布冻结原receipt/endpoint和私有ref；lookup无start/
     expect(first).not.toHaveProperty('canSend');
     expect(first).not.toHaveProperty('history');
     expect(owners[0]!.readSessionsFor).not.toHaveBeenCalled();
+    expect(owners[0]!.acquirePrincipal).not.toHaveBeenCalled();
     expect(open).toHaveBeenCalledTimes(2);
     owners[0]!.controlReady.mockReturnValue(false);
     expect(() => f.service.catalog(f.binding, id)).toThrowError(PersonVmError);

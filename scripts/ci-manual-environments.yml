@@ -44,6 +44,7 @@ files:
     - apps/worker/src/native-web/composition.test.ts
     - packages/person-vm/src/native-web-auth.test.ts
     - apps/worker/src/native-web/owner.test.ts
+    - apps/worker/src/native-web/owner.sealed-profile.integration.test.ts
     - apps/worker/src/native-web/transport.test.ts
     - apps/web/server/native-subagent-follow.test.mjs
     - apps/worker/dsh/allrice-native-accounting.test.mjs
@@ -78,12 +79,22 @@ files:
     - apps/worker/test/project-runtime.integration.test.ts
     - packages/browser-control/src/local-preview.integration.test.ts
   browser:
+    - apps/worker/src/d-entry/principal-page-carrier.browser.test.ts
+    - packages/dsh-web-composition/tests/installed-profile.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-sidebar.browser.test.ts
+    - packages/dsh-web-composition/tests/settings-integration.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-causal-probe.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-reference-origin.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-panels-native-placement.browser.test.ts
+    - packages/dsh-web-composition/tests/employee-topbar.browser.test.ts
     - apps/web/app/chatflow/brand-media.browser.test.ts
     - apps/web/app/chatflow/brand-content-panel.test.tsx
     - scripts/test-proxy.browser.test.mjs
     - apps/web/server/project-preview.test.mjs
     - scripts/m1/smoke-reply.browser.test.mjs
   browser+db:
+    - apps/web/lib/d-entry/employee-panels-http.integration.test.ts
     - apps/web/app/chatflow/candidate-memory.browser.test.ts
     - apps/web/app/chatflow/reference-library.browser.test.ts
     - apps/web/app/chatflow/reference-publication-dialog.browser.test.ts
@@ -103,6 +114,7 @@ files:
     - packages/model-gateway/src/admission.integration.test.ts
     - packages/approval-gateway/src/postgres.integration.test.ts
     - apps/worker/test/allrice-mcp-business.integration.test.ts
+    - apps/worker/test/allrice-mcp-deliverable-read.integration.test.ts
     - apps/web/lib/execution/model-failure-api.integration.test.ts
     - apps/web/lib/brand-media.integration.test.ts
     - apps/web/lib/reference-publications.integration.test.ts

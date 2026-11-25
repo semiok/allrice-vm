@@ -157,7 +157,9 @@ class DeployDevMigrations(unittest.TestCase):
         env['CONTRACT_FILE'] = os.path.join(self.tmp, 'contract.txt')
         write(env['CONTRACT_FILE'], CONTRACT)
         path = ':'.join([self.stubs, os.path.dirname(NODE), '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
-        env = dict(HOME=self.home, PATH=path, TEST_PATH=path, APPLIED=self.applied, **env)
+        # The source helper imports service_target under this isolated environment.
+        env = dict(HOME=self.home, PATH=path, TEST_PATH=path, APPLIED=self.applied,
+                   PYTHONDONTWRITEBYTECODE='1', **env)
         return subprocess.run(['/bin/bash', '-c', 'source "$1"; PATH=$TEST_PATH; ' + script,
                                'test', DEPLOY_DEV], env=env, capture_output=True, text=True, timeout=60)
 
@@ -1403,7 +1405,7 @@ def observe_unix_socket(pid, file):
         agents = os.path.join(self.home, 'Library/LaunchAgents')
         for role, plist in (('worker', worker), ('web', web)):
             destination = os.path.join(agents, plist['Label'] + '.plist')
-            subprocess.run([sys.executable, os.path.join(HERE, 'qa-lease.py'), 'publish-plist',
+            subprocess.run([sys.executable, '-B', os.path.join(HERE, 'qa-lease.py'), 'publish-plist',
                             os.path.join(instance, 'instance.json'), role, destination],
                            env=dict(HOME=self.home, PATH=os.defpath), capture_output=True, text=True, check=True)
         self.recovery_web_plist = destination

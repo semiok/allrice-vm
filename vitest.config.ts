@@ -2,8 +2,10 @@ import { fileURLToPath } from 'node:url';
 
 import { defineConfig } from 'vitest/config';
 import { testTags } from './scripts/ci-integration-tests.mjs';
+import { principalFixtureTransform } from './packages/d-entry-principal/test/fixture-transform.js';
 
 export default defineConfig({
+  plugins: [principalFixtureTransform],
   test: {
     setupFiles: ['./scripts/test-proxy.setup.mjs'],
     tags: testTags(),
@@ -80,6 +82,9 @@ export default defineConfig({
       ),
       '@allrice/contracts': fileURLToPath(
         new URL('./packages/contracts/src/index.ts', import.meta.url),
+      ),
+      '@allrice/d-entry-principal/types': fileURLToPath(
+        new URL('./packages/d-entry-principal/src/types.ts', import.meta.url),
       ),
       '@allrice/database/technical-contracts': fileURLToPath(
         new URL(

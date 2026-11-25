@@ -128,6 +128,122 @@ export const DEntryNativeOwnerRequestSchema = z
     selection: DEntrySelectionInputSchema,
   })
   .strict();
+// Page locators carry no authority. Borrowers must present the original login.
+export const DEntryPageScopeReferenceSchema = z
+  .object({ scopeId: UuidSchema })
+  .strict();
+export const DEntryPageOpenedSchema = z
+  .object({
+    type: z.literal('opened'),
+    scopeReference: DEntryPageScopeReferenceSchema,
+    bindingRef: z.string().min(1),
+  })
+  .strict();
+export const DEntryPageClosedSchema = z
+  .object({ type: z.literal('closed'), scopeId: UuidSchema })
+  .strict();
+export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
+  carrier: z.literal('page'),
+  organizationId: UuidSchema,
+  scopeId: UuidSchema.optional(),
+});
+export const DEntryPageUnarySchema = z.enum([
+  'session/attachment',
+  'session/page',
+  'session/projections',
+  'skills/list',
+  'session/prompt',
+  'session/updateQueue',
+  'session/cancel',
+  'session/rename',
+  'session/selectModel',
+]);
+export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
+  {
+    selection: DEntrySelectionInputSchema,
+    rpcId: z.string(),
+    endpoint: DEntryPageUnarySchema,
+    payload: z.object({ args: z.record(z.string(), z.unknown()) }).strict(),
+  },
+);
+
+export const DEntryPageBorrowSchema = DEntrySelectionInputSchema.extend({
+  scopeId: UuidSchema,
+});
+const profileToken = z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/);
+export const DEntryProfileBindingSchema = DEntryPageBorrowSchema.extend({
+  bindingRef: profileToken,
+});
+export const DEntryProfileAssetSchema = DEntryProfileBindingSchema.extend({
+  reference: z.string().min(1).max(16384),
+  revision: profileToken,
+});
+export const DEntryProfileAddressSchema = z.strictObject({
+  bindingRef: profileToken,
+  graphRev: profileToken,
+  manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
+const profileEntry = z.strictObject({
+  id: z.string().min(1),
+  url: z.string().startsWith('plugins/??'),
+  rev: profileToken,
+  inject: z.array(z.string()).optional(),
+  immediately: z.boolean().optional(),
+  external: z.array(z.string()).optional(),
+});
+export const DEntryProfileGraphSchema = z.strictObject({
+  rev: profileToken,
+  release: z.strictObject({
+    version: z.string().min(1),
+    commit: z.string().min(1).optional(),
+  }),
+  entries: z.array(profileEntry).min(1),
+  batches: z
+    .array(
+      z.strictObject({
+        phase: z.enum(['bootstrap', 'application']),
+        url: z.string().startsWith('plugins/??'),
+        rev: profileToken,
+        entries: z.array(z.string()).min(1),
+      }),
+    )
+    .min(1),
+});
+export const DEntryProfileInjectionSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('script'),
+    placement: z.literal('head'),
+    text: z.string().min(1),
+  }),
+  z.strictObject({
+    kind: z.literal('script-src'),
+    placement: z.literal('head'),
+    src: z.string().startsWith('plugins/??'),
+  }),
+  z.strictObject({
+    kind: z.literal('script-preload'),
+    src: z.string().startsWith('plugins/??'),
+  }),
+  z.strictObject({
+    kind: z.literal('global'),
+    name: z.enum(['__DSH_BOOT__', '__DSH_REMOTE_ACCESS__']),
+    value: z.json(),
+  }),
+]);
+export const DEntryProfileBootstrapSchema = z.strictObject({
+  version: z.literal(1),
+  scopeReference: DEntryPageScopeReferenceSchema,
+  bindingRef: profileToken,
+  graph: DEntryProfileGraphSchema,
+  injections: z.array(DEntryProfileInjectionSchema).min(1),
+});
+export const DEntryProfileFilePathSchema = z
+  .string()
+  .regex(/^[0-9A-Za-z_@.+()/-]{1,512}$/)
+  .refine((path) =>
+    path.split('/').every((part) => part && part !== '.' && part !== '..'),
+  );
+
 export const DEntryNativePrewarmTriggerSchema = z.enum(['page', 'input']);
 export const DEntryNativePrewarmInputSchema = z
   .object({

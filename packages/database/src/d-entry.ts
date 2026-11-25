@@ -1,6 +1,7 @@
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
+  sameDEntryIdentity,
   selectDEntryGeneration,
   type DEntryIdentity,
   type RequestContext,
@@ -10,13 +11,16 @@ import {
   authorizeSessionHistoryOwner,
   authorizeSessionOwner,
   getSessionExecutionGeneration,
+  readDEntrySidebarSessionPage,
 } from './workspace/service.ts';
 import {
+  EmployeeInstanceError,
   getEmployeeInstance,
   getEmployeeInstanceForHistory,
 } from './employees/employee-instances.ts';
 import { requireCurrentWorkspaceWriteAuthority } from './identity.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
+import { getDatabase } from './core/client.ts';
 
 const identityServices = {
   authorizeSessionHistoryOwner,
@@ -104,4 +108,120 @@ export async function requireDEntryNativeIdentity(
   )
     throw new DataAccessError('authorization_denied');
   return identity;
+}
+
+/** The authenticated D document owns this directory. The cursor is internal,
+ * and every page comes from the same read-only PostgreSQL cut. */
+export async function readDEntryEmployeeDirectory(
+  context: RequestContext,
+  input: unknown,
+  signal: AbortSignal,
+) {
+  const identity = await requireDEntryNativeIdentity(context, input);
+  if (!identity.threadId) throw new DataAccessError('not_found');
+  signal.throwIfAborted();
+  const scope = { ...context, workspaceId: identity.workspaceId };
+  const result = await getDatabase().begin(
+    'isolation level repeatable read read only',
+    async (sql) => {
+      const policy = await readDEntryReleasePolicy(sql);
+      const employees = [];
+      for (const item of policy.selections) {
+        if (
+          item.organizationId !== identity.organizationId ||
+          item.personId !== identity.personId ||
+          item.generation !== '4.0'
+        )
+          continue;
+        signal.throwIfAborted();
+        try {
+          const instance = await getEmployeeInstance(
+            scope,
+            item.employeeInstanceId,
+            sql,
+          );
+          const [version] = await sql<
+            { employee_id: string; name: string; is_default: boolean }[]
+          >`
+            select v.employee_id,v.name,a.is_default
+            from allrice_employee_assignments a
+            join allrice_employee_versions v
+              on v.id=${instance.source.employeeVersionId}
+              and v.organization_id=a.organization_id and v.workspace_id=a.workspace_id
+            where a.id=${instance.assignmentId}
+              and a.organization_id=${identity.organizationId}
+              and a.workspace_id=${identity.workspaceId} and a.user_id=${identity.personId}`;
+          if (!version) continue;
+          const currentVersion = {
+            id: instance.source.employeeVersionId,
+            manifest: {
+              name: instance.profile.name ?? version.name,
+              description: instance.profile.description,
+              appearance: instance.profile.appearance,
+            },
+          };
+          employees.push({
+            id: instance.assignmentId,
+            instanceId: instance.id,
+            employeeId: version.employee_id,
+            isDefault: version.is_default && instance.kind === 'general',
+            currentVersion,
+            versions: [currentVersion],
+          });
+        } catch (error) {
+          if (
+            (error instanceof DataAccessError &&
+              (error.code === 'not_found' ||
+                error.code === 'authorization_denied')) ||
+            (error instanceof EmployeeInstanceError &&
+              error.code === 'instance_archived')
+          )
+            continue;
+          throw error;
+        }
+      }
+      const employeeIds = employees.map(({ instanceId }) => instanceId);
+      if (!employeeIds.includes(identity.employeeInstanceId))
+        throw new DataAccessError('authorization_denied');
+      const sessions = [];
+      let cursor: string | undefined;
+      do {
+        signal.throwIfAborted();
+        const page = await readDEntrySidebarSessionPage(
+          scope,
+          identity.workspaceId,
+          employeeIds,
+          cursor,
+          sql,
+        );
+        sessions.push(...page.sessions);
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      if (
+        !sessions.some(
+          (thread) =>
+            thread.id === identity.threadId &&
+            (thread.employeeInstanceId ?? thread.employeeAssignmentId) ===
+              identity.employeeInstanceId,
+        )
+      )
+        throw new DataAccessError('not_found');
+      return { employees, sessions, revision: policy.revision };
+    },
+  );
+  const checked = await requireDEntryNativeIdentity(context, input);
+  const currentPolicy = await readDEntryReleasePolicy();
+  signal.throwIfAborted();
+  if (
+    !sameDEntryIdentity(checked, identity) ||
+    currentPolicy.revision !== result.revision
+  )
+    throw new DataAccessError('authorization_denied');
+  return {
+    organizationId: identity.organizationId,
+    workspaceId: identity.workspaceId,
+    viewerId: identity.personId,
+    employees: result.employees,
+    sessions: result.sessions,
+  };
 }

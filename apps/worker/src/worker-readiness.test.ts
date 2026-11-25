@@ -70,6 +70,8 @@ async function host(options: { detail?: string; arrivals?: number } = {}) {
     createServer,
     process,
     makeHealthResponse,
+    dEntryProfile: { handle: async () => false },
+    dEntryPageRpc: { handle: async () => false },
     dEntryHttp: async () => false,
     nativeRunDiagnosticsHttp: async () => false,
     stopping: false,

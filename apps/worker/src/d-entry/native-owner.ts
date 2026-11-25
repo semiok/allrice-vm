@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import type {
+  DEntryPrincipalIssue,
+  DEntryPrincipalActivity,
+} from '@allrice/d-entry-principal/types';
 import {
   DEntryNativeResourceFactsSchema,
   UuidSchema,
@@ -52,14 +56,24 @@ type ConsumedReceipt = Readonly<{
   rosterDigest: string;
   endpoints: readonly Readonly<OwnerView['endpoint']>[];
 }>;
+import type { DEntryFixedProfileSource } from './released-profile.js';
+
 export type ResolvedDEntryNativeOwner = Readonly<{
   receipt: ConsumedReceipt;
   endpoint: Readonly<OwnerView['endpoint']>;
   bindingRef: string;
+  fixedProfile?: DEntryFixedProfileSource;
   revoked: AbortSignal;
   controlReady(): boolean;
   assertCurrent(context: RequestContext, signal: AbortSignal): Promise<void>;
   readSessions(signal: AbortSignal): Promise<RemoteResult<SessionListValue>>;
+  /** Actual same-Host issuer. Acquisition does not start I/O; run opens the
+   * fixed generated control scope. No browser-provided principal or grants. */
+  acquirePrincipal(
+    context: RequestContext,
+    input: DEntryPrincipalIssue,
+    signal: AbortSignal,
+  ): DEntryPrincipalActivity;
 }>;
 export interface DEntryNativeOwnerPort {
   resolve(
@@ -151,6 +165,10 @@ export async function resolveDEntryNativeResource(input: {
   owner: ResolvedDEntryNativeOwner;
   signal: AbortSignal;
   root?: typeof getDEntryNativeRootPin;
+  checkGrants?: {
+    nativeSessionIds: readonly string[];
+    checked(current: boolean): void;
+  };
 }) {
   const { context, identity, owner, nativeSessionId } = input;
   if (!identity.threadId) return deny();
@@ -184,17 +202,21 @@ export async function resolveDEntryNativeResource(input: {
   const root = entries.get(pin.rootNativeSessionId);
   if (!root || root.parentSessionId || root.origin === 'subagent')
     return deny();
-  let cursor = entries.get(nativeSessionId);
-  if (!cursor) return deny();
-  const parent = cursor.parentSessionId ?? null;
-  const visited = new Set<string>();
-  while (cursor.sessionId !== pin.rootNativeSessionId) {
-    if (visited.has(cursor.sessionId) || !cursor.parentSessionId) return deny();
-    visited.add(cursor.sessionId);
-    const next = entries.get(cursor.parentSessionId);
-    if (!next) return deny();
-    cursor = next;
+  function lineage(id: string) {
+    let cursor = entries.get(id);
+    if (!cursor) return;
+    const parent = cursor.parentSessionId ?? null;
+    const visited = new Set<string>();
+    while (cursor.sessionId !== pin.rootNativeSessionId) {
+      if (visited.has(cursor.sessionId) || !cursor.parentSessionId) return;
+      visited.add(cursor.sessionId);
+      cursor = entries.get(cursor.parentSessionId);
+      if (!cursor) return;
+    }
+    return { parent };
   }
+  const resource = lineage(nativeSessionId);
+  if (!resource) return deny();
   // Re-read the actual business pin after the native read so a replacement
   // cannot turn a stale catalog into current resource authority.
   const after = await (input.root ?? getDEntryNativeRootPin)(
@@ -211,6 +233,9 @@ export async function resolveDEntryNativeResource(input: {
     return deny();
   await owner.assertCurrent(context, signal);
   signal.throwIfAborted();
+  const grants = input.checkGrants;
+  if (grants)
+    grants.checked(grants.nativeSessionIds.every((id) => !!lineage(id)));
   return DEntryNativeResourceFactsSchema.parse({
     organizationId: identity.organizationId,
     personId: identity.personId,
@@ -218,7 +243,7 @@ export async function resolveDEntryNativeResource(input: {
     threadId: identity.threadId,
     nativeSessionId,
     rootNativeSessionId: pin.rootNativeSessionId,
-    parentNativeSessionId: parent,
+    parentNativeSessionId: resource.parent,
     bindingRef: owner.bindingRef,
   });
 }
