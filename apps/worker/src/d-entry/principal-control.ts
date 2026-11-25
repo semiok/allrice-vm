@@ -281,9 +281,23 @@ export function createDEntryPrincipalControl(
                     { call },
                     AbortSignal.any([active, business]),
                   );
+                  if (!result.ok) {
+                    // These native prompt errors are raised before inbox
+                    // acceptance. An ambiguous carrier error keeps its scope.
+                    const code = result.error?.code;
+                    if (
+                      call.endpoint === 'session/prompt' &&
+                      [
+                        'session/invalid-time-zone',
+                        'session/attachment-invalid',
+                        'session/model-unavailable',
+                      ].includes(String(code))
+                    )
+                      await undispatched?.();
+                    throw result.error;
+                  }
                   business.throwIfAborted();
                   active.throwIfAborted();
-                  if (!result.ok) throw result.error;
                   const value = TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].result

@@ -33,6 +33,7 @@ const attempt = z
     kind: z.enum(['assistant', 'compaction', 'session-title']),
     cursor: z.number().int().nonnegative(),
     turn: z.number().int().nullable(),
+    contributingRequestIds: z.array(z.string().min(1)),
   })
   .strict();
 

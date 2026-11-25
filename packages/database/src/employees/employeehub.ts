@@ -1,3 +1,4 @@
+import { notifyNativeRosterInsert } from './native-roster-notification.ts';
 import { brandMediaTools, type BrandMediaInvocation } from '@allrice/contracts';
 import {
   freezeEmployeeMemoryIndexV2,
@@ -631,6 +632,15 @@ export async function createEmployee(context: RequestContext, input: unknown) {
         ${actorId}, false, true, ${actorId}
       )
     `;
+    await notifyNativeRosterInsert(
+      transaction,
+      'allrice_employee_assignments',
+      {
+        organizationId: context.organizationId,
+        workspaceId,
+        personId: actorId,
+      },
+    );
     await synchronizeEmployeeSkillBindings(transaction, {
       organizationId: context.organizationId,
       workspaceId,
@@ -941,6 +951,12 @@ export async function manageEmployeeAssignments(
           assigned_at = excluded.assigned_at, updated_at = now()
       `;
     }
+    if (userIds.length)
+      await notifyNativeRosterInsert(
+        transaction,
+        'allrice_employee_assignments',
+        { organizationId: context.organizationId, workspaceId },
+      );
     await transaction`
       update allrice_chat_sessions session
       set employee_version_id = assignment.employee_version_id

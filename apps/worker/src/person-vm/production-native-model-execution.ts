@@ -54,6 +54,7 @@ const promptKey = (adapterId: string, root: string, requestId: string) =>
 async function persistExecution(
   call: ModelCallBinding,
   prompt: PromptOwner,
+  contributingRequestIds: readonly string[],
   signal: AbortSignal,
 ) {
   const { context, vm, native, execution } = call;
@@ -90,6 +91,7 @@ async function persistExecution(
     kind: native.attemptKind!,
     cursor: native.attemptCursor!,
     turn: native.attemptTurn ?? null,
+    contributingRequestIds,
   };
   signal.throwIfAborted();
   await getDatabase().begin(async (tx) => {
@@ -149,7 +151,7 @@ async function publishObservedRunEnd(
   const state =
     end.reason === 'completed'
       ? 'succeeded'
-      : end.reason === 'aborted'
+      : ['aborted', 'interrupted'].includes(end.reason)
         ? 'canceled'
         : ['blocked', 'error', 'max-tokens'].includes(end.reason)
           ? 'failed'
@@ -314,6 +316,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const executions = new WeakMap<PromptOwner, Map<string, string>>();
       const trackedTurns = new WeakMap<PromptOwner, Set<PromptOwner>>();
       const endedPrompts = new WeakSet<PromptOwner>();
+      let promptChange = new AbortController();
+      function notifyPromptChange() {
+        const was = promptChange;
+        promptChange = new AbortController();
+        was.abort();
+      }
       function trackTurn(
         prompt: PromptOwner,
         owner: ReturnType<typeof host.startup.catalog>['owner'],
@@ -338,6 +346,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           await publishObservedRunEnd(prompt, turn, end);
           for (const member of members) endedPrompts.add(member);
           endedPrompts.add(prompt);
+          notifyPromptChange();
           await releaseFinishedPrompts(prompt.adapterId, prompt.root);
         }).catch(() => {
           // A lost observation is not a fabricated Run terminal.
@@ -365,6 +374,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         const prompt = selected.get(key);
         if (!prompt) return;
         selected.delete(key);
+        notifyPromptChange();
         prompt.stop.abort();
         const joined = prompt.join();
         operations.add(joined);
@@ -390,24 +400,41 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           ),
         );
       }
-      function assertLoginOwner(
+      function conflictingLogin(
         adapterId: string,
         root: string,
         context: RequestContext,
       ) {
-        for (const { scope: previous } of selected.values()) {
-          if (
+        return [...selected.values()].some(
+          ({ scope: previous }) =>
             previous.adapterId === adapterId &&
             previous.root === root &&
             !previous.revoked.aborted &&
             !endedPrompts.has(previous) &&
-            previous.context.sessionId !== context.sessionId
-          )
-            return reject();
+            previous.context.sessionId !== context.sessionId,
+        );
+      }
+      async function waitForLoginOwner(
+        adapterId: string,
+        root: string,
+        context: RequestContext,
+        mode: 'queue' | 'steer',
+        active: AbortSignal,
+      ) {
+        // Keep native queued sends ordered by admitted login. A different login
+        // cannot steer the open turn owned by another response scope.
+        while (conflictingLogin(adapterId, root, context)) {
+          if (mode === 'steer') throw new PersonVmError('VM_ACTIVE');
+          const wake = AbortSignal.any([active, promptChange.signal]);
+          if (!wake.aborted)
+            await new Promise<void>((resolve) =>
+              wake.addEventListener('abort', () => resolve(), { once: true }),
+            );
+          active.throwIfAborted();
         }
       }
       const uninstallPrompt = host.startup.installModelPromptObserver(
-        ({ binding, adapterId, context, issue, requestId }, signal) =>
+        ({ binding, adapterId, context, issue, requestId, mode }, signal) =>
           run(signal, async (active) => {
             active.throwIfAborted();
             const { identity } = issue;
@@ -436,7 +463,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               requestId,
             );
             if (selected.has(key)) return reject();
-            assertLoginOwner(adapterId, root.rootNativeSessionId, context);
+            await waitForLoginOwner(
+              adapterId,
+              root.rootNativeSessionId,
+              context,
+              mode,
+              active,
+            );
             const route = await input.assertRouteCurrent(active);
             const close = new AbortController();
             const watching = AbortSignal.any([
@@ -487,7 +520,19 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               return reject();
             }
             try {
-              assertLoginOwner(adapterId, root.rootNativeSessionId, context);
+              while (
+                conflictingLogin(adapterId, root.rootNativeSessionId, context)
+              )
+                await waitForLoginOwner(
+                  adapterId,
+                  root.rootNativeSessionId,
+                  context,
+                  mode,
+                  AbortSignal.any([active, scope.revoked]),
+                );
+              active.throwIfAborted();
+              scope.revoked.throwIfAborted();
+              if (selected.has(key)) return reject();
               const retire = () => {
                 void forgetPrompt(key).catch(() => {});
               };
@@ -639,6 +684,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   owner: ReturnType<typeof host.startup.catalog>['owner'];
                   address: SessionAddress;
                   order: number;
+                  sourceTurn: number | null;
                 }
               | undefined;
             const coalesced: PromptOwner[] = [];
@@ -734,6 +780,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 owner: profile.owner,
                 address: resource.nativeAddress!,
                 order,
+                sourceTurn: attempt.sourceTurn,
                 call: {
                   context: structuredClone(scope.context),
                   vm: binding,
@@ -765,7 +812,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               };
             }
             if (!matched) return reject();
-            const { scope, call, owner: profileOwner, address } = matched;
+            const {
+              scope,
+              call,
+              owner: profileOwner,
+              address,
+              sourceTurn,
+            } = matched;
             const callId = call.native.callId;
             const deadline = AbortSignal.timeout(30_000);
             const effective = AbortSignal.any([
@@ -809,19 +862,23 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       call,
                       authorization,
                       async (admitted) => {
-                        await persistExecution(call, scope, admitted);
+                        await persistExecution(
+                          call,
+                          scope,
+                          coalesced.map((member) => member.requestId).sort(),
+                          admitted,
+                        );
                         entry.persisted = true;
                         await assertPersistedExecution(call, admitted);
                         if (
-                          kind === 'assistant' &&
-                          call.native.attemptTurn != null &&
+                          sourceTurn !== null &&
                           call.native.parentSessionId === null
                         )
                           trackTurn(
                             scope,
                             profileOwner,
                             address,
-                            call.native.attemptTurn,
+                            sourceTurn,
                             coalesced,
                           );
                         await host.reserveNativeModelCall(call);

@@ -100,6 +100,24 @@ export function readNativeModelAttempt(
   return null;
 }
 
+function nativePromptTurn(
+  snapshot: Pick<Extract<SessionFollowFrame, { type: 'snapshot' }>, 'records'>,
+  attempt: { turn: number | null; cursor: number },
+) {
+  const start = snapshot.records.findLast(
+    ({ event }) =>
+      event.type === 'turn/start' &&
+      event.seq <= attempt.cursor &&
+      (attempt.turn === null ||
+        (event.data as { turn?: unknown })?.turn === attempt.turn),
+  )?.event;
+  const turn = (start?.data as { turn?: unknown } | undefined)?.turn;
+  return {
+    start,
+    turn: typeof turn === 'number' && Number.isSafeInteger(turn) ? turn : null,
+  };
+}
+
 // Accepted native user events refer to the original public prompt request.
 // No identity is read from the text or from a selected browser tab.
 export function readNativeAttemptPromptIds(
@@ -107,36 +125,21 @@ export function readNativeAttemptPromptIds(
   attempt: { turn: number | null; cursor: number },
 ) {
   const records = snapshot.records.map(({ event }) => event);
-  const start = records.findLast(
-    (event) =>
-      event.type === 'turn/start' &&
-      event.seq <= attempt.cursor &&
-      (attempt.turn === null ||
-        (event.data as { turn?: unknown })?.turn === attempt.turn),
-  );
+  const { start } = nativePromptTurn(snapshot, attempt);
   const ids = new Set<string>();
   for (const event of records) {
-    if (!start || event.seq <= start.seq || event.seq > attempt.cursor)
+    if (
+      !start ||
+      event.seq <= start.seq ||
+      event.seq > attempt.cursor ||
+      event.type !== 'user/message'
+    )
       continue;
-    const data = event.data as
-      | {
-          source?: { kind?: unknown; rpcId?: unknown };
-          inserted?: { source?: { kind?: unknown; rpcId?: unknown } }[];
-        }
-      | undefined;
-    const messages =
-      event.type === 'user/message'
-        ? [data]
-        : event.type === 'agent/inbox/spliced' && Array.isArray(data?.inserted)
-          ? data.inserted
-          : [];
-    for (const message of messages) {
-      if (
-        message?.source?.kind === 'user' &&
-        typeof message.source.rpcId === 'string'
-      )
-        ids.add(message.source.rpcId);
-    }
+    const source = (
+      event.data as { source?: { kind?: unknown; rpcId?: unknown } } | null
+    )?.source;
+    if (source?.kind === 'user' && typeof source.rpcId === 'string')
+      ids.add(source.rpcId);
   }
   return [...ids];
 }
@@ -157,6 +160,7 @@ export async function openNativeWebOwner(input: {
       context: RequestContext;
       issue: DEntryPrincipalIssue;
       requestId: string;
+      mode: 'queue' | 'steer';
     },
     signal: AbortSignal,
   ): Promise<() => Promise<void>>;
@@ -599,6 +603,7 @@ export async function openNativeWebOwner(input: {
                 context,
                 issue,
                 requestId: call.args.request.requestId,
+                mode: call.args.request.mode,
               },
               active,
             );
@@ -716,6 +721,7 @@ export async function openNativeWebOwner(input: {
                   ...attempt,
                   recipient: undefined,
                   promptIds: [] as string[],
+                  sourceTurn: null,
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -751,6 +757,10 @@ export async function openNativeWebOwner(input: {
                 ...attempt,
                 id: kind === 'assistant' ? attempt.id : id.data,
                 recipient: value.recipient,
+                sourceTurn:
+                  address.kind === 'session'
+                    ? nativePromptTurn(snapshot, attempt).turn
+                    : null,
                 promptIds:
                   address.kind === 'session'
                     ? readNativeAttemptPromptIds(snapshot, attempt)

@@ -1,3 +1,4 @@
+import { notifyNativeRosterInsert } from './employees/native-roster-notification.ts';
 import {
   employeePublicationPolicy,
   RuntimePolicyControlsSchema,
@@ -35,10 +36,11 @@ export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
             select 1 from allrice_memberships m join allrice_users u on u.id=m.user_id and u.status='active'
             where m.organization_id=a.organization_id and m.user_id=a.user_id and m.active and m.role in ('admin','member')
               and (m.workspace_id is null or m.workspace_id=a.workspace_id))))`;
+  let changedRoster = false;
   for (const d of deployments.filter(
     (d) => d.active && d.employee_status === 'active',
   )) {
-    await tx`insert into allrice_employee_assignments
+    const changed = await tx`insert into allrice_employee_assignments
       (organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
       select ${organizationId},${workspaceId},${d.tenant_employee_id},${d.tenant_employee_version_id},m.user_id,false,true,null
       from allrice_memberships m join allrice_users u on u.id=m.user_id and u.status='active'
@@ -54,13 +56,17 @@ export async function synchronizeTenantEmployeeAccess(tx: Tx, scope: Scope) {
       on conflict(organization_id,workspace_id,user_id,employee_id) do update
         set employee_version_id=excluded.employee_version_id,is_default=allrice_employee_assignments.active and allrice_employee_assignments.is_default,active=true,updated_at=clock_timestamp()
         where allrice_employee_assignments.selection_mode<>'exclude' and (not allrice_employee_assignments.active
-          or allrice_employee_assignments.employee_version_id<>excluded.employee_version_id)`;
+          or allrice_employee_assignments.employee_version_id<>excluded.employee_version_id)
+      returning id`;
+    changedRoster ||= changed.length > 0;
     // Preserve an existing personal default; new members inherit the workspace default.
     await tx`update allrice_employee_assignments a set is_default=true,updated_at=clock_timestamp()
       where a.organization_id=${organizationId} and a.workspace_id=${workspaceId} and a.employee_id=${d.tenant_employee_id}
         and a.active and not a.is_default and not exists(select 1 from allrice_employee_assignments other
           where other.organization_id=a.organization_id and other.workspace_id=a.workspace_id and other.user_id=a.user_id and other.active and other.is_default)`;
   }
+  if (changedRoster)
+    await notifyNativeRosterInsert(tx, 'allrice_employee_assignments', scope);
   // A new employee version is not conversation activity; preserve sidebar recency.
   await tx`update allrice_chat_sessions s set employee_version_id=a.employee_version_id
     from allrice_employee_assignments a

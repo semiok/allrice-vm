@@ -247,18 +247,10 @@ function delegatedPromptIds(sessions, sessionId) {
     const result = new Set();
     for (const event of events) {
       if (event.seq <= start.seq || event.seq > edge.seq) continue;
-      const messages =
-        event.type === 'user/message'
-          ? [event.data]
-          : event.type === 'agent/inbox/spliced'
-            ? event.data.inserted
-            : [];
-      for (const message of messages)
-        if (
-          message?.source?.kind === 'user' &&
-          typeof message.source.rpcId === 'string'
-        )
-          result.add(message.source.rpcId);
+      if (event.type !== 'user/message') continue;
+      const source = event.data.source;
+      if (source?.kind === 'user' && typeof source.rpcId === 'string')
+        result.add(source.rpcId);
     }
     return [...result];
   }
