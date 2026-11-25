@@ -141,6 +141,7 @@ export async function prepareNativeWebLaunch(
                   artifactPath: artifact.path,
                   nonce: auth.nonce,
                   baseUrl: auth.origin,
+                  ...(commandMemory ? { requireCommandMemory: true } : {}),
                 },
               },
             ],

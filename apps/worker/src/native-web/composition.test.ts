@@ -272,7 +272,10 @@ it('stages the existing governed Bash overlay for every employee from the same p
         {
           insert: [
             { id: 'allrice-current-principal' },
-            { id: 'allrice-native-web-owner' },
+            {
+              id: 'allrice-native-web-owner',
+              config: { requireCommandMemory: true },
+            },
           ],
         },
         { id: 'sandbox', disabled: true },

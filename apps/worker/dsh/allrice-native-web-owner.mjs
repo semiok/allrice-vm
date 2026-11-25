@@ -19,6 +19,7 @@ export const inject = [
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
+const commandMemoryReady = Symbol.for('allrice.person-vm-command-memory.ready');
 const original = (value) => value?.[cordisOriginal] ?? value;
 const publicationCodes = new Set([
   'EACCES',
@@ -171,7 +172,7 @@ export async function unloadNativeWebOwner(fiber) {
 
 /** Native local login only. This file never establishes an AllRice principal. */
 export function apply(ctx, config) {
-  const { artifactPath, nonce, baseUrl } = config;
+  const { artifactPath, nonce, baseUrl, requireCommandMemory } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -184,6 +185,7 @@ export function apply(ctx, config) {
   let publishing;
   let publicationFailure;
   let stagingCleanupFailure;
+  let commandMemory;
   let published = false;
   let retiring = false;
   const stop = () => {
@@ -193,12 +195,16 @@ export function apply(ctx, config) {
   const sameConfig = (value) =>
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
-    value?.baseUrl === baseUrl;
+    value?.baseUrl === baseUrl &&
+    value?.requireCommandMemory === requireCommandMemory;
   const entry = fiber.entry;
   const current = () =>
     !retiring &&
     fiber.uid !== null &&
     (!entry || sameConfig(entry.options.config)) &&
+    (!commandMemory ||
+      (original(ctx.get('subprocess')) === commandMemory.subprocess &&
+        original(ctx.get('sandbox')) === commandMemory.sandbox)) &&
     providers.every(([name, provider, value]) => {
       const live = ctx.get(name);
       return provider.uid !== null && live != null && original(live) === value;
@@ -294,6 +300,18 @@ export function apply(ctx, config) {
     )
       return;
     if (!current()) return;
+    if (requireCommandMemory === true) {
+      // rc.2 allows optional entries to fail while Web continues booting.
+      // This profile disables the stock providers and requires the managed pair.
+      const subprocess = original(ctx.get('subprocess'));
+      const sandbox = original(ctx.get('sandbox'));
+      if (
+        subprocess?.[commandMemoryReady] !== true ||
+        typeof sandbox?.confine !== 'function'
+      )
+        throw Error('Native command memory controls are unavailable');
+      commandMemory = { subprocess, sandbox };
+    }
     publicationStage = 'mux';
     await confirmGatewayMux(ctx.webServer, baseUrl, signal);
     if (!current()) return;
