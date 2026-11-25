@@ -7,9 +7,11 @@ import type {
   PersonVmWebEndpointReceipt,
   PersonVmWebStartup,
   PersonVmWebRosterPort,
+  ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
 import { PersonVmError, sameVmBinding } from '@allrice/person-vm';
 import { preparePersonNativeWebRoster } from '@allrice/database';
+import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
   prepareNativeWebLaunch,
   type NativeWebConfiguration,
@@ -41,6 +43,10 @@ export const personNativeWebRoster: PersonVmWebRosterPort = {
 export function createAssignedNativeWebStartup(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'];
+  commandMemory?: Readonly<{
+    controls: ReadonlyCommandMemoryDirectory;
+    readonlyDshDirectory: string;
+  }>;
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
@@ -130,6 +136,13 @@ export function createAssignedNativeWebStartup(input: {
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
+        const commandMemory = input.commandMemory
+          ? createPersonVmDshCommandMemoryPatch(memory, {
+              ...input.commandMemory,
+              cliPath: input.configuration.cliPath,
+              cleanupTimeoutMs: input.cleanupTimeoutMs,
+            })
+          : undefined;
         const profile = await input.readEmployeeProfile(signal);
         current(binding, web);
         signal.throwIfAborted();
@@ -154,6 +167,7 @@ export function createAssignedNativeWebStartup(input: {
               },
               binding,
               profile,
+              commandMemory,
             );
           }),
         );

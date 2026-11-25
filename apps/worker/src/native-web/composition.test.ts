@@ -4,10 +4,14 @@ import type { RequestContext } from '@allrice/contracts';
 import type {
   PersonVmBootstrapScope,
   PersonVmWebStartup,
+  PersonVmMemoryGuestPlan,
   PersonVmStore,
   PersonVmBinding,
+  ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
 import { PersonVmError, PersonVmService } from '@allrice/person-vm';
+import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
+import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { NativeWebOwner } from './owner.js';
 import {
   harness,
@@ -34,7 +38,10 @@ function latch() {
   });
   return { promise, resolve };
 }
-function fixture() {
+function fixture(commandMemory?: {
+  controls: ReadonlyCommandMemoryDirectory;
+  readonlyDshDirectory: string;
+}) {
   const binding = {
     vmId: randomUUID(),
     instanceId: randomUUID(),
@@ -76,17 +83,22 @@ function fixture() {
     launcher: '/person/launcher',
     env: {},
   };
-  const memoryGuestPlan = vi.fn(async () => memory);
+  const memoryGuestPlan = vi.fn(
+    async (): Promise<PersonVmMemoryGuestPlan> => memory,
+  );
   const service = createAssignedNativeWebStartup({
     vm: { assertCurrentBinding: vi.fn() },
     memoryGuestPlan,
+    commandMemory,
     readEmployeeProfile: async () => [
       { path: 'package.json', contents: '{"name":"fixture-profile"}' },
     ],
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
     configuration: {
-      cliPath: '/opt/dsh/lib/bin.js',
+      cliPath: commandMemory
+        ? commandMemory.readonlyDshDirectory + '/lib/bin.js'
+        : '/opt/dsh/lib/bin.js',
       guestAddress: '10.0.0.2',
       startupTimeoutMs: 3000,
       publicUrl: (endpoint) =>
@@ -210,6 +222,83 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
     f.service.owner(f.binding, f.web.receipt.endpoints[0]!.employeeInstanceId),
   ).toThrow();
 });
+it('stages the existing governed Bash overlay for every employee from the same protected plan', async () => {
+  const sha256 = 'a'.repeat(64);
+  const controls = {
+    sha256,
+    hostDirectory: `/release/${sha256}`,
+    guestDirectory: `/opt/allrice/command-memory/${sha256}`,
+  };
+  const readonlyDshDirectory = '/opt/allrice/dsh/' + 'b'.repeat(64);
+  const f = fixture({ controls, readonlyDshDirectory });
+  const platform = readPlatformPersonVmConfiguration();
+  f.memoryGuestPlan.mockImplementation(async () =>
+    createVmMemoryGuestPlan({
+      persistentDirectory: '/work',
+      policyRef: 'fixture',
+      policy: {
+        physicalBytes: platform.memoryMiB * 1024 ** 2,
+        swapBytes: 64,
+        dshLowBytes: 1,
+        dshSwapMaxBytes: 1,
+        commandHighBytes: platform.commandHighBytes,
+        commandMaxBytes: platform.commandMaxBytes,
+        commandSwapMaxBytes: platform.commandSwapMaxBytes,
+        commandOomGroup: 0,
+        dshOomScoreAdj: -1,
+        commandOomScoreAdj: 1,
+      },
+      dshCommandMemory: controls,
+    }),
+  );
+  try {
+    f.memoryGuestPlan.mockResolvedValueOnce(f.memory);
+    await expect(
+      f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web),
+    ).rejects.toThrow('invalid_dsh_command_memory_patch');
+    expect(open).not.toHaveBeenCalled();
+    const plan = await f.service.memoryGuestPlan(
+      f.binding,
+      f.scope.signal,
+      f.web,
+    );
+    const patches = plan.files.filter((file) =>
+      file.path.endsWith('/owner.patch.json'),
+    );
+    expect(patches).toHaveLength(f.web.receipt.endpoints.length);
+    for (const patch of patches) {
+      expect(JSON.parse(patch.contents)).toMatchObject([
+        { id: 'web-runtime' },
+        {
+          insert: [
+            { id: 'allrice-current-principal' },
+            { id: 'allrice-native-web-owner' },
+          ],
+        },
+        { id: 'sandbox', disabled: true },
+        { id: 'subprocess', disabled: true },
+        {
+          insert: [
+            {
+              id: 'allrice-person-vm-command-memory',
+              name: `file://${controls.guestDirectory}/dsh-command-memory.mjs`,
+              config: {
+                readonlyDshDirectory,
+                controlDirectory: controls.guestDirectory,
+                guard: plan.env.BASH_ENV,
+                writer: plan.env.ALLRICE_MEMORY_RECEIPT_WRITER,
+              },
+            },
+          ],
+        },
+      ]);
+      expect(patch.contents).not.toContain(controls.hostDirectory);
+    }
+  } finally {
+    await f.service.close();
+  }
+});
+
 it('startup缺真实receipt或当前epoch不匹配时，在memory/native owner副作用前拒绝', async () => {
   const f = fixture();
   await expect(

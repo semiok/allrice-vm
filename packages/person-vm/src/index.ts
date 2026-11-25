@@ -72,6 +72,7 @@ export {
   COMMAND_MEMORY_STATE_ROOT,
   checkedReadonlyCommandMemoryDirectory,
   hashCommandMemoryControlFiles,
+  verifyReadonlyCommandMemoryDirectory,
   type ReadonlyCommandMemoryDirectory,
 } from './readonly-artifact.ts';
 

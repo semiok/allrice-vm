@@ -4,6 +4,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { setImmediate as turn } from 'node:timers/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { COMMAND_MEMORY_CONTROL_FILES } from '@allrice/person-vm';
 import { deferred } from '../d-entry/native-entry.fixture.js';
 import { productionInputsFixture } from './production-inputs.fixture.js';
 const source = vi.hoisted<{
@@ -41,13 +42,13 @@ afterEach(async () => {
   await fs.rm(f.root, { recursive: true, force: true });
 });
 
-it('checks complete actual bytes for all three artifacts and returns the exact sealed snapshot', async () => {
+it('checks complete actual bytes for all native and command memory artifacts and returns the exact sealed snapshot', async () => {
   const opened: FileHandle[] = [];
   source.opened = (file) => opened.push(file);
   const current = signal();
   expect(await readVerifiedProductionPersonVmInputs(current)).toBe(f.loaded);
   expect(source.read).toHaveBeenCalledExactlyOnceWith(current);
-  expect(opened).toHaveLength(3);
+  expect(opened).toHaveLength(3 + COMMAND_MEMORY_CONTROL_FILES.length);
   for (const file of opened)
     await expect(file.stat()).rejects.toMatchObject({ code: 'EBADF' });
 });
@@ -71,6 +72,31 @@ it.each(['missing', 'directory', 'symlink'] as const)(
     await fs.unlink(path);
     if (kind === 'directory') await fs.mkdir(path);
     if (kind === 'symlink') await fs.symlink(copy, path);
+    await expect(
+      readVerifiedProductionPersonVmInputs(signal()),
+    ).rejects.toBeInstanceOf(ProductionPersonVmArtifactsUnavailable);
+  },
+);
+
+it.each(['bytes', 'mode', 'symlink', 'extra'] as const)(
+  'rejects command memory controls with changed %s',
+  async (change) => {
+    const directory =
+      f.loaded.configuration.native.readonlyCommandMemoryDirectory
+        .hostDirectory;
+    const file = join(directory, 'bash-env.sh');
+    if (change === 'bytes') {
+      await fs.unlink(file);
+      await fs.writeFile(file, 'changed', { mode: 0o444 });
+    }
+    if (change === 'mode') await fs.chmod(file, 0o644);
+    if (change === 'symlink') {
+      const target = join(f.root, 'same-control');
+      await fs.copyFile(file, target);
+      await fs.unlink(file);
+      await fs.symlink(target, file);
+    }
+    if (change === 'extra') await fs.writeFile(join(directory, 'extra'), '');
     await expect(
       readVerifiedProductionPersonVmInputs(signal()),
     ).rejects.toBeInstanceOf(ProductionPersonVmArtifactsUnavailable);

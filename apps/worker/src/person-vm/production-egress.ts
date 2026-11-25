@@ -287,6 +287,8 @@ export function createProductionEgressInstallation(
           throw unavailable();
         const plan = await createVmMemoryGuestPlan({
           ...loaded.configuration.memory,
+          dshCommandMemory:
+            loaded.configuration.native.readonlyCommandMemoryDirectory,
         });
         const directory = posix.join(
           loaded.configuration.memory.persistentDirectory,

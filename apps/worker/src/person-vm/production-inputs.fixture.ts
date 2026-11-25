@@ -1,8 +1,9 @@
 /** Synthetic seal boundary and real private files for H2 component tests only. */
 import { createHash } from 'node:crypto';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
+import { readPersonVmDshCommandMemoryControls } from '@allrice/vm-memory/guest-plan';
 import type {
   ProductionHostConfiguration,
   readProductionHostConfiguration,
@@ -25,6 +26,14 @@ export async function productionInputsFixture() {
     artifactChecksums[name] =
       'sha256:' + createHash('sha256').update(bytes).digest('hex');
   }
+  const { files, ...controls } = await readPersonVmDshCommandMemoryControls();
+  const hostDirectory = join(await realpath(root), controls.sha256);
+  await mkdir(hostDirectory, { mode: 0o700 });
+  await Promise.all(
+    files.map(({ name, contents, mode }) =>
+      writeFile(join(hostDirectory, name), contents, { mode }),
+    ),
+  );
   const platform = readPlatformPersonVmConfiguration();
   const configuration: ProductionHostConfiguration = {
     version: 1,
@@ -41,6 +50,7 @@ export async function productionInputsFixture() {
         sealedManifestSha256: hash,
         treeSha256: hash,
       },
+      readonlyCommandMemoryDirectory: { hostDirectory, ...controls },
       rootDiskGiB: 8,
       socketRoot: join(root, 's'),
       jobCleanupTimeoutMs: 10000,

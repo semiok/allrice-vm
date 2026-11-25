@@ -13,6 +13,7 @@ import {
   type PersonVmMemoryGuestPlan,
   type PersonVmNativeWebAuthRequest,
 } from '@allrice/person-vm';
+import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 
 /** Trusted host configuration for an ALREADY published loopback endpoint. No
  * port allocation, guest-selected target, or running-VM restart is performed. */
@@ -48,6 +49,7 @@ export async function prepareNativeWebLaunch(
   config: NativeWebConfiguration,
   binding: PersonVmBinding,
   profile: NativeWebGuestProfile,
+  commandMemory?: ReturnType<typeof createPersonVmDshCommandMemoryPatch>,
 ): Promise<NativeWebLaunch> {
   let origin: URL, publicUrl: URL;
   try {
@@ -143,6 +145,7 @@ export async function prepareNativeWebLaunch(
               },
             ],
           },
+          ...(commandMemory ?? []),
         ]),
         mode: 0o600,
       },

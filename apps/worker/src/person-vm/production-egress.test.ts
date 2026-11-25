@@ -1,5 +1,5 @@
 /** Actual private file/HTTP/public bootstrap consumer; synthetic identity, permit and native runner only. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -144,7 +144,11 @@ it('uses actual bind0 origin in receipt, real private readback and public memory
       0o777,
   ).toBe(0o700);
   const plan = await installation.memoryGuestPlan(binding, signal());
-  const original = await createVmMemoryGuestPlan(f.loaded.configuration.memory);
+  const original = await createVmMemoryGuestPlan({
+    ...f.loaded.configuration.memory,
+    dshCommandMemory:
+      f.loaded.configuration.native.readonlyCommandMemoryDirectory,
+  });
   expect(plan.files.slice(0, original.files.length)).toEqual(original.files);
   expect(plan.initialize).toEqual(original.initialize);
   expect(plan.launcher).toBe(original.launcher);
@@ -702,16 +706,44 @@ it.each(['failure', 'cancel'] as const)(
   },
 );
 
-it('the actual native bootstrap copies the readback plan files and launches with its protected env', async () => {
+it('the actual native provider mounts both sealed directories and bootstraps the readback policy', async () => {
   await installation.provisioner.install(binding, mount, access, signal());
   const plan = await installation.memoryGuestPlan(binding, signal());
   const copied: { target: string; contents: string; mode: number }[] = [];
   const commands: string[][] = [];
+  const image =
+    'docker.io/library/node@sha256:af0bb4bf5b7318e3269417a7684a9e116c3c22eaf05382578b0d0d33de597ad2';
+  const original = f.loaded.configuration.native.readonlyDshDirectory;
+  const release = join(await fs.realpath(f.root), original.artifactSha256);
+  const dsh = {
+    ...original,
+    descriptorPath: join(release, 'descriptor.json'),
+    hostDirectory: join(release, 'public'),
+  };
+  await fs.mkdir(dsh.hostDirectory, { recursive: true, mode: 0o700 });
+  const descriptor = JSON.stringify({
+    ...dsh,
+    kind: 'allrice-dsh-readonly-directory-v2',
+    baseImage: image,
+    dshVersion: '0.2.1-rc.2',
+    nodeVersion: '22.23.2',
+    publisherSha256: 'a'.repeat(64),
+    gateSha256: 'b'.repeat(64),
+  });
+  await fs.writeFile(dsh.descriptorPath, descriptor, { mode: 0o444 });
+  const controls = f.loaded.configuration.native.readonlyCommandMemoryDirectory;
+  let vmName: string | undefined;
+  let running = false;
+  let mounts: object[] = [];
   const native = new MicrosandboxPersonVm({
-    binary: f.loaded.configuration.native.binary,
-    libkrunfw: f.loaded.configuration.native.libkrunfw,
-    agentd: f.loaded.configuration.native.agentd,
-    image: f.loaded.configuration.native.image,
+    ...f.loaded.configuration.native,
+    readonlyDshDirectory: {
+      ...dsh,
+      sealedManifestSha256: createHash('sha256')
+        .update(descriptor)
+        .digest('hex'),
+    },
+    image,
     rootDiskGiB: 8,
     socketRoot: f.loaded.configuration.native.socketRoot,
     memoryMiB: f.loaded.platform.memoryMiB,
@@ -719,6 +751,41 @@ it('the actual native bootstrap copies the readback plan files and launches with
       const args = [...command.args];
       commands.push(args);
       if (args[0] === '--version') return 'microsandbox 0.7.16';
+      if (args[0] === 'list') return '[]';
+      if (args[0] === 'pull') return '';
+      if (args[0] === 'create') {
+        vmName = args[args.indexOf('--name') + 1];
+        mounts = args.flatMap((arg, index) => {
+          if (arg !== '--mount-dir') return [];
+          const [host, guest, mode] = args[index + 1]!.split(':');
+          return [
+            {
+              type: 'Bind',
+              host,
+              guest,
+              options: {
+                readonly: mode === 'ro',
+                noexec: false,
+                nosuid: false,
+                nodev: false,
+              },
+              stat_virtualization: 'strict',
+              host_permissions: 'private',
+              follow_root_symlinks: false,
+              quota_mib: null,
+            },
+          ];
+        });
+        return '';
+      }
+      if (args[0] === 'inspect')
+        return JSON.stringify({
+          name: vmName,
+          status: running ? 'Running' : 'Created',
+          config: { mounts },
+          active_config: running ? { mounts } : null,
+          pending_changes: [],
+        });
       if (args[0] === 'cp') {
         const source = args[1],
           target = args[2];
@@ -738,6 +805,17 @@ it('the actual native bootstrap copies the readback plan files and launches with
     },
   });
   await native.prepare(binding, mount, signal());
+  await native.create(
+    binding,
+    { binding, bindingId: randomUUID(), gatewayPorts: [34567] },
+    signal(),
+  );
+  const create = commands.find((args) => args[0] === 'create');
+  expect(create).toContain(`${dsh.hostDirectory}:${dsh.guestDirectory}:ro`);
+  expect(create).toContain(
+    `${controls.hostDirectory}:${controls.guestDirectory}:ro`,
+  );
+  running = true;
   const current = vi.fn(async () => {});
   const prepared = await native.bootstrap(
     { binding, signal: signal(), assertCurrent: current },

@@ -320,6 +320,10 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         memoryGuestPlan: providers.memoryGuestPlan,
+        commandMemory: {
+          controls: native.readonlyCommandMemoryDirectory,
+          readonlyDshDirectory: native.readonlyDshDirectory.guestDirectory,
+        },
         async readEmployeeProfile(active) {
           if (
             !web.cliPath.startsWith(
