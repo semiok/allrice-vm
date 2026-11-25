@@ -5,7 +5,9 @@ import { Agent, request } from 'node:http';
 import { isIP } from 'node:net';
 import { dirname } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
+import { TextEncoder } from 'node:util';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -410,7 +412,7 @@ export function observeNativePrompts(scope, lifetime) {
         if (observer.itemId !== message.id) continue;
         // rc.2 queue edit replaces in place. Queue steer removes and immediately
         // reinserts the same occurrence in its synchronous native command.
-        queueMicrotask(() => {
+        globalThis.queueMicrotask(() => {
           if (!observers.has(observer.id) || observer.turn !== undefined)
             return;
           try {
@@ -435,11 +437,9 @@ export function observeNativePrompts(scope, lifetime) {
     },
     { global: true },
   );
-  return (value, request, peer) => {
+  return (value, request) => {
     const notFound = () => new globalThis.Response(null, { status: 404 });
     if (
-      peer.principal.kind !== 'owner' ||
-      peer.interactions !== 'none' ||
       typeof value?.id !== 'string' ||
       value.id.length !== 36 ||
       typeof value.sessionId !== 'string' ||
@@ -785,7 +785,7 @@ export function applyNativeWebOwner(
             path: '/api/allrice-managed-model/current',
             methods: ['POST'],
             requestBody: 'buffered',
-            async fetch(request, peer) {
+            async fetch(request) {
               if (!current())
                 return new globalThis.Response(null, { status: 404 });
               const value = await request.json();
@@ -794,7 +794,7 @@ export function applyNativeWebOwner(
                 (value.action === 'observe-prompt' ||
                   value.action === 'prompt-outcome')
               )
-                return promptFacts(value, request, peer);
+                return promptFacts(value, request);
               if (
                 value?.adapterId !== id ||
                 typeof value?.sessionId !== 'string' ||

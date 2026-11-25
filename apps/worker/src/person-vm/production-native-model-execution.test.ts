@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { NativePromptObservation } from '../native-web/prompt-observation.js';
+import {
+  deferredPromptFact,
+  type NativePromptObservation,
+} from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
 import { createProductionNativeModelExecution } from './production-native-model-execution.js';
 
@@ -71,8 +74,8 @@ beforeEach(() => {
 
 function nativeFacts() {
   let inserted = false;
-  const settled = Promise.withResolvers<'discarded' | 'ended'>();
-  const closed = Promise.withResolvers<void>();
+  const settled = deferredPromptFact<'discarded' | 'ended'>();
+  const closed = deferredPromptFact<void>();
   const observation = {
     ready: Promise.resolve(),
     settled: settled.promise,

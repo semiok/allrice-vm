@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { TextDecoder } from 'node:util';
 import {
   observeNativePrompts,
   readRootPromptOrigins,
@@ -52,9 +53,8 @@ function promptFixture() {
     session: { id: 'root', header: {} },
     inbox: { nextTurn: [], nextStep: [] },
   };
-  const lifetime = new AbortController();
-  const peer = { principal: { kind: 'owner' }, interactions: 'none' };
-  const request = { signal: new AbortController().signal };
+  const lifetime = new globalThis.AbortController();
+  const request = { signal: new globalThis.AbortController().signal };
   const observe = observeNativePrompts(
     {
       on: events.on.bind(events),
@@ -69,13 +69,9 @@ function promptFixture() {
     requestId,
   });
   const open = (value) =>
-    observe(
-      { ...value, action: 'observe-prompt' },
-      request,
-      peer,
-    ).body.getReader();
+    observe({ ...value, action: 'observe-prompt' }, request).body.getReader();
   const outcome = (value) =>
-    observe({ ...value, action: 'prompt-outcome' }, request, peer).json();
+    observe({ ...value, action: 'prompt-outcome' }, request).json();
   const message = ({ scopeId, requestId }) => ({
     id: randomUUID(),
     source: {

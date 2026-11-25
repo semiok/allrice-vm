@@ -30,6 +30,7 @@ import {
 } from '../d-entry/native-owner.js';
 import type { NativeModelAttemptKind } from '../native-web/owner.js';
 import {
+  deferredPromptFact,
   waitForPromptFact,
   type NativePromptObservation,
 } from '../native-web/prompt-observation.js';
@@ -482,7 +483,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             ) {
               await waitForPromptFact(previous, active);
             }
-            const dispatch = Promise.withResolvers<void>();
+            const dispatch = deferredPromptFact<void>();
             promptDispatches.set(requestKey, dispatch.promise);
             const dispatched = () => {
               if (promptDispatches.get(requestKey) === dispatch.promise) {

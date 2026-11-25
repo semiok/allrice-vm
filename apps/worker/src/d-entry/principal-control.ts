@@ -1,5 +1,6 @@
 import { sameDEntryIdentity } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
+import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
 import type {
   RemoteStreamHandle,
   TypertSchema,
@@ -41,7 +42,8 @@ export function isCertainNativePromptRejection(
     // rc.2's prompt rejects this exact shape before resolving an Agent or
     // checking duplicates. This gateway code alone proves nothing.
     return call.args.request.content.every(
-      (part) => part.type === 'text' && part.text.trim().length === 0,
+      (part: PromptContentPart) =>
+        part.type === 'text' && part.text.trim().length === 0,
     );
   }
   return [

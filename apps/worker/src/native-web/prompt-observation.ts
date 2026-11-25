@@ -3,12 +3,22 @@ import { randomUUID } from 'node:crypto';
 import { PersonVmError } from '@allrice/person-vm';
 import type { nativeWebTransport } from './transport.js';
 
+export function deferredPromptFact<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
 export async function waitForPromptFact<T>(
   fact: Promise<T>,
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const aborted = Promise.withResolvers<never>();
+  const aborted = deferredPromptFact<never>();
   const listener = addAbortListener(signal, () =>
     aborted.reject(signal.reason),
   );
@@ -36,8 +46,8 @@ export function observeNativePrompt(
   const close = new AbortController();
   const current = AbortSignal.any([signal, close.signal]);
   const request = { ...source, id: randomUUID() };
-  const ready = Promise.withResolvers<void>();
-  const claim = Promise.withResolvers<void>();
+  const ready = deferredPromptFact<void>();
+  const claim = deferredPromptFact<void>();
   const failed = () => new PersonVmError('PROVIDER_FAILED');
   let state: 'opening' | 'ready' | 'inserted' | 'claimed' = 'opening';
   let terminal: 'discarded' | 'ended' | undefined;
