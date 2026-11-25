@@ -32,9 +32,10 @@ it('replays the committed DSH Web journal through the rc.2 read handle', async (
       ),
       'utf8',
     );
-    const [{ type: _type, ...header }, ...events] = JSON.parse(
+    const [{ type, ...header }, ...events] = JSON.parse(
       fixture.replaceAll('__WORKSPACE__', root),
     );
+    expect(type).toBe('session');
     const writer = await native.create(header);
     try {
       await writer.append(events.slice(0, 23));
