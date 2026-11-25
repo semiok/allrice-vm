@@ -87,12 +87,16 @@ describe('APFS adapter protocol and private filesystem (not actual encryption ac
     attachments.set(image, join(root, 'different-mount'));
     expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
     attachments.set(image, mount);
+    const other = join(volume, 'warm', randomUUID() + '.sparseimage');
+    attachments.set(other, mount);
+    expect(await disk.verifyAttachedMount(ref, signal())).toBeNull();
+    attachments.delete(other);
     expect(
       calls
         .slice(start)
         .filter((call) => call.executable.endsWith('hdiutil'))
         .map((call) => call.args[0]),
-    ).toEqual(['imageinfo', 'info', 'imageinfo', 'info']);
+    ).toEqual(['imageinfo', 'info', 'imageinfo', 'info', 'imageinfo', 'info']);
     await expect(disk.move(ref, 'cold', signal())).rejects.toMatchObject({
       code: 'CLEANUP_INCOMPLETE',
     });

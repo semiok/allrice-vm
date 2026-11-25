@@ -264,13 +264,19 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     const observed = await this.inspectExisting(disk.vmId, signal);
     if (observed.state !== 'ready' || observed.disk.tier !== disk.tier)
       return null;
-    const mounts = (await this.info(signal)).images?.filter(
-      (entry) => entry['image-path'] === this.image(disk),
-    );
     const mount = this.mount(disk);
+    const image = this.image(disk);
+    const matches = (await this.info(signal)).images?.filter(
+      (entry) =>
+        entry['image-path'] === image ||
+        entry['system-entities']?.some(
+          (entity) => entity['mount-point'] === mount,
+        ),
+    );
     signal.throwIfAborted();
-    return mounts?.length === 1 &&
-      mounts[0]?.['system-entities']?.filter(
+    return matches?.length === 1 &&
+      matches[0]?.['image-path'] === image &&
+      matches[0]['system-entities']?.filter(
         (entity) => entity['mount-point'] === mount,
       ).length === 1
       ? mount

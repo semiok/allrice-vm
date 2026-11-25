@@ -29,6 +29,7 @@ const protocolValues: Record<string, readonly string[]> = {
   'allrice-native-display.mjs': ['assistant'],
   // Exact Host RPC purpose alongside compaction and session-title.
   'allrice-native-web-owner.mjs': ['assistant'],
+  'allrice-native-run-journal.mjs': ['assistant'],
 };
 // These memory provenance rules refer to the model's own output, not delegated
 // children. Exempt only these phrases in their documented source files.
