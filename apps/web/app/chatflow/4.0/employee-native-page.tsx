@@ -13,25 +13,72 @@ import {
   pageClosing,
   pageCompletion,
   pageDocumentReady,
+  pageEditorMounted,
   pageNavigate,
   pageRevoked,
   pageStartupFailed,
 } from '../../../lib/d-entry/page-messages';
+import {
+  EmployeeEntryError,
+  employeeEntryQuery,
+  prepareEmployeeEntry,
+} from '../../../lib/d-entry/entry-client';
+import styles from './employee-native-page.module.css';
 
-export function EmployeeNativePage({ query }: { query: string }) {
+type Status =
+  | 'warming'
+  | 'opening'
+  | 'ready'
+  | 'cancelled'
+  | 'failed'
+  | 'denied'
+  | 'closing'
+  | 'unknown';
+
+// Only the browser's wait is bounded. The Worker owns each admitted VM start.
+const entryWaitMs = 5 * 60_000;
+const closingNoticeMs = 10_000;
+
+export function EmployeeNativePage({
+  query,
+  prepare = false,
+  initialUnavailable = false,
+}: {
+  query: string;
+  prepare?: boolean;
+  initialUnavailable?: boolean;
+}) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
-  const [activation, setActivation] = useState({ query });
+  const [status, setStatus] = useState<Status>(
+    initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
+  );
+  const [settled, setSettled] = useState(false);
+  const [activation, setActivation] = useState<{
+    query: string;
+    confirmedQuery?: string;
+  }>({ query });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
     undefined,
   );
   const replace = useRef<(() => void) | undefined>(undefined);
+  const cancel = useRef<(() => void) | undefined>(undefined);
+  const resume = useRef<(() => void) | undefined>(undefined);
   const nextQuery = useRef(query);
   nextQuery.current = query;
 
   useEffect(() => {
+    if (initialUnavailable || (prepare && !activeQuery)) {
+      setStatus(initialUnavailable ? 'failed' : 'denied');
+      setSettled(true);
+      const changeSelection = () => setActivation({ query: nextQuery.current });
+      replace.current = changeSelection;
+      return () => {
+        if (replace.current === changeSelection) replace.current = undefined;
+      };
+    }
     const lifetime = new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
@@ -39,10 +86,16 @@ export function EmployeeNativePage({ query }: { query: string }) {
     let mounted = false;
     let documentStarted = false;
     let remoteRevoked = false;
+    let selectedQuery = activation.confirmedQuery;
+    let timer: number | undefined;
+    let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
+    let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
     setSource(undefined);
     setFailed(false);
+    setStatus('warming');
+    setSettled(false);
     const send = (type: string, state?: 'closed' | 'unknown') => {
       if (scopeId)
         frame.current?.contentWindow?.postMessage(
@@ -67,6 +120,10 @@ export function EmployeeNativePage({ query }: { query: string }) {
         // A render change keeps the old iframe and its authenticated sender
         // attached until both halves have settled.
         if (!mounted || !frame.current) {
+          // A dispatched open can be creating the irreversible native root.
+          // Stop taking its result into the UI, then close after it settles.
+          if (prepare && carrier?.dispatched)
+            await carrier.ready.catch(() => {});
           lifetime.abort();
           const [remote] = await Promise.all([close(), setting]);
           return remote !== 'unknown';
@@ -76,10 +133,32 @@ export function EmployeeNativePage({ query }: { query: string }) {
         return remote === 'closed' && entry === 'closed';
       })());
     }
+    function finish(status: 'cancelled' | 'failed' | 'denied') {
+      if (navigating || replace.current !== applyQuery) return;
+      navigating = true;
+      window.clearTimeout(timer);
+      setStatus(status);
+      closingNotice = window.setTimeout(
+        () => setStatus('closing'),
+        closingNoticeMs,
+      );
+      void retire().then((closed) => {
+        window.clearTimeout(closingNotice);
+        if (replace.current !== applyQuery) return;
+        if (closed) {
+          setSource(undefined);
+          setStatus(status);
+          setSettled(true);
+        } else setStatus('unknown');
+      });
+    }
     function failedDocument(state: 'closed' | 'unknown') {
       local.resolve(state);
-      setFailed(true);
-      void close();
+      if (prepare) finish('failed');
+      else {
+        setFailed(true);
+        void close();
+      }
     }
     const documentLoaded = (node: HTMLIFrameElement) => {
       if (!scopeId || node !== frame.current || !mounted) return;
@@ -121,13 +200,23 @@ export function EmployeeNativePage({ query }: { query: string }) {
     const applyQuery = () => {
       if (navigating) return;
       navigating = true;
+      window.clearTimeout(timer);
       void retire().then((closed) => {
         if (replace.current !== applyQuery) return;
         if (closed) setActivation({ query: nextQuery.current });
+        else if (prepare) setStatus('unknown');
         else setFailed(true);
       });
     };
     replace.current = applyQuery;
+    cancel.current = () => finish('cancelled');
+    resume.current = () => {
+      const query = nextQuery.current;
+      setActivation({
+        query,
+        confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+      });
+    };
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -138,12 +227,34 @@ export function EmployeeNativePage({ query }: { query: string }) {
         return;
       if (event.data.type === pageClosing) void close();
       if (event.data.type === pageStartupFailed) {
-        setFailed(true);
-        void close();
+        if (prepare) finish('failed');
+        else {
+          setFailed(true);
+          void close();
+        }
       }
       if (event.data.type === pageDocumentReady) {
         documentStarted = true;
         if (replacing || remoteRevoked) send(pageRevoked);
+      }
+      if (
+        event.data.type === pageEditorMounted &&
+        prepare &&
+        !navigating &&
+        !remoteRevoked
+      ) {
+        window.clearTimeout(timer);
+        setStatus('ready');
+        if (
+          selectedQuery &&
+          location.pathname === '/chatflow/4.0' &&
+          nextQuery.current === activeQuery
+        )
+          history.replaceState(
+            history.state,
+            '',
+            '/chatflow/4.0?' + selectedQuery,
+          );
       }
       if (
         event.data.type === pageCompletion &&
@@ -154,11 +265,14 @@ export function EmployeeNativePage({ query }: { query: string }) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (!next.success || !carrier || navigating) return;
         navigating = true;
+        window.clearTimeout(timer);
         const params = new URLSearchParams(
           Object.entries(next.data).filter(
             (entry): entry is [string, string] => typeof entry[1] === 'string',
           ),
         );
+        if (prepare && !next.data.threadId)
+          params.set('new', crypto.randomUUID());
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
         // work independently and keep the frame until both report back.
@@ -168,25 +282,44 @@ export function EmployeeNativePage({ query }: { query: string }) {
             if (nextQuery.current !== activeQuery)
               setActivation({ query: nextQuery.current });
             else location.assign('/chatflow/4.0?' + params);
-          } else setFailed(true);
+          } else if (prepare) setStatus('unknown');
+          else setFailed(true);
         });
       }
     };
     window.addEventListener('message', receive);
-    window.addEventListener('pagehide', close);
+    const leaving = () => {
+      if (detached) return;
+      detached = true;
+      lifetime.abort();
+      send(pageRevoked);
+      if (prepare && carrier?.dispatched && !scopeId)
+        void carrier.ready.catch(() => {}).then(close);
+      else void close();
+    };
+    window.addEventListener('pagehide', leaving);
+    if (prepare) timer = window.setTimeout(() => finish('failed'), entryWaitMs);
     const setup = async () => {
-      const params = new URLSearchParams(activeQuery);
-      if ([...params.keys()].some((key) => params.getAll(key).length !== 1))
-        throw Error('Invalid employee selection');
-      const selection = DEntrySelectionInputSchema.parse(
-        Object.fromEntries(params),
+      const entry = employeeEntryQuery(
+        activation.confirmedQuery ?? activeQuery,
+        prepare,
       );
+      const selection = prepare
+        ? await prepareEmployeeEntry(entry, lifetime.signal, () =>
+            setStatus('opening'),
+          )
+        : entry.selection;
+      const { params } = entry;
+      if (selection.threadId && !entry.selection.threadId) {
+        params.set('threadId', selection.threadId);
+        selectedQuery = params.toString();
+      }
       const response = await fetch('/api/v1/d-entry/identity?' + params, {
         signal: lifetime.signal,
         cache: 'no-store',
         credentials: 'same-origin',
       });
-      if (!response.ok) throw Error('Employee selection unavailable');
+      if (!response.ok) throw new EmployeeEntryError(response.status);
       const { identity } = DEntryIdentityResultSchema.parse(
         await response.json(),
       );
@@ -200,27 +333,41 @@ export function EmployeeNativePage({ query }: { query: string }) {
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         send(pageRevoked);
-        if (!lifetime.signal.aborted) setFailed(true);
+        if (!prepare && !lifetime.signal.aborted) setFailed(true);
+        // Before issuance, ready's rejection is handled by setting below.
+        if (prepare && mounted) finish('failed');
       });
       const issued = (await carrier.ready).scopeReference;
       scopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
+      if (navigating) return;
       params.set('scopeId', issued.scopeId);
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
     };
-    const setting = setup().catch(() => {
-      if (!lifetime.signal.aborted) setFailed(true);
+    const setting = setup().catch((error: unknown) => {
+      if (lifetime.signal.aborted) return;
+      if (!prepare) setFailed(true);
+      else
+        finish(
+          error instanceof EmployeeEntryError &&
+            [400, 401, 403, 404].includes(error.status)
+            ? 'denied'
+            : 'failed',
+        );
     });
     return () => {
-      lifetime.abort();
-      close();
+      window.clearTimeout(timer);
+      window.clearTimeout(closingNotice);
+      leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
+      cancel.current = undefined;
+      resume.current = undefined;
       window.removeEventListener('message', receive);
-      window.removeEventListener('pagehide', close);
+      window.removeEventListener('pagehide', leaving);
     };
-  }, [activation, activeQuery]);
+  }, [activation, activeQuery, prepare, initialUnavailable]);
 
   useEffect(() => {
     if (nextQuery.current !== activeQuery) replace.current?.();
@@ -235,6 +382,9 @@ export function EmployeeNativePage({ query }: { query: string }) {
           src={source}
           onLoad={(event) => loaded.current?.(event.currentTarget)}
           referrerPolicy="no-referrer"
+          className={
+            prepare && status !== 'ready' ? styles.startingFrame : undefined
+          }
           style={{
             display: 'block',
             width: '100%',
@@ -243,7 +393,73 @@ export function EmployeeNativePage({ query }: { query: string }) {
           }}
         />
       )}
-      {failed && <p role="alert">当前入口暂不可用</p>}
+      {prepare && status !== 'ready' && (
+        <EntryStatus
+          status={status}
+          settled={initialUnavailable || settled}
+          stop={() => cancel.current?.()}
+          retry={() => {
+            if (initialUnavailable) location.reload();
+            else resume.current?.();
+          }}
+        />
+      )}
+      {!prepare && failed && <p role="alert">当前入口暂不可用</p>}
     </main>
+  );
+}
+
+const messages = {
+  warming: [
+    '正在启动工作台',
+    '首次启动可能需要一些时间，就绪后将自动打开对话。',
+  ],
+  opening: ['正在打开对话', '工作台已启动，正在连接对话。'],
+  failed: ['暂时无法打开工作台', '请重试。已创建的对话会继续打开。'],
+  cancelled: ['已取消等待', '可以继续打开工作台。'],
+  denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
+  closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
+  unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
+} as const;
+
+function EntryStatus({
+  status,
+  settled,
+  stop,
+  retry,
+}: {
+  status: Exclude<Status, 'ready'>;
+  settled: boolean;
+  stop(): void;
+  retry(): void;
+}) {
+  const [title, description] = messages[status];
+  const starting = status === 'warming' || status === 'opening';
+  const resumable = status === 'cancelled' || status === 'failed';
+  return (
+    <div className={styles.status}>
+      <section>
+        <div
+          role={
+            status === 'failed' || status === 'denied' || status === 'unknown'
+              ? 'alert'
+              : 'status'
+          }
+        >
+          <h1>{title}</h1>
+          <p>{description}</p>
+        </div>
+        {starting && (
+          <button type="button" onClick={stop}>
+            取消等待
+          </button>
+        )}
+        {resumable && (
+          <button type="button" disabled={!settled} onClick={retry}>
+            {status === 'cancelled' ? '继续' : '重试'}
+          </button>
+        )}
+      </section>
+    </div>
   );
 }

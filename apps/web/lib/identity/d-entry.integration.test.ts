@@ -53,6 +53,8 @@ import { GET } from '../../app/api/v1/d-entry/identity/route';
 import { POST } from '../../app/api/v1/d-entry/admission/route';
 import { POST as createNativeRoot } from '../../app/api/v1/d-entry/native-root/route';
 import { PATCH } from '../../app/api/v1/sessions/[id]/route';
+import { POST as createBusinessThread } from '../../app/api/v1/sessions/route';
+import { findDEntryEmployee } from '../d-entry/entry-threads';
 import {
   POST as uploadAttachment,
   PUT as attachWorkspaceFile,
@@ -1804,6 +1806,96 @@ suite(
           { sessionId: thread.id },
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
+    });
+    it('opens the first 4.0 business thread once and retries explicit New at the same durable ID', async () => {
+      const f = await setup();
+      await clearPublished();
+      const selection = {
+        workspaceId: f.workspace,
+        employeeInstanceId: f.assignment,
+      };
+      const request = (operationId?: string, origin = 'https://allrice.test') =>
+        new Request('https://allrice.test/api/v1/sessions?entry=4.0', {
+          method: 'POST',
+          headers: { origin, 'x-allrice-organization-id': f.org },
+          body: JSON.stringify({ selection, operationId }),
+        });
+      const rows =
+        () => fixture.db`select id,execution_generation,native_root_origin,d_entry_native_root
+        from allrice_chat_sessions where owner_id=${f.user} order by id`;
+      expect(await findDEntryEmployee(f.context)).toBeNull();
+      expect((await createBusinessThread(request())).status).toBe(403);
+      expect(await rows()).toHaveLength(1);
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      await updateDEntryReleasePolicy(f.context, {
+        revision: 'initial',
+        defaultGeneration: '3.x',
+        selections: [
+          {
+            organizationId: f.org,
+            personId: f.user,
+            employeeInstanceId: f.assignment,
+            generation: '4.0',
+          },
+        ],
+      });
+      try {
+        expect(
+          await findDEntryEmployee({ ...f.context, workspaceId: null }),
+        ).toEqual(selection);
+        expect(
+          (await createBusinessThread(request(undefined, 'https://other.test')))
+            .status,
+        ).toBe(403);
+        const first = await Promise.all([
+          createBusinessThread(request()),
+          createBusinessThread(request()),
+        ]);
+        expect(first.map(({ status }) => status)).toEqual([200, 200]);
+        const [one, same] = await Promise.all(
+          first.map((response) => response.json()),
+        );
+        expect(one).toEqual({ ...selection, threadId: expect.any(String) });
+        expect(same).toEqual(one);
+        expect(await rows()).toHaveLength(2);
+        const id = randomUUID();
+        const explicit = await createBusinessThread(request(id));
+        expect(explicit.status).toBe(200);
+        expect(await explicit.json()).toEqual({ ...selection, threadId: id });
+        expect(await (await createBusinessThread(request(id))).json()).toEqual({
+          ...selection,
+          threadId: id,
+        });
+        const active = await rows();
+        expect(active).toHaveLength(3);
+        const [audit] = await fixture.db`select count(*)::int as count
+          from allrice_audit_events where actor_id=${f.user} and resource_id=${id} and action='session.create'`;
+        expect(audit?.count).toBe(1);
+        expect(
+          active.filter(
+            ({ execution_generation }) => execution_generation === '4.0',
+          ),
+        ).toEqual(
+          expect.arrayContaining(
+            [one.threadId, id].map((threadId) => ({
+              id: threadId,
+              execution_generation: '4.0',
+              native_root_origin: null,
+              d_entry_native_root: null,
+            })),
+          ),
+        );
+        expect((await createBusinessThread(request(f.session))).status).toBe(
+          403,
+        );
+        await revokeSession(f.login.token);
+        expect((await createBusinessThread(request(randomUUID()))).status).toBe(
+          401,
+        );
+        expect(await rows()).toEqual(active);
+      } finally {
+        await clearPublished();
+      }
     });
     it('serializes competing 3.x/4.0 creations at the same actual thread identity', async () => {
       const f = await setup(),

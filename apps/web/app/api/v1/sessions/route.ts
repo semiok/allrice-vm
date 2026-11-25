@@ -6,6 +6,12 @@ import {
 
 import { getRequestContext } from '../../../../lib/identity/session';
 import { storageErrorResponse } from '../../../../lib/storage/responses';
+import {
+  dEntryThreadRequest,
+  openDEntryThread,
+} from '../../../../lib/d-entry/entry-threads';
+import { authenticateNativeRequest } from '../../../../lib/d-entry/native-request';
+import { dEntryErrorResponse } from '../../../../lib/d-entry/responses';
 
 export const runtime = 'nodejs';
 
@@ -35,6 +41,21 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const entry = new URL(request.url).searchParams.getAll('entry');
+  if (entry.length) {
+    try {
+      const context = await authenticateNativeRequest(request);
+      if (entry.length !== 1 || entry[0] !== '4.0')
+        throw new SyntaxError('Invalid session entry');
+      const input = dEntryThreadRequest.parse(await request.json());
+      const selection = await openDEntryThread(context, input, request.signal);
+      return Response.json(selection, {
+        headers: { 'cache-control': 'private, no-store' },
+      });
+    } catch (error) {
+      return dEntryErrorResponse(error);
+    }
+  }
   try {
     const context = await getRequestContext(request);
     if (!context) throw new DataAccessError('authentication_required');

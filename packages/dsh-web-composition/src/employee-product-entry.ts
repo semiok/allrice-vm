@@ -8,7 +8,10 @@ import {
   startEmployeeWebEntry,
   type EmployeeWebEntryClose,
 } from './employee-web-entry';
-import { pageStartupFailed } from '../../../apps/web/lib/d-entry/page-messages';
+import {
+  pageEditorMounted,
+  pageStartupFailed,
+} from '../../../apps/web/lib/d-entry/page-messages';
 
 const container = document.getElementById('app');
 const scope = globalThis as typeof globalThis & {
@@ -84,6 +87,11 @@ function boot(
     window.addEventListener('pagehide', close, { once: true });
     documentOwner.signal.addEventListener('abort', close, { once: true });
     void entry.started.then((result) => {
+      if (result.state === 'ready' && !document.signal.aborted && !closing)
+        parent.postMessage(
+          { type: pageEditorMounted, scopeId },
+          location.origin,
+        );
       if (result.state !== 'failed') return;
       fail();
       close();
