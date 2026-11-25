@@ -15,6 +15,7 @@ import {
 import { responsesFixture } from '../../../../packages/model-gateway/src/revision.fixture.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { zstdDecompressSync } from 'node:zlib';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 
@@ -161,9 +162,24 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
   let outboundImage = false;
   const sse = await responsesFixture({
     codex: true,
-    onRequestBody(body) {
-      outboundImage =
-        body.includes('"type":"input_image"') && body.includes(png);
+    onRequestBody(body, contentEncoding) {
+      // The rc.2 Codex SSE provider compresses the actual model request on
+      // Node versions supporting zstd. Inspect the received wire bytes.
+      expect([undefined, 'zstd']).toContain(contentEncoding);
+      const payload = JSON.parse(
+        (contentEncoding === 'zstd' ? zstdDecompressSync(body) : body).toString(
+          'utf8',
+        ),
+      );
+      outboundImage = payload.input.some(
+        (item: { content?: { type?: string; image_url?: string }[] }) =>
+          Array.isArray(item.content) &&
+          item.content.some(
+            (part) =>
+              part.type === 'input_image' &&
+              part.image_url === 'data:image/png;base64,' + png,
+          ),
+      );
     },
   });
   const access = [

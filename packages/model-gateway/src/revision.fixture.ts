@@ -186,7 +186,7 @@ export async function responsesFixture(
     tools?: boolean;
     holdFailedBody?: boolean;
     failuresBeforeSuccess?: number;
-    onRequestBody?(body: string): void;
+    onRequestBody?(body: Buffer, contentEncoding: string | undefined): void;
   } = {},
 ) {
   const requests: string[] = [];
@@ -198,7 +198,10 @@ export async function responsesFixture(
       const body: Buffer[] = [];
       for await (const part of request)
         if (options.onRequestBody) body.push(Buffer.from(part));
-      options.onRequestBody?.(Buffer.concat(body).toString('utf8'));
+      options.onRequestBody?.(
+        Buffer.concat(body),
+        request.headers['content-encoding'],
+      );
       requests.push(request.url!);
       active++;
       response.once('close', () => {
