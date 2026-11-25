@@ -4,3 +4,4 @@ export const pageNavigate = 'allrice:d-entry:navigate';
 export const pageRevoked = 'allrice:d-entry:revoked';
 export const pageStartupFailed = 'allrice:d-entry:startup-failed';
 export const pageDocumentReady = 'allrice:d-entry:document-ready';
+export const pageEditorMounted = 'allrice:d-entry:editor-mounted';

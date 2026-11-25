@@ -60,6 +60,7 @@ export function openNativePageCarrier(
   let scopeId: string | undefined;
   let requested = false,
     complete = false,
+    dispatched = false,
     gotClosed = false,
     gotEnd = false;
   function send(value: object) {
@@ -82,8 +83,17 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'open',
     () => {
-      send({ type: 'open', endpoint: '$d-entry/page', payload: { args: {} } });
-      if (requested) end();
+      if (requested) return;
+      try {
+        send({
+          type: 'open',
+          endpoint: '$d-entry/page',
+          payload: { args: {} },
+        });
+        dispatched = true;
+      } catch (error) {
+        failure = fail(error);
+      }
     },
     { once: true },
   );
@@ -128,6 +138,11 @@ export function openNativePageCarrier(
   socket.addEventListener(
     'close',
     (event) => {
+      if (!dispatched) {
+        fail(failure ?? Error('Native page carrier did not open'));
+        joined.resolve();
+        return;
+      }
       if (gotEnd && event.wasClean && !failure) {
         complete = true;
         joined.resolve();
@@ -146,6 +161,7 @@ export function openNativePageCarrier(
         requested = true;
         ready.reject(new DOMException('Page closed', 'AbortError'));
         if (socket.readyState === WebSocket.OPEN) end();
+        if (socket.readyState === WebSocket.CONNECTING) socket.close();
       }
       return joined.promise;
     },

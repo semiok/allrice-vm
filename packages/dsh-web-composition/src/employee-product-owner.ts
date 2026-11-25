@@ -149,7 +149,9 @@ export function installEmployeeProductOwner(ctx: Context) {
             if (session) navigate(id, session.id);
             else notice('此员工暂没有可打开的工作。');
           },
-          onNewSession: () => notice('当前入口暂无法新建工作。'),
+          onNewSession(id) {
+            if (employeeChoice(workspace, id)) navigate(id);
+          },
           onDetails: () => notice('当前入口暂无法打开员工详情。'),
         },
       };
