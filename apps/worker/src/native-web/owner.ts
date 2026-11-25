@@ -543,6 +543,50 @@ export async function openNativeWebOwner(input: {
           }),
         );
       },
+      readNativeAttemptFor(
+        context: RequestContext,
+        nativeSessionId: string,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            const protocol = TYPERT_REMOTE.methods['session/follow'];
+            const { request } = protocol
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  address: { kind: 'session', sessionId: nativeSessionId },
+                  maxMessages: 1,
+                  assistantStream: true,
+                },
+              });
+            const follow = root.remote.session.follow(request, active);
+            const frames = follow[Symbol.asyncIterator]();
+            try {
+              const first = await frames.next();
+              active.throwIfAborted();
+              if (first.done) throw new PersonVmError('RUNTIME_NOT_READY');
+              const snapshot = protocol.result.create().parse(first.value);
+              if (snapshot.type !== 'snapshot')
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              const found = snapshot.assistantStream?.activeAttempt;
+              return found ? { id: found.attemptId, turn: found.turn } : null;
+            } finally {
+              // Dispose this logical read on its original carrier. The
+              // shared owner still owns actual socket close at retirement.
+              follow.dispose();
+              await frames.return?.();
+            }
+          },
+        );
+      },
       /** Running Host catalog only; never startup readiness or a browser grant.
        * Native modelCatalog has zero arguments and no wire cancellation slot. */
       readModelCatalogFor(context: RequestContext, requestSignal: AbortSignal) {

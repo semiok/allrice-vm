@@ -64,6 +64,7 @@ function fixture() {
       fetchOwned: vi.fn(),
       close: vi.fn(),
       stoppedEvidence: vi.fn(),
+      beforeDispatch: vi.fn(),
     },
     confirmTransportStopped: vi.fn(),
     assertCurrent: vi.fn(async (signal) => signal?.throwIfAborted()),

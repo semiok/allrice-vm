@@ -97,7 +97,7 @@ export async function createProductionCodexRuntime(
     stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
     return (closing ??= host.fiber.dispose());
   }
-  async function assertCurrent(signal?: AbortSignal) {
+  async function assertSelectedGeneration(signal?: AbortSignal) {
     const active = signal ? AbortSignal.any([signal, revoked]) : revoked;
     active.throwIfAborted();
     const selected = await readSelectedSubscription().catch(
@@ -106,18 +106,20 @@ export async function createProductionCodexRuntime(
         throw error;
       },
     );
-    active.throwIfAborted();
-    const record = await host.credentials.describeRecord(credential);
-    active.throwIfAborted();
     if (
       selected.slot !== selection.slot ||
-      selected.revision !== selection.revision ||
-      !record.configured ||
-      record.kind !== 'grant'
-    ) {
+      selected.revision !== selection.revision
+    )
       stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
-      active.throwIfAborted();
-    }
+    active.throwIfAborted();
+  }
+  async function assertCurrent(signal?: AbortSignal) {
+    const active = signal ? AbortSignal.any([signal, revoked]) : revoked;
+    active.throwIfAborted();
+    const record = await host.credentials.describeRecord(credential);
+    if (!record.configured || record.kind !== 'grant')
+      stopped.abort(new ModelGatewayError('AUTHORIZATION_DENIED'));
+    await assertSelectedGeneration(active);
   }
   let modelInfo: Awaited<ReturnType<LlmRuntime['resolveModelInfo']>>;
   try {
@@ -174,7 +176,7 @@ export async function createProductionCodexRuntime(
     modelInfo,
     revoked,
     assertCurrent,
-    transport,
+    transport: { ...transport, beforeDispatch: assertSelectedGeneration },
     confirmTransportStopped: transport.stoppedEvidence,
     async close() {
       try {

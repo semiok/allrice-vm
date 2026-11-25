@@ -33,6 +33,7 @@ export type ModelCallBinding = Readonly<{
     rootSessionId: string;
     parentSessionId: string | null;
     callId: string;
+    attemptId?: string;
   }>;
   executionGeneration: string;
   gatewayRelease: string;
@@ -89,6 +90,7 @@ export type GatewayFetchClassification = Readonly<{
 export interface GatewayProvider {
   /** Optional exact Host-owned transport. Only the gateway calls it after it
    * has committed the metered attempt. No Guest data selects the dispatcher. */
+  assertDispatchCurrent?(signal: AbortSignal): Promise<void>;
   fetchOwned?: (
     fetch: typeof globalThis.fetch,
     request: Request,
@@ -149,6 +151,8 @@ export interface CapacitySubscription {
   close(): Promise<void>;
 }
 export interface ModelGatewayStore {
+  /** Commit exact native authorization before delivering any Guest reference. */
+  reserveNativeCall?(binding: ModelCallBinding): Promise<void>;
   /** Immutable unique native call claim. Duplicate/reconnect never dispatches. */
   claimCall(binding: ModelCallBinding, requestDigest: string): Promise<string>;
   /** Subscribe BEFORE tryStartAttempt, then recheck after each notification. */
@@ -165,8 +169,6 @@ export interface ModelGatewayStore {
   attempts(callId: string): Promise<readonly ModelAttemptReceipt[]>;
   usage(personId: string, organizationId: string): Promise<RuntimeRunUsage>;
   /** Internal owner port; public caller goes through ModelGatewayPort.reconcileOwner. */
-  /** Trusted Worker shutdown only; exact dispatcher proof is bound at construction. */
-  reconcileClosedOwner?(signal: AbortSignal): Promise<number>;
   reconcileOwner(ownerId: string, evidenceRef: string): Promise<number>;
 }
 export interface UsageLedgerPort {
@@ -176,6 +178,8 @@ export interface UsageLedgerPort {
   ): Promise<RuntimeRunUsage>;
 }
 export interface ModelGatewayPort {
+  /** Trusted Worker shutdown only; exact dispatcher proof is bound at construction. */
+  reconcileClosedOwner?(signal: AbortSignal): Promise<number>;
   /** Exact freeze/observe/subscribe/thaw protocol owned by the shared host.
    * A gateway-only thaw is not permission to wake, advance epoch or dispatch. */
   readonly admission: PersonVmAdmissionPort;

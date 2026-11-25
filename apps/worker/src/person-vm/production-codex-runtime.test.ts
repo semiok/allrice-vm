@@ -200,6 +200,7 @@ it('refreshes an expired managed Codex grant and meters the fixed SSE route thro
       host.llm,
       host.route,
       host.transport.fetchOwned,
+      host.transport.beforeDispatch,
     ),
   });
   try {

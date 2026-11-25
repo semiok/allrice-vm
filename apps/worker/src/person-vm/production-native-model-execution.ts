@@ -147,6 +147,17 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         }
       >();
       const operations = new Set<Promise<unknown>>();
+      const executions = new WeakMap<
+        object,
+        Map<
+          string,
+          {
+            turn: number;
+            runId: string;
+            executionId: string;
+          }
+        >
+      >();
       const uninstall = host.startup.installModelAdapter(
         async (binding, signal) => {
           const active = AbortSignal.any([live, signal]);
@@ -211,9 +222,15 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           requireRunning: true,
           signal: active,
         });
+        const attempt = await profile.owner.readNativeAttemptFor(
+          context,
+          sessionId,
+          active,
+        );
         profile.revoked.throwIfAborted();
         active.throwIfAborted();
-        return { resource, profile };
+        if (!attempt) return reject();
+        return { resource, profile, attempt };
       }
       async function assertCall(call: ModelCallBinding, signal: AbortSignal) {
         return run(signal, async (active) => {
@@ -225,12 +242,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           )
             return reject();
           await input.assertRouteCurrent(active);
-          const { resource, profile } = await resolveSession(
+          const { resource, profile, attempt } = await resolveSession(
             owned.scope,
             call.native.sessionId,
             active,
           );
           if (
+            attempt.id !== call.native.attemptId ||
             resource.rootNativeSessionId !== call.native.rootSessionId ||
             resource.parentNativeSessionId !== call.native.parentSessionId ||
             resource.threadId !== call.allriceThreadRef ||
@@ -239,6 +257,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             profile.owner.modelAdapterId !== call.native.profile
           )
             return reject();
+          await input.assertRouteCurrent(active);
         });
       }
 
@@ -280,14 +299,31 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 throw error;
               });
               if (!resolved) continue;
-              const { resource, profile } = resolved;
+              const { resource, profile, attempt } = resolved;
+              let bySession = executions.get(profile.owner);
+              if (!bySession) {
+                bySession = new Map();
+                executions.set(profile.owner, bySession);
+              }
+              let execution = bySession.get(resource.nativeSessionId);
+              if (execution?.turn !== attempt.turn) {
+                execution = {
+                  turn: attempt.turn,
+                  runId: randomUUID(),
+                  executionId: randomUUID(),
+                };
+                bySession.set(resource.nativeSessionId, execution);
+              }
               if (matched) return reject();
               matched = {
                 scope,
                 call: {
                   context: structuredClone(scope.context),
                   vm: binding,
-                  execution: { runId: randomUUID(), executionId: randomUUID() },
+                  execution: {
+                    runId: execution.runId,
+                    executionId: execution.executionId,
+                  },
                   employeeInstanceId: scope.identity.employeeInstanceId,
                   employeeRelease: scope.identity.employeeVersionId,
                   allriceThreadRef: resource.threadId,
@@ -298,6 +334,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     rootSessionId: resource.rootNativeSessionId,
                     parentSessionId: resource.parentNativeSessionId,
                     callId: randomUUID(),
+                    attemptId: attempt.id,
                   },
                   executionGeneration: '4.0',
                   gatewayRelease:
@@ -338,6 +375,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 async dispatch(response, current) {
                   current.throwIfAborted();
                   try {
+                    const authorization = AbortSignal.any([current, effective]);
+                    await assertCall(call, authorization);
+                    await host.reserveNativeModelCall(call);
+                    authorization.throwIfAborted();
                     const reference = await input.issueCall(call, effective);
                     current.throwIfAborted();
                     issued = true;

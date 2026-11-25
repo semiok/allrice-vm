@@ -93,14 +93,37 @@ export function createPostgresModelGatewayStore(
   const json = (value: unknown) =>
     db.json(JSON.parse(JSON.stringify(value)) as postgres.JSONValue);
   return {
+    async reserveNativeCall(binding) {
+      if (!binding.native.attemptId || binding.executionGeneration !== '4.0')
+        throw new ModelGatewayError('BINDING_INVALID');
+      const key = nativeCallKey(binding) + ':authority';
+      const identity = json(binding);
+      const digest = createHash('sha256')
+        .update(JSON.stringify(binding))
+        .digest('hex');
+      const rows = await db<{ id: string }[]>`
+        insert into allrice_model_gateway_calls
+          (id,native_key,person_id,organization_id,binding,request_digest)
+        values(${randomUUID()},${key},${binding.vm.personId},${binding.vm.organizationId},
+          ${identity},${digest}) on conflict(native_key) do nothing returning id
+      `;
+      if (!rows.length) throw new ModelGatewayError('DUPLICATE_CALL');
+    },
     async claimCall(binding, requestDigest) {
       const id = randomUUID();
-      const rows = await db<
-        { id: string }[]
-      >`insert into allrice_model_gateway_calls
-        (id,native_key,person_id,organization_id,binding,request_digest)
-        values(${id},${nativeCallKey(binding)},${binding.vm.personId},${binding.vm.organizationId},
-          ${json(binding)},${requestDigest}) on conflict(native_key) do nothing returning id`;
+      const key = nativeCallKey(binding);
+      const identity = json(binding);
+      const rows = await db<{ id: string }[]>`
+        insert into allrice_model_gateway_calls
+          (id,native_key,person_id,organization_id,binding,request_digest)
+        select ${id},${key},${binding.vm.personId},${binding.vm.organizationId},
+          ${identity},${requestDigest}
+        where ${!binding.native.attemptId} or exists (
+          select 1 from allrice_model_gateway_calls
+          where native_key=${key + ':authority'} and binding=${identity}
+        )
+        on conflict(native_key) do nothing returning id
+      `;
       if (!rows.length) throw new ModelGatewayError('DUPLICATE_CALL');
       return id;
     },

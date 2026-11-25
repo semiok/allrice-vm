@@ -48,10 +48,12 @@ export function createDshGatewayProvider(
     ): GatewayFetchClassification | null;
   },
   fetchOwned?: GatewayProvider['fetchOwned'],
+  assertDispatchCurrent?: GatewayProvider['assertDispatchCurrent'],
 ): GatewayProvider {
   return {
     classify: route.classify,
     fetchOwned,
+    assertDispatchCurrent,
     async *stream(binding, input, signal) {
       if (
         binding.provider !== route.provider ||

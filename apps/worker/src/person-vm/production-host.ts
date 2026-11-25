@@ -81,6 +81,7 @@ export type ProductionPersonVmHostSources = Readonly<{
     current: Current;
     lifetime: AbortSignal;
     modelOwnerId: string;
+    reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
   }): Promise<{
     runtime: Pick<PersonVmRuntimePort, 'readiness' | 'activity'> & {
       /** Fence observations and join their actual work/subscriptions. */
@@ -103,6 +104,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       route: Parameters<typeof createDshGatewayProvider>[1];
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
+        beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
         close(): Promise<void>;
         stoppedEvidence(ownerId: string, signal: AbortSignal): Promise<string>;
       }>;
@@ -339,26 +341,26 @@ export function createProductionPersonVmHost(input: {
         : [];
       const transport = sourceOwner?.model.transport;
       if (transport) await settle([transport.close]);
-      if (modelFailures.length) {
-        modelRecovery = { providerJoined: false, releasedAttempts: 0 };
-        if (transport && modelOwner?.reconcileClosedOwner && providers) {
-          const cleanup = AbortSignal.timeout(
-            providers.configuration.lifecycle.cleanupTimeoutMs,
-          );
-          const failures = await collectFailures([
-            () => modelOwner.reconcileClosedOwner!(cleanup),
-          ]);
-          if (failures.length) modelFailures.push(...failures);
-          else {
-            modelFailures = [];
-            modelRecovery = undefined;
-            // Previously unknown model join can block receipt retirement.
-            // Recheck the same physical epochs only after ledger reconciliation.
+      if (transport && modelOwner?.reconcileClosedOwner && providers) {
+        const cleanup = AbortSignal.timeout(
+          providers.configuration.lifecycle.cleanupTimeoutMs,
+        );
+        const failures = await collectFailures([
+          () => modelOwner.reconcileClosedOwner!(cleanup),
+        ]);
+        if (failures.length) modelFailures.push(...failures);
+        else {
+          modelFailures = [];
+          if (vmFailures.length || receiptFailures.length) {
+            // A proven stopped dispatcher can release a receipt that was
+            // blocked by the previously unresolved ledger.
             vmFailures = await stopOwnedVms();
             receiptFailures = await retireReceipts();
           }
         }
       }
+      if (modelFailures.length)
+        modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       const providerOwner = providers;
       await settle([
         ...(sourceOwner && !modelRecovery
@@ -458,6 +460,7 @@ export function createProductionPersonVmHost(input: {
       // actual store/admission operation opens its own dedicated SQL client.
       const trustedDatabase = getDatabase();
       const openSql = () => createDedicatedDatabase(trustedDatabase);
+      const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const store = new PostgresPersonVmStore(openSql);
       const runtime: PersonVmRuntimePort = {
         memoryGuestPlan: (...args) => requireStartup().memoryGuestPlan(...args),
@@ -572,6 +575,11 @@ export function createProductionPersonVmHost(input: {
         providers,
         lifetime,
         modelOwnerId,
+        async reserveNativeModelCall(call) {
+          if (!storeModel.reserveNativeCall)
+            throw new Error('MODEL_CALL_AUTHORIZATION_STORE_UNAVAILABLE');
+          await storeModel.reserveNativeCall(call);
+        },
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
@@ -584,8 +592,9 @@ export function createProductionPersonVmHost(input: {
           modelSource.llm,
           modelRoute,
           modelSource.transport?.fetchOwned,
+          modelSource.transport?.beforeDispatch,
         ),
-        store: createPostgresModelGatewayStore(trustedDatabase),
+        store: storeModel,
         confirmTransportStopped: modelSource.transport?.stoppedEvidence,
         admission: {
           boundary: admission,
