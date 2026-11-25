@@ -24,16 +24,14 @@ export default async function ChatFlowPage({
     normalizeHost(requestHeaders.get('host')) === 'allricevm.bplabs.xyz' &&
     !Object.keys(await searchParams).length
   ) {
-    const context = await getRequestContext(
+    const enterTrial = await getRequestContext(
       new Request('https://allricevm.bplabs.xyz/chatflow', {
         headers: requestHeaders,
       }),
-    );
-    if (
-      context &&
-      (await findDEntryEmployee(context).then(Boolean, () => true))
     )
-      redirect('/chatflow/4.0');
+      .then((context) => context && findDEntryEmployee(context))
+      .then(Boolean, () => true);
+    if (enterTrial) redirect('/chatflow/4.0');
   }
   return (
     <ChatFlowClient

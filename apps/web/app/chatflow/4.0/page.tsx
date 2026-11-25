@@ -1,5 +1,6 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
+import { IdentityError } from '@allrice/database';
 import { findDEntryEmployee } from '../../../lib/d-entry/entry-threads';
 import { getRequestContext } from '../../../lib/identity/session';
 import { EmployeeNativePage } from './employee-native-page';
@@ -22,13 +23,33 @@ export default async function EmployeeNativeEntryPage({
       query.append(key, item);
   }
   if (!query.size) {
-    const context = await getRequestContext(
+    const auth = await getRequestContext(
       new Request('http://localhost/chatflow/4.0', {
         headers: await headers(),
       }),
+    ).then(
+      (context) => ({ context, state: 'checked' as const }),
+      (error: unknown) => ({
+        context: null,
+        state:
+          error instanceof IdentityError &&
+          ['tenant_context_invalid', 'authorization_denied'].includes(
+            error.code,
+          )
+            ? ('denied' as const)
+            : ('unavailable' as const),
+      }),
     );
-    if (!context) redirect('/login?next=%2Fchatflow%2F4.0');
-    const result = await findDEntryEmployee(context).then(
+    if (auth.state !== 'checked')
+      return (
+        <EmployeeNativePage
+          query=""
+          initialUnavailable={auth.state === 'unavailable'}
+          prepare
+        />
+      );
+    if (!auth.context) redirect('/login?next=%2Fchatflow%2F4.0');
+    const result = await findDEntryEmployee(auth.context).then(
       (selection) => ({ selection, unavailable: false }),
       () => ({ selection: null, unavailable: true }),
     );

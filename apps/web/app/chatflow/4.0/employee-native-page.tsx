@@ -32,6 +32,7 @@ type Status =
   | 'cancelled'
   | 'failed'
   | 'denied'
+  | 'closing'
   | 'unknown';
 
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
@@ -138,7 +139,7 @@ export function EmployeeNativePage({
       window.clearTimeout(timer);
       setStatus(status);
       closingNotice = window.setTimeout(
-        () => setStatus('unknown'),
+        () => setStatus('closing'),
         closingNoticeMs,
       );
       void retire().then((closed) => {
@@ -417,7 +418,8 @@ const messages = {
   failed: ['暂时无法打开工作台', '请重试。已创建的对话会继续打开。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
-  unknown: ['暂时无法打开工作台', '旧连接的关闭状态未确认，请稍后重新打开。'],
+  closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
+  unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
 } as const;
 
 function EntryStatus({

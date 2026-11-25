@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { IdentityError } from '@allrice/database';
 import ChatFlowPage from './page';
+import EmployeeNativeEntryPage from './4.0/page';
 
 const entry = vi.hoisted(() => ({
   host: 'localhost',
@@ -72,5 +74,20 @@ describe('ChatFlow server local command capability', () => {
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({}) }),
     ).rejects.toThrow('/chatflow/4.0');
+  });
+  it('renders the denied trial entry when the original login has lost its tenant', async () => {
+    entry.host = 'allricevm.bplabs.xyz';
+    entry.context.mockRejectedValue(
+      new IdentityError('tenant_context_invalid'),
+    );
+    const input = { searchParams: Promise.resolve({}) };
+    await expect(ChatFlowPage(input)).rejects.toThrow('/chatflow/4.0');
+    const denied = await EmployeeNativeEntryPage(input);
+    expect(denied.props).toMatchObject({
+      query: '',
+      prepare: true,
+      initialUnavailable: false,
+    });
+    expect(entry.find).not.toHaveBeenCalled();
   });
 });
