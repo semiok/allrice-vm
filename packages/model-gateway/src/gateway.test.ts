@@ -51,6 +51,7 @@ it('rejects a chunked oversized request without waiting for EOF or dispatching u
         },
       },
       (response) => {
+        response.once('error', reject);
         response.resume();
         response.once('end', () => {
           resolve(response.statusCode);
@@ -59,9 +60,22 @@ it('rejects a chunked oversized request without waiting for EOF or dispatching u
       },
     );
     outgoing.once('error', reject);
-    // Keep the upload open. The response must arrive at the byte limit.
+    // Keep the upload open and send only one byte past the cap. Queuing a
+    // whole extra MiB races the required early response against client EPIPE.
     const chunk = Buffer.alloc(1024 * 1024, 32);
-    for (let i = 0; i < 9; i++) outgoing.write(chunk);
+    let remaining = 8;
+    const write = () => {
+      if (remaining === 0) {
+        outgoing.write(' ');
+        return;
+      }
+      remaining -= 1;
+      outgoing.write(chunk, (error) => {
+        if (error) reject(error);
+        else write();
+      });
+    };
+    write();
   });
   expect(status).toBe(413);
   expect(f.upstream.requests).toHaveLength(0);
