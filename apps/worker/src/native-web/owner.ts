@@ -577,7 +577,13 @@ export async function openNativeWebOwner(input: {
               if (snapshot.type !== 'snapshot')
                 throw new PersonVmError('RUNTIME_NOT_READY');
               const found = snapshot.assistantStream?.activeAttempt;
-              return found ? { id: found.attemptId, turn: found.turn } : null;
+              return found
+                ? {
+                    id: found.attemptId,
+                    turn: found.turn,
+                    cursor: found.startedAfterSeq,
+                  }
+                : null;
             } finally {
               // Dispose this logical read on its original carrier. The
               // shared owner still owns actual socket close at retirement.

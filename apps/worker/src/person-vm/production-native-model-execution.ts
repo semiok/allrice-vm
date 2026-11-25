@@ -249,6 +249,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           );
           if (
             attempt.id !== call.native.attemptId ||
+            attempt.turn !== call.native.attemptTurn ||
+            attempt.cursor !== call.native.attemptCursor ||
             resource.rootNativeSessionId !== call.native.rootSessionId ||
             resource.parentNativeSessionId !== call.native.parentSessionId ||
             resource.threadId !== call.allriceThreadRef ||
@@ -290,6 +292,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 active,
               ).catch((error: unknown) => {
                 if (
+                  scope.revoked.aborted ||
                   (error instanceof DataAccessError &&
                     error.code === 'authorization_denied') ||
                   (error instanceof IdentityError &&
@@ -335,6 +338,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     parentSessionId: resource.parentNativeSessionId,
                     callId: randomUUID(),
                     attemptId: attempt.id,
+                    attemptTurn: attempt.turn,
+                    attemptCursor: attempt.cursor,
                   },
                   executionGeneration: '4.0',
                   gatewayRelease:

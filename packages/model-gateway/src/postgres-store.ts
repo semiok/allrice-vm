@@ -80,7 +80,12 @@ export function nativeCallKey(binding: ModelCallBinding): string {
         binding.native.instanceId,
         binding.native.sessionId,
         binding.native.attemptId
-          ? ['native-attempt', binding.native.attemptId]
+          ? [
+              'native-attempt',
+              binding.native.attemptId,
+              binding.native.attemptTurn,
+              binding.native.attemptCursor,
+            ]
           : binding.native.callId,
       ]),
     )
@@ -96,7 +101,12 @@ export function createPostgresModelGatewayStore(
     db.json(JSON.parse(JSON.stringify(value)) as postgres.JSONValue);
   return {
     async reserveNativeCall(binding) {
-      if (!binding.native.attemptId || binding.executionGeneration !== '4.0')
+      if (
+        !binding.native.attemptId ||
+        !Number.isSafeInteger(binding.native.attemptTurn) ||
+        !Number.isSafeInteger(binding.native.attemptCursor) ||
+        binding.executionGeneration !== '4.0'
+      )
         throw new ModelGatewayError('BINDING_INVALID');
       const key = nativeCallKey(binding) + ':authority';
       const identity = json(binding);

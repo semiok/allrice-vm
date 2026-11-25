@@ -118,7 +118,12 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
     const binding = {
       ...base,
       executionGeneration: '4.0',
-      native: { ...base.native, attemptId: 'fixture-actual-native-attempt' },
+      native: {
+        ...base.native,
+        attemptId: 'fixture-actual-native-attempt',
+        attemptTurn: 1,
+        attemptCursor: 7,
+      },
     };
     await expect(
       store.claimCall(binding, 'request-digest'),
