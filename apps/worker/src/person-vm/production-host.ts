@@ -84,6 +84,9 @@ export type ProductionPersonVmHostSources = Readonly<{
       authority: EgressAuthority;
       policy: EgressPolicy;
       services?: readonly ManagedHostService[];
+      /** Register the exact private request context used by the model route
+       * before EgressAuthority.allow receives it with the same signal. */
+      bindModelCall?(call: ModelCallBinding, signal: AbortSignal): void;
       /** Host upstream transport/credentials stay owned by sources. */
       close(): Promise<void>;
     };
@@ -516,6 +519,7 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       const modelSource = bound.model;
+      const egressSource = bound.egress;
       const modelRoute = Object.freeze({ ...modelSource.route });
       const modelOwner = createModelGateway({
         ownerId: modelOwnerId,
@@ -555,6 +559,10 @@ export function createProductionPersonVmHost(input: {
             Object.freeze(membership);
           Object.freeze(call.context.memberships);
           Object.freeze(call.context);
+          Object.freeze(call.vm);
+          Object.freeze(call.execution);
+          Object.freeze(call.native);
+          egressSource.bindModelCall?.(Object.freeze(call), signal);
           return {
             context: call.context,
             dispatch: (response, active) =>
@@ -567,15 +575,15 @@ export function createProductionPersonVmHost(input: {
       gateway = createEgressGateway({
         vm,
         admission,
-        authority: bound.egress.authority,
-        policy: bound.egress.policy,
+        authority: egressSource.authority,
+        policy: egressSource.policy,
         transport: createPublicHttpsTransport(),
         lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
           active.throwIfAborted();
         },
-        services: [...(bound.egress.services ?? []), modelService],
+        services: [...(egressSource.services ?? []), modelService],
         provisioner: providers.egressInstallation.provisioner,
       });
       lifetime.throwIfAborted();

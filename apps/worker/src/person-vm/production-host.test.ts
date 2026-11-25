@@ -168,6 +168,7 @@ function fixture() {
       // No model/read route is exercised by this inert construction fixture.
       // This is not a production model-disabled adapter or send-ready proof.
       policy: { routes: [] },
+      bindModelCall: vi.fn(),
       close: vi.fn(async () => {}),
     },
     model: {
@@ -531,6 +532,7 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
     );
   }
   expect(value.model.handle).not.toHaveBeenCalled();
+  expect(value.bound.egress.bindModelCall).not.toHaveBeenCalled();
 
   const next = {
     ...call,
@@ -547,6 +549,13 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   next.execution.executionId = randomUUID();
   expect(operation.context).not.toBe(next.context);
   expect(operation.context).toEqual(expected.context);
+  expect(value.bound.egress.bindModelCall).toHaveBeenCalledExactlyOnceWith(
+    expected,
+    active,
+  );
+  const policyBinding = vi.mocked(value.bound.egress.bindModelCall!).mock
+    .calls[0]![0];
+  expect(operation.context).toBe(policyBinding.context);
   expect(Object.isFrozen(operation.context.actor)).toBe(true);
   expect(Object.isFrozen(operation.context.memberships)).toBe(true);
   await operation.dispatch(response, active);
