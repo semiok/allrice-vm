@@ -186,6 +186,7 @@ export async function responsesFixture(
     tools?: boolean;
     holdFailedBody?: boolean;
     failuresBeforeSuccess?: number;
+    onRequestBody?(body: string): void;
   } = {},
 ) {
   const requests: string[] = [];
@@ -194,7 +195,10 @@ export async function responsesFixture(
   let closedCount = 0;
   const server = createServer((request, response) => {
     void (async () => {
-      for await (const part of request) void part;
+      const body: Buffer[] = [];
+      for await (const part of request)
+        if (options.onRequestBody) body.push(Buffer.from(part));
+      options.onRequestBody?.(Buffer.concat(body).toString('utf8'));
       requests.push(request.url!);
       active++;
       response.once('close', () => {

@@ -159,7 +159,13 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
     bytes: data.length,
   };
   let outboundImage = false;
-  const sse = await responsesFixture({ codex: true });
+  const sse = await responsesFixture({
+    codex: true,
+    onRequestBody(body) {
+      outboundImage =
+        body.includes('"type":"input_image"') && body.includes(png);
+    },
+  });
   const access = [
     'fixture',
     Buffer.from(
@@ -186,30 +192,22 @@ it('refreshes an expired managed Codex grant and meters an image-capable SSE req
   });
   const oauth = await listen(refresh);
   const used: string[] = [];
-  vi.stubGlobal(
-    'fetch',
-    async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (!(input instanceof Request)) return nativeFetch(input, init);
-      const target = {
-        'https://auth.openai.com/oauth/token': oauth,
-        'https://chatgpt.com/backend-api/codex/responses': sse.url,
-      }[input.url];
-      if (!target) return nativeFetch(input, init);
-      used.push(input.url);
-      if (target === sse.url) {
-        const body = await input.text();
-        outboundImage =
-          body.includes('"type":"input_image"') && body.includes(png);
-      }
-      const wire = {
-        ...init,
-        method: input.method,
-        headers: input.headers,
-        signal: input.signal,
-      };
-      return nativeFetch(target, wire);
-    },
-  );
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!(input instanceof Request)) return nativeFetch(input, init);
+    const target = {
+      'https://auth.openai.com/oauth/token': oauth,
+      'https://chatgpt.com/backend-api/codex/responses': sse.url,
+    }[input.url];
+    if (!target) return nativeFetch(input, init);
+    used.push(input.url);
+    const wire = {
+      ...init,
+      method: input.method,
+      headers: input.headers,
+      signal: input.signal,
+    };
+    return nativeFetch(target, wire);
+  });
   const selected = modelBinding();
   const readImage = vi.fn(
     async (
