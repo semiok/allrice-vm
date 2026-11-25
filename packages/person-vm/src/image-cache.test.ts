@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -271,6 +272,38 @@ describe('sealed public OCI cache', () => {
     await expect(seed()).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
     expect(await readFile(existing, 'utf8')).toBe('unexpected cache contents');
     expect(await readdir(a.native)).toEqual(['cache']);
+  });
+
+  it('retries after interruption between linking a private cache file and cleaning its stage', async () => {
+    const f = await fixture();
+    const a = await f.person('a');
+    const stage = await mkdtemp(join(a.native, '.public-oci-'));
+    const staged = join(stage, '0');
+    const linked = join(a.cache, layerPath);
+    await mkdir(dirname(linked), { recursive: true, mode: 0o700 });
+    await writeFile(staged, layer, { mode: 0o600 });
+    await link(staged, linked);
+    const { ino: inode, nlink } = await lstat(linked);
+    expect(nlink).toBe(2);
+
+    await seedPublicImageCache(f.source, f.image, a.native, active());
+
+    expect(await lstat(linked)).toMatchObject({ ino: inode, nlink: 1 });
+    await expect(lstat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(join(a.cache, blobPath), 'utf8')).toBe(blob);
+  });
+
+  it('refuses unexpected data in the staging namespace without deleting it', async () => {
+    const f = await fixture();
+    const a = await f.person('a');
+    const stage = await mkdtemp(join(a.native, '.public-oci-'));
+    const unrelated = join(stage, 'unexpected');
+    await writeFile(unrelated, 'retain me');
+    await expect(
+      seedPublicImageCache(f.source, f.image, a.native, active()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(await readFile(unrelated, 'utf8')).toBe('retain me');
+    expect(await readdir(a.native)).toEqual([stage.split('/').at(-1)]);
   });
 
   it('does not replace a private destination symlink or consume a source in the same mount', async () => {

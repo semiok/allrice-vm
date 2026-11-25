@@ -9,6 +9,8 @@ import {
   readdir,
   realpath,
   rm,
+  rmdir,
+  unlink,
   writeFile,
 } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path';
@@ -371,6 +373,22 @@ async function privateCacheDirectory(path: string) {
     invalid();
 }
 
+async function discardInterruptedStages(root: string, signal: AbortSignal) {
+  // The caller holds the VM's physical owner until seeding has settled.
+  // Another attempt cannot be writing within this VM's staging namespace.
+  for (const name of await readdir(root)) {
+    if (!/^\.public-oci-[A-Za-z0-9]{6}$/.test(name)) continue;
+    signal.throwIfAborted();
+    const stage = join(root, name);
+    await verifyDirectory(stage, 0o700);
+    const entries = await readdir(stage, { withFileTypes: true });
+    if (entries.some((entry) => !entry.isFile() || !/^\d+$/.test(entry.name)))
+      invalid();
+    for (const entry of entries) await unlink(join(stage, entry.name));
+    await rmdir(stage);
+  }
+}
+
 /** Under the VM owner, seed only public bytes into the existing encrypted
  * per-VM cache. MSB can create locks and staging files only in that private
  * cache. Host publication must stage these exact entries from a fresh,
@@ -389,6 +407,7 @@ export async function seedPublicImageCache(
     if (inside(mount, input.directory) || inside(input.directory, mount))
       invalid();
     const files = await readSeed(input, image, signal);
+    await discardInterruptedStages(root, signal);
     const stage = await mkdtemp(join(root, '.public-oci-'));
     try {
       const staged = new Map<string, string>();
