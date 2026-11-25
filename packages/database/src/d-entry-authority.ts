@@ -175,6 +175,10 @@ export type DEntryPrincipalAuthoritySubscription = DEntryAuthoritySubscription &
 
 type ObservedAuthority = DEntryPrincipalAuthoritySubscription &
   Readonly<{ assertObserved(signal: AbortSignal): Promise<void> }>;
+type NativeRosterChecks = Readonly<{
+  verifyRoster(signal: AbortSignal): Promise<void>;
+  verifyBinding(signal: AbortSignal): Promise<void>;
+}>;
 
 /** LISTEN is ready and the callback registered BEFORE this authoritative read.
  * A commit during setup either aborts the registered subscription or is seen
@@ -186,7 +190,7 @@ async function watchDEntryAuthority(
   signal: AbortSignal,
   access: 'native' | 'history' | 'identity',
   feed?: Feed,
-  verifyRoster?: (signal: AbortSignal) => Promise<void>,
+  nativeChecks?: NativeRosterChecks,
 ): Promise<ObservedAuthority> {
   const selection = (
     access === 'history'
@@ -232,7 +236,7 @@ async function watchDEntryAuthority(
     if (!session || !sameDEntryIdentity(identity, expected))
       throw new DataAccessError('authorization_denied');
     schema = session.schema;
-    await verifyRoster?.(revoked);
+    await nativeChecks?.verifyRoster(revoked);
     revoked.throwIfAborted();
     expiresAt = session.expires_at.toISOString();
     if (timer) clearTimeout(timer);
@@ -251,6 +255,20 @@ async function watchDEntryAuthority(
   };
   const enqueue = () => {
     if (!stopped) checks = checks.then(recheck).catch(invalidate);
+  };
+  let bindingPending = false;
+  const enqueueBinding = () => {
+    if (!nativeChecks || stopped || bindingPending) return;
+    bindingPending = true;
+    checks = checks
+      .then(async () => {
+        bindingPending = false;
+        if (stopped) return;
+        revoked.throwIfAborted();
+        await nativeChecks.verifyBinding(revoked);
+        revoked.throwIfAborted();
+      })
+      .catch(invalidate);
   };
   const joinChecks = async () => {
     // A notification can append another real read while the preceding read is
@@ -274,8 +292,7 @@ async function watchDEntryAuthority(
       {
         changed(change) {
           if (change.table === 'person_virtual_machines') {
-            if (verifyRoster && change.personId === expected.personId)
-              enqueue();
+            if (change.personId === expected.personId) enqueueBinding();
             return;
           }
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
@@ -283,7 +300,7 @@ async function watchDEntryAuthority(
           if (
             (!schema || change.schema === schema) &&
             (affects(change, context, expected) ||
-              (verifyRoster &&
+              (nativeChecks &&
                 !['allrice_chat_sessions', 'allrice_sessions'].includes(
                   change.table,
                 ) &&
@@ -348,7 +365,7 @@ export function watchDEntryNativeRosterAuthority(
   input: unknown,
   expected: DEntryIdentity,
   signal: AbortSignal,
-  verifyRoster: (signal: AbortSignal) => Promise<void>,
+  nativeChecks: NativeRosterChecks,
   feed?: Feed,
 ) {
   return watchDEntryAuthority(
@@ -358,7 +375,7 @@ export function watchDEntryNativeRosterAuthority(
     signal,
     'native',
     feed,
-    verifyRoster,
+    nativeChecks,
   );
 }
 

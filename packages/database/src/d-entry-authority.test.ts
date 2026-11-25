@@ -106,12 +106,13 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
     const signal = new AbortController().signal;
     const source = feed();
     const verify = vi.fn(async () => {});
+    const binding = vi.fn(async () => {});
     const watch = await watchDEntryNativeRosterAuthority(
       context,
       selection,
       identity,
       signal,
-      verify,
+      { verifyRoster: verify, verifyBinding: binding },
       source,
     );
     try {
@@ -123,8 +124,13 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
         channel: 'allrice_person_vm_admission',
         payload: identity.personId,
       });
+      client.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
       await watch.assertObserved(signal);
-      expect(verify).toHaveBeenCalledTimes(2);
+      expect(binding).toHaveBeenCalledTimes(1);
+      expect(verify).toHaveBeenCalledTimes(1);
       verify.mockRejectedValueOnce(Error('published roster no longer current'));
       client.emit('notification', {
         channel: 'allrice_d_entry_authority',
@@ -139,6 +145,39 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
       });
       await expect(watch.assertObserved(signal)).rejects.toThrow(
         'published roster no longer current',
+      );
+      expect(watch.revoked.aborted).toBe(true);
+    } finally {
+      await watch.close();
+    }
+  });
+
+  it('fences in-flight delivery on an exact VM binding change', async () => {
+    const signal = new AbortController().signal;
+    const verifyBinding = vi.fn(async () => {
+      throw Error('expected VM binding changed');
+    });
+    const watch = await watchDEntryNativeRosterAuthority(
+      context,
+      selection,
+      identity,
+      signal,
+      { verifyRoster: vi.fn(async () => {}), verifyBinding },
+      feed(),
+    );
+    try {
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: randomUUID(),
+      });
+      await watch.assertObserved(signal);
+      expect(verifyBinding).not.toHaveBeenCalled();
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_person_vm_admission',
+        payload: identity.personId,
+      });
+      await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'expected VM binding changed',
       );
       expect(watch.revoked.aborted).toBe(true);
     } finally {

@@ -487,20 +487,24 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               },
               identity,
               watching,
-              async (current) => {
-                const observed = await currentDEntryNativeOwner(
-                  dEntryNativeOwnerPort,
-                  context,
-                  identity,
-                  current,
-                );
-                if (
-                  !sameVmBinding(observed.view.receipt.binding, binding) ||
-                  observed.view.bindingRef !== profile.bindingRef ||
-                  observed.view.receipt.rosterDigest !==
-                    profile.receipt.rosterDigest
-                )
-                  return reject();
+              {
+                verifyBinding: (current) =>
+                  host.vm.assertCurrentBinding(context, binding, current),
+                async verifyRoster(current) {
+                  const observed = await currentDEntryNativeOwner(
+                    dEntryNativeOwnerPort,
+                    context,
+                    identity,
+                    current,
+                  );
+                  if (
+                    !sameVmBinding(observed.view.receipt.binding, binding) ||
+                    observed.view.bindingRef !== profile.bindingRef ||
+                    observed.view.receipt.rosterDigest !==
+                      profile.receipt.rosterDigest
+                  )
+                    return reject();
+                },
               },
             );
             const scope: PromptOwner = Object.freeze({
