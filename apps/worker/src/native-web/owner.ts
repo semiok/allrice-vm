@@ -13,7 +13,6 @@ import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import type { RequestContext } from '@allrice/contracts';
 import type { SessionCreateRequest } from '@deepseek-ai/dsh-api-session-controller/types';
-import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   PersonVmError,
   sameVmBinding,
@@ -270,13 +269,9 @@ export async function openNativeWebOwner(input: {
     if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
     return reply.result;
   }
-  function value(result: Awaited<ReturnType<typeof readSessionReply>>) {
+  function replyValue(result: Awaited<ReturnType<typeof readSessionReply>>) {
     if (result.ok) return result.value;
-    throw new RemoteError(
-      result.error.code,
-      result.error.message,
-      result.error.details,
-    );
+    throw new PersonVmError('PROVIDER_FAILED');
   }
   try {
     signal.throwIfAborted();
@@ -387,7 +382,7 @@ export async function openNativeWebOwner(input: {
                 );
                 return {
                   ok: true as const,
-                  value: method.result.create().parse(value(result)),
+                  value: method.result.create().parse(replyValue(result)),
                 };
               }),
             active,
@@ -420,7 +415,7 @@ export async function openNativeWebOwner(input: {
             });
             return {
               ok: true as const,
-              value: method.result.create().parse(value(result)),
+              value: method.result.create().parse(replyValue(result)),
             };
           },
         );
