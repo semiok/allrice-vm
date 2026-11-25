@@ -27,9 +27,9 @@ those sealed input bytes against fixed pins and carries the bundled copyright
 and license files. It accepts no npm installs, credential inputs, profiles,
 user homes, or mutable service directories.
 
-Required tools on the isolated builder's PATH are Node 22+, Python 3.9+,
-LLVM objdump and e2fsprogs 1.47.4 with libarchive tar population. Use a fixed
-toolchain for byte comparisons. Plan for roughly 8 GiB of temporary disk
+Required tools on the isolated builder's PATH are Node 22.23.2, Python 3.9+,
+LLVM objdump, and e2fsprogs 1.47.4 with libarchive tar population and debugfs.
+Record the Git commit and tool versions for byte comparisons. Plan for roughly 8 GiB of temporary disk
 space for a build or verification, plus space for the inputs and final output.
 The included Dockerfile describes the same root-owned copy, for OCI tooling
 with a pre-staged base and the normalized payload. The offline CLI constructs
@@ -52,13 +52,16 @@ node scripts/person-vm-image/verify.mjs /isolated/base /isolated/sealed /isolate
   manifest digest identifies the image. The added layer installs the sealed
   runtime under `/opt/allrice/dsh/<sealed-artifact-sha256>/`.
 - `runtime.ext4` contains the same payload at the filesystem root. The receipt
-  records the independent SHA-256 of the complete disk bytes. Its host mode is 0444. The consuming runtime must use a read-only mount and prove in-guest
+  records the independent SHA-256 of the complete disk bytes. Its host mode
+  is 0444. The consuming runtime must use a read-only mount and prove in-guest
   execution and write rejection before switching from the existing delivery.
 - `candidate.json` binds source pins, CLI and lock hashes, normalized payload,
   checked ELF dependency closure, OCI manifest and layer and raw disk.
   The verifier recomputes those expectations from the pinned inputs in private
   scratch space, checks the filesystem without mounting it, then reads and
-  verifies both outputs. A receipt by itself is never its trust anchor.
+  verifies both outputs. The disk readback checks the actual inode inventory,
+  owners, modes, link targets, file contents and absence of bwrap attributes.
+  A receipt by itself is never its trust anchor.
 
 The payload has fixed root ownership and normalized permissions and timestamps.
 Only declared, exact file bytes and internal links are carried forward. The

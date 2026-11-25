@@ -6,6 +6,7 @@ import {
   copyFileSync,
   createReadStream,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -153,8 +154,19 @@ for name, row in rows.items():
     if row['kind'] == 'symlink':
         target = row['target']
         require(target and not target.startswith('/') and '\\' not in target, 'Unsafe link: ' + name)
-        target = p.normpath(p.join(parent, target))
-        require(target in rows and rows[target]['kind'] == 'file', 'Link must end at a declared local file: ' + name)
+        parts = parent.split('/') if parent else []
+        for index, component in enumerate(target.split('/')):
+            if component == '..':
+                require(parts, 'Link must end at a declared local file: ' + name)
+                parts.pop()
+            else:
+                require(component not in ('', '.'), 'Unsafe link: ' + name)
+                parts.append(component)
+                path = '/'.join(parts)
+                kind = 'file' if index == len(target.split('/')) - 1 else 'directory'
+                require(path in rows and rows[path]['kind'] == kind, 'Link must end at a declared local file: ' + name)
+        require('/'.join(parts) in rows and rows['/'.join(parts)]['kind'] == 'file',
+                'Link must end at a declared local file: ' + name)
 def info(name, item=None):
     row = rows.get(name)
     result = tarfile.TarInfo(name)
@@ -252,6 +264,8 @@ for layer in layers:
             name = item.name.removeprefix('./').rstrip('/')
             if name == 'opt/allrice' or name.startswith('opt/allrice/'):
                 raise ValueError('Pinned base overlaps candidate payload')
+            if name == 'usr/local/bin/node' and (not item.isfile() or not item.mode & 0o111):
+                raise ValueError('Pinned Node executable is missing or non-executable')
             if name in ('lib', 'usr/lib/ld-linux-aarch64.so.1', 'usr/local/bin/node') or re.fullmatch(r'usr/lib/aarch64-linux-gnu/[^/]+\.so(?:\.[\d.]+)?', name):
                 if name in ('lib', 'usr/lib/ld-linux-aarch64.so.1', 'usr/local/bin/node') or name.rsplit('/', 1)[-1].startswith(
                     ('ld-linux-', 'libc.so', 'libcap.so', 'libselinux.so', 'libpcre2-8.so', 'libstdc++.so', 'libgcc_s.so', 'libm.so', 'libpthread.so', 'libdl.so', 'librt.so')):
@@ -268,6 +282,7 @@ function inspectElf(file) {
       bytes
         .subarray(0, 6)
         .equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1])) &&
+      [2, 3].includes(bytes.readUInt16LE(16)) &&
       bytes.readUInt16LE(18) === 183,
     'Runtime includes a non-ARM64 ELF',
   );
@@ -472,6 +487,15 @@ export async function prepareCandidate(base, release, scratch) {
       sealed.treeSha256 === source.treeSha256 &&
       sealed.manifestSha256 === source.manifestSha256 &&
       sealed.baseImage === source.baseImage &&
+      sealed.dshVersion === source.dshVersion &&
+      sealed.nodeVersion === source.nodeVersion &&
+      sealed.originalDshTarSha256 === source.originalDshTarSha256 &&
+      sealed.sandboxBackend.kind === 'bubblewrap' &&
+      sealed.sandboxBackend.path === 'sandbox-bin/bwrap' &&
+      sealed.sandboxBackend.mode === 0o555 &&
+      sealed.sandboxBackend.architecture === 'arm64' &&
+      sealed.sandboxBackend.packageVersion === source.bubblewrapVersion &&
+      sealed.sandboxBackend.packageSha256 === source.bubblewrapDebSha256 &&
       sealed.sandboxBackend.sha256 === source.bubblewrapElfSha256 &&
       files.containsAuthFiles === false &&
       files.platform === 'linux-arm64-gnu',
@@ -562,6 +586,7 @@ export async function prepareCandidate(base, release, scratch) {
   return {
     receipt,
     disk,
+    payload,
     layers,
     documents: new Map([
       [configSha, imageConfig],
@@ -582,9 +607,152 @@ function inventoryAt(dir, entries) {
   );
 }
 
+export function requireReadOnlyDisk(file) {
+  const stat = lstatSync(file);
+  ensure(
+    stat.isFile() &&
+      stat.uid === process.getuid() &&
+      stat.nlink === 1 &&
+      (stat.mode & 0o7777) === 0o444,
+    'Runtime disk must be an owner-controlled 0444 regular file with one link',
+  );
+  return stat;
+}
+
+// Read actual ext4 directory entries, including modes that rdump normalizes.
+// rdump is used for content and link targets after the raw SHA-256 is checked.
+const diskInventoryProgram = String.raw`
+import re, stat, sys, tarfile
+from pathlib import Path
+payload, batch, operation = sys.argv[1:]
+expected = {'/': (0o40555, ''), '/lost+found': (0o40700, '')}
+with tarfile.open(payload) as source:
+    for member in source:
+        kind = stat.S_IFREG if member.isfile() else stat.S_IFDIR if member.isdir() else stat.S_IFLNK
+        size = str(member.size) if member.isfile() else str(len(member.linkname.encode('utf-8'))) if member.issym() else ''
+        expected['/' + member.name] = (kind | member.mode, size)
+directories = {name for name, (mode, _) in expected.items() if stat.S_ISDIR(mode)}
+if operation == 'commands':
+    if any('"' in name for name in directories):
+        raise ValueError('Unexpected quote in sealed directory name')
+    Path(batch).write_text(''.join('ls -p "' + name + '"\n' for name in sorted(directories)), encoding='utf-8')
+else:
+    actual, listed, inodes = {}, set(), set()
+    for line in sys.stdin.read().splitlines():
+        if line.startswith('debugfs: ls -p '):
+            match = re.fullmatch(r'debugfs: ls -p "(/[^"]*)"', line)
+            if not match or match[1] not in directories or match[1] in listed:
+                raise ValueError('Unexpected ext4 listing: ' + line)
+            current = match[1]
+            listed.add(current)
+        elif line.startswith('/'):
+            _, ino, mode, uid, gid, name, size, _ = line.split('/')
+            if ino == '0' and not name or name == '..' or name == '.' and current != '/':
+                continue
+            path = '/' if name == '.' else current.rstrip('/') + '/' + name
+            if ino == '0' or ino in inodes or path in actual or (uid, gid) != ('0', '0'):
+                raise ValueError('Invalid ext4 inode identity: ' + path)
+            inodes.add(ino)
+            actual[path] = (int(mode, 8), size)
+        elif line and not re.fullmatch(r'debugfs [0-9.]+ \(.*\)', line):
+            raise ValueError('Cannot read ext4 directory: ' + line)
+    if actual != expected or listed != directories:
+        changed = next((name for name in actual.keys() | expected.keys() if actual.get(name) != expected.get(name)), '/')
+        raise ValueError('Ext4 inode inventory differs from the payload: ' + changed)
+`;
+
+const diskContentProgram = String.raw`
+import hashlib, os, stat, sys, tarfile
+from pathlib import Path
+payload, output, operation = sys.argv[1:]
+root = Path(output)
+if operation == 'cleanup':
+    for path, _, _ in os.walk(root, followlinks=False):
+        os.chmod(path, 0o700)
+else:
+    def digest(handle):
+        result = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            result.update(chunk)
+        return result.digest()
+    with tarfile.open(payload) as source:
+        for member in source:
+            target = root / member.name
+            mode = target.lstat().st_mode
+            if member.isfile() and stat.S_ISREG(mode):
+                with target.open('rb') as actual, source.extractfile(member) as original:
+                    if digest(actual) == digest(original):
+                        continue
+            elif member.issym() and stat.S_ISLNK(mode) and os.readlink(target) == member.linkname:
+                continue
+            elif member.isdir() and stat.S_ISDIR(mode):
+                continue
+            raise ValueError('Ext4 file contents, type or link differ: ' + member.name)
+`;
+
+function readBackDisk(disk, payload, scratch) {
+  ensure(
+    tool('debugfs', ['-V']).includes(' ' + e2fsVersion + ' '),
+    'Use e2fsprogs ' + e2fsVersion,
+  );
+  const batch = join(scratch, 'debugfs-list');
+  tool('python3', [
+    '-I',
+    '-c',
+    diskInventoryProgram,
+    payload,
+    batch,
+    'commands',
+  ]);
+  const inventory = tool('debugfs', ['-f', batch, disk], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  tool('python3', ['-I', '-c', diskInventoryProgram, payload, batch, 'check'], {
+    input: inventory,
+  });
+  const attributes = tool('debugfs', [
+    '-R',
+    'ea_list /sandbox-bin/bwrap',
+    disk,
+  ]);
+  ensure(
+    /^debugfs [0-9.]+ \(.*\)$/.test(attributes.trim()),
+    'Unexpected attributes on the runtime bwrap inode',
+  );
+  const directory = join(scratch, 'runtime-tree');
+  mkdirSync(directory, { mode: 0o700 });
+  try {
+    // Unprivileged debugfs cannot chown the copy to root; owners were
+    // checked on the real inodes above, so only compare copied bytes/links.
+    tool('debugfs', ['-R', 'rdump / .', disk], {
+      cwd: directory,
+      stdio: 'ignore',
+    });
+    tool('python3', [
+      '-I',
+      '-c',
+      diskContentProgram,
+      payload,
+      directory,
+      'check',
+    ]);
+  } finally {
+    tool('python3', [
+      '-I',
+      '-c',
+      diskContentProgram,
+      payload,
+      directory,
+      'cleanup',
+    ]);
+  }
+}
+
 export async function verifyCandidate(base, release, output) {
   return withScratch(tmpdir(), async (scratch) => {
     inventoryAt(output, ['oci', 'runtime.ext4', 'candidate.json']);
+    const disk = join(output, 'runtime.ext4');
+    requireReadOnlyDisk(disk);
     const candidate = await prepareCandidate(base, release, scratch);
     const oci = join(output, 'oci');
     inventoryAt(oci, [...candidate.layout.keys(), 'blobs']);
@@ -609,16 +777,20 @@ export async function verifyCandidate(base, release, output) {
         (await hashFile(join(blobs, digest))) === digest,
         'OCI layer SHA-256 mismatch',
       );
-    const disk = join(output, 'runtime.ext4');
+    const readback = join(scratch, 'readback.ext4');
+    const { size } = requireReadOnlyDisk(disk);
+    copyFileSync(disk, readback, constants.COPYFILE_EXCL);
     ensure(
-      statSync(disk).size === statSync(candidate.disk).size &&
-        (await hashFile(disk)) === JSON.parse(candidate.receipt).disk.sha256,
+      size === statSync(candidate.disk).size &&
+        (await hashFile(readback)) ===
+          JSON.parse(candidate.receipt).disk.sha256,
       'Runtime disk SHA-256 mismatch',
     );
     ensure(
       readRegular(join(output, 'candidate.json')).equals(candidate.receipt),
       'Candidate receipt does not match verified sources and outputs',
     );
+    readBackDisk(readback, candidate.payload, scratch);
     return candidate.receipt;
   });
 }

@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -10,7 +12,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadBase, normalizeArchive, sha256, withScratch } from './verify.mjs';
+import {
+  loadBase,
+  normalizeArchive,
+  requireReadOnlyDisk,
+  sha256,
+  withScratch,
+} from './verify.mjs';
 
 let temp;
 beforeEach(() => {
@@ -155,6 +163,11 @@ describe('offline payload', () => {
     ['absolute symlink', [link('outside', '/tmp/outside')], /Unsafe link/],
     ['symlink cycle', [link('cycle', 'cycle')], /declared local file/],
     [
+      'missing directory in a symlink',
+      [link('alias', 'missing/../plain'), regular('plain')],
+      /declared local file/,
+    ],
+    [
       'setuid',
       [regular('unsafe', 'payload', 0o4755)],
       /Privileged archive metadata/,
@@ -276,4 +289,19 @@ it('cleans only its scratch directory after a failure', async () => {
     }),
   ).rejects.toThrow('first failure');
   expect(execFileSync('/bin/ls', ['-A', temp], { encoding: 'utf8' })).toBe('');
+});
+
+it('rejects writable, hard-linked and symlinked runtime disk files', () => {
+  const image = join(temp, 'runtime.ext4');
+  const alias = join(temp, 'alias');
+  writeFileSync(image, 'fixture', { mode: 0o444 });
+  expect(requireReadOnlyDisk(image).size).toBe(7);
+  chmodSync(image, 0o644);
+  expect(() => requireReadOnlyDisk(image)).toThrow(/0444/);
+  chmodSync(image, 0o444);
+  linkSync(image, alias);
+  expect(() => requireReadOnlyDisk(image)).toThrow(/one link/);
+  rmSync(alias);
+  symlinkSync(image, alias);
+  expect(() => requireReadOnlyDisk(alias)).toThrow(/regular file/);
 });
