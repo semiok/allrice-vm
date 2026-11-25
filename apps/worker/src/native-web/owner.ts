@@ -100,50 +100,6 @@ export function readNativeModelAttempt(
   return null;
 }
 
-function nativePromptTurn(
-  snapshot: Pick<Extract<SessionFollowFrame, { type: 'snapshot' }>, 'records'>,
-  attempt: { turn: number | null; cursor: number },
-) {
-  const start = snapshot.records.findLast(
-    ({ event }) =>
-      event.type === 'turn/start' &&
-      event.seq <= attempt.cursor &&
-      (attempt.turn === null ||
-        (event.data as { turn?: unknown })?.turn === attempt.turn),
-  )?.event;
-  const turn = (start?.data as { turn?: unknown } | undefined)?.turn;
-  return {
-    start,
-    turn: typeof turn === 'number' && Number.isSafeInteger(turn) ? turn : null,
-  };
-}
-
-// Accepted native user events refer to the original public prompt request.
-// No identity is read from the text or from a selected browser tab.
-export function readNativeAttemptPromptIds(
-  snapshot: Pick<Extract<SessionFollowFrame, { type: 'snapshot' }>, 'records'>,
-  attempt: { turn: number | null; cursor: number },
-) {
-  const records = snapshot.records.map(({ event }) => event);
-  const { start } = nativePromptTurn(snapshot, attempt);
-  const ids = new Set<string>();
-  for (const event of records) {
-    if (
-      !start ||
-      event.seq <= start.seq ||
-      event.seq > attempt.cursor ||
-      event.type !== 'user/message'
-    )
-      continue;
-    const source = (
-      event.data as { source?: { kind?: unknown; rpcId?: unknown } } | null
-    )?.source;
-    if (source?.kind === 'user' && typeof source.rpcId === 'string')
-      ids.add(source.rpcId);
-  }
-  return [...ids];
-}
-
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
 export async function openNativeWebOwner(input: {
@@ -731,6 +687,8 @@ export async function openNativeWebOwner(input: {
                       ? address.sessionId
                       : address.childSessionId,
                   purpose: kind,
+                  cursor: attempt.cursor,
+                  turn: attempt.turn,
                 }),
                 active,
               );
@@ -738,17 +696,22 @@ export async function openNativeWebOwner(input: {
               const value = JSON.parse(proof) as {
                 id?: unknown;
                 recipient?: unknown;
-                delegatedPromptIds?: unknown;
+                sourceTurn?: unknown;
+                promptIds?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
                 !/^[A-Za-z0-9_-]{43}$/.test(value.recipient) ||
-                Object.keys(value).length !== 3 ||
-                !Array.isArray(value.delegatedPromptIds) ||
-                value.delegatedPromptIds.length > 64 ||
-                value.delegatedPromptIds.some(
+                Object.keys(value).length !== 4 ||
+                (address.kind === 'session'
+                  ? !Number.isSafeInteger(value.sourceTurn) ||
+                    (attempt.turn !== null && value.sourceTurn !== attempt.turn)
+                  : value.sourceTurn !== null) ||
+                !Array.isArray(value.promptIds) ||
+                value.promptIds.length > 64 ||
+                value.promptIds.some(
                   (id) => typeof id !== 'string' || id.length > 256,
                 )
               )
@@ -757,14 +720,8 @@ export async function openNativeWebOwner(input: {
                 ...attempt,
                 id: kind === 'assistant' ? attempt.id : id.data,
                 recipient: value.recipient,
-                sourceTurn:
-                  address.kind === 'session'
-                    ? nativePromptTurn(snapshot, attempt).turn
-                    : null,
-                promptIds:
-                  address.kind === 'session'
-                    ? readNativeAttemptPromptIds(snapshot, attempt)
-                    : (value.delegatedPromptIds as string[]),
+                sourceTurn: value.sourceTurn as number | null,
+                promptIds: value.promptIds as string[],
               };
             } finally {
               // Dispose this logical read on its original carrier. The

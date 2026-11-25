@@ -211,6 +211,90 @@ async function readManagedImage(scope, request, value, owned) {
   return { ...image, data: Buffer.from(image.data).toString('base64') };
 }
 
+// The controller's follow window is for display. Read all admitted input
+// from the live journal at the exact cursor of the authenticated attempt.
+export function readRootPromptOrigins(events, cursor, turn, purpose) {
+  const addPrompt = (event, ids) => {
+    if (event?.type !== 'user/message') return;
+    const source = event.data.source;
+    if (source?.kind === 'user' && typeof source.rpcId === 'string')
+      ids.add(source.rpcId);
+  };
+  if (purpose === 'session-title') {
+    const request = events[cursor];
+    if (request?.type !== 'session/title-llm-request') return null;
+    const messageSeqs = request.data.messageSeqs;
+    if (
+      !Array.isArray(messageSeqs) ||
+      messageSeqs.some(
+        (seq) => !Number.isSafeInteger(seq) || seq < 0 || seq >= cursor,
+      )
+    )
+      return null;
+    const ids = new Set();
+    let sourceTurn = null;
+    for (const seq of messageSeqs) {
+      const previousSize = ids.size;
+      addPrompt(events[seq], ids);
+      if (ids.size !== previousSize && sourceTurn === null)
+        sourceTurn =
+          events.findLast(
+            (event) => event.seq < seq && event.type === 'turn/start',
+          )?.data.turn ?? null;
+    }
+    return sourceTurn === null ? null : { turn: sourceTurn, ids: [...ids] };
+  }
+  const start = events.findLast(
+    (event) =>
+      event.seq <= cursor &&
+      event.type === 'turn/start' &&
+      (turn === null || event.data.turn === turn),
+  );
+  if (!start) return null;
+  const ids = new Set();
+  for (const event of events.slice(start.seq + 1, cursor + 1))
+    addPrompt(event, ids);
+  return { turn: start.data.turn, ids: [...ids] };
+}
+
+async function observeRootPromptOrigins(
+  scope,
+  id,
+  cursor,
+  turn,
+  purpose,
+  signal,
+) {
+  if (
+    !Number.isSafeInteger(cursor) ||
+    cursor < 0 ||
+    !(turn === null || Number.isSafeInteger(turn))
+  )
+    return null;
+  const live = scope.sessions.get(id);
+  if (!live || live.header.parentSession || live.header.isSeeded) return null;
+  const observed = await scope.sessionQuery.observeSession(id, { signal });
+  try {
+    signal.throwIfAborted();
+    if (
+      observed.source !== 'live' ||
+      scope.sessions.get(id) !== live ||
+      observed.header.id !== id ||
+      observed.cursor < cursor
+    )
+      return null;
+    const origin = readRootPromptOrigins(
+      observed.events,
+      cursor,
+      turn,
+      purpose,
+    );
+    return origin?.ids.length > 0 && origin.ids.length <= 64 ? origin : null;
+  } finally {
+    observed[Symbol.dispose]();
+  }
+}
+
 // DSH publishes a child's durable catalog entry on its exact parent before
 // running the initial delegated prompt. Continuing a child in a later turn
 // needs its own accepted-input source and cannot reuse its creation event.
@@ -508,7 +592,14 @@ export function applyNativeWebOwner(
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       modelFiber = ctx.inject(
-        ['llm', 'connection', 'sessionController', 'attachments', 'sessions'],
+        [
+          'llm',
+          'connection',
+          'sessionController',
+          'attachments',
+          'sessions',
+          'sessionQuery',
+        ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
@@ -537,15 +628,35 @@ export function applyNativeWebOwner(
               if (!found || found.signal.aborted)
                 return new globalThis.Response(null, { status: 404 });
               const headers = { 'cache-control': 'no-store' };
-              if (value.action === undefined)
+              if (value.action === undefined) {
+                const session = scope.sessions.get(value.sessionId);
+                if (!session)
+                  return new globalThis.Response(null, { status: 404 });
+                const origin = session.header.parentSession
+                  ? null
+                  : await observeRootPromptOrigins(
+                      scope,
+                      value.sessionId,
+                      value.cursor,
+                      value.turn,
+                      value.purpose,
+                      globalThis.AbortSignal.any([
+                        found.signal,
+                        request.signal,
+                      ]),
+                    );
+                if (!session.header.parentSession && !origin)
+                  return new globalThis.Response(null, { status: 404 });
                 return globalThis.Response.json(
                   {
                     id: found.id,
                     recipient: found.recipient,
-                    delegatedPromptIds: found.delegatedPromptIds,
+                    sourceTurn: origin?.turn ?? null,
+                    promptIds: origin?.ids ?? found.delegatedPromptIds,
                   },
                   { headers },
                 );
+              }
               if (
                 value.action !== 'read-image' ||
                 (value.purpose !== 'assistant' && value.attemptId !== found.id)

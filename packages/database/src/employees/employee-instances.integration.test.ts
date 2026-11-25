@@ -253,6 +253,37 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
       (select count(*)::int from allrice_jobs) jobs`;
     return counts;
   }
+  it('publishes the committed roster change when the application creates a custom employee', async () => {
+    const f = await setup();
+    const existing = await preparePersonNativeWebRoster(f.a.context);
+    const [namespace] = await fixture.db<{ schema: string }[]>`
+      select current_schema() as schema`;
+    const notifications: unknown[] = [];
+    const subscription = await fixture.db.listen(
+      'allrice_d_entry_authority',
+      (payload) => notifications.push(JSON.parse(payload)),
+    );
+    try {
+      const created = await f.custom('New employee with roster observer');
+      await vi.waitFor(() =>
+        expect(notifications).toContainEqual({
+          schema: namespace!.schema,
+          table: 'allrice_employee_instances',
+          id: null,
+          organizationId: f.a.organizationId,
+          workspaceId: f.a.workspaceId,
+          personId: f.a.user.id,
+        }),
+      );
+      const current = await readPersonNativeWebRoster(f.a.context);
+      expect(current.digest).not.toBe(existing.digest);
+      expect(current.entries).toContainEqual(
+        expect.objectContaining({ employeeInstanceId: created.id }),
+      );
+    } finally {
+      await subscription.unlisten();
+    }
+  });
   it('只读roster复用真实当前新Session，完整返回既有准备且不新增instance/revision/audit/Run', async () => {
     const f = await setup();
     await f.custom('Readonly native employee');
