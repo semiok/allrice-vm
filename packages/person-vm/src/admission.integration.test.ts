@@ -201,6 +201,84 @@ suite(
         },
       };
     }
+    it('takes a durable journal read lease only across idle admission and then releases it', async () => {
+      const h = await setup();
+      const store = new PostgresPersonVmStore(h.physical.open);
+      const entered = latch(),
+        finish = latch();
+      const result = own(
+        store.withRetainedReadLease(
+          h.binding,
+          signal(),
+          async (scope, disk) => {
+            expect(disk).toEqual({ vmId: h.binding.vmId, tier: 'warm' });
+            expect(
+              (await h.peerStore.read(h.binding.personId))?.leaseOwner,
+            ).toBe(scope.leaseOwner);
+            entered.resolve();
+            await finish.promise;
+            return 'physical-journal';
+          },
+        ),
+      );
+      await Promise.race([entered.promise, result]);
+      const options = { now: h.now, ttlMs: 90_000 };
+      await expect(
+        h.peerStore.withLease(
+          h.binding.personId,
+          options,
+          async () => undefined,
+        ),
+      ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+      finish.resolve();
+      await expect(result).resolves.toBe('physical-journal');
+      expect(
+        (await h.peerStore.read(h.binding.personId))?.leaseOwner,
+      ).toBeNull();
+      const stale = { ...h.binding, leaseEpoch: h.binding.leaseEpoch + 1 };
+      await expect(
+        store.withRetainedReadLease(stale, signal(), async () => undefined),
+      ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    });
+    it('keeps the physical fence after PG loss until the owned journal read has joined', async () => {
+      const h = await setup();
+      const store = new PostgresPersonVmStore(h.physical.open);
+      const entered = latch(),
+        observedLoss = latch(),
+        finish = latch();
+      const result = own(
+        store.withRetainedReadLease(h.binding, signal(), async (scope) => {
+          scope.signal.addEventListener('abort', observedLoss.resolve, {
+            once: true,
+          });
+          entered.resolve();
+          await finish.promise;
+          scope.signal.throwIfAborted();
+        }),
+      );
+      const rejected = expect(result).rejects.toMatchObject({
+        code: 'LEASE_LOST',
+      });
+      await Promise.race([entered.promise, result]);
+      const connection = h.physical.names.at(-1);
+      const [backend] =
+        await admin`select pid from pg_stat_activity where application_name=${connection!}`;
+      expect(backend).toBeDefined();
+      await admin`select pg_terminate_backend(${backend!.pid})`;
+      await Promise.race([observedLoss.promise, result]);
+      expect(
+        (await h.peerStore.read(h.binding.personId))?.leaseOwner,
+      ).toBeTruthy();
+      await expect(
+        h.peerStore.withLease(
+          h.binding.personId,
+          { now: h.now, ttlMs: 90_000 },
+          async () => undefined,
+        ),
+      ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+      finish.resolve();
+      await rejected;
+    });
     it('settles an old mount under the real PG lease without touching a peer-started VM', async () => {
       const h = await setup();
       const old = h.binding;
