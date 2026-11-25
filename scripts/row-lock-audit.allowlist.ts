@@ -168,6 +168,16 @@ export const reviewedUnresolvedCalls: readonly {
       'The only production history subscription comes from watchDEntryHistoryAuthority. Its close fences abort, detaches and unregisters the exact listener and joins the existing current-read queue. Neither teardown nor those reads hold row locks.',
   },
   {
+    target: 'packages/database/src/d-entry-authority.ts verifyBinding',
+    reason:
+      'The Web history and download GET handlers use watchDEntryHistoryAuthority without NativeRosterChecks, so VM notifications return before invoking verifyBinding. Only the Worker prompt owner supplies this callback through watchDEntryNativeRosterAuthority. Re-review if a GET caller supplies these checks.',
+  },
+  {
+    target: 'packages/database/src/d-entry-authority.ts verifyRoster',
+    reason:
+      'The Web history and download GET handlers use watchDEntryHistoryAuthority without NativeRosterChecks, so the optional verifyRoster call does not run. The Worker prompt owner supplies the only production implementation. Its roster FOR SHARE is outside this GET review. Re-review if a GET caller supplies these checks.',
+  },
+  {
     target: 'packages/contracts/src/storage.ts get',
     reason: 'Object storage adapters read blobs; they run no SQL.',
   },
