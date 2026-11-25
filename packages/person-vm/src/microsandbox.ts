@@ -475,6 +475,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const command = (args: string[], active: AbortSignal, nonzero?: boolean) =>
       this.runWithPaths(paths, args, active, nonzero);
     const name = this.name(binding);
+    if (!/\b0\.7\.16\b/.test(await command(['--version'], signal)))
+      throw new PersonVmError('PROVIDER_FAILED');
     const inspect = JSON.parse(
       await command(['inspect', name, '--format', 'json'], signal),
     );

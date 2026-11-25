@@ -322,13 +322,14 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(guard.mock.calls.length).toBeGreaterThan(1);
     const reads = (await f.calls()).slice(start);
     expect(reads.map(([name]) => name)).toEqual([
+      '--version',
       'inspect',
       'exec',
       'wait',
       'logs',
     ]);
-    expect(reads[1]).toContain('--detach');
-    expect(reads[1]).toContain('10s');
+    expect(reads[2]).toContain('--detach');
+    expect(reads[2]).toContain('10s');
 
     await f.native.stop(binding, signal());
     const stopped = (await f.calls()).length;
@@ -338,6 +339,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       code: 'PROVIDER_FAILED',
     });
     expect((await f.calls()).slice(stopped).map(([name]) => name)).toEqual([
+      '--version',
       'inspect',
     ]);
   });
