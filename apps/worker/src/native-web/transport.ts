@@ -298,13 +298,17 @@ export function nativeWebTransport(
   return {
     fetch,
     readExact,
-    async createRoot(body: string, caller: AbortSignal) {
+    async readSessionReply(
+      endpoint: 'create' | 'modelCatalog',
+      body: string,
+      caller: AbortSignal,
+    ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
-        new URL('api/session/create', origin),
+        new URL('api/session/' + endpoint, origin),
         caller,
         {
-          maxBytes: 16 * 1024,
+          maxBytes: endpoint === 'create' ? 16 * 1024 : nativeIndexByteLimit,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>

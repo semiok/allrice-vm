@@ -250,6 +250,34 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
+  async function readSessionReply(
+    endpoint: 'create' | 'modelCatalog',
+    args: object,
+    signal: AbortSignal,
+  ) {
+    const method = 'session/' + endpoint;
+    const rpcId = randomUUID();
+    const body = JSON.stringify(
+      clientRequestSchema.parse({
+        type: 'client-request',
+        method,
+        rpcId,
+        payload: { args },
+      }),
+    );
+    const wire = await transport.readSessionReply(endpoint, body, signal);
+    const reply = serverResponseSchema.parse(JSON.parse(wire));
+    if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
+    return reply.result;
+  }
+  function value(result: Awaited<ReturnType<typeof readSessionReply>>) {
+    if (result.ok) return result.value;
+    throw new RemoteError(
+      result.error.code,
+      result.error.message,
+      result.error.details,
+    );
+  }
   try {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
@@ -331,7 +359,11 @@ export async function openNativeWebOwner(input: {
       ) {
         if (startingScope !== input.scope)
           return Promise.reject(new PersonVmError('LEASE_LOST'));
-        const current = AbortSignal.any([caller, startingScope.signal]);
+        const current = AbortSignal.any([
+          caller,
+          startingScope.signal,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
         const guard = () => startingScope.assertCurrent();
         return readCurrent(current, guard, (active) =>
           verify(
@@ -345,9 +377,19 @@ export async function openNativeWebOwner(input: {
                 ),
             },
             () =>
-              readCurrent(active, guard, () =>
-                root.remote.session.modelCatalog(),
-              ),
+              readCurrent(active, guard, async (signal) => {
+                const method = TYPERT_REMOTE.methods['session/modelCatalog'];
+                const args = method.input({ strict: true }).create().parse({});
+                const result = await readSessionReply(
+                  'modelCatalog',
+                  args,
+                  signal,
+                );
+                return {
+                  ok: true as const,
+                  value: method.result.create().parse(value(result)),
+                };
+              }),
             active,
           ),
         );
@@ -366,41 +408,19 @@ export async function openNativeWebOwner(input: {
               .input({ strict: true })
               .create()
               .parse({ request });
-            const rpcId = randomUUID();
-            const body = JSON.stringify(
-              clientRequestSchema.parse({
-                type: 'client-request',
-                method: 'session/create',
-                rpcId,
-                payload: { args },
-              }),
-            );
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.
-            const result = await (async () => {
-              try {
-                const wire = await transport.createRoot(
-                  body,
-                  AbortSignal.timeout(input.cleanupTimeoutMs),
-                );
-                const reply = serverResponseSchema.parse(JSON.parse(wire));
-                if (reply.rpcId !== rpcId)
-                  throw new PersonVmError('PROVIDER_FAILED');
-                return reply.result;
-              } catch (error) {
-                throw new NativeRootJoinUnknown(error);
-              }
-            })();
-            if (!result.ok)
-              throw new RemoteError(
-                result.error.code,
-                result.error.message,
-                result.error.details,
-              );
+            const result = await readSessionReply(
+              'create',
+              args,
+              AbortSignal.timeout(input.cleanupTimeoutMs),
+            ).catch((error: unknown) => {
+              throw new NativeRootJoinUnknown(error);
+            });
             return {
               ok: true as const,
-              value: method.result.create().parse(result.value),
+              value: method.result.create().parse(value(result)),
             };
           },
         );
