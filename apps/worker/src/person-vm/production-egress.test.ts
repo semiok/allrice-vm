@@ -733,7 +733,6 @@ it('the actual native provider mounts both sealed directories and bootstraps the
   await fs.writeFile(dsh.descriptorPath, descriptor, { mode: 0o444 });
   const controls = f.loaded.configuration.native.readonlyCommandMemoryDirectory;
   let vmName: string | undefined;
-  let running = false;
   let mounts: object[] = [];
   const native = new MicrosandboxPersonVm({
     ...f.loaded.configuration.native,
@@ -781,9 +780,9 @@ it('the actual native provider mounts both sealed directories and bootstraps the
       if (args[0] === 'inspect')
         return JSON.stringify({
           name: vmName,
-          status: running ? 'Running' : 'Created',
+          status: 'Running',
           config: { mounts },
-          active_config: running ? { mounts } : null,
+          active_config: { mounts },
           pending_changes: [],
         });
       if (args[0] === 'cp') {
@@ -815,7 +814,6 @@ it('the actual native provider mounts both sealed directories and bootstraps the
   expect(create).toContain(
     `${controls.hostDirectory}:${controls.guestDirectory}:ro`,
   );
-  running = true;
   const current = vi.fn(async () => {});
   const prepared = await native.bootstrap(
     { binding, signal: signal(), assertCurrent: current },
