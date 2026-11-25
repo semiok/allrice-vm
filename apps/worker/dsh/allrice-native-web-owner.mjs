@@ -308,6 +308,23 @@ function isPrompt(event, requestId) {
   return source.kind === 'user' && source.rpcId === requestId;
 }
 
+function isWakeMessage(event, sessionId) {
+  if (event.type !== 'user/message') return false;
+  const source = record(record(event.data).source);
+  if (
+    typeof source.senderSessionId !== 'string' ||
+    !source.senderSessionId ||
+    source.senderSessionId === sessionId
+  )
+    return false;
+  return (
+    (source.kind === 'agent-message' && source.form === 'relay') ||
+    (source.kind === 'subagent-settled' &&
+      source.form === 'notice' &&
+      typeof source.summary === 'string')
+  );
+}
+
 function terminalReason(event) {
   const kind = record(record(event.data).reason).kind;
   switch (kind) {
@@ -323,7 +340,7 @@ function terminalReason(event) {
   }
 }
 
-/** Project only a contiguous physical root journal returned by native
+/** Project only a contiguous physical journal returned by native
  * sessionPersistence. session-query can synthesize a cold interrupted tail. */
 export function findDEntryNativeRunTerminal(
   {
@@ -331,24 +348,36 @@ export function findDEntryNativeRunTerminal(
     nativeRequestId,
     cursor: index,
     turn: expectedTurn,
-    attemptId,
     purpose,
+    delegated = false,
+    parentSessionId = null,
   },
-  { header, events },
+  { header, events, inheritedEventCount },
 ) {
   const cursor = events[index];
+  const child = parentSessionId !== null;
+  const matchingHeader = child
+    ? delegated &&
+      header.origin === 'subagent' &&
+      header.parentSession === parentSessionId
+    : !header.isSeeded &&
+      header.parentSession === undefined &&
+      header.origin === undefined &&
+      inheritedEventCount === 0;
   if (
     sessionId !== header.id ||
-    header.isSeeded ||
-    header.parentSession !== undefined ||
-    header.origin !== undefined ||
+    !matchingHeader ||
+    !Number.isSafeInteger(inheritedEventCount) ||
+    inheritedEventCount < 0 ||
+    (!header.isSeeded && inheritedEventCount !== 0) ||
+    index < inheritedEventCount ||
     cursor?.seq !== index
   )
     return null;
 
   let anchor = cursor.seq;
   if (purpose === 'session-title') {
-    if (cursor.type !== 'session/title-llm-request') return null;
+    if (delegated || cursor.type !== 'session/title-llm-request') return null;
     const seqs = record(cursor.data).messageSeqs;
     if (!Array.isArray(seqs)) return null;
     const matching = new Set();
@@ -367,7 +396,8 @@ export function findDEntryNativeRunTerminal(
       const data = record(cursor.data);
       if (
         cursor.type !== 'compaction/start' ||
-        data.compactionId !== attemptId ||
+        typeof data.compactionId !== 'string' ||
+        !data.compactionId ||
         data.turn !== expectedTurn
       )
         return null;
@@ -375,8 +405,10 @@ export function findDEntryNativeRunTerminal(
   }
 
   let start;
-  let containsPrompt = false;
-  for (let seq = anchor; seq >= 0; --seq) {
+  // Child scope was established at admission. Its header and own bracket
+  // pin that fact. A root wake also needs an actual adopted native message.
+  let hasInput = child;
+  for (let seq = anchor; seq >= inheritedEventCount; --seq) {
     const event = events[seq];
     if (
       event?.seq !== seq ||
@@ -388,11 +420,14 @@ export function findDEntryNativeRunTerminal(
       start = event;
       break;
     }
-    if (isPrompt(event, nativeRequestId)) containsPrompt = true;
+    if (!hasInput)
+      hasInput = delegated
+        ? isWakeMessage(event, sessionId)
+        : isPrompt(event, nativeRequestId);
   }
   const turn = record(start?.data).turn;
   if (
-    !containsPrompt ||
+    !hasInput ||
     typeof turn !== 'number' ||
     !Number.isSafeInteger(turn) ||
     turn < 1 ||
@@ -435,7 +470,14 @@ async function readPersistedRunTerminal(
   selection,
   ownerSignal,
 ) {
-  const { sessionId, nativeRequestId, cursor, turn, attemptId } = selection;
+  const {
+    sessionId,
+    nativeRequestId,
+    cursor,
+    turn,
+    delegated = false,
+    parentSessionId = null,
+  } = selection;
   if (
     sessionId.length === 0 ||
     sessionId.length > 256 ||
@@ -445,9 +487,13 @@ async function readPersistedRunTerminal(
     !Number.isSafeInteger(cursor) ||
     cursor < 0 ||
     !(turn === null || Number.isSafeInteger(turn)) ||
-    typeof attemptId !== 'string' ||
-    attemptId.length === 0 ||
-    attemptId.length > 512
+    typeof delegated !== 'boolean' ||
+    (parentSessionId !== null &&
+      (!delegated ||
+        typeof parentSessionId !== 'string' ||
+        parentSessionId.length === 0 ||
+        parentSessionId.length > 256 ||
+        parentSessionId === sessionId))
   )
     return null;
   const active = globalThis.AbortSignal.any([request.signal, ownerSignal]);
@@ -465,8 +511,7 @@ async function readPersistedRunTerminal(
     return null;
   const handle = await persistence.open(sessionId, 'read', { signal: active });
   try {
-    if (handle.access !== 'read' || handle.inheritedEventCount !== 0)
-      return null;
+    if (handle.access !== 'read') return null;
     const { events } = await handle.read(0, undefined, { signal: active });
     const after = await persistence.stat(sessionId, { signal: active });
     active.throwIfAborted();
@@ -479,6 +524,7 @@ async function readPersistedRunTerminal(
     return findDEntryNativeRunTerminal(selection, {
       header: handle.header,
       events,
+      inheritedEventCount: handle.inheritedEventCount,
     });
   } finally {
     await handle.close();

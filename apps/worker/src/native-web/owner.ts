@@ -842,9 +842,10 @@ export async function openNativeWebOwner(input: {
           sessionId: string;
           nativeRequestId: string;
           purpose: NativeModelAttemptKind;
-          attemptId: string;
           cursor: number;
           turn: number | null;
+          delegated?: boolean;
+          parentSessionId?: string | null;
         },
         assertCurrent: (active: AbortSignal) => Promise<void>,
         caller: AbortSignal,

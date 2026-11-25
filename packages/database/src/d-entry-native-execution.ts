@@ -231,6 +231,28 @@ export type DEntryNativeRunJournalOwner = Readonly<{
   nativeInstanceId: string;
 }>;
 
+function matchesRunScope(
+  run: DEntryNativeRunCandidate['prompt'],
+  execution: DEntryNativeRunCandidate['attempt'],
+) {
+  if (
+    run.adapterId !== execution.profile ||
+    !execution.contributingRequestIds.includes(run.nativeRequestId)
+  )
+    return false;
+  const root = execution.sessionId === run.rootSessionId;
+  if (run.source === 'dsh-native-prompt')
+    return root && execution.parentSessionId === null;
+  return (
+    execution.kind !== 'session-title' &&
+    execution.turn !== null &&
+    (root
+      ? execution.parentSessionId === null
+      : !!execution.parentSessionId &&
+        execution.parentSessionId !== execution.sessionId)
+  );
+}
+
 type ScanCursor = { runId: string; sequence: number };
 
 /** Host-only enumeration for one authenticated employee-profile owner. */
@@ -260,22 +282,20 @@ export async function listDEntryNativeRunCandidates(
       and r.state='running' and r.visibility='private'
       and r.execution_spec @> ${sql.json({
         generation: '4.0',
-        source: 'dsh-native-prompt',
         personId: owner.personId,
         vmId: owner.vmId,
         employeeInstanceId: owner.employeeInstanceId,
         employeeRelease: owner.employeeRelease,
         adapterId: owner.adapterId,
       })}
+      and r.execution_spec->>'source' in ('dsh-native-prompt','dsh-native-delegation')
       and e.payload @> ${sql.json({
         source: 'dsh-native-attempt',
-        parentSessionId: null,
         profile: owner.adapterId,
         nativeInstanceId: owner.nativeInstanceId,
         vmInstanceId: owner.vmInstanceId,
         leaseEpoch: owner.leaseEpoch,
       })}
-      and e.payload->>'sessionId'=r.execution_spec->>'rootSessionId'
       ${after ? sql`and (r.id,e.sequence) > (${after.runId}::uuid,${after.sequence}::integer)` : sql``}
     order by r.id, e.sequence
     limit 64
@@ -287,8 +307,7 @@ export async function listDEntryNativeRunCandidates(
       !source.success ||
       !step.success ||
       source.data.personId !== row.owner_id ||
-      source.data.adapterId !== step.data.profile ||
-      !step.data.contributingRequestIds.includes(source.data.nativeRequestId)
+      !matchesRunScope(source.data, step.data)
     )
       return [];
     return [
@@ -367,11 +386,9 @@ export async function publishDEntryNativeRunTerminal(
   const { runId, executionId, organizationId, workspaceId, ownerId } =
     candidate;
   if (
-    candidate.prompt.source !== 'dsh-native-prompt' ||
     candidate.prompt.personId !== ownerId ||
+    !matchesRunScope(candidate.prompt, candidate.attempt) ||
     candidate.attempt.sessionId !== end.sessionId ||
-    candidate.prompt.rootSessionId !== end.sessionId ||
-    candidate.attempt.parentSessionId !== null ||
     (candidate.attempt.turn !== null && candidate.attempt.turn !== end.turn) ||
     (candidate.attempt.kind !== 'session-title' &&
       (candidate.attempt.turn === null ||

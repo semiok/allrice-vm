@@ -55,9 +55,10 @@ export async function reconcileNativeRunTerminals(
               sessionId: attempt.sessionId,
               nativeRequestId: prompt.nativeRequestId,
               purpose: attempt.kind,
-              attemptId: attempt.attemptId,
               cursor: attempt.cursor,
               turn: attempt.turn,
+              delegated: prompt.source === 'dsh-native-delegation',
+              parentSessionId: attempt.parentSessionId,
             },
             async (reading) => {
               if (

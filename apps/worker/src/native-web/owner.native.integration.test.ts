@@ -689,7 +689,6 @@ it.skipIf(!cli)(
           sessionId: requested,
           nativeRequestId: nativePrompt,
           purpose: kind,
-          attemptId: attempt.id,
           cursor: attempt.cursor,
           turn: attempt.turn,
         };
