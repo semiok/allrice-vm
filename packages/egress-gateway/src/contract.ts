@@ -90,14 +90,35 @@ export type ManagedHostService = Readonly<{
   method: 'GET' | 'POST';
   /** Service owns admission AND complete call identity; local capability is insufficient. */
   admissionOwner: 'service';
-  /** Owner parses native protocol and resolves call/resource authority; no raw proxy. */
-  handle(
-    request: IncomingMessage,
-    response: ServerResponse,
-    trusted: { context: RequestContext; binding: PersonVmBinding },
-    signal: AbortSignal,
-  ): Promise<void>;
-}>;
+}> &
+  (
+    | Readonly<{
+        resolve?: never;
+        /** This service is authorized at the VM context and owns its resources. */
+        handle(
+          request: IncomingMessage,
+          response: ServerResponse,
+          trusted: { context: RequestContext; binding: PersonVmBinding },
+          signal: AbortSignal,
+        ): Promise<void>;
+      }>
+    | Readonly<{
+        handle?: never;
+        /** Resolve the actual authorized operation context before the gateway
+         * applies current binding and route policy. No dispatch here. */
+        resolve(
+          request: IncomingMessage,
+          binding: PersonVmBinding,
+          signal: AbortSignal,
+        ): Promise<{
+          context: RequestContext;
+          dispatch(
+            response: ServerResponse,
+            signal: AbortSignal,
+          ): Promise<void>;
+        }>;
+      }>
+  );
 
 /** Upstream credentials are NEVER returned. This is a VM-specific local capability. */
 export type GuestEgressAccess = Readonly<{

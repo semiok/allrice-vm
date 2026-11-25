@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { RequestContext } from '@allrice/contracts';
+import type { IncomingHttpHeaders } from 'node:http';
 import { createDedicatedDatabase, getDatabase } from '@allrice/database';
 import {
   createModelGateway,
@@ -90,8 +90,8 @@ export type ProductionPersonVmHostSources = Readonly<{
       /** Resolve the current trusted native call. Host request metadata may
        * be used to find a registration; it cannot authorize that registration. */
       resolveCall(
-        request: Parameters<ManagedHostService['handle']>[0],
-        trusted: { context: RequestContext; binding: PersonVmBinding },
+        headers: Readonly<IncomingHttpHeaders>,
+        binding: PersonVmBinding,
         signal: AbortSignal,
       ): Promise<ModelCallBinding>;
     };
@@ -446,27 +446,30 @@ export function createProductionPersonVmHost(input: {
         path: '/v1/stream',
         method: 'POST',
         admissionOwner: 'service',
-        async handle(request, response, trusted, signal) {
-          const active = AbortSignal.any([signal, lifetime]);
-          active.throwIfAborted();
-          const call = await modelSource.resolveCall(request, trusted, active);
-          active.throwIfAborted();
-          const { context, binding } = trusted;
+        async resolve(request, binding, signal) {
+          signal.throwIfAborted();
+          const call = await modelSource.resolveCall(
+            request.headers,
+            binding,
+            signal,
+          );
+          signal.throwIfAborted();
           if (
             !sameVmBinding(call.vm, binding) ||
             call.provider !== modelRoute.provider ||
             call.model !== modelRoute.model ||
-            context.actor.type !== 'user' ||
             call.context.actor.type !== 'user' ||
-            call.context.actor.id !== context.actor.id ||
-            call.context.organizationId !== context.organizationId
+            call.context.actor.id !== binding.personId ||
+            call.context.organizationId !== binding.organizationId
           )
             throw new EgressError('DENIED');
-          // The resolver binds this call's own login and workspace. The
-          // VM-level context alone cannot identify that individual session.
-          await vm.assertAdmissionBinding(call.context, binding, active);
-          active.throwIfAborted();
-          await modelOwner.handle(request, response, call, active);
+          // Egress checks this call's actual current context before dispatch.
+          // The gateway reauthorizes the complete native call on every attempt.
+          return {
+            context: call.context,
+            dispatch: (response, active) =>
+              modelOwner.handle(request, response, call, active),
+          };
         },
       };
       // The same shared boundary owns all egress calls. Sources may never
@@ -477,6 +480,7 @@ export function createProductionPersonVmHost(input: {
         authority: bound.egress.authority,
         policy: bound.egress.policy,
         transport: createPublicHttpsTransport(),
+        lifetime,
         async revokeModel(binding, active) {
           await modelOwner.revoke(binding);
           active.throwIfAborted();

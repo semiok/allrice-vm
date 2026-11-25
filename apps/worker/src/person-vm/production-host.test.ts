@@ -463,7 +463,7 @@ it('an egress source cannot substitute another VM or shared admission boundary',
         path: '/v1/stream',
         method: 'POST',
         admissionOwner: 'service',
-        handle: expect.any(Function),
+        resolve: expect.any(Function),
       },
     ],
     provisioner: actual.providers.egressInstallation.provisioner,
@@ -472,8 +472,7 @@ it('an egress source cannot substitute another VM or shared admission boundary',
 
 it('dispatches only the trusted model-call resolution for the exact lease and approved route', async () => {
   const value = await open(),
-    scope = nativeEntryFixture(),
-    vm = value.input().vm;
+    scope = nativeEntryFixture();
   const context = scope.context;
   const binding = {
     vmId: randomUUID(),
@@ -485,11 +484,9 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   const model = io.gateway.mock.calls[0]?.[0].services?.find(
     (service) => service.id === 'model',
   );
-  if (!model) throw Error('Missing registered model service');
-  const assertAdmission = vi
-    .spyOn(vm, 'assertAdmissionBinding')
-    .mockResolvedValue(undefined);
-  const request = {} as IncomingMessage;
+  if (!model?.resolve) throw Error('Missing registered model service');
+  const headers = { 'x-synthetic-call': 'lookup-only' };
+  const request = { headers } as IncomingMessage;
   const response = {} as ServerResponse;
   const call: Model.ModelCallBinding = {
     context,
@@ -513,18 +510,16 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   };
   const resolveCall = vi.mocked(value.bound.model.resolveCall);
   const active = signal();
-  const trusted = { context, binding };
   for (const wrong of [
     { ...call, vm: { ...binding, leaseEpoch: 2 } },
     { ...call, context: { ...context, organizationId: randomUUID() } },
     { ...call, model: 'different-route' },
   ]) {
     resolveCall.mockResolvedValueOnce(wrong);
-    await expect(
-      model.handle(request, response, trusted, active),
-    ).rejects.toMatchObject({ code: 'DENIED' });
+    await expect(model.resolve(request, binding, active)).rejects.toMatchObject(
+      { code: 'DENIED' },
+    );
   }
-  expect(assertAdmission).not.toHaveBeenCalled();
   expect(value.model.handle).not.toHaveBeenCalled();
 
   const next = {
@@ -533,42 +528,17 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   };
   resolveCall.mockResolvedValueOnce(next);
   value.model.handle.mockResolvedValueOnce(undefined);
-  await model.handle(request, response, trusted, active);
-  const resolvedSignal = resolveCall.mock.lastCall?.[2];
-  expect(resolvedSignal).toBeInstanceOf(AbortSignal);
-  expect(resolveCall).toHaveBeenLastCalledWith(
-    request,
-    trusted,
-    resolvedSignal,
-  );
-  expect(assertAdmission).toHaveBeenCalledExactlyOnceWith(
-    next.context,
-    binding,
-    resolvedSignal,
-  );
+  const operation = await model.resolve(request, binding, active);
+  expect(operation.context).toBe(next.context);
+  expect(resolveCall).toHaveBeenLastCalledWith(headers, binding, active);
+  expect(value.model.handle).not.toHaveBeenCalled();
+  await operation.dispatch(response, active);
   expect(value.model.handle).toHaveBeenCalledExactlyOnceWith(
     request,
     response,
     next,
-    resolvedSignal,
+    active,
   );
-
-  const entered = gate();
-  resolveCall.mockImplementationOnce(async (_request, _trusted, current) => {
-    const stopped = new Promise<never>((_resolve, reject) => {
-      current.addEventListener('abort', () => reject(current.reason), {
-        once: true,
-      });
-    });
-    entered.release();
-    return stopped;
-  });
-  const resolving = model
-    .handle(request, response, trusted, active)
-    .catch((error: unknown) => error);
-  await entered.promise;
-  await value.host.close();
-  expect(await resolving).toBe(value.input().lifetime.reason);
   expect(value.model.handle).toHaveBeenCalledTimes(1);
 });
 
