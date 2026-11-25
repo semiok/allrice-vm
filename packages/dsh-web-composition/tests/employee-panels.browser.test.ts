@@ -699,6 +699,15 @@ suite('installed native employee panels with synthetic business owner', () => {
         .getByRole('button', { name: '展开工作台', exact: true })
         .count(),
     ).toBe(0);
+    await command('unknownFiles', true);
+    const files = entries.getByRole('button', {
+      name: '交付成果',
+      exact: true,
+    });
+    await files.waitFor({ state: 'visible' });
+    expect((await evidence()).ownerBound).toBe(true);
+    expect(await entries.getByRole('button').count()).toBe(4);
+    expect(await files.locator('span[aria-hidden="true"]').count()).toBe(0);
     for (const kind of kinds) {
       await open(kind);
       expect((await evidence()).expanded).toBe(true);
@@ -709,21 +718,6 @@ suite('installed native employee panels with synthetic business owner', () => {
       .getByRole('button', { name: '关闭', exact: true })
       .click();
     await body(page, 'workflow').waitFor({ state: 'hidden' });
-    await command('unknownFiles', true);
-    const files = entries.getByRole('button', {
-      name: '交付成果',
-      exact: true,
-    });
-    await files.waitFor({ state: 'visible' });
-    expect((await evidence()).ownerBound).toBe(true);
-    expect(await entries.getByRole('button').count()).toBe(4);
-    expect(await files.locator('span[aria-hidden="true"]').count()).toBe(0);
-    await files.click();
-    await body(page, 'files').waitFor({ state: 'visible' });
-    await entries
-      .getByRole('button', { name: '企业资料', exact: true })
-      .click();
-    await body(page, 'materials').waitFor({ state: 'visible' });
     await command('unknownFiles', false);
     await entries
       .getByRole('button', { name: '交付成果，5 项新增', exact: true })
