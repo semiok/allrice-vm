@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { RequestContext } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
+import type * as Database from '@allrice/database';
 import { afterEach, expect, it, vi } from 'vitest';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import type { ResolvedDEntryNativeOwner } from '../d-entry/native-owner.js';
@@ -12,7 +13,7 @@ const { current, policy, profile } = vi.hoisted(() => ({
   profile: vi.fn(),
 }));
 vi.mock('@allrice/database', async (original) => ({
-  ...(await original<typeof import('@allrice/database')>()),
+  ...(await original<typeof Database>()),
   requireDEntryNativeIdentity: current,
   readDEntryReleasePolicy: policy,
 }));
