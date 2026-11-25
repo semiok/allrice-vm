@@ -508,6 +508,14 @@ export class PersonVmService
     ) {
       if ((await this.takeoverSafe(row, signal, lease)).state !== 'ready')
         throw new PersonVmError('PROVIDER_FAILED');
+      if (
+        row.egressReceipt &&
+        this.options.ownsEgressReceipt &&
+        !this.options.ownsEgressReceipt(
+          this.receipt(bindingOf(row), row.egressReceipt),
+        )
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
       await this.cleanup(row, lease, 'takeover');
     }
     await lease.assertAdmissionOpen(true);

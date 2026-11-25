@@ -775,6 +775,9 @@ it('preserves an older receipt when this process cannot prove its egress owner',
     'synthetic retained VM status failure',
   );
   status.mockResolvedValue('stopped');
+  await expect(vm.start(context, signal())).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
   const closeFixture = cleanup.pop()!;
   const original = value.host.close();
   cleanup.push(async () => {
