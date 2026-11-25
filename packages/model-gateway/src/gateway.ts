@@ -218,6 +218,9 @@ export function createModelGateway(options: {
   }>();
   let closed = false;
   const revoked = new Set<string>();
+  // The request callback may finish without proving the underlying join.
+  // Keep the failure after it leaves the active set, scoped to its VM epoch.
+  const unconfirmedJoins = new Map<string, ModelGatewayError>();
   return {
     admission: options.admission.participant,
     async handle(request, response, bindingInput, hostSignal) {
@@ -439,8 +442,8 @@ export function createModelGateway(options: {
                 }
               }
             }
-            if (!joined)
-              throw new ModelGatewayError('LEDGER_UNAVAILABLE', {
+            if (!joined) {
+              const error = new ModelGatewayError('LEDGER_UNAVAILABLE', {
                 cause:
                   operationFailed && operationFailure !== joinFailure
                     ? new AggregateError(
@@ -449,6 +452,9 @@ export function createModelGateway(options: {
                       )
                     : joinFailure,
               });
+              if (!unconfirmedJoins.has(key)) unconfirmedJoins.set(key, error);
+              throw error;
+            }
             return operationFailed
               ? { ok: false, error: operationFailure }
               : { ok: true, value: terminalReply! };
@@ -502,6 +508,8 @@ export function createModelGateway(options: {
       for (const entry of entries)
         entry.controller.abort(new Error('model_gateway_binding_revoked'));
       await Promise.all(entries.map((entry) => entry.done));
+      const incomplete = unconfirmedJoins.get(key);
+      if (incomplete) throw incomplete;
     },
     async reconcileOwner(context, ownerId, signal) {
       signal.throwIfAborted();
@@ -521,6 +529,11 @@ export function createModelGateway(options: {
         entry.controller.abort(new Error('model_gateway_closed'));
       await Promise.all([...active].map((entry) => entry.done));
       uninstall();
+      if (unconfirmedJoins.size)
+        throw new AggregateError(
+          [...unconfirmedJoins.values()],
+          'Model gateway join unconfirmed',
+        );
     },
     ledger: {
       async summarize(context, signal) {

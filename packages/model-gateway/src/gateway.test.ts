@@ -9,6 +9,7 @@ import { ModelGatewayError } from './contract.ts';
 import type { GatewayProvider } from './contract.ts';
 import { withGatewayAuthTransaction } from './transport.ts';
 import {
+  closeServer,
   deferred,
   FixtureStore,
   freshCall,
@@ -584,6 +585,64 @@ describe.sequential(
       await f.upstream.closed;
       expect(f.store.slots.get(f.binding.vm.personId)?.size).toBe(0);
       expect(f.upstream.active).toBe(0);
+    });
+
+    it('retains an unconfirmed native join for the exact epoch after its handler finishes', async () => {
+      const entered = deferred();
+      const joinError = new Error('native iterator release unconfirmed');
+      const f = await gatewayFixture({
+        provider: {
+          classify: () => null,
+          stream(_binding, _input, signal) {
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  next() {
+                    return new Promise<IteratorResult<StreamChunk>>(
+                      (_resolve, reject) => {
+                        const abort = () => reject(signal.reason);
+                        signal.addEventListener('abort', abort, { once: true });
+                        if (signal.aborted) abort();
+                        entered.resolve();
+                      },
+                    );
+                  },
+                  async return() {
+                    throw joinError;
+                  },
+                };
+              },
+            };
+          },
+        },
+      });
+      const collecting = f.collect();
+      try {
+        await entered.promise;
+        const revoke = f.gateway.revoke(f.binding.vm);
+        await expect(revoke).rejects.toMatchObject({
+          code: 'LEDGER_UNAVAILABLE',
+        });
+        expect(finish(await collecting)).toMatchObject({
+          reason: { kind: 'error' },
+        });
+        await expect(f.gateway.revoke(f.binding.vm)).rejects.toMatchObject({
+          code: 'LEDGER_UNAVAILABLE',
+        });
+        await expect(
+          f.gateway.revoke({ ...f.binding.vm, leaseEpoch: 99 }),
+        ).resolves.toBeUndefined();
+        await expect(f.gateway.close()).rejects.toBeInstanceOf(AggregateError);
+      } finally {
+        try {
+          await f.gateway.close();
+        } catch (error) {
+          if (!(error instanceof AggregateError)) throw error;
+        } finally {
+          await closeServer(f.server);
+          await Promise.allSettled([collecting]);
+        }
+      }
     });
 
     it('ledger提交失败拒绝成功，未知slot保留，guest不能调用恢复释放', async () => {
