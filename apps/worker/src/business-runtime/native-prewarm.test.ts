@@ -451,6 +451,42 @@ it('preserves a successful new epoch when the prior running epoch stops before d
   expect(f.readCoordination).toHaveBeenCalledTimes(2);
 });
 
+it('falls back to the existing lease if a ready shared epoch changes during the caller proof', async () => {
+  const f = fixture(true);
+  const { context, identity } = f.base;
+  await f.runPrewarm(context, { trigger: 'page' }, signal());
+  const old = (await f.h.store.read(identity.personId))!;
+  const proof = vi
+    .fn(async () => signal())
+    .mockImplementationOnce(async () => {
+      f.h.states.set(old.vmId, 'stopped');
+      await f.h.service.stop(context, signal());
+      return signal();
+    });
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady: proof,
+  });
+  try {
+    const ready = await f.assembly.port.prewarm(
+      context,
+      identity,
+      'page',
+      signal(),
+      signal(),
+    );
+    expect(ready).toBe(await proof.mock.results[1]!.value);
+    expect(await f.h.store.read(identity.personId)).toMatchObject({
+      phase: 'running',
+      leaseEpoch: old.leaseEpoch + 1,
+    });
+    expect(f.start).toHaveBeenCalledTimes(2);
+    expect(f.vm).toHaveBeenCalledTimes(2);
+  } finally {
+    uninstall();
+  }
+});
+
 it('current authority rejects before any VM call, and post-start denial does not stop shared running work', async () => {
   const f = fixture();
   authority.identity.mockRejectedValueOnce(

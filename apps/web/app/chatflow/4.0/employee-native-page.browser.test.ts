@@ -56,6 +56,8 @@ suite('4.0 browser cold entry', () => {
         });
       const firstRetry = deferred<ServerResponse>();
       const retryClosed = deferred<void>();
+      const supersededWarmup = deferred<ServerResponse>();
+      const supersededClosed = deferred<void>();
       let opening = false;
       const allowOpening = deferred<void>();
       const warmCalls: unknown[] = [],
@@ -78,6 +80,11 @@ suite('4.0 browser cold entry', () => {
           if (warmCalls.length === 2) {
             response.once('close', () => retryClosed.resolve());
             firstRetry.resolve(response);
+            return;
+          }
+          if (warmCalls.length === 8) {
+            response.once('close', () => supersededClosed.resolve());
+            supersededWarmup.resolve(response);
             return;
           }
           return response.writeHead(204).end();
@@ -229,15 +236,23 @@ suite('4.0 browser cold entry', () => {
       }
       const oldScope = await showEditor(f.selection.threadId);
       const oldDocument = page.frameLocator('iframe').locator('body');
-      expect(
-        await oldDocument.evaluate(() =>
+      const claim = () =>
+        oldDocument.evaluate(() =>
           (
             window as unknown as {
               __ALLRICE_EMPLOYEE_DOCUMENT__: { claim(): boolean };
             }
           ).__ALLRICE_EMPLOYEE_DOCUMENT__.claim(),
-        ),
-      ).toBe(true);
+        );
+      const finish = () =>
+        oldDocument.evaluate(() => {
+          (
+            window as unknown as {
+              __ALLRICE_EMPLOYEE_DOCUMENT__: { finish(state: 'closed'): void };
+            }
+          ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed');
+        });
+      expect(await claim()).toBe(true);
       await page
         .frameLocator('iframe')
         .getByRole('button', { name: '新建对话' })
@@ -248,13 +263,7 @@ suite('4.0 browser cold entry', () => {
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(
         f.selection.threadId,
       );
-      await oldDocument.evaluate(() => {
-        (
-          window as unknown as {
-            __ALLRICE_EMPLOYEE_DOCUMENT__: { finish(state: 'closed'): void };
-          }
-        ).__ALLRICE_EMPLOYEE_DOCUMENT__.finish('closed');
-      });
+      await finish();
       await page.waitForURL((url) => url.searchParams.has('new'));
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);
@@ -291,6 +300,30 @@ suite('4.0 browser cold entry', () => {
         { selection: employee, trigger: 'page' },
         { selection: { ...employee, threadId: next }, trigger: 'page' },
       ]);
+
+      expect(await claim()).toBe(true);
+      try {
+        await page
+          .frameLocator('iframe')
+          .getByRole('button', { name: '新建对话' })
+          .click();
+        const waiting = await supersededWarmup.promise;
+        await page.evaluate(() => history.back());
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await supersededClosed.promise;
+        expect(waiting.writableFinished).toBe(false);
+        expect(births).toHaveLength(2);
+      } finally {
+        await finish();
+      }
+      await showEditor(f.selection.threadId);
+      expect(warmCalls.slice(7)).toEqual([
+        { selection: employee, trigger: 'page' },
+        { selection: f.selection, trigger: 'page' },
+      ]);
+      expect(births).toHaveLength(2);
     },
   );
 });

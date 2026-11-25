@@ -118,6 +118,7 @@ export function EmployeeNativePage({
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
+    let superseded = false;
     let timer: number | undefined;
     let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
@@ -235,6 +236,11 @@ export function EmployeeNativePage({
     loaded.current = documentLoaded;
     const applyQuery = () => {
       if (navigating) {
+        if (nextWarmup && nextQuery.current !== activeQuery) {
+          nextWarmup.lifetime.abort();
+          nextWarmup = undefined;
+          superseded = true;
+        }
         if (retired && nextQuery.current !== activeQuery)
           setActivation({ query: nextQuery.current });
         return;
@@ -336,7 +342,7 @@ export function EmployeeNativePage({
           const warmup = nextWarmup;
           nextWarmup = undefined;
           if (closed) {
-            if (nextQuery.current !== activeQuery) {
+            if (superseded || nextQuery.current !== activeQuery) {
               warmup?.lifetime.abort();
               setActivation({ query: nextQuery.current });
             } else if (warmup) {

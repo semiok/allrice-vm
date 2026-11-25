@@ -46,6 +46,7 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
           vm: VmStampRow | null;
           grants: string[];
           employeeGrant: string | null;
+          threadGrant: string | null;
         }[]
       >`
       select (select row_to_json(stamp) from (
@@ -70,14 +71,24 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
         join allrice_users u on u.id=i.owner_id and u.status='active'
         where i.id=${identity.employeeInstanceId} and i.owner_id=${identity.personId}
           and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
-          and i.archived_at is null and a.active) as "employeeGrant"`;
-      const { vm, grants, employeeGrant } = snapshot!;
+          and i.archived_at is null and a.active) as "employeeGrant",
+      case when ${identity.threadId}::uuid is null then 'employee'
+      else (select c.xmin::text from allrice_chat_sessions c
+        where c.id=${identity.threadId} and c.owner_id=${identity.personId}
+          and c.organization_id=${identity.organizationId} and c.workspace_id=${identity.workspaceId}
+          and c.archived_at is null) end as "threadGrant"`;
+      const { vm, grants, employeeGrant, threadGrant } = snapshot!;
       return {
         // Tuple versions partition reuse across a revoke/regrant even if the
         // restored membership has the same role. They never grant authority.
         authorityRevision:
-          grants.length && employeeGrant
-            ? JSON.stringify([policy.revision, grants, employeeGrant])
+          grants.length && employeeGrant && threadGrant
+            ? JSON.stringify([
+                policy.revision,
+                grants,
+                employeeGrant,
+                threadGrant,
+              ])
             : null,
         vm: vm ? { ...vm, leaseEpoch: Number(vm.leaseEpoch) } : null,
       };
@@ -299,36 +310,39 @@ export function createDEntryNativePrewarmPort(input: {
               })
             : undefined;
         const warmed = ticket && (await ticket.flight.work);
-        // A lifecycle transition may outrun the read used to reserve a flight.
-        // The initiator already used the real lease; a waiter must qualify
-        // its own operation if the successful start belonged to another epoch.
-        if (ticket && !ticket.started && !warmed?.generation) await current();
-        active.throwIfAborted();
-        const result =
-          warmed && (ticket?.started || warmed.generation)
-            ? warmed.result
-            : await start(AbortSignal.any([input.lifetime, revoked]));
-        await current();
-        if (
-          result.personId !== identity.personId ||
-          result.organizationId !== identity.organizationId
-        )
-          throw new DataAccessError('authorization_denied');
-        const proof = await prove?.(context, identity, active);
-        if (
-          warmed?.generation &&
-          read &&
-          revision &&
-          !matchingGeneration(
-            await read(identity),
-            revision,
-            result,
-            warmed.generation,
+        async function qualify(result: PersonVmView, generation?: Generation) {
+          await current();
+          if (
+            result.personId !== identity.personId ||
+            result.organizationId !== identity.organizationId
           )
-        )
-          throw new PersonVmError('LEASE_LOST');
+            throw new DataAccessError('authorization_denied');
+          const proof = await prove?.(context, identity, active);
+          if (
+            generation &&
+            read &&
+            revision &&
+            !matchingGeneration(
+              await read(identity),
+              revision,
+              result,
+              generation,
+            )
+          )
+            return;
+          active.throwIfAborted();
+          return { proof };
+        }
+        if (warmed && (ticket?.started || warmed.generation)) {
+          const qualified = await qualify(warmed.result, warmed.generation);
+          if (qualified) return qualified.proof;
+        }
+        // A transition can outrun the reservation or a caller's editor proof.
+        // Use the original lease path when the shared epoch no longer matches.
+        if (ticket) await current();
         active.throwIfAborted();
-        return proof;
+        const own = await start(AbortSignal.any([input.lifetime, revoked]));
+        return (await qualify(own))?.proof;
       });
       pending.add(task);
       void task.then(
