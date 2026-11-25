@@ -97,6 +97,7 @@ export class PersonVmService
       observeOwnedMount?: (binding: PersonVmBinding) => void;
       observeOwnedStop?: (binding: PersonVmBinding) => void;
       ownsEgressReceipt?: (receipt: PersonVmEgressReceipt) => boolean;
+      /** An unresolved local egress epoch keeps its shared mount reserved. */
       hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
       settleSupersededBinding?: (
         binding: PersonVmBinding,
@@ -464,6 +465,8 @@ export class PersonVmService
     signal: AbortSignal,
   ) {
     const row = this.required(lease.row);
+    if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row)))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (!this.options.egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
     if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
     if (

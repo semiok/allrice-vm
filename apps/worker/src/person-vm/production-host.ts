@@ -606,7 +606,14 @@ export function createProductionPersonVmHost(input: {
             if (sameReceipt(retained, receipt)) return true;
           return false;
         },
-        hasUnconfirmedEgress: hasUnconfirmedPreparation,
+        hasUnconfirmedEgress(binding) {
+          return [...uncertainPreparation.keys()].some(
+            (pending) =>
+              pending.vmId === binding.vmId &&
+              pending.personId === binding.personId &&
+              pending.organizationId === binding.organizationId,
+          );
+        },
         settleSupersededBinding,
         ...providers.configuration.lifecycle,
       });

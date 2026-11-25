@@ -400,6 +400,7 @@ export function createEgressGateway(
         signal.throwIfAborted();
         const previous = states.get(binding.vmId);
         if (previous) {
+          if (previous.rollbackPending) throw new EgressError('UNAVAILABLE');
           if (exact(previous.receipt.binding, binding) && previous.active) {
             // An initial empty lease port list may retry before its save ACK.
             // It reuses the actual allocated receipt, never allocates again.

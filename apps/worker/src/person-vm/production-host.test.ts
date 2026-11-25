@@ -820,6 +820,26 @@ it.each(['original epoch', 'peer epoch'] as const)(
     expect(record).toMatchObject({ phase: 'failed', egressReceipt: null });
     expect(providers.native.stop).toHaveBeenCalled();
     expect(providers.disk.detach).not.toHaveBeenCalled();
+    const peer = kind === 'peer epoch';
+    if (peer) {
+      await value.memory.withLease(
+        context.actor.id,
+        { now: () => new Date(), ttlMs: 5000 },
+        async (lease) => {
+          const next = lease.row!;
+          next.instanceId = randomUUID();
+          next.leaseEpoch++;
+          next.phase = 'stopped';
+          await lease.save(next);
+        },
+      );
+      const attachCount = vi.mocked(providers.disk.attach).mock.calls.length;
+      await expect(vm.start(context, signal())).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(providers.disk.attach).toHaveBeenCalledTimes(attachCount);
+      expect(value.prepare).toHaveBeenCalledOnce();
+    }
     const original = value.host.close();
     await expect(original).rejects.toMatchObject({
       errors: expect.arrayContaining([failed]),
@@ -838,20 +858,6 @@ it.each(['original epoch', 'peer epoch'] as const)(
 
     expect(providers.native.stop).toHaveBeenCalledTimes(beforeRecovery);
     vi.mocked(provisioner.remove).mockResolvedValue(undefined);
-    const peer = kind === 'peer epoch';
-    if (peer) {
-      await value.memory.withLease(
-        context.actor.id,
-        { now: () => new Date(), ttlMs: 5000 },
-        async (lease) => {
-          const next = lease.row!;
-          next.instanceId = randomUUID();
-          next.leaseEpoch++;
-          next.phase = 'stopped';
-          await lease.save(next);
-        },
-      );
-    }
     const before = await value.memory.read(context.actor.id);
     const statuses = vi.mocked(providers.native.status).mock.calls.length;
     await expect(value.host.recoverModelOwner(context, signal())).resolves.toBe(

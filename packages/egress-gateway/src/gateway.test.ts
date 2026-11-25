@@ -415,6 +415,10 @@ describe('trusted VM HTTP egress (VM and identity owners are explicit fixtures)'
     ).rejects.toMatchObject({
       code: 'STALE_BINDING',
     });
+    const later = { ...next, instanceId: 'instance-c', leaseEpoch: 3 };
+    await expect(
+      f.gateway.prepare(later, { mount: f.mount, gatewayPorts: [] }, signal()),
+    ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
     expect(f.provisioner.remove).not.toHaveBeenCalled();
     await expect(f.gateway.retireFailedPrepare(next, signal())).rejects.toThrow(
       'EGRESS_CLEANUP_INCOMPLETE',
