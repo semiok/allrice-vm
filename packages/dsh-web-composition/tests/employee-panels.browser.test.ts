@@ -686,7 +686,7 @@ suite('installed native employee panels with synthetic business owner', () => {
     }
   });
 
-  it('uses four original entries and native tabs/close while unknown owner data fails closed', async () => {
+  it('uses four original entries and native tabs/close without a badge for an unknown unread count', async () => {
     const entries = page.locator('[aria-label="工作台入口"]');
     expect(await entries.getByRole('button').count()).toBe(4);
     expect(
@@ -710,9 +710,18 @@ suite('installed native employee panels with synthetic business owner', () => {
       .click();
     await body(page, 'workflow').waitFor({ state: 'hidden' });
     await command('unknownFiles', true);
-    await entries.waitFor({ state: 'hidden' });
+    const files = entries.getByRole('button', {
+      name: '交付成果',
+      exact: true,
+    });
+    await files.waitFor({ state: 'visible' });
+    expect((await evidence()).ownerBound).toBe(true);
+    expect(await entries.getByRole('button').count()).toBe(4);
+    expect(await files.locator('span[aria-hidden="true"]').count()).toBe(0);
     await command('unknownFiles', false);
-    await entries.waitFor({ state: 'visible' });
+    await entries
+      .getByRole('button', { name: '交付成果，5 项新增', exact: true })
+      .waitFor({ state: 'visible' });
     expect(
       await entries
         .getByRole('button', { name: '企业资料', exact: true })
@@ -809,6 +818,7 @@ suite('installed native employee panels with synthetic business owner', () => {
       .locator('[aria-label="工作台入口"]')
       .waitFor({ state: 'hidden' });
     const disposed = await evidence();
+    expect(disposed.ownerBound).toBe(false);
     expect(disposed.oldOwnerAborted).toBe(true);
     expect(disposed.listeners).toBe(0);
     expect(disposed.panelEntries).toEqual([]);

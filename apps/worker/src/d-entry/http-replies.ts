@@ -68,14 +68,22 @@ export function createDEntryHttpReplies(serviceSignal: AbortSignal) {
       const wire = new Promise<boolean>((resolve) => {
         settle = resolve;
       });
-      const finished = () => settle(true);
+      function finished() {
+        // A pending write callback can run during disconnect. Wait for the
+        // actual socket close in that case. Observe finish before Node assigns
+        // the socket to its next response or starts a normal connection close.
+        if (!socket.destroyed && !socket.errored) settle(true);
+      }
       const closed = () => settle(false);
-      response.once('finish', finished);
-      response.once('close', closed);
+      const responseClosed = () => {
+        if (!socket.destroyed && !socket.errored) closed();
+      };
+      response.prependOnceListener('finish', finished);
+      response.once('close', responseClosed);
       physical.addEventListener('abort', closed, { once: true });
       void wire.then(() => {
         response.off('finish', finished);
-        response.off('close', closed);
+        response.off('close', responseClosed);
         physical.removeEventListener('abort', closed);
       });
 
@@ -126,24 +134,37 @@ export function createDEntryHttpReplies(serviceSignal: AbortSignal) {
         return false;
       }
       if (active.aborted && !response.headersSent) return refuse();
-      // Once a fixed-length response has started, only transport closure
-      // can both stop its bytes and avoid corrupting HTTP/1.1 framing.
+      const destroy = () => {
+        if (
+          !response.writableFinished &&
+          !response.destroyed &&
+          response.socket
+        )
+          response.destroy();
+      };
       const abort = () => {
-        if (!response.writableFinished && response.socket) response.destroy();
+        // end() committed the whole finite reply to Node. Drain that reply
+        // without tearing down the shared HTTP/1.1 connection. An unended
+        // SSE response still needs actual transport cancellation.
+        if (!response.writableEnded) destroy();
       };
       active.addEventListener('abort', abort, { once: true });
+      // The Worker is stopping the entire HTTP service, including this
+      // connection. Do not wait for a blocked peer to consume pending bytes.
+      serviceSignal.addEventListener('abort', destroy, { once: true });
       try {
         if (active.aborted) abort();
         else write();
         return await wire;
       } catch (error) {
         if (response.headersSent) {
-          abort();
+          destroy();
           await wire;
         } else closed();
         throw error;
       } finally {
         active.removeEventListener('abort', abort);
+        serviceSignal.removeEventListener('abort', destroy);
       }
     }
   }

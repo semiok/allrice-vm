@@ -367,29 +367,57 @@ it(
   },
 );
 
-it(
-  'keeps page close pending until a backpressured native RPC physically closes',
+it.each(['full reply', 'peer disconnect'] as const)(
+  'joins the committed RPC on %s after fencing the page on a shared HTTP socket',
   { timeout: 30_000 },
-  async () => {
+  async (outcome) => {
     const f = await fixture();
     const page = await open(f);
     const neighbor = await open(f);
-    f.host.catalog.pageRecords = [
+    const data = 'synthetic private response'.repeat(400_000);
+    const records = [
       {
         type: 'event',
         event: {
           type: 'fixture-response-bytes',
           seq: 1,
           time: 1,
-          data: 'synthetic private response'.repeat(400_000),
+          data,
           ignorable: true,
         },
       },
-    ];
+    ] as const;
+    f.host.catalog.pageRecords = records;
+
     const submitted = deferred<ServerResponse>();
+    const successorWaiting = deferred<ServerResponse>();
+    const successorChecking = deferred();
+    const allowSuccessor = deferred();
+    let serverSocket: Socket | undefined;
+    let firstFinished = false;
     const observe = (request: IncomingMessage, response: ServerResponse) => {
       if (request.url !== rpcPath) return;
-      f.worker.off('request', observe);
+      if (serverSocket) {
+        if (request.socket !== serverSocket) return;
+        f.worker.off('request', observe);
+        response.once('socket', () => {
+          vi.mocked(f.owner.assertCurrent).mockImplementationOnce(async () => {
+            successorChecking.resolve();
+            await allowSuccessor.promise;
+          });
+        });
+        function queued(event: string | symbol) {
+          if (event !== 'socket') return;
+          response.off('newListener', queued);
+          successorWaiting.resolve(response);
+        }
+        response.on('newListener', queued);
+        return;
+      }
+      serverSocket = request.socket;
+      response.once('finish', () => {
+        firstFinished = true;
+      });
       const end = response.end;
       const wrapped = vi
         .spyOn(response, 'end')
@@ -404,56 +432,117 @@ it(
     closes.push(async () => f.worker.off('request', observe));
     const { address, port } = f.worker.address() as AddressInfo;
     const client = createConnection({ host: address, port });
-    // Keep the real peer paused so the kernel cannot accept the complete reply.
-    client.pause();
     const closed = once(client, 'close');
     void closed.catch(() => {});
+    const wire = observeProfileWire(client);
+    // The peer can pipeline its second request, but it cannot consume the first.
+    client.pause();
     closes.push(async () => {
       client.destroy();
       await closed.catch(() => {});
+      await wire.dispose();
     });
+    closes.push(async () => allowSuccessor.resolve());
+    function beforeDisconnect<T>(work: Promise<T>) {
+      return Promise.race([
+        work,
+        closed.then(() => {
+          throw Error('RPC socket ended before the expected response phase');
+        }),
+      ]);
+    }
     await once(client, 'connect');
     writePageRpc(
       client,
       f.rpcBody(page.scopeId, { rpcId: 'backpressured-rpc' }),
     );
-    const response = await Promise.race([
-      submitted.promise,
-      closed.then(() => {
-        throw Error('RPC socket ended before submitting the result');
-      }),
-    ]);
+    const response = await beforeDisconnect(submitted.promise);
+    const socket = serverSocket!;
     expect(response.statusCode).toBe(200);
+    expect(response.socket).toBe(socket);
     expect(response.writableEnded).toBe(true);
-    expect(response.writableFinished).toBe(false);
-    expect(response.socket!.writableLength).toBeGreaterThan(0);
-    const held = holdSocket(response);
+    expect(firstFinished).toBe(false);
+    expect(socket.writableLength).toBeGreaterThan(0);
+    const destroy = vi.spyOn(socket, 'destroy');
+    let physicallyClosed = false;
+    const serverClosed = new Promise<void>((resolve) =>
+      socket.once('close', () => {
+        physicallyClosed = true;
+        resolve();
+      }),
+    );
+
     f.host.catalog.pageRecords = [];
+    writePageRpc(
+      client,
+      f.rpcBody(neighbor.scopeId, { rpcId: 'neighbor-after-commit' }),
+      'close',
+    );
+    const successor = await beforeDisconnect(successorWaiting.promise);
+    expect(successor.socket).toBeNull();
+    expect(successor.headersSent).toBe(false);
+
     let delivered = false;
     const terminal = page.receive().then((frame) => {
       delivered = true;
+      if (outcome === 'peer disconnect') expect(physicallyClosed).toBe(true);
+      else expect(firstFinished).toBe(true);
       return frame;
     });
+    void terminal.catch(() => {});
+    const fenced = once(page.revoked, 'abort');
+    closePage(page.peer);
+    await Promise.race([fenced, terminal]);
+    expect(page.revoked.aborted).toBe(true);
+    expect((await f.invoke(page.scopeId)).status).toBe(404);
+    expect(delivered).toBe(false);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(firstFinished).toBe(false);
+    expect(physicallyClosed).toBe(false);
+    expect(successor.headersSent).toBe(false);
+
+    if (outcome === 'peer disconnect') {
+      client.resetAndDestroy();
+      await serverClosed;
+      expect(await terminal).toMatchObject({
+        value: { type: 'closed', scopeId: page.scopeId },
+      });
+      expect(await page.receive()).toEqual({ type: 'end', streamId: 'life' });
+      expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
+      return;
+    }
 
     try {
-      closePage(page.peer);
-      await Promise.race([
-        held.fenced,
-        terminal.then(() => {
-          throw Error('Page terminated while RPC output was still live');
-        }),
-      ]);
-      expect(page.revoked.aborted).toBe(true);
-      expect((await f.invoke(page.scopeId)).status).toBe(404);
-      expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
-      expect(delivered).toBe(false);
-      expect(response.socket!.closed).toBe(false);
+      client.resume();
+      const first = await wire.head(200);
+      expect(JSON.parse((await wire.body(first)).toString())).toEqual({
+        type: 'server-response',
+        rpcId: 'backpressured-rpc',
+        result: { ok: true, value: { records, hasMore: false } },
+      });
+      await beforeDisconnect(successorChecking.promise);
+      expect(await terminal).toMatchObject({
+        value: { type: 'closed', scopeId: page.scopeId },
+      });
+      expect(await page.receive()).toEqual({ type: 'end', streamId: 'life' });
+      expect(firstFinished).toBe(true);
+      expect(physicallyClosed).toBe(false);
+      expect(successor.socket).toBe(socket);
+      expect(successor.headersSent).toBe(false);
+      expect(destroy).not.toHaveBeenCalled();
     } finally {
-      held.release.resolve();
+      allowSuccessor.resolve();
     }
-    await held.closed;
-    expect(await terminal).toMatchObject({ value: { type: 'closed' } });
-    expect(await page.receive()).toEqual({ type: 'end', streamId: 'life' });
+    const last = await wire.head(200);
+    expect(last.get('connection')).toBe('close');
+    expect(JSON.parse((await wire.body(last)).toString())).toEqual({
+      type: 'server-response',
+      rpcId: 'neighbor-after-commit',
+      result: { ok: true, value: { records: [], hasMore: false } },
+    });
+    await wire.expectEnd();
+    await closed;
+    await serverClosed;
     expect((await f.invoke(neighbor.scopeId)).status).toBe(200);
   },
 );
