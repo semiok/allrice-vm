@@ -121,6 +121,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       native: {
         ...base.native,
         attemptId: 'fixture-actual-native-attempt',
+        attemptKind: 'assistant' as const,
         attemptTurn: 1,
         attemptCursor: 7,
       },

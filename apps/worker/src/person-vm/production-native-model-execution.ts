@@ -24,6 +24,7 @@ import {
   dEntryNativeOwnerPort,
   resolveDEntryNativeResource,
 } from '../d-entry/native-owner.js';
+import type { NativeModelAttemptKind } from '../native-web/owner.js';
 import type { ProductionNativeModelExecution } from './production-sources.js';
 
 export type NativeModelSelection = Readonly<{
@@ -152,7 +153,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         Map<
           string,
           {
-            turn: number;
+            turn: number | string;
             runId: string;
             executionId: string;
           }
@@ -190,6 +191,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       async function resolveSession(
         scope: NativeModelSelection,
         sessionId: string,
+        kind: NativeModelAttemptKind,
         signal: AbortSignal,
       ) {
         const active = AbortSignal.any([signal, scope.revoked]);
@@ -219,13 +221,14 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           identity,
           owner: current.owner,
           nativeSessionId: sessionId,
-          requireRunning: true,
+          requireLiveAgent: true,
           signal: active,
         });
         const attempt = await profile.owner.readNativeAttemptFor(
           context,
           sessionId,
           active,
+          kind,
         );
         profile.revoked.throwIfAborted();
         active.throwIfAborted();
@@ -245,9 +248,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           const { resource, profile, attempt } = await resolveSession(
             owned.scope,
             call.native.sessionId,
+            call.native.attemptKind ?? 'assistant',
             active,
           );
           if (
+            attempt.kind !== call.native.attemptKind ||
             attempt.id !== call.native.attemptId ||
             attempt.turn !== call.native.attemptTurn ||
             attempt.cursor !== call.native.attemptCursor ||
@@ -263,9 +268,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         });
       }
 
-      const references: ManagedHostService = {
+      const paths = [
+        ['assistant', '/v1/reference'],
+        ['compaction', '/v1/reference/compaction'],
+      ] as const;
+      const references = paths.map<ManagedHostService>(([kind, path]) => ({
         id: 'model-reference',
-        path: '/v1/reference',
+        path,
         method: 'POST',
         admissionOwner: 'service',
         async resolve(request, binding, signal) {
@@ -289,6 +298,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               const resolved = await resolveSession(
                 scope,
                 wanted.sessionId,
+                kind,
                 active,
               ).catch((error: unknown) => {
                 if (
@@ -309,9 +319,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 executions.set(profile.owner, bySession);
               }
               let execution = bySession.get(resource.nativeSessionId);
-              if (execution?.turn !== attempt.turn) {
+              const turn = attempt.turn ?? attempt.id;
+              if (execution?.turn !== turn) {
                 execution = {
-                  turn: attempt.turn,
+                  turn,
                   runId: randomUUID(),
                   executionId: randomUUID(),
                 };
@@ -337,6 +348,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     rootSessionId: resource.rootNativeSessionId,
                     parentSessionId: resource.parentNativeSessionId,
                     callId: randomUUID(),
+                    attemptKind: attempt.kind,
                     attemptId: attempt.id,
                     attemptTurn: attempt.turn,
                     attemptCursor: attempt.cursor,
@@ -406,7 +418,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             }
           });
         },
-      };
+      }));
       let closing: Promise<void> | undefined;
       const owner: Installed = {
         assertCall,

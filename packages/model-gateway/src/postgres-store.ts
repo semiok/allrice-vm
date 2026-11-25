@@ -82,6 +82,7 @@ export function nativeCallKey(binding: ModelCallBinding): string {
         binding.native.attemptId
           ? [
               'native-attempt',
+              binding.native.attemptKind,
               binding.native.attemptId,
               binding.native.attemptTurn,
               binding.native.attemptCursor,
@@ -103,7 +104,9 @@ export function createPostgresModelGatewayStore(
     async reserveNativeCall(binding) {
       if (
         !binding.native.attemptId ||
-        !Number.isSafeInteger(binding.native.attemptTurn) ||
+        !binding.native.attemptKind ||
+        (binding.native.attemptTurn !== null &&
+          !Number.isSafeInteger(binding.native.attemptTurn)) ||
         !Number.isSafeInteger(binding.native.attemptCursor) ||
         binding.executionGeneration !== '4.0'
       )

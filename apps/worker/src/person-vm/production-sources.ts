@@ -52,7 +52,7 @@ export interface ProductionNativeModelExecution {
       selection: NativeModelSelection,
       signal: AbortSignal,
     ): Promise<void>;
-    references?: ManagedHostService;
+    references?: readonly ManagedHostService[];
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
@@ -148,7 +148,7 @@ export function createProductionPersonVmSources(
             authority: egress.authority,
             bindModelCall: egress.bindModelCall,
             policy: { routes: [] },
-            services: owned.references ? [owned.references] : [],
+            services: owned.references ?? [],
             close: codex.close,
           },
           model: {

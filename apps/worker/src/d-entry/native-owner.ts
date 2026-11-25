@@ -173,6 +173,7 @@ export async function resolveDEntryNativeResource(input: {
   signal: AbortSignal;
   root?: typeof getDEntryNativeRootPin;
   requireRunning?: boolean;
+  requireLiveAgent?: boolean;
   checkGrants?: {
     nativeSessionIds: readonly string[];
     checked(current: boolean): void;
@@ -227,6 +228,7 @@ export async function resolveDEntryNativeResource(input: {
   const currentSession = entries.get(nativeSessionId);
   if (
     !resource ||
+    (input.requireLiveAgent && !currentSession?.agentAvailable) ||
     (input.requireRunning &&
       (!currentSession?.agentAvailable || !currentSession.running))
   )

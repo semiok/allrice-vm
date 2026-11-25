@@ -26,6 +26,7 @@ type ManagedGuestModelCall = {
       sessionId: NonNullable<GenerateOptions['sessionId']>;
     }>,
     signal: AbortSignal,
+    purpose?: GenerateOptions['purpose'],
   ): Promise<string>;
 };
 import type {
@@ -136,10 +137,14 @@ export class GatewayLlmAdapter extends LlmAdapter {
       )
         throw new ModelGatewayError('BINDING_INVALID');
       signal.throwIfAborted();
-      reference = await this.managed.resolveCallReference(
-        { provider, model, sessionId },
-        signal,
-      );
+      const selection = { provider, model, sessionId };
+      reference = options.purpose
+        ? await this.managed.resolveCallReference(
+            selection,
+            signal,
+            options.purpose,
+          )
+        : await this.managed.resolveCallReference(selection, signal);
       signal.throwIfAborted();
       if (!isModelCallReference(reference))
         throw new ModelGatewayError('BINDING_INVALID');

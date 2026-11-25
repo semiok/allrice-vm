@@ -461,6 +461,7 @@ it('an egress source cannot substitute another VM or shared admission boundary',
       admission: {
         boundary: actual.admission,
         participant: expect.objectContaining({ participant: 'gateway' }),
+        recoverStoppedPermit: expect.any(Function),
       },
     }),
   );

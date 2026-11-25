@@ -345,7 +345,6 @@ export function apply(ctx, config) {
         modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
-      const endpoint = new URL('/v1/reference', origin);
       modelFiber = ctx.inject(['llm'], async (scope) => {
         if (!current()) return;
         const dispose = registerManagedGatewayAdapter(scope.llm, {
@@ -356,7 +355,17 @@ export function apply(ctx, config) {
             model,
             modelInfo,
             lifetime: signal,
-            async resolveCallReference(selection, active) {
+            async resolveCallReference(selection, active, purpose) {
+              // The optional native title plugin has a durable request record
+              // but no live call join marker. Its native fallback remains.
+              if (purpose === 'session-title')
+                throw Error('Native title model ownership is unavailable');
+              const endpoint = new URL(
+                purpose === 'compaction'
+                  ? '/v1/reference/compaction'
+                  : '/v1/reference',
+                origin,
+              );
               const response = await globalThis.fetch(endpoint, {
                 method: 'POST',
                 redirect: 'error',

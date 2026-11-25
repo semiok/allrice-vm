@@ -14,6 +14,7 @@ import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import type { RequestContext } from '@allrice/contracts';
 import type {
   ModelCatalog,
+  SessionFollowFrame,
   SessionCreateRequest,
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import {
@@ -40,6 +41,49 @@ type EditorEvidence<T> = (
   signal: AbortSignal,
   modelAdapterId?: string,
 ) => Promise<T>;
+
+export type NativeModelAttemptKind = 'assistant' | 'compaction';
+
+export function readNativeModelAttempt(
+  snapshot: Pick<
+    Extract<SessionFollowFrame, { type: 'snapshot' }>,
+    'records' | 'assistantStream'
+  >,
+  kind: NativeModelAttemptKind,
+) {
+  if (kind === 'assistant') {
+    const attempt = snapshot.assistantStream?.activeAttempt;
+    return attempt
+      ? {
+          kind,
+          id: attempt.attemptId,
+          turn: attempt.turn,
+          cursor: attempt.startedAfterSeq,
+        }
+      : null;
+  }
+  // Native automatic and manual compaction own a real journal bracket before
+  // their summarizer enters Llm. A seed cut closes a prior lifecycle.
+  for (const { event } of [...snapshot.records].reverse()) {
+    if (event.type === 'session/end-seed' || event.type === 'compaction/end')
+      break;
+    if (event.type !== 'compaction/start') continue;
+    const data = event.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const { compactionId, turn } = data;
+    if (
+      typeof compactionId !== 'string' ||
+      !compactionId ||
+      !(
+        turn === null ||
+        (typeof turn === 'number' && Number.isSafeInteger(turn))
+      )
+    )
+      return null;
+    return { kind, id: compactionId, turn, cursor: event.seq };
+  }
+  return null;
+}
 
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
@@ -547,6 +591,7 @@ export async function openNativeWebOwner(input: {
         context: RequestContext,
         nativeSessionId: string,
         caller: AbortSignal,
+        kind: NativeModelAttemptKind = 'assistant',
       ) {
         const current = AbortSignal.any([
           caller,
@@ -576,14 +621,7 @@ export async function openNativeWebOwner(input: {
               const snapshot = protocol.result.create().parse(first.value);
               if (snapshot.type !== 'snapshot')
                 throw new PersonVmError('RUNTIME_NOT_READY');
-              const found = snapshot.assistantStream?.activeAttempt;
-              return found
-                ? {
-                    id: found.attemptId,
-                    turn: found.turn,
-                    cursor: found.startedAfterSeq,
-                  }
-                : null;
+              return readNativeModelAttempt(snapshot, kind);
             } finally {
               // Dispose this logical read on its original carrier. The
               // shared owner still owns actual socket close at retirement.
