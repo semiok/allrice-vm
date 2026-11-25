@@ -252,10 +252,16 @@ it.skipIf(!cli)(
       );
       if (view.endpoint !== 'session/projections' || !view.value)
         throw Error('Native inbox projection unavailable');
-      const inbox = view.value.values.inbox as {
-        'next-turn': { id: string }[];
-      };
-      expect(inbox['next-turn']).toHaveLength(1);
+      const pending = view.value.values.inbox?.['next-turn'];
+      expect(pending).toHaveLength(1);
+      const item = pending?.[0];
+      if (
+        !item ||
+        typeof item !== 'object' ||
+        !('id' in item) ||
+        typeof item.id !== 'string'
+      )
+        throw Error('Native inbox item ID unavailable');
       expect(
         await scope.invoke(
           {
@@ -267,7 +273,7 @@ it.skipIf(!cli)(
               .parse({
                 request: {
                   sessionId,
-                  itemId: inbox['next-turn'][0]!.id,
+                  itemId: item.id,
                   action: { kind: 'remove' },
                 },
               }),
