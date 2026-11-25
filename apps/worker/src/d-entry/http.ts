@@ -302,7 +302,8 @@ export function createDEntryHttpHandler(
         // Control readiness is only a necessary transport prerequisite. It
         // never grants editor/send readiness or substitutes for the real
         // complete-envelope resolver/admission owner below.
-        if (!data || !current.owner.controlReady())
+        const acquireRpc = data?.acquireRpc?.bind(data);
+        if (!data || !current.owner.controlReady() || (rpc && !acquireRpc))
           throw new DEntryNativeUnavailable();
         const parsed = parsedRpc;
         const pin = creatingRoot
@@ -482,9 +483,9 @@ export function createDEntryHttpHandler(
                     );
                 },
               };
-            } else if (parsed) {
+            } else if (parsed && acquireRpc) {
               try {
-                activity = data.acquireRpc(
+                activity = acquireRpc(
                   {
                     owner: current.owner,
                     invocation: parsed,

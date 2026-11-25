@@ -7,6 +7,7 @@ import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/re
 import { createDEntryPrincipalControl } from '../d-entry/principal-control.js';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import type { RequestContext } from '@allrice/contracts';
+import type { SessionCreateRequest } from '@deepseek-ai/dsh-api-session-controller/types';
 import {
   PersonVmError,
   sameVmBinding,
@@ -16,6 +17,7 @@ import {
 } from '@allrice/person-vm';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
 
 /** Real public Node control owner for one already published native Web job.
  * This is not Runtime.ready, editor readiness, or a VM-wide activity producer. */
@@ -190,6 +192,52 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
+  function readGraph(current: AbortSignal) {
+    return transport.readIndex(current).then((html): unknown => {
+      const rows = [
+        ...html.matchAll(
+          /<script>globalThis\["__DSH_BOOT__"\] = ([^<]+)<\/script>/g,
+        ),
+      ];
+      if (rows.length !== 1) throw new PersonVmError('RUNTIME_NOT_READY');
+      return JSON.parse(rows[0]![1]!);
+    });
+  }
+  function readBundle(
+    reference: string,
+    expectedBytes: number,
+    current: AbortSignal,
+  ) {
+    if (
+      !/^plugins\/\?\?(?:[@a-z\d._/-]+(?:,[@a-z\d._/-]+)*)&rev=[a-f\d]+$/i.test(
+        reference,
+      )
+    )
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    const url = new URL(reference, input.launch.auth.origin);
+    if (url.pathname !== '/plugins/' || url.hash)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    return transport.readExact(url, expectedBytes, current);
+  }
+  function readCurrent<T>(
+    requestSignal: AbortSignal,
+    assertCurrent: (active: AbortSignal) => Promise<void>,
+    read: (active: AbortSignal) => Promise<T>,
+  ) {
+    const current = AbortSignal.any([signal, requestSignal]);
+    return own(
+      Promise.resolve().then(async () => {
+        current.throwIfAborted();
+        if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
+        await assertCurrent(current);
+        current.throwIfAborted();
+        const result = await read(current);
+        await assertCurrent(current);
+        current.throwIfAborted();
+        return result;
+      }),
+    );
+  }
   try {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
@@ -252,11 +300,57 @@ export async function openNativeWebOwner(input: {
         }
       })(),
     ).catch(() => {});
+    // The bootstrap capability expires normally after the enclosing start
+    // callback. The adopted native job belongs to the Host lifetime from here.
+    input.scope.signal.removeEventListener('abort', aborted);
     return Object.freeze({
       binding,
       revoked: signal,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
+      verifyStartingEditor<T>(
+        startingScope: PersonVmBootstrapScope,
+        caller: AbortSignal,
+        verify: (
+          profile: DEntryFixedProfileSource,
+          models: () => ReturnType<typeof root.remote.session.modelCatalog>,
+          active: AbortSignal,
+        ) => Promise<T>,
+      ) {
+        if (startingScope !== input.scope)
+          return Promise.reject(new PersonVmError('LEASE_LOST'));
+        const current = AbortSignal.any([caller, startingScope.signal]);
+        const guard = () => startingScope.assertCurrent();
+        return readCurrent(current, guard, (active) =>
+          verify(
+            {
+              revoked: active,
+              readImmutableGraph: (signal) =>
+                readCurrent(signal, guard, readGraph),
+              readImmutableBundle: (reference, bytes, signal) =>
+                readCurrent(signal, guard, (reading) =>
+                  readBundle(reference, bytes, reading),
+                ),
+            },
+            () =>
+              readCurrent(active, guard, () =>
+                root.remote.session.modelCatalog(),
+              ),
+            active,
+          ),
+        );
+      },
+      createRootFor(
+        context: RequestContext,
+        request: SessionCreateRequest,
+        caller: AbortSignal,
+      ) {
+        return readCurrent(
+          caller,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          () => root.remote.session.create(request),
+        );
+      },
       acquirePrincipal(
         issue: DEntryPrincipalIssue,
         requestSignal: AbortSignal,
@@ -303,16 +397,7 @@ export async function openNativeWebOwner(input: {
             current.throwIfAborted();
             if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const html = await transport.readIndex(current);
-            // renderIndexInjections uses exact global assignment with JSON; any
-            // ambiguity, changed rendering contract or missing graph fails closed.
-            const rows = [
-              ...html.matchAll(
-                /<script>globalThis\["__DSH_BOOT__"\] = ([^<]+)<\/script>/g,
-              ),
-            ];
-            if (rows.length !== 1) throw new PersonVmError('RUNTIME_NOT_READY');
-            const graph: unknown = JSON.parse(rows[0]![1]!);
+            const graph = await readGraph(current);
             await input.vm.assertCurrentBinding(context, binding, current);
             current.throwIfAborted();
             return graph;
@@ -331,19 +416,9 @@ export async function openNativeWebOwner(input: {
         return own(
           Promise.resolve().then(async () => {
             current.throwIfAborted();
-            if (
-              !ready ||
-              closing ||
-              !/^plugins\/\?\?(?:[@a-z\d._/-]+(?:,[@a-z\d._/-]+)*)&rev=[a-f\d]+$/i.test(
-                reference,
-              )
-            )
-              throw new PersonVmError('RUNTIME_NOT_READY');
-            const url = new URL(reference, input.launch.auth.origin);
-            if (url.pathname !== '/plugins/' || url.hash)
-              throw new PersonVmError('RUNTIME_NOT_READY');
+            if (!ready || closing) throw new PersonVmError('RUNTIME_NOT_READY');
             await input.vm.assertCurrentBinding(context, binding, current);
-            const data = await transport.readExact(url, expectedBytes, current);
+            const data = await readBundle(reference, expectedBytes, current);
             await input.vm.assertCurrentBinding(context, binding, current);
             current.throwIfAborted();
             return data;

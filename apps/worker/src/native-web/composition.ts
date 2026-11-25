@@ -11,6 +11,7 @@ import type {
 } from '@allrice/person-vm';
 import { PersonVmError, sameVmBinding } from '@allrice/person-vm';
 import { preparePersonNativeWebRoster } from '@allrice/database';
+import type { RequestContext } from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
   prepareNativeWebLaunch,
@@ -21,6 +22,20 @@ import {
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
+type StartingEditorProof = (
+  input: Readonly<{
+    binding: PersonVmBinding;
+    endpoint: Endpoint;
+    context: RequestContext;
+    profile: Parameters<
+      Parameters<NativeWebOwner['verifyStartingEditor']>[2]
+    >[0];
+    readModels: Parameters<
+      Parameters<NativeWebOwner['verifyStartingEditor']>[2]
+    >[1];
+  }>,
+  signal: AbortSignal,
+) => Promise<boolean>;
 export type AssignedNativeWebCatalog = Readonly<{
   receipt: PersonVmWebEndpointReceipt;
   endpoint: Endpoint;
@@ -69,6 +84,8 @@ export function createAssignedNativeWebStartup(input: {
       bindingRef: string;
       revoked: AbortController;
       ready: boolean;
+      verifiedBy?: StartingEditorProof;
+      verifiedEmployees: Set<string>;
       owners: Map<string, NativeWebOwner>;
       starting: Promise<void>;
       retiring?: Promise<void>;
@@ -79,6 +96,7 @@ export function createAssignedNativeWebStartup(input: {
   const lifetime = AbortSignal.any([input.lifetime, stopped.signal]);
   const pending = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
+  let editorProof: StartingEditorProof | undefined;
   function track<T>(work: () => Promise<T>) {
     const operation = Promise.resolve().then(work);
     pending.add(operation);
@@ -126,6 +144,14 @@ export function createAssignedNativeWebStartup(input: {
   input.lifetime.addEventListener('abort', abort, { once: true });
   if (input.lifetime.aborted) abort();
   return {
+    installStartingEditorProof(proof: StartingEditorProof) {
+      lifetime.throwIfAborted();
+      if (closing || editorProof) throw new PersonVmError('RUNTIME_NOT_READY');
+      editorProof = proof;
+      return () => {
+        if (editorProof === proof) editorProof = undefined;
+      };
+    },
     memoryGuestPlan(
       binding: PersonVmBinding,
       signal: AbortSignal,
@@ -209,12 +235,13 @@ export function createAssignedNativeWebStartup(input: {
             ),
           ),
         });
-        const group = {
+        const group: NonNullable<ReturnType<typeof running.get>> = {
           binding,
           receipt,
           bindingRef: randomUUID(),
           revoked: new AbortController(),
           ready: false,
+          verifiedEmployees: new Set(),
           owners: new Map<string, NativeWebOwner>(),
           starting: operation,
           retiring: undefined as Promise<void> | undefined,
@@ -222,6 +249,7 @@ export function createAssignedNativeWebStartup(input: {
         };
         running.set(binding.vmId, group);
         try {
+          const prove = editorProof;
           for (const [index, launch] of launches.entries()) {
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
             current(binding, web);
@@ -236,10 +264,27 @@ export function createAssignedNativeWebStartup(input: {
               lifetime,
               cleanupTimeoutMs: input.cleanupTimeoutMs,
             });
-            group.owners.set(
-              web.receipt.endpoints[index]!.employeeInstanceId,
-              owner,
-            );
+            const endpoint = receipt.endpoints[index]!;
+            group.owners.set(endpoint.employeeInstanceId, owner);
+            if (
+              prove &&
+              (await owner.verifyStartingEditor(
+                scope,
+                signal,
+                (profile, readModels, active) =>
+                  prove(
+                    {
+                      binding: receipt.binding,
+                      endpoint,
+                      context: web.context,
+                      profile,
+                      readModels,
+                    },
+                    active,
+                  ),
+              ))
+            )
+              group.verifiedEmployees.add(endpoint.employeeInstanceId);
             current(binding, web);
             signal.throwIfAborted();
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
@@ -248,11 +293,14 @@ export function createAssignedNativeWebStartup(input: {
           signal.throwIfAborted();
           if (
             group.retiring ||
+            editorProof !== prove ||
+            (prove && !group.verifiedEmployees.size) ||
             [...group.owners.values()].some(
               (owner) => owner.revoked.aborted || !owner.controlReady(),
             )
           )
             throw new PersonVmError('RUNTIME_NOT_READY');
+          group.verifiedBy = prove;
           group.ready = true;
         } catch (error) {
           group.ready = false;
@@ -325,6 +373,30 @@ export function createAssignedNativeWebStartup(input: {
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
     },
+    assertVerifiedEditor(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      employeeInstanceId?: string,
+    ) {
+      const group = running.get(binding.vmId);
+      signal.throwIfAborted();
+      if (
+        !editorProof ||
+        group?.verifiedBy !== editorProof ||
+        !group.ready ||
+        !sameVmBinding(binding, group.binding) ||
+        group.retiring ||
+        group.revoked.signal.aborted ||
+        closing ||
+        lifetime.aborted ||
+        !group.verifiedEmployees.size ||
+        (employeeInstanceId &&
+          !group.verifiedEmployees.has(employeeInstanceId)) ||
+        !group.owners.size ||
+        [...group.owners.values()].some((owner) => !owner.controlReady())
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY');
+    },
     /** Publish only a completely started, exact group; this never starts a VM. */
     catalog(
       binding: PersonVmBinding,
@@ -386,6 +458,12 @@ export function createAssignedNativeWebStartup(input: {
     PersonVmRuntimePort,
     'memoryGuestPlan' | 'start' | 'retireAfterNativeStop'
   > & {
+    installStartingEditorProof(proof: StartingEditorProof): () => void;
+    assertVerifiedEditor(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      employeeInstanceId?: string,
+    ): void;
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,

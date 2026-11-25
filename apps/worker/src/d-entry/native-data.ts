@@ -24,11 +24,10 @@ export type DEntryNativeMuxChannel = Readonly<{
   send(frame: string): Promise<void>;
 }>;
 
-/** 271-owned request adapter requirements, NOT an implemented 273 transport.
- * A trusted composition must provide the real complete envelope resolver and
- * owned handles covering partial init, all children and actual transport join.
- * acquire is synchronous: failure before a handle exists stays unknown. run
- * starts I/O; close actively cancels then joins it. No long-lived job.close. */
+/** The admitted page carrier owns its non-owner RPC and mux transports.
+ * Older standalone carriers require their own explicit transport owners.
+ * Acquire is inert; close cancels and joins the operation without closing
+ * the shared native job. */
 export interface DEntryNativeDataPort {
   admission: DEntryAdmissionPorts;
   resolveAdmissionOwner(input: {
@@ -38,7 +37,7 @@ export interface DEntryNativeDataPort {
     operationId: string;
     signal: AbortSignal;
   }): Promise<DEntryAdmissionOwner>;
-  acquireRpc(
+  acquireRpc?(
     input: {
       owner: ResolvedDEntryNativeOwner;
       // Parsed generated input only. The adapter calls run ONLY after the
@@ -48,7 +47,7 @@ export interface DEntryNativeDataPort {
     },
     signal: AbortSignal,
   ): DEntryOwnedActivity<void>;
-  acquireMux(
+  acquireMux?(
     input: {
       owner: ResolvedDEntryNativeOwner;
       serve(

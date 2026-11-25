@@ -12,6 +12,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import * as PrincipalControl from '../d-entry/principal-control.js';
+import { holdReleasedProfile } from '../d-entry/released-profile.js';
 import {
   PersonVmError,
   type PersonVmBootstrapScope,
@@ -61,11 +62,34 @@ it.skipIf(!cli)(
   async () => {
     const f = await setup();
     expect(f.owner.controlReady()).toBe(true);
-    f.startup.abort();
-    expect((await f.owner.readSessions(new AbortController().signal)).ok).toBe(
-      true,
+    const signal = new AbortController().signal;
+    await expect(
+      f.owner.verifyStartingEditor({ ...f.scope }, signal, async () => {}),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    await f.owner.verifyStartingEditor(
+      f.scope,
+      signal,
+      async (source, readModels, active) => {
+        const held = await holdReleasedProfile(
+          f.seal.directory,
+          source,
+          active,
+          f.seal.manifestSha256,
+        );
+        expect(held.graph.entries.length).toBeGreaterThan(0);
+        expect((await readModels()).ok).toBe(true);
+      },
     );
-    expect(f.current).toHaveBeenCalledTimes(2);
+    expect(f.current).not.toHaveBeenCalled();
+    f.startup.abort();
+    await expect(
+      f.owner.verifyStartingEditor(f.scope, signal, async () => {}),
+    ).rejects.toBe(f.startup.signal.reason);
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    expect(created.ok).toBe(true);
+    const sessions = await f.owner.readSessions(signal);
+    expect(sessions.ok).toBe(true);
+    expect(f.current).toHaveBeenCalledTimes(4);
     expect(f.child.exitCode).toBe(null);
     await Promise.all([f.owner.close(), f.owner.close()]);
     expect(f.owner.controlReady()).toBe(false);
