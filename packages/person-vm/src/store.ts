@@ -7,6 +7,8 @@ import {
   type PersonVmView,
   type PersonVmHoldKind,
 } from './contract.ts';
+import type { PersonDisk } from './encrypted-disk.ts';
+import type { PersonVmStartingScope } from './guest-bootstrap.ts';
 
 export type VmHold = {
   id: string;
@@ -266,6 +268,69 @@ export class PostgresPersonVmStore implements PersonVmStore {
       );
       return row ? fromRow(row) : null;
     } finally {
+      await session.end();
+    }
+  }
+
+  /** The physical lifecycle and this read contend for the same exclusive
+   * PostgreSQL advisory lease. This read never claims business admission or
+   * replaces a durable owner left by a previous operation. */
+  async withRetainedReadLease<T>(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    work: (scope: PersonVmStartingScope, disk: PersonDisk) => Promise<T>,
+  ): Promise<T> {
+    signal.throwIfAborted();
+    binding = Object.freeze({ ...binding });
+    const session = new VmSqlSession(this.openSql());
+    const sql = session.client;
+    const scopeEnded = new AbortController();
+    const active = AbortSignal.any([signal, session.signal, scopeEnded.signal]);
+    async function readCurrent() {
+      active.throwIfAborted();
+      const [row] = await session.query(
+        () => sql`select phase, disk_tier, disk_retained, native_created, lease_owner
+        from person_virtual_machines where person_id=${binding.personId}
+          and organization_id=${binding.organizationId} and vm_id=${binding.vmId}
+          and instance_id=${binding.instanceId} and lease_epoch=${binding.leaseEpoch}`,
+      );
+      active.throwIfAborted();
+      if (
+        !row ||
+        row.phase !== 'running' ||
+        !row.disk_retained ||
+        !row.native_created ||
+        row.lease_owner !== null ||
+        (row.disk_tier !== 'warm' && row.disk_tier !== 'cold')
+      )
+        throw new PersonVmError('LEASE_LOST');
+      return row.disk_tier as PersonDisk['tier'];
+    }
+    try {
+      const [lock] = await session.query(
+        () =>
+          sql`select pg_try_advisory_lock(hashtextextended(${'person-vm:' + binding.personId},0)) as locked`,
+      );
+      if (!lock?.locked) throw new PersonVmError('LEASE_CONFLICT');
+      const tier = await readCurrent();
+      const scope: PersonVmStartingScope = Object.freeze({
+        binding,
+        signal: active,
+        async assertCurrent() {
+          if ((await readCurrent()) !== tier)
+            throw new PersonVmError('LEASE_LOST');
+        },
+      });
+      const result = await work(
+        scope,
+        Object.freeze({ vmId: binding.vmId, tier }),
+      );
+      await scope.assertCurrent();
+      return result;
+    } finally {
+      scopeEnded.abort();
+      // Closing the single owned PG connection releases the advisory lease.
+      // The read and all of its native cleanup have already returned.
       await session.end();
     }
   }

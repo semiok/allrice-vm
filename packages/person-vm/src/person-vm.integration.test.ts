@@ -124,6 +124,56 @@ suite(
         await admin`select pg_terminate_backend(${rows[0]!.pid}) as killed`;
       expect(killed!.killed).toBe(true);
     }
+    it('retains the physical read lease across the journal probe without fencing business admission', async () => {
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      let entered!: () => void;
+      let release!: () => void;
+      let captured!: PersonVmStartingScope;
+      const started = new Promise<void>((done) => {
+        entered = done;
+      });
+      const blocked = new Promise<void>((done) => {
+        release = done;
+      });
+      const read = store.withRetainedReadLease(
+        binding,
+        signal(),
+        async (scope, disk) => {
+          captured = scope;
+          expect(disk).toEqual({ vmId: binding.vmId, tier: 'warm' });
+          entered();
+          await blocked;
+          return 'physical-journal';
+        },
+      );
+      try {
+        await Promise.race([started, read]);
+        expect((await store.read(rc.actor.id))?.leaseOwner).toBeNull();
+        await expect(
+          store.withLease(
+            rc.actor.id,
+            { now: h.now, ttlMs: 90_000 },
+            async () => undefined,
+          ),
+        ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+      } finally {
+        release();
+      }
+      await expect(read).resolves.toBe('physical-journal');
+      expect(captured.signal.aborted).toBe(true);
+      await expect(
+        store.withLease(
+          rc.actor.id,
+          { now: h.now, ttlMs: 90_000 },
+          async () => 'released',
+        ),
+      ).resolves.toBe('released');
+      const stale = { ...binding, leaseEpoch: binding.leaseEpoch + 1 };
+      await expect(
+        store.withRetainedReadLease(stale, signal(), async () => 'not allowed'),
+      ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    });
     it('真实PG物理owner持有至confirmed-stop runtime退役实际join，再释放并允许新代重试', async () => {
       const h = harness(store),
         rc = context();
