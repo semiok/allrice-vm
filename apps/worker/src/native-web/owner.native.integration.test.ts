@@ -1,6 +1,12 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
+import {
+  closeServer,
+  deferred,
+  listen,
+} from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
@@ -138,6 +144,137 @@ it.skipIf(!cli)(
         );
       },
     );
+  },
+);
+
+it.skipIf(!cli)(
+  'reads the actual running rc.2 attempt while the sealed adapter requests its Host reference',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const wire = deferred();
+    void wire.promise.catch(() => {});
+    const facts: {
+      sessionId?: string;
+      attemptId?: string;
+      redeemed?: boolean;
+    } = {};
+    let readAttempt: ((session: string) => Promise<string>) | undefined;
+    const capability = 'a'.repeat(43);
+    const reference = 'b'.repeat(43);
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        if (request.headers.authorization !== 'Bearer ' + capability)
+          throw Error('Wrong fixture capability');
+        if (request.url === '/v1/reference') {
+          const selection = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+          if (
+            selection.provider !== 'openai-codex' ||
+            selection.model !== 'fixture-codex'
+          )
+            throw Error('Wrong native model selection');
+          facts.sessionId = selection.sessionId;
+          facts.attemptId = await readAttempt?.(selection.sessionId);
+          if (!facts.attemptId) throw Error('No current attempt present');
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference }));
+          return;
+        }
+        if (
+          request.url !== '/v1/stream' ||
+          request.headers['x-allrice-model-call-reference'] !== reference
+        )
+          throw Error('Native adapter did not redeem its reference');
+        facts.redeemed = true;
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          JSON.stringify({ type: 'finish', reason: { kind: 'stop' } }) + '\n',
+        );
+        wire.resolve();
+      })().catch((error: unknown) => {
+        response.destroy();
+        wire.reject(error);
+      });
+    });
+    const browserlessOrigin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        transport = create(...args);
+        return transport;
+      },
+    );
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin: browserlessOrigin,
+        capability,
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+        },
+      },
+    );
+    const signal = new AbortController().signal;
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    if (!created.ok || !transport)
+      throw Error('Native owner fixture did not start');
+    const sessionId = created.value.sessionId;
+    readAttempt = async (requested) => {
+      const attempt = await f.owner.readNativeAttemptFor(
+        f.context,
+        requested,
+        signal,
+      );
+      if (!attempt)
+        throw Error(
+          'DSH model attempt did not exist on the authenticated owner',
+        );
+      return attempt.id;
+    };
+    const method = NATIVE_REMOTE.methods['session/prompt'];
+    const args = method
+      .input({ strict: true })
+      .create()
+      .parse({
+        request: {
+          sessionId,
+          requestId: randomUUID(),
+          content: [{ type: 'text', text: 'Synthetic lifecycle test' }],
+          mode: 'queue',
+        },
+      });
+    const response = await transport.fetch('api/session/prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: randomUUID(),
+        method: 'session/prompt',
+        payload: { args },
+      }),
+    });
+    const receipt = serverResponseSchema.parse(await response.json());
+    expect(receipt.result).toMatchObject({
+      ok: true,
+      value: { accepted: true },
+    });
+    await wire.promise;
+    expect(facts).toEqual({
+      redeemed: true,
+      sessionId,
+      attemptId: expect.any(String),
+    });
   },
 );
 
