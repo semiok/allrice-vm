@@ -84,10 +84,24 @@ async function openCodexGeneration(
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
+  const users = new Set<Promise<void>>();
+  function retain() {
+    revoked.throwIfAborted();
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    users.add(done);
+    return () => {
+      users.delete(done);
+      release();
+    };
+  }
   let closing: Promise<void> | undefined;
   function close() {
+    if (closing) return closing;
     stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
-    return (closing ??= host.fiber.dispose());
+    return (closing = Promise.all([...users]).then(() => host.fiber.dispose()));
   }
   async function assertCurrent(signal: AbortSignal) {
     const active = AbortSignal.any([signal, revoked]);
@@ -121,8 +135,8 @@ async function openCodexGeneration(
     const modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
     await assertCurrent(revoked);
     return {
-      selection,
       revoked,
+      retain,
       close,
       modelInfo,
       llm: host.llm,
@@ -164,6 +178,19 @@ export async function createProductionCodexRuntime(
   const transport = createOwnedModelTransport(ownerId);
   let generation: Awaited<ReturnType<typeof openCodexGeneration>> | undefined;
   let operations = Promise.resolve();
+  const retiring = new Set<Promise<void>>();
+  const retirementFailures: unknown[] = [];
+  function retire(value: NonNullable<typeof generation>) {
+    const joined = value.close();
+    retiring.add(joined);
+    void joined.then(
+      () => retiring.delete(joined),
+      (error: unknown) => {
+        retiring.delete(joined);
+        retirementFailures.push(error);
+      },
+    );
+  }
   let closing: Promise<void> | undefined;
 
   async function current(signal: AbortSignal = revoked) {
@@ -190,8 +217,11 @@ export async function createProductionCodexRuntime(
       } catch (error) {
         if (active.aborted && !revoked.aborted) throw error;
         if (generation) {
-          await generation.close();
+          // Revocation is synchronous. A stream in this very check may own
+          // the old generation until its native HTTP/credential work joins.
+          const previous = generation;
           generation = undefined;
+          retire(previous);
         }
         throw error;
       }
@@ -211,7 +241,10 @@ export async function createProductionCodexRuntime(
         selected.revoked,
         ...(signal ? [signal] : []),
       ]);
-      const prepared = await selected.llm.prepareCall(config, operation);
+      const releasePrepare = selected.retain();
+      const prepared = await selected.llm
+        .prepareCall(config, operation)
+        .finally(releasePrepare);
       operation.throwIfAborted();
       return {
         ...prepared,
@@ -219,9 +252,14 @@ export async function createProductionCodexRuntime(
           const active = options.signal
             ? AbortSignal.any([operation, options.signal])
             : operation;
-          await current(active);
-          active.throwIfAborted();
-          yield* prepared.stream({ ...options, signal: active });
+          const release = selected.retain();
+          try {
+            await current(active);
+            active.throwIfAborted();
+            yield* prepared.stream({ ...options, signal: active });
+          } finally {
+            release();
+          }
         },
       };
     },
@@ -253,7 +291,15 @@ export async function createProductionCodexRuntime(
       stopped.abort(new ModelGatewayError('ADMISSION_CLOSED'));
       return (closing = Promise.allSettled([
         transport.close(),
-        operations.then(() => generation?.close()),
+        operations.then(async () => {
+          if (generation) retire(generation);
+          await Promise.allSettled([...retiring]);
+          if (retirementFailures.length)
+            throw new AggregateError(
+              retirementFailures,
+              'CODEX_GENERATION_CLOSE_UNKNOWN',
+            );
+        }),
       ]).then((results) => {
         const failures = results.flatMap((result) =>
           result.status === 'rejected' ? [result.reason] : [],

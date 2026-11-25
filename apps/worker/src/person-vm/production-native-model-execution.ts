@@ -9,6 +9,7 @@ import {
   getDatabase,
   watchDEntryNativeAuthority,
   requireCurrentPlatformAdmin,
+  requireDEntryNativeIdentity,
   requireCurrentWorkspaceWriteAuthority,
 } from '@allrice/database';
 import { EgressError, type ManagedHostService } from '@allrice/egress-gateway';
@@ -29,7 +30,7 @@ import {
 import type { NativeModelAttemptKind } from '../native-web/owner.js';
 import type { ProductionNativeModelExecution } from './production-sources.js';
 
-export type NativeModelSelection = Readonly<{
+type NativeModelSelection = Readonly<{
   context: RequestContext;
   identity: DEntryIdentity;
   binding: PersonVmBinding;
@@ -464,7 +465,27 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   error instanceof DataAccessError &&
                   error.code === 'not_found'
                 ) {
-                  await forgetPrompt(key);
+                  // Resource absence can mean the requested session belongs to
+                  // another root. Recheck this candidate's own selector before
+                  // removing its prompt authority.
+                  const keySelection = {
+                    workspaceId: scope.identity.workspaceId,
+                    employeeInstanceId: scope.identity.employeeInstanceId,
+                    threadId: scope.identity.threadId,
+                  };
+                  try {
+                    await requireDEntryNativeIdentity(
+                      scope.context,
+                      keySelection,
+                    );
+                  } catch (identityError) {
+                    if (
+                      identityError instanceof DataAccessError &&
+                      identityError.code === 'not_found'
+                    )
+                      await forgetPrompt(key);
+                    else if (!scope.revoked.aborted) throw identityError;
+                  }
                   return null;
                 }
                 if (

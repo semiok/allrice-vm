@@ -160,6 +160,8 @@ it.skipIf(!cli)(
       assistant: { sessionId: '', attemptId: '', redeemed: false },
       'session-title': { sessionId: '', attemptId: '', redeemed: false },
     };
+    const recipients = new Map<string, string>();
+    const nativePrompt = randomUUID();
     const readAttempt =
       deferred<
         (session: string, kind: keyof typeof facts) => Promise<string>
@@ -191,6 +193,9 @@ it.skipIf(!cli)(
             selection.model !== 'fixture-codex'
           )
             throw Error('Wrong native model selection');
+          expect(selection.adapterId).toMatch(/^[a-f0-9]{64}$/);
+          expect(selection.recipient).toMatch(/^[A-Za-z0-9_-]{43}$/);
+          recipients.set(kind, selection.recipient);
           facts[kind].sessionId = selection.sessionId;
           facts[kind].attemptId = await (
             await readAttempt.promise
@@ -208,6 +213,9 @@ it.skipIf(!cli)(
           request.headers['x-allrice-model-call-reference'] !== references[kind]
         )
           throw Error('Native adapter did not redeem its reference');
+        expect(request.headers['x-allrice-model-call-recipient']).toBe(
+          recipients.get(kind),
+        );
         if (kind === 'assistant') {
           const message = payload.messages.find(
             (entry: { role: string }) => entry.role === 'user',
@@ -278,6 +286,9 @@ it.skipIf(!cli)(
         throw Error(
           'DSH model attempt did not exist on the authenticated owner',
         );
+      expect(attempt.recipient).toBe(recipients.get(kind));
+      if (kind === 'assistant')
+        expect(attempt.promptIds).toContain(nativePrompt);
       return attempt.id;
     });
     readImage.resolve(async (requested, ref) => {
@@ -317,7 +328,7 @@ it.skipIf(!cli)(
       .parse({
         request: {
           sessionId,
-          requestId: randomUUID(),
+          requestId: nativePrompt,
           content: [
             { type: 'text', text: 'Synthetic lifecycle test' },
             { type: 'image', mediaType: 'image/png', data: png },

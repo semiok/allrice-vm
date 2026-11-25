@@ -514,9 +514,10 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
   });
 
   it('Worker shutdown checks holds and preserves a running owner when coverage is unknown', async () => {
-    const h = harness();
+    const store = new MemoryStore();
+    const h = harness(store);
     const { rc, binding } = await running(h);
-    const row = h.store.rows.get(rc.actor.id)!;
+    const row = store.rows.get(rc.actor.id)!;
     row.holds.push({
       id: randomUUID(),
       operationId: 'approval-1',

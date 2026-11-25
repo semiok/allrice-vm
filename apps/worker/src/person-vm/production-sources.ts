@@ -7,7 +7,6 @@ import type { PersonVmRuntimePort } from '@allrice/person-vm';
 import type { ManagedHostService } from '@allrice/egress-gateway';
 import type { ModelCallBinding } from '@allrice/model-gateway';
 import type { ReadProductionModelImage } from './production-model-images.js';
-import type { NativeModelSelection } from './production-native-model-execution.js';
 import {
   installProductionDEntrySource,
   type ResolveProductionDEntrySendRoute,
@@ -49,10 +48,6 @@ export interface ProductionNativeModelExecution {
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
-    observeModelSelection?(
-      selection: NativeModelSelection,
-      signal: AbortSignal,
-    ): Promise<void>;
     references?: readonly ManagedHostService[];
     readModelImage?: ReadProductionModelImage;
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
@@ -106,7 +101,6 @@ export function createProductionPersonVmSources(
           startup,
           admission,
           lifetime,
-          observeModelSelection: owned.observeModelSelection,
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);
             const generation = await codex.assertCurrent(active);
