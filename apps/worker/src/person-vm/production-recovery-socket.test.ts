@@ -2,7 +2,10 @@ import { stat } from 'node:fs/promises';
 import { request } from 'node:http';
 import { dirname } from 'node:path';
 import { expect, it, vi } from 'vitest';
-import { modelBinding } from '../../../../packages/model-gateway/src/gateway.fixture.js';
+import {
+  deferred,
+  modelBinding,
+} from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { openProductionRecoverySocket } from './production-recovery-socket.js';
 
 it('keeps the exact maintenance owner reachable over a private Unix socket until authorized completion', async () => {
@@ -147,8 +150,8 @@ it('reports the current stop attempt only to an authorized local operator', asyn
 });
 
 it('joins authentication for a disconnected client before releasing the maintenance socket', async () => {
-  const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
+  const entered = deferred();
+  const release = deferred();
   const recover = vi.fn(async () => 0);
   const socket = await openProductionRecoverySocket({
     async authenticate() {
@@ -165,7 +168,7 @@ it('joins authentication for a disconnected client before releasing the maintena
     method: 'POST',
     headers: { authorization: 'Bearer synthetic-session' },
   });
-  const disconnected = Promise.withResolvers<void>();
+  const disconnected = deferred();
   client.once('error', () => {});
   client.once('close', disconnected.resolve);
   client.end();
