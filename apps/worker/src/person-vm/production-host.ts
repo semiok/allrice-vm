@@ -362,25 +362,30 @@ export function createProductionPersonVmHost(input: {
           }
         }
       }
+      const providerOwner = providers;
+      const installationFailures = providerOwner
+        ? await collectFailures([
+            () => providerOwner.egressInstallation.close(),
+          ])
+        : [];
       // The original pool owns both the model ledger and the physical VM
       // lease. Keep that maintenance path available when either is unresolved.
-      if (modelFailures.length || vmFailures.length || receiptFailures.length)
+      if (
+        modelFailures.length ||
+        vmFailures.length ||
+        receiptFailures.length ||
+        installationFailures.length
+      )
         modelRecovery = { providerJoined: false, releasedAttempts: 0 };
-      const providerOwner = providers;
-      await settle([
-        ...(sourceOwner && !modelRecovery
-          ? [() => sourceOwner.egress.close()]
-          : []),
-        ...(providerOwner
-          ? [() => providerOwner.egressInstallation.close()]
-          : []),
-      ]);
+      if (sourceOwner && !modelRecovery)
+        await settle([() => sourceOwner.egress.close()]);
       input.lifetime.removeEventListener('abort', aborted);
       const errors = [
         ...independentCloseFailures,
         ...uncertainPreparation,
         ...vmFailures,
         ...receiptFailures,
+        ...installationFailures,
         ...modelFailures,
       ];
       if (errors.length)
@@ -423,6 +428,12 @@ export function createProductionPersonVmHost(input: {
       // maintenance request disconnects or the Worker lifetime has ended.
       const vmFailures = await stopOwnedVms();
       const receiptFailures = await retireReceipts();
+      const providerOwner = providers;
+      const installationFailures = providerOwner
+        ? await collectFailures([
+            () => providerOwner.egressInstallation.close(),
+          ])
+        : [];
       const sourceFailures = recovery.providerJoined
         ? []
         : await collectFailures([
@@ -436,11 +447,13 @@ export function createProductionPersonVmHost(input: {
         ...uncertainPreparation,
         ...vmFailures,
         ...receiptFailures,
+        ...installationFailures,
         ...sourceFailures,
       ];
       if (
         !vmFailures.length &&
         !receiptFailures.length &&
+        !installationFailures.length &&
         !sourceFailures.length
       )
         modelRecovery = undefined;

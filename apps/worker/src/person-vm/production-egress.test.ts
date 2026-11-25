@@ -213,6 +213,29 @@ it('reopens exactly the persisted port and rejects wrong active inputs without r
   await readHttp();
 });
 
+it('retries retirement only against the original staged directory and file', async () => {
+  const active = await prepare();
+  const staged = join(mount, '.allrice-egress');
+  const held = staged + '-held';
+  await fs.rename(staged, held);
+  await fs.mkdir(staged, { mode: 0o700 });
+  try {
+    await expect(
+      active.value.revoke(active.receipt, 'stop', signal()),
+    ).rejects.toMatchObject({ message: 'EGRESS_CLEANUP_INCOMPLETE' });
+    await expect(installation.close()).rejects.toMatchObject({
+      message: 'EGRESS_CLEANUP_INCOMPLETE',
+    });
+    expect(await fs.readdir(staged)).toEqual([]);
+  } finally {
+    await fs.rmdir(staged);
+    await fs.rename(held, staged);
+  }
+  await active.value.revoke(active.receipt, 'stop', signal());
+  await installation.close();
+  expect(await storedFiles()).toEqual([]);
+});
+
 it('rejects an occupied persisted port without selecting another or disturbing its current owner', async () => {
   const first = await prepare();
   const other = createProductionEgressInstallation(f.loaded, signal());
