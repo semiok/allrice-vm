@@ -27,6 +27,10 @@ import {
 } from '@allrice/person-vm';
 import * as NativeTransport from './transport.js';
 import { setupNativeWebFixture } from './owner.native.fixture.js';
+import {
+  waitForPromptFact,
+  type NativePromptObservation,
+} from './prompt-observation.js';
 
 // Actual published rc.2 entry, not a fixture protocol server. Its complete
 // compatible-OS package tree must be provisioned separately and recorded.
@@ -102,6 +106,191 @@ it.skipIf(!cli)(
     expect(f.owner.controlReady()).toBe(false);
     expect(f.kills()).toBe(1);
     expect(f.child.exitCode !== null || f.child.signalCode !== null).toBe(true);
+  },
+);
+
+it.skipIf(!cli)(
+  'observes the actual rc.2 scoped prompt, native idempotent receipt, and exact queued remove',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const firstModel = deferred(),
+      releaseModel = deferred();
+    const observing = new AbortController();
+    const accepted = new Map<string, Promise<boolean>[]>();
+    const observations = new Map<string, NativePromptObservation[]>();
+    let assistantReferences = 0;
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        if (request.url?.startsWith('/v1/reference')) {
+          if (request.url === '/v1/reference') assistantReferences++;
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference: 'r'.repeat(43) }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        const payload = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        if (payload.purpose !== 'session-title') {
+          firstModel.resolve();
+          await releaseModel.promise;
+        }
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          JSON.stringify({ type: 'finish', reason: { kind: 'stop' } }) + '\n',
+        );
+      })().catch((error: unknown) => {
+        firstModel.reject(error);
+        response.destroy();
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(async () => {
+      observing.abort();
+      releaseModel.resolve();
+      await closeServer(server);
+    });
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      {
+        origin,
+        capability: 'q'.repeat(43),
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        modelInfo: {
+          provider: 'openai-codex',
+          id: 'fixture-codex',
+          name: 'fixture-codex',
+          inputModalities: ['text'],
+        },
+      },
+      async ({ requestId, observe }) => {
+        const observation = observe(observing.signal);
+        const group = observations.get(requestId) ?? [];
+        group.push(observation);
+        observations.set(requestId, group);
+        await observation.ready;
+        return {
+          undispatched: () => observation.close(),
+          accepted() {
+            const replies = accepted.get(requestId) ?? [];
+            replies.push(observation.confirmedReplay());
+            accepted.set(requestId, replies);
+          },
+          unknown() {},
+        };
+      },
+    );
+    const signal = AbortSignal.timeout(15000);
+    const created = await f.owner.createRootFor(f.context, {}, signal);
+    if (!created.ok) throw Error('Native root unavailable');
+    const sessionId = created.value.sessionId;
+    const issue: DEntryPrincipalIssue = {
+      scopeId: randomUUID(),
+      access: 'execute',
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
+      },
+      root: {
+        nativeSessionId: sessionId,
+        rootOriginDigest: 'manual-test-native-create-only',
+        rootBindingRef: 'manual-test-no-sql-permit',
+      },
+    };
+    const activity = f.owner.acquirePrincipal(issue, signal, f.context);
+    const scope = await activity.run(signal);
+    const prompt = (requestId: string, text: string) =>
+      scope.invoke(
+        {
+          endpoint: 'session/prompt',
+          scopeId: issue.scopeId,
+          args: NATIVE_REMOTE.methods['session/prompt']
+            .input({ strict: true })
+            .create()
+            .parse({
+              request: {
+                sessionId,
+                requestId,
+                mode: 'queue',
+                content: [{ type: 'text', text }],
+              },
+            }),
+        },
+        signal,
+      );
+    try {
+      const firstId = randomUUID(),
+        queuedId = randomUUID();
+      const receipt = { endpoint: 'session/prompt', value: { accepted: true } };
+      expect(await prompt(firstId, 'Native active turn')).toEqual(receipt);
+      await waitForPromptFact(firstModel.promise, signal);
+      await observations.get(firstId)![0]!.assertClaimed(signal);
+
+      expect(await prompt(queuedId, 'Native pending occurrence')).toEqual(
+        receipt,
+      );
+      expect(
+        await prompt(queuedId, 'Native replay of that occurrence'),
+      ).toEqual(receipt);
+      expect(await Promise.all(accepted.get(queuedId)!)).toEqual([false, true]);
+      await observations.get(queuedId)![1]!.close();
+      const view = await scope.invoke(
+        {
+          endpoint: 'session/projections',
+          scopeId: issue.scopeId,
+          args: { request: { sessionId } },
+        },
+        signal,
+      );
+      if (view.endpoint !== 'session/projections' || !view.value)
+        throw Error('Native inbox projection unavailable');
+      const inbox = view.value.values.inbox as {
+        'next-turn': { id: string }[];
+      };
+      expect(inbox['next-turn']).toHaveLength(1);
+      expect(
+        await scope.invoke(
+          {
+            endpoint: 'session/updateQueue',
+            scopeId: issue.scopeId,
+            args: NATIVE_REMOTE.methods['session/updateQueue']
+              .input({ strict: true })
+              .create()
+              .parse({
+                request: {
+                  sessionId,
+                  itemId: inbox['next-turn'][0]!.id,
+                  action: { kind: 'remove' },
+                },
+              }),
+          },
+          signal,
+        ),
+      ).toEqual({ endpoint: 'session/updateQueue', value: { accepted: true } });
+      await expect(
+        waitForPromptFact(observations.get(queuedId)![0]!.settled, signal),
+      ).resolves.toBe('discarded');
+      await expect(prompt(randomUUID(), ' \n ')).rejects.toHaveProperty(
+        'code',
+        'gateway/bad-request',
+      );
+      releaseModel.resolve();
+      await expect(
+        waitForPromptFact(observations.get(firstId)![0]!.settled, signal),
+      ).resolves.toBe('ended');
+      expect(assistantReferences).toBe(1);
+    } finally {
+      observing.abort();
+      releaseModel.resolve();
+      await activity.close();
+    }
   },
 );
 

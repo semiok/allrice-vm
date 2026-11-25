@@ -149,6 +149,7 @@ export async function setupNativeWebFixture(
     onPublicationDiagnostic?: (text: string) => void;
   },
   managedModel?: NativeWebModelAdapter,
+  beforePrompt?: Parameters<typeof openNativeWebOwner>[0]['beforePrompt'],
 ) {
   const isolateProfile = isolated !== undefined;
   if (!installedCli) throw Error('The exact rc.2 CLI is required');
@@ -574,6 +575,7 @@ export async function setupNativeWebFixture(
     vm: { assertCurrentBinding: current },
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
+    beforePrompt,
   }).catch(async (error: unknown) => {
     if (!isolateProfile) throw error;
     const patchRead = await access(tracePath).then(
