@@ -180,7 +180,7 @@ export function createDEntryPrincipalControl(
       beforeInvoke?: (
         call: DEntryScopedUnaryCall,
         signal: AbortSignal,
-      ) => Promise<void>,
+      ) => Promise<(() => Promise<void>) | undefined>,
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
@@ -263,12 +263,17 @@ export function createDEntryPrincipalControl(
                 const task = Promise.resolve().then(async () => {
                   business.throwIfAborted();
                   active.throwIfAborted();
-                  await beforeInvoke?.(
+                  const undispatched = await beforeInvoke?.(
                     call,
                     AbortSignal.any([active, business]),
                   );
-                  business.throwIfAborted();
-                  active.throwIfAborted();
+                  try {
+                    business.throwIfAborted();
+                    active.throwIfAborted();
+                  } catch (error) {
+                    await undispatched?.();
+                    throw error;
+                  }
                   const result = await TYPERT_REMOTE.methods[
                     'allricePrincipal/invokeScoped'
                   ].invoke(

@@ -298,7 +298,7 @@ export function createAssignedNativeWebStartup(input: {
                     ) {
                       if (!beforePrompt)
                         throw new PersonVmError('RUNTIME_NOT_READY');
-                      await beforePrompt(request, active);
+                      return beforePrompt(request, active);
                     },
                   }
                 : {}),

@@ -488,11 +488,25 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             }
             try {
               assertLoginOwner(adapterId, root.rootNativeSessionId, context);
-              selected.set(key, { scope, stop: close, join: watch.close });
+              const retire = () => {
+                void forgetPrompt(key).catch(() => {});
+              };
+              const join = async () => {
+                scope.revoked.removeEventListener('abort', retire);
+                await watch.close();
+              };
+              selected.set(key, { scope, stop: close, join });
+              scope.revoked.addEventListener('abort', retire, { once: true });
               await releaseFinishedPrompts(adapterId, root.rootNativeSessionId);
+              active.throwIfAborted();
+              scope.revoked.throwIfAborted();
+              return () => forgetPrompt(key);
             } catch (error) {
-              close.abort();
-              await watch.close();
+              if (selected.get(key)?.scope === scope) await forgetPrompt(key);
+              else {
+                close.abort();
+                await watch.close();
+              }
               throw error;
             }
           }),

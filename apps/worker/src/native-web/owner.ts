@@ -159,7 +159,7 @@ export async function openNativeWebOwner(input: {
       requestId: string;
     },
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<() => Promise<void>>;
 }) {
   if (
     !input.scope.readNativeWebAuth ||
@@ -592,7 +592,7 @@ export async function openNativeWebOwner(input: {
               call.args.request.sessionId !== issue.root.nativeSessionId
             )
               throw new PersonVmError('AUTHORIZATION_DENIED');
-            await input.beforePrompt(
+            return input.beforePrompt(
               {
                 binding,
                 adapterId: installedModelAdapter,
