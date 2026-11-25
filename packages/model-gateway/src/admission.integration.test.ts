@@ -965,6 +965,13 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
     expect(mounted.trace.finishErrors).toMatchObject([
       { code: 'CLEANUP_INCOMPLETE' },
     ]);
+    await expect(mounted.gateway.revoke(f.binding)).rejects.toMatchObject({
+      code: 'LEDGER_UNAVAILABLE',
+    });
+    await expect(mounted.gateway.close()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ code: 'LEDGER_UNAVAILABLE' })],
+    });
+    gateways.delete(mounted.gateway); // This case explicitly asserted its close.
     // No foreign finish/recover, fake TTL, or private permit deletion follows.
   });
 

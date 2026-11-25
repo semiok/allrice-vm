@@ -516,7 +516,7 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   const trusted = { context, binding };
   for (const wrong of [
     { ...call, vm: { ...binding, leaseEpoch: 2 } },
-    { ...call, context: { ...context, sessionId: randomUUID() } },
+    { ...call, context: { ...context, organizationId: randomUUID() } },
     { ...call, model: 'different-route' },
   ]) {
     resolveCall.mockResolvedValueOnce(wrong);
@@ -527,21 +527,49 @@ it('dispatches only the trusted model-call resolution for the exact lease and ap
   expect(assertAdmission).not.toHaveBeenCalled();
   expect(value.model.handle).not.toHaveBeenCalled();
 
-  resolveCall.mockResolvedValueOnce(call);
+  const next = {
+    ...call,
+    context: { ...context, sessionId: randomUUID(), workspaceId: randomUUID() },
+  };
+  resolveCall.mockResolvedValueOnce(next);
   value.model.handle.mockResolvedValueOnce(undefined);
   await model.handle(request, response, trusted, active);
-  expect(resolveCall).toHaveBeenLastCalledWith(request, trusted, active);
+  const resolvedSignal = resolveCall.mock.lastCall?.[2];
+  expect(resolvedSignal).toBeInstanceOf(AbortSignal);
+  expect(resolveCall).toHaveBeenLastCalledWith(
+    request,
+    trusted,
+    resolvedSignal,
+  );
   expect(assertAdmission).toHaveBeenCalledExactlyOnceWith(
-    context,
+    next.context,
     binding,
-    active,
+    resolvedSignal,
   );
   expect(value.model.handle).toHaveBeenCalledExactlyOnceWith(
     request,
     response,
-    call,
-    active,
+    next,
+    resolvedSignal,
   );
+
+  const entered = gate();
+  resolveCall.mockImplementationOnce(async (_request, _trusted, current) => {
+    const stopped = new Promise<never>((_resolve, reject) => {
+      current.addEventListener('abort', () => reject(current.reason), {
+        once: true,
+      });
+    });
+    entered.release();
+    return stopped;
+  });
+  const resolving = model
+    .handle(request, response, trusted, active)
+    .catch((error: unknown) => error);
+  await entered.promise;
+  await value.host.close();
+  expect(await resolving).toBe(value.input().lifetime.reason);
+  expect(value.model.handle).toHaveBeenCalledTimes(1);
 });
 
 it('actual service cleanup revokes a copied receipt once and Host.close does not revoke it again', async () => {
@@ -811,6 +839,20 @@ it('close fences the native ports and joins source work; repeated close has one 
     released.release();
     await outcome;
   }
+});
+
+it('retains the provider owner when the model gateway cannot prove its join', async () => {
+  const value = fixture();
+  const failure = Error('synthetic unknown model transport join');
+  value.model.close.mockRejectedValue(failure);
+  const host = await createProductionPersonVmHost({
+    sources: value.sources,
+    lifetime: signal(),
+  });
+  await expect(host.close()).rejects.toMatchObject({ errors: [failure] });
+  expect(value.model.close).toHaveBeenCalledTimes(1);
+  expect(value.bound.egress.close).not.toHaveBeenCalled();
+  expectUninstalled();
 });
 
 it('runtime close drives cancellation of an outstanding native observation and the Host joins its real outcome', async () => {

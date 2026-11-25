@@ -275,10 +275,19 @@ export function createProductionPersonVmHost(input: {
       // Join the model gateway before closing the provider it uses.
       // No VM stop/delete or assertion of guest termination is made here.
       const modelOwner = model;
-      if (modelOwner) await settle([() => modelOwner.close()]);
+      let modelJoined = !modelOwner;
+      if (modelOwner)
+        await settle([
+          async () => {
+            await modelOwner.close();
+            modelJoined = true;
+          },
+        ]);
       const providerOwner = providers;
       await settle([
-        ...(sourceOwner ? [() => sourceOwner.egress.close()] : []),
+        ...(sourceOwner && modelJoined
+          ? [() => sourceOwner.egress.close()]
+          : []),
         ...(providerOwner
           ? [() => providerOwner.egressInstallation.close()]
           : []),
@@ -437,7 +446,8 @@ export function createProductionPersonVmHost(input: {
         path: '/v1/stream',
         method: 'POST',
         admissionOwner: 'service',
-        async handle(request, response, trusted, active) {
+        async handle(request, response, trusted, signal) {
+          const active = AbortSignal.any([signal, lifetime]);
           active.throwIfAborted();
           const call = await modelSource.resolveCall(request, trusted, active);
           active.throwIfAborted();
@@ -449,12 +459,11 @@ export function createProductionPersonVmHost(input: {
             context.actor.type !== 'user' ||
             call.context.actor.type !== 'user' ||
             call.context.actor.id !== context.actor.id ||
-            call.context.sessionId !== context.sessionId ||
-            call.context.organizationId !== context.organizationId ||
-            (context.workspaceId !== null &&
-              call.context.workspaceId !== context.workspaceId)
+            call.context.organizationId !== context.organizationId
           )
             throw new EgressError('DENIED');
+          // The resolver binds this call's own login and workspace. The
+          // VM-level context alone cannot identify that individual session.
           await vm.assertAdmissionBinding(call.context, binding, active);
           active.throwIfAborted();
           await modelOwner.handle(request, response, call, active);
