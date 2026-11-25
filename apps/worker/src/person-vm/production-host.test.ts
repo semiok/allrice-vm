@@ -927,8 +927,41 @@ it('model recovery does not clear unrelated Host close failures', async () => {
   await expect(
     host.recoverModelOwner(nativeEntryFixture().context, signal()),
   ).rejects.toMatchObject({ errors: [observation] });
+  await expect(host.close()).rejects.toMatchObject({ errors: [observation] });
   expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
   expectUninstalled();
+});
+
+it('rechecks authority when resuming provider cleanup after model recovery', async () => {
+  const value = fixture();
+  const transport = Error('unconfirmed model transport');
+  const provider = Error('provider close failed');
+  const denied = Error('later operator proof refused');
+  const context = nativeEntryFixture().context;
+  value.model.close.mockRejectedValueOnce(transport);
+  vi.mocked(value.bound.egress.close).mockRejectedValueOnce(provider);
+  const host = await createProductionPersonVmHost({
+    sources: value.sources,
+    lifetime: signal(),
+  });
+  const original = host.close();
+  await expect(original).rejects.toMatchObject({ errors: [transport] });
+  value.model.reconcileOwner.mockResolvedValueOnce(2);
+  await expect(host.recoverModelOwner(context, signal())).rejects.toMatchObject(
+    {
+      errors: [provider],
+    },
+  );
+  await expect(host.close()).rejects.toMatchObject({ errors: [provider] });
+  value.model.reconcileOwner.mockRejectedValueOnce(denied);
+  await expect(host.recoverModelOwner(context, signal())).rejects.toBe(denied);
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(1);
+
+  value.model.reconcileOwner.mockResolvedValueOnce(0);
+  await expect(host.recoverModelOwner(context, signal())).resolves.toBe(2);
+  expect(value.bound.egress.close).toHaveBeenCalledTimes(2);
+  await expect(host.close()).resolves.toBeUndefined();
+  await expect(original).rejects.toMatchObject({ errors: [transport] });
 });
 
 it('runtime close drives cancellation of an outstanding native observation and the Host joins its real outcome', async () => {

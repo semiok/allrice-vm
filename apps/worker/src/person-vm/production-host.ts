@@ -139,9 +139,10 @@ export function createProductionPersonVmHost(input: {
   const uncertainPreparation: unknown[] = [];
   const independentCloseFailures: unknown[] = [];
   const modelOwnerId = randomUUID();
-  let modelJoinUnconfirmed = false;
+  let modelRecovery:
+    { providerJoined: boolean; releasedAttempts: number } | undefined;
   let recovering = false;
-  let recovered = false;
+  let recoveredClose: { error: AggregateError | null } | undefined;
   let providers: Providers | undefined,
     current: Current | undefined,
     startup: Startup | undefined,
@@ -267,7 +268,10 @@ export function createProductionPersonVmHost(input: {
     );
   }
   function close(): Promise<void> {
-    if (recovered) return Promise.resolve();
+    if (recoveredClose)
+      return recoveredClose.error
+        ? Promise.reject(recoveredClose.error)
+        : Promise.resolve();
     if (closing) return closing;
     closing = Promise.resolve().then(async () => {
       // Construction may be held in real I/O. Join it before taking the owner
@@ -303,10 +307,11 @@ export function createProductionPersonVmHost(input: {
       const modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      modelJoinUnconfirmed = modelFailures.length > 0;
+      if (modelFailures.length)
+        modelRecovery = { providerJoined: false, releasedAttempts: 0 };
       const providerOwner = providers;
       await settle([
-        ...(sourceOwner && !modelJoinUnconfirmed
+        ...(sourceOwner && !modelRecovery
           ? [() => sourceOwner.egress.close()]
           : []),
         ...(providerOwner
@@ -345,33 +350,42 @@ export function createProductionPersonVmHost(input: {
     try {
       await originalClose.catch(() => {});
       signal.throwIfAborted();
-      if (!modelJoinUnconfirmed)
+      const recovery = modelRecovery;
+      if (!recovery)
         throw new ProductionPersonVmHostUnavailable(
           'MODEL_RECOVERY_UNAVAILABLE',
         );
-      const released = await modelOwner.reconcileOwner(
+      recovery.releasedAttempts += await modelOwner.reconcileOwner(
         context,
         modelOwnerId,
         signal,
       );
       await modelOwner.close();
-      modelJoinUnconfirmed = false;
       // Once the stop proof has been accepted, join cleanup even if the
       // maintenance request disconnects or the Worker lifetime has ended.
       const receiptFailures = await retireReceipts();
-      const sourceFailures = await collectFailures([
-        () => sourceOwner.egress.close(),
-      ]);
+      const sourceFailures = recovery.providerJoined
+        ? []
+        : await collectFailures([
+            async () => {
+              await sourceOwner.egress.close();
+              recovery.providerJoined = true;
+            },
+          ]);
       const errors = [
         ...independentCloseFailures,
         ...uncertainPreparation,
         ...receiptFailures,
         ...sourceFailures,
       ];
-      if (errors.length)
-        throw new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE');
-      recovered = true;
-      return released;
+      if (!receiptFailures.length && !sourceFailures.length)
+        modelRecovery = undefined;
+      const error = errors.length
+        ? new AggregateError(errors, 'PERSON_VM_HOST_CLOSE_INCOMPLETE')
+        : null;
+      recoveredClose = { error };
+      if (error) throw error;
+      return recovery.releasedAttempts;
     } finally {
       recovering = false;
     }
