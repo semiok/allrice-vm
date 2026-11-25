@@ -174,7 +174,7 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
     `);
     try {
       await expect(
-        publishDEntryNativeRunTerminal(candidate, terminal, signal),
+        publishDEntryNativeRunTerminal(candidate, terminal, signal, { owner }),
       ).rejects.toThrow('fixture missed terminal commit');
       expect(await getRunForRead(context, workspaceId, runId)).toMatchObject({
         status: 'running',
@@ -266,6 +266,18 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       await db`update person_virtual_machines
         set lease_owner=null,lease_expires_at=null where person_id=${personId}`;
     }
+    // A stale positive Guest read cannot settle the Run after the actual
+    // publication boundary has lost its employee binding.
+    await db`update allrice_employee_assignments set active=false where id=${f.assignment}`;
+    try {
+      await expect(
+        publishDEntryNativeRunTerminal(candidate, terminal, signal, {
+          owner: restarted,
+        }),
+      ).resolves.toBe(false);
+    } finally {
+      await db`update allrice_employee_assignments set active=true where id=${f.assignment}`;
+    }
     // A successor authenticates with its own adapter. The birth provenance
     // remains the original payload on both the Run and the exact execution.
     expect(
@@ -281,11 +293,16 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
         },
         terminal,
         signal,
+        { owner: restarted },
       ),
     ).toBe(false);
     const racing = await Promise.all([
-      publishDEntryNativeRunTerminal(reread!, terminal, signal),
-      publishDEntryNativeRunTerminal(reread!, terminal, signal),
+      publishDEntryNativeRunTerminal(reread!, terminal, signal, {
+        owner: restarted,
+      }),
+      publishDEntryNativeRunTerminal(reread!, terminal, signal, {
+        owner: restarted,
+      }),
     ]);
     expect(racing.sort()).toEqual([false, true]);
     expect(

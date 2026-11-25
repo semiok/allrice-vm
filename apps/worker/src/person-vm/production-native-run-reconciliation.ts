@@ -76,7 +76,10 @@ export async function reconcileNativeRunTerminals(
             },
             active,
           );
-          if (end) await publishDEntryNativeRunTerminal(candidate, end, active);
+          if (end)
+            await publishDEntryNativeRunTerminal(candidate, end, active, {
+              owner: scope,
+            });
         } catch {
           // Lost evidence, a busy owner or an uncertain SQL outcome all leave
           // the existing row discoverable on the next pass through this page.

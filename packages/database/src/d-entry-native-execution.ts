@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { TransactionSql } from 'postgres';
 import {
   RunStatusSchema,
   UuidSchema,
@@ -262,8 +263,10 @@ function belongsToRetainedDisk(
   );
 }
 
+type JournalSql = ReturnType<typeof getDatabase> | TransactionSql;
+
 function currentJournalScope(
-  sql: ReturnType<typeof getDatabase>,
+  sql: JournalSql,
   owner: DEntryNativeRunJournalOwner,
   leaseOwner?: string,
 ) {
@@ -271,20 +274,26 @@ function currentJournalScope(
     v.vm_id=${owner.vmId} and v.organization_id=${owner.organizationId}
     and v.person_id=${owner.personId} and v.instance_id=${owner.vmInstanceId}
     and v.lease_epoch=${owner.leaseEpoch} and v.phase='running'
-    and v.disk_retained
+    and v.disk_retained and v.native_created
     and v.lease_owner is not distinct from ${leaseOwner ?? null}::uuid
     and t.workspace_id=${owner.workspaceId} and t.execution_generation='4.0'
+    and t.archived_at is null
     and coalesce(t.employee_instance_id,t.employee_assignment_id)=${owner.employeeInstanceId}
     and t.d_entry_native_root is not null
     and t.d_entry_native_root#>>'{host,binding,vmId}'=${owner.vmId}
     and t.d_entry_native_root#>>'{host,binding,organizationId}'=${owner.organizationId}
     and t.d_entry_native_root#>>'{host,binding,personId}'=${owner.personId}
+    and t.d_entry_native_root#>>'{identity,organizationId}'=${owner.organizationId}
+    and t.d_entry_native_root#>>'{identity,workspaceId}'=${owner.workspaceId}
+    and t.d_entry_native_root#>>'{identity,personId}'=${owner.personId}
+    and t.d_entry_native_root#>>'{identity,employeeInstanceId}'=${owner.employeeInstanceId}
+    and t.d_entry_native_root#>>'{identity,threadId}'=t.id::text
   `;
 }
 
 // The fixed on-disk employee namespace must still match a current assignment.
 // This projection intentionally has no account session or browser token.
-function retainedJournalProfile(sql: ReturnType<typeof getDatabase>) {
+function retainedJournalProfile(sql: JournalSql, lock = false) {
   return sql`
     select i.id,i.organization_id,i.workspace_id,i.owner_id,a.employee_version_id
     from allrice_employee_instances i
@@ -303,12 +312,14 @@ function retainedJournalProfile(sql: ReturnType<typeof getDatabase>) {
         where m.organization_id=i.organization_id and m.user_id=i.owner_id
           and m.active and m.role in ('admin','member')
           and (m.workspace_id is null or m.workspace_id=i.workspace_id)
+        ${lock ? sql`for share of m` : sql``}
       )
       and not exists (
         select 1 from allrice_platform_employee_tenant_assignments d
         where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
           and d.tenant_employee_id=e.id and not d.active
       )
+      ${lock ? sql`for share of i,a,e,w,o,u` : sql``}
   `;
 }
 
@@ -452,11 +463,13 @@ export async function listDEntryNativeRunCandidates(
 
 /** A persisted root and the same current local owner fence the read. This
  * ledger work uses the original scope, even after its login has expired. */
-export async function isDEntryNativeRunJournalCurrent(
+async function checkCurrentRunJournal(
+  sql: JournalSql,
   candidate: DEntryNativeRunCandidate,
   owner: DEntryNativeRunJournalOwner,
   signal: AbortSignal,
   leaseOwner?: string,
+  lock = false,
 ) {
   signal.throwIfAborted();
   const { prompt } = candidate;
@@ -471,26 +484,40 @@ export async function isDEntryNativeRunJournalCurrent(
     !belongsToRetainedDisk(candidate.attempt, owner)
   )
     return false;
-  const sql = getDatabase();
+  if (lock || leaseOwner) {
+    const [profile] = await sql`
+      select i.id from (${retainedJournalProfile(sql, lock)}) i
+      where i.id=${owner.employeeInstanceId}
+        and i.organization_id=${owner.organizationId} and i.workspace_id=${owner.workspaceId}
+        and i.owner_id=${owner.personId} and i.employee_version_id=${owner.employeeRelease}
+    `;
+    if (!profile) return false;
+  }
   const [row] = await sql`
     select 1 from person_virtual_machines v
     join allrice_chat_sessions t on t.id=${prompt.threadId}
       and t.organization_id=v.organization_id and t.owner_id=v.person_id
     where ${currentJournalScope(sql, owner, leaseOwner)}
       and t.d_entry_native_root->>'nativeSessionId'=${prompt.rootSessionId}
-      ${
-        leaseOwner
-          ? sql`and exists (
-        select 1 from (${retainedJournalProfile(sql)}) i
-        where i.id=${owner.employeeInstanceId}
-          and i.organization_id=${owner.organizationId} and i.workspace_id=${owner.workspaceId}
-          and i.owner_id=${owner.personId} and i.employee_version_id=${owner.employeeRelease}
-      )`
-          : sql``
-      }
+      ${lock ? sql`for share of v,t` : sql``}
   `;
   signal.throwIfAborted();
   return !!row;
+}
+
+export function isDEntryNativeRunJournalCurrent(
+  candidate: DEntryNativeRunCandidate,
+  owner: DEntryNativeRunJournalOwner,
+  signal: AbortSignal,
+  leaseOwner?: string,
+) {
+  return checkCurrentRunJournal(
+    getDatabase(),
+    candidate,
+    owner,
+    signal,
+    leaseOwner,
+  );
 }
 
 const outcomes = {
@@ -509,6 +536,7 @@ export async function publishDEntryNativeRunTerminal(
   candidate: DEntryNativeRunCandidate,
   terminal: DEntryNativeTurnEnd,
   signal: AbortSignal,
+  authority: { owner: DEntryNativeRunJournalOwner; leaseOwner?: string },
 ) {
   const end = DEntryNativeTurnEndSchema.parse(terminal);
   const { runId, executionId, organizationId, workspaceId, ownerId } =
@@ -526,7 +554,17 @@ export async function publishDEntryNativeRunTerminal(
   signal.throwIfAborted();
   const { state, event } = outcomes[end.reason];
   return getDatabase().begin(async (tx) => {
-    signal.throwIfAborted();
+    if (
+      !(await checkCurrentRunJournal(
+        tx,
+        candidate,
+        authority.owner,
+        signal,
+        authority.leaseOwner,
+        true,
+      ))
+    )
+      return false;
     const [row] = await tx`
       update allrice_runs r set state=${state},
         completed_at=${end.occurredAt},updated_at=clock_timestamp()

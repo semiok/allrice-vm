@@ -116,7 +116,10 @@ export function createRetainedNativeRunReconciler(input: {
         const decoded: unknown = JSON.parse(output);
         if (decoded === null) return false;
         const end = DEntryNativeTurnEndSchema.parse(decoded);
-        return publishDEntryNativeRunTerminal(candidate, end, scope.signal);
+        return publishDEntryNativeRunTerminal(candidate, end, scope.signal, {
+          owner,
+          leaseOwner: lease.leaseOwner,
+        });
       },
     );
   };
