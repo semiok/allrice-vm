@@ -11,6 +11,7 @@ import {
   SessionId,
   SessionLogOffset,
   SessionSeq,
+  SessionStore,
   SESSION_FORMAT_VERSION,
   type SessionEvent,
   type SessionHeader,
@@ -21,7 +22,11 @@ import { expect, it } from 'vitest';
 // @ts-expect-error The fixed guest plugin is copied as JavaScript.
 import * as runJournal from '../../dsh/allrice-native-run-journal.mjs';
 
-const { findDEntryNativeRunTerminal, readPersistedRunTerminal } = runJournal;
+const {
+  createNativeRunTerminalAttestations,
+  findDEntryNativeRunTerminal,
+  readPersistedRunTerminal,
+} = runJournal;
 
 const sessionId = 'session-00000000-0000-4000-8000-000000000036';
 const selection = {
@@ -189,6 +194,105 @@ async function writeAndRead(
     await reader.close();
   }
 }
+
+it('requires the same attached rc.2 turn and terminal fact as the durable journal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'allrice-native-run-receipt-'));
+  const ctx = new Context();
+  try {
+    await ctx.plugin(JsonlPersistence, { root, compression: 'none' }).await();
+    await ctx.plugin(SessionStore).await();
+    const native = ctx.get('sessionPersistence') as SessionPersistence;
+    const sessions = ctx.get('sessions');
+    const session = sessions.prepare(SessionId(sessionId), {
+      meta: { cwd: root },
+    });
+    const detach = sessions.enter(session);
+    const attested = createNativeRunTerminalAttestations();
+    ctx.on(
+      'session/event',
+      (subject, event) => {
+        if (sessions.get(subject.id) === subject)
+          attested.observe(subject, event);
+      },
+      { global: true },
+    );
+    let rows: SessionEvent[];
+    try {
+      rows = appendTurn(
+        session,
+        1,
+        { kind: 'user', rpcId: selection.nativeRequestId },
+        true,
+      );
+      const start = rows[0]!;
+      const end = rows.at(-1)!;
+      if (end.type !== 'turn/end')
+        throw new Error('Expected a native turn end');
+      const selected = { ...selection, cursor: rows[2]!.seq };
+      const active = new AbortController().signal;
+      const read = (receipts = attested) =>
+        receipts.read(session, native, selected, active);
+
+      expect(await read()).toBeNull();
+      const journal = await writeAndRead(native, session, rows);
+      const terminal = findDEntryNativeRunTerminal(selected, journal);
+      expect(terminal).toMatchObject({
+        sessionId,
+        turn: 1,
+        reason: 'completed',
+        sequence: end.seq,
+      });
+      expect(await read()).toEqual(terminal);
+      expect(await read(createNativeRunTerminalAttestations())).toBeNull();
+
+      for (const event of [
+        { ...end, time: end.time + 1 },
+        { ...end, seq: end.seq + 1 },
+        { ...end, data: { ...end.data, turn: 2 } },
+        { ...end, data: { ...end.data, reason: { kind: 'max-tokens' } } },
+        { ...end, data: { ...end.data, reason: { kind: 'interrupted' } } },
+        { ...end, data: { ...end.data, reason: { kind: 'forked' } } },
+      ]) {
+        const wrong = createNativeRunTerminalAttestations();
+        wrong.observe(session, start);
+        wrong.observe(session, event);
+        expect(await read(wrong)).toBeNull();
+      }
+      const noStart = createNativeRunTerminalAttestations();
+      noStart.observe(session, end);
+      expect(await read(noStart)).toBeNull();
+      const wrongStart = createNativeRunTerminalAttestations();
+      wrongStart.observe(session, { ...start, seq: start.seq + 1 });
+      wrongStart.observe(session, end);
+      expect(await read(wrongStart)).toBeNull();
+      expect(
+        await attested.read(
+          session,
+          native,
+          { ...selected, turn: null, purpose: 'session-title' },
+          active,
+        ),
+      ).toBeNull();
+    } finally {
+      detach();
+    }
+
+    const replacement = sessions.prepare(SessionId(sessionId), {
+      meta: { cwd: root },
+    });
+    attested.observe(replacement, rows[0]);
+    attested.observe(replacement, rows.at(-1));
+    const selected = { ...selection, cursor: rows[2]!.seq };
+    const active = new AbortController().signal;
+    expect(
+      await attested.read(replacement, native, selected, active),
+    ).toBeNull();
+    expect(await attested.read(session, native, selected, active)).toBeNull();
+  } finally {
+    await ctx.fiber.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('matches a derived turn only inside its physical child or root-wake bracket', async () => {
   const root = await mkdtemp(

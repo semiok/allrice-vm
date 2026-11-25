@@ -2,40 +2,26 @@ import { setTimeout as wait } from 'node:timers/promises';
 import {
   isDEntryNativeRunJournalCurrent,
   listDEntryNativeRunCandidates,
-  nextRetainedDEntryNativeRunJournalOwner,
   publishDEntryNativeRunTerminal,
-  type DEntryNativeRunJournalOwner,
 } from '@allrice/database';
 import { PersonVmError } from '@allrice/person-vm';
 import type { createAssignedNativeWebStartup } from '../native-web/composition.js';
 import type { NativeWebOwner } from '../native-web/owner.js';
-import {
-  dEntryNativeRunJournalSelection,
-  type RetainedNativeRunReconciler,
-} from './retained-native-run-reader.js';
+import { dEntryNativeRunJournalSelection } from './retained-native-run-reader.js';
 
-/** Passive projection for each authenticated local profile. The retry source
- * is the persisted Run + execution rows, with no dependency on model calls or
- * on the original prompt's request lifetime. */
+/** Retry the durable ledger while the original native owner can attest the
+ * terminal event from its process memory. */
 export async function reconcileNativeRunTerminals(
   startup: Pick<
     ReturnType<typeof createAssignedNativeWebStartup>,
     'runJournalOwners'
   >,
-  reconcileRetainedRun: RetainedNativeRunReconciler,
   signal: AbortSignal,
 ) {
   const positions = new WeakMap<
     NativeWebOwner,
     Parameters<typeof listDEntryNativeRunCandidates>[1]
   >();
-  let retainedAfter: DEntryNativeRunJournalOwner | undefined;
-  let retained:
-    | {
-        scope: DEntryNativeRunJournalOwner;
-        after?: Parameters<typeof listDEntryNativeRunCandidates>[1];
-      }
-    | undefined;
   while (!signal.aborted) {
     const local = startup.runJournalOwners();
     for (const location of local) {
@@ -61,6 +47,16 @@ export async function reconcileNativeRunTerminals(
       if (!page) continue;
       for (const candidate of page.candidates) {
         if (active.aborted) break;
+        const { attempt, prompt } = candidate;
+        if (
+          prompt.adapterId !== owner.modelAdapterId ||
+          attempt.profile !== owner.modelAdapterId ||
+          attempt.nativeInstanceId !== owner.nativeInstanceId ||
+          attempt.vmInstanceId !== scope.vmInstanceId ||
+          attempt.leaseEpoch !== scope.leaseEpoch ||
+          attempt.turn === null
+        )
+          continue;
         try {
           const end = await owner.readPersistedRunTerminalFor(
             dEntryNativeRunJournalSelection(candidate),
@@ -87,40 +83,6 @@ export async function reconcileNativeRunTerminals(
       }
       positions.set(owner, page.next);
     }
-    if (signal.aborted) break;
-    if (!retained) {
-      const scope = await nextRetainedDEntryNativeRunJournalOwner(
-        retainedAfter,
-      ).catch(() => undefined);
-      if (scope) retained = { scope };
-      else retainedAfter = undefined;
-    }
-    if (retained) {
-      const { scope, after } = retained;
-      const haveLocalOwner = startup
-        .runJournalOwners()
-        .some((location) => location.receipt.binding.vmId === scope.vmId);
-      const page = haveLocalOwner
-        ? null
-        : await listDEntryNativeRunCandidates(scope, after, 4).catch(
-            () => null,
-          );
-      for (const candidate of page?.candidates ?? []) {
-        if (signal.aborted) break;
-        try {
-          await reconcileRetainedRun(candidate, scope, signal);
-        } catch {
-          // Unavailable physical scope, native evidence or a database ACK
-          // leaves the exact pending Run discoverable on a later scan.
-        }
-      }
-      if (page?.next) retained = { scope, after: page.next };
-      else {
-        retainedAfter = scope;
-        retained = undefined;
-      }
-    }
-
     await wait(10_000, undefined, { signal, ref: false }).catch(
       (error: unknown) => {
         if (!signal.aborted) throw error;

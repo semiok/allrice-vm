@@ -8,7 +8,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
 import { TextEncoder } from 'node:util';
-import { readPersistedRunTerminal } from './allrice-native-run-journal.mjs';
+import { createNativeRunTerminalAttestations } from './allrice-native-run-journal.mjs';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -962,6 +962,28 @@ export function applyNativeWebOwner(
           const modelCalls = new Map();
           const delegations = observeDelegatedInputs(scope);
           const promptFacts = observeNativePrompts(scope, signal);
+          const terminalAttestations = createNativeRunTerminalAttestations();
+          const liveSession = (sessionId) => {
+            const session = original(scope.sessions.get(sessionId));
+            const agent = original(scope.agents.get(sessionId));
+            return session && original(agent?.session) === session
+              ? session
+              : null;
+          };
+          scope.on(
+            'session/event',
+            (subject, event) => {
+              if (
+                !current() ||
+                (event.type !== 'turn/start' && event.type !== 'turn/end')
+              )
+                return;
+              const session = original(subject);
+              if (liveSession(session.id) === session)
+                terminalAttestations.observe(session, event);
+            },
+            { global: true },
+          );
           scope.connection.fetch.register({
             // Native exact Fetch routes are delivered only to the authenticated
             // owner Peer. This path is consumed by the managed Host transport.
@@ -999,14 +1021,17 @@ export function applyNativeWebOwner(
               )
                 return new globalThis.Response(null, { status: 404 });
               if (value.action === 'read-run-terminal') {
+                const session = liveSession(value.sessionId);
                 const persistence = scope.get('sessionPersistence');
-                const terminal = await readPersistedRunTerminal(
+                const terminal = await terminalAttestations.read(
+                  session,
                   persistence,
                   value,
                   globalThis.AbortSignal.any([request.signal, signal]),
                 );
                 return terminal &&
                   current() &&
+                  liveSession(value.sessionId) === session &&
                   original(scope.get('sessionPersistence')) ===
                     original(persistence)
                   ? globalThis.Response.json(terminal, {

@@ -47,6 +47,26 @@ function terminalReason(event) {
   }
 }
 
+function turnEnd(sessionId, event, turn) {
+  const reason = terminalReason(event);
+  const time = new Date(event.time);
+  if (
+    record(event.data).turn !== turn ||
+    !reason ||
+    !Number.isSafeInteger(event.time) ||
+    event.time < 0 ||
+    !Number.isFinite(+time)
+  )
+    return null;
+  return {
+    sessionId,
+    sequence: event.seq,
+    turn,
+    reason,
+    occurredAt: time.toISOString(),
+  };
+}
+
 /** Project only a contiguous physical journal returned by native
  * sessionPersistence. session-query can synthesize a cold interrupted tail. */
 export function findDEntryNativeRunTerminal(
@@ -60,6 +80,7 @@ export function findDEntryNativeRunTerminal(
     parentSessionId = null,
   },
   { header, events, inheritedEventCount },
+  witnessedStartSequence,
 ) {
   const cursor = events[index];
   const child = parentSessionId !== null;
@@ -138,7 +159,9 @@ export function findDEntryNativeRunTerminal(
     typeof turn !== 'number' ||
     !Number.isSafeInteger(turn) ||
     turn < 1 ||
-    (expectedTurn !== null && turn !== expectedTurn)
+    (expectedTurn !== null && turn !== expectedTurn) ||
+    (witnessedStartSequence !== undefined &&
+      start.seq !== witnessedStartSequence)
   )
     return null;
 
@@ -151,27 +174,17 @@ export function findDEntryNativeRunTerminal(
     )
       return null;
     if (event.type !== 'turn/end') continue;
-    const reason = terminalReason(event);
-    if (record(event.data).turn !== turn || !reason) return null;
-    const time = new Date(event.time);
-    if (
-      !Number.isSafeInteger(event.time) ||
-      event.time < 0 ||
-      !Number.isFinite(+time)
-    )
-      return null;
-    return {
-      sessionId: header.id,
-      sequence,
-      turn,
-      reason,
-      occurredAt: time.toISOString(),
-    };
+    return turnEnd(header.id, event, turn);
   }
   return null;
 }
 
-export async function readPersistedRunTerminal(persistence, selection, active) {
+export async function readPersistedRunTerminal(
+  persistence,
+  selection,
+  active,
+  witnessedStartSequence,
+) {
   const {
     sessionId,
     nativeRequestId,
@@ -218,14 +231,103 @@ export async function readPersistedRunTerminal(persistence, selection, active) {
     active.throwIfAborted();
     if (after?.revision !== stored.revision || after.formatStatus !== 'current')
       return null;
-    return findDEntryNativeRunTerminal(selection, {
-      header: handle.header,
-      events,
-      inheritedEventCount: handle.inheritedEventCount,
-    });
+    return findDEntryNativeRunTerminal(
+      selection,
+      {
+        header: handle.header,
+        events,
+        inheritedEventCount: handle.inheritedEventCount,
+      },
+      witnessedStartSequence,
+    );
   } finally {
     await handle.close();
   }
+}
+
+/** One observer per managed native owner. Only attached SessionStore events
+ * reach observe. Persistence is a second copy of the witnessed facts. */
+export function createNativeRunTerminalAttestations() {
+  const sessions = new Map();
+  const receipts = new Map();
+  return {
+    observe(session, event) {
+      const { id } = session;
+      let state = sessions.get(id);
+      if (state === null) return;
+      if (state && state.session.deref() !== session) {
+        // A restored session can reuse its id and old turn numbers. Keep
+        // this denial for the life of the owner, even after receipt eviction.
+        sessions.set(id, null);
+        return;
+      }
+      const { type, seq } = event;
+      const turn = record(event.data).turn;
+      if (
+        !Number.isSafeInteger(turn) ||
+        turn < 1 ||
+        !Number.isSafeInteger(seq) ||
+        seq < 0
+      )
+        return;
+      if (type === 'turn/start') {
+        if (!state) {
+          if (sessions.size >= 1024) return;
+          state = { session: new WeakRef(session), turn: 0, start: null };
+          sessions.set(id, state);
+        }
+        if (state.start !== null || turn <= state.turn) {
+          sessions.set(id, null);
+          return;
+        }
+        state.turn = turn;
+        state.start = seq;
+        return;
+      }
+      if (type !== 'turn/end' || !state || state.start === null) return;
+      const start = state.start;
+      state.start = null;
+      const end = turnEnd(id, event, state.turn);
+      // Native cold recovery can persist an interrupted closer before it
+      // attaches the Session. Fork closers are excluded by turnEnd as well.
+      if (!end || end.reason === 'interrupted' || end.sequence <= start) return;
+      receipts.set(JSON.stringify([id, turn]), { start, end });
+      if (receipts.size > 2048) receipts.delete(receipts.keys().next().value);
+    },
+    async read(session, persistence, selection, active) {
+      const { sessionId, turn, cursor, purpose, parentSessionId } = selection;
+      if (
+        !session ||
+        session.id !== sessionId ||
+        (session.header.parentSession ?? null) !== (parentSessionId ?? null) ||
+        !Number.isSafeInteger(turn) ||
+        turn < 1 ||
+        (purpose !== 'assistant' && purpose !== 'compaction')
+      )
+        return null;
+      const state = sessions.get(sessionId);
+      if (state?.session.deref() !== session) return null;
+      const receipt = receipts.get(JSON.stringify([sessionId, turn]));
+      if (!receipt || cursor <= receipt.start || cursor >= receipt.end.sequence)
+        return null;
+      const stored = await readPersistedRunTerminal(
+        persistence,
+        selection,
+        active,
+        receipt.start,
+      );
+      active.throwIfAborted();
+      const { end } = receipt;
+      return sessions.get(sessionId) === state &&
+        stored?.sessionId === end.sessionId &&
+        stored.turn === end.turn &&
+        stored.sequence === end.sequence &&
+        stored.reason === end.reason &&
+        stored.occurredAt === end.occurredAt
+        ? stored
+        : null;
+    },
+  };
 }
 
 // Executed only by the Host's fixed managed read probe on an already running

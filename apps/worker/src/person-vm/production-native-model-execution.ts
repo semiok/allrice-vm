@@ -36,7 +36,6 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
-import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 
 type NativeModelSelection = Readonly<{
   context: RequestContext;
@@ -1329,13 +1328,6 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         },
       };
       installed = owner;
-      void run(live, (active) =>
-        reconcileNativeRunTerminals(
-          host.startup,
-          host.reconcileRetainedRun,
-          active,
-        ),
-      ).catch(() => {});
       return owner;
     },
   };
