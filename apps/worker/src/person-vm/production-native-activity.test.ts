@@ -170,7 +170,7 @@ it('restarts after a missed slot and does not use guard reads as replacements', 
 it('blocks an active schedule at the configured inclusive safety boundary', async () => {
   const h = harness();
   for (let slot = 0; slot < 20; slot++) await h.sample(slot);
-  h.nearWake(h.guardMs + 1);
+  h.nearWake(period + h.guardMs + 1);
   expect((await h.sample(20)).eligible).toBe(true);
   h.nearWake(h.guardMs);
   expect(await h.sample(20, 'stop-guard')).toMatchObject({
