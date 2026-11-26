@@ -4,7 +4,7 @@ import { open, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const stages = [
+const stages = new Map([
   ['preflight', '实例、封签和卷身份'],
   ['host', 'KVM、LUKS2/XFS 和 reflink'],
   ['single-vm', '单 VM 启动、隔离及卸载'],
@@ -12,7 +12,7 @@ const stages = [
   ['timing', '冷启、预备盘、同盘重启与热开的分段计时'],
   ['concurrency', '1→2→4 个合成人的并发及释放'],
   ['recovery', '合成 PG 和卷恢复'],
-];
+]);
 
 const skipReasons = new Map([
   ['not-run', '尚未执行'],
@@ -83,10 +83,9 @@ async function summarize(indexFile) {
   }
   const { run } = packet;
   const identity = runIdentity(run);
-  const known = new Map(stages);
   const records = new Map();
   for (const record of packet.records) {
-    if (!known.has(record?.step) || records.has(record.step)) {
+    if (!stages.has(record?.step) || records.has(record.step)) {
       throw new EvidenceError('阶段未知或重复');
     }
     if (runIdentity(record.run) !== identity) {
