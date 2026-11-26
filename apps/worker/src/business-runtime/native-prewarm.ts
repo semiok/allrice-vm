@@ -33,18 +33,24 @@ type VmStamp = Generation & {
 };
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
 type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
-type ReadCoordination = (identity: DEntryIdentity) => Promise<Coordination>;
+type ReadCoordination = (
+  identity: DEntryIdentity,
+  sessionId: string,
+) => Promise<Coordination>;
 
-const readCurrentCoordination: ReadCoordination = (identity) =>
+const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
   getDatabase().begin(
     'isolation level repeatable read read only',
     async (sql) => {
       const policy = await readDEntryReleasePolicy(sql);
       if (selectDEntryGeneration(policy, identity) !== '4.0')
         throw new DataAccessError('authorization_denied');
+      // An existing thread needs its exact tuple version. A restored row can
+      // carry identical access fields; fresh admission is required on change.
       const [snapshot] = await sql<
         {
           vm: VmStampRow | null;
+          loginActive: boolean;
           grants: string[];
           employeeGrant: string | null;
           threadGrant: string | null;
@@ -56,6 +62,9 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
           lease_epoch::text as "leaseEpoch" from person_virtual_machines
         where person_id=${identity.personId} and organization_id=${identity.organizationId}
       ) stamp) as vm,
+      exists(select 1 from allrice_sessions s where s.id=${sessionId}
+        and s.user_id=${identity.personId} and s.revoked_at is null
+        and s.expires_at>clock_timestamp()) as "loginActive",
       array(select m.id::text || ':' || m.xmin::text from allrice_memberships m
         where m.user_id=${identity.personId} and m.organization_id=${identity.organizationId}
           and m.active and m.role in ('admin','member')
@@ -75,18 +84,17 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
           and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
           and i.archived_at is null and a.active) as "employeeGrant",
       case when ${identity.threadId}::uuid is null then 'employee'
-      else (select jsonb_build_array(c.id, c.employee_instance_id,
-          c.employee_assignment_id, c.employee_version_id, c.execution_generation)::text
+      else (select c.xmin::text
         from allrice_chat_sessions c
         where c.id=${identity.threadId} and c.owner_id=${identity.personId}
           and c.organization_id=${identity.organizationId} and c.workspace_id=${identity.workspaceId}
           and c.archived_at is null) end as "threadGrant"`;
-      const { vm, grants, employeeGrant, threadGrant } = snapshot!;
+      const { vm, loginActive, grants, employeeGrant, threadGrant } = snapshot!;
       return {
         // Tuple versions partition reuse across a revoke/regrant even if the
         // restored membership has the same role. They never grant authority.
         authorityRevision:
-          grants.length && employeeGrant && threadGrant
+          loginActive && grants.length && employeeGrant && threadGrant
             ? JSON.stringify([
                 policy.revision,
                 grants,
@@ -259,7 +267,7 @@ export function createDEntryNativePrewarmPort(input: {
   ) {
     const signal = AbortSignal.any([admission, caller]);
     signal.throwIfAborted();
-    const stamp = await input.readCoordination?.(identity);
+    const stamp = await input.readCoordination?.(identity, context.sessionId);
     signal.throwIfAborted();
     if (
       !stamp?.authorityRevision ||
@@ -276,6 +284,7 @@ export function createDEntryNativePrewarmPort(input: {
       return (
         stamp.vm?.phase === 'running' &&
         !!stamp.vm.instanceId &&
+        !stamp.vm.leaseOwner &&
         exact(stamp.vm)
       );
     return (
@@ -292,43 +301,17 @@ export function createDEntryNativePrewarmPort(input: {
       const data = currentDEntryNativeDataPort();
       if (!read || (input.requireEditorProof && !data?.assertEditorReady))
         throw new DEntryNativeUnavailable();
-      const stamp = await read(identity);
+      const stamp = await read(identity, context.sessionId);
       signal.throwIfAborted();
       const target = plannedGeneration(stamp.vm);
       if (!stamp.authorityRevision || !target)
         throw new DataAccessError('authorization_denied');
       const key = prewarmKey(context, identity, stamp.authorityRevision);
-      if (stamp.vm?.phase !== 'running' || !data?.assertEditorReady)
-        return { key, target };
-      try {
-        const ready = await data.assertEditorReady(context, identity, signal);
-        if (
-          !(await isCurrent(
-            context,
-            identity,
-            { key, target },
-            signal,
-            'ready',
-          ))
-        )
-          throw new DataAccessError('authorization_denied');
-        ready.throwIfAborted();
-        return { key, target, ready };
-      } catch (error) {
-        signal.throwIfAborted();
-        if (
-          error instanceof DEntryNativeUnavailable ||
-          (error instanceof PersonVmError &&
-            [
-              'NOT_FOUND',
-              'LEASE_CONFLICT',
-              'LEASE_LOST',
-              'RUNTIME_NOT_READY',
-            ].includes(error.code))
-        )
-          return { key, target };
-        throw error;
-      }
+      return {
+        key,
+        target,
+        running: stamp.vm?.phase === 'running' && !stamp.vm.leaseOwner,
+      };
     },
     prewarm(context, identity, trigger, caller, revoked, plan) {
       if (admission.aborted) return Promise.reject(admission.reason);
@@ -354,7 +337,30 @@ export function createDEntryNativePrewarmPort(input: {
         active.throwIfAborted();
         // Enrol a newly eligible employee on a live Host before the running
         // branch checks VM-wide readiness. A cold Host follows normal startup.
-        if (!plan && input.requireEditorProof && prove) {
+        if (plan?.running && prove) {
+          try {
+            const proof = await prove(context, identity, active);
+            if (await isCurrent(context, identity, plan, active, 'ready')) {
+              proof.throwIfAborted();
+              return proof;
+            }
+          } catch (error) {
+            active.throwIfAborted();
+            if (
+              !(error instanceof DEntryNativeUnavailable) &&
+              !(
+                error instanceof PersonVmError &&
+                [
+                  'NOT_FOUND',
+                  'LEASE_CONFLICT',
+                  'LEASE_LOST',
+                  'RUNTIME_NOT_READY',
+                ].includes(error.code)
+              )
+            )
+              throw error;
+          }
+        } else if (!plan && input.requireEditorProof && prove) {
           try {
             await prove(context, identity, active);
           } catch (error) {
@@ -369,7 +375,7 @@ export function createDEntryNativePrewarmPort(input: {
         // Genuine authority revocation still fences this physical operation.
         active.throwIfAborted();
         const read = input.readCoordination;
-        const stamp = await read?.(identity);
+        const stamp = await read?.(identity, context.sessionId);
         active.throwIfAborted();
         const revision = stamp?.authorityRevision;
         const target =
@@ -387,7 +393,26 @@ export function createDEntryNativePrewarmPort(input: {
           input.prewarmCurrent(
             context,
             identity,
-            { trigger, ...(plan && { target: plan.target }) },
+            {
+              trigger,
+              ...(plan && {
+                target: {
+                  ...plan.target,
+                  async assertAuthority(current) {
+                    if (
+                      !(await isCurrent(
+                        context,
+                        identity,
+                        plan,
+                        current,
+                        'authority',
+                      ))
+                    )
+                      throw new DataAccessError('authorization_denied');
+                  },
+                },
+              }),
+            },
             signal,
           );
         const ticket =
@@ -400,7 +425,7 @@ export function createDEntryNativePrewarmPort(input: {
                 start,
                 async confirm(result, flight) {
                   return matchingGeneration(
-                    await read(identity),
+                    await read(identity, context.sessionId),
                     revision,
                     result,
                     flight.target,
@@ -420,7 +445,7 @@ export function createDEntryNativePrewarmPort(input: {
             const expected = plan?.target ?? generation;
             if (!expected || !read || !revision) return true;
             const actual = matchingGeneration(
-              await read(identity),
+              await read(identity, context.sessionId),
               revision,
               result,
               expected,

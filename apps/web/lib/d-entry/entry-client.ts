@@ -126,7 +126,8 @@ export async function prewarmEmployeeEntry(
       request.throwIfAborted();
       // A gateway outage says nothing about an already admitted operation.
       // Pause and let Continue reuse its ticket when polling is available.
-      if (response.status >= 500) throw new EmployeeEntryError(408);
+      if (response.status === 429 || response.status >= 500)
+        throw new EmployeeEntryError(408);
       if (response.status !== 200 && response.status !== 410)
         throw new EmployeeEntryError(response.status);
       const body = await response.json().catch((error: unknown) => {
@@ -136,7 +137,9 @@ export async function prewarmEmployeeEntry(
         throw error;
       });
       request.throwIfAborted();
-      const status = DEntryNativePrewarmStatusSchema.parse(body);
+      const parsed = DEntryNativePrewarmStatusSchema.safeParse(body);
+      if (!parsed.success) throw new EmployeeEntryError(408);
+      const status = parsed.data;
       if (response.status === 410 || status.state === 'expired')
         throw new EmployeeEntryError(410);
       if (status.state === 'failed')

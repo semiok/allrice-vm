@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -328,7 +329,7 @@ export function createDEntryHttpHandler(
             );
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
-      if (prewarmRequest && plan) {
+      if (prewarmRequest && plan && check) {
         const next = await currentDEntryRequest(deps, token, input, signal);
         if (
           auth.context.sessionId !== next.context.sessionId ||
@@ -336,29 +337,48 @@ export function createDEntryHttpHandler(
         )
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
-        const receipt = {
-          identity: next.identity,
-          trigger: prewarmRequest.trigger,
-        };
-        if (!plan.ready) {
-          const { context, identity } = next;
-          const { trigger } = prewarmRequest;
-          const accepted = prewarm.accept(
-            context,
-            identity,
-            plan,
-            authority,
-            (active) =>
-              deps.prewarm.prewarm(
-                context,
-                identity,
-                trigger,
-                active,
-                active,
-                plan,
-              ),
-          );
-          transferred = accepted.owned;
+        const { context, identity } = next;
+        const { trigger } = prewarmRequest;
+        const receipt = { identity, trigger };
+        const accepted = prewarm.accept(
+          context,
+          identity,
+          plan,
+          authority,
+          (active) =>
+            deps.prewarm.prewarm(
+              context,
+              identity,
+              trigger,
+              active,
+              active,
+              plan,
+            ),
+        );
+        transferred = accepted.owned;
+        let hot = false;
+        // An already running VM only gets a short window for immediate proof.
+        // If proof is slow, keep that same Worker-owned task and return its ID.
+        if (plan.running) {
+          const budget = new AbortController();
+          try {
+            await Promise.race([
+              accepted.settled,
+              delay(1000, undefined, {
+                signal: AbortSignal.any([signal, budget.signal]),
+                ref: false,
+              }),
+            ]);
+          } finally {
+            budget.abort();
+          }
+          hot =
+            accepted.ready() &&
+            (await check(context, identity, plan, signal, 'ready')) &&
+            accepted.ready();
+          signal.throwIfAborted();
+        }
+        if (!hot) {
           response
             .writeHead(202, {
               'content-type': 'application/json',
@@ -374,7 +394,6 @@ export function createDEntryHttpHandler(
             );
           return true;
         }
-        if (plan.ready.aborted) throw new DEntryNativeUnavailable();
         response.writeHead(200, {
           'content-type': 'application/json',
           'cache-control': 'no-store',

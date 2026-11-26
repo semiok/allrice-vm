@@ -16,6 +16,7 @@ import {
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
+  type PersonVmPrewarmFence,
   type PersonVmPrewarmTarget,
   type PersonVmRuntimePort,
   type PersonVmView,
@@ -280,7 +281,7 @@ export class PersonVmService
   async create(
     context: RequestContext,
     signal: AbortSignal,
-    target?: PersonVmPrewarmTarget,
+    target?: PersonVmPrewarmFence,
   ) {
     return this.leased(
       context,
@@ -288,6 +289,7 @@ export class PersonVmService
       signal,
       async (lease, identity, signal) => {
         this.assertPrewarmTarget(lease.row, target);
+        if (target) await target.assertAuthority(signal);
         const retry =
           lease.row &&
           !lease.row.instanceId &&
@@ -341,6 +343,7 @@ export class PersonVmService
           if (inspected.state === 'unknown')
             throw new PersonVmError('PROVIDER_FAILED');
           if (inspected.state === 'absent') {
+            if (target) await target.assertAuthority(signal);
             await this.options.disk.create(
               { vmId: row.vmId, tier: row.diskTier },
               signal,
@@ -459,15 +462,21 @@ export class PersonVmService
   async start(
     context: RequestContext,
     signal: AbortSignal,
-    target?: PersonVmPrewarmTarget,
+    target?: PersonVmPrewarmFence,
   ) {
     return this.leased(
       context,
       'start',
       signal,
-      (lease, _identity, current) => {
+      async (lease, _identity, current) => {
         this.assertPrewarmTarget(lease.row, target);
-        return this.startOwned(context, lease, current);
+        if (target) await target.assertAuthority(current);
+        return this.startOwned(
+          context,
+          lease,
+          current,
+          target?.assertAuthority,
+        );
       },
     );
   }
@@ -499,6 +508,7 @@ export class PersonVmService
     context: RequestContext,
     lease: VmLease,
     signal: AbortSignal,
+    assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
   ) {
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const row = this.required(lease.row);
@@ -563,6 +573,7 @@ export class PersonVmService
       await this.cleanup(row, lease, 'takeover');
     }
     await lease.assertAdmissionOpen(true);
+    if (assertAuthority) await assertAuthority(signal);
     row.leaseEpoch += 1;
     row.instanceId = randomUUID();
     row.phase = 'starting';
@@ -581,6 +592,7 @@ export class PersonVmService
       this.options.observeOwnedStart?.(binding);
       signal.throwIfAborted();
       await lease.guard();
+      if (assertAuthority) await assertAuthority(signal);
       if (row.diskTier === 'cold') {
         await this.options.disk.move(
           { vmId: row.vmId, tier: 'cold' },
@@ -648,6 +660,7 @@ export class PersonVmService
       }
       const native = this.options.native;
       const state = await native.status(binding, signal);
+      if (assertAuthority) await assertAuthority(signal);
       let checkedWebAfterStart = false;
       if (state === 'absent' && !row.nativeCreated) {
         if (web) await native.create(binding, receipt, signal, web.receipt);
@@ -730,7 +743,7 @@ export class PersonVmService
   }
   async prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmTarget },
+    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
     signal: AbortSignal,
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
@@ -740,6 +753,7 @@ export class PersonVmService
     if (row) this.checkOrganization(row, identity.organizationId);
     this.assertPrewarmTarget(row, input.target);
     if (row?.phase === 'running') {
+      if (input.target) await input.target.assertAuthority(signal);
       const binding = bindingOf(row);
       if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
       const roster = await this.webRoster(context, signal);

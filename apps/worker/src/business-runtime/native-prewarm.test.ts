@@ -709,20 +709,41 @@ it('the real Worker listener requires current release eligibility and the instal
   expect(f.start).toHaveBeenCalledTimes(1);
 });
 
+it('checks the accepted revision inside the lifecycle lease before creating a disk', async () => {
+  const f = fixture(true);
+  const { context, identity } = f.base;
+  const active = signal();
+  const plan = await f.assembly.port.prepare!(context, identity, active);
+  const lease = f.h.store.withLease.bind(f.h.store);
+  vi.spyOn(f.h.store, 'withLease').mockImplementationOnce((...args) => {
+    f.readCoordination.mockResolvedValue({
+      authorityRevision: 'new-grant',
+      vm: null,
+    });
+    return lease(...args);
+  });
+  await expect(
+    f.assembly.port.prewarm(context, identity, 'page', active, active, plan),
+  ).rejects.toMatchObject({ code: 'authorization_denied' });
+  expect(f.h.log).toEqual([]);
+  expect(await f.h.store.read(identity.personId)).toBeNull();
+});
+
 it('returns Worker 200 on a verified hot path and refuses proof revoked during reply qualification', async () => {
   const f = fixture();
   const route = new AbortController();
   const entered = deferred<void>();
   const release = deferred<void>();
-  const prewarm = vi.fn(async () => {});
+  const prewarm = vi.fn(async () => route.signal);
+  const check = vi.fn(async () => true);
   const server = await nativeEntryServer(f.base, {
     ...f.base.deps,
     prewarm: {
-      isCurrent: async () => true,
+      isCurrent: check,
       prepare: async () => ({
         key: 'hot-exact',
         target: f.base.binding,
-        ready: route.signal,
+        running: true,
       }),
       prewarm,
     },
@@ -735,19 +756,60 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
     identity: f.base.identity,
     trigger: 'page',
   });
-  f.base.deps.identity
-    .mockResolvedValueOnce(f.base.identity)
-    .mockImplementationOnce(async () => {
-      entered.resolve();
-      await release.promise;
-      return f.base.identity;
-    });
+  check.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return true;
+  });
   const request = server.request('native-prewarm', body);
   await entered.promise;
   route.abort();
   release.resolve();
-  expect((await request).status).toBe(503);
-  expect(prewarm).not.toHaveBeenCalled();
+  expect((await request).status).toBe(202);
+  expect(prewarm).toHaveBeenCalledTimes(2);
+});
+
+it('returns a ticket for a running VM with slow editor proof and keeps just one owned job', async () => {
+  const f = fixture(),
+    proof = deferred<AbortSignal>();
+  const prewarm = vi.fn(() => proof.promise);
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async () => true,
+      prepare: async () => ({
+        key: 'same-boot',
+        target: f.base.binding,
+        running: true,
+      }),
+      prewarm,
+    },
+  });
+  cleanups.push(server.close);
+  try {
+    const body = { ...f.base.body, trigger: 'page' };
+    const replies = await Promise.all([
+      server.request('native-prewarm', body),
+      server.request('native-prewarm', body),
+    ]);
+    expect(replies.map((reply) => reply.status)).toEqual([202, 202]);
+    const [{ ticket }, duplicate] = await Promise.all(
+      replies.map((reply) => reply.json()),
+    );
+    expect(duplicate.ticket).toEqual(ticket);
+    expect(prewarm).toHaveBeenCalledOnce();
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'starting' });
+    proof.resolve(signal());
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+  } finally {
+    proof.resolve(signal());
+  }
 });
 
 it('serves short polls over a cold startup longer than 125 seconds and deduplicates POSTs', async () => {
@@ -806,6 +868,16 @@ it('serves short polls over a cold startup longer than 125 seconds and deduplica
     });
     expect(f.base.authorityClose).toHaveBeenCalledTimes(2);
     expect(f.start).toHaveBeenCalledTimes(1);
+    f.readCoordination.mockImplementationOnce(async () => ({
+      authorityRevision: 'release-1',
+      vm: {
+        ...(await f.h.store.read(f.base.identity.personId))!,
+        leaseOwner: randomUUID(),
+      },
+    }));
+    const busy = await prewarmStatus(server, ticket.operationId);
+    expect(await busy.json()).toEqual({ state: 'expired' });
+    expect(busy.status).toBe(410);
     time.mockReturnValue(now + 601_000);
     const expired = await prewarmStatus(server, ticket.operationId);
     expect(expired.status).toBe(410);

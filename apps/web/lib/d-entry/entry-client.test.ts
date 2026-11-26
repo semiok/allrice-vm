@@ -94,7 +94,14 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
-it.each(['deadline', 'gateway', 'network', 'truncated status'])(
+it.each([
+  'deadline',
+  'gateway',
+  'network',
+  'truncated status',
+  'schema mismatch',
+  'rate limit',
+])(
   'resumes a paused wait with the original ticket after %s',
   async (reason) => {
     vi.useFakeTimers();
@@ -107,6 +114,8 @@ it.each(['deadline', 'gateway', 'network', 'truncated status'])(
       .fn<typeof globalThis.fetch>(async () => {
         if (reason === 'network') throw new TypeError('Failed to fetch');
         if (reason === 'truncated status') return new Response('{');
+        if (reason === 'schema mismatch') return Response.json({});
+        if (reason === 'rate limit') return new Response(null, { status: 429 });
         return reason === 'gateway'
           ? new Response(null, { status: 503 })
           : Response.json({ state: 'starting' });

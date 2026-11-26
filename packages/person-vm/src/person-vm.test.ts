@@ -29,6 +29,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       vmId: previous.vmId,
       instanceId: null,
       leaseEpoch: previous.leaseEpoch + 1,
+      assertAuthority: async () => {},
     };
     const withLease = store.withLease.bind(store);
     vi.spyOn(store, 'withLease').mockImplementationOnce((...args) => {
@@ -46,6 +47,45 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(store.rows.get(rc.actor.id)?.leaseEpoch).toBe(target.leaseEpoch);
     expect(store.rows.get(rc.actor.id)?.leaseOwner).toBeNull();
   });
+  it.each(['create', 'start'])(
+    'checks the accepted authority while owning the %s lease',
+    async (phase) => {
+      const store = new MemoryStore(),
+        h = harness(store),
+        rc = context();
+      if (phase === 'start') await h.service.create(rc, signal());
+      h.log.length = 0;
+      let acquisitions = 0;
+      const withLease = store.withLease.bind(store);
+      vi.spyOn(store, 'withLease').mockImplementation((...args) => {
+        acquisitions++;
+        return withLease(...args);
+      });
+      const denied = new PersonVmError('AUTHORIZATION_DENIED');
+      const target = {
+        vmId: store.rows.get(rc.actor.id)?.vmId ?? null,
+        instanceId: null,
+        leaseEpoch: 1,
+        async assertAuthority() {
+          if (acquisitions === (phase === 'create' ? 1 : 2)) throw denied;
+        },
+      };
+      await expect(
+        h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+      ).rejects.toBe(denied);
+      expect(h.log).toEqual([]);
+      expect(store.rows.get(rc.actor.id)?.phase ?? 'missing').toBe(
+        phase === 'start' ? 'stopped' : 'missing',
+      );
+      await expect(
+        store.withLease(
+          rc.actor.id,
+          { now: () => new Date(), ttlMs: 1000 },
+          async () => 'released',
+        ),
+      ).resolves.toBe('released');
+    },
+  );
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');

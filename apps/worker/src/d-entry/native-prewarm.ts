@@ -14,7 +14,7 @@ export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
-  ready?: AbortSignal;
+  running?: boolean;
 };
 
 export function compatiblePrewarmGeneration(
@@ -89,6 +89,7 @@ export function createPrewarmOperations(
     expires: number;
     state: DEntryNativePrewarmStatus;
     proof?: AbortSignal;
+    settled?: Promise<void>;
   };
   const tickets = new Map<string, Operation>();
   const pending = new Set<Promise<void>>();
@@ -101,6 +102,12 @@ export function createPrewarmOperations(
   ) =>
     entry.sessionId === context.sessionId &&
     sameDEntryIdentity(entry.identity, identity);
+  const accepted = (entry: Operation, owned: boolean) => ({
+    ticket: entry.ticket,
+    owned,
+    settled: entry.settled,
+    ready: () => entry.state.state === 'ready' && !entry.proof?.aborted,
+  });
 
   return {
     accept(
@@ -122,7 +129,7 @@ export function createPrewarmOperations(
           entry.plan.key === plan.key &&
           compatiblePrewarmGeneration(entry.plan.target, plan.target)
         ) {
-          return { ticket: entry.ticket, owned: false };
+          return accepted(entry, false);
         }
       }
       if (pending.size >= 256) throw new DEntryNativeUnavailable();
@@ -188,8 +195,9 @@ export function createPrewarmOperations(
             : { state: 'ready' };
       });
       pending.add(task);
+      operation.settled = task;
       void task.then(() => pending.delete(task));
-      return { ticket, owned: true };
+      return accepted(operation, true);
     },
     async read(
       operationId: string,
