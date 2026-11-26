@@ -306,7 +306,7 @@ export async function openNativeWebOwner(input: {
     (error, status, failed, source) => {
       if (!recordingStartup()) return;
       if (startupFailureAudit) return failed ? startupFailureAudit : undefined;
-      if (source === 'websocket' && step.startsWith('editor-')) {
+      if (source === 'websocket' && step !== 'control-first-frame') {
         if (!failed) return;
         stage('control-websocket');
       }
