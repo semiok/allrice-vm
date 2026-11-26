@@ -139,6 +139,14 @@ export function startProductionDiskPreprovision(input: {
       const active = AbortSignal.any([signal, cancel.signal]);
       let rechecking: Promise<void> | undefined;
       let recheckRequested = false;
+      const guards = new Set<Promise<void>>();
+      const trackGuard = (check: () => Promise<void>) => () => {
+        const pending = check();
+        guards.add(pending);
+        const settled = () => guards.delete(pending);
+        void pending.then(settled, settled);
+        return pending;
+      };
       try {
         const readTarget = () =>
           readSource(active, () => input.readTarget(personId, active));
@@ -194,8 +202,8 @@ export function startProductionDiskPreprovision(input: {
         active.throwIfAborted();
         await input.port.prepare(target, {
           signal: active,
-          assertCurrent,
-          assertCapacity,
+          assertCurrent: trackGuard(assertCurrent),
+          assertCapacity: trackGuard(assertCapacity),
         });
         active.throwIfAborted();
         defer(personId, false);
@@ -216,6 +224,7 @@ export function startProductionDiskPreprovision(input: {
         cancel.abort();
         attempt = undefined;
         await rechecking;
+        await Promise.allSettled(guards);
       }
     }
 

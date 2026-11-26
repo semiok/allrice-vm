@@ -331,3 +331,34 @@ it('coalesces repeated notifications without starving the foreground database', 
   expect(reads[1]! - reads[0]!).toBeGreaterThan(900);
   expect(f.input.readTarget).toHaveBeenCalledTimes(2);
 });
+
+it('joins direct guard reads even if a parallel guard rejects first', async () => {
+  const f = fixture();
+  const gate = latch();
+  f.input.readTarget
+    .mockResolvedValueOnce(target(first))
+    .mockResolvedValueOnce(target(first))
+    .mockImplementationOnce(async () => {
+      await gate.promise;
+      return target(first);
+    });
+  f.input.availableBytes.mockResolvedValueOnce(100n).mockResolvedValueOnce(89n);
+  f.input.port.prepare.mockImplementationOnce(async (_target, guard) => {
+    await Promise.all([guard.assertCurrent(), guard.assertCapacity()]);
+    return 'prepared';
+  });
+  const owner = f.start();
+  try {
+    await vi.waitFor(() =>
+      expect(f.input.observe).toHaveBeenCalledWith('capacity-deferred'),
+    );
+    const close = owner.close();
+    await turn();
+    expect(f.feed.close).not.toHaveBeenCalled();
+    gate.resolve();
+    await close;
+    expect(f.feed.close).toHaveBeenCalledOnce();
+  } finally {
+    gate.resolve();
+  }
+});
