@@ -339,6 +339,7 @@ describe('Employee Web profile capture', () => {
       binding: 'eth0',
       diskSha256: native.readonlyDshRuntimeDisk.diskSha256,
       candidateSha256: native.readonlyDshRuntimeDisk.candidateSha256,
+      cacheManifestSha256: native.publicImageCache.manifestSha256,
       nativeChecksums: native.artifactChecksums,
     });
     expect(
@@ -348,6 +349,12 @@ describe('Employee Web profile capture', () => {
           ...native.artifactChecksums,
           agentd: 'sha256:' + 'd'.repeat(64),
         },
+      }),
+    ).not.toEqual(employeeProfileRuntime(native));
+    expect(
+      employeeProfileRuntime({
+        ...native,
+        publicImageCache: { manifestSha256: '9'.repeat(64) },
       }),
     ).not.toEqual(employeeProfileRuntime(native));
     expect(() =>

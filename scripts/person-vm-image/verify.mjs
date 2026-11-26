@@ -75,7 +75,7 @@ export function employeeProfileRuntime(native) {
     agentd: native.artifactChecksums?.agentd,
   };
   ensure(
-    native.publicImageCache &&
+    /^[a-f0-9]{64}$/.test(native.publicImageCache?.manifestSha256) &&
       native.image === source.baseImage &&
       native.readonlyDshDirectory?.artifactSha256 === source.artifactSha256 &&
       /^[a-f0-9]{64}$/.test(disk.diskSha256) &&
@@ -92,6 +92,7 @@ export function employeeProfileRuntime(native) {
     binding: 'eth0',
     diskSha256: disk.diskSha256,
     candidateSha256: disk.candidateSha256,
+    cacheManifestSha256: native.publicImageCache.manifestSha256,
     nativeChecksums: Object.freeze(nativeChecksums),
   });
 }
