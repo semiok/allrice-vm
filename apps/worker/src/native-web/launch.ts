@@ -100,10 +100,10 @@ export function dEntryNativePublicUrl(
     workspaceId: endpoint.workspaceId,
     employeeInstanceId: endpoint.employeeInstanceId,
   });
-  const url = new URL('/chatflow/4.0', origin);
-  url.searchParams.set('workspaceId', selection.workspaceId);
-  url.searchParams.set('employeeInstanceId', selection.employeeInstanceId);
-  return url.href;
+  return new URL(
+    `/chatflow/4.0/${selection.workspaceId}/${selection.employeeInstanceId}/`,
+    origin,
+  ).href;
 }
 
 export async function prepareNativeWebLaunch(
@@ -139,10 +139,8 @@ export async function prepareNativeWebLaunch(
     !['http:', 'https:'].includes(publicUrl.protocol) ||
     publicUrl.username ||
     publicUrl.password ||
-    (publicUrl.search &&
-      publicUrl.href !==
-        dEntryNativePublicUrl(publicUrl.origin, config.principalProfile)) ||
-    publicUrl.hash ||
+    config.publicUrl.includes('?') ||
+    config.publicUrl.includes('#') ||
     [config.agentsHome, config.workdir, config.cliPath].some(
       (path) =>
         !posix.isAbsolute(path) ||

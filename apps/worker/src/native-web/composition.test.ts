@@ -348,11 +348,10 @@ it('launches each employee with an authenticated Web entry locator on the sealed
       const { args } = open.mock.calls[index]![0].launch.command;
       const url = new URL(args[args.indexOf('--public-url') + 1]);
       expect(url.origin).toBe(origin);
-      expect(url.pathname).toBe('/chatflow/4.0');
-      expect([...url.searchParams]).toEqual([
-        ['workspaceId', endpoint.workspaceId],
-        ['employeeInstanceId', endpoint.employeeInstanceId],
-      ]);
+      expect(url.pathname).toBe(
+        `/chatflow/4.0/${endpoint.workspaceId}/${endpoint.employeeInstanceId}/`,
+      );
+      expect(url.href).toBe(origin + url.pathname);
       expect(args).toContain(url.host);
       expect(url.port).toBe('');
     }

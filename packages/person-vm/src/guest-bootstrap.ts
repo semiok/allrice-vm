@@ -40,9 +40,10 @@ export interface PersonVmBootstrapScope extends PersonVmStartingScope {
   /** Only after person memory init; always prepends the installed native launcher.
    * The runtime owner retains the returned job, not this expiring startup scope. */
   launch(command: PersonVmGuestCommand): Promise<PersonVmManagedJob>;
-  /** Fixed nonce artifact only, captured privately. Missing provider support fails closed. */
+  /** Fixed nonce artifact only, captured privately. The reader joins on cancellation. */
   readNativeWebAuth?(
     request: PersonVmNativeWebAuthRequest,
+    signal?: AbortSignal,
   ): Promise<PersonVmNativeWebAuth>;
 }
 export interface PersonVmGuestBootstrapPort {
@@ -113,8 +114,10 @@ export async function bootstrapPersonVm(input: {
         track(() => launcher.launch(command)),
       ...(launcher.readNativeWebAuth
         ? {
-            readNativeWebAuth: (request: PersonVmNativeWebAuthRequest) =>
-              track(() => launcher.readNativeWebAuth!(request)),
+            readNativeWebAuth: (
+              request: PersonVmNativeWebAuthRequest,
+              signal?: AbortSignal,
+            ) => track(() => launcher.readNativeWebAuth!(request, signal)),
           }
         : {}),
     });

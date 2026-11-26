@@ -417,9 +417,20 @@ export async function bootstrapMicrosandbox(input: {
     await rm(stage, { recursive: true, force: true });
   }
   return Object.freeze({
-    readNativeWebAuth: async (request: PersonVmNativeWebAuthRequest) => {
+    readNativeWebAuth: async (
+      request: PersonVmNativeWebAuthRequest,
+      signal = scope.signal,
+    ) => {
       const { path, maxBytes } = nativeWebAuthArtifact(request);
+      // exec accepts whole seconds; keep the host's exact millisecond budget.
+      const active = AbortSignal.any([
+        scope.signal,
+        signal,
+        AbortSignal.timeout(request.timeoutMs),
+      ]);
+      active.throwIfAborted();
       await scope.assertCurrent();
+      active.throwIfAborted();
       const text = await command(
         [
           'exec',
@@ -435,10 +446,10 @@ export async function bootstrapMicrosandbox(input: {
           path,
           String(maxBytes),
         ],
-        // exec accepts whole seconds; keep the host's exact millisecond budget.
-        AbortSignal.any([scope.signal, AbortSignal.timeout(request.timeoutMs)]),
+        active,
       );
       await scope.assertCurrent();
+      active.throwIfAborted();
       return parseNativeWebAuth(text, request);
     },
     launch: async (spec: PersonVmGuestCommand) => {

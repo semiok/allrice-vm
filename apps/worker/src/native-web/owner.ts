@@ -450,8 +450,10 @@ export async function openNativeWebOwner(input: {
         if (!waitAbort.signal.aborted) lost();
       },
     );
+    // Loss of this exact CLI job aborts the attached artifact read. Keep it
+    // tracked in setup so close still waits for the native reader to join.
     const auth = await setup(() =>
-      input.scope.readNativeWebAuth!(input.launch.auth),
+      input.scope.readNativeWebAuth!(input.launch.auth, signal),
     );
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
