@@ -16,8 +16,8 @@ HERE = Path(__file__).resolve().parent
 MIGRATIONS = HERE.parents[2] / 'packages/database/migrations'
 PG_ENV = {key: value for key, value in os.environ.items() if not key.startswith('PG')}
 PG_ENV['LC_ALL'] = 'C'
-ORG, PERSON, ADMIN, ACCEPTOR, WORKSPACE, EMPLOYEE, VERSION = (
-    str(uuid.UUID(int=index)) for index in range(1, 8)
+ORG, PERSON, ADMIN, ACCEPTOR, WORKSPACE, EMPLOYEE, VERSION, NATIVE_SESSION, PRIVATE, PRIVATE_VERSION, PRIVATE_ASSIGNMENT = (
+    str(uuid.UUID(int=index)) for index in range(1, 12)
 )
 TARGET = 'snow_reset_restore'
 SOURCE = 'snow_reset_source'
@@ -75,6 +75,32 @@ insert into allrice_employee_run_steps (organization_id,workspace_id,run_id,sequ
 insert into allrice_memories (id,organization_id,workspace_id,owner_id,content,source_type,source_id)
   select id,organization_id,workspace_id,owner_id,'fixture','message',id
   from allrice_messages where organization_id=:'organization';
+insert into allrice_employees (id,organization_id,workspace_id,employee_key,name)
+  values (:'private',:'organization',:'workspace','personal-' || :'private','Synthetic personal');
+insert into allrice_employee_versions (id,organization_id,workspace_id,employee_id,version,name,
+  model,system_prompt,capabilities,config_checksum)
+  values (:'private_version',:'organization',:'workspace',:'private',1,'Synthetic personal',
+    'fixture','fixture','{}','sha256:' || repeat('0',64));
+insert into allrice_employee_assignments (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,assigned_by,is_default)
+  values (:'private_assignment',:'organization',:'workspace',:'private',:'private_version',:'person',:'person',false);
+insert into allrice_employee_instances (id,organization_id,workspace_id,owner_id,assignment_id,
+  kind,creation_version_id,creation_request_id,creation_input)
+  values (:'private_assignment',:'organization',:'workspace',:'person',:'private_assignment',
+    'custom',:'private_version',:'private_assignment','{}');
+insert into allrice_employee_instance_revisions (instance_id,revision,profile)
+  values (:'private_assignment',1,'{}');
+insert into allrice_chat_sessions (id,organization_id,workspace_id,owner_id,title,employee_assignment_id,
+  employee_instance_id,employee_version_id,execution_generation)
+  values (:'native_session',:'organization',:'workspace',:'person','Synthetic 4.0 session',
+    :'private_assignment',:'private_assignment',:'private_version','4.0');
+update allrice_chat_sessions set d_entry_native_root_claim=jsonb_build_object('schemaVersion',1,
+  'identity',jsonb_build_object('organizationId',:'organization','workspaceId',:'workspace','personId',:'person',
+    'threadId',:'native_session','employeeInstanceId',:'private_assignment','employeeRevision',1,'employeeVersionId',:'private_version'),
+  'host',jsonb_build_object('binding',jsonb_build_object('organizationId',:'organization','personId',:'person',
+    'vmId',:'native_session','instanceId',:'native_session','leaseEpoch',1),'bindingRef','fixture','rosterDigest','fixture'),
+  'releaseRevision','fixture','operationId','fixture') where id=:'native_session';
+update allrice_chat_sessions set d_entry_native_root=d_entry_native_root_claim || '{"nativeSessionId":"fixture"}'::jsonb
+  where id=:'native_session';
 insert into allrice_credential_bindings (organization_id,owner_id,provider,label,vault_key)
   values (:'organization',:'admin','openai-codex','mock metadata','synthetic-no-credential');
 insert into allrice_settings (scope_type,key,value)
@@ -85,20 +111,23 @@ insert into allrice_settings (scope_type,key,value)
       jsonb_build_object('organizationId',:'organization','personId',:'acceptor'))));
 """
 EXPECTED_REMOVALS = {
-    'allrice_employee_assignments': 'id',
-    'allrice_employee_user_profiles': 'user_id',
-    'allrice_employee_instances': 'id',
-    'allrice_employee_instance_revisions': 'instance_id',
-    'allrice_chat_sessions': 'id',
-    'allrice_messages': 'id',
-    'allrice_chat_input_requests': 'user_message_id',
-    'allrice_runs': 'id',
-    'allrice_employee_runs': 'run_id',
-    'allrice_employee_run_steps': 'run_id',
-    'allrice_memories': 'id',
+    'allrice_employee_assignments': ('id', (PERSON, PRIVATE_ASSIGNMENT)),
+    'allrice_employee_user_profiles': ('user_id', (PERSON,)),
+    'allrice_employee_instances': ('id', (PERSON, PRIVATE_ASSIGNMENT)),
+    'allrice_employee_instance_revisions': ('instance_id', (PERSON, PRIVATE_ASSIGNMENT)),
+    'allrice_employees': ('id', (PRIVATE,)),
+    'allrice_employee_versions': ('id', (PRIVATE_VERSION,)),
+    'allrice_chat_sessions': ('id', (PERSON, NATIVE_SESSION)),
+    'allrice_messages': ('id', (PERSON,)),
+    'allrice_chat_input_requests': ('user_message_id', (PERSON,)),
+    'allrice_runs': ('id', (PERSON,)),
+    'allrice_employee_runs': ('run_id', (PERSON,)),
+    'allrice_employee_run_steps': ('run_id', (PERSON,)),
+    'allrice_memories': ('id', (PERSON,)),
 }
 VARIABLES = dict(organization=ORG, person=PERSON, admin=ADMIN, acceptor=ACCEPTOR,
-                 workspace=WORKSPACE, employee=EMPLOYEE, version=VERSION)
+                 workspace=WORKSPACE, employee=EMPLOYEE, version=VERSION, native_session=NATIVE_SESSION,
+                 private=PRIVATE, private_version=PRIVATE_VERSION, private_assignment=PRIVATE_ASSIGNMENT)
 
 
 def run(argv, *, text=None, suppress=False):
@@ -114,8 +143,8 @@ def snapshot(sql, *, expected=False):
     # Compare every public table's row multiset, excluding only the expected
     # target rows and the single rollout row, which is checked separately.
     conditions = {
-        table: f"t.{column} <> '{PERSON}'::uuid"
-        for table, column in EXPECTED_REMOVALS.items()
+        table: f"t.{column} not in (" + ", ".join(f"'{value}'::uuid" for value in ids) + ")"
+        for table, (column, ids) in EXPECTED_REMOVALS.items()
     } if expected else {}
     conditions['allrice_settings'] = "not (scope_type='system' and key='d_entry_rollout_policy')"
     predicates = ','.join(
@@ -209,6 +238,26 @@ update allrice_settings set value=jsonb_set(value,'{selections,1}',(value->'sele
     assert snapshot(sql) == cross_parent_before
     sql(TARGET, "update allrice_runs set owner_id=:'person' where id=:'person';")
     assert snapshot(sql) == before
+
+    sql(TARGET, """
+create table synthetic_unreviewed (thread uuid references allrice_chat_sessions(id));
+insert into synthetic_unreviewed values (:'native_session');
+""")
+    before_unknown = snapshot(sql)
+    unknown = sql(TARGET, packet, policy_format='person', suppress=True)
+    assert unknown.returncode and 'unreviewed dependent table' in unknown.stderr
+    assert snapshot(sql) == before_unknown
+    sql(TARGET, 'drop table synthetic_unreviewed;')
+
+    sql(TARGET, """
+insert into allrice_jobs (organization_id,workspace_id,owner_id,run_id,idempotency_key,timeout_at,payload)
+  values (:'organization',:'workspace',:'person',:'person','fixture-active',now() + interval '1 hour','{}');
+""")
+    before_job = snapshot(sql)
+    active_job = sql(TARGET, packet, policy_format='person', suppress=True)
+    assert active_job.returncode and 'snow has active jobs' in active_job.stderr
+    assert snapshot(sql) == before_job
+    sql(TARGET, "delete from allrice_jobs where idempotency_key='fixture-active';")
 
     sql(TARGET, """
 create function pg_temp_marker() returns trigger language plpgsql as $$
