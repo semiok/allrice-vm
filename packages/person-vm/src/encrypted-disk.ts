@@ -5,15 +5,18 @@ import {
   mkdir,
   open,
   readdir,
-  realpath,
   rename,
   rm,
   stat,
 } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { PersonVmError } from './contract.ts';
-import { missing, syncDiskPoolDirectory } from './disk-pool-ledger.ts';
+import {
+  missing,
+  privatePersonVmDirectory,
+  syncDiskPoolDirectory,
+} from './disk-pool-ledger.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 
 export type PersonDisk = Readonly<{ vmId: string; tier: 'warm' | 'cold' }>;
@@ -73,20 +76,10 @@ async function privateFileIds(
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const dir = await lstat(path).catch((error: unknown) => {
-    if (!missing(error)) throw error;
-    return null;
-  });
-  if (!dir) return [];
-  if (
-    !dir.isDirectory() ||
-    dir.uid !== process.getuid?.() ||
-    (dir.mode & 0o7777) !== 0o700 ||
-    (await realpath(path)) !== path
-  )
-    throw new PersonVmError('CLEANUP_INCOMPLETE');
+  const directory = await privatePersonVmDirectory(path);
+  if (!directory) return [];
   const ids: string[] = [];
-  for (const entry of await readdir(path, { withFileTypes: true })) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
     if (!entry.name.endsWith(suffix)) continue;
     if (!entry.isFile()) throw new PersonVmError('CLEANUP_INCOMPLETE');
     ids.push(checkedId(entry.name.slice(0, -suffix.length)));
@@ -143,21 +136,15 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
     await rm(this.filePath(id), { force: true });
   }
   async confirmAbsence(id: string) {
-    const root = await lstat(this.root);
-    if (
-      !root.isDirectory() ||
-      root.uid !== process.getuid?.() ||
-      (root.mode & 0o7777) !== 0o700 ||
-      (await realpath(this.root)) !== this.root
-    )
-      return false;
+    const root = await privatePersonVmDirectory(this.root);
+    if (!root) return false;
     try {
-      await lstat(this.filePath(id));
+      await lstat(join(root, basename(this.filePath(id))));
       return false;
     } catch (error) {
       if (!missing(error)) throw error;
     }
-    await syncDiskPoolDirectory(this.root);
+    await syncDiskPoolDirectory(root);
     return true;
   }
   listDiskIds(signal: AbortSignal) {
@@ -333,17 +320,15 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     return this.inspectExisting(vmId, signal);
   }
   async listFormalDiskIds(signal: AbortSignal) {
+    const root = await privatePersonVmDirectory(this.options.root);
     const ids = new Set(await this.options.keys.listDiskIds?.(signal));
+    if (!root) return [...ids];
     for (const [dir, suffix] of [
       ['warm', '.sparseimage'],
       ['cold', '.sparseimage'],
       ['manifests', '.json'],
     ] as const) {
-      for (const id of await privateFileIds(
-        join(this.options.root, dir),
-        suffix,
-        signal,
-      ))
+      for (const id of await privateFileIds(join(root, dir), suffix, signal))
         ids.add(id);
     }
     return [...ids];
@@ -351,21 +336,15 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
   async confirmAbsence(vmId: string, signal: AbortSignal) {
     // An absent image/manifest pair alone can still leave an attached device
     // or an old key. Validate the original root before accepting absence.
-    const root = await lstat(this.options.root);
-    if (
-      !root.isDirectory() ||
-      root.uid !== process.getuid?.() ||
-      (root.mode & 0o7777) !== 0o700 ||
-      (await realpath(this.options.root)) !== this.options.root
-    )
-      return false;
+    const root = await privatePersonVmDirectory(this.options.root);
+    if (!root) return false;
     if ((await this.inspectExisting(vmId, signal)).state !== 'absent')
       return false;
     for (const tier of ['warm', 'cold'] as const)
       await this.verifyOffline({ vmId, tier }, signal);
     if (!(await this.options.keys.confirmAbsence?.(vmId))) return false;
     for (const dir of ['warm', 'cold', 'manifests'])
-      await syncDiskPoolDirectory(join(this.options.root, dir));
+      await syncDiskPoolDirectory(join(root, dir));
     signal.throwIfAborted();
     return true;
   }

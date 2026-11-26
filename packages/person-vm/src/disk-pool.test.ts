@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+} from 'node:fs/promises';
 import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +31,7 @@ import { context, harness, MemoryStore, signal } from './test-support.ts';
 
 const faults = vi.hoisted(() => ({
   afterLedgerFileSync: undefined as (() => void) | undefined,
+  afterDirectorySync: undefined as ((path: string) => void) | undefined,
 }));
 vi.mock('node:fs/promises', async (original) => {
   const fs = await original<typeof Filesystem>();
@@ -38,6 +47,15 @@ vi.mock('node:fs/promises', async (original) => {
         vi.spyOn(file, 'sync').mockImplementation(async () => {
           await sync();
           faults.afterLedgerFileSync?.();
+        });
+      } else if (
+        faults.afterDirectorySync &&
+        (await file.stat()).isDirectory()
+      ) {
+        const sync = file.sync.bind(file);
+        vi.spyOn(file, 'sync').mockImplementation(async () => {
+          await sync();
+          faults.afterDirectorySync?.(String(args[0]));
         });
       }
       return file;
@@ -276,6 +294,7 @@ class Platform implements DiskPoolPlatform {
 const roots: string[] = [];
 afterEach(async () => {
   faults.afterLedgerFileSync = undefined;
+  faults.afterDirectorySync = undefined;
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
@@ -341,6 +360,73 @@ const adminGuard = () => ({
   assertCurrent: vi.fn(async () => {}),
   assertCapacity: vi.fn(async () => {}),
 });
+
+it.each([false, true])(
+  'persists lazy catalog ancestry before publishing an owner receipt (already created=%s)',
+  async (existing) => {
+    const f = await fixture();
+    const parent = join(f.root, 'volume', 'people');
+    const disk = join(parent, 'disks');
+    const catalog = join(disk, '.preprovision-ledger');
+    if (existing) await mkdir(catalog, { mode: 0o700, recursive: true });
+    const synced: string[] = [];
+    faults.afterDirectorySync = (path) => synced.push(path);
+    const ledger = new DiskPoolLedger(disk);
+    const owner = {
+      personId: randomUUID(),
+      organizationId: randomUUID(),
+      vmId: randomUUID(),
+    };
+    const beforeLink = vi.fn(async () => {
+      expect(synced.slice(0, 4)).toEqual([
+        disk,
+        parent,
+        join(f.root, 'volume'),
+        f.root,
+      ]);
+    });
+    await ledger.recordOrdinaryOwner(owner, signal(), beforeLink);
+    expect(beforeLink).toHaveBeenCalledOnce();
+    expect(synced).toContain(catalog);
+    expect(
+      (await ledger.read(signal(), true)).ordinaryOwners.get(owner.vmId),
+    ).toMatchObject(owner);
+  },
+);
+
+it.each(['ancestor', 'disk', 'ledger', 'mode'] as const)(
+  'refuses an untrusted catalog directory (%s) before writing',
+  async (which) => {
+    const f = await fixture();
+    const other = join(f.root, 'other');
+    const ancestor = join(f.root, 'ancestor');
+    const disk = join(which === 'ancestor' ? ancestor : f.root, 'disks');
+    await mkdir(other, { mode: 0o700 });
+    if (which === 'ancestor') {
+      await symlink(other, ancestor, 'dir');
+    } else if (which === 'disk') {
+      await symlink(other, disk, 'dir');
+    } else {
+      await mkdir(disk, { mode: 0o700 });
+      if (which === 'mode') await chmod(disk, 0o755);
+      if (which === 'ledger')
+        await symlink(other, join(disk, '.preprovision-ledger'), 'dir');
+    }
+    const ledger = new DiskPoolLedger(disk);
+    const owner = {
+      personId: randomUUID(),
+      organizationId: randomUUID(),
+      vmId: randomUUID(),
+    };
+    await expect(ledger.read(signal())).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    await expect(
+      ledger.recordOrdinaryOwner(owner, signal(), async () => {}),
+    ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+    expect(await readdir(other)).toEqual([]);
+  },
+);
 
 it('has three independent offline slots, claims three of five parallel first workbench opens, then replenishes', async () => {
   const f = await fixture();

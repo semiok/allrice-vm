@@ -1,7 +1,7 @@
 import type * as ProductionConfig from './production-config.js';
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
-import { realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
 import { join } from 'node:path';
@@ -402,6 +402,40 @@ it('does not install disk preparation from a seal with the switch off', async ()
   });
   cleanup.push(() => host.close());
   expect(io.diskPreprovision).not.toHaveBeenCalled();
+});
+
+it('creates and reopens the first private cold owner receipt through the default-off Host and system tmp path', async () => {
+  const configuration = f.loaded.configuration.disk;
+  configuration.root = join(f.root, 'volume', 'person-vms', 'disks');
+  await mkdir(configuration.keyRoot, { mode: 0o700 });
+  await expect(lstat(configuration.root)).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  const opened = await receiptFixture();
+  const owner = (await opened.memory.read(opened.entry.context.actor.id))!;
+  const physicalRoot = join(
+    await realpath(f.root),
+    'volume',
+    'person-vms',
+    'disks',
+  );
+  const ledger = join(physicalRoot, '.preprovision-ledger');
+  const record = join(ledger, `owner.${owner.vmId}.json`);
+  expect((await lstat(physicalRoot)).mode & 0o777).toBe(0o700);
+  expect((await lstat(ledger)).mode & 0o777).toBe(0o700);
+  expect((await lstat(record)).mode & 0o777).toBe(0o600);
+  expect(JSON.parse(await readFile(record, 'utf8'))).toEqual({
+    version: 1,
+    personId: owner.personId,
+    organizationId: owner.organizationId,
+    vmId: owner.vmId,
+  });
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+  opened.memory.rows.delete(owner.personId);
+  await expect(
+    opened.input().vm.create(opened.entry.context, signal()),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  expect(await opened.memory.read(owner.personId)).toBeNull();
 });
 
 it('rejects an enabled Host with no sealed public cache', async () => {

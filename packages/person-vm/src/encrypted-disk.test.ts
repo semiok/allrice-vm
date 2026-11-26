@@ -30,6 +30,31 @@ const hash = (value: Buffer) =>
   createHash('sha256').update(value).digest('hex');
 
 describe('APFS adapter protocol and private filesystem (not actual encryption acceptance)', () => {
+  it('accounts for and retires existing formal files through a system tmp ancestor', async () => {
+    const root = await mkdtemp('/tmp/ar-apfs-alias-');
+    temporary.push(root);
+    const keyRoot = join(root, 'keys');
+    const keys = new FilePersonVmKeyStore(keyRoot);
+    const native = new ApfsPersonVmDisk({
+      root: join(root, 'disks'),
+      keys,
+      capacityGiB: 8,
+      runner: async ({ executable, args, input }) => {
+        if (executable.endsWith('/plutil'))
+          return Buffer.from(input!).toString();
+        if (args[0] === 'info') return JSON.stringify({ images: [] });
+        if (args[0] === 'create') await writeFile(args.at(-1)!, 'test image');
+        return '';
+      },
+    });
+    const ref = { vmId: randomUUID(), tier: 'warm' as const };
+    await native.create(ref, signal());
+    expect(await native.listFormalDiskIds(signal())).toEqual([ref.vmId]);
+    expect(await keys.listDiskIds(signal())).toEqual([ref.vmId]);
+    await native.delete(ref, signal());
+    await expect(native.confirmAbsence(ref.vmId, signal())).resolves.toBe(true);
+    expect(await native.listFormalDiskIds(signal())).toEqual([]);
+  });
   it('key仅stdin、AES-256参数、停止后挂卸/冷盘移动/重开保留同字节', async () => {
     const root = await directory(),
       volume = join(root, 'volume'),

@@ -9,7 +9,15 @@ import {
   realpath,
   unlink,
 } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  sep,
+} from 'node:path';
 import { UuidSchema } from '@allrice/contracts';
 import { PersonVmError } from './contract.ts';
 import {
@@ -51,12 +59,81 @@ export function missing(error: unknown) {
 function incomplete(): never {
   throw new PersonVmError('CLEANUP_INCOMPLETE');
 }
+
+async function storageAncestor(path: string) {
+  const canonical = await realpath(path).catch((error: unknown) => {
+    if (!missing(error)) throw error;
+    return null;
+  });
+  if (!canonical || canonical === path) return canonical;
+  // Allow a system-owned top-level alias such as Darwin's /tmp or /var.
+  // No further symbolic link may change the remainder of the configured path.
+  const root = parse(path).root;
+  const alias = join(root, path.slice(root.length).split(sep)[0]!);
+  const info = await lstat(alias);
+  if (
+    !info.isSymbolicLink() ||
+    info.uid !== 0 ||
+    canonical !== join(await realpath(alias), relative(alias, path))
+  )
+    incomplete();
+  return canonical;
+}
+
+/** Resolve a trusted ancestor, then validate the requested directory leaf. */
+export async function privatePersonVmDirectory(path: string) {
+  if (!isAbsolute(path) || path === dirname(path)) incomplete();
+  const parent = await storageAncestor(dirname(path));
+  if (!parent) return null;
+  const canonical = join(parent, basename(path));
+  const info = await lstat(canonical).catch((error: unknown) => {
+    if (!missing(error)) throw error;
+    return null;
+  });
+  if (!info) return null;
+  if (
+    !info.isDirectory() ||
+    info.uid !== process.getuid?.() ||
+    (info.mode & 0o7777) !== 0o700
+  )
+    incomplete();
+  return canonical;
+}
+
+async function ensurePrivatePersonVmDirectory(path: string): Promise<string> {
+  const existing = await privatePersonVmDirectory(path);
+  if (existing) return existing;
+  const parent = dirname(path);
+  const canonical =
+    (await storageAncestor(parent)) ??
+    (await ensurePrivatePersonVmDirectory(parent));
+  const target = join(canonical, basename(path));
+  try {
+    await mkdir(target, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+  }
+  return (await privatePersonVmDirectory(target)) ?? incomplete();
+}
+
 export async function syncDiskPoolDirectory(path: string) {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     await handle.sync();
   } finally {
     await handle.close();
+  }
+}
+
+async function syncCatalogParents(path: string) {
+  // Even an observed directory could have been just created by another
+  // process. Persist its name and each owned ancestor's name up to the
+  // independently managed parent before creating an authoritative receipt.
+  for (let parent = dirname(path); ; parent = dirname(parent)) {
+    const info = await lstat(parent);
+    if (!info.isDirectory()) incomplete();
+    await syncDiskPoolDirectory(parent);
+    if (info.uid !== process.getuid?.() || parent === dirname(parent)) return;
   }
 }
 
@@ -220,29 +297,16 @@ function follows(previous: DiskPoolRecord | null, entry: DiskPoolRecord) {
 /** Host-local private catalog. Each fixed stock slot has an append-only
  * sequence. A bound generation frees its slot and keeps its original claim. */
 export class DiskPoolLedger {
-  private readonly root: string;
   private seen = false;
-  constructor(diskRoot: string) {
-    this.root = join(diskRoot, '.preprovision-ledger');
-  }
-  private async exists() {
-    const stat = await lstat(this.root).catch((error: unknown) => {
-      if (!missing(error)) throw error;
-      return null;
-    });
-    if (!stat) {
-      if (this.seen) incomplete();
-      return false;
-    }
-    if (
-      !stat.isDirectory() ||
-      stat.uid !== process.getuid?.() ||
-      (stat.mode & 0o7777) !== 0o700 ||
-      (await realpath(this.root)) !== this.root
-    )
-      incomplete();
-    this.seen = true;
-    return true;
+  constructor(private readonly diskRoot: string) {}
+  private async location() {
+    const disk = await privatePersonVmDirectory(this.diskRoot);
+    const ledger =
+      disk &&
+      (await privatePersonVmDirectory(join(disk, '.preprovision-ledger')));
+    if (ledger) this.seen = true;
+    else if (this.seen) incomplete();
+    return ledger;
   }
   async read(signal: AbortSignal, includeOrdinaryOwners = false) {
     const slots: DiskPoolSlot[] = Array.from(
@@ -257,8 +321,9 @@ export class DiskPoolLedger {
     const boundByPerson = new Map<string, DiskPoolClaim[]>();
     const ordinaryOwners = new Map<string, DiskPoolOwner>();
     signal.throwIfAborted();
-    if (await this.exists()) {
-      const names = await readdir(this.root);
+    const root = await this.location();
+    if (root) {
+      const names = await readdir(root);
       const files = names
         .flatMap((name) => {
           if (stageName.test(name) || ordinaryOwnerName.test(name)) return [];
@@ -271,7 +336,7 @@ export class DiskPoolLedger {
         .sort((a, b) => a.index - b.index || a.revision - b.revision);
       // A writer which lost its SQL session after linking might have been
       // interrupted before its fsync. Make this observed prefix durable.
-      await syncDiskPoolDirectory(this.root);
+      await syncDiskPoolDirectory(root);
       const refs = new Set<string>();
       const intents = new Set<string>();
       for (const { name, index, revision } of files) {
@@ -279,7 +344,7 @@ export class DiskPoolLedger {
         const slot = slots[index]!;
         if (!Number.isSafeInteger(revision) || revision !== slot.revision + 1)
           incomplete();
-        const entry = readRecord(await readEvidence(join(this.root, name)));
+        const entry = readRecord(await readEvidence(join(root, name)));
         if (!follows(slot.entry, entry)) incomplete();
         if (entry.state === 'filling') {
           if (refs.has(entry.ref)) incomplete();
@@ -306,7 +371,7 @@ export class DiskPoolLedger {
           signal.throwIfAborted();
           ordinaryOwners.set(
             vmId,
-            readOrdinaryOwner(await readEvidence(join(this.root, name)), vmId),
+            readOrdinaryOwner(await readEvidence(join(root, name)), vmId),
           );
         }
       }
@@ -317,16 +382,17 @@ export class DiskPoolLedger {
 
   private async ensure(signal: AbortSignal) {
     signal.throwIfAborted();
-    if (!(await this.exists())) {
-      try {
-        await mkdir(this.root, { mode: 0o700 });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
-      }
-      if (!(await this.exists())) incomplete();
-      await syncDiskPoolDirectory(dirname(this.root));
+    let root = await this.location();
+    if (!root) {
+      const disk = await ensurePrivatePersonVmDirectory(this.diskRoot);
+      root = await ensurePrivatePersonVmDirectory(
+        join(disk, '.preprovision-ledger'),
+      );
+      this.seen = true;
     }
+    await syncCatalogParents(root);
     signal.throwIfAborted();
+    return root;
   }
 
   async recordOrdinaryOwner(
@@ -343,9 +409,9 @@ export class DiskPoolLedger {
       },
       owner.vmId,
     );
-    await this.ensure(signal);
+    const root = await this.ensure(signal);
     await publishDiskPoolRecord(
-      join(this.root, `owner.${owner.vmId}.json`),
+      join(root, `owner.${owner.vmId}.json`),
       record,
       { signal, beforeLink },
     );
@@ -358,10 +424,10 @@ export class DiskPoolLedger {
     beforeLink?: () => Promise<void>,
   ) {
     if (!follows(slot.entry, entry)) incomplete();
-    await this.ensure(signal);
+    const root = await this.ensure(signal);
     try {
       await publishDiskPoolRecord(
-        join(this.root, `${slot.index}.${slot.revision + 1}.json`),
+        join(root, `${slot.index}.${slot.revision + 1}.json`),
         entry,
         { signal, beforeLink },
       );
