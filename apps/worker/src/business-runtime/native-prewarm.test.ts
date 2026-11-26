@@ -1061,8 +1061,10 @@ it('keeps the thread observer alive after readiness and expires the original tic
 it('reports a startup failure when the observer closes during an authenticated poll', async () => {
   const f = fixture(),
     finish = deferred<void>(),
+    closeHeld = deferred<void>(),
     checked = deferred<void>(),
     resume = deferred<void>();
+  f.base.authorityClose.mockImplementationOnce(() => closeHeld.promise);
   const watch = f.base.deps.watch.getMockImplementation()!;
   f.base.deps.watch.mockImplementationOnce(async () => ({
     ...(await watch()),
@@ -1105,12 +1107,16 @@ it('reports a startup failure when the observer closes during an authenticated p
     resume.resolve();
     const response = await status;
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      state: 'failed',
-      code: 'START_UNAVAILABLE',
-    });
+    expect(await response.json()).toEqual({ state: 'starting' });
+    closeHeld.resolve();
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'failed', code: 'START_UNAVAILABLE' }),
+    );
   } finally {
     finish.resolve();
+    closeHeld.resolve();
     resume.resolve();
   }
 });

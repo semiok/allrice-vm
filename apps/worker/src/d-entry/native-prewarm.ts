@@ -94,6 +94,7 @@ export function createPrewarmOperations(
     revoked: AbortSignal;
     proof?: AbortSignal;
     settled?: Promise<void>;
+    closeJoin?: Promise<boolean>;
     release(): Promise<boolean>;
   };
   const tickets = new Map<string, Operation>();
@@ -179,7 +180,6 @@ export function createPrewarmOperations(
         authority.revoked,
         AbortSignal.timeout(lifetimeMs),
       ]);
-      let closing: Promise<boolean> | undefined;
       const operation: Operation = {
         identity,
         sessionId: context.sessionId,
@@ -191,9 +191,9 @@ export function createPrewarmOperations(
         state: { state: 'accepted' },
         revoked: authority.revoked,
         release() {
-          if (closing) return closing;
+          if (operation.closeJoin) return operation.closeJoin;
           signal.removeEventListener('abort', releaseExpired);
-          closing = Promise.resolve()
+          const closing = Promise.resolve()
             .then(() => authority.close())
             .then(
               () => true,
@@ -202,9 +202,9 @@ export function createPrewarmOperations(
                 return false;
               },
             );
+          operation.closeJoin = closing;
           lifetimeReleases.add(closing);
-          const settled = closing;
-          void settled.then(() => lifetimeReleases.delete(settled));
+          void closing.then(() => lifetimeReleases.delete(closing));
           return closing;
         },
       };
@@ -277,7 +277,9 @@ export function createPrewarmOperations(
           // can have captured 'starting' immediately before that close.
           if (
             !entry.revoked.aborted &&
-            entry.state.state === 'failed' &&
+            entry.closeJoin &&
+            (entry.state.state === 'starting' ||
+              entry.state.state === 'failed') &&
             entry.expires > Date.now()
           )
             return entry.state;
