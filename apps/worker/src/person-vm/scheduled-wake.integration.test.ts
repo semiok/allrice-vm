@@ -103,6 +103,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     return {
       assertCurrent,
       binding,
+      origin,
       catalog,
       start,
       store,
@@ -136,6 +137,105 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       },
     };
   }
+
+  async function publishFixtureAuthority(
+    f: Awaited<ReturnType<typeof fixture>>,
+  ) {
+    const {
+      personId,
+      organizationId,
+      workspaceId,
+      employeeInstanceId,
+      employeeVersionId,
+    } = f.origin;
+    await db.begin(async (tx) => {
+      await tx`insert into allrice_users(id,email,display_name,password_hash)
+        values(${personId},${personId + '@example.test'},'Fixture','not-a-real-password')`;
+      await tx`insert into allrice_organizations(id,slug,name)
+        values(${organizationId},${organizationId},'Fixture')`;
+      await tx`insert into allrice_workspaces(id,organization_id,slug,name)
+        values(${workspaceId},${organizationId},'fixture','Fixture')`;
+      await tx`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+        values(${organizationId},${workspaceId},${personId},'member')`;
+      const [employee] = await tx<
+        { id: string }[]
+      >`insert into allrice_employees
+        (organization_id,workspace_id,employee_key,name)
+        values(${organizationId},${workspaceId},'fixture','Fixture') returning id`;
+      await tx`insert into allrice_employee_versions
+        (id,organization_id,workspace_id,employee_id,version,name,model,system_prompt,capabilities,config_checksum)
+        values(${employeeVersionId},${organizationId},${workspaceId},${employee!.id},
+          1,'Fixture','fixture-model','', '{}'::jsonb,${'sha256:' + 'a'.repeat(64)})`;
+      await tx`insert into allrice_employee_assignments
+        (id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
+        values(${employeeInstanceId},${organizationId},${workspaceId},${employee!.id},${employeeVersionId},${personId})`;
+      await tx`insert into allrice_employee_instances
+        (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id)
+        values(${employeeInstanceId},${organizationId},${workspaceId},${personId},
+          ${employeeInstanceId},'general',${employeeVersionId})`;
+      await tx`insert into allrice_settings(scope_type,key,value)
+        values('system','d_entry_rollout_policy',${tx.json({
+          revision: randomUUID(),
+          defaultGeneration: '3.x',
+          selections: [
+            {
+              personId,
+              organizationId,
+              employeeInstanceId,
+              generation: '4.0',
+            },
+          ],
+        })})
+        on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+    });
+  }
+
+  it('rechecks current retained roster without a login and never revives a revoked plan', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await expect(
+      f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+    const logins =
+      await db`select id from allrice_sessions where user_id=${f.binding.personId}`;
+    expect(logins).toEqual([]);
+    await expect(f.store().readClaimRoster(claim!)).resolves.toMatchObject({
+      personId: f.binding.personId,
+      organizationId: f.binding.organizationId,
+      entries: [
+        {
+          workspaceId: f.origin.workspaceId,
+          employeeInstanceId: f.origin.employeeInstanceId,
+          employeeRevision: 1,
+          employeeVersionId: f.origin.employeeVersionId,
+        },
+      ],
+    });
+    await expect(
+      f.store().readClaimRoster({ ...claim!, planId: randomUUID() }),
+    ).resolves.toBeNull();
+    await db`update allrice_employee_instances set archived_at=now()
+      where id=${f.origin.employeeInstanceId}`;
+    await db`update allrice_employee_instances set archived_at=null
+      where id=${f.origin.employeeInstanceId}`;
+    await expect(f.store().readClaimRoster(claim!)).resolves.toBeNull();
+    expect(await f.store().isCurrent(claim!)).toBe(false);
+    await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
+      where plan_id=${planId}`;
+    expect(await f.store().claim(300_000)).toBeNull();
+    const rows = await db`select action,error_code from person_vm_audit
+      where request_id=${planId} and action='scheduled-wake.invalidate'`;
+    expect(rows).toEqual([
+      {
+        action: 'scheduled-wake.invalidate',
+        error_code: 'CURRENT_AUTHORITY_CHANGED',
+      },
+    ]);
+  });
 
   it('uses the same audited stop, then claims once across host restarts or concurrent ticks', async () => {
     const f = await fixture();
