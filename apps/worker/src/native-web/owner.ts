@@ -678,7 +678,7 @@ export async function openNativeWebOwner(input: {
                 const args = method
                   .input({ strict: true })
                   .create()
-                  .parse({ request: {} });
+                  .parse({ _request: {} });
                 const result = await readUnaryReply(
                   'session/list',
                   args,

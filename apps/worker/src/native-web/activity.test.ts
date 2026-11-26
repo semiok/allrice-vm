@@ -126,7 +126,10 @@ describe('public DSH activity sightings', () => {
           projections: async () => ({
             kind: 'migration-required',
             values: {
-              inbox: { 'next-turn': [{ id: 'historical', role: 'user' }] },
+              inbox: {
+                'next-turn': [{ id: 'historical', role: 'user' }],
+                'next-step': [],
+              },
             },
           }),
         }),
