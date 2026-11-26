@@ -24,7 +24,7 @@ export function nativeWebTransport(
     error: unknown,
     status: number | undefined,
     failed: boolean,
-  ) => void,
+  ) => void | Promise<void>,
 ) {
   const sockets = new Set<Duplex>(),
     websockets = new Set<WebSocket>();
@@ -35,7 +35,7 @@ export function nativeWebTransport(
     closing = false;
   function observe(error: unknown, status?: number, failed = true) {
     try {
-      observeStartup?.(error, status, failed);
+      return observeStartup?.(error, status, failed);
     } catch {
       // Observability cannot change the native transport outcome.
     }
@@ -153,6 +153,7 @@ export function nativeWebTransport(
           init,
           (response) => {
             status = response.statusCode;
+            observe(undefined, status, false);
             const chunks: Buffer[] = [];
             response.on('data', (chunk: Buffer) => chunks.push(chunk));
             response.on('error', rejectResponse);
@@ -215,7 +216,7 @@ export function nativeWebTransport(
       let received = 0;
       let responseStatus: number | undefined;
       let complete: IncomingHttpHeaders | undefined;
-      let failure: { reason: unknown } | undefined;
+      let failure: { reason: unknown; audit?: Promise<void> } | undefined;
       let physicalClose: Promise<void> | undefined;
       // This agent owns exactly this request, even when the request dies
       // before Node assigns the already created socket to ClientRequest.
@@ -226,13 +227,22 @@ export function nativeWebTransport(
         });
       });
       const fail = (error?: unknown) => {
-        if (failure) return;
+        if (failure) return failure.audit;
         const reason = active.aborted
           ? active.reason
           : new PersonVmError('PROVIDER_FAILED');
-        observe(error ?? (active.aborted ? reason : undefined), responseStatus);
-        failure = { reason };
+        const audit = observe(active.aborted ? reason : error, responseStatus);
+        failure = { reason, audit: audit || undefined };
+        return audit;
       };
+      function discard(response: IncomingMessage, audit: void | Promise<void>) {
+        if (audit) {
+          const destroy = () => {
+            response.destroy();
+          };
+          void audit.then(destroy, destroy);
+        } else response.destroy();
+      }
       const { call, send } = prepareRequest(
         input,
         {
@@ -259,15 +269,13 @@ export function nativeWebTransport(
                 ? BigInt(declared) > BigInt(bounds.maxBytes)
                 : BigInt(declared) !== BigInt(bounds.exact)))
           ) {
-            fail();
-            response.destroy();
+            discard(response, fail());
             return;
           }
           response.on('data', (chunk: Buffer) => {
             if (failure) return;
             if (chunk.length > bounds.maxBytes - received) {
-              fail();
-              response.destroy();
+              discard(response, fail());
               return;
             }
             if (fixed) chunk.copy(fixed, received);
@@ -276,9 +284,9 @@ export function nativeWebTransport(
             try {
               bounds.onChunk?.(chunk);
             } catch (reason) {
-              observe(reason, responseStatus);
-              failure = { reason };
-              response.destroy();
+              const audit = observe(reason, responseStatus);
+              failure = { reason, audit: audit || undefined };
+              discard(response, audit);
             }
           });
           response.once('end', () => {
@@ -293,13 +301,13 @@ export function nativeWebTransport(
       call.once('close', () => {
         void (async () => {
           await physicalClose;
+          if (active.aborted || !complete) fail();
+          // Preserve the actual socket join. An explicit local teardown can
+          // follow the bounded startup audit when a diagnostic was needed.
+          if (failure?.audit) await failure.audit.catch(() => {});
           connection.destroy();
-          if (active.aborted) fail();
           if (failure) reject(failure.reason);
-          else if (!complete) {
-            observe(undefined, responseStatus);
-            reject(new PersonVmError('PROVIDER_FAILED'));
-          } else
+          else if (complete)
             resolve({
               data: fixed ?? Buffer.concat(chunks, received),
               headers: complete,
@@ -444,6 +452,7 @@ export function nativeWebTransport(
             // take ownership of rejection. Observe the HTTP response only.
             const captureStatus = (response: IncomingMessage) => {
               responseStatus = response.statusCode;
+              observe(undefined, responseStatus, false);
             };
             call.prependListener('response', captureStatus);
             call.prependListener('upgrade', captureStatus);
@@ -465,7 +474,11 @@ export function nativeWebTransport(
         new Promise((done) =>
           socket.once('close', () => {
             websockets.delete(socket);
-            if (!closing) lost();
+            if (!closing) {
+              if (responseStatus !== undefined)
+                observe(undefined, responseStatus, false);
+              lost();
+            }
             done();
           }),
         ),

@@ -136,7 +136,11 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
-  recordStartupFailure?(failure: NativeWebSetupFailure): Promise<void>;
+  startupPending?(): boolean;
+  recordStartupFailure?(
+    failure: NativeWebSetupFailure,
+    signal: AbortSignal,
+  ): Promise<void>;
   beforePrompt?(
     input: {
       binding: PersonVmBinding;
@@ -163,8 +167,11 @@ export async function openNativeWebOwner(input: {
     step = next;
     transportStatus = undefined;
   }
+  function recordingStartup() {
+    return !startupComplete || input.startupPending?.() === true;
+  }
   function recordFailure(reason: unknown) {
-    if (startupComplete || startupFailureAudit) return;
+    if (!recordingStartup() || startupFailureAudit) return;
     startupFailureAudit = Promise.resolve();
     const diagnostic: NativeWebSetupFailure = {
       step,
@@ -181,22 +188,23 @@ export async function openNativeWebOwner(input: {
     } catch {
       // Logging cannot change the failure or its cleanup.
     }
-    try {
-      const audit = input.recordStartupFailure?.(diagnostic);
-      if (audit) {
-        // Let a healthy audit insert finish before local teardown. An
-        // unavailable sink must not delay physical cleanup indefinitely.
-        let timer: ReturnType<typeof setTimeout>;
-        const deadline = new Promise<void>((done) => {
-          timer = setTimeout(done, 250);
-        });
-        startupFailureAudit = Promise.race([
-          audit.catch(() => {}),
-          deadline,
-        ]).finally(() => clearTimeout(timer));
-      }
-    } catch {
-      // An unavailable audit writer cannot prevent physical cleanup.
+    if (input.recordStartupFailure) {
+      // A stalled diagnostic writer must not delay the cause or cleanup.
+      const budget = new AbortController();
+      let timer: ReturnType<typeof setTimeout>;
+      const deadline = new Promise<void>((done) => {
+        timer = setTimeout(() => {
+          budget.abort();
+          done();
+        }, 250);
+      });
+      const audit = Promise.resolve().then(() =>
+        input.recordStartupFailure!(diagnostic, budget.signal),
+      );
+      startupFailureAudit = Promise.race([
+        audit.catch(() => {}),
+        deadline,
+      ]).finally(() => clearTimeout(timer));
     }
   }
   if (
@@ -261,10 +269,18 @@ export async function openNativeWebOwner(input: {
   const lost = (reason: unknown = new PersonVmError('PROVIDER_FAILED')) => {
     if (disconnected) return;
     recordFailure(reason);
+    const abortCarrier = () => {
+      carrier.abort(new PersonVmError('PROVIDER_FAILED'));
+      waitAbort.abort();
+    };
+    const audit = startupFailureAudit;
     // Publish before abort callbacks can reenter. Local drain is not remote ACK.
     disconnected = Promise.resolve().then(async () => {
+      if (audit) {
+        await audit;
+        abortCarrier();
+      }
       await Promise.allSettled([starting, nativeWait]);
-      if (startupFailureAudit) await startupFailureAudit;
       const results = await Promise.allSettled([
         principals.drainLocal(),
         transport.close(),
@@ -280,8 +296,7 @@ export async function openNativeWebOwner(input: {
     ready = false;
     principals.fence(new PersonVmError('PROVIDER_FAILED'));
     stale.abort(new PersonVmError('PROVIDER_FAILED'));
-    carrier.abort(new PersonVmError('PROVIDER_FAILED'));
-    waitAbort.abort();
+    if (!audit) abortCarrier();
     void disconnected.catch(() => {});
   };
   const transport = nativeWebTransport(
@@ -289,9 +304,13 @@ export async function openNativeWebOwner(input: {
     carrier.signal,
     lost,
     (error, status, failed) => {
-      if (startupComplete || startupFailureAudit) return;
+      if (!recordingStartup()) return;
+      if (startupFailureAudit) return failed ? startupFailureAudit : undefined;
       transportStatus = status;
-      if (failed) recordFailure(error);
+      if (failed) {
+        recordFailure(error);
+        return startupFailureAudit;
+      }
     },
   );
   function joinHost() {
@@ -597,6 +616,7 @@ export async function openNativeWebOwner(input: {
     stage('final-authority');
     await setup(() => input.scope.assertCurrent());
     signal.throwIfAborted();
+    stage('awaiting-group-ready');
     startupComplete = true;
     ready = true;
     own(
@@ -641,6 +661,7 @@ export async function openNativeWebOwner(input: {
           await startupFailureAudit;
           throw error;
         } finally {
+          stage('awaiting-group-ready');
           startupComplete = true;
         }
       },

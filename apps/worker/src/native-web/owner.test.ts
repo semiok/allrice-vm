@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { createServer } from 'node:http';
+import { createServer, IncomingMessage } from 'node:http';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
@@ -363,7 +363,8 @@ it.each([
           location: '/?token=' + secrets.redirect,
           'set-cookie': 'private=' + secrets.cookie,
         });
-        response.end(secrets.body);
+        if (path === '/') response.write(secrets.body);
+        else response.end(secrets.body);
       } else {
         response.writeHead(302, {
           location: './api/remote.mux',
@@ -381,9 +382,21 @@ it.each([
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {
       calls.push('log');
     });
+    const destroy = IncomingMessage.prototype.destroy;
+    const responseDiscarded = vi.fn();
+    const discard = vi
+      .spyOn(IncomingMessage.prototype, 'destroy')
+      .mockImplementation(function (
+        this: IncomingMessage,
+        ...args: Parameters<IncomingMessage['destroy']>
+      ) {
+        if (this.statusCode === 401 && !this.complete) responseDiscarded();
+        return destroy.apply(this, args);
+      });
     const auditStarted = deferred<void>();
     const auditFinished = deferred<void>();
-    const audit = vi.fn(async () => {
+    const audit = vi.fn(async (_diagnostic: unknown, signal: AbortSignal) => {
+      expect(signal.aborted).toBe(false);
       calls.push('audit');
       auditStarted.resolve(undefined);
       await auditFinished.promise;
@@ -436,8 +449,10 @@ it.each([
       });
       await auditStarted.promise;
       expect(calls).toEqual(['log', 'audit']);
+      expect(responseDiscarded).not.toHaveBeenCalled();
       auditFinished.resolve(undefined);
       await assertion;
+      if (path === '/') expect(responseDiscarded).toHaveBeenCalled();
       const fields = {
         step,
         errorType: 'HttpError',
@@ -446,7 +461,10 @@ it.each([
         target,
       };
       expect(calls).toEqual(['log', 'audit', 'audit-finished', 'cancel']);
-      expect(audit.mock.calls).toEqual([[fields]]);
+      expect(audit).toHaveBeenCalledExactlyOnceWith(
+        fields,
+        expect.any(AbortSignal),
+      );
       expect(warning.mock.calls).toEqual([
         [
           '[MET-273] native Web startup failed',
@@ -458,7 +476,10 @@ it.each([
           },
         ],
       ]);
-      const recorded = JSON.stringify([warning.mock.calls, audit.mock.calls]);
+      const recorded = JSON.stringify([
+        warning.mock.calls,
+        audit.mock.calls[0]?.[0],
+      ]);
       for (const value of Object.values(secrets))
         expect(recorded).not.toContain(value);
     } finally {
@@ -466,6 +487,7 @@ it.each([
       lifetime.abort();
       exited.resolve(exit);
       warning.mockRestore();
+      discard.mockRestore();
       server.closeAllConnections();
       await new Promise<void>((done) => server.close(() => done()));
     }
