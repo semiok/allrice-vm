@@ -9,15 +9,16 @@ import {
 import { readDEntryPrincipalHostArtifact } from '../d-entry/principal-artifact.js';
 import type { readReleasedGuestProfile } from '../d-entry/released-profile.js';
 import { readFile } from 'node:fs/promises';
-import { isIP } from 'node:net';
 import { posix } from 'node:path';
 import {
+  isMicrosandboxGuestIpv4,
   nativeWebAuthArtifact,
   PersonVmError,
   type PersonVmBinding,
   type PersonVmGuestCommand,
   type PersonVmMemoryGuestPlan,
   type PersonVmNativeWebAuthRequest,
+  type PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 
@@ -26,7 +27,6 @@ import type { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/gue
 export type NativeWebConfiguration = Readonly<{
   origin: string;
   publicUrl: string;
-  guestAddress: string;
   guestPort: number;
   dshHome: string;
   agentsHome: string;
@@ -47,6 +47,8 @@ export type NativeWebLaunch = Readonly<{
   files: PersonVmMemoryGuestPlan['files'];
   command: PersonVmGuestCommand;
 }>;
+export type NativeWebLaunchPlan = Omit<NativeWebLaunch, 'command'> &
+  Readonly<{ commandWithoutHost: PersonVmGuestCommand }>;
 export type NativeWebModelAdapter = Readonly<{
   origin: string;
   capability: string;
@@ -112,7 +114,7 @@ export async function prepareNativeWebLaunch(
   profile: NativeWebGuestProfile,
   commandMemory?: ReturnType<typeof createPersonVmDshCommandMemoryPatch>,
   modelAdapter?: NativeWebModelAdapter,
-): Promise<NativeWebLaunch> {
+): Promise<NativeWebLaunchPlan> {
   let origin: URL, publicUrl: URL;
   try {
     origin = new URL(config.origin);
@@ -131,8 +133,6 @@ export async function prepareNativeWebLaunch(
   });
   const artifact = nativeWebAuthArtifact(auth);
   if (
-    !isIP(config.guestAddress) ||
-    ['0.0.0.0', '::'].includes(config.guestAddress) ||
     !Number.isInteger(config.guestPort) ||
     config.guestPort < 1 ||
     config.guestPort > 65535 ||
@@ -283,7 +283,7 @@ export function apply(ctx, config) {
         mode: 0o600,
       })),
     ]),
-    command: Object.freeze({
+    commandWithoutHost: Object.freeze({
       executable: 'node',
       args: Object.freeze([
         config.cliPath,
@@ -292,8 +292,6 @@ export function apply(ctx, config) {
         '--patch',
         patch,
         '--no-open',
-        '--host',
-        config.guestAddress,
         '--port',
         String(config.guestPort),
         '--public-url',
@@ -308,6 +306,21 @@ export function apply(ctx, config) {
         DSH_AGENTS_HOME: config.agentsHome,
       }),
       workdir: config.workdir,
+    }),
+  });
+}
+
+export function nativeWebLaunchOnGuest(
+  { commandWithoutHost, ...launch }: NativeWebLaunchPlan,
+  guestAddress: PersonVmNativeWebGuestAddress,
+): NativeWebLaunch {
+  if (!isMicrosandboxGuestIpv4(guestAddress))
+    throw new PersonVmError('PROVIDER_FAILED');
+  return Object.freeze({
+    ...launch,
+    command: Object.freeze({
+      ...commandWithoutHost,
+      args: Object.freeze([...commandWithoutHost.args, '--host', guestAddress]),
     }),
   });
 }

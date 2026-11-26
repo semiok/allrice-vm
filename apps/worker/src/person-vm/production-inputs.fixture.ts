@@ -78,7 +78,6 @@ export async function productionInputsFixture() {
     },
     web: {
       cliPath: `/opt/allrice/dsh/${hash}/cli.mjs`,
-      guestAddress: '127.0.0.1',
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
     },

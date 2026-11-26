@@ -7,9 +7,10 @@ import { composeEntries } from '@deepseek-ai/dsh-app-boot';
 import type {
   PersonVmBootstrapScope,
   PersonVmJobExit,
+  PersonVmNativeWebGuestAddress,
 } from '@allrice/person-vm';
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
-import { prepareNativeWebLaunch } from './launch.js';
+import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 
 const binding = {
@@ -49,7 +50,6 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   const config = {
     origin: 'http://127.0.0.1:32179/',
     publicUrl: 'https://e1.example.test/',
-    guestAddress: '10.0.0.2',
     guestPort: 8080,
     dshHome: '/work/employee-a/dsh',
     agentsHome: '/work/employee-a/agents',
@@ -66,8 +66,14 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   const profile = [
     { path: 'package.json', contents: '{"name":"fixture-profile"}' },
   ] as const;
-  const a = await prepareNativeWebLaunch(config, binding, profile),
-    b = await prepareNativeWebLaunch(
+  const staged = await prepareNativeWebLaunch(config, binding, profile);
+  expect(staged.commandWithoutHost.args).not.toContain('--host');
+  const a = nativeWebLaunchOnGuest(
+    staged,
+    '10.0.0.2' as PersonVmNativeWebGuestAddress,
+  );
+  const b = nativeWebLaunchOnGuest(
+    await prepareNativeWebLaunch(
       {
         ...config,
         dshHome: '/work/employee-b/dsh',
@@ -79,9 +85,24 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
       },
       binding,
       profile,
-    );
+    ),
+    '10.0.0.6' as PersonVmNativeWebGuestAddress,
+  );
   expect(a.command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
   expect(a.command.args).toContain('--no-open');
+  expect(a.command.args.slice(a.command.args.indexOf('--port'))).toEqual([
+    '--port',
+    '8080',
+    '--public-url',
+    config.publicUrl,
+    '--trusted-host',
+    '127.0.0.1:32179',
+    '--trusted-host',
+    'e1.example.test',
+    '--host',
+    '10.0.0.2',
+  ]);
+  expect(a.auth.origin).toBe(config.origin);
   expect(a.command.args.indexOf('--patch')).toBeLessThan(
     a.command.args.indexOf('--no-open'),
   );
@@ -99,6 +120,7 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     'allrice-current-principal',
     'allrice-native-web-owner',
   ]);
+  expect(entries[1].insert[1].config.baseUrl).toBe(config.origin);
   expect(entries[1].insert[0]).toEqual({
     id: 'allrice-current-principal',
     name: 'file:///work/employee-a/dsh/native-web/current-principal.mjs',
@@ -151,10 +173,21 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
   });
   expect(b.auth.nonce).not.toBe(a.auth.nonce);
   expect(JSON.stringify(a)).not.toContain('?token=');
-  for (const guestAddress of ['0.0.0.0', '::', 'guest.example.test'])
-    await expect(
-      prepareNativeWebLaunch({ ...config, guestAddress }, binding, profile),
-    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  for (const guestAddress of [
+    '0.0.0.0',
+    '127.0.0.1',
+    '172.16.0.5',
+    '198.51.100.6',
+    '::',
+    '::1%lo0',
+    'guest.example.test',
+  ])
+    expect(() =>
+      nativeWebLaunchOnGuest(
+        staged,
+        guestAddress as PersonVmNativeWebGuestAddress,
+      ),
+    ).toThrow(expect.objectContaining({ code: 'PROVIDER_FAILED' }));
   for (const suffix of ['?workspaceId=fixture', '#fragment', '?', '#'])
     await expect(
       prepareNativeWebLaunch(

@@ -106,7 +106,6 @@ function value() {
     },
     web: {
       cliPath: '/opt/allrice/dsh/synthetic/cli.mjs',
-      guestAddress: '127.0.0.1',
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
     },
@@ -343,6 +342,17 @@ describe('private production Host configuration', () => {
       await fs.rm(f.root, { recursive: true, force: true });
     }
   });
+  it.each(['127.0.0.1', '172.16.0.6'])(
+    'rejects a sealed manually configured guest Web bind %s',
+    async (guestAddress) => {
+      const config = value();
+      await seal({ ...config, web: { ...config.web, guestAddress } });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
+
   it('reads only exact measured bytes after the original build verifier succeeds', async () => {
     const result = await readProductionHostConfiguration(signal());
     expect(result.configuration).toEqual(value());

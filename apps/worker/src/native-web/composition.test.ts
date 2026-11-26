@@ -5,6 +5,7 @@ import type {
   PersonVmBootstrapScope,
   PersonVmWebStartup,
   PersonVmMemoryGuestPlan,
+  PersonVmNativeWebGuestAddress,
   PersonVmStore,
   PersonVmBinding,
   ReadonlyCommandMemoryDirectory,
@@ -27,6 +28,8 @@ const { open, prepareRoster } = vi.hoisted(() => ({
   open: vi.fn(),
   prepareRoster: vi.fn(),
 }));
+const firstGuestAddress = '172.16.0.6' as PersonVmNativeWebGuestAddress;
+const retainedGuestAddress = '172.16.0.10' as PersonVmNativeWebGuestAddress;
 vi.mock('./owner.js', () => ({ openNativeWebOwner: open }));
 vi.mock('@allrice/database', () => ({
   preparePersonNativeWebRoster: prepareRoster,
@@ -103,7 +106,6 @@ function fixture(
       cliPath: commandMemory
         ? commandMemory.readonlyDshDirectory + '/lib/bin.js'
         : '/opt/dsh/lib/bin.js',
-      guestAddress: '10.0.0.2',
       startupTimeoutMs: 3000,
       publicUrl: (endpoint) =>
         publicOrigin
@@ -111,11 +113,13 @@ function fixture(
           : `https://native.example.test/e/${endpoint.employeeInstanceId}/`,
     },
   });
+  const readNativeWebGuestAddress = vi.fn(async () => firstGuestAddress);
   const scope = {
     binding,
     signal: startup.signal,
     assertCurrent: vi.fn(async () => {}),
     launch: vi.fn(),
+    readNativeWebGuestAddress,
   } as PersonVmBootstrapScope;
   return {
     binding,
@@ -124,6 +128,7 @@ function fixture(
     memoryGuestPlan,
     service,
     scope,
+    readNativeWebGuestAddress,
     startup,
     lifetime,
   };
@@ -176,8 +181,10 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       path.endsWith('/allrice-native-run-journal.mjs'),
     ),
   ).toHaveLength(f.web.receipt.endpoints.length);
+  expect(f.readNativeWebGuestAddress).not.toHaveBeenCalled();
   await f.service.start(f.binding, f.scope.signal, f.scope, f.web);
   expect(f.memoryGuestPlan).toHaveBeenCalledTimes(1);
+  expect(f.readNativeWebGuestAddress).toHaveBeenCalledTimes(1);
   expect(open).toHaveBeenCalledTimes(2);
   for (const [index, endpoint] of f.web.receipt.endpoints.entries()) {
     const input = open.mock.calls[index]![0];
@@ -195,6 +202,9 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       '--profile',
       'allrice-web',
     ]);
+    expect(input.launch.command.args).toEqual(
+      expect.arrayContaining(['--host', '172.16.0.6']),
+    );
     expect(plan.files).toContainEqual({
       path: `/work/.allrice/employees/${endpoint.employeeInstanceId}/dsh/profiles/allrice-web/package.json`,
       contents: '{"name":"fixture-profile"}',
@@ -243,6 +253,74 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   expect(() =>
     f.service.owner(f.binding, f.web.receipt.endpoints[0]!.employeeInstanceId),
   ).toThrow();
+});
+it('refuses to spawn any owner when the exact startup scope has no native address reader', async () => {
+  const f = fixture();
+  const scope = {
+    binding: f.scope.binding,
+    signal: f.scope.signal,
+    launch: f.scope.launch,
+    assertCurrent: f.scope.assertCurrent,
+  };
+  await f.service.memoryGuestPlan(f.binding, scope.signal, f.web);
+  await expect(
+    f.service.start(f.binding, scope.signal, scope, f.web),
+  ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  expect(open).not.toHaveBeenCalled();
+  await f.service.close();
+});
+it('checks the live binding again after observing its address and before any owner starts', async () => {
+  const f = fixture(),
+    entered = latch(),
+    release = latch();
+  f.readNativeWebGuestAddress.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return firstGuestAddress;
+  });
+  await f.service.memoryGuestPlan(f.binding, f.scope.signal, f.web);
+  const outcome = expect(
+    f.service.start(f.binding, f.scope.signal, f.scope, f.web),
+  ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+  await entered.promise;
+  expect(open).not.toHaveBeenCalled();
+  vi.mocked(f.scope.assertCurrent).mockRejectedValueOnce(
+    new PersonVmError('LEASE_LOST'),
+  );
+  release.resolve();
+  await outcome;
+  expect(open).not.toHaveBeenCalled();
+  await f.service.close();
+});
+it('allows a new epoch after a failed address probe and confirmed native stop', async () => {
+  const f = fixture();
+  f.readNativeWebGuestAddress.mockRejectedValueOnce(
+    new PersonVmError('CLEANUP_INCOMPLETE'),
+  );
+  await f.service.memoryGuestPlan(f.binding, signal(), f.web);
+  await expect(
+    f.service.start(f.binding, signal(), f.scope, f.web),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  expect(open).not.toHaveBeenCalled();
+  await expect(
+    f.service.retireAfterNativeStop(f.binding, signal()),
+  ).resolves.toBeUndefined();
+
+  const binding = {
+    ...f.binding,
+    instanceId: randomUUID(),
+    leaseEpoch: f.binding.leaseEpoch + 1,
+  };
+  const web = { ...f.web, receipt: { ...f.web.receipt, binding } };
+  open.mockResolvedValue(catalogOwner());
+  await f.service.memoryGuestPlan(binding, signal(), web);
+  await f.service.start(binding, signal(), { ...f.scope, binding }, web);
+  expect(f.readNativeWebGuestAddress).toHaveBeenCalledTimes(2);
+  expect(open).toHaveBeenCalledTimes(web.receipt.endpoints.length);
+  expect(() =>
+    f.service.assertAuthenticatedGroup(binding, signal()),
+  ).not.toThrow();
+  await f.service.close();
 });
 it('holds the bootstrap scope through editor proof and exposes only proved employees in that epoch', async () => {
   const f = fixture();
@@ -865,10 +943,21 @@ it('完成后retire立即撤旧catalog；真实host join结束后新epoch必须�
   await retiring;
   const binding = { ...f.binding, instanceId: randomUUID(), leaseEpoch: 4 };
   const web = { ...f.web, receipt: { ...f.web.receipt, binding } };
+  f.readNativeWebGuestAddress.mockResolvedValueOnce(retainedGuestAddress);
   open.mockResolvedValue(catalogOwner());
   await f.service.memoryGuestPlan(binding, signal(), web);
   await f.service.start(binding, signal(), { ...f.scope, binding }, web);
   const next = f.service.catalog(binding, id);
+  expect(f.readNativeWebGuestAddress).toHaveBeenCalledTimes(2);
+  expect(
+    open.mock.calls.map(
+      ([
+        {
+          launch: { command },
+        },
+      ]) => command.args[command.args.indexOf('--host') + 1],
+    ),
+  ).toEqual(['172.16.0.6', '172.16.0.6', '172.16.0.10', '172.16.0.10']);
   expect(next.bindingRef).not.toBe(old.bindingRef);
   expect(next.receipt.binding).toEqual(binding);
   expect(old.receipt.binding).toEqual(f.binding);
