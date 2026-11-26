@@ -302,7 +302,7 @@ it('requires an exact, still published platform source without rejecting tenant-
   });
   expect(
     await readPersonVmDiskPreparationTarget(person, signal()),
-  ).not.toBeNull();
+  ).toMatchObject({ employeeVersionId: version, platformRevisionId: null });
   expect(data.publication).not.toHaveBeenCalled();
 });
 
@@ -319,7 +319,7 @@ it('does not treat a missing platform version mapping as a tenant-only publicati
   fixture([selection()], [], '3.x', false);
   expect(
     await readPersonVmDiskPreparationTarget(person, signal()),
-  ).not.toBeNull();
+  ).toMatchObject({ employeeVersionId: version, platformRevisionId: null });
 });
 
 it('reports an older platform version with no mapping after deployment moves to a different version', async () => {
@@ -332,8 +332,36 @@ it('reports an older platform version with no mapping after deployment moves to 
   const proof = seen.find(({ query }) => query.includes('as verified'));
   expect(proof?.params).toEqual([org, workspace, assignedEmployee, version]);
   expect(proof?.query).toContain('audit.resource_id=v.id');
+  expect(proof?.query).toContain("'admin_published_immutable_manifest'");
   expect(data.publication).not.toHaveBeenCalled();
 });
+
+it.each([
+  [first, second],
+  [second, first],
+])(
+  'skips the same person regardless of the ordering of known and unknown sources (%s, %s)',
+  async (left, right) => {
+    fixture([selection(left), selection(right)], [], '3.x', false, false);
+    data.employee.mockImplementation(async (_scope, employeeId) => ({
+      id: employeeId,
+      workspaceId: workspace,
+      revision: 1,
+      source:
+        employeeId === first
+          ? {
+              kind: 'platform',
+              employeeVersionId: id(11),
+              templateRevisionId: id(12),
+            }
+          : { kind: 'tenant_version', employeeVersionId: version },
+    }));
+    data.publication.mockResolvedValue({ revision_id: id(12) });
+    expect(await readPersonVmDiskPreparationTarget(person, signal())).toBe(
+      'version-source-unverified',
+    );
+  },
+);
 
 it('terminates its dedicated transaction on cancellation and joins the current read', async () => {
   const { end } = fixture([selection()]);

@@ -190,7 +190,8 @@ async function hasTenantDiskPreparationVersion(
             and audit.resource_id=v.employee_id and audit.reason='admin_created_employee_definition')
           or
           (audit.action='employee.version.publish' and audit.resource_type='employee_version'
-            and audit.resource_id=v.id and audit.reason='admin_published_immutable_candidate'
+            and audit.resource_id=v.id
+            and audit.reason in ('admin_published_immutable_candidate', 'admin_published_immutable_manifest')
             and audit.metadata->>'checksum'=v.config_checksum)
         )
     ) as verified`;
@@ -233,13 +234,13 @@ export async function readPersonVmDiskPreparationTarget(
         return null;
 
       const eligible: PersonVmDiskPreparationTarget[] = [];
+      let organizationConflict = false;
       for (const entry of policy.selections) {
         active.throwIfAborted();
         if (
           entry.generation !== '4.0' ||
           entry.personId !== personId ||
-          (vm && entry.organizationId !== vm.organization_id) ||
-          eligible[0]?.organizationId === entry.organizationId
+          (vm && entry.organizationId !== vm.organization_id)
         )
           continue;
         const [owner] = await sql<
@@ -292,7 +293,6 @@ export async function readPersonVmDiskPreparationTarget(
               '4.0'
           )
             continue;
-          if (eligible[0]?.organizationId === identity.organizationId) continue;
           const source = employee.source;
           if (
             source.kind === 'tenant_version' &&
@@ -319,7 +319,11 @@ export async function readPersonVmDiskPreparationTarget(
             if (publication?.revision_id !== platformRevisionId) continue;
           }
           active.throwIfAborted();
-          if (eligible.length) throw new PersonVmError('ORGANIZATION_CONFLICT');
+          if (eligible[0]) {
+            organizationConflict ||=
+              eligible[0].organizationId !== identity.organizationId;
+            continue;
+          }
           eligible.push(
             Object.freeze({
               ...identity,
@@ -339,6 +343,8 @@ export async function readPersonVmDiskPreparationTarget(
         }
       }
       active.throwIfAborted();
+      if (organizationConflict)
+        throw new PersonVmError('ORGANIZATION_CONFLICT');
       return eligible[0] ?? null;
     },
   );
