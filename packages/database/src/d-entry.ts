@@ -1,6 +1,7 @@
 import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
+  hasDEntryPersonRelease,
   sameDEntryIdentity,
   selectDEntryGeneration,
   type DEntryIdentity,
@@ -17,6 +18,7 @@ import {
   EmployeeInstanceError,
   getEmployeeInstance,
   getEmployeeInstanceForHistory,
+  listEmployeeInstances,
 } from './employees/employee-instances.ts';
 import { requireCurrentWorkspaceWriteAuthority } from './identity.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
@@ -126,20 +128,23 @@ export async function readDEntryEmployeeDirectory(
     async (sql) => {
       const policy = await readDEntryReleasePolicy(sql);
       const employees = [];
-      for (const item of policy.selections) {
-        if (
-          item.organizationId !== identity.organizationId ||
-          item.personId !== identity.personId ||
-          item.generation !== '4.0'
-        )
-          continue;
+      const personReleased = hasDEntryPersonRelease(policy, identity);
+      const employeeIdsFromPolicy = policy.selections.flatMap((item) =>
+        item.organizationId === identity.organizationId &&
+        item.personId === identity.personId &&
+        item.generation === '4.0'
+          ? [item.employeeInstanceId]
+          : [],
+      );
+      const employeeIdsToRead = personReleased
+        ? (await listEmployeeInstances(scope, identity.workspaceId, sql)).map(
+            (instance) => instance.id,
+          )
+        : employeeIdsFromPolicy;
+      for (const employeeId of employeeIdsToRead) {
         signal.throwIfAborted();
         try {
-          const instance = await getEmployeeInstance(
-            scope,
-            item.employeeInstanceId,
-            sql,
-          );
+          const instance = await getEmployeeInstance(scope, employeeId, sql);
           const [version] = await sql<
             { employee_id: string; name: string; is_default: boolean }[]
           >`

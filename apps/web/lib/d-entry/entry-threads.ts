@@ -2,6 +2,7 @@ import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
   UuidSchema,
+  hasDEntryPersonRelease,
   selectDEntryGeneration,
   type RequestContext,
 } from '@allrice/contracts';
@@ -16,6 +17,7 @@ import {
   readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
   resolveEmployeeSessionInstance,
+  resolveWorkspaceId,
 } from '@allrice/database';
 import { z } from 'zod';
 
@@ -24,24 +26,47 @@ export const dEntryThreadRequest = z
   .object({ selection: employeeSelection, operationId: UuidSchema.optional() })
   .strict();
 
+export async function isDEntryPersonReleased(context: RequestContext) {
+  return (
+    context.actor.type === 'user' &&
+    hasDEntryPersonRelease(await readDEntryReleasePolicy(), {
+      organizationId: context.organizationId,
+      personId: context.actor.id,
+    })
+  );
+}
+
+/** Resolve an authorized creation workspace without provisioning an employee. */
+export async function findDEntryCreationWorkspace(context: RequestContext) {
+  if (!(await isDEntryPersonReleased(context))) return null;
+  const workspaceId = await resolveWorkspaceId(context);
+  return (await readContentPrincipal({ ...context, workspaceId }))?.writable
+    ? workspaceId
+    : null;
+}
+
 /** Bare entry discovers only the current login's explicitly enabled employees. */
 export async function findDEntryEmployee(context: RequestContext) {
   if (context.actor.type !== 'user') return null;
   const policy = await readDEntryReleasePolicy();
+  const personReleased = hasDEntryPersonRelease(policy, {
+    organizationId: context.organizationId,
+    personId: context.actor.id,
+  });
   const enabled = policy.selections.filter(
     (item) =>
       item.organizationId === context.organizationId &&
       item.personId === context.actor.id &&
       item.generation === '4.0',
   );
-  if (!enabled.length) return null;
+  if (!personReleased && !enabled.length) return null;
   const sql = getDatabase();
   const candidates = await sql<{ id: string; workspace_id: string }[]>`
     select id,workspace_id from allrice_employee_instances
     where organization_id=${context.organizationId} and owner_id=${context.actor.id}
       and (${context.workspaceId}::uuid is null or workspace_id=${context.workspaceId})
       and archived_at is null
-      and id=any(${sql.array(enabled.map(({ employeeInstanceId }) => employeeInstanceId))}::uuid[])
+      and (${personReleased} or id=any(${sql.array(enabled.map(({ employeeInstanceId }) => employeeInstanceId))}::uuid[]))
     order by (kind='general') desc,created_at,id`;
   for (const candidate of candidates) {
     const selection = {

@@ -58,6 +58,11 @@ export const DEntryRolloutPolicySchema = z
   .object({
     revision: z.string().min(1),
     defaultGeneration: ExecutionGenerationSchema,
+    personSelections: z
+      .array(
+        z.object({ organizationId: UuidSchema, personId: UuidSchema }).strict(),
+      )
+      .optional(),
     selections: z.array(
       z
         .object({
@@ -71,6 +76,19 @@ export const DEntryRolloutPolicySchema = z
   })
   .strict()
   .superRefine((policy, ctx) => {
+    const people = new Set<string>();
+    for (const [index, { organizationId, personId }] of (
+      policy.personSelections ?? []
+    ).entries()) {
+      const key = JSON.stringify([organizationId, personId]);
+      if (people.has(key))
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Duplicate person selection',
+          path: ['personSelections', index],
+        });
+      people.add(key);
+    }
     const keys = new Set<string>();
     for (const [index, selection] of policy.selections.entries()) {
       const key = JSON.stringify([
@@ -89,6 +107,19 @@ export const DEntryRolloutPolicySchema = z
   });
 export type DEntryRolloutPolicy = z.infer<typeof DEntryRolloutPolicySchema>;
 
+export function hasDEntryPersonRelease(
+  policy: DEntryRolloutPolicy,
+  identity: Pick<DEntryIdentity, 'organizationId' | 'personId'>,
+) {
+  return (
+    policy.personSelections?.some(
+      (selection) =>
+        selection.organizationId === identity.organizationId &&
+        selection.personId === identity.personId,
+    ) ?? false
+  );
+}
+
 /** Selects a NEW thread's writer only; never changes a persisted thread pin. */
 export function selectDEntryGeneration(
   policyInput: DEntryRolloutPolicy,
@@ -96,6 +127,7 @@ export function selectDEntryGeneration(
 ): ExecutionGeneration {
   const policy = DEntryRolloutPolicySchema.parse(policyInput);
   const identity = DEntryIdentitySchema.parse(identityInput);
+  if (hasDEntryPersonRelease(policy, identity)) return '4.0';
   return (
     policy.selections.find(
       (selection) =>
