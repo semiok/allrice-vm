@@ -167,12 +167,42 @@ export async function readPersonVmDiskPreparationForegroundBusy(
   });
 }
 
+/** Tenant provenance must come from the exact version's creation transaction.
+ * A missing platform mapping alone can also describe old materialized versions. */
+async function hasTenantDiskPreparationVersion(
+  sql: postgres.TransactionSql,
+  identity: Pick<
+    PersonVmDiskPreparationTarget,
+    'organizationId' | 'workspaceId' | 'employeeVersionId'
+  >,
+  employeeId: string,
+) {
+  const [proof] = await sql<{ verified: boolean }[]>`
+    select exists (
+      select 1 from allrice_employee_versions v
+      join allrice_audit_events audit
+        on audit.organization_id=v.organization_id and audit.workspace_id=v.workspace_id
+      where v.organization_id=${identity.organizationId} and v.workspace_id=${identity.workspaceId}
+        and v.employee_id=${employeeId} and v.id=${identity.employeeVersionId}
+        and audit.decision='allowed' and audit.occurred_at=v.published_at
+        and (
+          (v.version=1 and audit.action='employee.create' and audit.resource_type='employee'
+            and audit.resource_id=v.employee_id and audit.reason='admin_created_employee_definition')
+          or
+          (audit.action='employee.version.publish' and audit.resource_type='employee_version'
+            and audit.resource_id=v.id and audit.reason='admin_published_immutable_candidate'
+            and audit.metadata->>'checksum'=v.config_checksum)
+        )
+    ) as verified`;
+  return proof?.verified === true;
+}
+
 /** Rebuild current storage eligibility from committed data in one short read.
  * The returned facts authorize neither a logged-in principal nor VM startup. */
 export async function readPersonVmDiskPreparationTarget(
   personId: string,
   signal: AbortSignal,
-): Promise<PersonVmDiskPreparationTarget | null> {
+): Promise<PersonVmDiskPreparationTarget | null | 'version-source-unverified'> {
   UuidSchema.parse(personId);
   signal.throwIfAborted();
   if (personId !== personId.toLowerCase()) return null;
@@ -264,8 +294,16 @@ export async function readPersonVmDiskPreparationTarget(
             continue;
           if (eligible[0]?.organizationId === identity.organizationId) continue;
           const source = employee.source;
-          if (source.kind === 'tenant_version' && owner.platform_version)
-            continue;
+          if (
+            source.kind === 'tenant_version' &&
+            (owner.platform_version ||
+              !(await hasTenantDiskPreparationVersion(
+                sql,
+                identity,
+                owner.employee_id,
+              )))
+          )
+            return 'version-source-unverified';
           const platformRevisionId =
             source.kind === 'platform' ? source.templateRevisionId : null;
           if (platformRevisionId) {

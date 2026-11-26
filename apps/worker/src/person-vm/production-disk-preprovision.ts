@@ -37,6 +37,7 @@ type Feed = Pick<
 type PreparationEvent =
   | 'capacity-deferred'
   | 'organization-conflict'
+  | 'version-source-unverified'
   | 'cleanup-incomplete'
   | 'prepare-failed'
   | 'source-unavailable';
@@ -162,8 +163,19 @@ export function startProductionDiskPreprovision(input: {
         return pending;
       };
       try {
-        const readTarget = () =>
-          readSource(active, () => input.readTarget(personId, active));
+        const readTarget = async () => {
+          const result = await readSource(active, () =>
+            input.readTarget(personId, active),
+          );
+          active.throwIfAborted();
+          if (result === 'version-source-unverified') {
+            input.observe(result);
+            defer(personId, true);
+            cancel.abort(Error('DISK_PREPARATION_AUTHORITY_CHANGED'));
+            throw active.reason;
+          }
+          return result;
+        };
         const target = await readTarget();
         active.throwIfAborted();
         if (!target) {

@@ -53,6 +53,7 @@ function fixture(
   vm: Record<string, unknown>[] = [],
   defaultGeneration: DEntryRolloutPolicy['defaultGeneration'] = '3.x',
   platformVersion = false,
+  tenantVersionVerified = true,
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
   const sql = vi.fn(
@@ -72,6 +73,8 @@ function fixture(
         ];
       }
       if (query.includes('from person_virtual_machines')) return vm;
+      if (query.includes('join allrice_audit_events audit'))
+        return [{ verified: tenantVersionVerified }];
       if (query.includes('from allrice_employee_instances'))
         return [
           {
@@ -305,7 +308,9 @@ it('requires an exact, still published platform source without rejecting tenant-
 
 it('does not treat a missing platform version mapping as a tenant-only publication', async () => {
   const { seen } = fixture([selection()], [], '3.x', true);
-  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBe(
+    'version-source-unverified',
+  );
   expect(
     seen.find(({ query }) => query.includes('as platform_version'))?.query,
   ).toContain('d.tenant_employee_version_id=a.employee_version_id');
@@ -315,6 +320,19 @@ it('does not treat a missing platform version mapping as a tenant-only publicati
   expect(
     await readPersonVmDiskPreparationTarget(person, signal()),
   ).not.toBeNull();
+});
+
+it('reports an older platform version with no mapping after deployment moves to a different version', async () => {
+  // PostgreSQL can confirm the deployment points elsewhere, while mapInstances
+  // labels the still-assigned older version tenant_version solely from absence.
+  const { seen } = fixture([selection()], [], '3.x', false, false);
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBe(
+    'version-source-unverified',
+  );
+  const proof = seen.find(({ query }) => query.includes('as verified'));
+  expect(proof?.params).toEqual([org, workspace, assignedEmployee, version]);
+  expect(proof?.query).toContain('audit.resource_id=v.id');
+  expect(data.publication).not.toHaveBeenCalled();
 });
 
 it('terminates its dedicated transaction on cancellation and joins the current read', async () => {

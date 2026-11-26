@@ -409,3 +409,19 @@ it('invalidates the original platform release even when the version ID stays the
     gate.resolve();
   }
 });
+
+it('reports unknown version provenance and skips disk work without stopping the roster', async () => {
+  const f = fixture();
+  f.page.mockReturnValueOnce({ personIds: [first, second], nextOffset: null });
+  f.input.readTarget.mockResolvedValueOnce('version-source-unverified');
+  f.start();
+  await vi.waitFor(() => expect(f.input.port.prepare).toHaveBeenCalledOnce());
+  expect(f.input.port.prepare.mock.calls[0]?.[0].personId).toBe(second);
+  expect(f.input.foregroundBusy).not.toHaveBeenCalledWith(
+    first,
+    expect.anything(),
+  );
+  expect(f.input.observe).toHaveBeenCalledExactlyOnceWith(
+    'version-source-unverified',
+  );
+});
