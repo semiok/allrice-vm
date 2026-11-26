@@ -102,6 +102,40 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('retires a stuck marker connection at the deadline and waits for the actual query to settle', async () => {
+    const source = feed();
+    const controller = new AbortController();
+    const lost = vi.fn();
+    const detach = await source.subscribe(
+      { changed: vi.fn(), lost },
+      controller.signal,
+    );
+    const client = state.clients[0]!;
+    const query = deferred();
+    client.query.mockImplementationOnce(() => query.promise);
+    vi.useFakeTimers();
+    try {
+      let finished = false;
+      const reading = source
+        .observeThroughCommit(controller.signal)
+        .finally(() => {
+          finished = true;
+        });
+      const rejected = expect(reading).rejects.toThrow(
+        'D_ENTRY_AUTHORITY_FENCE_TIMEOUT',
+      );
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(lost).toHaveBeenCalledOnce();
+      expect(client.end).toHaveBeenCalledOnce();
+      expect(finished).toBe(false);
+      query.resolve();
+      await rejected;
+    } finally {
+      query.resolve();
+      vi.useRealTimers();
+      detach();
+    }
+  });
   it('revokes an optional pinned grant revision even when the identity has been restored', async () => {
     const original = new AbortController().signal;
     const verify = vi.fn(async () => {});

@@ -133,6 +133,7 @@ export function createPrewarmOperations(
           }
         } else if (
           active(entry) &&
+          !entry.revoked.aborted &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
           compatiblePrewarmGeneration(entry.plan.target, plan.target)

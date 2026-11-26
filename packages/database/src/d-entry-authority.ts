@@ -43,6 +43,7 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
     connectionString: databaseUrl,
     application_name: 'allrice-d-entry-authority',
     connectionTimeoutMillis: 5000, // Same database connect budget as the pool.
+    query_timeout: 5000,
   });
   let unavailable: unknown;
   let failed = false;
@@ -99,12 +100,22 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
       if (failed) throw unavailable;
       const marker = randomUUID();
       let cancel!: () => void;
+      let timedOut!: () => void;
       const seen = new Promise<void>((resolve, reject) => {
         cancel = () => reject(signal.reason);
+        timedOut = () => {
+          const failure = new Error('D_ENTRY_AUTHORITY_FENCE_TIMEOUT');
+          reject(failure);
+          // A stuck marker means the shared connection cannot prove it has
+          // observed commits. Retire this connection and release queued work.
+          lost(failure);
+        };
         signal.addEventListener('abort', cancel, { once: true });
         fences.set(marker, resolve);
       });
       void seen.catch(() => {});
+      const timer = setTimeout(timedOut, 3000);
+      timer.unref();
       try {
         // The same listener receives its own committed marker after all
         // earlier committed authority changes, even across channels.
@@ -115,6 +126,7 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
         await seen;
         signal.throwIfAborted();
       } finally {
+        clearTimeout(timer);
         fences.delete(marker);
         signal.removeEventListener('abort', cancel);
       }
@@ -408,9 +420,7 @@ async function watchDEntryAuthority(
       ...(ticketThread && {
         async assertTicketThread(active: AbortSignal) {
           if (stopped) throw new DataAccessError('authorization_denied');
-          await source.observeThroughCommit(
-            AbortSignal.any([active, revoked, AbortSignal.timeout(3000)]),
-          );
+          await source.observeThroughCommit(AbortSignal.any([active, revoked]));
           if (stopped) throw new DataAccessError('authorization_denied');
         },
       }),
