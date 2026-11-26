@@ -616,6 +616,7 @@ suite(
       'system-ok',
       'system-revoked',
       'system-late-revoked',
+      'system-wake-window',
       'system-recovery',
       'system-unknown',
     ] as const)(
@@ -728,6 +729,8 @@ suite(
               expect(requestId).toBe(scheduledRequestId);
               if (outcome === 'system-late-revoked')
                 throw new PersonVmError('AUTHORIZATION_DENIED');
+              if (outcome === 'system-wake-window')
+                h.advance(wakeAt.getTime() - h.now().getTime());
               await stop(active);
             },
           },
@@ -803,7 +806,13 @@ suite(
                       on conflict (plan_id) do nothing`;
                     return { ok: true, nextWakeAt: wakeAt.toISOString() };
                   }
-                  return { ok: true, nextWakeAt: null };
+                  return {
+                    ok: true,
+                    nextWakeAt:
+                      outcome === 'system-wake-window'
+                        ? wakeAt.toISOString()
+                        : null,
+                  };
                 },
         });
         const reconcileOwned = () =>
@@ -848,7 +857,12 @@ suite(
         try {
           const reconcile = reconcileOwned();
           if (
-            ['changed', 'mount-change', 'wake-plan-changed'].includes(outcome)
+            [
+              'changed',
+              'mount-change',
+              'wake-plan-changed',
+              'system-wake-window',
+            ].includes(outcome)
           )
             await expect(reconcile).rejects.toMatchObject({
               code: 'ACTIVITY_UNKNOWN',
@@ -972,7 +986,8 @@ suite(
         const rechecked =
           stopped ||
           outcome === 'wake-plan-changed' ||
-          outcome === 'system-late-revoked';
+          outcome === 'system-late-revoked' ||
+          outcome === 'system-wake-window';
         const checkedOnce = [
           'blocked',
           'changed',

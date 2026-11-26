@@ -1350,6 +1350,13 @@ export class PersonVmAdmissionHost
             const preparation = { ...request, assertStopCurrent };
             const plan = await prepare(preparation, active);
             if (!('ok' in plan) || plan.ok !== true) return;
+            const assertWakeWindow = () => {
+              if (
+                plan.nextWakeAt !== null &&
+                !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+            };
             await this.options.stopIdleOwned(
               requestId,
               owned,
@@ -1363,19 +1370,17 @@ export class PersonVmAdmissionHost
                 )
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
                 await assertStopCurrent(probe);
-                if (
-                  plan.nextWakeAt !== null &&
-                  !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
-                )
-                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+                assertWakeWindow();
               },
               scheduled &&
-                ((dispatchSignal, stop) =>
-                  scheduled.dispatch(dispatchSignal, async (fenced) => {
-                    await owned.guard();
-                    fenced.throwIfAborted();
-                    await stop(fenced);
-                  })),
+                (async (dispatchSignal, stop) => {
+                  await owned.guard();
+                  dispatchSignal.throwIfAborted();
+                  await scheduled.dispatch(dispatchSignal, (fenced) => {
+                    assertWakeWindow();
+                    return stop(fenced);
+                  });
+                }),
             );
             this.idle.delete(binding.personId);
             return true;
