@@ -6,9 +6,14 @@ import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
   readPersonNativeWebRoster,
-  type getDatabase,
+  readPersonVmWakeRoster,
+  getDatabase,
 } from '@allrice/database';
-import { PersonVmError, type PersonVmBinding } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmBinding,
+  type PersonVmService,
+} from '@allrice/person-vm';
 import type {
   AssignedNativeWebCatalog,
   createAssignedNativeWebStartup,
@@ -34,8 +39,7 @@ export type PersonVmWakePreparation = Readonly<{
   assertStopCurrent(signal: AbortSignal): Promise<void>;
 }>;
 
-/** Private installation from the owner of durable execution and VM startup.
- * The observation ledger itself cannot issue a grant or reconstruct a login. */
+/** Internal authorization and retained startup, independent of login. */
 export type ProductionScheduledWakeSource = Readonly<{
   leadMs?: number;
   assertDeliverable(
@@ -48,6 +52,54 @@ export type ProductionScheduledWakeSource = Readonly<{
   ): Promise<void>;
   start: WakeOptions['start'];
 }>;
+
+export function createProductionScheduledWakeSource(
+  vm: Pick<PersonVmService, 'startRetainedForSchedule'>,
+): ProductionScheduledWakeSource {
+  const db = getDatabase();
+  const store = createPostgresPersonVmScheduledWakeStore(db);
+  return {
+    async assertDeliverable({ binding }, profiles, signal) {
+      signal.throwIfAborted();
+      const roster = await db.begin(
+        'isolation level repeatable read read only',
+        (tx) =>
+          readPersonVmWakeRoster(
+            tx,
+            binding,
+            profiles.map(({ origin }) => origin),
+          ),
+      );
+      signal.throwIfAborted();
+      if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+    },
+    async start(claim, assertClaim, signal) {
+      try {
+        await vm.startRetainedForSchedule(
+          claim,
+          claim.claimId,
+          async (active) => {
+            active.throwIfAborted();
+            if (!(await assertClaim())) throw new PersonVmError('LEASE_LOST');
+            const roster = await store.readClaimRoster(claim);
+            active.throwIfAborted();
+            if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+            return roster;
+          },
+          signal,
+        );
+        return 'ready';
+      } catch (error) {
+        if (error instanceof PersonVmError) {
+          if (error.code === 'AUTHORIZATION_DENIED') return 'denied';
+          if (error.code === 'LEASE_LOST') return 'stale';
+          if (error.code === 'LEASE_CONFLICT') return 'not-started';
+        }
+        return 'unknown';
+      }
+    },
+  };
+}
 
 function receiptId(planId: string, employeeInstanceId: string) {
   const bytes = createHash('sha256')
@@ -175,7 +227,7 @@ export function createProductionScheduledWake(input: {
             receiptId: receiptId(planId, endpoint.employeeInstanceId),
             schedule: {
               catalog: () =>
-                owner.readScheduleCatalogForStop(
+                owner.readScheduleCatalog(
                   (signal) => request.assertStopCurrent(signal),
                   AbortSignal.any([active, revoked]),
                 ),

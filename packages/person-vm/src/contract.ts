@@ -107,10 +107,16 @@ export interface PersonVmRuntimePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<PersonVmActivity>;
+  /** Host-only proof of native scheduler startup, without editor/send rights. */
+  assertScheduledReady?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** 401/reachable is NOT ready. Must prove authenticated editor + send capability. */
   readiness(
     binding: PersonVmBinding,
     signal: AbortSignal,
+    context?: RequestContext,
   ): Promise<{
     binding: PersonVmBinding;
     authenticated: boolean;

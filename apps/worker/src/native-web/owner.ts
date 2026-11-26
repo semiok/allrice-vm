@@ -132,7 +132,7 @@ export function readNativeModelAttempt(
 export async function openNativeWebOwner(input: {
   scope: PersonVmBootstrapScope;
   launch: NativeWebLaunch;
-  context: RequestContext;
+  context?: RequestContext;
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
@@ -630,19 +630,18 @@ export async function openNativeWebOwner(input: {
         );
       },
       readSessions(requestSignal: AbortSignal) {
-        async function assertCurrent(current: AbortSignal) {
+        const context = input.context;
+        if (!context)
+          return Promise.reject(new PersonVmError('AUTHORIZATION_DENIED'));
+        const assertCurrent = async (current: AbortSignal) => {
           try {
-            await input.vm.assertCurrentBinding(
-              input.context,
-              binding,
-              current,
-            );
+            await input.vm.assertCurrentBinding(context, binding, current);
           } catch (error) {
             // Normal closing/retirement owns this business abort; keep ACK carrier.
             if (!closing && !requestSignal.aborted) lost();
             throw error;
           }
-        }
+        };
         return readCurrentSessions(requestSignal, assertCurrent);
       },
       /** Request denial does not certify loss of this shared native owner. */
@@ -657,10 +656,9 @@ export async function openNativeWebOwner(input: {
           notDispatched,
         );
       },
-      /** The host supplies the current stop guard under its physical lease.
-       * Running-only browser authority cannot borrow that lease. */
-      readScheduleCatalogForStop(
-        assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+      /** The host supplies its guard under the current physical lease. */
+      readScheduleCatalog(
+        assertCurrent: (signal: AbortSignal) => Promise<void>,
         caller: AbortSignal,
       ) {
         const method = SCHEDULE_REMOTE.methods['schedule/catalog'];
@@ -668,7 +666,7 @@ export async function openNativeWebOwner(input: {
           caller,
           AbortSignal.timeout(input.launch.auth.timeoutMs),
         ]);
-        return readCurrent(current, assertStopCurrent, async (active) => {
+        return readCurrent(current, assertCurrent, async (active) => {
           const args = method.input({ strict: true }).create().parse({});
           const result = await readUnaryReply('schedule/catalog', args, active);
           const value = replyValue(result);

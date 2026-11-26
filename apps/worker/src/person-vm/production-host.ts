@@ -565,11 +565,16 @@ export function createProductionPersonVmHost(input: {
         start: (...args) => requireStartup().start(...args),
         retireAfterNativeStop: (...args) =>
           requireStartup().retireAfterNativeStop(...args),
-        readiness: (binding, signal) =>
+        assertScheduledReady: async (binding, signal) => {
+          requireStartup().assertAuthenticatedGroup(binding, signal);
+        },
+        readiness: (binding, signal, context) =>
           own(() =>
             currentWork(signal, async (active) => {
               const native = requireStartup();
               native.assertAuthenticatedGroup(binding, active);
+              if (context)
+                await native.prepareForegroundEditor(binding, context, active);
               const readiness = await requireRuntime().readiness(
                 binding,
                 active,

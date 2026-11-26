@@ -1,6 +1,9 @@
-import { randomUUID } from 'node:crypto';
-import type { PersonVmBinding } from '@allrice/person-vm';
+import { createHash, randomUUID } from 'node:crypto';
+import { selectDEntryGeneration } from '@allrice/contracts';
+import type { PersonVmBinding, PersonVmWebRoster } from '@allrice/person-vm';
 import type { ISql, Sql, TransactionSql } from 'postgres';
+import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
+import type { NativeScheduleLedgerOrigin } from './native-schedule-observation-ledger.ts';
 
 type Identity = PersonVmBinding & { planId: string };
 type WakePlan = Identity & {
@@ -65,6 +68,82 @@ function hasInvalidation(sql: ISql, receiptIds: readonly string[]) {
         where lower(invalidated.id)=original.receipt_id::text))`;
 }
 
+/** Read the current facts for every profile that will restart on this disk.
+ * This is an internal boot check, not a replacement for user authorization. */
+export async function readPersonVmWakeRoster(
+  tx: TransactionSql,
+  binding: PersonVmBinding,
+  expected: readonly Pick<
+    NativeScheduleLedgerOrigin,
+    | 'workspaceId'
+    | 'employeeInstanceId'
+    | 'employeeVersionId'
+    | 'employeeRevision'
+  >[],
+): Promise<PersonVmWebRoster | null> {
+  const { personId, organizationId } = binding;
+  if (!expected.length) return null;
+  const rows = await tx<
+    {
+      workspace_id: string;
+      instance_id: string;
+      revision: number;
+      version_id: string;
+    }[]
+  >`select i.workspace_id,i.id as instance_id,i.revision,a.employee_version_id as version_id
+    from allrice_employee_instances i
+    join allrice_employee_assignments a on a.id=i.assignment_id
+      and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
+      and a.user_id=i.owner_id and a.active
+    join allrice_employees e on e.id=a.employee_id
+      and e.organization_id=i.organization_id and e.workspace_id=i.workspace_id and e.status='active'
+    join allrice_users u on u.id=i.owner_id and u.status='active'
+    join allrice_organizations o on o.id=i.organization_id and o.archived_at is null
+    join allrice_workspaces ws on ws.id=i.workspace_id and ws.organization_id=o.id and ws.archived_at is null
+    where i.id=any(${expected.map((entry) => entry.employeeInstanceId)}::uuid[])
+      and i.organization_id=${organizationId} and i.owner_id=${personId} and i.archived_at is null
+      and exists(select 1 from allrice_memberships m where m.organization_id=o.id and m.user_id=u.id
+        and m.active and m.role in ('admin','member') and (m.workspace_id is null or m.workspace_id=ws.id))
+      and not exists(select 1 from allrice_platform_employee_tenant_assignments d
+        where d.organization_id=o.id and d.workspace_id=ws.id and d.tenant_employee_id=e.id and not d.active)`;
+  if (rows.length !== expected.length) return null;
+  const policy = await readDEntryReleasePolicy(tx);
+  const entries = rows
+    .map((row) => ({
+      workspaceId: row.workspace_id,
+      employeeInstanceId: row.instance_id,
+      employeeRevision: row.revision,
+      employeeVersionId: row.version_id,
+    }))
+    .sort((a, b) => a.employeeInstanceId.localeCompare(b.employeeInstanceId));
+  const wanted = new Map(
+    expected.map((entry) => [entry.employeeInstanceId, entry]),
+  );
+  if (
+    entries.some((entry) => {
+      const previous = wanted.get(entry.employeeInstanceId);
+      return (
+        !previous ||
+        previous.workspaceId !== entry.workspaceId ||
+        previous.employeeRevision !== entry.employeeRevision ||
+        previous.employeeVersionId !== entry.employeeVersionId ||
+        selectDEntryGeneration(policy, {
+          ...entry,
+          personId,
+          organizationId,
+          threadId: null,
+        }) !== '4.0'
+      );
+    })
+  )
+    return null;
+  const facts = { personId, organizationId, entries };
+  return {
+    ...facts,
+    digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+  };
+}
+
 async function audit(
   tx: TransactionSql,
   row: PlanRow,
@@ -116,7 +195,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         >`select w.* from person_vm_scheduled_wakes w
           join person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
           where w.plan_id=${plan.planId} and w.person_id=${plan.personId}
-            and vm.phase='running' and not ${hasInvalidation(tx, plan.receiptIds)}`;
+            and w.revoked_at is null and vm.phase='running'
+            and not ${hasInvalidation(tx, plan.receiptIds)}`;
         return (
           !!existing &&
           ['empty', 'waiting'].includes(existing.state) &&
@@ -150,6 +230,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
               and p.vm_id=vm.vm_id and p.instance_id=vm.instance_id
               and p.lease_epoch=vm.lease_epoch
             where vm.phase in ('stopped','cold') and vm.disk_retained
+              and p.revoked_at is null
               and vm.egress_receipt is null and vm.lease_owner is null
               and jsonb_array_length(vm.holds)=0
               and coalesce(p.retry_at,p.wake_at)<=now()
@@ -216,8 +297,51 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           and vm_id=${claim.vmId} and instance_id=${claim.instanceId}
           and lease_epoch=${claim.leaseEpoch} and plan_id=${claim.planId}
           and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
+          and revoked_at is null
           and not ${hasInvalidation(sql, claim.receiptIds)}`;
       return !!row;
+    },
+
+    readClaimRoster(
+      claim: ScheduledWakeClaim,
+    ): Promise<PersonVmWebRoster | null> {
+      return sql.begin(
+        'isolation level repeatable read read only',
+        async (tx) => {
+          // The physical owner can already have advanced the current epoch.
+          // Recheck the immutable stopped source and its original receipt here.
+          const [plan] = await tx<{ receipt_ids: string[] }[]>`
+          select p.receipt_ids from person_vm_scheduled_wakes p
+          where p.plan_id=${claim.planId} and p.claim_id=${claim.claimId}
+            and p.person_id=${claim.personId} and p.organization_id=${claim.organizationId}
+            and p.vm_id=${claim.vmId} and p.instance_id=${claim.instanceId}
+            and p.lease_epoch=${claim.leaseEpoch} and p.state='claimed'
+            and p.claim_until>now() and p.revoked_at is null
+            and not ${hasInvalidation(tx, claim.receiptIds)}
+            and p.plan_id=(
+              select a.request_id from person_vm_audit a
+              where a.person_id=p.person_id and a.organization_id=p.organization_id
+                and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
+                and a.action='stop' and a.result='succeeded'
+              order by a.id desc limit 1)`;
+          if (
+            !plan ||
+            plan.receipt_ids.length !== claim.receiptIds.length ||
+            plan.receipt_ids.some((id, index) => id !== claim.receiptIds[index])
+          )
+            return null;
+          const receipts = await tx<{ origin: NativeScheduleLedgerOrigin }[]>`
+          select input_payload->'origin' as origin
+          from allrice_native_schedule_observation_receipts
+          where receipt_id=any(${plan.receipt_ids}::uuid[])`;
+          if (receipts.length !== plan.receipt_ids.length) return null;
+          return readPersonVmWakeRoster(
+            tx,
+            claim,
+            receipts.map(({ origin }) => origin),
+          );
+        },
+      );
     },
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
