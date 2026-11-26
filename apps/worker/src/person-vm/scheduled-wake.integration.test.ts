@@ -162,6 +162,19 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ]);
   });
 
+  it('replays an exact stop preparation using a noncanonical UUID spelling', async () => {
+    const f = await fixture();
+    const planId = ('a' + randomUUID().slice(1)).toUpperCase();
+    for (const host of [f.module(), f.module()]) {
+      await expect(
+        host.prepareStopWithWake(f.binding, planId, signal),
+      ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    }
+    const prepares = await db`select request_id from person_vm_audit
+      where person_id=${f.binding.personId} and action='scheduled-wake.prepare'`;
+    expect(prepares).toEqual([{ request_id: planId.toLowerCase() }]);
+  });
+
   it('uses the snapshot for the actual stop after rules change or are deleted', async () => {
     const f = await fixture();
     const host = f.module();

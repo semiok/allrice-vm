@@ -39,14 +39,15 @@ export type ScheduledWakeOutcome =
   | { state: 'unknown'; reason: 'START_UNCONFIRMED' };
 
 function equalPlan(row: PlanRow, plan: WakePlan) {
+  const receipts = plan.receiptIds.map((id) => id.toLowerCase()).sort();
   return (
-    row.plan_id === plan.planId &&
-    row.organization_id === plan.organizationId &&
-    row.vm_id === plan.vmId &&
-    row.instance_id === plan.instanceId &&
+    row.plan_id === plan.planId.toLowerCase() &&
+    row.organization_id === plan.organizationId.toLowerCase() &&
+    row.vm_id === plan.vmId.toLowerCase() &&
+    row.instance_id === plan.instanceId.toLowerCase() &&
     Number(row.lease_epoch) === plan.leaseEpoch &&
-    row.receipt_ids.length === plan.receiptIds.length &&
-    row.receipt_ids.every((id, index) => id === plan.receiptIds[index]) &&
+    row.receipt_ids.length === receipts.length &&
+    [...row.receipt_ids].sort().every((id, index) => id === receipts[index]) &&
     row.target_at?.getTime() === plan.targetAt?.getTime() &&
     row.wake_at?.getTime() === plan.wakeAt?.getTime()
   );
