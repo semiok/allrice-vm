@@ -51,8 +51,12 @@ export function getIdleScheduleGuardMs(config: {
   cleanupTimeoutMs: number;
   idleScheduleSafetyMarginMs?: number;
 }) {
+  // Wake cannot claim the VM until stop commits and releases its lease.
+  // After the bounded native stop, egress revoke, native retirement and disk
+  // detach each have their own sequential cleanup budget in PersonVmService.
   return (
-    Math.max(config.cleanupTimeoutMs, IDLE_RECONCILE_TIMEOUT_MS) +
+    IDLE_RECONCILE_TIMEOUT_MS +
+    3 * config.cleanupTimeoutMs +
     (config.idleScheduleSafetyMarginMs ?? 30_000)
   );
 }

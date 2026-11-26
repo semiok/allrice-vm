@@ -175,6 +175,15 @@ it.each([false, true])(
   },
 );
 
+it('reserves all three cleanup budgets before the scheduled wake can claim the VM', () => {
+  expect(
+    getIdleScheduleGuardMs({
+      cleanupTimeoutMs: 90_000,
+      idleScheduleSafetyMarginMs: 0,
+    }),
+  ).toBe(285_000);
+});
+
 it('blocks an active schedule at the configured inclusive safety boundary', async () => {
   const h = harness();
   h.nearWake(idleMs + h.guardMs + 1, true);
