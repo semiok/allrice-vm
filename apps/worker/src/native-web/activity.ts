@@ -55,33 +55,41 @@ export async function readNativeProfileActivity(
       work.add(session.origin === 'subagent' ? 'subagent' : 'turn');
   }
   if (work.size) return work;
-  // The VM poll has its own deadline. Bound work on a profile with a long
-  // history even if every underlying RPC answers immediately.
-  for (const session of sessions.slice(0, 32)) {
+  // Prefer loaded Agents, while still checking older Sessions for owned Jobs
+  // within the existing deadline. The first positive fact settles the state.
+  const ordered = [
+    ...sessions.filter(({ agentAvailable }) => agentAvailable),
+    ...sessions.filter(({ agentAvailable }) => !agentAvailable),
+  ];
+  for (const session of ordered) {
     signal.throwIfAborted();
-    const [jobs, projections, goal] = await Promise.allSettled([
-      read.jobs(session.sessionId, signal),
-      read.projections(session.sessionId, signal),
-      session.agentAvailable ? read.goal(session.sessionId, signal) : undefined,
+    const settled = new AbortController();
+    const current = AbortSignal.any([signal, settled.signal]);
+    function found(kind: NativeWork | undefined) {
+      if (!kind) return;
+      work.add(kind);
+      settled.abort();
+    }
+    await Promise.allSettled([
+      read.jobs(session.sessionId, current).then(({ jobs }) => {
+        if (
+          jobs.some(
+            ({ status }) => status === 'running' || status === 'stopping',
+          )
+        )
+          found('job');
+      }),
+      read
+        .projections(session.sessionId, current)
+        .then((view) => found(pendingWork(view))),
+      session.agentAvailable
+        ? read.goal(session.sessionId, current).then((goal) => {
+            if (goal?.phase === 'active' && goal.activation === 'armed')
+              found('goal');
+          })
+        : undefined,
     ]);
     signal.throwIfAborted();
-    if (
-      jobs.status === 'fulfilled' &&
-      jobs.value.jobs.some(
-        ({ status }) => status === 'running' || status === 'stopping',
-      )
-    )
-      work.add('job');
-    if (projections.status === 'fulfilled') {
-      const pending = pendingWork(projections.value);
-      if (pending) work.add(pending);
-    }
-    if (
-      goal.status === 'fulfilled' &&
-      goal.value?.phase === 'active' &&
-      goal.value.activation === 'armed'
-    )
-      work.add('goal');
     if (work.size) break;
   }
   return work;

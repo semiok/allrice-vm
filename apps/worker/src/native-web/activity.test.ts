@@ -66,6 +66,44 @@ describe('public DSH activity sightings', () => {
     },
   );
 
+  it('finds an older owned Job and joins the cancelled sibling read', async () => {
+    const sessions = Array.from({ length: 40 }, (_, index) => ({
+      ...root,
+      sessionId: String(index) as SessionSummary['sessionId'],
+      agentAvailable: false,
+    }));
+    const last = sessions.at(-1)!.sessionId;
+    const job: JobView = {
+      id: 'bash-older' as JobView['id'],
+      kind: 'bash',
+      label: 'fixture',
+      startedAt: 1,
+      status: 'running',
+      output: { earliest: 0, total: 0 },
+    };
+    const cancelled = vi.fn();
+    const seen = await readNativeProfileActivity(
+      reads({
+        sessions: async () => sessions,
+        jobs: async (id) => ({ type: 'rows', jobs: id === last ? [job] : [] }),
+        projections: async (id, active) => {
+          if (id !== last) return null;
+          return new Promise((_, reject) => {
+            const stop = () => {
+              cancelled();
+              reject(active.reason);
+            };
+            if (active.aborted) stop();
+            else active.addEventListener('abort', stop, { once: true });
+          });
+        },
+      }),
+      signal,
+    );
+    expect(seen).toEqual(new Set(['job']));
+    expect(cancelled).toHaveBeenCalledOnce();
+  });
+
   it.each(['schedule', 'goal'] as const)(
     'reads already queued %s work from a native projection',
     async (kind) => {
