@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { PersonVmBinding } from '@allrice/person-vm';
-import type { Sql, TransactionSql } from 'postgres';
+import type { ISql, Sql, TransactionSql } from 'postgres';
 
 type Identity = PersonVmBinding & { planId: string };
 type WakePlan = Identity & {
@@ -52,7 +52,7 @@ function equalPlan(row: PlanRow, plan: WakePlan) {
   );
 }
 
-function hasInvalidation(sql: Sql, receiptIds: readonly string[]) {
+function hasInvalidation(sql: ISql, receiptIds: readonly string[]) {
   return sql`exists (
     select 1 from allrice_native_schedule_observation_receipts original
     join allrice_native_schedule_observation_receipts revision
