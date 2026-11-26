@@ -7,6 +7,7 @@ import type { RequestContext } from '@allrice/contracts';
 import { PersonVmError } from './contract.ts';
 import { DiskPoolLedger } from './disk-pool-ledger.ts';
 import {
+  DiskPoolBudgetExceeded,
   DiskPoolInventoryMismatch,
   type DiskPoolClaim,
   type DiskPoolLock,
@@ -30,6 +31,7 @@ function gate() {
 type Lane = 'fill' | 'inventory';
 class Locks implements DiskPoolLocks {
   foreground = false;
+  afterInventory?: () => Promise<void>;
   private held = new Map<
     Lane,
     { done: ReturnType<typeof gate>; owner: AbortController }
@@ -50,12 +52,15 @@ class Locks implements DiskPoolLocks {
     this.held.set(kind, item);
     const active = AbortSignal.any([owner.signal, signal]);
     try {
-      return await work({
+      const value = await work({
         signal: active,
         ownerSignal: owner.signal,
         assertOwned: async () => owner.signal.throwIfAborted(),
         foregroundStarting: async () => this.foreground,
       });
+      if (kind === 'inventory') await this.afterInventory?.();
+      active.throwIfAborted();
+      return value;
     } finally {
       if (this.held.get(kind) === item) this.held.delete(kind);
       done.release();
@@ -744,6 +749,62 @@ it('retires a full obsolete generation and refills all three slots with exact in
   ).resolves.toMatchObject({ phase: 'stopped' });
   expect(f.platform.binds[0]).toMatchObject({ source: currentSource });
 });
+
+it('finishes an elected idle retirement when shutdown arrives after its durable append', async () => {
+  const f = await fixture();
+  await f.pool.refill(signal());
+  const stop = new AbortController();
+  const closed = Error('synthetic caller shutdown after durable retiring');
+  f.locks.afterInventory = async () => {
+    const { slots } = await f.ledger.read(signal());
+    if (slots[0]?.entry?.state === 'retiring') stop.abort(closed);
+  };
+  const rotated = f.newPool(true, 'new@digest/manifest');
+  await expect(rotated.refill(stop.signal)).rejects.toBe(closed);
+  expect((await f.ledger.read(signal())).slots[0]?.entry).toMatchObject({
+    state: 'retired',
+    reason: 'source-changed',
+  });
+  expect(f.platform.disks.size).toBe(0);
+  await rotated.refill(signal());
+  expect((await f.ledger.read(signal())).slots[0]?.entry).toMatchObject({
+    state: 'ready',
+    source: 'new@digest/manifest',
+  });
+});
+
+it.each(['ENOSPC', 'EDQUOT'] as const)(
+  'releases a capacity-failed %s write only after actual offline retirement',
+  async (code) => {
+    const f = await fixture();
+    const detached = gate();
+    const release = gate();
+    const failure = Object.assign(new Error('synthetic disk write'), { code });
+    f.platform.onSeed = async () => {
+      throw new DiskPoolBudgetExceeded(undefined, { cause: failure });
+    };
+    f.platform.onUnmount = async () => {
+      detached.release();
+      await release.promise;
+    };
+    const refill = f.pool.refill(signal());
+    try {
+      await detached.promise;
+      expect(f.platform.destroyed).toHaveLength(0);
+      expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+        'filling',
+      );
+    } finally {
+      release.release();
+    }
+    await refill;
+    expect(f.platform.destroyed).toHaveLength(1);
+    expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+      'retired',
+    );
+    expect(f.events).toHaveBeenCalledWith({ event: 'capacity-deferred' });
+  },
+);
 
 it.each(['key', 'receipt'] as const)(
   'finishes an existing same-owner %s claim across a seal rotation',

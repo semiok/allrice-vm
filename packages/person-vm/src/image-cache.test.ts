@@ -22,10 +22,36 @@ import {
   verifySeededPublicImageCache,
 } from './image-cache.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
+import { DiskPoolLedger } from './disk-pool-ledger.ts';
+import { MacosPersonVmDiskPool } from './disk-pool-macos.ts';
+import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
+import type { CommandRunner } from './process.ts';
+
+const faults = vi.hoisted(() => ({
+  cacheWrite: undefined as Error | undefined,
+  afterRename: undefined as ((from: string, to: string) => void) | undefined,
+}));
 
 vi.mock('node:fs/promises', async (original) => {
   const filesystem = await original<typeof Filesystem>();
-  return { ...filesystem, writeFile: vi.fn(filesystem.writeFile) };
+  return {
+    ...filesystem,
+    writeFile: vi.fn(filesystem.writeFile),
+    async open(...args: Parameters<typeof filesystem.open>) {
+      const file = await filesystem.open(...args);
+      if (
+        faults.cacheWrite &&
+        args[1] === 'wx' &&
+        String(args[0]).includes('/.public-oci-')
+      )
+        vi.spyOn(file, 'writeFile').mockRejectedValueOnce(faults.cacheWrite);
+      return file;
+    },
+    async rename(from: string, to: string) {
+      await filesystem.rename(from, to);
+      faults.afterRename?.(from, to);
+    },
+  };
 });
 
 const roots: string[] = [];
@@ -45,6 +71,8 @@ async function removeFixture(path: string) {
 }
 
 afterEach(async () => {
+  faults.cacheWrite = undefined;
+  faults.afterRename = undefined;
   for (const path of roots.splice(0)) {
     await removeFixture(path);
     await rm(path, { recursive: true, force: true });
@@ -57,6 +85,7 @@ async function fixture(
     nativeEnv?: string[];
     abi?: number;
     corruptDerivation?: boolean;
+    metadataSpacing?: number;
   } = {},
 ) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'pc-')));
@@ -88,31 +117,35 @@ async function fixture(
   const image = 'docker.io/library/node@' + imageDigest;
   const metadataPath = 'manifests/' + hash(image) + '.json';
   const entries = {
-    [metadataPath]: JSON.stringify({
-      manifest_digest: imageDigest,
-      config_digest: config.digest,
-      raw_manifest_json: JSON.stringify(oci),
-      raw_config_json: rawConfig,
-      config: {
-        env: opts.nativeEnv ?? ['NODE_VERSION=22.23.2'],
-        cmd: ['node'],
-        entrypoint: null,
-        working_dir: null,
-        user: null,
-        exposed_ports: [],
-        volumes: [],
-        labels: {},
-        stop_signal: null,
-      },
-      layers: [
-        {
-          digest: descriptor.digest,
-          media_type: descriptor.mediaType,
-          size_bytes: descriptor.size,
-          diff_id: diffId,
+    [metadataPath]: JSON.stringify(
+      {
+        manifest_digest: imageDigest,
+        config_digest: config.digest,
+        raw_manifest_json: JSON.stringify(oci),
+        raw_config_json: rawConfig,
+        config: {
+          env: opts.nativeEnv ?? ['NODE_VERSION=22.23.2'],
+          cmd: ['node'],
+          entrypoint: null,
+          working_dir: null,
+          user: null,
+          exposed_ports: [],
+          volumes: [],
+          labels: {},
+          stop_signal: null,
         },
-      ],
-    }),
+        layers: [
+          {
+            digest: descriptor.digest,
+            media_type: descriptor.mediaType,
+            size_bytes: descriptor.size,
+            diff_id: diffId,
+          },
+        ],
+      },
+      null,
+      opts.metadataSpacing,
+    ),
     ['flat/refs/' + imageDigest.replace(':', '_') + '.json']: JSON.stringify({
       schema: 1,
       manifest_digest: imageDigest,
@@ -148,7 +181,10 @@ async function fixture(
   });
   const manifestSha256 = hash(manifest);
   const directory = join(root, 'published', manifestSha256);
-  const files = { ...entries, 'manifest.json': manifest };
+  const files: Record<string, string> = {
+    ...entries,
+    'manifest.json': manifest,
+  };
   await mkdir(directory, { recursive: true });
   const directories = new Set([directory]);
   for (const [path, contents] of Object.entries(files)) {
@@ -171,7 +207,7 @@ async function fixture(
     await mkdir(native, { mode: 0o700 });
     return { mount, native, cache: join(native, 'cache') };
   };
-  return { root, image, source, person, files };
+  return { root, image, source, person, files, metadataPath };
 }
 const active = () => new AbortController().signal;
 
@@ -495,4 +531,212 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
         );
     },
   );
+});
+
+it.each(['ENOSPC', 'EDQUOT'] as const)(
+  'keeps actual owned %s write failure as a capacity error after staging settles',
+  async (code) => {
+    const f = await fixture();
+    const person = await f.person('budget');
+    const failure = Object.assign(new Error('synthetic owned disk write'), {
+      code,
+      syscall: 'write',
+    });
+    faults.cacheWrite = failure;
+    await expect(
+      seedPublicImageCache(f.source, f.image, person.native, active(), {
+        bytes: 32n * 4096n,
+        blockBytes: 4096n,
+      }),
+    ).rejects.toMatchObject({
+      name: 'Error',
+      message: 'PERSON_VM_PUBLIC_CACHE_BUDGET_EXCEEDED',
+      cause: failure,
+    });
+    expect(await readdir(person.native)).toEqual([]);
+  },
+);
+
+it('refreshes a verified older bound disk before first native create, resumes cutover, and retains all old state', async () => {
+  const old = await fixture();
+  const next = await fixture({ metadataSpacing: 2 });
+  expect(old.image).toBe(next.image);
+  expect(old.metadataPath).toBe(next.metadataPath);
+  expect(old.files[old.metadataPath]).not.toBe(next.files[next.metadataPath]);
+  const root = join(old.root, 'pool');
+  const keyRoot = join(old.root, 'keys');
+  const attachments = new Map<string, string>();
+  const diskRunner: CommandRunner = async ({ args, executable, input }) => {
+    if (executable.endsWith('/plutil')) return Buffer.from(input!).toString();
+    if (args[0] === 'info')
+      return JSON.stringify({
+        images: [...attachments].map(([path, mount]) => ({
+          'image-path': path,
+          'system-entities': [{ 'mount-point': mount }],
+        })),
+      });
+    if (args[0] === 'create')
+      await writeFile(args.at(-1)!, 'synthetic encrypted disk payload');
+    if (args[0] === 'attach')
+      attachments.set(args[1]!, args[args.indexOf('-mountpoint') + 1]!);
+    return '';
+  };
+  const keys = new FilePersonVmKeyStore(keyRoot);
+  const disk = new ApfsPersonVmDisk({
+    root,
+    keys,
+    capacityGiB: 8,
+    runner: diskRunner,
+  });
+  const adapter = (seed: typeof old) =>
+    new MacosPersonVmDiskPool({
+      root,
+      keyRoot,
+      capacityGiB: 8,
+      keys,
+      disk,
+      runner: diskRunner,
+      image: seed.image,
+      imageCache: seed.source,
+    });
+  const older = adapter(old),
+    current = adapter(next);
+  const binding = {
+    vmId: randomUUID(),
+    personId: randomUUID(),
+    organizationId: randomUUID(),
+    instanceId: randomUUID(),
+    leaseEpoch: 1,
+  };
+  const { vmId, personId, organizationId } = binding;
+  const ref = randomUUID();
+  const oldStock = { ref, source: older.source };
+  await older.readCapacity([], active());
+  await expect(
+    older.assertCreationBudget(
+      { minimumFreeBytes: 1n, reserveBytes: 1n },
+      active(),
+    ),
+  ).rejects.toThrow('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED');
+  expect(await readdir(join(root, '.preprovision-images', 'warm'))).toEqual([]);
+  await older.createEncryptedDisk(ref, active());
+  const proof = await older.inspectStock(oldStock, active());
+  const claim = {
+    ...oldStock,
+    proof,
+    intent: {
+      id: randomUUID(),
+      requestId: randomUUID(),
+      owner: { vmId, personId, organizationId },
+    },
+  };
+  const ledger = new DiskPoolLedger(root);
+  const append = async (entry: Parameters<DiskPoolLedger['append']>[1]) => {
+    await ledger.append(
+      (await ledger.read(active())).slots[0]!,
+      entry,
+      active(),
+    );
+  };
+  await append({ ...oldStock, state: 'filling' });
+  await append({ ...oldStock, proof, state: 'ready' });
+  await append({ ...claim, state: 'claiming' });
+  await older.bindDisk(claim, active());
+  await append({ ...claim, state: 'bound' });
+  const mount = await disk.attach({ vmId, tier: 'warm' }, active());
+  const nativeRoot = join(mount, 'microsandbox');
+  await mkdir(nativeRoot, { mode: 0o700 });
+  await seedPublicImageCache(old.source, old.image, nativeRoot, active());
+  await mkdir(join(nativeRoot, 'secrets'), { mode: 0o700 });
+  await writeFile(
+    join(nativeRoot, 'secrets', 'private'),
+    'retained native state',
+  );
+  await writeFile(
+    join(nativeRoot, 'cache', 'unknown'),
+    'retained unknown cache bytes',
+  );
+  const metadata = join(nativeRoot, 'cache', old.metadataPath);
+  expect(await readFile(metadata, 'utf8')).toBe(old.files[old.metadataPath]);
+  const socketRoot = await mkdtemp('/tmp/ar-');
+  roots.push(socketRoot);
+  const calls: string[][] = [];
+  const native = new MicrosandboxPersonVm({
+    binary: '/fixture/msb',
+    libkrunfw: '/fixture/libkrunfw',
+    agentd: '/fixture/agentd',
+    image: next.image,
+    publicImageCache: next.source,
+    rootDiskGiB: 8,
+    socketRoot,
+    seededPublicCache: current.hasSeededPublicCache.bind(current),
+    refreshBoundPublicCache: current.refreshBoundPublicCache.bind(current),
+    runner: async ({ args }) => {
+      calls.push([...args]);
+      if (args[0] === '--version') return 'microsandbox 0.7.16';
+      if (args[0] === 'list') return '[]';
+      if (args[0] === 'create')
+        expect(await readFile(metadata, 'utf8')).toBe(
+          next.files[next.metadataPath],
+        );
+      return '';
+    },
+  });
+  const receipt = { binding, bindingId: randomUUID(), gatewayPorts: [] };
+  await native.prepare(binding, mount, active());
+  await expect(
+    current.refreshBoundPublicCache(
+      { ...binding, organizationId: randomUUID() },
+      mount,
+      active(),
+    ),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  vi.mocked(writeFile).mockRejectedValueOnce(
+    Object.assign(new Error('synthetic staging disk full'), { code: 'ENOSPC' }),
+  );
+  await expect(native.create(binding, receipt, active())).rejects.toMatchObject(
+    { code: 'PROVIDER_FAILED' },
+  );
+  expect(await readFile(metadata, 'utf8')).toBe(old.files[old.metadataPath]);
+  expect(await readFile(join(nativeRoot, 'cache', 'unknown'), 'utf8')).toBe(
+    'retained unknown cache bytes',
+  );
+  const interruption = Error('synthetic restart after cache archive');
+  faults.afterRename = (_from, to) => {
+    if (to.endsWith('/previous')) throw interruption;
+  };
+  await expect(native.create(binding, receipt, active())).rejects.toBe(
+    interruption,
+  );
+  faults.afterRename = undefined;
+  expect(calls.map(([command]) => command)).toEqual([
+    '--version',
+    'list',
+    'list',
+  ]);
+  await native.prepare(binding, mount, active());
+  expect(await readFile(metadata, 'utf8')).toBe(next.files[next.metadataPath]);
+  await expect(
+    native.create(binding, receipt, active()),
+  ).resolves.toBeUndefined();
+  const transaction = (await readdir(nativeRoot)).find((name) =>
+    /^\.public-oci-refresh-[a-f0-9]{64}$/.test(name),
+  );
+  expect(transaction).toBeDefined();
+  const preserved = join(nativeRoot, transaction!, 'previous');
+  expect(await readFile(join(preserved, 'unknown'), 'utf8')).toBe(
+    'retained unknown cache bytes',
+  );
+  expect(await readFile(join(preserved, old.metadataPath), 'utf8')).toBe(
+    old.files[old.metadataPath],
+  );
+  expect(await readFile(join(nativeRoot, 'secrets', 'private'), 'utf8')).toBe(
+    'retained native state',
+  );
+  expect(calls.filter(([command]) => command === 'create')).toHaveLength(1);
+  await writeFile(metadata, 'corruption of installed current seal');
+  await expect(native.create(binding, receipt, active())).rejects.toMatchObject(
+    { code: 'PROVIDER_FAILED' },
+  );
+  expect(calls.filter(([command]) => command === 'create')).toHaveLength(1);
 });

@@ -25,8 +25,9 @@ export class DiskPoolBudgetExceeded extends Error {
       DiskPoolCapacity,
       'availableBytes' | 'allocatedBytes'
     >,
+    options?: ErrorOptions,
   ) {
-    super('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED');
+    super('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED', options);
   }
 }
 /** The caller makes a fresh catalog observation before deciding an image is untracked. */
@@ -41,6 +42,10 @@ export interface DiskPoolPlatform {
     inventory: readonly Readonly<{ ref: string; vmId?: string }>[],
     signal: AbortSignal,
   ): Promise<DiskPoolCapacity>;
+  assertCreationBudget?(
+    budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
+    signal: AbortSignal,
+  ): Promise<void>;
   createEncryptedDisk(ref: string, signal: AbortSignal): Promise<void>;
   mountDisk(ref: string, signal: AbortSignal): Promise<string>;
   seedPublicCache(

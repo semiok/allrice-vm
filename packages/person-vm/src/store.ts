@@ -571,7 +571,6 @@ export class PostgresPersonVmStore implements PersonVmStore {
       if (!locked && preparation?.mode === 'join') {
         const holder = await physicalLeaseHolder(session, physical, marker!);
         if (holder === 'preparation') {
-          joinedOfflinePreparation = true;
           // Only the identified offline lane can make us wait. Once its gate
           // is shared, a new preparation cannot win it ahead of this attempt.
           for (;;) {
@@ -592,8 +591,10 @@ export class PostgresPersonVmStore implements PersonVmStore {
         active!.throwIfAborted();
         // An empty observation means the original holder just released. Any
         // unrelated operation encountered at reacquisition still fails fast.
-        if (holder === 'preparation' || holder === 'none')
+        if (holder === 'preparation' || holder === 'none') {
+          joinedOfflinePreparation = true;
           locked = await tryPhysical();
+        }
       }
       active?.throwIfAborted();
       if (!locked) throw new PersonVmError('LEASE_CONFLICT');

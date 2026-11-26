@@ -45,17 +45,21 @@ async function fixture() {
   const keyRoot = join(root, 'keys');
   const manifestSha256 = '1'.repeat(64);
   const attachments = new Map<string, string>();
+  let afterInfo: (() => void) | undefined;
   const keyByInode = new Map<bigint, string>();
   const runner: CommandRunner = async ({ executable, args, input }) => {
     if (executable.endsWith('/plutil'))
       return Buffer.from(input!).toString('utf8');
-    if (args[0] === 'info')
-      return JSON.stringify({
+    if (args[0] === 'info') {
+      const snapshot = JSON.stringify({
         images: [...attachments].map(([image, mount]) => ({
           'image-path': image,
           'system-entities': [{ 'mount-point': mount }],
         })),
       });
+      afterInfo?.();
+      return snapshot;
+    }
     const verify = async (path: string) => {
       const { ino } = await fs.stat(path, { bigint: true });
       if (
@@ -102,8 +106,45 @@ async function fixture() {
         manifestSha256: currentSeal,
       },
     });
-  return { root, diskRoot, keyRoot, attachments, disk, keys, adapter };
+  return {
+    root,
+    diskRoot,
+    keyRoot,
+    attachments,
+    disk,
+    keys,
+    adapter,
+    onInfo(callback: () => void) {
+      afterInfo = callback;
+    },
+  };
 }
+
+it.each([true, false])(
+  'requires a fresh hdiutil view to confirm unrelated vanished paths (resolved=%s)',
+  async (resolved) => {
+    const f = await fixture();
+    const s = await stock(f);
+    await s.platform.bindDisk(s.claim, signal());
+    const missingPath = join(f.root, 'vanished-other-image');
+    f.attachments.set(missingPath, join(f.root, 'unrelated-mount'));
+    let observed = 0;
+    f.onInfo(() => {
+      observed += 1;
+      if (resolved && observed === 1) f.attachments.delete(missingPath);
+    });
+    const offline = f.disk.verifyOffline(
+      { vmId: s.vmId, tier: 'warm' },
+      signal(),
+    );
+    if (resolved) await expect(offline).resolves.toBeUndefined();
+    else
+      await expect(offline).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+    expect(observed).toBe(2);
+  },
+);
 
 it('validates the original formal receipt after rotation and keeps the warm-cache decision tied to the current seal', async () => {
   const f = await fixture();

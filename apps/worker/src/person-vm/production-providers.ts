@@ -24,23 +24,23 @@ export async function createProductionPersonVmProviders(signal: AbortSignal) {
   const keys = new FilePersonVmKeyStore(keyRoot);
   const disk = new ApfsPersonVmDisk({ root, keys, capacityGiB });
   let diskPool: PersonVmDiskPoolOptions | undefined;
-  let poolPlatform: MacosPersonVmDiskPool | undefined;
+  // The ordinary production disk provider already selects APFS. Bound cache
+  // proof stays available on that platform even after disabling refill/claim.
+  const poolPlatform =
+    process.platform === 'darwin' && nativeConfiguration.publicImageCache
+      ? new MacosPersonVmDiskPool({
+          root,
+          keyRoot,
+          capacityGiB,
+          disk,
+          keys,
+          image: nativeConfiguration.image,
+          imageCache: nativeConfiguration.publicImageCache,
+        })
+      : undefined;
   if (preprovision?.enabled) {
-    if (
-      preprovision.platform !== 'macos' ||
-      process.platform !== 'darwin' ||
-      !nativeConfiguration.publicImageCache
-    )
+    if (preprovision.platform !== 'macos' || !poolPlatform)
       throw new ProductionHostConfigurationUnavailable();
-    poolPlatform = new MacosPersonVmDiskPool({
-      root,
-      keyRoot,
-      capacityGiB,
-      disk,
-      keys,
-      image: nativeConfiguration.image,
-      imageCache: nativeConfiguration.publicImageCache,
-    });
     diskPool = Object.freeze({
       platform: poolPlatform,
       source: poolPlatform.source,
@@ -53,6 +53,8 @@ export async function createProductionPersonVmProviders(signal: AbortSignal) {
     ...nativeConfiguration,
     memoryMiB: loaded.platform.memoryMiB,
     seededPublicCache: poolPlatform?.hasSeededPublicCache.bind(poolPlatform),
+    refreshBoundPublicCache:
+      poolPlatform?.refreshBoundPublicCache.bind(poolPlatform),
   });
   signal.throwIfAborted();
   const egressInstallation = createProductionEgressInstallation(loaded, signal);

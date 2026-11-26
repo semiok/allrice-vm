@@ -10,8 +10,9 @@ import {
   unlink,
 } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { PersonVmError } from './contract.ts';
+import { PersonVmError, type PersonVmBinding } from './contract.ts';
 import {
+  DiskPoolLedger,
   missing,
   publishDiskPoolRecord,
   syncDiskPoolDirectory,
@@ -19,6 +20,7 @@ import {
 import {
   DiskPoolBudgetExceeded,
   DiskPoolInventoryMismatch,
+  sameDiskPoolOwner,
   type DiskPoolClaim,
   type DiskPoolPlatform,
   type DiskPoolStock,
@@ -32,6 +34,10 @@ import {
 } from './encrypted-disk.ts';
 import {
   checkedPublicImageCache,
+  hasPendingPublicCacheRefresh,
+  isCapacityWriteError,
+  publicImageCacheBytes,
+  refreshSeededPublicImageCache,
   PublicImageCacheBudgetExceeded,
   seedPublicImageCache,
   type PublicImageCache,
@@ -41,6 +47,11 @@ import type { CommandRunner } from './process.ts';
 type Inode = Readonly<{ device: string; inode: string }>;
 type StockProof = Readonly<{ image: Inode; key: Inode }>;
 type FileIdentity = Inode & Readonly<{ links: bigint; bytes: bigint }>;
+
+// hdiutil(1) documents 1 MiB allocation increments for default single-file UDSP.
+const sparseImageBandBytes = 1024n * 1024n;
+const roundBytes = (bytes: bigint, block: bigint) =>
+  ((bytes + block - 1n) / block) * block;
 
 function invalid(): never {
   throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -56,6 +67,12 @@ function checkedInode(value: Inode) {
     /^\d+$/.test(value.device) &&
     /^\d+$/.test(value.inode)
   );
+}
+function checkedStockProof(value: string) {
+  const proof = JSON.parse(value) as StockProof;
+  if (!proof || !checkedInode(proof.image) || !checkedInode(proof.key))
+    invalid();
+  return proof;
 }
 async function identity(
   path: string,
@@ -179,6 +196,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
   private readonly stockKeys: FilePersonVmKeyStore;
   private readonly stockDisk: ApfsPersonVmDisk;
   private readonly imageCache: PublicImageCache;
+  private readonly ledger: DiskPoolLedger;
 
   constructor(
     private readonly options: Readonly<{
@@ -193,6 +211,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     }>,
   ) {
     this.stockRoot = join(options.root, '.preprovision-images');
+    this.ledger = new DiskPoolLedger(options.root);
     this.stockKeyRoot = join(options.keyRoot, '.preprovision-keys');
     this.stockKeys = new FilePersonVmKeyStore(this.stockKeyRoot);
     this.stockDisk = new ApfsPersonVmDisk({
@@ -285,6 +304,34 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     await this.stockDisk.create(disk, signal);
   }
 
+  async assertCreationBudget(
+    {
+      reserveBytes,
+      minimumFreeBytes,
+    }: { reserveBytes: bigint; minimumFreeBytes: bigint },
+    signal: AbortSignal,
+  ) {
+    const seedBytes = await publicImageCacheBytes(
+      this.imageCache,
+      this.options.image,
+      signal,
+    );
+    const volume = await statfs(join(this.stockRoot, 'warm'), { bigint: true });
+    if (volume.bsize <= 0n) invalid();
+    const availableBytes = volume.bavail * volume.bsize;
+    // Reject a budget too small for the public payload and initial image
+    // growth headroom before invoking hdiutil. Actual growth is checked again
+    // after formatting/mount and around every bounded copy write.
+    const initialWindow =
+      roundBytes(seedBytes, sparseImageBandBytes) + 2n * sparseImageBandBytes;
+    if (
+      reserveBytes < initialWindow ||
+      availableBytes < minimumFreeBytes + reserveBytes
+    )
+      throw new DiskPoolBudgetExceeded({ availableBytes, allocatedBytes: 0n });
+    signal.throwIfAborted();
+  }
+
   mountDisk(ref: string, signal: AbortSignal) {
     return this.stockDisk.attach(warm(ref), signal);
   }
@@ -312,18 +359,35 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     const outerRoot = dirname(image);
     const outerDevice = String(await directory(outerRoot));
     if (!original || original.device !== outerDevice) invalid();
+    const backing = await open(
+      image,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
     const sample = async (nextBytes: bigint) => {
       signal.throwIfAborted();
+      await backing.sync();
       const volume = await statfs(outerRoot, { bigint: true });
-      const current = await identity(image);
-      if (!current || !sameInode(original, current) || volume.bsize <= 0n)
+      const guest = await statfs(mount, { bigint: true });
+      const current = await backing.stat({ bigint: true });
+      if (
+        current.dev.toString() !== original.device ||
+        current.ino.toString() !== original.inode ||
+        current.nlink !== 1n ||
+        volume.bsize <= 0n ||
+        guest.bsize !== bsize
+      )
         invalid();
       const availableBytes = volume.bavail * volume.bsize;
-      const allocatedBytes = current.bytes;
-      const chunk = ((nextBytes + bsize - 1n) / bsize) * bsize;
+      const allocatedBytes = current.blocks * 512n;
+      const chunk = roundBytes(nextBytes, bsize);
+      // Include a distinct band for image/filesystem metadata and count the
+      // prior guest fsync in the backing allocation before the next write.
+      const growth =
+        roundBytes(chunk, sparseImageBandBytes) + sparseImageBandBytes;
       if (
-        allocatedBytes + chunk > reserveBytes ||
-        availableBytes < minimumFreeBytes + chunk
+        allocatedBytes + growth > reserveBytes ||
+        availableBytes < minimumFreeBytes + growth ||
+        guest.bavail * bsize < chunk + bsize
       )
         throw new PublicImageCacheBudgetExceeded({
           availableBytes,
@@ -349,8 +413,12 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
       );
     } catch (error) {
       if (error instanceof PublicImageCacheBudgetExceeded)
-        throw new DiskPoolBudgetExceeded(error.capacity);
+        throw new DiskPoolBudgetExceeded(error.capacity, { cause: error });
+      if (isCapacityWriteError(error))
+        throw new DiskPoolBudgetExceeded(undefined, { cause: error });
       throw error;
+    } finally {
+      await backing.close();
     }
   }
 
@@ -413,10 +481,68 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     );
   }
 
-  private async binding(claim: DiskPoolClaim, signal: AbortSignal) {
-    const proof = JSON.parse(claim.proof) as StockProof;
-    if (!proof || !checkedInode(proof.image) || !checkedInode(proof.key))
+  /** The native create caller owns the boot lease and selected attached disk. */
+  async refreshBoundPublicCache(
+    binding: PersonVmBinding,
+    mount: string,
+    signal: AbortSignal,
+    resumeOnly = false,
+  ) {
+    signal.throwIfAborted();
+    const disk = warm(binding.vmId);
+    const { image, manifest: receiptPath } = this.options.disk.poolFiles(disk);
+    const receipt = await manifest(receiptPath);
+    if (!receipt?.poolClaimId || receipt.poolSource === this.source)
+      return false;
+    const nativeRoot = join(mount, 'microsandbox');
+    if (
+      resumeOnly &&
+      !(await hasPendingPublicCacheRefresh(
+        this.imageCache,
+        this.options.image,
+        nativeRoot,
+        receipt.poolClaimId,
+      ))
+    )
+      return false;
+    const claim = (await this.ledger.read(signal)).bound.get(binding.vmId);
+    if (
+      !claim ||
+      !sameDiskPoolOwner(claim.intent.owner, binding) ||
+      claim.intent.id !== receipt.poolClaimId ||
+      claim.source !== receipt.poolSource ||
+      receipt.version !== 1 ||
+      receipt.vmId !== binding.vmId
+    )
       invalid();
+    const proof = checkedStockProof(claim.proof);
+    const diskIdentity = await identity(image);
+    const keyIdentity = await identity(
+      this.options.keys.filePath(binding.vmId),
+    );
+    if (
+      !diskIdentity ||
+      !keyIdentity ||
+      diskIdentity.links !== 1n ||
+      keyIdentity.links !== 1n ||
+      !sameInode(receipt, proof.image) ||
+      !sameInode(diskIdentity, proof.image) ||
+      !sameInode(keyIdentity, proof.key) ||
+      (await this.options.disk.verifyAttachedMount(disk, signal)) !== mount
+    )
+      invalid();
+    await refreshSeededPublicImageCache(
+      this.imageCache,
+      this.options.image,
+      nativeRoot,
+      claim.intent.id,
+      signal,
+    );
+    return true;
+  }
+
+  private async binding(claim: DiskPoolClaim, signal: AbortSignal) {
+    const proof = checkedStockProof(claim.proof);
     await this.layout(signal);
     const stock = warm(claim.ref);
     const formal = warm(claim.intent.owner.vmId);

@@ -8,6 +8,7 @@ import {
   open,
   readdir,
   realpath,
+  rename,
   rm,
   rmdir,
   unlink,
@@ -16,6 +17,10 @@ import {
 import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { PersonVmError } from './contract.ts';
+import {
+  publishDiskPoolRecord,
+  syncDiskPoolDirectory,
+} from './disk-pool-ledger.ts';
 
 export type PublicImageCache = Readonly<{
   directory: string;
@@ -27,8 +32,27 @@ export class PublicImageCacheBudgetExceeded extends Error {
       availableBytes: bigint;
       allocatedBytes: bigint;
     }>,
+    options?: ErrorOptions,
   ) {
-    super('PERSON_VM_PUBLIC_CACHE_BUDGET_EXCEEDED');
+    super('PERSON_VM_PUBLIC_CACHE_BUDGET_EXCEEDED', options);
+  }
+}
+export function isCapacityWriteError(error: unknown) {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === 'ENOSPC' || code === 'EDQUOT';
+}
+type WriteBudget = Readonly<{
+  bytes: bigint;
+  blockBytes: bigint;
+  beforeWrite?(bytes: bigint): Promise<void>;
+}>;
+async function writeToCache<T>(write: () => Promise<T>) {
+  try {
+    return await write();
+  } catch (error) {
+    if (isCapacityWriteError(error))
+      throw new PublicImageCacheBudgetExceeded(undefined, { cause: error });
+    throw error;
   }
 }
 
@@ -321,13 +345,25 @@ async function readSeed(
   return files;
 }
 
+export async function publicImageCacheBytes(
+  input: PublicImageCache,
+  image: string,
+  signal: AbortSignal,
+) {
+  const entries = await readSeed(input, image, signal);
+  return [...entries.values()].reduce(
+    (sum, entry) => sum + BigInt(entry.bytes),
+    0n,
+  );
+}
+
 async function verifyFile(
   path: string,
   expected: CacheFile,
   signal: AbortSignal,
   sealed: boolean,
   destination?: string,
-  beforeWrite?: (bytes: bigint) => Promise<void>,
+  budget?: WriteBudget,
 ) {
   signal.throwIfAborted();
   const { file, stat } = await checkedFile(path, sealed);
@@ -346,12 +382,25 @@ async function verifyFile(
         if (size > expected.bytes) invalid();
         const chunk = buffer.subarray(0, bytesRead);
         hash.update(chunk);
-        if (beforeWrite) await beforeWrite(BigInt(bytesRead));
         yield chunk;
       }
     }
     const contents = chunks();
-    if (destination) {
+    if (destination && budget) {
+      await budget.beforeWrite?.(0n);
+      const output = await writeToCache(() => open(destination, 'wx', 0o600));
+      try {
+        for await (const chunk of contents) {
+          await budget.beforeWrite?.(BigInt(chunk.length));
+          await writeToCache(async () => {
+            await output.writeFile(chunk);
+            await output.sync();
+          });
+        }
+      } finally {
+        await output.close();
+      }
+    } else if (destination) {
       await writeFile(destination, contents, {
         flag: 'wx',
         mode: 0o600,
@@ -449,6 +498,168 @@ export async function verifySeededPublicImageCache(
   }
 }
 
+type CacheRefreshIntent = Readonly<{
+  version: 1;
+  previous: string | null;
+  installed: string;
+}>;
+
+async function cacheDirectoryInode(path: string, device: bigint) {
+  if (!(await privateCacheDirectory(path, false))) return null;
+  const stat = await lstat(path, { bigint: true });
+  if (stat.dev !== device) invalid();
+  return String(stat.ino);
+}
+const validInode = (value: unknown) =>
+  typeof value === 'string' && /^\d+$/.test(value);
+const cacheRefreshDirectory = (
+  root: string,
+  claimId: string,
+  image: string,
+  seal: string,
+) =>
+  join(root, '.public-oci-refresh-' + sha256(`${claimId}\0${image}\0${seal}`));
+
+export async function hasPendingPublicCacheRefresh(
+  input: PublicImageCache,
+  image: string,
+  nativeRoot: string,
+  claimId: string,
+) {
+  const root = await checkedNativeCacheRoot(input, nativeRoot);
+  const transaction = cacheRefreshDirectory(
+    root,
+    claimId,
+    image,
+    input.manifestSha256,
+  );
+  return (
+    (await privateCacheDirectory(transaction, false)) &&
+    (await privateCacheDirectory(join(transaction, 'cache'), false))
+  );
+}
+
+async function readCacheRefreshIntent(path: string) {
+  const { file, stat } = await checkedFile(path, false);
+  try {
+    if ((stat.mode & 0o7777) !== 0o600 || stat.size > 4096) invalid();
+    const intent = JSON.parse(
+      await file.readFile('utf8'),
+    ) as CacheRefreshIntent;
+    if (
+      !intent ||
+      intent.version !== 1 ||
+      !validInode(intent.installed) ||
+      (intent.previous !== null && !validInode(intent.previous))
+    )
+      invalid();
+    return intent;
+  } finally {
+    await file.close();
+  }
+}
+
+/** Same-owner first native create. The caller has proved the original pooled
+ * claim and mounted image. Stage and flush the full current seal before moving
+ * any existing cache, and retain the entire previous directory on that disk. */
+export async function refreshSeededPublicImageCache(
+  input: PublicImageCache,
+  image: string,
+  nativeRoot: string,
+  claimId: string,
+  signal: AbortSignal,
+) {
+  const root = await checkedNativeCacheRoot(input, nativeRoot);
+  // The verified image is stable across mounts, but its guest device number
+  // can change. Check the live mount device and persist only in-volume inodes.
+  const { dev } = await lstat(root, { bigint: true });
+  const transaction = cacheRefreshDirectory(
+    root,
+    claimId,
+    image,
+    input.manifestSha256,
+  );
+  const cache = join(root, 'cache');
+  const previous = join(transaction, 'previous');
+  const staged = join(transaction, 'cache');
+  const intentPath = 'intent.json';
+  signal.throwIfAborted();
+  if (!(await privateCacheDirectory(transaction, false))) {
+    const original = await cacheDirectoryInode(cache, dev);
+    if (!original) invalid();
+    const scratch = await mkdtemp(join(root, '.public-oci-refresh-stage-'));
+    let published = false;
+    try {
+      let intent: CacheRefreshIntent;
+      const alreadyCurrent = await verifySeededPublicImageCache(
+        input,
+        image,
+        root,
+        signal,
+      ).then(
+        () => true,
+        () => false,
+      );
+      signal.throwIfAborted();
+      if (alreadyCurrent) {
+        intent = { version: 1, previous: null, installed: original };
+      } else {
+        // A full verified copy fits before any user-owned directory is moved.
+        await seedPublicImageCache(input, image, scratch, signal);
+        const next = join(scratch, 'cache');
+        const installed = await cacheDirectoryInode(next, dev);
+        if (!installed) invalid();
+        const files = await readSeed(input, image, signal);
+        for (const name of files.keys()) {
+          signal.throwIfAborted();
+          const { file } = await checkedFile(join(next, name), false);
+          try {
+            await file.sync();
+          } finally {
+            await file.close();
+          }
+        }
+        for (const directory of [...sourceDirectories].reverse())
+          await syncDiskPoolDirectory(join(next, directory));
+        await syncDiskPoolDirectory(next);
+        intent = { version: 1, previous: original, installed };
+      }
+      await publishDiskPoolRecord(join(scratch, intentPath), intent);
+      signal.throwIfAborted();
+      await rename(scratch, transaction);
+      published = true;
+      await syncDiskPoolDirectory(root);
+    } finally {
+      if (!published) await rm(scratch, { force: true, recursive: true });
+    }
+  }
+
+  const intent = await readCacheRefreshIntent(join(transaction, intentPath));
+  const active = await cacheDirectoryInode(cache, dev);
+  const old = await cacheDirectoryInode(previous, dev);
+  const next = await cacheDirectoryInode(staged, dev);
+  if (active !== intent.installed) {
+    if (!intent.previous || next !== intent.installed) invalid();
+    await verifySeededPublicImageCache(input, image, transaction, signal);
+    // The lease serializes this pair of moves. Every already present
+    // destination must be exactly the one captured by the durable intent.
+    if (old) {
+      if (old !== intent.previous || active) invalid();
+    } else {
+      if (active !== intent.previous) invalid();
+      signal.throwIfAborted();
+      await rename(cache, previous);
+    }
+    await syncDiskPoolDirectory(transaction);
+    await syncDiskPoolDirectory(root);
+    signal.throwIfAborted();
+    await rename(staged, cache);
+  } else if (next || old !== intent.previous) invalid();
+  await syncDiskPoolDirectory(transaction);
+  await syncDiskPoolDirectory(root);
+  await verifySeededPublicImageCache(input, image, root, signal);
+}
+
 /** Under the VM owner, seed only public bytes into the existing encrypted
  * per-VM cache. MSB can create locks and staging files only in that private
  * cache. Host publication must stage these exact entries from a fresh,
@@ -458,11 +669,7 @@ export async function seedPublicImageCache(
   image: string,
   nativeRoot: string,
   signal: AbortSignal,
-  budget?: Readonly<{
-    bytes: bigint;
-    blockBytes: bigint;
-    beforeWrite?(bytes: bigint): Promise<void>;
-  }>,
+  budget?: WriteBudget,
 ) {
   try {
     const root = await checkedNativeCacheRoot(input, nativeRoot);
@@ -490,8 +697,13 @@ export async function seedPublicImageCache(
       if (await privateCacheDirectory(path, false))
         existingDirectories.add(path);
     }
-    const stage = await mkdtemp(join(root, '.public-oci-'));
+    const stagePrefix = join(root, '.public-oci-');
+    const stage = budget
+      ? await writeToCache(() => mkdtemp(stagePrefix))
+      : await mkdtemp(stagePrefix);
+    let failure: unknown;
     try {
+      if (budget) await writeToCache(() => syncDiskPoolDirectory(root));
       const staged = new Map<string, { path: string; entry: CacheFile }>();
       for (const [name, entry] of files) {
         const destination = join(cache, name);
@@ -511,25 +723,50 @@ export async function seedPublicImageCache(
           signal,
           true,
           path,
-          path ? budget?.beforeWrite : undefined,
+          path ? budget : undefined,
         );
         if (path !== undefined) staged.set(destination, { path, entry });
       }
-      await budget?.beforeWrite?.(0n);
-      for (const path of directories) await privateCacheDirectory(path, true);
+      for (const path of directories) {
+        if (budget) {
+          await budget.beforeWrite?.(0n);
+          await writeToCache(async () => {
+            await privateCacheDirectory(path, true);
+            await syncDiskPoolDirectory(dirname(path));
+          });
+        } else await privateCacheDirectory(path, true);
+      }
       // Link only from private staging. An already verified private entry
       // needs no second copy, including after an interrupted partial install.
       for (const [destination, { path, entry }] of staged) {
         signal.throwIfAborted();
         try {
-          await link(path, destination);
+          if (budget) {
+            await budget.beforeWrite?.(0n);
+            await writeToCache(async () => {
+              await link(path, destination);
+              await syncDiskPoolDirectory(dirname(destination));
+            });
+          } else await link(path, destination);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
           await verifyFile(destination, entry, signal, false);
         }
       }
+    } catch (error) {
+      failure = error;
+      throw error;
     } finally {
-      await rm(stage, { recursive: true, force: true });
+      try {
+        await rm(stage, { recursive: true, force: true });
+      } catch (cleanup) {
+        if (failure instanceof PublicImageCacheBudgetExceeded)
+          throw new PublicImageCacheBudgetExceeded(failure.capacity, {
+            cause: new AggregateError([failure, cleanup]),
+          });
+        if (failure) throw new AggregateError([failure, cleanup]);
+        throw cleanup;
+      }
     }
     signal.throwIfAborted();
   } catch (error) {

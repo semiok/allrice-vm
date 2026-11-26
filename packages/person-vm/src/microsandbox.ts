@@ -141,6 +141,12 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
       publicImageCache?: PublicImageCache;
       seededPublicCache?(vmId: string, signal: AbortSignal): Promise<boolean>;
+      refreshBoundPublicCache?(
+        binding: PersonVmBinding,
+        mount: string,
+        signal: AbortSignal,
+        resumeOnly?: boolean,
+      ): Promise<boolean>;
       rootDiskGiB: number;
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
@@ -464,6 +470,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     await privateDirectory(this.options.socketRoot);
     const target = join(mount, 'microsandbox');
     await privateDirectory(target);
+    // Rejoin an elected cache cutover before the CLI can open its cache path.
+    await this.options.refreshBoundPublicCache?.(binding, mount, signal, true);
     const userHome = join(mount, 'host-home');
     await privateDirectory(userHome);
     try {
@@ -610,15 +618,24 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         binding.vmId,
         signal,
       );
-      const prepareCache = hasSeed
-        ? verifySeededPublicImageCache
-        : seedPublicImageCache;
-      await prepareCache(
-        this.options.publicImageCache,
-        this.options.image,
-        join(dirname(paths.config), 'microsandbox'),
-        signal,
-      );
+      const mount = dirname(paths.config);
+      const nativeRoot = join(mount, 'microsandbox');
+      if (hasSeed)
+        await verifySeededPublicImageCache(
+          this.options.publicImageCache,
+          this.options.image,
+          nativeRoot,
+          signal,
+        );
+      else if (
+        !(await this.options.refreshBoundPublicCache?.(binding, mount, signal))
+      )
+        await seedPublicImageCache(
+          this.options.publicImageCache,
+          this.options.image,
+          nativeRoot,
+          signal,
+        );
     } else
       await this.command(
         binding,

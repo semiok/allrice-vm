@@ -230,37 +230,50 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
   async verifyOffline(disk: PersonDisk, signal: AbortSignal) {
     const image = this.image(disk);
     const mount = this.mount(disk);
-    const state = await this.info(signal);
-    if (
-      !Array.isArray(state.images) ||
-      state.images.some(
-        (entry) =>
-          !entry ||
-          typeof entry['image-path'] !== 'string' ||
-          entry['image-path'] === image ||
-          !Array.isArray(entry['system-entities']) ||
-          entry['system-entities'].some(
-            (entity) => !entity || entity['mount-point'] === mount,
-          ),
-      )
-    )
-      throw new PersonVmError('CLEANUP_INCOMPLETE');
     const actual = await stat(image, { bigint: true }).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return null;
+      (error: unknown) => {
+        if (missing(error)) return null;
         throw error;
       },
     );
-    if (actual) {
+    const observe = async (disappeared?: string) => {
+      const state = await this.info(signal);
+      if (
+        !Array.isArray(state.images) ||
+        state.images.some(
+          (entry) =>
+            !entry ||
+            typeof entry['image-path'] !== 'string' ||
+            entry['image-path'] === image ||
+            entry['image-path'] === disappeared ||
+            !Array.isArray(entry['system-entities']) ||
+            entry['system-entities'].some(
+              (entity) => !entity || entity['mount-point'] === mount,
+            ),
+        )
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      if (!actual) return;
       for (const item of state.images) {
         signal.throwIfAborted();
         const path = item['image-path'];
         if (!isAbsolute(path)) throw new PersonVmError('CLEANUP_INCOMPLETE');
-        const candidate = await stat(path, { bigint: true });
+        let candidate;
+        try {
+          candidate = await stat(path, { bigint: true });
+        } catch (error) {
+          if (missing(error)) return path;
+          throw error;
+        }
         if (candidate.dev === actual.dev && candidate.ino === actual.ino)
           throw new PersonVmError('CLEANUP_INCOMPLETE');
       }
-    }
+    };
+    const disappeared = await observe();
+    // A vanished path is harmless only when a fresh device inventory no
+    // longer reports that attachment and still proves the target offline.
+    if (disappeared && (await observe(disappeared)))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
     const root = await lstat(this.options.root);
     const mounted = await lstat(mount).catch((error: NodeJS.ErrnoException) => {
       if (error.code === 'ENOENT') return null;

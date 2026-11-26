@@ -209,6 +209,7 @@ export class PersonVmDiskPool {
             },
           },
         };
+        await guard.assertCurrent();
         await guard.assertOwner();
         await lock.assertOwned();
         await this.ledger.append(slot, entry, lock.signal);
@@ -336,13 +337,14 @@ export class PersonVmDiskPool {
     options: PersonVmDiskPoolOptions,
     signal: AbortSignal,
   ) {
+    signal.throwIfAborted();
     const { ref, source } = slot.entry!;
     const stock = { ref, source, proof };
     const retiring = await this.advanceStock(
       slot,
       { ...stock, state: 'retiring', reason },
       fill,
-      signal,
+      fill.ownerSignal,
     );
     try {
       // A later owner cannot reissue a retiring slot whose actual deletion did
@@ -395,6 +397,10 @@ export class PersonVmDiskPool {
       }
       if (check.availableBytes < minimumFreeBytes + reserveBytes)
         throw new DiskPoolBudgetExceeded(check);
+      await platform.assertCreationBudget?.(
+        { reserveBytes, minimumFreeBytes },
+        active,
+      );
       await fill.assertOwned();
       active.throwIfAborted();
       let problem: unknown;
