@@ -2,6 +2,7 @@ import {
   ApfsPersonVmDisk,
   FilePersonVmKeyStore,
   MicrosandboxPersonVm,
+  PersonVmError,
 } from '@allrice/person-vm';
 import { readVerifiedProductionPersonVmInputs } from './production-artifacts.js';
 import { createProductionEgressInstallation } from './production-egress.js';
@@ -9,12 +10,23 @@ import { createProductionEgressInstallation } from './production-egress.js';
 /** Real inert provider construction only, not an installed Host or runtime.
  * Nothing boots or allocates a disk here. The final single-service composition
  * must pass this same platform snapshot to its shared admission host. */
-export async function createProductionPersonVmProviders(signal: AbortSignal) {
+export async function createProductionPersonVmProviders(
+  signal: AbortSignal,
+  reserve?: NonNullable<
+    ConstructorParameters<typeof MicrosandboxPersonVm>[0]['restartMemory']
+  >['reserve'],
+) {
   const loaded = await readVerifiedProductionPersonVmInputs(signal);
   signal.throwIfAborted();
+  const capacityEnabled =
+    loaded.configuration.lifecycle.hostVmBudgetMiB !== undefined;
+  if (capacityEnabled && !reserve) throw new PersonVmError('RUNTIME_NOT_READY');
   const native = new MicrosandboxPersonVm({
     ...loaded.configuration.native,
     memoryMiB: loaded.platform.memoryMiB,
+    ...(capacityEnabled && {
+      restartMemory: { memoryMiB: loaded.platform.memoryMiB, reserve },
+    }),
   });
   const disk = new ApfsPersonVmDisk({
     root: loaded.configuration.disk.root,

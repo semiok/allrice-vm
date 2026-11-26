@@ -46,9 +46,18 @@ export interface VmLease {
   /** Loss cancels owned work; the holder still MUST join before releasing. */
   signal: AbortSignal;
   assertAdmissionOpen(generationChange?: boolean): Promise<void>;
-  save(row: VmRecord): Promise<void>;
+  save(
+    row: VmRecord,
+    audit?: VmAudit,
+    capacityReleased?: boolean,
+  ): Promise<void>;
+  /** Returns whether the replaced generation had already released capacity. */
+  reserveStartup?(row: VmRecord): Promise<boolean>;
   guard(): Promise<void>;
   assertPhysicalOwner?(): Promise<void>;
+  idleStopReceipt?(
+    binding: PersonVmBinding,
+  ): ReturnType<typeof readIdleStopReceipt>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
 }
 export interface PersonVmStore {
@@ -63,6 +72,49 @@ export interface PersonVmStore {
     options: { now: () => Date; ttlMs: number; signal: AbortSignal },
     work: (lease: VmLease) => Promise<T>,
   ): Promise<T>;
+}
+
+function stateWithAudit(
+  sql: postgres.Sql | postgres.TransactionSql,
+  save: postgres.PendingQuery<postgres.Row[]>,
+  event?: VmAudit,
+  capacityReleased = false,
+) {
+  if (!event && !capacityReleased) return save;
+  const result = event
+    ? sql`insert into person_vm_audit
+      (vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
+    select vm_id,person_id,organization_id,${event.requestId},${event.action},
+      ${event.result},${event.errorCode ?? null},lease_epoch
+    from saved returning vm_id`
+    : sql`select vm_id from saved`;
+  // Publish lifecycle state, any wake audit and confirmed capacity release
+  // together. A metadata-only stop must leave its previous charge intact.
+  return sql`with saved as (${save})
+    ${
+      capacityReleased
+        ? sql`, released as (
+      insert into person_vm_audit
+        (vm_id,person_id,organization_id,request_id,action,result,lease_epoch)
+      select vm_id,person_id,organization_id,${event?.requestId ?? randomUUID()},
+        'capacity.release','succeeded',lease_epoch from saved
+    )`
+        : sql``
+    }
+    ${result}`;
+}
+
+function releasedVmCapacity(sql: postgres.ISql) {
+  return sql`exists (
+    select 1 from person_vm_audit a
+    where a.vm_id=vm.vm_id and a.person_id=vm.person_id
+      and a.organization_id=vm.organization_id and a.lease_epoch=vm.lease_epoch
+      and a.result='succeeded'
+      and (a.action='capacity.release' or (
+        a.action='stop' and vm.phase in ('stopped','cold','deleted')
+        and vm.stopped_at is not null and vm.egress_receipt is null
+      ))
+  )`;
 }
 
 export type PersonVmLeaseOwner = Readonly<{
@@ -173,6 +225,43 @@ export class VmSqlSession {
   }
 }
 
+async function readIdleStopReceipt(
+  session: VmSqlSession,
+  binding: PersonVmBinding,
+) {
+  const [record] = await session.query(
+    () => session.client`
+    select intent.request_id, completed.request_id is not null as completed
+    from person_virtual_machines vm
+    cross join lateral (
+      select id, request_id, result from person_vm_audit
+      where person_id=vm.person_id and organization_id=vm.organization_id
+        and vm_id=vm.vm_id and lease_epoch=vm.lease_epoch
+        and action='stop.idle-dispatch'
+      order by id desc limit 1
+    ) intent
+    left join lateral (
+      select request_id from person_vm_audit
+      where person_id=vm.person_id and organization_id=vm.organization_id
+        and vm_id=vm.vm_id and lease_epoch=vm.lease_epoch
+        and id>intent.id and action='stop' and result='succeeded'
+      order by id desc limit 1
+    ) completed on true
+    where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+      and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+      and vm.lease_epoch=${binding.leaseEpoch} and vm.phase<>'deleted'
+          and vm.disk_retained and vm.native_created and intent.result='succeeded'
+      and (completed.request_id is null or completed.request_id=intent.request_id)
+  `,
+  );
+  return record
+    ? {
+        requestId: String(record.request_id),
+        completed: record.completed === true,
+      }
+    : undefined;
+}
+
 function fromRow(row: Record<string, unknown>): VmRecord {
   const date = (value: unknown) => new Date(value as string).toISOString();
   return {
@@ -257,7 +346,14 @@ export class PostgresPersonVmStore implements PersonVmStore {
   constructor(
     private readonly openSql: PersonVmSqlFactory,
     private readonly fence?: PersonVmLeaseFencePort,
-  ) {}
+    private readonly maxResidentVms?: number,
+  ) {
+    if (
+      maxResidentVms !== undefined &&
+      (!Number.isSafeInteger(maxResidentVms) || maxResidentVms < 1)
+    )
+      throw new PersonVmError('PROVIDER_FAILED');
+  }
   /** Admission and physical ownership must use the SAME trusted factory/DB.
    * Factories must not change database/schema between calls. No DSN is exposed. */
   assertAdmissionFactory(factory: PersonVmSqlFactory) {
@@ -271,6 +367,15 @@ export class PostgresPersonVmStore implements PersonVmStore {
           session.client`select * from person_virtual_machines where person_id=${personId}`,
       );
       return row ? fromRow(row) : null;
+    } finally {
+      await session.end();
+    }
+  }
+
+  async idleStopReceipt(binding: PersonVmBinding) {
+    const session = new VmSqlSession(this.openSql());
+    try {
+      return await readIdleStopReceipt(session, binding);
     } finally {
       await session.end();
     }
@@ -430,6 +535,51 @@ export class PostgresPersonVmStore implements PersonVmStore {
         if (requireAdmission && current.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };
+      const save = async (
+        record: VmRecord,
+        db: postgres.Sql | postgres.TransactionSql,
+        audit?: VmAudit,
+        capacityReleased?: boolean,
+      ) => {
+        if (record.personId !== personId) throw new PersonVmError('LEASE_LOST');
+        const values = {
+          person_id: record.personId,
+          vm_id: record.vmId,
+          organization_id: record.organizationId,
+          phase: record.phase,
+          disk_tier: record.diskTier,
+          disk_retained: record.diskRetained,
+          native_created: record.nativeCreated,
+          instance_id: record.instanceId,
+          lease_epoch: record.leaseEpoch,
+          lease_owner: token,
+          lease_expires_at: expires(),
+          egress_receipt: record.egressReceipt
+            ? db.json(record.egressReceipt as postgres.JSONValue)
+            : null,
+          gateway_ports: db.json(record.gatewayPorts),
+          holds: db.json(record.holds),
+          last_activity_at: record.lastActivityAt,
+          stopped_at: record.stoppedAt,
+          idle_since: record.idleSince,
+          activity_observed_at: record.activityObservedAt,
+        };
+        const rows = await stateWithAudit(
+          db,
+          db`insert into person_virtual_machines ${db(values)}
+            on conflict (person_id) do update set
+              vm_id=excluded.vm_id,phase=excluded.phase,disk_tier=excluded.disk_tier,disk_retained=excluded.disk_retained,
+              native_created=excluded.native_created,instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
+              egress_receipt=excluded.egress_receipt,gateway_ports=excluded.gateway_ports,holds=excluded.holds,
+              last_activity_at=excluded.last_activity_at,stopped_at=excluded.stopped_at,idle_since=excluded.idle_since,
+              activity_observed_at=excluded.activity_observed_at,lease_expires_at=excluded.lease_expires_at,updated_at=now()
+            where person_virtual_machines.lease_owner=${token}
+            returning vm_id,person_id,organization_id,lease_epoch`,
+          audit,
+          capacityReleased,
+        );
+        if (rows.length !== 1) throw new PersonVmError('LEASE_LOST');
+      };
       const lease: VmLease = {
         row,
         signal: session.signal,
@@ -437,43 +587,34 @@ export class PostgresPersonVmStore implements PersonVmStore {
           assertAdmissionOpen(session, personId, change),
         guard,
         assertPhysicalOwner: () => guard(false),
-        save: async (record) => {
-          if (record.personId !== personId)
-            throw new PersonVmError('LEASE_LOST');
-          const values = {
-            person_id: record.personId,
-            vm_id: record.vmId,
-            organization_id: record.organizationId,
-            phase: record.phase,
-            disk_tier: record.diskTier,
-            disk_retained: record.diskRetained,
-            native_created: record.nativeCreated,
-            instance_id: record.instanceId,
-            lease_epoch: record.leaseEpoch,
-            lease_owner: token,
-            lease_expires_at: expires(),
-            egress_receipt: record.egressReceipt
-              ? sql.json(record.egressReceipt as postgres.JSONValue)
-              : null,
-            gateway_ports: sql.json(record.gatewayPorts),
-            holds: sql.json(record.holds),
-            last_activity_at: record.lastActivityAt,
-            stopped_at: record.stoppedAt,
-            idle_since: record.idleSince,
-            activity_observed_at: record.activityObservedAt,
-          };
-          const rows = await session.query(
-            () => sql`insert into person_virtual_machines ${sql(values)}
-            on conflict (person_id) do update set
-              vm_id=excluded.vm_id,phase=excluded.phase,disk_tier=excluded.disk_tier,disk_retained=excluded.disk_retained,
-              native_created=excluded.native_created,instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
-              egress_receipt=excluded.egress_receipt,gateway_ports=excluded.gateway_ports,holds=excluded.holds,
-              last_activity_at=excluded.last_activity_at,stopped_at=excluded.stopped_at,idle_since=excluded.idle_since,
-              activity_observed_at=excluded.activity_observed_at,lease_expires_at=excluded.lease_expires_at,updated_at=now()
-            where person_virtual_machines.lease_owner=${token} returning vm_id`,
-          );
-          if (rows.length !== 1) throw new PersonVmError('LEASE_LOST');
-        },
+        save: (record, audit, capacityReleased) =>
+          session.query(() => save(record, sql, audit, capacityReleased)),
+        ...(this.maxResidentVms === undefined
+          ? {}
+          : {
+              reserveStartup: (record: VmRecord) =>
+                session.query(() =>
+                  sql.begin('isolation level read committed', async (tx) => {
+                    await tx`select pg_advisory_xact_lock(hashtextextended('person-vm:host-peak-capacity',0))`;
+                    const [used] = await tx`select count(*)::int as count
+                from person_virtual_machines vm
+                where vm.person_id<>${personId} and vm.instance_id is not null
+                  and not ${releasedVmCapacity(tx)}`;
+                    if (
+                      typeof used?.count !== 'number' ||
+                      used.count >= this.maxResidentVms!
+                    )
+                      throw new PersonVmError('RUNTIME_NOT_READY');
+                    const [previous] =
+                      await tx`select ${releasedVmCapacity(tx)} as released
+                      from person_virtual_machines vm
+                      where vm.person_id=${personId} and vm.lease_owner=${token}`;
+                    await save(record, tx);
+                    return previous?.released === true;
+                  }),
+                ),
+            }),
+        idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
         audit: async (record, event) => {
           await session.query(
             () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
@@ -587,19 +728,26 @@ export class PostgresPersonVmStore implements PersonVmStore {
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),
         guard,
-        save: async (value) => {
+        save: async (value, audit, capacityReleased) => {
           if (
             value.vmId !== row.vmId ||
             value.personId !== personId ||
             value.leaseEpoch !== row.leaseEpoch
           )
             throw new PersonVmError('LEASE_LOST');
-          const [found] = await session.query(
-            () => sql`update person_virtual_machines set phase=${value.phase},disk_tier=${value.diskTier},native_created=${value.nativeCreated},stopped_at=${value.stoppedAt},egress_receipt=${value.egressReceipt ? sql.json(value.egressReceipt as postgres.JSONValue) : null},updated_at=now()
-            where person_id=${personId} and lease_owner=${token} and lease_epoch=${row.leaseEpoch} returning vm_id`,
+          const [found] = await session.query(() =>
+            stateWithAudit(
+              sql,
+              sql`update person_virtual_machines set phase=${value.phase},disk_tier=${value.diskTier},native_created=${value.nativeCreated},stopped_at=${value.stoppedAt},egress_receipt=${value.egressReceipt ? sql.json(value.egressReceipt as postgres.JSONValue) : null},updated_at=now()
+            where person_id=${personId} and lease_owner=${token} and lease_epoch=${row.leaseEpoch}
+            returning vm_id,person_id,organization_id,lease_epoch`,
+              audit,
+              capacityReleased,
+            ),
           );
           if (!found) throw new PersonVmError('LEASE_LOST');
         },
+        idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
         audit: async (value, event) => {
           await session.query(
             () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)

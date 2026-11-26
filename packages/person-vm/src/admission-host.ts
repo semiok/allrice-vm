@@ -23,6 +23,7 @@ import type {
   PersonVmAdmissionSubscription,
   PersonVmIdleCoverage,
   PersonVmNativeActivityPort,
+  PersonVmPrepareIdleStop,
 } from './admission-contract.ts';
 import {
   type PostgresPersonVmAdmissionStore,
@@ -33,7 +34,12 @@ import {
   sameLease,
   type AdmissionTransaction,
 } from './admission-store.ts';
-import type { PersonVmStore, VmLease, VmRecord } from './store.ts';
+import {
+  bindingOf,
+  type PersonVmStore,
+  type VmLease,
+  type VmRecord,
+} from './store.ts';
 
 type OwnedPermit = {
   context: RequestContext;
@@ -116,6 +122,14 @@ export class PersonVmAdmissionHost
       now: () => Date;
       monotonic?: () => number;
       nativeActivity?: PersonVmNativeActivityPort;
+      activityMaxAgeMs: number;
+      prepareIdleStop?: PersonVmPrepareIdleStop;
+      recoverIdleStop(
+        context: RequestContext,
+        binding: PersonVmBinding,
+        signal: AbortSignal,
+      ): Promise<boolean>;
+      idleStopped(binding: PersonVmBinding): void;
       startOwned(
         context: RequestContext,
         lease: VmLease,
@@ -127,6 +141,12 @@ export class PersonVmAdmissionHost
         signal: AbortSignal,
       ): Promise<PersonVmView>;
       assertStopSafe(lease: VmLease, signal: AbortSignal): Promise<void>;
+      stopIdleOwned(
+        context: RequestContext,
+        lease: VmLease,
+        signal: AbortSignal,
+        assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+      ): Promise<PersonVmView>;
     },
   ) {
     this.idleMs =
@@ -1129,63 +1149,165 @@ export class PersonVmAdmissionHost
       },
     );
   }
-  async reconcileIdle(
-    context: RequestContext,
+  private async readIdleCandidate(
     binding: PersonVmBinding,
+    row: VmRecord | null,
+    previous: IdleCandidate | undefined,
     signal: AbortSignal,
-  ): Promise<void> {
-    await this.authorize(context, binding, signal);
-    if (!this.options.nativeActivity) {
-      this.idle.delete(binding.personId);
-      return;
-    }
-    const [[g, e, accepted], native, row] = await Promise.all([
-      this.options.shared.transaction(binding.personId, signal, async (tx) => {
+  ) {
+    if (
+      !this.options.nativeActivity ||
+      row?.phase !== 'running' ||
+      !sameBinding(bindingOf(row), binding)
+    )
+      return undefined;
+    const observations = await this.options.shared.transaction(
+      binding.personId,
+      signal,
+      async (tx) => {
         this.check(tx, binding);
+        if (tx.state.round && !released(tx.state.round)) return undefined;
         return [
           await this.observation(tx, 'gateway'),
           await this.observation(tx, 'entry'),
           [tx.state.gateway.idleRevision, tx.state.entry.idleRevision],
         ] as const;
-      }),
-      this.options.nativeActivity.observe(binding, signal),
-      this.options.store.read(binding.personId),
-    ]);
-    const coverage = [g.coverage, e.coverage, native.coverage];
+      },
+    );
+    if (!observations) return undefined;
+    const [g, e, accepted] = observations;
+    const native = await this.options.nativeActivity.observe(binding, signal);
+    const now = this.options.now().getTime();
+    const age = now - Date.parse(native.activity.observedAt);
+    const coverage = native.coverage;
+    const through =
+      coverage.state === 'continuous' ? Date.parse(coverage.through) : NaN;
     if (
       g.state !== 'known' ||
       e.state !== 'known' ||
       g.active + g.queued + e.active + e.queued ||
       !sameBinding(native.activity.binding, binding) ||
       native.activity.state !== 'known' ||
+      coverage.state !== 'continuous' ||
+      !coverage.idleSince ||
+      !(Date.parse(coverage.from) <= Date.parse(coverage.idleSince)) ||
+      !(Date.parse(coverage.idleSince) <= through) ||
+      through > now ||
+      now - through > this.options.activityMaxAgeMs ||
+      !coverage.cursor.sourceId ||
+      !coverage.cursor.revision ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > this.options.activityMaxAgeMs ||
       native.activeScheduleDeliveries !== 0 ||
-      native.activity.activeTurns +
-        native.activity.activeJobs +
-        native.activity.activeSubtasks +
-        native.activity.pendingApprovals
+      ![
+        native.activity.activeTurns,
+        native.activity.activeJobs,
+        native.activity.activeSubtasks,
+        native.activity.pendingApprovals,
+      ].every((count) => count === 0)
+    )
+      return undefined;
+    return advanceIdleCandidate(
+      previous,
+      binding,
+      [g.coverage, e.coverage, native.coverage],
+      [...accepted, native.coverage.cursor?.revision],
+      row,
+      this.mono(),
+    );
+  }
+  async reconcileIdle(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    await this.authorize(context, binding, signal);
+    if (
+      this.options.prepareIdleStop &&
+      (await this.options.recoverIdleStop(context, binding, signal))
     ) {
       this.idle.delete(binding.personId);
       return;
     }
-    const mono = this.mono();
-    const candidate = advanceIdleCandidate(
-      this.idle.get(binding.personId),
+    const candidate = await this.readIdleCandidate(
       binding,
-      coverage,
-      [...accepted, native.coverage.cursor?.revision],
-      row,
-      mono,
-    );
+      await this.options.store.read(binding.personId),
+      this.idle.get(binding.personId),
+      signal,
+    ).catch((error: unknown) => {
+      this.idle.delete(binding.personId);
+      throw error;
+    });
     if (!candidate) {
       this.idle.delete(binding.personId);
       return;
     }
     this.idle.set(binding.personId, candidate);
-    if (mono - candidate.mono < this.idleMs) return;
-    // This composition has no native autonomous-admission barrier. Do not
-    // freeze users merely because an injected projection looks complete: it
-    // cannot commit a running stop. Keep the VM/open gates and the candidate.
-    // Explicit stopFrozen also enforces native stopped/absent before cleanup.
-    return;
+    const prepare = this.options.prepareIdleStop;
+    if (!prepare || this.mono() - candidate.mono < this.idleMs) return;
+    const stopped = await this.options.store
+      .withLease(
+        binding.personId,
+        { now: this.options.now, ttlMs: this.options.leaseTtlMs },
+        async (owned) => {
+          const current = AbortSignal.any([signal, owned.signal]);
+          return this.trackOwner(binding.personId, current, async (active) => {
+            const assertStopCurrent = async (probe: AbortSignal) => {
+              const checking = AbortSignal.any([active, probe]);
+              await owned.guard();
+              await this.authorize(context, binding, checking);
+              const latest = await this.readIdleCandidate(
+                binding,
+                owned.row,
+                candidate,
+                checking,
+              );
+              if (
+                latest !== candidate ||
+                this.mono() - latest.mono < this.idleMs
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+              checking.throwIfAborted();
+            };
+            await assertStopCurrent(active);
+            const plan = await prepare(
+              { context, binding, assertStopCurrent },
+              active,
+            );
+            if (!('ok' in plan) || plan.ok !== true) return;
+            await this.options.stopIdleOwned(
+              context,
+              owned,
+              active,
+              async (probe) => {
+                await assertStopCurrent(probe);
+                const checked = await prepare(
+                  { context, binding, assertStopCurrent },
+                  probe,
+                );
+                if (
+                  !('ok' in checked) ||
+                  checked.nextWakeAt !== plan.nextWakeAt
+                )
+                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+                await assertStopCurrent(probe);
+                if (
+                  plan.nextWakeAt !== null &&
+                  !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
+                )
+                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+              },
+            );
+            this.idle.delete(binding.personId);
+            return true;
+          });
+        },
+      )
+      .catch((error: unknown) => {
+        this.idle.delete(binding.personId);
+        throw error;
+      });
+    if (stopped) this.options.idleStopped(binding);
   }
 }
