@@ -16,7 +16,7 @@ export function publicDriver() {
     chromiumArgs: ['--no-proxy-server'],
     async install(
       context,
-      { inspect, muxRole, beginCarrier, observeFollow, fail },
+      { inspect, muxRole, beginCarrier, observeFollow, followClosed, fail },
     ) {
       await context.route('**/*', async (route) => {
         let response;
@@ -156,8 +156,10 @@ export function publicDriver() {
                 const sessionId = openStreams.get(frame?.streamId);
                 if (frame?.type === 'item' && sessionId)
                   observeFollow(sessionId, frame.value);
-                if (frame?.type === 'end' || frame?.type === 'error')
+                if (frame?.type === 'end' || frame?.type === 'error') {
+                  if (sessionId) followClosed?.(sessionId);
                   openStreams.delete(frame.streamId);
+                }
               }
               socket.send(message);
             } catch (error) {

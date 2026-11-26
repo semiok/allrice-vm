@@ -20,6 +20,10 @@ export function createHelloProbe(receipt) {
   const complete = new Promise((done) => {
     resolve = done;
   });
+  let resolveTurn;
+  const boundTurn = new Promise((done) => {
+    resolveTurn = done;
+  });
   const outcome = { dispatched: false, accepted: false, replyObserved: false };
   receipt.hello = outcome;
   const duration = () => Math.round(performance.now() - started);
@@ -28,6 +32,8 @@ export function createHelloProbe(receipt) {
   }
   return {
     complete,
+    boundTurn,
+    elapsed: duration,
     arm(nativeSessionId) {
       requireFact(
         !sessionId &&
@@ -37,6 +43,7 @@ export function createHelloProbe(receipt) {
         'hello-native-session-unverified',
       );
       sessionId = nativeSessionId;
+      started = performance.now();
     },
     dispatch(body) {
       const request = body?.payload?.args?.request;
@@ -57,7 +64,6 @@ export function createHelloProbe(receipt) {
         'hello-prompt-blocked',
       );
       requestId = request.requestId;
-      started = performance.now();
       outcome.dispatched = true;
       return body.rpcId;
     },
@@ -74,6 +80,12 @@ export function createHelloProbe(receipt) {
       outcome.accepted = true;
       finish();
     },
+    closed(target) {
+      requireFact(
+        target !== sessionId || !requestId || ended,
+        'hello-reply-stream-closed',
+      );
+    },
     follow(target, item) {
       if (!requestId || target !== sessionId || item?.type !== 'event' || ended)
         return;
@@ -87,6 +99,10 @@ export function createHelloProbe(receipt) {
           'hello-user-event-mismatch',
         );
         expectedTurn = openTurn;
+        outcome.correlation = createHash('sha256')
+          .update(JSON.stringify([sessionId, requestId, expectedTurn]))
+          .digest('hex');
+        resolveTurn(expectedTurn);
       }
       if (expectedTurn === undefined || data?.turn !== expectedTurn) return;
       if (
@@ -99,8 +115,6 @@ export function createHelloProbe(receipt) {
             block.text.trim(),
         )
       ) {
-        if (!outcome.replyObserved)
-          receipt.timings.helloToFirstReplyMs = duration();
         outcome.replyObserved = true;
       }
       if (type === 'turn/end') {
@@ -109,9 +123,10 @@ export function createHelloProbe(receipt) {
           'hello-reply-unconfirmed',
         );
         ended = true;
-        receipt.timings.helloToTurnEndMs = duration();
+        receipt.timings.helloToNativeTurnEndMs = duration();
         finish();
       }
     },
   };
 }
+import { createHash } from 'node:crypto';

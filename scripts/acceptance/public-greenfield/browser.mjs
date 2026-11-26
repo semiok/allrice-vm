@@ -261,7 +261,11 @@ function browserFlow({
       requireFact(
         readPaths.has(path) ||
           (onColdTicket &&
-            ['/favicon.ico', '/api/health/ready'].includes(path)) ||
+            [
+              '/favicon.ico',
+              '/brand/allrice-icon-v1.svg',
+              '/brand/apple-touch-icon-v1.png',
+            ].includes(path)) ||
           path === documentPath ||
           path.startsWith(documentPath + '/') ||
           path.startsWith('/_next/static/') ||
@@ -300,6 +304,16 @@ function browserFlow({
     }
     const reply = await exchange();
     const data = reply.json;
+    if (
+      onColdTicket &&
+      [401, 403, 410].includes(reply.status) &&
+      (path === documentPath ||
+        path.startsWith(documentPath + '/') ||
+        path.startsWith('/api/v1/d-entry/profile/') ||
+        path === paths.rpc)
+    ) {
+      throw new CheckFailed('native-page-access-denied', reply.status);
+    }
     if (prompt) hello.accept(prompt, reply);
     switch (`${method} ${path}`) {
       case `POST ${paths.login}`:
@@ -466,11 +480,13 @@ export async function runBrowser({
   sendHello = false,
   beforeHello,
   reopenWarm = true,
+  signal,
 }) {
+  requireFact(!signal?.aborted, 'acceptance-interrupted');
   const { chromium } = webRequire('playwright-core');
   const browser = await chromium.launch({
     executablePath: browserExecutable,
-    timeout,
+    timeout: onColdTicket ? 30_000 : timeout,
     headless: true,
     args: driver.chromiumArgs,
     env: Object.fromEntries(
@@ -510,10 +526,14 @@ export async function runBrowser({
     fail(stage, error);
     rejectNetwork(error);
   }
+  const cancel = () => failure(new CheckFailed('acceptance-interrupted'));
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const guarded = (action) => Promise.race([action, networkFailure]);
   let context;
   let publicEditor;
   try {
+    requireFact(!signal?.aborted, 'acceptance-interrupted');
     context = await browser.newContext({
       acceptDownloads: false,
       serviceWorkers: 'block',
@@ -531,6 +551,7 @@ export async function runBrowser({
       muxRole: flow.muxRole,
       beginCarrier: flow.beginCarrier,
       observeFollow: (sessionId, item) => hello?.follow(sessionId, item),
+      followClosed: (sessionId) => hello?.closed(sessionId),
       fail: failure,
     });
     const page = await context.newPage();
@@ -647,9 +668,14 @@ export async function runBrowser({
         delete receipt.browser.cold.readyObservedAt;
       }
       receipt.stages[`${phase}Editor`] = 'passed';
-      return { child, editor, nativeSessionId: after.nativeSessionId };
+      return {
+        child,
+        editor,
+        nativeSessionId: after.nativeSessionId,
+        readEditor,
+      };
     }
-    const { child, editor, nativeSessionId } = await focusedEditor(
+    const { child, editor, nativeSessionId, readEditor } = await focusedEditor(
       'cold',
       coldStart,
     );
@@ -657,6 +683,14 @@ export async function runBrowser({
     if (hello) {
       stage = 'hello';
       await guarded(beforeHello());
+      const current = await readEditor();
+      requireFact(
+        flow.hasDocumentScope(current) &&
+          current.nativeSessionId === nativeSessionId &&
+          current.editable &&
+          current.focused,
+        'hello-native-session-unverified',
+      );
       requireFact(
         !(await guarded(editor.innerText())).trim(),
         'hello-draft-not-empty',
@@ -666,15 +700,40 @@ export async function runBrowser({
         (await guarded(editor.innerText())).trim() === '你好',
         'hello-draft-mismatch',
       );
+      const send = child.getByRole('button', {
+        name: /^(发送消息|Send message)$/u,
+      });
+      await guarded(send.waitFor({ state: 'visible' }));
+      requireFact(await guarded(send.isEnabled()), 'hello-send-disabled');
       hello.arm(nativeSessionId);
-      await guarded(
-        child
-          .getByRole('button', { name: /^(发送消息|Send message)$/u })
-          .click(),
-      );
+      await guarded(send.click());
       await guarded(
         Promise.race([
-          hello.complete,
+          (async () => {
+            const turn = await hello.boundTurn;
+            // Observe the pinned DSH ChatView's assistant turn and Markdown
+            // wrapper. Reasoning disclosures have data-variant="think".
+            const response = child
+              .locator(
+                `[data-chat-flow-kind="assistant-step"][data-chat-turn="${turn}"]:not([data-chat-group-part="reasoning"]) .markdown:not([data-variant="think"] *):visible`,
+              )
+              .filter({ hasText: /\S/u })
+              .first();
+            await response.waitFor({ timeout: 120_000 });
+            receipt.timings.helloToFirstReplyMs = hello.elapsed();
+            await hello.complete;
+            await child
+              .locator(`[data-turn-tail="${turn}"]`)
+              .waitFor({ timeout: 120_000 });
+            const final = await readEditor();
+            requireFact(
+              flow.hasDocumentScope(final) &&
+                final.nativeSessionId === nativeSessionId &&
+                (await response.isVisible()),
+              'hello-reply-not-visible',
+            );
+            receipt.timings.helloToCompleteReplyMs = hello.elapsed();
+          })(),
           delay(120_000, undefined, { ref: false }).then(() => {
             throw new CheckFailed('hello-reply-timeout');
           }),
@@ -703,27 +762,38 @@ export async function runBrowser({
               const view = node.ownerDocument.defaultView;
               const scopeId = view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId;
               return new Promise((resolve) => {
+                let remoteClosed = false;
+                let frameClosed = false;
                 const finish = (closed) => {
                   view.clearTimeout(timer);
-                  view.removeEventListener('message', receive);
+                  view.removeEventListener('message', receiveRemote);
+                  view.parent.removeEventListener('message', receiveFrame);
                   resolve(closed);
                 };
-                const receive = (event) => {
-                  if (
-                    event.source === view.parent &&
-                    event.origin === view.location.origin &&
-                    event.data?.scopeId === scopeId &&
-                    event.data.type === 'allrice:d-entry:completion'
-                  ) {
-                    finish(event.data.state === 'closed');
-                  }
+                const completion = (event, source) =>
+                  scopeId &&
+                  event.source === source &&
+                  event.origin === view.location.origin &&
+                  event.data?.scopeId === scopeId &&
+                  event.data.type === 'allrice:d-entry:completion';
+                const receiveRemote = (event) => {
+                  if (!completion(event, view.parent)) return;
+                  if (event.data.state !== 'closed') return finish(false);
+                  remoteClosed = true;
+                  if (frameClosed) finish(true);
+                };
+                const receiveFrame = (event) => {
+                  if (!completion(event, view)) return;
+                  if (event.data.state !== 'closed') return finish(false);
+                  frameClosed = true;
+                  if (remoteClosed) finish(true);
                 };
                 const timer = view.setTimeout(() => finish(false), 15_000);
-                view.addEventListener('message', receive);
-                view.parent.postMessage(
-                  { type: 'allrice:d-entry:close', scopeId },
-                  view.location.origin,
-                );
+                view.addEventListener('message', receiveRemote);
+                view.parent.addEventListener('message', receiveFrame);
+                // The actual native local entry closes on pagehide and asks
+                // the parent carrier to join before it acknowledges disposal.
+                view.dispatchEvent(new view.PageTransitionEvent('pagehide'));
               });
             },
             undefined,
@@ -737,8 +807,12 @@ export async function runBrowser({
       }
       await context?.close();
     } finally {
-      await browser.close();
-      receipt.browser.closed = true;
+      try {
+        await browser.close();
+        receipt.browser.closed = true;
+      } finally {
+        signal?.removeEventListener('abort', cancel);
+      }
     }
   }
 }

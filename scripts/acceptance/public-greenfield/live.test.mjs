@@ -148,6 +148,30 @@ it('checks the managed owner before reading credentials or calling the public or
   expect(JSON.stringify(receipt)).not.toContain('owner private error');
 });
 
+it('rejects changed bytes in a private owner module before executing it', async () => {
+  await withCredentials(async (credentialPath, directory) => {
+    const fixture = managedFixture();
+    const ownerPath = join(directory, 'owner.mjs');
+    await writeFile(
+      ownerPath,
+      'throw new Error("unapproved module executed");',
+      { mode: 0o600 },
+    );
+    const receipt = await runLive(
+      { ownerPath, ownerDigest: '0'.repeat(64), credentialPath, seal },
+      { ...fixture, ownerSource: undefined },
+    );
+    expect(receipt).toMatchObject({
+      status: 'blocked',
+      firstFailure: {
+        stage: 'managedOwner',
+        code: 'managed-owner-digest-mismatch',
+      },
+    });
+    expect(fixture.publicHealth).not.toHaveBeenCalled();
+  });
+});
+
 it('joins only the VM tied to the observed ticket and retains its disk and account', async () => {
   await withCredentials(async (credentialPath) => {
     const fixture = managedFixture();
@@ -233,6 +257,36 @@ it('records the send intent after rechecking the assigned running instance', asy
     expect(JSON.stringify(recordHelloIntent.mock.calls)).not.toContain(
       operationId,
     );
+  });
+});
+
+it('retains the interruption and attempts only the corresponding joined cleanup', async () => {
+  await withCredentials(async (credentialPath) => {
+    const fixture = managedFixture();
+    const cancellation = new globalThis.AbortController();
+    const coldBrowser = fixture.browser.getMockImplementation();
+    fixture.browser.mockImplementation(async (input) => {
+      await coldBrowser(input);
+      cancellation.abort();
+    });
+    const receipt = await runLive(
+      {
+        ownerPath: '/test.mjs',
+        credentialPath,
+        seal,
+        signal: cancellation.signal,
+      },
+      fixture,
+    );
+    expect(receipt).toMatchObject({
+      status: 'failed',
+      firstFailure: { code: 'acceptance-interrupted' },
+      cleanup: { status: 'stopped' },
+    });
+    expect(fixture.owner.stopExact).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ binding }),
+    );
+    expect(fixture.owner.close).toHaveBeenCalledOnce();
   });
 });
 
@@ -403,12 +457,12 @@ it('allows one exact 你好 prompt and attributes reply timing only to its nativ
     root,
     event('turn/end', { turn: 2, reason: { kind: 'completed' } }),
   );
+  expect(await probe.boundTurn).toBe(2);
   await probe.complete;
   expect(receipt).toMatchObject({
     hello: { dispatched: true, accepted: true, replyObserved: true },
     timings: {
-      helloToFirstReplyMs: expect.any(Number),
-      helloToTurnEndMs: expect.any(Number),
+      helloToNativeTurnEndMs: expect.any(Number),
     },
   });
   expect(JSON.stringify(receipt)).not.toContain('private reply');

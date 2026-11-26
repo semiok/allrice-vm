@@ -1,15 +1,19 @@
+import { createHash } from 'node:crypto';
 import {
   constants,
   openSync,
   fstatSync,
   closeSync,
   readFileSync,
+  realpathSync,
+  lstatSync,
 } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runBrowser } from './browser.mjs';
 import {
   captureVmBinding,
+  CheckFailed,
   checkHealth,
   failure,
   isId,
@@ -73,13 +77,37 @@ export function credentials(path) {
   });
 }
 
-async function loadOwner(path) {
+async function loadOwner(path, expectedDigest) {
   // This is executable code explicitly supplied by the release operator. It
   // binds the already authorized local Host owner. No public stop URL is used.
-  withPrivateFile(path, () =>
-    requireFact(path.endsWith('.mjs'), 'managed-owner-module-invalid'),
+  requireFact(
+    typeof path === 'string' &&
+      isAbsolute(path) &&
+      path.endsWith('.mjs') &&
+      typeof expectedDigest === 'string' &&
+      expectedDigest.length === 64 &&
+      /^[0-9a-f]{64}$/u.test(expectedDigest),
+    'managed-owner-module-invalid',
   );
-  const { managedOwner } = await import(pathToFileURL(path).href);
+  const directory = realpathSync(dirname(path));
+  const dir = lstatSync(directory);
+  requireFact(
+    dir.isDirectory() &&
+      dir.uid === process.getuid?.() &&
+      (dir.mode & 0o7777) === 0o700,
+    'managed-owner-directory-not-private',
+  );
+  const verifiedPath = join(directory, basename(path));
+  withPrivateFile(verifiedPath, (fd, info) => {
+    requireFact(
+      info.size > 0 &&
+        info.size <= 1024 * 1024 &&
+        createHash('sha256').update(readFileSync(fd)).digest('hex') ===
+          expectedDigest,
+      'managed-owner-digest-mismatch',
+    );
+  });
+  const { managedOwner } = await import(pathToFileURL(verifiedPath).href);
   requireFact(
     [
       'prepare',
@@ -94,11 +122,14 @@ async function loadOwner(path) {
   return managedOwner;
 }
 
-async function webHealth() {
+async function webHealth(signal) {
   const response = await fetch(`${publicOrigin}/api/health/ready`, {
     cache: 'no-store',
     redirect: 'error',
-    signal: globalThis.AbortSignal.timeout(15_000),
+    signal: globalThis.AbortSignal.any([
+      signal,
+      globalThis.AbortSignal.timeout(15_000),
+    ]),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -121,8 +152,14 @@ export async function runLive(
 ) {
   const pre = preflight(options);
   if (pre.blockers.length) return pre;
-  const { ownerPath, credentialPath, seal, sendHello, browserExecutable } =
-    options;
+  const {
+    ownerPath,
+    credentialPath,
+    seal,
+    sendHello,
+    browserExecutable,
+    signal: cancelled,
+  } = options;
   if (sendHello && !recordHelloIntent) {
     pre.blockers.push('hello-intent-receipt-required');
     return pre;
@@ -166,7 +203,8 @@ export async function runLive(
       vmBootMs: null,
       guestDshReadyMs: null,
       helloToFirstReplyMs: null,
-      helloToTurnEndMs: null,
+      helloToNativeTurnEndMs: null,
+      helloToCompleteReplyMs: null,
     },
     cleanup: { status: 'not-dispatched' },
     firstFailure: null,
@@ -187,11 +225,16 @@ export async function runLive(
   let helloBinding;
   let stage = 'managedOwner';
   const signal = () => globalThis.AbortSignal.timeout(30_000);
+  const active = () =>
+    cancelled ? globalThis.AbortSignal.any([cancelled, signal()]) : signal();
+  const assertActive = () =>
+    requireFact(!cancelled?.aborted, 'acceptance-interrupted');
   const readBoots = async () => {
-    const workers = await owner.workerHealth({ release, signal: signal() });
+    assertActive();
+    const workers = await owner.workerHealth({ release, signal: active() });
     return [
       checkHealth(workers, release, 'worker'),
-      checkHealth(await publicHealth(), release),
+      checkHealth(await publicHealth(active()), release),
     ];
   };
   const currentOperation = async () => {
@@ -215,7 +258,9 @@ export async function runLive(
     );
   }
   try {
-    owner = await ownerSource(ownerPath);
+    assertActive();
+    owner = await ownerSource(ownerPath, options.ownerDigest);
+    assertActive();
     stage = 'credentials';
     const config = credentials(credentialPath);
     identity = config.identity;
@@ -224,7 +269,7 @@ export async function runLive(
       identity,
       username: config.account.username,
       release,
-      signal: signal(),
+      signal: active(),
     });
     requireFact(
       prepared?.role === '验收员' &&
@@ -249,6 +294,7 @@ export async function runLive(
       timeout: 320_000,
       browserExecutable,
       fail,
+      signal: cancelled,
       sendHello,
       reopenWarm: false,
       beforeHello: async () => {
@@ -257,6 +303,7 @@ export async function runLive(
         requireFact(started.state === 'allocated', 'hello-start-unconfirmed');
         helloBinding = captureVmBinding(started.binding, identity);
         const current = await readVm();
+        assertActive();
         requireFact(
           current?.state === 'running' && sameVmBinding(helloBinding, current),
           'hello-owner-changed',
@@ -283,7 +330,10 @@ export async function runLive(
     assertBoots(before, await readBoots());
     receipt.stages[stage] = 'passed';
   } catch (error) {
-    fail(stage, error);
+    fail(
+      stage,
+      cancelled?.aborted ? new CheckFailed('acceptance-interrupted') : error,
+    );
   } finally {
     try {
       if (receipt.browser.cold.prewarmRequests) {
@@ -357,6 +407,8 @@ export async function runLive(
       }
     }
   }
+  if (cancelled?.aborted)
+    fail('interrupted', new CheckFailed('acceptance-interrupted'));
   if (!receipt.firstFailure) receipt.status = 'passed';
   return receipt;
 }

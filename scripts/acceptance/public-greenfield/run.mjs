@@ -234,6 +234,7 @@ async function main() {
       'release-seal': { type: 'string' },
       credentials: { type: 'string' },
       'managed-owner': { type: 'string' },
+      'managed-owner-sha256': { type: 'string' },
       'send-hello': { type: 'boolean' },
       output: { type: 'string' },
     },
@@ -248,6 +249,7 @@ async function main() {
           values['release-seal'] ||
           values.credentials ||
           values['managed-owner'] ||
+          values['managed-owner-sha256'] ||
           values['send-hello']
         )),
     'conflicting-run-mode',
@@ -265,8 +267,14 @@ async function main() {
     process.env.ALLRICE_BROWSER_EXECUTABLE ??
     process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
   const recordFirstFailure = (item) => write('first-failure.json', item);
-  const receipt = values.live
-    ? await runLive(
+  const cancellation = new globalThis.AbortController();
+  const cancel = () => cancellation.abort();
+  let receipt;
+  if (values.live) {
+    process.on('SIGINT', cancel);
+    process.on('SIGTERM', cancel);
+    try {
+      receipt = await runLive(
         {
           allowPublicWrites: values['allow-public-writes'],
           releaseSha: values['release-sha'],
@@ -274,15 +282,23 @@ async function main() {
           seal: values['release-seal'],
           credentialPath: values.credentials,
           ownerPath: values['managed-owner'],
+          ownerDigest: values['managed-owner-sha256'],
           sendHello: values['send-hello'],
           browserExecutable,
+          signal: cancellation.signal,
         },
         {
           recordFirstFailure,
           recordHelloIntent: (item) => write('hello-intent.json', item),
         },
-      )
-    : await dryRun({ browserExecutable, recordFirstFailure });
+      );
+    } finally {
+      process.off('SIGINT', cancel);
+      process.off('SIGTERM', cancel);
+    }
+  } else {
+    receipt = await dryRun({ browserExecutable, recordFirstFailure });
+  }
   write('receipt.json', receipt);
   process.stdout.write(
     `${receipt.mode} ${receipt.status} · ${join(output, 'receipt.json')}\n`,

@@ -29,16 +29,17 @@ ALLRICE_RUN_BROWSER_INTEGRATION=1 pnpm exec vitest run --maxWorkers=1 \
 node scripts/acceptance/public-greenfield/run.mjs --live --allow-public-writes \
   --release-sha "$TARGET" --release-tree "$TREE" --release-seal "$SEAL" \
   --credentials "$PRIVATE/acceptance.json" --managed-owner "$PRIVATE/owner.mjs" \
+  --managed-owner-sha256 "$APPROVED_OWNER_SHA256" \
   --output "$OUT/greenfield"
 ```
 
 `acceptance.json` 为仓库外的私有普通文件，当前操作员属主、模式 `0600`。它只含 `username`、`password`、`organizationId`、`personId`、`workspaceId`。只使用从发布负责人取得的验收员资料。用户名、口令、Cookie、原生消息、票据和物理实例身份都不进入回执。关闭 Playwright 调试。运行前后独立核对 Web/Worker 与相同 release 和进程 boot ID。
 
-只有本次获准发送时才加 `--send-hello`。点击前重新核对发布、进程和本次票据的运行实例，写 `hello-intent.json`。浏览器一次点击，同一原生根会话仅放行一次单文本 `session/prompt`，内容为“你好”。回复计时从真实请求截获到同一原生回合首条非空回复，再到回合完成。报告只留计时与状态。发送或回执未知时结束，保持首败并交负责人查原回合。
+只有本次获准发送时才加 `--send-hello`。点击前重新核对发布、进程和本次票据的运行实例，写 `hello-intent.json`。浏览器一次点击，同一原生根会话仅放行一次单文本 `session/prompt`，内容为“你好”。同一回合分别记录点击到 iframe 首条非空回复、原生回合完成和 iframe 完整回复。回执留计时、状态和关联摘要。发送或回执未知时结束，保持首败并交负责人查原回合。Ctrl+C 和 SIGTERM 停止新的浏览器操作，并转入同一票据的受管收尾。
 
 ### 受管 Host 前置
 
-当前生产 authority 只开放 read/create/start，现有恢复 socket 没有 exact-owner 停机动作。`--managed-owner` 必须是发布负责人审核且安装在仓库外的本机 `0600` 模块，使用已批准生产 Host 能力。缺实际 Host 能力时不提供模块。工具会在读凭据和访问公网之前返回阻塞。模块是受信操作员代码，不得用合成结果或可编辑 JSON 充当权威回执。
+当前生产 authority 只开放 read/create/start，现有恢复 socket没有 exact-owner 停机动作。`--managed-owner` 必须是发布负责人审核且安装在仓库外本机 `0700` 目录的 `0600` 模块，使用已批准生产 Host 能力。摘要从负责人审核记录取得。缺实际 Host 能力时不提供模块。工具会在读凭据和访问公网之前返回阻塞。模块是受信操作员代码，其依赖也应绑定已发布版本。不得用合成结果或可编辑 JSON 充当权威回执。
 
 模块具名导出 `managedOwner`，每次操作遵守传入的 `signal` 并在退出时会合。需要以下现有事实：
 

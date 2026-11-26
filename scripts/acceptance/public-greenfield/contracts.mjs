@@ -175,6 +175,23 @@ export function livePreflight(options, git = localGit) {
     } catch {
       blockers.push('zero-employee-page-wiring-unverified');
     }
+    try {
+      git([
+        'grep',
+        '-q',
+        'createEmployeeLinuxCapture(config.native, runtime)',
+        main,
+        '--',
+        'scripts/dev-release/prepare-identity.mjs',
+      ]);
+      git([
+        'cat-file',
+        '-e',
+        `${main}:scripts/person-vm-image/employee-profile.mjs`,
+      ]);
+    } catch {
+      blockers.push('employee-linux-profile-sealing-unverified');
+    }
   } catch {
     blockers.push('repository-release-unavailable');
   }
