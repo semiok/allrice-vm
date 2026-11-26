@@ -118,7 +118,11 @@ export async function prewarmEmployeeEntry(
           credentials: 'same-origin',
           redirect: 'error',
         },
-      );
+      ).catch((error: unknown) => {
+        request.throwIfAborted();
+        if (error instanceof TypeError) throw new EmployeeEntryError(408);
+        throw error;
+      });
       request.throwIfAborted();
       // A gateway outage says nothing about an already admitted operation.
       // Pause and let Continue reuse its ticket when polling is available.

@@ -94,9 +94,9 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
-it.each([false, true])(
-  'resumes a paused wait with the original ticket (gateway unavailable: %s)',
-  async (gatewayUnavailable) => {
+it.each(['deadline', 'gateway', 'network'])(
+  'resumes a paused wait with the original ticket after %s',
+  async (reason) => {
     vi.useFakeTimers();
     const ticket = {
       operationId: randomUUID(),
@@ -104,17 +104,18 @@ it.each([false, true])(
       pollAfterMs: 1000,
     };
     const fetch = vi
-      .fn<typeof globalThis.fetch>(async () =>
-        gatewayUnavailable
+      .fn<typeof globalThis.fetch>(async () => {
+        if (reason === 'network') throw new TypeError('Failed to fetch');
+        return reason === 'gateway'
           ? new Response(null, { status: 503 })
-          : Response.json({ state: 'starting' }),
-      )
+          : Response.json({ state: 'starting' });
+      })
       .mockResolvedValueOnce(Response.json(ticket, { status: 202 }));
     vi.stubGlobal('fetch', fetch);
     const paused = expect(
       prewarmEmployeeEntry(selection, new AbortController().signal),
     ).rejects.toMatchObject({ status: 408 });
-    await vi.advanceTimersByTimeAsync(gatewayUnavailable ? 1000 : 300_000);
+    await vi.advanceTimersByTimeAsync(reason === 'deadline' ? 300_000 : 1000);
     await paused;
     fetch.mockClear().mockResolvedValueOnce(Response.json({ state: 'ready' }));
     const done = prewarmEmployeeEntry(selection, new AbortController().signal, {
