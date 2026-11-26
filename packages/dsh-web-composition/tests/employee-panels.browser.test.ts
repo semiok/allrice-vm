@@ -1064,17 +1064,18 @@ suite('installed native employee panels with synthetic business owner', () => {
                 path: join(artifacts, `${prefix}-rev2.png`),
                 animations: 'disabled',
               });
+              const scope = {
+                mode: 'rev2-panel',
+                viewport: page.viewportSize(),
+                theme,
+                state: value,
+                panel: kind,
+                expectedCapture: 'rev2-element',
+                actualCapture: 'native-element',
+              } as const;
               const { pixels, ...pixelApproval } = compareApprovedPanelPixels(
                 pixelBrowser,
-                {
-                  mode: 'rev2-panel',
-                  viewport: page.viewportSize(),
-                  theme,
-                  state: value,
-                  panel: kind,
-                  expectedCapture: 'rev2-element',
-                  actualCapture: 'native-element',
-                },
+                scope,
                 expectedPng,
                 actualPng,
               );
@@ -1316,9 +1317,30 @@ suite('installed native employee panels with synthetic business owner', () => {
               expect
                 .soft(
                   pixelApproval.accepted,
-                  `${prefix} exact RGBA (${pixels.changedPixels} differing pixels)`,
+                  `${prefix} visual parity (${pixels.changedPixels} differing pixels)`,
                 )
                 .toBe(true);
+              if (prefix === '1440-light-denied-materials') {
+                // Keep the panel and search field geometry fixed while moving
+                // the very SVG whose rasterized edge can legitimately vary.
+                const shiftedIcon = await body(page, kind).screenshot({
+                  path: join(artifacts, prefix + '-shifted-icon-negative.png'),
+                  animations: 'disabled',
+                  style:
+                    'section[aria-label="企业资料"] [data-search-field] > svg { translate: 1px 0 !important; }',
+                });
+                const negative = compareApprovedPanelPixels(
+                  pixelBrowser,
+                  scope,
+                  expectedPng,
+                  shiftedIcon,
+                );
+                expect(negative.pixels.dimensionsMatch).toBe(true);
+                expect(negative.actualSha256).not.toBe(
+                  pixelApproval.actualSha256,
+                );
+                expect(negative.accepted).toBe(false);
+              }
             } catch (error) {
               const failure = {
                 prefix,

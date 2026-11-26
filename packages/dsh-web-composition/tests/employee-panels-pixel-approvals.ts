@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Browser } from 'playwright-core';
-import { compareSidebarPixels } from './sidebar-pixels';
+import { compareSidebarPixels, screenshotPixels } from './sidebar-pixels';
 
 export type PanelPixelScope = {
   mode:
@@ -112,6 +112,82 @@ const placementFrames: PngPair = [
   '6b5237a8f9fbe44376318eb31819e5d113e43c90c05f0bf76d51683232d00535',
 ];
 
+// Run 45773071205 (attempts 1/2) and PR #23 had identical native PNGs.
+// Only reference rasterization varied: the top edge of the search SVG or
+// the rounded toolbar borders. Rectangles use inclusive image coordinates.
+type RasterBudget = {
+  nativeSha256: string;
+  width: number;
+  edges: ReadonlyArray<{
+    rectangles: ReadonlyArray<readonly [number, number, number, number]>;
+    maxPixels: number;
+    maxRgbDelta: number;
+  }>;
+};
+const referenceRasterBudgets: Readonly<Record<string, RasterBudget>> = {
+  '1440-light-denied-materials': {
+    nativeSha256:
+      'b153add124c06e95f20bc968505f4a6ed84a8366f5d6e414bc5c01b4ea977973',
+    width: 647,
+    edges: [{ rectangles: [[33, 28, 42, 29]], maxPixels: 13, maxRgbDelta: 21 }],
+  },
+  '390-dark-denied-files': {
+    nativeSha256: panels['390-dark-denied-files']![2],
+    width: 389,
+    edges: [
+      {
+        rectangles: [
+          [15, 16, 18, 19],
+          [135, 16, 138, 17],
+          [15, 54, 16, 56],
+        ],
+        maxPixels: 15,
+        maxRgbDelta: 9,
+      },
+      {
+        rectangles: [
+          [366, 18, 370, 20],
+          [366, 53, 370, 55],
+        ],
+        maxPixels: 18,
+        maxRgbDelta: 8,
+      },
+    ],
+  },
+};
+
+function matchesReferenceRasterBudget(
+  budget: RasterBudget,
+  expectedPng: Buffer,
+  actualPng: Buffer,
+) {
+  const { rgba: expected, width } = screenshotPixels(expectedPng);
+  const { rgba: actual } = screenshotPixels(actualPng);
+  const counts = budget.edges.map(() => 0);
+  for (let i = 0; i < expected.length; i += 4) {
+    if (expected[i + 3] !== actual[i + 3]) return false;
+    const delta = Math.max(
+      Math.abs(expected[i]! - actual[i]!),
+      Math.abs(expected[i + 1]! - actual[i + 1]!),
+      Math.abs(expected[i + 2]! - actual[i + 2]!),
+    );
+    if (delta === 0) continue;
+    const x = (i / 4) % width;
+    const y = Math.floor(i / 4 / width);
+    const edge = budget.edges.findIndex(({ rectangles }) =>
+      rectangles.some(
+        ([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+      ),
+    );
+    if (edge < 0) return false;
+    const limit = budget.edges[edge]!;
+    counts[edge] = counts[edge]! + 1;
+    if (delta > limit.maxRgbDelta || counts[edge]! > limit.maxPixels)
+      return false;
+  }
+  return true;
+}
+
 function reviewedPair(scope: PanelPixelScope) {
   const {
     mode,
@@ -177,9 +253,11 @@ export function compareApprovedPanelPixels(
   const expectedSha256 = sha256(expectedPng);
   const actualSha256 = sha256(actualPng);
   const reviewed = reviewedPair(scope);
-  const exception =
+  const linuxChromium =
     browser.version === '151.0.7922.34' &&
-    browser.userAgent.includes('(X11; Linux x86_64)') &&
+    browser.userAgent.includes('(X11; Linux x86_64)');
+  const exception =
+    linuxChromium &&
     reviewed &&
     pixels.dimensionsMatch &&
     pixels.expected.width === reviewed.width &&
@@ -189,6 +267,26 @@ export function compareApprovedPanelPixels(
     actualSha256 === reviewed.pair[2]
       ? { id: reviewed.id, sourceRunId: reviewed.sourceRunId }
       : null;
+  const rasterId = `${scope.viewport?.width}-${scope.theme}-${scope.state}-${scope.panel}`;
+  const budget = referenceRasterBudgets[rasterId];
+  // The native PNG must still be byte-identical to the CI originals. The
+  // budget can only accommodate reference noise, even inside these edges.
+  const referenceRasterization =
+    !exception &&
+    linuxChromium &&
+    scope.mode === 'rev2-panel' &&
+    scope.viewport?.height === 1000 &&
+    scope.expectedCapture === 'rev2-element' &&
+    scope.actualCapture === 'native-element' &&
+    budget &&
+    pixels.dimensionsMatch &&
+    pixels.expected.width === budget.width &&
+    pixels.expected.height === 962 &&
+    actualSha256 === budget.nativeSha256 &&
+    pixels.changedPixels !== 0 &&
+    matchesReferenceRasterBudget(budget, expectedPng, actualPng)
+      ? { id: rasterId, sourceRunId: 45773071205 }
+      : null;
   return {
     pixels,
     scope,
@@ -196,8 +294,11 @@ export function compareApprovedPanelPixels(
     expectedSha256,
     actualSha256,
     exception,
+    referenceRasterization,
     accepted:
       pixels.dimensionsMatch &&
-      (pixels.changedPixels === 0 || exception !== null),
+      (pixels.changedPixels === 0 ||
+        exception !== null ||
+        referenceRasterization !== null),
   };
 }
