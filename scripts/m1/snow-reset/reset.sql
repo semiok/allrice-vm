@@ -35,7 +35,7 @@ declare
   total integer;
   approved constant regclass[] := array[
     'allrice_employee_instances','allrice_employee_instance_revisions',
-    'allrice_employee_assignments','allrice_employees','allrice_employee_versions',
+    'allrice_employee_assignments','allrice_employee_user_profiles','allrice_employees','allrice_employee_versions',
     'allrice_chat_sessions','allrice_messages','allrice_message_attachments',
     'allrice_file_references','allrice_runs','allrice_run_events','allrice_jobs',
     'allrice_employee_runs','allrice_employee_run_steps','allrice_context_checkpoints',
@@ -65,6 +65,14 @@ begin
       where organization_id = target.organization and owner_id = target.person
     union all select tableoid, ctid from allrice_runs
       where organization_id = target.organization and owner_id = target.person;
+  -- Older per-person profile rows use the shared employee as parent rather
+  -- than the personal assignment. Delete only the exact target's profile.
+  insert into reset_rows
+    select p.tableoid, p.ctid from allrice_employee_user_profiles p
+    join allrice_employee_assignments a on
+      (a.organization_id, a.workspace_id, a.employee_id, a.user_id) =
+      (p.organization_id, p.workspace_id, p.employee_id, p.user_id)
+    join reset_rows x on x.relation = a.tableoid and x.location = a.ctid;
   -- The new creator stamps personal-<id> and the self-assignment's assigned_by.
   -- Generic deployment and version rows can be shared and are not roots.
   insert into reset_rows
@@ -75,7 +83,7 @@ begin
       and a.assigned_by = target.person and e.employee_key = 'personal-' || e.id;
   if exists (
     select 1 from allrice_runs r join reset_rows x on x.relation = r.tableoid and x.location = r.ctid
-    where r.state not in ('succeeded', 'failed', 'cancelled')
+    where r.state not in ('succeeded', 'failed', 'canceled')
   ) then raise exception 'snow has active runs'; end if;
 
   -- Compute incoming FK closure before any write. Discover even CASCADE and
@@ -139,7 +147,8 @@ begin
   select coalesce(jsonb_agg(selection order by position), '[]'::jsonb) into retained
     from jsonb_array_elements(old_policy->'selections') with ordinality as e(selection,position)
     where not (lower(selection->>'organizationId') = target.organization::text
-      and lower(selection->>'personId') = target.person::text);
+      and lower(selection->>'personId') = target.person::text
+      and (target.policy_format = 'person' or selection ? 'employeeInstanceId'));
   marker := jsonb_build_object('organizationId',target.organization,'personId',target.person);
   if target.policy_format = 'person' then
     if exists (select 1 from jsonb_array_elements(retained) e where e ? 'employeeInstanceId') then

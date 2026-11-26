@@ -41,6 +41,9 @@ insert into allrice_employee_versions (id,organization_id,workspace_id,employee_
 insert into allrice_employee_assignments (id,organization_id,workspace_id,employee_id,employee_version_id,user_id)
   select user_id, organization_id, workspace_id, :'employee', :'version', user_id from allrice_memberships
   where organization_id=:'organization';
+insert into allrice_employee_user_profiles (organization_id,workspace_id,employee_id,user_id)
+  select organization_id,workspace_id,employee_id,user_id from allrice_employee_assignments
+  where organization_id=:'organization';
 insert into allrice_employee_instances (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id)
   select id,organization_id,workspace_id,user_id,id,'general',employee_version_id from allrice_employee_assignments
   where organization_id=:'organization';
@@ -53,7 +56,8 @@ insert into allrice_messages (id,organization_id,workspace_id,session_id,owner_i
   select id,organization_id,workspace_id,id,owner_id,'user','"fixture"'
   from allrice_chat_sessions where organization_id=:'organization';
 insert into allrice_runs (id,organization_id,workspace_id,owner_id,state,execution_spec,input)
-  select id,organization_id,workspace_id,owner_id,'succeeded','{}','{}'
+  select id,organization_id,workspace_id,owner_id,
+    case when owner_id=:'person' then 'canceled' else 'succeeded' end,'{}','{}'
   from allrice_chat_sessions where organization_id=:'organization';
 insert into allrice_employee_runs (run_id,organization_id,workspace_id,owner_id,employee_assignment_id,
   employee_version_id,session_id,user_message_id,assistant_message_id,status,provider_snapshot,prompt_snapshot,completed_at)
@@ -76,6 +80,7 @@ insert into allrice_settings (scope_type,key,value)
 """
 EXPECTED_REMOVALS = {
     'allrice_employee_assignments': 'id',
+    'allrice_employee_user_profiles': 'user_id',
     'allrice_employee_instances': 'id',
     'allrice_employee_instance_revisions': 'instance_id',
     'allrice_chat_sessions': 'id',
@@ -135,7 +140,7 @@ def migrate(sql):
 
 
 def exercise(socket_path, dump):
-    connection = ['-h', str(socket_path), '-p', '5432', '-U', 'snow_rehearsal']
+    connection = ['-w', '-h', str(socket_path), '-p', '5432', '-U', 'snow_rehearsal']
 
     def sql(db, text, *, suppress=False, **overrides):
         variables = {**VARIABLES, **overrides}
@@ -201,6 +206,15 @@ update allrice_settings set value=jsonb_set(value,'{selections,1}',(value->'sele
     sql(TARGET, packet, policy_format='person')
     assert snapshot(sql) == expected
     assert json.loads(sql(TARGET, policy_query).stdout) == policy
+    sql(TARGET, """
+update allrice_settings set value=jsonb_set(value,'{selections}',
+  value->'selections' || jsonb_build_array(jsonb_build_object('organizationId',:'organization',
+    'personId',:'person','employeeInstanceId',:'person','generation','4.0')))
+where key='d_entry_rollout_policy';
+""")
+    sql(TARGET, packet, policy_format='tuple-remove')
+    assert json.loads(sql(TARGET, policy_query).stdout)['selections'] == policy['selections']
+    assert snapshot(sql) == expected
     print(f'PASS: {len(EXPECTED_REMOVALS)} scoped row families removed, {len(expected)} tables compared, foreign keys enabled', flush=True)
     print('PASS: admin/acceptance and shared rows preserved; foreign owner and mixed rollout rejected; repeat unchanged', flush=True)
 
@@ -216,6 +230,9 @@ def main():
     # service. The data directory, Unix socket and dump are all temporary.
     with tempfile.TemporaryDirectory(prefix='snowpg-', dir='/tmp') as directory:
         root = Path(directory)
+        passfile = root / 'pgpass'
+        passfile.touch(mode=0o600)
+        PG_ENV['PGPASSFILE'] = str(passfile)
         pgdata = root / 'pg'
         run(['initdb', '-D', str(pgdata), '-U', 'snow_rehearsal', '-A', 'trust', '-E', 'UTF8'])
         try:
