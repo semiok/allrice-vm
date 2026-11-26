@@ -431,6 +431,11 @@ export function createAssignedNativeWebStartup(input: {
         )
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
+      return AbortSignal.any([
+        lifetime,
+        group.revoked.signal,
+        ...[...group.owners.values()].map((owner) => owner.revoked),
+      ]);
     },
     assertVerifiedEditor(
       binding: PersonVmBinding,
@@ -613,7 +618,7 @@ export function createAssignedNativeWebStartup(input: {
     assertAuthenticatedGroup(
       binding: PersonVmBinding,
       signal: AbortSignal,
-    ): void;
+    ): AbortSignal;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,

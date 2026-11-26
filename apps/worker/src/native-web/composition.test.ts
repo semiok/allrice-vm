@@ -165,8 +165,14 @@ it('实际DB producer直接绑定service roster，取消仍等待已发SQL结束
   await f.service.close();
 });
 it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐个接收绑定，control不冒充editor ready', async () => {
-  const f = fixture(),
-    owners = f.web.receipt.endpoints.map(() => catalogOwner());
+  const f = fixture();
+  const ownerLifetimes = f.web.receipt.endpoints.map(
+    () => new AbortController(),
+  );
+  const owners = ownerLifetimes.map(({ signal }) => ({
+    ...catalogOwner(),
+    revoked: signal,
+  }));
   owners.forEach((owner) => open.mockResolvedValueOnce(owner));
   const plan = await f.service.memoryGuestPlan(
     f.binding,
@@ -230,9 +236,8 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
       owners[index],
     );
   }
-  expect(() =>
-    f.service.assertAuthenticatedGroup(f.binding, signal()),
-  ).not.toThrow();
+  const wholeGroup = f.service.assertAuthenticatedGroup(f.binding, signal());
+  expect(wholeGroup.aborted).toBe(false);
   expect(() =>
     f.service.assertAuthenticatedGroup(
       { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
@@ -243,6 +248,11 @@ it('实际employee receipt派生独立HOME/共享workdir；真实public owner逐
   expect(() => f.service.assertAuthenticatedGroup(f.binding, signal())).toThrow(
     'RUNTIME_NOT_READY',
   );
+  const siblingLost = new PersonVmError('LEASE_LOST');
+  ownerLifetimes[1]!.abort(siblingLost);
+  expect(owners[0]!.revoked.aborted).toBe(false);
+  expect(wholeGroup.aborted).toBe(true);
+  expect(wholeGroup.reason).toBe(siblingLost);
   expect(f.service).not.toHaveProperty('readiness');
   f.startup.abort();
   expect(owners[0]!.close).not.toHaveBeenCalled();

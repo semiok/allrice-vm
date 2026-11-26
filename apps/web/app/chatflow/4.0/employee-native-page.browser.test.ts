@@ -277,6 +277,7 @@ suite('4.0 browser cold entry', () => {
         .toBe(true);
       expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
       expect(documents).toEqual([]);
+      const birthsBeforePolling = births.slice();
       await page.getByRole('button', { name: '继续' }).click();
       try {
         await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
@@ -309,7 +310,7 @@ suite('4.0 browser cold entry', () => {
       ).toBe(true);
       expect(polls).toBe(2);
       expect(warmCalls).toHaveLength(4);
-      expect(births).toEqual([]);
+      expect(births).toEqual(birthsBeforePolling);
       await page.getByRole('button', { name: '重试', exact: true }).click();
       async function showEditor(threadId: string) {
         await assertWaiting('工作台已就绪', '正在打开对话。');

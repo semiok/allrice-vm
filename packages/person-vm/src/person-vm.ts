@@ -708,8 +708,8 @@ export class PersonVmService
           )
             throw new PersonVmError('AUTHORIZATION_DENIED');
         }
-        if (assertAuthority) await assertAuthority(signal);
         await lease.guard();
+        if (assertAuthority) await assertAuthority(signal);
       };
       await bootstrapPersonVm({
         binding,
