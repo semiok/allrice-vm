@@ -1811,6 +1811,44 @@ suite(
         await fixture.db`select snapshot,snapshot_version from allrice_native_once_controls where automation_id=${taskId}`;
       expect(controlAfter).toEqual(controlBefore);
     });
+    it('discovers an active assignment after materializing its first employee instance', async () => {
+      const f = await setup(),
+        other = await setup(),
+        assignmentId = randomUUID();
+      await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+        values(${f.org},${f.workspace},${other.user},'member')`;
+      await fixture.db`insert into allrice_employee_assignments
+        (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
+        select ${assignmentId},organization_id,workspace_id,employee_id,employee_version_id,${other.user},false,true,${f.user}
+        from allrice_employee_assignments where id=${f.assignment}`;
+      const context = await authenticateSession(other.login.token, {
+        organizationId: f.org,
+        workspaceId: f.workspace,
+      });
+      if (!context) throw Error('Synthetic assignment login unavailable');
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      try {
+        await updateDEntryReleasePolicy(f.context, {
+          revision: 'initial',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: f.org, personId: other.user }],
+        });
+        expect(await findDEntryEmployee(context)).toBeNull();
+        expect(
+          (await preparePersonNativeWebRoster(context)).entries,
+        ).toMatchObject([
+          { workspaceId: f.workspace, employeeInstanceId: assignmentId },
+        ]);
+        expect(await findDEntryEmployee(context)).toEqual({
+          workspaceId: f.workspace,
+          employeeInstanceId: assignmentId,
+        });
+      } finally {
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
+
     it('creates from an empty personal roster and opens a 4.0 thread without changing existing writers', async () => {
       const f = await setup();
       const ownerId = randomUUID();
@@ -1827,6 +1865,7 @@ suite(
       const input = {
         workspaceId: f.workspace,
         requestId: randomUUID(),
+        expectedOwnerId: ownerId,
         profile: { name: '🚀助理' },
       };
       const headers = {
@@ -1853,6 +1892,19 @@ suite(
           defaultGeneration: '3.x' as const,
           selections: [{ organizationId: f.org, personId: ownerId }],
         };
+        await updateDEntryReleasePolicy(f.context, {
+          ...initial,
+          selections: [
+            ...initial.selections,
+            { organizationId: f.org, personId: f.user },
+          ],
+        });
+        cookie.token = f.login.token;
+        expect((await create()).status).toBe(403);
+        expect(
+          await fixture.db`select id from allrice_employee_instances where creation_request_id=${input.requestId}`,
+        ).toEqual([]);
+        cookie.token = login.token;
         await updateDEntryReleasePolicy(f.context, initial);
         expect(await findDEntryCreationWorkspace(owner)).toBe(f.workspace);
         expect(await findDEntryEmployee(owner)).toBeNull();
@@ -2023,16 +2075,20 @@ suite(
             native.threadId,
           ),
         ).toBe('4.0');
+        const legacyInput = {
+          workspaceId: input.workspaceId,
+          profile: input.profile,
+          requestId: randomUUID(),
+        };
         await expect(
           createEmployeeInstance(owner, {
-            ...input,
-            requestId: randomUUID(),
+            ...legacyInput,
             assignmentId: instance.assignmentId,
           }),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
         await expect(
           createEmployeeInstance(owner, {
-            ...input,
+            ...legacyInput,
             assignmentId: f.assignment,
           }),
         ).rejects.toMatchObject({ code: 'authorization_denied' });

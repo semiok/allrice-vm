@@ -54,7 +54,9 @@ export function EmployeeCreateDialog({
     if (active.current || !canCreate || !values.name.trim()) return;
     const input = {
       workspaceId: workspace.workspaceId,
-      assignmentId,
+      ...(personal
+        ? { expectedOwnerId: workspace.viewerId }
+        : { assignmentId }),
       profile: createEmployeeProfile(values),
     };
     const payload = JSON.stringify(input);

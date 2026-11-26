@@ -205,6 +205,7 @@ export const CreateEmployeeInstanceInputSchema = z
 
 export const CreatePersonalEmployeeInstanceInputSchema =
   CreateEmployeeInstanceInputSchema.omit({ assignmentId: true }).extend({
+    expectedOwnerId: UuidSchema,
     profile: EmployeeInstanceProfileSchema.required({ name: true }),
   });
 

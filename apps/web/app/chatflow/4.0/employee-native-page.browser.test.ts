@@ -532,6 +532,7 @@ suite('4.0 browser cold entry', () => {
           profile: { name: '文案专家' },
         });
         expect(payload).not.toHaveProperty('assignmentId');
+        expect(payload).toHaveProperty('expectedOwnerId', f.identity.personId);
       } finally {
         await firstStart.close();
       }

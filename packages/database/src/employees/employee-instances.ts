@@ -965,10 +965,11 @@ export async function createEmployeeInstance(
     }
     if (
       !assigned &&
-      !hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
-        organizationId: scope.organizationId,
-        personId: ownerId,
-      })
+      (value.expectedOwnerId !== ownerId ||
+        !hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
+          organizationId: scope.organizationId,
+          personId: ownerId,
+        }))
     )
       throw new DataAccessError('authorization_denied');
     await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-instance-create:${scope.organizationId}:${scope.workspaceId}:${ownerId}:${value.requestId}`},0))`;

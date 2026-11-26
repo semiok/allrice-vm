@@ -1,6 +1,6 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { IdentityError } from '@allrice/database';
+import { IdentityError, preparePersonNativeWebRoster } from '@allrice/database';
 import {
   findDEntryCreationWorkspace,
   findDEntryEmployee,
@@ -55,29 +55,38 @@ export default async function EmployeeNativeEntryPage({
     if (!auth.context) redirect('/login?next=%2Fchatflow%2F4.0');
     const context = auth.context;
     try {
-      const selection = await findDEntryEmployee(context);
-      if (selection)
-        return (
-          <EmployeeNativePage
-            query={new URLSearchParams(selection).toString()}
-            prepare
-          />
-        );
-      if (context.actor.type === 'user') {
+      let selection = await findDEntryEmployee(context);
+      if (!selection && context.actor.type === 'user') {
         const workspaceId = await findDEntryCreationWorkspace(context);
-        if (workspaceId)
-          return (
-            <EmployeeFirstStart
-              organizationId={context.organizationId}
-              workspaceId={workspaceId}
-              viewerId={context.actor.id}
-            />
-          );
+        if (workspaceId) {
+          // Existing assignments can precede their general instances.
+          const { entries } = await preparePersonNativeWebRoster(context);
+          if (
+            !entries.some(
+              (entry) =>
+                !context.workspaceId ||
+                entry.workspaceId === context.workspaceId,
+            )
+          )
+            return (
+              <EmployeeFirstStart
+                organizationId={context.organizationId}
+                workspaceId={workspaceId}
+                viewerId={context.actor.id}
+              />
+            );
+          selection = await findDEntryEmployee(context);
+        }
       }
+      return (
+        <EmployeeNativePage
+          query={selection ? new URLSearchParams(selection).toString() : ''}
+          prepare
+        />
+      );
     } catch {
       return <EmployeeNativePage query="" initialUnavailable prepare />;
     }
-    return <EmployeeNativePage query="" prepare />;
   }
   return <EmployeeNativePage query={query.toString()} prepare />;
 }

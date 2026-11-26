@@ -10,6 +10,11 @@ const entry = vi.hoisted(() => ({
   find: vi.fn(),
   released: vi.fn(),
   createWorkspace: vi.fn(),
+  prepareRoster: vi.fn(),
+}));
+vi.mock('@allrice/database', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@allrice/database')>()),
+  preparePersonNativeWebRoster: entry.prepareRoster,
 }));
 vi.mock('./chatflow-client', () => ({ ChatFlowClient: () => null }));
 vi.mock('next/headers', () => ({
@@ -88,6 +93,7 @@ describe('ChatFlow server local command capability', () => {
       organizationId: 'organization',
     });
     entry.find.mockResolvedValue(null);
+    entry.prepareRoster.mockResolvedValue({ entries: [] });
     entry.createWorkspace
       .mockResolvedValueOnce('writable')
       .mockResolvedValueOnce(null);
@@ -102,6 +108,29 @@ describe('ChatFlow server local command capability', () => {
     const denied = await EmployeeNativeEntryPage(input);
     expect(denied.type).not.toBe(EmployeeFirstStart);
     expect(denied.props).toMatchObject({ query: '', prepare: true });
+  });
+  it('opens an existing assignment materialized during the zero employee check', async () => {
+    const selected = {
+      workspaceId: 'writable',
+      employeeInstanceId: 'assigned',
+    };
+    const owner = {
+      actor: { type: 'user', id: 'owner' },
+      organizationId: 'organization',
+      workspaceId: 'writable',
+    };
+    entry.context.mockResolvedValue(owner);
+    entry.find.mockResolvedValueOnce(null).mockResolvedValueOnce(selected);
+    entry.createWorkspace.mockResolvedValue(selected.workspaceId);
+    entry.prepareRoster.mockResolvedValue({ entries: [selected] });
+    const page = await EmployeeNativeEntryPage({
+      searchParams: Promise.resolve({}),
+    });
+    expect(entry.prepareRoster).toHaveBeenCalledWith(owner);
+    expect(page.props).toMatchObject({
+      query: 'workspaceId=writable&employeeInstanceId=assigned',
+      prepare: true,
+    });
   });
   it('renders the denied trial entry when the original login has lost its tenant', async () => {
     entry.host = 'allricevm.bplabs.xyz';
