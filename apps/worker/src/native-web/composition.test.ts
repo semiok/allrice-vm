@@ -13,7 +13,7 @@ import type {
 import { PersonVmError, PersonVmService } from '@allrice/person-vm';
 import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
-import type { NativeWebOwner } from './owner.js';
+import type { NativeWebOwner, openNativeWebOwner } from './owner.js';
 import {
   harness,
   MemoryStore,
@@ -660,7 +660,7 @@ it('writes the owner diagnostic through the startup lease before the normal fail
     target: '127.0.0.1:32171',
   };
   open.mockImplementationOnce(
-    (input: Parameters<typeof import('./owner.js').openNativeWebOwner>[0]) => {
+    (input: Parameters<typeof openNativeWebOwner>[0]) => {
       expect(input.recordStartupFailure).toBeTypeOf('function');
       input.recordStartupFailure!(diagnostic);
       throw new PersonVmError('PROVIDER_FAILED');
