@@ -1038,11 +1038,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       throw new PersonVmError('ACTIVITY_UNKNOWN');
     await assertCurrent();
     signal.throwIfAborted();
+    let commandJoined = false;
     const stop = async (active: AbortSignal) => {
       await this.command(binding, ['stop', this.name(binding)], active);
+      commandJoined = true;
     };
-    if (dispatch) await dispatch(signal, stop);
-    else await stop(signal);
+    if (dispatch) {
+      try {
+        await dispatch(signal, stop);
+      } catch (error) {
+        // Closing the read-only authority transaction may fail after the
+        // command joined. The physical lease still owns terminal readback.
+        if (!commandJoined) throw error;
+      }
+      if (!commandJoined) throw new PersonVmError('ACTIVITY_UNKNOWN');
+    } else await stop(signal);
     if ((await this.rawStatus(binding, signal)) !== 'Stopped')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
   }

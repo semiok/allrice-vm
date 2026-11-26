@@ -107,24 +107,25 @@ export async function readPersonVmWakeRoster(
       select m.id from allrice_memberships m where m.organization_id=o.id and m.user_id=u.id
         and m.active and m.role in ('admin','member')
         and (m.workspace_id is null or m.workspace_id=ws.id)
-      order by m.id limit 1 ${lock ? tx`for share of m` : tx``}
+      order by m.id limit 1 ${lock ? tx`for share of m nowait` : tx``}
     ) membership on true
     where i.id=any(${expected.map((entry) => entry.employeeInstanceId)}::uuid[])
       and i.organization_id=${organizationId} and i.owner_id=${personId} and i.archived_at is null
       and not exists(select 1 from allrice_platform_employee_tenant_assignments d
         where d.organization_id=o.id and d.workspace_id=ws.id and d.tenant_employee_id=e.id and not d.active)
-    ${lock ? tx`for share of i,a,u,o,ws for update of e` : tx``}`;
+    ${lock ? tx`for share of i,a,u,o,ws nowait for update of e nowait` : tx``}`;
   if (rows.length !== expected.length) return null;
   if (lock) {
     // The employee key lock also excludes new matching deployments through
-    // the foreign key. Lock existing deployments to cover active -> disabled.
+    // the foreign key. Tenant withdrawal locks the deployment before the
+    // employee and assignment; back off instead of waiting in reverse order.
     const deployments = await tx<{ active: boolean }[]>`
       select d.active from allrice_platform_employee_tenant_assignments d
       join allrice_employee_assignments a on a.employee_id=d.tenant_employee_id
         and a.organization_id=d.organization_id and a.workspace_id=d.workspace_id
       join allrice_employee_instances i on i.assignment_id=a.id
       where i.id=any(${expected.map((entry) => entry.employeeInstanceId)}::uuid[])
-      order by d.id for share of d`;
+      order by d.id for share of d nowait`;
     if (deployments.some(({ active }) => !active)) return null;
   }
   const policy = await readDEntryReleasePolicy(tx, lock);
@@ -239,7 +240,9 @@ async function withWakeAuthority<T>(
     const transaction = dedicated.begin(isolation, (tx) => {
       pending = (async () => {
         active.throwIfAborted();
-        await tx`set local lock_timeout='5s'`;
+        const lockTimeout =
+          isolation === 'isolation level read committed' ? '100ms' : '5s';
+        await tx`select set_config('lock_timeout', ${lockTimeout}, true)`;
         const value = await work(tx, active);
         active.throwIfAborted();
         return { value };
@@ -451,8 +454,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           );
           if (roster?.digest !== expected.digest) return false;
           const [plan] = await tx<
-            { receipt_ids: string[] }[]
-          >`select p.receipt_ids
+            { receipt_ids: string[]; wake_at: Date | null }[]
+          >`select p.receipt_ids, p.wake_at
           from person_vm_scheduled_wakes p
           join person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
           where p.plan_id=${requestId} and p.person_id=${binding.personId}
@@ -460,13 +463,18 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             and p.instance_id=${binding.instanceId} and p.lease_epoch=${binding.leaseEpoch}
             and p.revoked_at is null and p.state in ('empty','waiting')
             and vm.phase='running' and vm.lease_owner is not null
-            and vm.lease_expires_at>clock_timestamp()
-            and (p.wake_at is null or p.wake_at>clock_timestamp())
-          for share of p`;
+          for share of p nowait`;
           if (!plan) return false;
-          const [check] = await tx<{ invalidated: boolean }[]>`
-          select ${hasInvalidation(tx, plan.receipt_ids)} as invalidated`;
-          if (check?.invalidated !== false) return false;
+          const [current] = await tx<{ authorized: boolean }[]>`
+            select not ${hasInvalidation(tx, plan.receipt_ids)}
+              and (${plan.wake_at}::timestamptz is null or
+                ${plan.wake_at}::timestamptz>clock_timestamp()) as authorized
+            from person_virtual_machines vm
+            where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+              and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+              and vm.lease_epoch=${binding.leaseEpoch} and vm.phase='running'
+              and vm.lease_owner is not null and vm.lease_expires_at>clock_timestamp()`;
+          if (current?.authorized !== true) return false;
           active.throwIfAborted();
           await stop(active);
           return true;

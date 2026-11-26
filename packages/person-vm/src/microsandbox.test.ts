@@ -1904,8 +1904,10 @@ fs.writeFileSync(f,JSON.stringify(v));
       await provider.prepare(binding, await directory(), signal());
       runner.mockClear();
       return {
-        stopIdle: (assertCurrent: () => Promise<void>) =>
-          provider.stopIdle(binding, signal(), assertCurrent),
+        stopIdle: (
+          assertCurrent: () => Promise<void>,
+          dispatch?: Parameters<typeof provider.stopIdle>[3],
+        ) => provider.stopIdle(binding, signal(), assertCurrent, dispatch),
         assertStopped: () => provider.assertStopped(binding, signal()),
         start: () => provider.start(binding, signal()),
         startWithWeb: () =>
@@ -1946,6 +1948,47 @@ fs.writeFileSync(f,JSON.stringify(v));
           throw new PersonVmError('VM_ACTIVE');
         }),
       ).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+      expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      expect(f.state.status).toBe('Running');
+    });
+
+    it('joins the stop and reads the exact terminal state after authority close fails', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const connectionLost = Error('injected authority close failure');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async (active, stop) => {
+            await stop(active);
+            expect(f.commands().map(([command]) => command)).toEqual([
+              'list',
+              'stop',
+            ]);
+            throw connectionLost;
+          },
+        ),
+      ).resolves.toBeUndefined();
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'list',
+        'stop',
+        'list',
+      ]);
+      expect(f.state.status).toBe('Stopped');
+    });
+
+    it('preserves a failed authority gate before native stop', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const denied = new PersonVmError('AUTHORIZATION_DENIED');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async () => {
+            throw denied;
+          },
+        ),
+      ).rejects.toBe(denied);
       expect(f.commands().map(([command]) => command)).toEqual(['list']);
       expect(f.state.status).toBe('Running');
     });

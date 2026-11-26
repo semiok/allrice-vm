@@ -1369,7 +1369,13 @@ export class PersonVmAdmissionHost
                 )
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
               },
-              scheduled?.dispatch,
+              scheduled &&
+                ((dispatchSignal, stop) =>
+                  scheduled.dispatch(dispatchSignal, async (fenced) => {
+                    await owned.guard();
+                    fenced.throwIfAborted();
+                    await stop(fenced);
+                  })),
             );
             this.idle.delete(binding.personId);
             return true;

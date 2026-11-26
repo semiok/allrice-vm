@@ -150,7 +150,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       employeeInstanceId,
       employeeVersionId,
     } = f.origin;
-    await db.begin(async (tx) => {
+    return db.begin(async (tx) => {
       await tx`insert into allrice_users(id,email,display_name,password_hash)
         values(${personId},${personId + '@example.test'},'Fixture','not-a-real-password')`;
       await tx`insert into allrice_organizations(id,slug,name)
@@ -189,6 +189,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
           ],
         })})
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+      return employee!.id;
     });
   }
 
@@ -319,6 +320,57 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(stop).toHaveBeenCalledTimes(1);
     },
   );
+
+  it('declines a scheduled idle stop while a deployment writer holds the earlier lock', async () => {
+    const f = await fixture();
+    const tenantEmployeeId = await publishFixtureAuthority(f);
+    const { organizationId, workspaceId, personId, employeeInstanceId } =
+      f.origin;
+    const [platform] = await db`insert into allrice_platform_employees
+      (employee_key,name,description)
+      values(${'wake-' + randomUUID()},'Fixture','Fixture') returning id`;
+    const [revision] = await db`insert into allrice_platform_employee_revisions
+      (employee_id,revision,definition,checksum)
+      values(${platform!.id},1,'{}',${'sha256:' + 'a'.repeat(64)}) returning id`;
+    const [deployment] =
+      await db`insert into allrice_platform_employee_tenant_assignments
+      (employee_id,revision_id,organization_id,workspace_id,tenant_employee_id)
+      values(${platform!.id},${revision!.id},${organizationId},${workspaceId},${tenantEmployeeId})
+      returning id`;
+    const roster = await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+    );
+    expect(roster).not.toBeNull();
+    const planId = randomUUID();
+    expect(
+      await f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).toMatchObject({
+      ok: true,
+    });
+    await db`update person_virtual_machines
+      set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+      where person_id=${personId}`;
+    await db`update person_vm_scheduled_wakes
+      set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+      where plan_id=${planId}`;
+    const stop = vi.fn(async () => {});
+    const dispatch = () =>
+      f
+        .store()
+        .withPreparedStopAuthority(f.binding, roster!, planId, signal, stop);
+    await db.begin(async (tx) => {
+      await tx`select id from allrice_platform_employee_tenant_assignments
+        where id=${deployment!.id} for update`;
+      // The lock order here is the existing tenant withdrawal order.
+      await expect(dispatch()).rejects.toMatchObject({ code: '55P03' });
+      await tx`update allrice_platform_employee_tenant_assignments set active=false
+        where id=${deployment!.id}`;
+      await tx`update allrice_employee_assignments set active=false
+        where id=${employeeInstanceId}`;
+    });
+    await expect(dispatch()).resolves.toBe(false);
+    expect(stop).not.toHaveBeenCalled();
+  });
 
   it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
     const f = await fixture();
