@@ -77,6 +77,34 @@ function safeError(error: unknown) {
     : new PersonVmError('PROVIDER_FAILED', { cause: error });
 }
 
+function isAuthorizationFailure(error: unknown) {
+  return (
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    [
+      'authentication_required',
+      'authorization_denied',
+      'tenant_context_invalid',
+    ].includes(String(error.code))
+  );
+}
+
+async function assertPrewarmAuthority(
+  target: PersonVmPrewarmFence,
+  signal: AbortSignal,
+) {
+  try {
+    signal.throwIfAborted();
+    await target.assertAuthority(signal);
+    signal.throwIfAborted();
+  } catch (error) {
+    if (isAuthorizationFailure(error))
+      throw new PersonVmError('AUTHORIZATION_DENIED', { cause: error });
+    throw error;
+  }
+}
+
 export class PersonVmService
   implements PersonVmHostPort, PersonVmAdmissionBindingPort
 {
@@ -328,7 +356,10 @@ export class PersonVmService
       signal,
       async (lease, identity, signal) => {
         this.assertPrewarmTarget(lease.row, target, true);
-        if (target) await target.assertAuthority(signal);
+        if (target) {
+          await target.assertAuthority(signal);
+          signal.throwIfAborted();
+        }
         const retry = this.unfinishedCreate(lease.row);
         if (lease.row && lease.row.phase !== 'deleted' && !retry) {
           const catalog = await this.creationCatalog(lease.row, lease, signal);
@@ -337,6 +368,10 @@ export class PersonVmService
             (catalog === 'bound' && !lease.row.diskRetained)
           )
             throw new PersonVmError('CLEANUP_INCOMPLETE');
+          if (target && this.options.diskPool) {
+            await target.assertAuthority(signal);
+            signal.throwIfAborted();
+          }
           return view(lease.row);
         }
         if (lease.row?.diskRetained && !retry) {
@@ -344,6 +379,10 @@ export class PersonVmService
             (await this.creationCatalog(lease.row, lease, signal)) === 'pending'
           )
             throw new PersonVmError('CLEANUP_INCOMPLETE');
+          if (target && this.options.diskPool) {
+            await target.assertAuthority(signal);
+            signal.throwIfAborted();
+          }
           lease.row.phase = lease.row.diskTier === 'cold' ? 'cold' : 'stopped';
           await lease.save(lease.row);
           await lease.audit(lease.row, {
@@ -354,6 +393,8 @@ export class PersonVmService
           return view(lease.row);
         }
         const row = retry ? lease.row! : this.newVmRecord(identity);
+        const assertTicket =
+          target && (() => assertPrewarmAuthority(target, signal));
         await this.createDiskOwned(row, lease, signal, {
           action: 'create',
           requestId: context.requestId,
@@ -365,9 +406,8 @@ export class PersonVmService
               current.organizationId !== row.organizationId
             )
               throw new PersonVmError('AUTHORIZATION_DENIED');
-            if (target) await target.assertAuthority(signal);
           },
-          assertPrewarmAuthority: target && (() => target.assertAuthority(signal)),
+          assertPrewarmAuthority: assertTicket,
         });
         return view(row);
       },
@@ -476,6 +516,7 @@ export class PersonVmService
     },
   ) {
     const pool = this.options.diskPool;
+    const assertTicket = input.assertPrewarmAuthority;
     const catalog = await this.creationCatalog(row, lease, signal, true);
     const audit = { requestId: input.requestId, action: input.action };
     const newIdentity = lease.row?.vmId !== row.vmId;
@@ -488,6 +529,7 @@ export class PersonVmService
       await lease.assertAdmissionOpen();
       signal.throwIfAborted();
     }
+    if (assertTicket) await assertTicket();
     let committed = false;
     const commitOwner = async (current: AbortSignal) => {
       current.throwIfAborted();
@@ -499,7 +541,12 @@ export class PersonVmService
     if (!needsCandidate) await commitOwner(signal);
     const ownerGuard = {
       signal,
-      assertCurrent: input.assertCurrent,
+      assertCurrent: assertTicket
+        ? async () => {
+            await input.assertCurrent();
+            await assertTicket();
+          }
+        : input.assertCurrent,
       assertOwner: () => lease.guard(row),
     };
     const claim = () =>
@@ -535,11 +582,11 @@ export class PersonVmService
           if (pool) {
             if (catalog !== 'ordinary')
               await pool.recordOrdinaryOwner(row, ownerGuard);
-            await ownerGuard.assertCurrent();
+            await input.assertCurrent();
             await ownerGuard.assertOwner();
             signal.throwIfAborted();
-          } else if (input.assertPrewarmAuthority)
-            await input.assertPrewarmAuthority();
+          }
+          if (assertTicket) await assertTicket();
           await this.options.disk.create(
             { vmId: row.vmId, tier: row.diskTier },
             signal,
@@ -555,6 +602,7 @@ export class PersonVmService
         await lease.guard(row);
         signal.throwIfAborted();
       }
+      if (pool && assertTicket) await assertTicket();
       row.diskTier = inspected.disk.tier;
       row.phase = row.diskTier === 'cold' ? 'cold' : 'stopped';
       row.stoppedAt = this.now().toISOString();
@@ -742,7 +790,7 @@ export class PersonVmService
           context,
           lease,
           current,
-          target?.assertAuthority,
+          target && ((active) => assertPrewarmAuthority(target, active)),
         );
       },
       { joinOfflinePreparation: true },
@@ -758,16 +806,7 @@ export class PersonVmService
       signal.throwIfAborted();
       return roster;
     } catch (error) {
-      if (
-        error &&
-        typeof error === 'object' &&
-        'code' in error &&
-        [
-          'authentication_required',
-          'authorization_denied',
-          'tenant_context_invalid',
-        ].includes(String(error.code))
-      )
+      if (isAuthorizationFailure(error))
         throw new PersonVmError('AUTHORIZATION_DENIED', { cause: error });
       throw safeError(error);
     }
@@ -805,6 +844,8 @@ export class PersonVmService
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
     if (row.phase === 'running') {
+      if (this.options.diskPool && assertAuthority)
+        await assertAuthority(signal);
       await this.mounted(row, signal, lease);
       if (roster) {
         await lease.guard();
@@ -821,6 +862,8 @@ export class PersonVmService
         (await this.webRoster(context, signal))?.digest !== roster.digest
       )
         throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+      if (this.options.diskPool && assertAuthority)
+        await assertAuthority(signal);
       return view(row, true);
     }
     if (row.holds.length > 0) throw new PersonVmError('VM_ACTIVE');
@@ -1070,6 +1113,8 @@ export class PersonVmService
           throw new PersonVmError('AUTHORIZATION_DENIED');
         if (!this.options.native.prepareWebEndpoints)
           throw new PersonVmError('RUNTIME_NOT_READY');
+        if (target && this.options.diskPool)
+          await target.assertAuthority(signal);
         const endpoints = await this.options.native.prepareWebEndpoints(
           binding,
           roster,
@@ -1094,6 +1139,7 @@ export class PersonVmService
         confirmed.organizationId !== row.organizationId
       )
         throw new PersonVmError('AUTHORIZATION_DENIED');
+      if (target && this.options.diskPool) await target.assertAuthority(signal);
       await this.assertCurrentBinding(context, binding, signal);
       signal.throwIfAborted();
       return view(row, true);
@@ -1103,7 +1149,7 @@ export class PersonVmService
     return this.start(
       context,
       signal,
-      target && { ...target, vmId: created.vmId },
+      target && { ...target, vmId: target.vmId ?? created.vmId },
     );
   }
   private async inactive(

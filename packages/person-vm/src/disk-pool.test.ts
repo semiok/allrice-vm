@@ -615,6 +615,12 @@ it('joins active offline prep on the first workbench request and keeps exact sto
   const guard = adminGuard();
   const preparing = admin.prepare(firstEmployee, guard);
   const foreground = f.serviceFor(f.newPool());
+  const target = {
+    vmId: null,
+    instanceId: null,
+    leaseEpoch: 1,
+    assertAuthority: vi.fn(async () => {}),
+  };
   let opening: ReturnType<PersonVmService['prewarm']> | undefined;
   try {
     await started.promise;
@@ -633,7 +639,7 @@ it('joins active offline prep on the first workbench request and keeps exact sto
         }),
       ]),
     });
-    opening = foreground.prewarm(rc, { trigger: 'input' }, signal());
+    opening = foreground.prewarm(rc, { trigger: 'input', target }, signal());
     await waiting.promise;
     expect(f.h.log).toEqual([]);
   } finally {
@@ -646,6 +652,11 @@ it('joins active offline prep on the first workbench request and keeps exact sto
     vmId,
     ready: true,
   });
+  expect(await f.store.read(rc.actor.id)).toMatchObject({
+    vmId,
+    leaseEpoch: 1,
+  });
+  expect(target.assertAuthority).toHaveBeenCalled();
   const secondEmployee = adminTarget(rc);
   expect(secondEmployee.employeeInstanceId).not.toBe(
     firstEmployee.employeeInstanceId,
@@ -664,6 +675,133 @@ it('joins active offline prep on the first workbench request and keeps exact sto
       .filter((event) => event.action === 'disk-preprovision')
       .map((event) => event.result),
   ).toEqual(['started', 'succeeded']);
+});
+
+it('refuses a revoked admitted ticket after waiting for the inventory lock without claiming stock or falling back', async () => {
+  const f = await fixture();
+  const rc = context();
+  await f.pool.refill(signal());
+  const entered = gate(),
+    waiting = gate(),
+    release = gate();
+  const holder = f.locks.withLock('inventory', signal(), async () => {
+    entered.release();
+    await release.promise;
+  });
+  await entered.promise;
+  f.locks.beforeInventory = waiting.release;
+  let current = true;
+  const revoked = Object.assign(Error('ticket grant changed'), {
+    code: 'authorization_denied',
+  });
+  const opening = f.service.prewarm(
+    rc,
+    {
+      trigger: 'page',
+      target: {
+        vmId: null,
+        instanceId: null,
+        leaseEpoch: 1,
+        async assertAuthority() {
+          if (!current) throw revoked;
+        },
+      },
+    },
+    signal(),
+  );
+  const outcome = opening.catch((error: unknown) => error);
+  try {
+    expect(
+      await Promise.race([waiting.promise.then(() => 'waiting'), outcome]),
+    ).toBe('waiting');
+    current = false;
+  } finally {
+    release.release();
+    await holder;
+    await outcome;
+  }
+  expect(await outcome).toMatchObject({
+    code: 'AUTHORIZATION_DENIED',
+    cause: revoked,
+  });
+  const inventory = await f.ledger.read(signal(), true);
+  expect(inventory.slots[0]?.entry?.state).toBe('ready');
+  expect(inventory.ordinaryOwners.size).toBe(0);
+  expect(f.platform.binds).toHaveLength(0);
+  expect(f.h.log).toEqual([]);
+});
+
+it('does not commit a new owner when an admitted ticket is revoked during default-off catalog reconciliation', async () => {
+  const f = await fixture();
+  const rc = context();
+  const off = f.serviceFor(f.newPool(false));
+  let current = true;
+  vi.spyOn(f.h.disk, 'listFormalDiskIds').mockImplementationOnce(async () => {
+    current = false;
+    return [];
+  });
+  const revoked = Object.assign(Error('ticket grant changed'), {
+    code: 'authorization_denied',
+  });
+  await expect(
+    off.prewarm(
+      rc,
+      {
+        trigger: 'input',
+        target: {
+          vmId: null,
+          instanceId: null,
+          leaseEpoch: 1,
+          async assertAuthority() {
+            if (!current) throw revoked;
+          },
+        },
+      },
+      signal(),
+    ),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED', cause: revoked });
+  expect(await f.store.read(rc.actor.id)).toBeNull();
+  expect(f.h.log).toEqual([]);
+  expect(await readdir(f.root)).toEqual([]);
+});
+
+it('checks the admitted running ticket after the pending-disk observation', async () => {
+  const f = await fixture();
+  const rc = context();
+  await f.pool.refill(signal());
+  await f.service.prewarm(rc, { trigger: 'page' }, signal());
+  const running = (await f.store.read(rc.actor.id))!;
+  const before = f.h.log.slice();
+  let current = true;
+  const status = f.pool.status.bind(f.pool);
+  vi.spyOn(f.pool, 'status').mockImplementationOnce(async (...args) => {
+    const result = await status(...args);
+    current = false;
+    return result;
+  });
+  const revoked = new PersonVmError('AUTHORIZATION_DENIED');
+  await expect(
+    f.service.prewarm(
+      rc,
+      {
+        trigger: 'input',
+        target: {
+          vmId: running.vmId,
+          instanceId: running.instanceId,
+          leaseEpoch: running.leaseEpoch,
+          async assertAuthority() {
+            if (!current) throw revoked;
+          },
+        },
+      },
+      signal(),
+    ),
+  ).rejects.toBe(revoked);
+  expect(f.h.log).toEqual(before);
+  expect(await f.store.read(rc.actor.id)).toMatchObject({
+    phase: 'running',
+    instanceId: running.instanceId,
+  });
 });
 
 it('cancels a waiting workbench without cancelling or duplicating the offline owner', async () => {
