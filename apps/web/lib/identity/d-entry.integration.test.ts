@@ -1827,7 +1827,7 @@ suite(
       const input = {
         workspaceId: f.workspace,
         requestId: randomUUID(),
-        profile: { name: '第一个员工' },
+        profile: { name: '🚀助理' },
       };
       const headers = {
         origin: 'https://allrice.test',
@@ -1915,6 +1915,10 @@ suite(
           profile: input.profile,
           source: { kind: 'tenant_version' },
         });
+        const [version] = await fixture.db`
+          select manifest->'appearance'->>'avatarValue' as initial
+          from allrice_employee_versions where id=${instance.source.employeeVersionId}`;
+        expect(version?.initial).toBe('🚀');
         const selection = {
           workspaceId: f.workspace,
           employeeInstanceId: instance.id,

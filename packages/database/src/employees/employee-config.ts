@@ -224,7 +224,7 @@ export function employeeManifest(input: {
   const appearance = EmployeeAppearanceSchema.parse(
     input.appearance ?? {
       avatarType: 'initials',
-      avatarValue: name.slice(0, 1).toLocaleUpperCase(),
+      avatarValue: (Array.from(name)[0] ?? '').toLocaleUpperCase(),
     },
   );
   // Ordinary tenant producers own these independent policy fragments. A new
