@@ -253,7 +253,11 @@ async function assertAdmissionOpen(
   }
 }
 
-function insertVmAudit(sql: postgres.Sql, row: VmRecord, event: VmAudit) {
+function insertVmAudit(
+  sql: postgres.Sql | postgres.TransactionSql,
+  row: VmRecord,
+  event: VmAudit,
+) {
   return sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
     values(${row.vmId},${row.personId},${row.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${row.leaseEpoch})`;
 }
@@ -289,8 +293,14 @@ export class PostgresPersonVmStore implements PersonVmStore {
     };
     signal.addEventListener('abort', abort, { once: true });
     try {
-      signal.throwIfAborted();
-      await insertVmAudit(sql, row, event);
+      await sql.begin(async (tx) => {
+        signal.throwIfAborted();
+        // A sent PostgreSQL statement can outlive local client shutdown.
+        // Give the server its own deadline before dispatching the insert.
+        await tx`set local statement_timeout = '200ms'`;
+        signal.throwIfAborted();
+        await insertVmAudit(tx, row, event);
+      });
     } finally {
       signal.removeEventListener('abort', abort);
       await end();

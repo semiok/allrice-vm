@@ -124,7 +124,7 @@ suite(
         await admin`select pg_terminate_backend(${rows[0]!.pid}) as killed`;
       expect(killed!.killed).toBe(true);
     }
-    it('aborts a blocked diagnostic insert without blocking or closing the actual VM lease', async () => {
+    it('bounds a blocked diagnostic insert on its own connection and leaves the VM lease usable', async () => {
       const h = harness(store);
       const rc = context();
       await h.service.create(rc, signal());
