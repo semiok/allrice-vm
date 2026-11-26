@@ -304,6 +304,7 @@ export function createAssignedNativeWebStartup(input: {
               vm: input.vm,
               lifetime,
               cleanupTimeoutMs: input.cleanupTimeoutMs,
+              recordStartupFailure: web.recordNativeFailure,
               ...(modelAdapter
                 ? {
                     async beforePrompt(

@@ -36,6 +36,7 @@ import {
   checkedWebRoster,
   type PersonVmWebRosterPort,
   type PersonVmWebStartup,
+  type NativeWebSetupFailure,
 } from './web-endpoints.ts';
 import {
   bindingOf,
@@ -663,7 +664,22 @@ export class PersonVmService
           )
             throw new PersonVmError('PROVIDER_FAILED');
         }
-        web = Object.freeze({ context, receipt: endpoints });
+        web = Object.freeze({
+          context,
+          receipt: endpoints,
+          recordNativeFailure(failure: NativeWebSetupFailure) {
+            // Dispatch before the owner starts cleanup. The lease session
+            // tracks the actual insert and joins it when the session ends.
+            void lease
+              .audit(row, {
+                requestId: context.requestId,
+                action: 'start.native-web.' + failure.step,
+                result: 'failed',
+                errorCode: JSON.stringify(failure),
+              })
+              .catch(() => {});
+          },
+        });
         await lease.guard();
       }
       const native = this.options.native;

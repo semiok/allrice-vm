@@ -20,6 +20,7 @@ export function nativeWebTransport(
   origin: string,
   signal: AbortSignal,
   lost: () => void,
+  observeFailure?: (error: unknown, httpStatus?: number) => void,
 ) {
   const sockets = new Set<Duplex>(),
     websockets = new Set<WebSocket>();
@@ -28,6 +29,13 @@ export function nativeWebTransport(
   let cookie: string | undefined,
     indexCookie: string | undefined,
     closing = false;
+  function observe(error: unknown, status?: number) {
+    try {
+      observeFailure?.(error, status);
+    } catch {
+      // Observability cannot change the native transport outcome.
+    }
+  }
   function joined(promise: Promise<void>) {
     joins.add(promise);
     void promise.then(() => joins.delete(promise));
@@ -128,16 +136,21 @@ export function nativeWebTransport(
     credential: 'api' | 'index' | 'none',
   ): Promise<Response> =>
     new Promise((resolve, reject) => {
+      let status: number | undefined;
+      let responded = false;
+      const rejectResponse = (error?: unknown) => {
+        if (!responded) observe(error, status);
+        reject(new PersonVmError('PROVIDER_FAILED'));
+      };
       try {
         const { call, send } = prepareRequest(
           input,
           init,
           (response) => {
+            status = response.statusCode;
             const chunks: Buffer[] = [];
             response.on('data', (chunk: Buffer) => chunks.push(chunk));
-            response.on('error', () =>
-              reject(new PersonVmError('PROVIDER_FAILED')),
-            );
+            response.on('error', rejectResponse);
             response.on('end', () => {
               try {
                 const output = new Headers();
@@ -149,17 +162,15 @@ export function nativeWebTransport(
                       : [value])
                     output.append(key, item);
                 const body = Buffer.concat(chunks);
-                resolve(
-                  new Response(
-                    body.length ? Uint8Array.from(body).buffer : null,
-                    {
-                      status: response.statusCode!,
-                      headers: output,
-                    },
-                  ),
+                const result = new Response(
+                  body.length ? Uint8Array.from(body).buffer : null,
+                  { status: response.statusCode!, headers: output },
                 );
-              } catch {
-                reject(new PersonVmError('PROVIDER_FAILED'));
+                responded = true;
+                if (result.status >= 400) observe(undefined, result.status);
+                resolve(result);
+              } catch (error) {
+                rejectResponse(error);
               }
             });
           },
@@ -167,11 +178,11 @@ export function nativeWebTransport(
           credential,
         );
         // A closed, unanswered request is not a reply.
-        call.once('close', () => reject(new PersonVmError('PROVIDER_FAILED')));
-        call.on('error', () => reject(new PersonVmError('PROVIDER_FAILED')));
+        call.once('close', () => rejectResponse());
+        call.on('error', rejectResponse);
         send();
-      } catch {
-        reject(new PersonVmError('PROVIDER_FAILED'));
+      } catch (error) {
+        rejectResponse(error);
       }
     });
   const fetch: RpcFetch = (input, init) => requestResponse(input, init, 'api');
@@ -196,6 +207,7 @@ export function nativeWebTransport(
     const chunks: Buffer[] = [];
     return new Promise((resolve, reject) => {
       let received = 0;
+      let responseStatus: number | undefined;
       let complete: IncomingHttpHeaders | undefined;
       let failure: { reason: unknown } | undefined;
       let physicalClose: Promise<void> | undefined;
@@ -207,12 +219,13 @@ export function nativeWebTransport(
           else socket.once('close', done);
         });
       });
-      const fail = () => {
-        failure ??= {
-          reason: active.aborted
-            ? active.reason
-            : new PersonVmError('PROVIDER_FAILED'),
-        };
+      const fail = (error?: unknown) => {
+        if (failure) return;
+        const reason = active.aborted
+          ? active.reason
+          : new PersonVmError('PROVIDER_FAILED');
+        observe(error ?? (active.aborted ? reason : undefined), responseStatus);
+        failure = { reason };
       };
       const { call, send } = prepareRequest(
         input,
@@ -228,6 +241,7 @@ export function nativeWebTransport(
           signal: active,
         },
         (response) => {
+          responseStatus = response.statusCode;
           response.once('error', fail);
           const declared = response.headers['content-length'];
           if (
@@ -274,8 +288,10 @@ export function nativeWebTransport(
           connection.destroy();
           if (active.aborted) fail();
           if (failure) reject(failure.reason);
-          else if (!complete) reject(new PersonVmError('PROVIDER_FAILED'));
-          else
+          else if (!complete) {
+            observe(undefined, responseStatus);
+            reject(new PersonVmError('PROVIDER_FAILED'));
+          } else
             resolve({
               data: fixed ?? Buffer.concat(chunks, received),
               headers: complete,
@@ -362,8 +378,10 @@ export function nativeWebTransport(
         response.status !== 302 ||
         response.headers.get('location') !== './api/remote.mux' ||
         values.length !== 1
-      )
+      ) {
+        observe(undefined, response.status);
         throw new PersonVmError('PROVIDER_FAILED');
+      }
       cookie = values[0]!.split(';', 1)[0]!;
     },
     async authenticateIndex(authenticatedUrl: string) {
@@ -404,11 +422,17 @@ export function nativeWebTransport(
       )
         throw new PersonVmError('PROVIDER_FAILED');
       let socket: WebSocket;
+      let responseStatus: number | undefined;
       try {
         socket = new WebSocket(url, {
           agent,
           finishRequest(call) {
             requestJoin(call);
+            // A normal listener on ws's unexpected-response event would
+            // take ownership of rejection. Observe the HTTP response only.
+            call.prependListener('response', (response) => {
+              responseStatus = response.statusCode;
+            });
             call.end();
           },
           headers: {
@@ -417,11 +441,12 @@ export function nativeWebTransport(
             Origin: new URL(origin).origin,
           },
         });
-      } catch {
+      } catch (error) {
+        observe(error, responseStatus);
         throw new PersonVmError('PROVIDER_FAILED');
       }
       websockets.add(socket);
-      socket.on('error', () => {}); // Native carrier owns its typed failure; never log credential URLs.
+      socket.on('error', (error) => observe(error, responseStatus));
       joined(
         new Promise((done) =>
           socket.once('close', () => {

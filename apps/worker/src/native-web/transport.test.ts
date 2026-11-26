@@ -6,6 +6,7 @@ import type { Socket } from 'node:net';
 import WebSocket from 'ws';
 import { afterEach, expect, it, vi } from 'vitest';
 import { nativeIndexByteLimit, nativeWebTransport } from './transport.js';
+import { nativeSetupError } from './startup-diagnostic.js';
 
 const cleanup: (() => Promise<void>)[] = [];
 function latch<T = void>() {
@@ -500,6 +501,56 @@ for (const accepted of [false, true])
       transport.fetch(new URL('/', origin), { method: 'GET' }),
     ).rejects.toBeDefined();
   });
+
+it.each(['http', 'reset'] as const)(
+  'captures the original WebSocket %s failure before reporting loss',
+  async (kind) => {
+    const server = createServer((_request, response) => {
+      response.writeHead(302, {
+        location: './api/remote.mux',
+        'set-cookie': 'private=synthetic-api-cookie',
+      });
+      response.end();
+    });
+    server.on('upgrade', (_request, socket) => {
+      if (kind === 'reset') socket.destroy();
+      else
+        socket.end(
+          'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+        );
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const lost = latch(),
+      observations: ReturnType<typeof nativeSetupError>[] = [];
+    const transport = nativeWebTransport(
+      origin,
+      new AbortController().signal,
+      () => lost.resolve(),
+      (error, status) => observations.push(nativeSetupError(error, status)),
+    );
+    cleanup.push(async () => {
+      await transport.close();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    });
+    await transport.authenticate(origin + '/?token=synthetic-startup-token');
+    transport.createWebSocket(
+      origin.replace('http:', 'ws:') + '/api/remote.mux',
+    );
+    await lost.promise;
+    expect(observations).toEqual([
+      kind === 'reset'
+        ? { errorType: 'SystemError', errorCode: 'ECONNRESET' }
+        : {
+            errorType: 'HttpError',
+            errorCode: 'UNEXPECTED_HTTP_RESPONSE',
+            httpStatus: 404,
+          },
+    ]);
+  },
+);
 
 for (const accepted of [false, true])
   it(`WS handshake close joins physical request/socket ${accepted ? 'after TCP/Upgrade request' : 'before socket assignment'}`, async () => {

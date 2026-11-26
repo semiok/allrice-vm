@@ -29,6 +29,7 @@ import {
   type PersonVmBinding,
   type PersonVmBootstrapScope,
   type PersonVmPort,
+  type NativeWebSetupFailure,
 } from '@allrice/person-vm';
 import type {
   ImageAttachmentRef,
@@ -37,6 +38,7 @@ import type {
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
+import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
   observeNativePrompt,
   type NativePromptObservation,
@@ -134,6 +136,7 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
+  recordStartupFailure?(failure: NativeWebSetupFailure): void;
   beforePrompt?(
     input: {
       binding: PersonVmBinding;
@@ -152,15 +155,54 @@ export async function openNativeWebOwner(input: {
     signal: AbortSignal,
   ): Promise<PrincipalInvocationObservation | undefined>;
 }) {
+  let step = 'validate-setup';
+  let transportFailure: ReturnType<typeof nativeSetupError> | undefined;
+  let startupFailureRecorded = false;
+  let startupComplete = false;
+  function stage(next: string) {
+    step = next;
+    transportFailure = undefined;
+  }
+  function recordFailure(reason: unknown) {
+    if (startupComplete || startupFailureRecorded) return;
+    startupFailureRecorded = true;
+    const diagnostic: NativeWebSetupFailure = {
+      step,
+      ...(transportFailure ?? nativeSetupError(reason)),
+      target: nativeSetupTarget(input.launch.auth.origin),
+    };
+    try {
+      console.warn('[MET-273] native Web startup failed', {
+        requestId: UuidSchema.safeParse(input.context.requestId).data,
+        vmId: UuidSchema.safeParse(input.scope.binding.vmId).data,
+        leaseEpoch: input.scope.binding.leaseEpoch,
+        ...diagnostic,
+      });
+    } catch {
+      // Logging cannot change the failure or its cleanup.
+    }
+    try {
+      input.recordStartupFailure?.(diagnostic);
+    } catch {
+      // An unavailable audit writer cannot prevent physical cleanup.
+    }
+  }
   if (
     !input.scope.readNativeWebAuth ||
     !Number.isSafeInteger(input.cleanupTimeoutMs) ||
     input.cleanupTimeoutMs <= 0
-  )
-    throw new PersonVmError('PROVIDER_FAILED');
+  ) {
+    const error = new PersonVmError('PROVIDER_FAILED');
+    recordFailure(error);
+    throw error;
+  }
   const binding = Object.freeze({ ...input.scope.binding });
-  if (!sameVmBinding(input.launch.binding, binding))
-    throw new PersonVmError('LEASE_LOST');
+  if (!sameVmBinding(input.launch.binding, binding)) {
+    const error = new PersonVmError('LEASE_LOST');
+    recordFailure(error);
+    throw error;
+  }
+  stage('startup-authority');
   const stale = new AbortController(),
     carrier = new AbortController(),
     waitAbort = new AbortController();
@@ -202,8 +244,9 @@ export async function openNativeWebOwner(input: {
     while (operations.size) await Promise.allSettled([...operations]);
   }
   let disconnected: Promise<void> | undefined;
-  const lost = () => {
+  const lost = (reason: unknown = new PersonVmError('PROVIDER_FAILED')) => {
     if (disconnected) return;
+    recordFailure(reason);
     // Publish before abort callbacks can reenter. Local drain is not remote ACK.
     disconnected = Promise.resolve().then(async () => {
       await Promise.allSettled([starting, nativeWait]);
@@ -230,6 +273,10 @@ export async function openNativeWebOwner(input: {
     input.launch.auth.origin,
     carrier.signal,
     lost,
+    (error, status) => {
+      if (!startupComplete && !startupFailureRecorded)
+        transportFailure ??= nativeSetupError(error, status);
+    },
   );
   function joinHost() {
     if (hostClosing) return hostClosing;
@@ -291,12 +338,21 @@ export async function openNativeWebOwner(input: {
     return closing;
   }
   const aborted = () => {
+    recordFailure(
+      input.scope.signal.aborted
+        ? input.scope.signal.reason
+        : input.lifetime.reason,
+    );
     void close().catch(() => {});
   };
   input.lifetime.addEventListener('abort', aborted, { once: true });
   input.scope.signal.addEventListener('abort', aborted, { once: true });
   if (input.lifetime.aborted || input.scope.signal.aborted) aborted();
-  const startupTimer = setTimeout(lost, input.launch.auth.timeoutMs);
+  const startupTimer = setTimeout(
+    () =>
+      lost(new DOMException('Native Web startup timed out', 'TimeoutError')),
+    input.launch.auth.timeoutMs,
+  );
   function readCurrentSessions(
     requestSignal: AbortSignal,
     assertCurrent: (signal: AbortSignal) => Promise<void>,
@@ -432,6 +488,7 @@ export async function openNativeWebOwner(input: {
   try {
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    stage('launch');
     starting = setup(async () => {
       const opened = await input.scope.launch(input.launch.command);
       job = opened;
@@ -444,12 +501,13 @@ export async function openNativeWebOwner(input: {
     nativeWait = Promise.resolve().then(() => started.wait(waitAbort.signal));
     void nativeWait.then(
       () => {
-        if (!waitAbort.signal.aborted) lost();
+        if (!waitAbort.signal.aborted) lost('NATIVE_JOB_EXITED');
       },
-      () => {
-        if (!waitAbort.signal.aborted) lost();
+      (error: unknown) => {
+        if (!waitAbort.signal.aborted) lost(error);
       },
     );
+    stage('auth-artifact');
     // Loss of this exact CLI job aborts the attached artifact read. Keep it
     // tracked in setup so close still waits for the native reader to join.
     const auth = await setup(() =>
@@ -457,12 +515,17 @@ export async function openNativeWebOwner(input: {
     );
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
+    stage('auth-adapter-proof');
     if (auth.modelAdapterId !== input.launch.auth.modelAdapterId)
       throw new PersonVmError('RUNTIME_NOT_READY');
     installedModelAdapter = auth.modelAdapterId;
+    stage('authenticate');
     await setup(() => transport.authenticate(auth.authenticatedUrl));
+    stage('authenticate-index');
     await setup(() => transport.authenticateIndex(auth.authenticatedUrl));
+    stage('install-registry');
     await setup(() => root.plugin(TypertRegistry));
+    stage('install-connection');
     signal.throwIfAborted();
     installConnection(root, {
       interactions: 'none',
@@ -472,18 +535,25 @@ export async function openNativeWebOwner(input: {
         streamBaseUrl: input.launch.auth.origin,
       },
     });
+    stage('install-gateway');
     await setup(() => root.plugin(GatewayClient));
+    stage('mount-session');
     await setup(() => root.remote.$mount(TYPERT_REMOTE));
+    stage('mount-principal');
     await setup(() => root.remote.$mount(PRINCIPAL_REMOTE));
+    stage('session-list');
     const list = await own(root.remote.session.list({}, signal));
     if (!list.ok) throw new PersonVmError('PROVIDER_FAILED');
+    stage('control-first-frame');
     const stream = root.remote.session.control(signal);
     const iterator = stream[Symbol.asyncIterator]();
     const first = await own(iterator.next());
     if (first.done || first.value.type !== 'baseline')
       throw new PersonVmError('PROVIDER_FAILED');
+    stage('final-authority');
     await setup(() => input.scope.assertCurrent());
     signal.throwIfAborted();
+    startupComplete = true;
     ready = true;
     own(
       (async () => {
@@ -1032,7 +1102,8 @@ export async function openNativeWebOwner(input: {
         }
       },
     });
-  } catch {
+  } catch (error) {
+    recordFailure(error);
     try {
       await close();
     } finally {

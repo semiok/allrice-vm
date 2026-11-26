@@ -614,6 +614,90 @@ it.each([false, true])(
   },
 );
 
+it('writes the owner diagnostic through the startup lease before the normal failure audit and VM rollback', async () => {
+  const f = fixture();
+  const store = new MemoryStore();
+  const h = harness(store);
+  const entries = f.web.receipt.endpoints
+    .map(
+      ({
+        workspaceId,
+        employeeInstanceId,
+        employeeRevision,
+        employeeVersionId,
+      }) => ({
+        workspaceId,
+        employeeInstanceId,
+        employeeRevision,
+        employeeVersionId,
+      }),
+    )
+    .sort((a, b) => a.employeeInstanceId.localeCompare(b.employeeInstanceId));
+  const facts = {
+    personId: f.binding.personId,
+    organizationId: f.binding.organizationId,
+    entries,
+  };
+  const roster = {
+    ...facts,
+    digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+  };
+  h.native.prepareWebEndpoints = async (binding) => ({
+    binding,
+    rosterDigest: roster.digest,
+    endpoints: f.web.receipt.endpoints,
+  });
+  h.native.assertWebEndpoints = async () => {};
+  const bootstrap = h.native.bootstrap;
+  h.native.bootstrap = async (scope, plan) => ({
+    ...(await bootstrap(scope, plan)),
+    readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+  });
+  const diagnostic = {
+    step: 'session-list',
+    errorType: 'SystemError',
+    errorCode: 'ECONNRESET',
+    target: '127.0.0.1:32171',
+  };
+  open.mockImplementationOnce(
+    (input: Parameters<typeof import('./owner.js').openNativeWebOwner>[0]) => {
+      expect(input.recordStartupFailure).toBeTypeOf('function');
+      input.recordStartupFailure!(diagnostic);
+      throw new PersonVmError('PROVIDER_FAILED');
+    },
+  );
+  const service = new PersonVmService({
+    ...h.options,
+    nativeWeb: { prepare: async () => roster },
+    runtime: {
+      ...h.runtime,
+      memoryGuestPlan: f.service.memoryGuestPlan,
+      start: f.service.start,
+      retireAfterNativeStop: f.service.retireAfterNativeStop,
+    },
+  });
+  try {
+    await service.create(f.web.context, signal());
+    await expect(service.start(f.web.context, signal())).rejects.toMatchObject({
+      code: 'PROVIDER_FAILED',
+    });
+    expect(
+      store.audits.filter(({ result }) => result === 'failed'),
+    ).toMatchObject([
+      {
+        requestId: f.web.context.requestId,
+        action: 'start.native-web.session-list',
+        errorCode: JSON.stringify(diagnostic),
+      },
+      { action: 'start', errorCode: 'PROVIDER_FAILED' },
+    ]);
+    expect(h.log).toContain('native:stop');
+    expect(h.mounts.size).toBe(0);
+  } finally {
+    await f.service.close();
+  }
+});
+
 it.each(['readiness', 'save'] as const)(
   'service start已返回后%s失败：confirmed stop→exact host join→同组件新代重试（synthetic provider）',
   async (failure) => {

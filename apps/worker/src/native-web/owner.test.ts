@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
@@ -12,6 +14,7 @@ import type {
 import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { nativeWebLaunchOnGuest, prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
+import { nativeSetupError } from './startup-diagnostic.js';
 
 const binding = {
   vmId: randomUUID(),
@@ -338,6 +341,144 @@ it('CLI 启动退出会取消本次认证读取，等读取和原生关闭收尾
     lifetime.abort();
     await outcome;
   }
+});
+
+it.each([
+  ['/connect', 'authenticate'],
+  ['/', 'authenticate-index'],
+] as const)(
+  'reports a rejected %s exchange before native cleanup without leaking credentials',
+  async (path, step) => {
+    const secrets = {
+      token: 'synthetic-launch-token',
+      cookie: 'synthetic-cookie-value',
+      body: 'synthetic-private-response',
+      redirect: 'synthetic-redirect-token',
+      nonce: randomUUID(),
+    };
+    const server = createServer((request, response) => {
+      const pathname = new URL(request.url!, 'http://fixture').pathname;
+      if (pathname === path) {
+        response.writeHead(401, {
+          location: '/?token=' + secrets.redirect,
+          'set-cookie': 'private=' + secrets.cookie,
+        });
+        response.end(secrets.body);
+      } else {
+        response.writeHead(302, {
+          location: './api/remote.mux',
+          'set-cookie': 'private=' + secrets.cookie,
+        });
+        response.end();
+      }
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const target = `127.0.0.1:${(server.address() as { port: number }).port}`;
+    const origin = `http://${target}/`;
+    const requestId = randomUUID();
+    const calls: string[] = [];
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {
+      calls.push('log');
+    });
+    const audit = vi.fn(() => {
+      calls.push('audit');
+    });
+    const exited = deferred<PersonVmJobExit>();
+    const exit = { exitCode: 1, timedOut: false };
+    const lifetime = new AbortController();
+    const cancelAndWait = vi.fn(async () => {
+      calls.push('cancel');
+      exited.resolve(exit);
+      return exit;
+    });
+    try {
+      await expect(
+        openNativeWebOwner({
+          scope: {
+            binding,
+            signal: new AbortController().signal,
+            assertCurrent: vi.fn().mockResolvedValue(undefined),
+            launch: vi.fn().mockResolvedValue({
+              binding,
+              jobId: 'fixture',
+              wait: () => exited.promise,
+              cancelAndWait,
+            }),
+            readNativeWebAuth: async () => ({
+              authenticatedUrl: origin + '?token=' + secrets.token,
+            }),
+          },
+          launch: {
+            binding,
+            auth: {
+              dshHome: '/work/a',
+              origin,
+              nonce: secrets.nonce,
+              timeoutMs: 5000,
+            },
+            files: [],
+            command: { executable: 'node', args: [] },
+          },
+          context: { requestId } as never,
+          vm: { assertCurrentBinding: vi.fn() },
+          lifetime: lifetime.signal,
+          cleanupTimeoutMs: 3000,
+          recordStartupFailure: audit,
+        }),
+      ).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+        message: 'PROVIDER_FAILED',
+      });
+      const fields = {
+        step,
+        errorType: 'HttpError',
+        errorCode: 'UNEXPECTED_HTTP_RESPONSE',
+        httpStatus: 401,
+        target,
+      };
+      expect(calls).toEqual(['log', 'audit', 'cancel']);
+      expect(audit.mock.calls).toEqual([[fields]]);
+      expect(warning.mock.calls).toEqual([
+        [
+          '[MET-273] native Web startup failed',
+          {
+            requestId,
+            vmId: binding.vmId,
+            leaseEpoch: binding.leaseEpoch,
+            ...fields,
+          },
+        ],
+      ]);
+      const recorded = JSON.stringify([warning.mock.calls, audit.mock.calls]);
+      for (const value of Object.values(secrets))
+        expect(recorded).not.toContain(value);
+    } finally {
+      lifetime.abort();
+      exited.resolve(exit);
+      warning.mockRestore();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+    }
+  },
+);
+
+it('does not copy arbitrary names, codes, causes or opaque abort reasons', () => {
+  const privateValue = 'synthetic-private-diagnostic';
+  const error = Object.assign(
+    new Error(privateValue, { cause: privateValue }),
+    {
+      name: privateValue,
+      code: privateValue,
+    },
+  );
+  expect(nativeSetupError(error)).toEqual({ errorType: 'Error' });
+  const opaque = new Proxy(error, {
+    getPrototypeOf() {
+      throw error;
+    },
+  });
+  expect(nativeSetupError(opaque)).toEqual({ errorType: 'Error' });
 });
 
 it('requires the exact current compaction bracket and cannot substitute it for the assistant call', () => {
