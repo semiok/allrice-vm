@@ -91,15 +91,17 @@ test('fixture evidence cannot satisfy the target run and skip remains incomplete
   });
 });
 
-test('keeps a failure artifact and flags a downstream pass claim', async () => {
+test('keeps a failure visible when later claims lack a prerequisite or a valid artifact', async () => {
   await fixture(async ({ directory, records, report }) => {
     records[1].result = 'fail';
+    records[3].artifact.file = 'missing.log';
     const firstFailure = join(directory, records[1].artifact.file);
     const before = await readFile(firstFailure);
     const result = await report();
     assert.equal(result.status, 1);
     assert.match(result.stdout, /失败 \| `host.log`/);
-    assert.match(result.stdout, /顺序异常 \| `single-vm.log`/);
+    assert.match(result.stdout, /前置未通过 \| `single-vm.log`/);
+    assert.match(result.stdout, /原件无效 \| workbench 的原件缺失/);
     assert.deepEqual(await readFile(firstFailure), before);
   });
 });
@@ -138,15 +140,35 @@ test('rejects tampering, traversal, symlinks and missing files without exposing 
       artifact.file = file;
       const result = await report();
       assert.equal(result.status, 1);
-      assert.match(result.stderr, /preflight 的原件/);
-      assert.ok(!result.stderr.includes(file));
+      assert.match(result.stdout, /原件无效 \| preflight 的原件/);
+      assert.ok(!result.stdout.includes(file));
     }
     artifact.file = original;
     await writeFile(join(directory, original), 'replacement private bytes');
     const result = await report();
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /摘要不符/);
-    assert.doesNotMatch(result.stderr, /private bytes/);
+    assert.match(result.stdout, /摘要不符/);
+    assert.doesNotMatch(result.stdout, /private bytes/);
+  });
+});
+
+test('one artifact cannot satisfy two stages even under different filenames', async () => {
+  await fixture(async ({ directory, records, report }) => {
+    const first = records[0].artifact;
+    records[1].artifact = { ...first };
+    const duplicate = await report();
+    assert.equal(duplicate.status, 1);
+    assert.match(duplicate.stdout, /其他阶段已使用同一原件/);
+
+    const copy = 'copy.log';
+    await writeFile(
+      join(directory, copy),
+      await readFile(join(directory, first.file)),
+    );
+    records[1].artifact = { ...first, file: copy };
+    const repeatedBytes = await report();
+    assert.equal(repeatedBytes.status, 1);
+    assert.match(repeatedBytes.stdout, /其他阶段已使用同一原件/);
   });
 });
 
@@ -162,8 +184,8 @@ test('rejects duplicate stages, unknown results and unsafe skip reasons', async 
       records[0].reason = 'unrecognized reason';
       const invalid = await report();
       assert.equal(invalid.status, 1);
-      assert.match(invalid.stderr, /状态或跳过原因无效/);
-      assert.doesNotMatch(invalid.stderr, /unrecognized reason/);
+      assert.match(invalid.stdout, /状态或跳过原因无效/);
+      assert.doesNotMatch(invalid.stdout, /unrecognized reason/);
     }
   });
 });

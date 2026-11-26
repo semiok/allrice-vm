@@ -95,6 +95,8 @@ async function summarize(indexFile) {
   }
 
   const rows = [];
+  const files = new Set();
+  const digests = new Set();
   let priorPassed = true;
   let failed = false;
   for (const [step, title] of stages) {
@@ -102,32 +104,44 @@ async function summarize(indexFile) {
     let status = '待验';
     let detail = '未提交原件';
     if (record?.result === 'pass' || record?.result === 'fail') {
-      const file = await verifyArtifact(
-        dirname(indexFile),
-        step,
-        record.artifact,
-      );
-      failed ||= record.result === 'fail';
-      status = record.result === 'fail' ? '失败' : '已记录';
-      detail = `\`${file}\``;
-      if (record.result === 'pass' && !priorPassed) {
-        failed = true;
-        status = '顺序异常';
+      try {
+        const file = await verifyArtifact(
+          dirname(indexFile),
+          step,
+          record.artifact,
+        );
+        const { sha256 } = record.artifact;
+        if (files.has(file) || digests.has(sha256)) {
+          throw new EvidenceError('其他阶段已使用同一原件');
+        }
+        files.add(file);
+        digests.add(sha256);
+        status = '失败';
+        if (record.result === 'pass')
+          status = priorPassed ? '已记录' : '前置未通过';
+        detail = `\`${file}\``;
+      } catch (error) {
+        if (!(error instanceof EvidenceError)) throw error;
+        status = '原件无效';
+        detail = error.message;
       }
     } else if (record) {
-      if (record.result !== 'skip' || !skipReasons.has(record.reason)) {
-        throw new EvidenceError(`${step} 的状态或跳过原因无效`);
+      if (record.result === 'skip' && skipReasons.has(record.reason)) {
+        status = '跳过';
+        detail = skipReasons.get(record.reason);
+      } else {
+        status = '记录无效';
+        detail = '状态或跳过原因无效';
       }
-      status = '跳过';
-      detail = skipReasons.get(record.reason);
     }
-    priorPassed &&= record?.result === 'pass';
+    failed ||= !['待验', '跳过', '已记录'].includes(status);
+    priorPassed &&= status === '已记录';
     rows.push(`| ${title} | ${status} | ${detail} |`);
   }
 
   const fixture = run.mode === 'fixture';
   const state = failed
-    ? '记录有失败或顺序异常'
+    ? '记录有失败、原件无效或前置未通过'
     : fixture
       ? '仅模拟'
       : priorPassed
@@ -138,7 +152,7 @@ async function summarize(indexFile) {
     markdown: [
       '# Linux 首日验收证据',
       '',
-      `结论：${state}。工具核对运行身份、原件摘要和步骤顺序。`,
+      `结论：${state}。工具核对运行身份、原件摘要和前置状态。`,
       `运行 \`${run.id}\`，目标 \`${run.target}\`。`,
       `提交 \`${run.commit}\`，tree \`${run.tree}\`，封签 \`${run.seal}\`。`,
       '',
