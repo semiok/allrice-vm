@@ -1012,6 +1012,46 @@ it.each([
   },
 );
 
+it('keeps the thread observer alive after readiness and expires the original ticket when the observer revokes it', async () => {
+  const f = fixture();
+  const observe = vi.fn(async (signal: AbortSignal) => {
+    signal.throwIfAborted();
+    f.base.identityRevoked.signal.throwIfAborted();
+  });
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementationOnce(async () => ({
+    ...(await watch()),
+    assertTicketThread: observe,
+  }));
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      isCurrent: async () => true,
+      prepare: async () => ({ key: 'exact-thread', target: f.base.binding }),
+      prewarm: async () => signal(),
+    },
+  });
+  cleanups.push(server.close);
+  const reply = await server.request('native-prewarm', {
+    ...f.base.body,
+    trigger: 'page',
+  });
+  expect(reply.status).toBe(202);
+  const { ticket } = await reply.json();
+  await vi.waitFor(async () =>
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'ready' }),
+  );
+  expect(f.base.authorityClose).not.toHaveBeenCalled();
+  expect(observe.mock.calls.length).toBeGreaterThan(1);
+  f.base.identityRevoked.abort(new DataAccessError('authorization_denied'));
+  const status = await prewarmStatus(server, ticket.operationId);
+  expect(status.status).toBe(410);
+  expect(await status.json()).toEqual({ state: 'expired' });
+  expect(f.base.authorityClose).toHaveBeenCalledOnce();
+});
+
 it('reports immediate startup failure without exposing native errors', async () => {
   const f = fixture();
   const server = await nativeEntryServer(f.base, {

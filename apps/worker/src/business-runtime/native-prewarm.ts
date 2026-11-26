@@ -45,8 +45,6 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
       const policy = await readDEntryReleasePolicy(sql);
       if (selectDEntryGeneration(policy, identity) !== '4.0')
         throw new DataAccessError('authorization_denied');
-      // An existing thread needs its exact tuple version. A restored row can
-      // carry identical access fields; fresh admission is required on change.
       const [snapshot] = await sql<
         {
           vm: VmStampRow | null;
@@ -84,7 +82,8 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
           and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
           and i.archived_at is null and a.active) as "employeeGrant",
       case when ${identity.threadId}::uuid is null then 'employee'
-      else (select c.xmin::text
+      else (select jsonb_build_array(c.id, c.employee_instance_id,
+          c.employee_assignment_id, c.employee_version_id, c.execution_generation)::text
         from allrice_chat_sessions c
         where c.id=${identity.threadId} and c.owner_id=${identity.personId}
           and c.organization_id=${identity.organizationId} and c.workspace_id=${identity.workspaceId}
@@ -409,6 +408,7 @@ export function createDEntryNativePrewarmPort(input: {
                       ))
                     )
                       throw new DataAccessError('authorization_denied');
+                    await plan.assertTicketThread?.(current);
                   },
                 },
               }),

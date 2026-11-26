@@ -1,4 +1,5 @@
 import { Client } from 'pg';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
   DEntrySelectionInputSchema,
@@ -17,6 +18,7 @@ import { getSessionExecutionGeneration } from './workspace/service.ts';
 
 export const dEntryAuthorityChannel = 'allrice_d_entry_authority';
 const personVmAdmissionChannel = 'allrice_person_vm_admission';
+const ticketFenceChannel = 'allrice_d_entry_ticket_fence';
 const changeSchema = z.object({
   schema: z.string(),
   table: z.string(),
@@ -36,6 +38,7 @@ type Subscription = {
  * could hide a missed notification. A new request opens a new connection. */
 export function createDEntryAuthorityFeed(databaseUrl: string) {
   const listeners = new Set<Subscription>();
+  const fences = new Map<string, () => void>();
   const client = new Client({
     connectionString: databaseUrl,
     application_name: 'allrice-d-entry-authority',
@@ -56,6 +59,10 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
   client.on('error', lost);
   client.on('end', () => lost(Error('D_ENTRY_AUTHORITY_DISCONNECTED')));
   client.on('notification', (message) => {
+    if (message.channel === ticketFenceChannel) {
+      fences.get(message.payload ?? '')?.();
+      return;
+    }
     if (
       message.channel !== dEntryAuthorityChannel &&
       message.channel !== personVmAdmissionChannel
@@ -82,10 +89,36 @@ export function createDEntryAuthorityFeed(databaseUrl: string) {
     await client.connect();
     await client.query(`LISTEN ${dEntryAuthorityChannel}`);
     await client.query(`LISTEN ${personVmAdmissionChannel}`);
+    await client.query(`LISTEN ${ticketFenceChannel}`);
     if (failed) throw unavailable;
   })();
   void ready.catch(lost);
   return {
+    async observeThroughCommit(signal: AbortSignal) {
+      signal.throwIfAborted();
+      if (failed) throw unavailable;
+      const marker = randomUUID();
+      let cancel!: () => void;
+      const seen = new Promise<void>((resolve, reject) => {
+        cancel = () => reject(signal.reason);
+        signal.addEventListener('abort', cancel, { once: true });
+        fences.set(marker, resolve);
+      });
+      void seen.catch(() => {});
+      try {
+        // The same listener receives its own committed marker after all
+        // earlier committed authority changes, even across channels.
+        await client.query('select pg_notify($1,$2)', [
+          ticketFenceChannel,
+          marker,
+        ]);
+        await seen;
+        signal.throwIfAborted();
+      } finally {
+        fences.delete(marker);
+        signal.removeEventListener('abort', cancel);
+      }
+    },
     async subscribe(listener: Subscription, signal: AbortSignal) {
       const cancel = () => listener.lost(signal.reason);
       signal.addEventListener('abort', cancel, { once: true });
@@ -206,7 +239,10 @@ export type DEntryPrincipalAuthoritySubscription = DEntryAuthoritySubscription &
   Readonly<{ assertCurrent(signal: AbortSignal): Promise<void> }>;
 
 type ObservedAuthority = DEntryPrincipalAuthoritySubscription &
-  Readonly<{ assertObserved(signal: AbortSignal): Promise<void> }>;
+  Readonly<{
+    assertObserved(signal: AbortSignal): Promise<void>;
+    assertTicketThread?: (signal: AbortSignal) => Promise<void>;
+  }>;
 type NativeRosterChecks = Readonly<{
   verifyRoster(signal: AbortSignal): Promise<void>;
   verifyBinding(signal: AbortSignal): Promise<void>;
@@ -240,6 +276,7 @@ async function watchDEntryAuthority(
   let stopped = false;
   let expiresAt = '';
   let checks = Promise.resolve();
+  const ticketThread = verifyRevision && expected.threadId;
   const invalidate = (error: unknown) => abort.abort(error);
   const recheck = async (roster: boolean) => {
     if (stopped) return;
@@ -345,6 +382,17 @@ async function watchDEntryAuthority(
           // NOTIFY is only a hint. Never grants/revokes authority from payload;
           // current SQL decides, including a permission change during setup.
           if (schema && change.schema !== schema) return;
+          if (
+            ticketThread &&
+            change.table === 'allrice_chat_sessions' &&
+            change.id === ticketThread &&
+            affects(change, context, expected)
+          ) {
+            // This trigger names only authority fields, not title, pin or
+            // native-root metadata. A restored thread needs a new ticket.
+            invalidate(new DataAccessError('authorization_denied'));
+            return;
+          }
           const roster = !!nativeChecks && affectsRoster(change, expected);
           if (roster || affects(change, context, expected)) enqueue(roster);
         },
@@ -357,6 +405,15 @@ async function watchDEntryAuthority(
     revoked.throwIfAborted();
     return {
       revoked,
+      ...(ticketThread && {
+        async assertTicketThread(active: AbortSignal) {
+          if (stopped) throw new DataAccessError('authorization_denied');
+          await source.observeThroughCommit(
+            AbortSignal.any([active, revoked, AbortSignal.timeout(3000)]),
+          );
+          if (stopped) throw new DataAccessError('authorization_denied');
+        },
+      }),
       get expiresAt() {
         return expiresAt;
       },
@@ -393,7 +450,9 @@ export function watchDEntryNativeAuthority(
   signal: AbortSignal,
   feed?: Feed,
   verifyRevision?: (signal: AbortSignal) => Promise<void>,
-): Promise<DEntryAuthoritySubscription> {
+): Promise<
+  DEntryAuthoritySubscription & Pick<ObservedAuthority, 'assertTicketThread'>
+> {
   return watchDEntryAuthority(
     context,
     input,

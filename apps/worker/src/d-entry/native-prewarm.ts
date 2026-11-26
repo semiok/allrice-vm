@@ -15,6 +15,7 @@ export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
   running?: boolean;
+  assertTicketThread?(signal: AbortSignal): Promise<void>;
 };
 
 export function compatiblePrewarmGeneration(
@@ -88,11 +89,14 @@ export function createPrewarmOperations(
     ticket: DEntryNativePrewarmTicket;
     expires: number;
     state: DEntryNativePrewarmStatus;
+    revoked: AbortSignal;
     proof?: AbortSignal;
     settled?: Promise<void>;
+    release(): Promise<boolean>;
   };
   const tickets = new Map<string, Operation>();
   const pending = new Set<Promise<void>>();
+  const lifetimeReleases = new Set<Promise<boolean>>();
   const active = (entry: Operation) =>
     entry.state.state === 'accepted' || entry.state.state === 'starting';
   const belongs = (
@@ -107,6 +111,7 @@ export function createPrewarmOperations(
     owned,
     settled: entry.settled,
     ready: () => entry.state.state === 'ready' && !entry.proof?.aborted,
+    assertTicketThread: entry.plan.assertTicketThread,
   });
 
   return {
@@ -122,7 +127,10 @@ export function createPrewarmOperations(
       const now = Date.now();
       for (const [id, entry] of tickets) {
         if (entry.expires <= now) {
-          if (!active(entry)) tickets.delete(id);
+          if (!active(entry)) {
+            tickets.delete(id);
+            void entry.release();
+          }
         } else if (
           active(entry) &&
           belongs(entry, context, identity) &&
@@ -137,6 +145,7 @@ export function createPrewarmOperations(
         for (const [id, entry] of tickets) {
           if (active(entry)) continue;
           tickets.delete(id);
+          void entry.release();
           break;
         }
       }
@@ -147,6 +156,12 @@ export function createPrewarmOperations(
         expiresAt: new Date(expires).toISOString(),
         pollAfterMs: 1000,
       };
+      const signal = AbortSignal.any([
+        lifetime,
+        authority.revoked,
+        AbortSignal.timeout(lifetimeMs),
+      ]);
+      let closing: Promise<boolean> | undefined;
       const operation: Operation = {
         identity,
         sessionId: context.sessionId,
@@ -154,13 +169,31 @@ export function createPrewarmOperations(
         ticket,
         expires,
         state: { state: 'accepted' },
+        revoked: authority.revoked,
+        release() {
+          if (closing) return closing;
+          signal.removeEventListener('abort', releaseExpired);
+          closing = Promise.resolve()
+            .then(() => authority.close())
+            .then(
+              () => true,
+              (error) => {
+                cleanupFailed(error);
+                return false;
+              },
+            );
+          lifetimeReleases.add(closing);
+          const settled = closing;
+          void settled.then(() => lifetimeReleases.delete(settled));
+          return closing;
+        },
       };
       tickets.set(ticket.operationId, operation);
-      const signal = AbortSignal.any([
-        lifetime,
-        authority.revoked,
-        AbortSignal.timeout(lifetimeMs),
-      ]);
+      function releaseExpired() {
+        if (active(operation)) return; // the start owns cleanup until it joins
+        void operation.release();
+      }
+      signal.addEventListener('abort', releaseExpired, { once: true });
       const task = Promise.resolve().then(async () => {
         let failed = false;
         try {
@@ -172,12 +205,8 @@ export function createPrewarmOperations(
         } catch {
           failed = true;
         }
-        try {
-          await authority.close();
-        } catch (error) {
-          cleanupFailed(error);
-          failed = true;
-        }
+        if (!plan.assertTicketThread || failed || signal.aborted)
+          failed = !(await operation.release()) || failed;
         const reason: unknown = authority.revoked.reason;
         const denied =
           reason instanceof DataAccessError &&
@@ -203,6 +232,7 @@ export function createPrewarmOperations(
       operationId: string,
       context: RequestContext,
       identity: DEntryIdentity,
+      signal: AbortSignal,
       verify: (plan: PrewarmPlan, ready: boolean) => Promise<boolean>,
     ): Promise<DEntryNativePrewarmStatus> {
       const entry = tickets.get(operationId);
@@ -217,10 +247,26 @@ export function createPrewarmOperations(
         entry.expires <= Date.now()
       )
         return { state: 'expired' };
+      if (state.state !== 'failed') {
+        try {
+          await entry.plan.assertTicketThread?.(signal);
+        } catch (error) {
+          signal.throwIfAborted();
+          if (!entry.revoked.aborted && !(error instanceof DataAccessError))
+            throw new DEntryNativeUnavailable();
+          return { state: 'expired' };
+        }
+      }
+      if (entry.expires <= Date.now() || (ready && entry.proof?.aborted))
+        return { state: 'expired' };
       return state;
     },
     async close() {
       await Promise.allSettled(pending);
+      await Promise.allSettled(
+        [...tickets.values()].map((entry) => entry.release()),
+      );
+      await Promise.allSettled(lifetimeReleases);
       tickets.clear();
     },
   };
