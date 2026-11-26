@@ -52,7 +52,7 @@ function fixture(
   selections: DEntryRolloutPolicy['selections'],
   vm: Record<string, unknown>[] = [],
   defaultGeneration: DEntryRolloutPolicy['defaultGeneration'] = '3.x',
-  platformBacked = false,
+  platformVersion = false,
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
   const sql = vi.fn(
@@ -79,7 +79,7 @@ function fixture(
             organization_id: String(params[1]).toLowerCase(),
             workspace_id: workspace,
             employee_id: assignedEmployee,
-            platform_backed: platformBacked,
+            platform_version: platformVersion,
           },
         ];
       throw Error('Unexpected fixture query');
@@ -304,8 +304,17 @@ it('requires an exact, still published platform source without rejecting tenant-
 });
 
 it('does not treat a missing platform version mapping as a tenant-only publication', async () => {
-  fixture([selection()], [], '3.x', true);
+  const { seen } = fixture([selection()], [], '3.x', true);
   expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  expect(
+    seen.find(({ query }) => query.includes('as platform_version'))?.query,
+  ).toContain('d.tenant_employee_version_id=a.employee_version_id');
+
+  // A tenant-authored version of the same employee is independently eligible.
+  fixture([selection()], [], '3.x', false);
+  expect(
+    await readPersonVmDiskPreparationTarget(person, signal()),
+  ).not.toBeNull();
 });
 
 it('terminates its dedicated transaction on cancellation and joins the current read', async () => {

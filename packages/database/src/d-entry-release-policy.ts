@@ -218,13 +218,14 @@ export async function readPersonVmDiskPreparationTarget(
             organization_id: string;
             workspace_id: string;
             employee_id: string;
-            platform_backed: boolean;
+            platform_version: boolean;
           }[]
         >`
           select i.owner_id,i.organization_id,i.workspace_id,a.employee_id,
             exists (select 1 from allrice_platform_employee_tenant_assignments d
               where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
-                and d.tenant_employee_id=a.employee_id) as platform_backed
+                and d.tenant_employee_id=a.employee_id
+                and d.tenant_employee_version_id=a.employee_version_id) as platform_version
           from allrice_employee_instances i
           join allrice_employee_assignments a on a.id=i.assignment_id
           where i.id=${entry.employeeInstanceId} and i.organization_id=${entry.organizationId}
@@ -263,7 +264,7 @@ export async function readPersonVmDiskPreparationTarget(
             continue;
           if (eligible[0]?.organizationId === identity.organizationId) continue;
           const source = employee.source;
-          if (source.kind === 'tenant_version' && owner.platform_backed)
+          if (source.kind === 'tenant_version' && owner.platform_version)
             continue;
           const platformRevisionId =
             source.kind === 'platform' ? source.templateRevisionId : null;
