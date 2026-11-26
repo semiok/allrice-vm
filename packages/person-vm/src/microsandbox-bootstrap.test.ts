@@ -57,7 +57,10 @@ function fixture(data: string = JSON.stringify([row('172.16.0.6')])) {
     signal: new AbortController().signal,
     assertCurrent: vi.fn(async () => {}),
   };
-  const waitProbe = vi.fn(async (_signal: AbortSignal) => finished);
+  const waitProbe = vi.fn(async (signal: AbortSignal) => {
+    signal.throwIfAborted();
+    return finished;
+  });
   const readProbe = vi.fn(async () =>
     JSON.stringify({ id: probeId, d: data, s: 'stdout', e: null }),
   );
