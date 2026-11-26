@@ -21,6 +21,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
   const signal = new AbortController().signal;
   const wakeAt = '2024-11-03T05:58:00.000Z';
   const target = '2024-11-03T06:00:00.000Z';
+  type CaptureChecks = Pick<
+    Awaited<
+      ReturnType<Parameters<typeof createPersonVmScheduledWake>[0]['capture']>
+    >,
+    'assertDeliverable' | 'confirmObservations'
+  >;
   let database: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   let db: typeof database.db;
 
@@ -71,7 +77,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       Parameters<typeof createPersonVmScheduledWake>[0]['start']
     >(async () => 'ready');
     const store = () => createPostgresPersonVmScheduledWakeStore(db);
-    const module = (wakeStore = store()) =>
+    const module = (wakeStore = store(), checks: CaptureChecks = {}) =>
       createPersonVmScheduledWake({
         store: wakeStore,
         ledger: createPostgresNativeScheduleObservationLedger(db),
@@ -88,6 +94,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
               },
             ],
             assertCurrent,
+            ...checks,
           };
         },
         start,
@@ -224,6 +231,23 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       targetAt: new Date(target),
     });
     expect(await host.runDueOnce(signal)).toBe(false);
+  });
+
+  it('blocks stop if delivery permission is revoked while the plan commits', async () => {
+    const f = await fixture();
+    const assertDeliverable = vi
+      .fn<NonNullable<CaptureChecks['assertDeliverable']>>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('wake permission revoked'));
+    const planId = randomUUID();
+    const host = f.module(f.store(), { assertDeliverable });
+    await expect(
+      host.prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ blocked: true, reason: 'SCHEDULE_WAKE_UNAVAILABLE' });
+    expect(assertDeliverable).toHaveBeenCalledTimes(2);
+    await f.stop(randomUUID());
+    expect(await host.runDueOnce(signal)).toBe(false);
+    expect(f.start).not.toHaveBeenCalled();
   });
 
   it('uses the native committed UTC target across repeated New York wall time', async () => {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { addAbortListener } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
 import {
@@ -181,8 +182,19 @@ export function createProductionScheduledWake(input: {
             },
           }),
         );
+        async function assertCurrent(signal: AbortSignal) {
+          const current = await readCatalogs(signal);
+          if (
+            current.length !== catalogs.length ||
+            catalogs.some(
+              (catalog, index) => !sameOwner(catalog, current[index]),
+            )
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+        }
         return {
           profiles,
+          assertCurrent,
           async confirmObservations(batches, signal) {
             const results = await Promise.allSettled(
               profiles.map(({ schedule }) =>
@@ -194,17 +206,7 @@ export function createProductionScheduledWake(input: {
               if (result.value.fingerprint !== batches[index]?.fingerprint)
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
             }
-            await request.assertStopCurrent(signal);
-          },
-          async assertCurrent(signal) {
-            const current = await readCatalogs(signal);
-            if (
-              current.length !== catalogs.length ||
-              catalogs.some(
-                (catalog, index) => !sameOwner(catalog, current[index]),
-              )
-            )
-              throw new PersonVmError('AUTHORIZATION_DENIED');
+            await assertCurrent(signal);
           },
           async assertDeliverable(batches, signal) {
             await input.source.assertDeliverable(
@@ -264,9 +266,18 @@ export function createProductionScheduledWake(input: {
       });
       void runner.catch(() => {});
     },
-    async pause() {
+    async pause(signal: AbortSignal) {
+      signal.throwIfAborted();
       paused = true;
-      await Promise.allSettled([tick, ...pending]);
+      const joined = Promise.allSettled([tick, ...pending]);
+      await new Promise<void>((resolve, reject) => {
+        const abort = addAbortListener(signal, () => reject(signal.reason));
+        void joined.then(() => {
+          abort[Symbol.dispose]();
+          resolve();
+        });
+      });
+      signal.throwIfAborted();
     },
     resume() {
       paused = false;

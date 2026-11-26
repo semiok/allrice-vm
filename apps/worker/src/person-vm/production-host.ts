@@ -845,7 +845,7 @@ export function createProductionPersonVmHost(input: {
           if (gracefulStop) return;
           const reopen = vm.fenceWorkerStartup();
           try {
-            await scheduledWake?.pause();
+            await scheduledWake?.pause(signal);
             signal.throwIfAborted();
             for (const { binding } of ownedVms.values())
               await vm.assertWorkerShutdownSafe(binding, signal);
