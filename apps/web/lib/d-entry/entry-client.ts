@@ -120,6 +120,9 @@ export async function prewarmEmployeeEntry(
         },
       );
       request.throwIfAborted();
+      // A gateway outage says nothing about an already admitted operation.
+      // Pause and let Continue reuse its ticket when polling is available.
+      if (response.status >= 500) throw new EmployeeEntryError(408);
       if (response.status !== 200 && response.status !== 410)
         throw new EmployeeEntryError(response.status);
       const status = DEntryNativePrewarmStatusSchema.parse(

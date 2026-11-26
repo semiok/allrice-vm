@@ -94,36 +94,41 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
-it('pauses a long browser wait, then resumes the ticket with a GET and no new POST', async () => {
-  vi.useFakeTimers();
-  const ticket = {
-    operationId: randomUUID(),
-    expiresAt: new Date(Date.now() + 600_000).toISOString(),
-    pollAfterMs: 1000,
-  };
-  const fetch = vi
-    .fn<typeof globalThis.fetch>(async () =>
-      Response.json({ state: 'starting' }),
-    )
-    .mockResolvedValueOnce(Response.json(ticket, { status: 202 }));
-  vi.stubGlobal('fetch', fetch);
-  const paused = expect(
-    prewarmEmployeeEntry(selection, new AbortController().signal),
-  ).rejects.toMatchObject({ status: 408 });
-  await vi.advanceTimersByTimeAsync(300_000);
-  await paused;
-  fetch.mockClear().mockResolvedValueOnce(Response.json({ state: 'ready' }));
-  const done = prewarmEmployeeEntry(selection, new AbortController().signal, {
-    ticket,
-  });
-  await vi.advanceTimersByTimeAsync(1000);
-  await expect(done).resolves.toBeUndefined();
-  expect(fetch).toHaveBeenCalledExactlyOnceWith(
-    '/api/v1/d-entry/native-prewarm/status?' +
-      new URLSearchParams({ ...selection, operationId: ticket.operationId }),
-    expect.objectContaining({ method: 'GET' }),
-  );
-});
+it.each([false, true])(
+  'resumes a paused wait with the original ticket (gateway unavailable: %s)',
+  async (gatewayUnavailable) => {
+    vi.useFakeTimers();
+    const ticket = {
+      operationId: randomUUID(),
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      pollAfterMs: 1000,
+    };
+    const fetch = vi
+      .fn<typeof globalThis.fetch>(async () =>
+        gatewayUnavailable
+          ? new Response(null, { status: 503 })
+          : Response.json({ state: 'starting' }),
+      )
+      .mockResolvedValueOnce(Response.json(ticket, { status: 202 }));
+    vi.stubGlobal('fetch', fetch);
+    const paused = expect(
+      prewarmEmployeeEntry(selection, new AbortController().signal),
+    ).rejects.toMatchObject({ status: 408 });
+    await vi.advanceTimersByTimeAsync(gatewayUnavailable ? 1000 : 300_000);
+    await paused;
+    fetch.mockClear().mockResolvedValueOnce(Response.json({ state: 'ready' }));
+    const done = prewarmEmployeeEntry(selection, new AbortController().signal, {
+      ticket,
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(done).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      '/api/v1/d-entry/native-prewarm/status?' +
+        new URLSearchParams({ ...selection, operationId: ticket.operationId }),
+      expect.objectContaining({ method: 'GET' }),
+    );
+  },
+);
 
 it('keeps the New operation ID out of the prewarm selector and requires its exact reply', async () => {
   const id = randomUUID();
