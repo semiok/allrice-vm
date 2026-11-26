@@ -7,6 +7,7 @@ import {
 } from './disk-pool-ledger.ts';
 import {
   DiskPoolBudgetExceeded,
+  DiskPoolInventoryMismatch,
   sameDiskPoolOwner,
   type DiskPoolCapacity,
   type DiskPoolClaim,
@@ -38,6 +39,7 @@ type PoolEvent = Readonly<{
     | 'interrupted-fill'
     | 'fill-deferred'
     | 'stock-ready'
+    | 'stock-retired'
     | 'stock-quarantined'
     | 'claim-quarantined'
     | 'claim-bound';
@@ -60,9 +62,13 @@ function pendingFor(slots: DiskPoolSlot[], personId: string, vmId?: string) {
   return matches[0];
 }
 const vacant = (entry: DiskPoolRecord | null) =>
-  !entry || entry.state === 'bound' || entry.state === 'released-before-write';
+  !entry ||
+  entry.state === 'bound' ||
+  entry.state === 'retired' ||
+  entry.state === 'released-before-write';
 const unsettledFill = (entry: DiskPoolRecord | null) =>
   entry?.state === 'filling' ||
+  entry?.state === 'retiring' ||
   (entry?.state === 'quarantined' && entry.reason === 'cleanup-unconfirmed');
 
 /** Storage policy only. Call claim and person-specific reads under the existing
@@ -94,8 +100,24 @@ export class PersonVmDiskPool {
     }
   }
 
-  async status(owner: DiskPoolOwner, signal: AbortSignal) {
-    const { slots, bound } = await this.ledger.read(signal);
+  async status(
+    owner: DiskPoolOwner,
+    signal: AbortSignal,
+    verifyPriorRetirement?: (previous: DiskPoolOwner) => Promise<boolean>,
+  ) {
+    const { slots, bound, boundByPerson } = await this.ledger.read(signal);
+    if (verifyPriorRetirement) {
+      for (const completed of boundByPerson.get(owner.personId) ?? []) {
+        const previous = completed.intent.owner;
+        if (previous.organizationId !== owner.organizationId)
+          throw new PersonVmError('ORGANIZATION_CONFLICT');
+        if (
+          previous.vmId !== owner.vmId &&
+          !(await verifyPriorRetirement(previous))
+        )
+          incomplete();
+      }
+    }
     const slot = pendingFor(slots, owner.personId, owner.vmId);
     if (slot) {
       const entry = slot.entry!;
@@ -139,28 +161,6 @@ export class PersonVmDiskPool {
     await guard.assertOwner();
     guard.signal.throwIfAborted();
   }
-  private async quarantineOldSource(
-    slots: DiskPoolSlot[],
-    source: string,
-    lock: DiskPoolLock,
-  ) {
-    for (const slot of slots) {
-      const entry = slot.entry;
-      if (entry?.state !== 'ready' || entry.source === source) continue;
-      await lock.assertOwned();
-      await this.ledger.append(
-        slot,
-        {
-          ref: entry.ref,
-          source: entry.source,
-          state: 'quarantined',
-          reason: 'source-changed',
-        },
-        lock.signal,
-      );
-      this.observe({ event: 'stock-quarantined' });
-    }
-  }
 
   async claim(
     owner: DiskPoolOwner,
@@ -191,7 +191,6 @@ export class PersonVmDiskPool {
         // A completed claim without its normal disk cannot become a fresh one.
         if (bound.has(owner.vmId)) incomplete();
         if (lane === 'admin' && this.foreground) return null;
-        await this.quarantineOldSource(slots, options.source, lock);
         const slot = slots.find(
           ({ entry }) =>
             entry?.state === 'ready' && entry.source === options.source,
@@ -229,10 +228,8 @@ export class PersonVmDiskPool {
         return true;
       });
     await this.checkClaim(guard);
-    let state =
-      entry.source === options.source
-        ? await options.platform.inspectBinding(entry, guard.signal)
-        : 'unknown';
+    // A new seal changes stock eligibility, never an existing physical claim.
+    let state = await options.platform.inspectBinding(entry, guard.signal);
     if (state === 'pending') {
       await this.checkClaim(guard);
       await options.platform.bindDisk(entry, guard.signal);
@@ -251,45 +248,273 @@ export class PersonVmDiskPool {
 
   private async capacity(
     signal: AbortSignal,
-    slots: DiskPoolSlot[],
     options: PersonVmDiskPoolOptions,
   ) {
-    const inventory = slots.flatMap(({ entry }) =>
-      !entry || vacant(entry)
-        ? []
-        : [
-            {
-              ref: entry.ref,
-              ...((entry.state === 'claiming' ||
-                entry.state === 'claim-quarantined') && {
-                vmId: entry.intent.owner.vmId,
-              }),
-            },
-          ],
-    );
-    const measured = await options.platform.readCapacity(inventory, signal);
-    if (measured.availableBytes < 0n || measured.allocatedBytes < 0n)
-      incomplete();
-    return measured;
+    let { slots } = await this.ledger.read(signal);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const inventory = slots.flatMap(({ entry }) =>
+        !entry || vacant(entry)
+          ? []
+          : [
+              {
+                ref: entry.ref,
+                ...((entry.state === 'claiming' ||
+                  entry.state === 'claim-quarantined') && {
+                  vmId: entry.intent.owner.vmId,
+                }),
+              },
+            ],
+      );
+      let measured: DiskPoolCapacity | undefined;
+      let mismatch: unknown;
+      try {
+        measured = await options.platform.readCapacity(inventory, signal);
+      } catch (error) {
+        if (!(error instanceof DiskPoolInventoryMismatch)) throw error;
+        mismatch = error;
+      }
+      const latest = (await this.ledger.read(signal)).slots;
+      if (
+        latest.every((slot, index) => slot.revision === slots[index]?.revision)
+      ) {
+        if (
+          !measured ||
+          measured.availableBytes < 0n ||
+          measured.allocatedBytes < 0n
+        )
+          incomplete(mismatch);
+        return measured;
+      }
+      slots = latest;
+    }
+    // Repeated catalog changes are a capacity deferral. An untracked file
+    // against the same catalog revision is a maintenance error above.
+    throw new DiskPoolBudgetExceeded();
   }
 
   async availableBytes(signal: AbortSignal) {
     if (!this.options) incomplete();
-    return (
-      await this.capacity(
-        signal,
-        (await this.ledger.read(signal)).slots,
-        this.options,
-      )
-    ).availableBytes;
+    try {
+      return (await this.capacity(signal, this.options)).availableBytes;
+    } catch (error) {
+      if (error instanceof DiskPoolBudgetExceeded) return 0n;
+      throw error;
+    }
   }
 
-  private capacityDeferred(capacity: DiskPoolCapacity) {
+  private capacityDeferred(
+    capacity?: Pick<DiskPoolCapacity, 'availableBytes' | 'allocatedBytes'>,
+  ) {
     this.observe({
       event: 'capacity-deferred',
-      availableBytes: String(capacity.availableBytes),
-      allocatedBytes: String(capacity.allocatedBytes),
+      ...(capacity && {
+        availableBytes: String(capacity.availableBytes),
+        allocatedBytes: String(capacity.allocatedBytes),
+      }),
     });
+  }
+
+  private advanceStock(
+    slot: DiskPoolSlot,
+    entry: DiskPoolRecord,
+    fill: DiskPoolLock,
+    signal: AbortSignal,
+  ) {
+    return this.inventory(signal, async (lock) => {
+      await fill.assertOwned();
+      await lock.assertOwned();
+      await this.ledger.append(slot, entry, lock.signal);
+      return { ...slot, entry, revision: slot.revision + 1 };
+    });
+  }
+
+  private async retireStock(
+    slot: DiskPoolSlot,
+    proof: string,
+    reason: 'source-changed' | 'preparation-deferred',
+    fill: DiskPoolLock,
+    options: PersonVmDiskPoolOptions,
+    signal: AbortSignal,
+  ) {
+    const { ref, source } = slot.entry!;
+    const stock = { ref, source, proof };
+    const retiring = await this.advanceStock(
+      slot,
+      { ...stock, state: 'retiring', reason },
+      fill,
+      signal,
+    );
+    try {
+      // A later owner cannot reissue a retiring slot whose actual deletion did
+      // not settle. Even during shutdown, join this exact physical operation.
+      await options.platform.destroyStock(
+        stock,
+        AbortSignal.any([
+          fill.ownerSignal,
+          AbortSignal.timeout(options.cleanupTimeoutMs),
+        ]),
+      );
+      await this.advanceStock(
+        retiring,
+        { ...stock, state: 'retired', reason },
+        fill,
+        fill.ownerSignal,
+      );
+    } catch (error) {
+      incomplete(error);
+    }
+    this.observe({ event: 'stock-retired' });
+  }
+
+  private async prepareStock(
+    reservation: DiskPoolSlot,
+    fill: DiskPoolLock,
+    options: PersonVmDiskPoolOptions,
+    foregroundStarting: () => Promise<boolean>,
+  ) {
+    const entry = reservation.entry!;
+    const active = fill.signal;
+    const { platform, minimumFreeBytes, reserveBytes } = options;
+    let wrote = false;
+    let created = false;
+    let detached = false;
+    let unconfirmed = false;
+    let proof: string | undefined;
+    let inspecting = false;
+    try {
+      const check = await this.capacity(active, options);
+      if (await foregroundStarting()) {
+        this.observe({ event: 'foreground-deferred' });
+        await this.advanceStock(
+          reservation,
+          { ...entry, state: 'released-before-write' },
+          fill,
+          active,
+        );
+        return;
+      }
+      if (check.availableBytes < minimumFreeBytes + reserveBytes)
+        throw new DiskPoolBudgetExceeded(check);
+      await fill.assertOwned();
+      active.throwIfAborted();
+      let problem: unknown;
+      try {
+        wrote = true;
+        await platform.createEncryptedDisk(entry.ref, active);
+        created = true;
+        const mount = await platform.mountDisk(entry.ref, active);
+        const beforeSeed = await this.capacity(active, options);
+        const spent = beforeSeed.allocatedBytesByRef.get(entry.ref);
+        if (spent === undefined) incomplete();
+        if (
+          spent >= reserveBytes ||
+          beforeSeed.availableBytes < minimumFreeBytes + reserveBytes - spent
+        )
+          throw new DiskPoolBudgetExceeded(beforeSeed);
+        await fill.assertOwned();
+        await platform.seedPublicCache(
+          entry.ref,
+          mount,
+          entry.source,
+          { reserveBytes, minimumFreeBytes },
+          active,
+        );
+      } catch (error) {
+        problem = error;
+      } finally {
+        // A rejected attach can still have reached the physical device.
+        try {
+          await platform.unmountDisk(
+            entry.ref,
+            AbortSignal.timeout(options.cleanupTimeoutMs),
+          );
+          detached = true;
+        } catch (error) {
+          unconfirmed = true;
+          problem = problem ? new AggregateError([problem, error]) : error;
+        }
+      }
+      if (problem) throw problem;
+      inspecting = true;
+      proof = await platform.inspectStock(entry, active);
+      const after = await this.capacity(active, options);
+      const allocated = after.allocatedBytesByRef.get(entry.ref);
+      if (allocated === undefined) incomplete();
+      if (allocated > reserveBytes || after.availableBytes < minimumFreeBytes)
+        throw new DiskPoolBudgetExceeded(after);
+    } catch (error) {
+      if (error instanceof DiskPoolBudgetExceeded)
+        this.capacityDeferred(error.capacity);
+      let first = error;
+      if (!fill.ownerSignal.aborted) {
+        const canRetire =
+          created &&
+          detached &&
+          (error instanceof DiskPoolBudgetExceeded || active.aborted);
+        let known = canRetire ? proof : undefined;
+        if (canRetire && !known && !inspecting) {
+          try {
+            known = await platform.inspectStock(
+              entry,
+              AbortSignal.any([
+                fill.ownerSignal,
+                AbortSignal.timeout(options.cleanupTimeoutMs),
+              ]),
+            );
+          } catch (inspectionFailure) {
+            first = new AggregateError([error, inspectionFailure]);
+          }
+        }
+        try {
+          if (known)
+            await this.retireStock(
+              reservation,
+              known,
+              'preparation-deferred',
+              fill,
+              options,
+              fill.ownerSignal,
+            );
+          else {
+            await this.advanceStock(
+              reservation,
+              wrote
+                ? {
+                    ...entry,
+                    state: 'quarantined',
+                    reason: unconfirmed
+                      ? 'cleanup-unconfirmed'
+                      : 'preparation-failed',
+                  }
+                : { ...entry, state: 'released-before-write' },
+              fill,
+              fill.ownerSignal,
+            );
+            if (wrote) this.observe({ event: 'stock-quarantined' });
+          }
+        } catch (cleanupFailure) {
+          incomplete(new AggregateError([first, cleanupFailure]));
+        }
+      }
+      if (
+        unconfirmed ||
+        (first instanceof PersonVmError && first.code === 'CLEANUP_INCOMPLETE')
+      )
+        incomplete(first);
+      if (active.aborted) throw first;
+      this.observe({ event: 'fill-deferred' });
+      return;
+    }
+    // Once publication is attempted, a lost acknowledgement can already
+    // have admitted the disk. No failure path here may delete it.
+    if (!proof) incomplete();
+    await this.advanceStock(
+      reservation,
+      { ...entry, state: 'ready', proof },
+      fill,
+      active,
+    );
+    this.observe({ event: 'stock-ready' });
   }
 
   async refill(signal: AbortSignal) {
@@ -302,38 +527,41 @@ export class PersonVmDiskPool {
     await this.locks.withLock('fill', signal, async (fill) => {
       const active = fill.signal;
       const foregroundStarting = async () =>
-        this.foreground || (await fill.foregroundStarting());
+        this.foreground > 0 || (await fill.foregroundStarting());
       const snapshot = await this.ledger.read(active);
       if (snapshot.slots.some(({ entry }) => unsettledFill(entry))) {
-        // A released SQL socket does not prove a previous disk job finished.
         this.observe({ event: 'interrupted-fill' });
         return;
       }
-      if (
-        snapshot.slots.some(
-          ({ entry }) =>
-            entry?.state === 'ready' && entry.source !== options.source,
-        )
-      )
-        await this.inventory<boolean>(active, async (lock) => {
-          await this.quarantineOldSource(
-            (await this.ledger.read(lock.signal)).slots,
-            options.source,
-            lock,
-          );
-          return true;
-        });
-      if (!snapshot.slots.some(({ entry }) => vacant(entry))) return;
+      const obsolete = snapshot.slots.find(
+        ({ entry }) =>
+          entry?.state === 'ready' && entry.source !== options.source,
+      );
+      if (!obsolete && !snapshot.slots.some(({ entry }) => vacant(entry)))
+        return;
       if (await foregroundStarting()) {
         this.observe({ event: 'foreground-deferred' });
         return;
       }
-      const initial = await this.capacity(active, snapshot.slots, options);
-      if (
-        initial.availableBytes <
-        options.minimumFreeBytes + options.reserveBytes
-      ) {
-        this.capacityDeferred(initial);
+      if (obsolete?.entry?.state === 'ready')
+        await this.retireStock(
+          obsolete,
+          obsolete.entry.proof,
+          'source-changed',
+          fill,
+          options,
+          active,
+        );
+      try {
+        const initial = await this.capacity(active, options);
+        if (
+          initial.availableBytes <
+          options.minimumFreeBytes + options.reserveBytes
+        )
+          throw new DiskPoolBudgetExceeded(initial);
+      } catch (error) {
+        if (!(error instanceof DiskPoolBudgetExceeded)) throw error;
+        this.capacityDeferred(error.capacity);
         return;
       }
       const reservation = await this.inventory<DiskPoolSlot | null>(
@@ -360,126 +588,9 @@ export class PersonVmDiskPool {
           return { ...slot, entry, revision: slot.revision + 1 };
         },
       );
-      if (!reservation) {
-        if (this.foreground) this.observe({ event: 'foreground-deferred' });
-        return;
-      }
-      const entry = reservation.entry!;
-      const { platform, minimumFreeBytes, reserveBytes } = options;
-      let unconfirmed = false;
-      let wrote = false;
-      const settle = (next: DiskPoolRecord, signal: AbortSignal) =>
-        this.inventory<boolean>(signal, async (lock) => {
-          await fill.assertOwned();
-          await lock.assertOwned();
-          await this.ledger.append(reservation, next, lock.signal);
-          return true;
-        });
-      try {
-        const check = await this.capacity(
-          active,
-          (await this.ledger.read(active)).slots,
-          options,
-        );
-        if (await foregroundStarting()) {
-          await settle({ ...entry, state: 'released-before-write' }, active);
-          this.observe({ event: 'foreground-deferred' });
-          return;
-        }
-        if (check.availableBytes < minimumFreeBytes + reserveBytes) {
-          await settle({ ...entry, state: 'released-before-write' }, active);
-          this.capacityDeferred(check);
-          return;
-        }
-        await fill.assertOwned();
-        active.throwIfAborted();
-        let problem: unknown;
-        try {
-          wrote = true;
-          await platform.createEncryptedDisk(entry.ref, active);
-          const mount = await platform.mountDisk(entry.ref, active);
-          const beforeSeed = await this.capacity(
-            active,
-            (await this.ledger.read(active)).slots,
-            options,
-          );
-          const spent = beforeSeed.allocatedBytesByRef.get(entry.ref);
-          if (spent === undefined) incomplete();
-          if (
-            spent >= reserveBytes ||
-            beforeSeed.availableBytes <
-              minimumFreeBytes + (reserveBytes - spent)
-          ) {
-            this.capacityDeferred(beforeSeed);
-            throw new PersonVmError('PROVIDER_FAILED');
-          }
-          await fill.assertOwned();
-          try {
-            await platform.seedPublicCache(
-              entry.ref,
-              mount,
-              entry.source,
-              reserveBytes - spent,
-              active,
-            );
-          } catch (error) {
-            if (error instanceof DiskPoolBudgetExceeded)
-              this.capacityDeferred(beforeSeed);
-            throw error;
-          }
-        } catch (error) {
-          problem = error;
-        } finally {
-          // Even a rejected attach can have reached the physical device.
-          try {
-            await platform.unmountDisk(
-              entry.ref,
-              AbortSignal.timeout(options.cleanupTimeoutMs),
-            );
-          } catch (error) {
-            unconfirmed = true;
-            problem = problem ? new AggregateError([problem, error]) : error;
-          }
-        }
-        if (problem) throw problem;
-        const proof = await platform.inspectStock(entry, active);
-        const after = await this.capacity(
-          active,
-          (await this.ledger.read(active)).slots,
-          options,
-        );
-        const allocated = after.allocatedBytesByRef.get(entry.ref);
-        if (allocated === undefined) incomplete();
-        if (allocated > reserveBytes) {
-          this.capacityDeferred(after);
-          throw new DiskPoolBudgetExceeded();
-        }
-        await settle({ ...entry, state: 'ready', proof }, active);
-        this.observe({ event: 'stock-ready' });
-      } catch (error) {
-        if (!fill.ownerSignal.aborted) {
-          try {
-            await settle(
-              wrote
-                ? {
-                    ...entry,
-                    state: 'quarantined',
-                    reason: unconfirmed
-                      ? 'cleanup-unconfirmed'
-                      : 'preparation-failed',
-                  }
-                : { ...entry, state: 'released-before-write' },
-              fill.ownerSignal,
-            );
-          } catch (journalFailure) {
-            incomplete(new AggregateError([error, journalFailure]));
-          }
-          if (wrote) this.observe({ event: 'stock-quarantined' });
-        }
-        if (unconfirmed) incomplete(error);
-        if (active.aborted) throw error;
-        this.observe({ event: 'fill-deferred' });
-      }
+      if (reservation)
+        await this.prepareStock(reservation, fill, options, foregroundStarting);
+      else if (this.foreground) this.observe({ event: 'foreground-deferred' });
     });
   }
 }

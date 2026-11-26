@@ -10,11 +10,9 @@ export type DiskPoolIntent = Readonly<{
   owner: DiskPoolOwner;
 }>;
 export type DiskPoolStock = Readonly<{ ref: string; source: string }>;
-export type DiskPoolClaim = DiskPoolStock &
-  Readonly<{
-    proof: string;
-    intent: DiskPoolIntent;
-  }>;
+export type PreparedDiskPoolStock = DiskPoolStock & Readonly<{ proof: string }>;
+export type DiskPoolClaim = PreparedDiskPoolStock &
+  Readonly<{ intent: DiskPoolIntent }>;
 export type DiskPoolCapacity = Readonly<{
   availableBytes: bigint;
   allocatedBytes: bigint;
@@ -22,8 +20,19 @@ export type DiskPoolCapacity = Readonly<{
 }>;
 
 export class DiskPoolBudgetExceeded extends Error {
-  constructor() {
+  constructor(
+    readonly capacity?: Pick<
+      DiskPoolCapacity,
+      'availableBytes' | 'allocatedBytes'
+    >,
+  ) {
     super('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED');
+  }
+}
+/** The caller makes a fresh catalog observation before deciding an image is untracked. */
+export class DiskPoolInventoryMismatch extends Error {
+  constructor() {
+    super('PERSON_VM_DISK_POOL_INVENTORY_MISMATCH');
   }
 }
 
@@ -38,13 +47,18 @@ export interface DiskPoolPlatform {
     ref: string,
     mount: string,
     source: string,
-    budgetBytes: bigint,
+    budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
     signal: AbortSignal,
   ): Promise<void>;
   /** Join the native operation and prove that the image and mount are offline. */
   unmountDisk(ref: string, signal: AbortSignal): Promise<void>;
-  /** Identify the exact new disk and key after its public cache and detach settle. */
+  /** Identify the exact new disk and key once offline, including before seeding. */
   inspectStock(stock: DiskPoolStock, signal: AbortSignal): Promise<string>;
+  /** The durable catalog already retired this unassigned reference from use. */
+  destroyStock(
+    stock: PreparedDiskPoolStock,
+    signal: AbortSignal,
+  ): Promise<void>;
   inspectBinding(
     claim: DiskPoolClaim,
     signal: AbortSignal,

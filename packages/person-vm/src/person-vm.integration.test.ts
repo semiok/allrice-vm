@@ -11,6 +11,7 @@ import { context, harness, running, signal } from './test-support.ts';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import type { CommandRunner } from './process.ts';
 import { PersonVmService } from './person-vm.ts';
+import { PersonVmDiskPool } from './disk-pool.ts';
 import type { PersonVmStartingScope } from './guest-bootstrap.ts';
 
 // Actual adapter and filesystem renames, with a synthetic hdiutil protocol.
@@ -64,6 +65,7 @@ suite(
     const workerClosures: Promise<void>[] = [];
     const workerNames: string[] = [];
     let workerQueries = 0;
+    let observeWorkerQuery: ((query: string) => void) | undefined;
     let admin: postgres.Sql, db: postgres.Sql, store: PostgresPersonVmStore;
     function openWorker() {
       let closed!: () => void;
@@ -78,8 +80,9 @@ suite(
         max: 1,
         onnotice: () => {},
         onclose: () => closed(),
-        debug: () => {
+        debug: (_connection, query) => {
           workerQueries += 1;
+          observeWorkerQuery?.(query);
         },
         connection: { search_path: schema, application_name: name },
       });
@@ -175,6 +178,94 @@ suite(
       ).toEqual([]);
     });
 
+    it.each(['join', 'cancel'] as const)(
+      'a first workbench can %s the exact offline preparation across dedicated PG sessions',
+      async (scenario) => {
+        const h = harness(store);
+        const rc = context();
+        const old = await h.service.create(rc, signal());
+        const root = await realpath(
+          await mkdtemp(join(tmpdir(), 'ar-pool-wait-')),
+        );
+        const diskPool = new PersonVmDiskPool(
+          root,
+          store.diskPoolLocks(root),
+          () => {},
+        );
+        const foreground = new PersonVmService({ ...h.options, diskPool });
+        const offlineWorker = new PostgresPersonVmStore(openWorker);
+        let entered!: () => void, release!: () => void, observed!: () => void;
+        const markerReady = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const hold = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const gateSampled = new Promise<void>((resolve) => {
+          observed = resolve;
+        });
+        const preparation = offlineWorker.withLease(
+          rc.actor.id,
+          {
+            now: h.now,
+            ttlMs: 90000,
+            offlinePreparation: {
+              mode: 'prepare',
+              organizationId: rc.organizationId,
+              signal: signal(),
+            },
+          },
+          async (lease) => {
+            await lease.guard();
+            entered();
+            await hold;
+          },
+        );
+        const cancel = new AbortController();
+        let opening: ReturnType<PersonVmService['prewarm']> | undefined;
+        try {
+          const ownerReady = await Promise.race([
+            markerReady.then(() => 'marked'),
+            preparation.then(() => 'ended'),
+          ]);
+          expect(ownerReady).toBe('marked');
+          observeWorkerQuery = (query) => {
+            if (query.includes('pg_try_advisory_lock_shared')) observed();
+          };
+          opening = foreground.prewarm(rc, { trigger: 'page' }, cancel.signal);
+          // If the request returns early, report that original failure rather than waiting on an unobserved gate.
+          const early = await Promise.race([
+            gateSampled.then(() => 'gate'),
+            opening.then(() => 'opening'),
+          ]);
+          expect(early).toBe('gate');
+          expect((await store.read(rc.actor.id))?.leaseOwner).not.toBeNull();
+          if (scenario === 'cancel') {
+            cancel.abort('test caller closed');
+            await expect(opening).rejects.toBe('test caller closed');
+            expect((await store.read(rc.actor.id))?.leaseOwner).not.toBeNull();
+            expect(h.log).not.toContain('native:start');
+          }
+        } finally {
+          release();
+          try {
+            await preparation;
+            if (scenario === 'join') await opening;
+          } finally {
+            observeWorkerQuery = undefined;
+            await rm(root, { recursive: true, force: true });
+          }
+        }
+        if (scenario === 'join')
+          await expect(opening).resolves.toMatchObject({
+            vmId: old.vmId,
+            ready: true,
+          });
+        expect(await db`select vm_id from person_virtual_machines`).toEqual([
+          { vm_id: old.vmId },
+        ]);
+      },
+    );
     it('真实PG物理owner持有至confirmed-stop runtime退役实际join，再释放并允许新代重试', async () => {
       const h = harness(store),
         rc = context();

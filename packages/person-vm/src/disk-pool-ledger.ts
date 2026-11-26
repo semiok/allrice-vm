@@ -16,6 +16,7 @@ import {
   sameDiskPoolOwner,
   type DiskPoolClaim,
   type DiskPoolStock,
+  type PreparedDiskPoolStock,
 } from './disk-pool-platform.ts';
 
 export const diskPoolSize = 3;
@@ -27,6 +28,10 @@ export type DiskPoolRecord =
   | (DiskPoolStock & { state: 'filling' })
   | (DiskPoolStock & { state: 'released-before-write' })
   | (DiskPoolStock & { state: 'ready'; proof: string })
+  | (PreparedDiskPoolStock & {
+      state: 'retiring' | 'retired';
+      reason: 'source-changed' | 'preparation-deferred';
+    })
   | (DiskPoolClaim & { state: 'claiming' | 'bound' | 'claim-quarantined' })
   | (DiskPoolStock & {
       state: 'quarantined';
@@ -89,6 +94,14 @@ function readRecord(value: unknown): DiskPoolRecord {
     case 'ready':
       if (validText(entry.proof, 4096)) return entry;
       break;
+    case 'retiring':
+    case 'retired':
+      if (
+        validText(entry.proof, 4096) &&
+        ['source-changed', 'preparation-deferred'].includes(entry.reason)
+      )
+        return entry;
+      break;
     case 'quarantined':
       if (
         [
@@ -122,6 +135,7 @@ function follows(previous: DiskPoolRecord | null, entry: DiskPoolRecord) {
   if (
     !previous ||
     previous.state === 'bound' ||
+    previous.state === 'retired' ||
     previous.state === 'released-before-write'
   )
     return entry.state === 'filling';
@@ -131,14 +145,24 @@ function follows(previous: DiskPoolRecord | null, entry: DiskPoolRecord) {
     return (
       entry.state === 'ready' ||
       entry.state === 'quarantined' ||
+      (entry.state === 'retiring' && entry.reason === 'preparation-deferred') ||
       entry.state === 'released-before-write'
     );
   if (previous.state === 'ready') {
     return (
       entry.state === 'quarantined' ||
+      (entry.state === 'retiring' &&
+        entry.reason === 'source-changed' &&
+        entry.proof === previous.proof) ||
       (entry.state === 'claiming' && entry.proof === previous.proof)
     );
   }
+  if (previous.state === 'retiring')
+    return (
+      entry.state === 'retired' &&
+      entry.reason === previous.reason &&
+      entry.proof === previous.proof
+    );
   return (
     previous.state === 'claiming' &&
     (entry.state === 'bound' || entry.state === 'claim-quarantined') &&
@@ -186,6 +210,7 @@ export class DiskPoolLedger {
       }),
     );
     const bound = new Map<string, DiskPoolClaim>();
+    const boundByPerson = new Map<string, DiskPoolClaim[]>();
     signal.throwIfAborted();
     if (await this.exists()) {
       const files = (await readdir(this.root))
@@ -238,12 +263,16 @@ export class DiskPoolLedger {
         if (entry.state === 'bound') {
           if (bound.has(entry.intent.owner.vmId)) incomplete();
           bound.set(entry.intent.owner.vmId, entry);
+          const owner = entry.intent.owner.personId;
+          const previous = boundByPerson.get(owner);
+          if (previous) previous.push(entry);
+          else boundByPerson.set(owner, [entry]);
         }
         slots[index] = { index, revision, entry };
       }
     }
     signal.throwIfAborted();
-    return { slots, bound };
+    return { slots, bound, boundByPerson };
   }
 
   async append(slot: DiskPoolSlot, entry: DiskPoolRecord, signal: AbortSignal) {

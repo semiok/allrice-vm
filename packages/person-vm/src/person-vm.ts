@@ -213,17 +213,38 @@ export class PersonVmService
       identity: { personId: string; organizationId: string },
       signal: AbortSignal,
     ) => Promise<T>,
-    allowClosed = false,
+    options: { allowClosed?: boolean; joinOfflinePreparation?: boolean } = {},
   ) {
     const identity = await this.identity(context, action, signal);
+    const foreground =
+      this.options.diskPool && (action === 'create' || action === 'start');
     const workWithLease = () =>
       this.options.store.withLease(
         identity.personId,
-        { now: this.now, ttlMs: this.options.leaseTtlMs },
+        {
+          now: this.now,
+          ttlMs: this.options.leaseTtlMs,
+          ...(foreground &&
+            options.joinOfflinePreparation && {
+              offlinePreparation: {
+                mode: 'join',
+                organizationId: identity.organizationId,
+                signal,
+              },
+            }),
+        },
         async (lease) => {
-          if (!allowClosed) await lease.assertAdmissionOpen();
+          if (!options.allowClosed) await lease.assertAdmissionOpen();
           const current = AbortSignal.any([signal, lease.signal]);
           current.throwIfAborted();
+          if (lease.joinedOfflinePreparation) {
+            const latest = await this.identity(context, action, current);
+            if (
+              latest.personId !== identity.personId ||
+              latest.organizationId !== identity.organizationId
+            )
+              throw new PersonVmError('AUTHORIZATION_DENIED');
+          }
           if (lease.row)
             this.checkOrganization(lease.row, identity.organizationId);
           const operation = (ownedSignal: AbortSignal) =>
@@ -239,7 +260,7 @@ export class PersonVmService
             : operation(current);
         },
       );
-    return this.options.diskPool && (action === 'create' || action === 'start')
+    return foreground && this.options.diskPool
       ? this.options.diskPool.inForeground(workWithLease)
       : workWithLease();
   }
@@ -310,11 +331,19 @@ export class PersonVmService
         if (target) await target.assertAuthority(signal);
         const retry = this.unfinishedCreate(lease.row);
         if (lease.row && lease.row.phase !== 'deleted' && !retry) {
-          await this.assertNoPendingDisk(lease.row, signal);
+          const catalog = await this.creationCatalog(lease.row, lease, signal);
+          if (
+            catalog === 'pending' ||
+            (catalog === 'bound' && !lease.row.diskRetained)
+          )
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
           return view(lease.row);
         }
         if (lease.row?.diskRetained && !retry) {
-          await this.assertNoPendingDisk(lease.row, signal);
+          if (
+            (await this.creationCatalog(lease.row, lease, signal)) === 'pending'
+          )
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
           lease.row.phase = lease.row.diskTier === 'cold' ? 'cold' : 'stopped';
           await lease.save(lease.row);
           await lease.audit(lease.row, {
@@ -342,6 +371,7 @@ export class PersonVmService
         });
         return view(row);
       },
+      { joinOfflinePreparation: true },
     );
   }
 
@@ -385,6 +415,20 @@ export class PersonVmService
       throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
 
+  private creationCatalog(row: VmRecord, lease: VmLease, signal: AbortSignal) {
+    return this.options.diskPool?.status(row, signal, async (previous) => {
+      // The append-only claim identifies a physical predecessor even if PG
+      // lost or replaced its row. Both the exact delete audit and independent
+      // disk/key absence must agree before a different VM can be allocated.
+      if (!(await lease.hasCompletedDiskDeletion?.(previous))) return false;
+      signal.throwIfAborted();
+      return (
+        (await this.options.disk.confirmAbsence?.(previous.vmId, signal)) ===
+        true
+      );
+    });
+  }
+
   private async createDiskOwned(
     row: VmRecord,
     lease: VmLease,
@@ -398,7 +442,7 @@ export class PersonVmService
     },
   ) {
     const pool = this.options.diskPool;
-    const catalog = await pool?.status(row, signal);
+    const catalog = await this.creationCatalog(row, lease, signal);
     const audit = { requestId: input.requestId, action: input.action };
     if (catalog === 'pending' && !pool?.enabled)
       throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -494,7 +538,15 @@ export class PersonVmService
         try {
           return await this.options.store.withLease(
             target.personId,
-            { now: this.now, ttlMs: this.options.leaseTtlMs },
+            {
+              now: this.now,
+              ttlMs: this.options.leaseTtlMs,
+              offlinePreparation: {
+                mode: 'prepare',
+                organizationId: target.organizationId,
+                signal: guard.signal,
+              },
+            },
             async (lease) => {
               const signal = AbortSignal.any([guard.signal, lease.signal]);
               const assertCurrent = async () => {
@@ -639,6 +691,7 @@ export class PersonVmService
           target?.assertAuthority,
         );
       },
+      { joinOfflinePreparation: true },
     );
   }
   private async webRoster(context: RequestContext, signal: AbortSignal) {
@@ -1618,7 +1671,7 @@ export class PersonVmService
         row.lastActivityAt = this.now().toISOString();
         await lease.save(row);
       },
-      true,
+      { allowClosed: true },
     );
   }
 }

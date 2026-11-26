@@ -1,8 +1,18 @@
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, rename, rm, stat } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  realpath,
+  rename,
+  rm,
+  stat,
+} from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import { PersonVmError } from './contract.ts';
+import { missing, syncDiskPoolDirectory } from './disk-pool-ledger.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 
 export type PersonDisk = Readonly<{ vmId: string; tier: 'warm' | 'cold' }>;
@@ -12,6 +22,8 @@ export type PersonVmDiskInspection =
 export interface PersonVmDiskPort {
   /** Host-only non-destructive reconciliation of this vmId's two storage locations. */
   inspect(vmId: string, signal: AbortSignal): Promise<PersonVmDiskInspection>;
+  /** Independently confirm a previously retired VM's disk, key and mount are absent. */
+  confirmAbsence?(vmId: string, signal: AbortSignal): Promise<boolean>;
   create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
   attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
   detach(disk: PersonDisk, signal: AbortSignal): Promise<void>;
@@ -26,6 +38,7 @@ export interface PersonVmKeyStore {
   readOrCreate(vmId: string): Promise<Buffer>;
   read(vmId: string): Promise<Buffer>;
   delete(vmId: string): Promise<void>;
+  confirmAbsence?(vmId: string): Promise<boolean>;
 }
 
 function checkedId(vmId: string) {
@@ -92,6 +105,24 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
   }
   async delete(id: string) {
     await rm(this.filePath(id), { force: true });
+  }
+  async confirmAbsence(id: string) {
+    const root = await lstat(this.root);
+    if (
+      !root.isDirectory() ||
+      root.uid !== process.getuid?.() ||
+      (root.mode & 0o7777) !== 0o700 ||
+      (await realpath(this.root)) !== this.root
+    )
+      return false;
+    try {
+      await lstat(this.filePath(id));
+      return false;
+    } catch (error) {
+      if (!missing(error)) throw error;
+    }
+    await syncDiskPoolDirectory(this.root);
+    return true;
   }
 }
 
@@ -247,6 +278,27 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     for (const directory of ['', 'warm', 'cold', 'manifests'])
       await privateDirectory(join(this.options.root, directory));
     return this.inspectExisting(vmId, signal);
+  }
+  async confirmAbsence(vmId: string, signal: AbortSignal) {
+    // An absent image/manifest pair alone can still leave an attached device
+    // or an old key. Validate the original root before accepting absence.
+    const root = await lstat(this.options.root);
+    if (
+      !root.isDirectory() ||
+      root.uid !== process.getuid?.() ||
+      (root.mode & 0o7777) !== 0o700 ||
+      (await realpath(this.options.root)) !== this.options.root
+    )
+      return false;
+    if ((await this.inspectExisting(vmId, signal)).state !== 'absent')
+      return false;
+    for (const tier of ['warm', 'cold'] as const)
+      await this.verifyOffline({ vmId, tier }, signal);
+    if (!(await this.options.keys.confirmAbsence?.(vmId))) return false;
+    for (const dir of ['warm', 'cold', 'manifests'])
+      await syncDiskPoolDirectory(join(this.options.root, dir));
+    signal.throwIfAborted();
+    return true;
   }
   private async inspectExisting(
     vmId: string,

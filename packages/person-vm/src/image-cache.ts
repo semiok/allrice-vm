@@ -22,7 +22,12 @@ export type PublicImageCache = Readonly<{
   manifestSha256: string;
 }>;
 export class PublicImageCacheBudgetExceeded extends Error {
-  constructor() {
+  constructor(
+    readonly capacity?: Readonly<{
+      availableBytes: bigint;
+      allocatedBytes: bigint;
+    }>,
+  ) {
     super('PERSON_VM_PUBLIC_CACHE_BUDGET_EXCEEDED');
   }
 }
@@ -322,6 +327,7 @@ async function verifyFile(
   signal: AbortSignal,
   sealed: boolean,
   destination?: string,
+  beforeWrite?: (bytes: bigint) => Promise<void>,
 ) {
   signal.throwIfAborted();
   const { file, stat } = await checkedFile(path, sealed);
@@ -340,6 +346,7 @@ async function verifyFile(
         if (size > expected.bytes) invalid();
         const chunk = buffer.subarray(0, bytesRead);
         hash.update(chunk);
+        if (beforeWrite) await beforeWrite(BigInt(bytesRead));
         yield chunk;
       }
     }
@@ -451,7 +458,11 @@ export async function seedPublicImageCache(
   image: string,
   nativeRoot: string,
   signal: AbortSignal,
-  budget?: Readonly<{ bytes: bigint; blockBytes: bigint }>,
+  budget?: Readonly<{
+    bytes: bigint;
+    blockBytes: bigint;
+    beforeWrite?(bytes: bigint): Promise<void>;
+  }>,
 ) {
   try {
     const root = await checkedNativeCacheRoot(input, nativeRoot);
@@ -466,6 +477,7 @@ export async function seedPublicImageCache(
         );
       }, 0n);
       if (needed > budget.bytes) throw new PublicImageCacheBudgetExceeded();
+      await budget.beforeWrite?.(0n);
     }
     await discardInterruptedStages(root, signal);
     const cache = join(root, 'cache');
@@ -499,9 +511,11 @@ export async function seedPublicImageCache(
           signal,
           true,
           path,
+          path ? budget?.beforeWrite : undefined,
         );
         if (path !== undefined) staged.set(destination, { path, entry });
       }
+      await budget?.beforeWrite?.(0n);
       for (const path of directories) await privateCacheDirectory(path, true);
       // Link only from private staging. An already verified private entry
       // needs no second copy, including after an interrupted partial install.

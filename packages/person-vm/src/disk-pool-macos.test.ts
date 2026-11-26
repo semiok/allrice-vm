@@ -88,7 +88,7 @@ async function fixture() {
     capacityGiB: 8,
     runner,
   });
-  const adapter = () =>
+  const adapter = (currentSeal = manifestSha256) =>
     new MacosPersonVmDiskPool({
       root: diskRoot,
       keyRoot,
@@ -97,10 +97,53 @@ async function fixture() {
       capacityGiB: 8,
       runner,
       image: `docker.io/library/node@sha256:${'2'.repeat(64)}`,
-      imageCache: { directory: join(root, manifestSha256), manifestSha256 },
+      imageCache: {
+        directory: join(root, currentSeal),
+        manifestSha256: currentSeal,
+      },
     });
   return { root, diskRoot, keyRoot, attachments, disk, keys, adapter };
 }
+
+it('validates the original formal receipt after rotation and keeps the warm-cache decision tied to the current seal', async () => {
+  const f = await fixture();
+  const s = await stock(f);
+  const cut = Error('synthetic after formal receipt');
+  actions.afterLink = (_from, to) => {
+    if (to === s.newManifest) throw cut;
+  };
+  await expect(s.platform.bindDisk(s.claim, signal())).rejects.toBe(cut);
+  actions.afterLink = undefined;
+  const rotated = f.adapter('3'.repeat(64));
+  await expect(rotated.inspectBinding(s.claim, signal())).resolves.toBe(
+    'bound',
+  );
+  await expect(rotated.hasSeededPublicCache(s.vmId, signal())).resolves.toBe(
+    false,
+  );
+  await expect(s.platform.hasSeededPublicCache(s.vmId, signal())).resolves.toBe(
+    true,
+  );
+});
+
+it('retires only exact verified unassigned storage, including both its key and image', async () => {
+  const f = await fixture();
+  const s = await stock(f);
+  const rotated = f.adapter('3'.repeat(64));
+  await expect(
+    rotated.destroyStock({ ...s.claim, proof: 'unrelated-identity' }, signal()),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  expect((await fs.lstat(s.oldImage, { bigint: true })).ino).toBe(
+    s.oldProof.image,
+  );
+  expect((await fs.lstat(s.oldKey, { bigint: true })).ino).toBe(s.oldProof.key);
+  await expect(
+    rotated.destroyStock(s.claim, signal()),
+  ).resolves.toBeUndefined();
+  await expect(fs.lstat(s.oldImage)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(fs.lstat(s.oldKey)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(f.attachments.size).toBe(0);
+});
 
 async function stock(f: Awaited<ReturnType<typeof fixture>>) {
   const platform = f.adapter();

@@ -18,9 +18,11 @@ import {
 } from './disk-pool-ledger.ts';
 import {
   DiskPoolBudgetExceeded,
+  DiskPoolInventoryMismatch,
   type DiskPoolClaim,
   type DiskPoolPlatform,
   type DiskPoolStock,
+  type PreparedDiskPoolStock,
 } from './disk-pool-platform.ts';
 import {
   ApfsPersonVmDisk,
@@ -236,7 +238,8 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
       files.set(this.stockDisk.poolFiles(warm(ref)).image, ref);
       if (vmId) files.set(this.options.disk.poolFiles(warm(vmId)).image, ref);
     }
-    if (names.some((name) => !files.has(join(warmRoot, name)))) invalid();
+    if (names.some((name) => !files.has(join(warmRoot, name))))
+      throw new DiskPoolInventoryMismatch();
     const observed = new Map<string, bigint>();
     const allocatedBytesByRef = new Map<string, bigint>();
     for (const [path, ref] of files) {
@@ -290,7 +293,10 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     ref: string,
     mount: string,
     source: string,
-    budgetBytes: bigint,
+    {
+      reserveBytes,
+      minimumFreeBytes,
+    }: { reserveBytes: bigint; minimumFreeBytes: bigint },
     signal: AbortSignal,
   ) {
     if (
@@ -301,18 +307,49 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     const nativeRoot = join(mount, 'microsandbox');
     const { bsize } = await statfs(mount, { bigint: true });
     if (bsize <= 0n) invalid();
-    await privateDirectory(nativeRoot);
+    const image = this.stockDisk.poolFiles(warm(ref)).image;
+    const original = await identity(image);
+    const outerRoot = dirname(image);
+    const outerDevice = String(await directory(outerRoot));
+    if (!original || original.device !== outerDevice) invalid();
+    const sample = async (nextBytes: bigint) => {
+      signal.throwIfAborted();
+      const volume = await statfs(outerRoot, { bigint: true });
+      const current = await identity(image);
+      if (!current || !sameInode(original, current) || volume.bsize <= 0n)
+        invalid();
+      const availableBytes = volume.bavail * volume.bsize;
+      const allocatedBytes = current.bytes;
+      const chunk = ((nextBytes + bsize - 1n) / bsize) * bsize;
+      if (
+        allocatedBytes + chunk > reserveBytes ||
+        availableBytes < minimumFreeBytes + chunk
+      )
+        throw new PublicImageCacheBudgetExceeded({
+          availableBytes,
+          allocatedBytes,
+        });
+      return reserveBytes - allocatedBytes;
+    };
     try {
+      const bytes = await sample(0n);
+      await privateDirectory(nativeRoot);
       await seedPublicImageCache(
         this.imageCache,
         this.options.image,
         nativeRoot,
         signal,
-        { bytes: budgetBytes, blockBytes: bsize },
+        {
+          bytes,
+          blockBytes: bsize,
+          beforeWrite: async (chunk) => {
+            await sample(chunk);
+          },
+        },
       );
     } catch (error) {
       if (error instanceof PublicImageCacheBudgetExceeded)
-        throw new DiskPoolBudgetExceeded();
+        throw new DiskPoolBudgetExceeded(error.capacity);
       throw error;
     }
   }
@@ -325,12 +362,16 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
 
   async inspectStock(stock: DiskPoolStock, signal: AbortSignal) {
     if (stock.source !== this.source) invalid();
-    const disk = warm(stock.ref);
+    return this.identifyStock(stock.ref, signal);
+  }
+
+  private async identifyStock(ref: string, signal: AbortSignal) {
+    const disk = warm(ref);
     await this.stockDisk.verifyOffline(disk, signal);
     const { image, manifest: receipt } = this.stockDisk.poolFiles(disk);
-    const key = this.stockKeys.filePath(stock.ref);
+    const key = this.stockKeys.filePath(ref);
     for (const file of [image, key, receipt]) await syncFile(file);
-    const original = await this.stockDisk.inspect(stock.ref, signal);
+    const original = await this.stockDisk.inspect(ref, signal);
     if (original.state !== 'ready' || original.disk.tier !== 'warm') invalid();
     const diskIdentity = await identity(image);
     const keyIdentity = await identity(key);
@@ -345,6 +386,15 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
       image: { device: diskIdentity.device, inode: diskIdentity.inode },
       key: { device: keyIdentity.device, inode: keyIdentity.inode },
     } satisfies StockProof);
+  }
+
+  async destroyStock(stock: PreparedDiskPoolStock, signal: AbortSignal) {
+    await this.layout(signal);
+    if ((await this.identifyStock(stock.ref, signal)) !== stock.proof)
+      invalid();
+    signal.throwIfAborted();
+    await this.stockDisk.delete(warm(stock.ref), signal);
+    if (!(await this.stockDisk.confirmAbsence(stock.ref, signal))) invalid();
   }
 
   /** Only the normal VM start provider consumes this readback, after the
@@ -364,7 +414,6 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
   }
 
   private async binding(claim: DiskPoolClaim, signal: AbortSignal) {
-    if (claim.source !== this.source) invalid();
     const proof = JSON.parse(claim.proof) as StockProof;
     if (!proof || !checkedInode(proof.image) || !checkedInode(proof.key))
       invalid();

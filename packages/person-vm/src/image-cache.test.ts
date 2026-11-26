@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  PublicImageCacheBudgetExceeded,
   seedPublicImageCache,
   verifySeededPublicImageCache,
 } from './image-cache.ts';
@@ -377,6 +378,27 @@ describe('sealed public OCI cache', () => {
     ).rejects.toBe(cancelled);
     expect(await readdir(a.native)).toEqual([]);
   });
+});
+
+it('stops a partially copied public cache at the next observable write and removes staging', async () => {
+  const f = await fixture();
+  const person = await f.person('a');
+  const capacity = new PublicImageCacheBudgetExceeded({
+    availableBytes: 90n,
+    allocatedBytes: 200n,
+  });
+  let writes = 0;
+  await expect(
+    seedPublicImageCache(f.source, f.image, person.native, active(), {
+      bytes: 4096n * 32n,
+      blockBytes: 4096n,
+      async beforeWrite(bytes) {
+        if (bytes > 0n && ++writes === 2) throw capacity;
+      },
+    }),
+  ).rejects.toBe(capacity);
+  expect(writes).toBe(2);
+  expect(await readdir(person.native)).toEqual([]);
 });
 
 describe('Microsandbox create with a sealed public OCI seed', () => {
