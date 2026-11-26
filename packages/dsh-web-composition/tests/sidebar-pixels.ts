@@ -102,3 +102,45 @@ export function compareSidebarPixels(expectedPng: Buffer, actualPng: Buffer) {
     firstDifference,
   };
 }
+
+export type RasterEdgeBudget = {
+  // Inclusive coordinates in the element screenshot at device scale 1.
+  rectangles: readonly (readonly [number, number, number, number])[];
+  maxPixels: number;
+  maxRgbDelta: number;
+};
+
+/** Keep alpha and every pixel outside the supplied raster edges exact. */
+export function matchesRasterEdges(
+  expectedPng: Buffer,
+  actualPng: Buffer,
+  budgets: readonly RasterEdgeBudget[],
+) {
+  const expected = screenshotPixels(expectedPng);
+  const actual = screenshotPixels(actualPng);
+  if (expected.width !== actual.width || expected.height !== actual.height)
+    return false;
+  const counts = budgets.map(() => 0);
+  for (let i = 0; i < expected.rgba.length; i += 4) {
+    if (expected.rgba[i + 3] !== actual.rgba[i + 3]) return false;
+    const delta = Math.max(
+      Math.abs(expected.rgba[i]! - actual.rgba[i]!),
+      Math.abs(expected.rgba[i + 1]! - actual.rgba[i + 1]!),
+      Math.abs(expected.rgba[i + 2]! - actual.rgba[i + 2]!),
+    );
+    if (delta === 0) continue;
+    const x = (i / 4) % expected.width;
+    const y = Math.floor(i / 4 / expected.width);
+    const edge = budgets.findIndex(({ rectangles }) =>
+      rectangles.some(
+        ([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+      ),
+    );
+    if (edge < 0) return false;
+    const limit = budgets[edge]!;
+    counts[edge] = counts[edge]! + 1;
+    if (delta > limit.maxRgbDelta || counts[edge]! > limit.maxPixels)
+      return false;
+  }
+  return true;
+}

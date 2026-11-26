@@ -230,6 +230,51 @@ const inspectContent = (page: Page, kind: Kind, includePaint = false) =>
         timing: animation.effect?.getComputedTiming(),
       })),
     });
+    const rootBounds = node.getBoundingClientRect();
+    const rasterControl = (element: Element | null) => {
+      if (!element) return null;
+      const { x, y, width, height } = element.getBoundingClientRect();
+      if (
+        width <= 0 ||
+        height <= 0 ||
+        element.matches(':hover,:focus-within') ||
+        element
+          .getAnimations({ subtree: true })
+          .some(
+            (animation) =>
+              animation.pending || animation.playState === 'running',
+          )
+      )
+        return null;
+      const paint = (part: Element) => {
+        const style = getComputedStyle(part);
+        return {
+          // Compare computed corner shape; the legacy CSS does not name its
+          // intermediary corner token the same way as the native wrapper.
+          styles: Object.entries(paintStyle(style)).filter(
+            ([name]) => name !== 'cornerToken',
+          ),
+          fill: style.fill,
+          fillOpacity: style.fillOpacity,
+          fillRule: style.fillRule,
+          stroke: style.stroke,
+          strokeWidth: style.strokeWidth,
+          strokeOpacity: style.strokeOpacity,
+          outline: style.outline,
+        };
+      };
+      return {
+        x: x - rootBounds.x,
+        y: y - rootBounds.y,
+        width,
+        height,
+        paint: JSON.stringify({
+          style: paint(element),
+          svg: element instanceof SVGElement ? element.outerHTML : null,
+          parts: [...element.querySelectorAll('path')].map(paint),
+        }),
+      };
+    };
     const ancestors: ReturnType<typeof paintNode>[] = [];
     if (includePaint)
       for (
@@ -327,6 +372,20 @@ const inspectContent = (page: Page, kind: Kind, includePaint = false) =>
         height: innerHeight,
         dpr: devicePixelRatio,
       },
+      rasterControls:
+        includePaint && devicePixelRatio === 1
+          ? {
+              searchIcon: rasterControl(
+                node.querySelector('[data-search-field] > svg'),
+              ),
+              searchField: rasterControl(
+                node.querySelector('[data-search-field]'),
+              ),
+              employeePicker: rasterControl(
+                node.querySelector('[data-select-field]'),
+              ),
+            }
+          : null,
       // Full visible leaves include dots/avatars/skeletons omitted by the
       // typography sample above. Evidence only; no style/capture mutation.
       paintEvidence: includePaint
@@ -1064,19 +1123,28 @@ suite('installed native employee panels with synthetic business owner', () => {
                 path: join(artifacts, `${prefix}-rev2.png`),
                 animations: 'disabled',
               });
+              const scope = {
+                mode: 'rev2-panel',
+                viewport: page.viewportSize(),
+                theme,
+                state: value,
+                panel: kind,
+                expectedCapture: 'rev2-element',
+                actualCapture: 'native-element',
+              } as const;
+              const rasterControls =
+                actual.rasterControls && expected.rasterControls
+                  ? {
+                      actual: actual.rasterControls,
+                      expected: expected.rasterControls,
+                    }
+                  : undefined;
               const { pixels, ...pixelApproval } = compareApprovedPanelPixels(
                 pixelBrowser,
-                {
-                  mode: 'rev2-panel',
-                  viewport: page.viewportSize(),
-                  theme,
-                  state: value,
-                  panel: kind,
-                  expectedCapture: 'rev2-element',
-                  actualCapture: 'native-element',
-                },
+                scope,
                 expectedPng,
                 actualPng,
+                rasterControls,
               );
               const result = {
                 prefix,
@@ -1316,9 +1384,35 @@ suite('installed native employee panels with synthetic business owner', () => {
               expect
                 .soft(
                   pixelApproval.accepted,
-                  `${prefix} exact RGBA (${pixels.changedPixels} differing pixels)`,
+                  `${prefix} visual parity (${pixels.changedPixels} differing pixels)`,
                 )
                 .toBe(true);
+              if (prefix === '1440-light-denied-materials') {
+                expect(rasterControls?.actual.searchIcon).toBeTruthy();
+                expect(rasterControls?.actual.searchIcon).toEqual(
+                  rasterControls?.expected.searchIcon,
+                );
+                // Keep the panel and search field geometry fixed while moving
+                // the very SVG whose rasterized edge can legitimately vary.
+                const shiftedIcon = await body(page, kind).screenshot({
+                  path: join(artifacts, prefix + '-shifted-icon-negative.png'),
+                  animations: 'disabled',
+                  style:
+                    'section[aria-label="企业资料"] [data-search-field] > svg { translate: 1px 0 !important; }',
+                });
+                const negative = compareApprovedPanelPixels(
+                  pixelBrowser,
+                  scope,
+                  expectedPng,
+                  shiftedIcon,
+                  rasterControls,
+                );
+                expect(negative.pixels.dimensionsMatch).toBe(true);
+                expect(negative.actualSha256).not.toBe(
+                  pixelApproval.actualSha256,
+                );
+                expect(negative.accepted).toBe(false);
+              }
             } catch (error) {
               const failure = {
                 prefix,

@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { Browser } from 'playwright-core';
-import { compareSidebarPixels } from './sidebar-pixels';
+import {
+  compareSidebarPixels,
+  matchesRasterEdges,
+  type RasterEdgeBudget,
+} from './sidebar-pixels';
 
 export type PanelPixelScope = {
   mode:
@@ -112,6 +116,103 @@ const placementFrames: PngPair = [
   '6b5237a8f9fbe44376318eb31819e5d113e43c90c05f0bf76d51683232d00535',
 ];
 
+type RasterControl = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  paint: string;
+};
+
+export type PanelRasterControls = {
+  searchIcon: RasterControl | null;
+  searchField: RasterControl | null;
+  employeePicker: RasterControl | null;
+};
+
+function toolbarRasterBudgets(
+  scope: PanelPixelScope,
+  actual: PanelRasterControls,
+  expected: PanelRasterControls,
+) {
+  const budgets: RasterEdgeBudget[] = [];
+  const matching = (name: keyof PanelRasterControls) => {
+    const control = actual[name];
+    if (
+      !control ||
+      JSON.stringify(control) !== JSON.stringify(expected[name]) ||
+      ![control.x, control.y, control.width, control.height].every(
+        Number.isInteger,
+      )
+    )
+      return null;
+    return control;
+  };
+  const files = scope.panel === 'files' && scope.viewport?.width === 390;
+  const materials = scope.panel === 'materials' && scope.state === 'denied';
+  const search = matching('searchField');
+  const icon = matching('searchIcon');
+  // Linux CI 45773071205/45783199036 and the locked Chromium on M5
+  // vary only at these SVG and rounded-border edges. Paint and geometry
+  // must agree before a control can contribute any permitted pixels.
+  if (search && icon && (materials || (files && scope.state !== 'denied'))) {
+    const { x, y } = icon;
+    budgets.push({
+      rectangles: [[x + 2, y + 1, x + 11, y + 3]],
+      maxPixels: 13,
+      maxRgbDelta: scope.theme === 'dark' ? 27 : 21,
+    });
+  }
+  if (!files) return budgets;
+  const hasRows = scope.state === 'list' || scope.state === 'longname';
+  if (search) {
+    const { x, y, width, height } = search;
+    const right = x + width;
+    const bottom = y + height;
+    if (hasRows || scope.state === 'denied')
+      budgets.push({
+        rectangles: [
+          [right - 9, y, right - 5, y + 2],
+          [right - 9, bottom - 3, right - 5, bottom - 1],
+        ],
+        maxPixels: hasRows ? 9 : 18,
+        maxRgbDelta: 8,
+      });
+    if (scope.state === 'empty' || scope.state === 'loading')
+      budgets.push({
+        rectangles: [[x + 1, bottom - 6, x + 3, bottom - 3]],
+        maxPixels: 6,
+        maxRgbDelta: 8,
+      });
+  }
+  const picker = matching('employeePicker');
+  if (picker) {
+    const { x, y, width, height } = picker;
+    const right = x + width;
+    const bottom = y + height;
+    if (scope.state === 'denied')
+      budgets.push({
+        rectangles: [
+          [x + 1, y + 1, x + 4, y + 4],
+          [right - 5, y + 1, right - 2, y + 2],
+          [x + 1, bottom - 5, x + 2, bottom - 3],
+        ],
+        maxPixels: 15,
+        maxRgbDelta: 9,
+      });
+    if (hasRows)
+      budgets.push({
+        rectangles: [
+          [x + 4, bottom - 3, x + 7, bottom - 1],
+          [right - 6, bottom - 5, right - 2, bottom - 2],
+        ],
+        maxPixels: 11,
+        maxRgbDelta: 8,
+      });
+  }
+  return budgets;
+}
+
 function reviewedPair(scope: PanelPixelScope) {
   const {
     mode,
@@ -172,14 +273,17 @@ export function compareApprovedPanelPixels(
   scope: PanelPixelScope,
   expectedPng: Buffer,
   actualPng: Buffer,
+  controls?: { actual: PanelRasterControls; expected: PanelRasterControls },
 ) {
   const pixels = compareSidebarPixels(expectedPng, actualPng);
   const expectedSha256 = sha256(expectedPng);
   const actualSha256 = sha256(actualPng);
   const reviewed = reviewedPair(scope);
-  const exception =
+  const linuxChromium =
     browser.version === '151.0.7922.34' &&
-    browser.userAgent.includes('(X11; Linux x86_64)') &&
+    browser.userAgent.includes('(X11; Linux x86_64)');
+  const exception =
+    linuxChromium &&
     reviewed &&
     pixels.dimensionsMatch &&
     pixels.expected.width === reviewed.width &&
@@ -189,6 +293,27 @@ export function compareApprovedPanelPixels(
     actualSha256 === reviewed.pair[2]
       ? { id: reviewed.id, sourceRunId: reviewed.sourceRunId }
       : null;
+  const rasterBudgets =
+    !exception &&
+    pixels.dimensionsMatch &&
+    pixels.changedPixels !== 0 &&
+    browser.version === '151.0.7922.34' &&
+    (linuxChromium || browser.userAgent.includes('(Macintosh;')) &&
+    scope.mode === 'rev2-panel' &&
+    scope.viewport?.height === 1000 &&
+    (scope.viewport.width === 390 || scope.viewport.width === 1440) &&
+    pixels.expected.width === (scope.viewport.width === 390 ? 389 : 647) &&
+    pixels.expected.height === 962 &&
+    scope.expectedCapture === 'rev2-element' &&
+    scope.actualCapture === 'native-element' &&
+    controls
+      ? toolbarRasterBudgets(scope, controls.actual, controls.expected)
+      : [];
+  const referenceRasterization =
+    rasterBudgets.length > 0 &&
+    matchesRasterEdges(expectedPng, actualPng, rasterBudgets)
+      ? rasterBudgets
+      : null;
   return {
     pixels,
     scope,
@@ -196,8 +321,11 @@ export function compareApprovedPanelPixels(
     expectedSha256,
     actualSha256,
     exception,
+    referenceRasterization,
     accepted:
       pixels.dimensionsMatch &&
-      (pixels.changedPixels === 0 || exception !== null),
+      (pixels.changedPixels === 0 ||
+        exception !== null ||
+        referenceRasterization !== null),
   };
 }
