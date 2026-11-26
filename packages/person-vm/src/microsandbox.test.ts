@@ -120,11 +120,6 @@ else if(a[0]==='exec'){
  if(!a.includes('--detach')){
   // v0.7.16 exec uses parse_duration_secs, not the separate ms parser.
   if(!/^[0-9]+[smh]?$/.test(a[a.indexOf('--timeout')+1]??''))process.exit(44);
-  if(a.slice(a.indexOf('--')+1).join(' ')==='/bin/mkdir -p -- /work'){
-   if(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/')process.exit(46);
-   if(mode==='workdir-init-error')process.exit(47);
-   return;
-  }
   if(mode==='auth-budget'){
    fs.writeFileSync(p.join(home,'auth-reading'),String(process.pid));setInterval(()=>{},1000);return;
   }
@@ -133,7 +128,10 @@ else if(a[0]==='exec'){
  }
  if(!a.includes('--detach')||!a.includes('--no-stdin')||!a.includes('--no-tty'))process.exit(42);
  const id=require('node:crypto').randomUUID(),cmd=a.slice(a.indexOf('--')+1),init=cmd.includes('/work/memory/init.cjs');
- (v.jobs??={})[id]={cmd,code:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0};save();
+ const workdir=cmd.join(' ')==='/bin/mkdir -p -- /work';
+ if(workdir&&(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/'||a[a.indexOf('--timeout')+1]!=='10s'))process.exit(46);
+ const code=workdir&&mode==='workdir-init-error'?47:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0;
+ (v.jobs??={})[id]={cmd,code};save();
  if(!(init&&mode.startsWith('lost-id')))console.log(id);
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
@@ -481,7 +479,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       (await f.calls()).filter(
         (a) => a[0] === 'exec' && a.includes('--detach'),
       ),
-    ).toHaveLength(2); // mkdir/init only
+    ).toHaveLength(3); // workdir, staging directory, init
   });
   it('实际provider memory reader/observer映射固定node/roots/binding与exact job；retained wait不继承已关闭scope', async () => {
     const f = await bootstrapFixture('ok', undefined, 5000);
@@ -1005,7 +1003,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(bootstrap).toBeGreaterThan(start);
       expect(verbs[start - 1]).toBe('inspect');
       expect(verbs.slice(start + 1, bootstrap)).toEqual(
-        combined ? ['inspect', 'exec'] : ['inspect', 'exec', 'inspect'],
+        combined ? ['inspect'] : ['inspect', 'inspect'],
       );
       expect(verbs.slice(verbs.lastIndexOf('ping'))).toEqual([
         'ping',
@@ -1432,6 +1430,24 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     const launch = before.findIndex(
       (a) => a[0] === 'exec' && a.includes('/work/memory/launcher'),
     );
+    const firstGuest = before.findIndex((a) => a[0] === 'exec');
+    expect(before[firstGuest]?.slice(2)).toEqual([
+      '--detach',
+      '--no-stdin',
+      '--no-tty',
+      '--timeout',
+      '10s',
+      '--workdir',
+      '/',
+      '--',
+      '/bin/mkdir',
+      '-p',
+      '--',
+      '/work',
+    ]);
+    expect(before[firstGuest + 1]?.[0]).toBe('wait');
+    expect(before[firstGuest + 1]).toContain('--job');
+    expect(firstGuest + 1).toBeLessThan(before.findIndex((a) => a[0] === 'cp'));
     expect(before.filter((a) => a[0] === 'cp')).toHaveLength(3);
     expect(before.slice(0, init).filter((a) => a[0] === 'cp')).toHaveLength(3);
     expect(
@@ -1467,7 +1483,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       (await f.calls()).filter(
         (a) => a[0] === 'exec' && a.includes('--detach'),
       ),
-    ).toHaveLength(3); // mkdir, init, DSH
+    ).toHaveLength(4); // workdir, staging directory, init, DSH
   });
   it.each([
     'workdir-init-error',
@@ -1666,25 +1682,6 @@ fs.writeFileSync(f,JSON.stringify(v));
       ),
     ).toEqual(['--root-disk', 'flat:20G,clone=reflink']);
     expect(create.args[create.args.indexOf('--workdir') + 1]).toBe('/');
-    const setup = [
-      'exec',
-      'allrice-' + binding.vmId,
-      '--no-stdin',
-      '--no-tty',
-      '--timeout',
-      '10s',
-      '--workdir',
-      '/',
-      '--',
-      '/bin/mkdir',
-      '-p',
-      '--',
-      '/work',
-    ];
-    expect(calls[calls.indexOf(create) + 1]!.args).toEqual(setup);
-    expect(
-      calls[calls.findIndex(({ args }) => args[0] === 'start') + 1]!.args,
-    ).toEqual(setup);
     const diagnostic = calls.find(({ args }) =>
       args.includes('diagnostic'),
     )!.args;

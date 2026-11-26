@@ -673,32 +673,38 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     // No native idle-timeout: detached DSH jobs may be active without touching it.
     await this.command(binding, args, signal);
     await this.assertArtifact(binding, signal);
-    await this.ensureWorkDirectory(binding, signal);
   }
 
-  private async ensureWorkDirectory(
-    binding: PersonVmBinding,
-    signal: AbortSignal,
-  ) {
-    await this.command(
-      binding,
-      [
-        'exec',
-        this.name(binding),
-        '--no-stdin',
-        '--no-tty',
-        '--timeout',
-        '10s',
-        '--workdir',
-        '/',
-        '--',
-        '/bin/mkdir',
-        '-p',
-        '--',
-        GUEST_WORK_DIRECTORY,
-      ],
-      signal,
+  private async ensureWorkDirectory(scope: PersonVmStartingScope) {
+    const { binding, signal } = scope;
+    const cleanupTimeoutMs = this.options.jobCleanupTimeoutMs ?? 10_000;
+    const job = await spawnMicrosandboxManagedProbe(
+      {
+        scope,
+        name: this.name(binding),
+        cleanupTimeoutMs,
+        executionTimeoutSeconds: 10,
+        command: (args, active, nonzero) =>
+          this.command(binding, args, active, nonzero),
+      },
+      {
+        executable: '/bin/mkdir',
+        args: ['-p', '--', GUEST_WORK_DIRECTORY],
+        workdir: '/',
+      },
     );
+    const result = await job.wait(signal).catch(async (error) => {
+      try {
+        await job.cancelAndWait(AbortSignal.timeout(cleanupTimeoutMs));
+      } catch (cleanup) {
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError([error, cleanup]),
+        });
+      }
+      throw error;
+    });
+    if (result.exitCode !== 0 || result.timedOut)
+      throw new PersonVmError('PROVIDER_FAILED');
   }
   async prepareWebEndpoints(
     binding: PersonVmBinding,
@@ -769,7 +775,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   async start(binding: PersonVmBinding, signal: AbortSignal) {
     await this.startNative(binding, signal);
     await this.assertArtifact(binding, signal);
-    await this.ensureWorkDirectory(binding, signal);
   }
   async startWithWebEndpoints(
     receipt: PersonVmWebEndpointReceipt,
@@ -777,7 +782,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     await this.startNative(receipt.binding, signal);
     await this.assertArtifact(receipt.binding, signal, true, receipt);
-    await this.ensureWorkDirectory(receipt.binding, signal);
   }
   async stop(binding: PersonVmBinding, signal: AbortSignal) {
     const state = await this.status(binding, signal);
@@ -813,6 +817,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     ) {
       artifact = await this.assertArtifact(scope.binding, scope.signal);
     }
+    await this.ensureWorkDirectory(scope);
     return bootstrapMicrosandbox({
       scope,
       plan,
