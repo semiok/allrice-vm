@@ -24,6 +24,7 @@ export function nativeWebTransport(
     error: unknown,
     status: number | undefined,
     failed: boolean,
+    source: 'http' | 'websocket',
   ) => void | Promise<void>,
 ) {
   const sockets = new Set<Duplex>(),
@@ -33,9 +34,14 @@ export function nativeWebTransport(
   let cookie: string | undefined,
     indexCookie: string | undefined,
     closing = false;
-  function observe(error: unknown, status?: number, failed = true) {
+  function observe(
+    error: unknown,
+    status?: number,
+    failed = true,
+    source: 'http' | 'websocket' = 'http',
+  ) {
     try {
-      return observeStartup?.(error, status, failed);
+      return observeStartup?.(error, status, failed, source);
     } catch {
       // Observability cannot change the native transport outcome.
     }
@@ -452,7 +458,7 @@ export function nativeWebTransport(
             // take ownership of rejection. Observe the HTTP response only.
             const captureStatus = (response: IncomingMessage) => {
               responseStatus = response.statusCode;
-              observe(undefined, responseStatus, false);
+              observe(undefined, responseStatus, false, 'websocket');
             };
             call.prependListener('response', captureStatus);
             call.prependListener('upgrade', captureStatus);
@@ -465,18 +471,24 @@ export function nativeWebTransport(
           },
         });
       } catch (error) {
-        observe(error, responseStatus);
+        observe(error, responseStatus, true, 'websocket');
         throw new PersonVmError('PROVIDER_FAILED');
       }
       websockets.add(socket);
-      socket.on('error', (error) => observe(error, responseStatus));
+      socket.on('error', (error) =>
+        observe(error, responseStatus, true, 'websocket'),
+      );
       joined(
         new Promise((done) =>
           socket.once('close', () => {
             websockets.delete(socket);
             if (!closing) {
-              if (responseStatus !== undefined)
-                observe(undefined, responseStatus, false);
+              observe(
+                new PersonVmError('PROVIDER_FAILED'),
+                responseStatus,
+                true,
+                'websocket',
+              );
               lost();
             }
             done();

@@ -528,12 +528,17 @@ it.each(['http', 'invalid-upgrade', 'reset'] as const)(
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
     const lost = latch(),
       observations: ReturnType<typeof nativeSetupError>[] = [];
+    const sources: string[] = [];
     const transport = nativeWebTransport(
       origin,
       new AbortController().signal,
       () => lost.resolve(),
-      (error, status, failed) => {
-        if (failed) observations.push(nativeSetupError(error, status));
+      (error, status, failed, source) => {
+        // The owner keeps the first observation; the subsequent close is loss.
+        if (failed && !observations.length) {
+          observations.push(nativeSetupError(error, status));
+          sources.push(source);
+        }
       },
     );
     cleanup.push(async () => {
@@ -546,6 +551,7 @@ it.each(['http', 'invalid-upgrade', 'reset'] as const)(
       origin.replace('http:', 'ws:') + '/api/remote.mux',
     );
     await lost.promise;
+    expect(sources).toEqual(['websocket']);
     expect(observations).toEqual([
       kind === 'reset'
         ? { errorType: 'SystemError', errorCode: 'ECONNRESET' }

@@ -303,9 +303,13 @@ export async function openNativeWebOwner(input: {
     input.launch.auth.origin,
     carrier.signal,
     lost,
-    (error, status, failed) => {
+    (error, status, failed, source) => {
       if (!recordingStartup()) return;
       if (startupFailureAudit) return failed ? startupFailureAudit : undefined;
+      if (source === 'websocket' && step.startsWith('editor-')) {
+        if (!failed) return;
+        stage('control-websocket');
+      }
       transportStatus = status;
       if (failed) {
         recordFailure(error);
