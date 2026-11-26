@@ -488,10 +488,12 @@ export function EmployeeNativePage({
       if (!prepare) setFailed(true);
       else
         finish(
-          error instanceof EmployeeEntryError &&
-            [400, 401, 403, 404].includes(error.status)
-            ? 'denied'
-            : 'failed',
+          error instanceof EmployeeEntryError && error.status === 408
+            ? 'cancelled'
+            : error instanceof EmployeeEntryError &&
+                [400, 401, 403, 404].includes(error.status)
+              ? 'denied'
+              : 'failed',
         );
     });
     return () => {

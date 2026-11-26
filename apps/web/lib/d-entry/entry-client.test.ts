@@ -94,17 +94,25 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
-it('resumes the exact admitted ticket with a GET and no new POST', async () => {
+it('pauses a long browser wait, then resumes the ticket with a GET and no new POST', async () => {
   vi.useFakeTimers();
   const ticket = {
     operationId: randomUUID(),
     expiresAt: new Date(Date.now() + 600_000).toISOString(),
     pollAfterMs: 1000,
   };
-  const fetch = vi.fn<typeof globalThis.fetch>(async () =>
-    Response.json({ state: 'ready' }),
-  );
+  const fetch = vi
+    .fn<typeof globalThis.fetch>(async () =>
+      Response.json({ state: 'starting' }),
+    )
+    .mockResolvedValueOnce(Response.json(ticket, { status: 202 }));
   vi.stubGlobal('fetch', fetch);
+  const paused = expect(
+    prewarmEmployeeEntry(selection, new AbortController().signal),
+  ).rejects.toMatchObject({ status: 408 });
+  await vi.advanceTimersByTimeAsync(300_000);
+  await paused;
+  fetch.mockClear().mockResolvedValueOnce(Response.json({ state: 'ready' }));
   const done = prewarmEmployeeEntry(selection, new AbortController().signal, {
     ticket,
   });

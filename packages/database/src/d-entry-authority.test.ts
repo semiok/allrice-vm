@@ -125,6 +125,7 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
           id: randomUUID(),
           personId: identity.personId,
           organizationId: identity.organizationId,
+          workspaceId: identity.workspaceId,
         }),
       });
       await vi.waitFor(() => expect(watch.revoked.reason).toBe(stale));
