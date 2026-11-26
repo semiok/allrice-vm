@@ -8,6 +8,7 @@
   "region": "us-east-1",
   "instance": "i-01234567890abcdef",
   "profile": "allrice-trial",
+  "permissionSet": "ScopedTrial",
   "release": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "manifestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -15,9 +16,9 @@
 }
 ```
 
-- 在 AWS 控制台给这台试验机登记 `AllRicePurpose=4.0-linux-trial`，运行 `python3 scripts/linux/ec2-power.py policy --target PRIVATE_CONFIG` 得到权限清单。当前只授已实现的启动权限，绑定单实例 ARN 和试验标签。停止权限等真实排空入口验收后再配给指定角色。AWS 的 Describe 权限不能绑资源 ARN，清单仅给 DescribeInstances，并以区域条件限制。创建、终止、Spot、卷和 SSM 权限另由现有操作员管理。 [AWS EC2 权限表](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html)
-- 使用指向该测试账号的独立、现代 Identity Center SSO profile，通过 `aws sso login --profile allrice-trial` 自行登录。配置只放上面的非凭据字段。SSO 配置和临时缓存留在本机，工具屏蔽其它 AWS 环境凭据和默认 profile，AWS 调用的失败仅报告操作和退出码。
-- `status` 将 EC2 状态和已封签的 Web 就绪分别报告。`start` 只对 stopped 发普通 StartInstances，已启动或在启动时只等待。就绪探针核 Web 发布 SHA、tree 和 manifest，维护控制启用时要求状态 open。超时后先查状态。
+- 在 AWS 控制台给这台试验机登记 `AllRicePurpose=4.0-linux-trial`，运行 `python3 scripts/linux/ec2-power.py policy --target PRIVATE_CONFIG` 得到权限清单。把清单装到这台试验机专用的 Identity Center 权限集。当前只授启动，AWS 侧同时限制实例 ARN、标签、机型和 EBS 根卷。停止权限等真实排空入口验收后再配给指定角色。AWS 的 Describe 权限不能绑资源 ARN，清单仅给 DescribeInstances，并以区域条件限制。创建、终止、Spot、卷和 SSM 权限另由现有操作员管理。 [AWS EC2 权限表](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html)
+- 使用指向该测试账号和固定权限集的独立、现代 Identity Center SSO profile，通过 `aws sso login --profile allrice-trial` 自行登录。配置只放上面的非凭据字段。SSO 配置和临时缓存留在本机，工具屏蔽其它 AWS 环境凭据和默认 profile，AWS 调用的失败仅报告操作和退出码。
+- `status` 分别报告 EC2 状态和 HTTPS 入口的 Web/数据库就绪（webReady）。启用前核实该试验域名的 Tunnel 只指到指定实例，Worker 就绪另取目标机证据。`start` 只对 stopped 发普通 StartInstances，已启动或在启动时只等待。就绪探针核 Web 发布 SHA、tree 和 manifest，维护控制启用时要求状态 open。超时后先查状态。
 - `stop` 有普通关机与状态等待逻辑，必须走持续冻结 admission 的真实宿主 drain。当前 Workflow 没有交付可接入的整机排空证明入口，CLI 对运行中的实例返回 deferred。模拟测试使用注入的 owner gate 证明匹配后才调用普通 StopInstances。CLI 没有凭手工 JSON、标志或超时强关的入口。真实接线须把 VM/连接退尽、PG 同步以及持续冻结与同一目标绑定。
 - 本轮不创建或调用 AWS 资源。终止实例、迁移卷、设置 timer 和自动回收不在这条脚本的命令内。
 

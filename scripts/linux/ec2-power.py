@@ -2,7 +2,8 @@
 """Operate one configured AllRice ARM64 test instance using AWS CLI SSO."""
 
 import argparse
-from configparser import RawConfigParser
+from configparser import Error as ConfigError, RawConfigParser
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,8 @@ STATES = {'pending', 'running', 'stopping', 'stopped'}
 def checked_target(target):
     patterns = {
         'account': r'[0-9]{12}', 'region': r'[a-z]{2}-[a-z]+-[0-9]+',
-        'instance': r'i-[0-9a-f]{17}', 'profile': r'[A-Za-z0-9_-]+',
+        'instance': r'i-[0-9a-f]{17}', 'profile': r'[A-Za-z0-9][A-Za-z0-9_-]*',
+        'permissionSet': r'[A-Za-z0-9_+=,.@-]{1,32}',
         'release': r'[0-9a-f]{40}', 'tree': r'[0-9a-f]{40}',
         'manifestDigest': r'sha256:[0-9a-f]{64}',
     }
@@ -48,14 +50,19 @@ def iam_policy(target):
             {'Effect': 'Allow', 'Action': ['ec2:DescribeInstances'], 'Resource': '*',
              'Condition': {'StringEquals': {'aws:RequestedRegion': region}}},
             {'Effect': 'Allow', 'Action': ['ec2:StartInstances'], 'Resource': instance,
-             'Condition': {'StringEquals': {f'ec2:ResourceTag/{TAG}': TAG_VALUE}}},
+             'Condition': {'StringEquals': {f'ec2:ResourceTag/{TAG}': TAG_VALUE,
+                                         'ec2:InstanceType': 'c7g.metal', 'ec2:RootDeviceType': 'ebs'}}},
         ],
     }
 
 
 def check_sso_profile(target, path):
     config = RawConfigParser()
-    if not config.read(path):
+    try:
+        found = config.read(path, encoding='utf-8')
+    except (ConfigError, UnicodeError):
+        raise RuntimeError('AWS CLI SSO configuration is invalid') from None
+    if not found:
         raise RuntimeError('AWS CLI SSO configuration is unavailable')
     entry = 'profile ' + target['profile']
     if not config.has_section(entry):
@@ -63,7 +70,7 @@ def check_sso_profile(target, path):
     profile = config[entry]
     allowed = {'sso_session', 'sso_account_id', 'sso_role_name', 'region', 'output'}
     if (not set(profile) <= allowed or profile.get('sso_account_id') != target['account']
-            or not profile.get('sso_role_name') or not profile.get('sso_session')
+            or profile.get('sso_role_name') != target['permissionSet'] or not profile.get('sso_session')
             or not config.has_section('sso-session ' + profile['sso_session'])):
         raise RuntimeError('the named profile must directly select an Identity Center account and role')
 
@@ -133,7 +140,7 @@ def health_ready(target):
                     and identity['sourceSha'] == target['release'] and identity['sourceTree'] == target['tree']
                     and identity['manifestDigest'] == target['manifestDigest']
                     and open_for_use)
-    except (URLError, KeyError, TypeError, ValueError, TimeoutError):
+    except (URLError, HTTPException, OSError, KeyError, TypeError, ValueError):
         return False
 
 
@@ -141,11 +148,15 @@ def run_power(action, target, aws, *, ready=health_ready, stop_gate=None,
               now=time.monotonic, sleep=time.sleep, wait_seconds=900):
     if action not in {'status', 'start', 'stop'}:
         raise RuntimeError('unsupported power action')
-    if aws('sts', 'get-caller-identity')['Account'] != target['account']:
+    identity = aws('sts', 'get-caller-identity')
+    if identity.get('Account') != target['account']:
         raise RuntimeError('AWS caller account mismatch')
+    role = f"arn:aws:sts::{target['account']}:assumed-role/AWSReservedSSO_{target['permissionSet']}_"
+    if not re.fullmatch(re.escape(role) + r'[0-9a-f]{16}/[^/]+', identity.get('Arn', '')):
+        raise RuntimeError('AWS caller is not the selected trial permission set')
     state = instance_state(target, aws)
     if action == 'status':
-        return {'state': state, 'ready': state == 'running' and ready(target)}
+        return {'state': state, 'webReady': state == 'running' and ready(target)}
 
     if action == 'start':
         if state == 'stopping':
@@ -154,7 +165,7 @@ def run_power(action, target, aws, *, ready=health_ready, stop_gate=None,
             aws('ec2', 'start-instances', '--instance-ids', target['instance'])
     else:
         if state == 'stopped':
-            return {'state': 'stopped', 'ready': False}
+            return {'state': 'stopped', 'webReady': False}
         if state == 'running':
             if stop_gate is None:
                 raise RuntimeError('stop deferred: the owning host drain is unavailable')
@@ -173,9 +184,9 @@ def run_power(action, target, aws, *, ready=health_ready, stop_gate=None,
     while now() < deadline:
         state = instance_state(target, aws)
         if action == 'start' and state == 'running' and ready(target):
-            return {'state': state, 'ready': True}
+            return {'state': state, 'webReady': True}
         if action == 'stop' and state == 'stopped':
-            return {'state': state, 'ready': False}
+            return {'state': state, 'webReady': False}
         sleep(10)
     raise RuntimeError(f'{action} observation timed out; inspect state before acting again')
 

@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -12,7 +14,7 @@ spec.loader.exec_module(power)
 
 TARGET = {
     'account': '123456789012', 'region': 'us-east-1', 'instance': 'i-01234567890abcdef',
-    'profile': 'allrice-trial', 'release': 'a' * 40, 'tree': 'b' * 40,
+    'profile': 'allrice-trial', 'permissionSet': 'ScopedTrial', 'release': 'a' * 40, 'tree': 'b' * 40,
     'manifestDigest': 'sha256:' + 'c' * 64,
     'healthUrl': 'https://trial.example.com/api/health/ready',
 }
@@ -22,12 +24,15 @@ def receipt():
     return {key: TARGET[key] for key in ('account', 'region', 'instance', 'release', 'tree', 'manifestDigest')}
 
 
-def mock_aws(*states, account=TARGET['account'], tag=power.TAG_VALUE):
+ROLE_ARN = 'arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_ScopedTrial_0123456789abcdef/FakeSession'
+
+
+def mock_aws(*states, account=TARGET['account'], tag=power.TAG_VALUE, arn=ROLE_ARN):
     upcoming = iter(states)
 
     def invoke(service, operation, *args):
         if (service, operation) == ('sts', 'get-caller-identity'):
-            return {'Account': account}
+            return {'Account': account, 'Arn': arn}
         if args != ('--instance-ids', TARGET['instance']):
             raise AssertionError('unexpected EC2 selector')
         if operation == 'describe-instances':
@@ -51,6 +56,8 @@ class Ec2PowerTests(unittest.TestCase):
         self.assertEqual(read['Action'], ['ec2:DescribeInstances'])
         self.assertEqual(read['Condition']['StringEquals']['aws:RequestedRegion'], TARGET['region'])
         self.assertEqual(write['Action'], ['ec2:StartInstances'])
+        self.assertEqual(write['Condition']['StringEquals']['ec2:InstanceType'], 'c7g.metal')
+        self.assertEqual(write['Condition']['StringEquals']['ec2:RootDeviceType'], 'ebs')
         self.assertEqual(write['Resource'], 'arn:aws:ec2:us-east-1:123456789012:instance/i-01234567890abcdef')
 
     def test_targets_are_pinned_and_redirect_like_health_urls_are_rejected(self):
@@ -60,6 +67,10 @@ class Ec2PowerTests(unittest.TestCase):
                 power.checked_target({**TARGET, **overrides})
         aws = mock_aws(account='000000000000')
         with self.assertRaisesRegex(RuntimeError, 'account'):
+            power.run_power('start', TARGET, aws)
+        aws.assert_called_once_with('sts', 'get-caller-identity')
+        aws = mock_aws(arn=ROLE_ARN.replace('ScopedTrial', 'Administrator'))
+        with self.assertRaisesRegex(RuntimeError, 'permission set'):
             power.run_power('start', TARGET, aws)
         aws.assert_called_once_with('sts', 'get-caller-identity')
         with self.assertRaisesRegex(RuntimeError, 'test tag'):
@@ -79,16 +90,46 @@ sso_start_url = https://example.awsapps.com/start
 '''
             path.write_text(config)
             power.check_sso_profile(TARGET, path)
+            path.write_text(config.replace('ScopedTrial', 'Administrator'))
+            with self.assertRaisesRegex(RuntimeError, 'directly select'):
+                power.check_sso_profile(TARGET, path)
             path.write_text(config.replace('sso_session = trial', 'credential_process = my-script'))
             with self.assertRaisesRegex(RuntimeError, 'directly select'):
                 power.check_sso_profile(TARGET, path)
+            path.write_text('corrupted example access token line')
+            with self.assertRaisesRegex(RuntimeError, '^AWS CLI SSO configuration is invalid$'):
+                power.check_sso_profile(TARGET, path)
+
+    def test_cli_uses_pinned_profile_and_leaves_running_stop_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_file = Path(directory) / 'target.json'
+            target_file.write_text(json.dumps(TARGET))
+            fake = mock_aws('running')
+            calls = []
+
+            def subprocess_run(args, **options):
+                calls.append(args)
+                self.assertEqual(args[:5], ['aws', '--profile', TARGET['profile'], '--region', TARGET['region']])
+                self.assertNotIn('AWS_ACCESS_KEY_ID', options['env'])
+                self.assertNotIn('AWS_ENDPOINT_URL', options['env'])
+                self.assertEqual(options['env']['AWS_SHARED_CREDENTIALS_FILE'], os.devnull)
+                index = args.index('--cli-read-timeout') + 2
+                return SimpleNamespace(returncode=0, stdout=json.dumps(fake(*args[index:])))
+
+            with patch.object(power, 'check_sso_profile'), patch.object(power.subprocess, 'run', subprocess_run), \
+                    patch.dict(power.os.environ, {'AWS_ACCESS_KEY_ID': 'test-only', 'AWS_ENDPOINT_URL': 'test-only'}), \
+                    patch('sys.argv', ['ec2-power.py', 'stop', '--target', str(target_file)]):
+                with self.assertRaisesRegex(RuntimeError, 'stop deferred'):
+                    power.main()
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn('stop-instances', [arg for call in calls for arg in call])
 
     def test_start_waits_for_matching_ready_once_and_resumes_pending(self):
         for first in ('stopped', 'pending'):
             aws = mock_aws(first, 'pending', 'running', 'running')
             ready = Mock(side_effect=[False, True])
             self.assertEqual(power.run_power('start', TARGET, aws, ready=ready, sleep=lambda _: None),
-                             {'state': 'running', 'ready': True})
+                             {'state': 'running', 'webReady': True})
             self.assertEqual(sum(c.args[1] == 'start-instances' for c in aws.call_args_list),
                              int(first == 'stopped'))
 
@@ -108,7 +149,7 @@ sso_start_url = https://example.awsapps.com/start
         gate.freeze_and_prove.return_value = receipt()
         aws = mock_aws('running', 'running', 'stopping', 'stopped')
         self.assertEqual(power.run_power('stop', TARGET, aws, stop_gate=gate, sleep=lambda _: None),
-                         {'state': 'stopped', 'ready': False})
+                         {'state': 'stopped', 'webReady': False})
         gate.freeze_and_prove.assert_called_once_with(TARGET)
         self.assertIn(('ec2', 'stop-instances', '--instance-ids', TARGET['instance']),
                       [call.args for call in aws.call_args_list])
