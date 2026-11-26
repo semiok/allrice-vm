@@ -81,21 +81,24 @@ export function createProductionScheduledWakeSource(
           {
             async readRoster(active) {
               active.throwIfAborted();
-              if (!(await assertClaim())) throw new PersonVmError('LEASE_LOST');
-              const roster = await store.readClaimRoster(claim);
+              const read = async () =>
+                (await assertClaim()) ? store.readClaimRoster(claim) : null;
+              const roster = await read().catch((cause) => {
+                throw new PersonVmError('RUNTIME_NOT_READY', { cause });
+              });
               active.throwIfAborted();
               if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
               return roster;
             },
-            async dispatch(digest, active, start) {
+            async withCurrentAuthority(digest, active, work) {
               active.throwIfAborted();
-              const completed = await store.withClaimDispatch(
+              const completed = await store.withClaimAuthority(
                 claim,
-                async (roster) => {
-                  active.throwIfAborted();
+                active,
+                async (roster, dispatchSignal) => {
                   if (roster.digest !== digest)
                     throw new PersonVmError('AUTHORIZATION_DENIED');
-                  return { result: await start() };
+                  return { result: await work(dispatchSignal) };
                 },
               );
               if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');

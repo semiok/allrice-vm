@@ -215,6 +215,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     await db`update allrice_settings
       set value=jsonb_set(value,'{selections}',(value->'selections')-1)
       where key='d_entry_rollout_policy'`;
+    await db`insert into allrice_memberships(organization_id,user_id,role)
+      values(${f.binding.organizationId},${f.binding.personId},'member')`;
+    for (const role of ['viewer', 'member'])
+      await db`update allrice_memberships set role=${role}
+        where organization_id=${f.binding.organizationId} and user_id=${f.binding.personId}
+          and workspace_id=${f.origin.workspaceId}`;
     await expect(f.store().readClaimRoster(claim!)).resolves.not.toBeNull();
     const [original] = await db<{ value: Parameters<typeof db.json>[0] }[]>`
       select value from allrice_settings where key='d_entry_rollout_policy'`;
@@ -247,14 +253,57 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await expect(invalidate(true)).rejects.toMatchObject({ code: '55P03' });
       return 'dispatched';
     });
-    await expect(f.store().withClaimDispatch(claim!, dispatch)).resolves.toBe(
-      'dispatched',
-    );
+    await expect(
+      f.store().withClaimAuthority(claim!, signal, dispatch),
+    ).resolves.toBe('dispatched');
     await invalidate(false);
     await expect(
-      f.store().withClaimDispatch(claim!, dispatch),
+      f.store().withClaimAuthority(claim!, signal, dispatch),
     ).resolves.toBeNull();
     expect(dispatch).toHaveBeenCalledOnce();
+    await expect(f.store().settle(claim!, { state: 'ready' })).resolves.toBe(
+      true,
+    );
+    const [settled] =
+      await db`select state,reason from person_vm_scheduled_wakes
+      where plan_id=${planId}`;
+    expect(settled).toEqual({ state: 'blocked', reason: 'STALE_PLAN' });
+  });
+
+  it('aborts and joins native work when its dedicated PG authority connection closes', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await f.module().prepareStopWithWake(f.binding, planId, signal);
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+
+    let finished = false;
+    let joined = false;
+    const work = f
+      .store()
+      .withClaimAuthority(claim!, signal, async (_, active) => {
+        const killed = await db`with owner as (
+        select distinct l.pid from pg_locks l join pg_stat_activity a using(pid)
+        where l.relation='person_vm_scheduled_wakes'::regclass
+          and l.mode='RowShareLock' and l.granted and a.datname=current_database()
+          and a.application_name=current_setting('application_name')
+          and l.pid<>pg_backend_pid())
+        select pg_terminate_backend(pid, 1000) as stopped from owner
+        where (select count(*) from owner)=1`;
+        expect(killed).toEqual([{ stopped: true }]);
+        await expect.poll(() => active.aborted).toBe(true);
+        expect(finished).toBe(false);
+        joined = true;
+        active.throwIfAborted();
+      });
+    await expect(
+      work.finally(() => {
+        finished = true;
+      }),
+    ).rejects.toBeDefined();
+    expect(joined).toBe(true);
   });
 
   it('rechecks current retained roster without a login and never revives a revoked plan', async () => {
@@ -447,12 +496,14 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       host.prepareStopWithWake(f.binding, planId, signal),
     ).resolves.toEqual({ blocked: true, reason: 'WAKE_PLAN_UNCONFIRMED' });
     await f.stop(planId);
-    expect(await host.runDueOnce(signal)).toBe(true);
     expect(await host.runDueOnce(signal)).toBe(false);
     expect(f.start).not.toHaveBeenCalled();
     const [row] = await db`select state,reason from person_vm_scheduled_wakes
       where plan_id=${planId}`;
     expect(row).toMatchObject({ state: 'blocked', reason: 'STALE_PLAN' });
+    const [event] = await db`select error_code from person_vm_audit
+      where request_id=${planId} and action='scheduled-wake.invalidate'`;
+    expect(event).toEqual({ error_code: 'NATIVE_SCHEDULE_INVALIDATED' });
   });
 
   it('does not accept another person’s receipt even with a valid new stop ID', async () => {

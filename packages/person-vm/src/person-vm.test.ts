@@ -69,16 +69,18 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       expect((await f.store.read(f.binding.personId))?.leaseOwner).toBeTruthy();
       return f.roster;
     });
+    const fenced: string[] = [];
     const authority: Parameters<
       PersonVmService['startRetainedForSchedule']
     >[2] = {
       readRoster: roster,
-      async dispatch(digest, _signal, start) {
+      async withCurrentAuthority(digest, active, start) {
+        fenced.push(digest);
         expect(digest).toBe(f.roster.digest);
         expect(
           (await f.store.read(f.binding.personId))?.leaseOwner,
         ).toBeTruthy();
-        return start();
+        return start(active);
       },
     };
     const view = await f.service.startRetainedForSchedule(
@@ -95,6 +97,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     });
     expect(startup.mock.lastCall?.[3]).not.toHaveProperty('context');
     expect(f.verified).toHaveBeenCalledOnce();
+    expect(fenced).toEqual([f.roster.digest, f.roster.digest]);
     expect(f.interactiveRoster).not.toHaveBeenCalled();
     expect(browserProof).not.toHaveBeenCalled();
     expect(
@@ -125,7 +128,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
         randomUUID(),
         {
           readRoster: async () => f.roster,
-          dispatch: async () => {
+          withCurrentAuthority: async () => {
             throw new PersonVmError('AUTHORIZATION_DENIED');
           },
         },
@@ -136,6 +139,37 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(f.h.log.slice(before)).not.toContain('native:stop');
     expect(f.verified).not.toHaveBeenCalled();
     expect(f.h.mounts.size).toBe(0);
+  });
+
+  it('retires a dispatched VM if scheduled authority is lost at running publication', async () => {
+    const f = await scheduledFixture();
+    const requestId = randomUUID();
+    const before = f.h.log.length;
+    let fenced = 0;
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        requestId,
+        {
+          readRoster: async () => f.roster,
+          async withCurrentAuthority(_digest, active, work) {
+            if (++fenced === 2) throw new PersonVmError('AUTHORIZATION_DENIED');
+            return work(active);
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(
+      f.h.log.slice(before).filter((item) => item.startsWith('native:')),
+    ).toEqual(expect.arrayContaining(['native:start', 'native:stop']));
+    expect(f.h.states.get(f.binding.vmId)).toBe('stopped');
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      f.store.audits
+        .filter((event) => event.requestId === requestId)
+        .map((event) => event.result),
+    ).toEqual(['started', 'failed']);
   });
 
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {

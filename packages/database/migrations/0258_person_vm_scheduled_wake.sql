@@ -69,7 +69,9 @@ begin
     affected_workspace := (case when tg_table_name='allrice_workspaces' then fact->>'id'
       else fact->>'workspace_id' end)::uuid;
     with invalidated as (
-      update person_vm_scheduled_wakes w set revoked_at=clock_timestamp()
+      update person_vm_scheduled_wakes w set revoked_at=clock_timestamp(),
+        state=case when w.state='waiting' then 'blocked' else w.state end,
+        retry_at=null,reason='STALE_PLAN',updated_at=clock_timestamp()
       where w.revoked_at is null and w.state in ('empty','waiting','claimed')
         and (affected_person is null or w.person_id=affected_person)
         and (affected_org is null or w.organization_id=affected_org)
@@ -77,6 +79,14 @@ begin
           select 1 from allrice_native_schedule_observation_receipts receipt
           where receipt.receipt_id=any(w.receipt_ids)
             and receipt.workspace_id=affected_workspace))
+        and (tg_table_name<>'allrice_memberships' or exists(
+          select 1 from allrice_native_schedule_observation_receipts receipt
+          where receipt.receipt_id=any(w.receipt_ids)
+            and (affected_workspace is null or receipt.workspace_id=affected_workspace)
+            and not exists(select 1 from allrice_memberships member
+              where member.organization_id=w.organization_id and member.user_id=w.person_id
+                and member.active and member.role in ('admin','member')
+                and (member.workspace_id is null or member.workspace_id=receipt.workspace_id))))
         and (tg_table_name<>'allrice_employee_instances' or exists(
           select 1 from allrice_native_schedule_observation_receipts receipt
           where receipt.receipt_id=any(w.receipt_ids)

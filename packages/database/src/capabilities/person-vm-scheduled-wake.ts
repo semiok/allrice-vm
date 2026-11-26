@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { selectDEntryGeneration } from '@allrice/contracts';
 import type { PersonVmBinding, PersonVmWebRoster } from '@allrice/person-vm';
 import type { ISql, Sql, TransactionSql } from 'postgres';
+import { joinCallerSave } from '../business-runtime/caller-transaction.ts';
+import { createDedicatedDatabase } from '../core/client.ts';
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import type { NativeScheduleLedgerOrigin } from './native-schedule-observation-ledger.ts';
 
@@ -147,7 +149,7 @@ export async function readPersonVmWakeRoster(
 async function readClaimRoster(
   tx: TransactionSql,
   claim: ScheduledWakeClaim,
-  dispatch = false,
+  lock = false,
 ): Promise<PersonVmWebRoster | null> {
   // The physical owner can already have advanced the current epoch.
   // Recheck the immutable stopped source and its original receipt here.
@@ -165,7 +167,7 @@ async function readClaimRoster(
         and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
         and a.action='stop' and a.result='succeeded'
       order by a.id desc limit 1)
-    ${dispatch ? tx`for share of p` : tx``}`;
+    ${lock ? tx`for share of p` : tx``}`;
   if (
     !plan ||
     plan.receipt_ids.length !== claim.receiptIds.length ||
@@ -350,21 +352,43 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       );
     },
 
-    /** Authority changes and receipt invalidation update this same row before
-     * committing. The physical lease owner holds it through native dispatch. */
-    async withClaimDispatch<T>(
+    /** Order native dispatch and running publication against commits that
+     * update this same row to invalidate authority or native receipts. */
+    async withClaimAuthority<T>(
       claim: ScheduledWakeClaim,
-      work: (roster: PersonVmWebRoster) => Promise<T>,
+      signal: AbortSignal,
+      work: (roster: PersonVmWebRoster, active: AbortSignal) => Promise<T>,
     ): Promise<T | null> {
-      const result = await sql.begin(
-        'isolation level repeatable read',
-        async (tx) => {
-          await tx`set local lock_timeout='5s'`;
-          const roster = await readClaimRoster(tx, claim, true);
-          return { value: roster ? await work(roster) : null };
-        },
-      );
-      return result.value;
+      signal.throwIfAborted();
+      const dedicated = createDedicatedDatabase(sql);
+      const disconnected = new AbortController();
+      dedicated.options.onclose = () =>
+        disconnected.abort(
+          new Error('SCHEDULE_WAKE_AUTHORITY_CONNECTION_LOST'),
+        );
+      const active = AbortSignal.any([signal, disconnected.signal]);
+      let pending: Promise<{ value: T | null }> | undefined;
+      try {
+        const transaction = dedicated.begin(
+          'isolation level repeatable read',
+          (tx) => {
+            pending = (async () => {
+              active.throwIfAborted();
+              await tx`set local lock_timeout='5s'`;
+              const roster = await readClaimRoster(tx, claim, true);
+              active.throwIfAborted();
+              const value = roster ? await work(roster, active) : null;
+              active.throwIfAborted();
+              return { value };
+            })();
+            return pending;
+          },
+        );
+        const result = await joinCallerSave(transaction, () => pending);
+        return result.value;
+      } finally {
+        await dedicated.end({ timeout: 5 });
+      }
     },
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
@@ -405,9 +429,14 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         const reason = 'reason' in outcome ? outcome.reason : null;
         const retryDelayMs =
           outcome.state === 'waiting' ? outcome.retryDelayMs : null;
-        const [row] = await tx<PlanRow[]>`update person_vm_scheduled_wakes
-          set state=${outcome.state},claim_id=null,claim_until=null,reason=${reason},
-            retry_at=now()+${retryDelayMs}::double precision * interval '1 millisecond',
+        const [row] = await tx<
+          (PlanRow & { reason: string | null })[]
+        >`update person_vm_scheduled_wakes
+          set state=case when revoked_at is not null then 'blocked' else ${outcome.state} end,
+            claim_id=null,claim_until=null,
+            reason=case when revoked_at is not null then 'STALE_PLAN' else ${reason} end,
+            retry_at=case when revoked_at is null then
+              now()+${retryDelayMs}::double precision * interval '1 millisecond' end,
             updated_at=now()
           where person_id=${claim.personId} and plan_id=${claim.planId}
             and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
@@ -418,12 +447,12 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           row,
           claim.claimId,
           'settle',
-          outcome.state === 'ready'
+          row.state === 'ready'
             ? 'succeeded'
-            : outcome.state === 'blocked'
+            : row.state === 'blocked'
               ? 'denied'
               : 'failed',
-          reason,
+          row.reason,
         );
         return true;
       });
