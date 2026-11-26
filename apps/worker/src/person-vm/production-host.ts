@@ -996,6 +996,7 @@ export function createProductionPersonVmHost(input: {
         const period =
           providers.configuration.lifecycle.idleSampleIntervalMs ??
           DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
+        const inspecting = new Set<string>();
         void own(async () => {
           let slot = Math.floor(performance.now() / period);
           while (!lifetime.aborted) {
@@ -1008,35 +1009,42 @@ export function createProductionPersonVmHost(input: {
             if (current <= slot) continue;
             slot = current;
             if (pauseIdle) continue;
-            // One slow VM may not spend the other VMs' sampling slots.
-            await Promise.all(
-              [...ownedVms.values()].map(
-                async ({ binding, idleContext, scheduledIdleRoster }) => {
-                  if (lifetime.aborted) return;
-                  try {
-                    const active = AbortSignal.any([
-                      lifetime,
-                      AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
-                    ]);
-                    if (scheduledIdleRoster)
-                      await admission.reconcileScheduledIdle(
-                        binding,
-                        scheduledIdleRoster,
-                        active,
-                      );
-                    else if (idleContext)
-                      await admission.reconcileIdle(
-                        { ...idleContext, requestId: randomUUID() },
-                        binding,
-                        active,
-                      );
-                  } catch (error) {
-                    if (!lifetime.aborted && !(error instanceof PersonVmError))
-                      console.error('[person-vm] idle reconciliation failed');
-                  }
-                },
-              ),
-            );
+            // Each VM owns its own in-flight inspection. A stalled read
+            // leaves a gap for that VM without delaying the other clocks.
+            for (const {
+              binding,
+              idleContext,
+              scheduledIdleRoster,
+            } of ownedVms.values()) {
+              if (inspecting.has(binding.personId)) continue;
+              inspecting.add(binding.personId);
+              void own(async () => {
+                try {
+                  if (pauseIdle || lifetime.aborted) return;
+                  const active = AbortSignal.any([
+                    lifetime,
+                    AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
+                  ]);
+                  if (scheduledIdleRoster)
+                    await admission.reconcileScheduledIdle(
+                      binding,
+                      scheduledIdleRoster,
+                      active,
+                    );
+                  else if (idleContext)
+                    await admission.reconcileIdle(
+                      { ...idleContext, requestId: randomUUID() },
+                      binding,
+                      active,
+                    );
+                } catch (error) {
+                  if (!lifetime.aborted && !(error instanceof PersonVmError))
+                    console.error('[person-vm] idle reconciliation failed');
+                } finally {
+                  inspecting.delete(binding.personId);
+                }
+              });
+            }
           }
         }).catch((error: unknown) => {
           if (!lifetime.aborted)
