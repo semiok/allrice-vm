@@ -53,11 +53,12 @@ export class MemoryStore implements PersonVmStore {
         signal: new AbortController().signal,
         assertAdmissionOpen: async () => {},
         guard: async () => {},
-        save: async (value) => {
+        save: async (value, audit) => {
           this.rows.set(personId, {
             ...structuredClone(value),
             leaseOwner: owner,
           });
+          if (audit) this.audits.push({ ...audit, vmId: value.vmId });
         },
         audit: async (value, event) => {
           this.audits.push({ ...event, vmId: value.vmId });
@@ -157,6 +158,19 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
     stop: async (binding) => {
       log.push('native:stop');
       if (states.has(binding.vmId)) states.set(binding.vmId, 'stopped');
+    },
+    async stopIdle(binding, signal, assertCurrent) {
+      await assertCurrent();
+      signal.throwIfAborted();
+      await native.stop(binding, signal);
+      if (states.get(binding.vmId) !== 'stopped')
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+    },
+    async assertStopped(binding, signal) {
+      signal.throwIfAborted();
+      if (states.get(binding.vmId) !== 'stopped')
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      log.push('native:assert-stopped');
     },
     ping: async (binding) => {
       if (states.get(binding.vmId) !== 'running')

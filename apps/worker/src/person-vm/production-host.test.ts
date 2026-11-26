@@ -457,6 +457,42 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   ).toThrowError(PersonVmError);
 });
 
+it('gates idle stop at the Host and blocks when no wake owner is installed', async () => {
+  const admission = vi.spyOn(PersonVmService.prototype, 'createAdmissionHost');
+  io.read.mockResolvedValue({
+    ...f.loaded,
+    configuration: {
+      ...f.loaded.configuration,
+      lifecycle: {
+        ...f.loaded.configuration.lifecycle,
+        idleStopEnabled: true,
+      },
+    },
+  });
+  await open();
+  const prepare = admission.mock.calls[0]?.[0].prepareIdleStop;
+  expect(prepare).toBeTypeOf('function');
+  const entry = nativeEntryFixture();
+  const assertStopCurrent = vi.fn(async () => {});
+  await expect(
+    prepare!(
+      {
+        context: entry.context,
+        binding: {
+          vmId: randomUUID(),
+          personId: entry.context.actor.id,
+          organizationId: entry.context.organizationId,
+          instanceId: randomUUID(),
+          leaseEpoch: 1,
+        },
+        assertStopCurrent,
+      },
+      signal(),
+    ),
+  ).resolves.toEqual({ blocked: true });
+  expect(assertStopCurrent).not.toHaveBeenCalled();
+});
+
 it('an egress source cannot substitute another VM or shared admission boundary', async () => {
   const value = fixture();
   Object.assign(value.bound.egress, {

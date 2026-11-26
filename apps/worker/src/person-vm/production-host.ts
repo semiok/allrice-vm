@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { RequestContext } from '@allrice/contracts';
 import { createDedicatedDatabase, getDatabase } from '@allrice/database';
 import {
@@ -33,6 +34,7 @@ import {
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
 } from '@allrice/person-vm';
+import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
   readReleasedGuestProfile,
@@ -177,10 +179,16 @@ export function createProductionPersonVmHost(input: {
   const retiredReceipts = new Map<string, PersonVmEgressReceipt>();
   const ownedVms = new Map<
     string,
-    { binding: PersonVmBinding; stopNative: boolean }
+    {
+      binding: PersonVmBinding;
+      stopNative: boolean;
+      idleContext?: RequestContext;
+      idleAccessOrder?: number;
+    }
   >();
   let personVm: PersonVmService | undefined;
   let gracefulStop = false;
+  let pauseIdle = false;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
     PersonVmBinding,
@@ -551,7 +559,51 @@ export function createProductionPersonVmHost(input: {
   const construction = (async () => {
     try {
       lifetime.throwIfAborted();
-      providers = await createProductionPersonVmProviders(lifetime);
+      let capacityStore: PostgresPersonVmStore | undefined;
+      providers = await createProductionPersonVmProviders(
+        lifetime,
+        async ({ binding, memoryMiB }, signal) => {
+          const store = capacityStore;
+          if (!store || providers?.platform.memoryMiB !== memoryMiB)
+            throw new PersonVmError('RUNTIME_NOT_READY');
+          const assertCurrent = async (
+            request: { binding: PersonVmBinding; memoryMiB: number },
+            active: AbortSignal,
+          ) => {
+            if (
+              request.memoryMiB !== memoryMiB ||
+              !sameVmBinding(request.binding, binding)
+            )
+              throw new PersonVmError('LEASE_LOST');
+            active.throwIfAborted();
+            const row = await store.read(binding.personId);
+            active.throwIfAborted();
+            if (
+              !row?.leaseOwner ||
+              row.phase !== 'starting' ||
+              !sameVmBinding(
+                {
+                  vmId: row.vmId,
+                  personId: row.personId,
+                  organizationId: row.organizationId,
+                  instanceId: row.instanceId!,
+                  leaseEpoch: row.leaseEpoch,
+                },
+                binding,
+              )
+            )
+              throw new PersonVmError('LEASE_LOST');
+          };
+          await assertCurrent({ binding, memoryMiB }, signal);
+          // The durable starting row is already charged. This exact guard is
+          // the transfer to running: neither AbortSignal nor TTL frees the row.
+          return {
+            signal: lifetime,
+            assertCurrent,
+            commitRunning: assertCurrent,
+          };
+        },
+      );
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every
@@ -559,7 +611,20 @@ export function createProductionPersonVmHost(input: {
       const trustedDatabase = getDatabase();
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
-      const store = new PostgresPersonVmStore(openSql);
+      const budget = providers.configuration.lifecycle.hostVmBudgetMiB;
+      if (budget !== undefined && budget * 1024 ** 2 > totalmem())
+        throw new PersonVmError('PROVIDER_FAILED');
+      // Existing VM rows do not record their launch cap. Charge the maximum
+      // supported guest size plus overhead through confirmed physical release.
+      const store =
+        budget === undefined
+          ? new PostgresPersonVmStore(openSql)
+          : new PostgresPersonVmStore(
+              openSql,
+              undefined,
+              Math.floor(budget / (4096 + 512)),
+            );
+      if (budget !== undefined) capacityStore = store;
       const runtime: PersonVmRuntimePort = {
         memoryGuestPlan: (...args) => requireStartup().memoryGuestPlan(...args),
         start: (...args) => requireStartup().start(...args),
@@ -594,16 +659,38 @@ export function createProductionPersonVmHost(input: {
         store,
         authority: current.authority,
         native: providers.native,
+        ...(budget !== undefined && { nativeCapacityAccounting: true }),
         disk: providers.disk,
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
-        observeOwnedStart(binding) {
+        observeOwnedStart(binding, context) {
           ownedVms.set(binding.personId, {
             binding: Object.freeze({ ...binding }),
             stopNative: true,
+            ...(context &&
+              providers!.configuration.lifecycle.idleStopEnabled === true && {
+                idleContext: structuredClone(context),
+              }),
           });
         },
+        ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          observeOwnedAccess(
+            binding: PersonVmBinding,
+            context: RequestContext,
+            order: number,
+          ) {
+            const entry = ownedVms.get(binding.personId);
+            if (
+              entry?.stopNative &&
+              sameVmBinding(entry.binding, binding) &&
+              order > (entry.idleAccessOrder ?? 0)
+            ) {
+              entry.idleContext = structuredClone(context);
+              entry.idleAccessOrder = order;
+            }
+          },
+        }),
         observeOwnedMount(binding) {
           const existing = ownedVms.get(binding.personId);
           if (
@@ -674,6 +761,12 @@ export function createProductionPersonVmHost(input: {
       const admission = vm.createAdmissionHost({
         openSql,
         idleMs: providers.platform.idleMs,
+        ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          prepareIdleStop: (request, signal) =>
+            scheduledWake
+              ? scheduledWake.prepareStopWithWake(request, signal)
+              : Promise.resolve({ blocked: true } as const),
+        }),
         nativeActivity: {
           observe(binding, signal) {
             return own(() =>
@@ -832,6 +925,34 @@ export function createProductionPersonVmHost(input: {
         scheduledWake = wake;
         wake.start();
       }
+      if (
+        providers.configuration.lifecycle.idleStopEnabled === true &&
+        bound.nativeActivity &&
+        scheduledWake
+      ) {
+        void own(async () => {
+          while (!lifetime.aborted) {
+            await sleep(15_000, undefined, { signal: lifetime, ref: false });
+            for (const { binding, idleContext } of [...ownedVms.values()]) {
+              if (pauseIdle || lifetime.aborted) break;
+              if (!idleContext) continue;
+              try {
+                await admission.reconcileIdle(
+                  { ...idleContext, requestId: randomUUID() },
+                  binding,
+                  AbortSignal.any([lifetime, AbortSignal.timeout(15_000)]),
+                );
+              } catch (error) {
+                if (!lifetime.aborted && !(error instanceof PersonVmError))
+                  console.error('[person-vm] idle reconciliation failed');
+              }
+            }
+          }
+        }).catch((error: unknown) => {
+          if (!lifetime.aborted)
+            console.error('[person-vm] idle owner failed', error);
+        });
+      }
       return Object.freeze({
         async prepareStopWithWake(
           request: PersonVmWakePreparation,
@@ -848,6 +969,7 @@ export function createProductionPersonVmHost(input: {
         },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;
+          pauseIdle = true;
           const reopen = vm.fenceWorkerStartup();
           try {
             await scheduledWake?.pause(signal);
@@ -856,6 +978,7 @@ export function createProductionPersonVmHost(input: {
               await vm.assertWorkerShutdownSafe(binding, signal);
             gracefulStop = true;
           } catch (error) {
+            pauseIdle = false;
             reopen();
             scheduledWake?.resume();
             throw error;

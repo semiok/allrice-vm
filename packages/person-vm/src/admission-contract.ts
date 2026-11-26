@@ -179,3 +179,14 @@ export interface PersonVmNativeActivityPort {
     signal: AbortSignal,
   ): Promise<PersonVmAdmissionSubscription>;
 }
+
+/** Trusted host callback, used while the exact physical lifecycle lease is
+ * held. The context's requestId is also the successful stop audit ID. */
+export type PersonVmPrepareIdleStop = (
+  request: Readonly<{
+    binding: PersonVmBinding;
+    context: RequestContext;
+    assertStopCurrent(signal: AbortSignal): Promise<void>;
+  }>,
+  signal: AbortSignal,
+) => Promise<{ ok: true; nextWakeAt: string | null } | { blocked: true }>;

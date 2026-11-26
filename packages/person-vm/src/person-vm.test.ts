@@ -70,6 +70,21 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       return f.roster;
     });
     const fenced: string[] = [];
+    const nativeStart = f.h.native.start;
+    const commitRunning = vi.fn(async () => {
+      expect(fenced).toHaveLength(2);
+      expect((await f.store.read(f.binding.personId))?.phase).toBe('starting');
+    });
+    const assertCapacityCurrent = vi.fn(async () => {});
+    f.h.native.start = async (binding, active) => {
+      expect(fenced).toHaveLength(1);
+      await nativeStart(binding, active);
+      return {
+        signal: active,
+        assertCurrent: assertCapacityCurrent,
+        commitRunning,
+      };
+    };
     const authority: Parameters<
       PersonVmService['startRetainedForSchedule']
     >[2] = {
@@ -98,6 +113,8 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(startup.mock.lastCall?.[3]).not.toHaveProperty('context');
     expect(f.verified).toHaveBeenCalledOnce();
     expect(fenced).toEqual([f.roster.digest, f.roster.digest]);
+    expect(assertCapacityCurrent).toHaveBeenCalled();
+    expect(commitRunning).toHaveBeenCalledOnce();
     expect(f.interactiveRoster).not.toHaveBeenCalled();
     expect(browserProof).not.toHaveBeenCalled();
     expect(
@@ -410,6 +427,161 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(h.log).not.toContain('native:bootstrap');
     expect(h.log).not.toContain('runtime:start');
     expect(h.mounts.size).toBe(0);
+  });
+
+  it.each(['guest plan', 'readiness', 'capacity commit'] as const)(
+    'losing retained-start capacity during %s prevents activation',
+    async (stage) => {
+      const store = new MemoryStore();
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+
+      const owner = new AbortController();
+      const lost = new PersonVmError('LEASE_LOST');
+      const assertCurrent = vi.fn(async () => owner.signal.throwIfAborted());
+      const commitRunning = vi.fn(async () => {
+        if (stage === 'capacity commit') owner.abort(lost);
+        owner.signal.throwIfAborted();
+      });
+      const startNative = h.native.start;
+      h.native.start = async (...args) => {
+        await startNative(...args);
+        return { signal: owner.signal, assertCurrent, commitRunning };
+      };
+      const plan = h.runtime.memoryGuestPlan;
+      const readiness = h.runtime.readiness;
+      const cancel = (active: AbortSignal) => {
+        expect(active.aborted).toBe(false);
+        owner.abort(lost);
+        expect(active.reason).toBe(lost);
+      };
+      h.runtime.memoryGuestPlan = async (...args) => {
+        if (stage === 'guest plan') cancel(args[1]);
+        return plan(...args);
+      };
+      h.runtime.readiness = async (...args) => {
+        if (stage === 'readiness') cancel(args[1]);
+        return readiness(...args);
+      };
+      const before = h.log.length;
+      const auditStart = store.audits.length;
+      await expect(h.service.start(rc, signal())).rejects.toBe(lost);
+
+      expect(assertCurrent).toHaveBeenCalled();
+      expect(commitRunning).toHaveBeenCalledTimes(
+        stage === 'capacity commit' ? 1 : 0,
+      );
+      const effects = h.log.slice(before);
+      expect(effects).toContain('native:start');
+      if (stage === 'guest plan')
+        expect(effects).not.toContain('native:bootstrap');
+      expect(effects).toContain('native:stop');
+      expect(effects).toContain('disk:detach');
+      expect(await store.read(binding.personId)).toMatchObject({
+        phase: 'stopped',
+        diskRetained: true,
+      });
+      expect(
+        store.audits
+          .slice(auditStart)
+          .filter(({ action }) => action === 'start')
+          .map(({ result }) => result),
+      ).toEqual(['started', 'failed']);
+    },
+  );
+  it.each(['publish', 'release'] as const)(
+    'keeps the post-commit running charge when the reservation expires during %s',
+    async (stage) => {
+      const owner = new AbortController();
+      let charged = false;
+      const expire = () => {
+        expect(charged).toBe(true);
+        owner.abort(new PersonVmError('LEASE_LOST'));
+      };
+      const store = new (class extends MemoryStore {
+        override withLease<T>(...args: Parameters<MemoryStore['withLease']>) {
+          const [person, options, work] = args;
+          return super.withLease<T>(person, options, async (lease) => {
+            const result = await work({
+              ...lease,
+              save: async (row, event) => {
+                if (
+                  charged &&
+                  stage === 'publish' &&
+                  event?.action === 'start' &&
+                  event.result === 'succeeded'
+                )
+                  expire();
+                await lease.save(row, event);
+              },
+            });
+            if (charged && stage === 'release') expire();
+            return result;
+          });
+        }
+      })();
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+
+      const startNative = h.native.start;
+      const commitRunning = vi.fn(async () => {
+        owner.signal.throwIfAborted();
+        expect(await store.read(binding.personId)).toMatchObject({
+          phase: 'starting',
+        });
+        owner.signal.throwIfAborted();
+        charged = true;
+      });
+      h.native.start = async (...args) => {
+        await startNative(...args);
+        return {
+          signal: owner.signal,
+          assertCurrent: async () => owner.signal.throwIfAborted(),
+          commitRunning,
+        };
+      };
+      const auditStart = store.audits.length;
+      await expect(h.service.start(rc, signal())).resolves.toMatchObject({
+        phase: 'running',
+        ready: true,
+      });
+      expect(commitRunning).toHaveBeenCalledOnce();
+      expect(owner.signal.aborted).toBe(true);
+      expect(charged).toBe(true);
+      expect(await store.read(binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseOwner: null,
+      });
+      expect(
+        store.audits.slice(auditStart).map(({ result }) => result),
+      ).toEqual(['started', 'succeeded']);
+    },
+  );
+  it('retains the disk and leaves a failed binding when retained start and cleanup are unconfirmed', async () => {
+    const h = harness();
+    const { rc, binding } = await running(h);
+    h.states.set(binding.vmId, 'stopped');
+    await h.service.stop(rc, signal());
+    h.native.start = async (current) => {
+      h.states.set(current.vmId, 'unknown');
+      throw new PersonVmError('PROVIDER_FAILED');
+    };
+    h.native.stop = async () => {};
+    const before = h.log.length;
+    await expect(h.service.start(rc, signal())).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    expect(h.log.slice(before)).not.toContain('disk:detach');
+    expect(h.mounts.has(binding.vmId)).toBe(true);
+    expect(await h.store.read(binding.personId)).toMatchObject({
+      phase: 'failed',
+      diskRetained: true,
+      leaseEpoch: binding.leaseEpoch + 1,
+    });
   });
   it.each(['authority', 'egress'] as const)(
     'starting失去%s后launch零派发，callback捕获拒绝也不得ready',
