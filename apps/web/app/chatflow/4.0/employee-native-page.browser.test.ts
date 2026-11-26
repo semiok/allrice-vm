@@ -66,6 +66,7 @@ suite('4.0 browser cold entry', () => {
       const supersededClosed = deferred<void>();
       let opening = false;
       const allowOpening = deferred<void>();
+      const allowStarting = deferred<void>();
       const allowReady = deferred<void>();
       const ticket = randomUUID();
       let polls = 0;
@@ -114,7 +115,10 @@ suite('4.0 browser cold entry', () => {
             address.searchParams.get('operationId') !== ticket
           )
             return response.writeHead(404).end();
-          if (++polls === 1) return json({ state: 'starting' });
+          if (++polls === 1) {
+            await allowStarting.promise;
+            return json({ state: 'starting' });
+          }
           await allowReady.promise;
           return json({ state: 'ready' });
         }
@@ -161,6 +165,13 @@ suite('4.0 browser cold entry', () => {
                 file.path.endsWith(css ? '.css' : '.js'),
               )!.text,
             );
+        }
+        if (address.pathname === '/chatflow') {
+          if (!address.search)
+            return response.writeHead(307, { location: '/chatflow/4.0' }).end();
+          if (address.searchParams.get('employee') === '')
+            return html('<!doctype html><h1>员工</h1>');
+          return response.writeHead(404).end();
         }
         return html(
           '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
@@ -268,6 +279,7 @@ suite('4.0 browser cold entry', () => {
       await page.getByRole('button', { name: '继续' }).click();
       try {
         await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
+        allowStarting.resolve();
         await assertWaiting(
           '正在启动工作台',
           '第一次启动需要一两分钟，留在这页就行。',
@@ -277,6 +289,7 @@ suite('4.0 browser cold entry', () => {
         ).toBe(true);
         expect(documents).toEqual([]);
       } finally {
+        allowStarting.resolve();
         allowReady.resolve();
       }
       async function showEditor(threadId: string) {
@@ -412,6 +425,9 @@ suite('4.0 browser cold entry', () => {
           url.pathname === '/chatflow' &&
           url.searchParams.get('employee') === '',
       );
+      await returnPage
+        .getByRole('heading', { name: '员工', exact: true })
+        .waitFor();
       await returnPage.close();
     },
   );
