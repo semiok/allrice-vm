@@ -113,6 +113,9 @@ test('renders sealed Linux units with mount, loopback and graceful-stop constrai
     expect(worker).toContain(
       'ALLRICE_EXECUTION_ROOT=/var/lib/allrice40/executions',
     );
+    expect(worker).toContain(
+      'ALLRICE_DSH_RUNTIME_ROOT=/var/lib/allrice40/dsh-runtime',
+    );
     for (const unit of [worker, web])
       expect(unit).toContain('ALLRICE_STORAGE_ROOT=/var/lib/allrice40/storage');
     expect(web).not.toContain('SupplementaryGroups=kvm');
@@ -245,7 +248,9 @@ test('refuses an existing vendor or runtime unit and a systemd drop-in', async (
       runtime = join(root, 'run');
     for (const directory of [own, vendor, runtime]) await mkdir(directory);
     const loadPaths = [own, runtime, vendor];
-    const missing = () => 'LoadState=not-found\nFragmentPath=\nDropInPaths=\n';
+    const idle = 'ActiveState=inactive\nMainPID=0\nControlPID=0\nJob=\n';
+    const missing = () =>
+      idle + 'LoadState=not-found\nFragmentPath=\nDropInPaths=\n';
     await checkUnitPlacement(own, loadPaths, missing);
     const fragment = join(vendor, 'allrice40-worker.service');
     await writeFile(fragment, 'vendor');
@@ -259,11 +264,28 @@ test('refuses an existing vendor or runtime unit and a systemd drop-in', async (
       /drop-in/,
     );
     await rm(dropin, { recursive: true });
+    const enabled = join(runtime, 'multi-user.target.wants');
+    await mkdir(enabled);
+    await symlink(
+      join(own, 'allrice40-worker.service'),
+      join(enabled, 'allrice40-worker.service'),
+    );
+    await expect(checkUnitPlacement(own, loadPaths, missing)).rejects.toThrow(
+      /dependency link/,
+    );
+    await rm(enabled, { recursive: true });
+    await expect(
+      checkUnitPlacement(own, loadPaths, () =>
+        missing()
+          .replace('ActiveState=inactive', 'ActiveState=active')
+          .replace('MainPID=0', 'MainPID=1234'),
+      ),
+    ).rejects.toThrow(/activity/);
     await expect(
       checkUnitPlacement(
         own,
         loadPaths,
-        () => 'LoadState=masked\nFragmentPath=/dev/null\nDropInPaths=\n',
+        () => idle + 'LoadState=masked\nFragmentPath=/dev/null\nDropInPaths=\n',
       ),
     ).rejects.toThrow(/mask/);
   });

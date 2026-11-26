@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readdir,
   realpath,
   rm,
   rmdir,
@@ -126,7 +127,7 @@ export function renderUnits({ root, sourceSha, config }) {
         'RuntimeDirectoryMode=0700',
         'RuntimeDirectoryPreserve=yes',
       ],
-      command: `ALLRICE_EXECUTION_ROOT=${config.dataMount}/executions ALLRICE_WORKER_HOST=127.0.0.1 ALLRICE_WORKER_PORT=${config.workerPort} ${config.node} ${root}/apps/worker/dist/index.js`,
+      command: `ALLRICE_EXECUTION_ROOT=${config.dataMount}/executions ALLRICE_DSH_RUNTIME_ROOT=${config.dataMount}/dsh-runtime ALLRICE_WORKER_HOST=127.0.0.1 ALLRICE_WORKER_PORT=${config.workerPort} ${config.node} ${root}/apps/worker/dist/index.js`,
     },
     {
       role: 'web',
@@ -217,12 +218,16 @@ export async function checkUnitPlacement(directory, loadPaths, show) {
       !['loaded', 'not-found'].includes(state) ||
       !info.has('FragmentPath') ||
       !info.has('DropInPaths') ||
+      info.get('ActiveState') !== 'inactive' ||
+      info.get('MainPID') !== '0' ||
+      info.get('ControlPID') !== '0' ||
+      !['', '0'].includes(info.get('Job')) ||
       info.get('FragmentPath') !== (state === 'loaded' ? own : '') ||
       info.get('DropInPaths') ||
       (state === 'loaded' && !(await exists(own)))
     )
       throw new Error(
-        'Existing systemd fragment, mask or drop-in; use the release owner',
+        'Existing systemd activity, fragment, mask or drop-in; use the release owner',
       );
     for (const root of loadPaths) {
       if (
@@ -234,6 +239,19 @@ export async function checkUnitPlacement(directory, loadPaths, show) {
         throw new Error(
           'Existing systemd fragment or drop-in in the search path',
         );
+      const children = await readdir(root).catch((error) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      });
+      for (const entry of children) {
+        if (
+          /\.(?:wants|requires|upholds)$/.test(entry) &&
+          (await exists(join(root, entry, name)))
+        )
+          throw new Error(
+            'Existing systemd dependency link could activate these units',
+          );
+      }
     }
   }
 }
@@ -323,7 +341,7 @@ function unitStatus(name) {
       '--system',
       'show',
       '--all',
-      '--property=LoadState,FragmentPath,DropInPaths',
+      '--property=LoadState,ActiveState,MainPID,ControlPID,Job,FragmentPath,DropInPaths',
       name,
     ]);
   } catch (error) {
@@ -376,9 +394,14 @@ async function main(args) {
       () =>
         checkUnitPlacement(
           directory,
-          managerCall('/usr/bin/systemd-analyze', ['--system', 'unit-paths'])
+          managerCall('/usr/bin/systemctl', [
+            '--system',
+            'show',
+            '--property=UnitPath',
+            '--value',
+          ])
             .trim()
-            .split('\n'),
+            .split(/\s+/),
           unitStatus,
         ),
       () => managerCall('/usr/bin/systemctl', ['--system', 'daemon-reload']),
