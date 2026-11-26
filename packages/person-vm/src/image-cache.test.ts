@@ -23,6 +23,7 @@ import {
 } from './image-cache.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 import { DiskPoolLedger } from './disk-pool-ledger.ts';
+import { DiskPoolForegroundDeferred } from './disk-pool-platform.ts';
 import { MacosPersonVmDiskPool } from './disk-pool-macos.ts';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import type { CommandRunner } from './process.ts';
@@ -31,6 +32,7 @@ const faults = vi.hoisted(() => ({
   cacheWrite: undefined as Error | undefined,
   secondCopy: undefined as Error | undefined,
   beforeLink: undefined as ((from: string, to: string) => void) | undefined,
+  removeCopyStage: undefined as (() => void) | undefined,
   afterRename: undefined as ((from: string, to: string) => void) | undefined,
 }));
 
@@ -51,6 +53,11 @@ vi.mock('node:fs/promises', async (original) => {
     async link(from: string, to: string) {
       faults.beforeLink?.(from, to);
       await filesystem.link(from, to);
+    },
+    async rm(...args: Parameters<typeof filesystem.rm>) {
+      if (/\/\.public-oci-[A-Za-z0-9]{6}$/.test(String(args[0])))
+        faults.removeCopyStage?.();
+      await filesystem.rm(...args);
     },
     async open(...args: Parameters<typeof filesystem.open>) {
       const file = await filesystem.open(...args);
@@ -89,6 +96,7 @@ afterEach(async () => {
   faults.cacheWrite = undefined;
   faults.secondCopy = undefined;
   faults.beforeLink = undefined;
+  faults.removeCopyStage = undefined;
   faults.afterRename = undefined;
   for (const path of roots.splice(0)) {
     await removeFixture(path);
@@ -778,3 +786,43 @@ it('refreshes a verified older bound disk before first native create, resumes cu
   );
   expect(calls.filter(([command]) => command === 'create')).toHaveLength(1);
 });
+
+it.each(['foreground', 'capacity'] as const)(
+  'preserves the %s and cleanup errors across concurrent cancellation',
+  async (kind) => {
+    const f = await fixture();
+    const person = await f.person('cleanup');
+    const stop = new AbortController();
+    const cleanup = Object.assign(new Error('synthetic stage cleanup failed'), {
+      code: 'EIO',
+    });
+    const failure =
+      kind === 'foreground'
+        ? new DiskPoolForegroundDeferred()
+        : new PublicImageCacheBudgetExceeded({
+            availableBytes: 50n,
+            allocatedBytes: 100n,
+          });
+    faults.removeCopyStage = () => {
+      stop.abort(Error('synthetic caller cancellation during cleanup'));
+      throw cleanup;
+    };
+    const copied = seedPublicImageCache(
+      f.source,
+      f.image,
+      person.native,
+      stop.signal,
+      {
+        bytes: 4096n * 32n,
+        blockBytes: 4096n,
+        async beforeWrite(bytes) {
+          if (bytes > 0n) throw failure;
+        },
+      },
+    );
+    await expect(copied).rejects.toBeInstanceOf(failure.constructor);
+    await expect(copied).rejects.toMatchObject({
+      cause: { errors: [failure, cleanup] },
+    });
+  },
+);

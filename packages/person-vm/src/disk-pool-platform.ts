@@ -31,8 +31,8 @@ export class DiskPoolBudgetExceeded extends Error {
   }
 }
 export class DiskPoolForegroundDeferred extends Error {
-  constructor() {
-    super('PERSON_VM_DISK_POOL_FOREGROUND_DEFERRED');
+  constructor(options?: ErrorOptions) {
+    super('PERSON_VM_DISK_POOL_FOREGROUND_DEFERRED', options);
   }
 }
 /** The caller makes a fresh catalog observation before deciding an image is untracked. */
@@ -51,7 +51,12 @@ export interface DiskPoolPlatform {
     budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
     signal: AbortSignal,
   ): Promise<void>;
-  createEncryptedDisk(ref: string, signal: AbortSignal): Promise<void>;
+  /** The optional guard runs after preflight, immediately before allocating a key. */
+  createEncryptedDisk(
+    ref: string,
+    signal: AbortSignal,
+    beforeKeyWrite?: () => Promise<void>,
+  ): Promise<void>;
   mountDisk(ref: string, signal: AbortSignal): Promise<string>;
   seedPublicCache(
     ref: string,

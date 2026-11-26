@@ -287,7 +287,11 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     };
   }
 
-  async createEncryptedDisk(ref: string, signal: AbortSignal) {
+  async createEncryptedDisk(
+    ref: string,
+    signal: AbortSignal,
+    beforeKeyWrite?: () => Promise<void>,
+  ) {
     await this.layout(signal);
     const disk = warm(ref);
     const { image, manifest: receipt } = this.stockDisk.poolFiles(disk);
@@ -301,7 +305,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     )
       invalid();
     signal.throwIfAborted();
-    await this.stockDisk.create(disk, signal);
+    await this.stockDisk.create(disk, signal, beforeKeyWrite);
   }
 
   async assertCreationBudget(

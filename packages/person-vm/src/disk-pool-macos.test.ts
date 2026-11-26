@@ -5,7 +5,10 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ApfsPersonVmDisk, FilePersonVmKeyStore } from './encrypted-disk.ts';
 import { MacosPersonVmDiskPool } from './disk-pool-macos.ts';
-import type { DiskPoolClaim } from './disk-pool-platform.ts';
+import {
+  DiskPoolForegroundDeferred,
+  type DiskPoolClaim,
+} from './disk-pool-platform.ts';
 import type { CommandRunner } from './process.ts';
 import { signal } from './test-support.ts';
 
@@ -119,6 +122,25 @@ async function fixture() {
     },
   };
 }
+
+it('checks the foreground guard after platform preflight and before the first key or image write', async () => {
+  const f = await fixture();
+  const ref = randomUUID();
+  const deferred = new DiskPoolForegroundDeferred();
+  const stockWarm = join(f.diskRoot, '.preprovision-images', 'warm');
+  const stockKeys = join(f.keyRoot, '.preprovision-keys');
+  const gate = vi.fn(async () => {
+    expect(await fs.readdir(stockWarm)).toEqual([]);
+    expect(await fs.readdir(stockKeys)).toEqual([]);
+    throw deferred;
+  });
+  await expect(
+    f.adapter().createEncryptedDisk(ref, signal(), gate),
+  ).rejects.toBe(deferred);
+  expect(gate).toHaveBeenCalledOnce();
+  expect(await fs.readdir(stockWarm)).toEqual([]);
+  expect(await fs.readdir(stockKeys)).toEqual([]);
+});
 
 it.each([true, false])(
   'requires a fresh hdiutil view to confirm unrelated vanished paths (resolved=%s)',

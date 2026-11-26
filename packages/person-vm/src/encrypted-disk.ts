@@ -35,7 +35,10 @@ export interface PersonVmDiskPort {
   delete(disk: PersonDisk, signal: AbortSignal): Promise<void>;
 }
 export interface PersonVmKeyStore {
-  readOrCreate(vmId: string): Promise<Buffer>;
+  readOrCreate(
+    vmId: string,
+    beforeWrite?: () => Promise<void>,
+  ): Promise<Buffer>;
   read(vmId: string): Promise<Buffer>;
   delete(vmId: string): Promise<void>;
   confirmAbsence?(vmId: string): Promise<boolean>;
@@ -66,9 +69,10 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
   filePath(id: string) {
     return join(this.root, `${checkedId(id)}.key`);
   }
-  async readOrCreate(id: string) {
+  async readOrCreate(id: string, beforeWrite?: () => Promise<void>) {
     await privateDirectory(this.root);
     const value = randomBytes(48).toString('hex');
+    if (beforeWrite) await beforeWrite();
     try {
       const file = await open(
         this.filePath(id),
@@ -204,9 +208,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     disk: PersonDisk,
     create: boolean,
     fn: (key: Buffer) => Promise<T>,
+    beforeKeyWrite?: () => Promise<void>,
   ) {
     const key = await (create
-      ? this.options.keys.readOrCreate(disk.vmId)
+      ? this.options.keys.readOrCreate(disk.vmId, beforeKeyWrite)
       : this.options.keys.read(disk.vmId));
     const input = Buffer.concat([key, Buffer.from([0])]);
     try {
@@ -399,32 +404,40 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       ? mount
       : null;
   }
-  async create(disk: PersonDisk, signal: AbortSignal) {
+  async create(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    beforeKeyWrite?: () => Promise<void>,
+  ) {
     await privateDirectory(this.options.root);
     await privateDirectory(join(this.options.root, disk.tier));
     const existing = await this.inspect(disk.vmId, signal);
     if (existing.state === 'ready') return;
     if (existing.state !== 'absent') throw new PersonVmError('PROVIDER_FAILED');
-    await this.withKey(disk, true, (key) =>
-      this.command(
-        [
-          'create',
-          '-size',
-          `${this.options.capacityGiB}g`,
-          '-fs',
-          'APFS',
-          '-volname',
-          `AllRice-${disk.vmId}`,
-          '-type',
-          'SPARSE',
-          '-encryption',
-          'AES-256',
-          '-stdinpass',
-          this.image(disk),
-        ],
-        signal,
-        key,
-      ),
+    await this.withKey(
+      disk,
+      true,
+      (key) =>
+        this.command(
+          [
+            'create',
+            '-size',
+            `${this.options.capacityGiB}g`,
+            '-fs',
+            'APFS',
+            '-volname',
+            `AllRice-${disk.vmId}`,
+            '-type',
+            'SPARSE',
+            '-encryption',
+            'AES-256',
+            '-stdinpass',
+            this.image(disk),
+          ],
+          signal,
+          key,
+        ),
+      beforeKeyWrite,
     );
     await chmod(this.image(disk), 0o600);
     const stat = await lstat(this.image(disk), { bigint: true });

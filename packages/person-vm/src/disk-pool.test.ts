@@ -127,6 +127,7 @@ class Platform implements DiskPoolPlatform {
   unsafeMount = false;
   onCapacity?: () => void | Promise<void>;
   onCreationBudget?: () => Promise<void>;
+  onCreatePreflight?: () => Promise<void>;
   onSeed?: (checkpoint?: () => Promise<void>) => Promise<void>;
   onInspect?: (scoped: AbortSignal) => Promise<void>;
   onBinding?: () => Promise<void>;
@@ -156,8 +157,14 @@ class Platform implements DiskPoolPlatform {
       allocatedBytesByRef,
     };
   }
-  async createEncryptedDisk(ref: string) {
+  async createEncryptedDisk(
+    ref: string,
+    _current?: AbortSignal,
+    beforeKeyWrite?: () => Promise<void>,
+  ) {
     expect(this.disks.has(ref)).toBe(false);
+    if (this.onCreatePreflight) await this.onCreatePreflight();
+    if (beforeKeyWrite) await beforeKeyWrite();
     this.disks.set(ref, {
       image: randomUUID(),
       key: randomUUID(),
@@ -1144,4 +1151,53 @@ it('does not publish ready when the actual fill connection is lost during offlin
   expect(f.platform.destroyed).toHaveLength(0);
   await f.newPool().refill(signal());
   expect(f.events).toHaveBeenCalledWith({ event: 'interrupted-fill' });
+});
+
+it.each(['shutdown', 'owner-loss'] as const)(
+  'settles or fences the exact empty reservation when %s occurs after the durable CAS',
+  async (point) => {
+    const f = await fixture();
+    const stop = new AbortController();
+    const stopped = Error('caller shut down after durable slot election');
+    let elected = false;
+    f.locks.afterInventory = async () => {
+      if (
+        !elected &&
+        (await f.ledger.read(signal())).slots[0]?.entry?.state === 'filling'
+      ) {
+        elected = true;
+        if (point === 'shutdown') stop.abort(stopped);
+        else f.locks.dropFillSession();
+      }
+    };
+    const refill = f.pool.refill(stop.signal);
+    if (point === 'shutdown') await expect(refill).rejects.toBe(stopped);
+    else await expect(refill).rejects.toThrow('filled owner SQL disconnected');
+    expect(elected).toBe(true);
+    expect(f.platform.disks.size).toBe(0);
+    expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+      point === 'shutdown' ? 'released-before-write' : 'filling',
+    );
+    await f.newPool().refill(signal());
+    if (point === 'shutdown')
+      expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+        'ready',
+      );
+    else expect(f.events).toHaveBeenCalledWith({ event: 'interrupted-fill' });
+  },
+);
+
+it('releases a known empty election when the foreground starts during platform preflight', async () => {
+  const f = await fixture();
+  f.platform.onCreatePreflight = async () => {
+    f.locks.foreground = true;
+  };
+  f.platform.onUnmount = vi.fn(async () => {});
+  await f.pool.refill(signal());
+  expect(f.platform.onUnmount).not.toHaveBeenCalled();
+  expect(f.platform.disks.size).toBe(0);
+  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+    'released-before-write',
+  );
+  expect(f.events).toHaveBeenCalledWith({ event: 'foreground-deferred' });
 });

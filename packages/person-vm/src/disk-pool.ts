@@ -408,10 +408,18 @@ export class PersonVmDiskPool {
       );
       await fill.assertOwned();
       await checkpoint(true);
-      let problem: unknown;
+      let problem: { error: unknown } | undefined;
+      let rejectedBeforeKey: { error: unknown } | undefined;
       try {
         wrote = true;
-        await platform.createEncryptedDisk(entry.ref, active);
+        await platform.createEncryptedDisk(entry.ref, active, async () => {
+          try {
+            await checkpoint(true);
+          } catch (error) {
+            rejectedBeforeKey = { error };
+            throw error;
+          }
+        });
         created = true;
         await checkpoint();
         const mount = await platform.mountDisk(entry.ref, active);
@@ -434,21 +442,31 @@ export class PersonVmDiskPool {
           () => checkpoint(),
         );
       } catch (error) {
-        problem = error;
+        // Only this exact pre-key guard rejection proves the create did not
+        // reach storage. Other create failures still go through cleanup.
+        if (!created && rejectedBeforeKey && error === rejectedBeforeKey.error)
+          wrote = false;
+        problem = { error };
       } finally {
-        // A rejected attach can still have reached the physical device.
-        try {
-          await platform.unmountDisk(
-            entry.ref,
-            AbortSignal.timeout(options.cleanupTimeoutMs),
-          );
-          detached = true;
-        } catch (error) {
-          unconfirmed = true;
-          problem = problem ? new AggregateError([problem, error]) : error;
+        if (wrote) {
+          // A rejected attach can still have reached the physical device.
+          try {
+            await platform.unmountDisk(
+              entry.ref,
+              AbortSignal.timeout(options.cleanupTimeoutMs),
+            );
+            detached = true;
+          } catch (error) {
+            unconfirmed = true;
+            problem = {
+              error: problem
+                ? new AggregateError([problem.error, error])
+                : error,
+            };
+          }
         }
       }
-      if (problem) throw problem;
+      if (problem) throw problem.error;
       inspecting = true;
       // After complete seeding and confirmed detach, join proof under the
       // physical fill owner even if the scanner is being stopped.
@@ -592,11 +610,15 @@ export class PersonVmDiskPool {
         this.capacityDeferred(error.capacity);
         return;
       }
+      active.throwIfAborted();
+      // Before the CAS the caller can still revoke the reservation. After a
+      // confirmed CAS the live fill owner must receive it and settle it.
       const reservation = await this.inventory<DiskPoolSlot | null>(
-        active,
+        fill.ownerSignal,
         async (lock) => {
+          const electing = AbortSignal.any([active, lock.signal]);
           if (this.foreground) return null;
-          const { slots } = await this.ledger.read(lock.signal);
+          const { slots } = await this.ledger.read(electing);
           if (this.foreground) return null;
           if (slots.some(({ entry }) => unsettledFill(entry))) {
             this.observe({ event: 'interrupted-fill' });
@@ -612,7 +634,7 @@ export class PersonVmDiskPool {
           await fill.assertOwned();
           await lock.assertOwned();
           if (this.foreground) return null;
-          await this.ledger.append(slot, entry, lock.signal);
+          await this.ledger.append(slot, entry, electing);
           return { ...slot, entry, revision: slot.revision + 1 };
         },
       );

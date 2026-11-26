@@ -801,22 +801,28 @@ export async function seedPublicImageCache(
     try {
       await rm(stage, { recursive: true, force: true });
     } catch (cleanup) {
+      const cause = new AggregateError(
+        failure ? [failure.error, cleanup] : [cleanup],
+      );
       if (failure?.error instanceof PublicImageCacheBudgetExceeded)
         throw new PublicImageCacheBudgetExceeded(failure.error.capacity, {
-          cause: new AggregateError([failure.error, cleanup]),
+          cause,
         });
-      if (failure) throw new AggregateError([failure.error, cleanup]);
-      throw cleanup;
+      if (failure?.error instanceof DiskPoolForegroundDeferred)
+        throw new DiskPoolForegroundDeferred({ cause });
+      throw cause;
     }
     if (failure) throw failure.error;
     signal.throwIfAborted();
   } catch (error) {
-    signal.throwIfAborted();
     if (
       error instanceof PublicImageCacheBudgetExceeded ||
       error instanceof DiskPoolForegroundDeferred
     )
       throw error;
+    // Joined cleanup failures retain the original operation and cleanup
+    // errors even when the caller concurrently cancels.
+    if (!(error instanceof AggregateError)) signal.throwIfAborted();
     invalid(error);
   }
 }
