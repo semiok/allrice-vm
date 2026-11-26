@@ -47,6 +47,7 @@ declare
   seen_people text[] := array[]::text[];
   selection_key text;
   row_counts jsonb;
+  native_conflict text;
   joins text;
   added integer;
   changed integer;
@@ -168,6 +169,60 @@ begin
       edge.child::regclass, edge.parent::regclass, edge.predicate) into changed;
     if changed > 0 then raise exception 'outside-scope personal parent: %', edge.parent::regclass; end if;
   end loop;
+
+  -- Compare typed reference paths against planned rows, even when the
+  -- reference claims a different person or version than its relational row.
+  with planned_threads as (
+    select s.id from allrice_chat_sessions s
+    join reset_rows x on x.relation = s.tableoid and x.location = s.ctid
+  ), planned_instances as (
+    select i.id from allrice_employee_instances i
+    join reset_rows x on x.relation = i.tableoid and x.location = i.ctid
+  ), planned_versions as (
+    select v.id from allrice_employee_versions v
+    join reset_rows x on x.relation = v.tableoid and x.location = v.ctid
+  ), planned_employees as (
+    select e.id from allrice_employees e
+    join reset_rows x on x.relation = e.tableoid and x.location = e.ctid
+  )
+  select case
+    when exists (
+      select 1 from allrice_chat_sessions s
+      cross join lateral (values (s.d_entry_native_root_claim), (s.d_entry_native_root)) as root(pin)
+      where root.pin is not null and s.id not in (select id from planned_threads)
+        and (lower(root.pin#>>'{identity,threadId}') in (select id::text from planned_threads)
+          or lower(root.pin#>>'{identity,employeeInstanceId}') in (select id::text from planned_instances)
+          or lower(root.pin#>>'{identity,employeeVersionId}') in (select id::text from planned_versions))
+    ) then 'D entry native root'
+    when exists (
+      select 1 from allrice_chat_sessions s
+      where s.native_root_origin->>'contextKind' = 'chat' and s.id not in (select id from planned_threads)
+        and (lower(s.native_root_origin->>'contextId') in (select id::text from planned_threads)
+          or lower(case s.native_root_origin->>'schemaVersion'
+            when '1' then s.native_root_origin#>>'{frozenIdentity,sourceId}'
+            when '2' then s.native_root_origin#>>'{birthSource,employeeVersionId}'
+          end) in (select id::text from planned_versions))
+    ) then 'legacy native root'
+    when exists (
+      select 1 from allrice_native_session_bindings b
+      where b.context_kind = 'chat' and b.context_id in (select id from planned_threads)
+    ) then 'native chat binding'
+    when exists (
+      select 1 from allrice_employee_memory_contexts m
+      where m.thread_id in (select id from planned_threads)
+        or m.instance_id in (select id from planned_instances)
+        or m.employee_id in (select id from planned_employees)
+    ) then 'employee memory context'
+    when exists (
+      select 1 from allrice_native_schedule_observation_receipts r
+      where r.employee_instance_id in (select id from planned_instances)
+        or lower(r.input_payload#>>'{origin,employeeVersionId}') in (select id::text from planned_versions)
+    ) then 'native schedule observation receipt'
+  end into native_conflict;
+  if native_conflict is not null then
+    raise exception 'retained % references a planned deletion', native_conflict;
+  end if;
+
   if exists (
     select 1 from allrice_message_attachments a
     join reset_rows x on x.relation = a.tableoid and x.location = a.ctid
@@ -211,7 +266,7 @@ begin
     -- Protect the whole existing setting, including unrelated entries and revision.
     select value into strict old_policy from allrice_settings
       where scope_type = 'system' and scope_id is null and key = 'd_entry_rollout_policy' for update;
-    if request.phase = 'cutover' and old_policy is distinct from request.expected_policy then
+    if old_policy is distinct from request.expected_policy then
       raise exception 'rollout policy changed since approved snapshot';
     end if;
     if jsonb_typeof(old_policy->'selections') is distinct from 'array'
@@ -264,7 +319,11 @@ begin
         update allrice_settings set
           value = jsonb_set(jsonb_set(old_policy, '{selections}', next_selections), '{revision}', to_jsonb(gen_random_uuid())),
           updated_at = clock_timestamp()
-          where scope_type = 'system' and scope_id is null and key = 'd_entry_rollout_policy';
+          where scope_type = 'system' and scope_id is null and key = 'd_entry_rollout_policy'
+          returning value into old_policy;
+      end if;
+      if request.mode = 'apply' then
+        update reset_receipt set result = result || jsonb_build_object('policy', old_policy);
       end if;
       return;
     end if;

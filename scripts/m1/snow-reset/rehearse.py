@@ -319,7 +319,7 @@ from pg_trigger;
                         'rows': {table: len(ids) for table, (_, ids) in removals.items()}}
     assert snapshot(sql) == before and policy_row() == old_row
     rejected_unchanged('cutover', 'snow business rows are not zero', expected=old_policy)
-    rejected_unchanged('acceptance', 'two-person rollout cutover has not completed')
+    rejected_unchanged('acceptance', 'two-person rollout cutover has not completed', expected=old_policy)
 
     # Two approved people still have independent FK closures.
     sql(TARGET, "update allrice_messages set owner_id=:'acceptor' where id=:'person';")
@@ -331,6 +331,35 @@ from pg_trigger;
     sql(TARGET, "update allrice_runs set owner_id=:'acceptor' where id=:'person';")
     rejected_unchanged('snow', 'outside-scope personal parent')
     sql(TARGET, "update allrice_runs set owner_id=:'person' where id=:'person';")
+
+    # Simulate a damaged stored proof on the account that Snow's reset retains.
+    # Change only the chosen JSON, leaving its relational bindings intact.
+    for column in ('d_entry_native_root_claim', 'd_entry_native_root'):
+        original_pin = json.loads(sql(TARGET, f"select {column} from allrice_chat_sessions where id=:'acceptor_session';").stdout)
+        write_pin = f"""
+begin;
+alter table allrice_chat_sessions disable trigger allrice_d_entry_native_root_guard;
+update allrice_chat_sessions set {column}=:'pin'::jsonb where id=:'acceptor_session';
+alter table allrice_chat_sessions enable trigger allrice_d_entry_native_root_guard;
+commit;
+"""
+        for field, foreign_id in [('threadId', NATIVE_SESSION), ('employeeInstanceId', PRIVATE_ASSIGNMENT),
+                                  ('employeeVersionId', PRIVATE_VERSION.upper())]:
+            wrong_pin = {**original_pin, 'identity': {**original_pin['identity'], field: foreign_id}}
+            sql(TARGET, write_pin, pin=json.dumps(wrong_pin))
+            rejected_unchanged('snow', 'retained D entry native root references a planned deletion')
+        sql(TARGET, write_pin, pin=json.dumps(original_pin))
+
+    sql(TARGET, """
+insert into allrice_employee_memory_contexts (organization_id,workspace_id,owner_id,instance_id,employee_id,
+  budget_ref,thread_id,native_owner_ref,native_profile_ref,root_native_session_ref,execution_generation,
+  module_release,module_config_revision_ref,document,state)
+values (:'organization',:'workspace',:'acceptor',:'acceptor_assignment',:'acceptor_private',
+  'fixture-foreign-thread',:'native_session','fixture','fixture','fixture','4.0',
+  '{}','fixture','fixture','{"schemaVersion":2,"meter":"utf8_bytes"}');
+""")
+    rejected_unchanged('snow', 'retained employee memory context references a planned deletion', mode='plan')
+    sql(TARGET, "delete from allrice_employee_memory_contexts where budget_ref='fixture-foreign-thread';")
 
     sql(TARGET, """
 create table synthetic_unreviewed (thread uuid references allrice_chat_sessions(id));
@@ -394,8 +423,10 @@ for each row execute function synthetic_fail_policy();
 """)
     rejected_unchanged('cutover', 'synthetic late rollout failure', expected=old_policy)
     sql(TARGET, 'drop trigger synthetic_fail_policy on allrice_settings; drop function synthetic_fail_policy();')
-    assert not reset('cutover', expected=old_policy)['rows']
-    policy = policy_row()['value']
+    cutover = reset('cutover', expected=old_policy)
+    assert not cutover['rows']
+    policy = cutover['policy']
+    assert policy_row()['value'] == policy
     assert policy['selections'] == [
         {'organizationId': ORG, 'personId': PERSON}, *old_policy['selections'][1:3],
         {'organizationId': ORG, 'personId': ACCEPTOR},
@@ -408,16 +439,31 @@ for each row execute function synthetic_fail_policy();
     rejected_unchanged('cutover', 'rollout policy changed since approved snapshot', expected=old_policy)
     assert not reset('cutover', expected=policy)['rows'] and policy_row() == new_row
 
+    rejected_unchanged('acceptance', 'rollout policy changed since approved snapshot')
+    replace_policy = """
+update allrice_settings set value=:'replacement'::jsonb
+where scope_type='system' and scope_id is null and key='d_entry_rollout_policy';
+"""
+    for changed_policy in [
+        {**policy, 'revision': 'changed-after-cutover'},
+        {**policy, 'selections': [policy['selections'][0], *reversed(policy['selections'][1:3]), policy['selections'][3]]},
+    ]:
+        sql(TARGET, replace_policy, replacement=json.dumps(changed_policy))
+        rejected_unchanged('acceptance', 'rollout policy changed since approved snapshot', expected=policy)
+    sql(TARGET, replace_policy, replacement=json.dumps(policy))
+    assert policy_row() == new_row
+
     sql(TARGET, setup_failure)
-    rejected_unchanged('acceptance', 'synthetic late delete failure')
+    rejected_unchanged('acceptance', 'synthetic late delete failure', expected=policy)
     sql(TARGET, teardown_failure)
     assert snapshot(sql) == expect_snow and policy_row() == new_row
-    assert reset('acceptance')['rows']
+    assert reset('acceptance', expected=policy)['rows']
     assert snapshot(sql) == expect_both and policy_row() == new_row
     assert sql(TARGET, trigger_query).stdout == triggers
-    assert not reset('acceptance')['rows'] and snapshot(sql) == expect_both and policy_row() == new_row
+    assert not reset('acceptance', expected=policy)['rows'] and snapshot(sql) == expect_both and policy_row() == new_row
     print(f'PASS: independently cleared both accounts across {len(ALL_REMOVALS)} row families; {len(before)} tables reconciled', flush=True)
     print('PASS: unauthorized identities, cross-person references, unknown dependents, active jobs, stale rollout and late failures rejected unchanged', flush=True)
+    print('PASS: retained native JSON and memory references rejected; acceptance bound to the committed rollout value', flush=True)
     print('PASS: two-person rollout changed once; unrelated entries, shared rows, accounts, credentials and FKs preserved', flush=True)
 
 
