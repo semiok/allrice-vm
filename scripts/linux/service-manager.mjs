@@ -218,6 +218,7 @@ export async function checkUnitPlacement(directory, loadPaths, show) {
       !['loaded', 'not-found'].includes(state) ||
       !info.has('FragmentPath') ||
       !info.has('DropInPaths') ||
+      info.get('UpheldBy') !== '' ||
       info.get('ActiveState') !== 'inactive' ||
       info.get('MainPID') !== '0' ||
       info.get('ControlPID') !== '0' ||
@@ -341,7 +342,7 @@ function unitStatus(name) {
       '--system',
       'show',
       '--all',
-      '--property=LoadState,ActiveState,MainPID,ControlPID,Job,FragmentPath,DropInPaths',
+      '--property=LoadState,ActiveState,MainPID,ControlPID,Job,FragmentPath,DropInPaths,UpheldBy',
       name,
     ]);
   } catch (error) {

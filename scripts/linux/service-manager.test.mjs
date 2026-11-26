@@ -248,7 +248,8 @@ test('refuses an existing vendor or runtime unit and a systemd drop-in', async (
       runtime = join(root, 'run');
     for (const directory of [own, vendor, runtime]) await mkdir(directory);
     const loadPaths = [own, runtime, vendor];
-    const idle = 'ActiveState=inactive\nMainPID=0\nControlPID=0\nJob=\n';
+    const idle =
+      'ActiveState=inactive\nMainPID=0\nControlPID=0\nJob=\nUpheldBy=\n';
     const missing = () =>
       idle + 'LoadState=not-found\nFragmentPath=\nDropInPaths=\n';
     await checkUnitPlacement(own, loadPaths, missing);
@@ -279,6 +280,11 @@ test('refuses an existing vendor or runtime unit and a systemd drop-in', async (
         missing()
           .replace('ActiveState=inactive', 'ActiveState=active')
           .replace('MainPID=0', 'MainPID=1234'),
+      ),
+    ).rejects.toThrow(/activity/);
+    await expect(
+      checkUnitPlacement(own, loadPaths, () =>
+        missing().replace('UpheldBy=', 'UpheldBy=active-upstream.service'),
       ),
     ).rejects.toThrow(/activity/);
     await expect(
