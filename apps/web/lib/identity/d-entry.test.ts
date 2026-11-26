@@ -248,6 +248,24 @@ describe('trusted cookie D entry and explicit release selection', () => {
       }).success,
     ).toBe(false);
   });
+  it('normalizes person selections before comparing or rejecting duplicates', () => {
+    const upper = {
+      organizationId: organizationId.toUpperCase(),
+      personId: personId.toUpperCase(),
+    };
+    const parsed = DEntryRolloutPolicySchema.parse({
+      ...policy,
+      selections: [upper],
+    });
+    expect(parsed.selections).toEqual([{ organizationId, personId }]);
+    expect(selectDEntryGeneration(parsed, identity)).toBe('4.0');
+    expect(
+      DEntryRolloutPolicySchema.safeParse({
+        ...policy,
+        selections: [upper, { organizationId, personId }],
+      }).success,
+    ).toBe(false);
+  });
   it('never changes an old thread writer and rejects unsupported 4.0 fallback', async () => {
     ports.generation.mockResolvedValue('3.x');
     expect(

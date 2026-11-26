@@ -85,6 +85,9 @@ import {
   preparePersonNativeWebRoster,
   readPersonNativeWebRoster,
   createEmployeeInstance,
+  getEmployeeDetails,
+  getOrganizationAiSharedDetails,
+  listOrganizationPersonAiInstances,
   createDEntryAuthorityFeed,
   watchDEntryNativeAuthority,
   watchDEntryHistoryAuthority,
@@ -1866,7 +1869,10 @@ suite(
         workspaceId: f.workspace,
         requestId: randomUUID(),
         expectedOwnerId: ownerId,
-        profile: { name: '🚀助理' },
+        profile: {
+          name: '🚀私人助理',
+          description: 'PRIVATE_FIRST_EMPLOYEE_DESCRIPTION',
+        },
       };
       const headers = {
         origin: 'https://allrice.test',
@@ -1890,7 +1896,12 @@ suite(
         const initial = {
           revision: 'initial',
           defaultGeneration: '3.x' as const,
-          selections: [{ organizationId: f.org, personId: ownerId }],
+          selections: [
+            {
+              organizationId: f.org.toUpperCase(),
+              personId: ownerId.toUpperCase(),
+            },
+          ],
         };
         await updateDEntryReleasePolicy(f.context, {
           ...initial,
@@ -1967,10 +1978,35 @@ suite(
           profile: input.profile,
           source: { kind: 'tenant_version' },
         });
-        const [version] = await fixture.db`
-          select manifest->'appearance'->>'avatarValue' as initial
-          from allrice_employee_versions where id=${instance.source.employeeVersionId}`;
-        expect(version?.initial).toBe('🚀');
+        expect(instance.profile.appearance).toMatchObject({
+          avatarValue: '🚀',
+        });
+        const details = await getEmployeeDetails(owner, instance.id);
+        expect(details.profile).toMatchObject(input.profile);
+        const directoryView = await listOrganizationPersonAiInstances(
+          f.context,
+          f.org,
+          ownerId,
+        );
+        const sharedDetails = await getOrganizationAiSharedDetails(
+          f.context,
+          f.org,
+          ownerId,
+          instance.id,
+        );
+        expect(directoryView.instances).toContainEqual(
+          expect.objectContaining({
+            id: instance.id,
+            sourceName: '自定义员工',
+          }),
+        );
+        expect(sharedDetails.details.profile.name).toBe('自定义员工');
+        expect(JSON.stringify({ directoryView, sharedDetails })).not.toContain(
+          input.profile.name,
+        );
+        expect(JSON.stringify({ directoryView, sharedDetails })).not.toContain(
+          input.profile.description,
+        );
         const selection = {
           workspaceId: f.workspace,
           employeeInstanceId: instance.id,

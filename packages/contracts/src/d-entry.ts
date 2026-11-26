@@ -54,12 +54,18 @@ export type DEntryAdmission = z.infer<typeof DEntryAdmissionSchema>;
 
 // No env/default/list is created here. The approved release source must supply
 // every field. Matching one person's employee never grants another's access.
+const RolloutUuidSchema = UuidSchema.transform((id) => id.toLowerCase());
 export const DEntryRolloutPolicySchema = z
   .object({
     revision: z.string().min(1),
     defaultGeneration: ExecutionGenerationSchema,
     selections: z.array(
-      z.object({ organizationId: UuidSchema, personId: UuidSchema }).strict(),
+      z
+        .object({
+          organizationId: RolloutUuidSchema,
+          personId: RolloutUuidSchema,
+        })
+        .strict(),
     ),
   })
   .strict()
@@ -85,10 +91,12 @@ export function hasDEntryPersonRelease(
   policy: DEntryRolloutPolicy,
   identity: Pick<DEntryIdentity, 'organizationId' | 'personId'>,
 ) {
+  const organizationId = identity.organizationId.toLowerCase();
+  const personId = identity.personId.toLowerCase();
   return policy.selections.some(
     (selection) =>
-      selection.organizationId === identity.organizationId &&
-      selection.personId === identity.personId,
+      selection.organizationId === organizationId &&
+      selection.personId === personId,
   );
 }
 

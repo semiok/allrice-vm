@@ -988,17 +988,21 @@ export async function createEmployeeInstance(
     const id = randomUUID();
     const current = assigned
       ? existingAssignment!
-      : await createPersonalEmployeeSource(
-          tx,
-          scope,
-          ownerId,
-          id,
-          value.profile,
-        );
+      : await createPersonalEmployeeSource(tx, scope, ownerId, id);
+    const profile = assigned
+      ? value.profile
+      : {
+          ...value.profile,
+          appearance: {
+            avatarType: 'initials',
+            avatarValue: Array.from(value.profile.name)[0]!.toLocaleUpperCase(),
+            ...value.profile.appearance,
+          },
+        };
     await tx`insert into allrice_employee_instances
       (id,organization_id,workspace_id,owner_id,assignment_id,kind,creation_version_id,profile,creation_request_id,creation_input)
-      values(${id},${scope.organizationId},${scope.workspaceId},${ownerId},${current.id},'custom',${current.employee_version_id},${tx.json(value.profile)},${value.requestId},${tx.json(value)})`;
-    await tx`insert into allrice_employee_instance_revisions(instance_id,revision,profile,operation) values(${id},1,${tx.json(value.profile)},'create')`;
+      values(${id},${scope.organizationId},${scope.workspaceId},${ownerId},${current.id},'custom',${current.employee_version_id},${tx.json(profile)},${value.requestId},${tx.json(value)})`;
+    await tx`insert into allrice_employee_instance_revisions(instance_id,revision,profile,operation) values(${id},1,${tx.json(profile)},'create')`;
     const result = await getEmployeeInstance(scope, id, tx);
     await tx`update allrice_employee_instance_revisions set response=${tx.json(result)} where instance_id=${id} and revision=1`;
     await auditInstance(
@@ -1027,15 +1031,16 @@ async function createPersonalEmployeeSource(
   scope: RequestContext & { workspaceId: string },
   ownerId: string,
   id: string,
-  profile: EmployeeInstanceProfile & { name: string },
 ) {
   const employeeId = randomUUID();
   const versionId = randomUUID();
   const key = `personal-${employeeId}`;
   const manifest = employeeManifest({
     key,
-    name: profile.name,
-    description: profile.description ?? profile.name,
+    // Company administration can read the source version. The owner's
+    // personal profile is written only to their instance and its revisions.
+    name: '自定义员工',
+    description: '个人自定义员工',
     applicableScenarios: [],
     behaviorRules: [],
     toolNames: [],
