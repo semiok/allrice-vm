@@ -38,6 +38,11 @@ interface SidebarTest {
   settingsLauncher: () => { ready: boolean; open: boolean };
   openSession: (id: string) => void;
   setTheme: (theme: 'light' | 'dark') => void;
+  setPersonalCreation: (scope?: {
+    organizationId: string;
+    workspaceId: string;
+    viewerId: string;
+  }) => void;
   setState: (state: string) => void;
   baseline: (shown: boolean, width?: number) => void;
   controlledOwner: {
@@ -604,34 +609,32 @@ suite('real AllRice sidebar in installed native profiles', () => {
   });
 
   it('opens the existing personal creation dialog from the native sidebar', async () => {
-    const creationPage = await context.newPage();
     try {
-      await creationPage.addInitScript(
-        (scope) => {
-          Object.assign(globalThis, { __allricePersonalCreation: scope });
-        },
+      await page.evaluate(
+        (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
         {
           organizationId: randomUUID(),
           workspaceId: randomUUID(),
           viewerId: randomUUID(),
         },
       );
-      await open(creationPage, hosts[0]!);
-      await creationPage
+      await page
         .locator('#chat-sidebar')
         .getByRole('button', { name: '创建员工', exact: true })
         .click();
-      const dialog = creationPage.getByRole('dialog', {
+      const dialog = page.getByRole('dialog', {
         name: '创建 AI 员工',
         exact: true,
       });
       await dialog
         .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
         .waitFor();
-      await creationPage.keyboard.press('Escape');
+      await page.keyboard.press('Escape');
       await dialog.waitFor({ state: 'hidden' });
     } finally {
-      await creationPage.close();
+      await page.evaluate(() =>
+        window.__allriceSidebarTest!.setPersonalCreation(),
+      );
     }
   });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {

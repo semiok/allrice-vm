@@ -80,7 +80,7 @@ window.__ModuleLoader__.load({
           loadPreview: (id) => record('preview', id),
           loadMore: (id) => record('more', id),
         };
-        let controlled;
+        let controlled, personalCreation;
         current = {
           archive,
           settingsOpen: false,
@@ -340,14 +340,16 @@ window.__ModuleLoader__.load({
             listeners.add(listener);
             return () => listeners.delete(listener);
           },
-          createEmployee: globalThis.__allricePersonalCreation
-            ? {
-                workspace: globalThis.__allricePersonalCreation,
-                headers: {},
-                onCreated: (instance) =>
-                  record('created-employee', instance.id),
-              }
-            : () => record('create-employee'),
+          get createEmployee() {
+            return personalCreation
+              ? {
+                  workspace: personalCreation,
+                  headers: {},
+                  onCreated: (instance) =>
+                    record('created-employee', instance.id),
+                }
+              : () => record('create-employee');
+          },
           openArchive: () => {
             record('open-archive');
             setFilter('only');
@@ -461,6 +463,10 @@ window.__ModuleLoader__.load({
           controlledOwner: controlled,
           openSession: (id) => ctx.uiWorkspace.openSession(id),
           setTheme: (mode) => ctx.theme.setTheme(mode),
+          setPersonalCreation: (workspace) => {
+            personalCreation = workspace;
+            publish();
+          },
           setState: (kind) => {
             const archive = {
               ...current.archive,
