@@ -1,5 +1,13 @@
 import { constants, type BigIntStats } from 'node:fs';
-import { lstat, open, readdir, realpath } from 'node:fs/promises';
+import {
+  lstat,
+  mkdtemp,
+  open,
+  readdir,
+  realpath,
+  rename,
+  rm,
+} from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { PersonVmError, type PersonVmBinding } from './contract.ts';
@@ -13,6 +21,13 @@ export type ReadonlyDshDirectory = Readonly<{
   manifestSha256: string;
   sealedManifestSha256: string;
   treeSha256: string;
+}>;
+export type ReadonlyDshRuntimeDisk = Readonly<{
+  diskPath: string;
+  diskSha256: string;
+  candidatePath: string;
+  candidateSha256: string;
+  provision: 'disk' | 'directory';
 }>;
 export type ReadonlyCommandMemoryDirectory = Readonly<{
   hostDirectory: string;
@@ -125,6 +140,146 @@ export function hashCommandMemoryControlFiles(
     ),
   );
 }
+export function checkedReadonlyDshRuntimeDisk(
+  value: ReadonlyDshRuntimeDisk,
+): ReadonlyDshRuntimeDisk {
+  const { diskPath, diskSha256, candidatePath, candidateSha256, provision } =
+    value;
+  if (
+    !digest(diskSha256) ||
+    !digest(candidateSha256) ||
+    typeof diskPath !== 'string' ||
+    !isAbsolute(diskPath) ||
+    resolve(diskPath) !== diskPath ||
+    /[:\0]/.test(diskPath) ||
+    basename(diskPath) !== 'runtime.ext4' ||
+    basename(dirname(diskPath)) !== diskSha256 ||
+    candidatePath !== join(dirname(diskPath), 'candidate.json') ||
+    !['directory', 'disk'].includes(provision)
+  )
+    invalid();
+  return Object.freeze({
+    diskPath,
+    diskSha256,
+    candidatePath,
+    candidateSha256,
+    provision,
+  });
+}
+
+function diskIdentity(stat: BigIntStats) {
+  owned(stat);
+  if (!stat.isFile() || mode(stat) !== 0o444 || stat.nlink !== 1n) invalid();
+  return [
+    stat.dev,
+    stat.ino,
+    stat.size,
+    stat.mtimeNs,
+    stat.ctimeNs,
+    stat.birthtimeNs,
+  ].join(':');
+}
+
+/** Recheck the sealed file's identity at each use. Hash its bytes once per
+ * immutable file identity, so retained starts avoid reading the whole disk. */
+export function createReadonlyDshDiskVerifier() {
+  let verified: string | undefined;
+  return async function verify(
+    disk: ReadonlyDshRuntimeDisk,
+    directory: ReadonlyDshDirectory,
+    image: string,
+    signal: AbortSignal,
+  ) {
+    try {
+      await publishedDirectory(dirname(disk.diskPath));
+      const bytes = await metadataFile(
+        disk.candidatePath,
+        MANIFEST_BYTES,
+        signal,
+        0o444,
+      );
+      const receipt = object(JSON.parse(bytes.toString('utf8')));
+      const source = object(receipt.source);
+      const imageDisk = object(receipt.disk);
+      const abi = object(receipt.abi);
+      if (
+        hash(bytes) !== disk.candidateSha256 ||
+        receipt.schemaVersion !== 1 ||
+        receipt.platform !== 'linux/arm64' ||
+        image !== BASE ||
+        source.baseImage !== image ||
+        source.dshVersion !== '0.2.1-rc.2' ||
+        source.nodeVersion !== '22.23.2' ||
+        source.artifactSha256 !== directory.artifactSha256 ||
+        source.manifestSha256 !== directory.manifestSha256 ||
+        source.descriptorSha256 !== directory.sealedManifestSha256 ||
+        source.treeSha256 !== directory.treeSha256 ||
+        source.bubblewrapVersion !== '0.8.0-2+deb12u1' ||
+        source.bubblewrapDebSha256 !== BUBBLEWRAP_PACKAGE_SHA256 ||
+        !digest(source.bubblewrapElfSha256) ||
+        source.cli !== 'node_modules/@deepseek-ai/dsh/lib/bin.js' ||
+        !digest(receipt.cliSha256) ||
+        !digest(receipt.lockSha256) ||
+        receipt.guestDirectory !== directory.guestDirectory ||
+        source.lock !== 'package-lock.json' ||
+        imageDisk.format !== 'raw/ext4' ||
+        imageDisk.e2fsprogs !== '1.47.4' ||
+        imageDisk.sha256 !== disk.diskSha256 ||
+        typeof imageDisk.bytes !== 'number' ||
+        !Number.isSafeInteger(imageDisk.bytes) ||
+        imageDisk.bytes <= 0 ||
+        ![SANDBOX_BWRAP_PATH, 'usr/local/bin/node'].every((name) => {
+          const entry = object(abi[name]);
+          return (
+            entry.interpreter === '/lib/ld-linux-aarch64.so.1' &&
+            Array.isArray(entry.needed) &&
+            entry.needed.every((lib) => typeof lib === 'string')
+          );
+        })
+      )
+        invalid();
+      const fd = await open(
+        disk.diskPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      try {
+        const stat = await fd.stat({ bigint: true });
+        const identity = diskIdentity(stat);
+        if (stat.size !== BigInt(imageDisk.bytes)) invalid();
+        const dependency =
+          disk.diskPath + ':' + disk.diskSha256 + ':' + identity;
+        if (verified !== dependency) {
+          const checksum = createHash('sha256');
+          for await (const chunk of fd.createReadStream({
+            autoClose: false,
+            signal,
+          }))
+            checksum.update(chunk);
+          if (checksum.digest('hex') !== disk.diskSha256) invalid();
+        }
+        if (
+          identity !== diskIdentity(await fd.stat({ bigint: true })) ||
+          identity !==
+            diskIdentity(await lstat(disk.diskPath, { bigint: true }))
+        )
+          invalid();
+        signal.throwIfAborted();
+        verified = dependency;
+      } finally {
+        await fd.close();
+      }
+      return {
+        descriptorSha256: directory.sealedManifestSha256,
+        sandboxSha256: source.bubblewrapElfSha256,
+        cliSha256: receipt.cliSha256,
+      };
+    } catch {
+      signal.throwIfAborted();
+      invalid();
+    }
+  };
+}
+
 async function publishedDirectory(path: string) {
   const s = await lstat(path, { bigint: true });
   owned(s);
@@ -282,6 +437,31 @@ export async function verifyReadonlyDshDirectory(
   }
 }
 
+// The provisioning choice applies only if this VM has no persisted artifact
+// reference. An existing VM keeps its original layout through policy changes.
+export async function selectedReadonlyRuntimeDisk(
+  home: string,
+  disk: ReadonlyDshRuntimeDisk | undefined,
+  create: boolean,
+  signal: AbortSignal,
+) {
+  if (!disk) return;
+  try {
+    const data = await metadataFile(
+      join(home, 'allrice-readonly-dsh.json'),
+      MANIFEST_BYTES,
+      signal,
+    );
+    const saved = object(JSON.parse(data.toString('utf8')));
+    return Object.hasOwn(saved, 'runtimeDiskSha256') ? disk : undefined;
+  } catch (error) {
+    if (create && (error as NodeJS.ErrnoException).code === 'ENOENT')
+      return disk.provision === 'disk' ? disk : undefined;
+    signal.throwIfAborted();
+    invalid();
+  }
+}
+
 /** Derived persistent VM reference, not an epoch/permission authority. */
 export async function readonlyArtifactReference(
   home: string,
@@ -291,23 +471,47 @@ export async function readonlyArtifactReference(
   signal: AbortSignal,
   descriptorSha256: string,
   controls?: ReadonlyCommandMemoryDirectory,
+  disk?: ReadonlyDshRuntimeDisk,
+  replaceAbsentDisk?: ReadonlyDshRuntimeDisk,
 ) {
   signal.throwIfAborted();
   if (!digest(descriptorSha256)) invalid();
   const path = join(home, 'allrice-readonly-dsh.json');
-  const value = {
-    version: 2,
-    vmId: binding.vmId,
-    personId: binding.personId,
-    ...c,
-    descriptorSha256,
-    ...(controls ? { commandMemorySha256: controls.sha256 } : {}),
-  };
-  if (create) {
+  function reference(runtimeDisk?: ReadonlyDshRuntimeDisk) {
+    return {
+      version: 2,
+      vmId: binding.vmId,
+      personId: binding.personId,
+      ...c,
+      descriptorSha256,
+      ...(controls ? { commandMemorySha256: controls.sha256 } : {}),
+      ...(runtimeDisk
+        ? {
+            runtimeDiskPath: runtimeDisk.diskPath,
+            runtimeDiskSha256: runtimeDisk.diskSha256,
+            runtimeCandidatePath: runtimeDisk.candidatePath,
+            runtimeCandidateSha256: runtimeDisk.candidateSha256,
+          }
+        : {}),
+    };
+  }
+  type Reference = ReturnType<typeof reference>;
+  async function check(expected: Reference) {
+    const raw = await metadataFile(path, MANIFEST_BYTES, signal);
+    const saved = object(JSON.parse(raw.toString('utf8')));
+    keys(saved, Object.keys(expected));
+    for (const [key, value] of Object.entries(expected))
+      if (saved[key] !== value) invalid();
+  }
+  async function write(
+    target: string,
+    value: Reference,
+    allowExisting = false,
+  ) {
     let fd;
     try {
       fd = await open(
-        path,
+        target,
         constants.O_WRONLY |
           constants.O_CREAT |
           constants.O_EXCL |
@@ -315,44 +519,63 @@ export async function readonlyArtifactReference(
         0o600,
       );
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') invalid();
+      if (allowExisting && (error as NodeJS.ErrnoException).code === 'EEXIST')
+        return false;
+      throw error;
     }
-    if (fd) {
-      try {
-        await fd.writeFile(JSON.stringify(value));
-        await fd.sync();
-      } finally {
-        await fd.close();
-      }
-      const directory = await open(
-        home,
-        constants.O_RDONLY | constants.O_DIRECTORY,
-      );
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+    try {
+      await fd.writeFile(JSON.stringify(value));
+      await fd.sync();
+    } finally {
+      await fd.close();
+    }
+    return true;
+  }
+  async function syncHome() {
+    const directory = await open(
+      home,
+      constants.O_RDONLY | constants.O_DIRECTORY,
+    );
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
     }
   }
   try {
-    const raw = await metadataFile(path, MANIFEST_BYTES, signal),
-      saved = object(JSON.parse(raw.toString('utf8')));
-    keys(saved, Object.keys(value));
-    for (const [key, expected] of Object.entries(value))
-      if (saved[key] !== expected) invalid();
+    if (replaceAbsentDisk) {
+      if (!create || disk || replaceAbsentDisk.provision !== 'directory')
+        invalid();
+      // Create proved native absence under the VM owner. Only an exact,
+      // earlier provisioning reference may be replaced before dispatch.
+      await check(reference(replaceAbsentDisk));
+      const stage = await mkdtemp(join(home, '.dsh-ref-'));
+      try {
+        const staged = join(stage, 'reference');
+        await write(staged, reference());
+        signal.throwIfAborted();
+        await rename(staged, path);
+        await syncHome();
+      } finally {
+        await rm(stage, { recursive: true, force: true });
+      }
+    } else if (create && (await write(path, reference(disk), true))) {
+      await syncHome();
+    }
+    await check(reference(disk));
   } catch {
     invalid();
   }
 }
 
-/** v0.7.16 public VolumeMount::Bind serialization; missing/extra is unknown. */
+/** Exact v0.7.16 public VolumeMount serialization for both sealed transports. */
 export function assertReadonlyArtifactInspection(
   value: unknown,
   name: string,
   c: ReadonlyDshDirectory,
   running: boolean,
   controls?: ReadonlyCommandMemoryDirectory,
+  disk?: ReadonlyDshRuntimeDisk,
 ) {
   const inspection = object(value);
   if (
@@ -376,6 +599,25 @@ export function assertReadonlyArtifactInspection(
           mounts.find((mount) => mount.guest === expected.guestDirectory),
         ),
         options = object(m.options);
+      keys(options, ['readonly', 'noexec', 'nosuid', 'nodev']);
+      if (
+        options.readonly !== true ||
+        options.noexec !== false ||
+        options.nosuid !== false ||
+        options.nodev !== false
+      )
+        invalid();
+      if (disk && expected === c) {
+        keys(m, ['type', 'host', 'guest', 'options', 'format', 'fstype']);
+        if (
+          m.type !== 'DiskImage' ||
+          m.host !== disk.diskPath ||
+          m.format !== 'Raw' ||
+          m.fstype !== 'ext4'
+        )
+          invalid();
+        continue;
+      }
       keys(m, [
         'type',
         'host',
@@ -386,18 +628,13 @@ export function assertReadonlyArtifactInspection(
         'follow_root_symlinks',
         'quota_mib',
       ]);
-      keys(options, ['readonly', 'noexec', 'nosuid', 'nodev']);
       if (
         m.type !== 'Bind' ||
         m.host !== expected.hostDirectory ||
         m.stat_virtualization !== 'strict' ||
         m.host_permissions !== 'private' ||
         m.follow_root_symlinks !== false ||
-        m.quota_mib !== null ||
-        options.readonly !== true ||
-        options.noexec !== false ||
-        options.nosuid !== false ||
-        options.nodev !== false
+        m.quota_mib !== null
       )
         invalid();
     }

@@ -6,6 +6,7 @@ import {
   DSH_SANDBOX_ROOT,
   launchDshSandbox,
   prepareDshSandbox,
+  verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 import type {
   PersonVmBootstrapScope,
@@ -262,7 +263,11 @@ export async function bootstrapMicrosandbox(input: {
   name: string;
   cleanupTimeoutMs: number;
   readonlyCommandMemoryDirectory?: string;
-  dshSandbox?: Readonly<{ guestDirectory: string; sha256: string }>;
+  dshSandbox?: Readonly<{
+    guestDirectory: string;
+    sha256: string;
+    cliSha256?: string;
+  }>;
   command: NativeCommand;
 }): Promise<Pick<PersonVmBootstrapScope, 'launch' | 'readNativeWebAuth'>> {
   const { scope, name, command } = input;
@@ -286,7 +291,16 @@ export async function bootstrapMicrosandbox(input: {
   if (
     sandbox &&
     (!/^\/opt\/allrice\/dsh\/[a-f0-9]{64}$/.test(sandbox.guestDirectory) ||
-      !/^[a-f0-9]{64}$/.test(sandbox.sha256))
+      !/^[a-f0-9]{64}$/.test(sandbox.sha256) ||
+      (sandbox.cliSha256 !== undefined &&
+        (!controls ||
+          !/^[a-f0-9]{64}$/.test(sandbox.cliSha256) ||
+          plan.files.some(
+            ({ path }) =>
+              path === sandbox.guestDirectory ||
+              path.startsWith(sandbox.guestDirectory + '/') ||
+              sandbox.guestDirectory.startsWith(path + '/'),
+          ))))
   )
     throw new PersonVmError('PROVIDER_FAILED');
   if (
@@ -388,7 +402,15 @@ export async function bootstrapMicrosandbox(input: {
     if (sandbox)
       await run({
         executable: '/usr/local/bin/node',
-        args: ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
+        args: sandbox.cliSha256
+          ? [
+              '-e',
+              verifyDshRuntimeDisk,
+              sandbox.guestDirectory,
+              sandbox.sha256,
+              sandbox.cliSha256,
+            ]
+          : ['-e', prepareDshSandbox, sandbox.guestDirectory, sandbox.sha256],
       });
     await scope.assertCurrent();
   } finally {
@@ -440,7 +462,11 @@ export async function bootstrapMicrosandbox(input: {
           '-c',
           launchDshSandbox,
           'allrice-dsh',
-          posix.join(DSH_SANDBOX_ROOT, sandbox.sha256) + ':' + BASE_IMAGE_PATH,
+          (sandbox.cliSha256
+            ? posix.join(sandbox.guestDirectory, 'sandbox-bin')
+            : posix.join(DSH_SANDBOX_ROOT, sandbox.sha256)) +
+            ':' +
+            BASE_IMAGE_PATH,
           '/usr/local/bin/node',
           ...spec.args,
         ];
