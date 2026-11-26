@@ -253,7 +253,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(roster).not.toBeNull();
       const { personId, employeeInstanceId } = f.origin;
       const refuse = async (
-        tx: Parameters<Parameters<typeof db.begin>[0]>[0],
+        tx: Parameters<typeof readPersonVmWakeRoster>[0],
       ) => {
         if (fact === 'qualification')
           await tx`update allrice_settings set value=jsonb_set(value,'{selections}','[]')
