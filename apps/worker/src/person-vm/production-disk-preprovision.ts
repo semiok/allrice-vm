@@ -13,6 +13,7 @@ import {
 
 const pageSize = 16;
 const scanMs = 15_000;
+const minimumSweepSpacingMs = 1_000;
 const initialRetryMs = 1_000;
 const maxRetryMs = 30_000;
 const eligibilityTables = new Set([
@@ -103,6 +104,7 @@ export function startProductionDiskPreprovision(input: {
     let waiting: AbortController | undefined;
     let attempt: { personId: string; recheck(): void } | undefined;
     let hinted = false;
+    let nextSweep = 0;
     const unsubscribe = await feed.subscribe(
       {
         changed(change) {
@@ -219,7 +221,11 @@ export function startProductionDiskPreprovision(input: {
 
     try {
       while (!signal.aborted) {
+        const delay = nextSweep - performance.now();
+        if (delay > 0) await sleep(delay, undefined, { signal, ref: false });
+        signal.throwIfAborted();
         hinted = false;
+        nextSweep = performance.now() + minimumSweepSpacingMs;
         const seen = new Set<string>();
         const roster = await input.readRoster(signal);
         signal.throwIfAborted();

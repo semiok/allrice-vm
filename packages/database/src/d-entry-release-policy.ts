@@ -16,6 +16,7 @@ import { DataAccessError } from './data.ts';
 import {
   EmployeeInstanceError,
   getEmployeeInstance,
+  readEmployeeVersionPublication,
 } from './employees/employee-instances.ts';
 import { requireCurrentPlatformAdmin } from './platform-authority.ts';
 
@@ -119,6 +120,25 @@ export async function readPersonVmDiskPreparationRoster(signal: AbortSignal) {
   });
 }
 
+/** Advisory preflight only. The provider owns physical lease arbitration. */
+export async function readPersonVmDiskPreparationForegroundBusy(
+  personId: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  signal.throwIfAborted();
+  const busy = await getDatabase().begin('read only', async (sql) => {
+    await sql`set local transaction_timeout = '5s'`;
+    signal.throwIfAborted();
+    const [row] = await sql<{ busy: boolean }[]>`
+      select lease_owner is not null or instance_id is not null
+        or holds <> '[]'::jsonb as busy
+      from person_virtual_machines where person_id=${UuidSchema.parse(personId)}`;
+    return row?.busy ?? false;
+  });
+  signal.throwIfAborted();
+  return busy;
+}
+
 /** Rebuild current storage eligibility from committed data in one short read.
  * The returned facts authorize neither a logged-in principal nor VM startup. */
 export async function readPersonVmDiskPreparationTarget(
@@ -170,11 +190,14 @@ export async function readPersonVmDiskPreparationTarget(
             owner_id: string;
             organization_id: string;
             workspace_id: string;
+            employee_id: string;
           }[]
         >`
-          select owner_id,organization_id,workspace_id from allrice_employee_instances
-          where id=${entry.employeeInstanceId} and organization_id=${entry.organizationId}
-            and owner_id=${personId} and archived_at is null`;
+          select i.owner_id,i.organization_id,i.workspace_id,a.employee_id
+          from allrice_employee_instances i
+          join allrice_employee_assignments a on a.id=i.assignment_id
+          where i.id=${entry.employeeInstanceId} and i.organization_id=${entry.organizationId}
+            and i.owner_id=${personId} and i.archived_at is null`;
         if (!owner) continue;
         // A read-only subject projection, deliberately without a session.
         const subject = {
@@ -208,6 +231,20 @@ export async function readPersonVmDiskPreparationTarget(
           )
             continue;
           if (eligible[0]?.organizationId === identity.organizationId) continue;
+          if (
+            employee.source.kind === 'platform' &&
+            !(await readEmployeeVersionPublication(
+              {
+                organizationId: identity.organizationId,
+                workspaceId: identity.workspaceId,
+                employeeId: owner.employee_id,
+                versionId: identity.employeeVersionId,
+              },
+              sql,
+            ))
+          )
+            continue;
+          signal.throwIfAborted();
           if (eligible.length) throw new PersonVmError('ORGANIZATION_CONFLICT');
           eligible.push(
             Object.freeze({ ...identity, policyRevision: policy.revision }),

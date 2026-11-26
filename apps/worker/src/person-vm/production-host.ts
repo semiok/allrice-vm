@@ -7,6 +7,7 @@ import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   getDatabase,
+  readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
 } from '@allrice/database';
@@ -833,32 +834,30 @@ export function createProductionPersonVmHost(input: {
           openFeed: () => createDEntryAuthorityFeed(databaseUrl),
           readRoster: readPersonVmDiskPreparationRoster,
           readTarget: readPersonVmDiskPreparationTarget,
-          async foregroundBusy(personId, signal) {
-            signal.throwIfAborted();
-            const row = await store.read(personId);
-            signal.throwIfAborted();
-            return Boolean(
-              row?.leaseOwner || row?.instanceId || row?.holds.length,
-            );
-          },
+          foregroundBusy: readPersonVmDiskPreparationForegroundBusy,
           async availableBytes(signal) {
-            signal.throwIfAborted();
-            const diskRoot = await lstat(disk.root).catch(
-              (error: NodeJS.ErrnoException) => {
-                if (error.code === 'ENOENT') return null;
-                throw error;
-              },
-            );
-            // The directory for the first disk may not exist yet. Budget on
-            // its current parent volume, then recheck the initialized root
-            // through the port guard before actual allocation.
-            const path = diskRoot ? disk.root : dirname(disk.root);
-            const directory = diskRoot ?? (await lstat(path));
-            if (!directory.isDirectory())
-              throw new PersonVmError('PROVIDER_FAILED');
-            const volume = await statfs(path, { bigint: true });
-            signal.throwIfAborted();
-            return volume.bavail * volume.bsize;
+            // The provider can create a fresh nested disk root. Budget on the
+            // nearest existing directory, then recheck the initialized root
+            // through the port guard before an actual allocation.
+            let path = disk.root;
+            while (true) {
+              signal.throwIfAborted();
+              const directory = await lstat(path).catch(
+                (error: NodeJS.ErrnoException) => {
+                  if (error.code === 'ENOENT' && dirname(path) !== path)
+                    return null;
+                  throw error;
+                },
+              );
+              if (directory) {
+                if (!directory.isDirectory())
+                  throw new PersonVmError('PROVIDER_FAILED');
+                const volume = await statfs(path, { bigint: true });
+                signal.throwIfAborted();
+                return volume.bavail * volume.bsize;
+              }
+              path = dirname(path);
+            }
           },
           minimumFreeBytes: disk.preprovision.minimumFreeBytes,
           reserveBytes: disk.preprovision.reserveBytes,

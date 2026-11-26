@@ -5,6 +5,7 @@ import type * as EmployeeInstances from './employees/employee-instances.ts';
 const data = vi.hoisted(() => ({
   getDatabase: vi.fn(),
   employee: vi.fn(),
+  publication: vi.fn(),
   principal: vi.fn(),
 }));
 vi.mock('./core/client.ts', () => ({ getDatabase: data.getDatabase }));
@@ -14,9 +15,11 @@ vi.mock('./content-maintenance.ts', () => ({
 vi.mock('./employees/employee-instances.ts', async (original) => ({
   ...(await original<typeof EmployeeInstances>()),
   getEmployeeInstance: data.employee,
+  readEmployeeVersionPublication: data.publication,
 }));
 
 import {
+  readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
 } from './d-entry-release-policy.ts';
@@ -32,6 +35,7 @@ const workspace = id(5);
 const first = id(6);
 const second = id(7);
 const version = id(8);
+const assignedEmployee = id(9);
 const selection = (
   employeeInstanceId = first,
   organizationId = org,
@@ -69,6 +73,7 @@ function fixture(
             owner_id: String(params[2]).toLowerCase(),
             organization_id: String(params[1]).toLowerCase(),
             workspace_id: workspace,
+            employee_id: assignedEmployee,
           },
         ];
       throw Error('Unexpected fixture query');
@@ -88,7 +93,7 @@ beforeEach(() => {
     id: String(employeeId).toLowerCase(),
     workspaceId: workspace,
     revision: 1,
-    source: { employeeVersionId: version },
+    source: { kind: 'tenant_version', employeeVersionId: version },
   }));
 });
 
@@ -223,4 +228,63 @@ it('propagates unexpected eligibility errors and rejects a cancelled scan', asyn
   await expect(
     readPersonVmDiskPreparationTarget(person, cancel.signal),
   ).rejects.toThrow('cancelled');
+});
+
+it('reads the foreground busy projection in a bounded read-only transaction', async () => {
+  const { begin, seen } = fixture([selection()], [{ busy: true }]);
+  expect(
+    await readPersonVmDiskPreparationForegroundBusy(person, signal()),
+  ).toBe(true);
+  expect(begin.mock.calls[0]?.[0]).toBe('read only');
+  expect(seen[0]?.query).toBe("set local transaction_timeout = '5s'");
+  expect(seen[1]?.query).toMatch(
+    /lease_owner is not null or instance_id is not null\s+or holds/,
+  );
+  expect(seen[1]?.params).toEqual([person]);
+
+  fixture([selection()]);
+  expect(
+    await readPersonVmDiskPreparationForegroundBusy(person, signal()),
+  ).toBe(false);
+});
+
+it('requires an exact, still published platform source without rejecting tenant-only versions', async () => {
+  const { sql } = fixture([selection()]);
+  data.employee.mockImplementation(async () => ({
+    id: first,
+    workspaceId: workspace,
+    revision: 1,
+    source: { kind: 'platform', employeeVersionId: version },
+  }));
+  data.publication
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce({ revision_id: id(10) });
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  expect(
+    await readPersonVmDiskPreparationTarget(person, signal()),
+  ).toMatchObject({
+    employeeVersionId: version,
+  });
+  expect(data.publication).toHaveBeenNthCalledWith(
+    1,
+    {
+      organizationId: org,
+      workspaceId: workspace,
+      employeeId: assignedEmployee,
+      versionId: version,
+    },
+    sql,
+  );
+
+  data.publication.mockClear();
+  data.employee.mockResolvedValueOnce({
+    id: first,
+    workspaceId: workspace,
+    revision: 1,
+    source: { kind: 'tenant_version', employeeVersionId: version },
+  });
+  expect(
+    await readPersonVmDiskPreparationTarget(person, signal()),
+  ).not.toBeNull();
+  expect(data.publication).not.toHaveBeenCalled();
 });

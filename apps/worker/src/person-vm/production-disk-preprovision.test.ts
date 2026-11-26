@@ -141,7 +141,9 @@ it('reserves bytes above the floor and defers rather than calling the port at lo
   );
   expect(f.input.port.prepare).not.toHaveBeenCalled();
   f.subscribers[0]?.changed(hint('allrice_settings'));
-  await vi.waitFor(() => expect(f.input.readRoster).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(f.input.readRoster).toHaveBeenCalledTimes(2), {
+    timeout: 2_500,
+  });
   expect(f.input.availableBytes).toHaveBeenCalledOnce(); // respects retry backoff
 });
 
@@ -312,4 +314,20 @@ it('reports ambiguous enterprise ownership without failing the whole roster', as
     'organization-conflict',
   );
   expect(f.feed.close).not.toHaveBeenCalled();
+});
+
+it('coalesces repeated notifications without starving the foreground database', async () => {
+  const f = fixture();
+  const reads: number[] = [];
+  f.input.readTarget.mockResolvedValue(null);
+  f.input.readRoster.mockImplementation(async () => {
+    reads.push(performance.now());
+    for (let i = 0; i < 10; i += 1)
+      f.subscribers[0]?.changed(hint('allrice_settings'));
+    return { page: f.page };
+  });
+  f.start();
+  await vi.waitFor(() => expect(reads).toHaveLength(2), { timeout: 2_500 });
+  expect(reads[1]! - reads[0]!).toBeGreaterThan(900);
+  expect(f.input.readTarget).toHaveBeenCalledTimes(2);
 });

@@ -414,6 +414,7 @@ it.each([
 
 it('joins the injected offline preparation before Host close settles', async () => {
   configureDiskPreprovision(true, true);
+  f.loaded.configuration.disk.root += '/missing/child';
   vi.stubEnv('DATABASE_URL', 'postgres://synthetic.invalid/test');
   const draining = gate();
   const schedulerClose = vi.fn(() => draining.promise);
