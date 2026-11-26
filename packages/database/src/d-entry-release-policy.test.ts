@@ -110,7 +110,7 @@ it('pages distinct 4.0 people without splitting same-person selections or includ
 
 it('does not authorize policy UUID spellings rejected by the foreground matcher', async () => {
   const spelled = 'a0000000-0000-4000-8000-000000000008';
-  fixture([selection(spelled.toUpperCase())], [], '4.0');
+  fixture([selection(spelled.toUpperCase())]);
   expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
   fixture([selection(first, org, spelled.toUpperCase())]);
   expect(
@@ -121,12 +121,14 @@ it('does not authorize policy UUID spellings rejected by the foreground matcher'
   ).toBeNull();
 });
 
-it('does not schedule implicit rollout defaults without an exact selection', async () => {
-  fixture([], [], '4.0');
-  expect(
-    (await readPersonVmDiskPreparationRoster(signal())).page(0, 16).personIds,
-  ).toEqual([]);
-  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+it('fails closed on a published policy that defaults everyone to 4.0', async () => {
+  fixture([selection()], [], '4.0');
+  await expect(readPersonVmDiskPreparationRoster(signal())).rejects.toThrow(
+    'D entry published policy is unavailable',
+  );
+  await expect(
+    readPersonVmDiskPreparationTarget(person, signal()),
+  ).rejects.toThrow('D entry published policy is unavailable');
 });
 
 it('reads policy, membership and employee version in one short snapshot without a session', async () => {
