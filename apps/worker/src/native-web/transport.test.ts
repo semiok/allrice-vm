@@ -529,11 +529,14 @@ it.each(['http', 'invalid-upgrade', 'reset'] as const)(
     const lost = latch(),
       observations: ReturnType<typeof nativeSetupError>[] = [];
     const sources: string[] = [];
+    const headers: number[] = [];
     const transport = nativeWebTransport(
       origin,
       new AbortController().signal,
       () => lost.resolve(),
       (error, status, failed, source) => {
+        if (!failed && source === 'websocket' && status !== undefined)
+          headers.push(status);
         // The owner keeps the first observation; the subsequent close is loss.
         if (failed && !observations.length) {
           observations.push(nativeSetupError(error, status));
@@ -552,6 +555,9 @@ it.each(['http', 'invalid-upgrade', 'reset'] as const)(
     );
     await lost.promise;
     expect(sources).toEqual(['websocket']);
+    expect(headers).toEqual(
+      kind === 'reset' ? [] : [kind === 'invalid-upgrade' ? 101 : 404],
+    );
     expect(observations).toEqual([
       kind === 'reset'
         ? { errorType: 'SystemError', errorCode: 'ECONNRESET' }

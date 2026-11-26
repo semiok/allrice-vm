@@ -161,6 +161,7 @@ export async function openNativeWebOwner(input: {
 }) {
   let step = 'validate-setup';
   let transportStatus: number | undefined;
+  let controlHandshakeStatus: number | undefined;
   let startupFailureAudit: Promise<void> | undefined;
   let startupComplete = false;
   function stage(next: string) {
@@ -175,7 +176,11 @@ export async function openNativeWebOwner(input: {
     startupFailureAudit = Promise.resolve();
     const diagnostic: NativeWebSetupFailure = {
       step,
-      ...nativeSetupError(reason, transportStatus),
+      ...nativeSetupError(
+        reason,
+        transportStatus ??
+          (step === 'control-first-frame' ? controlHandshakeStatus : undefined),
+      ),
       target: nativeSetupTarget(input.launch.auth.origin),
     };
     try {
@@ -306,9 +311,12 @@ export async function openNativeWebOwner(input: {
     (error, status, failed, source) => {
       if (!recordingStartup()) return;
       if (startupFailureAudit) return failed ? startupFailureAudit : undefined;
-      if (source === 'websocket' && step !== 'control-first-frame') {
-        if (!failed) return;
-        stage('control-websocket');
+      if (source === 'websocket') {
+        if (!failed) {
+          controlHandshakeStatus = status;
+          return;
+        }
+        if (step !== 'control-first-frame') stage('control-websocket');
       }
       transportStatus = status;
       if (failed) {
