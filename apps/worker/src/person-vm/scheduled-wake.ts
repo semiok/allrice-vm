@@ -25,6 +25,15 @@ type Capture = {
   /** Rechecks the complete roster and current authenticated native owners.
    * The stop coordinator still owns the final exclusion of concurrent writes. */
   assertCurrent(signal: AbortSignal): Promise<void>;
+  /** The production owner verifies captured work can actually be delivered. */
+  assertDeliverable?(
+    batches: readonly NativeScheduleObservationBatch[],
+    signal: AbortSignal,
+  ): Promise<void>;
+  confirmObservations?(
+    batches: readonly NativeScheduleObservationBatch[],
+    signal: AbortSignal,
+  ): Promise<void>;
 };
 type StartResult = 'ready' | 'not-started' | 'denied' | 'stale' | 'unknown';
 type Options = {
@@ -57,6 +66,7 @@ export type PrepareStopWithWakeResult =
       blocked: true;
       reason:
         | 'SCHEDULE_OBSERVATION_UNAVAILABLE'
+        | 'SCHEDULE_WAKE_UNAVAILABLE'
         | 'SCHEDULE_TOO_CLOSE'
         | 'WAKE_PLAN_UNCONFIRMED';
     };
@@ -128,6 +138,11 @@ export function createPersonVmScheduledWake(input: Options) {
         const canWait = () =>
           wakeAt === null || wakeAt.getTime() > now().getTime();
         if (!canWait()) return { blocked: true, reason: 'SCHEDULE_TOO_CLOSE' };
+        if (wakeAt !== null && captured.assertDeliverable) {
+          reason = 'SCHEDULE_WAKE_UNAVAILABLE';
+          await captured.assertDeliverable(batches, signal);
+          signal.throwIfAborted();
+        }
 
         reason = 'WAKE_PLAN_UNCONFIRMED';
         for (const [index, { origin, receiptId }] of profiles.entries()) {
@@ -156,6 +171,16 @@ export function createPersonVmScheduledWake(input: Options) {
         if (!staged) return { blocked: true, reason };
         await captured.assertCurrent(signal);
         signal.throwIfAborted();
+        if (wakeAt !== null && captured.assertDeliverable) {
+          reason = 'SCHEDULE_WAKE_UNAVAILABLE';
+          await captured.assertDeliverable(batches, signal);
+          signal.throwIfAborted();
+        }
+        if (captured.confirmObservations) {
+          reason = 'SCHEDULE_OBSERVATION_UNAVAILABLE';
+          await captured.confirmObservations(batches, signal);
+          signal.throwIfAborted();
+        }
         if (!canWait()) return { blocked: true, reason: 'SCHEDULE_TOO_CLOSE' };
         return { ok: true, nextWakeAt: wakeAt?.toISOString() ?? null };
       } catch (error) {

@@ -48,6 +48,12 @@ import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
+import {
+  createProductionScheduledWake,
+  type PersonVmWakePreparation,
+  type ProductionScheduledWakeSource,
+} from './production-scheduled-wake.js';
+import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -96,6 +102,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       close(): Promise<void>;
     };
     nativeActivity?: PersonVmNativeActivityPort;
+    scheduledWake?: ProductionScheduledWakeSource;
     egress: {
       authority: EgressAuthority;
       policy: EgressPolicy;
@@ -130,6 +137,10 @@ export type ProductionPersonVmHostSources = Readonly<{
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
 export interface ProductionPersonVmHost {
+  prepareStopWithWake(
+    request: PersonVmWakePreparation,
+    signal: AbortSignal,
+  ): Promise<PrepareStopWithWakeResult>;
   assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
@@ -187,6 +198,7 @@ export function createProductionPersonVmHost(input: {
     bound: BoundSources | undefined,
     gateway: ReturnType<typeof createEgressGateway> | undefined,
     model: ModelGatewayPort | undefined,
+    scheduledWake: ReturnType<typeof createProductionScheduledWake> | undefined,
     installed:
       ReturnType<typeof installAssignedDEntryNativeRuntime> | undefined,
     closing: Promise<void> | undefined;
@@ -381,6 +393,7 @@ export function createProductionPersonVmHost(input: {
         authorityOwner = current,
         startupOwner = startup,
         sourceOwner = bound;
+      if (scheduledWake) await settle([scheduledWake.close]);
       await settle([
         ...(installation ? [() => installation.close()] : []),
         ...(authorityOwner ? [() => authorityOwner.close()] : []),
@@ -804,16 +817,43 @@ export function createProductionPersonVmHost(input: {
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
       });
       lifetime.throwIfAborted();
+      if (bound.scheduledWake) {
+        const wake = createProductionScheduledWake({
+          vm,
+          startup,
+          database: trustedDatabase,
+          source: bound.scheduledWake,
+          lifetime,
+        });
+        scheduledWake = wake;
+        wake.start();
+      }
       return Object.freeze({
+        async prepareStopWithWake(
+          request: PersonVmWakePreparation,
+          signal: AbortSignal,
+        ) {
+          const active = AbortSignal.any([signal, lifetime]);
+          active.throwIfAborted();
+          if (!scheduledWake)
+            return {
+              blocked: true,
+              reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+            } as const;
+          return scheduledWake.prepareStopWithWake(request, active);
+        },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;
           const reopen = vm.fenceWorkerStartup();
           try {
+            await scheduledWake?.pause();
+            signal.throwIfAborted();
             for (const { binding } of ownedVms.values())
               await vm.assertWorkerShutdownSafe(binding, signal);
             gracefulStop = true;
           } catch (error) {
             reopen();
+            scheduledWake?.resume();
             throw error;
           }
         },

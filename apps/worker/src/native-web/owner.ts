@@ -9,6 +9,7 @@ import {
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as SCHEDULE_REMOTE } from '@deepseek-ai/dsh-schedule/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   createDEntryPrincipalControl,
@@ -36,7 +37,7 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
-import { nativeWebTransport } from './transport.js';
+import { nativeWebTransport, type NativeOwnedUnary } from './transport.js';
 import {
   observeNativePrompt,
   type NativePromptObservation,
@@ -371,12 +372,11 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
-  async function readSessionReply(
-    endpoint: 'create' | 'modelCatalog',
+  async function readUnaryReply(
+    method: NativeOwnedUnary,
     args: object,
     signal: AbortSignal,
   ) {
-    const method = 'session/' + endpoint;
     const rpcId = randomUUID();
     const body = JSON.stringify(
       clientRequestSchema.parse({
@@ -386,12 +386,12 @@ export async function openNativeWebOwner(input: {
         payload: { args },
       }),
     );
-    const wire = await transport.readSessionReply(endpoint, body, signal);
+    const wire = await transport.readUnaryReply(method, body, signal);
     const reply = serverResponseSchema.parse(JSON.parse(wire));
     if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
     return reply.result;
   }
-  function replyValue(result: Awaited<ReturnType<typeof readSessionReply>>) {
+  function replyValue(result: Awaited<ReturnType<typeof readUnaryReply>>) {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
@@ -418,7 +418,11 @@ export async function openNativeWebOwner(input: {
           readCurrent(active, guard, async (signal) => {
             const method = TYPERT_REMOTE.methods['session/modelCatalog'];
             const args = method.input({ strict: true }).create().parse({});
-            const result = await readSessionReply('modelCatalog', args, signal);
+            const result = await readUnaryReply(
+              'session/modelCatalog',
+              args,
+              signal,
+            );
             return {
               ok: true as const,
               value: method.result.create().parse(replyValue(result)),
@@ -547,8 +551,8 @@ export async function openNativeWebOwner(input: {
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.
-            const result = await readSessionReply(
-              'create',
+            const result = await readUnaryReply(
+              'session/create',
               args,
               AbortSignal.timeout(input.cleanupTimeoutMs),
             ).catch((error: unknown) => {
@@ -650,6 +654,31 @@ export async function openNativeWebOwner(input: {
           requestSignal,
           (current) => input.vm.assertCurrentBinding(context, binding, current),
           notDispatched,
+        );
+      },
+      /** All reminders in this already-authenticated employee profile. */
+      readScheduleCatalogFor(context: RequestContext, caller: AbortSignal) {
+        const method = SCHEDULE_REMOTE.methods['schedule/catalog'];
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            const args = method.input({ strict: true }).create().parse({});
+            const result = await readUnaryReply(
+              'schedule/catalog',
+              args,
+              active,
+            );
+            const value = replyValue(result);
+            const parsed = method.result.create().parse(value);
+            // The observation ledger must validate the original row, not a
+            // projection from which a protocol decoder dropped unknown fields.
+            return value as typeof parsed;
+          },
         );
       },
       /** The existing native index supplies the running Host's own graph.

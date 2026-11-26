@@ -15,6 +15,9 @@ import { PersonVmError } from '@allrice/person-vm';
 
 export const nativeIndexByteLimit = 1024 * 1024;
 
+export type NativeOwnedUnary =
+  'session/create' | 'session/modelCatalog' | 'schedule/catalog';
+
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(
   origin: string,
@@ -331,17 +334,18 @@ export function nativeWebTransport(
       );
       return data.length ? data.toString('utf8') : null;
     },
-    async readSessionReply(
-      endpoint: 'create' | 'modelCatalog',
+    async readUnaryReply(
+      method: NativeOwnedUnary,
       body: string,
       caller: AbortSignal,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
-        new URL('api/session/' + endpoint, origin),
+        new URL('api/' + method, origin),
         caller,
         {
-          maxBytes: endpoint === 'create' ? 16 * 1024 : nativeIndexByteLimit,
+          maxBytes:
+            method === 'session/create' ? 16 * 1024 : nativeIndexByteLimit,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>
