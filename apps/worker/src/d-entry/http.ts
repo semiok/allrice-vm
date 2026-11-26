@@ -154,7 +154,13 @@ export function createDEntryHttpHandler(
   const workerLifetime = serviceSignal
     ? AbortSignal.any([lifetime.signal, serviceSignal])
     : lifetime.signal;
-  const pending = new Set<Promise<boolean>>();
+  const pending = new Set<Promise<unknown>>();
+  function track<T>(work: Promise<T>) {
+    pending.add(work);
+    const settled = () => pending.delete(work);
+    void work.then(settled, settled);
+    return work;
+  }
   const cleanupErrors: unknown[] = [];
   const prewarm = createPrewarmOperations(workerLifetime, (error) =>
     cleanupErrors.push(error),
@@ -361,21 +367,26 @@ export function createDEntryHttpHandler(
         // If proof is slow, keep that same Worker-owned task and return its ID.
         if (plan.running) {
           const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
           try {
-            await Promise.race([
-              accepted.settled,
-              delay(1000, undefined, {
-                signal: AbortSignal.any([signal, budget.signal]),
-                ref: false,
-              }),
+            const verify = track(
+              (async () => {
+                await accepted.settled;
+                probe.throwIfAborted();
+                return (
+                  accepted.ready() &&
+                  (await check(context, identity, plan, probe, 'ready')) &&
+                  accepted.ready()
+                );
+              })().catch(() => false),
+            );
+            hot = await Promise.race([
+              verify,
+              delay(1000, false, { signal: probe, ref: false }),
             ]);
           } finally {
             budget.abort();
           }
-          hot =
-            accepted.ready() &&
-            (await check(context, identity, plan, signal, 'ready')) &&
-            accepted.ready();
           signal.throwIfAborted();
         }
         if (!hot) {
@@ -799,20 +810,14 @@ export function createDEntryHttpHandler(
   };
   return Object.assign(
     (request: IncomingMessage, response: ServerResponse, stopping = false) => {
-      const operation = handle(request, response, stopping);
-      pending.add(operation);
-      void operation.then(
-        () => pending.delete(operation),
-        () => pending.delete(operation),
-      );
-      return operation;
+      return track(handle(request, response, stopping));
     },
     {
       close() {
         if (closing) return closing;
         lifetime.abort();
         closing = (async () => {
-          await Promise.allSettled([...pending]);
+          while (pending.size) await Promise.allSettled([...pending]);
           await prewarm.close();
           if (cleanupErrors.length)
             throw new AggregateError(
