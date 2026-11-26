@@ -277,7 +277,10 @@ async function main() {
           sendHello: values['send-hello'],
           browserExecutable,
         },
-        { recordFirstFailure },
+        {
+          recordFirstFailure,
+          recordHelloIntent: (item) => write('hello-intent.json', item),
+        },
       )
     : await dryRun({ browserExecutable, recordFirstFailure });
   write('receipt.json', receipt);

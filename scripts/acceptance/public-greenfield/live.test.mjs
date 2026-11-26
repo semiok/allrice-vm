@@ -81,8 +81,16 @@ function managedFixture() {
       operationId,
       state: 'allocated',
       binding,
+      carrierJoined: true,
     })),
-    exactVm: vi.fn(async () => binding),
+    exactVm: vi.fn(async () => ({
+      ...binding,
+      state: 'stopped',
+      diskRetained: true,
+      unmounted: true,
+      leaseReleased: true,
+      portReleased: true,
+    })),
     stopExact: vi.fn(async () => ({
       ...binding,
       state: 'stopped',
@@ -90,6 +98,7 @@ function managedFixture() {
       accountRetained: true,
       unmounted: true,
       leaseReleased: true,
+      portReleased: true,
     })),
     close: vi.fn(async () => {}),
   };
@@ -107,6 +116,7 @@ function managedFixture() {
       input.receipt.browser.cold.prewarmRequests = 1;
       input.receipt.browser.cold.prewarmReady = true;
       input.receipt.browser.closed = true;
+      input.receipt.browser.carrierJoined = true;
       input.receipt.stages.coldEditor = 'passed';
     }),
   };
@@ -199,6 +209,33 @@ it('keeps the browser first failure and refuses to stop a replacement VM', async
   });
 });
 
+it('records the send intent after rechecking the assigned running instance', async () => {
+  await withCredentials(async (credentialPath) => {
+    const fixture = managedFixture();
+    fixture.owner.exactVm.mockResolvedValueOnce({
+      ...binding,
+      state: 'running',
+    });
+    const recordHelloIntent = vi.fn();
+    const coldBrowser = fixture.browser.getMockImplementation();
+    fixture.browser.mockImplementation(async (input) => {
+      await coldBrowser(input);
+      await input.beforeHello();
+      expect(recordHelloIntent).toHaveBeenCalledOnce();
+      input.receipt.stages.hello = 'passed';
+    });
+    const receipt = await runLive(
+      { ownerPath: '/test.mjs', credentialPath, seal, sendHello: true },
+      { ...fixture, recordHelloIntent },
+    );
+    expect(receipt.status).toBe('passed');
+    expect(fixture.owner.workerHealth).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(recordHelloIntent.mock.calls)).not.toContain(
+      operationId,
+    );
+  });
+});
+
 it('the public transport forwards only inspected traffic, with no redirects or retries', async () => {
   let handle;
   const fail = vi.fn();
@@ -248,6 +285,67 @@ it('the public transport forwards only inspected traffic, with no redirects or r
   expect(route.fetch).toHaveBeenCalledOnce();
   expect(route.abort).toHaveBeenCalledOnce();
   expect(fail).toHaveBeenCalledOnce();
+});
+
+it('forwards admitted native read streams and blocks unexpected uplink mutations', async () => {
+  let connect;
+  const fail = vi.fn();
+  const observeFollow = vi.fn();
+  await publicDriver().install(
+    {
+      route: async () => {},
+      routeWebSocket: async (_url, callback) => {
+        connect = callback;
+      },
+    },
+    { muxRole: () => 'streams', observeFollow, fail },
+  );
+  let clientMessage;
+  let serverMessage;
+  const server = {
+    onMessage: (callback) => {
+      serverMessage = callback;
+    },
+    send: vi.fn(),
+    close: vi.fn(async () => {}),
+  };
+  const socket = {
+    url: () => 'wss://allricevm.bplabs.xyz' + paths.mux,
+    connectToServer: () => server,
+    onMessage: (callback) => {
+      clientMessage = callback;
+    },
+    send: vi.fn(),
+    close: vi.fn(async () => {}),
+  };
+  connect(socket);
+  const streamId = randomUUID();
+  const open = JSON.stringify({
+    type: 'open',
+    endpoint: 'session/follow',
+    streamId,
+    payload: {
+      args: {
+        request: { address: { kind: 'session', sessionId: 'bound-root' } },
+      },
+    },
+  });
+  clientMessage(open);
+  expect(server.send).toHaveBeenCalledExactlyOnceWith(open);
+  const reply = JSON.stringify({
+    type: 'item',
+    streamId,
+    value: { type: 'event' },
+  });
+  serverMessage(reply);
+  expect(observeFollow).toHaveBeenCalledExactlyOnceWith('bound-root', {
+    type: 'event',
+  });
+  expect(socket.send).toHaveBeenCalledExactlyOnceWith(reply);
+  clientMessage(JSON.stringify({ type: 'item', streamId, value: 'write' }));
+  expect(server.send).toHaveBeenCalledOnce();
+  expect(fail).toHaveBeenCalledOnce();
+  expect(socket.close).toHaveBeenCalledOnce();
 });
 
 it('allows one exact 你好 prompt and attributes reply timing only to its native turn', async () => {

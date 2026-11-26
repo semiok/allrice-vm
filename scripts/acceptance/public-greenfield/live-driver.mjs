@@ -1,4 +1,4 @@
-import { isId, paths, requireFact } from './contracts.mjs';
+import { paths, requireFact } from './contracts.mjs';
 
 const replyJson = new Set([
   paths.login,
@@ -96,7 +96,8 @@ export function publicDriver() {
               );
               const frame = JSON.parse(message);
               requireFact(
-                isId(frame?.streamId),
+                typeof frame?.streamId === 'string' &&
+                  frame.streamId.length > 0,
                 'native-websocket-stream-unverified',
               );
               if (role === 'owner') {

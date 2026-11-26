@@ -108,7 +108,6 @@ const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const originMain = 'refs/remotes/origin/main';
 const prerequisites = {
   'async-prewarm': '1db5c856d66cdda41a429a2be0625a50d8ad50ce',
-  'first-employee': 'efb1537ec4b95930ee7d666af4b7b170a2d9ca65',
   'system-disk-and-dsh-startup': '70042d3cca750229f4ae96b96fdd8d76552d039c',
 };
 
@@ -164,6 +163,14 @@ export function livePreflight(options, git = localGit) {
         main,
         '--',
         'apps/web/app/chatflow/4.0/page.tsx',
+      ]);
+      git([
+        'grep',
+        '-q',
+        'expectedOwnerId: workspace.viewerId',
+        main,
+        '--',
+        'apps/web/app/chatflow/employee-create-dialog.tsx',
       ]);
     } catch {
       blockers.push('zero-employee-page-wiring-unverified');

@@ -185,6 +185,7 @@ function browserFlow({
           !employeeStarted &&
           !url.search &&
           body?.workspaceId === identity.workspaceId &&
+          (!onColdTicket || body.expectedOwnerId === identity.personId) &&
           !Object.hasOwn(body, 'assignmentId') &&
           isId(body.requestId) &&
           body.profile?.name === employeeName
@@ -463,6 +464,7 @@ export async function runBrowser({
   fail,
   onColdTicket,
   sendHello = false,
+  beforeHello,
   reopenWarm = true,
 }) {
   const { chromium } = webRequire('playwright-core');
@@ -510,6 +512,7 @@ export async function runBrowser({
   }
   const guarded = (action) => Promise.race([action, networkFailure]);
   let context;
+  let publicEditor;
   try {
     context = await browser.newContext({
       acceptDownloads: false,
@@ -650,8 +653,10 @@ export async function runBrowser({
       'cold',
       coldStart,
     );
+    if (onColdTicket) publicEditor = editor;
     if (hello) {
       stage = 'hello';
+      await guarded(beforeHello());
       requireFact(
         !(await guarded(editor.innerText())).trim(),
         'hello-draft-not-empty',
@@ -689,6 +694,47 @@ export async function runBrowser({
     throw error;
   } finally {
     try {
+      if (publicEditor) {
+        try {
+          // Use the existing authenticated document carrier's completion
+          // handshake before killing the Playwright context.
+          const joined = await publicEditor.evaluate(
+            (node) => {
+              const view = node.ownerDocument.defaultView;
+              const scopeId = view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId;
+              return new Promise((resolve) => {
+                const finish = (closed) => {
+                  view.clearTimeout(timer);
+                  view.removeEventListener('message', receive);
+                  resolve(closed);
+                };
+                const receive = (event) => {
+                  if (
+                    event.source === view.parent &&
+                    event.origin === view.location.origin &&
+                    event.data?.scopeId === scopeId &&
+                    event.data.type === 'allrice:d-entry:completion'
+                  ) {
+                    finish(event.data.state === 'closed');
+                  }
+                };
+                const timer = view.setTimeout(() => finish(false), 15_000);
+                view.addEventListener('message', receive);
+                view.parent.postMessage(
+                  { type: 'allrice:d-entry:close', scopeId },
+                  view.location.origin,
+                );
+              });
+            },
+            undefined,
+            { timeout: 15_000 },
+          );
+          requireFact(joined, 'public-carrier-close-unconfirmed');
+          receipt.browser.carrierJoined = true;
+        } catch (error) {
+          fail('carrierClose', error);
+        }
+      }
       await context?.close();
     } finally {
       await browser.close();

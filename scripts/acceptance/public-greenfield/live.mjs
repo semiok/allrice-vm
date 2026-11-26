@@ -57,7 +57,9 @@ export function credentials(path) {
         username === username.trim() &&
         username.length > 0 &&
         username.length <= 80 &&
-        !/[\u0000-\u001f\u007f]/u.test(username) &&
+        [...username].every(
+          (char) => char >= ' ' && char.charCodeAt(0) !== 127,
+        ) &&
         !['snow', 'admin'].includes(username.toLowerCase()) &&
         typeof password === 'string' &&
         password.length > 0 &&
@@ -96,7 +98,7 @@ async function webHealth() {
   const response = await fetch(`${publicOrigin}/api/health/ready`, {
     cache: 'no-store',
     redirect: 'error',
-    signal: AbortSignal.timeout(15_000),
+    signal: globalThis.AbortSignal.timeout(15_000),
   });
   return { status: response.status, body: await response.json() };
 }
@@ -114,18 +116,28 @@ export async function runLive(
     publicHealth = webHealth,
     browser = runBrowser,
     recordFirstFailure = () => {},
+    recordHelloIntent,
   } = {},
 ) {
   const pre = preflight(options);
   if (pre.blockers.length) return pre;
   const { ownerPath, credentialPath, seal, sendHello, browserExecutable } =
     options;
+  if (sendHello && !recordHelloIntent) {
+    pre.blockers.push('hello-intent-receipt-required');
+    return pre;
+  }
   if (!credentialPath || !/^sha256:[0-9a-f]{64}$/u.test(seal ?? '')) {
     pre.blockers.push('private-credentials-and-exact-release-seal-required');
     return pre;
   }
   // A caller's Playwright debugging settings can include network call details.
-  if (process.env.DEBUG || process.env.PWDEBUG || process.env.PWDEBUGIMPL) {
+  if (
+    process.env.DEBUG ||
+    process.env.NODE_DEBUG ||
+    process.env.PWDEBUG ||
+    process.env.PWDEBUGIMPL
+  ) {
     pre.blockers.push('browser-debugging-enabled');
     return pre;
   }
@@ -172,8 +184,9 @@ export async function runLive(
   let owner;
   let identity;
   let operationId;
+  let helloBinding;
   let stage = 'managedOwner';
-  const signal = () => AbortSignal.timeout(30_000);
+  const signal = () => globalThis.AbortSignal.timeout(30_000);
   const readBoots = async () => {
     const workers = await owner.workerHealth({ release, signal: signal() });
     return [
@@ -181,6 +194,26 @@ export async function runLive(
       checkHealth(await publicHealth(), release),
     ];
   };
+  const currentOperation = async () => {
+    requireFact(isId(operationId), 'cleanup-dispatch-unconfirmed');
+    const started = await owner.operationResult({
+      identity,
+      operationId,
+      signal: signal(),
+    });
+    requireFact(
+      started?.operationId === operationId,
+      'cleanup-operation-mismatch',
+    );
+    return started;
+  };
+  const readVm = () => owner.exactVm({ identity, signal: signal() });
+  function assertBoots(before, after) {
+    requireFact(
+      after.every((boot, index) => boot === before[index]),
+      'service-restarted',
+    );
+  }
   try {
     owner = await ownerSource(ownerPath);
     stage = 'credentials';
@@ -218,6 +251,22 @@ export async function runLive(
       fail,
       sendHello,
       reopenWarm: false,
+      beforeHello: async () => {
+        assertBoots(before, await readBoots());
+        const started = await currentOperation();
+        requireFact(started.state === 'allocated', 'hello-start-unconfirmed');
+        helloBinding = captureVmBinding(started.binding, identity);
+        const current = await readVm();
+        requireFact(
+          current?.state === 'running' && sameVmBinding(helloBinding, current),
+          'hello-owner-changed',
+        );
+        recordHelloIntent({
+          action:
+            '以验收员在本次新员工及线程只发送一条“你好”，收到回复后结束。',
+          release,
+        });
+      },
       onColdTicket: (id) => {
         operationId = id;
       },
@@ -225,35 +274,21 @@ export async function runLive(
     requireFact(
       isId(operationId) &&
         receipt.browser.cold.prewarmRequests === 1 &&
+        receipt.browser.carrierJoined === true &&
         receipt.stages.coldEditor === 'passed' &&
         (!sendHello || receipt.stages.hello === 'passed'),
       'public-workbench-unverified',
     );
     stage = 'releaseAfter';
-    const after = await readBoots();
-    requireFact(
-      after.every((boot, index) => boot === before[index]),
-      'service-restarted',
-    );
+    assertBoots(before, await readBoots());
     receipt.stages[stage] = 'passed';
   } catch (error) {
     fail(stage, error);
   } finally {
     try {
       if (receipt.browser.cold.prewarmRequests) {
-        requireFact(
-          receipt.browser.closed && operationId,
-          'cleanup-dispatch-unconfirmed',
-        );
-        const started = await owner.operationResult({
-          identity,
-          operationId,
-          signal: signal(),
-        });
-        requireFact(
-          started?.operationId === operationId,
-          'cleanup-operation-mismatch',
-        );
+        requireFact(receipt.browser.closed, 'cleanup-dispatch-unconfirmed');
+        const started = await currentOperation();
         if (started.state === 'unallocated') {
           requireFact(
             !receipt.browser.cold.prewarmReady,
@@ -266,7 +301,15 @@ export async function runLive(
             'cleanup-start-unconfirmed',
           );
           const binding = captureVmBinding(started.binding, identity);
-          const current = await owner.exactVm({ identity, signal: signal() });
+          requireFact(
+            !helloBinding || sameVmBinding(helloBinding, binding),
+            'cleanup-target-changed',
+          );
+          requireFact(
+            started.carrierJoined === true,
+            'cleanup-carrier-unconfirmed',
+          );
+          const current = await readVm();
           requireFact(
             sameVmBinding(binding, current),
             'cleanup-target-changed',
@@ -278,8 +321,19 @@ export async function runLive(
               stopped.diskRetained === true &&
               stopped.accountRetained === true &&
               stopped.unmounted === true &&
-              stopped.leaseReleased === true,
+              stopped.leaseReleased === true &&
+              stopped.portReleased === true,
             'cleanup-unconfirmed',
+          );
+          const readback = await readVm();
+          requireFact(
+            readback?.state === 'stopped' &&
+              sameVmBinding(binding, readback) &&
+              readback.diskRetained === true &&
+              readback.unmounted === true &&
+              readback.leaseReleased === true &&
+              readback.portReleased === true,
+            'cleanup-readback-unconfirmed',
           );
           receipt.cleanup = {
             status: 'stopped',

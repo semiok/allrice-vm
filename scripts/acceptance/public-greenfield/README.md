@@ -34,7 +34,7 @@ node scripts/acceptance/public-greenfield/run.mjs --live --allow-public-writes \
 
 `acceptance.json` 为仓库外的私有普通文件，当前操作员属主、模式 `0600`。它只含 `username`、`password`、`organizationId`、`personId`、`workspaceId`。只使用从发布负责人取得的验收员资料。用户名、口令、Cookie、原生消息、票据和物理实例身份都不进入回执。关闭 Playwright 调试。运行前后独立核对 Web/Worker 与相同 release 和进程 boot ID。
 
-只有本次获准发送时才加 `--send-hello`。浏览器一次点击，同一原生根会话仅放行一次单文本 `session/prompt`，内容为“你好”。回复计时从真实请求截获到同一原生回合首条非空回复，再到回合完成。报告只留计时与状态。发送或回执未知时结束，保持首败并交负责人查原回合。
+只有本次获准发送时才加 `--send-hello`。点击前重新核对发布、进程和本次票据的运行实例，写 `hello-intent.json`。浏览器一次点击，同一原生根会话仅放行一次单文本 `session/prompt`，内容为“你好”。回复计时从真实请求截获到同一原生回合首条非空回复，再到回合完成。报告只留计时与状态。发送或回执未知时结束，保持首败并交负责人查原回合。
 
 ### 受管 Host 前置
 
@@ -44,7 +44,7 @@ node scripts/acceptance/public-greenfield/run.mjs --live --allow-public-writes \
 
 - `prepare({ identity, username, release, signal })` 在独占验收窗口读回普通验收员的精确 `{ organizationId, personId, workspaceId }`、username、`role: '验收员'`、`state: 'zero-employee-no-vm'`、`personScopedRelease: true`。
 - `workerHealth({ release, signal })` 返回该受管 Worker 的 `{ status, body }`。
-- `operationResult({ identity, operationId, signal })` 用真实 202 票查本次分配，回相同 `operationId` 和 `state: 'allocated'` + `binding`，或已确认的 `state: 'unallocated'`。未知或仍在建时失败保留。`exactVm({ identity, signal })` 读回当前绑定，用 `vmId/personId/organizationId/instanceId/leaseEpoch` 对账。
-- `stopExact({ binding, signal })` 在同一个受权 Host 租约内再次核身份并仅停该 VM，返回同一绑定及 `state: 'stopped'`、`diskRetained/accountRetained/unmounted/leaseReleased: true`。`close({ signal })` 归还本模块占用的窗口和连接。脚本没有公共停机 URL。
+- `operationResult({ identity, operationId, signal })` 用真实 202 票查本次分配，回相同 `operationId` 和 `state: 'allocated'` + `binding`，或已确认的 `state: 'unallocated'`。未知或仍在建时失败保留。关闭浏览器后还需 `carrierJoined: true`。`exactVm({ identity, signal })` 读回当前绑定，用 `vmId/personId/organizationId/instanceId/leaseEpoch` 对账；发送前查 `state: 'running'`。
+- `stopExact({ binding, signal })` 在同一个受权 Host 租约内再次核身份并仅停该 VM，返回同一绑定及 `state: 'stopped'`、`diskRetained/accountRetained/unmounted/leaseReleased/portReleased: true`。停后用 `exactVm` 独立读回绑定、停止和物理资源状态。`close({ signal })` 归还本模块占用的窗口和连接。脚本没有公共停机 URL。
 
 当前片可离线检查真正的 HTTP/WebSocket 转发规则和原生回执识别。正式 Host 接线、真实公网与模型验收分别等待发布窗口。缺少新员工版本、已核生产 Host 接口或绑定权限时，退出 `2` 并保留阻塞回执。
