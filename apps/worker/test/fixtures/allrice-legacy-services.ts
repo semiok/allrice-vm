@@ -7,13 +7,13 @@ import {
 } from '@allrice/database';
 import type { StoragePort } from '@allrice/contracts';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { generateDeliverable } from '../deliverable-generator.js';
+import { generateDeliverable } from '../../src/deliverable-generator.js';
 import {
   allriceMcpApiError,
   type AllriceMcpDeliverableInput,
   type AllriceMcpScope,
   type AllriceMcpServices,
-} from './allrice-server.js';
+} from '../../src/mcp/allrice-server.js';
 
 /** Gateway-provided association to a real legacy execution. Native instance,
  * profile, session, employee and call are host facts, not parsed MCP fields. */

@@ -84,7 +84,7 @@ CallToolResultSchema 保原生 text/image/resource/structuredContent，不替业
 
 公开 schema 全沿 `@allrice/contracts` ApiVersion=v1、ContractVersion=1、CompatibilityPolicy rolling [1]；业务记忆为既有 V2 schema，原生 DSH 为当前单代。ReferenceReadSchema 强制 Run/generation/job/worker，RunMemoryContextV2StateSchema 强制 issued pins/预算，WorkbenchArtifact publisher 强制当前 Run/call；没有为 4.0 伪造这些字段。真实源码基线 `ec13399e7abcff68a6fae419c46a5c61a64f214e`；新增符号的固定 SHA/tree 由任务最终回执绑定。
 
-`createLegacyAllriceMcpServices` 明确声明 3.x，并校验 host person/org/workspace/employee/thread/native instance/profile/session/call 与实际 gateway execution 关联一致。4.0 server 不发布或调用 3.x adapter。默认 inline provider 仅绑定已有 markdown/text/html/json 生成路径；Office/python/转换和 changeset provider 未接时返回既有 DEPENDENCY_UNAVAILABLE，不伪造 Office 质量。模型 input 沿现 workspace.export.create JSON Schema；prepared bytes、host quality stamp、worker 和外发批准不入 guest schema。
+`apps/worker/test/fixtures/allrice-legacy-services.ts` 的 `createLegacyAllriceMcpServices` 仅用于集成测试。它声明 3.x，并校验 host person/org/workspace/employee/thread/native instance/profile/session/call 与实际 gateway execution 关联一致。4.0 server 不发布或调用 3.x adapter。默认 inline provider 仅绑定已有 markdown/text/html/json 生成路径；Office/python/转换和 changeset provider 未接时返回既有 DEPENDENCY_UNAVAILABLE，不伪造 Office 质量。模型 input 沿现 workspace.export.create JSON Schema；prepared bytes、host quality stamp、worker 和外发批准不入 guest schema。
 
 成果 owner 从本次 host authority 强制捕获 `expectedExecution` 的 worker/job/leaseToken/attempt，prepared 类型不能携带或覆盖它。既有 publisher 的三个事务检查点在首次 storage.put 前及提交前校验精确租约，保持原 `FOR SHARE` 锁；锁前换租约会拒绝，锁后轮换被串行化，真实时间到期仍会回滚新版本。该参数仅供受管接缝使用，原调用不传时语义不变。既有同 Run+call+requestDigest receipt 分支仍先查当前资源权限、恢复已提交版本，允许原执行取消后对账；异 digest 拒绝，不把恢复权限当成新发布权限。
 
