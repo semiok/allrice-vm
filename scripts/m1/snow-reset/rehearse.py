@@ -46,18 +46,18 @@ insert into allrice_employee_instances (id,organization_id,workspace_id,owner_id
   where organization_id=:'organization';
 insert into allrice_employee_instance_revisions (instance_id,revision,profile)
   select id,1,'{}' from allrice_employee_instances where organization_id=:'organization';
-insert into allrice_chat_sessions (id,organization_id,workspace_id,owner_id,title,employee_assignment_id,employee_instance_id)
-  select id,organization_id,workspace_id,owner_id,'QA session',assignment_id,id
+insert into allrice_chat_sessions (id,organization_id,workspace_id,owner_id,title,employee_assignment_id,employee_instance_id,employee_version_id)
+  select id,organization_id,workspace_id,owner_id,'QA session',assignment_id,id,creation_version_id
   from allrice_employee_instances where organization_id=:'organization';
 insert into allrice_messages (id,organization_id,workspace_id,session_id,owner_id,role,content)
   select id,organization_id,workspace_id,id,owner_id,'user','"fixture"'
   from allrice_chat_sessions where organization_id=:'organization';
-insert into allrice_runs (id,organization_id,workspace_id,owner_id,state)
-  select id,organization_id,workspace_id,owner_id,'succeeded'
+insert into allrice_runs (id,organization_id,workspace_id,owner_id,state,execution_spec,input)
+  select id,organization_id,workspace_id,owner_id,'succeeded','{}','{}'
   from allrice_chat_sessions where organization_id=:'organization';
 insert into allrice_employee_runs (run_id,organization_id,workspace_id,owner_id,employee_assignment_id,
-  employee_version_id,session_id,user_message_id,assistant_message_id,status,provider_snapshot,prompt_snapshot)
-  select id,organization_id,workspace_id,owner_id,id,:'version',id,id,id,'succeeded','{}','{}'
+  employee_version_id,session_id,user_message_id,assistant_message_id,status,provider_snapshot,prompt_snapshot,completed_at)
+  select id,organization_id,workspace_id,owner_id,id,:'version',id,id,id,'succeeded','{}','{}',now()
   from allrice_runs where organization_id=:'organization';
 insert into allrice_employee_run_steps (organization_id,workspace_id,run_id,sequence,event_type)
   select organization_id,workspace_id,run_id,0,'fixture.done'
@@ -110,7 +110,7 @@ def snapshot(sql, *, expected=False):
         f"('{table}', '{predicate.replace(chr(39), chr(39) * 2)}')"
         for table, predicate in conditions.items()
     )
-    output = sql(TARGET, f"""
+    output = sql(TARGET, rf"""
 select format('select %L || '':'' || md5(coalesce(string_agg(h, '''' order by h), ''''))
   from (select md5(to_jsonb(t)::text) h from public.%I t where %s) data',
   table_name, table_name, coalesce(predicate, 'true'))
