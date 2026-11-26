@@ -178,6 +178,11 @@ export const reviewedUnresolvedCalls: readonly {
       'The Web history and download GET handlers use watchDEntryHistoryAuthority without NativeRosterChecks, so the optional verifyRoster call does not run. The Worker prompt owner supplies the only production implementation. Its roster FOR SHARE is outside this GET review. Re-review if a GET caller supplies these checks.',
   },
   {
+    target: 'packages/database/src/d-entry-authority.ts verifyRevision',
+    reason:
+      'Only the Worker prewarm POST supplies this optional revision check. The Web GET history and download subscriptions omit it. The Worker callback uses the scoped repeatable-read snapshot with no row-lock clauses. Re-review if a GET subscription supplies a callback.',
+  },
+  {
     target: 'packages/contracts/src/storage.ts get',
     reason: 'Object storage adapters read blobs; they run no SQL.',
   },

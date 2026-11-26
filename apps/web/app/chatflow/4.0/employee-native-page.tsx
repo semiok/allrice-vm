@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
+  type DEntryNativePrewarmTicket,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
 import {
@@ -49,6 +50,7 @@ type EntryWarmup = {
   result: Promise<void>;
   progress: {
     current?: EmployeePrewarmProgress;
+    ticket?: DEntryNativePrewarmTicket;
     show?(state: EmployeePrewarmProgress): void;
   };
 };
@@ -89,6 +91,7 @@ export function EmployeeNativePage({
     query: string;
     confirmedQuery?: string;
     warmup?: EntryWarmup;
+    ticket?: DEntryNativePrewarmTicket;
   }>({ query });
   const activeQuery = activation.query;
   const loaded = useRef<((node: HTMLIFrameElement) => void) | undefined>(
@@ -125,6 +128,8 @@ export function EmployeeNativePage({
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
+    let ticket = activation.ticket;
+    let resumable = false;
     let superseded = false;
     let timer: number | undefined;
     let closingNotice: number | undefined;
@@ -175,6 +180,7 @@ export function EmployeeNativePage({
     function finish(status: 'cancelled' | 'failed' | 'denied') {
       if (navigating || replace.current !== applyQuery) return;
       navigating = true;
+      resumable = status === 'cancelled';
       window.clearTimeout(timer);
       setStatus(status);
       closingNotice = window.setTimeout(
@@ -268,6 +274,10 @@ export function EmployeeNativePage({
       setActivation({
         query,
         confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+        ticket:
+          resumable && query === activeQuery
+            ? (ticket ?? activation.warmup?.progress.ticket)
+            : undefined,
       });
     };
     const receive = (event: MessageEvent) => {
@@ -338,14 +348,15 @@ export function EmployeeNativePage({
           // This request has no page-carrier or thread-creation side effect.
           const lifetime = new AbortController();
           const progress: EntryWarmup['progress'] = {};
-          const result = prewarmEmployeeEntry(
-            next.data,
-            lifetime.signal,
-            (state) => {
+          const result = prewarmEmployeeEntry(next.data, lifetime.signal, {
+            accepted: (ticket) => {
+              progress.ticket = ticket;
+            },
+            progress(state) {
               progress.current = state;
               progress.show?.(state);
             },
-          );
+          });
           void result.catch(() => {}); // the next activation reports the result
           nextWarmup = { lifetime, result, progress };
         }
@@ -409,7 +420,13 @@ export function EmployeeNativePage({
             if (progress.current) showPrewarm(progress.current);
             await result;
           } else
-            await prewarmEmployeeEntry(selection, lifetime.signal, showPrewarm);
+            await prewarmEmployeeEntry(selection, lifetime.signal, {
+              ticket,
+              accepted: (accepted) => {
+                ticket = accepted;
+              },
+              progress: showPrewarm,
+            });
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -420,6 +437,9 @@ export function EmployeeNativePage({
             entry,
             lifetime.signal,
             () => {
+              ticket = undefined;
+              if (activation.warmup)
+                activation.warmup.progress.ticket = undefined;
               setStatus('opening');
               timer = window.setTimeout(() => finish('failed'), entryWaitMs);
             },

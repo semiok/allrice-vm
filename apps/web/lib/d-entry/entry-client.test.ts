@@ -45,7 +45,7 @@ it('polls one ticket at 1, 2, then 3 seconds and can open after 125 seconds with
     input,
     signal,
     opening,
-    prewarmEmployeeEntry(input.selection, signal, progress),
+    prewarmEmployeeEntry(input.selection, signal, { progress }),
   );
   await vi.advanceTimersByTimeAsync(125_000);
   expect(opening).not.toHaveBeenCalled();
@@ -92,6 +92,29 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   await vi.advanceTimersByTimeAsync(12_000);
   await abandoned;
   expect(fetch).toHaveBeenCalledTimes(3);
+});
+
+it('resumes the exact admitted ticket with a GET and no new POST', async () => {
+  vi.useFakeTimers();
+  const ticket = {
+    operationId: randomUUID(),
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    pollAfterMs: 1000,
+  };
+  const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+    Response.json({ state: 'ready' }),
+  );
+  vi.stubGlobal('fetch', fetch);
+  const done = prewarmEmployeeEntry(selection, new AbortController().signal, {
+    ticket,
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  await expect(done).resolves.toBeUndefined();
+  expect(fetch).toHaveBeenCalledExactlyOnceWith(
+    '/api/v1/d-entry/native-prewarm/status?' +
+      new URLSearchParams({ ...selection, operationId: ticket.operationId }),
+    expect.objectContaining({ method: 'GET' }),
+  );
 });
 
 it('keeps the New operation ID out of the prewarm selector and requires its exact reply', async () => {

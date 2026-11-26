@@ -233,9 +233,15 @@ export function createDEntryHttpHandler(
           operationId,
           context,
           identity,
-          async (plan) => {
-            if (!deps.prewarm.assertReady) throw new DEntryNativeUnavailable();
-            await deps.prewarm.assertReady(context, identity, plan, signal);
+          (plan, ready) => {
+            if (!deps.prewarm.isCurrent) throw new DEntryNativeUnavailable();
+            return deps.prewarm.isCurrent(
+              context,
+              identity,
+              plan,
+              signal,
+              ready ? 'ready' : 'operation',
+            );
           },
         );
         signal.throwIfAborted();
@@ -285,24 +291,49 @@ export function createDEntryHttpHandler(
         : undefined;
       parsedInput = true;
       const auth = await currentDEntryRequest(deps, token, input, signal);
-      authority = await deps.watch(
-        auth.context,
-        input.selection,
-        auth.identity,
-        // A cold operation takes ownership of this subscription on acceptance.
-        prewarmRequest ? workerLifetime : signal,
-      );
+      const plan =
+        prewarmRequest &&
+        (await deps.prewarm.prepare?.(auth.context, auth.identity, signal));
+      const check = deps.prewarm.isCurrent?.bind(deps.prewarm);
+      if (prewarmRequest && (!plan || !check))
+        throw new DEntryNativeUnavailable();
+      // The job takes ownership of its subscription on acceptance. LISTEN
+      // rechecks the captured revision even after a revoke/regrant.
+      authority =
+        plan && check
+          ? await deps.watch(
+              auth.context,
+              input.selection,
+              auth.identity,
+              workerLifetime,
+              undefined,
+              async (current) => {
+                if (
+                  !(await check(
+                    auth.context,
+                    auth.identity,
+                    plan,
+                    current,
+                    'authority',
+                  ))
+                )
+                  throw new DataAccessError('authorization_denied');
+              },
+            )
+          : await deps.watch(
+              auth.context,
+              input.selection,
+              auth.identity,
+              signal,
+            );
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
-      if (prewarmRequest) {
-        if (!deps.prewarm.prepare) throw new DEntryNativeUnavailable();
-        const plan = await deps.prewarm.prepare(
-          auth.context,
-          auth.identity,
-          signal,
-        );
+      if (prewarmRequest && plan) {
         const next = await currentDEntryRequest(deps, token, input, signal);
-        if (!sameDEntryIdentity(auth.identity, next.identity))
+        if (
+          auth.context.sessionId !== next.context.sessionId ||
+          !sameDEntryIdentity(auth.identity, next.identity)
+        )
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
         const receipt = {

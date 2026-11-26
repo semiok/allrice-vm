@@ -7,13 +7,10 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
+import type { PersonVmPrewarmTarget } from '@allrice/person-vm';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
-export type PrewarmGeneration = {
-  vmId: string | null;
-  instanceId: string | null;
-  leaseEpoch: number;
-};
+export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
@@ -38,12 +35,13 @@ export interface DEntryNativePrewarmPort {
     identity: DEntryIdentity,
     signal: AbortSignal,
   ): Promise<PrewarmPlan>;
-  assertReady?(
+  isCurrent?(
     context: RequestContext,
     identity: DEntryIdentity,
     plan: PrewarmPlan,
     signal: AbortSignal,
-  ): Promise<void>;
+    mode: 'authority' | 'operation' | 'ready',
+  ): Promise<boolean>;
   prewarm(
     context: RequestContext,
     identity: DEntryIdentity,
@@ -68,9 +66,9 @@ export const dEntryNativePrewarmPort: DEntryNativePrewarmPort = {
     if (!installed?.prepare) throw new DEntryNativeUnavailable();
     return installed.prepare(context, identity, signal);
   },
-  assertReady(context, identity, plan, signal) {
-    if (!installed?.assertReady) throw new DEntryNativeUnavailable();
-    return installed.assertReady(context, identity, plan, signal);
+  isCurrent(context, identity, plan, signal, mode) {
+    if (!installed?.isCurrent) throw new DEntryNativeUnavailable();
+    return installed.isCurrent(context, identity, plan, signal, mode);
   },
   prewarm(context, identity, trigger, signal, revoked, plan) {
     signal.throwIfAborted();
@@ -127,7 +125,14 @@ export function createPrewarmOperations(
           return { ticket: entry.ticket, owned: false };
         }
       }
-      if (tickets.size >= 256) throw new DEntryNativeUnavailable();
+      if (pending.size >= 256) throw new DEntryNativeUnavailable();
+      if (tickets.size >= 2048) {
+        for (const [id, entry] of tickets) {
+          if (active(entry)) continue;
+          tickets.delete(id);
+          break;
+        }
+      }
       const lifetimeMs = 10 * 60_000;
       const expires = now + lifetimeMs;
       const ticket = {
@@ -185,18 +190,21 @@ export function createPrewarmOperations(
       operationId: string,
       context: RequestContext,
       identity: DEntryIdentity,
-      verify: (plan: PrewarmPlan) => Promise<void>,
+      verify: (plan: PrewarmPlan, ready: boolean) => Promise<boolean>,
     ): Promise<DEntryNativePrewarmStatus> {
       const entry = tickets.get(operationId);
       if (!entry || entry.expires <= Date.now()) return { state: 'expired' };
       if (!belongs(entry, context, identity))
         throw new DataAccessError('not_found');
-      if (entry.state.state !== 'ready') return entry.state;
-      if (entry.proof?.aborted) return { state: 'expired' };
-      await verify(entry.plan);
-      if (entry.proof?.aborted || entry.expires <= Date.now())
+      const state = entry.state;
+      const ready = state.state === 'ready';
+      if (
+        !(await verify(entry.plan, ready)) ||
+        (ready && entry.proof?.aborted) ||
+        entry.expires <= Date.now()
+      )
         return { state: 'expired' };
-      return entry.state;
+      return state;
     },
     async close() {
       await Promise.allSettled(pending);

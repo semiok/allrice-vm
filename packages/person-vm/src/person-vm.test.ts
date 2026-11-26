@@ -19,6 +19,33 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  it('rejects a changed prewarm epoch under the lease before any disk or native side effect', async () => {
+    const store = new MemoryStore(),
+      h = harness(store),
+      rc = context();
+    await h.service.create(rc, signal());
+    const previous = store.rows.get(rc.actor.id)!;
+    const target = {
+      vmId: previous.vmId,
+      instanceId: null,
+      leaseEpoch: previous.leaseEpoch + 1,
+    };
+    const withLease = store.withLease.bind(store);
+    vi.spyOn(store, 'withLease').mockImplementationOnce((...args) => {
+      store.rows.set(rc.actor.id, {
+        ...previous,
+        leaseEpoch: target.leaseEpoch,
+      });
+      return withLease(...args);
+    });
+    h.log.length = 0;
+    await expect(
+      h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(h.log).toEqual([]);
+    expect(store.rows.get(rc.actor.id)?.leaseEpoch).toBe(target.leaseEpoch);
+    expect(store.rows.get(rc.actor.id)?.leaseOwner).toBeNull();
+  });
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');

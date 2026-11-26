@@ -23,10 +23,14 @@ import {
   installDEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
   type PrewarmGeneration as Generation,
+  type PrewarmPlan,
 } from '../d-entry/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 
-type VmStamp = Generation & { phase: PersonVmView['phase'] };
+type VmStamp = Generation & {
+  phase: PersonVmView['phase'];
+  leaseOwner: string | null;
+};
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
 type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
 type ReadCoordination = (identity: DEntryIdentity) => Promise<Coordination>;
@@ -48,6 +52,7 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
       >`
       select (select row_to_json(stamp) from (
         select vm_id as "vmId", instance_id as "instanceId", phase,
+          lease_owner as "leaseOwner",
           lease_epoch::text as "leaseEpoch" from person_virtual_machines
         where person_id=${identity.personId} and organization_id=${identity.organizationId}
       ) stamp) as vm,
@@ -70,7 +75,9 @@ const readCurrentCoordination: ReadCoordination = (identity) =>
           and i.organization_id=${identity.organizationId} and i.workspace_id=${identity.workspaceId}
           and i.archived_at is null and a.active) as "employeeGrant",
       case when ${identity.threadId}::uuid is null then 'employee'
-      else (select c.xmin::text from allrice_chat_sessions c
+      else (select jsonb_build_array(c.id, c.employee_instance_id,
+          c.employee_assignment_id, c.employee_version_id, c.execution_generation)::text
+        from allrice_chat_sessions c
         where c.id=${identity.threadId} and c.owner_id=${identity.personId}
           and c.organization_id=${identity.organizationId} and c.workspace_id=${identity.workspaceId}
           and c.archived_at is null) end as "threadGrant"`;
@@ -100,6 +107,16 @@ function targetGeneration(vm: VmStamp | null): Generation | undefined {
   // A retained or as-yet-unstarted VM advances exactly one epoch on start.
   if (!Number.isSafeInteger(vm.leaseEpoch + 1)) return;
   return { vmId: vm.vmId, instanceId: null, leaseEpoch: vm.leaseEpoch + 1 };
+}
+
+function plannedGeneration(vm: VmStamp | null) {
+  // An explicit request can select the next epoch of an already unowned
+  // starting row. A ticket issued while the prior owner was present cannot.
+  return targetGeneration(
+    vm?.phase === 'starting' && !vm.leaseOwner
+      ? { ...vm, instanceId: null }
+      : vm,
+  );
 }
 
 function matchingGeneration(
@@ -233,7 +250,41 @@ export function createDEntryNativePrewarmPort(input: {
     void work.then(settled, settled);
     return { flight, started: true };
   }
+  async function isCurrent(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    plan: PrewarmPlan,
+    caller: AbortSignal,
+    mode: 'authority' | 'operation' | 'ready',
+  ) {
+    const signal = AbortSignal.any([admission, caller]);
+    signal.throwIfAborted();
+    const stamp = await input.readCoordination?.(identity);
+    signal.throwIfAborted();
+    if (
+      !stamp?.authorityRevision ||
+      plan.key !== prewarmKey(context, identity, stamp.authorityRevision)
+    )
+      return false;
+    if (mode === 'authority') return true;
+    const exact = (vm: Generation | null | undefined) =>
+      !!vm &&
+      vm.leaseEpoch === plan.target.leaseEpoch &&
+      (!plan.target.vmId || vm.vmId === plan.target.vmId) &&
+      (!plan.target.instanceId || vm.instanceId === plan.target.instanceId);
+    if (mode === 'ready')
+      return (
+        stamp.vm?.phase === 'running' &&
+        !!stamp.vm.instanceId &&
+        exact(stamp.vm)
+      );
+    return (
+      stamp.vm?.phase !== 'deleted' &&
+      (exact(stamp.vm) || exact(plannedGeneration(stamp.vm)))
+    );
+  }
   const port: DEntryNativePrewarmPort = {
+    isCurrent,
     async prepare(context, identity, caller) {
       const signal = AbortSignal.any([admission, caller]);
       signal.throwIfAborted();
@@ -243,7 +294,7 @@ export function createDEntryNativePrewarmPort(input: {
         throw new DEntryNativeUnavailable();
       const stamp = await read(identity);
       signal.throwIfAborted();
-      const target = targetGeneration(stamp.vm);
+      const target = plannedGeneration(stamp.vm);
       if (!stamp.authorityRevision || !target)
         throw new DataAccessError('authorization_denied');
       const key = prewarmKey(context, identity, stamp.authorityRevision);
@@ -251,7 +302,16 @@ export function createDEntryNativePrewarmPort(input: {
         return { key, target };
       try {
         const ready = await data.assertEditorReady(context, identity, signal);
-        await port.assertReady!(context, identity, { key, target }, signal);
+        if (
+          !(await isCurrent(
+            context,
+            identity,
+            { key, target },
+            signal,
+            'ready',
+          ))
+        )
+          throw new DataAccessError('authorization_denied');
         ready.throwIfAborted();
         return { key, target, ready };
       } catch (error) {
@@ -269,20 +329,6 @@ export function createDEntryNativePrewarmPort(input: {
           return { key, target };
         throw error;
       }
-    },
-    async assertReady(context, identity, plan, caller) {
-      const signal = AbortSignal.any([admission, caller]);
-      signal.throwIfAborted();
-      const stamp = await input.readCoordination?.(identity);
-      signal.throwIfAborted();
-      if (
-        !stamp?.authorityRevision ||
-        stamp.vm?.phase !== 'running' ||
-        !stamp.vm.instanceId ||
-        !compatible(stamp.vm, plan.target) ||
-        plan.key !== prewarmKey(context, identity, stamp.authorityRevision)
-      )
-        throw new DataAccessError('authorization_denied');
     },
     prewarm(context, identity, trigger, caller, revoked, plan) {
       if (admission.aborted) return Promise.reject(admission.reason);
@@ -326,7 +372,9 @@ export function createDEntryNativePrewarmPort(input: {
         const stamp = await read?.(identity);
         active.throwIfAborted();
         const revision = stamp?.authorityRevision;
-        const target = stamp && targetGeneration(stamp.vm);
+        const target =
+          stamp &&
+          (plan ? plannedGeneration(stamp.vm) : targetGeneration(stamp.vm));
         if (
           plan &&
           (!revision ||
@@ -336,7 +384,12 @@ export function createDEntryNativePrewarmPort(input: {
         )
           throw new DataAccessError('authorization_denied');
         const start = (signal: AbortSignal) =>
-          input.prewarmCurrent(context, identity, { trigger }, signal);
+          input.prewarmCurrent(
+            context,
+            identity,
+            { trigger, ...(plan && { target: plan.target }) },
+            signal,
+          );
         const ticket =
           read && revision && target
             ? shared({

@@ -223,6 +223,7 @@ async function watchDEntryAuthority(
   access: 'native' | 'history' | 'identity',
   feed?: Feed,
   nativeChecks?: NativeRosterChecks,
+  verifyRevision?: (signal: AbortSignal) => Promise<void>,
 ): Promise<ObservedAuthority> {
   const selection = (
     access === 'history'
@@ -268,6 +269,7 @@ async function watchDEntryAuthority(
     if (!session || !sameDEntryIdentity(identity, expected))
       throw new DataAccessError('authorization_denied');
     schema = session.schema;
+    await verifyRevision?.(revoked);
     if (roster) await nativeChecks?.verifyRoster(revoked);
     revoked.throwIfAborted();
     expiresAt = session.expires_at.toISOString();
@@ -390,8 +392,18 @@ export function watchDEntryNativeAuthority(
   expected: DEntryIdentity,
   signal: AbortSignal,
   feed?: Feed,
+  verifyRevision?: (signal: AbortSignal) => Promise<void>,
 ): Promise<DEntryAuthoritySubscription> {
-  return watchDEntryAuthority(context, input, expected, signal, 'native', feed);
+  return watchDEntryAuthority(
+    context,
+    input,
+    expected,
+    signal,
+    'native',
+    feed,
+    undefined,
+    verifyRevision,
+  );
 }
 
 /** Whole VM roster joins the same current-login observation. Notification

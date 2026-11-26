@@ -1,6 +1,7 @@
 import {
   DEntryNativePrewarmStatusSchema,
   DEntryNativePrewarmTicketSchema,
+  type DEntryNativePrewarmTicket,
   DEntrySelectionInputSchema,
   UuidSchema,
   type DEntrySelectionInput,
@@ -64,21 +65,28 @@ function waitForPrewarmPoll(delay: number, signal: AbortSignal) {
 export async function prewarmEmployeeEntry(
   selection: DEntrySelectionInput,
   signal: AbortSignal,
-  progress?: (state: EmployeePrewarmProgress) => void,
+  options: {
+    ticket?: DEntryNativePrewarmTicket;
+    accepted?(ticket: DEntryNativePrewarmTicket): void;
+    progress?(state: EmployeePrewarmProgress): void;
+  } = {},
 ) {
-  const warm = await postEmployeeEntry(
-    '/api/v1/d-entry/native-prewarm',
-    { selection, trigger: 'page' },
-    signal,
-  );
+  let ticket = options.ticket;
+  if (!ticket) {
+    const warm = await postEmployeeEntry(
+      '/api/v1/d-entry/native-prewarm',
+      { selection, trigger: 'page' },
+      signal,
+    );
+    signal.throwIfAborted();
+    if (warm.status === 204) return;
+    if (warm.status !== 202) throw new EmployeeEntryError(warm.status);
+    ticket = DEntryNativePrewarmTicketSchema.parse(await warm.json());
+  }
   signal.throwIfAborted();
-  if (warm.status === 204) return;
-  if (warm.status !== 202) throw new EmployeeEntryError(warm.status);
-  const { operationId, pollAfterMs } = DEntryNativePrewarmTicketSchema.parse(
-    await warm.json(),
-  );
-  signal.throwIfAborted();
-  progress?.('accepted');
+  options.accepted?.(ticket);
+  options.progress?.('accepted');
+  const { operationId, pollAfterMs } = ticket;
   const query = new URLSearchParams({ ...selection, operationId });
   for (let delay = pollAfterMs; ; delay = Math.min(3000, delay + 1000)) {
     await waitForPrewarmPoll(delay, signal);
@@ -105,7 +113,7 @@ export async function prewarmEmployeeEntry(
         status.code === 'AUTHORITY_REVOKED' ? 403 : 503,
       );
     if (status.state === 'ready') return;
-    progress?.(status.state);
+    options.progress?.(status.state);
   }
 }
 

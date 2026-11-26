@@ -157,13 +157,19 @@ export class PersonVmError extends Error {
   }
 }
 
+export type PersonVmPrewarmTarget = Readonly<{
+  vmId: string | null;
+  instanceId: string | null;
+  leaseEpoch: number;
+}>;
+
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
 export interface PersonVmPort {
   create(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input' },
+    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmTarget },
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

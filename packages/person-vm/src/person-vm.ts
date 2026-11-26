@@ -16,6 +16,7 @@ import {
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
+  type PersonVmPrewarmTarget,
   type PersonVmRuntimePort,
   type PersonVmView,
 } from './contract.ts';
@@ -260,12 +261,33 @@ export class PersonVmService
     this.checkOrganization(row, identity.organizationId);
     return view(row); // A persisted running flag is not a readiness assertion.
   }
-  async create(context: RequestContext, signal: AbortSignal) {
+  private assertPrewarmTarget(
+    row: VmRecord | null,
+    target?: PersonVmPrewarmTarget,
+  ) {
+    if (!target) return;
+    const running = row?.phase === 'running';
+    const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
+    if (
+      row?.phase === 'deleted' ||
+      epoch !== target.leaseEpoch ||
+      (target.vmId !== null && target.vmId !== row?.vmId) ||
+      (target.instanceId !== null &&
+        (!running || target.instanceId !== row?.instanceId))
+    )
+      throw new PersonVmError('LEASE_LOST');
+  }
+  async create(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmTarget,
+  ) {
     return this.leased(
       context,
       'create',
       signal,
       async (lease, identity, signal) => {
+        this.assertPrewarmTarget(lease.row, target);
         const retry =
           lease.row &&
           !lease.row.instanceId &&
@@ -434,9 +456,19 @@ export class PersonVmService
     )
       throw new PersonVmError('RUNTIME_NOT_READY');
   }
-  async start(context: RequestContext, signal: AbortSignal) {
-    return this.leased(context, 'start', signal, (lease, _identity, current) =>
-      this.startOwned(context, lease, current),
+  async start(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmTarget,
+  ) {
+    return this.leased(
+      context,
+      'start',
+      signal,
+      (lease, _identity, current) => {
+        this.assertPrewarmTarget(lease.row, target);
+        return this.startOwned(context, lease, current);
+      },
     );
   }
   private async webRoster(context: RequestContext, signal: AbortSignal) {
@@ -698,7 +730,7 @@ export class PersonVmService
   }
   async prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input' },
+    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmTarget },
     signal: AbortSignal,
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
@@ -706,6 +738,7 @@ export class PersonVmService
     const identity = await this.identity(context, 'start', signal);
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
+    this.assertPrewarmTarget(row, input.target);
     if (row?.phase === 'running') {
       const binding = bindingOf(row);
       if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
@@ -747,8 +780,12 @@ export class PersonVmService
       return view(row, true);
     }
 
-    await this.create(context, signal);
-    return this.start(context, signal);
+    const created = await this.create(context, signal, input.target);
+    return this.start(
+      context,
+      signal,
+      input.target && { ...input.target, vmId: created.vmId },
+    );
   }
   private async inactive(
     row: VmRecord,

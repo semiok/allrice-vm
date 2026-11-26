@@ -718,6 +718,7 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
   const server = await nativeEntryServer(f.base, {
     ...f.base.deps,
     prewarm: {
+      isCurrent: async () => true,
       prepare: async () => ({
         key: 'hot-exact',
         target: f.base.binding,
@@ -791,6 +792,13 @@ it('serves short polls over a cold startup longer than 125 seconds and deduplica
     expect(physical?.aborted).toBe(false);
     // Only the duplicate watcher has closed so far.
     expect(f.base.authorityClose).toHaveBeenCalledTimes(1);
+    f.readCoordination.mockImplementationOnce(async () => ({
+      authorityRevision: 'new-release-same-business-identity',
+      vm: await f.h.store.read(f.base.identity.personId),
+    }));
+    const stale = await prewarmStatus(server, ticket.operationId);
+    expect(stale.status).toBe(410);
+    expect(await stale.json()).toEqual({ state: 'expired' });
     finish.resolve();
     await vi.waitFor(async () => {
       const ready = await prewarmStatus(server, ticket.operationId);
@@ -828,6 +836,7 @@ it('owns cancellation and cleanup independently of the admission response, and r
     ...f.base.deps,
     authenticate,
     prewarm: {
+      isCurrent: async () => true,
       prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
       prewarm,
     },
@@ -882,6 +891,7 @@ it('reports immediate startup failure without exposing native errors', async () 
   const server = await nativeEntryServer(f.base, {
     ...f.base.deps,
     prewarm: {
+      isCurrent: async () => true,
       prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
       prewarm: async () => {
         throw Error('private provider internals');

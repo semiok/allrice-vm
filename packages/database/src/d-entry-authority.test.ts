@@ -102,6 +102,37 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('revokes an optional pinned grant revision even when the identity has been restored', async () => {
+    const original = new AbortController().signal;
+    const verify = vi.fn(async () => {});
+    const watch = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      original,
+      feed(),
+      verify,
+    );
+    try {
+      expect(verify).toHaveBeenCalledOnce();
+      const stale = Error('accepted authority revision changed');
+      verify.mockRejectedValueOnce(stale);
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_d_entry_authority',
+        payload: JSON.stringify({
+          schema: 'isolated',
+          table: 'allrice_memberships',
+          id: randomUUID(),
+          personId: identity.personId,
+          organizationId: identity.organizationId,
+        }),
+      });
+      await vi.waitFor(() => expect(watch.revoked.reason).toBe(stale));
+      expect(state.identity).toHaveBeenCalledTimes(2);
+    } finally {
+      await watch.close();
+    }
+  });
   it('settles whole-roster and VM hints before delivery without rereading on quiet frames', async () => {
     const signal = new AbortController().signal;
     const source = feed();
