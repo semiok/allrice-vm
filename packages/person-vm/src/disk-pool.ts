@@ -31,6 +31,8 @@ type ClaimGuard = Readonly<{
   signal: AbortSignal;
   assertOwner(): Promise<void>;
   assertCurrent(): Promise<void>;
+  /** Only for a first admin allocation whose person lease has no SQL VM row. */
+  commitOwner?(signal: AbortSignal): Promise<void>;
 }>;
 type PoolEvent = Readonly<{
   event:
@@ -105,11 +107,20 @@ export class PersonVmDiskPool {
     owner: DiskPoolOwner,
     signal: AbortSignal,
     verifyPriorRetirement?: (previous: DiskPoolOwner) => Promise<boolean>,
+    allocating = false,
   ) {
-    const { slots, bound, boundByPerson } = await this.ledger.read(signal);
+    const { slots, bound, boundByPerson, ordinaryOwners } =
+      await this.ledger.read(signal, allocating);
+    const ordinary = ordinaryOwners.get(owner.vmId);
     if (verifyPriorRetirement) {
-      for (const completed of boundByPerson.get(owner.personId) ?? []) {
-        const previous = completed.intent.owner;
+      for (const previous of [
+        ...(boundByPerson.get(owner.personId) ?? []).map(
+          ({ intent }) => intent.owner,
+        ),
+        ...[...ordinaryOwners.values()].filter(
+          (saved) => saved.personId === owner.personId,
+        ),
+      ]) {
         if (previous.organizationId !== owner.organizationId)
           throw new PersonVmError('ORGANIZATION_CONFLICT');
         if (
@@ -123,6 +134,7 @@ export class PersonVmDiskPool {
     if (slot) {
       const entry = slot.entry!;
       if (
+        ordinary ||
         entry.state !== 'claiming' ||
         !sameDiskPoolOwner(entry.intent.owner, owner)
       )
@@ -131,7 +143,36 @@ export class PersonVmDiskPool {
     }
     const saved = bound.get(owner.vmId);
     if (saved && !sameDiskPoolOwner(saved.intent.owner, owner)) incomplete();
+    if (ordinary) {
+      if (saved || !sameDiskPoolOwner(ordinary, owner)) incomplete();
+      return 'ordinary' as const;
+    }
     return saved ? ('bound' as const) : ('none' as const);
+  }
+
+  async unaccountedFormalDisks(vmIds: readonly string[], signal: AbortSignal) {
+    if (vmIds.length === 0) return [];
+    const { slots, bound, ordinaryOwners } = await this.ledger.read(
+      signal,
+      true,
+    );
+    const pending = new Set(
+      slots.flatMap(({ entry }) =>
+        entry?.state === 'claiming' || entry?.state === 'claim-quarantined'
+          ? [entry.intent.owner.vmId]
+          : [],
+      ),
+    );
+    return vmIds.filter(
+      (id) => !bound.has(id) && !ordinaryOwners.has(id) && !pending.has(id),
+    );
+  }
+
+  async recordOrdinaryOwner(owner: DiskPoolOwner, guard: ClaimGuard) {
+    await this.checkClaim(guard);
+    await this.ledger.recordOrdinaryOwner(owner, guard.signal, () =>
+      this.checkClaim(guard),
+    );
   }
 
   async canPrepare(personId: string, signal: AbortSignal) {
@@ -174,7 +215,12 @@ export class PersonVmDiskPool {
       if ((await this.status(owner, guard.signal)) === 'pending') incomplete();
       return false;
     }
-    await this.checkClaim(guard);
+    if (guard.commitOwner) {
+      guard.signal.throwIfAborted();
+      await guard.assertCurrent();
+    } else {
+      await this.checkClaim(guard);
+    }
     const binding = await this.inventory<Bind | null>(
       guard.signal,
       async (lock) => {
@@ -183,6 +229,7 @@ export class PersonVmDiskPool {
         if (pending) {
           const entry = pending.entry!;
           if (
+            guard.commitOwner ||
             entry.state !== 'claiming' ||
             !sameDiskPoolOwner(entry.intent.owner, owner)
           )
@@ -197,6 +244,13 @@ export class PersonVmDiskPool {
             entry?.state === 'ready' && entry.source === options.source,
         );
         if (!slot || slot.entry?.state !== 'ready') return null;
+        if (guard.commitOwner) {
+          await guard.assertCurrent();
+          await lock.assertOwned();
+          lock.signal.throwIfAborted();
+          if (this.foreground) return null;
+          await guard.commitOwner(lock.signal);
+        }
         const entry: Claiming = {
           ...slot.entry,
           state: 'claiming',
@@ -224,9 +278,16 @@ export class PersonVmDiskPool {
     const { entry, slot } = binding;
     const finish = (state: 'bound' | 'claim-quarantined') =>
       this.inventory<boolean>(guard.signal, async (lock) => {
-        await guard.assertOwner();
-        await lock.assertOwned();
-        await this.ledger.append(slot, { ...entry, state }, lock.signal);
+        await this.ledger.append(
+          slot,
+          { ...entry, state },
+          lock.signal,
+          async () => {
+            if (state === 'bound') await this.checkClaim(guard);
+            else await guard.assertOwner();
+            await lock.assertOwned();
+          },
+        );
         return true;
       });
     await this.checkClaim(guard);
@@ -234,7 +295,9 @@ export class PersonVmDiskPool {
     let state = await options.platform.inspectBinding(entry, guard.signal);
     if (state === 'pending') {
       await this.checkClaim(guard);
-      await options.platform.bindDisk(entry, guard.signal);
+      await options.platform.bindDisk(entry, guard.signal, () =>
+        this.checkClaim(guard),
+      );
       state = await options.platform.inspectBinding(entry, guard.signal);
     }
     if (state === 'unknown') {
@@ -402,10 +465,6 @@ export class PersonVmDiskPool {
       await checkpoint();
       if (check.availableBytes < minimumFreeBytes + reserveBytes)
         throw new DiskPoolBudgetExceeded(check);
-      await platform.assertCreationBudget?.(
-        { reserveBytes, minimumFreeBytes },
-        active,
-      );
       await fill.assertOwned();
       await checkpoint(true);
       let problem: { error: unknown } | undefined;
@@ -594,16 +653,24 @@ export class PersonVmDiskPool {
         this.observe({ event: 'foreground-deferred' });
         return;
       }
-      if (obsolete?.entry?.state === 'ready')
-        await this.retireStock(
-          obsolete,
-          obsolete.entry.proof,
-          'source-changed',
-          fill,
-          options,
+      try {
+        await options.platform.assertSourceFitsReserve?.(
+          options.reserveBytes,
           active,
         );
-      try {
+        if (await foregroundStarting()) {
+          this.observe({ event: 'foreground-deferred' });
+          return;
+        }
+        if (obsolete?.entry?.state === 'ready')
+          await this.retireStock(
+            obsolete,
+            obsolete.entry.proof,
+            'source-changed',
+            fill,
+            options,
+            active,
+          );
         const initial = await this.capacity(active, options);
         if (
           initial.availableBytes <

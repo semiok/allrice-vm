@@ -47,8 +47,8 @@ export interface DiskPoolPlatform {
     inventory: readonly Readonly<{ ref: string; vmId?: string }>[],
     signal: AbortSignal,
   ): Promise<DiskPoolCapacity>;
-  assertCreationBudget?(
-    budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
+  assertSourceFitsReserve?(
+    reserveBytes: bigint,
     signal: AbortSignal,
   ): Promise<void>;
   /** Read-only for this ref until the supplied guard succeeds immediately before key creation. */
@@ -80,7 +80,11 @@ export interface DiskPoolPlatform {
     signal: AbortSignal,
   ): Promise<'pending' | 'bound' | 'unknown'>;
   /** No overwrite. Continue only a known physical prefix of the same claim. */
-  bindDisk(claim: DiskPoolClaim, signal: AbortSignal): Promise<void>;
+  bindDisk(
+    claim: DiskPoolClaim,
+    signal: AbortSignal,
+    beforeManifestLink?: () => Promise<void>,
+  ): Promise<void>;
 }
 
 export type DiskPoolLock = Readonly<{

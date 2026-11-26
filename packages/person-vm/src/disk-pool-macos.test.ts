@@ -14,6 +14,7 @@ import { signal } from './test-support.ts';
 
 const actions = vi.hoisted(() => ({
   beforeLstat: undefined as ((path: string) => void) | undefined,
+  afterManifestSync: undefined as (() => void) | undefined,
   afterLink: undefined as ((from: string, to: string) => void) | undefined,
   afterUnlink: undefined as ((path: string) => void) | undefined,
 }));
@@ -24,6 +25,20 @@ vi.mock('node:fs/promises', async (original) => {
     async lstat(...args: Parameters<typeof actual.lstat>) {
       actions.beforeLstat?.(String(args[0]));
       return actual.lstat(...args);
+    },
+    async open(...args: Parameters<typeof actual.open>) {
+      const file = await actual.open(...args);
+      if (
+        actions.afterManifestSync &&
+        String(args[0]).includes('/manifests/.stage-')
+      ) {
+        const sync = file.sync.bind(file);
+        vi.spyOn(file, 'sync').mockImplementation(async () => {
+          await sync();
+          actions.afterManifestSync?.();
+        });
+      }
+      return file;
     },
     link: async (from: string, to: string) => {
       await actual.link(from, to);
@@ -39,6 +54,7 @@ vi.mock('node:fs/promises', async (original) => {
 const roots: string[] = [];
 afterEach(async () => {
   actions.beforeLstat = undefined;
+  actions.afterManifestSync = undefined;
   actions.afterLink = undefined;
   actions.afterUnlink = undefined;
   for (const root of roots.splice(0))
@@ -240,6 +256,47 @@ it('validates the original formal receipt after rotation and keeps the warm-cach
     true,
   );
 });
+
+it.each(['cancel', 'revoke'] as const)(
+  'checks %s after the formal manifest has been staged and before its final link',
+  async (mode) => {
+    const f = await fixture();
+    const s = await stock(f);
+    const stop = new AbortController();
+    const reason = Error('formal manifest publication denied');
+    let revoked = false;
+    actions.afterManifestSync = () => {
+      if (mode === 'cancel') stop.abort(reason);
+      else revoked = true;
+    };
+    const authorize = vi.fn(async () => {
+      if (revoked) throw reason;
+    });
+    await expect(
+      s.platform.bindDisk(s.claim, stop.signal, authorize),
+    ).rejects.toBe(reason);
+    expect(authorize).toHaveBeenCalledTimes(mode === 'revoke' ? 1 : 0);
+    await expect(fs.lstat(s.newManifest)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.lstat(s.oldKey)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await fs.lstat(s.newImage, { bigint: true })).ino).toBe(
+      s.oldProof.image,
+    );
+    expect((await fs.lstat(s.newKey, { bigint: true })).ino).toBe(
+      s.oldProof.key,
+    );
+    await expect(s.platform.inspectBinding(s.claim, signal())).resolves.toBe(
+      'pending',
+    );
+    actions.afterManifestSync = undefined;
+    revoked = false;
+    await s.platform.bindDisk(s.claim, signal(), authorize);
+    await expect(s.platform.inspectBinding(s.claim, signal())).resolves.toBe(
+      'bound',
+    );
+  },
+);
 
 it('retires only exact verified unassigned storage, including both its key and image', async () => {
   const f = await fixture();

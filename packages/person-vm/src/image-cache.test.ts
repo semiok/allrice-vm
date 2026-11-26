@@ -637,12 +637,9 @@ it('refreshes a verified older bound disk before first native create, resumes cu
   const ref = randomUUID();
   const oldStock = { ref, source: older.source };
   await older.readCapacity([], active());
-  await expect(
-    older.assertCreationBudget(
-      { minimumFreeBytes: 1n, reserveBytes: 1n },
-      active(),
-    ),
-  ).rejects.toThrow('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED');
+  await expect(older.assertSourceFitsReserve(1n, active())).rejects.toThrow(
+    'PERSON_VM_DISK_POOL_BUDGET_EXCEEDED',
+  );
   expect(await readdir(join(root, '.preprovision-images', 'warm'))).toEqual([]);
   await older.createEncryptedDisk(ref, active());
   const proof = await older.inspectStock(oldStock, active());

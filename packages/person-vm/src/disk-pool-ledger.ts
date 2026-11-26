@@ -15,6 +15,7 @@ import { PersonVmError } from './contract.ts';
 import {
   sameDiskPoolOwner,
   type DiskPoolClaim,
+  type DiskPoolOwner,
   type DiskPoolStock,
   type PreparedDiskPoolStock,
 } from './disk-pool-platform.ts';
@@ -22,6 +23,7 @@ import {
 export const diskPoolSize = 3;
 const maxRecordBytes = 8 * 1024;
 const recordName = /^([0-2])\.([1-9][0-9]*)\.json$/;
+const ordinaryOwnerName = /^owner\.([0-9a-f-]{36})\.json$/;
 const stageName = /^\.stage-[0-9a-f-]{36}$/;
 
 export type DiskPoolRecord =
@@ -92,6 +94,40 @@ function validText(v: unknown, limit: number): v is string {
 function uuid(v: unknown) {
   return UuidSchema.safeParse(v).success;
 }
+function readOrdinaryOwner(value: unknown, vmId: string): DiskPoolOwner {
+  const record = value as (DiskPoolOwner & { version: number }) | null;
+  if (
+    !record ||
+    record.version !== 1 ||
+    record.vmId !== vmId ||
+    !uuid(record.vmId) ||
+    !uuid(record.personId) ||
+    !uuid(record.organizationId)
+  )
+    incomplete();
+  return record;
+}
+
+async function readEvidence(path: string): Promise<unknown> {
+  const file = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const stat = await file.stat();
+    if (
+      !stat.isFile() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o7777) !== 0o600 ||
+      stat.size > maxRecordBytes
+    )
+      incomplete();
+    return JSON.parse(await file.readFile('utf8'));
+  } finally {
+    await file.close();
+  }
+}
+
 function readRecord(value: unknown): DiskPoolRecord {
   const entry = value as DiskPoolRecord | null;
   if (!entry || !uuid(entry.ref) || !validText(entry.source, 320)) incomplete();
@@ -208,7 +244,7 @@ export class DiskPoolLedger {
     this.seen = true;
     return true;
   }
-  async read(signal: AbortSignal) {
+  async read(signal: AbortSignal, includeOrdinaryOwners = false) {
     const slots: DiskPoolSlot[] = Array.from(
       { length: diskPoolSize },
       (_, index) => ({
@@ -219,11 +255,13 @@ export class DiskPoolLedger {
     );
     const bound = new Map<string, DiskPoolClaim>();
     const boundByPerson = new Map<string, DiskPoolClaim[]>();
+    const ordinaryOwners = new Map<string, DiskPoolOwner>();
     signal.throwIfAborted();
     if (await this.exists()) {
-      const files = (await readdir(this.root))
+      const names = await readdir(this.root);
+      const files = names
         .flatMap((name) => {
-          if (stageName.test(name)) return [];
+          if (stageName.test(name) || ordinaryOwnerName.test(name)) return [];
           const match = recordName.exec(name);
           if (!match) return incomplete();
           return [
@@ -241,24 +279,7 @@ export class DiskPoolLedger {
         const slot = slots[index]!;
         if (!Number.isSafeInteger(revision) || revision !== slot.revision + 1)
           incomplete();
-        const file = await open(
-          join(this.root, name),
-          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-        );
-        let entry: DiskPoolRecord;
-        try {
-          const stat = await file.stat();
-          if (
-            !stat.isFile() ||
-            stat.uid !== process.getuid?.() ||
-            (stat.mode & 0o7777) !== 0o600 ||
-            stat.size > maxRecordBytes
-          )
-            incomplete();
-          entry = readRecord(JSON.parse(await file.readFile('utf8')));
-        } finally {
-          await file.close();
-        }
+        const entry = readRecord(await readEvidence(join(this.root, name)));
         if (!follows(slot.entry, entry)) incomplete();
         if (entry.state === 'filling') {
           if (refs.has(entry.ref)) incomplete();
@@ -278,19 +299,24 @@ export class DiskPoolLedger {
         }
         slots[index] = { index, revision, entry };
       }
+      if (includeOrdinaryOwners) {
+        for (const name of names) {
+          const vmId = ordinaryOwnerName.exec(name)?.[1];
+          if (!vmId) continue;
+          signal.throwIfAborted();
+          ordinaryOwners.set(
+            vmId,
+            readOrdinaryOwner(await readEvidence(join(this.root, name)), vmId),
+          );
+        }
+      }
     }
     signal.throwIfAborted();
-    return { slots, bound, boundByPerson };
+    return { slots, bound, boundByPerson, ordinaryOwners };
   }
 
-  async append(
-    slot: DiskPoolSlot,
-    entry: DiskPoolRecord,
-    signal: AbortSignal,
-    beforeLink?: () => Promise<void>,
-  ) {
+  private async ensure(signal: AbortSignal) {
     signal.throwIfAborted();
-    if (!follows(slot.entry, entry)) incomplete();
     if (!(await this.exists())) {
       try {
         await mkdir(this.root, { mode: 0o700 });
@@ -301,6 +327,38 @@ export class DiskPoolLedger {
       await syncDiskPoolDirectory(dirname(this.root));
     }
     signal.throwIfAborted();
+  }
+
+  async recordOrdinaryOwner(
+    owner: DiskPoolOwner,
+    signal: AbortSignal,
+    beforeLink: () => Promise<void>,
+  ) {
+    const record = readOrdinaryOwner(
+      {
+        version: 1,
+        vmId: owner.vmId,
+        personId: owner.personId,
+        organizationId: owner.organizationId,
+      },
+      owner.vmId,
+    );
+    await this.ensure(signal);
+    await publishDiskPoolRecord(
+      join(this.root, `owner.${owner.vmId}.json`),
+      record,
+      { signal, beforeLink },
+    );
+  }
+
+  async append(
+    slot: DiskPoolSlot,
+    entry: DiskPoolRecord,
+    signal: AbortSignal,
+    beforeLink?: () => Promise<void>,
+  ) {
+    if (!follows(slot.entry, entry)) incomplete();
+    await this.ensure(signal);
     try {
       await publishDiskPoolRecord(
         join(this.root, `${slot.index}.${slot.revision + 1}.json`),

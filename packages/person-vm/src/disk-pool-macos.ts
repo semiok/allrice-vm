@@ -308,32 +308,19 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     await this.stockDisk.create(disk, signal, beforeKeyWrite);
   }
 
-  async assertCreationBudget(
-    {
-      reserveBytes,
-      minimumFreeBytes,
-    }: { reserveBytes: bigint; minimumFreeBytes: bigint },
-    signal: AbortSignal,
-  ) {
+  async assertSourceFitsReserve(reserveBytes: bigint, signal: AbortSignal) {
     const seedBytes = await publicImageCacheBytes(
       this.imageCache,
       this.options.image,
       signal,
     );
-    const volume = await statfs(join(this.stockRoot, 'warm'), { bigint: true });
-    if (volume.bsize <= 0n) invalid();
-    const availableBytes = volume.bavail * volume.bsize;
     // Reject a budget too small for the public payload and initial image
-    // growth headroom before invoking hdiutil. Actual growth is checked again
+    // growth headroom before reserving stock. Actual growth is checked
     // after formatting/mount and around every bounded copy write.
     const initialWindow =
       roundBytes(seedBytes, sparseImageBandBytes) + 2n * sparseImageBandBytes;
-    if (
-      reserveBytes < initialWindow ||
-      availableBytes < minimumFreeBytes + reserveBytes
-    )
-      throw new DiskPoolBudgetExceeded({ availableBytes, allocatedBytes: 0n });
     signal.throwIfAborted();
+    if (reserveBytes < initialWindow) throw new DiskPoolBudgetExceeded();
   }
 
   mountDisk(ref: string, signal: AbortSignal) {
@@ -633,7 +620,11 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     }
   }
 
-  async bindDisk(claim: DiskPoolClaim, signal: AbortSignal) {
+  async bindDisk(
+    claim: DiskPoolClaim,
+    signal: AbortSignal,
+    beforeManifestLink?: () => Promise<void>,
+  ) {
     const state = await this.binding(claim, signal);
     if (state.current) return;
     const { from, to } = state;
@@ -658,13 +649,16 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
       // Persist both a just-completed unlink and one observed on recovery.
       await syncDiskPoolDirectory(dirname(path));
     }
-    signal.throwIfAborted();
-    await publishDiskPoolRecord(to.manifest, {
-      version: 1,
-      vmId: state.formal.vmId,
-      ...state.proof.image,
-      poolClaimId: claim.intent.id,
-      poolSource: claim.source,
-    });
+    await publishDiskPoolRecord(
+      to.manifest,
+      {
+        version: 1,
+        vmId: state.formal.vmId,
+        ...state.proof.image,
+        poolClaimId: claim.intent.id,
+        poolSource: claim.source,
+      },
+      { signal, beforeLink: beforeManifestLink },
+    );
   }
 }

@@ -266,6 +266,52 @@ suite(
         ]);
       },
     );
+    it('preserves cold and legacy disk ownership across a missing PostgreSQL row', async () => {
+      const h = harness(store);
+      const { root, volume, disk } = await syntheticDisk();
+      try {
+        const legacy = new PersonVmService({ ...h.options, disk });
+        const guarded = new PersonVmService({
+          ...h.options,
+          disk,
+          diskPool: new PersonVmDiskPool(
+            volume,
+            store.diskPoolLocks(volume),
+            () => {},
+          ),
+        });
+        const olderUser = context();
+        const previous = await legacy.create(olderUser, signal());
+        const coldUser = context();
+        // The legacy disk is accounted for by its exact retained PG row.
+        const cold = await guarded.create(coldUser, signal());
+        await db`delete from person_virtual_machines where person_id=${coldUser.actor.id}`;
+        await expect(guarded.create(coldUser, signal())).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(await store.read(coldUser.actor.id)).toBeNull();
+        // The missing PG row has a host receipt, so unrelated users can
+        // still allocate while the known cold disk remains fenced to its owner.
+        const currentUser = context();
+        const current = await guarded.create(currentUser, signal());
+        await db`delete from person_virtual_machines where person_id=${olderUser.actor.id}`;
+        const denied = context();
+        await expect(guarded.create(denied, signal())).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(await store.read(denied.actor.id)).toBeNull();
+        await expect(
+          guarded.create(currentUser, signal()),
+        ).resolves.toMatchObject({
+          vmId: current.vmId,
+        });
+        expect(new Set(await disk.listFormalDiskIds(signal()))).toEqual(
+          new Set([previous.vmId, cold.vmId, current.vmId]),
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
     it('真实PG物理owner持有至confirmed-stop runtime退役实际join，再释放并允许新代重试', async () => {
       const h = harness(store),
         rc = context();

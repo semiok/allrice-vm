@@ -53,6 +53,7 @@ export interface VmLease {
   guard(expected?: DiskPoolOwner): Promise<void>;
   assertPhysicalOwner?(): Promise<void>;
   hasCompletedDiskDeletion?(owner: DiskPoolOwner): Promise<boolean>;
+  hasRetainedDiskRows?(vmIds: readonly string[]): Promise<boolean>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
 }
 type VmLeaseOptions = {
@@ -648,6 +649,14 @@ export class PostgresPersonVmStore implements PersonVmStore {
               and action='delete-disk' and result='succeeded') as deleted`,
           );
           return record?.deleted === true;
+        },
+        hasRetainedDiskRows: async (vmIds) => {
+          const [record] = await session.query(
+            () => sql`
+            select count(*)::int as retained from person_virtual_machines
+              where disk_retained and vm_id = any(${sql.array([...vmIds])}::uuid[])`,
+          );
+          return record?.retained === vmIds.length;
         },
         save: async (record) => {
           if (record.personId !== personId)

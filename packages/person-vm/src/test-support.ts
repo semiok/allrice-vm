@@ -94,6 +94,12 @@ export class MemoryStore implements PersonVmStore {
               event.action === 'delete-disk' &&
               event.result === 'succeeded',
           ),
+        hasRetainedDiskRows: async (vmIds) =>
+          vmIds.every((id) =>
+            [...this.rows.values()].some(
+              (row) => row.vmId === id && row.diskRetained,
+            ),
+          ),
         save: async (value) => {
           this.rows.set(personId, {
             ...structuredClone(value),
@@ -142,6 +148,7 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
     },
   };
   const disk: PersonVmDiskPort = {
+    listFormalDiskIds: async () => [...new Set([...disks, ...partialDisks])],
     confirmAbsence: async (vmId) =>
       !disks.has(vmId) && !partialDisks.has(vmId) && !mounts.has(vmId),
     inspect: async (id) =>

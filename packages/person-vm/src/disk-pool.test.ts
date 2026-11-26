@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -184,7 +184,7 @@ class Platform implements DiskPoolPlatform {
       stage: 0,
     });
   }
-  async assertCreationBudget() {
+  async assertSourceFitsReserve() {
     await this.onCreationBudget?.();
   }
   async mountDisk(ref: string) {
@@ -242,7 +242,11 @@ class Platform implements DiskPoolPlatform {
     expect(claim.proof).toBe(await this.inspectStock(claim));
     return disk.stage === 4 ? ('bound' as const) : ('pending' as const);
   }
-  async bindDisk(claim: DiskPoolClaim) {
+  async bindDisk(
+    claim: DiskPoolClaim,
+    _scoped?: AbortSignal,
+    beforeManifestLink?: () => Promise<void>,
+  ) {
     this.binds.push(structuredClone(claim));
     await this.onBinding?.();
     const disk = this.current(claim.ref);
@@ -261,6 +265,7 @@ class Platform implements DiskPoolPlatform {
       this.at('revocation');
     }
     if (disk.stage === 3) {
+      await beforeManifestLink?.();
       this.installed(disk.target!);
       disk.stage = 4;
       this.at('receipt');
@@ -394,6 +399,45 @@ it('leaves the admin row absent for a proven empty pool and immediately follows 
     { event: 'pool-empty', lane: 'foreground' },
   ]);
 });
+
+it.each(['last-stock', 'foreground-priority'] as const)(
+  'leaves the first admin organization unbound when %s changes after probing',
+  async (cause) => {
+    const f = await fixture();
+    await f.pool.refill(signal());
+    const first = context();
+    const second = context(randomUUID(), first.actor.id);
+    const guard = adminGuard();
+    const release = gate();
+    let foreground: Promise<unknown> | undefined;
+    guard.assertCapacity.mockImplementation(async () => {
+      if (cause === 'last-stock') {
+        await f.service.prewarm(context(), { trigger: 'page' }, signal());
+      } else {
+        foreground = f.pool.inForeground(() => release.promise);
+      }
+    });
+    try {
+      await expect(
+        f.service.diskPreparationPort().prepare(adminTarget(first), guard),
+      ).resolves.toBe('deferred');
+      expect(guard.assertCapacity).toHaveBeenCalledOnce();
+      expect(await f.store.read(first.actor.id)).toBeNull();
+      expect(
+        f.store.audits.filter((audit) => audit.personId === first.actor.id),
+      ).toHaveLength(0);
+    } finally {
+      release.release();
+      await foreground;
+    }
+    await expect(
+      f.service.prewarm(second, { trigger: 'page' }, signal()),
+    ).resolves.toMatchObject({
+      organizationId: second.organizationId,
+      ready: true,
+    });
+  },
+);
 
 it('joins active offline prep on the first workbench request and keeps exact storage for every assigned employee', async () => {
   const f = await fixture();
@@ -633,6 +677,22 @@ it('checks capacity again before creating a disk and yields to foreground before
   f.locks.foreground = false;
   await f.pool.refill(signal());
   expect(f.platform.disks.size).toBe(1);
+});
+
+it('records repeated static source reserve deferrals without reserving a slot', async () => {
+  const f = await fixture();
+  f.platform.onCreationBudget = async () => {
+    throw new DiskPoolBudgetExceeded();
+  };
+  for (let i = 0; i < 3; i++) await f.pool.refill(signal());
+  expect(f.platform.disks.size).toBe(0);
+  expect(
+    (await f.ledger.read(signal())).slots.map(({ revision }) => revision),
+  ).toEqual([0, 0, 0]);
+  expect(await readdir(f.root)).toEqual([]);
+  expect(f.events.mock.calls).toEqual(
+    Array.from({ length: 3 }, () => [{ event: 'capacity-deferred' }]),
+  );
 });
 
 it('enforces one filler without holding inventory while copying or blocking a foreground fallback', async () => {
@@ -988,6 +1048,57 @@ it.each(['missing', 'replaced', 'non-retained'] as const)(
   },
 );
 
+it('fences a cold first allocation after its owner row is restored away', async () => {
+  const f = await fixture();
+  const rc = context();
+  const createDisk = f.h.disk.create.bind(f.h.disk);
+  vi.spyOn(f.h.disk, 'create').mockImplementation(async (ref, scoped) => {
+    const coldReceipt = (await f.ledger.read(scoped, true)).ordinaryOwners.get(
+      ref.vmId,
+    );
+    expect(coldReceipt).toMatchObject({
+      personId: rc.actor.id,
+      organizationId: rc.organizationId,
+      vmId: ref.vmId,
+    });
+    await createDisk(ref, scoped);
+  });
+  const first = await f.service.create(rc, signal());
+  expect(f.h.log).toEqual(['disk:create']);
+  f.store.rows.delete(rc.actor.id);
+  await f.pool.refill(signal());
+  const reopened = f.serviceFor(f.newPool());
+  await expect(
+    reopened.diskPreparationPort().prepare(adminTarget(rc), adminGuard()),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  await expect(
+    f.serviceFor(f.newPool(false)).create(rc, signal()),
+  ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+  expect(await f.store.read(rc.actor.id)).toBeNull();
+  expect([...f.h.disks]).toEqual([first.vmId]);
+  expect(f.platform.binds).toHaveLength(0);
+  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe('ready');
+});
+
+it('replaces a recorded cold allocation only after authorized deletion and verified absence', async () => {
+  const f = await fixture();
+  const rc = context();
+  const disabled = f.serviceFor(f.newPool(false));
+  const first = await disabled.create(rc, signal());
+  f.h.authorizeDiskDelete(true);
+  await expect(
+    disabled.delete(rc, { deleteDisk: true }, signal()),
+  ).resolves.toMatchObject({ diskRetained: false });
+  f.h.partialDisks.add(first.vmId);
+  await expect(disabled.create(rc, signal())).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+  });
+  f.h.partialDisks.delete(first.vmId);
+  const next = await disabled.create(rc, signal());
+  expect(next.vmId).not.toBe(first.vmId);
+  expect([...f.h.disks]).toEqual([next.vmId]);
+});
+
 it('permits authorized deletion and replacement only after the exact prior disk is physically absent', async () => {
   const f = await fixture();
   const rc = context();
@@ -1036,7 +1147,7 @@ it('preserves the initial target and disk when roster authority is withdrawn dur
   await expect(
     f.service.prewarm(rc, { trigger: 'page' }, signal()),
   ).resolves.toMatchObject({ vmId: first.intent.owner.vmId, ready: true });
-  expect(f.platform.binds).toHaveLength(1);
+  expect(f.platform.binds).toEqual([first, first]);
 });
 
 it('rechecks foreground after the creation budget preflight without opening a disk', async () => {
@@ -1046,9 +1157,7 @@ it('rechecks foreground after the creation budget preflight without opening a di
   };
   await f.pool.refill(signal());
   expect(f.platform.disks.size).toBe(0);
-  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
-    'released-before-write',
-  );
+  expect((await f.ledger.read(signal())).slots[0]?.entry).toBeNull();
   expect(f.events).toHaveBeenCalledWith({ event: 'foreground-deferred' });
 });
 
@@ -1143,6 +1252,37 @@ it('leaves the stock ready when authority is revoked after claim staging fsync a
     phase: 'stopped',
   });
   expect(f.platform.binds).toHaveLength(1);
+});
+
+it('keeps the exact physical claim pending when authority is revoked after staging the bound record', async () => {
+  const f = await fixture();
+  await f.pool.refill(signal());
+  const rc = context();
+  const guard = adminGuard();
+  const revoked = new PersonVmError('AUTHORIZATION_DENIED');
+  let staged = 0;
+  faults.afterLedgerFileSync = () => {
+    if (++staged === 2) guard.assertCurrent.mockRejectedValue(revoked);
+  };
+  await expect(
+    f.service.diskPreparationPort().prepare(adminTarget(rc), guard),
+  ).rejects.toBe(revoked);
+  faults.afterLedgerFileSync = undefined;
+  expect(staged).toBe(2);
+  const first = f.platform.binds[0]!;
+  expect([...f.h.disks]).toEqual([first.intent.owner.vmId]);
+  expect((await f.ledger.read(signal())).slots[0]?.entry).toMatchObject({
+    state: 'claiming',
+    intent: first.intent,
+  });
+  await expect(f.service.create(rc, signal())).resolves.toMatchObject({
+    vmId: first.intent.owner.vmId,
+    phase: 'stopped',
+  });
+  expect(f.platform.binds).toEqual([first]);
+  expect(
+    (await f.ledger.read(signal())).bound.get(first.intent.owner.vmId),
+  ).toMatchObject({ intent: first.intent });
 });
 
 it('does not publish ready when the actual fill connection is lost during offline proof', async () => {

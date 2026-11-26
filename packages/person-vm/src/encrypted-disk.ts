@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   realpath,
   rename,
   rm,
@@ -24,6 +25,8 @@ export interface PersonVmDiskPort {
   inspect(vmId: string, signal: AbortSignal): Promise<PersonVmDiskInspection>;
   /** Independently confirm a previously retired VM's disk, key and mount are absent. */
   confirmAbsence?(vmId: string, signal: AbortSignal): Promise<boolean>;
+  /** Formal Host references that need an owner before allocating new storage. */
+  listFormalDiskIds?(signal: AbortSignal): Promise<string[]>;
   create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
   attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
   detach(disk: PersonDisk, signal: AbortSignal): Promise<void>;
@@ -42,6 +45,7 @@ export interface PersonVmKeyStore {
   read(vmId: string): Promise<Buffer>;
   delete(vmId: string): Promise<void>;
   confirmAbsence?(vmId: string): Promise<boolean>;
+  listDiskIds?(signal: AbortSignal): Promise<string[]>;
 }
 
 function checkedId(vmId: string) {
@@ -61,6 +65,34 @@ export async function privateDirectory(path: string) {
   if (!stat.isDirectory() || stat.isSymbolicLink())
     throw new PersonVmError('PROVIDER_FAILED');
   await chmod(path, 0o700);
+}
+
+async function privateFileIds(
+  path: string,
+  suffix: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const dir = await lstat(path).catch((error: unknown) => {
+    if (!missing(error)) throw error;
+    return null;
+  });
+  if (!dir) return [];
+  if (
+    !dir.isDirectory() ||
+    dir.uid !== process.getuid?.() ||
+    (dir.mode & 0o7777) !== 0o700 ||
+    (await realpath(path)) !== path
+  )
+    throw new PersonVmError('CLEANUP_INCOMPLETE');
+  const ids: string[] = [];
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    if (!entry.name.endsWith(suffix)) continue;
+    if (!entry.isFile()) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    ids.push(checkedId(entry.name.slice(0, -suffix.length)));
+  }
+  signal.throwIfAborted();
+  return ids;
 }
 
 /** Dedicated host directory only. Never use a DSH plugin storageDir or guest path. */
@@ -127,6 +159,9 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
     }
     await syncDiskPoolDirectory(this.root);
     return true;
+  }
+  listDiskIds(signal: AbortSignal) {
+    return privateFileIds(this.root, '.key', signal);
   }
 }
 
@@ -296,6 +331,22 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     for (const directory of ['', 'warm', 'cold', 'manifests'])
       await privateDirectory(join(this.options.root, directory));
     return this.inspectExisting(vmId, signal);
+  }
+  async listFormalDiskIds(signal: AbortSignal) {
+    const ids = new Set(await this.options.keys.listDiskIds?.(signal));
+    for (const [dir, suffix] of [
+      ['warm', '.sparseimage'],
+      ['cold', '.sparseimage'],
+      ['manifests', '.json'],
+    ] as const) {
+      for (const id of await privateFileIds(
+        join(this.options.root, dir),
+        suffix,
+        signal,
+      ))
+        ids.add(id);
+    }
+    return [...ids];
   }
   async confirmAbsence(vmId: string, signal: AbortSignal) {
     // An absent image/manifest pair alone can still leave an attached device

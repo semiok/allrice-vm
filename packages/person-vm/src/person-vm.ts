@@ -415,18 +415,52 @@ export class PersonVmService
       throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
 
-  private creationCatalog(row: VmRecord, lease: VmLease, signal: AbortSignal) {
-    return this.options.diskPool?.status(row, signal, async (previous) => {
-      // The append-only claim identifies a physical predecessor even if PG
-      // lost or replaced its row. Both the exact delete audit and independent
-      // disk/key absence must agree before a different VM can be allocated.
-      if (!(await lease.hasCompletedDiskDeletion?.(previous))) return false;
-      signal.throwIfAborted();
-      return (
-        (await this.options.disk.confirmAbsence?.(previous.vmId, signal)) ===
-        true
+  private creationCatalog(
+    row: VmRecord,
+    lease: VmLease,
+    signal: AbortSignal,
+    allocating = false,
+  ) {
+    return this.options.diskPool?.status(
+      row,
+      signal,
+      async (previous) => {
+        // Both the exact delete audit and independent disk/key absence must
+        // agree before a durable owner can be replaced with a different VM.
+        if (!(await lease.hasCompletedDiskDeletion?.(previous))) return false;
+        signal.throwIfAborted();
+        return (
+          (await this.options.disk.confirmAbsence?.(previous.vmId, signal)) ===
+          true
+        );
+      },
+      allocating,
+    );
+  }
+
+  private async assertAccountedFormalDisks(
+    lease: VmLease,
+    signal: AbortSignal,
+  ) {
+    const { disk, diskPool } = this.options;
+    if (!diskPool) return;
+    const list = disk.listFormalDiskIds?.bind(disk);
+    if (!list) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const accounted = async () => {
+      const unknown = await diskPool.unaccountedFormalDisks(
+        await list(signal),
+        signal,
       );
-    });
+      const valid =
+        unknown.length === 0 ||
+        (await lease.hasRetainedDiskRows?.(unknown)) === true;
+      signal.throwIfAborted();
+      return valid;
+    };
+    // Reobserve on a mismatch in case an authorized deletion just retired
+    // a legacy reference in between the physical and SQL observations.
+    if (!(await accounted()) && !(await accounted()))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
   }
 
   private async createDiskOwned(
@@ -442,27 +476,40 @@ export class PersonVmService
     },
   ) {
     const pool = this.options.diskPool;
-    const catalog = await this.creationCatalog(row, lease, signal);
+    const catalog = await this.creationCatalog(row, lease, signal, true);
     const audit = { requestId: input.requestId, action: input.action };
+    const newIdentity = lease.row?.vmId !== row.vmId;
+    const needsCandidate = input.lane === 'admin' && !lease.row;
     if (catalog === 'pending' && !pool?.enabled)
       throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (newIdentity) await this.assertAccountedFormalDisks(lease, signal);
     if (pool?.enabled) {
       await input.assertCurrent();
       await lease.assertAdmissionOpen();
       signal.throwIfAborted();
     }
-    row.phase = 'starting';
-    await lease.save(row); // Commit the exact owner before touching inventory or physical storage.
-    await lease.audit(row, { ...audit, result: 'started' });
+    let committed = false;
+    const commitOwner = async (current: AbortSignal) => {
+      current.throwIfAborted();
+      row.phase = 'starting';
+      await lease.save(row);
+      committed = true;
+      await lease.audit(row, { ...audit, result: 'started' });
+    };
+    if (!needsCandidate) await commitOwner(signal);
+    const ownerGuard = {
+      signal,
+      assertCurrent: input.assertCurrent,
+      assertOwner: () => lease.guard(row),
+    };
     const claim = () =>
       pool?.claim(row, input.requestId, input.lane, {
-        signal,
-        assertCurrent: input.assertCurrent,
-        assertOwner: () => lease.guard(row),
+        ...ownerGuard,
+        ...(needsCandidate && { commitOwner }),
       });
     try {
       signal.throwIfAborted();
-      await lease.guard();
+      if (committed) await lease.guard();
       if (catalog === 'pending' && !(await claim()))
         throw new PersonVmError('CLEANUP_INCOMPLETE');
       let inspected = await this.options.disk.inspect(row.vmId, signal);
@@ -471,8 +518,11 @@ export class PersonVmService
       if (inspected.state === 'absent') {
         if (catalog === 'bound' || catalog === 'pending')
           throw new PersonVmError('CLEANUP_INCOMPLETE');
-        if (!(pool?.enabled && (await claim()))) {
+        if (!newIdentity && catalog !== 'ordinary')
+          await this.assertAccountedFormalDisks(lease, signal);
+        if (!(pool?.enabled && catalog !== 'ordinary' && (await claim()))) {
           if (input.lane === 'admin') {
+            if (!committed) return 'deferred' as const;
             row.phase = 'failed';
             await lease.save(row);
             await lease.audit(row, {
@@ -482,9 +532,11 @@ export class PersonVmService
             });
             return 'deferred' as const;
           }
-          if (pool?.enabled) {
-            await input.assertCurrent();
-            await lease.guard(row);
+          if (pool) {
+            if (catalog !== 'ordinary')
+              await pool.recordOrdinaryOwner(row, ownerGuard);
+            await ownerGuard.assertCurrent();
+            await ownerGuard.assertOwner();
             signal.throwIfAborted();
           } else if (input.assertPrewarmAuthority)
             await input.assertPrewarmAuthority();
@@ -497,6 +549,7 @@ export class PersonVmService
       }
       if (inspected.state !== 'ready')
         throw new PersonVmError('PROVIDER_FAILED');
+      if (!committed) throw new PersonVmError('CLEANUP_INCOMPLETE');
       if (pool?.enabled) {
         await input.assertCurrent();
         await lease.guard(row);
@@ -510,6 +563,7 @@ export class PersonVmService
       return 'prepared' as const;
     } catch (error) {
       const failure = safeError(error);
+      if (!committed) throw failure;
       row.phase = 'failed';
       try {
         await lease.save(row);
