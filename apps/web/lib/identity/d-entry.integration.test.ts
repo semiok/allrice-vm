@@ -31,6 +31,7 @@ import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src
 import {
   createChatSession,
   getSessionExecutionGeneration,
+  ensureDefaultEmployee,
   sendChatMessage,
   updateChatSession,
   linkFileToSession,
@@ -1839,9 +1840,43 @@ suite(
         await updateDEntryReleasePolicy(f.context, initial);
         expect(await findDEntryCreationWorkspace(owner)).toBe(f.workspace);
         expect(await findDEntryEmployee(owner)).toBeNull();
+        expect(await ensureDefaultEmployee(owner)).toBeNull();
         expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
 
         const other = await setup();
+        const legacy = await createBusinessThread(
+          new Request('https://allrice.test/api/v1/sessions', {
+            method: 'POST',
+            headers: { 'x-allrice-organization-id': other.org },
+            body: JSON.stringify({
+              workspaceId: other.workspace,
+              employeeInstanceId: other.assignment,
+            }),
+          }),
+        );
+        expect(legacy.status).toBe(201);
+        const { session: legacyThread } = await legacy.json();
+        expect(
+          await getSessionExecutionGeneration(
+            other.context,
+            other.workspace,
+            legacyThread.id,
+          ),
+        ).toBe('3.x');
+        await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
+          values(${other.org},${other.workspace},${ownerId},'member')`;
+        const otherTenant = await authenticateSession(login.token, {
+          organizationId: other.org,
+          workspaceId: other.workspace,
+        });
+        if (!otherTenant) throw Error('Synthetic second tenant unavailable');
+        expect(await isDEntryPersonReleased(otherTenant)).toBe(false);
+        await expect(
+          createEmployeeInstance(otherTenant, {
+            ...input,
+            workspaceId: other.workspace,
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
         cookie.token = login.token;
         expect(
           (await create({ ...input, workspaceId: other.workspace })).status,
@@ -1885,6 +1920,17 @@ suite(
           },
         ]);
         expect(await readPersonNativeWebRoster(owner)).toEqual(roster);
+        expect(
+          (
+            await createBusinessThread(
+              new Request('https://allrice.test/api/v1/sessions', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(selection),
+              }),
+            )
+          ).status,
+        ).toBe(403);
         const thread = await createBusinessThread(
           new Request('https://allrice.test/api/v1/sessions?entry=4.0', {
             method: 'POST',

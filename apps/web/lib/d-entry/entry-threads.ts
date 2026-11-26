@@ -17,7 +17,6 @@ import {
   readDEntryReleasePolicy,
   requireDEntryNativeIdentity,
   resolveEmployeeSessionInstance,
-  resolveWorkspaceId,
 } from '@allrice/database';
 import { z } from 'zod';
 
@@ -38,10 +37,22 @@ export async function isDEntryPersonReleased(context: RequestContext) {
 
 /** Resolve an authorized creation workspace without provisioning an employee. */
 export async function findDEntryCreationWorkspace(context: RequestContext) {
-  if (!(await isDEntryPersonReleased(context))) return null;
-  const workspaceId = await resolveWorkspaceId(context);
-  return (await readContentPrincipal({ ...context, workspaceId }))?.writable
-    ? workspaceId
+  if (context.actor.type !== 'user' || !(await isDEntryPersonReleased(context)))
+    return null;
+  const sql = getDatabase();
+  const [workspace] = await sql<{ id: string }[]>`
+    select w.id from allrice_workspaces w
+    where w.organization_id=${context.organizationId} and w.archived_at is null
+      and (${context.workspaceId}::uuid is null or w.id=${context.workspaceId})
+      and exists (select 1 from allrice_memberships m
+        where m.organization_id=w.organization_id and m.user_id=${context.actor.id}
+          and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=w.id))
+    order by w.created_at,w.id limit 1`;
+  if (!workspace) return null;
+  return (await readContentPrincipal({ ...context, workspaceId: workspace.id }))
+    ?.writable
+    ? workspace.id
     : null;
 }
 
