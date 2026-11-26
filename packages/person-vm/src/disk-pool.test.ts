@@ -96,6 +96,7 @@ class Locks implements DiskPoolLocks {
   foregroundChecks = 0;
   beforeInventory?: (signal: AbortSignal) => void;
   afterInventory?: () => Promise<void>;
+  onInventoryOwnerCheck?: (signal: AbortSignal) => Promise<void>;
   private held = new Map<
     Lane,
     { done: ReturnType<typeof gate>; owner: AbortController }
@@ -130,7 +131,11 @@ class Locks implements DiskPoolLocks {
       const value = await work({
         signal: active,
         ownerSignal: owner.signal,
-        assertOwned: async () => owner.signal.throwIfAborted(),
+        assertOwned: async () => {
+          if (kind === 'inventory' && this.onInventoryOwnerCheck)
+            await this.onInventoryOwnerCheck(active);
+          owner.signal.throwIfAborted();
+        },
         foregroundStarting: async () => {
           this.foregroundChecks += 1;
           return this.foreground;
@@ -727,6 +732,68 @@ it('refuses a revoked admitted ticket after waiting for the inventory lock witho
   const inventory = await f.ledger.read(signal(), true);
   expect(inventory.slots[0]?.entry?.state).toBe('ready');
   expect(inventory.ordinaryOwners.size).toBe(0);
+  expect(f.platform.binds).toHaveLength(0);
+  expect(f.h.log).toEqual([]);
+});
+
+it('leaves exact stock ready when the admitted ticket is revoked during the final inventory ownership check', async () => {
+  const f = await fixture();
+  const rc = context();
+  await f.pool.refill(signal());
+  const ready = (await f.ledger.read(signal())).slots[0]!;
+  expect(ready.entry?.state).toBe('ready');
+  const stock = structuredClone(f.platform.disks.get(ready.entry!.ref));
+  const checking = gate();
+  const finish = gate();
+  let staged = 0;
+  faults.afterLedgerFileSync = () => {
+    staged += 1;
+  };
+  f.locks.onInventoryOwnerCheck = async (active) => {
+    expect(staged).toBe(1);
+    checking.release();
+    await finish.promise;
+    expect(active.aborted).toBe(false);
+  };
+  const revoked = Object.assign(Error('ticket grant changed'), {
+    code: 'authorization_denied',
+  });
+  const assertAuthority = vi.fn(async (active: AbortSignal) => {
+    active.throwIfAborted();
+  });
+  const outcome = f.service
+    .prewarm(
+      rc,
+      {
+        trigger: 'page',
+        target: {
+          vmId: null,
+          instanceId: null,
+          leaseEpoch: 1,
+          assertAuthority,
+        },
+      },
+      signal(),
+    )
+    .catch((error: unknown) => error);
+  try {
+    expect(
+      await Promise.race([checking.promise.then(() => 'checking'), outcome]),
+    ).toBe('checking');
+    expect(assertAuthority).toHaveBeenCalled();
+    assertAuthority.mockRejectedValue(revoked);
+  } finally {
+    finish.release();
+    await outcome;
+  }
+  expect(await outcome).toMatchObject({
+    code: 'AUTHORIZATION_DENIED',
+    cause: revoked,
+  });
+  const inventory = await f.ledger.read(signal(), true);
+  expect(inventory.slots[0]).toEqual(ready);
+  expect(inventory.ordinaryOwners.size).toBe(0);
+  expect(f.platform.disks.get(ready.entry!.ref)).toEqual(stock);
   expect(f.platform.binds).toHaveLength(0);
   expect(f.h.log).toEqual([]);
 });

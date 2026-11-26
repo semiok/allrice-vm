@@ -394,7 +394,8 @@ export class PersonVmService
         }
         const row = retry ? lease.row! : this.newVmRecord(identity);
         const assertTicket =
-          target && (() => assertPrewarmAuthority(target, signal));
+          target &&
+          ((active: AbortSignal) => assertPrewarmAuthority(target, active));
         await this.createDiskOwned(row, lease, signal, {
           action: 'create',
           requestId: context.requestId,
@@ -512,7 +513,7 @@ export class PersonVmService
       requestId: string;
       lane: 'foreground' | 'admin';
       assertCurrent(): Promise<void>;
-      assertPrewarmAuthority?(): Promise<void>;
+      assertPrewarmAuthority?: PersonVmPrewarmFence['assertAuthority'];
     },
   ) {
     const pool = this.options.diskPool;
@@ -529,7 +530,7 @@ export class PersonVmService
       await lease.assertAdmissionOpen();
       signal.throwIfAborted();
     }
-    if (assertTicket) await assertTicket();
+    if (assertTicket) await assertTicket(signal);
     let committed = false;
     const commitOwner = async (current: AbortSignal) => {
       current.throwIfAborted();
@@ -541,13 +542,9 @@ export class PersonVmService
     if (!needsCandidate) await commitOwner(signal);
     const ownerGuard = {
       signal,
-      assertCurrent: assertTicket
-        ? async () => {
-            await input.assertCurrent();
-            await assertTicket();
-          }
-        : input.assertCurrent,
+      assertCurrent: input.assertCurrent,
       assertOwner: () => lease.guard(row),
+      assertTicket,
     };
     const claim = () =>
       pool?.claim(row, input.requestId, input.lane, {
@@ -586,7 +583,7 @@ export class PersonVmService
             await ownerGuard.assertOwner();
             signal.throwIfAborted();
           }
-          if (assertTicket) await assertTicket();
+          if (assertTicket) await assertTicket(signal);
           await this.options.disk.create(
             { vmId: row.vmId, tier: row.diskTier },
             signal,
@@ -602,7 +599,7 @@ export class PersonVmService
         await lease.guard(row);
         signal.throwIfAborted();
       }
-      if (pool && assertTicket) await assertTicket();
+      if (pool && assertTicket) await assertTicket(signal);
       row.diskTier = inspected.disk.tier;
       row.phase = row.diskTier === 'cold' ? 'cold' : 'stopped';
       row.stoppedAt = this.now().toISOString();

@@ -31,6 +31,7 @@ type ClaimGuard = Readonly<{
   signal: AbortSignal;
   assertOwner(): Promise<void>;
   assertCurrent(): Promise<void>;
+  assertTicket?(signal: AbortSignal): Promise<void>;
   /** Only for a first admin allocation whose person lease has no SQL VM row. */
   commitOwner?(signal: AbortSignal): Promise<void>;
 }>;
@@ -197,11 +198,22 @@ export class PersonVmDiskPool {
     return result;
   }
 
-  private async checkClaim(guard: ClaimGuard) {
+  private async checkClaim(guard: ClaimGuard, lock?: DiskPoolLock) {
     guard.signal.throwIfAborted();
     await guard.assertCurrent();
     await guard.assertOwner();
     guard.signal.throwIfAborted();
+    if (lock) {
+      await lock.assertOwned();
+      lock.signal.throwIfAborted();
+    }
+    if (guard.assertTicket) {
+      guard.signal.throwIfAborted();
+      // Observe the admitted grant after the ownership calls have settled.
+      await guard.assertTicket(lock?.signal ?? guard.signal);
+      guard.signal.throwIfAborted();
+      lock?.signal.throwIfAborted();
+    }
   }
 
   async claim(
@@ -264,10 +276,9 @@ export class PersonVmDiskPool {
             },
           },
         };
-        await this.ledger.append(slot, entry, lock.signal, async () => {
-          await this.checkClaim(guard);
-          await lock.assertOwned();
-        });
+        await this.ledger.append(slot, entry, lock.signal, () =>
+          this.checkClaim(guard, lock),
+        );
         return { slot: { ...slot, entry, revision: slot.revision + 1 }, entry };
       },
     );
@@ -283,9 +294,12 @@ export class PersonVmDiskPool {
           { ...entry, state },
           lock.signal,
           async () => {
-            if (state === 'bound') await this.checkClaim(guard);
-            else await guard.assertOwner();
-            await lock.assertOwned();
+            if (state === 'bound') {
+              await this.checkClaim(guard, lock);
+            } else {
+              await guard.assertOwner();
+              await lock.assertOwned();
+            }
           },
         );
         return true;
