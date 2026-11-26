@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { access, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -72,10 +73,19 @@ it(
       {},
     );
     const active = new AbortController().signal;
-    expect(f.launch.command.args.slice(1, 3)).toEqual([
-      '--profile',
-      'allrice-web',
-    ]);
+    const command = f.launch.command;
+    expect(command.args.slice(1, 3)).toEqual(['--profile', 'allrice-web']);
+    const urlIndex = command.args.indexOf('--public-url') + 1;
+    const origin = new URL(f.launch.auth.origin).origin;
+    const { workspaceId, employeeInstanceId } = f.principalProfile;
+    const advertised = `${origin}/chatflow/4.0/${workspaceId}/${employeeInstanceId}/`;
+    expect(command.args[urlIndex]).toBe(advertised);
+    const patchPath = command.args[command.args.indexOf('--patch') + 1]!;
+    const entries = JSON.parse(await readFile(patchPath, 'utf8'));
+    expect(entries[0]).toMatchObject({
+      id: 'web-runtime',
+      config: { publicUrl: advertised },
+    });
     expect(f.owner.controlReady()).toBe(true);
     expect((await f.owner.readSessions(active)).ok).toBe(true);
     assertOneNativeLogin(await f.observeNativeStartup(f.child));
@@ -156,6 +166,29 @@ it(
     expect(await second.exited).toEqual({ exitCode: 0, timedOut: false });
     await expect(access(secondNonce)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(f.kills()).toBe(2);
+
+    const rejectedArgs = [...command.args];
+    rejectedArgs[urlIndex] =
+      `${origin}/chatflow/4.0?${new URLSearchParams({ workspaceId, employeeInstanceId })}`;
+    const rejected = spawnSync(process.execPath, rejectedArgs, {
+      cwd: command.workdir,
+      env: {
+        PATH: dirname(process.execPath),
+        HOME: command.workdir,
+        ...command.env,
+        DO_NOT_TRACK: '1',
+        NPM_CONFIG_OFFLINE: 'true',
+      },
+      encoding: 'utf8',
+      timeout: 5000,
+      killSignal: 'SIGKILL',
+    });
+    expect(rejected.error).toBeUndefined();
+    expect(rejected.status).toBe(1);
+    expect(rejected.stderr).toContain(
+      '--public-url must not include a query or fragment (? or #)',
+    );
+
     const patchFile = join(f.seal.directory, 'guest/cordis.patch.yml');
     const exactBytes = await readFile(patchFile);
     await rm(patchFile);

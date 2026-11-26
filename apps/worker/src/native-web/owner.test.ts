@@ -4,7 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { composeEntries } from '@deepseek-ai/dsh-app-boot';
-import type { PersonVmBootstrapScope } from '@allrice/person-vm';
+import type {
+  PersonVmBootstrapScope,
+  PersonVmJobExit,
+} from '@allrice/person-vm';
+import { deferred } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { prepareNativeWebLaunch } from './launch.js';
 import { openNativeWebOwner, readNativeModelAttempt } from './owner.js';
 
@@ -151,6 +155,14 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
     await expect(
       prepareNativeWebLaunch({ ...config, guestAddress }, binding, profile),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  for (const suffix of ['?workspaceId=fixture', '#fragment', '?', '#'])
+    await expect(
+      prepareNativeWebLaunch(
+        { ...config, publicUrl: config.publicUrl + suffix },
+        binding,
+        profile,
+      ),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
 
 it('真实Web启动缺有界auth capability时先拒绝，不launch或假ready', async () => {
@@ -212,6 +224,87 @@ it('启动plan绑定exact host epoch，旧plan不能在新scope dispatch', async
     }),
   ).rejects.toMatchObject({ code: 'LEASE_LOST' });
   expect(scope.launch).not.toHaveBeenCalled();
+});
+
+it('CLI 启动退出会取消本次认证读取，等读取和原生关闭收尾后返回脱敏错误', async () => {
+  const lifetime = new AbortController();
+  const guestExited = deferred<PersonVmJobExit>();
+  const readerStarted = deferred<AbortSignal | undefined>();
+  const readerClosed = deferred<void>();
+  const cancelStarted = deferred<AbortSignal>();
+  const cancelClosed = deferred<void>();
+  const exit = { exitCode: 1, timedOut: false };
+  const cancelAndWait = vi.fn(async (signal: AbortSignal) => {
+    cancelStarted.resolve(signal);
+    await cancelClosed.promise;
+    return exit;
+  });
+  const launch = {
+    binding,
+    auth: {
+      dshHome: '/work/a',
+      origin: 'http://127.0.0.1:32179/',
+      nonce: randomUUID(),
+      timeoutMs: 60000,
+    },
+    files: [],
+    command: { executable: 'node', args: [] },
+  };
+  const scope: PersonVmBootstrapScope = {
+    binding,
+    signal: new AbortController().signal,
+    assertCurrent: vi.fn().mockResolvedValue(undefined),
+    launch: vi.fn().mockResolvedValue({
+      binding,
+      jobId: 'fixture-launch',
+      wait: () => guestExited.promise,
+      cancelAndWait,
+    }),
+    readNativeWebAuth: async (request, signal) => {
+      expect(request).toBe(launch.auth);
+      readerStarted.resolve(signal);
+      await readerClosed.promise;
+      throw Error('fixture private reader diagnostic');
+    },
+  };
+  let settled = false;
+  const outcome = openNativeWebOwner({
+    scope,
+    launch,
+    context: {} as never,
+    vm: { assertCurrentBinding: vi.fn() },
+    lifetime: lifetime.signal,
+    cleanupTimeoutMs: 2000,
+  })
+    .catch((error: unknown) => error)
+    .finally(() => {
+      settled = true;
+    });
+  try {
+    const readerSignal = await readerStarted.promise;
+    guestExited.resolve(exit);
+    await vi.waitFor(() => expect(readerSignal?.aborted).toBe(true));
+    expect(scope.signal.aborted).toBe(false);
+    expect(lifetime.signal.aborted).toBe(false);
+    expect(settled).toBe(false);
+    readerClosed.resolve(undefined);
+    expect((await cancelStarted.promise).aborted).toBe(false);
+    expect(settled).toBe(false);
+    cancelClosed.resolve(undefined);
+    const failure = await outcome;
+    expect(failure).toMatchObject({
+      code: 'PROVIDER_FAILED',
+      message: 'PROVIDER_FAILED',
+    });
+    expect(failure).not.toHaveProperty('cause');
+    expect(cancelAndWait).toHaveBeenCalledTimes(1);
+  } finally {
+    guestExited.resolve(exit);
+    readerClosed.resolve(undefined);
+    cancelClosed.resolve(undefined);
+    lifetime.abort();
+    await outcome;
+  }
 });
 
 it('requires the exact current compaction bracket and cannot substitute it for the assistant call', () => {

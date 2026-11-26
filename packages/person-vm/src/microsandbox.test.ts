@@ -1344,58 +1344,68 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(f.h.mounts.size).toBe(unknownStop ? 1 : 0);
     },
   );
-  it('原生秒预算向上取整不延长host毫秒预算，取消后join实际CLI再stop/status', async () => {
-    const f = await bootstrapFixture('auth-budget'),
-      dshHome = await directory(),
-      budget = new AbortController(),
-      timeout = AbortSignal.timeout.bind(AbortSignal);
-    // Control the actual host deadline at admission, rather than rely on wall-clock sleeps.
-    const deadline = vi
-      .spyOn(AbortSignal, 'timeout')
-      .mockImplementation((ms) => (ms === 1001 ? budget.signal : timeout(ms)));
-    f.h.runtime.start = async (_binding, _signal, scope) => {
-      await scope.readNativeWebAuth!({
-        dshHome,
-        nonce: randomUUID(),
-        origin: 'http://127.0.0.1:32179/',
-        timeoutMs: 1001,
+  it.each(['deadline', 'owner'] as const)(
+    '取消认证读（%s）后 join 实际 CLI 再 stop/status',
+    async (source) => {
+      const f = await bootstrapFixture('auth-budget'),
+        dshHome = await directory(),
+        budget = new AbortController(),
+        owner = new AbortController(),
+        timeout = AbortSignal.timeout.bind(AbortSignal);
+      // Control the actual host deadline at admission, rather than rely on wall-clock sleeps.
+      const deadline = vi
+        .spyOn(AbortSignal, 'timeout')
+        .mockImplementation((ms) =>
+          ms === 1001 ? budget.signal : timeout(ms),
+        );
+      f.h.runtime.start = async (_binding, _signal, scope) => {
+        await scope.readNativeWebAuth!(
+          {
+            dshHome,
+            nonce: randomUUID(),
+            origin: 'http://127.0.0.1:32179/',
+            timeoutMs: 1001,
+          },
+          owner.signal,
+        );
+      };
+      const start = f.service.prewarm(f.rc, { trigger: 'page' }, signal());
+      const failure = expect(start).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
       });
-    };
-    const start = f.service.prewarm(f.rc, { trigger: 'page' }, signal());
-    const failure = expect(start).rejects.toMatchObject({
-      code: 'PROVIDER_FAILED',
-    });
-    let pid = 0;
-    try {
-      await vi.waitFor(
-        async () => {
-          pid = Number(
-            await readFile(join(f.mount, 'host-home/auth-reading'), 'utf8'),
-          );
-          expect(pid).toBeGreaterThan(0);
-        },
-        { timeout: 5000 },
-      );
-      expect(deadline).toHaveBeenCalledWith(1001);
-      budget.abort();
-      await failure;
-      expect(() => process.kill(pid, 0)).toThrow();
-      const calls = await f.calls();
-      const reader = calls.find(
-        (args) => args[0] === 'exec' && !args.includes('--detach'),
-      )!;
-      expect(reader[reader.indexOf('--timeout') + 1]).toBe('2s');
-      const stopped = calls.findIndex((args) => args[0] === 'stop');
-      expect(stopped).toBeGreaterThan(0);
-      expect(calls.slice(stopped + 1).some((args) => args[0] === 'list')).toBe(
-        true,
-      );
-      expect(f.h.mounts.size).toBe(0);
-    } finally {
-      budget.abort();
-      await start.catch(() => {});
-    }
-  });
+      let pid = 0;
+      try {
+        await vi.waitFor(
+          async () => {
+            pid = Number(
+              await readFile(join(f.mount, 'host-home/auth-reading'), 'utf8'),
+            );
+            expect(pid).toBeGreaterThan(0);
+          },
+          { timeout: 5000 },
+        );
+        expect(deadline).toHaveBeenCalledWith(1001);
+        if (source === 'owner') owner.abort();
+        else budget.abort();
+        await failure;
+        expect(() => process.kill(pid, 0)).toThrow();
+        const calls = await f.calls();
+        const reader = calls.find(
+          (args) => args[0] === 'exec' && !args.includes('--detach'),
+        )!;
+        expect(reader[reader.indexOf('--timeout') + 1]).toBe('2s');
+        const stopped = calls.findIndex((args) => args[0] === 'stop');
+        expect(stopped).toBeGreaterThan(0);
+        expect(
+          calls.slice(stopped + 1).some((args) => args[0] === 'list'),
+        ).toBe(true);
+        expect(f.h.mounts.size).toBe(0);
+      } finally {
+        budget.abort();
+        await start.catch(() => {});
+      }
+    },
+  );
   it('service真实启动入口按cp/mode→managed init wait→固定launcher/env，running不重init', async () => {
     const f = await bootstrapFixture();
     await f.service.prewarm(f.rc, { trigger: 'page' }, signal());

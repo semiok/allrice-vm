@@ -36,6 +36,7 @@ import {
 } from '../../../../packages/person-vm/src/native-web-auth.ts';
 import { runCommand } from '../../../../packages/person-vm/src/process.ts';
 import {
+  dEntryNativePublicUrl,
   prepareNativeWebLaunch,
   type NativeWebLaunch,
   type NativeWebModelAdapter,
@@ -212,7 +213,10 @@ export async function setupNativeWebFixture(
   };
   const configuration = {
     origin: `http://127.0.0.1:${port}/`,
-    publicUrl: `http://127.0.0.1:${port}/`,
+    publicUrl: dEntryNativePublicUrl(
+      `http://127.0.0.1:${port}`,
+      principalProfile,
+    ),
     guestAddress: '127.0.0.1',
     guestPort: port,
     dshHome,
@@ -513,7 +517,7 @@ export async function setupNativeWebFixture(
       }
       return job;
     },
-    async readNativeWebAuth(request) {
+    async readNativeWebAuth(request, active = startup.signal) {
       const file = nativeWebAuthArtifact(request);
       const trace = startupTraces.get(child);
       if (isolateProfile && !trace)
@@ -522,6 +526,7 @@ export async function setupNativeWebFixture(
       const cancelGate = new AbortController();
       const signal = AbortSignal.any([
         startup.signal,
+        active,
         AbortSignal.timeout(request.timeoutMs),
         cancelGate.signal,
       ]);
