@@ -21,7 +21,7 @@ import type {
   PersonVmAdmissionParticipant,
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
-  PersonVmIdleCoverage,
+  PersonVmNativeIdleCoverage,
   PersonVmIdleStopDispatch,
   PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
@@ -72,21 +72,21 @@ type IdleCandidate = { key: string; mono: number };
 export function advanceIdleCandidate(
   previous: IdleCandidate | undefined,
   binding: PersonVmBinding,
-  coverage: readonly PersonVmIdleCoverage[],
+  coverage: readonly PersonVmNativeIdleCoverage[],
   acceptedRevisions: readonly (string | undefined)[],
   row: Pick<VmRecord, 'holds' | 'lastActivityAt'> | null,
   mono: number,
 ): IdleCandidate | undefined {
   if (
     row?.holds.length ||
-    coverage.some((value) => value.state !== 'continuous' || !value.idleSince)
+    coverage.some((value) => value.state === 'unknown' || !value.idleSince)
   )
     return undefined;
   const key = JSON.stringify([
     binding,
     coverage.map((value) => [
       value.cursor?.sourceId,
-      value.state === 'continuous' ? value.idleSince : null,
+      value.state === 'unknown' ? null : value.idleSince,
     ]),
     acceptedRevisions,
     row?.lastActivityAt,
@@ -1160,6 +1160,7 @@ export class PersonVmAdmissionHost
     row: VmRecord | null,
     previous: IdleCandidate | undefined,
     signal: AbortSignal,
+    purpose: 'inspection' | 'stop-guard',
   ) {
     if (
       !this.options.nativeActivity ||
@@ -1182,19 +1183,23 @@ export class PersonVmAdmissionHost
     );
     if (!observations) return undefined;
     const [g, e, accepted] = observations;
-    const native = await this.options.nativeActivity.observe(binding, signal);
+    const native = await this.options.nativeActivity.observe(
+      binding,
+      signal,
+      purpose,
+    );
     const now = this.options.now().getTime();
     const age = now - Date.parse(native.activity.observedAt);
     const coverage = native.coverage;
     const through =
-      coverage.state === 'continuous' ? Date.parse(coverage.through) : NaN;
+      coverage.state === 'unknown' ? NaN : Date.parse(coverage.through);
     if (
       g.state !== 'known' ||
       e.state !== 'known' ||
       g.active + g.queued + e.active + e.queued ||
       !sameBinding(native.activity.binding, binding) ||
       native.activity.state !== 'known' ||
-      coverage.state !== 'continuous' ||
+      coverage.state === 'unknown' ||
       !coverage.idleSince ||
       !(Date.parse(coverage.from) <= Date.parse(coverage.idleSince)) ||
       !(Date.parse(coverage.idleSince) <= through) ||
@@ -1311,6 +1316,7 @@ export class PersonVmAdmissionHost
       await this.options.store.read(binding.personId),
       this.idle.get(binding.personId),
       signal,
+      'inspection',
     ).catch((error: unknown) => {
       this.idle.delete(binding.personId);
       throw error;
@@ -1337,6 +1343,7 @@ export class PersonVmAdmissionHost
                 owned.row,
                 candidate,
                 checking,
+                'stop-guard',
               );
               if (
                 latest !== candidate ||

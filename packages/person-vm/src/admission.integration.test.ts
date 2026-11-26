@@ -609,6 +609,7 @@ suite(
       'mount-change',
       'wake-plan-changed',
       'ok',
+      'sampled-ok',
       'commit-rejected',
       'commit-ack-lost',
       'native-proof-rejected',
@@ -699,6 +700,7 @@ suite(
           outcome === 'commit-rejected' || outcome === 'system-recovery';
         const recovering = commitRejected || outcome === 'commit-ack-lost';
         const nativeProofRejected = outcome === 'native-proof-rejected';
+        const samplePurposes: (string | undefined)[] = [];
         let mono = 0,
           runningJobs = 0,
           revision = 'first',
@@ -735,7 +737,8 @@ suite(
             },
           },
           nativeActivity: {
-            async observe(current) {
+            async observe(current, _signal, purpose) {
+              if (outcome === 'sampled-ok') samplePurposes.push(purpose);
               const observedAt = h.now().toISOString();
               return {
                 activity: {
@@ -749,11 +752,15 @@ suite(
                 },
                 activeScheduleDeliveries: 0,
                 coverage: {
-                  state: 'continuous',
                   cursor: { sourceId: 'native-fixture', revision },
                   from: since,
                   through: observedAt,
-                  idleSince: runningJobs ? null : since,
+                  ...(outcome === 'sampled-ok'
+                    ? { state: 'sampled', idleSince: since }
+                    : {
+                        state: 'continuous',
+                        idleSince: runningJobs ? null : since,
+                      }),
                 },
               };
             },
@@ -980,6 +987,7 @@ suite(
         }
         const stopped =
           outcome === 'ok' ||
+          outcome === 'sampled-ok' ||
           outcome === 'relogin' ||
           outcome === 'system-ok' ||
           recovering;
@@ -1016,7 +1024,21 @@ suite(
         );
         if (stopped)
           expect(Number(success[0]!.lease_epoch)).toBe(binding.leaseEpoch);
-        if (outcome === 'ok') {
+        if (outcome === 'sampled-ok') {
+          expect(samplePurposes.slice(0, 3)).toEqual([
+            'inspection',
+            'inspection',
+            'inspection',
+          ]);
+          expect(samplePurposes.slice(3)).toEqual(
+            Array.from(
+              { length: samplePurposes.length - 3 },
+              () => 'stop-guard',
+            ),
+          );
+          expect(samplePurposes.length).toBeGreaterThan(3);
+        }
+        if (outcome === 'ok' || outcome === 'sampled-ok') {
           expect(await service.start(rc, signal())).toMatchObject({
             vmId: binding.vmId,
             diskRetained: true,

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
   clientRequestSchema,
@@ -40,7 +41,10 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
-import { readNativeProfileActivity } from './activity.js';
+import {
+  isNativeActivityProjection,
+  readNativeProfileActivity,
+} from './activity.js';
 import { nativeWebTransport, type NativeOwnedUnary } from './transport.js';
 import {
   observeNativePrompt,
@@ -173,6 +177,10 @@ export async function openNativeWebOwner(input: {
   // typed close/closed/end until normal cleanup, actual loss or exact stop.
   const signal = AbortSignal.any([input.lifetime, stale.signal]);
   let installedModelAdapter: string | undefined;
+  let activityRevision = 0;
+  // job/list is a visibility filter, with unowned Jobs visible to every
+  // selector. This fresh selector creates no native Session.
+  const unownedJobSelector = SessionId(randomUUID());
   let ready = false,
     closing: Promise<void> | undefined,
     hostClosing: Promise<void> | undefined;
@@ -497,7 +505,19 @@ export async function openNativeWebOwner(input: {
     own(
       (async () => {
         try {
-          while (!(await iterator.next()).done) signal.throwIfAborted();
+          for (
+            let next = await iterator.next();
+            !next.done;
+            next = await iterator.next()
+          ) {
+            signal.throwIfAborted();
+            const frame = next.value;
+            if (
+              frame.type === 'projection' &&
+              isNativeActivityProjection(frame.key, frame.value)
+            )
+              activityRevision++;
+          }
         } finally {
           // Expected business cancellation must leave cleanup carrier alive.
           if (!closing) lost();
@@ -660,7 +680,8 @@ export async function openNativeWebOwner(input: {
           notDispatched,
         );
       },
-      /** Positive sightings from this authenticated, exact Host. None of
+      nativeActivityRevision: () => activityRevision,
+      /** Activity samples from this authenticated, exact Host. None of
        * these public queries activates or waits for a Session's runtime. */
       readNativeActivity(
         assertCurrent: (signal: AbortSignal) => Promise<void>,
@@ -687,7 +708,10 @@ export async function openNativeWebOwner(input: {
                 return method.result.create().parse(replyValue(result)).items;
               },
               jobs: async (sessionId, signal) => {
-                const stream = root.remote.job.list({ sessionId }, signal);
+                const stream = root.remote.job.list(
+                  { sessionId: sessionId ?? unownedJobSelector },
+                  signal,
+                );
                 const rows = stream[Symbol.asyncIterator]();
                 try {
                   const first = await rows.next();

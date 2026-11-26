@@ -25,6 +25,7 @@ import {
 } from '../native-schedule-observation.js';
 import {
   createPersonVmScheduledWake,
+  DEFAULT_SCHEDULE_WAKE_LEAD_MS,
   type PrepareStopWithWakeResult,
 } from './scheduled-wake.js';
 
@@ -143,6 +144,7 @@ export function createProductionScheduledWake(input: {
   database: ReturnType<typeof getDatabase>;
   source: ProductionScheduledWakeSource;
   lifetime: AbortSignal;
+  minimumLeadMs?: number;
 }) {
   const stopped = new AbortController();
   const lifetime = AbortSignal.any([input.lifetime, stopped.signal]);
@@ -160,7 +162,10 @@ export function createProductionScheduledWake(input: {
       ledger,
       capture,
       start: input.source.start,
-      leadMs: input.source.leadMs,
+      leadMs: Math.max(
+        input.minimumLeadMs ?? 0,
+        input.source.leadMs ?? DEFAULT_SCHEDULE_WAKE_LEAD_MS,
+      ),
     };
   }
   const wake = createPersonVmScheduledWake(

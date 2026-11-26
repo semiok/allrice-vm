@@ -99,9 +99,10 @@ it(
     await expect(f.owner.readScheduleCatalog(guard, active)).resolves.toEqual(
       [],
     );
-    await expect(f.owner.readNativeActivity(guard, active)).resolves.toEqual(
-      new Set(),
-    );
+    await expect(f.owner.readNativeActivity(guard, active)).resolves.toEqual({
+      work: new Set(),
+      complete: true,
+    });
     assertOneNativeLogin(await f.observeNativeStartup(f.child));
     const patch = await f.observedProfilePatch();
     expect(patch.actual).toEqual([patch.expected]);

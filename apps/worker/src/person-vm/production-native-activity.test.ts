@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import {
+  ScheduleId,
+  type ScheduleCatalogEntry,
+} from '@deepseek-ai/dsh-schedule';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { expect, it, vi } from 'vitest';
+import { advanceIdleCandidate } from '../../../../packages/person-vm/src/admission-host.js';
 import type { NativeWork } from '../native-web/activity.js';
-import { createProductionNativeActivity } from './production-native-activity.js';
+import {
+  createProductionNativeActivity,
+  getIdleScheduleGuardMs,
+} from './production-native-activity.js';
 
 const binding = {
   personId: randomUUID(),
@@ -11,53 +20,195 @@ const binding = {
   leaseEpoch: 1,
 };
 const signal = new AbortController().signal;
-const profile = (...work: NativeWork[]) => ({
-  owner: { readNativeActivity: vi.fn(async () => new Set(work)) },
-  revoked: signal,
+const period = 60_000;
+const idleMs = 20 * period;
+
+function profile() {
+  let revision = 0;
+  const owner = {
+    nativeActivityRevision: () => revision,
+    readNativeActivity: vi.fn(async () => ({
+      work: new Set<NativeWork>(),
+      complete: true,
+    })),
+    readScheduleCatalog: vi.fn(
+      async (): Promise<readonly ScheduleCatalogEntry[]> => [],
+    ),
+  };
+  return {
+    owner,
+    revoked: signal,
+    event: () => revision++,
+  };
+}
+
+function harness() {
+  let mono = 0;
+  const now = () => Date.parse('2026-11-26T12:00:00Z') + mono;
+  const first = profile();
+  const second = profile();
+  const catalogs = vi.fn(() => [first, second]);
+  const guardMs = getIdleScheduleGuardMs({
+    cleanupTimeoutMs: 15_000,
+    idleScheduleSafetyMarginMs: 20_000,
+  });
+  const startup = {
+    activityCatalogs: catalogs,
+    assertAuthenticatedGroup: () => {},
+  };
+  const create = (lifetime = signal) =>
+    createProductionNativeActivity(startup, lifetime, {
+      sampleIntervalMs: period,
+      scheduleGuardMs: guardMs,
+      now,
+      monotonic: () => mono,
+    });
+  let instance = new AbortController();
+  let activity = create(instance.signal);
+  let candidate: ReturnType<typeof advanceIdleCandidate>;
+  return {
+    first,
+    second,
+    catalogs,
+    guardMs,
+    nearWake(offsetMs: number) {
+      second.owner.readScheduleCatalog.mockResolvedValueOnce([
+        {
+          id: ScheduleId('scheduled-fixture'),
+          sessionId: SessionId('session'),
+          kind: 'at',
+          status: 'active',
+          scheduledAt: new Date(now() + offsetMs).toISOString(),
+          title: 'synthetic',
+          prompt: 'synthetic',
+        },
+      ]);
+    },
+    restart() {
+      instance.abort();
+      instance = new AbortController();
+      activity = create(instance.signal);
+      // Even a caller holding its old candidate cannot carry it into a new owner.
+    },
+    async sample(slot: number, purpose?: 'stop-guard') {
+      mono = slot * period;
+      const snapshot = await activity.observe(binding, signal, purpose);
+      const latest = advanceIdleCandidate(
+        candidate,
+        binding,
+        [snapshot.coverage],
+        [snapshot.coverage.cursor?.revision],
+        null,
+        mono,
+      );
+      const eligible = latest !== undefined && mono - latest.mono >= idleMs;
+      if (!purpose) candidate = latest;
+      return { snapshot, eligible };
+    },
+  };
+}
+
+it('gives the real admission candidate a complete 20-minute window, after the last slot', async () => {
+  const h = harness();
+  for (let slot = 0; slot < 20; slot++) {
+    const result = await h.sample(slot);
+    expect(result.snapshot.coverage.state).toBe('sampled');
+    expect(result.eligible).toBe(false);
+  }
+  const last = await h.sample(20);
+  expect(last.eligible).toBe(true);
+  expect(last.snapshot).toMatchObject({
+    status: 'idle',
+    activity: { state: 'known', binding },
+    activeScheduleDeliveries: 0,
+    coverage: { state: 'sampled', idleSince: '2026-11-26T12:00:00.000Z' },
+  });
+  expect((await h.sample(20.02, 'stop-guard')).eligible).toBe(true);
 });
 
-it('sees work in a second employee and never grants continuous idle', async () => {
-  const first = profile();
-  const second = profile('job', 'subagent', 'schedule');
-  const activity = createProductionNativeActivity(
-    {
-      activityCatalogs: () => [first, second],
-      assertAuthenticatedGroup: () => {},
+it.each(['sample', 'control event'] as const)(
+  'restarts the clock when busy evidence comes from a %s',
+  async (kind) => {
+    const h = harness();
+    for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+    if (kind === 'sample')
+      h.second.owner.readNativeActivity.mockResolvedValueOnce({
+        work: new Set(['job', 'subagent', 'schedule']),
+        complete: false,
+      });
+    else h.second.event();
+    expect(await h.sample(20)).toMatchObject({
+      eligible: false,
+      snapshot: { status: 'busy', coverage: { state: 'unknown' } },
+    });
+    for (let slot = 21; slot <= 40; slot++)
+      expect((await h.sample(slot)).eligible).toBe(false);
+    expect((await h.sample(41)).eligible).toBe(true);
+  },
+);
+
+it('restarts after a missed slot and does not use guard reads as replacements', async () => {
+  const h = harness();
+  for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+  expect((await h.sample(20, 'stop-guard')).snapshot.status).toBe('unknown');
+  expect(await h.sample(21)).toMatchObject({
+    eligible: false,
+    snapshot: {
+      coverage: { state: 'sampled', idleSince: '2026-11-26T12:21:00.000Z' },
     },
-    signal,
+  });
+  for (let slot = 22; slot <= 40; slot++)
+    expect((await h.sample(slot)).eligible).toBe(false);
+  expect((await h.sample(41)).eligible).toBe(true);
+});
+
+it('blocks an active schedule at the configured inclusive safety boundary', async () => {
+  const h = harness();
+  for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+  h.nearWake(h.guardMs + 1);
+  expect((await h.sample(20)).eligible).toBe(true);
+  h.nearWake(h.guardMs);
+  expect(await h.sample(20, 'stop-guard')).toMatchObject({
+    eligible: false,
+    snapshot: { status: 'busy', coverage: { state: 'unknown' } },
+  });
+});
+
+it('starts a new window and source identity after Worker restart', async () => {
+  const h = harness();
+  for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+  const previous = (await h.sample(19)).snapshot.coverage.cursor;
+  h.restart();
+  const next = await h.sample(20);
+  expect(next.eligible).toBe(false);
+  expect(next.snapshot.coverage.cursor?.sourceId).not.toBe(previous?.sourceId);
+  for (let slot = 21; slot < 40; slot++)
+    expect((await h.sample(slot)).eligible).toBe(false);
+  expect((await h.sample(40)).eligible).toBe(true);
+});
+
+it('treats missing evidence as unknown and keeps positive work from another profile', async () => {
+  const h = harness();
+  h.first.owner.readScheduleCatalog.mockRejectedValueOnce(
+    Error('catalog unavailable'),
   );
-  const snapshot = await activity.observe(binding, signal);
-  expect(first.owner.readNativeActivity).toHaveBeenCalledOnce();
-  expect(second.owner.readNativeActivity).toHaveBeenCalledOnce();
-  expect(snapshot).toMatchObject({
+  expect((await h.sample(0)).snapshot.status).toBe('unknown');
+
+  h.first.owner.readNativeActivity.mockRejectedValueOnce(
+    Error('session query unavailable'),
+  );
+  h.second.owner.readNativeActivity.mockResolvedValueOnce({
+    work: new Set(['job', 'schedule']),
+    complete: false,
+  });
+  expect((await h.sample(1)).snapshot).toMatchObject({
     status: 'busy',
-    activity: { binding, state: 'unknown', activeJobs: 1, activeSubtasks: 1 },
-    activeScheduleDeliveries: null,
-    coverage: { state: 'unknown', cursor: null },
+    activeScheduleDeliveries: 1,
+    activity: { activeJobs: 1 },
   });
-});
-
-it('does not accept a stale roster or assume live reads cover a quiet interval', async () => {
-  const first = profile();
-  const busy = profile('turn');
-  const catalogs = vi.fn().mockReturnValue([first]);
-  const activity = createProductionNativeActivity(
-    {
-      activityCatalogs: catalogs,
-      assertAuthenticatedGroup: () => {},
-    },
-    signal,
-  );
-  expect(await activity.observe(binding, signal)).toMatchObject({
-    status: 'unknown',
-    coverage: { state: 'unknown' },
-  });
-  catalogs.mockReturnValueOnce([busy]);
-  expect(await activity.observe(binding, signal)).toMatchObject({
-    status: 'unknown',
-    coverage: { state: 'unknown' },
-  });
-  await expect(activity.subscribe(binding, signal)).rejects.toMatchObject({
-    code: 'ACTIVITY_UNKNOWN',
-  });
+  expect((await h.sample(2)).snapshot.status).toBe('idle');
+  h.catalogs
+    .mockReturnValueOnce([h.first, h.second])
+    .mockReturnValueOnce([h.second]);
+  expect((await h.sample(3)).snapshot.status).toBe('unknown');
 });

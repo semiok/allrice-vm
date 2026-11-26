@@ -188,6 +188,18 @@ const configuration = z
         activityMaxAgeMs: positive,
         cleanupTimeoutMs: positive,
         idleStopEnabled: z.boolean().optional(),
+        idleSampleIntervalMs: z
+          .number()
+          .int()
+          .min(1_000)
+          .max(60_000)
+          .optional(),
+        idleScheduleSafetyMarginMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(600_000)
+          .optional(),
         // Omitting the reserved VM budget disables the capacity policy.
         hostVmBudgetMiB: z
           .number()

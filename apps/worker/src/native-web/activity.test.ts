@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { JobView } from '@deepseek-ai/dsh-api-job-controller/types';
 import type { GoalView } from '@deepseek-ai/dsh-goal/types';
-import { readNativeProfileActivity } from './activity.js';
+import {
+  isNativeActivityProjection,
+  readNativeProfileActivity,
+} from './activity.js';
 
 type Reader = Parameters<typeof readNativeProfileActivity>[0];
 const root: SessionSummary = {
@@ -13,10 +16,15 @@ const root: SessionSummary = {
   blank: false,
 };
 const signal = new AbortController().signal;
+const emptyView = {
+  kind: 'sequenced' as const,
+  asOfSeq: 1,
+  values: { inbox: { 'next-turn': [], 'next-step': [] } },
+};
 const reads = (override: Partial<Reader> = {}): Reader => ({
   sessions: async () => [root],
   jobs: async () => ({ type: 'rows', jobs: [] }),
-  projections: async () => null,
+  projections: async () => emptyView,
   goal: async () => undefined,
   ...override,
 });
@@ -40,7 +48,10 @@ describe('public DSH activity sightings', () => {
       }),
       signal,
     );
-    expect(seen).toEqual(new Set(['turn', 'subagent']));
+    expect(seen).toEqual({
+      work: new Set(['turn', 'subagent']),
+      complete: false,
+    });
     expect(jobs).not.toHaveBeenCalled();
   });
 
@@ -62,7 +73,10 @@ describe('public DSH activity sightings', () => {
           }),
           signal,
         ),
-      ).toEqual(new Set(status === 'completed' ? [] : ['job']));
+      ).toEqual({
+        work: new Set(status === 'completed' ? [] : ['job']),
+        complete: status === 'completed',
+      });
     },
   );
 
@@ -87,7 +101,7 @@ describe('public DSH activity sightings', () => {
         sessions: async () => sessions,
         jobs: async (id) => ({ type: 'rows', jobs: id === last ? [job] : [] }),
         projections: async (id, active) => {
-          if (id !== last) return null;
+          if (id !== last) return emptyView;
           return new Promise((_, reject) => {
             const stop = () => {
               cancelled();
@@ -100,7 +114,7 @@ describe('public DSH activity sightings', () => {
       }),
       signal,
     );
-    expect(seen).toEqual(new Set(['job']));
+    expect(seen).toEqual({ work: new Set(['job']), complete: false });
     expect(cancelled).toHaveBeenCalledOnce();
   });
 
@@ -125,7 +139,7 @@ describe('public DSH activity sightings', () => {
           }),
           signal,
         ),
-      ).toEqual(new Set([kind]));
+      ).toEqual({ work: new Set([kind]), complete: false });
     },
   );
 
@@ -150,7 +164,10 @@ describe('public DSH activity sightings', () => {
           }),
           signal,
         ),
-      ).toEqual(new Set(activation === 'armed' ? ['goal'] : []));
+      ).toEqual({
+        work: new Set(activation === 'armed' ? ['goal'] : []),
+        complete: activation === 'disarmed',
+      });
     },
   );
 
@@ -173,6 +190,65 @@ describe('public DSH activity sightings', () => {
         }),
         signal,
       ),
-    ).toEqual(new Set());
+    ).toEqual({ work: new Set(), complete: false });
+  });
+  it('checks unowned Jobs even when a profile has no sessions', async () => {
+    const jobs = vi.fn(async (): ReturnType<Reader['jobs']> => ({
+      type: 'rows',
+      jobs: [],
+    }));
+    const options = reads({ sessions: async () => [], jobs });
+    await expect(readNativeProfileActivity(options, signal)).resolves.toEqual({
+      work: new Set(),
+      complete: true,
+    });
+    expect(jobs).toHaveBeenCalledWith(undefined, signal);
+    jobs.mockResolvedValueOnce({
+      type: 'rows',
+      jobs: [
+        {
+          id: 'unowned' as JobView['id'],
+          kind: 'bash',
+          label: 'fixture',
+          startedAt: 1,
+          status: 'running',
+          output: { earliest: 0, total: 0 },
+        },
+      ],
+    });
+    await expect(readNativeProfileActivity(options, signal)).resolves.toEqual({
+      work: new Set(['job']),
+      complete: false,
+    });
+  });
+
+  it('rejects roster changes during a negative sample', async () => {
+    const sessions = vi
+      .fn()
+      .mockResolvedValueOnce([root])
+      .mockResolvedValueOnce([]);
+    await expect(
+      readNativeProfileActivity(reads({ sessions }), signal),
+    ).resolves.toEqual({
+      work: new Set(),
+      complete: false,
+    });
+  });
+
+  it('records visible transient work from the existing native control stream', () => {
+    expect(isNativeActivityProjection('inbox', emptyView.values.inbox)).toBe(
+      false,
+    );
+    expect(
+      isNativeActivityProjection('inbox', {
+        'next-turn': [],
+        'next-step': [
+          { id: 'scheduled', role: 'user', source: { kind: 'schedule' } },
+        ],
+      }),
+    ).toBe(true);
+    expect(isNativeActivityProjection('turnOutline', [])).toBe(true);
+    expect(isNativeActivityProjection('subagentTiming', {})).toBe(true);
+    expect(isNativeActivityProjection('sessionTitle', {})).toBe(false);
   });
 });
