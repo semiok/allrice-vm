@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  readPersonVmWakeRoster,
 } from '@allrice/database';
 import {
   createDailyScheduleRecord,
@@ -238,6 +239,86 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await host.close();
     }
   });
+
+  it.each(['qualification', 'ownership'] as const)(
+    'orders the scheduled-idle dispatch against a concurrent change in %s',
+    async (fact) => {
+      const f = await fixture();
+      await publishFixtureAuthority(f);
+      const stalePlan = randomUUID();
+      await f.module().prepareStopWithWake(f.binding, stalePlan, signal);
+      const roster = await db.begin((tx) =>
+        readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+      );
+      expect(roster).not.toBeNull();
+      const { personId, employeeInstanceId } = f.origin;
+      const refuse = async (
+        tx: Parameters<Parameters<typeof db.begin>[0]>[0],
+      ) => {
+        if (fact === 'qualification')
+          await tx`update allrice_settings set value=jsonb_set(value,'{selections}','[]')
+            where scope_type='system' and key='d_entry_rollout_policy'`;
+        else
+          await tx`update allrice_employee_instances set archived_at=now()
+            where id=${employeeInstanceId}`;
+      };
+      await db`update person_virtual_machines
+        set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+        where person_id=${personId}`;
+      // A preparation from the past has a wake time earlier than the DB clock.
+      // Give this synthetic candidate a future dispatch window.
+      await db`update person_vm_scheduled_wakes
+        set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+        where plan_id=${stalePlan}`;
+      const stop = vi.fn(async () => {
+        await expect(
+          db.begin(async (tx) => {
+            await tx`set local lock_timeout='100ms'`;
+            await refuse(tx);
+          }),
+        ).rejects.toMatchObject({ code: '55P03' });
+      });
+      const store = f.store();
+      await expect(
+        store.withPreparedStopAuthority(
+          { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+          roster!,
+          stalePlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+      await expect(
+        store.withPreparedStopAuthority(
+          f.binding,
+          roster!,
+          stalePlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(true);
+      await db.begin(refuse);
+      const newPlan = randomUUID();
+      // The earlier authority commit cannot revoke a plan that did not exist
+      // yet. The dispatch must fail even for a later, non-revoked plan.
+      await f.module().prepareStopWithWake(f.binding, newPlan, signal);
+      const [staged] = await db`update person_vm_scheduled_wakes
+        set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+        where plan_id=${newPlan} returning revoked_at`;
+      expect(staged?.revoked_at).toBeNull();
+      await expect(
+        store.withPreparedStopAuthority(
+          f.binding,
+          roster!,
+          newPlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(false);
+      expect(stop).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
     const f = await fixture();

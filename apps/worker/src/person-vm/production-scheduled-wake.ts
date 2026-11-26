@@ -299,25 +299,41 @@ export function createProductionScheduledWake(input: {
     return engine.prepareStopWithWake(binding, requestId, signal);
   }
 
-  const assertScheduledIdleCurrent: PersonVmScheduledIdleAuthority = async (
-    binding,
-    expected,
-    caller,
-  ) => {
-    const signal = AbortSignal.any([caller, lifetime]);
-    signal.throwIfAborted();
-    if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
-    const roster = await input.database.begin(
-      'isolation level repeatable read read only',
-      (tx) => readPersonVmWakeRoster(tx, binding, expected.entries),
-    );
-    signal.throwIfAborted();
-    if (paused || roster?.digest !== expected.digest)
-      throw new PersonVmError('AUTHORIZATION_DENIED');
-  };
+  const assertScheduledIdleCurrent: PersonVmScheduledIdleAuthority['assertCurrent'] =
+    async (binding, expected, caller) => {
+      const signal = AbortSignal.any([caller, lifetime]);
+      signal.throwIfAborted();
+      if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+      const roster = await input.database.begin(
+        'isolation level repeatable read read only',
+        (tx) => readPersonVmWakeRoster(tx, binding, expected.entries),
+      );
+      signal.throwIfAborted();
+      if (paused || roster?.digest !== expected.digest)
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+    };
+
+  const dispatchScheduledIdleStop: PersonVmScheduledIdleAuthority['dispatch'] =
+    async (binding, roster, requestId, caller, stop) => {
+      const signal = AbortSignal.any([caller, lifetime]);
+      signal.throwIfAborted();
+      if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+      const dispatched = await store.withPreparedStopAuthority(
+        binding,
+        roster,
+        requestId,
+        signal,
+        async (active) => {
+          if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+          await stop(active);
+        },
+      );
+      if (!dispatched) throw new PersonVmError('AUTHORIZATION_DENIED');
+    };
 
   return {
     assertScheduledIdleCurrent,
+    dispatchScheduledIdleStop,
     prepareStopWithWake(request: PersonVmWakePreparation, caller: AbortSignal) {
       const signal = AbortSignal.any([caller, lifetime]);
       signal.throwIfAborted();

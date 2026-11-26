@@ -7,6 +7,7 @@ import {
   type PersonVmBinding,
   type PersonVmEgressReceipt,
 } from './contract.ts';
+import type { PersonVmIdleStopDispatch } from './admission-contract.ts';
 import { privateDirectory } from './encrypted-disk.ts';
 import {
   checkedPublicImageCache,
@@ -177,6 +178,7 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     assertCurrent: () => Promise<void>,
+    dispatch?: PersonVmIdleStopDispatch,
   ): Promise<void>;
   assertStopped?(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   ping(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
@@ -1030,12 +1032,17 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
     assertCurrent: () => Promise<void>,
+    dispatch?: PersonVmIdleStopDispatch,
   ) {
     if ((await this.rawStatus(binding, signal)) !== 'Running')
       throw new PersonVmError('ACTIVITY_UNKNOWN');
     await assertCurrent();
     signal.throwIfAborted();
-    await this.command(binding, ['stop', this.name(binding)], signal);
+    const stop = async (active: AbortSignal) => {
+      await this.command(binding, ['stop', this.name(binding)], active);
+    };
+    if (dispatch) await dispatch(signal, stop);
+    else await stop(signal);
     if ((await this.rawStatus(binding, signal)) !== 'Stopped')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
   }

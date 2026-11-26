@@ -26,6 +26,7 @@ import {
   PostgresPersonVmAdmissionStore,
 } from './admission-store.ts';
 import type {
+  PersonVmIdleStopDispatch,
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
   PersonVmScheduledIdleAuthority,
@@ -77,6 +78,7 @@ function safeError(error: unknown) {
     : new PersonVmError('PROVIDER_FAILED', { cause: error });
 }
 type IdleStopGuard = Readonly<{
+  dispatch?: PersonVmIdleStopDispatch;
   requestId: string;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
@@ -164,7 +166,7 @@ export class PersonVmService
     idleMs?: number;
     nativeActivity?: PersonVmNativeActivityPort;
     prepareIdleStop?: PersonVmPrepareIdleStop;
-    assertScheduledIdleCurrent?: PersonVmScheduledIdleAuthority;
+    scheduledIdleAuthority?: PersonVmScheduledIdleAuthority;
     monotonic?: () => number;
   }) {
     if (this.admissionHost) throw new PersonVmError('LEASE_CONFLICT');
@@ -207,16 +209,23 @@ export class PersonVmService
           this.stopOwned(context, lease, signal, true),
         );
       },
-      stopIdleOwned: async (requestId, lease, signal, assertStopCurrent) => {
+      stopIdleOwned: async (
+        requestId,
+        lease,
+        signal,
+        assertStopCurrent,
+        dispatch,
+      ) => {
         const row = this.required(lease.row);
         if (row.phase !== 'running' || row.holds.length)
           throw new PersonVmError('ACTIVITY_UNKNOWN');
-        await assertStopCurrent(signal);
+        await lease.guard();
         signal.throwIfAborted();
         return this.commitStop(requestId, lease, row, {
           requestId,
           signal,
           assertCurrent: assertStopCurrent,
+          dispatch,
         });
       },
     });
@@ -1025,6 +1034,7 @@ export class PersonVmService
         throw new PersonVmError('ACTIVITY_UNKNOWN');
       // A denied recheck must leave egress and the running VM intact. Keep
       // slow retirement work on the confirmed side of the native stop.
+      const runDispatch = idle.dispatch;
       const dispatch = {
         requestId: idle.requestId,
         action: 'stop.idle-dispatch',
@@ -1032,11 +1042,22 @@ export class PersonVmService
       await lease.audit(row, { ...dispatch, result: 'started' });
       let dispatchApproved = false;
       try {
-        await this.options.native.stopIdle(bindingOf(row), signal, async () => {
-          await idle.assertCurrent(signal);
-          signal.throwIfAborted();
-          dispatchApproved = true;
-        });
+        await this.options.native.stopIdle(
+          bindingOf(row),
+          signal,
+          async () => {
+            await idle.assertCurrent(signal);
+            signal.throwIfAborted();
+            if (!runDispatch) dispatchApproved = true;
+          },
+          runDispatch &&
+            ((active, stop) =>
+              runDispatch(active, (fenced) => {
+                fenced.throwIfAborted();
+                dispatchApproved = true;
+                return stop(fenced);
+              })),
+        );
         if (!dispatchApproved) throw new PersonVmError('ACTIVITY_UNKNOWN');
         // Record the provider's completed, joined stop before any egress or
         // disk cleanup. A prior intent alone cannot activate its wake plan.

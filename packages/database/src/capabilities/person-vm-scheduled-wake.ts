@@ -82,6 +82,7 @@ export async function readPersonVmWakeRoster(
     | 'employeeVersionId'
     | 'employeeRevision'
   >[],
+  lock = false,
 ): Promise<PersonVmWebRoster | null> {
   const { personId, organizationId } = binding;
   if (!expected.length) return null;
@@ -102,14 +103,31 @@ export async function readPersonVmWakeRoster(
     join allrice_users u on u.id=i.owner_id and u.status='active'
     join allrice_organizations o on o.id=i.organization_id and o.archived_at is null
     join allrice_workspaces ws on ws.id=i.workspace_id and ws.organization_id=o.id and ws.archived_at is null
+    join lateral (
+      select m.id from allrice_memberships m where m.organization_id=o.id and m.user_id=u.id
+        and m.active and m.role in ('admin','member')
+        and (m.workspace_id is null or m.workspace_id=ws.id)
+      order by m.id limit 1 ${lock ? tx`for share of m` : tx``}
+    ) membership on true
     where i.id=any(${expected.map((entry) => entry.employeeInstanceId)}::uuid[])
       and i.organization_id=${organizationId} and i.owner_id=${personId} and i.archived_at is null
-      and exists(select 1 from allrice_memberships m where m.organization_id=o.id and m.user_id=u.id
-        and m.active and m.role in ('admin','member') and (m.workspace_id is null or m.workspace_id=ws.id))
       and not exists(select 1 from allrice_platform_employee_tenant_assignments d
-        where d.organization_id=o.id and d.workspace_id=ws.id and d.tenant_employee_id=e.id and not d.active)`;
+        where d.organization_id=o.id and d.workspace_id=ws.id and d.tenant_employee_id=e.id and not d.active)
+    ${lock ? tx`for share of i,a,u,o,ws for update of e` : tx``}`;
   if (rows.length !== expected.length) return null;
-  const policy = await readDEntryReleasePolicy(tx);
+  if (lock) {
+    // The employee key lock also excludes new matching deployments through
+    // the foreign key. Lock existing deployments to cover active -> disabled.
+    const deployments = await tx<{ active: boolean }[]>`
+      select d.active from allrice_platform_employee_tenant_assignments d
+      join allrice_employee_assignments a on a.employee_id=d.tenant_employee_id
+        and a.organization_id=d.organization_id and a.workspace_id=d.workspace_id
+      join allrice_employee_instances i on i.assignment_id=a.id
+      where i.id=any(${expected.map((entry) => entry.employeeInstanceId)}::uuid[])
+      order by d.id for share of d`;
+    if (deployments.some(({ active }) => !active)) return null;
+  }
+  const policy = await readDEntryReleasePolicy(tx, lock);
   const entries = rows
     .map((row) => ({
       workspaceId: row.workspace_id,
@@ -198,6 +216,44 @@ async function audit(
     (person_id,organization_id,vm_id,request_id,action,result,error_code,lease_epoch)
     values (${row.person_id},${row.organization_id},${row.vm_id},${request},
       ${'scheduled-wake.' + action},${result},${reason},${row.lease_epoch})`;
+}
+
+async function withWakeAuthority<T>(
+  sql: Sql,
+  isolation:
+    'isolation level read committed' | 'isolation level repeatable read',
+  signal: AbortSignal,
+  work: (tx: TransactionSql, active: AbortSignal) => Promise<T>,
+) {
+  signal.throwIfAborted();
+  const dedicated = createDedicatedDatabase(sql);
+  const disconnected = new AbortController();
+  let closing = false;
+  dedicated.options.onclose = () => {
+    if (!closing)
+      disconnected.abort(new Error('SCHEDULE_WAKE_AUTHORITY_CONNECTION_LOST'));
+  };
+  const active = AbortSignal.any([signal, disconnected.signal]);
+  let pending: Promise<{ value: T }> | undefined;
+  try {
+    const transaction = dedicated.begin(isolation, (tx) => {
+      pending = (async () => {
+        active.throwIfAborted();
+        await tx`set local lock_timeout='5s'`;
+        const value = await work(tx, active);
+        active.throwIfAborted();
+        return { value };
+      })();
+      return pending;
+    });
+    const result = await joinCallerSave(transaction, () => pending);
+    return result.value;
+  } finally {
+    // A successful native start can return a capacity handle that retains
+    // the dispatch signal through bootstrap. Normal SQL close is not loss.
+    closing = true;
+    await dedicated.end({ timeout: 5 });
+  }
 }
 
 /** Stores host boot intent. The eventual boot caller must hold the ordinary VM
@@ -359,42 +415,63 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       signal: AbortSignal,
       work: (roster: PersonVmWebRoster, active: AbortSignal) => Promise<T>,
     ): Promise<T | null> {
-      signal.throwIfAborted();
-      const dedicated = createDedicatedDatabase(sql);
-      const disconnected = new AbortController();
-      let closing = false;
-      dedicated.options.onclose = () => {
-        if (!closing)
-          disconnected.abort(
-            new Error('SCHEDULE_WAKE_AUTHORITY_CONNECTION_LOST'),
+      return withWakeAuthority(
+        sql,
+        'isolation level repeatable read',
+        signal,
+        async (tx, active) => {
+          const roster = await readClaimRoster(tx, claim, true);
+          active.throwIfAborted();
+          return roster ? work(roster, active) : null;
+        },
+      );
+    },
+
+    /** Keep the current employee facts and prepared stop plan pinned through
+     * the native command. The caller holds the physical lease. */
+    withPreparedStopAuthority(
+      binding: PersonVmBinding,
+      expected: PersonVmWebRoster,
+      requestId: string,
+      signal: AbortSignal,
+      stop: (active: AbortSignal) => Promise<void>,
+    ): Promise<boolean> {
+      // Read deployments after taking the employee key lock so the next
+      // statement also sees any deployments inserted before that lock.
+      return withWakeAuthority(
+        sql,
+        'isolation level read committed',
+        signal,
+        async (tx, active) => {
+          const roster = await readPersonVmWakeRoster(
+            tx,
+            binding,
+            expected.entries,
+            true,
           );
-      };
-      const active = AbortSignal.any([signal, disconnected.signal]);
-      let pending: Promise<{ value: T | null }> | undefined;
-      try {
-        const transaction = dedicated.begin(
-          'isolation level repeatable read',
-          (tx) => {
-            pending = (async () => {
-              active.throwIfAborted();
-              await tx`set local lock_timeout='5s'`;
-              const roster = await readClaimRoster(tx, claim, true);
-              active.throwIfAborted();
-              const value = roster ? await work(roster, active) : null;
-              active.throwIfAborted();
-              return { value };
-            })();
-            return pending;
-          },
-        );
-        const result = await joinCallerSave(transaction, () => pending);
-        return result.value;
-      } finally {
-        // A successful native start can return a capacity handle that retains
-        // the dispatch signal through bootstrap. Normal SQL close is not loss.
-        closing = true;
-        await dedicated.end({ timeout: 5 });
-      }
+          if (roster?.digest !== expected.digest) return false;
+          const [plan] = await tx<
+            { receipt_ids: string[] }[]
+          >`select p.receipt_ids
+          from person_vm_scheduled_wakes p
+          join person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
+          where p.plan_id=${requestId} and p.person_id=${binding.personId}
+            and p.organization_id=${binding.organizationId} and p.vm_id=${binding.vmId}
+            and p.instance_id=${binding.instanceId} and p.lease_epoch=${binding.leaseEpoch}
+            and p.revoked_at is null and p.state in ('empty','waiting')
+            and vm.phase='running' and vm.lease_owner is not null
+            and vm.lease_expires_at>clock_timestamp()
+            and (p.wake_at is null or p.wake_at>clock_timestamp())
+          for share of p`;
+          if (!plan) return false;
+          const [check] = await tx<{ invalidated: boolean }[]>`
+          select ${hasInvalidation(tx, plan.receipt_ids)} as invalidated`;
+          if (check?.invalidated !== false) return false;
+          active.throwIfAborted();
+          await stop(active);
+          return true;
+        },
+      );
     },
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {

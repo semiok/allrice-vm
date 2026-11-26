@@ -615,6 +615,8 @@ suite(
       'relogin',
       'system-ok',
       'system-revoked',
+      'system-late-revoked',
+      'system-recovery',
       'system-unknown',
     ] as const)(
       'idle wake preparation and stop under one physical lease: %s',
@@ -692,8 +694,9 @@ suite(
         const since = h.now().toISOString();
         const wakeAt = new Date(h.now().getTime() + 60 * 60_000);
         const wake = createPostgresPersonVmScheduledWakeStore(db);
-        const recovering =
-          outcome === 'commit-rejected' || outcome === 'commit-ack-lost';
+        const commitRejected =
+          outcome === 'commit-rejected' || outcome === 'system-recovery';
+        const recovering = commitRejected || outcome === 'commit-ack-lost';
         const nativeProofRejected = outcome === 'native-proof-rejected';
         let mono = 0,
           runningJobs = 0,
@@ -709,11 +712,24 @@ suite(
           openSql: open,
           idleMs: 5 * 60_000,
           monotonic: () => mono,
-          async assertScheduledIdleCurrent(current, roster) {
-            expect(current).toEqual(binding);
-            expect(roster).toBe(scheduledRoster);
-            if (!scheduledAuthority)
-              throw new PersonVmError('AUTHORIZATION_DENIED');
+          scheduledIdleAuthority: {
+            assertOwned(current, roster) {
+              if (current.leaseEpoch !== binding.leaseEpoch)
+                throw new PersonVmError('LEASE_LOST');
+              expect(current).toEqual(binding);
+              expect(roster).toBe(scheduledRoster);
+            },
+            async assertCurrent() {
+              if (!scheduledAuthority)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+            async dispatch(current, roster, requestId, active, stop) {
+              this.assertOwned(current, roster);
+              expect(requestId).toBe(scheduledRequestId);
+              if (outcome === 'system-late-revoked')
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              await stop(active);
+            },
           },
           nativeActivity: {
             async observe(current) {
@@ -782,7 +798,7 @@ suite(
                       (person_id,organization_id,vm_id,instance_id,lease_epoch,plan_id,receipt_ids,
                       wake_at,target_at,state)
                       values (${binding.personId},${binding.organizationId},${binding.vmId},
-                      ${binding.instanceId},${binding.leaseEpoch},${attempt.requestId},
+                      ${binding.instanceId},${binding.leaseEpoch},${scheduledRequestId ?? attempt.requestId},
                       array[${randomUUID()}]::uuid[],${wakeAt},${wakeAt},'waiting')
                       on conflict (plan_id) do nothing`;
                     return { ok: true, nextWakeAt: wakeAt.toISOString() };
@@ -794,6 +810,14 @@ suite(
           scheduled
             ? host.reconcileScheduledIdle(binding, scheduledRoster, signal())
             : host.reconcileIdle(attempt, binding, signal());
+        if (scheduled)
+          await expect(
+            host.reconcileScheduledIdle(
+              { ...binding, leaseEpoch: binding.leaseEpoch - 1 },
+              scheduledRoster,
+              signal(),
+            ),
+          ).rejects.toMatchObject({ code: 'LEASE_LOST' });
         await reconcileOwned();
         mono += 5 * 60_000 - 1;
         h.advance(mono);
@@ -814,7 +838,7 @@ suite(
           expect(authorized?.sessionId).toBe(newLogin.sessionId);
           attempt = { ...authorized!, requestId: randomUUID() };
         }
-        if (outcome === 'commit-rejected')
+        if (commitRejected)
           await db`alter table person_vm_audit add constraint fixture_reject_stop_commit
             check (action<>'stop' or result<>'succeeded')`;
         if (nativeProofRejected)
@@ -829,7 +853,10 @@ suite(
             await expect(reconcile).rejects.toMatchObject({
               code: 'ACTIVITY_UNKNOWN',
             });
-          else if (outcome === 'system-revoked')
+          else if (
+            outcome === 'system-revoked' ||
+            outcome === 'system-late-revoked'
+          )
             await expect(reconcile).rejects.toMatchObject({
               code: 'AUTHORIZATION_DENIED',
             });
@@ -837,7 +864,7 @@ suite(
             await expect(reconcile).rejects.toBeInstanceOf(Error);
           else await reconcile;
         } finally {
-          if (outcome === 'commit-rejected' || nativeProofRejected)
+          if (commitRejected || nativeProofRejected)
             await db`alter table person_vm_audit drop constraint fixture_reject_stop_commit`;
         }
         if (nativeProofRejected) {
@@ -866,7 +893,18 @@ suite(
           expect(await wake.claim(90_000)).toBeNull();
           return;
         }
-        if (recovering) {
+        if (outcome === 'system-recovery') {
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: false,
+          });
+          scheduledAuthority = false;
+          await reconcileOwned();
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: true,
+          });
+        } else if (recovering) {
           expect(h.states.get(binding.vmId)).toBe('stopped');
           expect(await store.read(binding.personId)).toMatchObject(
             outcome === 'commit-rejected'
@@ -931,7 +969,10 @@ suite(
           outcome === 'relogin' ||
           outcome === 'system-ok' ||
           recovering;
-        const rechecked = stopped || outcome === 'wake-plan-changed';
+        const rechecked =
+          stopped ||
+          outcome === 'wake-plan-changed' ||
+          outcome === 'system-late-revoked';
         const checkedOnce = [
           'blocked',
           'changed',

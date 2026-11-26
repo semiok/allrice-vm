@@ -33,6 +33,7 @@ import {
   type PersonVmNativeActivityPort,
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
+  type PersonVmScheduledIdleAuthority,
   type PersonVmWebRoster,
 } from '@allrice/person-vm';
 import { totalmem } from 'node:os';
@@ -768,34 +769,45 @@ export function createProductionPersonVmHost(input: {
         lifetime,
         cleanupTimeoutMs: providers.configuration.lifecycle.cleanupTimeoutMs,
       });
+      const scheduledIdleAuthority: PersonVmScheduledIdleAuthority = {
+        assertOwned(binding, roster) {
+          const owner = ownedVms.get(binding.personId);
+          if (
+            !owner?.stopNative ||
+            !sameVmBinding(owner.binding, binding) ||
+            owner.scheduledIdleRoster !== roster
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          lifetime.throwIfAborted();
+        },
+        async assertCurrent(binding, roster, signal) {
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.assertScheduledIdleCurrent(
+            binding,
+            roster,
+            signal,
+          );
+        },
+        async dispatch(binding, roster, requestId, signal, stop) {
+          this.assertOwned(binding, roster);
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.dispatchScheduledIdleStop(
+            binding,
+            roster,
+            requestId,
+            signal,
+            (active) => {
+              this.assertOwned(binding, roster);
+              return stop(active);
+            },
+          );
+        },
+      };
       const admission = vm.createAdmissionHost({
         openSql,
         idleMs: providers.platform.idleMs,
         ...(providers.configuration.lifecycle.idleStopEnabled === true && {
-          async assertScheduledIdleCurrent(
-            binding: PersonVmBinding,
-            roster: PersonVmWebRoster,
-            signal: AbortSignal,
-          ) {
-            const owner = ownedVms.get(binding.personId);
-            if (
-              !scheduledWake ||
-              !owner?.stopNative ||
-              !sameVmBinding(owner.binding, binding) ||
-              owner.scheduledIdleRoster !== roster
-            )
-              throw new PersonVmError('AUTHORIZATION_DENIED');
-            await scheduledWake.assertScheduledIdleCurrent(
-              binding,
-              roster,
-              signal,
-            );
-            if (
-              ownedVms.get(binding.personId) !== owner ||
-              owner.scheduledIdleRoster !== roster
-            )
-              throw new PersonVmError('LEASE_LOST');
-          },
+          scheduledIdleAuthority,
           prepareIdleStop: (request, signal) =>
             scheduledWake
               ? scheduledWake.prepareStopWithWake(request, signal)

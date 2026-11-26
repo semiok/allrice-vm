@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import type { RequestContext } from '@allrice/contracts';
+import { RequestContextSchema, type RequestContext } from '@allrice/contracts';
 import {
   PersonVmError,
   PERSON_VM_IDLE_MS,
@@ -22,6 +22,7 @@ import type {
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
   PersonVmIdleCoverage,
+  PersonVmIdleStopDispatch,
   PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
@@ -127,7 +128,7 @@ export class PersonVmAdmissionHost
       nativeActivity?: PersonVmNativeActivityPort;
       activityMaxAgeMs: number;
       prepareIdleStop?: PersonVmPrepareIdleStop;
-      assertScheduledIdleCurrent?: PersonVmScheduledIdleAuthority;
+      scheduledIdleAuthority?: PersonVmScheduledIdleAuthority;
       recoverIdleStop(
         binding: PersonVmBinding,
         assertAuthority: (signal: AbortSignal) => Promise<void>,
@@ -150,6 +151,7 @@ export class PersonVmAdmissionHost
         lease: VmLease,
         signal: AbortSignal,
         assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+        dispatch?: PersonVmIdleStopDispatch,
       ): Promise<PersonVmView>;
     },
   ) {
@@ -1226,6 +1228,7 @@ export class PersonVmAdmissionHost
     binding: PersonVmBinding,
     signal: AbortSignal,
   ) {
+    RequestContextSchema.parse(context);
     return this.reconcileOwnedIdle(
       { binding, context },
       (active) => this.authorize(context, binding, active),
@@ -1238,12 +1241,28 @@ export class PersonVmAdmissionHost
     scheduledRoster: PersonVmWebRoster,
     signal: AbortSignal,
   ) {
-    const assertCurrent = this.options.assertScheduledIdleCurrent;
-    if (!assertCurrent) throw new PersonVmError('AUTHORIZATION_DENIED');
+    const authority = this.options.scheduledIdleAuthority;
+    if (!authority || !this.options.prepareIdleStop)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const requestId = randomUUID();
+    const assertOwned = async (active: AbortSignal) => {
+      active.throwIfAborted();
+      authority.assertOwned(binding, scheduledRoster);
+    };
+    await assertOwned(signal);
     return this.reconcileOwnedIdle(
-      { binding, requestId: randomUUID(), scheduledRoster },
-      (active) => assertCurrent(binding, scheduledRoster, active),
+      { binding, requestId, scheduledRoster },
+      async (active) => {
+        await assertOwned(active);
+        await authority.assertCurrent(binding, scheduledRoster, active);
+        await assertOwned(active);
+      },
       signal,
+      {
+        assertOwned,
+        dispatch: (active, stop) =>
+          authority.dispatch(binding, scheduledRoster, requestId, active, stop),
+      },
     );
   }
 
@@ -1251,10 +1270,27 @@ export class PersonVmAdmissionHost
     request: PersonVmIdleStopSource,
     assertAuthority: (signal: AbortSignal) => Promise<void>,
     signal: AbortSignal,
+    scheduled?: {
+      assertOwned(signal: AbortSignal): Promise<void>;
+      dispatch: PersonVmIdleStopDispatch;
+    },
   ) {
     const { binding } = request;
     const requestId =
       'context' in request ? request.context.requestId : request.requestId;
+    // Only an exact joined native receipt enters this path; it closes
+    // existing resources without granting a new stop after revocation.
+    if (
+      scheduled &&
+      (await this.options.recoverIdleStop(
+        binding,
+        scheduled.assertOwned,
+        signal,
+      ))
+    ) {
+      this.idle.delete(binding.personId);
+      return;
+    }
     try {
       await assertAuthority(signal);
       signal.throwIfAborted();
@@ -1263,6 +1299,7 @@ export class PersonVmAdmissionHost
       throw error;
     }
     if (
+      !scheduled &&
       this.options.prepareIdleStop &&
       (await this.options.recoverIdleStop(binding, assertAuthority, signal))
     ) {
@@ -1295,7 +1332,6 @@ export class PersonVmAdmissionHost
             const assertStopCurrent = async (probe: AbortSignal) => {
               const checking = AbortSignal.any([active, probe]);
               await owned.guard();
-              await assertAuthority(checking);
               const latest = await this.readIdleCandidate(
                 binding,
                 owned.row,
@@ -1307,6 +1343,7 @@ export class PersonVmAdmissionHost
                 this.mono() - latest.mono < this.idleMs
               )
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
+              await assertAuthority(checking);
               checking.throwIfAborted();
             };
             await assertStopCurrent(active);
@@ -1332,6 +1369,7 @@ export class PersonVmAdmissionHost
                 )
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
               },
+              scheduled?.dispatch,
             );
             this.idle.delete(binding.personId);
             return true;

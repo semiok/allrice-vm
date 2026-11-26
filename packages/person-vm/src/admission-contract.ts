@@ -202,8 +202,22 @@ export type PersonVmPrepareIdleStop = (
 
 /** Host only. A roster is usable only on the exact locally owned generation
  * that completed scheduled startup and while all profiles are still eligible. */
-export type PersonVmScheduledIdleAuthority = (
-  binding: PersonVmBinding,
-  roster: PersonVmWebRoster,
+export type PersonVmIdleStopDispatch = (
   signal: AbortSignal,
+  stop: (signal: AbortSignal) => Promise<void>,
 ) => Promise<void>;
+
+export type PersonVmScheduledIdleAuthority = Readonly<{
+  assertOwned(binding: PersonVmBinding, roster: PersonVmWebRoster): void;
+  assertCurrent(
+    binding: PersonVmBinding,
+    roster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ): Promise<void>;
+  dispatch(
+    binding: PersonVmBinding,
+    roster: PersonVmWebRoster,
+    requestId: string,
+    ...args: Parameters<PersonVmIdleStopDispatch>
+  ): Promise<void>;
+}>;
