@@ -60,14 +60,51 @@ export function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-async function hashFile(file) {
+/** The runtime artifact itself is verified again by the production native
+ * provider immediately before mounting it in the capture guest. */
+export function employeeProfileRuntime(native) {
+  const disk = native?.readonlyDshRuntimeDisk;
+  if (disk === undefined || disk?.provision === 'directory') return undefined;
+  ensure(disk?.provision === 'disk', 'Invalid Employee Web disk provision');
+  ensure(
+    native.publicImageCache &&
+      native.image === source.baseImage &&
+      native.readonlyDshDirectory?.artifactSha256 === source.artifactSha256 &&
+      /^[a-f0-9]{64}$/.test(disk.diskSha256) &&
+      /^[a-f0-9]{64}$/.test(disk.candidateSha256),
+    'Employee Web capture requires the sealed offline runtime',
+  );
+  return Object.freeze({
+    platform: 'linux/arm64',
+    binding: 'eth0',
+    diskSha256: disk.diskSha256,
+    candidateSha256: disk.candidateSha256,
+  });
+}
+
+async function hashFile(file, signal) {
   ensure(lstatSync(file).isFile(), 'Expected a regular file');
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(file, {
-    flags: constants.O_RDONLY | constants.O_NOFOLLOW,
+    flags: constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    signal,
   }))
     hash.update(chunk);
   return hash.digest('hex');
+}
+
+/** Match native runtime inputs to the hashes in the staged private config. */
+export async function verifyEmployeeProfileNativeInputs(native, signal) {
+  for (const key of ['binary', 'libkrunfw', 'agentd']) {
+    signal.throwIfAborted();
+    const expected = native.artifactChecksums?.[key];
+    ensure(
+      typeof expected === 'string' &&
+        /^sha256:[a-f0-9]{64}$/.test(expected) &&
+        'sha256:' + (await hashFile(native[key], signal)) === expected,
+      'Employee Web capture native artifact checksum mismatch',
+    );
+  }
 }
 
 function ensure(condition, message) {

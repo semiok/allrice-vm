@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { lstat, mkdir, writeFile, rename } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { mkdir, open, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { stagePersonVmConfiguration } from './stage-person-vm-config.mjs';
 import { resolveServiceBuildSource } from './prepare-identity-root.mjs';
@@ -28,19 +29,47 @@ if (configArgs.length)
     root,
     configArgs[0].slice('--person-vm-config='.length),
   );
-const hostConfiguration = await lstat(
+const hostConfiguration = await open(
   join(root, '.local/person-vm-host.json'),
+  constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
 ).catch((error) => {
   if (error?.code !== 'ENOENT') throw error;
   return undefined;
 });
 if (hostConfiguration) {
-  if (!hostConfiguration.isFile()) throw Error('DEV_BUILD_IDENTITY_INVALID');
+  let config;
+  try {
+    const stat = await hostConfiguration.stat();
+    if (
+      !stat.isFile() ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o777) !== 0o600 ||
+      stat.size > 64 * 1024 ** 2
+    )
+      throw Error('Invalid private configuration');
+    const bytes = await hostConfiguration.readFile();
+    if (bytes.length !== stat.size)
+      throw Error('Invalid private configuration');
+    config = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    throw Error('DEV_BUILD_PRIVATE_CONFIG_INVALID');
+  } finally {
+    await hostConfiguration.close();
+  }
+  const { employeeProfileRuntime } =
+    await import('../person-vm-image/verify.mjs');
+  const runtime = employeeProfileRuntime(config?.native);
   const { prepareEmployeeWebServiceArtifact } =
     await import('../../packages/dsh-web-composition/build-web-entry.mjs');
+  const linuxCapture = runtime
+    ? (
+        await import('../person-vm-image/employee-profile.mjs')
+      ).createEmployeeLinuxCapture(config.native, runtime)
+    : undefined;
   await prepareEmployeeWebServiceArtifact(
     join(root, 'apps/worker/dist/d-entry-web'),
     sourceSha,
+    linuxCapture,
   );
 }
 const manifest = await prepareServiceBuildManifest(source);
