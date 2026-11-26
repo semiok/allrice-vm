@@ -536,7 +536,17 @@ export async function bootstrapMicrosandbox(input: {
           String(maxBytes),
         ],
         active,
-      );
+      ).catch((error: unknown) => {
+        if (
+          !active.aborted &&
+          error instanceof PersonVmError &&
+          error.code === 'PROVIDER_FAILED'
+        )
+          throw new PersonVmError('PROVIDER_FAILED', {
+            cause: 'AUTH_ARTIFACT_READ_FAILED',
+          });
+        throw error;
+      });
       await scope.assertCurrent();
       active.throwIfAborted();
       return parseNativeWebAuth(text, request);
