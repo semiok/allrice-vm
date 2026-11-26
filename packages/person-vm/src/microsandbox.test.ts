@@ -120,6 +120,11 @@ else if(a[0]==='exec'){
  if(!a.includes('--detach')){
   // v0.7.16 exec uses parse_duration_secs, not the separate ms parser.
   if(!/^[0-9]+[smh]?$/.test(a[a.indexOf('--timeout')+1]??''))process.exit(44);
+  if(a.slice(a.indexOf('--')+1).join(' ')==='/bin/mkdir -p -- /work'){
+   if(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/')process.exit(46);
+   if(mode==='workdir-init-error')process.exit(47);
+   return;
+  }
   if(mode==='auth-budget'){
    fs.writeFileSync(p.join(home,'auth-reading'),String(process.pid));setInterval(()=>{},1000);return;
   }
@@ -472,7 +477,11 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toThrow('PROVIDER_FAILED');
     };
     await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
-    expect((await f.calls()).filter((a) => a[0] === 'exec')).toHaveLength(2); // mkdir/init only
+    expect(
+      (await f.calls()).filter(
+        (a) => a[0] === 'exec' && a.includes('--detach'),
+      ),
+    ).toHaveLength(2); // mkdir/init only
   });
   it('实际provider memory reader/observer映射固定node/roots/binding与exact job；retained wait不继承已关闭scope', async () => {
     const f = await bootstrapFixture('ok', undefined, 5000);
@@ -525,26 +534,28 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       PERSON_VM_GUEST_CONTROL_READER,
       PERSON_VM_COMMAND_MEMORY_PROGRAM,
     ].entries()) {
-      expect(probes[i]!.slice(0, 8)).toEqual([
+      expect(probes[i]!.slice(0, 10)).toEqual([
         'exec',
         name,
         '--detach',
         '--no-stdin',
         '--no-tty',
+        '--workdir',
+        '/work',
         '--',
         readerConfiguration.nodeExecutable,
         '-e',
       ]);
-      expect(probes[i]![8]).toBe(program);
+      expect(probes[i]![10]).toBe(program);
     }
-    expect(JSON.parse(probes[0]![9]!)).toEqual({
+    expect(JSON.parse(probes[0]![11]!)).toEqual({
       cgroupRoot: readerConfiguration.cgroupRoot,
       targets: readerConfiguration.targets.map(({ target, path }) => ({
         target,
         path,
       })),
     });
-    expect(JSON.parse(probes[1]![9]!)).toEqual({
+    expect(JSON.parse(probes[1]![11]!)).toEqual({
       cgroupRoot: observerConfiguration.cgroupRoot,
       commandsGroup: observerConfiguration.commandsGroup,
       dshGroup: observerConfiguration.dshGroup,
@@ -553,7 +564,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       executionRef: 'provider-command',
       pid: 4242,
     });
-    expect(probes[1]![10]).toBe('complete-and-release');
+    expect(probes[1]![12]).toBe('complete-and-release');
     expect(
       calls.filter((a) => a[0] === 'inspect' && a.includes('--job')),
     ).toEqual(
@@ -987,12 +998,14 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       const calls = (await f.calls()).slice(before);
       const verbs = calls.map(([verb]) => verb);
       const start = verbs.indexOf('start');
-      const bootstrap = verbs.indexOf('exec');
+      const bootstrap = calls.findIndex(
+        (args) => args[0] === 'exec' && args.includes('--detach'),
+      );
       expect(start).toBeGreaterThan(0);
       expect(bootstrap).toBeGreaterThan(start);
       expect(verbs[start - 1]).toBe('inspect');
       expect(verbs.slice(start + 1, bootstrap)).toEqual(
-        combined ? ['inspect'] : ['inspect', 'inspect'],
+        combined ? ['inspect', 'exec'] : ['inspect', 'exec', 'inspect'],
       );
       expect(verbs.slice(verbs.lastIndexOf('ping'))).toEqual([
         'ping',
@@ -1300,7 +1313,10 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         ),
       ).toBe(true);
       const reader = calls.find(
-        (args) => args[0] === 'exec' && !args.includes('--detach'),
+        (args) =>
+          args[0] === 'exec' &&
+          !args.includes('--detach') &&
+          args.includes('-e'),
       )!;
       expect(reader[reader.indexOf('--timeout') + 1]).toBe(
         `${Math.ceil(timeoutMs / 1000)}s`,
@@ -1447,30 +1463,35 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ),
     ).toBe(false);
     await f.service.start(f.rc, signal());
-    expect((await f.calls()).filter((a) => a[0] === 'exec')).toHaveLength(3); // mkdir, init, DSH
+    expect(
+      (await f.calls()).filter(
+        (a) => a[0] === 'exec' && a.includes('--detach'),
+      ),
+    ).toHaveLength(3); // mkdir, init, DSH
   });
-  it.each(['init-error', 'lost-id', 'lost-id-unknown-stop', 'unknown-wait'])(
-    'bootstrap %s不ready；真实stop确认后才detach',
-    async (mode) => {
-      const f = await bootstrapFixture(mode);
-      await expect(
-        f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
-      ).rejects.toMatchObject({
-        code:
-          mode === 'lost-id-unknown-stop' || mode === 'unknown-wait'
-            ? 'CLEANUP_INCOMPLETE'
-            : 'PROVIDER_FAILED',
-      });
-      const calls = await f.calls();
-      expect(calls.some((a) => a[0] === 'stop')).toBe(true);
-      expect(
-        calls.some(
-          (a) => a[0] === 'exec' && a.includes('/work/memory/launcher'),
-        ),
-      ).toBe(false);
-      expect(f.h.mounts.size).toBe(mode === 'lost-id-unknown-stop' ? 1 : 0);
-    },
-  );
+  it.each([
+    'workdir-init-error',
+    'init-error',
+    'lost-id',
+    'lost-id-unknown-stop',
+    'unknown-wait',
+  ])('bootstrap %s不ready；真实stop确认后才detach', async (mode) => {
+    const f = await bootstrapFixture(mode);
+    await expect(
+      f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
+    ).rejects.toMatchObject({
+      code:
+        mode === 'lost-id-unknown-stop' || mode === 'unknown-wait'
+          ? 'CLEANUP_INCOMPLETE'
+          : 'PROVIDER_FAILED',
+    });
+    const calls = await f.calls();
+    expect(calls.some((a) => a[0] === 'stop')).toBe(true);
+    expect(
+      calls.some((a) => a[0] === 'exec' && a.includes('/work/memory/launcher')),
+    ).toBe(false);
+    expect(f.h.mounts.size).toBe(mode === 'lost-id-unknown-stop' ? 1 : 0);
+  });
   it.each([1, 3])(
     'rechecks current authority after copy %i before sending another file or initializing',
     async (copies) => {
@@ -1493,7 +1514,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
       const calls = await f.calls();
       expect(calls.filter(([verb]) => verb === 'cp')).toHaveLength(copies);
-      expect(calls.filter(([verb]) => verb === 'exec')).toHaveLength(1); // only mkdir
+      expect(calls.filter(([verb]) => verb === 'exec')).toHaveLength(2); // only directory setup
       expect(calls.some(([verb]) => verb === 'stop')).toBe(true);
       expect(f.h.mounts.size).toBe(0);
       expect(
@@ -1510,7 +1531,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
     const verbs = (await f.calls()).map(([verb]) => verb);
     expect(verbs.filter((verb) => verb === 'cp')).toHaveLength(1);
-    expect(verbs.filter((verb) => verb === 'exec')).toHaveLength(1); // only mkdir
+    expect(verbs.filter((verb) => verb === 'exec')).toHaveLength(2); // only directory setup
     expect(verbs).toContain('stop');
     expect(f.h.mounts.size).toBe(0);
     expect(
@@ -1637,6 +1658,44 @@ fs.writeFileSync(f,JSON.stringify(v));
     );
     expect(create.args).not.toContain('--idle-timeout');
     expect(create.args).not.toContain('--replace');
+    expect(create.args).not.toContain('--mkdir');
+    expect(
+      create.args.slice(
+        create.args.indexOf('--root-disk'),
+        create.args.indexOf('--root-disk') + 2,
+      ),
+    ).toEqual(['--root-disk', 'flat:20G,clone=reflink']);
+    expect(create.args[create.args.indexOf('--workdir') + 1]).toBe('/');
+    const setup = [
+      'exec',
+      'allrice-' + binding.vmId,
+      '--no-stdin',
+      '--no-tty',
+      '--timeout',
+      '10s',
+      '--workdir',
+      '/',
+      '--',
+      '/bin/mkdir',
+      '-p',
+      '--',
+      '/work',
+    ];
+    expect(calls[calls.indexOf(create) + 1]!.args).toEqual(setup);
+    expect(
+      calls[calls.findIndex(({ args }) => args[0] === 'start') + 1]!.args,
+    ).toEqual(setup);
+    const diagnostic = calls.find(({ args }) =>
+      args.includes('diagnostic'),
+    )!.args;
+    expect(diagnostic.slice(diagnostic.indexOf('--') - 2)).toEqual([
+      '--workdir',
+      '/work',
+      '--',
+      'node',
+      '-e',
+      'diagnostic',
+    ]);
     for (const call of calls) {
       // CoreFoundation can inject this key into a macOS child with an explicit
       // env. Permit only that platform key; every other key remains exact.

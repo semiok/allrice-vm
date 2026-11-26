@@ -56,6 +56,7 @@ import {
 const CANONICAL_SOCKET_HASH_BYTES = 12;
 const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
+const GUEST_WORK_DIRECTORY = '/work';
 type NativePaths = { home: string; config: string; userHome: string };
 
 function assertSocketHome(home: string) {
@@ -228,6 +229,17 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
     readNonzeroExit = false,
   ) {
+    if (args[0] === 'exec') {
+      const separator = args.indexOf('--', 2);
+      if (separator !== -1 && !args.slice(2, separator).includes('--workdir')) {
+        args = [
+          ...args.slice(0, separator),
+          '--workdir',
+          GUEST_WORK_DIRECTORY,
+          ...args.slice(separator),
+        ];
+      }
+    }
     return this.run({
       executable: this.options.binary,
       args,
@@ -620,13 +632,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       '--max-memory',
       `${this.memoryMiB}M`,
       '--root-disk',
-      `flat:${this.options.rootDiskGiB}G`,
+      `flat:${this.options.rootDiskGiB}G,clone=reflink`,
       '--net-default',
       'deny',
-      '--mkdir',
-      '/work',
+      // v0.7.16 treats --mkdir as a rootfs patch, rebuilding all OCI layers.
+      // The unpatched image must boot from a directory that already exists.
       '--workdir',
-      '/work',
+      '/',
     ];
     const directory = this.options.readonlyDshDirectory;
     if (directory) {
@@ -661,6 +673,32 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     // No native idle-timeout: detached DSH jobs may be active without touching it.
     await this.command(binding, args, signal);
     await this.assertArtifact(binding, signal);
+    await this.ensureWorkDirectory(binding, signal);
+  }
+
+  private async ensureWorkDirectory(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    await this.command(
+      binding,
+      [
+        'exec',
+        this.name(binding),
+        '--no-stdin',
+        '--no-tty',
+        '--timeout',
+        '10s',
+        '--workdir',
+        '/',
+        '--',
+        '/bin/mkdir',
+        '-p',
+        '--',
+        GUEST_WORK_DIRECTORY,
+      ],
+      signal,
+    );
   }
   async prepareWebEndpoints(
     binding: PersonVmBinding,
@@ -731,6 +769,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   async start(binding: PersonVmBinding, signal: AbortSignal) {
     await this.startNative(binding, signal);
     await this.assertArtifact(binding, signal);
+    await this.ensureWorkDirectory(binding, signal);
   }
   async startWithWebEndpoints(
     receipt: PersonVmWebEndpointReceipt,
@@ -738,6 +777,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     await this.startNative(receipt.binding, signal);
     await this.assertArtifact(receipt.binding, signal, true, receipt);
+    await this.ensureWorkDirectory(receipt.binding, signal);
   }
   async stop(binding: PersonVmBinding, signal: AbortSignal) {
     const state = await this.status(binding, signal);
