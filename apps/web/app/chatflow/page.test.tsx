@@ -12,10 +12,12 @@ const entry = vi.hoisted(() => ({
   released: vi.fn(),
   createWorkspace: vi.fn(),
   prepareRoster: vi.fn(),
+  hasEmployeeOrVm: vi.fn(),
 }));
 vi.mock('@allrice/database', async (importOriginal) => ({
   ...(await importOriginal<typeof Database>()),
   preparePersonNativeWebRoster: entry.prepareRoster,
+  hasExistingDEntryEmployeeOrVm: entry.hasEmployeeOrVm,
 }));
 vi.mock('./chatflow-client', () => ({ ChatFlowClient: () => null }));
 vi.mock('next/headers', () => ({
@@ -95,7 +97,11 @@ describe('ChatFlow server local command capability', () => {
     });
     entry.find.mockResolvedValue(null);
     entry.prepareRoster.mockResolvedValue({ entries: [] });
+    entry.hasEmployeeOrVm
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
     entry.createWorkspace
+      .mockResolvedValueOnce('writable')
       .mockResolvedValueOnce('writable')
       .mockResolvedValueOnce(null);
     const input = { searchParams: Promise.resolve({}) };
@@ -105,10 +111,15 @@ describe('ChatFlow server local command capability', () => {
       organizationId: 'organization',
       workspaceId: 'writable',
       viewerId: 'owner',
+      creationBlocked: false,
     });
+    const blocked = await EmployeeNativeEntryPage(input);
+    expect(blocked.type).toBe(EmployeeFirstStart);
+    expect(blocked.props.creationBlocked).toBe(true);
     const denied = await EmployeeNativeEntryPage(input);
     expect(denied.type).not.toBe(EmployeeFirstStart);
     expect(denied.props).toMatchObject({ query: '', prepare: true });
+    expect(entry.hasEmployeeOrVm).toHaveBeenCalledTimes(2);
   });
   it('opens an existing assignment materialized during the zero employee check', async () => {
     const selected = {
@@ -128,6 +139,7 @@ describe('ChatFlow server local command capability', () => {
       searchParams: Promise.resolve({}),
     });
     expect(entry.prepareRoster).toHaveBeenCalledWith(owner);
+    expect(entry.hasEmployeeOrVm).not.toHaveBeenCalled();
     expect(page.props).toMatchObject({
       query: 'workspaceId=writable&employeeInstanceId=assigned',
       prepare: true,

@@ -10,6 +10,7 @@ import {
   type BrowserContext,
   type Frame,
   type Page,
+  type Request,
 } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startInstalledProfile } from './installed-profile';
@@ -611,13 +612,22 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
   });
 
-  it('opens the existing personal creation dialog from the native sidebar', async ({
+  it('shows the temporary limit in the native sidebar instead of submitting another employee', async ({
     onTestFinished,
   }) => {
-    // Leave the live dialog in place until the suite captures a failure.
-    onTestFinished(() =>
-      page.evaluate(() => window.__allriceSidebarTest!.setPersonalCreation()),
-    );
+    const createRequests: string[] = [];
+    const recordCreate = (request: Request) => {
+      if (new URL(request.url()).pathname === '/api/v1/employee-instances')
+        createRequests.push(request.method());
+    };
+    page.on('request', recordCreate);
+    // Leave the live prompt in place until the suite captures a failure.
+    onTestFinished(async () => {
+      page.off('request', recordCreate);
+      await page.evaluate(() =>
+        window.__allriceSidebarTest!.setPersonalCreation(),
+      );
+    });
     await page.evaluate(
       (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
       {
@@ -630,15 +640,18 @@ suite('real AllRice sidebar in installed native profiles', () => {
       .locator('#chat-sidebar')
       .getByRole('button', { name: '创建员工', exact: true })
       .click();
-    const dialog = page.getByRole('dialog', {
-      name: '创建 AI 员工',
-      exact: true,
-    });
-    await dialog
-      .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
-      .waitFor();
-    await page.keyboard.press('Escape');
-    await dialog.waitFor({ state: 'hidden' });
+    const notice = page
+      .locator('#chat-sidebar')
+      .getByRole('status')
+      .filter({ hasText: '暂时每人只能创建一个 4.0 员工，多员工马上开放。' });
+    await notice.waitFor();
+    expect(await notice.textContent()).toBe(
+      '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+    );
+    expect(
+      await page.getByRole('dialog', { name: '创建 AI 员工' }).count(),
+    ).toBe(0);
+    expect(createRequests).toEqual([]);
   });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {
     const sidebar = page.locator('#chat-sidebar');

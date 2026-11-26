@@ -5,13 +5,14 @@ import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
-import { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
+import type { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
 import { ChatSidebarFrame } from '../../../apps/web/app/chatflow/chat-sidebar-frame';
 import { EmployeeSidebarView } from '../../../apps/web/app/chatflow/employee-sidebar-view';
 import {
   SidebarSettingsButton,
   SidebarSettingsTrigger,
 } from '../../../apps/web/app/chatflow/sidebar-settings-trigger';
+import { dEntryFirstEmployeeLimitMessage } from '../../../apps/web/lib/d-entry/employee-creation';
 import '@allrice/ui/tokens.css';
 import '../../../apps/web/app/styles/sidebar-palette.css';
 
@@ -74,13 +75,13 @@ export function EmployeeSidebar({
     compactSnapshot,
     () => false,
   );
-  const [createOpen, setCreateOpen] = useState(false);
+  const [showCreationLimit, setShowCreationLimit] = useState(false);
   if (!snapshot) return null;
   const creation = port.createEmployee;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
   };
-  const frame = (
+  return (
     <ChatSidebarFrame
       archive={snapshot.archive}
       employeeArchiveOpen={snapshot.employeeArchiveOpen}
@@ -89,7 +90,11 @@ export function EmployeeSidebar({
       style={{ height: '100%' }}
       onCollapsedChange={() => ctx.layout.toggleSidebar()}
       onCreateEmployee={
-        typeof creation === 'function' ? creation : () => setCreateOpen(true)
+        // Personal creation is offered here only after selecting an employee
+        // and mounting its VM. The first employee dialog lives at bare entry.
+        typeof creation === 'function'
+          ? creation
+          : () => setShowCreationLimit(true)
       }
       onOpenArchive={port.openArchive}
       onOpenAutomations={() => {
@@ -102,6 +107,9 @@ export function EmployeeSidebar({
       employeeTree={
         <>
           {snapshot.error && <p role="alert">{snapshot.error}</p>}
+          {typeof creation !== 'function' && showCreationLimit && (
+            <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
+          )}
           <EmployeeSidebarView
             {...snapshot.tree}
             archive={snapshot.archive}
@@ -120,22 +128,6 @@ export function EmployeeSidebar({
       }
       settings={renderSlot('sidebar.settings', { wide: !collapsed })}
     />
-  );
-  return (
-    <>
-      {frame}
-      {createOpen && typeof creation !== 'function' && (
-        <EmployeeCreateDialog
-          {...creation}
-          personal
-          onClose={() => setCreateOpen(false)}
-          onCreated={(instance) => {
-            setCreateOpen(false);
-            creation.onCreated(instance);
-          }}
-        />
-      )}
-    </>
   );
 }
 

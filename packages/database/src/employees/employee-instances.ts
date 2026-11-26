@@ -676,7 +676,10 @@ function parseEmployeePersonaVersion(
 export class EmployeeInstanceError extends Error {
   constructor(
     public readonly code:
-      'instance_conflict' | 'instance_archived' | 'default_protected',
+      | 'instance_conflict'
+      | 'instance_archived'
+      | 'default_protected'
+      | 'd_entry_first_employee_limit',
   ) {
     super(code);
   }
@@ -930,6 +933,22 @@ export async function listHistoricalEmployeeInstances(
   );
 }
 
+/** The caller must establish current workspace write authority first. The
+ * limit belongs to the person, and retained employees and disks still count. */
+export async function hasExistingDEntryEmployeeOrVm(
+  context: RequestContext,
+  sql: Sql = getDatabase(),
+) {
+  const personId = actorId(context);
+  const [row] = await sql<{ blocked: boolean }[]>`select
+    exists(select 1 from allrice_employee_instances where owner_id=${personId})
+    or exists(select 1 from allrice_employee_assignments where user_id=${personId} and active)
+    or exists(select 1 from person_virtual_machines
+      where person_id=${personId} and (phase<>'deleted' or disk_retained))
+    as blocked`;
+  return row?.blocked !== false;
+}
+
 export async function createEmployeeInstance(
   context: RequestContext,
   input: unknown,
@@ -951,10 +970,18 @@ export async function createEmployeeInstance(
     // pre-existing assignment. Keep the legacy path's assignment lock.
     await authority(scope, tx, assigned ? true : 'update_user');
     const ownerId = actorId(scope);
+    if (!assigned && value.expectedOwnerId !== ownerId)
+      throw new DataAccessError('authorization_denied');
+    const released = hasDEntryPersonRelease(
+      await readDEntryReleasePolicy(tx, true),
+      { organizationId: scope.organizationId, personId: ownerId },
+    );
+    if (!assigned && !released)
+      throw new DataAccessError('authorization_denied');
     const existingAssignment = assigned
       ? await assignment(scope, value.assignmentId, tx, true)
       : undefined;
-    if (existingAssignment) {
+    if (existingAssignment && !released) {
       // The private ownership row of a self-created employee is not a
       // dispatched template for the legacy creation endpoint.
       const [personal] = await tx`select 1 from allrice_employee_instances
@@ -963,15 +990,6 @@ export async function createEmployeeInstance(
           and workspace_id=${scope.workspaceId} and owner_id=${ownerId}`;
       if (personal) throw new DataAccessError('authorization_denied');
     }
-    if (
-      !assigned &&
-      (value.expectedOwnerId !== ownerId ||
-        !hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
-          organizationId: scope.organizationId,
-          personId: ownerId,
-        }))
-    )
-      throw new DataAccessError('authorization_denied');
     await tx`select pg_advisory_xact_lock(hashtextextended(${`employee-instance-create:${scope.organizationId}:${scope.workspaceId}:${ownerId}:${value.requestId}`},0))`;
     const [prior] = await tx<
       { id: string; matches: boolean }[]
@@ -985,6 +1003,13 @@ export async function createEmployeeInstance(
         await tx`select response from allrice_employee_instance_revisions where instance_id=${prior.id} and revision=1`;
       return EmployeeInstanceSchema.parse(saved?.response);
     }
+    // A verified assignment already counts as an existing employee. Only the
+    // unassigned path can admit a new 4.0 employee, under its person row lock.
+    if (
+      released &&
+      (existingAssignment || (await hasExistingDEntryEmployeeOrVm(scope, tx)))
+    )
+      throw new EmployeeInstanceError('d_entry_first_employee_limit');
     const id = randomUUID();
     const current = assigned
       ? existingAssignment!

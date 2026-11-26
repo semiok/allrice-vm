@@ -84,6 +84,7 @@ import {
   readDEntryEmployeeDirectory,
   preparePersonNativeWebRoster,
   readPersonNativeWebRoster,
+  hasExistingDEntryEmployeeOrVm,
   createEmployeeInstance,
   getEmployeeDetails,
   getOrganizationAiSharedDetails,
@@ -175,6 +176,16 @@ suite(
     beforeEach(() => {
       cookie.token = '';
     });
+    async function expectFirstEmployeeLimit(response: Response) {
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: {
+          code: 'CONFLICT',
+          message: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+          retryable: false,
+        },
+      });
+    }
     afterAll(async () => {
       cookie.token = '';
       vi.restoreAllMocks();
@@ -1816,15 +1827,18 @@ suite(
     });
     it('discovers an active assignment after materializing its first employee instance', async () => {
       const f = await setup(),
-        other = await setup(),
+        user = randomUUID(),
         assignmentId = randomUUID();
+      await fixture.db`insert into allrice_users(id,email,display_name,password_hash)
+        values(${user},${user + '@example.test'},'Assigned employee owner','synthetic')`;
       await fixture.db`insert into allrice_memberships(organization_id,workspace_id,user_id,role)
-        values(${f.org},${f.workspace},${other.user},'member')`;
+        values(${f.org},${f.workspace},${user},'member')`;
       await fixture.db`insert into allrice_employee_assignments
         (id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default,active,assigned_by)
-        select ${assignmentId},organization_id,workspace_id,employee_id,employee_version_id,${other.user},false,true,${f.user}
+        select ${assignmentId},organization_id,workspace_id,employee_id,employee_version_id,${user},false,true,${f.user}
         from allrice_employee_assignments where id=${f.assignment}`;
-      const context = await authenticateSession(other.login.token, {
+      const { token } = await createSession(user);
+      const context = await authenticateSession(token, {
         organizationId: f.org,
         workspaceId: f.workspace,
       });
@@ -1834,9 +1848,33 @@ suite(
         await updateDEntryReleasePolicy(f.context, {
           revision: 'initial',
           defaultGeneration: '3.x',
-          selections: [{ organizationId: f.org, personId: other.user }],
+          selections: [{ organizationId: f.org, personId: user }],
         });
         expect(await findDEntryEmployee(context)).toBeNull();
+        expect(await hasExistingDEntryEmployeeOrVm(context)).toBe(true);
+        cookie.token = token;
+        const requestId = randomUUID();
+        await expectFirstEmployeeLimit(
+          await createEmployee(
+            new Request('https://allrice.test/api/v1/employee-instances', {
+              method: 'POST',
+              headers: {
+                origin: 'https://allrice.test',
+                'x-allrice-organization-id': f.org,
+                'x-allrice-workspace-id': f.workspace,
+              },
+              body: JSON.stringify({
+                assignmentId,
+                workspaceId: f.workspace,
+                requestId,
+                profile: { name: '额外员工' },
+              }),
+            }),
+          ),
+        );
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${user}`,
+        ).toEqual([]);
         expect(
           (await preparePersonNativeWebRoster(context)).entries,
         ).toMatchObject([
@@ -1879,7 +1917,7 @@ suite(
         'x-allrice-organization-id': f.org,
         'x-allrice-workspace-id': f.workspace,
       };
-      const create = (body = input) =>
+      const create = (body: unknown = input) =>
         createEmployee(
           new Request('https://allrice.test/api/v1/employee-instances', {
             method: 'POST',
@@ -1921,6 +1959,23 @@ suite(
         expect(await findDEntryEmployee(owner)).toBeNull();
         expect(await ensureDefaultEmployee(owner)).toBeNull();
         expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
+
+        const vmId = randomUUID();
+        await fixture.db`insert into person_virtual_machines
+          (person_id,vm_id,organization_id,phase,disk_tier)
+          values(${ownerId},${vmId},${f.org},'starting','warm')`;
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
+        await expectFirstEmployeeLimit(await create());
+        await fixture.db`update person_virtual_machines
+          set phase='deleted' where vm_id=${vmId}`;
+        await expectFirstEmployeeLimit(await create());
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
+        ).toEqual([]);
+        await fixture.db`update person_virtual_machines
+          set disk_retained=false where vm_id=${vmId}`;
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
 
         const other = await setup();
         const legacy = await createBusinessThread(
@@ -1961,16 +2016,54 @@ suite(
           (await create({ ...input, workspaceId: other.workspace })).status,
         ).toBe(403);
         expect(await isDEntryPersonReleased(f.context)).toBe(false);
+        cookie.token = f.login.token;
+        expect(
+          (
+            await create({
+              workspaceId: f.workspace,
+              assignmentId: f.assignment,
+              requestId: randomUUID(),
+              profile: { name: '既有 3.x 创建流程' },
+            })
+          ).status,
+        ).toBe(201);
+        cookie.token = login.token;
         await fixture.db`update allrice_memberships set role='viewer' where user_id=${ownerId}`;
         expect((await create()).status).toBe(403);
         await fixture.db`update allrice_memberships set role='member' where user_id=${ownerId}`;
 
-        const responses = await Promise.all([create(), create()]);
+        const attempts = [input, { ...input, requestId: randomUUID() }];
+        const concurrent = await Promise.all(attempts.map(create));
+        expect(concurrent.map(({ status }) => status).sort()).toEqual([
+          201, 409,
+        ]);
+        await expectFirstEmployeeLimit(
+          concurrent.find((result) => result.status === 409)!,
+        );
+        const winner =
+          attempts[concurrent.findIndex((result) => result.status === 201)]!;
+        const responses = await Promise.all([create(winner), create(winner)]);
         expect(responses.map(({ status }) => status)).toEqual([201, 201]);
         const [{ instance }, replay] = await Promise.all(
           responses.map((response) => response.json()),
         );
         expect(replay.instance).toEqual(instance);
+        expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(true);
+        await expectFirstEmployeeLimit(
+          await create({ ...input, requestId: randomUUID() }),
+        );
+        await expectFirstEmployeeLimit(
+          await create({
+            workspaceId: f.workspace,
+            assignmentId: instance.assignmentId,
+            requestId: randomUUID(),
+            profile: input.profile,
+          }),
+        );
+        expect(
+          await fixture.db`select id from allrice_employee_instances where owner_id=${ownerId}`,
+        ).toEqual([{ id: instance.id }]);
+        await fixture.db`delete from person_virtual_machines where vm_id=${vmId}`;
         expect(instance).toMatchObject({
           kind: 'custom',
           workspaceId: f.workspace,
