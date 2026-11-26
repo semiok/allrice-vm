@@ -16,6 +16,7 @@ import {
   missing,
   privatePersonVmDirectory,
   syncDiskPoolDirectory,
+  systemPathNormalizer,
 } from './disk-pool-ledger.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 
@@ -23,6 +24,12 @@ export type PersonDisk = Readonly<{ vmId: string; tier: 'warm' | 'cold' }>;
 export type PersonVmDiskInspection =
   | Readonly<{ state: 'absent' | 'unknown' }>
   | Readonly<{ state: 'ready'; disk: PersonDisk }>;
+type DiskImageInfo = {
+  images?: {
+    'image-path': string;
+    'system-entities'?: { 'mount-point'?: string }[];
+  }[];
+};
 export interface PersonVmDiskPort {
   /** Host-only non-destructive reconciliation of this vmId's two storage locations. */
   inspect(vmId: string, signal: AbortSignal): Promise<PersonVmDiskInspection>;
@@ -197,12 +204,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       ...(input ? { input } : {}),
     });
   }
-  private async info(signal: AbortSignal): Promise<{
-    images?: {
-      'image-path': string;
-      'system-entities'?: { 'mount-point'?: string }[];
-    }[];
-  }> {
+  private async info(
+    signal: AbortSignal,
+    canonical: ReturnType<typeof systemPathNormalizer>,
+  ): Promise<DiskImageInfo> {
     const plist = await this.command(['info', '-plist'], signal);
     const json = await this.run({
       executable: '/usr/bin/plutil',
@@ -211,17 +216,33 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       signal,
       input: Buffer.from(plist),
     });
-    return JSON.parse(json);
+    const state = JSON.parse(json) as DiskImageInfo;
+    if (Array.isArray(state.images)) {
+      for (const image of state.images) {
+        signal.throwIfAborted();
+        if (typeof image?.['image-path'] === 'string')
+          image['image-path'] = await canonical(image['image-path']);
+        if (Array.isArray(image?.['system-entities'])) {
+          for (const entity of image['system-entities']) {
+            const point = entity?.['mount-point'];
+            if (typeof point === 'string')
+              entity['mount-point'] = await canonical(point);
+          }
+        }
+      }
+    }
+    return state;
   }
   private async isAttached(disk: PersonDisk, signal: AbortSignal) {
-    const image = (await this.info(signal)).images?.find(
-      (item) => item['image-path'] === this.image(disk),
+    const canonical = systemPathNormalizer();
+    const path = await canonical(this.image(disk));
+    const mount = await canonical(this.mount(disk));
+    const image = (await this.info(signal, canonical)).images?.find(
+      (item) => item['image-path'] === path,
     );
     if (
       image &&
-      !image['system-entities']?.some(
-        (item) => item['mount-point'] === this.mount(disk),
-      )
+      !image['system-entities']?.some((item) => item['mount-point'] === mount)
     )
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     return Boolean(image);
@@ -255,8 +276,9 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
 
   /** Pool entries may not have a live device or an occupied mount point. */
   async verifyOffline(disk: PersonDisk, signal: AbortSignal) {
-    const image = this.image(disk);
-    const mount = this.mount(disk);
+    const canonical = systemPathNormalizer();
+    const image = await canonical(this.image(disk));
+    const mount = await canonical(this.mount(disk));
     const actual = await stat(image, { bigint: true }).catch(
       (error: unknown) => {
         if (missing(error)) return null;
@@ -264,7 +286,7 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       },
     );
     const observe = async (disappeared?: string) => {
-      const state = await this.info(signal);
+      const state = await this.info(signal, canonical);
       if (
         !Array.isArray(state.images) ||
         state.images.some(
@@ -416,9 +438,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     const observed = await this.inspectExisting(disk.vmId, signal);
     if (observed.state !== 'ready' || observed.disk.tier !== disk.tier)
       return null;
-    const mount = this.mount(disk);
-    const image = this.image(disk);
-    const matches = (await this.info(signal)).images?.filter(
+    const canonical = systemPathNormalizer();
+    const mount = await canonical(this.mount(disk));
+    const image = await canonical(this.image(disk));
+    const matches = (await this.info(signal, canonical)).images?.filter(
       (entry) =>
         entry['image-path'] === image ||
         entry['system-entities']?.some(
@@ -431,7 +454,7 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       matches[0]['system-entities']?.filter(
         (entity) => entity['mount-point'] === mount,
       ).length === 1
-      ? mount
+      ? this.mount(disk)
       : null;
   }
   async create(

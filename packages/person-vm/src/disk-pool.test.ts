@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -32,12 +33,38 @@ import { context, harness, MemoryStore, signal } from './test-support.ts';
 const faults = vi.hoisted(() => ({
   afterLedgerFileSync: undefined as (() => void) | undefined,
   afterDirectorySync: undefined as ((path: string) => void) | undefined,
+  managedParent: undefined as
+    | { path: string; writable: boolean; error: NodeJS.ErrnoException }
+    | undefined,
 }));
 vi.mock('node:fs/promises', async (original) => {
   const fs = await original<typeof Filesystem>();
   return {
     ...fs,
+    async lstat(...args: Parameters<typeof fs.lstat>) {
+      const info = await fs.lstat(...args);
+      if (
+        faults.managedParent?.path === String(args[0]) &&
+        info &&
+        typeof info.uid === 'number'
+      )
+        info.uid += 1;
+      return info;
+    },
+    async access(...args: Parameters<typeof fs.access>) {
+      if (
+        faults.managedParent?.path === String(args[0]) &&
+        !faults.managedParent.writable &&
+        args[1] === constants.W_OK
+      )
+        throw Object.assign(Error('synthetic write access denied'), {
+          code: 'EACCES',
+        });
+      return fs.access(...args);
+    },
     async open(...args: Parameters<typeof fs.open>) {
+      if (faults.managedParent?.path === String(args[0]))
+        throw faults.managedParent.error;
       const file = await fs.open(...args);
       if (
         faults.afterLedgerFileSync &&
@@ -295,6 +322,7 @@ const roots: string[] = [];
 afterEach(async () => {
   faults.afterLedgerFileSync = undefined;
   faults.afterDirectorySync = undefined;
+  faults.managedParent = undefined;
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
@@ -391,6 +419,56 @@ it.each([false, true])(
     expect(
       (await ledger.read(signal(), true)).ordinaryOwners.get(owner.vmId),
     ).toMatchObject(owner);
+  },
+);
+
+it.each([
+  {
+    edge: 'pre-existing search-only',
+    existing: true,
+    writable: false,
+    code: 'EACCES',
+  },
+  {
+    edge: 'pre-existing writable',
+    existing: true,
+    writable: true,
+    code: 'EACCES',
+  },
+  { edge: 'newly created', existing: false, writable: false, code: 'EACCES' },
+  {
+    edge: 'pre-existing with I/O failure',
+    existing: true,
+    writable: false,
+    code: 'EIO',
+  },
+])(
+  'only permits the worker to skip syncing a proven stable managed edge ($edge)',
+  async ({ existing, writable, code }) => {
+    const f = await fixture();
+    const disk = join(f.root, 'disks');
+    if (existing) await mkdir(disk, { mode: 0o700 });
+    const failure = Object.assign(
+      Error('synthetic managed parent open failure'),
+      { code },
+    );
+    faults.managedParent = { path: f.root, writable, error: failure };
+    const ledger = new DiskPoolLedger(disk);
+    const owner = {
+      personId: randomUUID(),
+      organizationId: randomUUID(),
+      vmId: randomUUID(),
+    };
+    const write = ledger.recordOrdinaryOwner(owner, signal(), async () => {});
+    if (existing && !writable && code === 'EACCES') {
+      await expect(write).resolves.toBeUndefined();
+      expect(
+        (await ledger.read(signal(), true)).ordinaryOwners.get(owner.vmId),
+      ).toMatchObject(owner);
+    } else {
+      await expect(write).rejects.toBe(failure);
+      expect((await ledger.read(signal(), true)).ordinaryOwners.size).toBe(0);
+    }
   },
 );
 
