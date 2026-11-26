@@ -7,4 +7,4 @@
 3. 以有权读取 mapper 的发布操作员运行 `python3 scripts/linux/host-preflight.py check-luks --scratch-mount PATH --scratch-uuid FS_UUID --scratch-luks-uuid LUKS_UUID`。记录 XFS 和 LUKS2 对该 UUID 的检查结果。
 4. 以真正的非 root Worker 账号运行 `python3 scripts/linux/host-preflight.py check-runtime --scratch-mount PATH --scratch-uuid FS_UUID --scratch-luks-uuid LUKS_UUID --data-uuid UUID --node ABSOLUTE_NODE --msb ABSOLUTE_MSB`。检查 cgroup v2、PSI、KVM API 12 与立即关闭的空 VM fd、严格 reflink 及写后原件独立、固定 MSB 版本。两条检查对账 scratch 的文件系统 UUID、LUKS UUID 与设备号，并在首个合成 Person VM 之前通过。MSB doctor 会写入有效 MSB_HOME，留到目标机有封签的 scratch 配置后单验。
 
-M5 测试用伪造 mount/cryptsetup、模拟 ioctl 和临时 fixture 验证流程。实际 KVM、XFS、LUKS2、制品和服务 UID 权限仍须目标机取证。这个片段没有接入 Person VM 的磁盘或预热池。
+M5 测试用模拟 mount、mapper 身份与 ioctl 和临时 fixture 验证流程。实际 KVM、XFS、LUKS2、制品和服务 UID 权限仍须目标机取证。这个片段没有接入 Person VM 的磁盘或预热池。
