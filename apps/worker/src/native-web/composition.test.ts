@@ -661,6 +661,15 @@ it.each(['readiness', 'save'] as const)(
       endpoints: f.web.receipt.endpoints,
     });
     h.native.assertWebEndpoints = async () => {};
+    const bootstrap = h.native.bootstrap;
+    h.native.bootstrap = async (scope, plan) => ({
+      ...(await bootstrap(scope, plan)),
+      async readNativeWebGuestAddress(active = scope.signal) {
+        active.throwIfAborted();
+        expect(h.states.get(scope.binding.vmId)).toBe('running');
+        return f.readNativeWebGuestAddress();
+      },
+    });
     const retired = vi.fn(
       async (binding: PersonVmBinding, cleanup: AbortSignal) => {
         expect(h.states.get(binding.vmId)).toBe('stopped');
@@ -712,6 +721,7 @@ it.each(['readiness', 'save'] as const)(
       expect(h.mounts.size).toBe(0);
       h.setReadiness({ authenticated: true, editorReady: true, canSend: true });
       expect((await service.start(f.web.context, signal())).ready).toBe(true);
+      expect(f.readNativeWebGuestAddress).toHaveBeenCalledTimes(2);
       const next = await service.resolve(f.web.context, signal());
       expect(next.instanceId).not.toBe(old.instanceId);
       expect(next.leaseEpoch).toBeGreaterThan(old.leaseEpoch);
