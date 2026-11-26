@@ -31,9 +31,7 @@ function profile() {
       work: new Set<NativeWork>(),
       complete: true,
     })),
-    readScheduleCatalog: vi.fn(
-      async (): Promise<readonly ScheduleCatalogEntry[]> => [],
-    ),
+    readScheduleCatalog: vi.fn(async (): Promise<ScheduleCatalogEntry[]> => []),
   };
   return {
     owner,

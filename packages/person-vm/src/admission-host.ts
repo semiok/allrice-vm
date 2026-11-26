@@ -1341,8 +1341,7 @@ export class PersonVmAdmissionHost
           const current = AbortSignal.any([signal, owned.signal]);
           return this.trackOwner(binding.personId, current, async (active) => {
             let sample: PersonVmActivityCursor | undefined;
-            const assertStopCurrent = async (probe: AbortSignal) => {
-              const checking = AbortSignal.any([active, probe]);
+            const checkIdle = async (checking: AbortSignal) => {
               await owned.guard();
               const latest = await this.readIdleCandidate(
                 binding,
@@ -1350,8 +1349,8 @@ export class PersonVmAdmissionHost
                 candidate,
                 checking,
                 'stop-guard',
-                (current) => {
-                  sample = current;
+                (cursor) => {
+                  sample = cursor;
                 },
               );
               if (
@@ -1360,6 +1359,19 @@ export class PersonVmAdmissionHost
               )
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
               await assertAuthority(checking);
+              checking.throwIfAborted();
+            };
+            let pendingCheck: Promise<void> | undefined;
+            const assertStopCurrent = async (probe: AbortSignal) => {
+              const checking = AbortSignal.any([active, probe]);
+              checking.throwIfAborted();
+              // Schedule capture reads employee catalogs in parallel, all
+              // under this exact physical lease and with the same authority.
+              // Share only in-flight checks. Each later round reads live again.
+              pendingCheck ??= checkIdle(checking).finally(() => {
+                pendingCheck = undefined;
+              });
+              await pendingCheck;
               checking.throwIfAborted();
             };
             await assertStopCurrent(active);

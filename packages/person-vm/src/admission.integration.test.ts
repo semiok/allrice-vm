@@ -801,7 +801,17 @@ suite(
                       async () => {},
                     ),
                   ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
-                  await request.assertStopCurrent(active);
+                  if (outcome === 'sampled-ok') {
+                    const before = samplePurposes.length;
+                    await Promise.all(
+                      [active, active].map((signal) =>
+                        request.assertStopCurrent(signal),
+                      ),
+                    );
+                    expect(samplePurposes.slice(before)).toEqual([
+                      'stop-guard',
+                    ]);
+                  } else await request.assertStopCurrent(active);
                   if (outcome === 'system-revoked') scheduledAuthority = false;
                   if (outcome === 'changed') revision = 'new-native-work';
                   if (
