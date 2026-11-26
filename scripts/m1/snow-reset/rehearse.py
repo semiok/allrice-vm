@@ -21,6 +21,7 @@ ORG, PERSON, ADMIN, ACCEPTOR, WORKSPACE, EMPLOYEE, VERSION, NATIVE_SESSION, PRIV
 )
 TARGET = 'snow_reset_restore'
 SOURCE = 'snow_reset_source'
+requested_signal = None
 
 FIXTURE = """
 insert into allrice_organizations (id,slug,name) values (:'organization','snow-reset-fixture','Synthetic QA');
@@ -131,9 +132,11 @@ VARIABLES = dict(organization=ORG, person=PERSON, admin=ADMIN, acceptor=ACCEPTOR
 
 
 def run(argv, *, text=None, suppress=False):
+    check_interrupted()
     result = subprocess.run(
         argv, env=PG_ENV, input=text, text=True, capture_output=True, timeout=180,
     )
+    check_interrupted()
     if result.returncode and not suppress:
         raise RuntimeError(f'{Path(argv[0]).name}: {result.stderr.strip()}')
     return result
@@ -299,7 +302,14 @@ where key='d_entry_rollout_policy';
 
 
 def interrupted(signum, _frame):
-    raise InterruptedError(f'rehearsal interrupted by signal {signum}')
+    # Do not raise across Popen's child creation/handle handoff or shutdown.
+    global requested_signal
+    requested_signal = signum
+
+
+def check_interrupted():
+    if requested_signal is not None:
+        raise InterruptedError(f'rehearsal interrupted by signal {requested_signal}')
 
 
 def main():
@@ -339,6 +349,7 @@ def main():
                 except subprocess.TimeoutExpired:
                     raise RuntimeError(f'PostgreSQL shutdown incomplete; retained private directory {root}') from None
         shutil.rmtree(root)
+    check_interrupted()
     print('Private PostgreSQL stopped; socket, dump and data directory released', flush=True)
 
 
