@@ -1,8 +1,12 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { IdentityError } from '@allrice/database';
-import { findDEntryEmployee } from '../../../lib/d-entry/entry-threads';
+import {
+  findDEntryCreationWorkspace,
+  findDEntryEmployee,
+} from '../../../lib/d-entry/entry-threads';
 import { getRequestContext } from '../../../lib/identity/session';
+import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
@@ -49,21 +53,31 @@ export default async function EmployeeNativeEntryPage({
         />
       );
     if (!auth.context) redirect('/login?next=%2Fchatflow%2F4.0');
-    const result = await findDEntryEmployee(auth.context).then(
-      (selection) => ({ selection, unavailable: false }),
-      () => ({ selection: null, unavailable: true }),
-    );
-    return (
-      <EmployeeNativePage
-        query={
-          result.selection
-            ? new URLSearchParams(result.selection).toString()
-            : ''
-        }
-        initialUnavailable={result.unavailable}
-        prepare
-      />
-    );
+    const context = auth.context;
+    try {
+      const selection = await findDEntryEmployee(context);
+      if (selection)
+        return (
+          <EmployeeNativePage
+            query={new URLSearchParams(selection).toString()}
+            prepare
+          />
+        );
+      if (context.actor.type === 'user') {
+        const workspaceId = await findDEntryCreationWorkspace(context);
+        if (workspaceId)
+          return (
+            <EmployeeFirstStart
+              organizationId={context.organizationId}
+              workspaceId={workspaceId}
+              viewerId={context.actor.id}
+            />
+          );
+      }
+    } catch {
+      return <EmployeeNativePage query="" initialUnavailable prepare />;
+    }
+    return <EmployeeNativePage query="" prepare />;
   }
   return <EmployeeNativePage query={query.toString()} prepare />;
 }

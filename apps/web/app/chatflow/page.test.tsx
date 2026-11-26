@@ -2,11 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IdentityError } from '@allrice/database';
 import ChatFlowPage from './page';
 import EmployeeNativeEntryPage from './4.0/page';
+import { EmployeeFirstStart } from './4.0/employee-first-start';
 
 const entry = vi.hoisted(() => ({
   host: 'localhost',
   context: vi.fn(),
   find: vi.fn(),
+  released: vi.fn(),
+  createWorkspace: vi.fn(),
 }));
 vi.mock('./chatflow-client', () => ({ ChatFlowClient: () => null }));
 vi.mock('next/headers', () => ({
@@ -22,6 +25,8 @@ vi.mock('../../lib/identity/session', () => ({
 }));
 vi.mock('../../lib/d-entry/entry-threads', () => ({
   findDEntryEmployee: entry.find,
+  findDEntryCreationWorkspace: entry.createWorkspace,
+  isDEntryPersonReleased: entry.released,
 }));
 
 describe('ChatFlow server local command capability', () => {
@@ -48,12 +53,10 @@ describe('ChatFlow server local command capability', () => {
       expect(entry.context).not.toHaveBeenCalled();
     },
   );
-  it('opens 4.0 from the trial login destination only for the released employee', async () => {
+  it('opens 4.0 from the trial login destination for a released person with an empty roster', async () => {
     entry.host = 'allricevm.bplabs.xyz';
     entry.context.mockResolvedValue({ actor: { id: 'owner' } });
-    entry.find
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({ employeeInstanceId: 'enabled' });
+    entry.released.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({}) }),
     ).resolves.toHaveProperty('props');
@@ -68,15 +71,37 @@ describe('ChatFlow server local command capability', () => {
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({ employee: '' }) }),
     ).resolves.toHaveProperty('props');
-    expect(entry.find).toHaveBeenCalledTimes(2);
+    expect(entry.released).toHaveBeenCalledTimes(2);
+    expect(entry.find).not.toHaveBeenCalled();
   });
   it('shows the trial failure instead of defaulting to the legacy writer when policy is unavailable', async () => {
     entry.host = 'allricevm.bplabs.xyz';
     entry.context.mockResolvedValue({ actor: { id: 'owner' } });
-    entry.find.mockRejectedValue(Error('policy unavailable'));
+    entry.released.mockRejectedValue(Error('policy unavailable'));
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({}) }),
     ).rejects.toThrow('/chatflow/4.0');
+  });
+  it('offers the first employee form only with an authorized creation workspace', async () => {
+    entry.context.mockResolvedValue({
+      actor: { type: 'user', id: 'owner' },
+      organizationId: 'organization',
+    });
+    entry.find.mockResolvedValue(null);
+    entry.createWorkspace
+      .mockResolvedValueOnce('writable')
+      .mockResolvedValueOnce(null);
+    const input = { searchParams: Promise.resolve({}) };
+    const empty = await EmployeeNativeEntryPage(input);
+    expect(empty.type).toBe(EmployeeFirstStart);
+    expect(empty.props).toEqual({
+      organizationId: 'organization',
+      workspaceId: 'writable',
+      viewerId: 'owner',
+    });
+    const denied = await EmployeeNativeEntryPage(input);
+    expect(denied.type).not.toBe(EmployeeFirstStart);
+    expect(denied.props).toMatchObject({ query: '', prepare: true });
   });
   it('renders the denied trial entry when the original login has lost its tenant', async () => {
     entry.host = 'allricevm.bplabs.xyz';

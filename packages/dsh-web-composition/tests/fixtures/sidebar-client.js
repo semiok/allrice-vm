@@ -340,7 +340,14 @@ window.__ModuleLoader__.load({
             listeners.add(listener);
             return () => listeners.delete(listener);
           },
-          createEmployee: () => record('create-employee'),
+          createEmployee: globalThis.__allricePersonalCreation
+            ? {
+                workspace: globalThis.__allricePersonalCreation,
+                headers: {},
+                onCreated: (instance) =>
+                  record('created-employee', instance.id),
+              }
+            : () => record('create-employee'),
           openArchive: () => {
             record('open-archive');
             setFilter('only');

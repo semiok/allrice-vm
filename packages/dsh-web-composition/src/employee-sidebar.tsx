@@ -1,10 +1,11 @@
-import { useSyncExternalStore, type ComponentProps } from 'react';
+import { useState, useSyncExternalStore, type ComponentProps } from 'react';
 import { flushSync } from 'react-dom';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
+import { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
 import { ChatSidebarFrame } from '../../../apps/web/app/chatflow/chat-sidebar-frame';
 import { EmployeeSidebarView } from '../../../apps/web/app/chatflow/employee-sidebar-view';
 import {
@@ -24,6 +25,10 @@ const subscribeCompact = (listener: () => void) => {
 
 type Tree = ComponentProps<typeof EmployeeSidebarView>;
 type Frame = ComponentProps<typeof ChatSidebarFrame>;
+type PersonalCreation = Omit<
+  Extract<ComponentProps<typeof EmployeeCreateDialog>, { personal: true }>,
+  'personal' | 'onClose'
+>;
 
 /** Business projection and operations supplied by the authenticated AllRice owner. */
 export interface EmployeeSidebarSnapshot {
@@ -39,7 +44,7 @@ export interface EmployeeSidebarSnapshot {
 export interface EmployeeSidebarPort {
   getSnapshot: () => EmployeeSidebarSnapshot | null;
   subscribe: (listener: () => void) => () => void;
-  createEmployee: () => void;
+  createEmployee: (() => void) | PersonalCreation;
   openArchive: () => void;
   /** MET-279 supplies the employee settings surface; never an admin route. */
   openEmployeeSettings: () => void;
@@ -69,11 +74,13 @@ export function EmployeeSidebar({
     compactSnapshot,
     () => false,
   );
+  const [createOpen, setCreateOpen] = useState(false);
   if (!snapshot) return null;
+  const creation = port.createEmployee;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
   };
-  return (
+  const frame = (
     <ChatSidebarFrame
       archive={snapshot.archive}
       employeeArchiveOpen={snapshot.employeeArchiveOpen}
@@ -81,7 +88,9 @@ export function EmployeeSidebar({
       overlay={compact && !collapsed}
       style={{ height: '100%' }}
       onCollapsedChange={() => ctx.layout.toggleSidebar()}
-      onCreateEmployee={port.createEmployee}
+      onCreateEmployee={
+        typeof creation === 'function' ? creation : () => setCreateOpen(true)
+      }
       onOpenArchive={port.openArchive}
       onOpenAutomations={() => {
         ctx.layout.selectPanel(
@@ -111,6 +120,22 @@ export function EmployeeSidebar({
       }
       settings={renderSlot('sidebar.settings', { wide: !collapsed })}
     />
+  );
+  return (
+    <>
+      {frame}
+      {createOpen && typeof creation !== 'function' && (
+        <EmployeeCreateDialog
+          {...creation}
+          personal
+          onClose={() => setCreateOpen(false)}
+          onCreated={(instance) => {
+            setCreateOpen(false);
+            creation.onCreated(instance);
+          }}
+        />
+      )}
+    </>
   );
 }
 

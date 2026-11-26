@@ -46,7 +46,10 @@ suite('4.0 browser cold entry', () => {
           stdin: {
             contents: `import { createRoot } from 'react-dom/client';
           import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
-          createRoot(document.getElementById('root')).render(<EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+          import { EmployeeFirstStart } from './app/chatflow/4.0/employee-first-start';
+          createRoot(document.getElementById('root')).render(location.search
+            ? <EmployeeNativePage prepare query={location.search.slice(1)} />
+            : <EmployeeFirstStart workspaceId={${JSON.stringify(workspaceId)}} organizationId={${JSON.stringify(f.identity.organizationId)}} viewerId={${JSON.stringify(f.identity.personId)}} />);`,
             loader: 'tsx',
             resolveDir: join(process.cwd(), 'apps/web'),
           },
@@ -451,6 +454,87 @@ suite('4.0 browser cold entry', () => {
         .getByRole('heading', { name: '员工', exact: true })
         .waitFor();
       await returnPage.close();
+
+      const firstStart = await context.newPage();
+      try {
+        const { organizationId, personId, employeeVersionId } = f.identity;
+        let payload: Record<string, unknown> | undefined;
+        await firstStart.route(
+          '**/api/v1/employee-instances',
+          async (route) => {
+            expect(route.request().method()).toBe('POST');
+            expect(route.request().headers()['x-allrice-organization-id']).toBe(
+              organizationId,
+            );
+            expect(route.request().headers()['x-allrice-workspace-id']).toBe(
+              workspaceId,
+            );
+            payload = route.request().postDataJSON();
+            const version = { kind: 'tenant_version', employeeVersionId };
+            const now = new Date().toISOString();
+            await route.fulfill({
+              status: 201,
+              json: {
+                instance: {
+                  id: employeeInstanceId,
+                  assignmentId: employeeInstanceId,
+                  organizationId,
+                  workspaceId,
+                  ownerId: personId,
+                  kind: 'custom',
+                  revision: 1,
+                  profile: payload?.profile,
+                  source: version,
+                  creationSource: version,
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              },
+            });
+          },
+        );
+        const previousBirths = births.length;
+        await firstStart.goto(f.origin + '/chatflow');
+        await firstStart
+          .getByRole('heading', { name: '新建你的第一个员工', exact: true })
+          .waitFor();
+        await firstStart
+          .getByText('给员工起个名字，建好后就能打开工作台。', { exact: true })
+          .waitFor();
+        await firstStart
+          .getByRole('button', { name: '创建员工', exact: true })
+          .click();
+        const dialog = firstStart.getByRole('dialog', {
+          name: '创建 AI 员工',
+          exact: true,
+        });
+        await dialog
+          .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
+          .fill('文案专家');
+        await dialog
+          .getByRole('button', { name: '确认创建', exact: true })
+          .click();
+        await firstStart.waitForURL(
+          (url) =>
+            url.pathname === '/chatflow/4.0' &&
+            url.searchParams.get('employeeInstanceId') === employeeInstanceId,
+        );
+        const frame = firstStart.frameLocator('iframe');
+        await frame
+          .locator('body[data-mount-ready=yes]')
+          .evaluate(() =>
+            (window as unknown as { publishMount(): void }).publishMount(),
+          );
+        await frame.getByRole('textbox', { name: '消息' }).waitFor();
+        expect(births.slice(previousBirths)).toEqual([{ selection: employee }]);
+        expect(payload).toMatchObject({
+          workspaceId,
+          profile: { name: '文案专家' },
+        });
+        expect(payload).not.toHaveProperty('assignmentId');
+      } finally {
+        await firstStart.close();
+      }
     },
   );
 });

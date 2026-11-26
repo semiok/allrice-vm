@@ -603,6 +603,37 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
   });
 
+  it('opens the existing personal creation dialog from the native sidebar', async () => {
+    const creationPage = await context.newPage();
+    try {
+      await creationPage.addInitScript(
+        (scope) => {
+          Object.assign(globalThis, { __allricePersonalCreation: scope });
+        },
+        {
+          organizationId: randomUUID(),
+          workspaceId: randomUUID(),
+          viewerId: randomUUID(),
+        },
+      );
+      await open(creationPage, hosts[0]!);
+      await creationPage
+        .locator('#chat-sidebar')
+        .getByRole('button', { name: '创建员工', exact: true })
+        .click();
+      const dialog = creationPage.getByRole('dialog', {
+        name: '创建 AI 员工',
+        exact: true,
+      });
+      await dialog
+        .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
+        .waitFor();
+      await creationPage.keyboard.press('Escape');
+      await dialog.waitFor({ state: 'hidden' });
+    } finally {
+      await creationPage.close();
+    }
+  });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {
     const sidebar = page.locator('#chat-sidebar');
     expect(
