@@ -4,6 +4,7 @@ import {
   createPostgresPersonVmScheduledWakeStore,
 } from '@allrice/database';
 import {
+  createDailyScheduleRecord,
   ScheduleId,
   type ScheduleCatalogEntry,
 } from '@deepseek-ai/dsh-schedule';
@@ -170,6 +171,47 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await db`select receipt_id from allrice_native_schedule_observation_receipts
       where person_id=${f.binding.personId}`;
     expect(receipts).toHaveLength(3);
+  });
+
+  it('uses the native committed UTC target across repeated New York wall time', async () => {
+    const f = await fixture();
+    const native = createDailyScheduleRecord(
+      ScheduleId('daily'),
+      'synthetic',
+      { time: '01:30:00', time_zone: 'America/New_York' },
+      Date.parse('2026-11-01T04:00:00.000Z'),
+      'synthetic',
+    );
+    expect(native.scheduledAt).toBe('2026-11-01T05:30:00.000Z');
+    f.setRows([
+      { ...native, status: 'active', sessionId: SessionId('session') },
+    ]);
+    await expect(
+      f.module().prepareStopWithWake(f.binding, randomUUID(), signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T05:28:00.000Z' });
+  });
+
+  it('does not accept another person’s receipt even with a valid new stop ID', async () => {
+    const other = await fixture();
+    await other
+      .module()
+      .prepareStopWithWake(other.binding, randomUUID(), signal);
+    const [row] = await db<{ receipt_id: string }[]>`select receipt_id
+      from allrice_native_schedule_observation_receipts
+      where person_id=${other.binding.personId}`;
+    const f = await fixture();
+    expect(
+      await f.store().stage(
+        {
+          ...f.binding,
+          planId: randomUUID(),
+          receiptIds: [row!.receipt_id],
+          targetAt: new Date(target),
+          wakeAt: new Date(wakeAt),
+        },
+        null,
+      ),
+    ).toBe(false);
   });
 
   it('blocks unknown catalog and targets inside the lead window', async () => {

@@ -90,6 +90,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           where vm.person_id=${plan.personId} and vm.organization_id=${plan.organizationId}
             and vm.vm_id=${plan.vmId} and vm.instance_id=${plan.instanceId}
             and vm.lease_epoch=${plan.leaseEpoch} and vm.phase='running'
+            and (select count(*) from allrice_native_schedule_observation_receipts r
+              where r.receipt_id=any(${[...plan.receiptIds]}::uuid[])
+                and r.person_id=vm.person_id and r.organization_id=vm.organization_id
+                and r.vm_id=vm.vm_id and r.input_payload->>'kind'='snapshot'
+                and lower(r.input_payload #>> '{origin,instanceId}')=vm.instance_id::text
+                and r.input_payload #>> '{origin,leaseEpoch}'=vm.lease_epoch::text)
+              =cardinality(${[...plan.receiptIds]}::uuid[])
             and (${previousId}::uuid is null or exists (
               select 1 from person_vm_scheduled_wakes h where h.person_id=vm.person_id))
           on conflict(person_id) do update set
