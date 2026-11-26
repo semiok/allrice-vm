@@ -127,21 +127,14 @@ export async function readDEntryEmployeeDirectory(
     'isolation level repeatable read read only',
     async (sql) => {
       const policy = await readDEntryReleasePolicy(sql);
+      if (!hasDEntryPersonRelease(policy, identity))
+        throw new DataAccessError('authorization_denied');
       const employees = [];
-      const personReleased = hasDEntryPersonRelease(policy, identity);
-      const employeeIdsFromPolicy = policy.selections.flatMap((item) =>
-        item.organizationId === identity.organizationId &&
-        item.personId === identity.personId &&
-        item.generation === '4.0'
-          ? [item.employeeInstanceId]
-          : [],
-      );
-      const employeeIdsToRead = personReleased
-        ? (await listEmployeeInstances(scope, identity.workspaceId, sql)).map(
-            (instance) => instance.id,
-          )
-        : employeeIdsFromPolicy;
-      for (const employeeId of employeeIdsToRead) {
+      for (const { id: employeeId } of await listEmployeeInstances(
+        scope,
+        identity.workspaceId,
+        sql,
+      )) {
         signal.throwIfAborted();
         try {
           const instance = await getEmployeeInstance(scope, employeeId, sql);

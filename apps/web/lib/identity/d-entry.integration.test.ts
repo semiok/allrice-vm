@@ -295,14 +295,7 @@ suite(
       const policy = await updateDEntryReleasePolicy(f.context, {
         revision: 'not-a-published-revision',
         defaultGeneration: '3.x',
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0',
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       });
       const identity = await requireDEntryNativeIdentity(f.context, selection);
       return { ...f, thread, selection, identity, policy };
@@ -818,7 +811,7 @@ suite(
     });
 
     for (const otherOnly of [true, false])
-      it(`rechecks the current person/employee rollout after create, ignoring only unrelated policy changes (otherOnly=${otherOnly})`, async () => {
+      it(`rechecks the current person's rollout after create, ignoring only unrelated policy changes (otherOnly=${otherOnly})`, async () => {
         const f = await enabledFour(),
           other = otherOnly ? await setup() : null,
           fact = creation(f),
@@ -830,17 +823,9 @@ suite(
             selections: other
               ? [
                   ...f.policy.selections,
-                  {
-                    organizationId: other.org,
-                    personId: other.user,
-                    employeeInstanceId: other.assignment,
-                    generation: '4.0',
-                  },
+                  { organizationId: other.org, personId: other.user },
                 ]
-              : f.policy.selections.map((entry) => ({
-                  ...entry,
-                  generation: '3.x',
-                })),
+              : [],
           });
           expect(policy.revision).not.toBe(f.policy.revision);
           return fact;
@@ -1201,9 +1186,10 @@ suite(
         expect(
           (await createNativeRoot(rootRequest(f, f.selection))).status,
         ).toBe(503);
-        expect((await readDEntryReleasePolicy()).selections).toContainEqual(
-          expect.objectContaining({ personId: f.user, generation: '4.0' }),
-        );
+        expect((await readDEntryReleasePolicy()).selections).toContainEqual({
+          organizationId: f.org,
+          personId: f.user,
+        });
         for (const [path, body] of [
           ['native-owner', server.body],
           ['native-root', server.body],
@@ -1373,6 +1359,51 @@ suite(
         await Promise.allSettled([revoke, publish]);
       }
     });
+    it('orders the first person rollout publication after an in-flight default policy reader', async () => {
+      const f = await setup();
+      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+      const held = deferred<number>();
+      const release = deferred<void>();
+      let publish: ReturnType<typeof updateDEntryReleasePolicy> | undefined;
+      const read = fixture.db.begin(async (tx) => {
+        const policy = await readDEntryReleasePolicy(tx, true);
+        const [backend] = await tx`select pg_backend_pid() pid`;
+        held.resolve(backend!.pid);
+        await release.promise;
+        return policy;
+      });
+      try {
+        const blocker = await held.promise;
+        publish = updateDEntryReleasePolicy(f.context, {
+          revision: 'caller-revision',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: f.org, personId: f.user }],
+        });
+        void publish.catch(() => {});
+        await expect
+          .poll(async () => {
+            const [wait] =
+              await fixture.db`select exists(select 1 from pg_stat_activity a
+                where ${blocker}::integer=any(pg_blocking_pids(a.pid))
+                  and a.wait_event='advisory') blocked`;
+            return wait!.blocked;
+          })
+          .toBe(true);
+        expect((await readDEntryReleasePolicy()).revision).toBe('unpublished');
+        release.resolve();
+        expect((await read).revision).toBe('unpublished');
+        const published = await publish;
+        expect(published.selections).toEqual([
+          { organizationId: f.org, personId: f.user },
+        ]);
+        expect(await readDEntryReleasePolicy()).toEqual(published);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([read, publish]);
+        await clearPublished();
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', '');
+      }
+    });
     it('maps the real login cookie to current person/employee/root without starting a VM', async () => {
       const f = await setup();
       const req = request(f);
@@ -1402,14 +1433,7 @@ suite(
       const policy = {
         revision: 'caller-revision-is-not-authority',
         defaultGeneration: '3.x' as const,
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0' as const,
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       };
       expect(await readDEntryReleasePolicy()).toEqual({
         revision: 'unpublished',
@@ -1504,14 +1528,7 @@ suite(
       const policy = {
         revision: 'synthetic-approved-policy',
         defaultGeneration: '3.x' as const,
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0' as const,
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       };
       for (const selection of [existing, newThread])
         expect(
@@ -1834,8 +1851,7 @@ suite(
         const initial = {
           revision: 'initial',
           defaultGeneration: '3.x' as const,
-          selections: [],
-          personSelections: [{ organizationId: f.org, personId: ownerId }],
+          selections: [{ organizationId: f.org, personId: ownerId }],
         };
         await updateDEntryReleasePolicy(f.context, initial);
         expect(await findDEntryCreationWorkspace(owner)).toBe(f.workspace);
@@ -1988,7 +2004,7 @@ suite(
         expect(row?.n).toBe(1);
         await updateDEntryReleasePolicy(f.context, {
           ...initial,
-          personSelections: [],
+          selections: [],
         });
         await expect(
           requireDEntryNativeIdentity(owner, native),
@@ -2068,14 +2084,7 @@ suite(
       await updateDEntryReleasePolicy(f.context, {
         revision: 'initial',
         defaultGeneration: '3.x',
-        selections: [
-          {
-            organizationId: f.org,
-            personId: f.user,
-            employeeInstanceId: f.assignment,
-            generation: '4.0',
-          },
-        ],
+        selections: [{ organizationId: f.org, personId: f.user }],
       });
       try {
         expect(

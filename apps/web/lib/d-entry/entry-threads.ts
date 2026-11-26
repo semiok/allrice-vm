@@ -58,26 +58,14 @@ export async function findDEntryCreationWorkspace(context: RequestContext) {
 
 /** Bare entry discovers only the current login's explicitly enabled employees. */
 export async function findDEntryEmployee(context: RequestContext) {
-  if (context.actor.type !== 'user') return null;
-  const policy = await readDEntryReleasePolicy();
-  const personReleased = hasDEntryPersonRelease(policy, {
-    organizationId: context.organizationId,
-    personId: context.actor.id,
-  });
-  const enabled = policy.selections.filter(
-    (item) =>
-      item.organizationId === context.organizationId &&
-      item.personId === context.actor.id &&
-      item.generation === '4.0',
-  );
-  if (!personReleased && !enabled.length) return null;
+  if (context.actor.type !== 'user' || !(await isDEntryPersonReleased(context)))
+    return null;
   const sql = getDatabase();
   const candidates = await sql<{ id: string; workspace_id: string }[]>`
     select id,workspace_id from allrice_employee_instances
     where organization_id=${context.organizationId} and owner_id=${context.actor.id}
       and (${context.workspaceId}::uuid is null or workspace_id=${context.workspaceId})
       and archived_at is null
-      and (${personReleased} or id=any(${sql.array(enabled.map(({ employeeInstanceId }) => employeeInstanceId))}::uuid[]))
     order by (kind='general') desc,created_at,id`;
   for (const candidate of candidates) {
     const selection = {

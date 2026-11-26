@@ -58,51 +58,25 @@ export const DEntryRolloutPolicySchema = z
   .object({
     revision: z.string().min(1),
     defaultGeneration: ExecutionGenerationSchema,
-    personSelections: z
-      .array(
-        z.object({ organizationId: UuidSchema, personId: UuidSchema }).strict(),
-      )
-      .optional(),
     selections: z.array(
-      z
-        .object({
-          organizationId: UuidSchema,
-          personId: UuidSchema,
-          employeeInstanceId: UuidSchema,
-          generation: ExecutionGenerationSchema,
-        })
-        .strict(),
+      z.object({ organizationId: UuidSchema, personId: UuidSchema }).strict(),
     ),
   })
   .strict()
   .superRefine((policy, ctx) => {
     const people = new Set<string>();
-    for (const [index, { organizationId, personId }] of (
-      policy.personSelections ?? []
-    ).entries()) {
-      const key = JSON.stringify([organizationId, personId]);
-      if (people.has(key))
-        ctx.addIssue({
-          code: 'custom',
-          message: 'Duplicate person selection',
-          path: ['personSelections', index],
-        });
-      people.add(key);
-    }
-    const keys = new Set<string>();
     for (const [index, selection] of policy.selections.entries()) {
       const key = JSON.stringify([
         selection.organizationId,
         selection.personId,
-        selection.employeeInstanceId,
       ]);
-      if (keys.has(key))
+      if (people.has(key))
         ctx.addIssue({
           code: 'custom',
-          message: 'Duplicate employee selection',
+          message: 'Duplicate person selection',
           path: ['selections', index],
         });
-      keys.add(key);
+      people.add(key);
     }
   });
 export type DEntryRolloutPolicy = z.infer<typeof DEntryRolloutPolicySchema>;
@@ -111,12 +85,10 @@ export function hasDEntryPersonRelease(
   policy: DEntryRolloutPolicy,
   identity: Pick<DEntryIdentity, 'organizationId' | 'personId'>,
 ) {
-  return (
-    policy.personSelections?.some(
-      (selection) =>
-        selection.organizationId === identity.organizationId &&
-        selection.personId === identity.personId,
-    ) ?? false
+  return policy.selections.some(
+    (selection) =>
+      selection.organizationId === identity.organizationId &&
+      selection.personId === identity.personId,
   );
 }
 
@@ -127,15 +99,7 @@ export function selectDEntryGeneration(
 ): ExecutionGeneration {
   const policy = DEntryRolloutPolicySchema.parse(policyInput);
   const identity = DEntryIdentitySchema.parse(identityInput);
-  if (hasDEntryPersonRelease(policy, identity)) return '4.0';
-  return (
-    policy.selections.find(
-      (selection) =>
-        selection.organizationId === identity.organizationId &&
-        selection.personId === identity.personId &&
-        selection.employeeInstanceId === identity.employeeInstanceId,
-    )?.generation ?? policy.defaultGeneration
-  );
+  return hasDEntryPersonRelease(policy, identity) ? '4.0' : '3.x';
 }
 
 // Browser-safe mount references only; no guest URL, cookie, token or disk path.
