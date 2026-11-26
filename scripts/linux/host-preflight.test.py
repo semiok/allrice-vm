@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -11,10 +12,14 @@ spec = importlib.util.spec_from_file_location('host_preflight', script)
 host = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(host)
 UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+LUKS = '11111111-2222-3333-4444-555555555555'
+MAPPER_ID = 'CRYPT-LUKS2-' + LUKS.replace('-', '') + '-qa'
 
 
 def mount(path, **overrides):
     result = dict(target=str(path), source='/dev/mapper/qa', fstype='xfs', uuid=UUID, options='rw,nosuid')
+    device = Path(path).stat().st_dev if Path(path).exists() else None
+    result['maj:min'] = f'{os.major(device)}:{os.minor(device)}' if device is not None else '253:7'
     return json.dumps({'filesystems': [{**result, **overrides}]})
 
 
@@ -44,14 +49,15 @@ class PreflightTests(unittest.TestCase):
 
     def test_luks_guard_requires_exact_mount_uuid_and_luks2(self):
         path = Path('/scratch')
-        command = Mock(side_effect=[mount(path), '  type: LUKS2\n  mode: read/write\n'])
-        host.verify_luks2(path, UUID, command)
-        command.assert_called_with('/usr/sbin/cryptsetup', 'status', '/dev/mapper/qa')
+        read = Mock(return_value=MAPPER_ID)
+        host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path)), read)
+        read.assert_called_once_with('253:7')
         for override in [{'uuid': 'wrong'}, {'options': 'ro'}, {'fstype': 'ext4'}, {'source': '/dev/vdb'}]:
             with self.assertRaises(RuntimeError):
-                host.verify_luks2(path, UUID, Mock(return_value=mount(path, **override)))
+                host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path, **override)), read)
         with self.assertRaisesRegex(RuntimeError, 'LUKS2'):
-            host.verify_luks2(path, UUID, Mock(side_effect=[mount(path), '  type: LUKS1\n']))
+            host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path)), Mock(return_value='CRYPT-LUKS1-wrong'))
+
 
     def test_reflink_protocol_checks_cow_and_cleans_its_scratch_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -63,7 +69,7 @@ class PreflightTests(unittest.TestCase):
                 self.assertEqual(args[:3], ('/usr/bin/cp', '--reflink=always', '--'))
                 shutil.copyfile(args[3], args[4])  # Simulate a successful kernel COW command.
 
-            host.verify_reflink(path, UUID, clone_or_findmnt)
+            host.verify_reflink(path, UUID, LUKS, clone_or_findmnt, Mock(return_value=MAPPER_ID))
             self.assertEqual(list(path.iterdir()), [])
 
             def reject_clone(*args):
@@ -72,7 +78,7 @@ class PreflightTests(unittest.TestCase):
                 raise RuntimeError('unsupported reflink')
 
             with self.assertRaisesRegex(RuntimeError, 'unsupported reflink'):
-                host.verify_reflink(path, UUID, reject_clone)
+                host.verify_reflink(path, UUID, LUKS, reject_clone, Mock(return_value=MAPPER_ID))
             self.assertEqual(list(path.iterdir()), [])
 
     def test_dependency_plan_has_no_effect_until_explicitly_applied_as_operator(self):

@@ -56,7 +56,7 @@ def read_mount(path, expected_uuid, command=run):
         raise RuntimeError('an explicit filesystem UUID is required')
     data = json.loads(command(
         '/usr/bin/findmnt', '--json', '--mountpoint', str(path),
-        '--output', 'TARGET,SOURCE,FSTYPE,UUID,OPTIONS',
+        '--output', 'TARGET,SOURCE,FSTYPE,UUID,OPTIONS,MAJ:MIN',
     ))
     entries = data.get('filesystems')
     if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
@@ -68,15 +68,21 @@ def read_mount(path, expected_uuid, command=run):
     return mount
 
 
-def verify_luks2(path, expected_uuid, command=run):
+def read_dm_uuid(device):
+    return (Path('/sys/dev/block') / device / 'dm/uuid').read_text().strip()
+
+
+def verify_luks2(path, expected_uuid, luks_uuid, command=run, dm_uuid=read_dm_uuid):
     mount = read_mount(path, expected_uuid, command)
-    source = mount.get('source')
+    source, device = mount.get('source'), mount.get('maj:min')
     if (mount.get('fstype') != 'xfs' or not isinstance(source, str) or
-            not re.fullmatch(r'/dev/(mapper/[A-Za-z0-9_-]+|dm-[0-9]+)', source)):
+            not re.fullmatch(r'/dev/(mapper/[A-Za-z0-9_-]+|dm-[0-9]+)', source) or
+            not isinstance(device, str) or not re.fullmatch(r'[0-9]+:[0-9]+', device)):
         raise RuntimeError('the separate scratch volume must be XFS on dm-crypt')
-    status = command('/usr/sbin/cryptsetup', 'status', source)
-    if not re.search(r'^\s*type:\s*LUKS2\s*$', status, re.M):
-        raise RuntimeError('scratch mapper is not confirmed LUKS2')
+    if not FS_UUID.fullmatch(luks_uuid) or not dm_uuid(device).startswith(
+        'CRYPT-LUKS2-' + luks_uuid.replace('-', '') + '-',
+    ):
+        raise RuntimeError('scratch mapper is not the expected LUKS2 volume')
     return mount
 
 
@@ -93,13 +99,16 @@ def verify_kvm(uid, open_device=os.open, ioctl=fcntl.ioctl, close=os.close):
         close(fd)
 
 
-def verify_reflink(path, expected_uuid, command=run):
-    mount = read_mount(path, expected_uuid, command)
-    if mount.get('fstype') != 'xfs':
-        raise RuntimeError('expected XFS for the reflink check')
+def verify_reflink(path, expected_uuid, luks_uuid, command=run, dm_uuid=read_dm_uuid):
+    mount = verify_luks2(path, expected_uuid, luks_uuid, command, dm_uuid)
+    device = path.stat().st_dev
+    if mount['maj:min'] != f'{os.major(device)}:{os.minor(device)}':
+        raise RuntimeError('scratch device changed before the reflink check')
     # Do not accept a global sample on a different mount or cp's fallback mode.
     # Use a unique directory on the explicit disposable XFS test filesystem.
     with tempfile.TemporaryDirectory(prefix='.allrice-reflink-', dir=path) as directory:
+        if Path(directory).stat().st_dev != device:
+            raise RuntimeError('scratch device changed during the reflink check')
         source = Path(directory) / 'source'
         clone = Path(directory) / 'clone'
         data = b'fixture before copy' * 4096
@@ -111,6 +120,7 @@ def verify_reflink(path, expected_uuid, command=run):
             file.write(b'changed')
         if source.read_bytes() != data or clone.read_bytes() == data:
             raise RuntimeError('strict reflink did not isolate the write')
+    return mount
 
 
 def install_dependencies(uid, apply, command=run):
@@ -131,6 +141,7 @@ def main():
         check = actions.add_parser(action)
         check.add_argument('--scratch-mount', required=True)
         check.add_argument('--scratch-uuid', required=True)
+        check.add_argument('--scratch-luks-uuid', required=True)
         if action == 'check-runtime':
             check.add_argument('--data-uuid', required=True)
             check.add_argument('--node', required=True)
@@ -147,26 +158,32 @@ def main():
     if str(scratch) == '/' or scratch == Path(DATA_MOUNT) or Path(DATA_MOUNT) in scratch.parents:
         raise RuntimeError('a separate disposable mount is required')
     if args.action == 'check-luks':
-        verify_luks2(scratch, args.scratch_uuid)
-        print(json.dumps({'luks2': True, 'scratchUuid': args.scratch_uuid}))
+        mount = verify_luks2(scratch, args.scratch_uuid, args.scratch_luks_uuid)
+        status = run('/usr/sbin/cryptsetup', 'status', mount['source'])
+        if not re.search(r'^\s*type:\s*LUKS2\s*$', status, re.M):
+            raise RuntimeError('cryptsetup did not confirm the scratch mapper')
+        print(json.dumps({'luks2': True, 'scratchUuid': args.scratch_uuid,
+                          'scratchLuksUuid': args.scratch_luks_uuid, 'device': mount['maj:min']}))
         return
 
     if args.data_uuid == args.scratch_uuid:
         raise RuntimeError('data and scratch filesystems must differ')
-    read_mount(require_path(DATA_MOUNT), args.data_uuid)
+    data = read_mount(require_path(DATA_MOUNT), args.data_uuid)
     verify_kvm(os.geteuid())
     for required in ('/sys/fs/cgroup/cgroup.controllers', '/proc/pressure/memory'):
         if not Path(required).is_file():
             raise RuntimeError('cgroup v2 and memory PSI are required')
-    verify_reflink(scratch, args.scratch_uuid)
+    mount = verify_reflink(scratch, args.scratch_uuid, args.scratch_luks_uuid)
     if run(str(require_path(args.node)), '--version').strip() != 'v22.23.2':
         raise RuntimeError('unexpected release Node version')
     msb = str(require_path(args.msb))
     if not re.search(r'\b0\.7\.16\b', run(msb, '--version')):
         raise RuntimeError('unexpected release MSB version')
-    run(msb, 'doctor', timeout=60)
-    print(json.dumps({'kvmApi': 12, 'reflink': True, 'msbDoctor': True,
-                      'kernel': platform.release(), 'pageBytes': os.sysconf('SC_PAGE_SIZE')}))
+    print(json.dumps({'kvmApi': 12, 'reflink': True, 'msbVersion': '0.7.16',
+                      'dataUuid': args.data_uuid, 'dataDevice': data['maj:min'],
+                      'scratchUuid': args.scratch_uuid, 'scratchLuksUuid': args.scratch_luks_uuid,
+                      'scratchDevice': mount['maj:min'], 'kernel': platform.release(),
+                      'pageBytes': os.sysconf('SC_PAGE_SIZE')}))
 
 
 if __name__ == '__main__':
