@@ -8,7 +8,7 @@ m5-test HEAD --on m5 --db --build 'python3 scripts/m1/snow-reset/rehearse.py && 
 
 SQL 按企业及 snow 用户 ID 枚举实例、会话、Run、派驻和已核实的本人私有员工源。按正向外键关系找从属行，保留共用员工版本和对象。已验证的 message-based Memory 也纳入。遇到未审从属表、跨人引用、非终态 Run、未归还 job lease、删除环或外键错误，整笔回滚。演练在同一事务只暂停四个已列出的不可变拦截器，外键始终启用，检查触发器恢复。对象存储、工作流、定时、审核、插件等若出现未审关联，需按实际库存补足清单。演练成功不证明 snow 实际数据已覆盖。
 
-VM 演练调用真实的 `PersonVmService.delete(…, {deleteDisk: true}, …)`，模拟 store、native 和 disk，验证单独的删盘权限、只删除匹配本人、第二次不再删盘。生产 authority 当前仅授权 read/create/start（`apps/worker/src/person-vm/production-authority.ts`），生产 Host 对外接口只有自身收尾和模型恢复（`production-host.ts`）。等 Host owner 提供经授权且绑定精确 VM 的调用入口，再把此阶段纳入正式包。不得用 SQL 改 VM 状态、另造生产 authority 或直接删除文件。VM 的 `deleted` 行和审计证据允许保留，物理 disk 与 native VM 必须无存留。
+VM 演练调用真实的 `PersonVmService.delete(…, {deleteDisk: true}, …)`，模拟 store、native 和 disk，验证单独的删盘权限、只删除匹配本人、第二次不再删盘。生产 authority 当前仅授权 read/create/start（`apps/worker/src/person-vm/production-authority.ts`），生产 Host 对外接口只有自身收尾和模型恢复（`production-host.ts`）。等 Host owner 提供经授权且绑定精确 VM 的调用入口，再把此阶段纳入正式包。不得用 SQL 改 VM 状态、另造生产 authority 或直接删除文件。服务保存的 `deleted` 行和审计可以保留。现有 service 接受 native `stopped` 或 `absent` 作为停止证明，演练覆盖的是停止、卸载与删盘。正式入口还须提供物理盘、密钥以及原生实例和挂载无存留的独立证据，不能用 `deleted` 回执代替。
 
 ## 正式执行前置及顺序
 
