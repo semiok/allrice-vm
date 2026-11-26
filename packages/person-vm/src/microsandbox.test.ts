@@ -110,7 +110,7 @@ else if(a[0]==='inspect'){
  console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports},mounts},active_config:{network:{ports:active},mounts:activeMounts},pending_changes:[]}));
 }
 else if(a[0]==='start'){v.retained=true;v.status='Running';}
-else if(a[0]==='stop'){if(!['lost-id-unknown-stop','auth-unknown-stop','web-inspect-unknown-stop'].includes(mode))v.status='Stopped';}
+else if(a[0]==='stop'){if(!['lost-id-unknown-stop','workdir-lost-id-unknown-stop','auth-unknown-stop','web-inspect-unknown-stop'].includes(mode))v.status='Stopped';}
 else if(a[0]==='ping'){if(v.status!=='Running')process.exit(41);}
 else if(a[0]==='cp'){
  const meta=fs.statSync(a[1]);(v.copies??=[]).push({target:a[2],mode:meta.mode&511,contents:fs.readFileSync(a[1],'utf8')});
@@ -118,12 +118,16 @@ else if(a[0]==='cp'){
 }
 else if(a[0]==='exec'){
  if(!a.includes('--detach')){
+  const cmd=a.slice(a.indexOf('--')+1);
+  if(cmd.join(' ')==='node -e diagnostic'){
+   if(a[a.indexOf('--workdir')+1]!=='/work'||!Object.values(v.jobs??{}).some(j=>j.cmd.join(' ')==='/bin/mkdir -p -- /work'&&j.state==='exited'&&j.code===0))process.exit(47);
+   console.log('synthetic-exec-protocol');return;
+  }
   // v0.7.16 exec uses parse_duration_secs, not the separate ms parser.
   if(!/^[0-9]+[smh]?$/.test(a[a.indexOf('--timeout')+1]??''))process.exit(44);
   if(mode==='auth-budget'){
    fs.writeFileSync(p.join(home,'auth-reading'),String(process.pid));setInterval(()=>{},1000);return;
   }
-  const cmd=a.slice(a.indexOf('--')+1);
   process.exit(require('node:child_process').spawnSync(process.execPath,cmd.slice(1),{stdio:'inherit'}).status??1);
  }
  if(!a.includes('--detach')||!a.includes('--no-stdin')||!a.includes('--no-tty'))process.exit(42);
@@ -132,7 +136,7 @@ else if(a[0]==='exec'){
  if(workdir&&(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/bin'||a[a.indexOf('--timeout')+1]!=='10s'))process.exit(46);
  const code=workdir&&mode==='workdir-init-error'?47:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0;
  (v.jobs??={})[id]={cmd,code};save();
- if(!(init&&mode.startsWith('lost-id')))console.log(id);
+ if(!(init&&mode.startsWith('lost-id'))&&!(workdir&&mode.startsWith('workdir-lost-id')))console.log(id);
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
 else if(a[0]==='logs'){
@@ -147,7 +151,7 @@ else if(a[0]==='logs'){
 else if(a[0]==='wait'){
  const job=v.jobs[a[a.indexOf('--job')+1]];
  if(mode==='unknown-wait'){console.log('{}');save();process.exit(0);}
- if(((mode==='cancel-init'&&job.cmd.includes('/work/memory/init.cjs'))||(mode==='cancel-memory-probe'&&job.cmd[1]==='-e')||(mode==='cancel-retained-command'&&job.cmd.includes('native-dsh')))&&job.code===0){
+ if(((mode==='cancel-workdir'&&job.cmd.join(' ')==='/bin/mkdir -p -- /work')||(mode==='cancel-init'&&job.cmd.includes('/work/memory/init.cjs'))||(mode==='cancel-memory-probe'&&job.cmd[1]==='-e')||(mode==='cancel-retained-command'&&job.cmd.includes('native-dsh')))&&job.code===0){
   save();fs.writeFileSync(p.join(home,'waiting'),String(process.pid));setInterval(()=>{},1000);return;
  }
  job.state='exited';
@@ -475,11 +479,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toThrow('PROVIDER_FAILED');
     };
     await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
-    expect(
-      (await f.calls()).filter(
-        (a) => a[0] === 'exec' && a.includes('--detach'),
-      ),
-    ).toHaveLength(3); // workdir, staging directory, init
+    expect((await f.calls()).filter((a) => a[0] === 'exec')).toHaveLength(3); // workdir, staging directory, init
   });
   it('实际provider memory reader/observer映射固定node/roots/binding与exact job；retained wait不继承已关闭scope', async () => {
     const f = await bootstrapFixture('ok', undefined, 5000);
@@ -996,9 +996,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       const calls = (await f.calls()).slice(before);
       const verbs = calls.map(([verb]) => verb);
       const start = verbs.indexOf('start');
-      const bootstrap = calls.findIndex(
-        (args) => args[0] === 'exec' && args.includes('--detach'),
-      );
+      const bootstrap = verbs.indexOf('exec');
       expect(start).toBeGreaterThan(0);
       expect(bootstrap).toBeGreaterThan(start);
       expect(verbs[start - 1]).toBe('inspect');
@@ -1311,10 +1309,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         ),
       ).toBe(true);
       const reader = calls.find(
-        (args) =>
-          args[0] === 'exec' &&
-          !args.includes('--detach') &&
-          args.includes('-e'),
+        (args) => args[0] === 'exec' && !args.includes('--detach'),
       )!;
       expect(reader[reader.indexOf('--timeout') + 1]).toBe(
         `${Math.ceil(timeoutMs / 1000)}s`,
@@ -1479,14 +1474,19 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ),
     ).toBe(false);
     await f.service.start(f.rc, signal());
+    expect((await f.calls()).filter((a) => a[0] === 'exec')).toHaveLength(4); // workdir, staging directory, init, DSH
     expect(
-      (await f.calls()).filter(
-        (a) => a[0] === 'exec' && a.includes('--detach'),
+      await f.native.exec(
+        await f.service.resolve(f.rc, signal()),
+        ['node', '-e', 'diagnostic'],
+        signal(),
       ),
-    ).toHaveLength(4); // workdir, staging directory, init, DSH
+    ).toContain('synthetic-exec-protocol');
   });
   it.each([
     'workdir-init-error',
+    'workdir-lost-id',
+    'workdir-lost-id-unknown-stop',
     'init-error',
     'lost-id',
     'lost-id-unknown-stop',
@@ -1497,7 +1497,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
     ).rejects.toMatchObject({
       code:
-        mode === 'lost-id-unknown-stop' || mode === 'unknown-wait'
+        mode.endsWith('unknown-stop') || mode === 'unknown-wait'
           ? 'CLEANUP_INCOMPLETE'
           : 'PROVIDER_FAILED',
     });
@@ -1506,7 +1506,9 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(
       calls.some((a) => a[0] === 'exec' && a.includes('/work/memory/launcher')),
     ).toBe(false);
-    expect(f.h.mounts.size).toBe(mode === 'lost-id-unknown-stop' ? 1 : 0);
+    if (mode.startsWith('workdir-'))
+      expect(calls.some((a) => a[0] === 'cp')).toBe(false);
+    expect(f.h.mounts.size).toBe(mode.endsWith('unknown-stop') ? 1 : 0);
   });
   it.each([1, 3])(
     'rechecks current authority after copy %i before sending another file or initializing',
@@ -1556,45 +1558,48 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ),
     ).toBe(false);
   });
-  it('取消正在wait的init：CLI退出后仍exact kill+wait非零JSON；随后native stop/status', async () => {
-    const f = await bootstrapFixture('cancel-init'),
-      controller = new AbortController();
-    const start = f.service.prewarm(
-      f.rc,
-      { trigger: 'page' },
-      controller.signal,
-    );
-    const failure = expect(start).rejects.toMatchObject({
-      code: 'PROVIDER_FAILED',
-    });
-    let pid = 0;
-    for (let attempt = 0; attempt < 200 && !pid; attempt += 1) {
-      try {
-        pid = Number(
-          await readFile(join(f.mount, 'host-home/waiting'), 'utf8'),
-        );
-      } catch {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+  it.each(['cancel-workdir', 'cancel-init'])(
+    '取消正在wait的 %s：CLI退出后仍exact kill+wait非零JSON；随后native stop/status',
+    async (mode) => {
+      const f = await bootstrapFixture(mode),
+        controller = new AbortController();
+      const start = f.service.prewarm(
+        f.rc,
+        { trigger: 'page' },
+        controller.signal,
+      );
+      const failure = expect(start).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      let pid = 0;
+      for (let attempt = 0; attempt < 200 && !pid; attempt += 1) {
+        try {
+          pid = Number(
+            await readFile(join(f.mount, 'host-home/waiting'), 'utf8'),
+          );
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
       }
-    }
-    controller.abort();
-    await failure;
-    expect(pid).toBeGreaterThan(0);
-    expect(() => process.kill(pid, 0)).toThrow();
-    const calls = await f.calls(),
-      kill = calls.findIndex((a) => a[0] === 'kill');
-    expect(kill).toBeGreaterThan(0);
-    expect(calls[kill + 1]).toEqual([
-      'wait',
-      calls[kill]![1],
-      '--job',
-      calls[kill]![3],
-      '--format',
-      'json',
-    ]);
-    expect(calls.findIndex((a) => a[0] === 'stop')).toBeGreaterThan(kill + 1);
-    expect(f.h.mounts.size).toBe(0);
-  });
+      controller.abort();
+      await failure;
+      expect(pid).toBeGreaterThan(0);
+      expect(() => process.kill(pid, 0)).toThrow();
+      const calls = await f.calls(),
+        kill = calls.findIndex((a) => a[0] === 'kill');
+      expect(kill).toBeGreaterThan(0);
+      expect(calls[kill + 1]).toEqual([
+        'wait',
+        calls[kill]![1],
+        '--job',
+        calls[kill]![3],
+        '--format',
+        'json',
+      ]);
+      expect(calls.findIndex((a) => a[0] === 'stop')).toBeGreaterThan(kill + 1);
+      expect(f.h.mounts.size).toBe(0);
+    },
+  );
   it('空MSB_HOME公开pull预置、2G硬帽、默认deny、固定host端口、真正stop/start命令', async () => {
     vi.stubEnv('ALLRICE_PERSON_VM_SYNTHETIC_HOST_SECRET', 'must-not-inherit');
     const root = await directory();
@@ -1613,7 +1618,6 @@ else if(a[0]==='create'){if(v.image!==a[1])process.exit(27);v.name=a[a.indexOf('
 else if(a[0]==='stop')v.status='Stopped';
 else if(a[0]==='start')v.status='Running';
 else if(a[0]==='ping'){if(v.status!=='Running')process.exit(29);}
-else if(a[0]==='exec')console.log('synthetic-exec-protocol');
 else process.exit(30);
 fs.writeFileSync(f,JSON.stringify(v));
 `,
@@ -1642,9 +1646,6 @@ fs.writeFileSync(f,JSON.stringify(v));
       signal(),
     );
     await native.ping(binding, signal());
-    expect(
-      await native.exec(binding, ['node', '-e', 'diagnostic'], signal()),
-    ).toContain('synthetic-exec-protocol');
     await native.stop(binding, signal());
     expect(await native.status(binding, signal())).toBe('stopped');
     await native.start(binding, signal());
@@ -1682,17 +1683,6 @@ fs.writeFileSync(f,JSON.stringify(v));
       ),
     ).toEqual(['--root-disk', 'flat:20G,clone=reflink']);
     expect(create.args[create.args.indexOf('--workdir') + 1]).toBe('/');
-    const diagnostic = calls.find(({ args }) =>
-      args.includes('diagnostic'),
-    )!.args;
-    expect(diagnostic.slice(diagnostic.indexOf('--') - 2)).toEqual([
-      '--workdir',
-      '/work',
-      '--',
-      'node',
-      '-e',
-      'diagnostic',
-    ]);
     for (const call of calls) {
       // CoreFoundation can inject this key into a macOS child with an explicit
       // env. Permit only that platform key; every other key remains exact.

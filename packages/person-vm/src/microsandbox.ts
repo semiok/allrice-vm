@@ -678,21 +678,36 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   private async ensureWorkDirectory(scope: PersonVmStartingScope) {
     const { binding, signal } = scope;
     const cleanupTimeoutMs = this.options.jobCleanupTimeoutMs ?? 10_000;
+    let awaitingJobId = false;
     const job = await spawnMicrosandboxManagedProbe(
       {
         scope,
         name: this.name(binding),
         cleanupTimeoutMs,
         executionTimeoutSeconds: 10,
-        command: (args, active, nonzero) =>
-          this.command(binding, args, active, nonzero),
+        command: (args, active, nonzero) => {
+          awaitingJobId = args[0] === 'exec';
+          return this.command(binding, args, active, nonzero);
+        },
       },
       {
         executable: '/bin/mkdir',
         args: ['-p', '--', GUEST_WORK_DIRECTORY],
         workdir: '/bin',
       },
-    );
+    ).catch((error: unknown) => {
+      // Before an exact job ID is available, the startup owner still owns
+      // rollback of the entire VM. Preserve any later exact-job cleanup error.
+      if (
+        awaitingJobId &&
+        error instanceof PersonVmError &&
+        error.code === 'CLEANUP_INCOMPLETE'
+      )
+        throw (
+          error.cause ?? new PersonVmError('PROVIDER_FAILED', { cause: error })
+        );
+      throw error;
+    });
     const result = await job.wait(signal).catch(async (error) => {
       try {
         await job.cancelAndWait(AbortSignal.timeout(cleanupTimeoutMs));
