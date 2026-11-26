@@ -19,7 +19,6 @@ import {
   nativeSubagentReadyKey,
   useNativeSubagents,
 } from './use-native-subagents';
-import { nativeSubagentControlRoot } from './native-subagent-controls';
 import { useNativeQueryStartup } from './use-native-query-startup';
 import { presentationPolicyFor } from './dsh-upstream/presentation/presentation-policy';
 import {
@@ -2996,7 +2995,6 @@ export function ChatFlowClient({
                           key={`${settingsScope}/${activeId}`}
                           workspaceId={workspace.workspaceId}
                           sessionId={activeId}
-                          headers={tenantHeaders}
                           observation={{
                             ...nativeObservation,
                             reads: activeNativeReads,
@@ -3005,25 +3003,6 @@ export function ChatFlowClient({
                           onOpen={openSubagent}
                           openRequest={subagentDirectoryRequest}
                           employeeName={activeEmployeeName}
-                          viewerId={workspace.viewerId}
-                          canControl={
-                            !!workspace.viewerId &&
-                            activeSession?.ownerId === workspace.viewerId &&
-                            !conversationReadOnly
-                          }
-                          controlRoot={
-                            history?.session.id === activeId
-                              ? nativeSubagentControlRoot(
-                                  runViews[
-                                    activeRunMessages.at(-1)?.runId ?? ''
-                                  ],
-                                )
-                              : null
-                          }
-                          presentation={presentationPolicyFor(
-                            preferences.value.transcriptView,
-                            preferences.value.collapseTiming,
-                          )}
                         />
                       ) : (
                         <EmptyNativeSubagentDirectory key={settingsScope} />
