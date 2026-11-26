@@ -182,6 +182,13 @@ export interface PersonVmNativeActivityPort {
     signal: AbortSignal,
     purpose?: 'inspection' | 'stop-guard',
   ): Promise<PersonVmNativeActivityObservation>;
+  /** The stop provider calls this synchronously at the final dispatch boundary
+   * for a sampled observation, after any asynchronous authority checks. */
+  assertSampleCurrent?(
+    binding: PersonVmBinding,
+    cursor: PersonVmActivityCursor,
+    signal: AbortSignal,
+  ): void;
   subscribe(
     binding: PersonVmBinding,
     signal: AbortSignal,

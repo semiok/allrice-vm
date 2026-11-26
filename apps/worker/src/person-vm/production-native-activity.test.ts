@@ -90,6 +90,13 @@ function harness() {
       activity = create(instance.signal);
       // Even a caller holding its old candidate cannot carry it into a new owner.
     },
+    assertDispatch(
+      cursor: NonNullable<
+        Awaited<ReturnType<typeof activity.observe>>['coverage']['cursor']
+      >,
+    ) {
+      activity.assertSampleCurrent(binding, cursor, signal);
+    },
     async sample(slot: number, purpose?: 'stop-guard') {
       mono = slot * period;
       const snapshot = await activity.observe(binding, signal, purpose);
@@ -172,6 +179,17 @@ it('blocks an active schedule at the configured inclusive safety boundary', asyn
     eligible: false,
     snapshot: { status: 'busy', coverage: { state: 'unknown' } },
   });
+});
+
+it('rejects dispatch if a control event arrives after the final live recheck', async () => {
+  const h = harness();
+  for (let slot = 0; slot <= 20; slot++) await h.sample(slot);
+  const checked = await h.sample(20.02, 'stop-guard');
+  const cursor = checked.snapshot.coverage.cursor!;
+  expect(checked.eligible).toBe(true);
+  expect(() => h.assertDispatch(cursor)).not.toThrow();
+  h.second.event();
+  expect(() => h.assertDispatch(cursor)).toThrow('ACTIVITY_UNKNOWN');
 });
 
 it('starts a new window and source identity after Worker restart', async () => {

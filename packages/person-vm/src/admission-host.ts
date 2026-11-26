@@ -1161,6 +1161,7 @@ export class PersonVmAdmissionHost
     previous: IdleCandidate | undefined,
     signal: AbortSignal,
     purpose: 'inspection' | 'stop-guard',
+    onSample?: (cursor: PersonVmActivityCursor) => void,
   ) {
     if (
       !this.options.nativeActivity ||
@@ -1200,6 +1201,8 @@ export class PersonVmAdmissionHost
       !sameBinding(native.activity.binding, binding) ||
       native.activity.state !== 'known' ||
       coverage.state === 'unknown' ||
+      (coverage.state === 'sampled' &&
+        !this.options.nativeActivity.assertSampleCurrent) ||
       !coverage.idleSince ||
       !(Date.parse(coverage.from) <= Date.parse(coverage.idleSince)) ||
       !(Date.parse(coverage.idleSince) <= through) ||
@@ -1219,7 +1222,7 @@ export class PersonVmAdmissionHost
       ].every((count) => count === 0)
     )
       return undefined;
-    return advanceIdleCandidate(
+    const candidate = advanceIdleCandidate(
       previous,
       binding,
       [g.coverage, e.coverage, native.coverage],
@@ -1227,6 +1230,8 @@ export class PersonVmAdmissionHost
       row,
       this.mono(),
     );
+    if (candidate && coverage.state === 'sampled') onSample?.(coverage.cursor);
+    return candidate;
   }
   async reconcileIdle(
     context: RequestContext,
@@ -1335,6 +1340,7 @@ export class PersonVmAdmissionHost
         async (owned) => {
           const current = AbortSignal.any([signal, owned.signal]);
           return this.trackOwner(binding.personId, current, async (active) => {
+            let sample: PersonVmActivityCursor | undefined;
             const assertStopCurrent = async (probe: AbortSignal) => {
               const checking = AbortSignal.any([active, probe]);
               await owned.guard();
@@ -1344,6 +1350,9 @@ export class PersonVmAdmissionHost
                 candidate,
                 checking,
                 'stop-guard',
+                (current) => {
+                  sample = current;
+                },
               );
               if (
                 latest !== candidate ||
@@ -1379,15 +1388,25 @@ export class PersonVmAdmissionHost
                 await assertStopCurrent(probe);
                 assertWakeWindow();
               },
-              scheduled &&
-                (async (dispatchSignal, stop) => {
-                  await owned.guard();
-                  dispatchSignal.throwIfAborted();
-                  await scheduled.dispatch(dispatchSignal, (fenced) => {
-                    assertWakeWindow();
-                    return stop(fenced);
-                  });
-                }),
+              scheduled || sample
+                ? async (dispatchSignal, stop) => {
+                    await owned.guard();
+                    const dispatch = (fenced: AbortSignal) => {
+                      fenced.throwIfAborted();
+                      assertWakeWindow();
+                      if (sample)
+                        this.options.nativeActivity?.assertSampleCurrent?.(
+                          binding,
+                          sample,
+                          fenced,
+                        );
+                      return stop(fenced);
+                    };
+                    if (scheduled)
+                      await scheduled.dispatch(dispatchSignal, dispatch);
+                    else await dispatch(dispatchSignal);
+                  }
+                : undefined,
             );
             this.idle.delete(binding.personId);
             return true;

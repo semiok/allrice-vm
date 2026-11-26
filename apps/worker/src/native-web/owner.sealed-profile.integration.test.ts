@@ -103,6 +103,11 @@ it(
       work: new Set(),
       complete: true,
     });
+    await f.owner.createRootFor(f.context, {}, active);
+    await expect(f.owner.readNativeActivity(guard, active)).resolves.toEqual({
+      work: new Set(),
+      complete: true,
+    });
     assertOneNativeLogin(await f.observeNativeStartup(f.child));
     const patch = await f.observedProfilePatch();
     expect(patch.actual).toEqual([patch.expected]);

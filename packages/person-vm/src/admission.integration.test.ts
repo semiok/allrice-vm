@@ -764,6 +764,13 @@ suite(
                 },
               };
             },
+            assertSampleCurrent(current, cursor, active) {
+              active.throwIfAborted();
+              expect(outcome).toBe('sampled-ok');
+              expect(current).toEqual(binding);
+              expect(cursor).toEqual({ sourceId: 'native-fixture', revision });
+              samplePurposes.push('dispatch');
+            },
             async subscribe() {
               throw new Error('unexpected subscription');
             },
@@ -1030,13 +1037,14 @@ suite(
             'inspection',
             'inspection',
           ]);
-          expect(samplePurposes.slice(3)).toEqual(
+          expect(samplePurposes.slice(3, -1)).toEqual(
             Array.from(
-              { length: samplePurposes.length - 3 },
+              { length: samplePurposes.length - 4 },
               () => 'stop-guard',
             ),
           );
-          expect(samplePurposes.length).toBeGreaterThan(3);
+          expect(samplePurposes.at(-1)).toBe('dispatch');
+          expect(samplePurposes.length).toBeGreaterThan(4);
         }
         if (outcome === 'ok' || outcome === 'sampled-ok') {
           expect(await service.start(rc, signal())).toMatchObject({

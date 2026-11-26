@@ -828,6 +828,15 @@ export function createProductionPersonVmHost(input: {
               }),
             );
           },
+          assertSampleCurrent(binding, cursor, signal) {
+            if (!bound?.nativeActivity?.assertSampleCurrent)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            bound.nativeActivity.assertSampleCurrent(
+              binding,
+              cursor,
+              AbortSignal.any([signal, lifetime]),
+            );
+          },
           subscribe(binding, signal) {
             return own(async () => {
               const active = AbortSignal.any([signal, lifetime]);
@@ -984,10 +993,10 @@ export function createProductionPersonVmHost(input: {
         bound.nativeActivity &&
         scheduledWake
       ) {
+        const period =
+          providers.configuration.lifecycle.idleSampleIntervalMs ??
+          DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
         void own(async () => {
-          const period =
-            providers.configuration.lifecycle.idleSampleIntervalMs ??
-            DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
           let slot = Math.floor(performance.now() / period);
           while (!lifetime.aborted) {
             const delay = Math.max(

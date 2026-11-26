@@ -279,6 +279,33 @@ export function createProductionNativeActivity(
         if (reading && scope) scope.reading = false;
       }
     },
+    assertSampleCurrent(binding, cursor, signal) {
+      signal.throwIfAborted();
+      lifetime.throwIfAborted();
+      const scope = history.get(binding.personId);
+      const window = scope?.window;
+      const current = clock();
+      if (
+        !scope ||
+        !window ||
+        scope.reading ||
+        cursor.sourceId !== sourceId ||
+        cursor.revision !== window.revision ||
+        Math.floor(current.mono / period) !== window.lastSlot ||
+        current.wall < window.lastSample.wall ||
+        Math.abs(
+          current.wall -
+            window.lastSample.wall -
+            (current.mono - window.lastSample.mono),
+        ) > 1_000 ||
+        !matches(scope, binding, startup.activityCatalogs(binding, signal)) ||
+        scope.catalogs.some(
+          ({ owner }, index) =>
+            owner.nativeActivityRevision() !== window.revisions[index],
+        )
+      )
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+    },
     async subscribe(_binding, signal) {
       signal.throwIfAborted();
       lifetime.throwIfAborted();
