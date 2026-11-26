@@ -23,9 +23,6 @@ create table person_vm_scheduled_wakes (
   check ((claim_id is null) = (claim_until is null)),
   check (retry_at is null or state = 'waiting')
 );
-create index person_vm_scheduled_wakes_due
-  on person_vm_scheduled_wakes ((coalesce(retry_at,wake_at)),person_id)
-  where state in ('waiting','claimed');
 create index person_vm_scheduled_wakes_claim_expiry
   on person_vm_scheduled_wakes (claim_until,plan_id)
   where state = 'claimed';

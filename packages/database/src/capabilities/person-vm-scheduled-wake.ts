@@ -125,7 +125,9 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     },
 
     /** Expiry permits reclaim of intent only. The boot port checks the claim
-     * again under the VM lease before touching the exact stopped source. */
+     * again under the VM lease before touching the exact stopped source.
+     * Start from the VM's committed stop so abandoned preparations stay in
+     * the audit history without becoming candidates on every tick. */
     claim(leaseMs: number): Promise<ScheduledWakeClaim | null> {
       return sql.begin(async (tx) => {
         const claimId = randomUUID();
@@ -134,23 +136,26 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             claim_until=now()+${leaseMs}::double precision * interval '1 millisecond',
             retry_at=null,attempts=w.attempts+1,reason=null,updated_at=now()
           from (
-            select p.person_id,p.plan_id from person_vm_scheduled_wakes p
-            join person_virtual_machines vm
-              using (person_id,organization_id,vm_id,instance_id,lease_epoch)
+            select p.plan_id from person_virtual_machines vm
+            join lateral (
+              select a.request_id from person_vm_audit a
+              where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+                and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+                and a.action='stop' and a.result='succeeded'
+              order by a.id desc limit 1
+            ) as last_stop on true
+            join person_vm_scheduled_wakes p on p.plan_id=last_stop.request_id
+              and p.person_id=vm.person_id and p.organization_id=vm.organization_id
+              and p.vm_id=vm.vm_id and p.instance_id=vm.instance_id
+              and p.lease_epoch=vm.lease_epoch
             where vm.phase in ('stopped','cold') and vm.disk_retained
               and vm.egress_receipt is null and vm.lease_owner is null
               and jsonb_array_length(vm.holds)=0
-              and p.plan_id=(
-                select a.request_id from person_vm_audit a
-                where a.person_id=p.person_id and a.organization_id=p.organization_id
-                  and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
-                  and a.action='stop' and a.result='succeeded'
-                order by a.id desc limit 1)
               and coalesce(p.retry_at,p.wake_at)<=now()
               and (p.state='waiting' or (p.state='claimed' and p.claim_until<=now()))
             order by coalesce(p.retry_at,p.wake_at),p.person_id
             limit 1 for update of p skip locked
-          ) as due where w.person_id=due.person_id and w.plan_id=due.plan_id
+          ) as due where w.plan_id=due.plan_id
           returning w.*`;
         if (!row?.target_at) return null;
         await audit(tx, row, claimId, 'claim', 'started');
