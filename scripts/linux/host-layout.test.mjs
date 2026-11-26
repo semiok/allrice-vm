@@ -3,7 +3,7 @@ import { test } from 'vitest';
 import { resolveHostLayout } from './host-layout.mjs';
 
 const vm = 'c38fff6e-7ef5-49e5-b01e-b8dfbe604753';
-const hash = '98bd5fe02e0f23835accf4a52';
+const hash = '98bd5fe02e0f23835accf4a5';
 const linux = { platform: 'linux/arm64', socketRoot: '/run/ar' };
 const darwin = { platform: 'darwin/arm64', socketRoot: '/tmp/ar' };
 const linuxHost = { platform: 'linux', arch: 'arm64' };
