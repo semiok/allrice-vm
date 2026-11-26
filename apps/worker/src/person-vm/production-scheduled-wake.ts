@@ -7,11 +7,7 @@ import {
   readPersonNativeWebRoster,
   type getDatabase,
 } from '@allrice/database';
-import {
-  PersonVmError,
-  type PersonVmBinding,
-  type PersonVmPort,
-} from '@allrice/person-vm';
+import { PersonVmError, type PersonVmBinding } from '@allrice/person-vm';
 import type {
   AssignedNativeWebCatalog,
   createAssignedNativeWebStartup,
@@ -71,7 +67,6 @@ function receiptId(planId: string, employeeInstanceId: string) {
 }
 
 export function createProductionScheduledWake(input: {
-  vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   startup: Pick<ReturnType<typeof createAssignedNativeWebStartup>, 'catalog'>;
   database: ReturnType<typeof getDatabase>;
   source: ProductionScheduledWakeSource;
@@ -120,7 +115,6 @@ export function createProductionScheduledWake(input: {
         async function readCatalogs(signal: AbortSignal) {
           signal.throwIfAborted();
           await request.assertStopCurrent(signal);
-          await input.vm.assertCurrentBinding(context, binding, signal);
           const roster = await readPersonNativeWebRoster(
             context,
             input.database,
@@ -180,8 +174,8 @@ export function createProductionScheduledWake(input: {
             receiptId: receiptId(planId, endpoint.employeeInstanceId),
             schedule: {
               catalog: () =>
-                owner.readScheduleCatalogFor(
-                  context,
+                owner.readScheduleCatalogForStop(
+                  (signal) => request.assertStopCurrent(signal),
                   AbortSignal.any([active, revoked]),
                 ),
             },

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
@@ -656,30 +657,27 @@ export async function openNativeWebOwner(input: {
           notDispatched,
         );
       },
-      /** All reminders in this already-authenticated employee profile. */
-      readScheduleCatalogFor(context: RequestContext, caller: AbortSignal) {
+      /** The host supplies the current stop guard under its physical lease.
+       * Running-only browser authority cannot borrow that lease. */
+      readScheduleCatalogForStop(
+        assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
         const method = SCHEDULE_REMOTE.methods['schedule/catalog'];
         const current = AbortSignal.any([
           caller,
           AbortSignal.timeout(input.launch.auth.timeoutMs),
         ]);
-        return readCurrent(
-          current,
-          (active) => input.vm.assertCurrentBinding(context, binding, active),
-          async (active) => {
-            const args = method.input({ strict: true }).create().parse({});
-            const result = await readUnaryReply(
-              'schedule/catalog',
-              args,
-              active,
-            );
-            const value = replyValue(result);
-            const parsed = method.result.create().parse(value);
-            // The observation ledger must validate the original row, not a
-            // projection from which a protocol decoder dropped unknown fields.
-            return value as typeof parsed;
-          },
-        );
+        return readCurrent(current, assertStopCurrent, async (active) => {
+          const args = method.input({ strict: true }).create().parse({});
+          const result = await readUnaryReply('schedule/catalog', args, active);
+          const value = replyValue(result);
+          const parsed = method.result.create().parse(value);
+          // Reject protocol normalization before the observer hashes rows.
+          if (!isDeepStrictEqual(value, parsed))
+            throw new PersonVmError('PROVIDER_FAILED');
+          return parsed;
+        });
       },
       /** The existing native index supplies the running Host's own graph.
        * The release publisher independently verifies its complete code graph and

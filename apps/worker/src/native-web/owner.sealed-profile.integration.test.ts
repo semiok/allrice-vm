@@ -89,12 +89,15 @@ it(
     expect(f.owner.controlReady()).toBe(true);
     expect((await f.owner.readSessions(active)).ok).toBe(true);
     const revoked = Error('fixture revoked catalogue caller');
-    f.current.mockRejectedValueOnce(revoked);
     await expect(
-      f.owner.readScheduleCatalogFor(f.context, active),
+      f.owner.readScheduleCatalogForStop(async () => {
+        throw revoked;
+      }, active),
     ).rejects.toBe(revoked);
+    const guard = (signal: AbortSignal) =>
+      f.current(f.context, f.launch.binding, signal);
     await expect(
-      f.owner.readScheduleCatalogFor(f.context, active),
+      f.owner.readScheduleCatalogForStop(guard, active),
     ).resolves.toEqual([]);
     assertOneNativeLogin(await f.observeNativeStartup(f.child));
     const patch = await f.observedProfilePatch();
@@ -168,7 +171,7 @@ it(
     expect(second.owner.controlReady()).toBe(true);
     expect((await second.owner.readSessions(active)).ok).toBe(true);
     await expect(
-      second.owner.readScheduleCatalogFor(f.context, active),
+      second.owner.readScheduleCatalogForStop(guard, active),
     ).resolves.toEqual([]);
     assertOneNativeLogin(await f.observeNativeStartup(second.child));
     const secondNonce = nativeWebAuthArtifact(second.launch.auth).path;

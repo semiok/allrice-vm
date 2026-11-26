@@ -819,7 +819,6 @@ export function createProductionPersonVmHost(input: {
       lifetime.throwIfAborted();
       if (bound.scheduledWake) {
         const wake = createProductionScheduledWake({
-          vm,
           startup,
           database: trustedDatabase,
           source: bound.scheduledWake,
