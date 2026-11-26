@@ -636,18 +636,32 @@ suite('real AllRice sidebar in installed native profiles', () => {
         viewerId: randomUUID(),
       },
     );
-    await page
-      .locator('#chat-sidebar')
-      .getByRole('button', { name: '创建员工', exact: true })
-      .click();
-    const notice = page
-      .locator('#chat-sidebar')
-      .getByRole('status')
-      .filter({ hasText: '暂时每人只能创建一个 4.0 员工，多员工马上开放。' });
+    const sidebar = page.locator('#chat-sidebar');
+    const create = sidebar.getByRole('button', {
+      name: '创建员工',
+      exact: true,
+    });
+    const collapse = sidebar.getByRole('button', {
+      name: '收起侧边栏',
+      exact: true,
+    });
+    const limit = '暂时每人只能创建一个 4.0 员工，多员工马上开放。';
+    const notice = sidebar.getByRole('status').filter({ hasText: limit });
+    await create.click();
     await notice.waitFor();
-    expect(await notice.textContent()).toBe(
-      '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
-    );
+    expect(await notice.textContent()).toBe(limit);
+
+    await collapse.click();
+    await sidebar
+      .getByRole('button', { name: '展开侧边栏', exact: true })
+      .waitFor();
+    await notice.waitFor({ state: 'hidden' });
+    expect((await sidebar.boundingBox())!.width).toBeLessThan(100);
+    await create.click();
+    await collapse.waitFor();
+    await notice.waitFor();
+    expect(await notice.textContent()).toBe(limit);
+    expect((await notice.boundingBox())!.width).toBeGreaterThanOrEqual(180);
     expect(
       await page.getByRole('dialog', { name: '创建 AI 员工' }).count(),
     ).toBe(0);

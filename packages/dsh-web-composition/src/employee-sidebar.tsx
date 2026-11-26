@@ -94,7 +94,10 @@ export function EmployeeSidebar({
         // and mounting its VM. The first employee dialog lives at bare entry.
         typeof creation === 'function'
           ? creation
-          : () => setShowCreationLimit(true)
+          : () => {
+              if (collapsed) ctx.layout.toggleSidebar();
+              setShowCreationLimit(true);
+            }
       }
       onOpenArchive={port.openArchive}
       onOpenAutomations={() => {
@@ -107,9 +110,11 @@ export function EmployeeSidebar({
       employeeTree={
         <>
           {snapshot.error && <p role="alert">{snapshot.error}</p>}
-          {typeof creation !== 'function' && showCreationLimit && (
-            <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
-          )}
+          {!collapsed &&
+            typeof creation !== 'function' &&
+            showCreationLimit && (
+              <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
+            )}
           <EmployeeSidebarView
             {...snapshot.tree}
             archive={snapshot.archive}
