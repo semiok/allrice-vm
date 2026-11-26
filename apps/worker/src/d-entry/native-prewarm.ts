@@ -253,6 +253,14 @@ export function createPrewarmOperations(
           await entry.plan.assertTicketThread?.(signal);
         } catch (error) {
           signal.throwIfAborted();
+          // A normal failure joins and closes its observer. A concurrent poll
+          // can have captured 'starting' immediately before that close.
+          if (
+            !entry.revoked.aborted &&
+            entry.state.state === 'failed' &&
+            entry.expires > Date.now()
+          )
+            return entry.state;
           if (!entry.revoked.aborted && !(error instanceof DataAccessError))
             throw new DEntryNativeUnavailable();
           return { state: 'expired' };
@@ -260,7 +268,7 @@ export function createPrewarmOperations(
       }
       if (entry.expires <= Date.now() || (ready && entry.proof?.aborted))
         return { state: 'expired' };
-      return state;
+      return entry.state.state === 'failed' ? entry.state : state;
     },
     async close() {
       await Promise.allSettled(pending);

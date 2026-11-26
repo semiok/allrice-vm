@@ -1052,6 +1052,63 @@ it('keeps the thread observer alive after readiness and expires the original tic
   expect(f.base.authorityClose).toHaveBeenCalledOnce();
 });
 
+it('reports a startup failure when the observer closes during an authenticated poll', async () => {
+  const f = fixture(),
+    finish = deferred<void>(),
+    checked = deferred<void>(),
+    resume = deferred<void>();
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementationOnce(async () => ({
+    ...(await watch()),
+    async assertTicketThread() {
+      if (f.base.authorityClose.mock.calls.length)
+        throw new DataAccessError('authorization_denied');
+    },
+  }));
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      async isCurrent(_context, _identity, _plan, _signal, mode) {
+        if (mode === 'operation') {
+          checked.resolve();
+          await resume.promise;
+        }
+        return true;
+      },
+      prepare: async () => ({ key: 'exact-thread', target: f.base.binding }),
+      async prewarm() {
+        await finish.promise;
+        throw new Error('private native failure');
+      },
+    },
+  });
+  cleanups.push(server.close);
+  try {
+    const reply = await server.request('native-prewarm', {
+      ...f.base.body,
+      trigger: 'page',
+    });
+    expect(reply.status).toBe(202);
+    const { ticket } = await reply.json();
+    const status = prewarmStatus(server, ticket.operationId);
+    await checked.promise;
+    finish.resolve();
+    await vi.waitFor(() =>
+      expect(f.base.authorityClose).toHaveBeenCalledOnce(),
+    );
+    resume.resolve();
+    const response = await status;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      state: 'failed',
+      code: 'START_UNAVAILABLE',
+    });
+  } finally {
+    finish.resolve();
+    resume.resolve();
+  }
+});
+
 it('reports immediate startup failure without exposing native errors', async () => {
   const f = fixture();
   const server = await nativeEntryServer(f.base, {
