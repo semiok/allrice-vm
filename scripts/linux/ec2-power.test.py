@@ -50,7 +50,7 @@ class Ec2PowerTests(unittest.TestCase):
         read, write = power.iam_policy(TARGET)['Statement']
         self.assertEqual(read['Action'], ['ec2:DescribeInstances'])
         self.assertEqual(read['Condition']['StringEquals']['aws:RequestedRegion'], TARGET['region'])
-        self.assertEqual(write['Action'], ['ec2:StartInstances', 'ec2:StopInstances'])
+        self.assertEqual(write['Action'], ['ec2:StartInstances'])
         self.assertEqual(write['Resource'], 'arn:aws:ec2:us-east-1:123456789012:instance/i-01234567890abcdef')
 
     def test_targets_are_pinned_and_redirect_like_health_urls_are_rejected(self):
@@ -134,8 +134,11 @@ sso_start_url = https://example.awsapps.com/start
 
         with patch.object(power, 'build_opener', return_value=Mock(open=Mock(return_value=ReadyResponse()))):
             self.assertTrue(power.health_ready(TARGET))
-            body['maintenance'] = {'state': 'draining'}
-            self.assertFalse(power.health_ready(TARGET))
+            body['maintenance'] = {'state': 'open'}
+            self.assertTrue(power.health_ready(TARGET))
+            for state in ('requested', 'quiesced', 'unknown'):
+                body['maintenance'] = {'state': state}
+                self.assertFalse(power.health_ready(TARGET))
             body.pop('maintenance')
             body['identity']['manifestDigest'] = 'wrong'
             self.assertFalse(power.health_ready(TARGET))

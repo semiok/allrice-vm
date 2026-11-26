@@ -47,7 +47,7 @@ def iam_policy(target):
         'Statement': [
             {'Effect': 'Allow', 'Action': ['ec2:DescribeInstances'], 'Resource': '*',
              'Condition': {'StringEquals': {'aws:RequestedRegion': region}}},
-            {'Effect': 'Allow', 'Action': ['ec2:StartInstances', 'ec2:StopInstances'], 'Resource': instance,
+            {'Effect': 'Allow', 'Action': ['ec2:StartInstances'], 'Resource': instance,
              'Condition': {'StringEquals': {f'ec2:ResourceTag/{TAG}': TAG_VALUE}}},
         ],
     }
@@ -123,12 +123,16 @@ def health_ready(target):
                 return False
             document = json.loads(data)
             identity = document['identity']
+            maintenance = document.get('maintenance')
+            open_for_use = maintenance is None or (
+                isinstance(maintenance, dict) and maintenance.get('state') == 'open'
+            )
             return (document['status'] == 'ready' and identity['service'] == 'web'
                     and identity['environment'] == 'dev' and identity['mode'] == 'production'
                     and identity['repository'] == 'semiok/allrice-vm' and identity['repositoryId'] == 1469490636
                     and identity['sourceSha'] == target['release'] and identity['sourceTree'] == target['tree']
                     and identity['manifestDigest'] == target['manifestDigest']
-                    and not document.get('maintenance'))
+                    and open_for_use)
     except (URLError, KeyError, TypeError, ValueError, TimeoutError):
         return False
 
