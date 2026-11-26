@@ -94,7 +94,7 @@ it('never restarts an expired ticket or polls after the browser abandons its wai
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
-it.each(['deadline', 'gateway', 'network'])(
+it.each(['deadline', 'gateway', 'network', 'truncated status'])(
   'resumes a paused wait with the original ticket after %s',
   async (reason) => {
     vi.useFakeTimers();
@@ -106,6 +106,7 @@ it.each(['deadline', 'gateway', 'network'])(
     const fetch = vi
       .fn<typeof globalThis.fetch>(async () => {
         if (reason === 'network') throw new TypeError('Failed to fetch');
+        if (reason === 'truncated status') return new Response('{');
         return reason === 'gateway'
           ? new Response(null, { status: 503 })
           : Response.json({ state: 'starting' });

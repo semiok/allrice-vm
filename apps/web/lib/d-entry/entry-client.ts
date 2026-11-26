@@ -129,10 +129,14 @@ export async function prewarmEmployeeEntry(
       if (response.status >= 500) throw new EmployeeEntryError(408);
       if (response.status !== 200 && response.status !== 410)
         throw new EmployeeEntryError(response.status);
-      const status = DEntryNativePrewarmStatusSchema.parse(
-        await response.json(),
-      );
+      const body = await response.json().catch((error: unknown) => {
+        request.throwIfAborted();
+        if (error instanceof TypeError || error instanceof SyntaxError)
+          throw new EmployeeEntryError(408);
+        throw error;
+      });
       request.throwIfAborted();
+      const status = DEntryNativePrewarmStatusSchema.parse(body);
       if (response.status === 410 || status.state === 'expired')
         throw new EmployeeEntryError(410);
       if (status.state === 'failed')
