@@ -67,8 +67,10 @@ const policy = {
     },
   ],
 };
-const route = (params = selection, request = new Request(origin + path)) =>
-  GET(request, { params: Promise.resolve(params) });
+const route = (
+  params: Awaited<Parameters<typeof GET>[1]['params']> = selection,
+  request = new Request(origin + path),
+) => GET(request, { params: Promise.resolve(params) });
 
 beforeEach(() => {
   vi.resetAllMocks();
