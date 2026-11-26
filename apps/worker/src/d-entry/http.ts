@@ -6,8 +6,10 @@ import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import {
   DEntryNativeOwnerRequestSchema,
+  DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmRequestSchema,
   DEntryNativePrewarmResultSchema,
+  DEntryNativePrewarmStatusQuerySchema,
   DEntryNativeResourceRequestSchema,
   sameDEntryIdentity,
 } from '@allrice/contracts';
@@ -40,6 +42,7 @@ import {
   ownDEntryCatalog,
 } from './native-data.js';
 import {
+  createPrewarmOperations,
   dEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
 } from './native-prewarm.js';
@@ -147,15 +150,24 @@ export function createDEntryHttpHandler(
   serviceSignal?: AbortSignal,
 ) {
   const lifetime = new AbortController();
+  const workerLifetime = serviceSignal
+    ? AbortSignal.any([lifetime.signal, serviceSignal])
+    : lifetime.signal;
   const pending = new Set<Promise<boolean>>();
   const cleanupErrors: unknown[] = [];
+  const prewarm = createPrewarmOperations(workerLifetime, (error) =>
+    cleanupErrors.push(error),
+  );
+  const statusPath = '/internal/d-entry/native-prewarm/status';
   let closing: Promise<void> | undefined;
   const handle = async (
     request: IncomingMessage,
     response: ServerResponse,
     stopping = false,
   ) => {
-    const path = request.url;
+    const statusRequest =
+      request.url === statusPath || request.url?.startsWith(statusPath + '?');
+    const path = statusRequest ? statusPath : request.url;
     if (
       ![
         '/internal/d-entry/native-owner',
@@ -163,15 +175,12 @@ export function createDEntryHttpHandler(
         '/internal/d-entry/native-rpc',
         '/internal/d-entry/native-root',
         '/internal/d-entry/native-prewarm',
+        statusPath,
       ].includes(path ?? '')
     )
       return false;
     const abort = new AbortController();
-    const signal = AbortSignal.any([
-      abort.signal,
-      lifetime.signal,
-      ...(serviceSignal ? [serviceSignal] : []),
-    ]);
+    const signal = AbortSignal.any([abort.signal, workerLifetime]);
     const disconnect = () => {
       if (!response.writableEnded) abort.abort();
     };
@@ -185,10 +194,14 @@ export function createDEntryHttpHandler(
     let parsedInput = false;
     let authority:
       Awaited<ReturnType<typeof watchDEntryNativeAuthority>> | undefined;
+    let transferred = false;
     const revoke = () => abort.abort(authority?.revoked.reason);
     try {
       signal.throwIfAborted();
-      if (request.method !== 'POST' || request.headers.origin)
+      if (
+        request.method !== (statusRequest ? 'GET' : 'POST') ||
+        request.headers.origin
+      )
         throw new DataAccessError('not_found');
       if (stopping) throw new DEntryNativeUnavailable();
       const token = dEntryBearer(request);
@@ -198,6 +211,42 @@ export function createDEntryHttpHandler(
       if (!(await deps.authenticate(token)))
         throw new DataAccessError('authentication_required');
       signal.throwIfAborted();
+      if (statusRequest) {
+        const query = new URL(request.url!, 'http://worker.invalid')
+          .searchParams;
+        if ([...query.keys()].some((key) => query.getAll(key).length !== 1))
+          throw new SyntaxError('Invalid entry status request');
+        const { organizationId, ...selectors } = Object.fromEntries(query);
+        const { operationId, ...selection } =
+          DEntryNativePrewarmStatusQuerySchema.parse(selectors);
+        const input = DEntryNativeOwnerRequestSchema.parse({
+          organizationId,
+          selection,
+        });
+        const { context, identity } = await currentDEntryRequest(
+          deps,
+          token,
+          input,
+          signal,
+        );
+        const result = await prewarm.read(
+          operationId,
+          context,
+          identity,
+          async (plan) => {
+            if (!deps.prewarm.assertReady) throw new DEntryNativeUnavailable();
+            await deps.prewarm.assertReady(context, identity, plan, signal);
+          },
+        );
+        signal.throwIfAborted();
+        response
+          .writeHead(result.state === 'expired' ? 410 : 200, {
+            'content-type': 'application/json',
+            'cache-control': 'no-store',
+          })
+          .end(JSON.stringify(result));
+        return true;
+      }
       let size = 0;
       const chunks: Buffer[] = [];
       for await (const chunk of request) {
@@ -240,41 +289,67 @@ export function createDEntryHttpHandler(
         auth.context,
         input.selection,
         auth.identity,
-        // Keep genuine authority loss separate from browser disconnection.
-        // The watcher remains owned until actual prewarm settlement below.
-        prewarmRequest
-          ? AbortSignal.any([
-              lifetime.signal,
-              ...(serviceSignal ? [serviceSignal] : []),
-            ])
-          : signal,
+        // A cold operation takes ownership of this subscription on acceptance.
+        prewarmRequest ? workerLifetime : signal,
       );
       authority.revoked.addEventListener('abort', revoke, { once: true });
       if (authority.revoked.aborted) revoke();
       if (prewarmRequest) {
-        const proof = await deps.prewarm.prewarm(
+        if (!deps.prewarm.prepare) throw new DEntryNativeUnavailable();
+        const plan = await deps.prewarm.prepare(
           auth.context,
           auth.identity,
-          prewarmRequest.trigger,
           signal,
-          authority.revoked,
         );
         const next = await currentDEntryRequest(deps, token, input, signal);
         if (!sameDEntryIdentity(auth.identity, next.identity))
           throw new DataAccessError('authorization_denied');
         signal.throwIfAborted();
-        if (proof?.aborted) throw new DEntryNativeUnavailable();
+        const receipt = {
+          identity: next.identity,
+          trigger: prewarmRequest.trigger,
+        };
+        if (!plan.ready) {
+          const { context, identity } = next;
+          const { trigger } = prewarmRequest;
+          const accepted = prewarm.accept(
+            context,
+            identity,
+            plan,
+            authority,
+            (active) =>
+              deps.prewarm.prewarm(
+                context,
+                identity,
+                trigger,
+                active,
+                active,
+                plan,
+              ),
+          );
+          transferred = accepted.owned;
+          response
+            .writeHead(202, {
+              'content-type': 'application/json',
+              'cache-control': 'no-store',
+            })
+            .end(
+              JSON.stringify(
+                DEntryNativePrewarmAcceptedSchema.parse({
+                  ...receipt,
+                  ticket: accepted.ticket,
+                }),
+              ),
+            );
+          return true;
+        }
+        if (plan.ready.aborted) throw new DEntryNativeUnavailable();
         response.writeHead(200, {
           'content-type': 'application/json',
           'cache-control': 'no-store',
         });
         response.end(
-          JSON.stringify(
-            DEntryNativePrewarmResultSchema.parse({
-              identity: next.identity,
-              trigger: prewarmRequest.trigger,
-            }),
-          ),
+          JSON.stringify(DEntryNativePrewarmResultSchema.parse(receipt)),
         );
         return true;
       }
@@ -661,7 +736,7 @@ export function createDEntryHttpHandler(
     } finally {
       authority?.revoked.removeEventListener('abort', revoke);
       try {
-        await authority?.close();
+        if (!transferred) await authority?.close();
       } catch (error) {
         cleanupErrors.push(error);
         sendDEntryHttpProblem(response, error);
@@ -688,6 +763,7 @@ export function createDEntryHttpHandler(
         lifetime.abort();
         closing = (async () => {
           await Promise.allSettled([...pending]);
+          await prewarm.close();
           if (cleanupErrors.length)
             throw new AggregateError(
               cleanupErrors,

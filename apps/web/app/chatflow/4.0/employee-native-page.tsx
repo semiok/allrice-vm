@@ -24,11 +24,14 @@ import {
   employeeEntryQuery,
   prepareEmployeeEntry,
   prewarmEmployeeEntry,
+  type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
 import styles from './employee-native-page.module.css';
 
 type Status =
   | 'warming'
+  | 'accepted'
+  | 'starting'
   | 'opening'
   | 'ready'
   | 'cancelled'
@@ -44,7 +47,10 @@ const closingNoticeMs = 10_000;
 type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
-  expiresAt: number;
+  progress: {
+    current?: EmployeePrewarmProgress;
+    show?(state: EmployeePrewarmProgress): void;
+  };
 };
 
 async function waitForVisibleEntry(signal: AbortSignal) {
@@ -331,16 +337,17 @@ export function EmployeeNativePage({
           // for the selected thread while the old page joins its transport.
           // This request has no page-carrier or thread-creation side effect.
           const lifetime = new AbortController();
-          const expiresAt = performance.now() + entryWaitMs;
+          const progress: EntryWarmup['progress'] = {};
           const result = prewarmEmployeeEntry(
             next.data,
-            AbortSignal.any([
-              lifetime.signal,
-              AbortSignal.timeout(entryWaitMs),
-            ]),
+            lifetime.signal,
+            (state) => {
+              progress.current = state;
+              progress.show?.(state);
+            },
           );
           void result.catch(() => {}); // the next activation reports the result
-          nextWarmup = { lifetime, result, expiresAt };
+          nextWarmup = { lifetime, result, progress };
         }
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
@@ -388,20 +395,21 @@ export function EmployeeNativePage({
     const parsedEntry = Promise.resolve().then(() =>
       employeeEntryQuery(activation.confirmedQuery ?? activeQuery, prepare),
     );
-    // The rendered shell owns this one request. The existing POST qualifies
-    // the exact selection before starting a VM; no background request lends
-    // its result to another activation, cookie session, or page carrier.
+    // The shell owns only its wait; the Worker owns an accepted cold start.
+    const showPrewarm = (state: EmployeePrewarmProgress) => {
+      if (!lifetime.signal.aborted && !navigating) setStatus(state);
+    };
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
-          const remaining = activation.warmup
-            ? activation.warmup.expiresAt - performance.now()
-            : entryWaitMs;
-          if (remaining <= 0) throw new EmployeeEntryError(503);
-          timer = window.setTimeout(() => finish('failed'), remaining);
-          await (activation.warmup?.result ??
-            prewarmEmployeeEntry(selection, lifetime.signal));
+          if (activation.warmup) {
+            const { progress, result } = activation.warmup;
+            progress.show = showPrewarm;
+            if (progress.current) showPrewarm(progress.current);
+            await result;
+          } else
+            await prewarmEmployeeEntry(selection, lifetime.signal, showPrewarm);
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -411,7 +419,10 @@ export function EmployeeNativePage({
         ? await prepareEmployeeEntry(
             entry,
             lifetime.signal,
-            () => setStatus('opening'),
+            () => {
+              setStatus('opening');
+              timer = window.setTimeout(() => finish('failed'), entryWaitMs);
+            },
             prewarming,
           )
         : entry.selection;
@@ -466,6 +477,7 @@ export function EmployeeNativePage({
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
+      if (activation.warmup) activation.warmup.progress.show = undefined;
       leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
@@ -518,12 +530,14 @@ export function EmployeeNativePage({
 }
 
 const messages = {
-  warming: [
-    '正在启动工作台',
-    '首次启动可能需要一些时间，就绪后将自动打开对话。',
+  warming: ['正在打开对话', '正在联系工作台。'],
+  accepted: ['已接受启动请求', '工作台启动后会自动打开对话。'],
+  starting: ['正在启动工作台', '首次启动可能需要一些时间，你可以留在这里。'],
+  opening: ['工作台已就绪', '已通过编辑器验证，正在打开对话。'],
+  failed: [
+    '暂时无法打开工作台',
+    '启动失败或等待凭据已失效。你可以返回员工页，或选择重试。',
   ],
-  opening: ['正在打开对话', '工作台已启动，正在连接对话。'],
-  failed: ['暂时无法打开工作台', '请重试。已创建的对话会继续打开。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
@@ -542,7 +556,9 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = status === 'warming' || status === 'opening';
+  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
+    status,
+  );
   const resumable = status === 'cancelled' || status === 'failed';
   return (
     <div className={styles.status}>

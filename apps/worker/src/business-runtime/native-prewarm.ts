@@ -19,16 +19,13 @@ import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
+  compatiblePrewarmGeneration as compatible,
   installDEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
+  type PrewarmGeneration as Generation,
 } from '../d-entry/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 
-type Generation = {
-  vmId: string | null;
-  instanceId: string | null;
-  leaseEpoch: number;
-};
 type VmStamp = Generation & { phase: PersonVmView['phase'] };
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
 type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
@@ -103,14 +100,6 @@ function targetGeneration(vm: VmStamp | null): Generation | undefined {
   // A retained or as-yet-unstarted VM advances exactly one epoch on start.
   if (!Number.isSafeInteger(vm.leaseEpoch + 1)) return;
   return { vmId: vm.vmId, instanceId: null, leaseEpoch: vm.leaseEpoch + 1 };
-}
-
-function compatible(a: Generation, b: Generation) {
-  return (
-    a.leaseEpoch === b.leaseEpoch &&
-    (!a.vmId || !b.vmId || a.vmId === b.vmId) &&
-    (!a.instanceId || !b.instanceId || a.instanceId === b.instanceId)
-  );
 }
 
 function matchingGeneration(
@@ -245,7 +234,57 @@ export function createDEntryNativePrewarmPort(input: {
     return { flight, started: true };
   }
   const port: DEntryNativePrewarmPort = {
-    prewarm(context, identity, trigger, caller, revoked) {
+    async prepare(context, identity, caller) {
+      const signal = AbortSignal.any([admission, caller]);
+      signal.throwIfAborted();
+      const read = input.readCoordination;
+      const data = currentDEntryNativeDataPort();
+      if (!read || (input.requireEditorProof && !data?.assertEditorReady))
+        throw new DEntryNativeUnavailable();
+      const stamp = await read(identity);
+      signal.throwIfAborted();
+      const target = targetGeneration(stamp.vm);
+      if (!stamp.authorityRevision || !target)
+        throw new DataAccessError('authorization_denied');
+      const key = prewarmKey(context, identity, stamp.authorityRevision);
+      if (stamp.vm?.phase !== 'running' || !data?.assertEditorReady)
+        return { key, target };
+      try {
+        const ready = await data.assertEditorReady(context, identity, signal);
+        await port.assertReady!(context, identity, { key, target }, signal);
+        ready.throwIfAborted();
+        return { key, target, ready };
+      } catch (error) {
+        signal.throwIfAborted();
+        if (
+          error instanceof DEntryNativeUnavailable ||
+          (error instanceof PersonVmError &&
+            [
+              'NOT_FOUND',
+              'LEASE_CONFLICT',
+              'LEASE_LOST',
+              'RUNTIME_NOT_READY',
+            ].includes(error.code))
+        )
+          return { key, target };
+        throw error;
+      }
+    },
+    async assertReady(context, identity, plan, caller) {
+      const signal = AbortSignal.any([admission, caller]);
+      signal.throwIfAborted();
+      const stamp = await input.readCoordination?.(identity);
+      signal.throwIfAborted();
+      if (
+        !stamp?.authorityRevision ||
+        stamp.vm?.phase !== 'running' ||
+        !stamp.vm.instanceId ||
+        !compatible(stamp.vm, plan.target) ||
+        plan.key !== prewarmKey(context, identity, stamp.authorityRevision)
+      )
+        throw new DataAccessError('authorization_denied');
+    },
+    prewarm(context, identity, trigger, caller, revoked, plan) {
       if (admission.aborted) return Promise.reject(admission.reason);
       const data = currentDEntryNativeDataPort();
       const prove = data?.assertEditorReady?.bind(data);
@@ -269,7 +308,7 @@ export function createDEntryNativePrewarmPort(input: {
         active.throwIfAborted();
         // Enrol a newly eligible employee on a live Host before the running
         // branch checks VM-wide readiness. A cold Host follows normal startup.
-        if (input.requireEditorProof && prove) {
+        if (!plan && input.requireEditorProof && prove) {
           try {
             await prove(context, identity, active);
           } catch (error) {
@@ -288,6 +327,14 @@ export function createDEntryNativePrewarmPort(input: {
         active.throwIfAborted();
         const revision = stamp?.authorityRevision;
         const target = stamp && targetGeneration(stamp.vm);
+        if (
+          plan &&
+          (!revision ||
+            !target ||
+            !compatible(target, plan.target) ||
+            plan.key !== prewarmKey(context, identity, revision))
+        )
+          throw new DataAccessError('authorization_denied');
         const start = (signal: AbortSignal) =>
           input.prewarmCurrent(context, identity, { trigger }, signal);
         const ticket =
@@ -316,18 +363,18 @@ export function createDEntryNativePrewarmPort(input: {
             result.organizationId !== identity.organizationId
           )
             throw new DataAccessError('authorization_denied');
-          const sameGeneration = async () =>
-            !generation ||
-            !read ||
-            !revision ||
-            Boolean(
-              matchingGeneration(
-                await read(identity),
-                revision,
-                result,
-                generation,
-              ),
+          const sameGeneration = async () => {
+            const expected = plan?.target ?? generation;
+            if (!expected || !read || !revision) return true;
+            const actual = matchingGeneration(
+              await read(identity),
+              revision,
+              result,
+              expected,
             );
+            if (actual && plan) plan.target = actual;
+            return Boolean(actual);
+          };
           let proof: AbortSignal | undefined;
           try {
             proof = await prove?.(context, identity, active);
@@ -349,16 +396,19 @@ export function createDEntryNativePrewarmPort(input: {
           active.throwIfAborted();
           return { proof };
         }
-        if (warmed && (ticket?.started || warmed.generation)) {
+        if (warmed && (plan || ticket?.started || warmed.generation)) {
           const qualified = await qualify(warmed.result, warmed.generation);
           if (qualified) return qualified.proof;
         }
+        if (plan && ticket) throw new DEntryNativeUnavailable();
         // A transition can outrun the reservation or a caller's editor proof.
         // Use the original lease path when the shared epoch no longer matches.
         if (ticket) await current();
         active.throwIfAborted();
         const own = await start(AbortSignal.any([input.lifetime, revoked]));
-        return (await qualify(own))?.proof;
+        const qualified = await qualify(own);
+        if (plan && !qualified) throw new DEntryNativeUnavailable();
+        return qualified?.proof;
       });
       pending.add(task);
       void task.then(

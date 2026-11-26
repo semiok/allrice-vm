@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
@@ -60,6 +61,9 @@ suite('4.0 browser cold entry', () => {
       const supersededClosed = deferred<void>();
       let opening = false;
       const allowOpening = deferred<void>();
+      const allowReady = deferred<void>();
+      const ticket = randomUUID();
+      let polls = 0;
       const warmCalls: unknown[] = [],
         births: unknown[] = [],
         documents: string[] = [];
@@ -82,12 +86,32 @@ suite('4.0 browser cold entry', () => {
             firstRetry.resolve(response);
             return;
           }
+          if (warmCalls.length === 4)
+            return response
+              .writeHead(202, { 'content-type': 'application/json' })
+              .end(
+                JSON.stringify({
+                  operationId: ticket,
+                  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+                  pollAfterMs: 1000,
+                }),
+              );
           if (warmCalls.length === 8) {
             response.once('close', () => supersededClosed.resolve());
             supersededWarmup.resolve(response);
             return;
           }
           return response.writeHead(204).end();
+        }
+        if (address.pathname === '/api/v1/d-entry/native-prewarm/status') {
+          if (
+            request.method !== 'GET' ||
+            address.searchParams.get('operationId') !== ticket
+          )
+            return response.writeHead(404).end();
+          if (++polls === 1) return json({ state: 'starting' });
+          await allowReady.promise;
+          return json({ state: 'ready' });
         }
         if (
           address.pathname === '/api/v1/sessions' &&
@@ -163,7 +187,7 @@ suite('4.0 browser cold entry', () => {
       await page.goto(
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
-      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
       await page.evaluate(
         () => new Promise((painted) => requestAnimationFrame(painted)),
       );
@@ -181,7 +205,7 @@ suite('4.0 browser cold entry', () => {
       expect(births).toEqual([]);
       await page.getByRole('button', { name: '重试' }).click();
       const held = await firstRetry.promise;
-      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
       await page.getByRole('button', { name: '取消等待' }).click();
       await retryClosed.promise;
       expect(held.writableFinished).toBe(false);
@@ -210,8 +234,15 @@ suite('4.0 browser cold entry', () => {
       expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
       expect(documents).toEqual([]);
       await page.getByRole('button', { name: '继续' }).click();
+      try {
+        await page.getByRole('heading', { name: '已接受启动请求' }).waitFor();
+        await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+        expect(documents).toEqual([]);
+      } finally {
+        allowReady.resolve();
+      }
       async function showEditor(threadId: string) {
-        await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
+        await page.getByRole('heading', { name: '工作台已就绪' }).waitFor();
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
         const source = new URL((await iframe.getAttribute('src'))!, f.origin);

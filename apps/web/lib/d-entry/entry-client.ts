@@ -1,4 +1,6 @@
 import {
+  DEntryNativePrewarmStatusSchema,
+  DEntryNativePrewarmTicketSchema,
   DEntrySelectionInputSchema,
   UuidSchema,
   type DEntrySelectionInput,
@@ -42,9 +44,27 @@ function postEmployeeEntry(path: string, data: object, signal: AbortSignal) {
   });
 }
 
+export type EmployeePrewarmProgress = 'accepted' | 'starting';
+
+function waitForPrewarmPoll(delay: number, signal: AbortSignal) {
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const cancel = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', cancel);
+      resolve();
+    }, delay);
+    signal.addEventListener('abort', cancel, { once: true });
+  });
+}
+
 export async function prewarmEmployeeEntry(
   selection: DEntrySelectionInput,
   signal: AbortSignal,
+  progress?: (state: EmployeePrewarmProgress) => void,
 ) {
   const warm = await postEmployeeEntry(
     '/api/v1/d-entry/native-prewarm',
@@ -52,7 +72,41 @@ export async function prewarmEmployeeEntry(
     signal,
   );
   signal.throwIfAborted();
-  if (warm.status !== 204) throw new EmployeeEntryError(warm.status);
+  if (warm.status === 204) return;
+  if (warm.status !== 202) throw new EmployeeEntryError(warm.status);
+  const { operationId, pollAfterMs } = DEntryNativePrewarmTicketSchema.parse(
+    await warm.json(),
+  );
+  signal.throwIfAborted();
+  progress?.('accepted');
+  const query = new URLSearchParams({ ...selection, operationId });
+  for (let delay = pollAfterMs; ; delay = Math.min(3000, delay + 1000)) {
+    await waitForPrewarmPoll(delay, signal);
+    signal.throwIfAborted();
+    const response = await fetch(
+      '/api/v1/d-entry/native-prewarm/status?' + query,
+      {
+        method: 'GET',
+        signal,
+        cache: 'no-store',
+        credentials: 'same-origin',
+        redirect: 'error',
+      },
+    );
+    signal.throwIfAborted();
+    if (response.status !== 200 && response.status !== 410)
+      throw new EmployeeEntryError(response.status);
+    const status = DEntryNativePrewarmStatusSchema.parse(await response.json());
+    signal.throwIfAborted();
+    if (response.status === 410 || status.state === 'expired')
+      throw new EmployeeEntryError(410);
+    if (status.state === 'failed')
+      throw new EmployeeEntryError(
+        status.code === 'AUTHORITY_REVOKED' ? 403 : 503,
+      );
+    if (status.state === 'ready') return;
+    progress?.(status.state);
+  }
 }
 
 export async function prepareEmployeeEntry(
