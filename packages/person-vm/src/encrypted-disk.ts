@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, rename, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, rename, rm, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import { PersonVmError } from './contract.ts';
@@ -50,7 +50,7 @@ export async function privateDirectory(path: string) {
 /** Dedicated host directory only. Never use a DSH plugin storageDir or guest path. */
 export class FilePersonVmKeyStore implements PersonVmKeyStore {
   constructor(private readonly root: string) {}
-  private path(id: string) {
+  filePath(id: string) {
     return join(this.root, `${checkedId(id)}.key`);
   }
   async readOrCreate(id: string) {
@@ -58,7 +58,7 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
     const value = randomBytes(48).toString('hex');
     try {
       const file = await open(
-        this.path(id),
+        this.filePath(id),
         constants.O_WRONLY |
           constants.O_CREAT |
           constants.O_EXCL |
@@ -78,7 +78,7 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
   }
   async read(id: string) {
     const file = await open(
-      this.path(id),
+      this.filePath(id),
       constants.O_RDONLY | constants.O_NOFOLLOW,
     );
     try {
@@ -91,7 +91,7 @@ export class FilePersonVmKeyStore implements PersonVmKeyStore {
     }
   }
   async delete(id: string) {
-    await rm(this.path(id), { force: true });
+    await rm(this.filePath(id), { force: true });
   }
 }
 
@@ -122,6 +122,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
   }
   private manifest(vmId: string) {
     return join(this.options.root, 'manifests', `${checkedId(vmId)}.json`);
+  }
+  /** Trusted adapter only. Transferring ownership requires these exact paths. */
+  poolFiles(disk: PersonDisk) {
+    return { image: this.image(disk), manifest: this.manifest(disk.vmId) };
   }
   private async command(
     args: string[],
@@ -180,6 +184,60 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       key.fill(0);
       input.fill(0);
     }
+  }
+  async verifyImageKey(disk: PersonDisk, signal: AbortSignal) {
+    await this.withKey(disk, false, (key) =>
+      this.command(
+        ['imageinfo', this.image(disk), '-stdinpass', '-plist'],
+        signal,
+        key,
+      ),
+    );
+  }
+
+  /** Pool entries may not have a live device or an occupied mount point. */
+  async verifyOffline(disk: PersonDisk, signal: AbortSignal) {
+    const image = this.image(disk);
+    const mount = this.mount(disk);
+    const state = await this.info(signal);
+    if (
+      !Array.isArray(state.images) ||
+      state.images.some(
+        (entry) =>
+          !entry ||
+          typeof entry['image-path'] !== 'string' ||
+          entry['image-path'] === image ||
+          !Array.isArray(entry['system-entities']) ||
+          entry['system-entities'].some(
+            (entity) => !entity || entity['mount-point'] === mount,
+          ),
+      )
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const actual = await stat(image, { bigint: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      },
+    );
+    if (actual) {
+      for (const item of state.images) {
+        signal.throwIfAborted();
+        const path = item['image-path'];
+        if (!isAbsolute(path)) throw new PersonVmError('CLEANUP_INCOMPLETE');
+        const candidate = await stat(path, { bigint: true });
+        if (candidate.dev === actual.dev && candidate.ino === actual.ino)
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }
+    }
+    const root = await lstat(this.options.root);
+    const mounted = await lstat(mount).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (mounted && (!mounted.isDirectory() || mounted.dev !== root.dev))
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    signal.throwIfAborted();
   }
   async inspect(
     vmId: string,
@@ -245,13 +303,7 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     try {
       // Recognize/decrypt the completed container through the public command.
       // This does not mount, repair, reformat, or claim filesystem health.
-      await this.withKey(actual.disk, false, (key) =>
-        this.command(
-          ['imageinfo', this.image(actual.disk), '-stdinpass', '-plist'],
-          signal,
-          key,
-        ),
-      );
+      await this.verifyImageKey(actual.disk, signal);
     } catch (error) {
       if (signal.aborted) throw error;
       return { state: 'unknown' };

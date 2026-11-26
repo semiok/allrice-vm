@@ -1,9 +1,10 @@
 import type * as ProductionConfig from './production-config.js';
 /** Real inert constructors/installation; synthetic seal, SQL and required external sources only. */
 import { createHash, randomUUID } from 'node:crypto';
-import { rm, stat } from 'node:fs/promises';
+import { realpath, rm, stat } from 'node:fs/promises';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Socket } from 'node:net';
+import { join } from 'node:path';
 import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
@@ -384,52 +385,66 @@ function configureDiskPreprovision(enabled: boolean, sealedCache: boolean) {
     };
   }
   f.loaded.configuration.disk.preprovision = enabled
-    ? { enabled: true, minimumFreeBytes: 100, reserveBytes: 20 }
+    ? {
+        enabled: true,
+        platform: 'macos',
+        minimumFreeBytes: 100,
+        reserveBytes: 20,
+      }
     : { enabled: false };
 }
 
-it.each([
-  { enabled: false, sealedCache: true, port: true },
-  { enabled: true, sealedCache: false, port: true },
-  { enabled: true, sealedCache: true, port: false },
-])(
-  'only installs disk preparation with all three prerequisites (%j)',
-  async (scope) => {
-    configureDiskPreprovision(scope.enabled, scope.sealedCache);
-    const host = await createProductionPersonVmHost({
+it('does not install disk preparation from a seal with the switch off', async () => {
+  configureDiskPreprovision(false, true);
+  const host = await createProductionPersonVmHost({
+    lifetime: signal(),
+    sources: fixture().sources,
+  });
+  cleanup.push(() => host.close());
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+});
+
+it('rejects an enabled Host with no sealed public cache', async () => {
+  configureDiskPreprovision(true, false);
+  await expect(
+    createProductionPersonVmHost({
       lifetime: signal(),
       sources: fixture().sources,
-      ...(scope.port
-        ? {
-            diskPreparation: {
-              prepare: vi.fn(async () => 'prepared' as const),
-            },
-          }
-        : {}),
-    });
-    cleanup.push(() => host.close());
-    expect(io.diskPreprovision).not.toHaveBeenCalled();
-  },
-);
+    }),
+  ).rejects.toMatchObject({ code: 'HOST_CONFIGURATION_UNAVAILABLE' });
+  expect(io.diskPreprovision).not.toHaveBeenCalled();
+});
 
-it('joins the injected offline preparation before Host close settles', async () => {
+it('installs the actual service disk preparation and joins it before Host close settles', async () => {
   configureDiskPreprovision(true, true);
-  f.loaded.configuration.disk.root += '/missing/child';
+  const root = await realpath(f.root);
+  f.loaded.configuration.disk.root = join(root, 'missing', 'child');
+  f.loaded.configuration.disk.keyRoot = join(root, 'keys');
   vi.stubEnv('DATABASE_URL', 'postgres://synthetic.invalid/test');
   const draining = gate();
   const schedulerClose = vi.fn(() => draining.promise);
   io.diskPreprovision.mockReturnValue({ close: schedulerClose });
-  const diskPreparation = { prepare: vi.fn(async () => 'prepared' as const) };
-  const host = await createProductionPersonVmHost({
-    lifetime: signal(),
-    sources: fixture().sources,
-    diskPreparation,
-  });
+  const originalPlatform = Object.getOwnPropertyDescriptor(
+    process,
+    'platform',
+  )!;
+  const host = await (async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    try {
+      return await createProductionPersonVmHost({
+        lifetime: signal(),
+        sources: fixture().sources,
+      });
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+    }
+  })();
   cleanup.push(() => host.close());
   try {
     expect(io.diskPreprovision).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        port: diskPreparation,
+        port: { prepare: expect.any(Function) },
+        refill: expect.any(Function),
         minimumFreeBytes: 100,
         reserveBytes: 20,
       }),

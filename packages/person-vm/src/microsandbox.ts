@@ -11,6 +11,7 @@ import { privateDirectory } from './encrypted-disk.ts';
 import {
   checkedPublicImageCache,
   seedPublicImageCache,
+  verifySeededPublicImageCache,
   type PublicImageCache,
 } from './image-cache.ts';
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
@@ -139,6 +140,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       readonlyDshRuntimeDisk?: ReadonlyDshRuntimeDisk;
       readonlyCommandMemoryDirectory?: ReadonlyCommandMemoryDirectory;
       publicImageCache?: PublicImageCache;
+      seededPublicCache?(vmId: string, signal: AbortSignal): Promise<boolean>;
       rootDiskGiB: number;
       socketRoot: string;
       /** Host-only platform configuration snapshot, never guest/request input. */
@@ -603,14 +605,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if ((await this.status(binding, signal)) !== 'absent')
       throw new PersonVmError('PROVIDER_FAILED');
     const artifact = await this.artifact(binding, signal, true);
-    if (this.options.publicImageCache)
-      await seedPublicImageCache(
+    if (this.options.publicImageCache) {
+      const hasSeed = await this.options.seededPublicCache?.(
+        binding.vmId,
+        signal,
+      );
+      const prepareCache = hasSeed
+        ? verifySeededPublicImageCache
+        : seedPublicImageCache;
+      await prepareCache(
         this.options.publicImageCache,
         this.options.image,
         join(dirname(paths.config), 'microsandbox'),
         signal,
       );
-    else
+    } else
       await this.command(
         binding,
         ['pull', this.options.image, '--materialize', 'flat', '--quiet'],

@@ -21,6 +21,11 @@ export type PublicImageCache = Readonly<{
   directory: string;
   manifestSha256: string;
 }>;
+export class PublicImageCacheBudgetExceeded extends Error {
+  constructor() {
+    super('PERSON_VM_PUBLIC_CACHE_BUDGET_EXCEEDED');
+  }
+}
 
 type CacheFile = { bytes: number; sha256: string };
 
@@ -397,6 +402,46 @@ async function discardInterruptedStages(root: string, signal: AbortSignal) {
   }
 }
 
+async function checkedNativeCacheRoot(
+  input: PublicImageCache,
+  nativeRoot: string,
+) {
+  const root = await realpath(nativeRoot);
+  const mount = await realpath(dirname(nativeRoot));
+  if (root !== join(mount, basename(nativeRoot))) invalid();
+  await verifyDirectory(root, 0o700);
+  if (inside(mount, input.directory) || inside(input.directory, mount))
+    invalid();
+  return root;
+}
+
+/** A Host-verified pool binding already seeded these bytes. Rehash the exact
+ * mounted files against the current seal without reopening public blobs. */
+export async function verifySeededPublicImageCache(
+  input: PublicImageCache,
+  image: string,
+  nativeRoot: string,
+  signal: AbortSignal,
+) {
+  try {
+    const root = await checkedNativeCacheRoot(input, nativeRoot);
+    const files = await readSeed(input, image, signal);
+    const cache = join(root, 'cache');
+    for (const path of [
+      cache,
+      ...sourceDirectories.map((name) => join(cache, name)),
+    ]) {
+      if (!(await privateCacheDirectory(path, false))) invalid();
+    }
+    for (const [name, entry] of files)
+      await verifyFile(join(cache, name), entry, signal, false);
+    signal.throwIfAborted();
+  } catch {
+    signal.throwIfAborted();
+    invalid();
+  }
+}
+
 /** Under the VM owner, seed only public bytes into the existing encrypted
  * per-VM cache. MSB can create locks and staging files only in that private
  * cache. Host publication must stage these exact entries from a fresh,
@@ -406,15 +451,22 @@ export async function seedPublicImageCache(
   image: string,
   nativeRoot: string,
   signal: AbortSignal,
+  budget?: Readonly<{ bytes: bigint; blockBytes: bigint }>,
 ) {
   try {
-    const root = await realpath(nativeRoot);
-    const mount = await realpath(dirname(nativeRoot));
-    if (root !== join(mount, basename(nativeRoot))) invalid();
-    await verifyDirectory(root, 0o700);
-    if (inside(mount, input.directory) || inside(input.directory, mount))
-      invalid();
+    const root = await checkedNativeCacheRoot(input, nativeRoot);
     const files = await readSeed(input, image, signal);
+    if (budget) {
+      const needed = [...files.values()].reduce((total, file) => {
+        const size = BigInt(file.bytes);
+        return (
+          total +
+          ((size + budget.blockBytes - 1n) / budget.blockBytes) *
+            budget.blockBytes
+        );
+      }, 0n);
+      if (needed > budget.bytes) throw new PublicImageCacheBudgetExceeded();
+    }
     await discardInterruptedStages(root, signal);
     const cache = join(root, 'cache');
     const directories = [
@@ -466,8 +518,9 @@ export async function seedPublicImageCache(
       await rm(stage, { recursive: true, force: true });
     }
     signal.throwIfAborted();
-  } catch {
+  } catch (error) {
     signal.throwIfAborted();
+    if (error instanceof PublicImageCacheBudgetExceeded) throw error;
     invalid();
   }
 }

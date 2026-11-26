@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type postgres from 'postgres';
 import {
   PersonVmError,
@@ -8,6 +9,7 @@ import {
   type PersonVmHoldKind,
 } from './contract.ts';
 import type { PersonDisk } from './encrypted-disk.ts';
+import type { DiskPoolLocks, DiskPoolOwner } from './disk-pool-platform.ts';
 import type { PersonVmStartingScope } from './guest-bootstrap.ts';
 
 export type VmHold = {
@@ -47,7 +49,7 @@ export interface VmLease {
   signal: AbortSignal;
   assertAdmissionOpen(generationChange?: boolean): Promise<void>;
   save(row: VmRecord): Promise<void>;
-  guard(): Promise<void>;
+  guard(expected?: DiskPoolOwner): Promise<void>;
   assertPhysicalOwner?(): Promise<void>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
 }
@@ -306,6 +308,63 @@ export class PostgresPersonVmStore implements PersonVmStore {
       await end();
     }
   }
+  diskPoolLocks(namespace: string): DiskPoolLocks {
+    return {
+      withLock: async (kind, signal, work) => {
+        signal.throwIfAborted();
+        const session = new VmSqlSession(this.openSql());
+        const sql = session.client;
+        const active = AbortSignal.any([signal, session.signal]);
+        const key = `person-vm:disk-pool:${kind}:${namespace}`;
+        let locked = false;
+        try {
+          do {
+            active.throwIfAborted();
+            const [row] = await session.query(
+              () =>
+                sql`select pg_try_advisory_lock(hashtextextended(${key},0)) as locked`,
+            );
+            locked = row?.locked === true;
+            if (!locked) {
+              if (kind === 'fill') return undefined;
+              await sleep(15, undefined, { signal: active });
+            }
+          } while (!locked);
+          active.throwIfAborted();
+          const result = await work({
+            signal: active,
+            ownerSignal: session.signal,
+            assertOwned: async () => {
+              await session.query(() => sql`select 1`);
+            },
+            async foregroundStarting() {
+              // A recent start is a scheduling hint only. Physical ownership
+              // and settlement never depend on this clock comparison.
+              const [row] = await session.query(
+                () => sql`
+                select exists (select 1 from person_virtual_machines
+                  where phase='starting' and lease_owner is not null
+                    and lease_expires_at > statement_timestamp()) as busy`,
+              );
+              return row?.busy === true;
+            },
+          });
+          active.throwIfAborted();
+          return result;
+        } finally {
+          try {
+            if (locked && !session.connectionFailure)
+              await session.query(
+                () =>
+                  sql`select pg_advisory_unlock(hashtextextended(${key},0))`,
+              );
+          } finally {
+            await session.end();
+          }
+        }
+      },
+    };
+  }
   async read(personId: string) {
     const session = new VmSqlSession(this.openSql());
     try {
@@ -464,12 +523,23 @@ export class PostgresPersonVmStore implements PersonVmStore {
           () =>
             sql`update person_virtual_machines set lease_owner=${token},lease_expires_at=${expires()} where person_id=${personId}`,
         );
-      const guard = async (requireAdmission = true) => {
+      const guard = async (
+        requireAdmission = true,
+        expected?: DiskPoolOwner,
+      ) => {
         const [current] = await session.query(
           () => sql`update person_virtual_machines set lease_expires_at=${expires()}
           where person_id=${personId} and lease_owner=${token} returning *`,
         );
         if (!current) throw new PersonVmError('LEASE_LOST');
+        if (
+          expected &&
+          (current.person_id !== expected.personId ||
+            current.organization_id !== expected.organizationId ||
+            current.vm_id !== expected.vmId ||
+            current.disk_retained !== true)
+        )
+          throw new PersonVmError('LEASE_LOST');
         if (requireAdmission && current.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };
@@ -478,7 +548,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         signal: session.signal,
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),
-        guard,
+        guard: (expected) => guard(true, expected),
         assertPhysicalOwner: () => guard(false),
         save: async (record) => {
           if (record.personId !== personId)
@@ -612,12 +682,20 @@ export class PostgresPersonVmStore implements PersonVmStore {
       this.settledOrphans.delete(previousToken);
       row.leaseOwner = token;
       row.leaseExpiresAt = expires;
-      const guard = async () => {
+      const guard = async (expected?: DiskPoolOwner) => {
         const [found] = await session.query(
           () =>
             sql`update person_virtual_machines set lease_expires_at=${new Date(options.now().getTime() + options.ttlMs)} where person_id=${personId} and lease_owner=${token} returning *`,
         );
         if (!found) throw new PersonVmError('LEASE_LOST');
+        if (
+          expected &&
+          (found.person_id !== expected.personId ||
+            found.organization_id !== expected.organizationId ||
+            found.vm_id !== expected.vmId ||
+            found.disk_retained !== true)
+        )
+          throw new PersonVmError('LEASE_LOST');
         if (found.admission_state?.revoked)
           throw new PersonVmError('AUTHORIZATION_DENIED');
       };

@@ -73,6 +73,7 @@ export function startProductionDiskPreprovision(input: {
   readRoster: typeof readPersonVmDiskPreparationRoster;
   readTarget: typeof readPersonVmDiskPreparationTarget;
   foregroundBusy(personId: string, signal: AbortSignal): Promise<boolean>;
+  refill?(signal: AbortSignal): Promise<void>;
   availableBytes(signal: AbortSignal): Promise<bigint>;
   minimumFreeBytes: number;
   reserveBytes: number;
@@ -260,6 +261,13 @@ export function startProductionDiskPreprovision(input: {
         if (delay > 0) await sleep(delay, undefined, { signal, ref: false });
         signal.throwIfAborted();
         hinted = false;
+        try {
+          await input.refill?.(signal);
+        } catch (error) {
+          if (signal.aborted || vmError(error, 'CLEANUP_INCOMPLETE'))
+            throw error;
+          input.observe('prepare-failed');
+        }
         const seen = new Set<string>();
         const roster = await input.readRoster(signal);
         signal.throwIfAborted();

@@ -1,7 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, stat, statfs } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
-import { dirname } from 'node:path';
 import type { RequestContext } from '@allrice/contracts';
 import {
   createDedicatedDatabase,
@@ -32,11 +30,11 @@ import {
 } from '@allrice/egress-gateway';
 import {
   PersonVmError,
+  PersonVmDiskPool,
   PersonVmService,
   PostgresPersonVmStore,
   sameVmBinding,
   type PersonVmBinding,
-  type PersonVmDiskPreparationPort,
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmNativeActivityPort,
@@ -158,8 +156,6 @@ export interface ProductionPersonVmHost {
 export function createProductionPersonVmHost(input: {
   lifetime: AbortSignal;
   sources?: ProductionPersonVmHostSources;
-  /** In-process storage dependency. Missing until a real offline owner is bound. */
-  diskPreparation?: PersonVmDiskPreparationPort;
 }): Promise<ProductionPersonVmHost> {
   if (!input.sources)
     return Promise.reject(
@@ -564,6 +560,13 @@ export function createProductionPersonVmHost(input: {
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const store = new PostgresPersonVmStore(openSql);
+      const diskRoot = providers.configuration.disk.root;
+      const diskPool = new PersonVmDiskPool(
+        diskRoot,
+        store.diskPoolLocks(diskRoot),
+        (event) => console.warn('[person-vm.disk-pool]', event),
+        providers.diskPool,
+      );
       const runtime: PersonVmRuntimePort = {
         memoryGuestPlan: (...args) => requireStartup().memoryGuestPlan(...args),
         start: (...args) => requireStartup().start(...args),
@@ -594,6 +597,7 @@ export function createProductionPersonVmHost(input: {
         authority: current.authority,
         native: providers.native,
         disk: providers.disk,
+        diskPool,
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
@@ -822,11 +826,7 @@ export function createProductionPersonVmHost(input: {
       });
       lifetime.throwIfAborted();
       const { disk } = providers.configuration;
-      if (
-        disk.preprovision?.enabled &&
-        native.publicImageCache &&
-        input.diskPreparation
-      ) {
+      if (disk.preprovision?.enabled) {
         const databaseUrl = process.env.DATABASE_URL;
         if (!databaseUrl) throw Error('DATABASE_URL is required');
         diskPreprovision = startProductionDiskPreprovision({
@@ -835,34 +835,11 @@ export function createProductionPersonVmHost(input: {
           readRoster: readPersonVmDiskPreparationRoster,
           readTarget: readPersonVmDiskPreparationTarget,
           foregroundBusy: readPersonVmDiskPreparationForegroundBusy,
-          async availableBytes(signal) {
-            // The provider can create a fresh nested disk root. Budget on the
-            // nearest existing directory, then recheck the initialized root
-            // through the port guard before an actual allocation.
-            let path = disk.root;
-            while (true) {
-              signal.throwIfAborted();
-              const inspect = path === disk.root ? lstat : stat;
-              const directory = await inspect(path).catch(
-                (error: NodeJS.ErrnoException) => {
-                  if (error.code === 'ENOENT' && dirname(path) !== path)
-                    return null;
-                  throw error;
-                },
-              );
-              if (directory) {
-                if (!directory.isDirectory())
-                  throw new PersonVmError('PROVIDER_FAILED');
-                const volume = await statfs(path, { bigint: true });
-                signal.throwIfAborted();
-                return volume.bavail * volume.bsize;
-              }
-              path = dirname(path);
-            }
-          },
+          refill: (signal) => diskPool.refill(signal),
+          availableBytes: (signal) => diskPool.availableBytes(signal),
           minimumFreeBytes: disk.preprovision.minimumFreeBytes,
           reserveBytes: disk.preprovision.reserveBytes,
-          port: input.diskPreparation,
+          port: vm.diskPreparationPort(),
           observe: (event) =>
             console.warn('[person-vm.disk-preprovision]', event),
         });

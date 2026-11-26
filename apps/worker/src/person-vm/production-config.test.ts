@@ -240,9 +240,22 @@ describe('private production Host configuration', () => {
 
   it('requires a positive floor and reserve before accepting an enabled disk configuration', async () => {
     const config = value();
-    const enabled = { enabled: true, minimumFreeBytes: 100, reserveBytes: 20 };
+    const enabled = {
+      enabled: true,
+      platform: 'macos',
+      minimumFreeBytes: 100,
+      reserveBytes: 20,
+    };
     const withBudget = (preprovision: unknown) => ({
       ...config,
+      native: {
+        ...config.native,
+        image: `docker.io/library/node@sha256:${hash}`,
+        publicImageCache: {
+          directory: join(root, 'public', hash),
+          manifestSha256: hash,
+        },
+      },
       disk: { ...config.disk, preprovision },
     });
     await seal(withBudget(enabled));
@@ -250,12 +263,21 @@ describe('private production Host configuration', () => {
       (await readProductionHostConfiguration(signal())).configuration.disk
         .preprovision,
     ).toEqual(enabled);
-    for (const bad of [{ enabled: true }, { ...enabled, reserveBytes: 0 }]) {
+    for (const bad of [
+      { enabled: true },
+      { ...enabled, reserveBytes: 0 },
+      { ...enabled, platform: undefined },
+      { ...enabled, platform: 'linux' },
+    ]) {
       await seal(withBudget(bad));
       await expect(
         readProductionHostConfiguration(signal()),
       ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
     }
+    await seal({ ...config, disk: { ...config.disk, preprovision: enabled } });
+    await expect(
+      readProductionHostConfiguration(signal()),
+    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
   });
 
   it.each([

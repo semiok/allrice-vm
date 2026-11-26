@@ -132,6 +132,7 @@ const configuration = z
             z
               .object({
                 enabled: z.literal(true),
+                platform: z.literal('macos'),
                 minimumFreeBytes: positive,
                 reserveBytes: positive,
               })
@@ -202,6 +203,11 @@ const configuration = z
       .strict(),
   })
   .strict()
+  .refine(
+    (value) =>
+      !value.disk.preprovision?.enabled ||
+      Boolean(value.native.publicImageCache),
+  )
   .refine((value) => {
     const platform = readPlatformPersonVmConfiguration();
     const policy = value.memory.policy;

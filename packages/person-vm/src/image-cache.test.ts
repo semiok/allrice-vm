@@ -16,7 +16,10 @@ import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { seedPublicImageCache } from './image-cache.ts';
+import {
+  seedPublicImageCache,
+  verifySeededPublicImageCache,
+} from './image-cache.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
 
 vi.mock('node:fs/promises', async (original) => {
@@ -204,6 +207,27 @@ describe('sealed public OCI cache', () => {
     ]);
   });
 
+  it('verifies a warm disk locally against the seal and detects changed private bytes', async () => {
+    const f = await fixture();
+    const a = await f.person('a');
+    await seedPublicImageCache(f.source, f.image, a.native, active());
+    const sealedBlob = join(f.source.directory, blobPath);
+    await chmod(sealedBlob, 0o600);
+    await writeFile(
+      sealedBlob,
+      'changed while source remains sealed by its manifest',
+    );
+    await chmod(sealedBlob, 0o444);
+    await expect(
+      verifySeededPublicImageCache(f.source, f.image, a.native, active()),
+    ).resolves.toBeUndefined();
+    const diskBlob = join(a.cache, blobPath);
+    await writeFile(diskBlob, 'private cache corruption');
+    await expect(
+      verifySeededPublicImageCache(f.source, f.image, a.native, active()),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  });
+
   it.each([
     { extra: 'secrets/local' },
     { extra: 'manifests/other.lock' },
@@ -356,7 +380,7 @@ describe('sealed public OCI cache', () => {
 });
 
 describe('Microsandbox create with a sealed public OCI seed', () => {
-  it.each(['seeded', 'original', 'missing'] as const)(
+  it.each(['seeded', 'warm', 'original', 'missing'] as const)(
     'keeps native paths private and preserves the %s create behavior',
     async (mode) => {
       const f = await fixture();
@@ -364,6 +388,9 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
       const socketRoot = await mkdtemp('/tmp/a-');
       roots.push(socketRoot);
       const calls: string[][] = [];
+      const seededPublicCache = vi.fn(async () => true);
+      if (mode === 'warm')
+        await seedPublicImageCache(f.source, f.image, person.native, active());
       const vm = new MicrosandboxPersonVm({
         binary: '/fixture/msb',
         agentd: '/fixture/agentd',
@@ -372,11 +399,12 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
         rootDiskGiB: 8,
         socketRoot,
         ...(mode === 'original' ? {} : { publicImageCache: f.source }),
+        ...(mode === 'warm' ? { seededPublicCache } : {}),
         runner: async ({ args }) => {
           calls.push([...args]);
           if (args[0] === '--version') return 'microsandbox 0.7.16';
           if (args[0] === 'list') return '[]';
-          if (args[0] === 'create' && mode === 'seeded')
+          if (args[0] === 'create' && (mode === 'seeded' || mode === 'warm'))
             expect(await readFile(join(person.cache, blobPath), 'utf8')).toBe(
               blob,
             );
@@ -424,13 +452,25 @@ describe('Microsandbox create with a sealed public OCI seed', () => {
       }
       await vm.create(binding, receipt, active());
       expect(calls.map(([command]) => command)).toEqual(
-        mode === 'seeded'
+        mode === 'seeded' || mode === 'warm'
           ? ['--version', 'list', 'create']
           : ['--version', 'list', 'pull', 'create'],
       );
       expect(calls.at(-1)).toEqual(
-        expect.arrayContaining(['--pull', 'never', '--net-default', 'deny']),
+        expect.arrayContaining([
+          '--pull',
+          'never',
+          '--net-default',
+          'deny',
+          '--root-disk',
+          'flat:8G,clone=reflink',
+        ]),
       );
+      if (mode === 'warm')
+        expect(seededPublicCache).toHaveBeenCalledWith(
+          binding.vmId,
+          expect.any(AbortSignal),
+        );
     },
   );
 });
