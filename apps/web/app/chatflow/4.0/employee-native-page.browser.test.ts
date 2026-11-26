@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
@@ -53,6 +54,11 @@ suite('4.0 browser cold entry', () => {
           write: false,
           outdir: '/employee-entry-test',
           jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+          },
         });
       const firstRetry = deferred<ServerResponse>();
       const retryClosed = deferred<void>();
@@ -60,6 +66,10 @@ suite('4.0 browser cold entry', () => {
       const supersededClosed = deferred<void>();
       let opening = false;
       const allowOpening = deferred<void>();
+      const allowStarting = deferred<void>();
+      const allowReady = deferred<void>();
+      const ticket = randomUUID();
+      let polls = 0;
       const warmCalls: unknown[] = [],
         births: unknown[] = [],
         documents: string[] = [];
@@ -82,12 +92,36 @@ suite('4.0 browser cold entry', () => {
             firstRetry.resolve(response);
             return;
           }
+          if (warmCalls.length === 4)
+            return response
+              .writeHead(202, { 'content-type': 'application/json' })
+              .end(
+                JSON.stringify({
+                  operationId: ticket,
+                  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+                  pollAfterMs: 1000,
+                }),
+              );
           if (warmCalls.length === 8) {
             response.once('close', () => supersededClosed.resolve());
             supersededWarmup.resolve(response);
             return;
           }
           return response.writeHead(204).end();
+        }
+        if (address.pathname === '/api/v1/d-entry/native-prewarm/status') {
+          if (
+            request.method !== 'GET' ||
+            address.searchParams.get('operationId') !== ticket
+          )
+            return response.writeHead(404).end();
+          if (++polls === 1) {
+            await allowStarting.promise;
+            return json({ state: 'starting' });
+          }
+          await allowReady.promise;
+          if (polls === 2) return response.writeHead(503).end();
+          return json({ state: 'ready' });
         }
         if (
           address.pathname === '/api/v1/sessions' &&
@@ -133,6 +167,13 @@ suite('4.0 browser cold entry', () => {
               )!.text,
             );
         }
+        if (address.pathname === '/chatflow') {
+          if (!address.search)
+            return response.writeHead(307, { location: '/chatflow/4.0' }).end();
+          if (address.searchParams.get('employee') === '')
+            return html('<!doctype html><h1>员工</h1>');
+          return response.writeHead(404).end();
+        }
         return html(
           '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
         );
@@ -148,11 +189,24 @@ suite('4.0 browser cold entry', () => {
       closes.push(() => browser.close());
       const context = await browser.newContext({
         viewport: { width: 390, height: 844 },
+        reducedMotion: 'no-preference',
       });
       await context.addCookies([
         { name: 'allrice_session', value: sessionToken, url: f.origin },
       ]);
       const page = await context.newPage();
+      const status = page.getByRole('status');
+      const spinner = status.locator('[data-state="ongoing"]');
+      async function assertWaiting(title: string, description: string) {
+        await status
+          .getByRole('heading', { name: title, exact: true })
+          .waitFor();
+        expect(
+          await status.getByText(description, { exact: true }).isVisible(),
+        ).toBe(true);
+        expect(await status.getAttribute('aria-atomic')).toBe('true');
+        expect(await spinner.getAttribute('aria-hidden')).toBe('true');
+      }
       await page.addInitScript(() => {
         if (window.top === window && !sessionStorage.getItem('entry-visible'))
           Object.defineProperty(document, 'hidden', {
@@ -163,7 +217,15 @@ suite('4.0 browser cold entry', () => {
       await page.goto(
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
-      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await assertWaiting('正在打开对话', '马上就好。');
+      const animations = () =>
+        spinner.evaluate(
+          (element) => element.getAnimations({ subtree: true }).length,
+        );
+      await expect.poll(animations).toBeGreaterThan(0);
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+      await expect.poll(animations).toBe(0);
+      await assertWaiting('正在打开对话', '马上就好。');
       await page.evaluate(
         () => new Promise((painted) => requestAnimationFrame(painted)),
       );
@@ -176,12 +238,18 @@ suite('4.0 browser cold entry', () => {
       });
       await page
         .getByRole('alert')
-        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
+      expect(
+        await page
+          .getByRole('alert')
+          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .isVisible(),
+      ).toBe(true);
       expect(births).toEqual([]);
       await page.getByRole('button', { name: '重试' }).click();
       const held = await firstRetry.promise;
-      await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+      await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
       await page.getByRole('button', { name: '取消等待' }).click();
       await retryClosed.promise;
       expect(held.writableFinished).toBe(false);
@@ -209,9 +277,43 @@ suite('4.0 browser cold entry', () => {
         .toBe(true);
       expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
       expect(documents).toEqual([]);
+      const birthsBeforePolling = births.slice();
       await page.getByRole('button', { name: '继续' }).click();
+      try {
+        await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
+        allowStarting.resolve();
+        await assertWaiting(
+          '正在启动工作台',
+          '第一次启动需要一两分钟，留在这页就行。',
+        );
+        expect(
+          await page.getByRole('button', { name: '取消等待' }).isEnabled(),
+        ).toBe(true);
+        expect(documents).toEqual([]);
+      } finally {
+        allowStarting.resolve();
+        allowReady.resolve();
+      }
+      const pollingFailure = page.getByRole('alert');
+      await pollingFailure
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
+        .waitFor();
+      expect(
+        await pollingFailure
+          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .isVisible(),
+      ).toBe(true);
+      expect(
+        await page
+          .getByRole('link', { name: '返回员工页', exact: true })
+          .isVisible(),
+      ).toBe(true);
+      expect(polls).toBe(2);
+      expect(warmCalls).toHaveLength(4);
+      expect(births).toEqual(birthsBeforePolling);
+      await page.getByRole('button', { name: '重试', exact: true }).click();
       async function showEditor(threadId: string) {
-        await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
+        await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
         const source = new URL((await iframe.getAttribute('src'))!, f.origin);
@@ -235,6 +337,8 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      expect(polls).toBe(3);
+      expect(warmCalls).toHaveLength(4);
       const oldDocument = page.frameLocator('iframe').locator('body');
       const claim = () =>
         oldDocument.evaluate(() =>
@@ -289,9 +393,10 @@ suite('4.0 browser cold entry', () => {
         .click();
       await page
         .getByRole('alert')
-        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
       expect(births).toHaveLength(2);
+
       await page.evaluate(() => history.back());
       await page.waitForURL((url) => url.searchParams.get('threadId') === next);
       await showEditor(next);
@@ -324,6 +429,28 @@ suite('4.0 browser cold entry', () => {
         { selection: f.selection, trigger: 'page' },
       ]);
       expect(births).toHaveLength(2);
+
+      const returnPage = await context.newPage();
+      await returnPage.route('**/api/v1/d-entry/native-prewarm', (route) =>
+        route.fulfill({ status: 503 }),
+      );
+      await returnPage.goto(
+        f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
+      );
+      const back = returnPage.getByRole('link', {
+        name: '返回员工页',
+        exact: true,
+      });
+      await back.press('Enter');
+      await returnPage.waitForURL(
+        (url) =>
+          url.pathname === '/chatflow' &&
+          url.searchParams.get('employee') === '',
+      );
+      await returnPage
+        .getByRole('heading', { name: '员工', exact: true })
+        .waitFor();
+      await returnPage.close();
     },
   );
 });

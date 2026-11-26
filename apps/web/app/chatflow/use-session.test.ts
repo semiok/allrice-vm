@@ -152,6 +152,17 @@ describe('P26 History selection async control flow (synthetic fetch, explicit ho
     vi.unstubAllGlobals();
   });
 
+  it('opens the default employee draft from the return link even with existing conversations', async () => {
+    window.location.search = '?employee=';
+    const initial = render().loadWorkspace();
+    requests[0]!.result.resolve(Response.json({ workspace }));
+    requests[1]!.result.resolve(Response.json({ capabilities: {} }));
+    await initial;
+    const state = render();
+    expect(state.activeId).toBeNull();
+    expect(state.newSessionEmployee?.id).toBe('employee');
+  });
+
   it('keeps accepted Run facts through an older Workspace read while applying fresh metadata', async () => {
     const state = await ready();
     const reading = state.loadWorkspace();

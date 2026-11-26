@@ -262,6 +262,36 @@ export const DEntryNativePrewarmResultSchema = z
     trigger: DEntryNativePrewarmTriggerSchema,
   })
   .strict();
+export const DEntryNativePrewarmTicketSchema = z
+  .object({
+    operationId: UuidSchema,
+    expiresAt: z.iso.datetime(),
+    pollAfterMs: z.number().int().min(1000).max(3000),
+  })
+  .strict();
+export const DEntryNativePrewarmAcceptedSchema =
+  DEntryNativePrewarmResultSchema.extend({
+    ticket: DEntryNativePrewarmTicketSchema,
+  });
+export const DEntryNativePrewarmStatusQuerySchema =
+  DEntrySelectionInputSchema.extend({ operationId: UuidSchema });
+export const DEntryNativePrewarmStatusSchema = z.discriminatedUnion('state', [
+  z
+    .object({ state: z.enum(['accepted', 'starting', 'ready', 'expired']) })
+    .strict(),
+  z
+    .object({
+      state: z.literal('failed'),
+      code: z.enum(['START_UNAVAILABLE', 'AUTHORITY_REVOKED']),
+    })
+    .strict(),
+]);
+export type DEntryNativePrewarmTicket = z.infer<
+  typeof DEntryNativePrewarmTicketSchema
+>;
+export type DEntryNativePrewarmStatus = z.infer<
+  typeof DEntryNativePrewarmStatusSchema
+>;
 export const DEntryNativeResourceRequestSchema = z
   .object({
     organizationId: UuidSchema,

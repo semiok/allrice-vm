@@ -65,6 +65,9 @@ describe('ChatFlow server local command capability', () => {
         searchParams: Promise.resolve({ session: 'legacy-bookmark' }),
       }),
     ).resolves.toHaveProperty('props');
+    await expect(
+      ChatFlowPage({ searchParams: Promise.resolve({ employee: '' }) }),
+    ).resolves.toHaveProperty('props');
     expect(entry.find).toHaveBeenCalledTimes(2);
   });
   it('shows the trial failure instead of defaulting to the legacy writer when policy is unavailable', async () => {

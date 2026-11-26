@@ -848,8 +848,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
           },
         }),
       cleanupTimeoutMs: this.options.jobCleanupTimeoutMs ?? 10000,
-      command: (args, signal, readNonzeroExit) =>
-        this.command(scope.binding, args, signal, readNonzeroExit),
+      command: async (args, signal, readNonzeroExit) => {
+        // Local file staging happens before this dispatch boundary.
+        if (args[0] === 'cp') await scope.assertCurrent();
+        return this.command(scope.binding, args, signal, readNonzeroExit);
+      },
     });
   }
   /** Trusted diagnostics only. CLI abort is not proof of guest cancellation. */
