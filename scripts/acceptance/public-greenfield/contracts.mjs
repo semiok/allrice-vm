@@ -1,0 +1,118 @@
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+export const publicOrigin = 'https://allricevm.bplabs.xyz';
+export const entry = '/chatflow/4.0';
+export const paths = {
+  login: '/api/v1/auth/login',
+  employee: '/api/v1/employee-instances',
+  prewarm: '/api/v1/d-entry/native-prewarm',
+  poll: '/api/v1/d-entry/native-prewarm/status',
+  thread: '/api/v1/sessions',
+  identity: '/api/v1/d-entry/identity',
+  policy: '/api/v1/admin/d-entry-release-policy',
+};
+export const repo = 'semiok/allrice-vm';
+export const repoId = 1469490636;
+
+const sha = /^[a-f0-9]{40}$/;
+const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+export const isId = (value) => typeof value === 'string' && uuid.test(value);
+export const peoplePath = (org) => `/api/v1/admin/organizations/${org}/people`;
+export const DSH_EDITOR = '[role="textbox"][data-composer-input]';
+
+export class CheckFailed extends Error {
+  constructor(code, status) {
+    super(code);
+    this.code = code;
+    this.status = status;
+  }
+}
+
+export function requireFact(condition, code, status) {
+  if (!condition) throw new CheckFailed(code, status);
+}
+
+export function checkHealth(response, release, service = 'web') {
+  const info = response.body?.identity;
+  requireFact(
+    response.status === 200 &&
+      response.body?.status === 'ready' &&
+      info?.repository === repo &&
+      String(info.repositoryId) === String(repoId) &&
+      info?.service === service &&
+      info.environment === 'dev' &&
+      info.mode === 'production' &&
+      info.sourceSha === release.sha &&
+      info.sourceTree === release.tree &&
+      isId(info.bootId),
+    'release-identity-mismatch',
+    response.status,
+  );
+  return info.bootId;
+}
+
+export const sameSelection = (selection, expected) =>
+  selection &&
+  selection.workspaceId === expected.workspaceId &&
+  selection.employeeInstanceId === expected.employeeInstanceId &&
+  selection.threadId === expected.threadId;
+
+const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+const prerequisites = {
+  'async-prewarm': '4f28b4c48d3d00f658c411bd7fb4fda6ba1f81ba',
+  'first-employee': 'efb1537ec4b95930ee7d666af4b7b170a2d9ca65',
+  'system-disk-and-dsh-startup': '70042d3cca750229f4ae96b96fdd8d76552d039c',
+};
+
+function localGit(args) {
+  return execFileSync('git', args, {
+    cwd: repositoryRoot,
+    timeout: 5000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    encoding: 'utf8',
+  }).trim();
+}
+
+/** Check local source evidence before a future operator could use credentials. */
+export function liveBlockers(options, git = localGit) {
+  const { allowPublicWrites, releaseSha, releaseTree } = options;
+  if (
+    !allowPublicWrites ||
+    !sha.test(releaseSha ?? '') ||
+    !sha.test(releaseTree ?? '')
+  )
+    return ['explicit-live-approval-and-exact-release-required'];
+  const blockers = [];
+  try {
+    const main = git(['rev-parse', 'refs/remotes/origin/main^{commit}']);
+    const tree = git(['rev-parse', 'refs/remotes/origin/main^{tree}']);
+    if (main !== releaseSha || tree !== releaseTree)
+      blockers.push('local-origin-main-release-mismatch');
+    for (const [name, commit] of Object.entries(prerequisites)) {
+      try {
+        git(['merge-base', '--is-ancestor', commit, main]);
+      } catch {
+        blockers.push(`${name}-merge-unverified`);
+      }
+    }
+    try {
+      git([
+        'grep',
+        '-q',
+        '<EmployeeFirstStart',
+        main,
+        '--',
+        'apps/web/app/chatflow/4.0/page.tsx',
+      ]);
+    } catch {
+      blockers.push('zero-employee-page-wiring-unverified');
+    }
+  } catch {
+    blockers.push('repository-release-unavailable');
+  }
+  // Production authority explicitly denies public stops. No public browser run
+  // may start a VM until an authorized same-Worker exact-owner stop is bound.
+  blockers.push('managed-exact-owner-stop-unavailable');
+  return blockers;
+}
