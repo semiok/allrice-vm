@@ -16,7 +16,11 @@ const webRequire = createRequire(
 );
 const duration = (from) => Math.round(performance.now() - from);
 const POLL_LIMIT_MS = 5 * 60_000; // #23 entry-client.ts
+const POLL_REQUEST_MS = 20_000;
+const POLL_JITTER_MS = 50;
 const FRAME = 'iframe[title="员工工作区"]';
+const documentPath = `${entry}/document`;
+const profileToken = /^[a-zA-Z0-9_-]{1,160}$/;
 const readPaths = new Set([
   '/',
   '/login',
@@ -37,15 +41,115 @@ function responseStatus(status, expected, code) {
 /** Observe the browser's own requests, including the single polling loop. */
 function browserFlow({ identity, account, employeeName, receipt }) {
   let selection;
+  let employeeVersion;
+  let carrier;
+  let previousScope;
   let phase = 'cold';
   let loginStarted;
   let employeeStarted;
   let pollInFlight = false;
   let ticket;
   let prewarmStarted;
-  let acceptedAt;
+  let pollAfterMs;
+  let lastPollResponseAt;
+  let pollDeadline;
   const phases = receipt.browser;
   const current = () => phases[phase];
+
+  function isDocumentSource(url) {
+    const query = Object.fromEntries(url.searchParams);
+    return (
+      carrier &&
+      navigation(url, documentPath) &&
+      [...url.searchParams].length === 4 &&
+      query.scopeId === carrier.scopeId &&
+      sameSelection(query, selection)
+    );
+  }
+
+  function hasDocumentScope({ source, loaded, scopeId }) {
+    if (
+      !source ||
+      !loaded ||
+      !isDocumentSource(new URL(source)) ||
+      scopeId !== carrier.scopeId
+    )
+      return false;
+    const url = new URL(loaded);
+    if (isDocumentSource(url)) return true;
+    if (
+      url.origin !== publicOrigin ||
+      !url.pathname.startsWith(documentPath + '/') ||
+      url.search
+    )
+      return false;
+    const parts = url.pathname.slice(documentPath.length + 1).split('/');
+    const [
+      scope,
+      workspaceId,
+      employeeInstanceId,
+      threadId,
+      bindingRef,
+      graph,
+      digest,
+      folder,
+      file,
+    ] = parts;
+    return (
+      parts.length === 9 &&
+      scope === scopeId &&
+      bindingRef === carrier.bindingRef &&
+      sameSelection({ workspaceId, employeeInstanceId, threadId }, selection) &&
+      profileToken.test(graph) &&
+      /^[a-f0-9]{64}$/.test(digest) &&
+      folder === 'native' &&
+      file === 'index.html'
+    );
+  }
+
+  function openCarrier(url, frame, exchange) {
+    const query = Object.fromEntries(url.searchParams);
+    const { payload } = frame ?? {};
+    requireFact(
+      current().identityVerified &&
+        !carrier &&
+        url.protocol === 'wss:' &&
+        url.host === new URL(publicOrigin).host &&
+        !url.username &&
+        !url.password &&
+        url.pathname === paths.mux &&
+        [...url.searchParams].length === 5 &&
+        query.carrier === 'page' &&
+        query.organizationId === identity.organizationId &&
+        sameSelection(query, selection) &&
+        frame?.type === 'open' &&
+        frame.endpoint === '$d-entry/page' &&
+        isId(frame.streamId) &&
+        payload?.args &&
+        Object.keys(payload).length === 1 &&
+        Object.keys(payload.args).length === 0 &&
+        typeof payload.args === 'object' &&
+        !Array.isArray(payload.args),
+      'carrier-request-unverified',
+    );
+    const reply = exchange(frame);
+    const { scopeReference, bindingRef } = reply?.value ?? {};
+    requireFact(
+      reply?.type === 'item' &&
+        reply.streamId === frame.streamId &&
+        reply.value?.type === 'opened' &&
+        isId(scopeReference?.scopeId) &&
+        Object.keys(scopeReference).length === 1 &&
+        Object.keys(reply.value).length === 3 &&
+        scopeReference.scopeId !== previousScope &&
+        typeof bindingRef === 'string' &&
+        profileToken.test(bindingRef),
+      'carrier-open-unverified',
+    );
+    carrier = { scopeId: scopeReference.scopeId, bindingRef };
+    current().carrierVerified = true;
+    return reply;
+  }
 
   function allowWrite(path, url, body) {
     switch (path) {
@@ -99,7 +203,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
       'origin-blocked',
     );
     const query = Object.fromEntries(url.searchParams);
-    const isPoll = path === paths.poll && method === 'GET';
+    let poll;
     if (method === 'POST') {
       requireFact(allowWrite(path, url, body), 'write-blocked');
       if (path === paths.login) loginStarted = performance.now();
@@ -120,27 +224,39 @@ function browserFlow({ identity, account, employeeName, receipt }) {
       requireFact(method === 'GET', 'write-blocked');
       requireFact(
         readPaths.has(path) ||
-          path === `${entry}/document` ||
-          path.startsWith(`${entry}/document/`) ||
+          path === documentPath ||
+          path.startsWith(documentPath + '/') ||
           path.startsWith('/_next/static/') ||
           path === '/api/v1/d-entry/profile/bootstrap' ||
           path === '/api/v1/d-entry/profile/assets' ||
           path.startsWith('/api/v1/d-entry/profile/assets/static/'),
         'read-blocked',
       );
+      if (path === documentPath)
+        requireFact(isDocumentSource(url), 'native-document-scope');
     }
-    if (isPoll) {
+    if (path === paths.poll && method === 'GET') {
+      const now = performance.now();
       requireFact(
         phase === 'cold' &&
           ticket &&
           !current().prewarmReady &&
           !pollInFlight &&
-          duration(acceptedAt) <= POLL_LIMIT_MS &&
+          now <= pollDeadline &&
           current().polls.length < 300 &&
           query.operationId === ticket.operationId &&
           sameSelection(query, selection) &&
           [...url.searchParams].length === 3,
         'poll-scope-or-budget',
+      );
+      poll = {
+        intervalMs: Math.round(now - lastPollResponseAt),
+        requiredMs: pollAfterMs,
+      };
+      current().polls.push(poll);
+      requireFact(
+        now - lastPollResponseAt + POLL_JITTER_MS >= pollAfterMs,
+        'poll-too-early',
       );
       pollInFlight = true;
     }
@@ -163,12 +279,19 @@ function browserFlow({ identity, account, employeeName, receipt }) {
             instance.workspaceId === identity.workspaceId &&
             instance.ownerId === identity.personId &&
             instance.kind === 'custom' &&
-            isId(instance.id),
+            isId(instance.id) &&
+            Number.isSafeInteger(instance.revision) &&
+            instance.revision > 0 &&
+            isId(instance.source?.employeeVersionId),
           'employee-scope',
         );
         selection = {
           workspaceId: instance.workspaceId,
           employeeInstanceId: instance.id,
+        };
+        employeeVersion = {
+          revision: instance.revision,
+          id: instance.source.employeeVersionId,
         };
         receipt.timings.employeeCreationHttpMs = duration(employeeStarted);
         break;
@@ -193,7 +316,17 @@ function browserFlow({ identity, account, employeeName, receipt }) {
             'invalid-prewarm-ticket',
           );
           ticket = data;
-          acceptedAt = performance.now();
+          pollAfterMs = data.pollAfterMs;
+          lastPollResponseAt = performance.now();
+          pollDeadline =
+            lastPollResponseAt +
+            Math.min(
+              POLL_LIMIT_MS,
+              Math.max(
+                POLL_REQUEST_MS,
+                Date.parse(ticket.expiresAt) - Date.now(),
+              ),
+            );
         }
         break;
       case `GET ${paths.poll}`: {
@@ -205,10 +338,14 @@ function browserFlow({ identity, account, employeeName, receipt }) {
           'expired',
           'failed',
         ].find((value) => value === data?.state);
-        current().polls.push({
-          status: reply.status,
-          state: state ?? 'unrecognized',
-        });
+        poll.status = reply.status;
+        poll.state = state ?? 'unrecognized';
+        lastPollResponseAt = performance.now();
+        requireFact(
+          lastPollResponseAt <= pollDeadline + POLL_JITTER_MS,
+          'poll-scope-or-budget',
+        );
+        pollAfterMs = Math.min(3000, pollAfterMs + 1000);
         if (reply.status === 410 && state === 'expired')
           throw new CheckFailed('prewarm-expired', 410);
         responseStatus(reply.status, 200, 'prewarm-status-http');
@@ -242,10 +379,15 @@ function browserFlow({ identity, account, employeeName, receipt }) {
         requireFact(
           current().prewarmReady &&
             isId(selection?.threadId) &&
+            [...url.searchParams].length === 3 &&
             sameSelection(query, selection) &&
             sameSelection(data?.identity, selection) &&
+            Object.keys(data).length === 1 &&
+            Object.keys(data.identity).length === 7 &&
             data.identity.personId === identity.personId &&
-            data.identity.organizationId === identity.organizationId,
+            data.identity.organizationId === identity.organizationId &&
+            data.identity.employeeRevision === employeeVersion.revision &&
+            data.identity.employeeVersionId === employeeVersion.id,
           'native-identity-scope',
         );
         current().identityVerified = true;
@@ -256,8 +398,12 @@ function browserFlow({ identity, account, employeeName, receipt }) {
 
   return {
     request,
+    openCarrier,
+    hasDocumentScope,
     selection: () => selection,
     warm: () => {
+      previousScope = carrier.scopeId;
+      carrier = undefined;
       phase = 'warm';
     },
   };
@@ -320,6 +466,10 @@ export async function runBrowser({
       inspect: (request, exchange) => {
         requireFact(!routeFailed, 'request-after-failure');
         return flow.request(request, exchange);
+      },
+      openCarrier: (url, frame, exchange) => {
+        requireFact(!routeFailed, 'request-after-failure');
+        return flow.openCarrier(url, frame, exchange);
       },
       fail: failure,
     });
@@ -390,22 +540,27 @@ export async function runBrowser({
       const child = page.frameLocator(FRAME);
       const editor = child.locator(DSH_EDITOR);
       await guarded(editor.waitFor({ state: 'visible', timeout }));
-      requireFact(
-        await guarded(editor.evaluate((node) => node.isContentEditable)),
-        'composer-not-editable',
-      );
+      const readEditor = () =>
+        guarded(
+          editor.evaluate((node) => {
+            const view = node.ownerDocument.defaultView;
+            return {
+              source: view.frameElement?.src,
+              loaded: node.ownerDocument.URL,
+              scopeId: view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId,
+              editable: node.isContentEditable,
+              focused: node.ownerDocument.activeElement === node,
+            };
+          }),
+        );
+      const before = await readEditor();
+      requireFact(flow.hasDocumentScope(before), 'native-document-scope');
+      requireFact(before.editable, 'composer-not-editable');
       // Focus without inserting text, issuing keyboard shortcuts, or sending.
       await guarded(editor.focus());
-      requireFact(
-        await guarded(
-          editor.evaluate(
-            (node) =>
-              node.ownerDocument.activeElement === node &&
-              node.isContentEditable,
-          ),
-        ),
-        'composer-not-focused',
-      );
+      const after = await readEditor();
+      requireFact(flow.hasDocumentScope(after), 'native-document-scope');
+      requireFact(after.focused && after.editable, 'composer-not-focused');
       const url = new URL(page.url());
       requireFact(
         navigation(url, entry) &&
@@ -414,9 +569,11 @@ export async function runBrowser({
             flow.selection(),
           ) &&
           receipt.browser[phase].prewarmReady &&
-          receipt.browser[phase].identityVerified,
+          receipt.browser[phase].identityVerified &&
+          receipt.browser[phase].carrierVerified,
         'composer-scope-unverified',
       );
+      receipt.browser[phase].documentVerified = true;
       receipt.timings[`${phase}ToEditableMs`] = duration(start);
       receipt.stages[`${phase}Editor`] = 'passed';
     }

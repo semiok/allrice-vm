@@ -10,6 +10,7 @@ export const paths = {
   poll: '/api/v1/d-entry/native-prewarm/status',
   thread: '/api/v1/sessions',
   identity: '/api/v1/d-entry/identity',
+  mux: '/api/v1/d-entry/native-mux',
   policy: '/api/v1/admin/d-entry-release-policy',
 };
 export const repo = 'semiok/allrice-vm';
@@ -54,11 +55,40 @@ export function checkHealth(response, release, service = 'web') {
 
 export const sameSelection = (selection, expected) =>
   selection &&
+  expected &&
   selection.workspaceId === expected.workspaceId &&
   selection.employeeInstanceId === expected.employeeInstanceId &&
   selection.threadId === expected.threadId;
 
+// The host-only PersonVmBinding contract. None of these values reach receipts.
+const vmIdFields = ['vmId', 'personId', 'organizationId', 'instanceId'];
+export const sameVmBinding = (left, right) =>
+  left &&
+  right &&
+  left.leaseEpoch === right.leaseEpoch &&
+  vmIdFields.every((key) => left[key] === right[key]);
+
+export function captureVmBinding(binding, identity) {
+  requireFact(
+    binding &&
+      vmIdFields.every((key) => isId(binding[key])) &&
+      binding.personId === identity.personId &&
+      binding.organizationId === identity.organizationId &&
+      Number.isSafeInteger(binding.leaseEpoch) &&
+      binding.leaseEpoch > 0,
+    'start-binding-unverified',
+  );
+  return Object.freeze({
+    vmId: binding.vmId,
+    personId: binding.personId,
+    organizationId: binding.organizationId,
+    instanceId: binding.instanceId,
+    leaseEpoch: binding.leaseEpoch,
+  });
+}
+
 const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
+const originMain = 'refs/remotes/origin/main';
 const prerequisites = {
   'async-prewarm': '4f28b4c48d3d00f658c411bd7fb4fda6ba1f81ba',
   'first-employee': 'efb1537ec4b95930ee7d666af4b7b170a2d9ca65',
@@ -75,18 +105,31 @@ function localGit(args) {
 }
 
 /** Check local source evidence before a future operator could use credentials. */
-export function liveBlockers(options, git = localGit) {
+export function livePreflight(options, git = localGit) {
   const { allowPublicWrites, releaseSha, releaseTree } = options;
-  if (
-    !allowPublicWrites ||
-    !sha.test(releaseSha ?? '') ||
-    !sha.test(releaseTree ?? '')
-  )
-    return ['explicit-live-approval-and-exact-release-required'];
-  const blockers = [];
+  const expected =
+    sha.test(releaseSha ?? '') && sha.test(releaseTree ?? '')
+      ? { sha: releaseSha, tree: releaseTree }
+      : null;
+  const receipt = {
+    mode: 'live',
+    status: 'blocked',
+    requestedRelease: expected,
+    localRef: null,
+    blockers: [],
+  };
+  const { blockers } = receipt;
+  if (!allowPublicWrites || !expected) {
+    blockers.push('explicit-live-approval-and-exact-release-required');
+    return receipt;
+  }
   try {
-    const main = git(['rev-parse', 'refs/remotes/origin/main^{commit}']);
-    const tree = git(['rev-parse', 'refs/remotes/origin/main^{tree}']);
+    const main = git(['rev-parse', '--verify', originMain + '^{commit}']);
+    requireFact(sha.test(main), 'local-release-sha-invalid');
+    // Resolve the tree from the commit just read, even if the ref moves.
+    const tree = git(['rev-parse', '--verify', main + '^{tree}']);
+    requireFact(sha.test(tree), 'local-release-tree-invalid');
+    receipt.localRef = { name: originMain, sha: main, tree };
     if (main !== releaseSha || tree !== releaseTree)
       blockers.push('local-origin-main-release-mismatch');
     for (const [name, commit] of Object.entries(prerequisites)) {
@@ -114,5 +157,5 @@ export function liveBlockers(options, git = localGit) {
   // Production authority explicitly denies public stops. No public browser run
   // may start a VM until an authorized same-Worker exact-owner stop is bound.
   blockers.push('managed-exact-owner-stop-unavailable');
-  return blockers;
+  return receipt;
 }

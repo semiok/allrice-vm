@@ -1,13 +1,13 @@
-/* global document, FormData, window, URLSearchParams, crypto, setTimeout */
+/* global document, FormData, window, WebSocket, URLSearchParams, crypto, setTimeout */
 import { randomUUID } from 'node:crypto';
 import {
-  CheckFailed,
   entry,
   paths,
   peoplePath,
   repo,
   repoId,
   requireFact,
+  sameVmBinding,
 } from './contracts.mjs';
 
 const json = (value, status = 200, headers) => ({
@@ -25,7 +25,7 @@ const client = (run, args) =>
 const go = (path) =>
   html(`<script>window.location.replace(${JSON.stringify(path)})</script>`);
 
-export function fixtureDriver(publicHttp) {
+export function fixtureDriver(publicHttp, issueCarrier) {
   return {
     // All requests are fulfilled in Playwright. Chromium also has DNS and
     // proxy access disabled if something escapes interception.
@@ -33,7 +33,7 @@ export function fixtureDriver(publicHttp) {
       '--no-proxy-server',
       '--host-resolver-rules=MAP * ~NOTFOUND',
     ],
-    async install(context, { inspect, fail }) {
+    async install(context, { inspect, openCarrier, fail }) {
       await context.route('**/*', async (route) => {
         try {
           const request = route.request();
@@ -60,9 +60,26 @@ export function fixtureDriver(publicHttp) {
           await route.abort('blockedbyclient').catch(() => {});
         }
       });
-      await context.routeWebSocket('**/*', async (socket) => {
-        fail(new CheckFailed('fixture-websocket-blocked'));
-        await socket.close().catch(() => {});
+      await context.routeWebSocket('**/*', (socket) => {
+        // This is the in-process end of the synthetic WebSocket. It never
+        // calls connectToServer, including for an unexpected endpoint.
+        socket.onMessage((message) => {
+          try {
+            requireFact(
+              typeof message === 'string',
+              'fixture-websocket-blocked',
+            );
+            const reply = openCarrier(
+              new URL(socket.url()),
+              JSON.parse(message),
+              issueCarrier,
+            );
+            socket.send(JSON.stringify(reply));
+          } catch (error) {
+            fail(error);
+            void socket.close().catch(() => {});
+          }
+        });
       });
     },
   };
@@ -133,8 +150,9 @@ async function openEmployee({ entry, paths, failWith }) {
     const { operationId, pollAfterMs } = await start.json();
     const query = new URLSearchParams({ ...selection, operationId });
     let delay = pollAfterMs;
-    for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
+    for (let attempt = 0; ; attempt++) {
+      if (attempt === 0 || failWith !== 'fast-next-poll')
+        await new Promise((resolve) => setTimeout(resolve, delay));
       delay = Math.min(3000, delay + 1000);
       const poll = await fetch(paths.poll + '?' + query);
       if (!poll.ok) return;
@@ -149,10 +167,50 @@ async function openEmployee({ entry, paths, failWith }) {
     selection.threadId = (await opened.json()).threadId;
   }
   const query = new URLSearchParams(selection);
-  if (!(await fetch(paths.identity + '?' + query)).ok) return;
+  const checked = await fetch(paths.identity + '?' + query);
+  if (!checked.ok) return;
+  const { identity } = await checked.json();
+  const mux = new URL(paths.mux, window.location.href);
+  mux.protocol = 'wss:';
+  mux.search = new URLSearchParams({
+    carrier: 'page',
+    organizationId: identity.organizationId,
+    ...selection,
+  });
+  const { scopeId } = await new Promise((resolve) => {
+    const socket = new WebSocket(mux);
+    const streamId = crypto.randomUUID();
+    socket.addEventListener(
+      'open',
+      () =>
+        socket.send(
+          JSON.stringify({
+            type: 'open',
+            streamId,
+            endpoint: '$d-entry/page',
+            payload: { args: {} },
+          }),
+        ),
+      { once: true },
+    );
+    socket.addEventListener(
+      'message',
+      (event) => {
+        const frame = JSON.parse(event.data);
+        if (
+          frame.streamId === streamId &&
+          frame.type === 'item' &&
+          frame.value.type === 'opened'
+        )
+          resolve(frame.value.scopeReference);
+      },
+      { once: true },
+    );
+  });
   window.history.replaceState(null, '', entry + '?' + query);
   const frame = document.createElement('iframe');
   frame.title = '员工工作区';
+  query.set('scopeId', scopeId);
   frame.src = entry + '/document?' + query;
   document.body.append(frame);
 }
@@ -165,6 +223,10 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
   const threadId = '55555555-5555-4555-8555-555555555555';
   const operationId = '66666666-6666-4666-8666-666666666666';
   const vmId = '77777777-7777-4777-8777-777777777777';
+  const instanceId = randomUUID();
+  const employeeVersionId = randomUUID();
+  const employeeSource = { kind: 'tenant_version', employeeVersionId };
+  const employeeRevision = 1;
   const account = {
     username: 'qa-greenfield-fixture',
     password: 'synthetic-fixture-only',
@@ -184,6 +246,19 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
   let authenticated = false;
   let vm;
   let polls = 0;
+  let openedScope;
+  const bindingRef = 'fixture-binding';
+  const nativeDocument = (scopeId) =>
+    `${entry}/document/${[
+      scopeId,
+      workspaceId,
+      employeeInstanceId,
+      threadId,
+      bindingRef,
+      'fixture-graph',
+      'c'.repeat(64),
+      'native/index.html',
+    ].join('/')}`;
 
   return {
     account,
@@ -235,7 +310,7 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
       }
       return { status: 403 };
     },
-    publicHttp({ url, method }) {
+    publicHttp({ url, method }, recordColdStart) {
       if (method === 'GET' && url.pathname === '/') return go('/chatflow');
       if (method === 'GET' && url.pathname === '/chatflow') {
         return go(authenticated ? entry : '/login');
@@ -260,6 +335,7 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
         ${client(createEmployee, { endpoint: paths.employee, entry, organizationId, workspaceId })}`);
       if (method === 'POST' && url.pathname === paths.employee && !employee) {
         employee = true;
+        const timestamp = new Date().toISOString();
         return json(
           {
             instance: {
@@ -267,7 +343,14 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
               workspaceId,
               ownerId: personId,
               id: employeeInstanceId,
+              assignmentId: employeeInstanceId,
               kind: 'custom',
+              revision: employeeRevision,
+              profile: { name: '验收员工' },
+              source: employeeSource,
+              creationSource: employeeSource,
+              createdAt: timestamp,
+              updatedAt: timestamp,
             },
           },
           201,
@@ -280,14 +363,32 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
       }
       if (method === 'POST' && url.pathname === paths.prewarm) {
         if (vm) return { status: 204 };
-        vm = { ...scope, vmId, leaseEpoch: 1, diskRetained: true };
+        if (
+          failWith === 'startup-pending' ||
+          failWith === 'startup-unallocated'
+        ) {
+          recordColdStart({
+            state: failWith === 'startup-pending' ? 'pending' : 'unallocated',
+          });
+          return { status: 503 };
+        }
+        vm = {
+          vmId,
+          instanceId,
+          personId,
+          organizationId,
+          leaseEpoch: 1,
+          diskRetained: true,
+        };
+        if (failWith === 'startup-unknown') return { status: 503 };
+        recordColdStart({ state: 'allocated', binding: vm });
         return json(
           {
             operationId,
             expiresAt: new Date(Date.now() + 60_000).toISOString(),
             pollAfterMs: 1000,
           },
-          failWith === 'unexpected-cold-http' ? 200 : 202,
+          202,
         );
       }
       if (method === 'GET' && url.pathname === paths.poll) {
@@ -299,13 +400,52 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
       if (method === 'POST' && url.pathname === paths.thread)
         return json({ workspaceId, employeeInstanceId, threadId });
       if (method === 'GET' && url.pathname === paths.identity) {
-        return json({ identity: { ...scope, employeeInstanceId, threadId } });
+        return json({
+          identity: {
+            ...scope,
+            employeeInstanceId,
+            threadId,
+            employeeRevision:
+              failWith === 'missing-employee-revision'
+                ? undefined
+                : employeeRevision,
+            employeeVersionId:
+              failWith === 'wrong-employee-version'
+                ? randomUUID()
+                : employeeVersionId,
+          },
+        });
       }
       if (method === 'GET' && url.pathname === entry + '/document')
+        return go(nativeDocument(openedScope));
+      if (
+        method === 'GET' &&
+        openedScope &&
+        url.pathname === nativeDocument(openedScope)
+      ) {
+        const replaced =
+          failWith === 'replaced-document'
+            ? nativeDocument(randomUUID())
+            : undefined;
         return html(
-          `<div role="textbox" aria-multiline="true" data-composer-input contenteditable="${failWith !== 'locked-editor'}" tabindex="0" style="min-height: 1rem"></div>`,
+          `<script>globalThis.__ALLRICE_EMPLOYEE_DOCUMENT__ = { scopeId: ${JSON.stringify(openedScope)} };
+          ${replaced ? `window.history.replaceState(null, '', ${JSON.stringify(replaced)});` : ''}</script>
+          <div role="textbox" aria-multiline="true" data-composer-input contenteditable="${failWith !== 'locked-editor'}" tabindex="0" style="min-height: 1rem"></div>`,
         );
+      }
       return { status: 404 };
+    },
+    openCarrier({ streamId }) {
+      openedScope = randomUUID();
+      return {
+        type: 'item',
+        streamId,
+        value: {
+          type: 'opened',
+          scopeReference: { scopeId: openedScope },
+          bindingRef,
+        },
+      };
     },
     exactVm(scopeToStop) {
       if (!vm) return null;
@@ -318,9 +458,7 @@ export function makeFixture(failWith, { failCleanup = false } = {}) {
     },
     stopExact(binding) {
       requireFact(
-        !failCleanup &&
-          binding.vmId === vm?.vmId &&
-          binding.leaseEpoch === vm.leaseEpoch,
+        !failCleanup && sameVmBinding(binding, vm),
         'cleanup-unconfirmed',
       );
       const receipt = { ...vm, state: 'stopped', accountRetained: registered };

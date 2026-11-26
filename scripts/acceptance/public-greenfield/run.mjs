@@ -6,12 +6,14 @@ import { parseArgs } from 'node:util';
 import { runBrowser } from './browser.mjs';
 import {
   CheckFailed,
+  captureVmBinding,
   checkHealth,
   isId,
-  liveBlockers,
+  livePreflight,
   paths,
   peoplePath,
   requireFact,
+  sameVmBinding,
 } from './contracts.mjs';
 import { fixtureDriver, makeFixture } from './fixture.mjs';
 
@@ -127,7 +129,7 @@ export async function dryRun({
       coldToEditableMs: null,
       warmToEditableMs: null,
     },
-    cleanup: { status: 'vm-not-observed' },
+    cleanup: { status: 'not-dispatched' },
     firstFailure: null,
   };
   function fail(stage, error) {
@@ -145,6 +147,7 @@ export async function dryRun({
       checkHealth(fixture.health(service), fixture.release, service),
     );
   let identity;
+  let coldStart;
   let stage = 'releaseBefore';
   try {
     const before = currentDeploy();
@@ -153,8 +156,22 @@ export async function dryRun({
     identity = prepare(fixture, receipt);
     stage = 'browser';
     const { account, employeeName, timeout } = fixture;
+    // This observer is called by the synthetic host at the cold dispatch. It
+    // is separate from the public HTTP result and never persists a binding.
+    const recordColdStart = ({ state, binding }) => {
+      requireFact(!coldStart, 'cold-start-evidence-duplicate');
+      coldStart = {
+        state,
+        ...(state === 'allocated' && {
+          binding: captureVmBinding(binding, identity),
+        }),
+      };
+    };
     await runBrowser({
-      driver: fixtureDriver(fixture.publicHttp),
+      driver: fixtureDriver(
+        (request) => fixture.publicHttp(request, recordColdStart),
+        fixture.openCarrier,
+      ),
       account,
       employeeName,
       timeout,
@@ -174,38 +191,40 @@ export async function dryRun({
     fail(stage, error);
   } finally {
     try {
-      const target = identity && fixture.exactVm(identity);
-      requireFact(
-        target || !receipt.browser.cold.prewarmReady,
-        'cleanup-target-unverified',
-      );
-      if (target) {
-        requireFact(
-          receipt.browser.closed &&
-            target.personId === identity.personId &&
-            target.organizationId === identity.organizationId &&
-            target.workspaceId === identity.workspaceId &&
-            isId(target.vmId) &&
-            Number.isSafeInteger(target.leaseEpoch) &&
-            target.leaseEpoch > 0,
-          'cleanup-target-unverified',
-        );
-        const stopped = fixture.stopExact(target);
-        requireFact(
-          stopped?.state === 'stopped' &&
-            stopped.personId === identity.personId &&
-            stopped.organizationId === identity.organizationId &&
-            stopped.vmId === target.vmId &&
-            stopped.leaseEpoch === target.leaseEpoch &&
-            stopped.diskRetained === true &&
-            stopped.accountRetained === true,
-          'cleanup-unconfirmed',
-        );
-        receipt.cleanup = {
-          status: 'stopped',
-          accountRetained: true,
-          diskRetained: true,
-        };
+      if (receipt.browser.cold.prewarmRequests) {
+        const { state, binding } = coldStart ?? {};
+        if (state === 'unallocated') {
+          requireFact(
+            !receipt.browser.cold.prewarmReady,
+            'cleanup-unconfirmed',
+          );
+          receipt.cleanup = { status: 'not-allocated' };
+        } else {
+          requireFact(state !== 'pending', 'cleanup-start-pending');
+          requireFact(
+            state === 'allocated' && receipt.browser.closed,
+            'cleanup-start-unconfirmed',
+          );
+          const current = await fixture.exactVm(identity);
+          requireFact(current, 'cleanup-current-unconfirmed');
+          requireFact(
+            sameVmBinding(binding, current),
+            'cleanup-target-changed',
+          );
+          const stopped = await fixture.stopExact(binding);
+          requireFact(
+            stopped?.state === 'stopped' &&
+              sameVmBinding(binding, stopped) &&
+              stopped.diskRetained === true &&
+              stopped.accountRetained === true,
+            'cleanup-unconfirmed',
+          );
+          receipt.cleanup = {
+            status: 'stopped',
+            accountRetained: true,
+            diskRetained: true,
+          };
+        }
       }
     } catch (error) {
       receipt.cleanup = {
@@ -250,15 +269,11 @@ async function main() {
       mode: 0o600,
     });
   const receipt = values.live
-    ? {
-        mode: 'live',
-        status: 'blocked',
-        blockers: liveBlockers({
-          allowPublicWrites: values['allow-public-writes'],
-          releaseSha: values['release-sha'],
-          releaseTree: values['release-tree'],
-        }),
-      }
+    ? livePreflight({
+        allowPublicWrites: values['allow-public-writes'],
+        releaseSha: values['release-sha'],
+        releaseTree: values['release-tree'],
+      })
     : await dryRun({
         browserExecutable:
           process.env.ALLRICE_BROWSER_EXECUTABLE ??
