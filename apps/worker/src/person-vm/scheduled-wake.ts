@@ -174,7 +174,21 @@ export function createPersonVmScheduledWake(input: Options) {
           ? false
           : input.store.recordExpiredClaimWithoutStoppedSource();
       const current = () => input.store.isCurrent(claim);
-      const eligible = !signal.aborted && (await current());
+      let eligible: boolean;
+      try {
+        eligible = !signal.aborted && (await current());
+      } catch (error) {
+        try {
+          await input.store.releaseUnusedClaim(claim);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'SCHEDULE_WAKE_CLAIM_RELEASE_FAILED',
+            { cause: error },
+          );
+        }
+        throw error;
+      }
       if (signal.aborted) return input.store.releaseUnusedClaim(claim);
       let result: StartResult = 'stale';
       if (eligible) {

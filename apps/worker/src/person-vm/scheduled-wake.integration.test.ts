@@ -77,7 +77,8 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         ledger: createPostgresNativeScheduleObservationLedger(db),
         now: () => new Date('2024-11-03T05:00:00.000Z'),
         capture: async (_binding, planId) => {
-          if (!receiptIds.has(planId)) receiptIds.set(planId, randomUUID());
+          if (!receiptIds.has(planId))
+            receiptIds.set(planId, 'a' + randomUUID().slice(1));
           return {
             profiles: [
               {
@@ -106,7 +107,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
           kind: 'invalidation',
           origin,
           receiptId: randomUUID(),
-          invalidateReceiptIds: [receiptIds.get(planId)!],
+          invalidateReceiptIds: [receiptIds.get(planId)!.toUpperCase()],
           reasonRef: 'fixture-native-rule-deleted',
         });
       },
@@ -369,6 +370,29 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         })
         .runDueOnce(abort.signal),
     ).toBe(true);
+    expect(f.start).not.toHaveBeenCalled();
+    expect(await f.module().runDueOnce(signal)).toBe(true);
+    expect(f.start.mock.calls[0]?.[0].attempts).toBe(1);
+  });
+
+  it('preserves pre-dispatch read failure and makes the unused claim available', async () => {
+    const f = await fixture();
+    const planId = randomUUID();
+    await expect(
+      f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    await f.stop(planId);
+    const failed = new Error('eligibility read failed');
+    await expect(
+      f
+        .module({
+          ...f.store(),
+          async isCurrent() {
+            throw failed;
+          },
+        })
+        .runDueOnce(signal),
+    ).rejects.toBe(failed);
     expect(f.start).not.toHaveBeenCalled();
     expect(await f.module().runDueOnce(signal)).toBe(true);
     expect(f.start.mock.calls[0]?.[0].attempts).toBe(1);

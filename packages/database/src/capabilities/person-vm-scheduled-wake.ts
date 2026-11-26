@@ -58,7 +58,10 @@ function hasInvalidation(sql: ISql, receiptIds: readonly string[]) {
     join allrice_native_schedule_observation_receipts revision
       using (organization_id,workspace_id,person_id,vm_id,employee_instance_id)
     where original.receipt_id=any(${[...receiptIds]}::uuid[])
-      and (revision.input_payload->'invalidateReceiptIds') ? original.receipt_id::text)`;
+      and exists (
+        select 1
+        from jsonb_array_elements_text(revision.input_payload->'invalidateReceiptIds') invalidated(id)
+        where lower(invalidated.id)=original.receipt_id::text))`;
 }
 
 async function audit(
