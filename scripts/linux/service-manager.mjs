@@ -4,10 +4,12 @@ import { constants } from 'node:fs';
 import {
   link,
   lstat,
+  mkdir,
   mkdtemp,
   open,
   realpath,
   rm,
+  rmdir,
   writeFile,
 } from 'node:fs/promises';
 import { join, posix } from 'node:path';
@@ -54,7 +56,9 @@ export async function readLinuxRelease(root, expectedDigest) {
   )
     throw new Error('Invalid release root or trusted digest');
   const { manifestDigest, ...body } = JSON.parse(
-    await readRegular(join(root, sealPath), 32 * 1024 * 1024),
+    (await readRegular(join(root, sealPath), 32 * 1024 * 1024)).toString(
+      'utf8',
+    ),
   );
   if (
     manifestDigest !== expectedDigest ||
@@ -84,7 +88,7 @@ export async function readLinuxRelease(root, expectedDigest) {
     )
       throw new Error('Sealed release input changed');
     if (path === configPath) {
-      config = JSON.parse(bytes);
+      config = JSON.parse(bytes.toString('utf8'));
       if (
         Object.keys(config).sort().join(',') !==
           'dataMount,dataUuid,node,platform,socketRoot,webPort,workerPort' ||
@@ -120,13 +124,13 @@ export function renderUnits({ root, sourceSha, config }) {
         'RuntimeDirectoryMode=0700',
         'RuntimeDirectoryPreserve=yes',
       ],
-      command: `ALLRICE_WORKER_HOST=127.0.0.1 ALLRICE_WORKER_PORT=${config.workerPort} ${config.node} ${root}/apps/worker/dist/index.js`,
+      command: `ALLRICE_EXECUTION_ROOT=${config.dataMount}/executions ALLRICE_WORKER_HOST=127.0.0.1 ALLRICE_WORKER_PORT=${config.workerPort} ${config.node} ${root}/apps/worker/dist/index.js`,
     },
     {
       role: 'web',
       dir: `${root}/apps/web`,
       extra: [],
-      command: `${config.node} ${root}/apps/web/server.mjs --hostname 127.0.0.1 --port ${config.webPort}`,
+      command: `ALLRICE_WORKER_INTERNAL_URL=http://127.0.0.1:${config.workerPort} ${config.node} ${root}/apps/web/server.mjs --hostname 127.0.0.1 --port ${config.webPort}`,
     },
   ];
   return new Map(
@@ -151,8 +155,8 @@ export function renderUnits({ root, sourceSha, config }) {
         `WorkingDirectory=${dir}`,
         `EnvironmentFile=/etc/allrice40/${role}.env`,
         ...extra,
-        `ExecStartPre=/usr/bin/findmnt --noheadings --mountpoint ${config.dataMount} --source UUID=${config.dataUuid}`,
-        `ExecStart=/usr/bin/env NODE_ENV=production ALLRICE_RELEASE_SHA=${sourceSha} ${command}`,
+        `ExecStartPre=${config.node} ${root}/scripts/linux/service-manager.mjs check-mount ${config.dataMount} ${config.dataUuid}`,
+        `ExecStart=/usr/bin/env NODE_ENV=production ALLRICE_RELEASE_SHA=${sourceSha} ALLRICE_STORAGE_ROOT=${config.dataMount}/storage ${command}`,
         'KillMode=mixed',
         'SendSIGKILL=no',
         'TimeoutStopSec=infinity',
@@ -167,53 +171,184 @@ export function renderUnits({ root, sourceSha, config }) {
   );
 }
 
+/** An overmount must not let an older, hidden matching UUID pass. */
+export function assertDataMount(output, target, uuid) {
+  const { filesystems } = JSON.parse(output);
+  if (
+    !Array.isArray(filesystems) ||
+    filesystems.length !== 1 ||
+    filesystems[0].target !== target ||
+    filesystems[0].uuid !== uuid ||
+    !filesystems[0].options?.split(',').includes('rw')
+  )
+    throw new Error(
+      'Expected a single writable data mount matching the release',
+    );
+}
+
+async function exists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return false;
+  }
+}
+
+export async function checkUnitPlacement(directory, loadPaths, show) {
+  if (!loadPaths.includes(directory) || !loadPaths.every(safePath))
+    throw new Error('Cannot identify systemd unit search path');
+  for (const name of unitNames) {
+    const info = new Map(
+      show(name)
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const at = line.indexOf('=');
+          return [line.slice(0, at), line.slice(at + 1)];
+        }),
+    );
+    const own = join(directory, name);
+    const state = info.get('LoadState');
+    if (
+      !['loaded', 'not-found'].includes(state) ||
+      !info.has('FragmentPath') ||
+      !info.has('DropInPaths') ||
+      info.get('FragmentPath') !== (state === 'loaded' ? own : '') ||
+      info.get('DropInPaths')
+    )
+      throw new Error(
+        'Existing systemd fragment, mask or drop-in; use the release owner',
+      );
+    for (const root of loadPaths) {
+      if (
+        (root !== directory && (await exists(join(root, name)))) ||
+        (await exists(join(root, name + '.d'))) ||
+        (await exists(join(root, 'allrice40-.service.d'))) ||
+        (await exists(join(root, 'service.d')))
+      )
+        throw new Error(
+          'Existing systemd fragment or drop-in in the search path',
+        );
+    }
+  }
+}
+
 /** New/identical units only. Replacing release units needs the deploy drain
  * and rollback sequence, which is intentionally outside this installer. */
-export async function installUnitFiles(directory, units, reload) {
-  if ((await realpath(directory)) !== directory)
-    throw new Error('Aliased systemd unit directory');
-  const missing = [];
-  for (const [name, contents] of units) {
-    try {
-      const found = await readRegular(join(directory, name), 4096);
-      if (!found.equals(Buffer.from(contents)))
+export async function installUnitFiles(
+  directory,
+  units,
+  checkPlacement,
+  reload,
+) {
+  if (
+    (await realpath(directory)) !== directory ||
+    units.size !== unitNames.length ||
+    unitNames.some((name) => !units.has(name))
+  )
+    throw new Error('Invalid unit directory or unit set');
+  const lock = join(directory, '.allrice40-install.lock');
+  await mkdir(lock, { mode: 0o700 });
+  try {
+    await checkPlacement();
+    const missing = [];
+    for (const [name, contents] of units) {
+      const target = join(directory, name);
+      if (!(await exists(target))) {
+        missing.push([name, contents]);
+        continue;
+      }
+      if (!(await readRegular(target, 4096)).equals(Buffer.from(contents)))
         throw new Error(
           'Existing unit differs; drain and replace through the release owner',
         );
+    }
+    if (!missing.length) return;
+    const staging = await mkdtemp(join(lock, 'units-'));
+    const created = [];
+    try {
+      for (const [name, contents] of missing) {
+        const file = join(staging, name);
+        const target = join(directory, name);
+        await writeFile(file, contents, { mode: 0o644, flag: 'wx' });
+        await link(file, target);
+        created.push([file, target]);
+      }
+      await reload();
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      missing.push([name, contents]);
+      const cleaned = await Promise.allSettled(
+        created.map(async ([file, target]) => {
+          if (!(await exists(target))) return;
+          const [expected, actual] = await Promise.all([
+            lstat(file),
+            lstat(target),
+          ]);
+          if (expected.ino === actual.ino && expected.dev === actual.dev)
+            await rm(target);
+        }),
+      );
+      const failures = cleaned.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length)
+        throw new AggregateError(
+          [error, ...failures],
+          'unit install rollback incomplete',
+        );
+      throw error;
+    } finally {
+      await rm(staging, { recursive: true });
     }
-  }
-  const staging = await mkdtemp(join(directory, '.allrice40-'));
-  const created = [];
-  try {
-    for (const [name, contents] of missing) {
-      const file = join(staging, name);
-      const target = join(directory, name);
-      await writeFile(file, contents, { mode: 0o644, flag: 'wx' });
-      await link(file, target);
-      created.push(target);
-    }
-    await reload();
-  } catch (error) {
-    for (const target of created) {
-      const name = posix.basename(target);
-      const [expected, actual] = await Promise.all([
-        lstat(join(staging, name)),
-        lstat(target),
-      ]);
-      if (expected.ino === actual.ino && expected.dev === actual.dev)
-        await rm(target);
-    }
-    throw error;
   } finally {
-    await rm(staging, { recursive: true });
+    await rmdir(lock);
+  }
+}
+
+const managerEnvironment = { PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C' };
+const managerCall = (file, args) =>
+  execFileSync(file, args, {
+    encoding: 'utf8',
+    env: managerEnvironment,
+    timeout: 15000,
+  });
+
+function unitStatus(name) {
+  try {
+    return managerCall('/usr/bin/systemctl', [
+      '--system',
+      'show',
+      '--all',
+      '--property=LoadState,FragmentPath,DropInPaths',
+      name,
+    ]);
+  } catch (error) {
+    if (error.status === 1 && /^LoadState=not-found$/m.test(error.stdout ?? ''))
+      return error.stdout;
+    throw error;
   }
 }
 
 async function main(args) {
   const [action, root, manifestDigest] = args;
+  if (action === 'check-mount' && args.length === 3) {
+    if (root !== '/var/lib/allrice40' || !fsUuid.test(manifestDigest))
+      throw new Error('Invalid release data mount');
+    assertDataMount(
+      managerCall('/usr/bin/findmnt', [
+        '--json',
+        '--list',
+        '--mountpoint',
+        root,
+        '--output',
+        'TARGET,UUID,OPTIONS',
+      ]),
+      root,
+      manifestDigest,
+    );
+    return;
+  }
   if (args.length !== 3 || !['render', 'install'].includes(action))
     throw new Error(
       'Usage: service-manager.mjs render|install RELEASE EXPECTED_MANIFEST_DIGEST',
@@ -231,10 +366,19 @@ async function main(args) {
       !root.startsWith('/opt/allrice40/releases/')
     )
       throw new Error('Install requires the Linux arm64 release operator');
-    await installUnitFiles('/etc/systemd/system', units, () =>
-      execFileSync('/usr/bin/systemctl', ['daemon-reload'], {
-        stdio: 'ignore',
-      }),
+    const directory = '/etc/systemd/system';
+    await installUnitFiles(
+      directory,
+      units,
+      () =>
+        checkUnitPlacement(
+          directory,
+          managerCall('/usr/bin/systemd-analyze', ['--system', 'unit-paths'])
+            .trim()
+            .split('\n'),
+          unitStatus,
+        ),
+      () => managerCall('/usr/bin/systemctl', ['--system', 'daemon-reload']),
     );
     console.log(
       'Units installed; service activation remains with the release operator',
