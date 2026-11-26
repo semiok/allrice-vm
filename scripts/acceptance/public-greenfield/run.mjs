@@ -5,32 +5,17 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { runBrowser } from './browser.mjs';
 import {
-  CheckFailed,
   captureVmBinding,
   checkHealth,
+  failure,
   isId,
-  livePreflight,
   paths,
   peoplePath,
   requireFact,
   sameVmBinding,
 } from './contracts.mjs';
 import { fixtureDriver, makeFixture } from './fixture.mjs';
-
-function failure(stage, error) {
-  return {
-    stage,
-    code:
-      error instanceof CheckFailed
-        ? error.code
-        : error?.name === 'TimeoutError'
-          ? 'browser-timeout'
-          : 'operation-failed',
-    ...(error instanceof CheckFailed && Number.isInteger(error.status)
-      ? { httpStatus: error.status }
-      : {}),
-  };
-}
+import { runLive } from './live.mjs';
 
 function policySelections(response) {
   const policy = response.body;
@@ -246,6 +231,10 @@ async function main() {
       'allow-public-writes': { type: 'boolean' },
       'release-sha': { type: 'string' },
       'release-tree': { type: 'string' },
+      'release-seal': { type: 'string' },
+      credentials: { type: 'string' },
+      'managed-owner': { type: 'string' },
+      'send-hello': { type: 'boolean' },
       output: { type: 'string' },
     },
   });
@@ -255,7 +244,11 @@ async function main() {
         !(
           values['allow-public-writes'] ||
           values['release-sha'] ||
-          values['release-tree']
+          values['release-tree'] ||
+          values['release-seal'] ||
+          values.credentials ||
+          values['managed-owner'] ||
+          values['send-hello']
         )),
     'conflicting-run-mode',
   );
@@ -268,18 +261,25 @@ async function main() {
       flag: 'wx',
       mode: 0o600,
     });
+  const browserExecutable =
+    process.env.ALLRICE_BROWSER_EXECUTABLE ??
+    process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
+  const recordFirstFailure = (item) => write('first-failure.json', item);
   const receipt = values.live
-    ? livePreflight({
-        allowPublicWrites: values['allow-public-writes'],
-        releaseSha: values['release-sha'],
-        releaseTree: values['release-tree'],
-      })
-    : await dryRun({
-        browserExecutable:
-          process.env.ALLRICE_BROWSER_EXECUTABLE ??
-          process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE,
-        recordFirstFailure: (item) => write('first-failure.json', item),
-      });
+    ? await runLive(
+        {
+          allowPublicWrites: values['allow-public-writes'],
+          releaseSha: values['release-sha'],
+          releaseTree: values['release-tree'],
+          seal: values['release-seal'],
+          credentialPath: values.credentials,
+          ownerPath: values['managed-owner'],
+          sendHello: values['send-hello'],
+          browserExecutable,
+        },
+        { recordFirstFailure },
+      )
+    : await dryRun({ browserExecutable, recordFirstFailure });
   write('receipt.json', receipt);
   process.stdout.write(
     `${receipt.mode} ${receipt.status} · ${join(output, 'receipt.json')}\n`,

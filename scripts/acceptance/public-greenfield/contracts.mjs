@@ -11,6 +11,7 @@ export const paths = {
   thread: '/api/v1/sessions',
   identity: '/api/v1/d-entry/identity',
   mux: '/api/v1/d-entry/native-mux',
+  rpc: '/api/v1/d-entry/native-rpc',
   policy: '/api/v1/admin/d-entry-release-policy',
 };
 export const repo = 'semiok/allrice-vm';
@@ -34,6 +35,21 @@ export function requireFact(condition, code, status) {
   if (!condition) throw new CheckFailed(code, status);
 }
 
+export function failure(stage, error) {
+  return {
+    stage,
+    code:
+      error instanceof CheckFailed
+        ? error.code
+        : error?.name === 'TimeoutError'
+          ? 'browser-timeout'
+          : 'operation-failed',
+    ...(error instanceof CheckFailed && Number.isInteger(error.status)
+      ? { httpStatus: error.status }
+      : {}),
+  };
+}
+
 export function checkHealth(response, release, service = 'web') {
   const info = response.body?.identity;
   requireFact(
@@ -46,6 +62,7 @@ export function checkHealth(response, release, service = 'web') {
       info.mode === 'production' &&
       info.sourceSha === release.sha &&
       info.sourceTree === release.tree &&
+      (!release.seal || info.manifestDigest === release.seal) &&
       isId(info.bootId),
     'release-identity-mismatch',
     response.status,
@@ -90,7 +107,7 @@ export function captureVmBinding(binding, identity) {
 const repositoryRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const originMain = 'refs/remotes/origin/main';
 const prerequisites = {
-  'async-prewarm': '4f28b4c48d3d00f658c411bd7fb4fda6ba1f81ba',
+  'async-prewarm': '1db5c856d66cdda41a429a2be0625a50d8ad50ce',
   'first-employee': 'efb1537ec4b95930ee7d666af4b7b170a2d9ca65',
   'system-disk-and-dsh-startup': '70042d3cca750229f4ae96b96fdd8d76552d039c',
 };
@@ -106,7 +123,7 @@ function localGit(args) {
 
 /** Check local source evidence before a future operator could use credentials. */
 export function livePreflight(options, git = localGit) {
-  const { allowPublicWrites, releaseSha, releaseTree } = options;
+  const { allowPublicWrites, releaseSha, releaseTree, ownerPath } = options;
   const expected =
     sha.test(releaseSha ?? '') && sha.test(releaseTree ?? '')
       ? { sha: releaseSha, tree: releaseTree }
@@ -156,6 +173,6 @@ export function livePreflight(options, git = localGit) {
   }
   // Production authority explicitly denies public stops. No public browser run
   // may start a VM until an authorized same-Worker exact-owner stop is bound.
-  blockers.push('managed-exact-owner-stop-unavailable');
+  if (!ownerPath) blockers.push('managed-exact-owner-stop-unavailable');
   return receipt;
 }

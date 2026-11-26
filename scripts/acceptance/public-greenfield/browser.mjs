@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   CheckFailed,
   DSH_EDITOR,
@@ -10,6 +11,7 @@ import {
   requireFact,
   sameSelection,
 } from './contracts.mjs';
+import { createHelloProbe, nativeReadMethods } from './live-native.mjs';
 
 const webRequire = createRequire(
   new URL('../../../apps/web/package.json', import.meta.url),
@@ -39,7 +41,14 @@ function responseStatus(status, expected, code) {
 }
 
 /** Observe the browser's own requests, including the single polling loop. */
-function browserFlow({ identity, account, employeeName, receipt }) {
+function browserFlow({
+  identity,
+  account,
+  employeeName,
+  receipt,
+  onColdTicket,
+  hello,
+}) {
   let selection;
   let employeeVersion;
   let carrier;
@@ -107,21 +116,30 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     );
   }
 
-  function openCarrier(url, frame, exchange) {
+  function muxRole(url) {
     const query = Object.fromEntries(url.searchParams);
-    const { payload } = frame ?? {};
     requireFact(
       current().identityVerified &&
-        !carrier &&
         url.protocol === 'wss:' &&
         url.host === new URL(publicOrigin).host &&
         !url.username &&
         !url.password &&
         url.pathname === paths.mux &&
-        [...url.searchParams].length === 5 &&
+        url.searchParams.size === (query.scopeId ? 6 : 5) &&
+        new Set(url.searchParams.keys()).size === url.searchParams.size &&
         query.carrier === 'page' &&
         query.organizationId === identity.organizationId &&
         sameSelection(query, selection) &&
+        (query.scopeId ? query.scopeId === carrier?.scopeId : !carrier),
+      'carrier-address-unverified',
+    );
+    return query.scopeId ? 'streams' : 'owner';
+  }
+
+  function beginCarrier(url, frame) {
+    const { payload } = frame ?? {};
+    requireFact(
+      muxRole(url) === 'owner' &&
         frame?.type === 'open' &&
         frame.endpoint === '$d-entry/page' &&
         isId(frame.streamId) &&
@@ -132,23 +150,24 @@ function browserFlow({ identity, account, employeeName, receipt }) {
         !Array.isArray(payload.args),
       'carrier-request-unverified',
     );
-    const reply = exchange(frame);
-    const { scopeReference, bindingRef } = reply?.value ?? {};
-    requireFact(
-      reply?.type === 'item' &&
-        reply.streamId === frame.streamId &&
-        reply.value?.type === 'opened' &&
-        isId(scopeReference?.scopeId) &&
-        Object.keys(scopeReference).length === 1 &&
-        Object.keys(reply.value).length === 3 &&
-        scopeReference.scopeId !== previousScope &&
-        typeof bindingRef === 'string' &&
-        profileToken.test(bindingRef),
-      'carrier-open-unverified',
-    );
-    carrier = { scopeId: scopeReference.scopeId, bindingRef };
-    current().carrierVerified = true;
-    return reply;
+    return (reply) => {
+      const { scopeReference, bindingRef } = reply?.value ?? {};
+      requireFact(
+        reply?.type === 'item' &&
+          reply.streamId === frame.streamId &&
+          reply.value?.type === 'opened' &&
+          isId(scopeReference?.scopeId) &&
+          Object.keys(scopeReference).length === 1 &&
+          Object.keys(reply.value).length === 3 &&
+          scopeReference.scopeId !== previousScope &&
+          typeof bindingRef === 'string' &&
+          profileToken.test(bindingRef),
+        'carrier-open-unverified',
+      );
+      carrier = { scopeId: scopeReference.scopeId, bindingRef };
+      current().carrierVerified = true;
+      return reply;
+    };
   }
 
   function allowWrite(path, url, body) {
@@ -204,8 +223,24 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     );
     const query = Object.fromEntries(url.searchParams);
     let poll;
+    let prompt;
     if (method === 'POST') {
-      requireFact(allowWrite(path, url, body), 'write-blocked');
+      if (path === paths.rpc && onColdTicket) {
+        requireFact(
+          url.search === '?carrier=page' &&
+            carrier &&
+            body?.scopeId === carrier.scopeId &&
+            sameSelection(body.selection, selection),
+          'native-rpc-scope',
+        );
+        if (body.endpoint === 'session/prompt' && hello) {
+          prompt = hello.dispatch(body);
+        } else {
+          requireFact(nativeReadMethods.has(body.endpoint), 'write-blocked');
+        }
+      } else {
+        requireFact(allowWrite(path, url, body), 'write-blocked');
+      }
       if (path === paths.login) loginStarted = performance.now();
       if (path === paths.employee) {
         requireFact(
@@ -224,6 +259,8 @@ function browserFlow({ identity, account, employeeName, receipt }) {
       requireFact(method === 'GET', 'write-blocked');
       requireFact(
         readPaths.has(path) ||
+          (onColdTicket &&
+            ['/favicon.ico', '/api/health/ready'].includes(path)) ||
           path === documentPath ||
           path.startsWith(documentPath + '/') ||
           path.startsWith('/_next/static/') ||
@@ -262,6 +299,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
     }
     const reply = await exchange();
     const data = reply.json;
+    if (prompt) hello.accept(prompt, reply);
     switch (`${method} ${path}`) {
       case `POST ${paths.login}`:
         responseStatus(reply.status, 200, 'login-http');
@@ -316,6 +354,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
             'invalid-prewarm-ticket',
           );
           ticket = data;
+          onColdTicket?.(data.operationId);
           pollAfterMs = data.pollAfterMs;
           lastPollResponseAt = performance.now();
           pollDeadline =
@@ -359,6 +398,7 @@ function browserFlow({ identity, account, employeeName, receipt }) {
         }
         if (state === 'ready') {
           current().prewarmReady = true;
+          if (onColdTicket) current().readyObservedAt = performance.now();
           receipt.timings.coldPrewarmToReadyObservedMs =
             duration(prewarmStarted);
         }
@@ -398,7 +438,10 @@ function browserFlow({ identity, account, employeeName, receipt }) {
 
   return {
     request,
-    openCarrier,
+    muxRole,
+    beginCarrier,
+    openCarrier: (url, frame, exchange) =>
+      beginCarrier(url, frame)(exchange(frame)),
     hasDocumentScope,
     selection: () => selection,
     warm: () => {
@@ -418,6 +461,9 @@ export async function runBrowser({
   receipt,
   browserExecutable,
   fail,
+  onColdTicket,
+  sendHello = false,
+  reopenWarm = true,
 }) {
   const { chromium } = webRequire('playwright-core');
   const browser = await chromium.launch({
@@ -447,7 +493,15 @@ export async function runBrowser({
   void networkFailure.catch(() => {});
   let stage = 'browser';
   let routeFailed = false;
-  const flow = browserFlow({ identity, account, employeeName, receipt });
+  const hello = sendHello ? createHelloProbe(receipt) : null;
+  const flow = browserFlow({
+    identity,
+    account,
+    employeeName,
+    receipt,
+    onColdTicket,
+    hello,
+  });
   function failure(error) {
     if (routeFailed) return;
     routeFailed = true;
@@ -471,6 +525,9 @@ export async function runBrowser({
         requireFact(!routeFailed, 'request-after-failure');
         return flow.openCarrier(url, frame, exchange);
       },
+      muxRole: flow.muxRole,
+      beginCarrier: flow.beginCarrier,
+      observeFollow: (sessionId, item) => hello?.follow(sessionId, item),
       fail: failure,
     });
     const page = await context.newPage();
@@ -508,6 +565,8 @@ export async function runBrowser({
       'zero-employee-frame-present',
     );
     receipt.stages.zeroEmployee = 'passed';
+    if (onColdTicket)
+      receipt.timings.loginToZeroEmployeeMs = duration(loginStart);
     stage = 'employeeCreation';
     await guarded(
       page.getByRole('button', { name: '创建员工', exact: true }).click(),
@@ -548,6 +607,9 @@ export async function runBrowser({
               source: view.frameElement?.src,
               loaded: node.ownerDocument.URL,
               scopeId: view.__ALLRICE_EMPLOYEE_DOCUMENT__?.scopeId,
+              nativeSessionId: node.ownerDocument
+                .querySelector('[data-native-session-id]')
+                ?.getAttribute('data-native-session-id'),
               editable: node.isContentEditable,
               focused: node.ownerDocument.activeElement === node,
             };
@@ -575,14 +637,53 @@ export async function runBrowser({
       );
       receipt.browser[phase].documentVerified = true;
       receipt.timings[`${phase}ToEditableMs`] = duration(start);
+      if (onColdTicket && phase === 'cold') {
+        receipt.timings.readyToEditableMs = duration(
+          receipt.browser.cold.readyObservedAt,
+        );
+        delete receipt.browser.cold.readyObservedAt;
+      }
       receipt.stages[`${phase}Editor`] = 'passed';
+      return { child, editor, nativeSessionId: after.nativeSessionId };
     }
-    await focusedEditor('cold', coldStart);
-    flow.warm();
-    stage = 'warmReopen';
-    const warmStart = performance.now();
-    await guarded(page.reload({ waitUntil: 'domcontentloaded' }));
-    await focusedEditor('warm', warmStart);
+    const { child, editor, nativeSessionId } = await focusedEditor(
+      'cold',
+      coldStart,
+    );
+    if (hello) {
+      stage = 'hello';
+      requireFact(
+        !(await guarded(editor.innerText())).trim(),
+        'hello-draft-not-empty',
+      );
+      await guarded(page.keyboard.insertText('你好'));
+      requireFact(
+        (await guarded(editor.innerText())).trim() === '你好',
+        'hello-draft-mismatch',
+      );
+      hello.arm(nativeSessionId);
+      await guarded(
+        child
+          .getByRole('button', { name: /^(发送消息|Send message)$/u })
+          .click(),
+      );
+      await guarded(
+        Promise.race([
+          hello.complete,
+          delay(120_000, undefined, { ref: false }).then(() => {
+            throw new CheckFailed('hello-reply-timeout');
+          }),
+        ]),
+      );
+      receipt.stages.hello = 'passed';
+    }
+    if (reopenWarm) {
+      flow.warm();
+      stage = 'warmReopen';
+      const warmStart = performance.now();
+      await guarded(page.reload({ waitUntil: 'domcontentloaded' }));
+      await focusedEditor('warm', warmStart);
+    }
   } catch (error) {
     fail(stage, error);
     throw error;
