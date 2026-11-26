@@ -41,7 +41,7 @@ import {
   createLegacyAllriceMcpServices,
   prepareInlineMcpDeliverable,
   type LegacyMcpCallAuthority,
-} from '../src/mcp/allrice-legacy-services.js';
+} from './fixtures/allrice-legacy-services.js';
 import {
   createAllriceMcpServer,
   type AllriceMcpScope,
