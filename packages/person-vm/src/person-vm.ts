@@ -76,6 +76,11 @@ type ScheduledStart = Readonly<{
   purpose: 'scheduled-wake';
   requestId: string;
   readRoster(signal: AbortSignal): Promise<PersonVmWebRoster>;
+  dispatch<T>(
+    rosterDigest: string,
+    signal: AbortSignal,
+    start: () => Promise<T>,
+  ): Promise<T>;
 }>;
 
 export class PersonVmService
@@ -463,14 +468,15 @@ export class PersonVmService
   async startRetainedForSchedule(
     previous: PersonVmBinding,
     requestId: string,
-    readRoster: ScheduledStart['readRoster'],
+    authority: Pick<ScheduledStart, 'readRoster' | 'dispatch'>,
     signal: AbortSignal,
   ) {
     UuidSchema.parse(requestId);
     const intent: ScheduledStart = {
       purpose: 'scheduled-wake',
       requestId,
-      readRoster,
+      readRoster: authority.readRoster,
+      dispatch: authority.dispatch,
     };
     return this.options.store.withLease(
       previous.personId,
@@ -691,27 +697,25 @@ export class PersonVmService
       const native = this.options.native;
       const state = await native.status(binding, signal);
       let checkedWebAfterStart = false;
-      if (scheduled) {
-        await lease.guard();
-        if (
-          state !== 'stopped' ||
-          !roster ||
-          (await readRoster(signal))?.digest !== roster.digest
-        )
-          throw new PersonVmError('AUTHORIZATION_DENIED');
-        signal.throwIfAborted();
-      }
       if (!scheduled && state === 'absent' && !row.nativeCreated) {
         if (web) await native.create(binding, receipt, signal, web.receipt);
         else await native.create(binding, receipt, signal);
         row.nativeCreated = true;
         await lease.save(row);
       } else if (state === 'stopped' && row.nativeCreated) {
-        nativeStartAttempted = true;
-        if (web && native.startWithWebEndpoints) {
-          await native.startWithWebEndpoints(web.receipt, signal);
-          checkedWebAfterStart = true;
-        } else await native.start(binding, signal);
+        const start = async () => {
+          await lease.guard();
+          signal.throwIfAborted();
+          nativeStartAttempted = true;
+          if (web && native.startWithWebEndpoints) {
+            await native.startWithWebEndpoints(web.receipt, signal);
+            checkedWebAfterStart = true;
+          } else await native.start(binding, signal);
+        };
+        if (scheduled) {
+          if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+          await scheduled.dispatch(roster.digest, signal, start);
+        } else await start();
       } else throw new PersonVmError('PROVIDER_FAILED');
       if (web && !checkedWebAfterStart)
         await native.assertWebEndpoints!(web.receipt, signal);

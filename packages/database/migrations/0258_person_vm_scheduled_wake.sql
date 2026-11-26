@@ -40,17 +40,28 @@ declare
   affected_person uuid;
   affected_org uuid;
   affected_workspace uuid;
+  previous_policy jsonb := '[]';
+  current_policy jsonb := '[]';
 begin
   if tg_op='UPDATE' and new is not distinct from old then return null; end if;
+  if tg_table_name='allrice_settings' then
+    if tg_op='INSERT' or old.scope_type is distinct from 'system'
+      or old.scope_id is not null or old.key is distinct from 'd_entry_rollout_policy'
+      or jsonb_typeof(old.value->'selections') is distinct from 'array'
+    then return null; end if;
+    previous_policy := old.value->'selections';
+    if tg_op='UPDATE' and new.scope_type='system' and new.scope_id is null
+      and new.key='d_entry_rollout_policy' and new.value->>'defaultGeneration'='3.x'
+      and jsonb_typeof(new.value->'selections')='array'
+    then current_policy := new.value->'selections'; end if;
+    -- A new policy revision alone does not change anyone's qualification.
+  end if;
   for fact in select distinct value from jsonb_array_elements(
-    case when tg_op='INSERT' then jsonb_build_array(to_jsonb(new))
+    case when tg_table_name='allrice_settings' then jsonb_build_array('{}'::jsonb)
+      when tg_op='INSERT' then jsonb_build_array(to_jsonb(new))
       when tg_op='DELETE' then jsonb_build_array(to_jsonb(old))
       else jsonb_build_array(to_jsonb(old),to_jsonb(new)) end)
   loop
-    if tg_table_name='allrice_settings' and (
-      fact->>'scope_type' is distinct from 'system'
-      or fact->>'scope_id' is not null
-      or fact->>'key' is distinct from 'd_entry_rollout_policy') then continue; end if;
     affected_person := (case when tg_table_name='allrice_users' then fact->>'id'
       else coalesce(fact->>'user_id',fact->>'owner_id') end)::uuid;
     affected_org := (case when tg_table_name='allrice_organizations' then fact->>'id'
@@ -66,12 +77,45 @@ begin
           select 1 from allrice_native_schedule_observation_receipts receipt
           where receipt.receipt_id=any(w.receipt_ids)
             and receipt.workspace_id=affected_workspace))
+        and (tg_table_name<>'allrice_employee_instances' or exists(
+          select 1 from allrice_native_schedule_observation_receipts receipt
+          where receipt.receipt_id=any(w.receipt_ids)
+            and receipt.employee_instance_id=(fact->>'id')::uuid))
+        and (tg_table_name not in ('allrice_employee_assignments','allrice_employees',
+          'allrice_platform_employee_tenant_assignments') or exists(
+          select 1 from allrice_native_schedule_observation_receipts receipt
+          join allrice_employee_instances i on i.id=receipt.employee_instance_id
+          left join allrice_employee_assignments a on a.id=i.assignment_id
+          where receipt.receipt_id=any(w.receipt_ids)
+            and case tg_table_name
+              when 'allrice_employee_assignments' then i.assignment_id=(fact->>'id')::uuid
+              when 'allrice_employees' then a.employee_id=(fact->>'id')::uuid
+              else a.employee_id=(fact->>'tenant_employee_id')::uuid and fact->>'active'='false'
+            end))
+        and (tg_table_name<>'allrice_settings' or exists(
+          select 1 from allrice_native_schedule_observation_receipts receipt
+          cross join lateral (select jsonb_build_array(jsonb_build_object(
+            'organizationId',w.organization_id,'personId',w.person_id,
+            'employeeInstanceId',receipt.employee_instance_id,'generation','4.0')) as selection) allowed
+          where receipt.receipt_id=any(w.receipt_ids)
+            and previous_policy @> allowed.selection and not current_policy @> allowed.selection))
+        and (tg_table_name<>'allrice_native_schedule_observation_receipts' or exists(
+          select 1 from allrice_native_schedule_observation_receipts receipt
+          where receipt.receipt_id=any(w.receipt_ids)
+            and receipt.employee_instance_id::text=fact->>'employee_instance_id'
+            and receipt.workspace_id::text=fact->>'workspace_id'
+            and receipt.vm_id::text=fact->>'vm_id'
+            and exists(select 1 from jsonb_array_elements_text(
+              fact #> '{input_payload,invalidateReceiptIds}') invalidated(id)
+              where lower(invalidated.id)=receipt.receipt_id::text)))
       returning w.*
     )
     insert into person_vm_audit
       (person_id,organization_id,vm_id,request_id,action,result,error_code,lease_epoch)
     select person_id,organization_id,vm_id,plan_id,'scheduled-wake.invalidate',
-      'denied','CURRENT_AUTHORITY_CHANGED',lease_epoch from invalidated;
+      'denied',case when tg_table_name='allrice_native_schedule_observation_receipts'
+        then 'NATIVE_SCHEDULE_INVALIDATED' else 'CURRENT_AUTHORITY_CHANGED' end,
+      lease_epoch from invalidated;
   end loop;
   return null;
 end $$;
@@ -91,5 +135,9 @@ create trigger person_vm_wake_employee_changed after delete or update of status
   on allrice_employees for each row execute function allrice_person_vm_wake_authority_changed();
 create trigger person_vm_wake_deployment_changed after insert or delete or update
   on allrice_platform_employee_tenant_assignments for each row execute function allrice_person_vm_wake_authority_changed();
-create trigger person_vm_wake_policy_changed after insert or delete or update of scope_type,scope_id,key,value
+create trigger person_vm_wake_policy_changed after delete or update of scope_type,scope_id,key,value
   on allrice_settings for each row execute function allrice_person_vm_wake_authority_changed();
+create trigger person_vm_wake_schedule_invalidated after insert
+  on allrice_native_schedule_observation_receipts for each row
+  when (jsonb_array_length(new.input_payload->'invalidateReceiptIds')>0)
+  execute function allrice_person_vm_wake_authority_changed();

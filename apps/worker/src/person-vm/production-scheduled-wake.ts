@@ -78,13 +78,29 @@ export function createProductionScheduledWakeSource(
         await vm.startRetainedForSchedule(
           claim,
           claim.claimId,
-          async (active) => {
-            active.throwIfAborted();
-            if (!(await assertClaim())) throw new PersonVmError('LEASE_LOST');
-            const roster = await store.readClaimRoster(claim);
-            active.throwIfAborted();
-            if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
-            return roster;
+          {
+            async readRoster(active) {
+              active.throwIfAborted();
+              if (!(await assertClaim())) throw new PersonVmError('LEASE_LOST');
+              const roster = await store.readClaimRoster(claim);
+              active.throwIfAborted();
+              if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+              return roster;
+            },
+            async dispatch(digest, active, start) {
+              active.throwIfAborted();
+              const completed = await store.withClaimDispatch(
+                claim,
+                async (roster) => {
+                  active.throwIfAborted();
+                  if (roster.digest !== digest)
+                    throw new PersonVmError('AUTHORIZATION_DENIED');
+                  return { result: await start() };
+                },
+              );
+              if (!completed) throw new PersonVmError('AUTHORIZATION_DENIED');
+              return completed.result;
+            },
           },
           signal,
         );
@@ -93,7 +109,11 @@ export function createProductionScheduledWakeSource(
         if (error instanceof PersonVmError) {
           if (error.code === 'AUTHORIZATION_DENIED') return 'denied';
           if (error.code === 'LEASE_LOST') return 'stale';
-          if (error.code === 'LEASE_CONFLICT') return 'not-started';
+          if (
+            error.code === 'LEASE_CONFLICT' ||
+            error.code === 'RUNTIME_NOT_READY'
+          )
+            return 'not-started';
         }
         return 'unknown';
       }

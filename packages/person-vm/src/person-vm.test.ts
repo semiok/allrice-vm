@@ -23,6 +23,9 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     const store = new MemoryStore();
     const h = harness(store);
     const { rc, binding } = await running(h);
+    // The other module owns proof of a safe physical stop. Seed its native
+    // outcome and let the real service persist and clean up the retained VM.
+    h.states.set(binding.vmId, 'stopped');
     await h.service.stop(rc, signal());
     const endpoint = {
       workspaceId: randomUUID(),
@@ -66,10 +69,22 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       expect((await f.store.read(f.binding.personId))?.leaseOwner).toBeTruthy();
       return f.roster;
     });
+    const authority: Parameters<
+      PersonVmService['startRetainedForSchedule']
+    >[2] = {
+      readRoster: roster,
+      async dispatch(digest, _signal, start) {
+        expect(digest).toBe(f.roster.digest);
+        expect(
+          (await f.store.read(f.binding.personId))?.leaseOwner,
+        ).toBeTruthy();
+        return start();
+      },
+    };
     const view = await f.service.startRetainedForSchedule(
       f.binding,
       requestId,
-      roster,
+      authority,
       signal(),
     );
     expect(view).toMatchObject({ phase: 'running', ready: false });
@@ -94,7 +109,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       f.service.startRetainedForSchedule(
         f.binding,
         requestId,
-        roster,
+        authority,
         signal(),
       ),
     ).rejects.toMatchObject({ code: 'LEASE_LOST' });
@@ -103,16 +118,17 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
 
   it('does not launch or issue an unowned native stop when authority is lost before retained resume', async () => {
     const f = await scheduledFixture();
-    const roster = vi
-      .fn<() => Promise<typeof f.roster>>()
-      .mockResolvedValueOnce(f.roster)
-      .mockRejectedValue(new PersonVmError('AUTHORIZATION_DENIED'));
     const before = f.h.log.length;
     await expect(
       f.service.startRetainedForSchedule(
         f.binding,
         randomUUID(),
-        roster,
+        {
+          readRoster: async () => f.roster,
+          dispatch: async () => {
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          },
+        },
         signal(),
       ),
     ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });

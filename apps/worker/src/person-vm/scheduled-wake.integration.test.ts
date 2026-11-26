@@ -190,6 +190,73 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     });
   }
 
+  it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await f.module().prepareStopWithWake(f.binding, planId, signal);
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+
+    const other = {
+      personId: randomUUID(),
+      organizationId: f.binding.organizationId,
+      employeeInstanceId: randomUUID(),
+      generation: '4.0',
+    };
+    await db`update allrice_settings
+      set value=jsonb_set(value,'{revision}',to_jsonb(${randomUUID()}::text))
+      where key='d_entry_rollout_policy'`;
+    await db`update allrice_settings
+      set value=jsonb_set(value,'{selections}',
+        (value->'selections') || ${db.json(other)}::jsonb)
+      where key='d_entry_rollout_policy'`;
+    await db`update allrice_settings
+      set value=jsonb_set(value,'{selections}',(value->'selections')-1)
+      where key='d_entry_rollout_policy'`;
+    await expect(f.store().readClaimRoster(claim!)).resolves.not.toBeNull();
+    const [original] = await db<{ value: Parameters<typeof db.json>[0] }[]>`
+      select value from allrice_settings where key='d_entry_rollout_policy'`;
+    await db`update allrice_settings
+      set value=jsonb_set(value,'{selections}','[]'::jsonb)
+      where key='d_entry_rollout_policy'`;
+    await db`update allrice_settings set value=${db.json(original!.value)}
+      where key='d_entry_rollout_policy'`;
+    await expect(f.store().readClaimRoster(claim!)).resolves.toBeNull();
+  });
+
+  it('orders a real employee archive against the admitted native dispatch', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await f.module().prepareStopWithWake(f.binding, planId, signal);
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+
+    async function invalidate(lockTimeout: boolean) {
+      await db.begin(async (tx) => {
+        if (lockTimeout) await tx`set local lock_timeout='100ms'`;
+        await tx`update allrice_employee_instances set archived_at=now()
+            where id=${f.origin.employeeInstanceId}`;
+      });
+    }
+
+    const dispatch = vi.fn(async () => {
+      await expect(invalidate(true)).rejects.toMatchObject({ code: '55P03' });
+      return 'dispatched';
+    });
+    await expect(f.store().withClaimDispatch(claim!, dispatch)).resolves.toBe(
+      'dispatched',
+    );
+    await invalidate(false);
+    await expect(
+      f.store().withClaimDispatch(claim!, dispatch),
+    ).resolves.toBeNull();
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
   it('rechecks current retained roster without a login and never revives a revoked plan', async () => {
     const f = await fixture();
     await publishFixtureAuthority(f);

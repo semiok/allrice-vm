@@ -144,6 +144,46 @@ export async function readPersonVmWakeRoster(
   };
 }
 
+async function readClaimRoster(
+  tx: TransactionSql,
+  claim: ScheduledWakeClaim,
+  dispatch = false,
+): Promise<PersonVmWebRoster | null> {
+  // The physical owner can already have advanced the current epoch.
+  // Recheck the immutable stopped source and its original receipt here.
+  const [plan] = await tx<{ receipt_ids: string[] }[]>`
+  select p.receipt_ids from person_vm_scheduled_wakes p
+  where p.plan_id=${claim.planId} and p.claim_id=${claim.claimId}
+    and p.person_id=${claim.personId} and p.organization_id=${claim.organizationId}
+    and p.vm_id=${claim.vmId} and p.instance_id=${claim.instanceId}
+    and p.lease_epoch=${claim.leaseEpoch} and p.state='claimed'
+    and p.claim_until>clock_timestamp() and p.revoked_at is null
+    and not ${hasInvalidation(tx, claim.receiptIds)}
+    and p.plan_id=(
+      select a.request_id from person_vm_audit a
+      where a.person_id=p.person_id and a.organization_id=p.organization_id
+        and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
+        and a.action='stop' and a.result='succeeded'
+      order by a.id desc limit 1)
+    ${dispatch ? tx`for share of p` : tx``}`;
+  if (
+    !plan ||
+    plan.receipt_ids.length !== claim.receiptIds.length ||
+    plan.receipt_ids.some((id, index) => id !== claim.receiptIds[index])
+  )
+    return null;
+  const receipts = await tx<{ origin: NativeScheduleLedgerOrigin }[]>`
+  select input_payload->'origin' as origin
+  from allrice_native_schedule_observation_receipts
+  where receipt_id=any(${plan.receipt_ids}::uuid[])`;
+  if (receipts.length !== plan.receipt_ids.length) return null;
+  return readPersonVmWakeRoster(
+    tx,
+    claim,
+    receipts.map(({ origin }) => origin),
+  );
+}
+
 async function audit(
   tx: TransactionSql,
   row: PlanRow,
@@ -305,43 +345,26 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
     readClaimRoster(
       claim: ScheduledWakeClaim,
     ): Promise<PersonVmWebRoster | null> {
-      return sql.begin(
-        'isolation level repeatable read read only',
+      return sql.begin('isolation level repeatable read read only', (tx) =>
+        readClaimRoster(tx, claim),
+      );
+    },
+
+    /** Authority changes and receipt invalidation update this same row before
+     * committing. The physical lease owner holds it through native dispatch. */
+    async withClaimDispatch<T>(
+      claim: ScheduledWakeClaim,
+      work: (roster: PersonVmWebRoster) => Promise<T>,
+    ): Promise<T | null> {
+      const result = await sql.begin(
+        'isolation level repeatable read',
         async (tx) => {
-          // The physical owner can already have advanced the current epoch.
-          // Recheck the immutable stopped source and its original receipt here.
-          const [plan] = await tx<{ receipt_ids: string[] }[]>`
-          select p.receipt_ids from person_vm_scheduled_wakes p
-          where p.plan_id=${claim.planId} and p.claim_id=${claim.claimId}
-            and p.person_id=${claim.personId} and p.organization_id=${claim.organizationId}
-            and p.vm_id=${claim.vmId} and p.instance_id=${claim.instanceId}
-            and p.lease_epoch=${claim.leaseEpoch} and p.state='claimed'
-            and p.claim_until>now() and p.revoked_at is null
-            and not ${hasInvalidation(tx, claim.receiptIds)}
-            and p.plan_id=(
-              select a.request_id from person_vm_audit a
-              where a.person_id=p.person_id and a.organization_id=p.organization_id
-                and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
-                and a.action='stop' and a.result='succeeded'
-              order by a.id desc limit 1)`;
-          if (
-            !plan ||
-            plan.receipt_ids.length !== claim.receiptIds.length ||
-            plan.receipt_ids.some((id, index) => id !== claim.receiptIds[index])
-          )
-            return null;
-          const receipts = await tx<{ origin: NativeScheduleLedgerOrigin }[]>`
-          select input_payload->'origin' as origin
-          from allrice_native_schedule_observation_receipts
-          where receipt_id=any(${plan.receipt_ids}::uuid[])`;
-          if (receipts.length !== plan.receipt_ids.length) return null;
-          return readPersonVmWakeRoster(
-            tx,
-            claim,
-            receipts.map(({ origin }) => origin),
-          );
+          await tx`set local lock_timeout='5s'`;
+          const roster = await readClaimRoster(tx, claim, true);
+          return { value: roster ? await work(roster) : null };
         },
       );
+      return result.value;
     },
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
