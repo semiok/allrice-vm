@@ -1986,6 +1986,13 @@ suite(
         await expect(
           createEmployeeInstance(owner, {
             ...input,
+            requestId: randomUUID(),
+            assignmentId: instance.assignmentId,
+          }),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        await expect(
+          createEmployeeInstance(owner, {
+            ...input,
             assignmentId: f.assignment,
           }),
         ).rejects.toMatchObject({ code: 'authorization_denied' });

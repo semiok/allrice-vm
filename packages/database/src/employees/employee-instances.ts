@@ -954,6 +954,15 @@ export async function createEmployeeInstance(
     const existingAssignment = assigned
       ? await assignment(scope, value.assignmentId, tx, true)
       : undefined;
+    if (existingAssignment) {
+      // The private ownership row of a self-created employee is not a
+      // dispatched template for the legacy creation endpoint.
+      const [personal] = await tx`select 1 from allrice_employee_instances
+        where id=${existingAssignment.id} and assignment_id=id
+          and kind='custom' and organization_id=${scope.organizationId}
+          and workspace_id=${scope.workspaceId} and owner_id=${ownerId}`;
+      if (personal) throw new DataAccessError('authorization_denied');
+    }
     if (
       !assigned &&
       !hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
