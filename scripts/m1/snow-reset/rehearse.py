@@ -158,7 +158,7 @@ def exercise(socket_path, dump):
     policy_query = "select value from allrice_settings where key='d_entry_rollout_policy';"
     old_policy = json.loads(sql(TARGET, policy_query).stdout)
     trigger_query = """
-select json_agg(array[tgname,tgenabled] order by tgname)
+select json_agg(json_build_array(tgrelid::regclass,tgname,tgenabled) order by tgrelid::regclass::text,tgname)
 from pg_trigger where not tgisinternal;
 """
     triggers = sql(TARGET, trigger_query).stdout

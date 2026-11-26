@@ -39,7 +39,7 @@ declare
     'allrice_chat_sessions','allrice_messages','allrice_message_attachments',
     'allrice_file_references','allrice_runs','allrice_run_events','allrice_jobs',
     'allrice_employee_runs','allrice_employee_run_steps','allrice_context_checkpoints',
-    'allrice_memories','allrice_rag_chunks'
+    'allrice_memories','allrice_memory_revisions','allrice_employee_memory_operations'
   ]::regclass[];
 begin
   if current_database() <> 'snow_reset_restore' or inet_server_addr() is not null
