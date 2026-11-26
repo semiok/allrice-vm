@@ -99,7 +99,7 @@ export function startProductionDiskPreprovision(input: {
     });
   }
 
-  async function scan(feed: Feed, closeFeed: () => Promise<void>) {
+  async function scan(feed: Feed) {
     const disconnected = new AbortController();
     const signal = AbortSignal.any([lifetime, disconnected.signal]);
     let waiting: AbortController | undefined;
@@ -108,10 +108,15 @@ export function startProductionDiskPreprovision(input: {
     let nextSweep = 0;
     const startup = AbortSignal.any([signal, AbortSignal.timeout(6_000)]);
     startup.throwIfAborted();
-    const stopSetup = () => void closeFeed().catch(() => {});
+    // pg can leave connect() pending after an early end(). On abort let
+    // the owner join feed.close(), which closes the socket and seals admission.
+    let stopSetup!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      stopSetup = () => reject(startup.reason);
+    });
     startup.addEventListener('abort', stopSetup, { once: true });
-    const unsubscribe = await feed
-      .subscribe(
+    const unsubscribe = await Promise.race([
+      feed.subscribe(
         {
           changed(change) {
             // The admission feed also echoes our own physical lease updates.
@@ -127,8 +132,9 @@ export function startProductionDiskPreprovision(input: {
           lost: (error) => disconnected.abort(error),
         },
         startup,
-      )
-      .finally(() => startup.removeEventListener('abort', stopSetup));
+      ),
+      cancelled,
+    ]).finally(() => startup.removeEventListener('abort', stopSetup));
     startup.throwIfAborted();
 
     async function readSource<T>(active: AbortSignal, read: () => Promise<T>) {
@@ -284,21 +290,18 @@ export function startProductionDiskPreprovision(input: {
   const work = (async () => {
     while (!lifetime.aborted) {
       let feed: Feed | undefined;
-      let feedClosing: Promise<void> | undefined;
-      const closeFeed = () =>
-        (feedClosing ??= feed?.close() ?? Promise.resolve());
       let cleanupFailure: PersonVmError | undefined;
       let sourceFailed = false;
       try {
         feed = input.openFeed();
-        await scan(feed, closeFeed);
+        await scan(feed);
       } catch (error) {
         if (vmError(error, 'CLEANUP_INCOMPLETE')) cleanupFailure = error;
         else sourceFailed = true;
       }
       // A feed that cannot be closed must not be replaced by an extra owner.
       try {
-        await closeFeed();
+        await feed?.close();
       } catch (error) {
         if (cleanupFailure)
           throw new AggregateError(

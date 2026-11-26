@@ -364,23 +364,25 @@ it('joins direct guard reads even if a parallel guard rejects first', async () =
   }
 });
 
-it('closes a feed that is still subscribing before waiting for setup to settle', async () => {
+it('joins actual feed close even when the abandoned connect promise never settles', async () => {
   const f = fixture();
-  const gate = latch();
-  f.feed.subscribe.mockImplementationOnce(async (_listener, signal) => {
-    await gate.promise;
-    signal.throwIfAborted();
-    return f.unsubscribed;
-  });
-  f.feed.close.mockImplementationOnce(async () => gate.resolve());
+  const closed = latch();
+  f.feed.subscribe.mockImplementationOnce(() => new Promise(() => {}));
+  f.feed.close.mockImplementationOnce(() => closed.promise);
   const owner = f.start();
   try {
     await vi.waitFor(() => expect(f.feed.subscribe).toHaveBeenCalledOnce());
-    await owner.close();
-    expect(f.feed.close).toHaveBeenCalledOnce();
+    const closing = owner.close();
+    const finished = vi.fn();
+    void closing.then(finished, finished);
+    await vi.waitFor(() => expect(f.feed.close).toHaveBeenCalledOnce());
+    expect(finished).not.toHaveBeenCalled();
+    closed.resolve();
+    await closing;
+    expect(finished).toHaveBeenCalledOnce();
     expect(f.input.readRoster).not.toHaveBeenCalled();
   } finally {
-    gate.resolve();
+    closed.resolve();
   }
 });
 
