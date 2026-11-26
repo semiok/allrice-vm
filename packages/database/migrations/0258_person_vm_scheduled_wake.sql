@@ -1,11 +1,11 @@
 -- MET-289 host wake projection. Native observations stay in migration 0257.
 create table person_vm_scheduled_wakes (
-  person_id uuid primary key,
+  person_id uuid not null,
   organization_id uuid not null,
   vm_id uuid not null,
   instance_id uuid not null,
   lease_epoch bigint not null check (lease_epoch > 0),
-  plan_id uuid not null unique,
+  plan_id uuid primary key,
   receipt_ids uuid[] not null check (cardinality(receipt_ids) > 0),
   target_at timestamptz,
   wake_at timestamptz,
@@ -26,3 +26,6 @@ create table person_vm_scheduled_wakes (
 create index person_vm_scheduled_wakes_due
   on person_vm_scheduled_wakes ((coalesce(retry_at,wake_at)),person_id)
   where state in ('waiting','claimed');
+create index person_vm_scheduled_wakes_claim_expiry
+  on person_vm_scheduled_wakes (claim_until,plan_id)
+  where state = 'claimed';

@@ -19,8 +19,8 @@ const suite =
     : describe.skip;
 suite('scheduled wake host intent on real PostgreSQL', () => {
   const signal = new AbortController().signal;
-  const wakeAt = '2026-11-01T05:58:00.000Z';
-  const target = '2026-11-01T06:00:00.000Z';
+  const wakeAt = '2024-11-03T05:58:00.000Z';
+  const target = '2024-11-03T06:00:00.000Z';
   let database: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   let db: typeof database.db;
 
@@ -75,7 +75,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       createPersonVmScheduledWake({
         store: store(),
         ledger: createPostgresNativeScheduleObservationLedger(db),
-        now: () => new Date('2026-11-01T05:00:00.000Z'),
+        now: () => new Date('2024-11-03T05:00:00.000Z'),
         capture: async (_binding, planId) => {
           if (!receiptIds.has(planId)) receiptIds.set(planId, randomUUID());
           return {
@@ -93,6 +93,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       });
 
     return {
+      assertCurrent,
       binding,
       catalog,
       start,
@@ -149,16 +150,16 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ]);
   });
 
-  it('replaces the previous intent on changed targets and removes wake eligibility on delete', async () => {
+  it('uses the snapshot for the actual stop after rules change or are deleted', async () => {
     const f = await fixture();
     const host = f.module();
     await expect(
       host.prepareStopWithWake(f.binding, randomUUID(), signal),
     ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
-    f.reviseTime('2026-11-01T07:00:00.000Z');
+    f.reviseTime('2024-11-03T07:00:00.000Z');
     await expect(
       host.prepareStopWithWake(f.binding, randomUUID(), signal),
-    ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T06:58:00.000Z' });
+    ).resolves.toEqual({ ok: true, nextWakeAt: '2024-11-03T06:58:00.000Z' });
     f.setRows([]);
     const planId = randomUUID();
     await expect(
@@ -171,6 +172,33 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await db`select receipt_id from allrice_native_schedule_observation_receipts
       where person_id=${f.binding.personId}`;
     expect(receipts).toHaveLength(3);
+  });
+
+  it('keeps an earlier exact stop intent after other preparations stage or fail', async () => {
+    const f = await fixture();
+    const host = f.module();
+    const stopId = randomUUID();
+    await expect(
+      host.prepareStopWithWake(f.binding, stopId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    f.reviseTime('2024-11-03T07:00:00.000Z');
+    await expect(
+      host.prepareStopWithWake(f.binding, randomUUID(), signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: '2024-11-03T06:58:00.000Z' });
+    f.assertCurrent
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('lost roster after staging'));
+    await expect(
+      host.prepareStopWithWake(f.binding, randomUUID(), signal),
+    ).resolves.toEqual({ blocked: true, reason: 'WAKE_PLAN_UNCONFIRMED' });
+    await f.stop(stopId);
+    expect(await host.runDueOnce(signal)).toBe(true);
+    expect(f.start.mock.calls[0]?.[0]).toMatchObject({
+      planId: stopId,
+      targetAt: new Date(target),
+    });
+    expect(await host.runDueOnce(signal)).toBe(false);
   });
 
   it('uses the native committed UTC target across repeated New York wall time', async () => {
@@ -201,16 +229,13 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       where person_id=${other.binding.personId}`;
     const f = await fixture();
     expect(
-      await f.store().stage(
-        {
-          ...f.binding,
-          planId: randomUUID(),
-          receiptIds: [row!.receipt_id],
-          targetAt: new Date(target),
-          wakeAt: new Date(wakeAt),
-        },
-        null,
-      ),
+      await f.store().stage({
+        ...f.binding,
+        planId: randomUUID(),
+        receiptIds: [row!.receipt_id],
+        targetAt: new Date(target),
+        wakeAt: new Date(wakeAt),
+      }),
     ).toBe(false);
   });
 
@@ -224,11 +249,41 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       blocked: true,
       reason: 'SCHEDULE_OBSERVATION_UNAVAILABLE',
     });
-    f.reviseTime('2026-11-01T05:01:59.999Z');
+    f.reviseTime('2024-11-03T05:01:59.999Z');
     await expect(
       host.prepareStopWithWake(f.binding, randomUUID(), signal),
     ).resolves.toEqual({ blocked: true, reason: 'SCHEDULE_TOO_CLOSE' });
-    expect(await f.store().head(f.binding.personId)).toBeNull();
+    const staged = await db`select plan_id from person_vm_scheduled_wakes
+      where person_id=${f.binding.personId}`;
+    expect(staged).toEqual([]);
+  });
+
+  it('audits an expired claim whose VM advanced during boot without retrying on the new binding', async () => {
+    const f = await fixture(),
+      planId = randomUUID();
+    await expect(
+      f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim).not.toBeNull();
+    await db`update person_virtual_machines
+      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting'
+      where person_id=${f.binding.personId}`;
+    await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
+      where plan_id=${planId}`;
+    expect(await f.module().runDueOnce(signal)).toBe(true);
+    expect(await f.module().runDueOnce(signal)).toBe(false);
+    expect(f.start).not.toHaveBeenCalled();
+    expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
+    const [row] = await db`select w.state,a.error_code
+      from person_vm_scheduled_wakes w join person_vm_audit a using (person_id,vm_id)
+      where w.plan_id=${planId} and a.request_id=${claim!.claimId}
+        and a.action='scheduled-wake.settle'`;
+    expect(row).toMatchObject({
+      state: 'unknown',
+      error_code: 'START_UNCONFIRMED',
+    });
   });
 
   it('recovers an expired claim, retries a confirmed non-start, and fences late settlements', async () => {

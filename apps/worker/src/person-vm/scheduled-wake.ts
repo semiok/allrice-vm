@@ -42,8 +42,9 @@ type Options = {
   ): Promise<Capture>;
   /** Authorize again using current durable eligibility and then use the
    * original start/bootstrap under its physical lease. Check assertClaim
-   * inside that lease before any effect. Only report not-started with positive
-   * evidence that no prior or current start can commit. */
+   * and the exact stopped binding inside that lease before any effect.
+   * Only report not-started with positive evidence that no start took effect
+   * and that the original stopped generation still owns the retained disk. */
   start(
     claim: ScheduledWakeClaim,
     assertClaim: () => Promise<boolean>,
@@ -83,8 +84,9 @@ export function createPersonVmScheduledWake(input: Options) {
     throw new RangeError('SCHEDULE_WAKE_LEAD_INVALID');
 
   return {
-    /** A durable wake handoff only. The caller owns safe VM stop and supplies
-     * its stable attempt ID, used unchanged as the lifecycle stop request ID. */
+    /** A durable wake handoff only. The caller holds the ordinary lifecycle
+     * lease across preparation and physical stop, keeps the native observation
+     * current, and uses the same attempt ID for the successful stop audit. */
     async prepareStopWithWake(
       binding: PersonVmBinding,
       planId: string,
@@ -96,8 +98,6 @@ export function createPersonVmScheduledWake(input: Options) {
         { blocked: true }
       >['reason'] = 'WAKE_PLAN_UNCONFIRMED';
       try {
-        const previous = await input.store.head(binding.personId);
-        signal.throwIfAborted();
         reason = 'SCHEDULE_OBSERVATION_UNAVAILABLE';
         const captured = await input.capture(binding, planId, signal);
         const profiles = captured.profiles;
@@ -145,16 +145,13 @@ export function createPersonVmScheduledWake(input: Options) {
         await captured.assertCurrent(signal);
         signal.throwIfAborted();
         if (!canWait()) return { blocked: true, reason: 'SCHEDULE_TOO_CLOSE' };
-        const staged = await input.store.stage(
-          {
-            ...binding,
-            planId,
-            receiptIds: profiles.map(({ receiptId }) => receiptId).sort(),
-            targetAt: target === null ? null : new Date(target),
-            wakeAt,
-          },
-          previous,
-        );
+        const staged = await input.store.stage({
+          ...binding,
+          planId,
+          receiptIds: profiles.map(({ receiptId }) => receiptId).sort(),
+          targetAt: target === null ? null : new Date(target),
+          wakeAt,
+        });
         signal.throwIfAborted();
         if (!staged) return { blocked: true, reason };
         await captured.assertCurrent(signal);
@@ -172,7 +169,10 @@ export function createPersonVmScheduledWake(input: Options) {
     async runDueOnce(signal: AbortSignal): Promise<boolean> {
       signal.throwIfAborted();
       const claim = await input.store.claim(claimMs);
-      if (!claim) return false;
+      if (!claim)
+        return signal.aborted
+          ? false
+          : input.store.recordExpiredClaimWithoutStoppedSource();
       if (signal.aborted) return false; // left in PG for another tick
       let result: StartResult;
       try {

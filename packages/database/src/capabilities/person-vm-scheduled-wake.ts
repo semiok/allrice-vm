@@ -70,13 +70,7 @@ async function audit(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
-    async head(personId: string): Promise<string | null> {
-      const [row] = await sql<{ plan_id: string }[]>`select plan_id
-        from person_vm_scheduled_wakes where person_id=${personId}`;
-      return row?.plan_id ?? null;
-    },
-
-    stage(plan: WakePlan, previousId: string | null): Promise<boolean> {
+    stage(plan: WakePlan): Promise<boolean> {
       return sql.begin(async (tx) => {
         const [row] = await tx<
           PlanRow[]
@@ -97,17 +91,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
                 and lower(r.input_payload #>> '{origin,instanceId}')=vm.instance_id::text
                 and r.input_payload #>> '{origin,leaseEpoch}'=vm.lease_epoch::text)
               =cardinality(${[...plan.receiptIds]}::uuid[])
-            and (${previousId}::uuid is null or exists (
-              select 1 from person_vm_scheduled_wakes h where h.person_id=vm.person_id))
-          on conflict(person_id) do update set
-            organization_id=excluded.organization_id,vm_id=excluded.vm_id,
-            instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
-            plan_id=excluded.plan_id,receipt_ids=excluded.receipt_ids,
-            target_at=excluded.target_at,wake_at=excluded.wake_at,retry_at=null,
-            state=excluded.state,attempts=0,reason=null,updated_at=now()
-          where w.plan_id=${previousId} and w.plan_id<>excluded.plan_id
-            and (w.state<>'claimed' or w.instance_id<>excluded.instance_id
-              or w.lease_epoch<>excluded.lease_epoch)
+          on conflict(plan_id) do nothing
           returning w.*`;
         if (row) {
           await audit(tx, row, row.plan_id, 'prepare', 'succeeded');
@@ -117,7 +101,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           PlanRow[]
         >`select w.* from person_vm_scheduled_wakes w
           join person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
-          where w.person_id=${plan.personId} and vm.phase='running'`;
+          where w.plan_id=${plan.planId} and w.person_id=${plan.personId}
+            and vm.phase='running'`;
         return (
           !!existing &&
           ['empty', 'waiting'].includes(existing.state) &&
@@ -142,11 +127,12 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
             where vm.phase in ('stopped','cold') and vm.disk_retained
               and vm.egress_receipt is null and vm.lease_owner is null
               and jsonb_array_length(vm.holds)=0
-              and exists (
-                select 1 from person_vm_audit a
+              and p.plan_id=(
+                select a.request_id from person_vm_audit a
                 where a.person_id=p.person_id and a.organization_id=p.organization_id
                   and a.vm_id=p.vm_id and a.lease_epoch=p.lease_epoch
-                  and a.request_id=p.plan_id and a.action='stop' and a.result='succeeded')
+                  and a.action='stop' and a.result='succeeded'
+                order by a.id desc limit 1)
               and coalesce(p.retry_at,p.wake_at)<=now()
               and (p.state='waiting' or (p.state='claimed' and p.claim_until<=now()))
             order by coalesce(p.retry_at,p.wake_at),p.person_id
@@ -170,6 +156,41 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       });
     },
 
+    /** Once the exact stopped generation is gone, a prior boot may have
+     * executed. Record the unresolved attempt without dispatching it again. */
+    recordExpiredClaimWithoutStoppedSource(): Promise<boolean> {
+      return sql.begin(async (tx) => {
+        const [row] = await tx<(PlanRow & { expired_claim: string })[]>`
+          update person_vm_scheduled_wakes as w
+          set state='unknown',claim_id=null,claim_until=null,
+            reason='START_UNCONFIRMED',updated_at=now()
+          from (
+            select p.plan_id,p.claim_id from person_vm_scheduled_wakes p
+            where p.state='claimed' and p.claim_until<=now()
+              and not exists (
+                select 1 from person_virtual_machines vm where vm.person_id=p.person_id
+                  and (vm.lease_owner is not null or (
+                    vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
+                    and vm.instance_id=p.instance_id and vm.lease_epoch=p.lease_epoch
+                    and vm.phase in ('stopped','cold') and vm.disk_retained
+                    and vm.egress_receipt is null)))
+            order by p.claim_until,p.plan_id
+            limit 1 for update of p skip locked
+          ) as expired where w.plan_id=expired.plan_id
+          returning w.*,expired.claim_id as expired_claim`;
+        if (!row) return false;
+        await audit(
+          tx,
+          row,
+          row.expired_claim,
+          'settle',
+          'failed',
+          'START_UNCONFIRMED',
+        );
+        return true;
+      });
+    },
+
     async isCurrent(claim: ScheduledWakeClaim): Promise<boolean> {
       const [row] = await sql`select 1 from person_vm_scheduled_wakes
         where person_id=${claim.personId} and organization_id=${claim.organizationId}
@@ -184,15 +205,25 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       result: ScheduledWakeOutcome,
     ): Promise<boolean> {
       return sql.begin(async (tx) => {
-        const reason = 'reason' in result ? result.reason : null;
+        let outcome = result;
+        if (outcome.state === 'waiting') {
+          const [stopped] = await tx`select 1 from person_virtual_machines
+            where person_id=${claim.personId} and organization_id=${claim.organizationId}
+              and vm_id=${claim.vmId} and instance_id=${claim.instanceId}
+              and lease_epoch=${claim.leaseEpoch} and phase in ('stopped','cold')
+              and disk_retained and egress_receipt is null`;
+          if (!stopped)
+            outcome = { state: 'unknown', reason: 'START_UNCONFIRMED' };
+        }
+        const reason = 'reason' in outcome ? outcome.reason : null;
         const retryDelayMs =
-          result.state === 'waiting' ? result.retryDelayMs : null;
+          outcome.state === 'waiting' ? outcome.retryDelayMs : null;
         const [row] = await tx<PlanRow[]>`update person_vm_scheduled_wakes
-          set state=${result.state},claim_id=null,claim_until=null,reason=${reason},
+          set state=${outcome.state},claim_id=null,claim_until=null,reason=${reason},
             retry_at=now()+${retryDelayMs}::double precision * interval '1 millisecond',
             updated_at=now()
           where person_id=${claim.personId} and plan_id=${claim.planId}
-            and claim_id=${claim.claimId} and state='claimed'
+            and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
           returning *`;
         if (!row) return false;
         await audit(
@@ -200,9 +231,9 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           row,
           claim.claimId,
           'settle',
-          result.state === 'ready'
+          outcome.state === 'ready'
             ? 'succeeded'
-            : result.state === 'blocked'
+            : outcome.state === 'blocked'
               ? 'denied'
               : 'failed',
           reason,
