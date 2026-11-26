@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { mkdir, open, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -29,13 +30,15 @@ if (configArgs.length)
     root,
     configArgs[0].slice('--person-vm-config='.length),
   );
+const hostConfigurationPath = '.local/person-vm-host.json';
 const hostConfiguration = await open(
-  join(root, '.local/person-vm-host.json'),
+  join(root, hostConfigurationPath),
   constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
 ).catch((error) => {
   if (error?.code !== 'ENOENT') throw error;
   return undefined;
 });
+let hostConfigurationChecksum;
 if (hostConfiguration) {
   let config;
   try {
@@ -51,6 +54,8 @@ if (hostConfiguration) {
     if (bytes.length !== stat.size)
       throw Error('Invalid private configuration');
     config = JSON.parse(bytes.toString('utf8'));
+    hostConfigurationChecksum =
+      'sha256:' + createHash('sha256').update(bytes).digest('hex');
   } catch {
     throw Error('DEV_BUILD_PRIVATE_CONFIG_INVALID');
   } finally {
@@ -73,6 +78,13 @@ if (hostConfiguration) {
   );
 }
 const manifest = await prepareServiceBuildManifest(source);
+// The build inventory reopens the staged file. Its bytes must be the ones
+// that selected and supplied the profile capture, including absence.
+const sealedHostConfiguration = manifest.files.find(
+  ({ path, scope }) => path === hostConfigurationPath && scope === 'worker',
+);
+if (sealedHostConfiguration?.checksum !== hostConfigurationChecksum)
+  throw Error('DEV_BUILD_PRIVATE_CONFIG_CHANGED');
 const nativeArtifact = await measureDshNativeArtifact(root, undefined, {
   schemaVersion: 2,
 });

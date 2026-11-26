@@ -5,6 +5,7 @@ import {
   constants,
   copyFileSync,
   createReadStream,
+  createWriteStream,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -14,8 +15,10 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 
 const basePin =
@@ -93,18 +96,57 @@ async function hashFile(file, signal) {
   return hash.digest('hex');
 }
 
-/** Match native runtime inputs to the hashes in the staged private config. */
-export async function verifyEmployeeProfileNativeInputs(native, signal) {
-  for (const key of ['binary', 'libkrunfw', 'agentd']) {
+// The release command executes only private snapshots of the configured
+// native files, so replacing a source after validation cannot change the VM.
+export async function stageEmployeeProfileNativeInputs(
+  native,
+  directory,
+  signal,
+) {
+  const paths = {};
+  for (const [key, name] of Object.entries({
+    binary: 'msb',
+    libkrunfw: 'libkrunfw.5.dylib',
+    agentd: 'agentd-aarch64',
+  })) {
     signal.throwIfAborted();
-    const expected = native.artifactChecksums?.[key];
+    const checksum = native.artifactChecksums?.[key];
+    const input = native[key];
     ensure(
-      typeof expected === 'string' &&
-        /^sha256:[a-f0-9]{64}$/.test(expected) &&
-        'sha256:' + (await hashFile(native[key], signal)) === expected,
+      typeof checksum === 'string' &&
+        /^sha256:[a-f0-9]{64}$/.test(checksum) &&
+        typeof input === 'string' &&
+        isAbsolute(input),
+      'Invalid Employee Web capture native artifact',
+    );
+    const output = join(directory, name);
+    const file = await open(
+      input,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      ensure(
+        (await file.stat()).isFile(),
+        'Expected a regular native artifact',
+      );
+      await pipeline(
+        file.createReadStream({ autoClose: false }),
+        createWriteStream(output, {
+          flags: 'wx',
+          mode: key === 'libkrunfw' ? 0o400 : 0o500,
+        }),
+        { signal },
+      );
+    } finally {
+      await file.close();
+    }
+    ensure(
+      'sha256:' + (await hashFile(output, signal)) === checksum,
       'Employee Web capture native artifact checksum mismatch',
     );
+    paths[key] = output;
   }
+  return paths;
 }
 
 function ensure(condition, message) {

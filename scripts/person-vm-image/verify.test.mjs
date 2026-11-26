@@ -19,7 +19,7 @@ import {
   requireReadOnlyDisk,
   sha256,
   source,
-  verifyEmployeeProfileNativeInputs,
+  stageEmployeeProfileNativeInputs,
   withScratch,
 } from './verify.mjs';
 
@@ -343,11 +343,17 @@ describe('Employee Web profile capture', () => {
     ).toThrow('Invalid Employee Web disk provision');
   });
 
-  it('checks all native hashes and refuses a symbolic link before launching MSB', async () => {
+  it('stages only the expected native bytes and rejects changes and symbolic links', async () => {
+    const input = join(temp, 'inputs');
+    const output = join(temp, 'capture');
+    const failed = join(temp, 'failed');
+    mkdirSync(input);
+    mkdirSync(output);
+    mkdirSync(failed);
     const nativePaths = {
-      binary: join(temp, 'msb'),
-      libkrunfw: join(temp, 'firmware'),
-      agentd: join(temp, 'agent'),
+      binary: join(input, 'msb'),
+      libkrunfw: join(input, 'firmware'),
+      agentd: join(input, 'agent'),
     };
     const artifactChecksums = {};
     for (const [key, path] of Object.entries(nativePaths)) {
@@ -356,17 +362,24 @@ describe('Employee Web profile capture', () => {
     }
     const config = { ...nativePaths, artifactChecksums };
     const signal = new globalThis.AbortController().signal;
-    await expect(
-      verifyEmployeeProfileNativeInputs(config, signal),
-    ).resolves.toBeUndefined();
+    const staged = await stageEmployeeProfileNativeInputs(
+      config,
+      output,
+      signal,
+    );
     writeFileSync(nativePaths.agentd, 'changed');
+    expect(readFileSync(staged.agentd, 'utf8')).toBe('agentd');
     await expect(
-      verifyEmployeeProfileNativeInputs(config, signal),
+      stageEmployeeProfileNativeInputs(config, failed, signal),
     ).rejects.toThrow('checksum mismatch');
     const link = join(temp, 'link');
     symlinkSync(nativePaths.binary, link);
     await expect(
-      verifyEmployeeProfileNativeInputs({ ...config, binary: link }, signal),
+      stageEmployeeProfileNativeInputs(
+        { ...config, binary: link },
+        failed,
+        signal,
+      ),
     ).rejects.toThrow();
   });
 });

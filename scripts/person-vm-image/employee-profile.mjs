@@ -14,7 +14,7 @@ import {
   runCommand,
   hostEnvironment,
 } from '../../packages/person-vm/dist/process.js';
-import { verifyEmployeeProfileNativeInputs } from './verify.mjs';
+import { stageEmployeeProfileNativeInputs } from './verify.mjs';
 
 const guestRoot = '/tmp/allrice-profile-build';
 const guestHome = guestRoot + '/dsh';
@@ -102,9 +102,13 @@ export function createEmployeeLinuxCapture(native, identity) {
       let scratch;
       let keep = false;
       try {
-        await verifyEmployeeProfileNativeInputs(native, signal);
         scratch = await mkdtemp('/tmp/dw');
         const mount = await realpath(scratch);
+        const binaries = await stageEmployeeProfileNativeInputs(
+          native,
+          mount,
+          signal,
+        );
         const binding = Object.freeze({
           vmId: randomUUID(),
           instanceId: randomUUID(),
@@ -115,6 +119,7 @@ export function createEmployeeLinuxCapture(native, identity) {
         const name = 'allrice-' + binding.vmId;
         const provider = new MicrosandboxPersonVm({
           ...native,
+          ...binaries,
           socketRoot: scratch,
           memoryMiB: 2048,
         });
@@ -125,7 +130,7 @@ export function createEmployeeLinuxCapture(native, identity) {
         };
         const msb = (args, active = signal) =>
           runCommand({
-            executable: native.binary,
+            executable: binaries.binary,
             args,
             env,
             signal: active,
@@ -232,6 +237,7 @@ export function createEmployeeLinuxCapture(native, identity) {
           }
         }
         if (failure) throw failure;
+        cancelled.signal.throwIfAborted();
       } finally {
         try {
           if (scratch && !keep) await rm(scratch, { recursive: true });
