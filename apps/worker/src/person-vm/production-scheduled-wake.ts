@@ -11,7 +11,6 @@ import {
 } from '@allrice/database';
 import {
   PersonVmError,
-  type PersonVmBinding,
   type PersonVmIdleStopRequest,
   type PersonVmScheduledIdleAuthority,
   type PersonVmService,
