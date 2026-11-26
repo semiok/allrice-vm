@@ -15,6 +15,7 @@ import { createProductionEgressAuthority } from './production-egress-authority.j
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
 import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
+import { createProductionNativeActivity } from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
 type CodexRuntime = Awaited<ReturnType<typeof createProductionCodexRuntime>>;
@@ -126,6 +127,7 @@ export function createProductionPersonVmSources(
         lifetime.throwIfAborted();
         return {
           scheduledWake: createProductionScheduledWakeSource(host.vm),
+          nativeActivity: createProductionNativeActivity(startup, lifetime),
           runtime: {
             async readiness(binding, signal) {
               await codex.assertCurrent(signal);
