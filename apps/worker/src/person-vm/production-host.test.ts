@@ -415,8 +415,8 @@ it.each([
 it('joins the injected offline preparation before Host close settles', async () => {
   configureDiskPreprovision(true, true);
   vi.stubEnv('DATABASE_URL', 'postgres://synthetic.invalid/test');
-  const gate = Promise.withResolvers<void>();
-  const schedulerClose = vi.fn(() => gate.promise);
+  const draining = gate();
+  const schedulerClose = vi.fn(() => draining.promise);
   io.diskPreprovision.mockReturnValue({ close: schedulerClose });
   const diskPreparation = { prepare: vi.fn(async () => 'prepared' as const) };
   const host = await createProductionPersonVmHost({
@@ -440,11 +440,11 @@ it('joins the injected offline preparation before Host close settles', async () 
     await turn();
     expect(schedulerClose).toHaveBeenCalledOnce();
     expect(stopped).toBe(false);
-    gate.resolve();
+    draining.release();
     await closing;
     expect(stopped).toBe(true);
   } finally {
-    gate.resolve();
+    draining.release();
   }
 });
 

@@ -12,6 +12,14 @@ const first = id(1);
 const second = id(2);
 const third = id(3);
 
+function latch() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function target(personId: string): PersonVmDiskPreparationTarget {
   return {
     personId,
@@ -94,7 +102,7 @@ it('subscribes before scanning, pages serially, and gives the foreground lease p
   f.input.foregroundBusy.mockImplementation(
     async (personId) => personId === first,
   );
-  const gate = Promise.withResolvers<void>();
+  const gate = latch();
   f.input.port.prepare.mockImplementationOnce(async () => {
     await gate.promise;
     return 'prepared';
@@ -142,7 +150,7 @@ it('rejects a changed revision before dispatch and never treats notification dat
 
 it('fences revoked work, ignores its own lease hints, and joins before closing the feed', async () => {
   const f = fixture();
-  const gate = Promise.withResolvers<void>();
+  const gate = latch();
   f.input.port.prepare.mockImplementation(async () => {
     await gate.promise;
     return 'deferred';
@@ -191,7 +199,7 @@ it('rechecks capacity for the storage owner and invalidates guards after return'
 
 it('fences disconnected work, waits for join, then reconnects and starts a fresh scan', async () => {
   const f = fixture();
-  const gate = Promise.withResolvers<void>();
+  const gate = latch();
   f.input.port.prepare.mockImplementationOnce(async () => {
     await gate.promise;
     return 'deferred';
