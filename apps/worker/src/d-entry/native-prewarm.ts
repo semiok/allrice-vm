@@ -171,14 +171,19 @@ export function createPrewarmOperations(
           cleanupFailed(error);
           failed = true;
         }
+        const reason: unknown = authority.revoked.reason;
+        const denied =
+          reason instanceof DataAccessError &&
+          [
+            'authentication_required',
+            'authorization_denied',
+            'not_found',
+          ].includes(reason.code);
         operation.state =
           failed || signal.aborted || operation.proof?.aborted
             ? {
                 state: 'failed',
-                code:
-                  authority.revoked.aborted && !lifetime.aborted
-                    ? 'AUTHORITY_REVOKED'
-                    : 'START_UNAVAILABLE',
+                code: denied ? 'AUTHORITY_REVOKED' : 'START_UNAVAILABLE',
               }
             : { state: 'ready' };
       });

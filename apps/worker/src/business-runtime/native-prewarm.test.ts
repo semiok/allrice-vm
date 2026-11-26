@@ -816,75 +816,81 @@ it('serves short polls over a cold startup longer than 125 seconds and deduplica
   }
 });
 
-it('owns cancellation and cleanup independently of the admission response, and rejects another login and a restarted Worker', async () => {
-  const f = fixture(),
-    started = deferred<void>(),
-    finish = deferred<void>();
-  let owned: AbortSignal | undefined;
-  const changedLogin = { ...f.base.context, sessionId: randomUUID() };
-  const authenticate: typeof Database.authenticateSession = async (token) =>
-    token === 'other_valid_login_token' ? changedLogin : f.base.context;
-  const prewarm = vi.fn(
-    async (_context, _identity, _trigger, active: AbortSignal) => {
-      owned = active;
-      started.resolve();
-      await finish.promise;
-      active.throwIfAborted();
-    },
-  );
-  const deps = {
-    ...f.base.deps,
-    authenticate,
-    prewarm: {
-      isCurrent: async () => true,
-      prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
-      prewarm,
-    },
-  };
-  const server = await nativeEntryServer(f.base, deps);
-  cleanups.push(server.close);
-  const restarted = await nativeEntryServer(f.base, deps);
-  cleanups.push(restarted.close);
-  const reply = await server.request('native-prewarm', {
-    ...f.base.body,
-    trigger: 'page',
-  });
-  expect(reply.status).toBe(202);
-  const { ticket } = await reply.json();
-  await started.promise;
-  try {
-    expect(
-      (
-        await prewarmStatus(
-          server,
-          ticket.operationId,
-          'other_valid_login_token',
-        )
-      ).status,
-    ).toBe(404);
-    const gone = await prewarmStatus(restarted, ticket.operationId);
-    expect(gone.status).toBe(410);
-    expect(await gone.json()).toEqual({ state: 'expired' });
-    expect(prewarm).toHaveBeenCalledTimes(1);
-    f.base.identityRevoked.abort(new DataAccessError('authorization_denied'));
-    expect(owned?.aborted).toBe(true);
-    expect(f.base.authorityClose).not.toHaveBeenCalled();
-    expect(
-      await (await prewarmStatus(server, ticket.operationId)).json(),
-    ).toEqual({ state: 'starting' });
-  } finally {
-    finish.resolve();
-  }
-  await vi.waitFor(async () => {
-    expect(
-      await (await prewarmStatus(server, ticket.operationId)).json(),
-    ).toEqual({
-      state: 'failed',
-      code: 'AUTHORITY_REVOKED',
+it.each([
+  [new DataAccessError('authorization_denied'), 'AUTHORITY_REVOKED'],
+  [Error('authority observer disconnected'), 'START_UNAVAILABLE'],
+])(
+  'owns cancellation and cleanup after admission (%s), and rejects another login and a restarted Worker',
+  async (failure, code) => {
+    const f = fixture(),
+      started = deferred<void>(),
+      finish = deferred<void>();
+    let owned: AbortSignal | undefined;
+    const changedLogin = { ...f.base.context, sessionId: randomUUID() };
+    const authenticate: typeof Database.authenticateSession = async (token) =>
+      token === 'other_valid_login_token' ? changedLogin : f.base.context;
+    const prewarm = vi.fn(
+      async (_context, _identity, _trigger, active: AbortSignal) => {
+        owned = active;
+        started.resolve();
+        await finish.promise;
+        active.throwIfAborted();
+      },
+    );
+    const deps = {
+      ...f.base.deps,
+      authenticate,
+      prewarm: {
+        isCurrent: async () => true,
+        prepare: async () => ({ key: 'cold-exact', target: f.base.binding }),
+        prewarm,
+      },
+    };
+    const server = await nativeEntryServer(f.base, deps);
+    cleanups.push(server.close);
+    const restarted = await nativeEntryServer(f.base, deps);
+    cleanups.push(restarted.close);
+    const reply = await server.request('native-prewarm', {
+      ...f.base.body,
+      trigger: 'page',
     });
-  });
-  expect(f.base.authorityClose).toHaveBeenCalledOnce();
-});
+    expect(reply.status).toBe(202);
+    const { ticket } = await reply.json();
+    await started.promise;
+    try {
+      expect(
+        (
+          await prewarmStatus(
+            server,
+            ticket.operationId,
+            'other_valid_login_token',
+          )
+        ).status,
+      ).toBe(404);
+      const gone = await prewarmStatus(restarted, ticket.operationId);
+      expect(gone.status).toBe(410);
+      expect(await gone.json()).toEqual({ state: 'expired' });
+      expect(prewarm).toHaveBeenCalledTimes(1);
+      f.base.identityRevoked.abort(failure);
+      expect(owned?.aborted).toBe(true);
+      expect(f.base.authorityClose).not.toHaveBeenCalled();
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'starting' });
+    } finally {
+      finish.resolve();
+    }
+    await vi.waitFor(async () => {
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({
+        state: 'failed',
+        code,
+      });
+    });
+    expect(f.base.authorityClose).toHaveBeenCalledOnce();
+  },
+);
 
 it('reports immediate startup failure without exposing native errors', async () => {
   const f = fixture();
