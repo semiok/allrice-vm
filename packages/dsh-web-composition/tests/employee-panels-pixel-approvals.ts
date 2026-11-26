@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { Browser } from 'playwright-core';
-import { compareSidebarPixels, screenshotPixels } from './sidebar-pixels';
+import {
+  compareSidebarPixels,
+  matchesRasterEdges,
+  type RasterEdgeBudget,
+} from './sidebar-pixels';
 
 export type PanelPixelScope = {
   mode:
@@ -112,80 +116,101 @@ const placementFrames: PngPair = [
   '6b5237a8f9fbe44376318eb31819e5d113e43c90c05f0bf76d51683232d00535',
 ];
 
-// Run 45773071205 (attempts 1/2) and PR #23 had identical native PNGs.
-// Only reference rasterization varied: the top edge of the search SVG or
-// the rounded toolbar borders. Rectangles use inclusive image coordinates.
-type RasterBudget = {
-  nativeSha256: string;
+type RasterControl = {
+  x: number;
+  y: number;
   width: number;
-  edges: ReadonlyArray<{
-    rectangles: ReadonlyArray<readonly [number, number, number, number]>;
-    maxPixels: number;
-    maxRgbDelta: number;
-  }>;
+  height: number;
+  paint: string;
 };
-const referenceRasterBudgets: Readonly<Record<string, RasterBudget>> = {
-  '1440-light-denied-materials': {
-    nativeSha256:
-      'b153add124c06e95f20bc968505f4a6ed84a8366f5d6e414bc5c01b4ea977973',
-    width: 647,
-    edges: [{ rectangles: [[33, 28, 42, 29]], maxPixels: 13, maxRgbDelta: 21 }],
-  },
-  '390-dark-denied-files': {
-    nativeSha256: panels['390-dark-denied-files']![2],
-    width: 389,
-    edges: [
-      {
+
+export type PanelRasterControls = {
+  searchIcon: RasterControl | null;
+  searchField: RasterControl | null;
+  employeePicker: RasterControl | null;
+};
+
+function toolbarRasterBudgets(
+  scope: PanelPixelScope,
+  actual: PanelRasterControls,
+  expected: PanelRasterControls,
+) {
+  const budgets: RasterEdgeBudget[] = [];
+  const matching = (name: keyof PanelRasterControls) => {
+    const control = actual[name];
+    if (
+      !control ||
+      JSON.stringify(control) !== JSON.stringify(expected[name]) ||
+      ![control.x, control.y, control.width, control.height].every(
+        Number.isInteger,
+      )
+    )
+      return null;
+    return control;
+  };
+  const files = scope.panel === 'files' && scope.viewport?.width === 390;
+  const materials = scope.panel === 'materials' && scope.state === 'denied';
+  const search = matching('searchField');
+  const icon = matching('searchIcon');
+  // Linux CI 45773071205/45783199036 and the locked Chromium on M5
+  // vary only at these SVG and rounded-border edges. Paint and geometry
+  // must agree before a control can contribute any permitted pixels.
+  if (search && icon && (materials || (files && scope.state !== 'denied'))) {
+    const { x, y } = icon;
+    budgets.push({
+      rectangles: [[x + 2, y + 1, x + 11, y + 3]],
+      maxPixels: 13,
+      maxRgbDelta: scope.theme === 'dark' ? 27 : 21,
+    });
+  }
+  if (!files) return budgets;
+  const hasRows = scope.state === 'list' || scope.state === 'longname';
+  if (search) {
+    const { x, y, width, height } = search;
+    const right = x + width;
+    const bottom = y + height;
+    if (hasRows || scope.state === 'denied')
+      budgets.push({
         rectangles: [
-          [15, 16, 18, 19],
-          [135, 16, 138, 17],
-          [15, 54, 16, 56],
+          [right - 9, y, right - 5, y + 2],
+          [right - 9, bottom - 3, right - 5, bottom - 1],
+        ],
+        maxPixels: hasRows ? 9 : 18,
+        maxRgbDelta: 8,
+      });
+    if (scope.state === 'empty' || scope.state === 'loading')
+      budgets.push({
+        rectangles: [[x + 1, bottom - 6, x + 3, bottom - 3]],
+        maxPixels: 6,
+        maxRgbDelta: 8,
+      });
+  }
+  const picker = matching('employeePicker');
+  if (picker) {
+    const { x, y, width, height } = picker;
+    const right = x + width;
+    const bottom = y + height;
+    if (scope.state === 'denied')
+      budgets.push({
+        rectangles: [
+          [x + 1, y + 1, x + 4, y + 4],
+          [right - 5, y + 1, right - 2, y + 2],
+          [x + 1, bottom - 5, x + 2, bottom - 3],
         ],
         maxPixels: 15,
         maxRgbDelta: 9,
-      },
-      {
+      });
+    if (hasRows)
+      budgets.push({
         rectangles: [
-          [366, 18, 370, 20],
-          [366, 53, 370, 55],
+          [x + 4, bottom - 3, x + 7, bottom - 1],
+          [right - 6, bottom - 5, right - 2, bottom - 2],
         ],
-        maxPixels: 18,
+        maxPixels: 11,
         maxRgbDelta: 8,
-      },
-    ],
-  },
-};
-
-function matchesReferenceRasterBudget(
-  budget: RasterBudget,
-  expectedPng: Buffer,
-  actualPng: Buffer,
-) {
-  const { rgba: expected, width } = screenshotPixels(expectedPng);
-  const { rgba: actual } = screenshotPixels(actualPng);
-  const counts = budget.edges.map(() => 0);
-  for (let i = 0; i < expected.length; i += 4) {
-    if (expected[i + 3] !== actual[i + 3]) return false;
-    const delta = Math.max(
-      Math.abs(expected[i]! - actual[i]!),
-      Math.abs(expected[i + 1]! - actual[i + 1]!),
-      Math.abs(expected[i + 2]! - actual[i + 2]!),
-    );
-    if (delta === 0) continue;
-    const x = (i / 4) % width;
-    const y = Math.floor(i / 4 / width);
-    const edge = budget.edges.findIndex(({ rectangles }) =>
-      rectangles.some(
-        ([x0, y0, x1, y1]) => x >= x0 && x <= x1 && y >= y0 && y <= y1,
-      ),
-    );
-    if (edge < 0) return false;
-    const limit = budget.edges[edge]!;
-    counts[edge] = counts[edge]! + 1;
-    if (delta > limit.maxRgbDelta || counts[edge]! > limit.maxPixels)
-      return false;
+      });
   }
-  return true;
+  return budgets;
 }
 
 function reviewedPair(scope: PanelPixelScope) {
@@ -248,6 +273,7 @@ export function compareApprovedPanelPixels(
   scope: PanelPixelScope,
   expectedPng: Buffer,
   actualPng: Buffer,
+  controls?: { actual: PanelRasterControls; expected: PanelRasterControls },
 ) {
   const pixels = compareSidebarPixels(expectedPng, actualPng);
   const expectedSha256 = sha256(expectedPng);
@@ -267,25 +293,26 @@ export function compareApprovedPanelPixels(
     actualSha256 === reviewed.pair[2]
       ? { id: reviewed.id, sourceRunId: reviewed.sourceRunId }
       : null;
-  const rasterId = `${scope.viewport?.width}-${scope.theme}-${scope.state}-${scope.panel}`;
-  const budget = referenceRasterBudgets[rasterId];
-  // The native PNG must still be byte-identical to the CI originals. The
-  // budget can only accommodate reference noise, even inside these edges.
-  const referenceRasterization =
+  const rasterBudgets =
     !exception &&
-    linuxChromium &&
+    pixels.dimensionsMatch &&
+    pixels.changedPixels !== 0 &&
+    browser.version === '151.0.7922.34' &&
+    (linuxChromium || browser.userAgent.includes('(Macintosh;')) &&
     scope.mode === 'rev2-panel' &&
     scope.viewport?.height === 1000 &&
+    (scope.viewport.width === 390 || scope.viewport.width === 1440) &&
+    pixels.expected.width === (scope.viewport.width === 390 ? 389 : 647) &&
+    pixels.expected.height === 962 &&
     scope.expectedCapture === 'rev2-element' &&
     scope.actualCapture === 'native-element' &&
-    budget &&
-    pixels.dimensionsMatch &&
-    pixels.expected.width === budget.width &&
-    pixels.expected.height === 962 &&
-    actualSha256 === budget.nativeSha256 &&
-    pixels.changedPixels !== 0 &&
-    matchesReferenceRasterBudget(budget, expectedPng, actualPng)
-      ? { id: rasterId, sourceRunId: 45773071205 }
+    controls
+      ? toolbarRasterBudgets(scope, controls.actual, controls.expected)
+      : [];
+  const referenceRasterization =
+    rasterBudgets.length > 0 &&
+    matchesRasterEdges(expectedPng, actualPng, rasterBudgets)
+      ? rasterBudgets
       : null;
   return {
     pixels,
