@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Rehearse the two approved fixture accounts on a private PostgreSQL restore."""
 
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -22,8 +23,9 @@ PG_ENV['LC_ALL'] = 'C'
     NATIVE_SESSION, PRIVATE, PRIVATE_VERSION, PRIVATE_ASSIGNMENT,
     ACCEPTOR_SESSION, ACCEPTOR_PRIVATE, ACCEPTOR_VERSION, ACCEPTOR_ASSIGNMENT,
     OUTSIDE_ORG, OUTSIDE_WORKSPACE, OUTSIDER, SHARED_OBJECT,
+    LEGACY_THREAD, BINDING_JOB, SCHEDULE_RECEIPT,
 ) = (
-    str(uuid.UUID(f'00000000-0000-4000-8000-{index:012x}')) for index in range(1, 20)
+    str(uuid.UUID(f'00000000-0000-4000-8000-{index:012x}')) for index in range(1, 23)
 )
 TARGET = 'snow_reset_restore'
 SOURCE = 'snow_reset_source'
@@ -237,6 +239,80 @@ def migrate(sql):
     print(f'{len(files)} repository migrations applied', flush=True)
 
 
+def check_retained_legacy_references(sql, rejected_unchanged):
+    def digest(value):
+        encoded = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
+        return 'sha256:' + sha256(encoded).hexdigest()
+
+    # The legacy reader resolves the birth version from native_root_origin.
+    generation = 'dsh-0.2.1-rc.2-687f282'
+    checksum = 'sha256:' + '0' * 64
+    origin = dict(contextKind='chat', contextId=LEGACY_THREAD, rootSeed=LEGACY_THREAD,
+                  distributionGeneration=generation, profileId='restricted', artifactId=checksum)
+    source_policy = dict(family='allrice_declarative_employee_v1', variant='definition_only')
+    source_policy['digest'] = digest({
+        **source_policy, 'manifestSchema': 2, 'packageSchema': None, 'declaredGeneration': None,
+        'executionGeneration': generation, 'profileId': 'restricted',
+        'validation': 'original-checksums-known-tools-reviewed-frozen-bundles-v1',
+    })
+    for legacy_root in [
+        {**origin, 'schemaVersion': 1, 'frozenIdentity': {
+            'kind': 'employee_package', 'checksum': checksum, 'sourceId': PRIVATE_VERSION,
+        }},
+        {**origin, 'schemaVersion': 2, 'scope': dict(organizationId=ORG, workspaceId=WORKSPACE, ownerId=ACCEPTOR),
+         'birthSource': dict(employeeVersionId=PRIVATE_VERSION, configChecksum=checksum, manifestDigest=checksum,
+                             manifestSchema=2, packageSchema=None, packageChecksum=None, declaredGeneration=None,
+                             capabilitySnapshotDigest=checksum),
+         'sourcePolicy': source_policy},
+    ]:
+        sql(TARGET, """
+insert into allrice_chat_sessions (id,organization_id,workspace_id,owner_id,title,
+  employee_assignment_id,employee_instance_id,employee_version_id,execution_generation,native_root_origin)
+values (:'legacy_thread',:'organization',:'workspace',:'acceptor','Retained legacy chat',
+  :'acceptor',:'acceptor',:'version','3.x',:'legacy_root'::jsonb);
+""", legacy_thread=LEGACY_THREAD, legacy_root=json.dumps(legacy_root))
+        rejected_unchanged('snow', 'retained legacy native root references a planned deletion')
+        sql(TARGET, "delete from allrice_chat_sessions where id=:'legacy_thread';", legacy_thread=LEGACY_THREAD)
+
+    # The legacy writer uses the 3.x chat's ID as its context/storage key.
+    binding_id = f'dsh-{PERSON}-fixture'
+    sql(TARGET, """
+insert into allrice_native_session_bindings (native_session_id,organization_id,workspace_id,owner_id,
+  context_kind,context_id,storage_context_key,storage_namespace,artifact_id,artifact_manifest_digest,
+  distribution_generation,profile_id,first_run_id,first_job_id,first_attempt,binding_basis)
+values (:'binding_id',:'organization',:'workspace',:'acceptor','chat',:'person',:'person',
+  :'storage_namespace',:'checksum',:'checksum','dsh-0.1.5-rc.3-a4c74a9','restricted',
+  :'acceptor',:'binding_job',1,'approved_compatibility_reader');
+""", binding_id=binding_id, binding_job=BINDING_JOB, checksum=checksum,
+        storage_namespace=f'/fixture/{ORG}/{WORKSPACE}/{ACCEPTOR}/{PERSON}/sessions')
+    rejected_unchanged('snow', 'retained native chat binding references a planned deletion')
+    sql(TARGET, "delete from allrice_native_session_bindings where native_session_id=:'binding_id';",
+        binding_id=binding_id)
+
+    # The receipt's relational instance is retained, so only the JSON version can match.
+    receipt = dict(kind='snapshot', receiptId=SCHEDULE_RECEIPT, invalidateReceiptIds=[],
+                   origin=dict(organizationId=ORG, workspaceId=WORKSPACE, personId=ACCEPTOR,
+                               vmId=ACCEPTOR_SESSION, instanceId=ACCEPTOR_SESSION, leaseEpoch=1,
+                               employeeInstanceId=ACCEPTOR_ASSIGNMENT, employeeRevision=1,
+                               employeeVersionId=PRIVATE_VERSION, bindingRef='fixture'),
+                   batch=dict(items=[], fingerprint=digest([])))
+    sql(TARGET, """
+insert into allrice_native_schedule_observation_receipts (receipt_id,organization_id,workspace_id,
+  person_id,vm_id,employee_instance_id,input_digest,input_payload)
+values (:'receipt_id',:'organization',:'workspace',:'acceptor',:'acceptor_session',
+  :'acceptor_assignment',:'input_digest',:'receipt'::jsonb);
+""", receipt_id=SCHEDULE_RECEIPT, input_digest=digest(receipt), receipt=json.dumps(receipt))
+    rejected_unchanged('snow', 'retained native schedule observation receipt references a planned deletion')
+    # Remove the injected row from the disposable restore before the success scenario.
+    sql(TARGET, """
+begin;
+alter table allrice_native_schedule_observation_receipts disable trigger allrice_native_schedule_observation_receipt_immutable;
+delete from allrice_native_schedule_observation_receipts where receipt_id=:'receipt_id';
+alter table allrice_native_schedule_observation_receipts enable trigger allrice_native_schedule_observation_receipt_immutable;
+commit;
+""", receipt_id=SCHEDULE_RECEIPT)
+
+
 def exercise(socket_path, dump):
     connection = ['-w', '-h', str(socket_path), '-p', '5432', '-U', 'snow_rehearsal']
 
@@ -349,6 +425,8 @@ commit;
             sql(TARGET, write_pin, pin=json.dumps(wrong_pin))
             rejected_unchanged('snow', 'retained D entry native root references a planned deletion')
         sql(TARGET, write_pin, pin=json.dumps(original_pin))
+
+    check_retained_legacy_references(sql, rejected_unchanged)
 
     sql(TARGET, """
 insert into allrice_employee_memory_contexts (organization_id,workspace_id,owner_id,instance_id,employee_id,
