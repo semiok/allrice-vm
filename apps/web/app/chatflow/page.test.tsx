@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IdentityError } from '@allrice/database';
+import type * as Database from '@allrice/database';
 import ChatFlowPage from './page';
 import EmployeeNativeEntryPage from './4.0/page';
 import { EmployeeFirstStart } from './4.0/employee-first-start';
@@ -13,7 +14,7 @@ const entry = vi.hoisted(() => ({
   prepareRoster: vi.fn(),
 }));
 vi.mock('@allrice/database', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@allrice/database')>()),
+  ...(await importOriginal<typeof Database>()),
   preparePersonNativeWebRoster: entry.prepareRoster,
 }));
 vi.mock('./chatflow-client', () => ({ ChatFlowClient: () => null }));
