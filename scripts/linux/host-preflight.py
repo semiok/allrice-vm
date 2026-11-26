@@ -63,7 +63,8 @@ def read_mount(path, expected_uuid, command=run):
         raise RuntimeError('expected one exact mount')
     mount = entries[0]
     if (mount.get('target') != str(path) or mount.get('uuid') != expected_uuid or
-            'rw' not in str(mount.get('options', '')).split(',')):
+            'rw' not in str(mount.get('options', '')).split(',') or
+            not re.fullmatch(r'[0-9]+:[0-9]+', str(mount.get('maj:min', '')))):
         raise RuntimeError('mount identity or writable state mismatch')
     return mount
 
@@ -99,8 +100,10 @@ def verify_kvm(uid, open_device=os.open, ioctl=fcntl.ioctl, close=os.close):
         close(fd)
 
 
-def verify_reflink(path, expected_uuid, luks_uuid, command=run, dm_uuid=read_dm_uuid):
+def verify_reflink(path, expected_uuid, luks_uuid, command=run, dm_uuid=read_dm_uuid, blocked_devices=()):
     mount = verify_luks2(path, expected_uuid, luks_uuid, command, dm_uuid)
+    if mount['maj:min'] in blocked_devices:
+        raise RuntimeError('scratch device overlaps data or system root')
     device = path.stat().st_dev
     if mount['maj:min'] != f'{os.major(device)}:{os.minor(device)}':
         raise RuntimeError('scratch device changed before the reflink check')
@@ -173,11 +176,15 @@ def main():
     for required in ('/sys/fs/cgroup/cgroup.controllers', '/proc/pressure/memory'):
         if not Path(required).is_file():
             raise RuntimeError('cgroup v2 and memory PSI are required')
-    mount = verify_reflink(scratch, args.scratch_uuid, args.scratch_luks_uuid)
+    root_device = Path('/').stat().st_dev
+    mount = verify_reflink(
+        scratch, args.scratch_uuid, args.scratch_luks_uuid,
+        blocked_devices=(data['maj:min'], f'{os.major(root_device)}:{os.minor(root_device)}'),
+    )
     if run(str(require_path(args.node)), '--version').strip() != 'v22.23.2':
         raise RuntimeError('unexpected release Node version')
     msb = str(require_path(args.msb))
-    if not re.search(r'\b0\.7\.16\b', run(msb, '--version')):
+    if not re.search(r'(?:^|\s)v?0\.7\.16(?=\s|$)', run(msb, '--version')):
         raise RuntimeError('unexpected release MSB version')
     print(json.dumps({'kvmApi': 12, 'reflink': True, 'msbVersion': '0.7.16',
                       'dataUuid': args.data_uuid, 'dataDevice': data['maj:min'],

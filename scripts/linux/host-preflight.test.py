@@ -50,7 +50,7 @@ class PreflightTests(unittest.TestCase):
     def test_luks_guard_requires_exact_mount_uuid_and_luks2(self):
         path = Path('/scratch')
         read = Mock(return_value=MAPPER_ID)
-        host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path)), read)
+        host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path, **{'maj:min': '253:7'})), read)
         read.assert_called_once_with('253:7')
         for override in [{'uuid': 'wrong'}, {'options': 'ro'}, {'fstype': 'ext4'}, {'source': '/dev/vdb'}]:
             with self.assertRaises(RuntimeError):
@@ -70,6 +70,13 @@ class PreflightTests(unittest.TestCase):
                 shutil.copyfile(args[3], args[4])  # Simulate a successful kernel COW command.
 
             host.verify_reflink(path, UUID, LUKS, clone_or_findmnt, Mock(return_value=MAPPER_ID))
+            current = json.loads(mount(path))['filesystems'][0]['maj:min']
+            with self.assertRaisesRegex(RuntimeError, 'overlaps'):
+                host.verify_reflink(path, UUID, LUKS, clone_or_findmnt, Mock(return_value=MAPPER_ID),
+                                    blocked_devices=(current,))
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                host.verify_reflink(path, UUID, LUKS, Mock(return_value=mount(path, **{'maj:min': '253:99'})),
+                                    Mock(return_value=MAPPER_ID))
             self.assertEqual(list(path.iterdir()), [])
 
             def reject_clone(*args):
