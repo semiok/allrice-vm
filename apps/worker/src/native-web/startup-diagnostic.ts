@@ -1,4 +1,5 @@
 import { PersonVmError, type NativeWebSetupFailure } from '@allrice/person-vm';
+import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 
 const vmCodes = new Set([
   'AUTHORIZATION_DENIED',
@@ -38,6 +39,10 @@ export function nativeSetupError(error: unknown, status?: number): Failure {
   if (error === 'NATIVE_JOB_EXITED')
     return { errorType: 'NativeJobExit', errorCode: error, ...http };
   try {
+    if (error instanceof DEntryNativeUnavailable && error.graphRule) {
+      const errorType = 'DEntryNativeUnavailable';
+      return { errorType, errorCode: error.graphRule, ...http };
+    }
     if (error instanceof PersonVmError) {
       const cause = Object.getOwnPropertyDescriptor(error, 'cause')?.value;
       const code = Object.getOwnPropertyDescriptor(error, 'code')?.value;

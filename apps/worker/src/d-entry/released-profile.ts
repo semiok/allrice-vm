@@ -170,20 +170,21 @@ function withoutMapTrailer(data: Buffer, reference: string) {
  * dependency edges, parser module, URL limits and combo identity remain exact. */
 function assertNativeGraph(graph: Graph, sealed: Graph) {
   if (!isDeepStrictEqual(graph.release, sealed.release))
-    throw new DEntryNativeUnavailable();
+    throw new DEntryNativeUnavailable('release');
   const nodes = verified(graph.entries, ({ id }) => id);
   const sealedNodes = verified(sealed.entries, ({ id }) => id);
-  if (nodes.size !== sealedNodes.size) throw new DEntryNativeUnavailable();
+  if (nodes.size !== sealedNodes.size)
+    throw new DEntryNativeUnavailable('entries.length');
   const started = new Set<string>();
-  for (const entry of graph.entries) {
+  for (const [index, entry] of graph.entries.entries()) {
     const original = sealedNodes.get(entry.id);
+    if (!original) throw new DEntryNativeUnavailable(`entries[${index}].id`);
     if (
-      !original ||
       entry.url !== rc2Resource([entry.id], entry.rev, false) ||
       !/^[a-f0-9]{12}$/.test(entry.rev) ||
       !isDeepStrictEqual(topology(entry), topology(original))
     )
-      throw new DEntryNativeUnavailable();
+      throw new DEntryNativeUnavailable(`entries[${index}].url/rev/topology`);
     for (const external of entry.external ?? []) {
       const name = nodes.has(external)
         ? external
@@ -193,7 +194,7 @@ function assertNativeGraph(graph: Graph, sealed: Graph) {
         (!started.has(name) ||
           (entry.id === parserModule && name !== parserModule))
       )
-        throw new DEntryNativeUnavailable();
+        throw new DEntryNativeUnavailable(`entries[${index}].external.order`);
     }
     started.add(entry.id);
   }
@@ -213,7 +214,7 @@ function assertNativeGraph(graph: Graph, sealed: Graph) {
       url: rc2Resource(entries, rev, false),
     });
   }
-  if (!nodes.has(parserModule)) throw new DEntryNativeUnavailable();
+  if (!nodes.has(parserModule)) throw new DEntryNativeUnavailable('parser.id');
   append('bootstrap', [parserModule]);
   let group: string[] = [];
   for (const { id } of graph.entries) {
@@ -223,19 +224,19 @@ function assertNativeGraph(graph: Graph, sealed: Graph) {
       Buffer.byteLength(rc2Resource(candidate, '0'.repeat(12), true)) >
       3 * 1024
     ) {
-      if (!group.length) throw new DEntryNativeUnavailable();
+      if (!group.length) throw new DEntryNativeUnavailable('batches.url.size');
       append('application', group);
       group = [id];
     } else group = candidate;
   }
   if (group.length) append('application', group);
   if (!isDeepStrictEqual(graph.batches, batches))
-    throw new DEntryNativeUnavailable();
+    throw new DEntryNativeUnavailable('batches.phase/url/rev/entries');
   const revision = createHash('sha1')
     .update(JSON.stringify({ entries: graph.entries, batches: graph.batches }))
     .digest('hex')
     .slice(0, 12);
-  if (graph.rev !== revision) throw new DEntryNativeUnavailable();
+  if (graph.rev !== revision) throw new DEntryNativeUnavailable('rev');
 }
 
 async function readManifest(
