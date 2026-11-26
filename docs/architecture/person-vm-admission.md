@@ -1,6 +1,6 @@
 # 每人 VM 空闲与准入合同 v1（MET-266）
 
-本合同补充 `person-vm.md`，公开入口为 `@allrice/person-vm` 的 `admission-contract.ts` 导出，固定 gateway/entry 的 host-only v1协议。PG共享权威/普通准入实现现由 `PersonVmService.createAdmissionHost` 提供；两端生产接线、原生完整producer/自主准入屏障与MET273/274装配仍待完成。实现不等于运行或验收通过；当前仍拒绝普通running VM安全回收。
+本合同补充 `person-vm.md`，公开入口为 `@allrice/person-vm` 的 `admission-contract.ts` 导出，固定 gateway/entry 的 host-only v1协议。PG共享权威/普通准入实现现由 `PersonVmService.createAdmissionHost` 提供；两端生产接线、原生完整producer/自主准入屏障与MET273/274装配仍待完成。自动停机的宿主采样规则见下文。
 
 普通准入的追加公共入口为 `PersonVmAdmissionBoundary`（`admission-boundary.ts`），不改变本v1合同语义。两端在memory/8slot/refresh/连接副作用之前 `admit`，以 `queued` 拥有前置等待，再以 `activate` 拥有真实transport/事务/原生操作，finally `finish` 取消并join实际工作后才释放持久permit。deferred仅 `waitUntilReady` 等exact双release并经host真ready；返回新binding后finish旧permit、重新admit，不给旧执行envelope改标签。
 
@@ -50,9 +50,9 @@ idle候选在同一PG快照采集双端accepted修订，以来源/idleSince、ac
 
 admission事务使用NEW exclusive max1连接上的guarded BEGIN/各SQL步骤/COMMIT/ROLLBACK；锁定postgres3.4.9原生允许max1显式事务（connection.js:605–606）。不使用其失联后自动rollback的隐藏begin scope。连接失联后不再排新SQL/rollback；关闭先join实际已发query及callback的settlement，再end连接。COMMIT丢ACK仍保留unknown、未交付handle的既有恢复边界。LISTEN先join真实unlisten再end，关闭失败保留首因；不能用end返回或销毁连接冒充未完成操作已join。
 
-自动reconcile积累单调时钟候选；无完整原生producer即unknown。即使注入完整形状的fixture，缺自主admission barrier时也不先freeze用户或停running VM；stopFrozen只允许已由native确认stopped/absent的幂等清理。20min自动回收当前**未完成**，没有新增假native gate。
+MET-289 自动停机采用宿主采样，独立于下文的双端冻结流程，默认关闭。空闲候选要求同代次的完整周期样本、双端准入无活动、无 hold，并由监测到的忙碌、漏采、读失败或 Worker 重启重置。临近触发时停机准备被阻止。同一物理租约内准备唤醒，在派发边界验活动游标，按本次请求 ID 记录原生停机回执。`stopFrozen` 继续只允许经原生确认 stopped 或 absent 的幂等清理。
 
-依据：用户 2026-11-21 决定不等 DSH 上游，按冻结边界合同 v1.0 §9 的门卫/租约实现；持续 20min 同时无原生活动、gateway 本人 inflight/queued、入口本人 active connection/typing/prewarm 后，先冻结双端，再重核，最后安全停机。20min 使用现有 `PERSON_VM_IDLE_MS`。本次经写前核对增加0250共享准入字段/permit表；不增加业务阈值、TTL、私有原生接口或事件总线。
+下文冻结流程依据用户 2026-11-21 的决定，按冻结边界合同 v1.0 §9 的门卫/租约实现；持续 20min 同时无原生活动、gateway 本人 inflight/queued、入口本人 active connection/typing/prewarm 后，先冻结双端，再重核，最后安全停机。20min 使用现有 `PERSON_VM_IDLE_MS`。本次经写前核对增加0250共享准入字段/permit表；不增加业务阈值、TTL、私有原生接口或事件总线。
 
 ## 所有权与依赖
 
@@ -83,7 +83,7 @@ freeze 在线性化点之前已准入的 queued 保持 queued，不能改记 def
 
 freeze 不取消既有工作，也不等 active/queued 清零。重核见到既有 active/queued 即放弃这次停机、精确 thaw，使既有等待继续；不得冻结后等一个被自己阻住的 queued 永远归零。实际归零只发生在真实完成，或取消并 join 全部原生/transport/持久化操作以后，再从完整来源重读；失败或未知仍不是 0。
 
-native producer 必须覆盖本人的所有 root/后代、job、当前 schedule delivery、normal turn/approval 与公开 pending/waking 输入；不完整时 unknown。host hold 继续独立保护，并从最后释放点重新积累空闲，不能拿释放前旧 20min 立即停机。20min 候选取各完整来源与 hold 无保护窗口的交集，即所有 idleSince 的最晚者，并要求所有覆盖确实包含该区间。两个相隔 20min 的零快照不满足。
+宿主要求公开样本覆盖本人 VM 的全部员工、会话及子智能体、Job、可见的定时投递和 Goal。样本不完整时返回 unknown。host hold 继续独立保护，并从最后释放点重新积累空闲，不能拿释放前旧 20min 立即停机。20min 候选取各完整来源与 hold 无保护窗口的交集，即所有 idleSince 的最晚者，并要求所有覆盖确实包含该区间。两个相隔 20min 的零快照不满足。
 
 ## 方法、错误、幂等与关闭
 
