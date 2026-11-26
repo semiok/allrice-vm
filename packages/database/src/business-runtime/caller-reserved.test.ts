@@ -65,12 +65,13 @@ function fixture(run: (sql: string) => unknown = () => []) {
 
 describe('caller-owned dedicated transaction', () => {
   beforeEach(() => vi.mocked(createDedicatedDatabase).mockReset());
-  it('copies the entire trusted native configuration without changing the shared client', async () => {
+  it('preserves trusted options while disabling the inherited idle timeout on the dedicated client', async () => {
     const actual = await vi.importActual<{
       createDedicatedDatabase: typeof createDedicatedDatabase;
     }>('../core/client.ts');
     const source = postgres('postgres://fixture:fixture@127.0.0.1:1/fixture', {
       max: 3,
+      idle_timeout: 20,
       ssl: { rejectUnauthorized: true },
       connection: { search_path: 'fixture,public', statement_timeout: 5432 },
       types: {
@@ -82,8 +83,13 @@ describe('caller-owned dedicated transaction', () => {
     try {
       expect(dedicated).not.toBe(source);
       expect(dedicated.options).not.toBe(source.options);
-      expect(dedicated.options).toEqual({ ...source.options, max: 1 });
+      expect(dedicated.options).toEqual({
+        ...source.options,
+        max: 1,
+        idle_timeout: 0,
+      });
       expect(source.options.max).toBe(3);
+      expect(source.options.idle_timeout).toBe(20);
       expect(dedicated.options.ssl).toBe(source.options.ssl);
       expect(dedicated.options.types).toBe(source.options.types);
       expect(dedicated.options.transform).toBe(source.options.transform);

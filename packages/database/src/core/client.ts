@@ -45,6 +45,8 @@ export function createDedicatedDatabase(
   return postgres({
     ...db.options,
     max: 1,
+    // A caller-owned lease can span non-SQL work until its owner calls end().
+    idle_timeout: 0,
     shared: { retries: 0, typeArrayMap: { ...shared.typeArrayMap } },
     parameters: {},
     parsers: { ...db.options.parsers },
