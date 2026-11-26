@@ -311,7 +311,7 @@ suite(
       () => fixture.db`delete from allrice_settings where scope_type='system'
       and scope_id is null and key=${dEntryReleasePolicyKey}`;
     function creation(
-      f: Awaited<ReturnType<typeof enabledFour>>,
+      f: Pick<Fixture, 'org' | 'user'>,
       nativeSessionId = 'dsh-host-created-root',
     ) {
       return {
@@ -1947,14 +1947,34 @@ suite(
             native.threadId,
           ),
         ).toBe('4.0');
+        const signal = new AbortController().signal;
+        // A business thread is durable before its native root exists. The
+        // document directory opens only after the trusted host pins that root.
+        await expect(
+          readDEntryEmployeeDirectory(owner, native, signal),
+        ).rejects.toMatchObject({ code: 'not_found' });
+        const identity = await requireDEntryNativeIdentity(owner, native);
+        const receipt = creation({ org: f.org, user: ownerId });
+        const createRoot = vi.fn(async () => receipt);
+        const pin = await ensureDEntryNativeRoot(owner, native, identity, {
+          operationId: randomUUID(),
+          host: receipt.host,
+          signal,
+          create: createRoot,
+        });
+        expect(createRoot).toHaveBeenCalledOnce();
+        expect(pin.rootNativeSessionId).toBe(receipt.nativeSessionId);
         const directory = await readDEntryEmployeeDirectory(
           owner,
           native,
-          new AbortController().signal,
+          signal,
         );
         expect(directory.employees.map(({ instanceId }) => instanceId)).toEqual(
           [instance.id],
         );
+        expect(directory.sessions.map(({ id }) => id)).toEqual([
+          native.threadId,
+        ]);
         expect(
           await getSessionExecutionGeneration(
             f.context,
