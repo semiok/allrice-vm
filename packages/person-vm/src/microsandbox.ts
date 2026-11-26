@@ -56,6 +56,7 @@ import {
 const CANONICAL_SOCKET_HASH_BYTES = 12;
 const DARWIN_SOCKET_PATH_CAPACITY = 104;
 const VM_ID_PATH_BYTES = 36; // Host-generated canonical UUID, kept in full.
+const GUEST_WORK_DIRECTORY = '/work';
 type NativePaths = { home: string; config: string; userHome: string };
 
 function assertSocketHome(home: string) {
@@ -228,6 +229,17 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
     readNonzeroExit = false,
   ) {
+    if (args[0] === 'exec') {
+      const separator = args.indexOf('--', 2);
+      if (separator !== -1 && !args.slice(2, separator).includes('--workdir')) {
+        args = [
+          ...args.slice(0, separator),
+          '--workdir',
+          GUEST_WORK_DIRECTORY,
+          ...args.slice(separator),
+        ];
+      }
+    }
     return this.run({
       executable: this.options.binary,
       args,
@@ -620,13 +632,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       '--max-memory',
       `${this.memoryMiB}M`,
       '--root-disk',
-      `flat:${this.options.rootDiskGiB}G`,
+      `flat:${this.options.rootDiskGiB}G,clone=reflink`,
       '--net-default',
       'deny',
-      '--mkdir',
-      '/work',
+      // v0.7.16 treats --mkdir as a rootfs patch, rebuilding all OCI layers.
+      // The unpatched image must boot from a directory that already exists.
       '--workdir',
-      '/work',
+      '/',
     ];
     const directory = this.options.readonlyDshDirectory;
     if (directory) {
@@ -661,6 +673,53 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     // No native idle-timeout: detached DSH jobs may be active without touching it.
     await this.command(binding, args, signal);
     await this.assertArtifact(binding, signal);
+  }
+
+  private async ensureWorkDirectory(scope: PersonVmStartingScope) {
+    const { binding, signal } = scope;
+    const cleanupTimeoutMs = this.options.jobCleanupTimeoutMs ?? 10_000;
+    let awaitingJobId = false;
+    const job = await spawnMicrosandboxManagedProbe(
+      {
+        scope,
+        name: this.name(binding),
+        cleanupTimeoutMs,
+        executionTimeoutSeconds: 10,
+        command: (args, active, nonzero) => {
+          awaitingJobId = args[0] === 'exec';
+          return this.command(binding, args, active, nonzero);
+        },
+      },
+      {
+        executable: '/bin/mkdir',
+        args: ['-p', '--', GUEST_WORK_DIRECTORY],
+        workdir: '/bin',
+      },
+    ).catch((error: unknown) => {
+      // Before an exact job ID is available, the startup owner still owns
+      // rollback of the entire VM. Preserve any later exact-job cleanup error.
+      if (
+        awaitingJobId &&
+        error instanceof PersonVmError &&
+        error.code === 'CLEANUP_INCOMPLETE'
+      )
+        throw (
+          error.cause ?? new PersonVmError('PROVIDER_FAILED', { cause: error })
+        );
+      throw error;
+    });
+    const result = await job.wait(signal).catch(async (error) => {
+      try {
+        await job.cancelAndWait(AbortSignal.timeout(cleanupTimeoutMs));
+      } catch (cleanup) {
+        throw new PersonVmError('CLEANUP_INCOMPLETE', {
+          cause: new AggregateError([error, cleanup]),
+        });
+      }
+      throw error;
+    });
+    if (result.exitCode !== 0 || result.timedOut)
+      throw new PersonVmError('PROVIDER_FAILED');
   }
   async prepareWebEndpoints(
     binding: PersonVmBinding,
@@ -773,6 +832,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     ) {
       artifact = await this.assertArtifact(scope.binding, scope.signal);
     }
+    await this.ensureWorkDirectory(scope);
     return bootstrapMicrosandbox({
       scope,
       plan,
