@@ -1,6 +1,6 @@
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { join } from 'node:path';
@@ -16,7 +16,11 @@ import { startInstalledProfile } from './installed-profile';
 import { documentSession, processSession } from './native-history.mjs';
 import { createBrowserArtifacts } from './browser-artifacts';
 import { createSidebarFixtureData } from './fixtures/sidebar-data.mjs';
-import { compareSidebarPixels, matchesRasterEdges } from './sidebar-pixels';
+import {
+  compareSidebarPixels,
+  matchesRasterEdges,
+  type RasterEdgeBudget,
+} from './sidebar-pixels';
 import {
   sidebarBaselineHead,
   writeLegacySidebarBaseline,
@@ -94,8 +98,13 @@ const readingSnapshot = (node: Element) => ({
   retention: window.__allriceSidebarTest!.nativeRetention(),
 });
 
+const avatarSelector =
+  '[data-row-key^="workspace:"] > span:first-child > span:only-child';
+const pixelTolerance =
+  'Exact decoded RGBA except up to 29 pixels, at most one RGB level each, on the left corners of matching avatar tiles in 390px previews on locked Linux Chromium at DPR 1.';
+
 const sidebarGeometry = (view: Page, selector = '#chat-sidebar') =>
-  view.locator(selector).evaluate((frame) => {
+  view.locator(selector).evaluate((frame, avatarSelector) => {
     const read = (node: Element | null) => {
       if (!node) return null;
       const { x, y, width, height } = node.getBoundingClientRect();
@@ -220,6 +229,7 @@ const sidebarGeometry = (view: Page, selector = '#chat-sidebar') =>
             label,
             card: read(group.firstElementChild),
             row: read(row),
+            avatar: read(group.querySelector(avatarSelector)),
             title: read(title ?? null),
             titleLines: title
               ? [...range.getClientRects()].map(({ x, y, width, height }) => ({
@@ -244,9 +254,40 @@ const sidebarGeometry = (view: Page, selector = '#chat-sidebar') =>
         },
       ),
     };
-  });
+  }, avatarSelector);
 
 type SidebarGeometry = Awaited<ReturnType<typeof sidebarGeometry>>;
+
+function previewAvatarEdges(before: SidebarGeometry, after: SidebarGeometry) {
+  const root = before.root?.rect;
+  const actualRoot = after.root?.rect;
+  if (!root || root.x !== actualRoot?.x || root.y !== actualRoot.y) return [];
+  const rectangles: RasterEdgeBudget['rectangles'][number][] = [];
+  for (const [index, { avatar }] of before.groups.entries()) {
+    const actual = after.groups[index]?.avatar;
+    if (
+      !avatar ||
+      !actual ||
+      avatar.backgroundImage !== 'none' ||
+      actual.backgroundImage !== 'none' ||
+      avatar.borderRadius !== '10px' ||
+      actual.borderRadius !== avatar.borderRadius ||
+      actual.backgroundColor !== avatar.backgroundColor ||
+      actual.leafText !== avatar.leafText ||
+      avatar.rect.width !== 36 ||
+      avatar.rect.height !== 36 ||
+      JSON.stringify(avatar.rect) !== JSON.stringify(actual.rect)
+    )
+      return [];
+    const x = avatar.rect.x - root.x;
+    const y = avatar.rect.y - root.y;
+    if (!Number.isInteger(x) || !Number.isInteger(y)) return [];
+    // Bound the allowance to the two 6×5 strips seen in the original captures.
+    rectangles.push([x, y + 1, x + 5, y + 5], [x, y + 30, x + 5, y + 34]);
+  }
+  return [{ rectangles, maxPixels: 29, maxRgbDelta: 1 }];
+}
+
 const sidebarVisualDifferences = (
   before: SidebarGeometry,
   after: SidebarGeometry,
@@ -303,7 +344,7 @@ const sidebarVisualDifferences = (
       differences.push(`group ${index}: identity differs`);
       return;
     }
-    for (const key of ['card', 'row', 'title'] as const)
+    for (const key of ['card', 'row', 'avatar', 'title'] as const)
       box(`${group.label}.${key}`, group[key], current[key]);
     if (group.titleLines.length !== current.titleLines.length)
       differences.push(`${group.label}: title line count differs`);
@@ -1418,14 +1459,13 @@ suite('real AllRice sidebar in installed native profiles', () => {
             current,
           );
           const pixels = compareSidebarPixels(expected, actual);
-          // #23 (45783199036): only the legacy snapshot changed, at three
-          // avatars' left corners. Require the original native raster too.
+          // #23 and main run 45810403193 isolated rounding differences to
+          // the same avatar corners in compact previews in both themes.
+          const compactPreview = width === 390 && state === 'preview';
           const referenceAvatarRasterization =
             process.platform === 'linux' &&
             browser.version() === '151.0.7922.34' &&
-            width === 390 &&
-            theme === 'dark' &&
-            state === 'preview' &&
+            compactPreview &&
             current.document.dpr === 1 &&
             previous.document.dpr === 1 &&
             geometryDifferences.length === 0 &&
@@ -1433,22 +1473,11 @@ suite('real AllRice sidebar in installed native profiles', () => {
             pixels.expected.width === 352 &&
             pixels.expected.height === 1000 &&
             pixels.changedPixels !== 0 &&
-            createHash('sha256').update(actual).digest('hex') ===
-              '306aabcda362bc0cc57d6710b3e8793ecc0b8790c807e56e5003a824dc3d3da9' &&
-            matchesRasterEdges(expected, actual, [
-              {
-                rectangles: [
-                  [33, 203, 38, 207],
-                  [33, 232, 38, 236],
-                  [33, 494, 38, 498],
-                  [33, 523, 38, 527],
-                  [33, 785, 38, 789],
-                  [33, 814, 38, 818],
-                ],
-                maxPixels: 29,
-                maxRgbDelta: 1,
-              },
-            ]);
+            matchesRasterEdges(
+              expected,
+              actual,
+              previewAvatarEdges(previous, current),
+            );
           const comparison = {
             width,
             theme,
@@ -1463,6 +1492,24 @@ suite('real AllRice sidebar in installed native profiles', () => {
             join(artifacts, 'sidebar-visual-comparison.jsonl'),
             `${JSON.stringify(comparison)}\n`,
           );
+          if (compactPreview && theme === 'light') {
+            const edges = previewAvatarEdges(previous, current);
+            expect
+              .soft(edges.flatMap(({ rectangles }) => rectangles))
+              .toHaveLength(6);
+            // The screenshot-only style keeps the avatar boxes in place and
+            // tests the pixel gate against a visible change on the same edges.
+            const squareAvatars = await native.screenshot({
+              animations: 'disabled',
+              style: `#chat-sidebar ${avatarSelector} { border-radius: 0 !important; }`,
+            });
+            expect
+              .soft(compareSidebarPixels(actual, squareAvatars).dimensionsMatch)
+              .toBe(true);
+            expect
+              .soft(matchesRasterEdges(actual, squareAvatars, edges))
+              .toBe(false);
+          }
           return { current, previous };
         };
         const { current, previous } = await capturePair('preview');
@@ -1608,8 +1655,7 @@ suite('real AllRice sidebar in installed native profiles', () => {
       JSON.stringify(
         {
           geometryToleranceCssPx: 0.5,
-          pixelTolerance:
-            'Exact except the bounded legacy avatar edges in the 390/dark preview',
+          pixelTolerance,
           excludedPixels: 0,
           comparisons,
         },
@@ -1632,8 +1678,7 @@ suite('real AllRice sidebar in installed native profiles', () => {
           timezone: 'UTC',
           animationSampling:
             'Fonts ready; actual pointer moved outside both sidebars and active elements blurred; two animation frames settle; screenshot animations disabled',
-          pixelComparison:
-            'Exact decoded RGBA, with a bounded legacy avatar-edge tolerance only for the unchanged native 390/dark preview on locked Linux Chromium. All other scenes remain exact.',
+          pixelComparison: pixelTolerance,
           widths: [1440, 390],
           themes: ['light', 'dark'],
           baseline: `Actual pre-extraction ChatSidebar/EmployeeSidebar/SidebarSettings sources and layout CSS from ${sidebarBaselineHead}; same deterministic sidebar-data.mjs and measured width. Shared-frame image is supplementary current-head container comparison only.`,
