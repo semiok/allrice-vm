@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import {
-  access,
   link,
   lstat,
   mkdir,
@@ -118,51 +117,24 @@ export async function privatePersonVmDirectory(path: string) {
   return canonical;
 }
 
-async function ensurePrivatePersonVmDirectory(
-  path: string,
-  createdIn: Set<string>,
-): Promise<string> {
+async function ensurePrivatePersonVmDirectory(path: string): Promise<string> {
   const existing = await privatePersonVmDirectory(path);
   if (existing) return existing;
   const parent = dirname(path);
   const canonical =
     (await storageAncestor(parent)) ??
-    (await ensurePrivatePersonVmDirectory(parent, createdIn));
+    (await ensurePrivatePersonVmDirectory(parent));
   const target = join(canonical, basename(path));
   try {
     await mkdir(target, { mode: 0o700 });
-    createdIn.add(canonical);
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
   }
   return (await privatePersonVmDirectory(target)) ?? incomplete();
 }
 
-export async function syncDiskPoolDirectory(
-  path: string,
-  managedParent = false,
-) {
-  const handle = await open(
-    path,
-    constants.O_RDONLY | constants.O_NOFOLLOW,
-  ).catch(async (error: unknown) => {
-    if (!managedParent || (error as NodeJS.ErrnoException)?.code !== 'EACCES')
-      throw error;
-    // The worker cannot be responsible for publishing a pre-existing edge in
-    // a search-only managed directory. Check actual access, including ACLs.
-    const writable = await access(path, constants.W_OK).then(
-      () => true,
-      (failure: unknown) => {
-        if ((failure as NodeJS.ErrnoException)?.code !== 'EACCES')
-          throw failure;
-        return false;
-      },
-    );
-    if (writable) throw error;
-    await access(path, constants.X_OK);
-    return null;
-  });
-  if (!handle) return;
+export async function syncDiskPoolDirectory(path: string) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     await handle.sync();
   } finally {
@@ -170,16 +142,15 @@ export async function syncDiskPoolDirectory(
   }
 }
 
-async function syncCatalogParents(path: string, createdIn: Set<string>) {
+async function syncCatalogParents(path: string) {
   // Even an observed directory could have been just created by another
   // process. Persist its name and each owned ancestor's name up to the
   // independently managed parent before creating an authoritative receipt.
   for (let parent = dirname(path); ; parent = dirname(parent)) {
     const info = await lstat(parent);
     if (!info.isDirectory()) incomplete();
-    const managed = info.uid !== process.getuid?.();
-    await syncDiskPoolDirectory(parent, managed && !createdIn.has(parent));
-    if (managed || parent === dirname(parent)) return;
+    await syncDiskPoolDirectory(parent);
+    if (info.uid !== process.getuid?.() || parent === dirname(parent)) return;
   }
 }
 
@@ -429,19 +400,14 @@ export class DiskPoolLedger {
   private async ensure(signal: AbortSignal) {
     signal.throwIfAborted();
     let root = await this.location();
-    const createdIn = new Set<string>();
     if (!root) {
-      const disk = await ensurePrivatePersonVmDirectory(
-        this.diskRoot,
-        createdIn,
-      );
+      const disk = await ensurePrivatePersonVmDirectory(this.diskRoot);
       root = await ensurePrivatePersonVmDirectory(
         join(disk, '.preprovision-ledger'),
-        createdIn,
       );
       this.seen = true;
     }
-    await syncCatalogParents(root, createdIn);
+    await syncCatalogParents(root);
     signal.throwIfAborted();
     return root;
   }

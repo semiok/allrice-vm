@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -34,8 +33,7 @@ const faults = vi.hoisted(() => ({
   afterLedgerFileSync: undefined as (() => void) | undefined,
   afterDirectorySync: undefined as ((path: string) => void) | undefined,
   managedParent: undefined as
-    | { path: string; writable: boolean; error: NodeJS.ErrnoException }
-    | undefined,
+    { path: string; error: NodeJS.ErrnoException } | undefined,
 }));
 vi.mock('node:fs/promises', async (original) => {
   const fs = await original<typeof Filesystem>();
@@ -52,14 +50,8 @@ vi.mock('node:fs/promises', async (original) => {
       return info;
     },
     async access(...args: Parameters<typeof fs.access>) {
-      if (
-        faults.managedParent?.path === String(args[0]) &&
-        !faults.managedParent.writable &&
-        args[1] === constants.W_OK
-      )
-        throw Object.assign(Error('synthetic write access denied'), {
-          code: 'EACCES',
-        });
+      if (faults.managedParent?.path === String(args[0]))
+        throw Error('unexpected access probe for managed directory');
       return fs.access(...args);
     },
     async open(...args: Parameters<typeof fs.open>) {
@@ -423,28 +415,16 @@ it.each([false, true])(
 );
 
 it.each([
+  { edge: 'pre-existing unreadable', existing: true, code: 'EACCES' },
   {
-    edge: 'pre-existing search-only',
-    existing: true,
-    writable: false,
+    edge: 'newly created with unreadable parent',
+    existing: false,
     code: 'EACCES',
   },
-  {
-    edge: 'pre-existing writable',
-    existing: true,
-    writable: true,
-    code: 'EACCES',
-  },
-  { edge: 'newly created', existing: false, writable: false, code: 'EACCES' },
-  {
-    edge: 'pre-existing with I/O failure',
-    existing: true,
-    writable: false,
-    code: 'EIO',
-  },
+  { edge: 'pre-existing with I/O failure', existing: true, code: 'EIO' },
 ])(
-  'only permits the worker to skip syncing a proven stable managed edge ($edge)',
-  async ({ existing, writable, code }) => {
+  'fails closed before publishing a receipt through a managed parent ($edge)',
+  async ({ existing, code }) => {
     const f = await fixture();
     const disk = join(f.root, 'disks');
     if (existing) await mkdir(disk, { mode: 0o700 });
@@ -452,25 +432,40 @@ it.each([
       Error('synthetic managed parent open failure'),
       { code },
     );
-    faults.managedParent = { path: f.root, writable, error: failure };
+    faults.managedParent = { path: f.root, error: failure };
     const ledger = new DiskPoolLedger(disk);
     const owner = {
       personId: randomUUID(),
       organizationId: randomUUID(),
       vmId: randomUUID(),
     };
-    const write = ledger.recordOrdinaryOwner(owner, signal(), async () => {});
-    if (existing && !writable && code === 'EACCES') {
-      await expect(write).resolves.toBeUndefined();
-      expect(
-        (await ledger.read(signal(), true)).ordinaryOwners.get(owner.vmId),
-      ).toMatchObject(owner);
-    } else {
-      await expect(write).rejects.toBe(failure);
-      expect((await ledger.read(signal(), true)).ordinaryOwners.size).toBe(0);
-    }
+    const beforeLink = vi.fn(async () => {});
+    await expect(
+      ledger.recordOrdinaryOwner(owner, signal(), beforeLink),
+    ).rejects.toBe(failure);
+    expect(beforeLink).not.toHaveBeenCalled();
+    expect(await readdir(join(disk, '.preprovision-ledger'))).toEqual([]);
   },
 );
+
+it('stops a cold disk allocation when the managed catalog parent cannot be synced', async () => {
+  const f = await fixture();
+  const disk = join(f.root, 'disks');
+  await mkdir(disk, { mode: 0o700 });
+  const failure = Object.assign(Error('synthetic managed parent read denied'), {
+    code: 'EACCES',
+  });
+  faults.managedParent = { path: f.root, error: failure };
+  const create = vi.spyOn(f.h.disk, 'create');
+  const service = f.serviceFor(new PersonVmDiskPool(disk, f.locks, f.events));
+  await expect(service.create(context(), signal())).rejects.toMatchObject({
+    code: 'PROVIDER_FAILED',
+    cause: failure,
+  });
+  expect(create).not.toHaveBeenCalled();
+  expect(f.h.disks.size).toBe(0);
+  expect(await readdir(join(disk, '.preprovision-ledger'))).toEqual([]);
+});
 
 it.each(['ancestor', 'disk', 'ledger', 'mode'] as const)(
   'refuses an untrusted catalog directory (%s) before writing',
