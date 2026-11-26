@@ -690,7 +690,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       {
         executable: '/bin/mkdir',
         args: ['-p', '--', GUEST_WORK_DIRECTORY],
-        workdir: '/',
+        workdir: '/bin',
       },
     );
     const result = await job.wait(signal).catch(async (error) => {

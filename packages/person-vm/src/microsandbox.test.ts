@@ -129,7 +129,7 @@ else if(a[0]==='exec'){
  if(!a.includes('--detach')||!a.includes('--no-stdin')||!a.includes('--no-tty'))process.exit(42);
  const id=require('node:crypto').randomUUID(),cmd=a.slice(a.indexOf('--')+1),init=cmd.includes('/work/memory/init.cjs');
  const workdir=cmd.join(' ')==='/bin/mkdir -p -- /work';
- if(workdir&&(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/'||a[a.indexOf('--timeout')+1]!=='10s'))process.exit(46);
+ if(workdir&&(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/bin'||a[a.indexOf('--timeout')+1]!=='10s'))process.exit(46);
  const code=workdir&&mode==='workdir-init-error'?47:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0;
  (v.jobs??={})[id]={cmd,code};save();
  if(!(init&&mode.startsWith('lost-id')))console.log(id);
@@ -1438,7 +1438,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       '--timeout',
       '10s',
       '--workdir',
-      '/',
+      '/bin',
       '--',
       '/bin/mkdir',
       '-p',
