@@ -216,7 +216,8 @@ export async function checkUnitPlacement(directory, loadPaths, show) {
       !info.has('FragmentPath') ||
       !info.has('DropInPaths') ||
       info.get('FragmentPath') !== (state === 'loaded' ? own : '') ||
-      info.get('DropInPaths')
+      info.get('DropInPaths') ||
+      (state === 'loaded' && !(await exists(own)))
     )
       throw new Error(
         'Existing systemd fragment, mask or drop-in; use the release owner',
