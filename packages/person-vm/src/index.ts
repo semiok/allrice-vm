@@ -10,6 +10,7 @@ export type {
   PersonVmGuestCommand,
   PersonVmJobExit,
   PersonVmManagedJob,
+  PersonVmNativeWebGuestAddress,
   PersonVmStartingScope,
   PersonVmBootstrapScope,
   PersonVmGuestBootstrapPort,
@@ -35,6 +36,7 @@ export {
   MicrosandboxPersonVm,
   type PersonVmNativePort,
 } from './microsandbox.ts';
+export { isMicrosandboxGuestIpv4 } from './microsandbox-bootstrap.ts';
 export {
   ApfsPersonVmDisk,
   FilePersonVmKeyStore,

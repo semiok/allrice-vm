@@ -150,11 +150,6 @@ const configuration = z
     web: z
       .object({
         cliPath: guestPath,
-        guestAddress: z
-          .string()
-          .refine(
-            (value) => isIP(value) !== 0 && !['0.0.0.0', '::'].includes(value),
-          ),
         startupTimeoutMs: positive,
         publicOrigin: z.string().refine((value) => {
           try {
