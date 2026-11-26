@@ -8,10 +8,8 @@ import {
 } from 'react';
 import { createRoot } from 'react-dom/client';
 import { EmployeeSidebar } from '../app/chatflow/employee-sidebar';
-import {
-  NativeSubagentDirectory,
-  NativeSubagentDetail,
-} from '../app/chatflow/native-subagent-directory';
+import { NativeSubagentDirectory } from '../app/chatflow/native-subagent-directory';
+import { LegacySubagentDetailFixture } from './native-subagent-detail.fixture';
 import {
   WorkbenchEntries,
   WorkbenchStart,
@@ -97,10 +95,10 @@ declare global {
     };
   }
 }
-// Direct regression surface for the retained component; never part of the product directory.
+// Drives the fixture-only summary and control interactions.
 function DetailFixture(
   props: Omit<
-    ComponentProps<typeof NativeSubagentDetail>,
+    ComponentProps<typeof LegacySubagentDetailFixture>,
     'selected' | 'onClose'
   >,
 ) {
@@ -124,7 +122,7 @@ function DetailFixture(
         </button>
         <button onClick={props.observation.refresh}>刷新观察（测试）</button>
       </section>
-      <NativeSubagentDetail
+      <LegacySubagentDetailFixture
         {...props}
         selected={selected}
         onClose={() => {
@@ -251,16 +249,7 @@ function Page() {
                 key={activeId}
                 workspaceId="workspace"
                 sessionId={activeId}
-                headers={headers}
                 observation={observation}
-                viewerId={workspace.viewerId}
-                canControl={controls && ownerId === workspace.viewerId}
-                controlRoot={
-                  controls
-                    ? nativeSubagentControlRoot(runViews[rootRunId])
-                    : undefined
-                }
-                presentation={presentation}
                 scope={childView ? childScope : undefined}
                 onOpen={
                   childView

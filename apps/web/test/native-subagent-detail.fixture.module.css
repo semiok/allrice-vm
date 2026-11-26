@@ -1,0 +1,27 @@
+.detail {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-base, white);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  padding: 12px;
+  overflow: auto;
+}
+.detail header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.detail {
+  position: fixed;
+  z-index: 70;
+  inset: 64px 12px 12px auto;
+  width: min(460px, calc(100vw - 24px));
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+}
+.detail header {
+  justify-content: space-between;
+}
+.text {
+  white-space: pre-wrap;
+}

@@ -1,5 +1,4 @@
-.catalog,
-.detail {
+.catalog {
   color: var(--dsw-alias-label-primary);
   background: var(--dsw-alias-bg-base, white);
   border: 1px solid var(--dsw-alias-border-l2);
@@ -45,8 +44,7 @@
   padding-inline-start: 8px;
   border-inline-start: 1px solid var(--ar-border-subtle);
 }
-.row,
-.detail header {
+.row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -345,20 +343,6 @@ button.trigger.trigger[aria-expanded='true']:not(:disabled) {
   .processLink {
     min-height: 44px;
   }
-}
-.detail {
-  position: fixed;
-  z-index: 70;
-  inset: 64px 12px 12px auto;
-  width: min(460px, calc(100vw - 24px));
-  box-sizing: border-box;
-  overflow-wrap: anywhere;
-}
-.detail header {
-  justify-content: space-between;
-}
-.text {
-  white-space: pre-wrap;
 }
 .controls {
   border-top: 1px solid var(--dsw-alias-border-l2);
