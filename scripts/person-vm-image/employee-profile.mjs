@@ -237,7 +237,6 @@ export function createEmployeeLinuxCapture(native, identity) {
           }
         }
         if (failure) throw failure;
-        cancelled.signal.throwIfAborted();
       } finally {
         try {
           if (scratch && !keep) await rm(scratch, { recursive: true });
@@ -246,6 +245,7 @@ export function createEmployeeLinuxCapture(native, identity) {
             process.removeListener(signal, abort);
         }
       }
+      cancelled.signal.throwIfAborted();
     },
   };
 }
