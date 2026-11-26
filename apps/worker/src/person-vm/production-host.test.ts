@@ -433,6 +433,8 @@ it('joins the injected offline preparation before Host close settles', async () 
         reserveBytes: 20,
       }),
     );
+    const installed = io.diskPreprovision.mock.calls[0]?.[0];
+    expect((await installed.availableBytes(signal())) > 0n).toBe(true);
     let stopped = false;
     const closing = host.close().then(() => {
       stopped = true;

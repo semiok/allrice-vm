@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { statfs } from 'node:fs/promises';
+import { lstat, statfs } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
+import { dirname } from 'node:path';
 import type { RequestContext } from '@allrice/contracts';
 import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   getDatabase,
-  listPersonVmDiskPreparationPeople,
+  readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
 } from '@allrice/database';
 import {
@@ -830,7 +831,7 @@ export function createProductionPersonVmHost(input: {
         diskPreprovision = startProductionDiskPreprovision({
           lifetime,
           openFeed: () => createDEntryAuthorityFeed(databaseUrl),
-          listPeople: listPersonVmDiskPreparationPeople,
+          readRoster: readPersonVmDiskPreparationRoster,
           readTarget: readPersonVmDiskPreparationTarget,
           async foregroundBusy(personId, signal) {
             signal.throwIfAborted();
@@ -842,7 +843,21 @@ export function createProductionPersonVmHost(input: {
           },
           async availableBytes(signal) {
             signal.throwIfAborted();
-            const volume = await statfs(disk.root, { bigint: true });
+            const diskRoot = await lstat(disk.root).catch(
+              (error: NodeJS.ErrnoException) => {
+                if (error.code === 'ENOENT') return null;
+                throw error;
+              },
+            );
+            // The directory for the first disk may not exist yet. Budget on
+            // its current parent volume, then recheck the initialized root
+            // through the port guard before actual allocation.
+            const path = diskRoot ? disk.root : dirname(disk.root);
+            const directory = diskRoot ?? (await lstat(path));
+            if (!directory.isDirectory())
+              throw new PersonVmError('PROVIDER_FAILED');
+            const volume = await statfs(path, { bigint: true });
+            signal.throwIfAborted();
             return volume.bavail * volume.bsize;
           },
           minimumFreeBytes: disk.preprovision.minimumFreeBytes,

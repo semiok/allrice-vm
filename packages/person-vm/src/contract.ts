@@ -87,7 +87,9 @@ export interface PersonVmDiskPreparationPort {
   /** The provider owns the existing person lease and joins all disk I/O and
    * cleanup before settling. Recheck current scope inside the lease before
    * side effects and completion, and capacity before allocating bytes. This
-   * operation prepares only an offline disk and sealed public cache. */
+   * operation prepares only an offline disk and sealed public cache. Reject
+   * with PersonVmError('CLEANUP_INCOMPLETE') if cleanup remains unconfirmed,
+   * including when cancellation initiated that cleanup. */
   prepare(
     target: PersonVmDiskPreparationTarget,
     guard: Readonly<{

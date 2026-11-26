@@ -2,10 +2,14 @@ import { randomUUID } from 'node:crypto';
 import type postgres from 'postgres';
 import {
   DEntryRolloutPolicySchema,
+  selectDEntryGeneration,
   UuidSchema,
   type RequestContext,
 } from '@allrice/contracts';
-import type { PersonVmDiskPreparationTarget } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmDiskPreparationTarget,
+} from '@allrice/person-vm';
 import { readContentPrincipal } from './content-maintenance.ts';
 import { getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
@@ -78,19 +82,11 @@ export async function updateDEntryReleasePolicy(
   return policy;
 }
 
-/** Host polling only. Page by person so one person's selections cannot be
- * split across pages, including when checking for a conflicting enterprise. */
-export async function listPersonVmDiskPreparationPeople(
-  after: string | null,
-  limit: number,
-  signal: AbortSignal,
-) {
-  if (after !== null) UuidSchema.parse(after);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100)
-    throw new RangeError('Invalid disk preparation page size');
+/** One committed roster per sweep. Pages are scheduling hints only. */
+export async function readPersonVmDiskPreparationRoster(signal: AbortSignal) {
   signal.throwIfAborted();
   const policy = await getDatabase().begin('read only', async (sql) => {
-    await sql`set local statement_timeout = '5s'`;
+    await sql`set local transaction_timeout = '5s'`;
     signal.throwIfAborted();
     return readDEntryReleasePolicy(sql);
   });
@@ -101,18 +97,26 @@ export async function listPersonVmDiskPreparationPeople(
         .filter(
           (entry) =>
             entry.generation === '4.0' &&
-            (after === null || entry.personId > after),
+            entry.personId === entry.personId.toLowerCase(),
         )
         .map((entry) => entry.personId),
     ),
-  ]
-    .sort()
-    .slice(0, limit + 1);
-  const personIds = people.slice(0, limit);
-  return {
-    personIds,
-    nextAfter: people.length > limit ? personIds[limit - 1]! : null,
-  };
+  ].sort();
+  return Object.freeze({
+    page(offset: number, limit: number) {
+      if (
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        !Number.isInteger(limit) ||
+        limit < 1 ||
+        limit > 100
+      )
+        throw new RangeError('Invalid disk preparation page');
+      const personIds = people.slice(offset, offset + limit);
+      const next = offset + personIds.length;
+      return { personIds, nextOffset: next < people.length ? next : null };
+    },
+  });
 }
 
 /** Rebuild current storage eligibility from committed data in one short read.
@@ -123,10 +127,11 @@ export async function readPersonVmDiskPreparationTarget(
 ): Promise<PersonVmDiskPreparationTarget | null> {
   UuidSchema.parse(personId);
   signal.throwIfAborted();
+  if (personId !== personId.toLowerCase()) return null;
   return getDatabase().begin(
     'isolation level repeatable read read only',
     async (sql) => {
-      await sql`set local statement_timeout = '5s'`;
+      await sql`set local transaction_timeout = '5s'`;
       signal.throwIfAborted();
       const policy = await readDEntryReleasePolicy(sql);
       const [vm] = await sql<
@@ -160,15 +165,21 @@ export async function readPersonVmDiskPreparationTarget(
           eligible[0]?.organizationId === entry.organizationId
         )
           continue;
-        const [owner] = await sql<{ owner_id: string; workspace_id: string }[]>`
-          select owner_id,workspace_id from allrice_employee_instances
+        const [owner] = await sql<
+          {
+            owner_id: string;
+            organization_id: string;
+            workspace_id: string;
+          }[]
+        >`
+          select owner_id,organization_id,workspace_id from allrice_employee_instances
           where id=${entry.employeeInstanceId} and organization_id=${entry.organizationId}
             and owner_id=${personId} and archived_at is null`;
         if (!owner) continue;
         // A read-only subject projection, deliberately without a session.
         const subject = {
           actor: { type: 'user' as const, id: owner.owner_id },
-          organizationId: entry.organizationId,
+          organizationId: owner.organization_id,
           workspaceId: owner.workspace_id,
         };
         if (!(await readContentPrincipal(subject, sql))?.writable) continue;
@@ -179,17 +190,27 @@ export async function readPersonVmDiskPreparationTarget(
             sql,
           );
           signal.throwIfAborted();
-          if (eligible.length) return null; // Two eligible enterprises, no existing owner.
+          const identity = {
+            personId: owner.owner_id,
+            organizationId: owner.organization_id,
+            workspaceId: employee.workspaceId,
+            employeeInstanceId: employee.id,
+            employeeRevision: employee.revision,
+            employeeVersionId: employee.source.employeeVersionId,
+          };
+          // PostgreSQL UUID equality cannot replace the existing exact policy match.
+          if (
+            entry.organizationId !== identity.organizationId ||
+            entry.personId !== identity.personId ||
+            entry.employeeInstanceId !== identity.employeeInstanceId ||
+            selectDEntryGeneration(policy, { ...identity, threadId: null }) !==
+              '4.0'
+          )
+            continue;
+          if (eligible[0]?.organizationId === identity.organizationId) continue;
+          if (eligible.length) throw new PersonVmError('ORGANIZATION_CONFLICT');
           eligible.push(
-            Object.freeze({
-              personId,
-              organizationId: entry.organizationId,
-              workspaceId: employee.workspaceId,
-              employeeInstanceId: employee.id,
-              employeeRevision: employee.revision,
-              employeeVersionId: employee.source.employeeVersionId,
-              policyRevision: policy.revision,
-            }),
+            Object.freeze({ ...identity, policyRevision: policy.revision }),
           );
         } catch (error) {
           if (

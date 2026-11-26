@@ -17,7 +17,7 @@ vi.mock('./employees/employee-instances.ts', async (original) => ({
 }));
 
 import {
-  listPersonVmDiskPreparationPeople,
+  readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
 } from './d-entry-release-policy.ts';
 import { EmployeeInstanceError } from './employees/employee-instances.ts';
@@ -43,19 +43,20 @@ const signal = () => new AbortController().signal;
 function fixture(
   selections: DEntryRolloutPolicy['selections'],
   vm: Record<string, unknown>[] = [],
+  defaultGeneration: DEntryRolloutPolicy['defaultGeneration'] = '3.x',
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
   const sql = vi.fn(
     async (strings: TemplateStringsArray, ...params: unknown[]) => {
       const query = strings.join('?');
       seen.push({ query, params });
-      if (query.includes('set local statement_timeout')) return [];
+      if (query.includes('set local transaction_timeout')) return [];
       if (query.includes('from allrice_settings')) {
         return [
           {
             value: {
               revision: 'revision-1',
-              defaultGeneration: '3.x',
+              defaultGeneration,
               selections,
             },
           },
@@ -63,7 +64,13 @@ function fixture(
       }
       if (query.includes('from person_virtual_machines')) return vm;
       if (query.includes('from allrice_employee_instances'))
-        return [{ owner_id: params[2], workspace_id: workspace }];
+        return [
+          {
+            owner_id: String(params[2]).toLowerCase(),
+            organization_id: String(params[1]).toLowerCase(),
+            workspace_id: workspace,
+          },
+        ];
       throw Error('Unexpected fixture query');
     },
   );
@@ -78,7 +85,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   data.principal.mockResolvedValue({ writable: true });
   data.employee.mockImplementation(async (_subject, employeeId) => ({
-    id: employeeId,
+    id: String(employeeId).toLowerCase(),
     workspaceId: workspace,
     revision: 1,
     source: { employeeVersionId: version },
@@ -92,17 +99,34 @@ it('pages distinct 4.0 people without splitting same-person selections or includ
     selection(first, secondOrg, other),
     selection(first, org, id(9), '3.x'),
   ]);
-  expect(await listPersonVmDiskPreparationPeople(null, 1, signal())).toEqual({
-    personIds: [person],
-    nextAfter: person,
-  });
-  expect(await listPersonVmDiskPreparationPeople(person, 1, signal())).toEqual({
+  const roster = await readPersonVmDiskPreparationRoster(signal());
+  expect(roster.page(0, 1)).toEqual({ personIds: [person], nextOffset: 1 });
+  expect(roster.page(1, 1)).toEqual({
     personIds: [other],
-    nextAfter: null,
+    nextOffset: null,
   });
-  await expect(
-    listPersonVmDiskPreparationPeople(null, 0, signal()),
-  ).rejects.toThrow('Invalid disk preparation page size');
+  expect(() => roster.page(0, 0)).toThrow('Invalid disk preparation page');
+});
+
+it('does not authorize policy UUID spellings rejected by the foreground matcher', async () => {
+  const spelled = 'a0000000-0000-4000-8000-000000000008';
+  fixture([selection(spelled.toUpperCase())], [], '4.0');
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  fixture([selection(first, org, spelled.toUpperCase())]);
+  expect(
+    (await readPersonVmDiskPreparationRoster(signal())).page(0, 16).personIds,
+  ).toEqual([]);
+  expect(
+    await readPersonVmDiskPreparationTarget(spelled.toUpperCase(), signal()),
+  ).toBeNull();
+});
+
+it('does not schedule implicit rollout defaults without an exact selection', async () => {
+  fixture([], [], '4.0');
+  expect(
+    (await readPersonVmDiskPreparationRoster(signal())).page(0, 16).personIds,
+  ).toEqual([]);
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
 });
 
 it('reads policy, membership and employee version in one short snapshot without a session', async () => {
@@ -146,7 +170,11 @@ it('requires a writable current membership and a live assignment', async () => {
 it('denies ambiguous enterprise ownership and respects the existing person disk owner', async () => {
   const selections = [selection(), selection(second, secondOrg)];
   fixture(selections);
-  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+  await expect(
+    readPersonVmDiskPreparationTarget(person, signal()),
+  ).rejects.toMatchObject({
+    code: 'ORGANIZATION_CONFLICT',
+  });
   fixture(selections, [
     {
       organization_id: secondOrg,

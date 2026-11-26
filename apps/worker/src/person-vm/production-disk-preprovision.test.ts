@@ -1,11 +1,15 @@
 import { setImmediate as turn } from 'node:timers/promises';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { PersonVmDiskPreparationTarget } from '@allrice/person-vm';
+import {
+  PersonVmError,
+  type PersonVmDiskPreparationTarget,
+} from '@allrice/person-vm';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 
 type Input = Parameters<typeof startProductionDiskPreprovision>[0];
 type Feed = ReturnType<Input['openFeed']>;
 type Listener = Parameters<Feed['subscribe']>[0];
+type Roster = Awaited<ReturnType<Input['readRoster']>>;
 const id = (n: number) =>
   `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const first = id(1);
@@ -58,13 +62,14 @@ function fixture() {
     }),
     close: vi.fn<Feed['close']>(async () => {}),
   };
+  const page = vi.fn<Roster['page']>(() => ({
+    personIds: [first],
+    nextOffset: null,
+  }));
   const input = {
     lifetime: new AbortController().signal,
     openFeed: vi.fn(() => feed),
-    listPeople: vi.fn<Input['listPeople']>(async () => ({
-      personIds: [first],
-      nextAfter: null,
-    })),
+    readRoster: vi.fn<Input['readRoster']>(async () => ({ page })),
     readTarget: vi.fn<Input['readTarget']>(async (personId) =>
       target(personId),
     ),
@@ -84,11 +89,12 @@ function fixture() {
   return {
     input,
     feed,
+    page,
     subscribers,
     unsubscribed,
-    start() {
+    start(register = true) {
       const owner = startProductionDiskPreprovision(input);
-      started.push(owner);
+      if (register) started.push(owner);
       return owner;
     },
   };
@@ -96,9 +102,9 @@ function fixture() {
 
 it('subscribes before scanning, pages serially, and gives the foreground lease priority', async () => {
   const f = fixture();
-  f.input.listPeople
-    .mockResolvedValueOnce({ personIds: [first, second], nextAfter: second })
-    .mockResolvedValueOnce({ personIds: [third], nextAfter: null });
+  f.page
+    .mockReturnValueOnce({ personIds: [first, second], nextOffset: 2 })
+    .mockReturnValueOnce({ personIds: [third], nextOffset: null });
   f.input.foregroundBusy.mockImplementation(
     async (personId) => personId === first,
   );
@@ -112,14 +118,15 @@ it('subscribes before scanning, pages serially, and gives the foreground lease p
     await vi.waitFor(() =>
       expect(f.input.port.prepare).toHaveBeenCalledTimes(1),
     );
-    expect(f.feed.subscribe).toHaveBeenCalledBefore(f.input.listPeople);
+    expect(f.feed.subscribe).toHaveBeenCalledBefore(f.input.readRoster);
     expect(f.input.port.prepare.mock.calls[0]?.[0].personId).toBe(second);
-    expect(f.input.listPeople).toHaveBeenCalledTimes(1);
+    expect(f.page).toHaveBeenCalledTimes(1);
   } finally {
     gate.resolve();
   }
   await vi.waitFor(() => expect(f.input.port.prepare).toHaveBeenCalledTimes(2));
-  expect(f.input.listPeople.mock.calls[1]?.[0]).toBe(second);
+  expect(f.page.mock.calls[1]?.[0]).toBe(2);
+  expect(f.input.readRoster).toHaveBeenCalledOnce();
   expect(f.input.port.prepare.mock.calls[1]?.[0].personId).toBe(third);
 });
 
@@ -134,7 +141,7 @@ it('reserves bytes above the floor and defers rather than calling the port at lo
   );
   expect(f.input.port.prepare).not.toHaveBeenCalled();
   f.subscribers[0]?.changed(hint('allrice_settings'));
-  await vi.waitFor(() => expect(f.input.listPeople).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(f.input.readRoster).toHaveBeenCalledTimes(2));
   expect(f.input.availableBytes).toHaveBeenCalledOnce(); // respects retry backoff
 });
 
@@ -162,8 +169,16 @@ it('fences revoked work, ignores its own lease hints, and joins before closing t
     f.subscribers[0]?.changed(hint('person_virtual_machines', first));
     f.subscribers[0]?.changed(hint('allrice_memberships', second));
     expect(guard.signal.aborted).toBe(false);
+    const reads = f.input.readTarget.mock.calls.length;
+    f.subscribers[0]?.changed(hint('allrice_settings'));
+    await vi.waitFor(() =>
+      expect(f.input.readTarget.mock.calls).toHaveLength(reads + 1),
+    );
+    expect(guard.signal.aborted).toBe(false);
+
+    f.input.readTarget.mockResolvedValue(null);
     f.subscribers[0]?.changed(hint('allrice_memberships', first));
-    expect(guard.signal.aborted).toBe(true);
+    await vi.waitFor(() => expect(guard.signal.aborted).toBe(true));
     await expect(guard.assertCurrent()).rejects.toThrow('AUTHORITY_CHANGED');
     const close = owner.close();
     expect(owner.close()).toBe(close);
@@ -217,10 +232,84 @@ it('fences disconnected work, waits for join, then reconnects and starts a fresh
   await vi.waitFor(() => expect(f.subscribers).toHaveLength(2), {
     timeout: 2_500,
   });
-  await vi.waitFor(() =>
-    expect(f.input.listPeople.mock.calls[1]?.[0]).toBeNull(),
-  );
+  await vi.waitFor(() => expect(f.page.mock.calls[1]?.[0]).toBe(0));
   expect(f.feed.close).toHaveBeenCalled();
   await vi.waitFor(() => expect(f.input.port.prepare).toHaveBeenCalledTimes(2));
   expect(f.input.observe).toHaveBeenCalledWith('source-unavailable');
+});
+
+it.each(['close', 'disconnect'] as const)(
+  'retains incomplete provider cleanup and never reconnects after %s',
+  async (cause) => {
+    const f = fixture();
+    const gate = latch();
+    const cleanupError = new PersonVmError('CLEANUP_INCOMPLETE');
+    f.input.port.prepare.mockImplementationOnce(async () => {
+      await gate.promise;
+      throw cleanupError;
+    });
+    const owner = f.start(false);
+    try {
+      await vi.waitFor(() =>
+        expect(f.input.port.prepare).toHaveBeenCalledOnce(),
+      );
+      if (cause === 'close') void owner.close();
+      else f.subscribers[0]?.lost(Error('synthetic disconnect'));
+      expect(f.input.port.prepare.mock.calls[0]?.[1].signal.aborted).toBe(true);
+      expect(f.feed.close).not.toHaveBeenCalled();
+    } finally {
+      gate.resolve();
+      await vi.waitFor(() =>
+        expect(f.input.observe).toHaveBeenCalledWith('cleanup-incomplete'),
+      );
+      await expect(owner.close()).rejects.toBe(cleanupError);
+    }
+    expect(f.input.openFeed).toHaveBeenCalledOnce();
+    expect(f.feed.close).toHaveBeenCalledOnce();
+  },
+);
+
+it.each(['readTarget', 'foregroundBusy'] as const)(
+  'stops the entire pass and joins the feed after %s fails',
+  async (source) => {
+    const f = fixture();
+    const gate = latch();
+    f.page.mockReturnValueOnce({
+      personIds: [first, second],
+      nextOffset: null,
+    });
+    f.input[source].mockRejectedValueOnce(Error('synthetic database error'));
+    f.feed.close.mockImplementationOnce(async () => gate.promise);
+    f.start();
+    try {
+      await vi.waitFor(() => expect(f.feed.close).toHaveBeenCalledOnce());
+      expect(f.input.readTarget.mock.calls.map(([person]) => person)).toEqual([
+        first,
+      ]);
+      expect(f.input.port.prepare).not.toHaveBeenCalled();
+      expect(f.input.openFeed).toHaveBeenCalledOnce();
+    } finally {
+      gate.resolve();
+    }
+    await vi.waitFor(
+      () => expect(f.input.port.prepare).toHaveBeenCalledOnce(),
+      { timeout: 2_500 },
+    );
+    expect(f.input.openFeed).toHaveBeenCalledTimes(2);
+  },
+);
+
+it('reports ambiguous enterprise ownership without failing the whole roster', async () => {
+  const f = fixture();
+  f.page.mockReturnValueOnce({ personIds: [first, second], nextOffset: null });
+  f.input.readTarget.mockRejectedValueOnce(
+    new PersonVmError('ORGANIZATION_CONFLICT'),
+  );
+  f.start();
+  await vi.waitFor(() => expect(f.input.port.prepare).toHaveBeenCalledOnce());
+  expect(f.input.port.prepare.mock.calls[0]?.[0].personId).toBe(second);
+  expect(f.input.observe).toHaveBeenCalledExactlyOnceWith(
+    'organization-conflict',
+  );
+  expect(f.feed.close).not.toHaveBeenCalled();
 });

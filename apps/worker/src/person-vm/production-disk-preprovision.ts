@@ -2,12 +2,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { sameDEntryIdentity } from '@allrice/contracts';
 import type {
   createDEntryAuthorityFeed,
-  listPersonVmDiskPreparationPeople,
+  readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
 } from '@allrice/database';
-import type {
-  PersonVmDiskPreparationPort,
-  PersonVmDiskPreparationTarget,
+import {
+  PersonVmError,
+  type PersonVmDiskPreparationPort,
+  type PersonVmDiskPreparationTarget,
 } from '@allrice/person-vm';
 
 const pageSize = 16;
@@ -33,7 +34,11 @@ type Feed = Pick<
   'subscribe' | 'close'
 >;
 type PreparationEvent =
-  'capacity-deferred' | 'prepare-failed' | 'source-unavailable';
+  | 'capacity-deferred'
+  | 'organization-conflict'
+  | 'cleanup-incomplete'
+  | 'prepare-failed'
+  | 'source-unavailable';
 type Retry = { failures: number; notBefore: number };
 
 function matchesTarget(
@@ -50,12 +55,19 @@ function matchesTarget(
   );
 }
 
+function vmError<Code extends PersonVmError['code']>(
+  error: unknown,
+  code: Code,
+): error is PersonVmError & { code: Code } {
+  return error instanceof PersonVmError && error.code === code;
+}
+
 /** The Host owns this scanner. Its only mutating dependency is the offline
  * disk port, which must acquire the existing per-person physical lease. */
 export function startProductionDiskPreprovision(input: {
   lifetime: AbortSignal;
   openFeed(): Feed;
-  listPeople: typeof listPersonVmDiskPreparationPeople;
+  readRoster: typeof readPersonVmDiskPreparationRoster;
   readTarget: typeof readPersonVmDiskPreparationTarget;
   foregroundBusy(personId: string, signal: AbortSignal): Promise<boolean>;
   availableBytes(signal: AbortSignal): Promise<bigint>;
@@ -69,6 +81,7 @@ export function startProductionDiskPreprovision(input: {
   const retry = new Map<string, Retry>();
   const minimumFree =
     BigInt(input.minimumFreeBytes) + BigInt(input.reserveBytes);
+  const lowCapacity = Error('DISK_PREPARATION_CAPACITY_UNAVAILABLE');
 
   function defer(personId: string, failed: boolean) {
     const failures = failed
@@ -88,7 +101,7 @@ export function startProductionDiskPreprovision(input: {
     const disconnected = new AbortController();
     const signal = AbortSignal.any([lifetime, disconnected.signal]);
     let waiting: AbortController | undefined;
-    let attempt: { personId: string; cancel: AbortController } | undefined;
+    let attempt: { personId: string; recheck(): void } | undefined;
     let hinted = false;
     const unsubscribe = await feed.subscribe(
       {
@@ -99,9 +112,7 @@ export function startProductionDiskPreprovision(input: {
           const personId =
             change.personId ??
             (change.table === 'allrice_users' ? change.id : null);
-          if (!personId || attempt?.personId === personId) {
-            attempt?.cancel.abort(Error('DISK_PREPARATION_AUTHORITY_CHANGED'));
-          }
+          if (!personId || attempt?.personId === personId) attempt?.recheck();
           hinted = true;
           waiting?.abort();
         },
@@ -110,19 +121,34 @@ export function startProductionDiskPreprovision(input: {
       signal,
     );
 
+    async function readSource<T>(active: AbortSignal, read: () => Promise<T>) {
+      try {
+        return await read();
+      } catch (error) {
+        if (!active.aborted && !vmError(error, 'ORGANIZATION_CONFLICT'))
+          disconnected.abort(error);
+        throw error;
+      }
+    }
+
     async function prepare(personId: string) {
       if ((retry.get(personId)?.notBefore ?? 0) > performance.now()) return;
       const cancel = new AbortController();
       const active = AbortSignal.any([signal, cancel.signal]);
-      attempt = { personId, cancel };
+      let rechecking: Promise<void> | undefined;
+      let recheckRequested = false;
       try {
-        const target = await input.readTarget(personId, active);
+        const readTarget = () =>
+          readSource(active, () => input.readTarget(personId, active));
+        const target = await readTarget();
         active.throwIfAborted();
         if (!target) {
           retry.delete(personId);
           return;
         }
-        const busy = await input.foregroundBusy(personId, active);
+        const busy = await readSource(active, () =>
+          input.foregroundBusy(personId, active),
+        );
         active.throwIfAborted();
         if (busy) {
           defer(personId, false);
@@ -130,7 +156,7 @@ export function startProductionDiskPreprovision(input: {
         }
         const assertCurrent = async () => {
           active.throwIfAborted();
-          const current = await input.readTarget(personId, active);
+          const current = await readTarget();
           active.throwIfAborted();
           if (!matchesTarget(target, current)) {
             cancel.abort(Error('DISK_PREPARATION_AUTHORITY_CHANGED'));
@@ -143,6 +169,24 @@ export function startProductionDiskPreprovision(input: {
           active.throwIfAborted();
           if (available < minimumFree) throw lowCapacity;
         };
+        attempt = {
+          personId,
+          recheck() {
+            recheckRequested = true;
+            rechecking ??= Promise.resolve().then(async () => {
+              try {
+                while (recheckRequested && !active.aborted) {
+                  recheckRequested = false;
+                  await assertCurrent();
+                }
+              } catch (error) {
+                if (!active.aborted) cancel.abort(error);
+              } finally {
+                rechecking = undefined;
+              }
+            });
+          },
+        };
         await assertCapacity();
         await assertCurrent();
         active.throwIfAborted();
@@ -154,16 +198,22 @@ export function startProductionDiskPreprovision(input: {
         active.throwIfAborted();
         defer(personId, false);
       } catch (error) {
+        if (vmError(error, 'CLEANUP_INCOMPLETE')) throw error;
         if (signal.aborted) throw signal.reason;
         if (!active.aborted) {
           input.observe(
-            error === lowCapacity ? 'capacity-deferred' : 'prepare-failed',
+            error === lowCapacity
+              ? 'capacity-deferred'
+              : vmError(error, 'ORGANIZATION_CONFLICT')
+                ? 'organization-conflict'
+                : 'prepare-failed',
           );
           defer(personId, true);
         }
       } finally {
         cancel.abort();
         attempt = undefined;
+        await rechecking;
       }
     }
 
@@ -171,17 +221,20 @@ export function startProductionDiskPreprovision(input: {
       while (!signal.aborted) {
         hinted = false;
         const seen = new Set<string>();
-        let after: string | null = null;
+        const roster = await input.readRoster(signal);
+        signal.throwIfAborted();
+        let offset: number | null = 0;
         do {
-          const page = await input.listPeople(after, pageSize, signal);
-          signal.throwIfAborted();
+          const page = roster.page(offset, pageSize);
           for (const personId of page.personIds) {
             signal.throwIfAborted();
             seen.add(personId);
             await prepare(personId);
           }
-          after = page.nextAfter;
-        } while (after !== null);
+          offset = page.nextOffset;
+          if (offset !== null)
+            await sleep(0, undefined, { signal, ref: false });
+        } while (offset !== null);
         for (const personId of retry.keys()) {
           if (!seen.has(personId)) retry.delete(personId);
         }
@@ -205,19 +258,32 @@ export function startProductionDiskPreprovision(input: {
     }
   }
 
-  const lowCapacity = Error('DISK_PREPARATION_CAPACITY_UNAVAILABLE');
   const work = (async () => {
     while (!lifetime.aborted) {
       let feed: Feed | undefined;
+      let cleanupFailure: PersonVmError | undefined;
+      let sourceFailed = false;
       try {
         feed = input.openFeed();
         await scan(feed);
-      } catch {
-        if (!lifetime.aborted) input.observe('source-unavailable');
-      } finally {
-        // A feed that cannot be closed must not be replaced by an extra owner.
-        await feed?.close();
+      } catch (error) {
+        if (vmError(error, 'CLEANUP_INCOMPLETE')) cleanupFailure = error;
+        else sourceFailed = true;
       }
+      // A feed that cannot be closed must not be replaced by an extra owner.
+      try {
+        await feed?.close();
+      } catch (error) {
+        if (cleanupFailure)
+          throw new AggregateError(
+            [cleanupFailure, error],
+            'DISK_PREPARATION_CLOSE_INCOMPLETE',
+          );
+        throw error;
+      }
+      if (cleanupFailure) throw cleanupFailure;
+      if (!lifetime.aborted && sourceFailed)
+        input.observe('source-unavailable');
       if (!lifetime.aborted)
         await sleep(initialRetryMs, undefined, {
           signal: lifetime,
@@ -227,7 +293,7 @@ export function startProductionDiskPreprovision(input: {
         });
     }
   })();
-  void work.catch(() => input.observe('source-unavailable'));
+  void work.catch(() => input.observe('cleanup-incomplete'));
 
   return {
     close() {
