@@ -775,6 +775,103 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
   expect(prewarm).toHaveBeenCalledTimes(2);
 });
 
+it('uses both the selected editor proof and physical Host readiness on the real hot HTTP path', async () => {
+  const f = fixture(true);
+  const { context, body, data } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  const route = new AbortController();
+  const proof = vi.fn(async () => route.signal);
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    assertEditorReady: proof,
+  });
+  cleanups.push(async () => uninstall());
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent: f.prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+  const ping = vi.spyOn(f.h.native, 'ping');
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(ping).toHaveBeenCalledTimes(1);
+  // The selected owner still proves its editor, but an incomplete Host roster
+  // is reported by the existing VM-wide readiness port.
+  f.h.setReadiness({ authenticated: true, editorReady: false, canSend: false });
+  const rejected = await server.request('native-prewarm', {
+    ...body,
+    trigger: 'page',
+  });
+  expect(rejected.status).toBe(202);
+  const { ticket } = await rejected.json();
+  const status = await prewarmStatus(server, ticket.operationId);
+  expect(await status.json()).toEqual({
+    state: 'failed',
+    code: 'START_UNAVAILABLE',
+  });
+  expect(ping).toHaveBeenCalledTimes(2);
+  expect(proof).toHaveBeenCalledTimes(3);
+  expect(f.start).toHaveBeenCalledTimes(1);
+  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it('expires the old ticket and restores the exact retained disk on a fresh POST', async () => {
+  const f = fixture(true);
+  const { context, identity, body } = f.base;
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent: f.prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+  const post = () =>
+    server.request('native-prewarm', { ...body, trigger: 'page' });
+  const first = await post();
+  expect(first.status).toBe(202);
+  const { ticket: old } = await first.json();
+  await vi.waitFor(async () =>
+    expect(await (await prewarmStatus(server, old.operationId)).json()).toEqual(
+      { state: 'ready' },
+    ),
+  );
+  const binding = await f.h.service.resolve(context, signal());
+  f.h.states.set(binding.vmId, 'stopped');
+  await f.h.service.delete(context, {}, signal());
+  const before = f.h.log.slice();
+  const expired = await prewarmStatus(server, old.operationId);
+  expect(expired.status).toBe(410);
+  expect(await expired.json()).toEqual({ state: 'expired' });
+  expect(f.h.log).toEqual(before);
+  expect(await f.h.store.read(identity.personId)).toMatchObject({
+    phase: 'deleted',
+    diskRetained: true,
+  });
+  const restored = await post();
+  expect(restored.status).toBe(202);
+  const { ticket } = await restored.json();
+  expect(ticket.operationId).not.toBe(old.operationId);
+  await vi.waitFor(async () =>
+    expect(
+      await (await prewarmStatus(server, ticket.operationId)).json(),
+    ).toEqual({ state: 'ready' }),
+  );
+  expect(await f.h.service.resolve(context, signal())).toMatchObject({
+    vmId: binding.vmId,
+    leaseEpoch: binding.leaseEpoch + 1,
+  });
+  expect(f.h.log.filter((event) => event === 'disk:create')).toHaveLength(1);
+  expect(f.start).toHaveBeenCalledTimes(2);
+  expect((await prewarmStatus(server, old.operationId)).status).toBe(410);
+});
+
 it('returns a ticket for a running VM with slow editor proof and keeps just one owned job', async () => {
   const f = fixture(),
     proof = deferred<AbortSignal>();

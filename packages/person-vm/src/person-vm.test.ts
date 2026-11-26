@@ -86,6 +86,88 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       ).resolves.toBe('released');
     },
   );
+  it.each(['native create', 'readiness'] as const)(
+    'rechecks the admitted revision after %s before proceeding and joins startup cleanup',
+    async (boundary) => {
+      const h = harness(),
+        rc = context();
+      let valid = true;
+      const create = h.native.create.bind(h.native);
+      const readiness = h.runtime.readiness.bind(h.runtime);
+      if (boundary === 'native create')
+        vi.spyOn(h.native, 'create').mockImplementationOnce(async (...args) => {
+          await create(...args);
+          valid = false;
+        });
+      else
+        vi.spyOn(h.runtime, 'readiness').mockImplementationOnce(
+          async (...args) => {
+            const result = await readiness(...args);
+            valid = false;
+            return result;
+          },
+        );
+
+      const target = {
+        vmId: null,
+        instanceId: null,
+        leaseEpoch: 1,
+        async assertAuthority() {
+          if (!valid) throw new PersonVmError('AUTHORIZATION_DENIED');
+        },
+      };
+      await expect(
+        h.service.prewarm(rc, { trigger: 'page', target }, signal()),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      const saved = (await h.store.read(rc.actor.id))!;
+      expect(saved).toMatchObject({
+        phase: 'stopped',
+        diskRetained: true,
+        egressReceipt: null,
+        leaseOwner: null,
+      });
+      expect(h.log.includes('native:bootstrap')).toBe(boundary === 'readiness');
+      expect(h.log.includes('runtime:start')).toBe(boundary === 'readiness');
+      expect(h.states.get(saved.vmId)).toBe('stopped');
+      expect(h.mounts.size).toBe(0);
+      expect(h.active.size).toBe(0);
+    },
+  );
+  it('never restores a retained disk when a prewarm planned before deletion reaches the lease', async () => {
+    const h = harness(),
+      rc = context();
+    const created = await h.service.create(rc, signal());
+    const lease = h.store.withLease.bind(h.store);
+    const original = (await h.store.read(rc.actor.id))!;
+    vi.spyOn(h.store, 'withLease').mockImplementationOnce(async (...args) => {
+      await lease(rc.actor.id, args[1], async (deleteLease) => {
+        await deleteLease.save({ ...original, phase: 'deleted' });
+      });
+      return lease(...args);
+    });
+    const before = h.log.slice();
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: created.vmId,
+            instanceId: null,
+            leaseEpoch: 1,
+            assertAuthority: async () => {},
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(h.log).toEqual(before);
+    expect(await h.store.read(rc.actor.id)).toMatchObject({
+      phase: 'deleted',
+      diskRetained: true,
+      leaseOwner: null,
+    });
+  });
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');

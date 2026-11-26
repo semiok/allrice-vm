@@ -265,12 +265,17 @@ export class PersonVmService
   private assertPrewarmTarget(
     row: VmRecord | null,
     target?: PersonVmPrewarmTarget,
+    allowRetainedRestore = false,
   ) {
     if (!target) return;
     const running = row?.phase === 'running';
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
     if (
-      row?.phase === 'deleted' ||
+      (row?.phase === 'deleted' &&
+        (!allowRetainedRestore ||
+          !target.restoreRetained ||
+          !row.diskRetained ||
+          target.vmId !== row.vmId)) ||
       epoch !== target.leaseEpoch ||
       (target.vmId !== null && target.vmId !== row?.vmId) ||
       (target.instanceId !== null &&
@@ -288,7 +293,7 @@ export class PersonVmService
       'create',
       signal,
       async (lease, identity, signal) => {
-        this.assertPrewarmTarget(lease.row, target);
+        this.assertPrewarmTarget(lease.row, target, true);
         if (target) await target.assertAuthority(signal);
         const retry =
           lease.row &&
@@ -700,6 +705,7 @@ export class PersonVmService
           )
             throw new PersonVmError('AUTHORIZATION_DENIED');
         }
+        if (assertAuthority) await assertAuthority(signal);
         await lease.guard();
       };
       await bootstrapPersonVm({
@@ -751,7 +757,7 @@ export class PersonVmService
     const identity = await this.identity(context, 'start', signal);
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
-    this.assertPrewarmTarget(row, input.target);
+    this.assertPrewarmTarget(row, input.target, true);
     if (row?.phase === 'running') {
       if (input.target) await input.target.assertAuthority(signal);
       const binding = bindingOf(row);

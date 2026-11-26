@@ -178,10 +178,13 @@ export function EmployeeNativePage({
         return remote === 'closed' && entry === 'closed';
       })());
     }
-    function finish(status: 'cancelled' | 'failed' | 'denied') {
+    function finish(
+      status: 'cancelled' | 'failed' | 'denied',
+      retainTicket = status === 'cancelled',
+    ) {
       if (navigating || replace.current !== applyQuery) return;
       navigating = true;
-      resumable = status === 'cancelled';
+      resumable = retainTicket;
       window.clearTimeout(timer);
       setStatus(status);
       closingNotice = window.setTimeout(
@@ -489,12 +492,11 @@ export function EmployeeNativePage({
       if (!prepare) setFailed(true);
       else
         finish(
-          error instanceof EmployeeEntryError && error.status === 408
-            ? 'cancelled'
-            : error instanceof EmployeeEntryError &&
-                [400, 401, 403, 404].includes(error.status)
-              ? 'denied'
-              : 'failed',
+          error instanceof EmployeeEntryError &&
+            [400, 401, 403, 404].includes(error.status)
+            ? 'denied'
+            : 'failed',
+          error instanceof EmployeeEntryError && error.status === 408,
         );
     });
     return () => {

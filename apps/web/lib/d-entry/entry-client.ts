@@ -125,7 +125,7 @@ export async function prewarmEmployeeEntry(
       });
       request.throwIfAborted();
       // A gateway outage says nothing about an already admitted operation.
-      // Pause and let Continue reuse its ticket when polling is available.
+      // Let an explicit retry resume the same ticket when polling is available.
       if (response.status === 429 || response.status >= 500)
         throw new EmployeeEntryError(408);
       if (response.status !== 200 && response.status !== 410)

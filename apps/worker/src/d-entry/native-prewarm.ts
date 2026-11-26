@@ -154,6 +154,7 @@ export function createPrewarmOperations(
           !entry.revoked.aborted &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
+          (!plan.target.restoreRetained || entry.plan.target.restoreRetained) &&
           compatiblePrewarmGeneration(entry.plan.target, plan.target)
         ) {
           return accepted(entry, false);

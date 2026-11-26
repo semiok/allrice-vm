@@ -29,6 +29,7 @@ import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
 
 type VmStamp = Generation & {
   phase: PersonVmView['phase'];
+  diskRetained?: boolean;
   leaseOwner: string | null;
 };
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
@@ -56,7 +57,7 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
       >`
       select (select row_to_json(stamp) from (
         select vm_id as "vmId", instance_id as "instanceId", phase,
-          lease_owner as "leaseOwner",
+          disk_retained as "diskRetained", lease_owner as "leaseOwner",
           lease_epoch::text as "leaseEpoch" from person_virtual_machines
         where person_id=${identity.personId} and organization_id=${identity.organizationId}
       ) stamp) as vm,
@@ -106,9 +107,23 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
     },
   );
 
-function targetGeneration(vm: VmStamp | null): Generation | undefined {
+function targetGeneration(
+  vm: VmStamp | null,
+  allowRetainedRestore = false,
+): Generation | undefined {
   if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
-  if (vm.phase === 'deleted' || !Number.isSafeInteger(vm.leaseEpoch)) return;
+  if (!Number.isSafeInteger(vm.leaseEpoch)) return;
+  if (vm.phase === 'deleted') {
+    if (!allowRetainedRestore || !vm.diskRetained || !vm.vmId) return;
+    const leaseEpoch = vm.leaseEpoch + 1;
+    if (!Number.isSafeInteger(leaseEpoch)) return;
+    return {
+      vmId: vm.vmId,
+      instanceId: null,
+      leaseEpoch,
+      restoreRetained: true,
+    };
+  }
   if (vm.phase === 'running' || (vm.phase === 'starting' && vm.instanceId))
     return vm;
   // A retained or as-yet-unstarted VM advances exactly one epoch on start.
@@ -123,6 +138,7 @@ function plannedGeneration(vm: VmStamp | null) {
     vm?.phase === 'starting' && !vm.leaseOwner
       ? { ...vm, instanceId: null }
       : vm,
+    true,
   );
 }
 
@@ -203,9 +219,14 @@ export function createDEntryNativePrewarmPort(input: {
   }) {
     const group = flights.get(key) ?? new Set<Flight>();
     for (const flight of group) {
-      if (!compatible(flight.target, target)) continue;
+      if (
+        !compatible(flight.target, target) ||
+        (target.restoreRetained && !flight.target.restoreRetained)
+      )
+        continue;
       // A later waiter may already know which physical start was published.
       flight.target = {
+        ...flight.target,
         vmId: flight.target.vmId ?? target.vmId,
         instanceId: flight.target.instanceId ?? target.instanceId,
         leaseEpoch: target.leaseEpoch,
@@ -286,10 +307,12 @@ export function createDEntryNativePrewarmPort(input: {
         !stamp.vm.leaseOwner &&
         exact(stamp.vm)
       );
-    return (
-      stamp.vm?.phase !== 'deleted' &&
-      (exact(stamp.vm) || exact(plannedGeneration(stamp.vm)))
-    );
+    if (stamp.vm?.phase === 'deleted')
+      return (
+        plan.target.restoreRetained === true &&
+        exact(plannedGeneration(stamp.vm))
+      );
+    return exact(stamp.vm) || exact(plannedGeneration(stamp.vm));
   }
   const port: DEntryNativePrewarmPort = {
     isCurrent,
@@ -338,11 +361,7 @@ export function createDEntryNativePrewarmPort(input: {
         // branch checks VM-wide readiness. A cold Host follows normal startup.
         if (plan?.running && prove) {
           try {
-            const proof = await prove(context, identity, active);
-            if (await isCurrent(context, identity, plan, active, 'ready')) {
-              proof.throwIfAborted();
-              return proof;
-            }
+            await prove(context, identity, active);
           } catch (error) {
             active.throwIfAborted();
             if (
@@ -385,6 +404,7 @@ export function createDEntryNativePrewarmPort(input: {
           (!revision ||
             !target ||
             !compatible(target, plan.target) ||
+            (target.restoreRetained && !plan.target.restoreRetained) ||
             plan.key !== prewarmKey(context, identity, revision))
         )
           throw new DataAccessError('authorization_denied');

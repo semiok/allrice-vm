@@ -120,6 +120,7 @@ suite('4.0 browser cold entry', () => {
             return json({ state: 'starting' });
           }
           await allowReady.promise;
+          if (polls === 2) return response.writeHead(503).end();
           return json({ state: 'ready' });
         }
         if (
@@ -292,6 +293,24 @@ suite('4.0 browser cold entry', () => {
         allowStarting.resolve();
         allowReady.resolve();
       }
+      const pollingFailure = page.getByRole('alert');
+      await pollingFailure
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
+        .waitFor();
+      expect(
+        await pollingFailure
+          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .isVisible(),
+      ).toBe(true);
+      expect(
+        await page
+          .getByRole('link', { name: '返回员工页', exact: true })
+          .isVisible(),
+      ).toBe(true);
+      expect(polls).toBe(2);
+      expect(warmCalls).toHaveLength(4);
+      expect(births).toEqual([]);
+      await page.getByRole('button', { name: '重试', exact: true }).click();
       async function showEditor(threadId: string) {
         await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
@@ -317,6 +336,8 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      expect(polls).toBe(3);
+      expect(warmCalls).toHaveLength(4);
       const oldDocument = page.frameLocator('iframe').locator('body');
       const claim = () =>
         oldDocument.evaluate(() =>

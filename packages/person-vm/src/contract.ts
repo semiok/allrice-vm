@@ -161,6 +161,7 @@ export type PersonVmPrewarmTarget = Readonly<{
   vmId: string | null;
   instanceId: string | null;
   leaseEpoch: number;
+  restoreRetained?: true;
 }>;
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
