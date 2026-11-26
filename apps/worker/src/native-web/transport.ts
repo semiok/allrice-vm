@@ -16,7 +16,12 @@ import { PersonVmError } from '@allrice/person-vm';
 export const nativeIndexByteLimit = 1024 * 1024;
 
 export type NativeOwnedUnary =
-  'session/create' | 'session/modelCatalog' | 'schedule/catalog';
+  | 'session/create'
+  | 'session/modelCatalog'
+  | 'session/list'
+  | 'session/projections'
+  | 'goals/get'
+  | 'schedule/catalog';
 
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(

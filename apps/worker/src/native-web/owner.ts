@@ -10,6 +10,8 @@ import {
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as JOB_REMOTE } from '@deepseek-ai/dsh-api-job-controller/remote';
+import { TYPERT_REMOTE as GOAL_REMOTE } from '@deepseek-ai/dsh-goal/remote';
 import { TYPERT_REMOTE as SCHEDULE_REMOTE } from '@deepseek-ai/dsh-schedule/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
@@ -38,6 +40,7 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
+import { readNativeProfileActivity } from './activity.js';
 import { nativeWebTransport, type NativeOwnedUnary } from './transport.js';
 import {
   observeNativePrompt,
@@ -479,6 +482,7 @@ export async function openNativeWebOwner(input: {
     });
     await setup(() => root.plugin(GatewayClient));
     await setup(() => root.remote.$mount(TYPERT_REMOTE));
+    await setup(() => root.remote.$mount(JOB_REMOTE));
     await setup(() => root.remote.$mount(PRINCIPAL_REMOTE));
     const list = await own(root.remote.session.list({}, signal));
     if (!list.ok) throw new PersonVmError('PROVIDER_FAILED');
@@ -654,6 +658,73 @@ export async function openNativeWebOwner(input: {
           requestSignal,
           (current) => input.vm.assertCurrentBinding(context, binding, current),
           notDispatched,
+        );
+      },
+      /** Positive sightings from this authenticated, exact Host. None of
+       * these public queries activates or waits for a Session's runtime. */
+      readNativeActivity(
+        assertCurrent: (signal: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, (active) =>
+          readNativeProfileActivity(
+            {
+              sessions: async (signal) => {
+                const method = TYPERT_REMOTE.methods['session/list'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ request: {} });
+                const result = await readUnaryReply(
+                  'session/list',
+                  args,
+                  signal,
+                );
+                return method.result.create().parse(replyValue(result)).items;
+              },
+              jobs: async (sessionId, signal) => {
+                const stream = root.remote.job.list({ sessionId }, signal);
+                const rows = stream[Symbol.asyncIterator]();
+                try {
+                  const first = await rows.next();
+                  if (first.done) throw new PersonVmError('RUNTIME_NOT_READY');
+                  return JOB_REMOTE.methods['job/list'].result
+                    .create()
+                    .parse(first.value);
+                } finally {
+                  stream.dispose();
+                  await rows.return?.();
+                }
+              },
+              projections: async (sessionId, signal) => {
+                const method = TYPERT_REMOTE.methods['session/projections'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ request: { sessionId } });
+                const result = await readUnaryReply(
+                  'session/projections',
+                  args,
+                  signal,
+                );
+                return method.result.create().parse(replyValue(result));
+              },
+              goal: async (agentId, signal) => {
+                const method = GOAL_REMOTE.methods['goals/get'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ agentId });
+                const result = await readUnaryReply('goals/get', args, signal);
+                return method.result.create().parse(replyValue(result));
+              },
+            },
+            active,
+          ),
         );
       },
       /** The host supplies its guard under the current physical lease. */
