@@ -36,7 +36,7 @@ declare
   approved constant regclass[] := array[
     'allrice_employee_instances','allrice_employee_instance_revisions',
     'allrice_employee_assignments','allrice_employee_user_profiles','allrice_employees','allrice_employee_versions',
-    'allrice_chat_sessions','allrice_messages','allrice_message_attachments',
+    'allrice_chat_sessions','allrice_messages','allrice_chat_input_requests','allrice_message_attachments',
     'allrice_file_references','allrice_runs','allrice_run_events','allrice_jobs',
     'allrice_employee_runs','allrice_employee_run_steps','allrice_context_checkpoints',
     'allrice_memories','allrice_memory_revisions','allrice_employee_memory_operations'
@@ -119,6 +119,20 @@ begin
           (f.key in (''owner_id'', ''user_id'', ''person_id'') and f.value is distinct from $2))',
       item.relation::regclass) into changed using target.organization::text, target.person::text;
     if changed > 0 then raise exception 'cross-owner or cross-organization reference: %', item.relation::regclass; end if;
+  end loop;
+  -- Some legacy FKs pin a workspace and ID but omit the owning person.
+  -- Never remove an extension whose personal parent belongs to another user.
+  for edge in select * from reset_edges where child in (select relation from reset_rows)
+    and parent in ('allrice_employee_instances'::regclass, 'allrice_employee_assignments'::regclass,
+      'allrice_chat_sessions'::regclass, 'allrice_messages'::regclass,
+      'allrice_runs'::regclass, 'allrice_employee_runs'::regclass, 'allrice_memories'::regclass)
+  loop
+    execute format(
+      'select count(*) from %s child join %s parent on %s
+       join reset_rows x on x.relation = child.tableoid and x.location = child.ctid
+       where not exists (select 1 from reset_rows p where p.relation = parent.tableoid and p.location = parent.ctid)',
+      edge.child::regclass, edge.parent::regclass, edge.predicate) into changed;
+    if changed > 0 then raise exception 'outside-scope personal parent: %', edge.parent::regclass; end if;
   end loop;
   if exists (
     select 1 from allrice_jobs j join reset_rows x on x.relation = j.tableoid and x.location = j.ctid

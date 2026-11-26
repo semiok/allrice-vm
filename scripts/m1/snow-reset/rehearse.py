@@ -55,6 +55,10 @@ insert into allrice_chat_sessions (id,organization_id,workspace_id,owner_id,titl
 insert into allrice_messages (id,organization_id,workspace_id,session_id,owner_id,role,content)
   select id,organization_id,workspace_id,id,owner_id,'user','"fixture"'
   from allrice_chat_sessions where organization_id=:'organization';
+insert into allrice_chat_input_requests (user_message_id,organization_id,workspace_id,session_id,
+  owner_id,client_message_id,request_digest,kind)
+  select id,organization_id,workspace_id,session_id,owner_id,id,'sha256:' || repeat('0',64),'message'
+  from allrice_messages where organization_id=:'organization';
 insert into allrice_runs (id,organization_id,workspace_id,owner_id,state,execution_spec,input)
   select id,organization_id,workspace_id,owner_id,
     case when owner_id=:'person' then 'canceled' else 'succeeded' end,'{}','{}'
@@ -85,6 +89,7 @@ EXPECTED_REMOVALS = {
     'allrice_employee_instance_revisions': 'instance_id',
     'allrice_chat_sessions': 'id',
     'allrice_messages': 'id',
+    'allrice_chat_input_requests': 'user_message_id',
     'allrice_runs': 'id',
     'allrice_employee_runs': 'run_id',
     'allrice_employee_run_steps': 'run_id',
@@ -193,6 +198,14 @@ update allrice_settings set value=jsonb_set(value,'{selections,1}',(value->'sele
     cross_scope = sql(TARGET, packet, policy_format='person', suppress=True)
     assert cross_scope.returncode and 'cross-owner or cross-organization' in cross_scope.stderr
     sql(TARGET, "update allrice_messages set owner_id=:'person' where id=:'person';")
+    assert snapshot(sql) == before
+
+    sql(TARGET, "update allrice_runs set owner_id=:'admin' where id=:'person';")
+    cross_parent_before = snapshot(sql)
+    cross_parent = sql(TARGET, packet, policy_format='person', suppress=True)
+    assert cross_parent.returncode and 'outside-scope personal parent' in cross_parent.stderr
+    assert snapshot(sql) == cross_parent_before
+    sql(TARGET, "update allrice_runs set owner_id=:'person' where id=:'person';")
     assert snapshot(sql) == before
 
     sql(TARGET, packet, policy_format='person')
