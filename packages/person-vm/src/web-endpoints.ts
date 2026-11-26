@@ -23,10 +23,21 @@ export type PersonVmWebEndpointReceipt = Readonly<{
   endpoints: readonly (PersonVmWebRoster['entries'][number] &
     Readonly<{ hostPort: number; guestPort: number }>)[];
 }>;
+export type NativeWebSetupFailure = Readonly<{
+  step: string;
+  errorType: string;
+  errorCode?: string;
+  httpStatus?: number;
+  target?: string;
+}>;
 /** Startup metadata from the service's authenticated caller, never guest JSON. */
 export type PersonVmWebStartup = Readonly<{
   context: RequestContext;
   receipt: PersonVmWebEndpointReceipt;
+  recordNativeFailure?(
+    failure: NativeWebSetupFailure,
+    signal: AbortSignal,
+  ): Promise<void>;
 }>;
 export interface PersonVmWebRosterPort {
   prepare(

@@ -3,6 +3,7 @@ export type {
   PersonVmWebRoster,
   PersonVmWebEndpointReceipt,
   PersonVmWebStartup,
+  NativeWebSetupFailure,
   PersonVmWebRosterPort,
 } from './web-endpoints.ts';
 export type {

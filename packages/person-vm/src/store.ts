@@ -53,6 +53,11 @@ export interface VmLease {
 }
 export interface PersonVmStore {
   read(personId: string): Promise<VmRecord | null>;
+  auditStartupFailure?(
+    row: VmRecord,
+    event: VmAudit,
+    signal: AbortSignal,
+  ): Promise<void>;
   withLease<T>(
     personId: string,
     options: { now: () => Date; ttlMs: number },
@@ -248,6 +253,15 @@ async function assertAdmissionOpen(
   }
 }
 
+function insertVmAudit(
+  sql: postgres.Sql | postgres.TransactionSql,
+  row: VmRecord,
+  event: VmAudit,
+) {
+  return sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
+    values(${row.vmId},${row.personId},${row.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${row.leaseEpoch})`;
+}
+
 export class PostgresPersonVmStore implements PersonVmStore {
   // ownerToken -> personId. A claim whose COMMIT acknowledgement was lost may
   // leave either token durable; neither can authorize physical work until its
@@ -262,6 +276,35 @@ export class PostgresPersonVmStore implements PersonVmStore {
    * Factories must not change database/schema between calls. No DSN is exposed. */
   assertAdmissionFactory(factory: PersonVmSqlFactory) {
     if (factory !== this.openSql) throw new PersonVmError('PROVIDER_FAILED');
+  }
+  async auditStartupFailure(
+    row: VmRecord,
+    event: VmAudit,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    // This insert must never sit ahead of teardown on the advisory-lock
+    // connection. The diagnostic owns and closes its own short-lived client.
+    const sql = this.openSql();
+    let ending: Promise<void> | undefined;
+    const end = () => (ending ??= sql.end({ timeout: 0 }));
+    const abort = () => {
+      void end().catch(() => {});
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    try {
+      await sql.begin(async (tx) => {
+        signal.throwIfAborted();
+        // A sent PostgreSQL statement can outlive local client shutdown.
+        // Give the server its own deadline before dispatching the insert.
+        await tx`set local statement_timeout = '200ms'`;
+        signal.throwIfAborted();
+        await insertVmAudit(tx, row, event);
+      });
+    } finally {
+      signal.removeEventListener('abort', abort);
+      await end();
+    }
   }
   async read(personId: string) {
     const session = new VmSqlSession(this.openSql());
@@ -475,10 +518,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
           if (rows.length !== 1) throw new PersonVmError('LEASE_LOST');
         },
         audit: async (record, event) => {
-          await session.query(
-            () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
-            values(${record.vmId},${record.personId},${record.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${record.leaseEpoch})`,
-          );
+          await session.query(() => insertVmAudit(sql, record, event));
         },
       };
       result = await work(lease);
@@ -601,10 +641,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
           if (!found) throw new PersonVmError('LEASE_LOST');
         },
         audit: async (value, event) => {
-          await session.query(
-            () => sql`insert into person_vm_audit(vm_id,person_id,organization_id,request_id,action,result,error_code,lease_epoch)
-            values(${value.vmId},${value.personId},${value.organizationId},${event.requestId},${event.action},${event.result},${event.errorCode ?? null},${value.leaseEpoch})`,
-          );
+          await session.query(() => insertVmAudit(sql, value, event));
         },
       });
       const [cleared] = await session.query(
