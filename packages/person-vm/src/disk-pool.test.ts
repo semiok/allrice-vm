@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -20,6 +21,30 @@ import { PersonVmDiskPool } from './disk-pool.ts';
 import { PersonVmService } from './person-vm.ts';
 import { context, harness, MemoryStore, signal } from './test-support.ts';
 
+const faults = vi.hoisted(() => ({
+  afterLedgerFileSync: undefined as (() => void) | undefined,
+}));
+vi.mock('node:fs/promises', async (original) => {
+  const fs = await original<typeof Filesystem>();
+  return {
+    ...fs,
+    async open(...args: Parameters<typeof fs.open>) {
+      const file = await fs.open(...args);
+      if (
+        faults.afterLedgerFileSync &&
+        String(args[0]).includes('/.preprovision-ledger/.stage-')
+      ) {
+        const sync = file.sync.bind(file);
+        vi.spyOn(file, 'sync').mockImplementation(async () => {
+          await sync();
+          faults.afterLedgerFileSync?.();
+        });
+      }
+      return file;
+    },
+  };
+});
+
 function gate() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => {
@@ -31,6 +56,8 @@ function gate() {
 type Lane = 'fill' | 'inventory';
 class Locks implements DiskPoolLocks {
   foreground = false;
+  foregroundChecks = 0;
+  beforeInventory?: () => void;
   afterInventory?: () => Promise<void>;
   private held = new Map<
     Lane,
@@ -41,6 +68,7 @@ class Locks implements DiskPoolLocks {
     signal: AbortSignal,
     work: (lock: DiskPoolLock) => Promise<T>,
   ) {
+    if (kind === 'inventory') this.beforeInventory?.();
     for (let other = this.held.get(kind); other; other = this.held.get(kind)) {
       if (kind === 'fill') return undefined;
       await other.done.promise;
@@ -56,7 +84,10 @@ class Locks implements DiskPoolLocks {
         signal: active,
         ownerSignal: owner.signal,
         assertOwned: async () => owner.signal.throwIfAborted(),
-        foregroundStarting: async () => this.foreground,
+        foregroundStarting: async () => {
+          this.foregroundChecks += 1;
+          return this.foreground;
+        },
       });
       if (kind === 'inventory') await this.afterInventory?.();
       active.throwIfAborted();
@@ -95,7 +126,9 @@ class Platform implements DiskPoolPlatform {
   conflict = false;
   unsafeMount = false;
   onCapacity?: () => void | Promise<void>;
-  onSeed?: () => Promise<void>;
+  onCreationBudget?: () => Promise<void>;
+  onSeed?: (checkpoint?: () => Promise<void>) => Promise<void>;
+  onInspect?: (scoped: AbortSignal) => Promise<void>;
   onBinding?: () => Promise<void>;
   onUnmount?: () => Promise<void>;
   constructor(private readonly installed: (id: string) => void) {}
@@ -134,6 +167,9 @@ class Platform implements DiskPoolPlatform {
       stage: 0,
     });
   }
+  async assertCreationBudget() {
+    await this.onCreationBudget?.();
+  }
   async mountDisk(ref: string) {
     this.current(ref).mounted = true;
     return `opaque-${ref}`;
@@ -143,11 +179,13 @@ class Platform implements DiskPoolPlatform {
     mount: string,
     source: string,
     budget: { reserveBytes: bigint; minimumFreeBytes: bigint },
+    _signal: AbortSignal,
+    checkpoint?: () => Promise<void>,
   ) {
     expect(mount).toBe(`opaque-${ref}`);
     expect(this.current(ref).mounted).toBe(true);
     expect(budget.reserveBytes).toBeGreaterThan(0n);
-    await this.onSeed?.();
+    await this.onSeed?.(checkpoint);
     this.current(ref).seeded = source;
   }
   async unmountDisk(ref: string) {
@@ -155,7 +193,8 @@ class Platform implements DiskPoolPlatform {
     if (this.unsafeMount) throw Error('fake physical detach unconfirmed');
     this.current(ref).mounted = false;
   }
-  async inspectStock(stock: DiskPoolStock) {
+  async inspectStock(stock: DiskPoolStock, scoped = signal()) {
+    await this.onInspect?.(scoped);
     const disk = this.current(stock.ref);
     expect(disk.mounted).toBe(false);
     return `${disk.image}/${disk.key}`;
@@ -214,6 +253,7 @@ class Platform implements DiskPoolPlatform {
 
 const roots: string[] = [];
 afterEach(async () => {
+  faults.afterLedgerFileSync = undefined;
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
@@ -980,4 +1020,128 @@ it('preserves the initial target and disk when roster authority is withdrawn dur
     f.service.prewarm(rc, { trigger: 'page' }, signal()),
   ).resolves.toMatchObject({ vmId: first.intent.owner.vmId, ready: true });
   expect(f.platform.binds).toHaveLength(1);
+});
+
+it('rechecks foreground after the creation budget preflight without opening a disk', async () => {
+  const f = await fixture();
+  f.platform.onCreationBudget = async () => {
+    f.locks.foreground = true;
+  };
+  await f.pool.refill(signal());
+  expect(f.platform.disks.size).toBe(0);
+  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+    'released-before-write',
+  );
+  expect(f.events).toHaveBeenCalledWith({ event: 'foreground-deferred' });
+});
+
+it('yields active copying at the next bounded checkpoint without querying PG for each write', async () => {
+  const f = await fixture();
+  const copying = gate(),
+    next = gate(),
+    booted = gate(),
+    finish = gate();
+  let writes = 0;
+  f.platform.onSeed = async (checkpoint) => {
+    expect(checkpoint).toBeDefined();
+    for (let index = 0; index < 40; index++) {
+      await checkpoint!();
+      writes++;
+    }
+    copying.release();
+    await next.promise;
+    await checkpoint!();
+    writes++;
+  };
+  const refill = f.pool.refill(signal());
+  await copying.promise;
+  const foreground = f.pool.inForeground(async () => {
+    booted.release();
+    await finish.promise;
+  });
+  try {
+    await booted.promise;
+    next.release();
+    await refill;
+    expect(writes).toBe(40);
+    expect(f.locks.foregroundChecks).toBeLessThan(40);
+    expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+      'retired',
+    );
+    expect(f.platform.disks.size).toBe(0);
+    expect(f.events).toHaveBeenCalledWith({ event: 'foreground-deferred' });
+    expect(f.events).not.toHaveBeenCalledWith({ event: 'fill-deferred' });
+  } finally {
+    finish.release();
+    await foreground;
+  }
+});
+
+it.each(['proof', 'publication'] as const)(
+  'settles a confirmed detached disk when the scanner shuts down during %s',
+  async (point) => {
+    const f = await fixture();
+    const stop = new AbortController();
+    const reason = Error(`synthetic shutdown before ${point} completes`);
+    let inspected = false;
+    f.platform.onInspect = async (scoped) => {
+      if (point === 'proof') stop.abort(reason);
+      scoped.throwIfAborted();
+      inspected = true;
+    };
+    f.locks.beforeInventory = () => {
+      if (point === 'publication' && inspected) stop.abort(reason);
+    };
+    await expect(f.pool.refill(stop.signal)).rejects.toBe(reason);
+    expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+      'ready',
+    );
+    expect([...f.platform.disks.values()][0]?.mounted).toBe(false);
+    expect(f.platform.destroyed).toHaveLength(0);
+  },
+);
+
+it('leaves the stock ready when authority is revoked after claim staging fsync and before link', async () => {
+  const f = await fixture();
+  await f.pool.refill(signal());
+  const revoke = new AbortController();
+  const revoked = new PersonVmError('AUTHORIZATION_DENIED');
+  faults.afterLedgerFileSync = () => revoke.abort(revoked);
+  const owner = {
+    personId: randomUUID(),
+    organizationId: randomUUID(),
+    vmId: randomUUID(),
+  };
+  await expect(
+    f.pool.claim(owner, randomUUID(), 'admin', {
+      signal: revoke.signal,
+      assertCurrent: async () => revoke.signal.throwIfAborted(),
+      assertOwner: async () => {},
+    }),
+  ).rejects.toBe(revoked);
+  faults.afterLedgerFileSync = undefined;
+  expect(f.platform.binds).toHaveLength(0);
+  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe('ready');
+  await expect(f.service.create(context(), signal())).resolves.toMatchObject({
+    phase: 'stopped',
+  });
+  expect(f.platform.binds).toHaveLength(1);
+});
+
+it('does not publish ready when the actual fill connection is lost during offline proof', async () => {
+  const f = await fixture();
+  f.platform.onInspect = async (scoped) => {
+    f.locks.dropFillSession();
+    scoped.throwIfAborted();
+  };
+  await expect(f.pool.refill(signal())).rejects.toThrow(
+    'filled owner SQL disconnected',
+  );
+  expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+    'filling',
+  );
+  expect([...f.platform.disks.values()][0]?.mounted).toBe(false);
+  expect(f.platform.destroyed).toHaveLength(0);
+  await f.newPool().refill(signal());
+  expect(f.events).toHaveBeenCalledWith({ event: 'interrupted-fill' });
 });

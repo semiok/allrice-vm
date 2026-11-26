@@ -29,6 +29,8 @@ import type { CommandRunner } from './process.ts';
 
 const faults = vi.hoisted(() => ({
   cacheWrite: undefined as Error | undefined,
+  secondCopy: undefined as Error | undefined,
+  beforeLink: undefined as ((from: string, to: string) => void) | undefined,
   afterRename: undefined as ((from: string, to: string) => void) | undefined,
 }));
 
@@ -36,7 +38,20 @@ vi.mock('node:fs/promises', async (original) => {
   const filesystem = await original<typeof Filesystem>();
   return {
     ...filesystem,
-    writeFile: vi.fn(filesystem.writeFile),
+    writeFile: vi.fn(
+      async (...args: Parameters<typeof filesystem.writeFile>) => {
+        if (
+          faults.secondCopy &&
+          /\/\.public-oci-[A-Za-z0-9]{6}\/\d+$/.test(String(args[0]))
+        )
+          throw faults.secondCopy;
+        return filesystem.writeFile(...args);
+      },
+    ),
+    async link(from: string, to: string) {
+      faults.beforeLink?.(from, to);
+      await filesystem.link(from, to);
+    },
     async open(...args: Parameters<typeof filesystem.open>) {
       const file = await filesystem.open(...args);
       if (
@@ -72,6 +87,8 @@ async function removeFixture(path: string) {
 
 afterEach(async () => {
   faults.cacheWrite = undefined;
+  faults.secondCopy = undefined;
+  faults.beforeLink = undefined;
   faults.afterRename = undefined;
   for (const path of roots.splice(0)) {
     await removeFixture(path);
@@ -701,6 +718,30 @@ it('refreshes a verified older bound disk before first native create, resumes cu
   expect(await readFile(join(nativeRoot, 'cache', 'unknown'), 'utf8')).toBe(
     'retained unknown cache bytes',
   );
+  const beforePublication = Error(
+    'synthetic cut after staged bytes and before journal link',
+  );
+  faults.beforeLink = (_from, to) => {
+    if (to.endsWith('/intent.json')) throw beforePublication;
+  };
+  await expect(native.create(binding, receipt, active())).rejects.toBe(
+    beforePublication,
+  );
+  faults.beforeLink = undefined;
+  const transaction = (await readdir(nativeRoot)).find((name) =>
+    /^\.public-oci-refresh-[a-f0-9]{64}$/.test(name),
+  );
+  expect(transaction).toBeDefined();
+  const transactionRoot = join(nativeRoot, transaction!);
+  expect(
+    await readFile(join(transactionRoot, 'cache', next.metadataPath), 'utf8'),
+  ).toBe(next.files[next.metadataPath]);
+  expect(await readFile(metadata, 'utf8')).toBe(old.files[old.metadataPath]);
+  // The disk can hold the previous cache plus exactly one new payload.
+  faults.secondCopy = Object.assign(
+    new Error('no room for another staged copy'),
+    { code: 'ENOSPC' },
+  );
   const interruption = Error('synthetic restart after cache archive');
   faults.afterRename = (_from, to) => {
     if (to.endsWith('/previous')) throw interruption;
@@ -713,17 +754,14 @@ it('refreshes a verified older bound disk before first native create, resumes cu
     '--version',
     'list',
     'list',
+    'list',
   ]);
   await native.prepare(binding, mount, active());
   expect(await readFile(metadata, 'utf8')).toBe(next.files[next.metadataPath]);
   await expect(
     native.create(binding, receipt, active()),
   ).resolves.toBeUndefined();
-  const transaction = (await readdir(nativeRoot)).find((name) =>
-    /^\.public-oci-refresh-[a-f0-9]{64}$/.test(name),
-  );
-  expect(transaction).toBeDefined();
-  const preserved = join(nativeRoot, transaction!, 'previous');
+  const preserved = join(transactionRoot, 'previous');
   expect(await readFile(join(preserved, 'unknown'), 'utf8')).toBe(
     'retained unknown cache bytes',
   );

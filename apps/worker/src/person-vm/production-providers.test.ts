@@ -6,9 +6,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ApfsPersonVmDisk, MicrosandboxPersonVm } from '@allrice/person-vm';
 import { productionInputsFixture } from './production-inputs.fixture.js';
+import type * as ProductionConfig from './production-config.js';
 const source = vi.hoisted(() => ({ read: vi.fn(), run: vi.fn() }));
 vi.mock('./production-config.js', async (original) => ({
-  ...(await original<typeof import('./production-config.js')>()),
+  ...(await original<typeof ProductionConfig>()),
   readProductionHostConfiguration: source.read,
 }));
 vi.mock('../../../../packages/person-vm/src/process.ts', async (original) => ({

@@ -7,6 +7,7 @@ import {
 } from './disk-pool-ledger.ts';
 import {
   DiskPoolBudgetExceeded,
+  DiskPoolForegroundDeferred,
   DiskPoolInventoryMismatch,
   sameDiskPoolOwner,
   type DiskPoolCapacity,
@@ -209,10 +210,10 @@ export class PersonVmDiskPool {
             },
           },
         };
-        await guard.assertCurrent();
-        await guard.assertOwner();
-        await lock.assertOwned();
-        await this.ledger.append(slot, entry, lock.signal);
+        await this.ledger.append(slot, entry, lock.signal, async () => {
+          await this.checkClaim(guard);
+          await lock.assertOwned();
+        });
         return { slot: { ...slot, entry, revision: slot.revision + 1 }, entry };
       },
     );
@@ -383,18 +384,22 @@ export class PersonVmDiskPool {
     let unconfirmed = false;
     let proof: string | undefined;
     let inspecting = false;
+    let nextForegroundProbe = 0;
+    const checkpoint = async (force = false) => {
+      active.throwIfAborted();
+      if (this.foreground) throw new DiskPoolForegroundDeferred();
+      if (force || performance.now() >= nextForegroundProbe) {
+        const busy = await foregroundStarting();
+        // The local marker is checked at every write boundary. Remote
+        // starting hints share this connection and are sampled at most 1 Hz.
+        nextForegroundProbe = performance.now() + 1000;
+        if (busy || this.foreground) throw new DiskPoolForegroundDeferred();
+      }
+      active.throwIfAborted();
+    };
     try {
       const check = await this.capacity(active, options);
-      if (await foregroundStarting()) {
-        this.observe({ event: 'foreground-deferred' });
-        await this.advanceStock(
-          reservation,
-          { ...entry, state: 'released-before-write' },
-          fill,
-          active,
-        );
-        return;
-      }
+      await checkpoint();
       if (check.availableBytes < minimumFreeBytes + reserveBytes)
         throw new DiskPoolBudgetExceeded(check);
       await platform.assertCreationBudget?.(
@@ -402,12 +407,13 @@ export class PersonVmDiskPool {
         active,
       );
       await fill.assertOwned();
-      active.throwIfAborted();
+      await checkpoint(true);
       let problem: unknown;
       try {
         wrote = true;
         await platform.createEncryptedDisk(entry.ref, active);
         created = true;
+        await checkpoint();
         const mount = await platform.mountDisk(entry.ref, active);
         const beforeSeed = await this.capacity(active, options);
         const spent = beforeSeed.allocatedBytesByRef.get(entry.ref);
@@ -418,12 +424,14 @@ export class PersonVmDiskPool {
         )
           throw new DiskPoolBudgetExceeded(beforeSeed);
         await fill.assertOwned();
+        await checkpoint();
         await platform.seedPublicCache(
           entry.ref,
           mount,
           entry.source,
           { reserveBytes, minimumFreeBytes },
           active,
+          () => checkpoint(),
         );
       } catch (error) {
         problem = error;
@@ -442,8 +450,14 @@ export class PersonVmDiskPool {
       }
       if (problem) throw problem;
       inspecting = true;
-      proof = await platform.inspectStock(entry, active);
-      const after = await this.capacity(active, options);
+      // After complete seeding and confirmed detach, join proof under the
+      // physical fill owner even if the scanner is being stopped.
+      const settlement = AbortSignal.any([
+        fill.ownerSignal,
+        AbortSignal.timeout(options.cleanupTimeoutMs),
+      ]);
+      proof = await platform.inspectStock(entry, settlement);
+      const after = await this.capacity(settlement, options);
       const allocated = after.allocatedBytesByRef.get(entry.ref);
       if (allocated === undefined) incomplete();
       if (allocated > reserveBytes || after.availableBytes < minimumFreeBytes)
@@ -451,12 +465,16 @@ export class PersonVmDiskPool {
     } catch (error) {
       if (error instanceof DiskPoolBudgetExceeded)
         this.capacityDeferred(error.capacity);
+      const yielding = error instanceof DiskPoolForegroundDeferred;
+      let confirmedYield = yielding && !wrote;
       let first = error;
       if (!fill.ownerSignal.aborted) {
         const canRetire =
           created &&
           detached &&
-          (error instanceof DiskPoolBudgetExceeded || active.aborted);
+          (error instanceof DiskPoolBudgetExceeded ||
+            yielding ||
+            active.aborted);
         let known = canRetire ? proof : undefined;
         if (canRetire && !known && !inspecting) {
           try {
@@ -472,7 +490,7 @@ export class PersonVmDiskPool {
           }
         }
         try {
-          if (known)
+          if (known) {
             await this.retireStock(
               reservation,
               known,
@@ -481,7 +499,8 @@ export class PersonVmDiskPool {
               options,
               fill.ownerSignal,
             );
-          else {
+            confirmedYield = yielding;
+          } else {
             await this.advanceStock(
               reservation,
               wrote
@@ -504,11 +523,14 @@ export class PersonVmDiskPool {
       }
       if (
         unconfirmed ||
+        (yielding && !confirmedYield) ||
         (first instanceof PersonVmError && first.code === 'CLEANUP_INCOMPLETE')
       )
         incomplete(first);
       if (active.aborted) throw first;
-      this.observe({ event: 'fill-deferred' });
+      this.observe({
+        event: yielding ? 'foreground-deferred' : 'fill-deferred',
+      });
       return;
     }
     // Once publication is attempted, a lost acknowledgement can already
@@ -518,7 +540,7 @@ export class PersonVmDiskPool {
       reservation,
       { ...entry, state: 'ready', proof },
       fill,
-      active,
+      fill.ownerSignal,
     );
     this.observe({ event: 'stock-ready' });
   }

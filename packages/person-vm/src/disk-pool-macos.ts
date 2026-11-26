@@ -345,6 +345,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
       minimumFreeBytes,
     }: { reserveBytes: bigint; minimumFreeBytes: bigint },
     signal: AbortSignal,
+    checkpoint?: () => Promise<void>,
   ) {
     if (
       source !== this.source ||
@@ -365,6 +366,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
     );
     const sample = async (nextBytes: bigint) => {
       signal.throwIfAborted();
+      if (checkpoint) await checkpoint();
       await backing.sync();
       const volume = await statfs(outerRoot, { bigint: true });
       const guest = await statfs(mount, { bigint: true });
@@ -393,6 +395,7 @@ export class MacosPersonVmDiskPool implements DiskPoolPlatform {
           availableBytes,
           allocatedBytes,
         });
+      if (checkpoint) await checkpoint();
       return reserveBytes - allocatedBytes;
     };
     try {

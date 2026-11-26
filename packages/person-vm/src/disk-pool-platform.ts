@@ -30,6 +30,11 @@ export class DiskPoolBudgetExceeded extends Error {
     super('PERSON_VM_DISK_POOL_BUDGET_EXCEEDED', options);
   }
 }
+export class DiskPoolForegroundDeferred extends Error {
+  constructor() {
+    super('PERSON_VM_DISK_POOL_FOREGROUND_DEFERRED');
+  }
+}
 /** The caller makes a fresh catalog observation before deciding an image is untracked. */
 export class DiskPoolInventoryMismatch extends Error {
   constructor() {
@@ -54,6 +59,7 @@ export interface DiskPoolPlatform {
     source: string,
     budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
     signal: AbortSignal,
+    checkpoint?: () => Promise<void>,
   ): Promise<void>;
   /** Join the native operation and prove that the image and mount are offline. */
   unmountDisk(ref: string, signal: AbortSignal): Promise<void>;

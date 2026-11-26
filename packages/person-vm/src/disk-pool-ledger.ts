@@ -60,7 +60,12 @@ export async function syncDiskPoolDirectory(path: string) {
 
 /** Create and publish an immutable record. Link is the compare-and-set; a
  * disconnected advisory session cannot overwrite a successor's record. */
-export async function publishDiskPoolRecord(path: string, value: unknown) {
+export async function publishDiskPoolRecord(
+  path: string,
+  value: unknown,
+  options?: Readonly<{ signal: AbortSignal; beforeLink?(): Promise<void> }>,
+) {
+  options?.signal.throwIfAborted();
   const parent = dirname(path);
   const staging = join(parent, `.stage-${randomUUID()}`);
   const file = await open(staging, 'wx', 0o600);
@@ -71,6 +76,9 @@ export async function publishDiskPoolRecord(path: string, value: unknown) {
     } finally {
       await file.close();
     }
+    options?.signal.throwIfAborted();
+    if (options?.beforeLink) await options.beforeLink();
+    options?.signal.throwIfAborted();
     await link(staging, path);
     await syncDiskPoolDirectory(parent);
   } finally {
@@ -275,7 +283,12 @@ export class DiskPoolLedger {
     return { slots, bound, boundByPerson };
   }
 
-  async append(slot: DiskPoolSlot, entry: DiskPoolRecord, signal: AbortSignal) {
+  async append(
+    slot: DiskPoolSlot,
+    entry: DiskPoolRecord,
+    signal: AbortSignal,
+    beforeLink?: () => Promise<void>,
+  ) {
     signal.throwIfAborted();
     if (!follows(slot.entry, entry)) incomplete();
     if (!(await this.exists())) {
@@ -292,6 +305,7 @@ export class DiskPoolLedger {
       await publishDiskPoolRecord(
         join(this.root, `${slot.index}.${slot.revision + 1}.json`),
         entry,
+        { signal, beforeLink },
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code === 'EEXIST')
