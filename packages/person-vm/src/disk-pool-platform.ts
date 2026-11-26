@@ -51,7 +51,7 @@ export interface DiskPoolPlatform {
     budget: Readonly<{ reserveBytes: bigint; minimumFreeBytes: bigint }>,
     signal: AbortSignal,
   ): Promise<void>;
-  /** The optional guard runs after preflight, immediately before allocating a key. */
+  /** Read-only for this ref until the supplied guard succeeds immediately before key creation. */
   createEncryptedDisk(
     ref: string,
     signal: AbortSignal,

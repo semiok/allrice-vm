@@ -826,3 +826,17 @@ it.each(['foreground', 'capacity'] as const)(
     });
   },
 );
+
+it('keeps the ordinary unbudgeted seed cancellation reason when copy cleanup also fails', async () => {
+  const f = await fixture();
+  const person = await f.person('ordinary-cold');
+  const stop = new AbortController();
+  const reason = Error('synthetic cold start cancelled');
+  faults.removeCopyStage = () => {
+    stop.abort(reason);
+    throw Error('synthetic stage cleanup failed');
+  };
+  await expect(
+    seedPublicImageCache(f.source, f.image, person.native, stop.signal),
+  ).rejects.toBe(reason);
+});

@@ -57,7 +57,7 @@ type Lane = 'fill' | 'inventory';
 class Locks implements DiskPoolLocks {
   foreground = false;
   foregroundChecks = 0;
-  beforeInventory?: () => void;
+  beforeInventory?: (signal: AbortSignal) => void;
   afterInventory?: () => Promise<void>;
   private held = new Map<
     Lane,
@@ -68,10 +68,20 @@ class Locks implements DiskPoolLocks {
     signal: AbortSignal,
     work: (lock: DiskPoolLock) => Promise<T>,
   ) {
-    if (kind === 'inventory') this.beforeInventory?.();
+    if (kind === 'inventory') this.beforeInventory?.(signal);
     for (let other = this.held.get(kind); other; other = this.held.get(kind)) {
       if (kind === 'fill') return undefined;
-      await other.done.promise;
+      signal.throwIfAborted();
+      let abort!: () => void;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        abort = () => reject(signal.reason);
+      });
+      signal.addEventListener('abort', abort, { once: true });
+      try {
+        await Promise.race([other.done.promise, cancelled]);
+      } finally {
+        signal.removeEventListener('abort', abort);
+      }
     }
     signal.throwIfAborted();
     const done = gate();
@@ -1200,4 +1210,67 @@ it('releases a known empty election when the foreground starts during platform p
     'released-before-write',
   );
   expect(f.events).toHaveBeenCalledWith({ event: 'foreground-deferred' });
+});
+
+it.each([false, true])(
+  'releases caller-only cancellation before the first storage write and fences conflict (conflict=%s)',
+  async (conflicting) => {
+    const f = await fixture();
+    const stop = new AbortController();
+    const stopped = Error('caller canceled during platform preflight');
+    const conflict = new PersonVmError('PROVIDER_FAILED');
+    f.platform.onCreatePreflight = async () => {
+      stop.abort(stopped);
+      throw conflicting ? conflict : stopped;
+    };
+    const unmount = vi
+      .spyOn(f.platform, 'unmountDisk')
+      .mockResolvedValue(undefined);
+    await expect(f.pool.refill(stop.signal)).rejects.toBe(
+      conflicting ? conflict : stopped,
+    );
+    expect(unmount).toHaveBeenCalledTimes(conflicting ? 1 : 0);
+    expect(f.platform.disks.size).toBe(0);
+    expect((await f.ledger.read(signal())).slots[0]?.entry?.state).toBe(
+      conflicting ? 'quarantined' : 'released-before-write',
+    );
+  },
+);
+
+it('cancels a refill waiting for the occupied inventory lock before creating any reservation', async () => {
+  const f = await fixture();
+  const held = gate(),
+    release = gate(),
+    waiting = gate();
+  const holder = f.locks.withLock('inventory', signal(), async () => {
+    held.release();
+    await release.promise;
+  });
+  await held.promise;
+  const stop = new AbortController();
+  const reason = Error('caller cancellation before slot election');
+  let acquisition: AbortSignal | undefined;
+  f.locks.beforeInventory = (current) => {
+    acquisition = current;
+    waiting.release();
+  };
+  const refill = f.pool.refill(stop.signal);
+  try {
+    await waiting.promise;
+    stop.abort(reason);
+    // If acquisition was accidentally given an independent owner signal,
+    // fail here and release the fixture's holder instead of hanging the test.
+    expect(acquisition?.aborted).toBe(true);
+    await expect(refill).rejects.toBe(reason);
+    expect(
+      (await f.ledger.read(signal())).slots.every(
+        (slot) => slot.entry === null,
+      ),
+    ).toBe(true);
+    expect(f.platform.disks.size).toBe(0);
+  } finally {
+    release.release();
+    await holder;
+    await refill.catch(() => {});
+  }
 });

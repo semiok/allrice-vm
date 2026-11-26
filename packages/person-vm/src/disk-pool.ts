@@ -378,7 +378,7 @@ export class PersonVmDiskPool {
     const entry = reservation.entry!;
     const active = fill.signal;
     const { platform, minimumFreeBytes, reserveBytes } = options;
-    let wrote = false;
+    let mayHaveStorage = false;
     let created = false;
     let detached = false;
     let unconfirmed = false;
@@ -411,7 +411,6 @@ export class PersonVmDiskPool {
       let problem: { error: unknown } | undefined;
       let rejectedBeforeKey: { error: unknown } | undefined;
       try {
-        wrote = true;
         await platform.createEncryptedDisk(entry.ref, active, async () => {
           try {
             await checkpoint(true);
@@ -419,7 +418,9 @@ export class PersonVmDiskPool {
             rejectedBeforeKey = { error };
             throw error;
           }
+          mayHaveStorage = true;
         });
+        if (!mayHaveStorage) incomplete();
         created = true;
         await checkpoint();
         const mount = await platform.mountDisk(entry.ref, active);
@@ -442,13 +443,17 @@ export class PersonVmDiskPool {
           () => checkpoint(),
         );
       } catch (error) {
-        // Only this exact pre-key guard rejection proves the create did not
-        // reach storage. Other create failures still go through cleanup.
-        if (!created && rejectedBeforeKey && error === rejectedBeforeKey.error)
-          wrote = false;
+        // Before the key-write guard succeeds, a known cancellation or its
+        // own rejection cannot have allocated storage. An independent
+        // preflight error can still mean conflicting or unidentified storage.
+        if (!mayHaveStorage)
+          mayHaveStorage = !(
+            (active.aborted && error === active.reason) ||
+            (rejectedBeforeKey && error === rejectedBeforeKey.error)
+          );
         problem = { error };
       } finally {
-        if (wrote) {
+        if (mayHaveStorage) {
           // A rejected attach can still have reached the physical device.
           try {
             await platform.unmountDisk(
@@ -484,7 +489,7 @@ export class PersonVmDiskPool {
       if (error instanceof DiskPoolBudgetExceeded)
         this.capacityDeferred(error.capacity);
       const yielding = error instanceof DiskPoolForegroundDeferred;
-      let confirmedYield = yielding && !wrote;
+      let confirmedYield = yielding && !mayHaveStorage;
       let first = error;
       if (!fill.ownerSignal.aborted) {
         const canRetire =
@@ -521,7 +526,7 @@ export class PersonVmDiskPool {
           } else {
             await this.advanceStock(
               reservation,
-              wrote
+              mayHaveStorage
                 ? {
                     ...entry,
                     state: 'quarantined',
@@ -533,7 +538,7 @@ export class PersonVmDiskPool {
               fill,
               fill.ownerSignal,
             );
-            if (wrote) this.observe({ event: 'stock-quarantined' });
+            if (mayHaveStorage) this.observe({ event: 'stock-quarantined' });
           }
         } catch (cleanupFailure) {
           incomplete(new AggregateError([first, cleanupFailure]));
@@ -611,14 +616,13 @@ export class PersonVmDiskPool {
         return;
       }
       active.throwIfAborted();
-      // Before the CAS the caller can still revoke the reservation. After a
-      // confirmed CAS the live fill owner must receive it and settle it.
+      let acknowledged:
+        { slot: DiskPoolSlot; inventoryOwner: AbortSignal } | undefined;
       const reservation = await this.inventory<DiskPoolSlot | null>(
-        fill.ownerSignal,
+        active,
         async (lock) => {
-          const electing = AbortSignal.any([active, lock.signal]);
           if (this.foreground) return null;
-          const { slots } = await this.ledger.read(electing);
+          const { slots } = await this.ledger.read(lock.signal);
           if (this.foreground) return null;
           if (slots.some(({ entry }) => unsettledFill(entry))) {
             this.observe({ event: 'interrupted-fill' });
@@ -634,10 +638,35 @@ export class PersonVmDiskPool {
           await fill.assertOwned();
           await lock.assertOwned();
           if (this.foreground) return null;
-          await this.ledger.append(slot, entry, electing);
-          return { ...slot, entry, revision: slot.revision + 1 };
+          await this.ledger.append(slot, entry, lock.signal);
+          const elected = { ...slot, entry, revision: slot.revision + 1 };
+          // Only the durable append acknowledgement proves that this exact
+          // empty slot can be released if the wrapper reports cancellation.
+          acknowledged = { slot: elected, inventoryOwner: lock.ownerSignal };
+          return elected;
         },
-      );
+      ).catch(async (error: unknown) => {
+        if (
+          acknowledged &&
+          signal.aborted &&
+          error === signal.reason &&
+          !fill.ownerSignal.aborted &&
+          !acknowledged.inventoryOwner.aborted
+        ) {
+          const slot = acknowledged.slot;
+          try {
+            await this.advanceStock(
+              slot,
+              { ...slot.entry!, state: 'released-before-write' },
+              fill,
+              fill.ownerSignal,
+            );
+          } catch (cleanup) {
+            incomplete(new AggregateError([error, cleanup]));
+          }
+        }
+        throw error;
+      });
       if (reservation)
         await this.prepareStock(reservation, fill, options, foregroundStarting);
       else if (this.foreground) this.observe({ event: 'foreground-deferred' });

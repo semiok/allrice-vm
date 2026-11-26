@@ -815,6 +815,7 @@ export async function seedPublicImageCache(
     if (failure) throw failure.error;
     signal.throwIfAborted();
   } catch (error) {
+    if (!budget) signal.throwIfAborted();
     if (
       error instanceof PublicImageCacheBudgetExceeded ||
       error instanceof DiskPoolForegroundDeferred

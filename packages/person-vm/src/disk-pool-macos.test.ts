@@ -13,6 +13,7 @@ import type { CommandRunner } from './process.ts';
 import { signal } from './test-support.ts';
 
 const actions = vi.hoisted(() => ({
+  beforeLstat: undefined as ((path: string) => void) | undefined,
   afterLink: undefined as ((from: string, to: string) => void) | undefined,
   afterUnlink: undefined as ((path: string) => void) | undefined,
 }));
@@ -20,6 +21,10 @@ vi.mock('node:fs/promises', async (original) => {
   const actual = await original<typeof fs>();
   return {
     ...actual,
+    async lstat(...args: Parameters<typeof actual.lstat>) {
+      actions.beforeLstat?.(String(args[0]));
+      return actual.lstat(...args);
+    },
     link: async (from: string, to: string) => {
       await actual.link(from, to);
       actions.afterLink?.(from, to);
@@ -33,6 +38,7 @@ vi.mock('node:fs/promises', async (original) => {
 
 const roots: string[] = [];
 afterEach(async () => {
+  actions.beforeLstat = undefined;
   actions.afterLink = undefined;
   actions.afterUnlink = undefined;
   for (const root of roots.splice(0))
@@ -127,9 +133,21 @@ it('checks the foreground guard after platform preflight and before the first ke
   const f = await fixture();
   const ref = randomUUID();
   const deferred = new DiskPoolForegroundDeferred();
+  const stockColdImage = join(
+    f.diskRoot,
+    '.preprovision-images',
+    'cold',
+    ref + '.sparseimage',
+  );
   const stockWarm = join(f.diskRoot, '.preprovision-images', 'warm');
   const stockKeys = join(f.keyRoot, '.preprovision-keys');
+  let coldChecks = 0;
+  actions.beforeLstat = (path) => {
+    if (path === stockColdImage) coldChecks += 1;
+  };
   const gate = vi.fn(async () => {
+    // Both the pool adapter and APFS must check the exact cold image.
+    expect(coldChecks).toBe(2);
     expect(await fs.readdir(stockWarm)).toEqual([]);
     expect(await fs.readdir(stockKeys)).toEqual([]);
     throw deferred;
@@ -141,6 +159,40 @@ it('checks the foreground guard after platform preflight and before the first ke
   expect(await fs.readdir(stockWarm)).toEqual([]);
   expect(await fs.readdir(stockKeys)).toEqual([]);
 });
+
+it.each([false, true])(
+  'cancels untouched Mac preflight before the first-write guard and retains conflict evidence (conflict=%s)',
+  async (conflicting) => {
+    const f = await fixture();
+    const ref = randomUUID();
+    const stop = new AbortController();
+    const reason = Error('caller canceled during Mac disk preflight');
+    const stockRoot = join(f.diskRoot, '.preprovision-images');
+    const coldRoot = join(stockRoot, 'cold');
+    const coldImage = join(coldRoot, ref + '.sparseimage');
+    if (conflicting) {
+      await fs.mkdir(coldRoot, { recursive: true, mode: 0o700 });
+      await fs.writeFile(coldImage, 'unknown disk', { mode: 0o600 });
+    }
+    actions.beforeLstat = (path) => {
+      if (path === coldImage) stop.abort(reason);
+    };
+    const gate = vi.fn(async () => stop.signal.throwIfAborted());
+    const create = f.adapter().createEncryptedDisk(ref, stop.signal, gate);
+    if (conflicting) {
+      await expect(create).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      expect(await fs.readFile(coldImage, 'utf8')).toBe('unknown disk');
+    } else {
+      await expect(create).rejects.toBe(reason);
+      expect(await fs.readdir(coldRoot)).toEqual([]);
+    }
+    expect(gate).not.toHaveBeenCalled();
+    expect(await fs.readdir(join(f.keyRoot, '.preprovision-keys'))).toEqual([]);
+    expect(await fs.readdir(join(stockRoot, 'warm'))).toEqual([]);
+  },
+);
 
 it.each([true, false])(
   'requires a fresh hdiutil view to confirm unrelated vanished paths (resolved=%s)',
