@@ -156,16 +156,17 @@ export function createProductionScheduledWake(input: {
   let paused = false;
   let closing: Promise<void> | undefined;
 
+  const sourceLeadMs = input.source.leadMs ?? DEFAULT_SCHEDULE_WAKE_LEAD_MS;
+  if (!Number.isSafeInteger(sourceLeadMs) || sourceLeadMs < 0)
+    throw new RangeError('SCHEDULE_WAKE_LEAD_INVALID');
+
   function options(capture: WakeOptions['capture']) {
     return {
       store,
       ledger,
       capture,
       start: input.source.start,
-      leadMs: Math.max(
-        input.minimumLeadMs ?? 0,
-        input.source.leadMs ?? DEFAULT_SCHEDULE_WAKE_LEAD_MS,
-      ),
+      leadMs: Math.max(input.minimumLeadMs ?? 0, sourceLeadMs),
     };
   }
   const wake = createPersonVmScheduledWake(

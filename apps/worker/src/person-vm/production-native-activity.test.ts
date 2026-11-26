@@ -152,20 +152,26 @@ it.each(['sample', 'control event'] as const)(
   },
 );
 
-it('restarts after a missed slot and does not use guard reads as replacements', async () => {
-  const h = harness();
-  for (let slot = 0; slot < 20; slot++) await h.sample(slot);
-  expect((await h.sample(20, 'stop-guard')).snapshot.status).toBe('unknown');
-  expect(await h.sample(21)).toMatchObject({
-    eligible: false,
-    snapshot: {
-      coverage: { state: 'sampled', idleSince: '2026-11-26T12:21:00.000Z' },
-    },
-  });
-  for (let slot = 22; slot <= 40; slot++)
-    expect((await h.sample(slot)).eligible).toBe(false);
-  expect((await h.sample(41)).eligible).toBe(true);
-});
+it.each([false, true])(
+  'restarts after a missed slot with an intervening guard: %s',
+  async (guard) => {
+    const h = harness();
+    for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+    if (guard)
+      expect((await h.sample(20, 'stop-guard')).snapshot.status).toBe(
+        'unknown',
+      );
+    expect(await h.sample(21)).toMatchObject({
+      eligible: false,
+      snapshot: {
+        coverage: { state: 'sampled', idleSince: '2026-11-26T12:21:00.000Z' },
+      },
+    });
+    for (let slot = 22; slot <= 40; slot++)
+      expect((await h.sample(slot)).eligible).toBe(false);
+    expect((await h.sample(41)).eligible).toBe(true);
+  },
+);
 
 it('blocks an active schedule at the configured inclusive safety boundary', async () => {
   const h = harness();

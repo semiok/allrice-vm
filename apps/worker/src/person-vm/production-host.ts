@@ -1007,32 +1007,36 @@ export function createProductionPersonVmHost(input: {
             const current = Math.floor(performance.now() / period);
             if (current <= slot) continue;
             slot = current;
-            for (const { binding, idleContext, scheduledIdleRoster } of [
-              ...ownedVms.values(),
-            ]) {
-              if (pauseIdle || lifetime.aborted) break;
-              try {
-                const active = AbortSignal.any([
-                  lifetime,
-                  AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
-                ]);
-                if (scheduledIdleRoster)
-                  await admission.reconcileScheduledIdle(
-                    binding,
-                    scheduledIdleRoster,
-                    active,
-                  );
-                else if (idleContext)
-                  await admission.reconcileIdle(
-                    { ...idleContext, requestId: randomUUID() },
-                    binding,
-                    active,
-                  );
-              } catch (error) {
-                if (!lifetime.aborted && !(error instanceof PersonVmError))
-                  console.error('[person-vm] idle reconciliation failed');
-              }
-            }
+            if (pauseIdle) continue;
+            // One slow VM may not spend the other VMs' sampling slots.
+            await Promise.all(
+              [...ownedVms.values()].map(
+                async ({ binding, idleContext, scheduledIdleRoster }) => {
+                  if (lifetime.aborted) return;
+                  try {
+                    const active = AbortSignal.any([
+                      lifetime,
+                      AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
+                    ]);
+                    if (scheduledIdleRoster)
+                      await admission.reconcileScheduledIdle(
+                        binding,
+                        scheduledIdleRoster,
+                        active,
+                      );
+                    else if (idleContext)
+                      await admission.reconcileIdle(
+                        { ...idleContext, requestId: randomUUID() },
+                        binding,
+                        active,
+                      );
+                  } catch (error) {
+                    if (!lifetime.aborted && !(error instanceof PersonVmError))
+                      console.error('[person-vm] idle reconciliation failed');
+                  }
+                },
+              ),
+            );
           }
         }).catch((error: unknown) => {
           if (!lifetime.aborted)
