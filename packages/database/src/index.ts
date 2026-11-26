@@ -451,6 +451,11 @@ export {
 export * from './employee-memory-port.ts';
 export * from './capabilities/native-schedule-observation-ledger.ts';
 export {
+  createPostgresPersonVmScheduledWakeStore,
+  readPersonVmWakeRoster,
+  type ScheduledWakeClaim,
+} from './capabilities/person-vm-scheduled-wake.ts';
+export {
   createPostgresPersonalSkillPackageSource,
   type PersonalSkillPackageRead,
 } from './capabilities/personal-skill-package-source.ts';

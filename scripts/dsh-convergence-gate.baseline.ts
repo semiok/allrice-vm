@@ -46,6 +46,15 @@ export const baseline: readonly BaselineEntry[] = [
   },
   {
     kind: 'table',
+    id: 'person_vm_scheduled_wakes',
+    category: '租约',
+    basis:
+      'MET-289 / 0258：DSH Schedule 保存规则、计算下次触发并投递任务。宿主表把原生观察和已提交的物理停机绑定为可撤销启动计划，记录定时开机认领、重试和审计。只有宿主能恢复本人保留的 VM。',
+    approvedBy:
+      '2026-11-26 用户授权宿主 PG 定时唤醒账本及同租约现权复核，明确系统仅恢复开机，由 DSH 自行投递。',
+  },
+  {
+    kind: 'table',
     id: 'allrice_model_gateway_calls',
     category: '账本',
     basis:

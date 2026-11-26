@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
@@ -9,6 +10,7 @@ import {
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as SCHEDULE_REMOTE } from '@deepseek-ai/dsh-schedule/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
   createDEntryPrincipalControl,
@@ -36,7 +38,7 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
-import { nativeWebTransport } from './transport.js';
+import { nativeWebTransport, type NativeOwnedUnary } from './transport.js';
 import {
   observeNativePrompt,
   type NativePromptObservation,
@@ -130,7 +132,7 @@ export function readNativeModelAttempt(
 export async function openNativeWebOwner(input: {
   scope: PersonVmBootstrapScope;
   launch: NativeWebLaunch;
-  context: RequestContext;
+  context?: RequestContext;
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
@@ -371,12 +373,11 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
-  async function readSessionReply(
-    endpoint: 'create' | 'modelCatalog',
+  async function readUnaryReply(
+    method: NativeOwnedUnary,
     args: object,
     signal: AbortSignal,
   ) {
-    const method = 'session/' + endpoint;
     const rpcId = randomUUID();
     const body = JSON.stringify(
       clientRequestSchema.parse({
@@ -386,12 +387,12 @@ export async function openNativeWebOwner(input: {
         payload: { args },
       }),
     );
-    const wire = await transport.readSessionReply(endpoint, body, signal);
+    const wire = await transport.readUnaryReply(method, body, signal);
     const reply = serverResponseSchema.parse(JSON.parse(wire));
     if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
     return reply.result;
   }
-  function replyValue(result: Awaited<ReturnType<typeof readSessionReply>>) {
+  function replyValue(result: Awaited<ReturnType<typeof readUnaryReply>>) {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
@@ -418,7 +419,11 @@ export async function openNativeWebOwner(input: {
           readCurrent(active, guard, async (signal) => {
             const method = TYPERT_REMOTE.methods['session/modelCatalog'];
             const args = method.input({ strict: true }).create().parse({});
-            const result = await readSessionReply('modelCatalog', args, signal);
+            const result = await readUnaryReply(
+              'session/modelCatalog',
+              args,
+              signal,
+            );
             return {
               ok: true as const,
               value: method.result.create().parse(replyValue(result)),
@@ -547,8 +552,8 @@ export async function openNativeWebOwner(input: {
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.
-            const result = await readSessionReply(
-              'create',
+            const result = await readUnaryReply(
+              'session/create',
               args,
               AbortSignal.timeout(input.cleanupTimeoutMs),
             ).catch((error: unknown) => {
@@ -625,19 +630,18 @@ export async function openNativeWebOwner(input: {
         );
       },
       readSessions(requestSignal: AbortSignal) {
-        async function assertCurrent(current: AbortSignal) {
+        const context = input.context;
+        if (!context)
+          return Promise.reject(new PersonVmError('AUTHORIZATION_DENIED'));
+        const assertCurrent = async (current: AbortSignal) => {
           try {
-            await input.vm.assertCurrentBinding(
-              input.context,
-              binding,
-              current,
-            );
+            await input.vm.assertCurrentBinding(context, binding, current);
           } catch (error) {
             // Normal closing/retirement owns this business abort; keep ACK carrier.
             if (!closing && !requestSignal.aborted) lost();
             throw error;
           }
-        }
+        };
         return readCurrentSessions(requestSignal, assertCurrent);
       },
       /** Request denial does not certify loss of this shared native owner. */
@@ -651,6 +655,27 @@ export async function openNativeWebOwner(input: {
           (current) => input.vm.assertCurrentBinding(context, binding, current),
           notDispatched,
         );
+      },
+      /** The host supplies its guard under the current physical lease. */
+      readScheduleCatalog(
+        assertCurrent: (signal: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const method = SCHEDULE_REMOTE.methods['schedule/catalog'];
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, async (active) => {
+          const args = method.input({ strict: true }).create().parse({});
+          const result = await readUnaryReply('schedule/catalog', args, active);
+          const value = replyValue(result);
+          const parsed = method.result.create().parse(value);
+          // Reject protocol normalization before the observer hashes rows.
+          if (!isDeepStrictEqual(value, parsed))
+            throw new PersonVmError('PROVIDER_FAILED');
+          return parsed;
+        });
       },
       /** The existing native index supplies the running Host's own graph.
        * The release publisher independently verifies its complete code graph and

@@ -23,11 +23,13 @@ export type PersonVmWebEndpointReceipt = Readonly<{
   endpoints: readonly (PersonVmWebRoster['entries'][number] &
     Readonly<{ hostPort: number; guestPort: number }>)[];
 }>;
-/** Startup metadata from the service's authenticated caller, never guest JSON. */
-export type PersonVmWebStartup = Readonly<{
-  context: RequestContext;
-  receipt: PersonVmWebEndpointReceipt;
-}>;
+/** System wake brings up the original DSH host without a browser principal. */
+export type PersonVmWebStartup = Readonly<
+  { receipt: PersonVmWebEndpointReceipt } & (
+    | { context: RequestContext; purpose?: never }
+    | { context?: never; purpose: 'scheduled-wake' }
+  )
+>;
 export interface PersonVmWebRosterPort {
   prepare(
     context: RequestContext,

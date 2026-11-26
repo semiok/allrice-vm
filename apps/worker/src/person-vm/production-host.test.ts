@@ -383,6 +383,17 @@ it('an already cancelled lifetime returns the original reason without constructi
   expect(value.bound.egress.close).not.toHaveBeenCalled();
 });
 
+it('refuses to prepare a scheduled stop without the production wake source', async () => {
+  const { host } = await open();
+  const { binding, context } = nativeEntryFixture();
+  const assertStopCurrent = vi.fn(async () => {});
+  await expect(
+    host.prepareStopWithWake({ context, binding, assertStopCurrent }, signal()),
+  ).resolves.toEqual({ blocked: true, reason: 'SCHEDULE_WAKE_UNAVAILABLE' });
+  expect(assertStopCurrent).not.toHaveBeenCalled();
+  expect(io.dedicated).not.toHaveBeenCalled();
+});
+
 it('constructs the real store/service/admission/startup with one SQL factory and the same nondefault platform snapshot', async () => {
   const factory = vi.spyOn(
     PostgresPersonVmStore.prototype,

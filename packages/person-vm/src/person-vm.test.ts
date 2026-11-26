@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   PersonVmError,
   PERSON_VM_COLD_MS,
@@ -19,6 +19,159 @@ import {
 } from './test-support.ts';
 
 describe('host lifecycle service entrypoints (synthetic runtime; not real VM acceptance)', () => {
+  async function scheduledFixture() {
+    const store = new MemoryStore();
+    const h = harness(store);
+    const { rc, binding } = await running(h);
+    // The other module owns proof of a safe physical stop. Seed its native
+    // outcome and let the real service persist and clean up the retained VM.
+    h.states.set(binding.vmId, 'stopped');
+    await h.service.stop(rc, signal());
+    const endpoint = {
+      workspaceId: randomUUID(),
+      employeeInstanceId: randomUUID(),
+      employeeRevision: 1,
+      employeeVersionId: randomUUID(),
+    };
+    const facts = {
+      personId: binding.personId,
+      organizationId: binding.organizationId,
+      entries: [endpoint],
+    };
+    const roster = {
+      ...facts,
+      digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+    };
+    const interactiveRoster = vi.fn(async () => roster);
+    const verified = vi.fn(async () => {});
+    h.runtime.assertScheduledReady = verified;
+    h.runtime.retireAfterNativeStop = vi.fn(async () => {});
+    h.native.prepareWebEndpoints = vi.fn(async (current, expected) => ({
+      binding: current,
+      rosterDigest: expected.digest,
+      endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
+    }));
+    h.native.assertWebEndpoints = vi.fn(async () => {});
+    const service = new PersonVmService({
+      ...h.options,
+      nativeWeb: { prepare: interactiveRoster },
+    });
+    h.authorize(false);
+    return { h, store, binding, roster, service, interactiveRoster, verified };
+  }
+
+  it('resumes only the retained native VM with no user and no interactive readiness grant', async () => {
+    const f = await scheduledFixture();
+    const requestId = randomUUID();
+    const startup = vi.spyOn(f.h.runtime, 'start');
+    const browserProof = vi.spyOn(f.h.runtime, 'readiness');
+    const roster = vi.fn(async () => {
+      expect((await f.store.read(f.binding.personId))?.leaseOwner).toBeTruthy();
+      return f.roster;
+    });
+    const fenced: string[] = [];
+    const authority: Parameters<
+      PersonVmService['startRetainedForSchedule']
+    >[2] = {
+      readRoster: roster,
+      async withCurrentAuthority(digest, active, start) {
+        fenced.push(digest);
+        expect(digest).toBe(f.roster.digest);
+        expect(
+          (await f.store.read(f.binding.personId))?.leaseOwner,
+        ).toBeTruthy();
+        return start(active);
+      },
+    };
+    const view = await f.service.startRetainedForSchedule(
+      f.binding,
+      requestId,
+      authority,
+      signal(),
+    );
+    expect(view).toMatchObject({ phase: 'running', ready: false });
+    expect(f.h.log.filter((item) => item === 'native:create')).toHaveLength(1);
+    expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
+    expect(startup.mock.lastCall?.[3]).toMatchObject({
+      purpose: 'scheduled-wake',
+    });
+    expect(startup.mock.lastCall?.[3]).not.toHaveProperty('context');
+    expect(f.verified).toHaveBeenCalledOnce();
+    expect(fenced).toEqual([f.roster.digest, f.roster.digest]);
+    expect(f.interactiveRoster).not.toHaveBeenCalled();
+    expect(browserProof).not.toHaveBeenCalled();
+    expect(
+      f.store.audits
+        .filter((audit) => audit.requestId === requestId)
+        .map(({ action, result }) => [action, result]),
+    ).toEqual([
+      ['scheduled-wake.start', 'started'],
+      ['scheduled-wake.start', 'succeeded'],
+    ]);
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        requestId,
+        authority,
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
+  });
+
+  it('does not launch or issue an unowned native stop when authority is lost before retained resume', async () => {
+    const f = await scheduledFixture();
+    const before = f.h.log.length;
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        randomUUID(),
+        {
+          readRoster: async () => f.roster,
+          withCurrentAuthority: async () => {
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(f.h.log.slice(before)).not.toContain('native:start');
+    expect(f.h.log.slice(before)).not.toContain('native:stop');
+    expect(f.verified).not.toHaveBeenCalled();
+    expect(f.h.mounts.size).toBe(0);
+  });
+
+  it('retires a dispatched VM if scheduled authority is lost at running publication', async () => {
+    const f = await scheduledFixture();
+    const requestId = randomUUID();
+    const before = f.h.log.length;
+    let fenced = 0;
+    await expect(
+      f.service.startRetainedForSchedule(
+        f.binding,
+        requestId,
+        {
+          readRoster: async () => f.roster,
+          async withCurrentAuthority(_digest, active, work) {
+            if (++fenced === 2) throw new PersonVmError('AUTHORIZATION_DENIED');
+            return work(active);
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(
+      f.h.log.slice(before).filter((item) => item.startsWith('native:')),
+    ).toEqual(expect.arrayContaining(['native:start', 'native:stop']));
+    expect(f.h.states.get(f.binding.vmId)).toBe('stopped');
+    expect(f.h.mounts.size).toBe(0);
+    expect(
+      f.store.audits
+        .filter((event) => event.requestId === requestId)
+        .map((event) => event.result),
+    ).toEqual(['started', 'failed']);
+  });
+
   it('isolated command environment needs no NODE_ENV and never inherits the host', async () => {
     vi.stubEnv('ALLRICE_PROCESS_HOST_SENTINEL', 'synthetic-host-only');
     vi.stubEnv('NODE_ENV', 'test');
