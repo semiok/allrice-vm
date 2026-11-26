@@ -574,6 +574,9 @@ suite('real AllRice sidebar in installed native profiles', () => {
                 sidebar?.firstElementChild,
                 document.querySelector('[data-row-key="session:thread-0"]'),
                 document.querySelector('[aria-label="自动化任务"]'),
+                document.querySelector(
+                  '[role="dialog"][aria-label="创建 AI 员工"]',
+                ),
                 [...(sidebar?.querySelectorAll('button') ?? [])].find(
                   (button) => button.textContent?.startsWith('展开其余'),
                 ),
@@ -608,34 +611,34 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
   });
 
-  it('opens the existing personal creation dialog from the native sidebar', async () => {
-    try {
-      await page.evaluate(
-        (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
-        {
-          organizationId: randomUUID(),
-          workspaceId: randomUUID(),
-          viewerId: randomUUID(),
-        },
-      );
-      await page
-        .locator('#chat-sidebar')
-        .getByRole('button', { name: '创建员工', exact: true })
-        .click();
-      const dialog = page.getByRole('dialog', {
-        name: '创建 AI 员工',
-        exact: true,
-      });
-      await dialog
-        .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
-        .waitFor();
-      await page.keyboard.press('Escape');
-      await dialog.waitFor({ state: 'hidden' });
-    } finally {
-      await page.evaluate(() =>
-        window.__allriceSidebarTest!.setPersonalCreation(),
-      );
-    }
+  it('opens the existing personal creation dialog from the native sidebar', async ({
+    onTestFinished,
+  }) => {
+    // Leave the live dialog in place until the suite captures a failure.
+    onTestFinished(() =>
+      page.evaluate(() => window.__allriceSidebarTest!.setPersonalCreation()),
+    );
+    await page.evaluate(
+      (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
+      {
+        organizationId: randomUUID(),
+        workspaceId: randomUUID(),
+        viewerId: randomUUID(),
+      },
+    );
+    await page
+      .locator('#chat-sidebar')
+      .getByRole('button', { name: '创建员工', exact: true })
+      .click();
+    const dialog = page.getByRole('dialog', {
+      name: '创建 AI 员工',
+      exact: true,
+    });
+    await dialog
+      .getByPlaceholder('例如：文案专家、财务专员', { exact: true })
+      .waitFor();
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
   });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {
     const sidebar = page.locator('#chat-sidebar');
