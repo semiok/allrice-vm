@@ -1128,10 +1128,13 @@ it('missing native activity is unknown, and a real later observer is forwarded w
       throw reason;
     }),
   };
-  await expect(observer.observe(binding, current)).rejects.toBe(reason);
+  await expect(observer.observe(binding, current, 'stop-guard')).rejects.toBe(
+    reason,
+  );
   expect(value.bound.nativeActivity.observe).toHaveBeenCalledExactlyOnceWith(
     binding,
     expect.any(AbortSignal),
+    'stop-guard',
   );
 });
 

@@ -29,7 +29,7 @@ v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个
 
 后端 present；MCP none（模型不获 VM 管理权）；员工 UI none（本卡只提供页面/输入预开机服务接口，后续由已批界面接线）；后台 none（没有新增管理界面授权）；权限 present（每调用重查当前可信身份，删盘单独授权/审计，不默认删盘）。默认关闭/名单由发布入口控制，本包不新增产品开关。
 
-**20 分钟自动回收、运行中的普通安全 stop/delete/takeover 尚未实现。** 锁定 DSH 0.2.1-rc.2 的公开 `Agent.whenIdle/runMaintenance` 只覆盖单 agent；workspace 活动是瞬时快照，归档 stop 只发停止请求、不等收敛；未找到覆盖本人 VM 全域的连续活动水位与原子新任务准入冻结。采样之间可发生短 job，最后一次0之后也可产生工作，缩短轮询间隔不能补证明。当前 `reconcileIdle` 对 running 永远保留；普通停机/删除/接管在 running 瞬时0时仍拒绝 `ACTIVITY_UNKNOWN`，active/unknown/stale/host hold 继续拒绝。不会新增虚构 native gate 或第二套 Agent 状态机，不能把 fixture 通过当原生能力已接。
+**保守自动停机默认关闭。** 启用后，宿主每 60 秒采样当前 VM 的全部员工。持续看到空闲、没有漏采且未收到忙碌事件，才进入同一物理租约下的唤醒准备与停机。采样间隔可用 `lifecycle.idleSampleIntervalMs` 调整。原生读失败、漏采、Worker 重启或代次变化均重新计时。部分瞬态工作可在采样间发生。最后一次负向读取至原生停机之间也可能出现尚未被宿主观察到的工作。下一次定时触发落入停机预算与 `lifecycle.idleScheduleSafetyMarginMs` 的合计窗口时保留运行，默认安全余量为 30 秒。普通停机、删除和接管仍沿用各自的活动、租约和权限校验。
 
 仅 native 已真实 stopped/absent 时，可对账后清理并从确认的 stoppedAt 计算7天转冷。刚确认停止不能因旧 lastActivityAt 立即冷。自己本次启动失败的清理仍撤出口、尝试物理stop、确认后detach。权限撤销强制终止是另片已批需求，不作为普通 idle 回收证明。长周期测试只用时间夹具，未实等20min/7day；不做 Full 快照、不自动删盘。
 

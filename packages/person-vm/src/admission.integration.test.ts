@@ -609,6 +609,7 @@ suite(
       'mount-change',
       'wake-plan-changed',
       'ok',
+      'sampled-ok',
       'commit-rejected',
       'commit-ack-lost',
       'native-proof-rejected',
@@ -699,6 +700,7 @@ suite(
           outcome === 'commit-rejected' || outcome === 'system-recovery';
         const recovering = commitRejected || outcome === 'commit-ack-lost';
         const nativeProofRejected = outcome === 'native-proof-rejected';
+        const samplePurposes: (string | undefined)[] = [];
         let mono = 0,
           runningJobs = 0,
           revision = 'first',
@@ -735,7 +737,8 @@ suite(
             },
           },
           nativeActivity: {
-            async observe(current) {
+            async observe(current, _signal, purpose) {
+              if (outcome === 'sampled-ok') samplePurposes.push(purpose);
               const observedAt = h.now().toISOString();
               return {
                 activity: {
@@ -749,13 +752,24 @@ suite(
                 },
                 activeScheduleDeliveries: 0,
                 coverage: {
-                  state: 'continuous',
                   cursor: { sourceId: 'native-fixture', revision },
                   from: since,
                   through: observedAt,
-                  idleSince: runningJobs ? null : since,
+                  ...(outcome === 'sampled-ok'
+                    ? { state: 'sampled', idleSince: since }
+                    : {
+                        state: 'continuous',
+                        idleSince: runningJobs ? null : since,
+                      }),
                 },
               };
+            },
+            assertSampleCurrent(current, cursor, active) {
+              active.throwIfAborted();
+              expect(outcome).toBe('sampled-ok');
+              expect(current).toEqual(binding);
+              expect(cursor).toEqual({ sourceId: 'native-fixture', revision });
+              samplePurposes.push('dispatch');
             },
             async subscribe() {
               throw new Error('unexpected subscription');
@@ -787,7 +801,17 @@ suite(
                       async () => {},
                     ),
                   ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
-                  await request.assertStopCurrent(active);
+                  if (outcome === 'sampled-ok') {
+                    const before = samplePurposes.length;
+                    await Promise.all(
+                      [active, active].map((signal) =>
+                        request.assertStopCurrent(signal),
+                      ),
+                    );
+                    expect(samplePurposes.slice(before)).toEqual([
+                      'stop-guard',
+                    ]);
+                  } else await request.assertStopCurrent(active);
                   if (outcome === 'system-revoked') scheduledAuthority = false;
                   if (outcome === 'changed') revision = 'new-native-work';
                   if (
@@ -980,6 +1004,7 @@ suite(
         }
         const stopped =
           outcome === 'ok' ||
+          outcome === 'sampled-ok' ||
           outcome === 'relogin' ||
           outcome === 'system-ok' ||
           recovering;
@@ -1016,7 +1041,22 @@ suite(
         );
         if (stopped)
           expect(Number(success[0]!.lease_epoch)).toBe(binding.leaseEpoch);
-        if (outcome === 'ok') {
+        if (outcome === 'sampled-ok') {
+          expect(samplePurposes.slice(0, 3)).toEqual([
+            'inspection',
+            'inspection',
+            'inspection',
+          ]);
+          expect(samplePurposes.slice(3, -1)).toEqual(
+            Array.from(
+              { length: samplePurposes.length - 4 },
+              () => 'stop-guard',
+            ),
+          );
+          expect(samplePurposes.at(-1)).toBe('dispatch');
+          expect(samplePurposes.length).toBeGreaterThan(4);
+        }
+        if (outcome === 'ok' || outcome === 'sampled-ok') {
           expect(await service.start(rc, signal())).toMatchObject({
             vmId: binding.vmId,
             diskRetained: true,

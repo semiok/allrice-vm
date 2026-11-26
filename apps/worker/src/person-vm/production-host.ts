@@ -57,6 +57,11 @@ import {
   type PersonVmWakePreparation,
   type ProductionScheduledWakeSource,
 } from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  getIdleScheduleGuardMs,
+  IDLE_RECONCILE_TIMEOUT_MS,
+} from './production-native-activity.js';
 import type { PrepareStopWithWakeResult } from './scheduled-wake.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
@@ -814,13 +819,22 @@ export function createProductionPersonVmHost(input: {
               : Promise.resolve({ blocked: true } as const),
         }),
         nativeActivity: {
-          observe(binding, signal) {
+          observe(binding, signal, purpose) {
             return own(() =>
               currentWork(signal, async (active) => {
                 if (!bound?.nativeActivity)
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
-                return bound.nativeActivity.observe(binding, active);
+                return bound.nativeActivity.observe(binding, active, purpose);
               }),
+            );
+          },
+          assertSampleCurrent(binding, cursor, signal) {
+            if (!bound?.nativeActivity?.assertSampleCurrent)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            bound.nativeActivity.assertSampleCurrent(
+              binding,
+              cursor,
+              AbortSignal.any([signal, lifetime]),
             );
           },
           subscribe(binding, signal) {
@@ -966,6 +980,9 @@ export function createProductionPersonVmHost(input: {
           startup,
           database: trustedDatabase,
           source: bound.scheduledWake,
+          minimumLeadMs: getIdleScheduleGuardMs(
+            providers.configuration.lifecycle,
+          ),
           lifetime,
         });
         scheduledWake = wake;
@@ -976,34 +993,57 @@ export function createProductionPersonVmHost(input: {
         bound.nativeActivity &&
         scheduledWake
       ) {
+        const period =
+          providers.configuration.lifecycle.idleSampleIntervalMs ??
+          DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
+        const inspecting = new Set<string>();
         void own(async () => {
+          let slot = Math.floor(performance.now() / period);
           while (!lifetime.aborted) {
-            await sleep(15_000, undefined, { signal: lifetime, ref: false });
-            for (const { binding, idleContext, scheduledIdleRoster } of [
-              ...ownedVms.values(),
-            ]) {
-              if (pauseIdle || lifetime.aborted) break;
-              try {
-                const active = AbortSignal.any([
-                  lifetime,
-                  AbortSignal.timeout(15_000),
-                ]);
-                if (scheduledIdleRoster)
-                  await admission.reconcileScheduledIdle(
-                    binding,
-                    scheduledIdleRoster,
-                    active,
-                  );
-                else if (idleContext)
-                  await admission.reconcileIdle(
-                    { ...idleContext, requestId: randomUUID() },
-                    binding,
-                    active,
-                  );
-              } catch (error) {
-                if (!lifetime.aborted && !(error instanceof PersonVmError))
-                  console.error('[person-vm] idle reconciliation failed');
-              }
+            const delay = Math.max(
+              1,
+              Math.ceil((slot + 1) * period - performance.now()),
+            );
+            await sleep(delay, undefined, { signal: lifetime, ref: false });
+            const current = Math.floor(performance.now() / period);
+            if (current <= slot) continue;
+            slot = current;
+            if (pauseIdle) continue;
+            // Each VM owns its own in-flight inspection. A stalled read
+            // leaves a gap for that VM without delaying the other clocks.
+            for (const {
+              binding,
+              idleContext,
+              scheduledIdleRoster,
+            } of ownedVms.values()) {
+              if (inspecting.has(binding.personId)) continue;
+              inspecting.add(binding.personId);
+              void own(async () => {
+                try {
+                  if (pauseIdle || lifetime.aborted) return;
+                  const active = AbortSignal.any([
+                    lifetime,
+                    AbortSignal.timeout(IDLE_RECONCILE_TIMEOUT_MS),
+                  ]);
+                  if (scheduledIdleRoster)
+                    await admission.reconcileScheduledIdle(
+                      binding,
+                      scheduledIdleRoster,
+                      active,
+                    );
+                  else if (idleContext)
+                    await admission.reconcileIdle(
+                      { ...idleContext, requestId: randomUUID() },
+                      binding,
+                      active,
+                    );
+                } catch (error) {
+                  if (!lifetime.aborted && !(error instanceof PersonVmError))
+                    console.error('[person-vm] idle reconciliation failed');
+                } finally {
+                  inspecting.delete(binding.personId);
+                }
+              });
             }
           }
         }).catch((error: unknown) => {

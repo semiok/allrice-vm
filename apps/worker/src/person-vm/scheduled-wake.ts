@@ -73,8 +73,11 @@ export type PrepareStopWithWakeResult =
 
 const retryDelayMs = [10_000, 30_000, 60_000] as const;
 const claimMs = 5 * 60_000;
+export const DEFAULT_SCHEDULE_WAKE_LEAD_MS = 120_000;
 
-function earliest(batches: readonly NativeScheduleObservationBatch[]) {
+export function earliestNativeScheduleTarget(
+  batches: readonly NativeScheduleObservationBatch[],
+) {
   let target: number | null = null;
   for (const { items } of batches) {
     for (const item of items) {
@@ -89,7 +92,7 @@ function earliest(batches: readonly NativeScheduleObservationBatch[]) {
 
 export function createPersonVmScheduledWake(input: Options) {
   const now = input.now ?? (() => new Date());
-  const leadMs = input.leadMs ?? 120_000;
+  const leadMs = input.leadMs ?? DEFAULT_SCHEDULE_WAKE_LEAD_MS;
   if (!Number.isSafeInteger(leadMs) || leadMs < 0)
     throw new RangeError('SCHEDULE_WAKE_LEAD_INVALID');
 
@@ -133,7 +136,7 @@ export function createPersonVmScheduledWake(input: Options) {
         });
         await captured.assertCurrent(signal);
         signal.throwIfAborted();
-        const target = earliest(batches);
+        const target = earliestNativeScheduleTarget(batches);
         const wakeAt = target === null ? null : new Date(target - leadMs);
         const canWait = () =>
           wakeAt === null || wakeAt.getTime() > now().getTime();
