@@ -3,6 +3,7 @@ import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
+import { runBrowser } from './browser.mjs';
 import {
   paths,
   publicOrigin,
@@ -288,6 +289,21 @@ it('retains the interruption and attempts only the corresponding joined cleanup'
     );
     expect(fixture.owner.close).toHaveBeenCalledOnce();
   });
+});
+
+it('gives the live CLI exclusive ownership of Chromium interrupt signals', async () => {
+  const launch = vi.fn(async () => {
+    throw new Error('test before Chromium starts');
+  });
+  await expect(
+    runBrowser({ launch, onColdTicket: () => {}, driver: {} }),
+  ).rejects.toThrow('test before Chromium starts');
+  expect(launch).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      handleSIGINT: false,
+      handleSIGTERM: false,
+    }),
+  );
 });
 
 it('the public transport forwards only inspected traffic, with no redirects or retries', async () => {

@@ -65,6 +65,9 @@ export function createHelloProbe(receipt) {
       );
       requestId = request.requestId;
       outcome.dispatched = true;
+      outcome.requestFingerprint = createHash('sha256')
+        .update(JSON.stringify([sessionId, requestId]))
+        .digest('hex');
       return body.rpcId;
     },
     accept(rpcId, { status, json }) {

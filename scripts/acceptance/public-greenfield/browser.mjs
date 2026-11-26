@@ -481,12 +481,14 @@ export async function runBrowser({
   beforeHello,
   reopenWarm = true,
   signal,
+  launch = (options) => webRequire('playwright-core').chromium.launch(options),
 }) {
   requireFact(!signal?.aborted, 'acceptance-interrupted');
-  const { chromium } = webRequire('playwright-core');
-  const browser = await chromium.launch({
+  const browser = await launch({
     executablePath: browserExecutable,
     timeout: onColdTicket ? 30_000 : timeout,
+    handleSIGINT: !onColdTicket,
+    handleSIGTERM: !onColdTicket,
     headless: true,
     args: driver.chromiumArgs,
     env: Object.fromEntries(
@@ -532,6 +534,7 @@ export async function runBrowser({
   const guarded = (action) => Promise.race([action, networkFailure]);
   let context;
   let publicEditor;
+  let pendingPrewarm;
   try {
     requireFact(!signal?.aborted, 'acceptance-interrupted');
     context = await browser.newContext({
@@ -542,14 +545,28 @@ export async function runBrowser({
     await driver.install(context, {
       inspect: (request, exchange) => {
         requireFact(!routeFailed, 'request-after-failure');
-        return flow.request(request, exchange);
+        const result = flow.request(request, exchange);
+        if (
+          onColdTicket &&
+          !pendingPrewarm &&
+          request.method === 'POST' &&
+          request.url.pathname === paths.prewarm
+        )
+          pendingPrewarm = result;
+        return result;
       },
       openCarrier: (url, frame, exchange) => {
         requireFact(!routeFailed, 'request-after-failure');
         return flow.openCarrier(url, frame, exchange);
       },
-      muxRole: flow.muxRole,
-      beginCarrier: flow.beginCarrier,
+      muxRole: (url) => {
+        requireFact(!routeFailed, 'carrier-after-failure');
+        return flow.muxRole(url);
+      },
+      beginCarrier: (url, frame) => {
+        requireFact(!routeFailed, 'carrier-after-failure');
+        return flow.beginCarrier(url, frame);
+      },
       observeFollow: (sessionId, item) => hello?.follow(sessionId, item),
       followClosed: (sessionId) => hello?.closed(sessionId),
       fail: failure,
@@ -713,23 +730,24 @@ export async function runBrowser({
             const turn = await hello.boundTurn;
             // Observe the pinned DSH ChatView's assistant turn and Markdown
             // wrapper. Reasoning disclosures have data-variant="think".
-            const response = child
+            const responses = child
               .locator(
-                `[data-chat-flow-kind="assistant-step"][data-chat-turn="${turn}"]:not([data-chat-group-part="reasoning"]) .markdown:not([data-variant="think"] *):visible`,
+                `[data-chat-flow-kind="assistant-step"][data-chat-turn="${turn}"]:not([data-chat-group-part="reasoning"]) [class~="MarkdownText_markdown"]:not([data-variant="think"] *):visible`,
               )
-              .filter({ hasText: /\S/u })
-              .first();
-            await response.waitFor({ timeout: 120_000 });
+              .filter({ hasText: /\S/u });
+            await responses.first().waitFor({ timeout: 120_000 });
             receipt.timings.helloToFirstReplyMs = hello.elapsed();
             await hello.complete;
             await child
-              .locator(`[data-turn-tail="${turn}"]`)
+              .locator(
+                `[data-turn-tail="${turn}"][data-actions-reveal="always"]`,
+              )
               .waitFor({ timeout: 120_000 });
             const final = await readEditor();
             requireFact(
               flow.hasDocumentScope(final) &&
                 final.nativeSessionId === nativeSessionId &&
-                (await response.isVisible()),
+                (await responses.last().isVisible()),
               'hello-reply-not-visible',
             );
             receipt.timings.helloToCompleteReplyMs = hello.elapsed();
@@ -753,6 +771,14 @@ export async function runBrowser({
     throw error;
   } finally {
     try {
+      if (pendingPrewarm) {
+        // Let the one already-dispatched request yield its actual ticket. A
+        // lost reply is unknown ownership; no second POST is permitted.
+        await Promise.race([
+          pendingPrewarm.catch(() => {}),
+          delay(POLL_REQUEST_MS, undefined, { ref: false }),
+        ]);
+      }
       if (publicEditor) {
         try {
           // Use the existing authenticated document carrier's completion

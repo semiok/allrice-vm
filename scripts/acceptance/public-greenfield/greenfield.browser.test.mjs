@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import { describe, expect, it, vi } from 'vitest';
 import { paths } from './contracts.mjs';
 import { makeFixture } from './fixture.mjs';
+import { publicDriver } from './live-driver.mjs';
 import { dryRun } from './run.mjs';
 
 const suite =
@@ -13,6 +17,67 @@ const browserExecutable =
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
 suite('public greenfield offline Chromium', () => {
+  it('forwards redirects and the original session cookie over the real Playwright HTTP transport', async () => {
+    const requireWeb = createRequire(
+      new URL('../../../apps/web/package.json', import.meta.url),
+    );
+    const { chromium } = requireWeb('playwright-core');
+    let authenticated = false;
+    const server = createServer((request, response) => {
+      if (request.url === '/') {
+        response.writeHead(302, {
+          location: '/next',
+          'set-cookie': 'fixture_session=test; Path=/; HttpOnly',
+        });
+        return response.end();
+      }
+      if (request.url !== '/next') {
+        response.writeHead(204);
+        return response.end();
+      }
+      authenticated = request.headers.cookie === 'fixture_session=test';
+      response.writeHead(authenticated ? 200 : 401, {
+        'content-type': 'text/html; charset=utf-8',
+      });
+      response.end('<main>loopback browser fixture</main>');
+    });
+    let browser;
+    try {
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const origin = `http://127.0.0.1:${server.address().port}`;
+      const driver = publicDriver();
+      browser = await chromium.launch({
+        executablePath: browserExecutable,
+        headless: true,
+        args: driver.chromiumArgs,
+      });
+      const context = await browser.newContext({ serviceWorkers: 'block' });
+      const fail = vi.fn();
+      await driver.install(context, {
+        inspect: async ({ url }, exchange) => {
+          expect(url.origin).toBe(origin);
+          return exchange();
+        },
+        fail,
+      });
+      const page = await context.newPage();
+      const response = await page.goto(origin);
+      expect(response.status()).toBe(200);
+      expect(page.url()).toBe(origin + '/next');
+      expect(authenticated).toBe(true);
+      expect(fail).not.toHaveBeenCalled();
+    } finally {
+      try {
+        await browser?.close();
+      } finally {
+        server.closeAllConnections();
+        if (server.listening)
+          await new Promise((resolve) => server.close(resolve));
+      }
+    }
+  }, 30_000);
+
   it('opens a fresh native editor cold and reopens it once warm', async () => {
     const fixture = makeFixture();
     const stop = vi.spyOn(fixture, 'stopExact');

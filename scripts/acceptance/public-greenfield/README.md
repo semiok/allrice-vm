@@ -39,7 +39,7 @@ node scripts/acceptance/public-greenfield/run.mjs --live --allow-public-writes \
 
 ### 受管 Host 前置
 
-当前生产 authority 只开放 read/create/start，现有恢复 socket没有 exact-owner 停机动作。`--managed-owner` 必须是发布负责人审核且安装在仓库外本机 `0700` 目录的 `0600` 模块，使用已批准生产 Host 能力。摘要从负责人审核记录取得。缺实际 Host 能力时不提供模块。工具会在读凭据和访问公网之前返回阻塞。模块是受信操作员代码，其依赖也应绑定已发布版本。不得用合成结果或可编辑 JSON 充当权威回执。
+当前生产 authority 只开放 read/create/start，现有恢复 socket 未提供 exact-owner 停机动作。`--managed-owner` 必须是发布负责人审核且安装在仓库外本机 `0700` 目录的 `0600` 模块，使用已批准生产 Host 能力。摘要从负责人审核记录取得。缺实际 Host 能力时不提供模块。工具会在读凭据和访问公网之前返回阻塞。模块是受信操作员代码，其依赖绑定已发布版本，目录由负责人独占且本轮保持静止。不得用合成结果或可编辑 JSON 充当权威回执。
 
 模块具名导出 `managedOwner`，每次操作遵守传入的 `signal` 并在退出时会合。需要以下现有事实：
 
@@ -48,4 +48,4 @@ node scripts/acceptance/public-greenfield/run.mjs --live --allow-public-writes \
 - `operationResult({ identity, operationId, signal })` 用真实 202 票查本次分配，回相同 `operationId` 和 `state: 'allocated'` + `binding`，或已确认的 `state: 'unallocated'`。未知或仍在建时失败保留。关闭浏览器后还需 `carrierJoined: true`。`exactVm({ identity, signal })` 读回当前绑定，用 `vmId/personId/organizationId/instanceId/leaseEpoch` 对账；发送前查 `state: 'running'`。
 - `stopExact({ binding, signal })` 在同一个受权 Host 租约内再次核身份并仅停该 VM，返回同一绑定及 `state: 'stopped'`、`diskRetained/accountRetained/unmounted/leaseReleased/portReleased: true`。停后用 `exactVm` 独立读回绑定、停止和物理资源状态。`close({ signal })` 归还本模块占用的窗口和连接。脚本没有公共停机 URL。
 
-当前片可离线检查真正的 HTTP/WebSocket 转发规则和原生回执识别。正式 Host 接线、真实公网与模型验收分别等待发布窗口。缺少新员工版本、已核生产 Host 接口或绑定权限时，退出 `2` 并保留阻塞回执。
+离线验收覆盖 Chromium 的回环 HTTP 重定向和会话 Cookie、模拟 WebSocket 转发，以及模拟 Host 和原生回执。正式 Host 接线、真实公网与模型验收分别等待发布窗口。缺少新员工版本、已核生产 Host 接口或绑定权限时，退出 `2` 并保留阻塞回执。
