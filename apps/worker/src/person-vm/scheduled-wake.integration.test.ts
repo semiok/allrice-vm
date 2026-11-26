@@ -249,13 +249,13 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       });
     }
 
-    const dispatch = vi.fn(async () => {
+    const dispatch = vi.fn(async (_roster: unknown, active: AbortSignal) => {
       await expect(invalidate(true)).rejects.toMatchObject({ code: '55P03' });
-      return 'dispatched';
+      return active;
     });
     await expect(
       f.store().withClaimAuthority(claim!, signal, dispatch),
-    ).resolves.toBe('dispatched');
+    ).resolves.toMatchObject({ aborted: false });
     await invalidate(false);
     await expect(
       f.store().withClaimAuthority(claim!, signal, dispatch),

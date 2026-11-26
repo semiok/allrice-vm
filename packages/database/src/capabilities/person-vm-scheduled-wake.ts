@@ -362,10 +362,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
       signal.throwIfAborted();
       const dedicated = createDedicatedDatabase(sql);
       const disconnected = new AbortController();
-      dedicated.options.onclose = () =>
-        disconnected.abort(
-          new Error('SCHEDULE_WAKE_AUTHORITY_CONNECTION_LOST'),
-        );
+      let closing = false;
+      dedicated.options.onclose = () => {
+        if (!closing)
+          disconnected.abort(
+            new Error('SCHEDULE_WAKE_AUTHORITY_CONNECTION_LOST'),
+          );
+      };
       const active = AbortSignal.any([signal, disconnected.signal]);
       let pending: Promise<{ value: T | null }> | undefined;
       try {
@@ -387,15 +390,22 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         const result = await joinCallerSave(transaction, () => pending);
         return result.value;
       } finally {
+        // A successful native start can return a capacity handle that retains
+        // the dispatch signal through bootstrap. Normal SQL close is not loss.
+        closing = true;
         await dedicated.end({ timeout: 5 });
       }
     },
 
     releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
       return sql.begin(async (tx) => {
-        const [row] = await tx<PlanRow[]>`update person_vm_scheduled_wakes
-          set state='waiting',claim_id=null,claim_until=null,attempts=attempts-1,
-            reason='DISPATCH_CANCELLED',updated_at=now()
+        const [row] = await tx<
+          (PlanRow & { reason: string })[]
+        >`update person_vm_scheduled_wakes
+          set state=case when revoked_at is null then 'waiting' else 'blocked' end,
+            claim_id=null,claim_until=null,attempts=attempts-1,
+            reason=case when revoked_at is null then 'DISPATCH_CANCELLED' else 'STALE_PLAN' end,
+            updated_at=now()
           where plan_id=${claim.planId} and claim_id=${claim.claimId} and state='claimed'
           returning *`;
         if (!row) return false;
@@ -404,8 +414,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           row,
           claim.claimId,
           'settle',
-          'failed',
-          'DISPATCH_CANCELLED',
+          row.state === 'blocked' ? 'denied' : 'failed',
+          row.reason,
         );
         return true;
       });
