@@ -1,5 +1,6 @@
 import type { RequestContext } from '@allrice/contracts';
 import type { PersonVmActivity, PersonVmBinding } from './contract.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 export const PERSON_VM_ADMISSION_CONTRACT_VERSION = 1 as const;
 
@@ -180,13 +181,29 @@ export interface PersonVmNativeActivityPort {
   ): Promise<PersonVmAdmissionSubscription>;
 }
 
-/** Trusted host callback, used while the exact physical lifecycle lease is
- * held. The context's requestId is also the successful stop audit ID. */
-export type PersonVmPrepareIdleStop = (
-  request: Readonly<{
-    binding: PersonVmBinding;
-    context: RequestContext;
+export type PersonVmIdleStopSource = Readonly<
+  { binding: PersonVmBinding } & (
+    | { context: RequestContext }
+    | { requestId: string; scheduledRoster: PersonVmWebRoster }
+  )
+>;
+
+export type PersonVmIdleStopRequest = PersonVmIdleStopSource &
+  Readonly<{
     assertStopCurrent(signal: AbortSignal): Promise<void>;
-  }>,
+  }>;
+
+/** Trusted host callback, used while the exact physical lifecycle lease is
+ * held. The request ID is also the successful stop audit ID. */
+export type PersonVmPrepareIdleStop = (
+  request: PersonVmIdleStopRequest,
   signal: AbortSignal,
 ) => Promise<{ ok: true; nextWakeAt: string | null } | { blocked: true }>;
+
+/** Host only. A roster is usable only on the exact locally owned generation
+ * that completed scheduled startup and while all profiles are still eligible. */
+export type PersonVmScheduledIdleAuthority = (
+  binding: PersonVmBinding,
+  roster: PersonVmWebRoster,
+  signal: AbortSignal,
+) => Promise<void>;

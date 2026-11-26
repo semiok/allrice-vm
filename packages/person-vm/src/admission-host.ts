@@ -22,8 +22,10 @@ import type {
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
   PersonVmIdleCoverage,
+  PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
+  PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import {
   type PostgresPersonVmAdmissionStore,
@@ -40,6 +42,7 @@ import {
   type VmLease,
   type VmRecord,
 } from './store.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
   context: RequestContext;
@@ -124,9 +127,10 @@ export class PersonVmAdmissionHost
       nativeActivity?: PersonVmNativeActivityPort;
       activityMaxAgeMs: number;
       prepareIdleStop?: PersonVmPrepareIdleStop;
+      assertScheduledIdleCurrent?: PersonVmScheduledIdleAuthority;
       recoverIdleStop(
-        context: RequestContext,
         binding: PersonVmBinding,
+        assertAuthority: (signal: AbortSignal) => Promise<void>,
         signal: AbortSignal,
       ): Promise<boolean>;
       idleStopped(binding: PersonVmBinding): void;
@@ -142,7 +146,7 @@ export class PersonVmAdmissionHost
       ): Promise<PersonVmView>;
       assertStopSafe(lease: VmLease, signal: AbortSignal): Promise<void>;
       stopIdleOwned(
-        context: RequestContext,
+        requestId: string,
         lease: VmLease,
         signal: AbortSignal,
         assertStopCurrent: (signal: AbortSignal) => Promise<void>,
@@ -1222,10 +1226,45 @@ export class PersonVmAdmissionHost
     binding: PersonVmBinding,
     signal: AbortSignal,
   ) {
-    await this.authorize(context, binding, signal);
+    return this.reconcileOwnedIdle(
+      { binding, context },
+      (active) => this.authorize(context, binding, active),
+      signal,
+    );
+  }
+
+  async reconcileScheduledIdle(
+    binding: PersonVmBinding,
+    scheduledRoster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ) {
+    const assertCurrent = this.options.assertScheduledIdleCurrent;
+    if (!assertCurrent) throw new PersonVmError('AUTHORIZATION_DENIED');
+    return this.reconcileOwnedIdle(
+      { binding, requestId: randomUUID(), scheduledRoster },
+      (active) => assertCurrent(binding, scheduledRoster, active),
+      signal,
+    );
+  }
+
+  private async reconcileOwnedIdle(
+    request: PersonVmIdleStopSource,
+    assertAuthority: (signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal,
+  ) {
+    const { binding } = request;
+    const requestId =
+      'context' in request ? request.context.requestId : request.requestId;
+    try {
+      await assertAuthority(signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      if ('scheduledRoster' in request) this.idle.delete(binding.personId);
+      throw error;
+    }
     if (
       this.options.prepareIdleStop &&
-      (await this.options.recoverIdleStop(context, binding, signal))
+      (await this.options.recoverIdleStop(binding, assertAuthority, signal))
     ) {
       this.idle.delete(binding.personId);
       return;
@@ -1256,7 +1295,7 @@ export class PersonVmAdmissionHost
             const assertStopCurrent = async (probe: AbortSignal) => {
               const checking = AbortSignal.any([active, probe]);
               await owned.guard();
-              await this.authorize(context, binding, checking);
+              await assertAuthority(checking);
               const latest = await this.readIdleCandidate(
                 binding,
                 owned.row,
@@ -1271,21 +1310,16 @@ export class PersonVmAdmissionHost
               checking.throwIfAborted();
             };
             await assertStopCurrent(active);
-            const plan = await prepare(
-              { context, binding, assertStopCurrent },
-              active,
-            );
+            const preparation = { ...request, assertStopCurrent };
+            const plan = await prepare(preparation, active);
             if (!('ok' in plan) || plan.ok !== true) return;
             await this.options.stopIdleOwned(
-              context,
+              requestId,
               owned,
               active,
               async (probe) => {
                 await assertStopCurrent(probe);
-                const checked = await prepare(
-                  { context, binding, assertStopCurrent },
-                  probe,
-                );
+                const checked = await prepare(preparation, probe);
                 if (
                   !('ok' in checked) ||
                   checked.nextWakeAt !== plan.nextWakeAt

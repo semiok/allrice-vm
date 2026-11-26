@@ -613,6 +613,9 @@ suite(
       'commit-ack-lost',
       'native-proof-rejected',
       'relogin',
+      'system-ok',
+      'system-revoked',
+      'system-unknown',
     ] as const)(
       'idle wake preparation and stop under one physical lease: %s',
       async (outcome) => {
@@ -677,6 +680,15 @@ suite(
         });
         const { rc, binding } = await running({ ...h, service });
         let attempt = { ...rc, requestId: randomUUID() };
+        const scheduled = outcome.startsWith('system-');
+        const scheduledRoster = {
+          ...binding,
+          entries: [],
+          digest: 'system-fixture',
+        };
+        let scheduledRequestId: string | undefined;
+        let scheduledAuthority = true;
+        if (scheduled) invalidSession = rc.sessionId;
         const since = h.now().toISOString();
         const wakeAt = new Date(h.now().getTime() + 60 * 60_000);
         const wake = createPostgresPersonVmScheduledWakeStore(db);
@@ -697,6 +709,12 @@ suite(
           openSql: open,
           idleMs: 5 * 60_000,
           monotonic: () => mono,
+          async assertScheduledIdleCurrent(current, roster) {
+            expect(current).toEqual(binding);
+            expect(roster).toBe(scheduledRoster);
+            if (!scheduledAuthority)
+              throw new PersonVmError('AUTHORIZATION_DENIED');
+          },
           nativeActivity: {
             async observe(current) {
               const observedAt = h.now().toISOString();
@@ -704,7 +722,7 @@ suite(
                 activity: {
                   binding: current,
                   observedAt,
-                  state: 'known',
+                  state: outcome === 'system-unknown' ? 'unknown' : 'known',
                   activeTurns: 0,
                   activeJobs: runningJobs,
                   activeSubtasks: 0,
@@ -729,7 +747,15 @@ suite(
               ? undefined
               : async (request, active) => {
                   prepared++;
-                  expect(request.context.requestId).toBe(attempt.requestId);
+                  if ('context' in request) {
+                    expect(scheduled).toBe(false);
+                    expect(request.context.requestId).toBe(attempt.requestId);
+                  } else {
+                    expect(scheduled).toBe(true);
+                    expect(request.scheduledRoster).toBe(scheduledRoster);
+                    scheduledRequestId ??= request.requestId;
+                    expect(request.requestId).toBe(scheduledRequestId);
+                  }
                   expect(request.binding).toEqual(binding);
                   expect(await store.read(binding.personId)).toMatchObject({
                     leaseOwner: expect.any(String),
@@ -743,6 +769,7 @@ suite(
                     ),
                   ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
                   await request.assertStopCurrent(active);
+                  if (outcome === 'system-revoked') scheduledAuthority = false;
                   if (outcome === 'changed') revision = 'new-native-work';
                   if (
                     outcome === 'blocked' ||
@@ -763,10 +790,14 @@ suite(
                   return { ok: true, nextWakeAt: null };
                 },
         });
-        await host.reconcileIdle(attempt, binding, signal());
+        const reconcileOwned = () =>
+          scheduled
+            ? host.reconcileScheduledIdle(binding, scheduledRoster, signal())
+            : host.reconcileIdle(attempt, binding, signal());
+        await reconcileOwned();
         mono += 5 * 60_000 - 1;
         h.advance(mono);
-        await host.reconcileIdle(attempt, binding, signal());
+        await reconcileOwned();
         expect(prepared).toBe(0);
         mono++;
         h.advance(1);
@@ -791,12 +822,16 @@ suite(
             check (action<>'stop.idle-dispatch' or result<>'succeeded')`;
         loseAcknowledgement = outcome === 'commit-ack-lost';
         try {
-          const reconcile = host.reconcileIdle(attempt, binding, signal());
+          const reconcile = reconcileOwned();
           if (
             ['changed', 'mount-change', 'wake-plan-changed'].includes(outcome)
           )
             await expect(reconcile).rejects.toMatchObject({
               code: 'ACTIVITY_UNKNOWN',
+            });
+          else if (outcome === 'system-revoked')
+            await expect(reconcile).rejects.toMatchObject({
+              code: 'AUTHORIZATION_DENIED',
             });
           else if (recovering || nativeProofRejected)
             await expect(reconcile).rejects.toBeInstanceOf(Error);
@@ -891,11 +926,18 @@ suite(
           });
           expect(await wake.claim(90_000)).toBeNull();
         }
-        const stopped = outcome === 'ok' || outcome === 'relogin' || recovering;
+        const stopped =
+          outcome === 'ok' ||
+          outcome === 'relogin' ||
+          outcome === 'system-ok' ||
+          recovering;
         const rechecked = stopped || outcome === 'wake-plan-changed';
-        const checkedOnce = ['blocked', 'changed', 'mount-change'].includes(
-          outcome,
-        );
+        const checkedOnce = [
+          'blocked',
+          'changed',
+          'mount-change',
+          'system-revoked',
+        ].includes(outcome);
         expect(prepared).toBe(rechecked ? 2 : checkedOnce ? 1 : 0);
         expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
           stopped ? 1 : 0,
@@ -914,7 +956,7 @@ suite(
           await db`select request_id, lease_epoch from person_vm_audit
           where vm_id=${binding.vmId} and action='stop' and result='succeeded'`;
         expect(success.map((row) => row.request_id)).toEqual(
-          stopped ? [attempt.requestId] : [],
+          stopped ? [scheduled ? scheduledRequestId : attempt.requestId] : [],
         );
         if (stopped)
           expect(Number(success[0]!.lease_epoch)).toBe(binding.leaseEpoch);

@@ -12,6 +12,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
+import { createProductionScheduledWake } from './production-scheduled-wake.js';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -189,6 +190,54 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
     });
   }
+
+  it('checks the scheduled-idle enrolled roster from current PG authority without a login', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await f.module().prepareStopWithWake(f.binding, planId, signal);
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+    const roster = await f.store().readClaimRoster(claim!);
+    expect(roster).not.toBeNull();
+    expect(
+      await db`select 1 from allrice_sessions where user_id=${f.binding.personId}`,
+    ).toEqual([]);
+    const catalog = vi.fn();
+    const host = createProductionScheduledWake({
+      startup: { catalog },
+      database: db,
+      lifetime: signal,
+      source: { start: f.start, assertDeliverable: vi.fn() },
+    });
+    try {
+      const current = {
+        ...f.binding,
+        instanceId: randomUUID(),
+        leaseEpoch: f.binding.leaseEpoch + 1,
+      };
+      await expect(
+        host.assertScheduledIdleCurrent(current, roster!, signal),
+      ).resolves.toBeUndefined();
+      await expect(
+        host.assertScheduledIdleCurrent(
+          { ...current, personId: randomUUID() },
+          roster!,
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      await db`update allrice_settings
+        set value=jsonb_set(value,'{selections}','[]')
+        where key='d_entry_rollout_policy'`;
+      await expect(
+        host.assertScheduledIdleCurrent(current, roster!, signal),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      expect(catalog).not.toHaveBeenCalled();
+    } finally {
+      await host.close();
+    }
+  });
 
   it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
     const f = await fixture();

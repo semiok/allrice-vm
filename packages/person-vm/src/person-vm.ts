@@ -28,6 +28,7 @@ import {
 import type {
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
+  PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import type { PersonVmSqlFactory } from './store.ts';
 import type { PersonVmDiskPort } from './encrypted-disk.ts';
@@ -121,6 +122,10 @@ export class PersonVmService
         binding: PersonVmBinding,
         context?: RequestContext,
       ) => void;
+      observeScheduledStart?: (
+        binding: PersonVmBinding,
+        roster: PersonVmWebRoster,
+      ) => void;
       observeOwnedAccess?: (
         binding: PersonVmBinding,
         context: RequestContext,
@@ -159,6 +164,7 @@ export class PersonVmService
     idleMs?: number;
     nativeActivity?: PersonVmNativeActivityPort;
     prepareIdleStop?: PersonVmPrepareIdleStop;
+    assertScheduledIdleCurrent?: PersonVmScheduledIdleAuthority;
     monotonic?: () => number;
   }) {
     if (this.admissionHost) throw new PersonVmError('LEASE_CONFLICT');
@@ -174,8 +180,8 @@ export class PersonVmService
       leaseTtlMs: this.options.leaseTtlMs,
       activityMaxAgeMs: this.options.activityMaxAgeMs,
       now: this.now,
-      recoverIdleStop: (context, binding, signal) =>
-        this.recoverIdleStop(context, binding, signal),
+      recoverIdleStop: (binding, assertAuthority, signal) =>
+        this.recoverIdleStop(binding, assertAuthority, signal),
       idleStopped: (binding) => this.options.observeOwnedStop?.(binding),
       startOwned: async (context, lease, signal) => {
         await this.identity(context, 'start', signal);
@@ -201,20 +207,14 @@ export class PersonVmService
           this.stopOwned(context, lease, signal, true),
         );
       },
-      stopIdleOwned: async (context, lease, signal, assertStopCurrent) => {
+      stopIdleOwned: async (requestId, lease, signal, assertStopCurrent) => {
         const row = this.required(lease.row);
-        const identity = await this.identity(context, 'read', signal);
-        if (
-          row.phase !== 'running' ||
-          row.holds.length ||
-          identity.personId !== row.personId ||
-          identity.organizationId !== row.organizationId
-        )
+        if (row.phase !== 'running' || row.holds.length)
           throw new PersonVmError('ACTIVITY_UNKNOWN');
-        await lease.guard();
+        await assertStopCurrent(signal);
         signal.throwIfAborted();
-        return this.commitStop(context, lease, row, {
-          requestId: context.requestId,
+        return this.commitStop(requestId, lease, row, {
+          requestId,
           signal,
           assertCurrent: assertStopCurrent,
         });
@@ -848,6 +848,7 @@ export class PersonVmService
       if (scheduled) {
         if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
         await scheduled.withCurrentAuthority(roster.digest, signal, publish);
+        this.options.observeScheduledStart?.(binding, roster);
       } else await publish(signal);
       return view(row, !scheduled);
     } catch (error) {
@@ -1245,22 +1246,22 @@ export class PersonVmService
     if (row.phase === 'starting') throw new PersonVmError('ACTIVITY_UNKNOWN');
     if ((row.phase === 'cold' || row.phase === 'stopped') && !row.egressReceipt)
       return view(row);
-    return this.commitStop(context, lease, row);
+    return this.commitStop(context.requestId, lease, row);
   }
   private async commitStop(
-    context: RequestContext,
+    requestId: string,
     lease: VmLease,
     row: VmRecord,
     idle?: IdleStopGuard,
   ) {
     await lease.audit(row, {
-      requestId: context.requestId,
+      requestId,
       action: 'stop',
       result: 'started',
     });
     try {
       const stoppedAudit: VmAudit = {
-        requestId: context.requestId,
+        requestId,
         action: 'stop',
         result: 'succeeded',
       };
@@ -1273,7 +1274,7 @@ export class PersonVmService
       return view(row);
     } catch (error) {
       await lease.audit(row, {
-        requestId: context.requestId,
+        requestId,
         action: 'stop',
         result: 'failed',
         errorCode: safeError(error).code,
@@ -1561,8 +1562,8 @@ export class PersonVmService
   }
 
   private async recoverIdleStop(
-    context: RequestContext,
     binding: PersonVmBinding,
+    assertAuthority: (signal: AbortSignal) => Promise<void>,
     signal: AbortSignal,
   ) {
     const store = this.options.store;
@@ -1587,10 +1588,7 @@ export class PersonVmService
       const row = this.required(lease.row);
       if (!row.instanceId || !sameVmBinding(bindingOf(row), binding))
         throw new PersonVmError('LEASE_LOST');
-      const identity = await this.identity(context, 'read', current);
-      if (identity.personId !== row.personId)
-        throw new PersonVmError('AUTHORIZATION_DENIED');
-      this.checkOrganization(row, identity.organizationId);
+      await assertAuthority(current);
       await lease.assertAdmissionOpen(true);
       await lease.guard();
       const latest = await lease.idleStopReceipt?.(binding);

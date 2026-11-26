@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { addAbortListener } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { UuidSchema, type RequestContext } from '@allrice/contracts';
+import { UuidSchema } from '@allrice/contracts';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
@@ -12,6 +12,8 @@ import {
 import {
   PersonVmError,
   type PersonVmBinding,
+  type PersonVmIdleStopRequest,
+  type PersonVmScheduledIdleAuthority,
   type PersonVmService,
 } from '@allrice/person-vm';
 import type {
@@ -32,12 +34,7 @@ type CapturedProfile = Awaited<
   ReturnType<WakeOptions['capture']>
 >['profiles'][number];
 
-export type PersonVmWakePreparation = Readonly<{
-  binding: PersonVmBinding;
-  context: RequestContext;
-  /** The stop owner checks its exact lease and still-current native stop facts. */
-  assertStopCurrent(signal: AbortSignal): Promise<void>;
-}>;
+export type PersonVmWakePreparation = PersonVmIdleStopRequest;
 
 /** Internal authorization and retained startup, independent of login. */
 export type ProductionScheduledWakeSource = Readonly<{
@@ -177,12 +174,16 @@ export function createProductionScheduledWake(input: {
     request: PersonVmWakePreparation,
     signal: AbortSignal,
   ): Promise<PrepareStopWithWakeResult> {
-    const { context, binding } = request;
+    const { binding } = request;
+    const context = 'context' in request ? request.context : undefined;
+    const requestId =
+      'context' in request ? request.context.requestId : request.requestId;
     if (
-      context.actor.type !== 'user' ||
-      context.actor.id !== binding.personId ||
-      context.organizationId !== binding.organizationId ||
-      !UuidSchema.safeParse(context.requestId).success
+      (context &&
+        (context.actor.type !== 'user' ||
+          context.actor.id !== binding.personId ||
+          context.organizationId !== binding.organizationId)) ||
+      !UuidSchema.safeParse(requestId).success
     )
       return { blocked: true, reason: 'SCHEDULE_OBSERVATION_UNAVAILABLE' };
 
@@ -191,10 +192,10 @@ export function createProductionScheduledWake(input: {
         async function readCatalogs(signal: AbortSignal) {
           signal.throwIfAborted();
           await request.assertStopCurrent(signal);
-          const roster = await readPersonNativeWebRoster(
-            context,
-            input.database,
-          );
+          const roster =
+            'context' in request
+              ? await readPersonNativeWebRoster(request.context, input.database)
+              : request.scheduledRoster;
           signal.throwIfAborted();
           if (
             roster.personId !== binding.personId ||
@@ -296,10 +297,28 @@ export function createProductionScheduledWake(input: {
         };
       }),
     );
-    return engine.prepareStopWithWake(binding, context.requestId, signal);
+    return engine.prepareStopWithWake(binding, requestId, signal);
   }
 
+  const assertScheduledIdleCurrent: PersonVmScheduledIdleAuthority = async (
+    binding,
+    expected,
+    caller,
+  ) => {
+    const signal = AbortSignal.any([caller, lifetime]);
+    signal.throwIfAborted();
+    if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+    const roster = await input.database.begin(
+      'isolation level repeatable read read only',
+      (tx) => readPersonVmWakeRoster(tx, binding, expected.entries),
+    );
+    signal.throwIfAborted();
+    if (paused || roster?.digest !== expected.digest)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+  };
+
   return {
+    assertScheduledIdleCurrent,
     prepareStopWithWake(request: PersonVmWakePreparation, caller: AbortSignal) {
       const signal = AbortSignal.any([caller, lifetime]);
       signal.throwIfAborted();
