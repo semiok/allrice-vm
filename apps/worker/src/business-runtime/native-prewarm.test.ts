@@ -816,7 +816,7 @@ it('uses both the selected editor proof and physical Host readiness on the real 
     code: 'START_UNAVAILABLE',
   });
   expect(ping).toHaveBeenCalledTimes(2);
-  expect(proof).toHaveBeenCalledTimes(3);
+  expect(proof).toHaveBeenCalledTimes(2);
   expect(f.start).toHaveBeenCalledTimes(1);
   expect(f.stop).not.toHaveBeenCalled();
 });

@@ -565,6 +565,9 @@ export class PersonVmService
       row.phase === 'starting' ||
       row.egressReceipt
     ) {
+      // Confirm the ticket before taking responsibility for the prior
+      // generation. Once reconciliation starts its owned cleanup must finish.
+      if (assertAuthority) await assertAuthority(signal);
       if ((await this.takeoverSafe(row, signal, lease)).state !== 'ready')
         throw new PersonVmError('PROVIDER_FAILED');
       if (
@@ -726,6 +729,9 @@ export class PersonVmService
         action: 'start',
         result: 'succeeded',
       });
+      // The persisted running row still holds this lease and cannot be used
+      // by the running entrypoints until the admitted authority is confirmed.
+      if (assertAuthority) await assertAuthority(signal);
       return view(row, true);
     } catch (error) {
       const failure = safeError(error);

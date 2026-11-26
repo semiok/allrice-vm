@@ -359,26 +359,11 @@ export function createDEntryNativePrewarmPort(input: {
         active.throwIfAborted();
         // Enrol a newly eligible employee on a live Host before the running
         // branch checks VM-wide readiness. A cold Host follows normal startup.
-        if (plan?.running && prove) {
-          try {
-            await prove(context, identity, active);
-          } catch (error) {
-            active.throwIfAborted();
-            if (
-              !(error instanceof DEntryNativeUnavailable) &&
-              !(
-                error instanceof PersonVmError &&
-                [
-                  'NOT_FOUND',
-                  'LEASE_CONFLICT',
-                  'LEASE_LOST',
-                  'RUNTIME_NOT_READY',
-                ].includes(error.code)
-              )
-            )
-              throw error;
-          }
-        } else if (!plan && input.requireEditorProof && prove) {
+        const runningProof = plan?.running
+          ? await prove?.(context, identity, active)
+          : undefined;
+        runningProof?.throwIfAborted();
+        if (!plan && input.requireEditorProof && prove) {
           try {
             await prove(context, identity, active);
           } catch (error) {
@@ -475,7 +460,7 @@ export function createDEntryNativePrewarmPort(input: {
           };
           let proof: AbortSignal | undefined;
           try {
-            proof = await prove?.(context, identity, active);
+            proof = runningProof ?? (await prove?.(context, identity, active));
           } catch (error) {
             active.throwIfAborted();
             const missingOwner =
@@ -492,6 +477,7 @@ export function createDEntryNativePrewarmPort(input: {
           }
           if (!(await sameGeneration())) return;
           active.throwIfAborted();
+          proof?.throwIfAborted();
           return { proof };
         }
         if (warmed && (plan || ticket?.started || warmed.generation)) {

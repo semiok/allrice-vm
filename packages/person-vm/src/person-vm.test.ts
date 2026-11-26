@@ -133,6 +133,90 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       expect(h.active.size).toBe(0);
     },
   );
+  it('cleans up a running row if the admitted grant changes while saving it under the lease', async () => {
+    const store = new MemoryStore(),
+      h = harness(store),
+      rc = context();
+    let valid = true,
+      sawOwnedPublication = false;
+    const withLease = store.withLease.bind(store);
+    vi.spyOn(store, 'withLease').mockImplementation((id, options, work) =>
+      withLease(id, options, (lease) =>
+        work({
+          ...lease,
+          async save(row) {
+            await lease.save(row);
+            if (row.phase === 'running') {
+              sawOwnedPublication = !!(await store.read(id))?.leaseOwner;
+              valid = false;
+            }
+          },
+        }),
+      ),
+    );
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: null,
+            instanceId: null,
+            leaseEpoch: 1,
+            async assertAuthority() {
+              if (!valid) throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(sawOwnedPublication).toBe(true);
+    const saved = (await store.read(rc.actor.id))!;
+    expect(saved).toMatchObject({
+      phase: 'stopped',
+      leaseOwner: null,
+      egressReceipt: null,
+    });
+    expect(h.states.get(saved.vmId)).toBe('stopped');
+    expect(h.mounts.size).toBe(0);
+    expect(h.active.size).toBe(0);
+  });
+  it('checks the admitted authority before taking responsibility for an interrupted generation', async () => {
+    const store = new MemoryStore(),
+      h = harness(store);
+    const { rc, binding } = await running(h);
+    const previous = store.rows.get(rc.actor.id)!;
+    store.rows.set(rc.actor.id, { ...previous, phase: 'failed' });
+    h.states.set(binding.vmId, 'stopped');
+    const before = h.log.slice();
+    let checks = 0;
+    await expect(
+      h.service.prewarm(
+        rc,
+        {
+          trigger: 'page',
+          target: {
+            vmId: binding.vmId,
+            instanceId: null,
+            leaseEpoch: binding.leaseEpoch + 1,
+            async assertAuthority() {
+              // Create and initial start checks finish before the revision changes.
+              if (++checks > 2) throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          },
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(h.log).toEqual(before);
+    expect(await store.read(rc.actor.id)).toMatchObject({
+      phase: 'failed',
+      leaseOwner: null,
+      egressReceipt: previous.egressReceipt,
+    });
+    expect(h.active.size).toBe(1);
+  });
   it('never restores a retained disk when a prewarm planned before deletion reaches the lease', async () => {
     const h = harness(),
       rc = context();
