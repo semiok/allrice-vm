@@ -5,11 +5,11 @@ set local lock_timeout = '5s';
 set local statement_timeout = '30s';
 
 -- This packet only accepts the private cluster created by rehearse.py.
-create temporary table reset_input (organization uuid, person uuid, policy_format text);
+create temporary table reset_input (organization uuid, person uuid, policy_format text) on commit drop;
 insert into reset_input values (:'organization', :'person', :'policy_format');
 
-create temporary table reset_rows (relation oid, location tid, primary key (relation, location));
-create temporary table reset_edges as
+create temporary table reset_rows (relation oid, location tid, primary key (relation, location)) on commit drop;
+create temporary table reset_edges on commit drop as
 select c.confrelid as parent, c.conrelid as child,
   string_agg(format('child.%I = parent.%I', a.attname, b.attname), ' and ' order by k.n) as predicate
 from pg_constraint c
@@ -24,6 +24,7 @@ declare
   target reset_input%rowtype;
   edge record;
   item record;
+  guard record;
   old_policy jsonb;
   new_policy jsonb;
   retained jsonb;
@@ -173,12 +174,22 @@ begin
     raise exception 'unsupported rollout format';
   end if;
 
-  -- Exact deletion-only exceptions exercised only on the disposable restore.
-  -- FKs and every other trigger stay enabled; the transaction restores the original four.
-  alter table allrice_employee_instance_revisions disable trigger employee_instance_revision_immutable;
-  alter table allrice_employee_versions disable trigger allrice_employee_versions_no_delete;
-  alter table allrice_employee_runs disable trigger allrice_employee_runs_no_delete;
-  alter table allrice_employee_run_steps disable trigger allrice_employee_run_steps_no_delete;
+  -- Only these reviewed non-FK guards on the disposable restore may be
+  -- paused. Unfamiliar modes fail closed instead of silently changing them.
+  create temporary table reset_guards (relation regclass, name name) on commit drop;
+  insert into reset_guards values
+    ('allrice_employee_instance_revisions', 'employee_instance_revision_immutable'),
+    ('allrice_employee_versions', 'allrice_employee_versions_no_delete'),
+    ('allrice_employee_runs', 'allrice_employee_runs_no_delete'),
+    ('allrice_employee_run_steps', 'allrice_employee_run_steps_no_delete');
+  for guard in select * from reset_guards loop
+    if not exists (select 1 from pg_trigger where tgrelid = guard.relation
+      and tgname = guard.name and not tgisinternal and tgenabled = 'O'
+      and (tgtype & 8) <> 0) then
+      raise exception 'unexpected deletion guard: %', guard.name;
+    end if;
+    execute format('alter table %s disable trigger %I', guard.relation, guard.name);
+  end loop;
   loop
     total := 0;
     for item in select distinct relation from reset_rows loop
@@ -197,10 +208,9 @@ begin
     exit when not exists (select 1 from reset_rows);
     if total = 0 then raise exception 'dependency cycle or blocked delete'; end if;
   end loop;
-  alter table allrice_employee_run_steps enable trigger allrice_employee_run_steps_no_delete;
-  alter table allrice_employee_runs enable trigger allrice_employee_runs_no_delete;
-  alter table allrice_employee_versions enable trigger allrice_employee_versions_no_delete;
-  alter table allrice_employee_instance_revisions enable trigger employee_instance_revision_immutable;
+  for guard in select * from reset_guards loop
+    execute format('alter table %s enable trigger %I', guard.relation, guard.name);
+  end loop;
 
   if retained is distinct from old_policy->'selections' then
     new_policy := jsonb_set(jsonb_set(old_policy,'{selections}',retained),'{revision}',to_jsonb(gen_random_uuid()));

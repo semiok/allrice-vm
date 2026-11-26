@@ -4,9 +4,11 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 
 
@@ -169,7 +171,7 @@ def exercise(socket_path, dump):
     old_policy = json.loads(sql(TARGET, policy_query).stdout)
     trigger_query = """
 select json_agg(json_build_array(tgrelid::regclass,tgname,tgenabled) order by tgrelid::regclass::text,tgname)
-from pg_trigger where not tgisinternal;
+from pg_trigger;
 """
     triggers = sql(TARGET, trigger_query).stdout
     assert len(before) > 200 and len(before) == len(expected)
@@ -208,6 +210,21 @@ update allrice_settings set value=jsonb_set(value,'{selections,1}',(value->'sele
     sql(TARGET, "update allrice_runs set owner_id=:'person' where id=:'person';")
     assert snapshot(sql) == before
 
+    sql(TARGET, """
+create function pg_temp_marker() returns trigger language plpgsql as $$
+begin
+  raise exception 'synthetic late delete failure';
+end $$;
+create trigger synthetic_fail_delete before delete on allrice_employee_assignments
+for each row execute function pg_temp_marker();
+""")
+    guarded_triggers = sql(TARGET, trigger_query).stdout
+    late_failure = sql(TARGET, packet, policy_format='person', suppress=True)
+    assert late_failure.returncode and 'synthetic late delete failure' in late_failure.stderr
+    assert snapshot(sql) == before and sql(TARGET, trigger_query).stdout == guarded_triggers
+    assert json.loads(sql(TARGET, policy_query).stdout) == old_policy
+    sql(TARGET, "drop trigger synthetic_fail_delete on allrice_employee_assignments; drop function pg_temp_marker();")
+
     sql(TARGET, packet, policy_format='person')
     assert snapshot(sql) == expected
     assert sql(TARGET, trigger_query).stdout == triggers
@@ -241,20 +258,38 @@ def main():
     signal.signal(signal.SIGINT, interrupted)
     # No host/database arguments, no fallback to DATABASE_URL or the test PG
     # service. The data directory, Unix socket and dump are all temporary.
-    with tempfile.TemporaryDirectory(prefix='snowpg-', dir='/tmp') as directory:
-        root = Path(directory)
+    root = Path(tempfile.mkdtemp(prefix='snowpg-', dir='/tmp'))
+    pgdata = root / 'pg'
+    server = None
+    try:
         passfile = root / 'pgpass'
         passfile.touch(mode=0o600)
         PG_ENV['PGPASSFILE'] = str(passfile)
-        pgdata = root / 'pg'
         run(['initdb', '-D', str(pgdata), '-U', 'snow_rehearsal', '-A', 'trust', '-E', 'UTF8'])
-        try:
-            run(['pg_ctl', '-D', str(pgdata), '-l', str(root / 'postgres.log'),
-                 '-o', f"-c listen_addresses='' -p 5432 -k {root}", '-w', 'start'])
-            exercise(root, root / 'synthetic.dump')
-        finally:
-            if (pgdata / 'postmaster.pid').exists():
-                run(['pg_ctl', '-D', str(pgdata), '-m', 'immediate', '-w', 'stop'])
+        with (root / 'postgres.log').open('wb') as log:
+            server = subprocess.Popen(
+                ['postgres', '-D', str(pgdata), '-c', 'listen_addresses=', '-p', '5432', '-k', str(root)],
+                env=PG_ENV, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            )
+        deadline = time.monotonic() + 15
+        while run(['pg_isready', '-q', '-h', str(root), '-p', '5432', '-t', '1',
+                   '-U', 'snow_rehearsal', '-d', 'postgres'], suppress=True).returncode:
+            if server.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError('private PostgreSQL failed readiness')
+            time.sleep(0.1)
+        exercise(root, root / 'synthetic.dump')
+    finally:
+        if server is not None and server.poll() is None:
+            server.send_signal(signal.SIGINT)  # PostgreSQL fast shutdown and join.
+            try:
+                server.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                server.send_signal(signal.SIGQUIT)
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(f'PostgreSQL shutdown incomplete; retained private directory {root}') from None
+        shutil.rmtree(root)
     print('Private PostgreSQL stopped; socket, dump and data directory released', flush=True)
 
 
