@@ -38,6 +38,11 @@ async function fixture(run) {
     const seal = async (selection = config, extra = []) => {
       const originals = [
         [configPath, 'worker', JSON.stringify(selection, null, 2)],
+        [
+          'apps/worker/dist/linux-service-manager.mjs',
+          'worker',
+          '// mount checker',
+        ],
         ['apps/worker/dist/index.js', 'worker', '// worker'],
         ['apps/web/server.mjs', 'web', '// web'],
         ['apps/web/.next/BUILD_ID', 'web', 'fixture-build'],
@@ -131,6 +136,12 @@ test('refuses stale digests, modified bytes, path aliases and wrong platform', a
       '// changed entry',
     );
     await expect(readLinuxRelease(root, original)).rejects.toThrow(/changed/);
+    const checkSeal = await seal();
+    await writeFile(
+      join(root, 'apps/worker/dist/linux-service-manager.mjs'),
+      '// changed checker',
+    );
+    await expect(readLinuxRelease(root, checkSeal)).rejects.toThrow(/changed/);
     const macSeal = await seal({ ...config, platform: 'darwin/arm64' });
     await expect(readLinuxRelease(root, macSeal)).rejects.toThrow(
       /Linux service/,

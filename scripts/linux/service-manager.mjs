@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const sealPath = '.local/dev-build-identity.json';
 const configPath = 'apps/worker/dist/linux-service-config.json';
+const mountCheckPath = 'apps/worker/dist/linux-service-manager.mjs';
 const unitNames = ['allrice40-worker.service', 'allrice40-web.service'];
 const sha = /^[0-9a-f]{40}$/;
 const sha256 = /^sha256:[0-9a-f]{64}$/;
@@ -75,6 +76,7 @@ export async function readLinuxRelease(root, expectedDigest) {
   let config;
   for (const [path, scope] of [
     [configPath, 'worker'],
+    [mountCheckPath, 'worker'],
     ['apps/worker/dist/index.js', 'worker'],
     ['apps/web/server.mjs', 'web'],
   ]) {
@@ -155,7 +157,7 @@ export function renderUnits({ root, sourceSha, config }) {
         `WorkingDirectory=${dir}`,
         `EnvironmentFile=/etc/allrice40/${role}.env`,
         ...extra,
-        `ExecStartPre=${config.node} ${root}/scripts/linux/service-manager.mjs check-mount ${config.dataMount} ${config.dataUuid}`,
+        `ExecStartPre=${config.node} ${root}/${mountCheckPath} check-mount ${config.dataMount} ${config.dataUuid}`,
         `ExecStart=/usr/bin/env NODE_ENV=production ALLRICE_RELEASE_SHA=${sourceSha} ALLRICE_STORAGE_ROOT=${config.dataMount}/storage ${command}`,
         'KillMode=mixed',
         'SendSIGKILL=no',
