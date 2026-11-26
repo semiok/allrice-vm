@@ -54,6 +54,11 @@ suite('4.0 browser cold entry', () => {
           write: false,
           outdir: '/employee-entry-test',
           jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+          },
         });
       const firstRetry = deferred<ServerResponse>();
       const retryClosed = deferred<void>();
@@ -172,11 +177,24 @@ suite('4.0 browser cold entry', () => {
       closes.push(() => browser.close());
       const context = await browser.newContext({
         viewport: { width: 390, height: 844 },
+        reducedMotion: 'no-preference',
       });
       await context.addCookies([
         { name: 'allrice_session', value: sessionToken, url: f.origin },
       ]);
       const page = await context.newPage();
+      const status = page.getByRole('status');
+      const spinner = status.locator('[data-state="ongoing"]');
+      async function assertWaiting(title: string, description: string) {
+        await status
+          .getByRole('heading', { name: title, exact: true })
+          .waitFor();
+        expect(
+          await status.getByText(description, { exact: true }).isVisible(),
+        ).toBe(true);
+        expect(await status.getAttribute('aria-atomic')).toBe('true');
+        expect(await spinner.getAttribute('aria-hidden')).toBe('true');
+      }
       await page.addInitScript(() => {
         if (window.top === window && !sessionStorage.getItem('entry-visible'))
           Object.defineProperty(document, 'hidden', {
@@ -187,7 +205,15 @@ suite('4.0 browser cold entry', () => {
       await page.goto(
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
-      await page.getByRole('heading', { name: '正在打开对话' }).waitFor();
+      await assertWaiting('正在打开对话', '马上就好。');
+      const animations = () =>
+        spinner.evaluate(
+          (element) => element.getAnimations({ subtree: true }).length,
+        );
+      await expect.poll(animations).toBeGreaterThan(0);
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+      await expect.poll(animations).toBe(0);
+      await assertWaiting('正在打开对话', '马上就好。');
       await page.evaluate(
         () => new Promise((painted) => requestAnimationFrame(painted)),
       );
@@ -200,8 +226,14 @@ suite('4.0 browser cold entry', () => {
       });
       await page
         .getByRole('alert')
-        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
+      expect(
+        await page
+          .getByRole('alert')
+          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .isVisible(),
+      ).toBe(true);
       expect(births).toEqual([]);
       await page.getByRole('button', { name: '重试' }).click();
       const held = await firstRetry.promise;
@@ -235,14 +267,20 @@ suite('4.0 browser cold entry', () => {
       expect(documents).toEqual([]);
       await page.getByRole('button', { name: '继续' }).click();
       try {
-        await page.getByRole('heading', { name: '已接受启动请求' }).waitFor();
-        await page.getByRole('heading', { name: '正在启动工作台' }).waitFor();
+        await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
+        await assertWaiting(
+          '正在启动工作台',
+          '第一次启动需要一两分钟，留在这页就行。',
+        );
+        expect(
+          await page.getByRole('button', { name: '取消等待' }).isEnabled(),
+        ).toBe(true);
         expect(documents).toEqual([]);
       } finally {
         allowReady.resolve();
       }
       async function showEditor(threadId: string) {
-        await page.getByRole('heading', { name: '工作台已就绪' }).waitFor();
+        await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
         const source = new URL((await iframe.getAttribute('src'))!, f.origin);
@@ -320,9 +358,10 @@ suite('4.0 browser cold entry', () => {
         .click();
       await page
         .getByRole('alert')
-        .getByRole('heading', { name: '暂时无法打开工作台' })
+        .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
       expect(births).toHaveLength(2);
+
       await page.evaluate(() => history.back());
       await page.waitForURL((url) => url.searchParams.get('threadId') === next);
       await showEditor(next);
@@ -355,6 +394,25 @@ suite('4.0 browser cold entry', () => {
         { selection: f.selection, trigger: 'page' },
       ]);
       expect(births).toHaveLength(2);
+
+      const returnPage = await context.newPage();
+      await returnPage.route('**/api/v1/d-entry/native-prewarm', (route) =>
+        route.fulfill({ status: 503 }),
+      );
+      await returnPage.goto(
+        f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
+      );
+      const back = returnPage.getByRole('link', {
+        name: '返回员工页',
+        exact: true,
+      });
+      await back.press('Enter');
+      await returnPage.waitForURL(
+        (url) =>
+          url.pathname === '/chatflow' &&
+          url.searchParams.get('employee') === '',
+      );
+      await returnPage.close();
     },
   );
 });

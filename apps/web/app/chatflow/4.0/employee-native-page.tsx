@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
   DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
@@ -552,14 +553,11 @@ export function EmployeeNativePage({
 }
 
 const messages = {
-  warming: ['正在打开对话', '正在联系工作台。'],
-  accepted: ['已接受启动请求', '工作台启动后会自动打开对话。'],
-  starting: ['正在启动工作台', '首次启动可能需要一些时间，你可以留在这里。'],
-  opening: ['工作台已就绪', '已通过编辑器验证，正在打开对话。'],
-  failed: [
-    '暂时无法打开工作台',
-    '启动失败或等待凭据已失效。你可以返回员工页，或选择重试。',
-  ],
+  warming: ['正在打开对话', '马上就好。'],
+  accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
+  starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  opening: ['工作台已就绪', '正在打开对话。'],
+  failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
@@ -591,7 +589,9 @@ function EntryStatus({
               ? 'alert'
               : 'status'
           }
+          aria-atomic="true"
         >
+          {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
           <p>{description}</p>
         </div>
@@ -605,6 +605,9 @@ function EntryStatus({
             {status === 'cancelled' ? '继续' : '重试'}
           </button>
         )}
+        {/* The existing employee selector accepts an empty value for the
+            default workspace view. Bare /chatflow reopens 4.0 on the trial host. */}
+        {status === 'failed' && <a href="/chatflow?employee=">返回员工页</a>}
       </section>
     </div>
   );

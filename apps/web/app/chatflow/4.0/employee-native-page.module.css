@@ -29,7 +29,8 @@
   color: var(--ar-text-secondary);
 }
 
-.status button {
+.status button,
+.status a {
   margin-top: 16px;
   padding: 6px 12px;
   border: 1px solid var(--ar-border);
@@ -40,6 +41,13 @@
   cursor: pointer;
 }
 
-.status button:hover:enabled {
+.status a {
+  display: inline-block;
+  margin-inline-start: var(--ar-space-2);
+  text-decoration: none;
+}
+
+.status button:hover:enabled,
+.status a:hover {
   background: var(--ar-surface-hover);
 }
