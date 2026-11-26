@@ -381,8 +381,13 @@ it.each([
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {
       calls.push('log');
     });
-    const audit = vi.fn(() => {
+    const auditStarted = deferred<void>();
+    const auditFinished = deferred<void>();
+    const audit = vi.fn(async () => {
       calls.push('audit');
+      auditStarted.resolve(undefined);
+      await auditFinished.promise;
+      calls.push('audit-finished');
     });
     const exited = deferred<PersonVmJobExit>();
     const exit = { exitCode: 1, timedOut: false };
@@ -393,43 +398,46 @@ it.each([
       return exit;
     });
     try {
-      await expect(
-        openNativeWebOwner({
-          scope: {
+      const outcome = openNativeWebOwner({
+        scope: {
+          binding,
+          signal: new AbortController().signal,
+          assertCurrent: vi.fn().mockResolvedValue(undefined),
+          launch: vi.fn().mockResolvedValue({
             binding,
-            signal: new AbortController().signal,
-            assertCurrent: vi.fn().mockResolvedValue(undefined),
-            launch: vi.fn().mockResolvedValue({
-              binding,
-              jobId: 'fixture',
-              wait: () => exited.promise,
-              cancelAndWait,
-            }),
-            readNativeWebAuth: async () => ({
-              authenticatedUrl: origin + '?token=' + secrets.token,
-            }),
+            jobId: 'fixture',
+            wait: () => exited.promise,
+            cancelAndWait,
+          }),
+          readNativeWebAuth: async () => ({
+            authenticatedUrl: origin + '?token=' + secrets.token,
+          }),
+        },
+        launch: {
+          binding,
+          auth: {
+            dshHome: '/work/a',
+            origin,
+            nonce: secrets.nonce,
+            timeoutMs: 5000,
           },
-          launch: {
-            binding,
-            auth: {
-              dshHome: '/work/a',
-              origin,
-              nonce: secrets.nonce,
-              timeoutMs: 5000,
-            },
-            files: [],
-            command: { executable: 'node', args: [] },
-          },
-          context: { requestId } as never,
-          vm: { assertCurrentBinding: vi.fn() },
-          lifetime: lifetime.signal,
-          cleanupTimeoutMs: 3000,
-          recordStartupFailure: audit,
-        }),
-      ).rejects.toMatchObject({
+          files: [],
+          command: { executable: 'node', args: [] },
+        },
+        context: { requestId } as never,
+        vm: { assertCurrentBinding: vi.fn() },
+        lifetime: lifetime.signal,
+        cleanupTimeoutMs: 3000,
+        recordStartupFailure: audit,
+      });
+      const assertion = expect(outcome).rejects.toMatchObject({
         code: 'PROVIDER_FAILED',
         message: 'PROVIDER_FAILED',
       });
+      await auditStarted.promise;
+      expect(calls).toEqual(['log', 'audit']);
+      auditFinished.resolve(undefined);
+      await assertion;
       const fields = {
         step,
         errorType: 'HttpError',
@@ -437,7 +445,7 @@ it.each([
         httpStatus: 401,
         target,
       };
-      expect(calls).toEqual(['log', 'audit', 'cancel']);
+      expect(calls).toEqual(['log', 'audit', 'audit-finished', 'cancel']);
       expect(audit.mock.calls).toEqual([[fields]]);
       expect(warning.mock.calls).toEqual([
         [
@@ -454,6 +462,7 @@ it.each([
       for (const value of Object.values(secrets))
         expect(recorded).not.toContain(value);
     } finally {
+      auditFinished.resolve(undefined);
       lifetime.abort();
       exited.resolve(exit);
       warning.mockRestore();

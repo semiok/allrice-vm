@@ -116,6 +116,28 @@ function fixture(data: string = JSON.stringify([row('172.16.0.6')])) {
   return { bootstrap, binding, scope, command, waitProbe, readProbe };
 }
 
+it('labels a failed auth artifact read without retaining guest command output', async () => {
+  const f = fixture();
+  const native = await f.bootstrap();
+  f.command.mockRejectedValueOnce(
+    new PersonVmError('PROVIDER_FAILED', {
+      cause: Error('synthetic private native command output'),
+    }),
+  );
+  await expect(
+    native.readNativeWebAuth!({
+      dshHome: '/work/dsh',
+      origin: 'http://127.0.0.1:32179/',
+      nonce: randomUUID(),
+      timeoutMs: 3000,
+    }),
+  ).rejects.toMatchObject({
+    code: 'PROVIDER_FAILED',
+    message: 'PROVIDER_FAILED',
+    cause: 'AUTH_ARTIFACT_READ_FAILED',
+  });
+});
+
 it.each(['10.4.1.10', '172.16.0.6', '192.168.4.2'])(
   'returns exactly one current private assigned guest IPv4 %s after native wait and logs',
   async (address) => {

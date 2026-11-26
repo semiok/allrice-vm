@@ -502,7 +502,7 @@ for (const accepted of [false, true])
     ).rejects.toBeDefined();
   });
 
-it.each(['http', 'reset'] as const)(
+it.each(['http', 'invalid-upgrade', 'reset'] as const)(
   'captures the original WebSocket %s failure before reporting loss',
   async (kind) => {
     const server = createServer((_request, response) => {
@@ -514,6 +514,10 @@ it.each(['http', 'reset'] as const)(
     });
     server.on('upgrade', (_request, socket) => {
       if (kind === 'reset') socket.destroy();
+      else if (kind === 'invalid-upgrade')
+        socket.end(
+          'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: invalid\r\n\r\n',
+        );
       else
         socket.end(
           'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
@@ -528,7 +532,9 @@ it.each(['http', 'reset'] as const)(
       origin,
       new AbortController().signal,
       () => lost.resolve(),
-      (error, status) => observations.push(nativeSetupError(error, status)),
+      (error, status, failed) => {
+        if (failed) observations.push(nativeSetupError(error, status));
+      },
     );
     cleanup.push(async () => {
       await transport.close();
@@ -546,7 +552,7 @@ it.each(['http', 'reset'] as const)(
         : {
             errorType: 'HttpError',
             errorCode: 'UNEXPECTED_HTTP_RESPONSE',
-            httpStatus: 404,
+            httpStatus: kind === 'invalid-upgrade' ? 101 : 404,
           },
     ]);
   },

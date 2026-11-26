@@ -660,9 +660,9 @@ it('writes the owner diagnostic through the startup lease before the normal fail
     target: '127.0.0.1:32171',
   };
   open.mockImplementationOnce(
-    (input: Parameters<typeof openNativeWebOwner>[0]) => {
+    async (input: Parameters<typeof openNativeWebOwner>[0]) => {
       expect(input.recordStartupFailure).toBeTypeOf('function');
-      input.recordStartupFailure!(diagnostic);
+      await input.recordStartupFailure!(diagnostic);
       throw new PersonVmError('PROVIDER_FAILED');
     },
   );

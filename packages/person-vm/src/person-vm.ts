@@ -668,16 +668,12 @@ export class PersonVmService
           context,
           receipt: endpoints,
           recordNativeFailure(failure: NativeWebSetupFailure) {
-            // Dispatch before the owner starts cleanup. The lease session
-            // tracks the actual insert and joins it when the session ends.
-            void lease
-              .audit(row, {
-                requestId: context.requestId,
-                action: 'start.native-web.' + failure.step,
-                result: 'failed',
-                errorCode: JSON.stringify(failure),
-              })
-              .catch(() => {});
+            return lease.audit(row, {
+              requestId: context.requestId,
+              action: 'start.native-web.' + failure.step,
+              result: 'failed',
+              errorCode: JSON.stringify(failure),
+            });
           },
         });
         await lease.guard();

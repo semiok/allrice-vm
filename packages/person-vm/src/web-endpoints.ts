@@ -34,7 +34,7 @@ export type NativeWebSetupFailure = Readonly<{
 export type PersonVmWebStartup = Readonly<{
   context: RequestContext;
   receipt: PersonVmWebEndpointReceipt;
-  recordNativeFailure?(failure: NativeWebSetupFailure): void;
+  recordNativeFailure?(failure: NativeWebSetupFailure): Promise<void>;
 }>;
 export interface PersonVmWebRosterPort {
   prepare(

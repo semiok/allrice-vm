@@ -44,7 +44,8 @@ export function nativeSetupError(error: unknown, status?: number): Failure {
       return {
         errorType: 'PersonVmError',
         errorCode:
-          cause === 'AUTH_ARTIFACT_INVALID'
+          cause === 'AUTH_ARTIFACT_INVALID' ||
+          cause === 'AUTH_ARTIFACT_READ_FAILED'
             ? cause
             : typeof code === 'string' && vmCodes.has(code)
               ? code

@@ -20,7 +20,11 @@ export function nativeWebTransport(
   origin: string,
   signal: AbortSignal,
   lost: () => void,
-  observeFailure?: (error: unknown, httpStatus?: number) => void,
+  observeStartup?: (
+    error: unknown,
+    status: number | undefined,
+    failed: boolean,
+  ) => void,
 ) {
   const sockets = new Set<Duplex>(),
     websockets = new Set<WebSocket>();
@@ -29,9 +33,9 @@ export function nativeWebTransport(
   let cookie: string | undefined,
     indexCookie: string | undefined,
     closing = false;
-  function observe(error: unknown, status?: number) {
+  function observe(error: unknown, status?: number, failed = true) {
     try {
-      observeFailure?.(error, status);
+      observeStartup?.(error, status, failed);
     } catch {
       // Observability cannot change the native transport outcome.
     }
@@ -134,6 +138,7 @@ export function nativeWebTransport(
     input: Parameters<RpcFetch>[0],
     init: Parameters<RpcFetch>[1],
     credential: 'api' | 'index' | 'none',
+    rpc = false,
   ): Promise<Response> =>
     new Promise((resolve, reject) => {
       let status: number | undefined;
@@ -167,7 +172,7 @@ export function nativeWebTransport(
                   { status: response.statusCode!, headers: output },
                 );
                 responded = true;
-                if (result.status >= 400) observe(undefined, result.status);
+                if (rpc) observe(undefined, result.status, !result.ok);
                 resolve(result);
               } catch (error) {
                 rejectResponse(error);
@@ -185,7 +190,8 @@ export function nativeWebTransport(
         rejectResponse(error);
       }
     });
-  const fetch: RpcFetch = (input, init) => requestResponse(input, init, 'api');
+  const fetch: RpcFetch = (input, init) =>
+    requestResponse(input, init, 'api', true);
   /** Each finite proof reads only its own bounded response and keeps
    * ownership through physical shutdown. */
   async function readOwned(
@@ -242,6 +248,7 @@ export function nativeWebTransport(
         },
         (response) => {
           responseStatus = response.statusCode;
+          observe(undefined, responseStatus, false);
           response.once('error', fail);
           const declared = response.headers['content-length'];
           if (
@@ -269,6 +276,7 @@ export function nativeWebTransport(
             try {
               bounds.onChunk?.(chunk);
             } catch (reason) {
+              observe(reason, responseStatus);
               failure = { reason };
               response.destroy();
             }
@@ -372,7 +380,11 @@ export function nativeWebTransport(
       const url = target(authenticatedUrl);
       url.pathname = '/connect';
       url.searchParams.set('interactions', 'none');
-      const response = await fetch(url, { method: 'GET', redirect: 'manual' });
+      const response = await requestResponse(
+        url,
+        { method: 'GET', redirect: 'manual' },
+        'api',
+      );
       const values = response.headers.getSetCookie();
       if (
         response.status !== 302 ||
@@ -430,9 +442,11 @@ export function nativeWebTransport(
             requestJoin(call);
             // A normal listener on ws's unexpected-response event would
             // take ownership of rejection. Observe the HTTP response only.
-            call.prependListener('response', (response) => {
+            const captureStatus = (response: IncomingMessage) => {
               responseStatus = response.statusCode;
-            });
+            };
+            call.prependListener('response', captureStatus);
+            call.prependListener('upgrade', captureStatus);
             call.end();
           },
           headers: {

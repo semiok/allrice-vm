@@ -136,7 +136,7 @@ export async function openNativeWebOwner(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
-  recordStartupFailure?(failure: NativeWebSetupFailure): void;
+  recordStartupFailure?(failure: NativeWebSetupFailure): Promise<void>;
   beforePrompt?(
     input: {
       binding: PersonVmBinding;
@@ -156,19 +156,19 @@ export async function openNativeWebOwner(input: {
   ): Promise<PrincipalInvocationObservation | undefined>;
 }) {
   let step = 'validate-setup';
-  let transportFailure: ReturnType<typeof nativeSetupError> | undefined;
-  let startupFailureRecorded = false;
+  let transportStatus: number | undefined;
+  let startupFailureAudit: Promise<void> | undefined;
   let startupComplete = false;
   function stage(next: string) {
     step = next;
-    transportFailure = undefined;
+    transportStatus = undefined;
   }
   function recordFailure(reason: unknown) {
-    if (startupComplete || startupFailureRecorded) return;
-    startupFailureRecorded = true;
+    if (startupComplete || startupFailureAudit) return;
+    startupFailureAudit = Promise.resolve();
     const diagnostic: NativeWebSetupFailure = {
       step,
-      ...(transportFailure ?? nativeSetupError(reason)),
+      ...nativeSetupError(reason, transportStatus),
       target: nativeSetupTarget(input.launch.auth.origin),
     };
     try {
@@ -182,7 +182,19 @@ export async function openNativeWebOwner(input: {
       // Logging cannot change the failure or its cleanup.
     }
     try {
-      input.recordStartupFailure?.(diagnostic);
+      const audit = input.recordStartupFailure?.(diagnostic);
+      if (audit) {
+        // Let a healthy audit insert finish before local teardown. An
+        // unavailable sink must not delay physical cleanup indefinitely.
+        let timer: ReturnType<typeof setTimeout>;
+        const deadline = new Promise<void>((done) => {
+          timer = setTimeout(done, 250);
+        });
+        startupFailureAudit = Promise.race([
+          audit.catch(() => {}),
+          deadline,
+        ]).finally(() => clearTimeout(timer));
+      }
     } catch {
       // An unavailable audit writer cannot prevent physical cleanup.
     }
@@ -194,12 +206,14 @@ export async function openNativeWebOwner(input: {
   ) {
     const error = new PersonVmError('PROVIDER_FAILED');
     recordFailure(error);
+    await startupFailureAudit;
     throw error;
   }
   const binding = Object.freeze({ ...input.scope.binding });
   if (!sameVmBinding(input.launch.binding, binding)) {
     const error = new PersonVmError('LEASE_LOST');
     recordFailure(error);
+    await startupFailureAudit;
     throw error;
   }
   stage('startup-authority');
@@ -250,6 +264,7 @@ export async function openNativeWebOwner(input: {
     // Publish before abort callbacks can reenter. Local drain is not remote ACK.
     disconnected = Promise.resolve().then(async () => {
       await Promise.allSettled([starting, nativeWait]);
+      if (startupFailureAudit) await startupFailureAudit;
       const results = await Promise.allSettled([
         principals.drainLocal(),
         transport.close(),
@@ -273,9 +288,10 @@ export async function openNativeWebOwner(input: {
     input.launch.auth.origin,
     carrier.signal,
     lost,
-    (error, status) => {
-      if (!startupComplete && !startupFailureRecorded)
-        transportFailure ??= nativeSetupError(error, status);
+    (error, status, failed) => {
+      if (startupComplete || startupFailureAudit) return;
+      transportStatus = status;
+      if (failed) recordFailure(error);
     },
   );
   function joinHost() {
@@ -310,6 +326,7 @@ export async function openNativeWebOwner(input: {
     if (closing) return closing;
     // Publish before fence/abort: nested close must join this exact attempt.
     closing = Promise.resolve().then(async () => {
+      if (startupFailureAudit) await startupFailureAudit;
       const [scopes] = await Promise.allSettled([principals.close()]);
       // Even an unknown remote scope must get a real local drain. Only this
       // shared owner's close owns job cancellation; page scopes never do.
@@ -455,7 +472,22 @@ export async function openNativeWebOwner(input: {
     caller: AbortSignal,
     guard: (signal: AbortSignal) => Promise<void>,
     verify: EditorEvidence<T>,
+    duringStartup = false,
   ) {
+    function editorRead<R>(name: string, read: () => Promise<R>) {
+      if (!duringStartup) return read();
+      stage(name);
+      return read().then(
+        (value) => {
+          stage('editor-proof');
+          return value;
+        },
+        (error: unknown) => {
+          recordFailure(error);
+          throw error;
+        },
+      );
+    }
     const current = AbortSignal.any([
       caller,
       AbortSignal.timeout(input.launch.auth.timeoutMs),
@@ -464,22 +496,33 @@ export async function openNativeWebOwner(input: {
       verify(
         {
           revoked: active,
-          readImmutableGraph: (signal) => readCurrent(signal, guard, readGraph),
+          readImmutableGraph: (signal) =>
+            editorRead('editor-index', () =>
+              readCurrent(signal, guard, readGraph),
+            ),
           readImmutableBundle: (reference, bytes, signal) =>
-            readCurrent(signal, guard, (reading) =>
-              readBundle(reference, bytes, reading),
+            editorRead('editor-bundle', () =>
+              readCurrent(signal, guard, (reading) =>
+                readBundle(reference, bytes, reading),
+              ),
             ),
         },
         () =>
-          readCurrent(active, guard, async (signal) => {
-            const method = TYPERT_REMOTE.methods['session/modelCatalog'];
-            const args = method.input({ strict: true }).create().parse({});
-            const result = await readSessionReply('modelCatalog', args, signal);
-            return {
-              ok: true as const,
-              value: method.result.create().parse(replyValue(result)),
-            };
-          }),
+          editorRead('editor-model-catalog', () =>
+            readCurrent(active, guard, async (signal) => {
+              const method = TYPERT_REMOTE.methods['session/modelCatalog'];
+              const args = method.input({ strict: true }).create().parse({});
+              const result = await readSessionReply(
+                'modelCatalog',
+                args,
+                signal,
+              );
+              return {
+                ok: true as const,
+                value: method.result.create().parse(replyValue(result)),
+              };
+            }),
+          ),
         active,
         installedModelAdapter,
       ),
@@ -513,6 +556,7 @@ export async function openNativeWebOwner(input: {
     const auth = await setup(() =>
       input.scope.readNativeWebAuth!(input.launch.auth, signal),
     );
+    stage('auth-authority');
     signal.throwIfAborted();
     await setup(() => input.scope.assertCurrent());
     stage('auth-adapter-proof');
@@ -576,18 +620,29 @@ export async function openNativeWebOwner(input: {
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
-      verifyStartingEditor<T>(
+      async verifyStartingEditor<T>(
         startingScope: PersonVmBootstrapScope,
         caller: AbortSignal,
         verify: EditorEvidence<T>,
       ) {
         if (startingScope !== input.scope)
-          return Promise.reject(new PersonVmError('LEASE_LOST'));
-        return verifyEditor(
-          AbortSignal.any([caller, startingScope.signal]),
-          () => startingScope.assertCurrent(),
-          verify,
-        );
+          throw new PersonVmError('LEASE_LOST');
+        startupComplete = false;
+        stage('editor-proof');
+        try {
+          return await verifyEditor(
+            AbortSignal.any([caller, startingScope.signal]),
+            () => startingScope.assertCurrent(),
+            verify,
+            true,
+          );
+        } catch (error) {
+          recordFailure(error);
+          await startupFailureAudit;
+          throw error;
+        } finally {
+          startupComplete = true;
+        }
       },
       verifyRunningEditor<T>(
         context: RequestContext,
