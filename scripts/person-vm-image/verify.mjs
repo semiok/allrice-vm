@@ -69,12 +69,22 @@ export function employeeProfileRuntime(native) {
   const disk = native?.readonlyDshRuntimeDisk;
   if (disk === undefined || disk?.provision === 'directory') return undefined;
   ensure(disk?.provision === 'disk', 'Invalid Employee Web disk provision');
+  const nativeChecksums = {
+    binary: native.artifactChecksums?.binary,
+    libkrunfw: native.artifactChecksums?.libkrunfw,
+    agentd: native.artifactChecksums?.agentd,
+  };
   ensure(
     native.publicImageCache &&
       native.image === source.baseImage &&
       native.readonlyDshDirectory?.artifactSha256 === source.artifactSha256 &&
       /^[a-f0-9]{64}$/.test(disk.diskSha256) &&
-      /^[a-f0-9]{64}$/.test(disk.candidateSha256),
+      /^[a-f0-9]{64}$/.test(disk.candidateSha256) &&
+      Object.values(nativeChecksums).every(
+        (checksum) =>
+          typeof checksum === 'string' &&
+          /^sha256:[a-f0-9]{64}$/.test(checksum),
+      ),
     'Employee Web capture requires the sealed offline runtime',
   );
   return Object.freeze({
@@ -82,6 +92,7 @@ export function employeeProfileRuntime(native) {
     binding: 'eth0',
     diskSha256: disk.diskSha256,
     candidateSha256: disk.candidateSha256,
+    nativeChecksums: Object.freeze(nativeChecksums),
   });
 }
 
