@@ -180,7 +180,7 @@ where key='d_entry_rollout_policy';
     assert conflict.returncode and 'other people still have tuples' in conflict.stderr
     assert snapshot(sql) == before and sql(TARGET, policy_query).stdout == mixed
     sql(TARGET, """
-update allrice_settings set value=jsonb_set(value,'{selections,1}',value->'selections'->1
+update allrice_settings set value=jsonb_set(value,'{selections,1}',(value->'selections'->1)
   - array['employeeInstanceId','generation']) where key='d_entry_rollout_policy';
 """)
 
