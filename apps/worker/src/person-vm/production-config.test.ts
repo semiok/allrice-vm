@@ -225,6 +225,39 @@ afterEach(async () => {
 });
 
 describe('private production Host configuration', () => {
+  it('keeps disk preprovision disabled when absent or explicitly off', async () => {
+    const read = () => readProductionHostConfiguration(signal());
+    expect((await read()).configuration.disk.preprovision).toBeUndefined();
+    const config = value();
+    await seal({
+      ...config,
+      disk: { ...config.disk, preprovision: { enabled: false } },
+    });
+    expect((await read()).configuration.disk.preprovision).toEqual({
+      enabled: false,
+    });
+  });
+
+  it('requires a positive floor and reserve before accepting an enabled disk configuration', async () => {
+    const config = value();
+    const enabled = { enabled: true, minimumFreeBytes: 100, reserveBytes: 20 };
+    const withBudget = (preprovision: unknown) => ({
+      ...config,
+      disk: { ...config.disk, preprovision },
+    });
+    await seal(withBudget(enabled));
+    expect(
+      (await readProductionHostConfiguration(signal())).configuration.disk
+        .preprovision,
+    ).toEqual(enabled);
+    for (const bad of [{ enabled: true }, { ...enabled, reserveBytes: 0 }]) {
+      await seal(withBudget(bad));
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    }
+  });
+
   it.each([
     '0.0.0.0',
     '::',

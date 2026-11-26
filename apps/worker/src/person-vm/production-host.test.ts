@@ -38,6 +38,7 @@ const io = vi.hoisted(() => ({
   read: vi.fn(),
   database: vi.fn(),
   dedicated: vi.fn(),
+  diskPreprovision: vi.fn(),
   model:
     vi.fn<
       (
@@ -65,6 +66,9 @@ const io = vi.hoisted(() => ({
         gateway: ReturnType<typeof Egress.createEgressGateway>,
       ) => void
     >(),
+}));
+vi.mock('./production-disk-preprovision.js', () => ({
+  startProductionDiskPreprovision: io.diskPreprovision,
 }));
 vi.mock('./production-config.js', async (original) => ({
   ...(await original<typeof ProductionConfig>()),
@@ -332,6 +336,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   io.authority.mockReset();
   io.installation.mockReset();
+  io.diskPreprovision.mockReset();
   f = await productionInputsFixture();
   io.read.mockResolvedValue(f.loaded);
   io.database.mockReturnValue(trustedDatabase);
@@ -347,6 +352,7 @@ afterEach(async () => {
       .map((close) => close()),
   );
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await rm(f.root, { recursive: true, force: true });
   const errors = joined.flatMap((result) =>
     result.status === 'rejected' ? [result.reason] : [],
@@ -365,6 +371,81 @@ it('missing required production sources leaves ports uninstalled before any prov
   expect(io.database).not.toHaveBeenCalled();
   expect(io.gateway).not.toHaveBeenCalled();
   expectUninstalled();
+});
+
+function configureDiskPreprovision(enabled: boolean, sealedCache: boolean) {
+  const native = f.loaded.configuration.native;
+  if (sealedCache) {
+    const hash = '1'.repeat(64);
+    native.image = `docker.io/library/node@sha256:${hash}`;
+    native.publicImageCache = {
+      directory: `${f.root}/cache/${hash}`,
+      manifestSha256: hash,
+    };
+  }
+  f.loaded.configuration.disk.preprovision = enabled
+    ? { enabled: true, minimumFreeBytes: 100, reserveBytes: 20 }
+    : { enabled: false };
+}
+
+it.each([
+  { enabled: false, sealedCache: true, port: true },
+  { enabled: true, sealedCache: false, port: true },
+  { enabled: true, sealedCache: true, port: false },
+])(
+  'only installs disk preparation with all three prerequisites (%j)',
+  async (scope) => {
+    configureDiskPreprovision(scope.enabled, scope.sealedCache);
+    const host = await createProductionPersonVmHost({
+      lifetime: signal(),
+      sources: fixture().sources,
+      ...(scope.port
+        ? {
+            diskPreparation: {
+              prepare: vi.fn(async () => 'prepared' as const),
+            },
+          }
+        : {}),
+    });
+    cleanup.push(() => host.close());
+    expect(io.diskPreprovision).not.toHaveBeenCalled();
+  },
+);
+
+it('joins the injected offline preparation before Host close settles', async () => {
+  configureDiskPreprovision(true, true);
+  vi.stubEnv('DATABASE_URL', 'postgres://synthetic.invalid/test');
+  const gate = Promise.withResolvers<void>();
+  const schedulerClose = vi.fn(() => gate.promise);
+  io.diskPreprovision.mockReturnValue({ close: schedulerClose });
+  const diskPreparation = { prepare: vi.fn(async () => 'prepared' as const) };
+  const host = await createProductionPersonVmHost({
+    lifetime: signal(),
+    sources: fixture().sources,
+    diskPreparation,
+  });
+  cleanup.push(() => host.close());
+  try {
+    expect(io.diskPreprovision).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        port: diskPreparation,
+        minimumFreeBytes: 100,
+        reserveBytes: 20,
+      }),
+    );
+    let stopped = false;
+    const closing = host.close().then(() => {
+      stopped = true;
+    });
+    await turn();
+    expect(schedulerClose).toHaveBeenCalledOnce();
+    expect(stopped).toBe(false);
+    gate.resolve();
+    await closing;
+    expect(stopped).toBe(true);
+  } finally {
+    gate.resolve();
+  }
 });
 
 it('an already cancelled lifetime returns the original reason without constructing sources', async () => {

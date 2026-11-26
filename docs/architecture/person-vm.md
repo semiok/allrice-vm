@@ -72,3 +72,13 @@ postgres.js 3.4.9的`release()`无条件把reserved连接标回可用，FATAL关
 同一 running start 入口只重核 readiness，**不重跑 person init**。MET273 运行中新员工须由真实 running owner 继续用已安装 launcher/env，不可复用过期 starting scope 或重配活跃 cgroup。本 kernel 不建立 DSH 控制通道/guest header 身份；273 必须实际装配 native owner、认证 editor/send ready、独立员工 homes/配置/会话与所有 launcher。未装配时不得返回 ready。此片不证明 MET26702 镜像内没有抢跑 producer、04 exact-child/OOM、实际2G运行读回、n2-B全 producer/20min 或组织撤权；真实联验另排，协议 fixture 不作产品启动验收。
 
 首建原生 `create --memory/--max-memory` 与 `sandbox_defaults.memory_mib` 使用同一构造时 host 平台快照；正式默认仍2048MiB。配置读回不是 physical enforced cap 证明，已有 VM 不因本修复热改或自动迁移。
+
+## 4.0 磁盘预建后台调度
+
+预建名册取自已提交的 4.0 灰度策略。Worker 按真人分页，用当前可写成员关系、员工归属、实例状态和发布版本核对每个目标。未分配 4.0 的员工不会触发预建。同一真人在同一企业的多个员工实例共用一块盘。有盘时沿用既有企业归属。没有盘但同时有多个企业符合条件时暂缓。归档员工、撤权或变更版本会使旧目标失效，既有个人数据仍按独立的删盘授权处理。
+
+`PersonVmDiskPreparationPort.prepare(target, guard)` 是 Host 进程内接缝。目标携带精确真人、企业、工作区、员工实例、员工版本和灰度策略 revision。提供方持有既有物理租约，在租约内调用 `guard.assertCurrent()`，分配前调用 `guard.assertCapacity()`。调用返回前等实际文件操作和清理结束。返回值区分新准备、已有完成凭据和暂缓。接缝只服务离线加密盘与已封存公开缓存。
+
+可选封签配置 `disk.preprovision.enabled` 默认关闭。启用时必须给出正整数 `minimumFreeBytes` 与 `reserveBytes`，两者之和是本次准备前的可用空间门槛。Worker 同时处理一个目标。已有前台租约时退让。数据库变更通知用于唤醒和作废当前范围，定期重读名册处理遗漏。feed 断连后先取消并等待当前工作结束，再重连重扫。Host 关闭时等待扫描、提供方和 feed 收尾。
+
+第一段只接后台调度和测试替身。即使配置开启，缺封存缓存或缺真实磁盘提供方时也不启动扫描。后续磁盘提供方复用既有建盘、缓存灌入、独占租约和审计。前台首次登录与正在灌入的交接由后续阶段对齐异步预热入口。
