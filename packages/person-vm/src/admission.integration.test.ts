@@ -613,6 +613,12 @@ suite(
       'commit-ack-lost',
       'native-proof-rejected',
       'relogin',
+      'system-ok',
+      'system-revoked',
+      'system-late-revoked',
+      'system-wake-window',
+      'system-recovery',
+      'system-unknown',
     ] as const)(
       'idle wake preparation and stop under one physical lease: %s',
       async (outcome) => {
@@ -677,11 +683,21 @@ suite(
         });
         const { rc, binding } = await running({ ...h, service });
         let attempt = { ...rc, requestId: randomUUID() };
+        const scheduled = outcome.startsWith('system-');
+        const scheduledRoster = {
+          ...binding,
+          entries: [],
+          digest: 'system-fixture',
+        };
+        let scheduledRequestId: string | undefined;
+        let scheduledAuthority = true;
+        if (scheduled) invalidSession = rc.sessionId;
         const since = h.now().toISOString();
         const wakeAt = new Date(h.now().getTime() + 60 * 60_000);
         const wake = createPostgresPersonVmScheduledWakeStore(db);
-        const recovering =
-          outcome === 'commit-rejected' || outcome === 'commit-ack-lost';
+        const commitRejected =
+          outcome === 'commit-rejected' || outcome === 'system-recovery';
+        const recovering = commitRejected || outcome === 'commit-ack-lost';
         const nativeProofRejected = outcome === 'native-proof-rejected';
         let mono = 0,
           runningJobs = 0,
@@ -697,6 +713,27 @@ suite(
           openSql: open,
           idleMs: 5 * 60_000,
           monotonic: () => mono,
+          scheduledIdleAuthority: {
+            assertOwned(current, roster) {
+              if (current.leaseEpoch !== binding.leaseEpoch)
+                throw new PersonVmError('LEASE_LOST');
+              expect(current).toEqual(binding);
+              expect(roster).toBe(scheduledRoster);
+            },
+            async assertCurrent() {
+              if (!scheduledAuthority)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+            async dispatch(current, roster, requestId, active, stop) {
+              this.assertOwned(current, roster);
+              expect(requestId).toBe(scheduledRequestId);
+              if (outcome === 'system-late-revoked')
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              if (outcome === 'system-wake-window')
+                h.advance(wakeAt.getTime() - h.now().getTime());
+              await stop(active);
+            },
+          },
           nativeActivity: {
             async observe(current) {
               const observedAt = h.now().toISOString();
@@ -704,7 +741,7 @@ suite(
                 activity: {
                   binding: current,
                   observedAt,
-                  state: 'known',
+                  state: outcome === 'system-unknown' ? 'unknown' : 'known',
                   activeTurns: 0,
                   activeJobs: runningJobs,
                   activeSubtasks: 0,
@@ -729,7 +766,15 @@ suite(
               ? undefined
               : async (request, active) => {
                   prepared++;
-                  expect(request.context.requestId).toBe(attempt.requestId);
+                  if ('context' in request) {
+                    expect(scheduled).toBe(false);
+                    expect(request.context.requestId).toBe(attempt.requestId);
+                  } else {
+                    expect(scheduled).toBe(true);
+                    expect(request.scheduledRoster).toBe(scheduledRoster);
+                    scheduledRequestId ??= request.requestId;
+                    expect(request.requestId).toBe(scheduledRequestId);
+                  }
                   expect(request.binding).toEqual(binding);
                   expect(await store.read(binding.personId)).toMatchObject({
                     leaseOwner: expect.any(String),
@@ -743,6 +788,7 @@ suite(
                     ),
                   ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
                   await request.assertStopCurrent(active);
+                  if (outcome === 'system-revoked') scheduledAuthority = false;
                   if (outcome === 'changed') revision = 'new-native-work';
                   if (
                     outcome === 'blocked' ||
@@ -755,18 +801,36 @@ suite(
                       (person_id,organization_id,vm_id,instance_id,lease_epoch,plan_id,receipt_ids,
                       wake_at,target_at,state)
                       values (${binding.personId},${binding.organizationId},${binding.vmId},
-                      ${binding.instanceId},${binding.leaseEpoch},${attempt.requestId},
+                      ${binding.instanceId},${binding.leaseEpoch},${scheduledRequestId ?? attempt.requestId},
                       array[${randomUUID()}]::uuid[],${wakeAt},${wakeAt},'waiting')
                       on conflict (plan_id) do nothing`;
                     return { ok: true, nextWakeAt: wakeAt.toISOString() };
                   }
-                  return { ok: true, nextWakeAt: null };
+                  return {
+                    ok: true,
+                    nextWakeAt:
+                      outcome === 'system-wake-window'
+                        ? wakeAt.toISOString()
+                        : null,
+                  };
                 },
         });
-        await host.reconcileIdle(attempt, binding, signal());
+        const reconcileOwned = () =>
+          scheduled
+            ? host.reconcileScheduledIdle(binding, scheduledRoster, signal())
+            : host.reconcileIdle(attempt, binding, signal());
+        if (scheduled)
+          await expect(
+            host.reconcileScheduledIdle(
+              { ...binding, leaseEpoch: binding.leaseEpoch - 1 },
+              scheduledRoster,
+              signal(),
+            ),
+          ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+        await reconcileOwned();
         mono += 5 * 60_000 - 1;
         h.advance(mono);
-        await host.reconcileIdle(attempt, binding, signal());
+        await reconcileOwned();
         expect(prepared).toBe(0);
         mono++;
         h.advance(1);
@@ -783,7 +847,7 @@ suite(
           expect(authorized?.sessionId).toBe(newLogin.sessionId);
           attempt = { ...authorized!, requestId: randomUUID() };
         }
-        if (outcome === 'commit-rejected')
+        if (commitRejected)
           await db`alter table person_vm_audit add constraint fixture_reject_stop_commit
             check (action<>'stop' or result<>'succeeded')`;
         if (nativeProofRejected)
@@ -791,18 +855,30 @@ suite(
             check (action<>'stop.idle-dispatch' or result<>'succeeded')`;
         loseAcknowledgement = outcome === 'commit-ack-lost';
         try {
-          const reconcile = host.reconcileIdle(attempt, binding, signal());
+          const reconcile = reconcileOwned();
           if (
-            ['changed', 'mount-change', 'wake-plan-changed'].includes(outcome)
+            [
+              'changed',
+              'mount-change',
+              'wake-plan-changed',
+              'system-wake-window',
+            ].includes(outcome)
           )
             await expect(reconcile).rejects.toMatchObject({
               code: 'ACTIVITY_UNKNOWN',
+            });
+          else if (
+            outcome === 'system-revoked' ||
+            outcome === 'system-late-revoked'
+          )
+            await expect(reconcile).rejects.toMatchObject({
+              code: 'AUTHORIZATION_DENIED',
             });
           else if (recovering || nativeProofRejected)
             await expect(reconcile).rejects.toBeInstanceOf(Error);
           else await reconcile;
         } finally {
-          if (outcome === 'commit-rejected' || nativeProofRejected)
+          if (commitRejected || nativeProofRejected)
             await db`alter table person_vm_audit drop constraint fixture_reject_stop_commit`;
         }
         if (nativeProofRejected) {
@@ -831,7 +907,18 @@ suite(
           expect(await wake.claim(90_000)).toBeNull();
           return;
         }
-        if (recovering) {
+        if (outcome === 'system-recovery') {
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: false,
+          });
+          scheduledAuthority = false;
+          await reconcileOwned();
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: true,
+          });
+        } else if (recovering) {
           expect(h.states.get(binding.vmId)).toBe('stopped');
           expect(await store.read(binding.personId)).toMatchObject(
             outcome === 'commit-rejected'
@@ -891,11 +978,22 @@ suite(
           });
           expect(await wake.claim(90_000)).toBeNull();
         }
-        const stopped = outcome === 'ok' || outcome === 'relogin' || recovering;
-        const rechecked = stopped || outcome === 'wake-plan-changed';
-        const checkedOnce = ['blocked', 'changed', 'mount-change'].includes(
-          outcome,
-        );
+        const stopped =
+          outcome === 'ok' ||
+          outcome === 'relogin' ||
+          outcome === 'system-ok' ||
+          recovering;
+        const rechecked =
+          stopped ||
+          outcome === 'wake-plan-changed' ||
+          outcome === 'system-late-revoked' ||
+          outcome === 'system-wake-window';
+        const checkedOnce = [
+          'blocked',
+          'changed',
+          'mount-change',
+          'system-revoked',
+        ].includes(outcome);
         expect(prepared).toBe(rechecked ? 2 : checkedOnce ? 1 : 0);
         expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
           stopped ? 1 : 0,
@@ -914,7 +1012,7 @@ suite(
           await db`select request_id, lease_epoch from person_vm_audit
           where vm_id=${binding.vmId} and action='stop' and result='succeeded'`;
         expect(success.map((row) => row.request_id)).toEqual(
-          stopped ? [attempt.requestId] : [],
+          stopped ? [scheduled ? scheduledRequestId : attempt.requestId] : [],
         );
         if (stopped)
           expect(Number(success[0]!.lease_epoch)).toBe(binding.leaseEpoch);

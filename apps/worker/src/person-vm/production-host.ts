@@ -33,6 +33,8 @@ import {
   type PersonVmNativeActivityPort,
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
+  type PersonVmScheduledIdleAuthority,
+  type PersonVmWebRoster,
 } from '@allrice/person-vm';
 import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
@@ -183,6 +185,7 @@ export function createProductionPersonVmHost(input: {
       binding: PersonVmBinding;
       stopNative: boolean;
       idleContext?: RequestContext;
+      scheduledIdleRoster?: PersonVmWebRoster;
       idleAccessOrder?: number;
     }
   >();
@@ -675,6 +678,14 @@ export function createProductionPersonVmHost(input: {
           });
         },
         ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          observeScheduledStart(
+            binding: PersonVmBinding,
+            roster: PersonVmWebRoster,
+          ) {
+            const entry = ownedVms.get(binding.personId);
+            if (entry?.stopNative && sameVmBinding(entry.binding, binding))
+              entry.scheduledIdleRoster = structuredClone(roster);
+          },
           observeOwnedAccess(
             binding: PersonVmBinding,
             context: RequestContext,
@@ -758,10 +769,45 @@ export function createProductionPersonVmHost(input: {
         lifetime,
         cleanupTimeoutMs: providers.configuration.lifecycle.cleanupTimeoutMs,
       });
+      const scheduledIdleAuthority: PersonVmScheduledIdleAuthority = {
+        assertOwned(binding, roster) {
+          const owner = ownedVms.get(binding.personId);
+          if (
+            !owner?.stopNative ||
+            !sameVmBinding(owner.binding, binding) ||
+            owner.scheduledIdleRoster !== roster
+          )
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          lifetime.throwIfAborted();
+        },
+        async assertCurrent(binding, roster, signal) {
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.assertScheduledIdleCurrent(
+            binding,
+            roster,
+            signal,
+          );
+        },
+        async dispatch(binding, roster, requestId, signal, stop) {
+          this.assertOwned(binding, roster);
+          if (!scheduledWake) throw new PersonVmError('RUNTIME_NOT_READY');
+          await scheduledWake.dispatchScheduledIdleStop(
+            binding,
+            roster,
+            requestId,
+            signal,
+            (active) => {
+              this.assertOwned(binding, roster);
+              return stop(active);
+            },
+          );
+        },
+      };
       const admission = vm.createAdmissionHost({
         openSql,
         idleMs: providers.platform.idleMs,
         ...(providers.configuration.lifecycle.idleStopEnabled === true && {
+          scheduledIdleAuthority,
           prepareIdleStop: (request, signal) =>
             scheduledWake
               ? scheduledWake.prepareStopWithWake(request, signal)
@@ -933,15 +979,27 @@ export function createProductionPersonVmHost(input: {
         void own(async () => {
           while (!lifetime.aborted) {
             await sleep(15_000, undefined, { signal: lifetime, ref: false });
-            for (const { binding, idleContext } of [...ownedVms.values()]) {
+            for (const { binding, idleContext, scheduledIdleRoster } of [
+              ...ownedVms.values(),
+            ]) {
               if (pauseIdle || lifetime.aborted) break;
-              if (!idleContext) continue;
               try {
-                await admission.reconcileIdle(
-                  { ...idleContext, requestId: randomUUID() },
-                  binding,
-                  AbortSignal.any([lifetime, AbortSignal.timeout(15_000)]),
-                );
+                const active = AbortSignal.any([
+                  lifetime,
+                  AbortSignal.timeout(15_000),
+                ]);
+                if (scheduledIdleRoster)
+                  await admission.reconcileScheduledIdle(
+                    binding,
+                    scheduledIdleRoster,
+                    active,
+                  );
+                else if (idleContext)
+                  await admission.reconcileIdle(
+                    { ...idleContext, requestId: randomUUID() },
+                    binding,
+                    active,
+                  );
               } catch (error) {
                 if (!lifetime.aborted && !(error instanceof PersonVmError))
                   console.error('[person-vm] idle reconciliation failed');

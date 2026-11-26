@@ -52,12 +52,23 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
     }));
     h.native.assertWebEndpoints = vi.fn(async () => {});
+    const idleOwner = vi.fn();
     const service = new PersonVmService({
       ...h.options,
       nativeWeb: { prepare: interactiveRoster },
+      observeScheduledStart: idleOwner,
     });
     h.authorize(false);
-    return { h, store, binding, roster, service, interactiveRoster, verified };
+    return {
+      h,
+      store,
+      binding,
+      roster,
+      service,
+      interactiveRoster,
+      verified,
+      idleOwner,
+    };
   }
 
   it('resumes only the retained native VM with no user and no interactive readiness grant', async () => {
@@ -105,6 +116,14 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       signal(),
     );
     expect(view).toMatchObject({ phase: 'running', ready: false });
+    expect(f.idleOwner).toHaveBeenCalledExactlyOnceWith(
+      {
+        ...f.binding,
+        instanceId: expect.any(String),
+        leaseEpoch: f.binding.leaseEpoch + 1,
+      },
+      f.roster,
+    );
     expect(f.h.log.filter((item) => item === 'native:create')).toHaveLength(1);
     expect(f.h.log.filter((item) => item === 'native:start')).toHaveLength(1);
     expect(startup.mock.lastCall?.[3]).toMatchObject({
@@ -155,6 +174,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
     expect(f.h.log.slice(before)).not.toContain('native:start');
     expect(f.h.log.slice(before)).not.toContain('native:stop');
     expect(f.verified).not.toHaveBeenCalled();
+    expect(f.idleOwner).not.toHaveBeenCalled();
     expect(f.h.mounts.size).toBe(0);
   });
 

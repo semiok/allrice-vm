@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  readPersonVmWakeRoster,
 } from '@allrice/database';
 import {
   createDailyScheduleRecord,
@@ -12,6 +13,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
+import { createProductionScheduledWake } from './production-scheduled-wake.js';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1'
@@ -148,7 +150,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       employeeInstanceId,
       employeeVersionId,
     } = f.origin;
-    await db.begin(async (tx) => {
+    return db.begin(async (tx) => {
       await tx`insert into allrice_users(id,email,display_name,password_hash)
         values(${personId},${personId + '@example.test'},'Fixture','not-a-real-password')`;
       await tx`insert into allrice_organizations(id,slug,name)
@@ -187,8 +189,188 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
           ],
         })})
         on conflict(scope_type,scope_id,key) do update set value=excluded.value`;
+      return employee!.id;
     });
   }
+
+  it('checks the scheduled-idle enrolled roster from current PG authority without a login', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const planId = randomUUID();
+    await f.module().prepareStopWithWake(f.binding, planId, signal);
+    await f.stop(planId);
+    const claim = await f.store().claim(300_000);
+    expect(claim?.planId).toBe(planId);
+    const roster = await f.store().readClaimRoster(claim!);
+    expect(roster).not.toBeNull();
+    expect(
+      await db`select 1 from allrice_sessions where user_id=${f.binding.personId}`,
+    ).toEqual([]);
+    const catalog = vi.fn();
+    const host = createProductionScheduledWake({
+      startup: { catalog },
+      database: db,
+      lifetime: signal,
+      source: { start: f.start, assertDeliverable: vi.fn() },
+    });
+    try {
+      const current = {
+        ...f.binding,
+        instanceId: randomUUID(),
+        leaseEpoch: f.binding.leaseEpoch + 1,
+      };
+      await expect(
+        host.assertScheduledIdleCurrent(current, roster!, signal),
+      ).resolves.toBeUndefined();
+      await expect(
+        host.assertScheduledIdleCurrent(
+          { ...current, personId: randomUUID() },
+          roster!,
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      await db`update allrice_settings
+        set value=jsonb_set(value,'{selections}','[]')
+        where key='d_entry_rollout_policy'`;
+      await expect(
+        host.assertScheduledIdleCurrent(current, roster!, signal),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      expect(catalog).not.toHaveBeenCalled();
+    } finally {
+      await host.close();
+    }
+  });
+
+  it.each(['qualification', 'ownership'] as const)(
+    'orders the scheduled-idle dispatch against a concurrent change in %s',
+    async (fact) => {
+      const f = await fixture();
+      await publishFixtureAuthority(f);
+      const stalePlan = randomUUID();
+      await f.module().prepareStopWithWake(f.binding, stalePlan, signal);
+      const roster = await db.begin((tx) =>
+        readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+      );
+      expect(roster).not.toBeNull();
+      const { personId, employeeInstanceId } = f.origin;
+      const refuse = async (
+        tx: Parameters<typeof readPersonVmWakeRoster>[0],
+      ) => {
+        if (fact === 'qualification')
+          await tx`update allrice_settings set value=jsonb_set(value,'{selections}','[]')
+            where scope_type='system' and key='d_entry_rollout_policy'`;
+        else
+          await tx`update allrice_employee_instances set archived_at=now()
+            where id=${employeeInstanceId}`;
+      };
+      await db`update person_virtual_machines
+        set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+        where person_id=${personId}`;
+      // A preparation from the past has a wake time earlier than the DB clock.
+      // Give this synthetic candidate a future dispatch window.
+      await db`update person_vm_scheduled_wakes
+        set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+        where plan_id=${stalePlan}`;
+      const stop = vi.fn(async () => {
+        await expect(
+          db.begin(async (tx) => {
+            await tx`set local lock_timeout='100ms'`;
+            await refuse(tx);
+          }),
+        ).rejects.toMatchObject({ code: '55P03' });
+      });
+      const store = f.store();
+      await expect(
+        store.withPreparedStopAuthority(
+          { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+          roster!,
+          stalePlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+      await expect(
+        store.withPreparedStopAuthority(
+          f.binding,
+          roster!,
+          stalePlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(true);
+      await db.begin(refuse);
+      const newPlan = randomUUID();
+      // The earlier authority commit cannot revoke a plan that did not exist
+      // yet. The dispatch must fail even for a later, non-revoked plan.
+      await f.module().prepareStopWithWake(f.binding, newPlan, signal);
+      const [staged] = await db`update person_vm_scheduled_wakes
+        set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+        where plan_id=${newPlan} returning revoked_at`;
+      expect(staged?.revoked_at).toBeNull();
+      await expect(
+        store.withPreparedStopAuthority(
+          f.binding,
+          roster!,
+          newPlan,
+          signal,
+          stop,
+        ),
+      ).resolves.toBe(false);
+      expect(stop).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('declines a scheduled idle stop while a deployment writer holds the earlier lock', async () => {
+    const f = await fixture();
+    const tenantEmployeeId = await publishFixtureAuthority(f);
+    const { organizationId, workspaceId, personId, employeeInstanceId } =
+      f.origin;
+    const [platform] = await db`insert into allrice_platform_employees
+      (employee_key,name,description)
+      values(${'wake-' + randomUUID()},'Fixture','Fixture') returning id`;
+    const [revision] = await db`insert into allrice_platform_employee_revisions
+      (employee_id,revision,definition,checksum)
+      values(${platform!.id},1,'{}',${'sha256:' + 'a'.repeat(64)}) returning id`;
+    const [deployment] =
+      await db`insert into allrice_platform_employee_tenant_assignments
+      (employee_id,revision_id,organization_id,workspace_id,tenant_employee_id)
+      values(${platform!.id},${revision!.id},${organizationId},${workspaceId},${tenantEmployeeId})
+      returning id`;
+    const roster = await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+    );
+    expect(roster).not.toBeNull();
+    const planId = randomUUID();
+    expect(
+      await f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).toMatchObject({
+      ok: true,
+    });
+    await db`update person_virtual_machines
+      set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+      where person_id=${personId}`;
+    await db`update person_vm_scheduled_wakes
+      set wake_at=now()+interval '10 minutes',target_at=now()+interval '12 minutes'
+      where plan_id=${planId}`;
+    const stop = vi.fn(async () => {});
+    const dispatch = () =>
+      f
+        .store()
+        .withPreparedStopAuthority(f.binding, roster!, planId, signal, stop);
+    await db.begin(async (tx) => {
+      await tx`select id from allrice_platform_employee_tenant_assignments
+        where id=${deployment!.id} for update`;
+      // The lock order here is the existing tenant withdrawal order.
+      await expect(dispatch()).rejects.toMatchObject({ code: '55P03' });
+      await tx`update allrice_platform_employee_tenant_assignments set active=false
+        where id=${deployment!.id}`;
+      await tx`update allrice_employee_assignments set active=false
+        where id=${employeeInstanceId}`;
+    });
+    await expect(dispatch()).resolves.toBe(false);
+    expect(stop).not.toHaveBeenCalled();
+  });
 
   it('invalidates only an employee whose existing 4.0 qualification is removed', async () => {
     const f = await fixture();

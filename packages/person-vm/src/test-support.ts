@@ -159,10 +159,12 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
       log.push('native:stop');
       if (states.has(binding.vmId)) states.set(binding.vmId, 'stopped');
     },
-    async stopIdle(binding, signal, assertCurrent) {
+    async stopIdle(binding, signal, assertCurrent, dispatch) {
       await assertCurrent();
       signal.throwIfAborted();
-      await native.stop(binding, signal);
+      const stop = (active: AbortSignal) => native.stop(binding, active);
+      if (dispatch) await dispatch(signal, stop);
+      else await stop(signal);
       if (states.get(binding.vmId) !== 'stopped')
         throw new PersonVmError('CLEANUP_INCOMPLETE');
     },

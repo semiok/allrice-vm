@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import type { RequestContext } from '@allrice/contracts';
+import { RequestContextSchema, type RequestContext } from '@allrice/contracts';
 import {
   PersonVmError,
   PERSON_VM_IDLE_MS,
@@ -22,8 +22,11 @@ import type {
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
   PersonVmIdleCoverage,
+  PersonVmIdleStopDispatch,
+  PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
+  PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import {
   type PostgresPersonVmAdmissionStore,
@@ -40,6 +43,7 @@ import {
   type VmLease,
   type VmRecord,
 } from './store.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
   context: RequestContext;
@@ -124,9 +128,10 @@ export class PersonVmAdmissionHost
       nativeActivity?: PersonVmNativeActivityPort;
       activityMaxAgeMs: number;
       prepareIdleStop?: PersonVmPrepareIdleStop;
+      scheduledIdleAuthority?: PersonVmScheduledIdleAuthority;
       recoverIdleStop(
-        context: RequestContext,
         binding: PersonVmBinding,
+        assertAuthority: (signal: AbortSignal) => Promise<void>,
         signal: AbortSignal,
       ): Promise<boolean>;
       idleStopped(binding: PersonVmBinding): void;
@@ -142,10 +147,11 @@ export class PersonVmAdmissionHost
       ): Promise<PersonVmView>;
       assertStopSafe(lease: VmLease, signal: AbortSignal): Promise<void>;
       stopIdleOwned(
-        context: RequestContext,
+        requestId: string,
         lease: VmLease,
         signal: AbortSignal,
         assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+        dispatch?: PersonVmIdleStopDispatch,
       ): Promise<PersonVmView>;
     },
   ) {
@@ -1222,10 +1228,80 @@ export class PersonVmAdmissionHost
     binding: PersonVmBinding,
     signal: AbortSignal,
   ) {
-    await this.authorize(context, binding, signal);
+    RequestContextSchema.parse(context);
+    return this.reconcileOwnedIdle(
+      { binding, context },
+      (active) => this.authorize(context, binding, active),
+      signal,
+    );
+  }
+
+  async reconcileScheduledIdle(
+    binding: PersonVmBinding,
+    scheduledRoster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ) {
+    const authority = this.options.scheduledIdleAuthority;
+    if (!authority || !this.options.prepareIdleStop)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const requestId = randomUUID();
+    const assertOwned = async (active: AbortSignal) => {
+      active.throwIfAborted();
+      authority.assertOwned(binding, scheduledRoster);
+    };
+    await assertOwned(signal);
+    return this.reconcileOwnedIdle(
+      { binding, requestId, scheduledRoster },
+      async (active) => {
+        await assertOwned(active);
+        await authority.assertCurrent(binding, scheduledRoster, active);
+        await assertOwned(active);
+      },
+      signal,
+      {
+        assertOwned,
+        dispatch: (active, stop) =>
+          authority.dispatch(binding, scheduledRoster, requestId, active, stop),
+      },
+    );
+  }
+
+  private async reconcileOwnedIdle(
+    request: PersonVmIdleStopSource,
+    assertAuthority: (signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal,
+    scheduled?: {
+      assertOwned(signal: AbortSignal): Promise<void>;
+      dispatch: PersonVmIdleStopDispatch;
+    },
+  ) {
+    const { binding } = request;
+    const requestId =
+      'context' in request ? request.context.requestId : request.requestId;
+    // Only an exact joined native receipt enters this path; it closes
+    // existing resources without granting a new stop after revocation.
     if (
+      scheduled &&
+      (await this.options.recoverIdleStop(
+        binding,
+        scheduled.assertOwned,
+        signal,
+      ))
+    ) {
+      this.idle.delete(binding.personId);
+      return;
+    }
+    try {
+      await assertAuthority(signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      if ('scheduledRoster' in request) this.idle.delete(binding.personId);
+      throw error;
+    }
+    if (
+      !scheduled &&
       this.options.prepareIdleStop &&
-      (await this.options.recoverIdleStop(context, binding, signal))
+      (await this.options.recoverIdleStop(binding, assertAuthority, signal))
     ) {
       this.idle.delete(binding.personId);
       return;
@@ -1256,7 +1332,6 @@ export class PersonVmAdmissionHost
             const assertStopCurrent = async (probe: AbortSignal) => {
               const checking = AbortSignal.any([active, probe]);
               await owned.guard();
-              await this.authorize(context, binding, checking);
               const latest = await this.readIdleCandidate(
                 binding,
                 owned.row,
@@ -1268,36 +1343,44 @@ export class PersonVmAdmissionHost
                 this.mono() - latest.mono < this.idleMs
               )
                 throw new PersonVmError('ACTIVITY_UNKNOWN');
+              await assertAuthority(checking);
               checking.throwIfAborted();
             };
             await assertStopCurrent(active);
-            const plan = await prepare(
-              { context, binding, assertStopCurrent },
-              active,
-            );
+            const preparation = { ...request, assertStopCurrent };
+            const plan = await prepare(preparation, active);
             if (!('ok' in plan) || plan.ok !== true) return;
+            const assertWakeWindow = () => {
+              if (
+                plan.nextWakeAt !== null &&
+                !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+            };
             await this.options.stopIdleOwned(
-              context,
+              requestId,
               owned,
               active,
               async (probe) => {
                 await assertStopCurrent(probe);
-                const checked = await prepare(
-                  { context, binding, assertStopCurrent },
-                  probe,
-                );
+                const checked = await prepare(preparation, probe);
                 if (
                   !('ok' in checked) ||
                   checked.nextWakeAt !== plan.nextWakeAt
                 )
                   throw new PersonVmError('ACTIVITY_UNKNOWN');
                 await assertStopCurrent(probe);
-                if (
-                  plan.nextWakeAt !== null &&
-                  !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
-                )
-                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+                assertWakeWindow();
               },
+              scheduled &&
+                (async (dispatchSignal, stop) => {
+                  await owned.guard();
+                  dispatchSignal.throwIfAborted();
+                  await scheduled.dispatch(dispatchSignal, (fenced) => {
+                    assertWakeWindow();
+                    return stop(fenced);
+                  });
+                }),
             );
             this.idle.delete(binding.personId);
             return true;
