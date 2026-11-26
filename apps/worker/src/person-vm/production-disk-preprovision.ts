@@ -49,6 +49,7 @@ function matchesTarget(
   return (
     current !== null &&
     current.policyRevision === previous.policyRevision &&
+    current.platformRevisionId === previous.platformRevisionId &&
     sameDEntryIdentity(
       { ...current, threadId: null },
       { ...previous, threadId: null },
@@ -98,30 +99,37 @@ export function startProductionDiskPreprovision(input: {
     });
   }
 
-  async function scan(feed: Feed) {
+  async function scan(feed: Feed, closeFeed: () => Promise<void>) {
     const disconnected = new AbortController();
     const signal = AbortSignal.any([lifetime, disconnected.signal]);
     let waiting: AbortController | undefined;
     let attempt: { personId: string; recheck(): void } | undefined;
     let hinted = false;
     let nextSweep = 0;
-    const unsubscribe = await feed.subscribe(
-      {
-        changed(change) {
-          // The admission feed also echoes our own physical lease updates.
-          // Existing physical lease and admission guards belong to the port.
-          if (!eligibilityTables.has(change.table)) return;
-          const personId =
-            change.personId ??
-            (change.table === 'allrice_users' ? change.id : null);
-          if (!personId || attempt?.personId === personId) attempt?.recheck();
-          hinted = true;
-          waiting?.abort();
+    const startup = AbortSignal.any([signal, AbortSignal.timeout(6_000)]);
+    startup.throwIfAborted();
+    const stopSetup = () => void closeFeed().catch(() => {});
+    startup.addEventListener('abort', stopSetup, { once: true });
+    const unsubscribe = await feed
+      .subscribe(
+        {
+          changed(change) {
+            // The admission feed also echoes our own physical lease updates.
+            // Existing physical lease and admission guards belong to the port.
+            if (!eligibilityTables.has(change.table)) return;
+            const personId =
+              change.personId ??
+              (change.table === 'allrice_users' ? change.id : null);
+            if (!personId || attempt?.personId === personId) attempt?.recheck();
+            hinted = true;
+            waiting?.abort();
+          },
+          lost: (error) => disconnected.abort(error),
         },
-        lost: (error) => disconnected.abort(error),
-      },
-      signal,
-    );
+        startup,
+      )
+      .finally(() => startup.removeEventListener('abort', stopSetup));
+    startup.throwIfAborted();
 
     async function readSource<T>(active: AbortSignal, read: () => Promise<T>) {
       try {
@@ -234,7 +242,6 @@ export function startProductionDiskPreprovision(input: {
         if (delay > 0) await sleep(delay, undefined, { signal, ref: false });
         signal.throwIfAborted();
         hinted = false;
-        nextSweep = performance.now() + minimumSweepSpacingMs;
         const seen = new Set<string>();
         const roster = await input.readRoster(signal);
         signal.throwIfAborted();
@@ -253,6 +260,7 @@ export function startProductionDiskPreprovision(input: {
         for (const personId of retry.keys()) {
           if (!seen.has(personId)) retry.delete(personId);
         }
+        nextSweep = performance.now() + minimumSweepSpacingMs;
         if (hinted) continue;
         waiting = new AbortController();
         try {
@@ -276,18 +284,21 @@ export function startProductionDiskPreprovision(input: {
   const work = (async () => {
     while (!lifetime.aborted) {
       let feed: Feed | undefined;
+      let feedClosing: Promise<void> | undefined;
+      const closeFeed = () =>
+        (feedClosing ??= feed?.close() ?? Promise.resolve());
       let cleanupFailure: PersonVmError | undefined;
       let sourceFailed = false;
       try {
         feed = input.openFeed();
-        await scan(feed);
+        await scan(feed, closeFeed);
       } catch (error) {
         if (vmError(error, 'CLEANUP_INCOMPLETE')) cleanupFailure = error;
         else sourceFailed = true;
       }
       // A feed that cannot be closed must not be replaced by an extra owner.
       try {
-        await feed?.close();
+        await closeFeed();
       } catch (error) {
         if (cleanupFailure)
           throw new AggregateError(

@@ -32,6 +32,7 @@ function target(personId: string): PersonVmDiskPreparationTarget {
     employeeInstanceId: id(6),
     employeeRevision: 1,
     employeeVersionId: id(7),
+    platformRevisionId: null,
     policyRevision: 'committed-1',
   };
 }
@@ -358,6 +359,50 @@ it('joins direct guard reads even if a parallel guard rejects first', async () =
     gate.resolve();
     await close;
     expect(f.feed.close).toHaveBeenCalledOnce();
+  } finally {
+    gate.resolve();
+  }
+});
+
+it('closes a feed that is still subscribing before waiting for setup to settle', async () => {
+  const f = fixture();
+  const gate = latch();
+  f.feed.subscribe.mockImplementationOnce(async (_listener, signal) => {
+    await gate.promise;
+    signal.throwIfAborted();
+    return f.unsubscribed;
+  });
+  f.feed.close.mockImplementationOnce(async () => gate.resolve());
+  const owner = f.start();
+  try {
+    await vi.waitFor(() => expect(f.feed.subscribe).toHaveBeenCalledOnce());
+    await owner.close();
+    expect(f.feed.close).toHaveBeenCalledOnce();
+    expect(f.input.readRoster).not.toHaveBeenCalled();
+  } finally {
+    gate.resolve();
+  }
+});
+
+it('invalidates the original platform release even when the version ID stays the same', async () => {
+  const f = fixture();
+  f.input.readTarget.mockResolvedValue({
+    ...target(first),
+    platformRevisionId: id(9),
+  });
+  const gate = latch();
+  f.input.port.prepare.mockImplementationOnce(async () => {
+    await gate.promise;
+    return 'deferred';
+  });
+  f.start();
+  try {
+    await vi.waitFor(() => expect(f.input.port.prepare).toHaveBeenCalledOnce());
+    const guard = f.input.port.prepare.mock.calls[0]![1];
+    f.input.readTarget.mockResolvedValue(target(first));
+    f.subscribers[0]?.changed(hint('allrice_employee_version_sources'));
+    await vi.waitFor(() => expect(guard.signal.aborted).toBe(true));
+    await expect(guard.assertCurrent()).rejects.toThrow('AUTHORITY_CHANGED');
   } finally {
     gate.resolve();
   }

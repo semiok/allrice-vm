@@ -4,11 +4,15 @@ import type * as EmployeeInstances from './employees/employee-instances.ts';
 
 const data = vi.hoisted(() => ({
   getDatabase: vi.fn(),
+  createDedicatedDatabase: vi.fn(),
   employee: vi.fn(),
   publication: vi.fn(),
   principal: vi.fn(),
 }));
-vi.mock('./core/client.ts', () => ({ getDatabase: data.getDatabase }));
+vi.mock('./core/client.ts', () => ({
+  getDatabase: data.getDatabase,
+  createDedicatedDatabase: data.createDedicatedDatabase,
+}));
 vi.mock('./content-maintenance.ts', () => ({
   readContentPrincipal: data.principal,
 }));
@@ -48,6 +52,7 @@ function fixture(
   selections: DEntryRolloutPolicy['selections'],
   vm: Record<string, unknown>[] = [],
   defaultGeneration: DEntryRolloutPolicy['defaultGeneration'] = '3.x',
+  platformBacked = false,
 ) {
   const seen: { query: string; params: unknown[] }[] = [];
   const sql = vi.fn(
@@ -74,6 +79,7 @@ function fixture(
             organization_id: String(params[1]).toLowerCase(),
             workspace_id: workspace,
             employee_id: assignedEmployee,
+            platform_backed: platformBacked,
           },
         ];
       throw Error('Unexpected fixture query');
@@ -83,8 +89,10 @@ function fixture(
     async (_mode: string, callback: (tx: typeof sql) => unknown) =>
       callback(sql),
   );
-  data.getDatabase.mockReturnValue(Object.assign(sql, { begin }));
-  return { begin, seen, sql };
+  const end = vi.fn(async () => {});
+  data.getDatabase.mockReturnValue({ trusted: true });
+  data.createDedicatedDatabase.mockReturnValue({ begin, end });
+  return { begin, end, seen, sql };
 }
 beforeEach(() => {
   vi.resetAllMocks();
@@ -145,6 +153,7 @@ it('reads policy, membership and employee version in one short snapshot without 
     employeeInstanceId: first,
     employeeRevision: 1,
     employeeVersionId: version,
+    platformRevisionId: null,
     policyRevision: 'revision-1',
   });
   expect(begin.mock.calls[0]?.[0]).toBe(
@@ -254,7 +263,11 @@ it('requires an exact, still published platform source without rejecting tenant-
     id: first,
     workspaceId: workspace,
     revision: 1,
-    source: { kind: 'platform', employeeVersionId: version },
+    source: {
+      kind: 'platform',
+      employeeVersionId: version,
+      templateRevisionId: id(10),
+    },
   }));
   data.publication
     .mockResolvedValueOnce(undefined)
@@ -264,6 +277,7 @@ it('requires an exact, still published platform source without rejecting tenant-
     await readPersonVmDiskPreparationTarget(person, signal()),
   ).toMatchObject({
     employeeVersionId: version,
+    platformRevisionId: id(10),
   });
   expect(data.publication).toHaveBeenNthCalledWith(
     1,
@@ -287,4 +301,36 @@ it('requires an exact, still published platform source without rejecting tenant-
     await readPersonVmDiskPreparationTarget(person, signal()),
   ).not.toBeNull();
   expect(data.publication).not.toHaveBeenCalled();
+});
+
+it('does not treat a missing platform version mapping as a tenant-only publication', async () => {
+  fixture([selection()], [], '3.x', true);
+  expect(await readPersonVmDiskPreparationTarget(person, signal())).toBeNull();
+});
+
+it('terminates its dedicated transaction on cancellation and joins the current read', async () => {
+  const { end } = fixture([selection()]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  data.principal.mockImplementationOnce(async () => {
+    await gate;
+    return { writable: true };
+  });
+  const controller = new AbortController();
+  const result = readPersonVmDiskPreparationTarget(person, controller.signal);
+  const finished = vi.fn();
+  void result.then(finished, finished);
+  try {
+    await vi.waitFor(() => expect(data.principal).toHaveBeenCalledOnce());
+    controller.abort(Error('read cancelled'));
+    await vi.waitFor(() =>
+      expect(end).toHaveBeenCalledExactlyOnceWith({ timeout: 0 }),
+    );
+    expect(finished).not.toHaveBeenCalled();
+  } finally {
+    release();
+  }
+  await expect(result).rejects.toThrow('read cancelled');
 });

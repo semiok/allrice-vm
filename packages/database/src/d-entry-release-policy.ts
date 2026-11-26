@@ -11,7 +11,8 @@ import {
   type PersonVmDiskPreparationTarget,
 } from '@allrice/person-vm';
 import { readContentPrincipal } from './content-maintenance.ts';
-import { getDatabase } from './core/client.ts';
+import { joinCallerSave } from './business-runtime/caller-transaction.ts';
+import { createDedicatedDatabase, getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
 import {
   EmployeeInstanceError,
@@ -83,15 +84,47 @@ export async function updateDEntryReleasePolicy(
   return policy;
 }
 
+/** Preparation reads stay off the request pool. Cancellation closes only
+ * this owned connection and joins even a callback interrupted by disconnect. */
+async function readDiskPreparation<T>(
+  mode: string,
+  signal: AbortSignal,
+  read: (sql: postgres.TransactionSql, active: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const active = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
+  active.throwIfAborted();
+  const client = createDedicatedDatabase(getDatabase());
+  let closing: Promise<void> | undefined;
+  let callback: Promise<{ value: T }> | undefined;
+  const close = () => (closing ??= client.end({ timeout: 0 }));
+  const abort = () => void close().catch(() => {});
+  active.addEventListener('abort', abort, { once: true });
+  try {
+    const result = await joinCallerSave(
+      client.begin(mode, (sql) => {
+        callback = (async () => {
+          active.throwIfAborted();
+          await sql`set local transaction_timeout = '5s'`;
+          active.throwIfAborted();
+          return { value: await read(sql, active) };
+        })();
+        return callback;
+      }),
+      () => callback,
+    );
+    active.throwIfAborted();
+    return result.value;
+  } finally {
+    active.removeEventListener('abort', abort);
+    await close();
+  }
+}
+
 /** One committed roster per sweep. Pages are scheduling hints only. */
 export async function readPersonVmDiskPreparationRoster(signal: AbortSignal) {
-  signal.throwIfAborted();
-  const policy = await getDatabase().begin('read only', async (sql) => {
-    await sql`set local transaction_timeout = '5s'`;
-    signal.throwIfAborted();
-    return readDEntryReleasePolicy(sql);
-  });
-  signal.throwIfAborted();
+  const policy = await readDiskPreparation('read only', signal, (sql) =>
+    readDEntryReleasePolicy(sql),
+  );
   const people = [
     ...new Set(
       policy.selections
@@ -125,18 +158,13 @@ export async function readPersonVmDiskPreparationForegroundBusy(
   personId: string,
   signal: AbortSignal,
 ): Promise<boolean> {
-  signal.throwIfAborted();
-  const busy = await getDatabase().begin('read only', async (sql) => {
-    await sql`set local transaction_timeout = '5s'`;
-    signal.throwIfAborted();
+  return readDiskPreparation('read only', signal, async (sql) => {
     const [row] = await sql<{ busy: boolean }[]>`
       select lease_owner is not null or instance_id is not null
         or holds <> '[]'::jsonb as busy
       from person_virtual_machines where person_id=${UuidSchema.parse(personId)}`;
     return row?.busy ?? false;
   });
-  signal.throwIfAborted();
-  return busy;
 }
 
 /** Rebuild current storage eligibility from committed data in one short read.
@@ -148,11 +176,10 @@ export async function readPersonVmDiskPreparationTarget(
   UuidSchema.parse(personId);
   signal.throwIfAborted();
   if (personId !== personId.toLowerCase()) return null;
-  return getDatabase().begin(
+  return readDiskPreparation(
     'isolation level repeatable read read only',
-    async (sql) => {
-      await sql`set local transaction_timeout = '5s'`;
-      signal.throwIfAborted();
+    signal,
+    async (sql, active) => {
       const policy = await readDEntryReleasePolicy(sql);
       const [vm] = await sql<
         {
@@ -177,7 +204,7 @@ export async function readPersonVmDiskPreparationTarget(
 
       const eligible: PersonVmDiskPreparationTarget[] = [];
       for (const entry of policy.selections) {
-        signal.throwIfAborted();
+        active.throwIfAborted();
         if (
           entry.generation !== '4.0' ||
           entry.personId !== personId ||
@@ -191,9 +218,13 @@ export async function readPersonVmDiskPreparationTarget(
             organization_id: string;
             workspace_id: string;
             employee_id: string;
+            platform_backed: boolean;
           }[]
         >`
-          select i.owner_id,i.organization_id,i.workspace_id,a.employee_id
+          select i.owner_id,i.organization_id,i.workspace_id,a.employee_id,
+            exists (select 1 from allrice_platform_employee_tenant_assignments d
+              where d.organization_id=i.organization_id and d.workspace_id=i.workspace_id
+                and d.tenant_employee_id=a.employee_id) as platform_backed
           from allrice_employee_instances i
           join allrice_employee_assignments a on a.id=i.assignment_id
           where i.id=${entry.employeeInstanceId} and i.organization_id=${entry.organizationId}
@@ -212,7 +243,7 @@ export async function readPersonVmDiskPreparationTarget(
             entry.employeeInstanceId,
             sql,
           );
-          signal.throwIfAborted();
+          active.throwIfAborted();
           const identity = {
             personId: owner.owner_id,
             organizationId: owner.organization_id,
@@ -231,9 +262,13 @@ export async function readPersonVmDiskPreparationTarget(
           )
             continue;
           if (eligible[0]?.organizationId === identity.organizationId) continue;
-          if (
-            employee.source.kind === 'platform' &&
-            !(await readEmployeeVersionPublication(
+          const source = employee.source;
+          if (source.kind === 'tenant_version' && owner.platform_backed)
+            continue;
+          const platformRevisionId =
+            source.kind === 'platform' ? source.templateRevisionId : null;
+          if (platformRevisionId) {
+            const publication = await readEmployeeVersionPublication(
               {
                 organizationId: identity.organizationId,
                 workspaceId: identity.workspaceId,
@@ -241,13 +276,17 @@ export async function readPersonVmDiskPreparationTarget(
                 versionId: identity.employeeVersionId,
               },
               sql,
-            ))
-          )
-            continue;
-          signal.throwIfAborted();
+            );
+            if (publication?.revision_id !== platformRevisionId) continue;
+          }
+          active.throwIfAborted();
           if (eligible.length) throw new PersonVmError('ORGANIZATION_CONFLICT');
           eligible.push(
-            Object.freeze({ ...identity, policyRevision: policy.revision }),
+            Object.freeze({
+              ...identity,
+              platformRevisionId,
+              policyRevision: policy.revision,
+            }),
           );
         } catch (error) {
           if (
@@ -260,7 +299,7 @@ export async function readPersonVmDiskPreparationTarget(
           throw error;
         }
       }
-      signal.throwIfAborted();
+      active.throwIfAborted();
       return eligible[0] ?? null;
     },
   );

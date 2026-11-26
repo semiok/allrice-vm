@@ -80,7 +80,7 @@ export type PersonVmDiskPreparationTarget = Readonly<
     | 'employeeInstanceId'
     | 'employeeRevision'
     | 'employeeVersionId'
-  > & { policyRevision: string }
+  > & { platformRevisionId: string | null; policyRevision: string }
 >;
 
 export interface PersonVmDiskPreparationPort {

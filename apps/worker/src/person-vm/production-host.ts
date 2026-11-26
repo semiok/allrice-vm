@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, statfs } from 'node:fs/promises';
+import { lstat, stat, statfs } from 'node:fs/promises';
 import type { IncomingHttpHeaders } from 'node:http';
 import { dirname } from 'node:path';
 import type { RequestContext } from '@allrice/contracts';
@@ -842,7 +842,8 @@ export function createProductionPersonVmHost(input: {
             let path = disk.root;
             while (true) {
               signal.throwIfAborted();
-              const directory = await lstat(path).catch(
+              const inspect = path === disk.root ? lstat : stat;
+              const directory = await inspect(path).catch(
                 (error: NodeJS.ErrnoException) => {
                   if (error.code === 'ENOENT' && dirname(path) !== path)
                     return null;
