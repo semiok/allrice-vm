@@ -32,6 +32,7 @@ type Window = {
   lastSample: ClockReading;
   lastStarted: number;
   revisions: readonly number[];
+  scheduleFingerprints: readonly string[];
 };
 type History = {
   binding: PersonVmBinding;
@@ -234,11 +235,18 @@ export function createProductionNativeActivity(
           return observation('unknown', end.wall);
         }
 
+        const scheduleFingerprints = batches.map(
+          ({ fingerprint }) => fingerprint,
+        );
         const slot = Math.floor(start.mono / period);
         // Only periodic inspections fill slots. Wall time independently detects
         // suspension or clock changes on hosts whose monotonic clock pauses.
         const continuous =
           previous &&
+          scheduleFingerprints.every(
+            (fingerprint, index) =>
+              fingerprint === previous.scheduleFingerprints[index],
+          ) &&
           start.mono >= previous.lastStarted &&
           start.mono - previous.lastStarted <=
             period + Math.min(1_000, period / 10) &&
@@ -263,6 +271,7 @@ export function createProductionNativeActivity(
               lastSample: end,
               lastStarted: start.mono,
               revisions,
+              scheduleFingerprints,
             };
         if (purpose === 'inspection' && slot !== window.lastSlot) {
           window.lastSlot = slot;

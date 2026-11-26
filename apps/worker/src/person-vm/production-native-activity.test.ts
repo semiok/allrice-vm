@@ -69,8 +69,8 @@ function harness() {
     second,
     catalogs,
     guardMs,
-    nearWake(offsetMs: number) {
-      second.owner.readScheduleCatalog.mockResolvedValueOnce([
+    nearWake(offsetMs: number, persistent = false) {
+      const rows: ScheduleCatalogEntry[] = [
         {
           id: ScheduleId('scheduled-fixture'),
           sessionId: SessionId('session'),
@@ -80,7 +80,9 @@ function harness() {
           title: 'synthetic',
           prompt: 'synthetic',
         },
-      ]);
+      ];
+      if (persistent) second.owner.readScheduleCatalog.mockResolvedValue(rows);
+      else second.owner.readScheduleCatalog.mockResolvedValueOnce(rows);
     },
     restart() {
       instance.abort();
@@ -175,13 +177,25 @@ it.each([false, true])(
 
 it('blocks an active schedule at the configured inclusive safety boundary', async () => {
   const h = harness();
+  h.nearWake(idleMs + h.guardMs + 1, true);
   for (let slot = 0; slot < 20; slot++) await h.sample(slot);
-  h.nearWake(period + h.guardMs + 1);
   expect((await h.sample(20)).eligible).toBe(true);
   h.nearWake(h.guardMs);
   expect(await h.sample(20, 'stop-guard')).toMatchObject({
     eligible: false,
     snapshot: { status: 'busy', coverage: { state: 'unknown' } },
+  });
+});
+
+it('rejects a changed catalog at the final guard, even outside the stop window', async () => {
+  const h = harness();
+  h.nearWake(idleMs + 10 * period, true);
+  for (let slot = 0; slot < 20; slot++) await h.sample(slot);
+  expect((await h.sample(20)).eligible).toBe(true);
+  h.nearWake(9 * period);
+  expect(await h.sample(20, 'stop-guard')).toMatchObject({
+    eligible: false,
+    snapshot: { status: 'unknown', coverage: { state: 'unknown' } },
   });
 });
 
