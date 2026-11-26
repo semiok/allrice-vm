@@ -24,7 +24,7 @@ function pendingWork(
   if (projections?.kind !== 'sequenced') return;
   const inbox = projections.values.inbox;
   if (!inbox || typeof inbox !== 'object' || Array.isArray(inbox)) return;
-  for (const target of ['next-turn', 'next-step']) {
+  for (const target of ['next-turn', 'next-step'] as const) {
     const messages = inbox[target];
     if (!Array.isArray(messages) || !messages.length) continue;
     for (const item of messages) {
