@@ -736,6 +736,11 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
   const release = deferred<void>();
   const prewarm = vi.fn(async () => route.signal);
   const check = vi.fn(async () => true);
+  const watch = f.base.deps.watch.getMockImplementation()!;
+  f.base.deps.watch.mockImplementation(async () => ({
+    ...(await watch()),
+    assertTicketThread: async () => {},
+  }));
   const server = await nativeEntryServer(f.base, {
     ...f.base.deps,
     prewarm: {
@@ -756,6 +761,7 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
     identity: f.base.identity,
     trigger: 'page',
   });
+  await vi.waitFor(() => expect(f.base.authorityClose).toHaveBeenCalledOnce());
   check.mockImplementationOnce(async () => {
     entered.resolve();
     await release.promise;

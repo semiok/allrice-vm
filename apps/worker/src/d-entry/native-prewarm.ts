@@ -88,6 +88,8 @@ export function createPrewarmOperations(
     plan: PrewarmPlan;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
+    replies: number;
+    published: boolean;
     state: DEntryNativePrewarmStatus;
     revoked: AbortSignal;
     proof?: AbortSignal;
@@ -106,13 +108,28 @@ export function createPrewarmOperations(
   ) =>
     entry.sessionId === context.sessionId &&
     sameDEntryIdentity(entry.identity, identity);
-  const accepted = (entry: Operation, owned: boolean) => ({
-    ticket: entry.ticket,
-    owned,
-    settled: entry.settled,
-    ready: () => entry.state.state === 'ready' && !entry.proof?.aborted,
-    assertTicketThread: entry.plan.assertTicketThread,
-  });
+  function discardUnpublished(entry: Operation) {
+    if (entry.published || entry.replies || active(entry)) return;
+    tickets.delete(entry.ticket.operationId);
+    void entry.release();
+  }
+  function accepted(entry: Operation, owned: boolean) {
+    entry.replies += 1;
+    return {
+      ticket: entry.ticket,
+      owned,
+      settled: entry.settled,
+      ready: () => entry.state.state === 'ready' && !entry.proof?.aborted,
+      assertTicketThread: entry.plan.assertTicketThread,
+      publish() {
+        entry.published = true;
+      },
+      finishReply() {
+        entry.replies -= 1;
+        discardUnpublished(entry);
+      },
+    };
+  }
 
   return {
     accept(
@@ -169,6 +186,8 @@ export function createPrewarmOperations(
         plan,
         ticket,
         expires,
+        replies: 0,
+        published: false,
         state: { state: 'accepted' },
         revoked: authority.revoked,
         release() {
@@ -223,6 +242,7 @@ export function createPrewarmOperations(
                 code: denied ? 'AUTHORITY_REVOKED' : 'START_UNAVAILABLE',
               }
             : { state: 'ready' };
+        discardUnpublished(operation);
       });
       pending.add(task);
       operation.settled = task;

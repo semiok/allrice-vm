@@ -202,6 +202,7 @@ export function createDEntryHttpHandler(
     let authority:
       Awaited<ReturnType<typeof watchDEntryNativeAuthority>> | undefined;
     let transferred = false;
+    let finishPrewarmReply: (() => void) | undefined;
     const revoke = () => abort.abort(authority?.revoked.reason);
     try {
       signal.throwIfAborted();
@@ -365,6 +366,7 @@ export function createDEntryHttpHandler(
             ),
         );
         transferred = accepted.owned;
+        finishPrewarmReply = accepted.finishReply;
         let hot = false;
         // An already running VM only gets a short window for immediate proof.
         // If proof is slow, keep that same Worker-owned task and return its ID.
@@ -395,6 +397,7 @@ export function createDEntryHttpHandler(
           signal.throwIfAborted();
         }
         if (!hot) {
+          accepted.publish();
           response
             .writeHead(202, {
               'content-type': 'application/json',
@@ -800,6 +803,7 @@ export function createDEntryHttpHandler(
           : error,
       );
     } finally {
+      finishPrewarmReply?.();
       authority?.revoked.removeEventListener('abort', revoke);
       try {
         if (!transferred) await authority?.close();
