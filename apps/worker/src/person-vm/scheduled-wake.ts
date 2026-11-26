@@ -173,16 +173,16 @@ export function createPersonVmScheduledWake(input: Options) {
         return signal.aborted
           ? false
           : input.store.recordExpiredClaimWithoutStoppedSource();
-      if (signal.aborted) return false; // left in PG for another tick
-      let result: StartResult;
-      try {
-        result = await input.start(
-          claim,
-          () => input.store.isCurrent(claim),
-          signal,
-        );
-      } catch {
-        result = 'unknown';
+      const current = () => input.store.isCurrent(claim);
+      const eligible = !signal.aborted && (await current());
+      if (signal.aborted) return input.store.releaseUnusedClaim(claim);
+      let result: StartResult = 'stale';
+      if (eligible) {
+        try {
+          result = await input.start(claim, current, signal);
+        } catch {
+          result = 'unknown';
+        }
       }
       if (result === 'ready') {
         await input.store.settle(claim, { state: 'ready' });

@@ -71,9 +71,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       Parameters<typeof createPersonVmScheduledWake>[0]['start']
     >(async () => 'ready');
     const store = () => createPostgresPersonVmScheduledWakeStore(db);
-    const module = () =>
+    const module = (wakeStore = store()) =>
       createPersonVmScheduledWake({
-        store: store(),
+        store: wakeStore,
         ledger: createPostgresNativeScheduleObservationLedger(db),
         now: () => new Date('2024-11-03T05:00:00.000Z'),
         capture: async (_binding, planId) => {
@@ -99,6 +99,17 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       start,
       store,
       module,
+      async invalidate(planId: string) {
+        await createPostgresNativeScheduleObservationLedger(
+          db,
+        ).invalidateReceipts({
+          kind: 'invalidation',
+          origin,
+          receiptId: randomUUID(),
+          invalidateReceiptIds: [receiptIds.get(planId)!],
+          reasonRef: 'fixture-native-rule-deleted',
+        });
+      },
       setRows(next: ScheduleCatalogEntry[]) {
         rows = next;
       },
@@ -219,6 +230,26 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T05:28:00.000Z' });
   });
 
+  it('refuses to dispatch an explicitly invalidated snapshot', async () => {
+    const f = await fixture();
+    const host = f.module();
+    const planId = randomUUID();
+    await expect(
+      host.prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    await f.invalidate(planId);
+    await expect(
+      host.prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ blocked: true, reason: 'WAKE_PLAN_UNCONFIRMED' });
+    await f.stop(planId);
+    expect(await host.runDueOnce(signal)).toBe(true);
+    expect(await host.runDueOnce(signal)).toBe(false);
+    expect(f.start).not.toHaveBeenCalled();
+    const [row] = await db`select state,reason from person_vm_scheduled_wakes
+      where plan_id=${planId}`;
+    expect(row).toMatchObject({ state: 'blocked', reason: 'STALE_PLAN' });
+  });
+
   it('does not accept another person’s receipt even with a valid new stop ID', async () => {
     const other = await fixture();
     await other
@@ -314,6 +345,33 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       where plan_id=${planId}`;
     expect(await f.module().runDueOnce(signal)).toBe(true);
     expect(f.start).toHaveBeenCalledTimes(2);
+  });
+
+  it('makes a claim cancelled before dispatch immediately available after restart', async () => {
+    const f = await fixture();
+    const planId = randomUUID();
+    await expect(
+      f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toEqual({ ok: true, nextWakeAt: wakeAt });
+    await f.stop(planId);
+    const abort = new AbortController();
+    const store = f.store();
+    expect(
+      await f
+        .module({
+          ...store,
+          async claim(timeout) {
+            const claimed = await store.claim(timeout);
+            expect(claimed?.planId).toBe(planId);
+            abort.abort();
+            return claimed;
+          },
+        })
+        .runDueOnce(abort.signal),
+    ).toBe(true);
+    expect(f.start).not.toHaveBeenCalled();
+    expect(await f.module().runDueOnce(signal)).toBe(true);
+    expect(f.start.mock.calls[0]?.[0].attempts).toBe(1);
   });
 
   it('retains an unconfirmed start for operators without retrying it', async () => {

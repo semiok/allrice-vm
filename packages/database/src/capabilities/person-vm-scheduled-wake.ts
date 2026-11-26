@@ -52,6 +52,15 @@ function equalPlan(row: PlanRow, plan: WakePlan) {
   );
 }
 
+function hasInvalidation(sql: Sql, receiptIds: readonly string[]) {
+  return sql`exists (
+    select 1 from allrice_native_schedule_observation_receipts original
+    join allrice_native_schedule_observation_receipts revision
+      using (organization_id,workspace_id,person_id,vm_id,employee_instance_id)
+    where original.receipt_id=any(${[...receiptIds]}::uuid[])
+      and (revision.input_payload->'invalidateReceiptIds') ? original.receipt_id::text)`;
+}
+
 async function audit(
   tx: TransactionSql,
   row: PlanRow,
@@ -84,6 +93,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           where vm.person_id=${plan.personId} and vm.organization_id=${plan.organizationId}
             and vm.vm_id=${plan.vmId} and vm.instance_id=${plan.instanceId}
             and vm.lease_epoch=${plan.leaseEpoch} and vm.phase='running'
+            and not ${hasInvalidation(tx, plan.receiptIds)}
             and (select count(*) from allrice_native_schedule_observation_receipts r
               where r.receipt_id=any(${[...plan.receiptIds]}::uuid[])
                 and r.person_id=vm.person_id and r.organization_id=vm.organization_id
@@ -102,7 +112,7 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         >`select w.* from person_vm_scheduled_wakes w
           join person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
           where w.plan_id=${plan.planId} and w.person_id=${plan.personId}
-            and vm.phase='running'`;
+            and vm.phase='running' and not ${hasInvalidation(tx, plan.receiptIds)}`;
         return (
           !!existing &&
           ['empty', 'waiting'].includes(existing.state) &&
@@ -196,8 +206,29 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         where person_id=${claim.personId} and organization_id=${claim.organizationId}
           and vm_id=${claim.vmId} and instance_id=${claim.instanceId}
           and lease_epoch=${claim.leaseEpoch} and plan_id=${claim.planId}
-          and claim_id=${claim.claimId} and state='claimed' and claim_until>now()`;
+          and claim_id=${claim.claimId} and state='claimed' and claim_until>now()
+          and not ${hasInvalidation(sql, claim.receiptIds)}`;
       return !!row;
+    },
+
+    releaseUnusedClaim(claim: ScheduledWakeClaim): Promise<boolean> {
+      return sql.begin(async (tx) => {
+        const [row] = await tx<PlanRow[]>`update person_vm_scheduled_wakes
+          set state='waiting',claim_id=null,claim_until=null,attempts=attempts-1,
+            reason='DISPATCH_CANCELLED',updated_at=now()
+          where plan_id=${claim.planId} and claim_id=${claim.claimId} and state='claimed'
+          returning *`;
+        if (!row) return false;
+        await audit(
+          tx,
+          row,
+          claim.claimId,
+          'settle',
+          'failed',
+          'DISPATCH_CANCELLED',
+        );
+        return true;
+      });
     },
 
     settle(
