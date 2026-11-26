@@ -136,6 +136,7 @@ else if(a[0]==='exec'){
  if(workdir&&(v.status!=='Running'||a[a.indexOf('--workdir')+1]!=='/bin'||a[a.indexOf('--timeout')+1]!=='10s'))process.exit(46);
  const code=workdir&&mode==='workdir-init-error'?47:init&&mode==='init-error'?23:mode==='sandbox-stage-error'&&cmd[2]?.includes('invalid-dsh-sandbox-input')?24:0;
  (v.jobs??={})[id]={cmd,code};save();
+ if(workdir&&mode==='workdir-dispatch-failed')process.exit(48);
  if(!(init&&mode.startsWith('lost-id'))&&!(workdir&&mode.startsWith('workdir-lost-id')))console.log(id);
 }
 else if(a[0]==='kill')v.jobs[a[a.indexOf('--job')+1]].code=137;
@@ -150,7 +151,10 @@ else if(a[0]==='logs'){
 }
 else if(a[0]==='wait'){
  const job=v.jobs[a[a.indexOf('--job')+1]];
- if(mode==='unknown-wait'){console.log('{}');save();process.exit(0);}
+ const workdir=job.cmd.join(' ')==='/bin/mkdir -p -- /work';
+ if((mode==='unknown-wait'&&job.cmd[0]==='/bin/mkdir'&&!workdir)||(mode==='workdir-unknown-wait'&&workdir)){
+  console.log('{}');save();process.exit(0);
+ }
  if(((mode==='cancel-workdir'&&job.cmd.join(' ')==='/bin/mkdir -p -- /work')||(mode==='cancel-init'&&job.cmd.includes('/work/memory/init.cjs'))||(mode==='cancel-memory-probe'&&job.cmd[1]==='-e')||(mode==='cancel-retained-command'&&job.cmd.includes('native-dsh')))&&job.code===0){
   save();fs.writeFileSync(p.join(home,'waiting'),String(process.pid));setInterval(()=>{},1000);return;
  }
@@ -1485,6 +1489,8 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
   });
   it.each([
     'workdir-init-error',
+    'workdir-dispatch-failed',
+    'workdir-unknown-wait',
     'workdir-lost-id',
     'workdir-lost-id-unknown-stop',
     'init-error',
@@ -1497,7 +1503,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       f.service.prewarm(f.rc, { trigger: 'page' }, signal()),
     ).rejects.toMatchObject({
       code:
-        mode.endsWith('unknown-stop') || mode === 'unknown-wait'
+        mode.endsWith('unknown-stop') || mode.endsWith('unknown-wait')
           ? 'CLEANUP_INCOMPLETE'
           : 'PROVIDER_FAILED',
     });
@@ -1506,7 +1512,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(
       calls.some((a) => a[0] === 'exec' && a.includes('/work/memory/launcher')),
     ).toBe(false);
-    if (mode.startsWith('workdir-'))
+    if (mode.startsWith('workdir-') || mode === 'unknown-wait')
       expect(calls.some((a) => a[0] === 'cp')).toBe(false);
     expect(f.h.mounts.size).toBe(mode.endsWith('unknown-stop') ? 1 : 0);
   });
