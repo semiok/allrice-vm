@@ -1,8 +1,18 @@
 import type { RequestContext } from '@allrice/contracts';
-import type { PersonVmBinding } from './contract.ts';
+import { PersonVmError, type PersonVmBinding } from './contract.ts';
 import type { PersonVmAdmissionParticipant } from './admission-contract.ts';
 
 export const PERSON_VM_ADMISSION_BOUNDARY_VERSION = 1 as const;
+
+/** Trusted Host startup reached local join without obtaining a guest job ID. */
+export class NativeWebGuestLaunchUnacknowledged extends PersonVmError {
+  readonly binding: PersonVmBinding;
+
+  constructor(binding: PersonVmBinding, cause: PersonVmError) {
+    super('CLEANUP_INCOMPLETE', { cause });
+    this.binding = Object.freeze({ ...binding });
+  }
+}
 
 /** HOST ONLY. A handle belongs to its issuing boundary/operation, not JSON.
  * The signal is canceled on caller cancellation, owner loss or revocation.

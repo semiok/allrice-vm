@@ -9,9 +9,10 @@ import {
   type PersonVmBinding,
   type PersonVmView,
 } from './contract.ts';
-import type {
-  PersonVmAdmissionBoundary,
-  PersonVmAdmissionPermit,
+import {
+  NativeWebGuestLaunchUnacknowledged,
+  type PersonVmAdmissionBoundary,
+  type PersonVmAdmissionPermit,
 } from './admission-boundary.ts';
 import type {
   PersonVmActivityCursor,
@@ -57,7 +58,8 @@ type OwnedPermit = {
   closing: boolean;
   activated: boolean;
   joined: boolean;
-  unsafe: boolean;
+  unsafe?: 'entry-guest-launch' | 'unknown';
+  entryLaunchListenerJoined?: true;
   detach(): void;
 };
 type Frame = { personId: string; lease: VmLease; active: boolean };
@@ -105,6 +107,10 @@ export class PersonVmAdmissionHost
   private readonly permits = new WeakMap<
     PersonVmAdmissionPermit,
     OwnedPermit
+  >();
+  private readonly stoppedEntryPermits = new Map<
+    string,
+    Set<PersonVmAdmissionPermit>
   >();
   // Only failed admit calls that never returned a handle/callback. Not TTL takeover.
   private readonly unacknowledged = new Set<string>();
@@ -650,7 +656,6 @@ export class PersonVmAdmissionHost
       closing: false,
       activated: false,
       joined: false,
-      unsafe: false,
       detach: () => signal.removeEventListener('abort', cancel),
     });
     return permit;
@@ -706,7 +711,7 @@ export class PersonVmAdmissionHost
         try {
           await listener.close();
         } catch (error) {
-          owned.unsafe = true;
+          owned.unsafe = 'unknown';
           throw error;
         }
       };
@@ -737,13 +742,24 @@ export class PersonVmAdmissionHost
         // Rejection after entry is not proof that actual children joined.
         // Confirmed business failure/cancellation must fulfil a local outcome;
         // an outer catch (including another queued callback) cannot undo this.
-        if (entered) owned.unsafe = true;
+        if (entered) {
+          owned.unsafe =
+            !owned.unsafe &&
+            active &&
+            permit.participant === 'entry' &&
+            error instanceof NativeWebGuestLaunchUnacknowledged &&
+            sameBinding(error.binding, permit.binding)
+              ? 'entry-guest-launch'
+              : 'unknown';
+        }
         throw error;
       } finally {
         closing = true;
         listener.signal.removeEventListener('abort', lost);
         await checking;
         await closeListener();
+        if (active && owned.unsafe === 'entry-guest-launch')
+          owned.entryLaunchListenerJoined = true;
       }
     });
     owned.pending.add(promise);
@@ -771,7 +787,19 @@ export class PersonVmAdmissionHost
       owned.controller.abort(new PersonVmError('LEASE_LOST'));
       await Promise.allSettled([...owned.pending]);
       owned.detach();
-      if (owned.unsafe) throw new PersonVmError('CLEANUP_INCOMPLETE');
+      if (owned.unsafe) {
+        if (
+          owned.unsafe === 'entry-guest-launch' &&
+          owned.entryLaunchListenerJoined &&
+          !owned.pending.size
+        ) {
+          const personId = permit.binding.personId;
+          const permits = this.stoppedEntryPermits.get(personId) ?? new Set();
+          permits.add(permit);
+          this.stoppedEntryPermits.set(personId, permits);
+        }
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }
       owned.joined = true;
       await this.releasePermit(permit, owned, new AbortController().signal);
     })());
@@ -802,6 +830,79 @@ export class PersonVmAdmissionHost
     if (!owned.joined || owned.unsafe)
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     await this.releasePermit(permit, owned, signal);
+  }
+  hasStoppedEntryRecovery(binding: PersonVmBinding) {
+    return [...(this.stoppedEntryPermits.get(binding.personId) ?? [])].some(
+      (permit) => sameBinding(binding, permit.binding),
+    );
+  }
+  forgetStoppedEntryRecovery(binding: PersonVmBinding) {
+    const permits = this.stoppedEntryPermits.get(binding.personId);
+    if (!permits) return;
+    for (const permit of permits)
+      if (sameBinding(permit.binding, binding)) permits.delete(permit);
+    if (!permits.size) this.stoppedEntryPermits.delete(binding.personId);
+  }
+  /** Runs under the existing physical lease with this Host's original handles.
+   * Generic unsafe entry callbacks and handles from another process stay put. */
+  async recoverStoppedEntryPermits(
+    lease: VmLease,
+    signal: AbortSignal,
+    expected?: PersonVmBinding,
+  ) {
+    if (!lease.row?.instanceId) return false;
+    const binding = bindingOf(lease.row);
+    if (expected && !sameBinding(expected, binding))
+      throw new PersonVmError('LEASE_LOST');
+    if (!this.hasStoppedEntryRecovery(binding)) return false;
+    const token = lease.ownerToken;
+    if (!token) throw new PersonVmError('LEASE_LOST');
+    const active = AbortSignal.any([signal, lease.signal]);
+    const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+    await guard();
+    try {
+      await this.options.assertStopSafe(lease, active);
+    } catch (error) {
+      if (error instanceof PersonVmError && error.code === 'ACTIVITY_UNKNOWN')
+        return false;
+      throw error;
+    }
+    await guard();
+    const permits = this.stoppedEntryPermits.get(binding.personId)!;
+    for (const permit of permits) {
+      if (!sameBinding(permit.binding, binding)) continue;
+      const owned = this.owned(permit);
+      if (
+        !owned.finish ||
+        !owned.closing ||
+        owned.unsafe !== 'entry-guest-launch'
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      await owned.finish.catch(() => {});
+      if (owned.pending.size) throw new PersonVmError('CLEANUP_INCOMPLETE');
+      await this.options.shared.transaction(
+        binding.personId,
+        active,
+        async (tx) => {
+          if (
+            tx.row.lease_owner !== token ||
+            !sameBinding(rowBinding(tx.row), binding) ||
+            tx.state.sourceId !== owned.source
+          )
+            throw new PersonVmError('LEASE_LOST');
+          const removed = await tx.sql`delete from person_vm_admission_permits
+          where permit_id=${permit.permitId} and owner_ref=${owned.owner} and operation_id=${owned.operationId}
+          and person_id=${binding.personId} and vm_id=${binding.vmId} and organization_id=${binding.organizationId}
+          and instance_id=${binding.instanceId} and lease_epoch=${binding.leaseEpoch}
+          and participant='entry' and disposition='active' returning permit_id`;
+          if (removed.length) tx.touch('entry', true);
+        },
+        true,
+      );
+    }
+    // Keep the original local witness until the lifecycle actually publishes
+    // a stopped row or a new generation. Other permits may still block stop.
+    return true;
   }
   /** Process-local recovery after the owning Gateway callbacks and its exact
    * dispatcher are stopped. Only that Gateway's original handle can settle. */
@@ -1053,6 +1154,7 @@ export class PersonVmAdmissionHost
       async (current) => {
         const owned = this.frames.getStore()!.lease;
         await this.options.assertStopSafe(owned, current);
+        await this.recoverStoppedEntryPermits(owned, current, lease.binding);
         await this.options.shared.transaction(
           lease.binding.personId,
           current,

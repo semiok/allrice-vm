@@ -64,6 +64,7 @@ export async function createProductionPersonVmProviders(
     ...(capacityEnabled && {
       restartMemory: { memoryMiB: loaded.platform.memoryMiB, reserve },
     }),
+    employeePortSlots: loaded.platform.employeePortSlots,
     seededPublicCache: poolPlatform?.hasSeededPublicCache.bind(poolPlatform),
     refreshBoundPublicCache:
       poolPlatform?.refreshBoundPublicCache.bind(poolPlatform),

@@ -69,9 +69,8 @@ export interface PersonVmAuthority {
   }>;
 }
 
-/** Host-derived storage target only. A rollout revision is not a user session
- * or permission to start a VM. */
-export type PersonVmDiskPreparationTarget = Readonly<
+/** Exact employee profile checked by the current authenticated entry authorizer. */
+export type PersonVmEmployeeSelection = Readonly<
   Pick<
     DEntryIdentity,
     | 'personId'
@@ -80,8 +79,13 @@ export type PersonVmDiskPreparationTarget = Readonly<
     | 'employeeInstanceId'
     | 'employeeRevision'
     | 'employeeVersionId'
-  > & { platformRevisionId: string | null; policyRevision: string }
+  >
 >;
+
+/** Host-derived storage target only. A rollout revision is not a user session
+ * or permission to start a VM. */
+export type PersonVmDiskPreparationTarget = PersonVmEmployeeSelection &
+  Readonly<{ platformRevisionId: string | null; policyRevision: string }>;
 
 export interface PersonVmDiskPreparationPort {
   /** The provider owns the existing person lease and joins all disk I/O and
@@ -205,13 +209,47 @@ export type PersonVmPrewarmTarget = Readonly<{
   replacesVmId?: string;
 }>;
 
-export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
-  assertAuthority(signal: AbortSignal): Promise<void>;
-  dispatchUpgradeStop?(
-    binding: PersonVmBinding,
-    signal: AbortSignal,
-    dispatch: () => Promise<void>,
-  ): Promise<void>;
+/** Host-only stages. A written candidate proves nothing until independently visible. */
+export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
+
+/** Host-only observations from this request's create and start leases. */
+export type PersonVmPrewarmObserver = {
+  observeVmReservation?(vmId: string): void;
+  observeVmStart?(binding: PersonVmBinding): void;
+};
+
+export type PersonVmPrewarmFence = PersonVmPrewarmTarget &
+  PersonVmPrewarmObserver & {
+    assertAuthority(signal: AbortSignal): Promise<void>;
+    dispatchUpgradeStop?(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      dispatch: () => Promise<void>,
+    ): Promise<void>;
+    /** Opaque deletion fact from the Worker snapshot, checked under the VM lease. */
+    readonly deletionFence?: string | null;
+    /** Host-only observations for this ticket's exact orphaned start. */
+    orphanedStart?: Readonly<{
+      predecessor: PersonVmBinding;
+      observeLease(ownerToken: string, signal: AbortSignal): void;
+      observeInstance(binding: PersonVmBinding): void;
+      observeFailure?(
+        ownerToken: string,
+        phase: 'starting' | 'stopped' | 'failed',
+      ): void;
+      observeRelease?(
+        ownerToken: string,
+        rowVersion: string,
+        stage: PersonVmLeaseReleaseStage,
+      ): void;
+    }>;
+  };
+
+export type PersonVmPrewarmInput = {
+  trigger: 'page' | 'input' | 'open';
+  target?: PersonVmPrewarmFence;
+  observer?: PersonVmPrewarmObserver;
+  selectedEmployee?: PersonVmEmployeeSelection;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
@@ -220,10 +258,7 @@ export interface PersonVmPort {
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: {
-      trigger: 'page' | 'input' | 'open';
-      target?: PersonVmPrewarmFence;
-    },
+    input: PersonVmPrewarmInput,
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

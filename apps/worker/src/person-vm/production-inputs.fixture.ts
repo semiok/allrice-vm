@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import { readPersonVmDshCommandMemoryControls } from '@allrice/vm-memory/guest-plan';
+import { resolveProductionEmployeeRuntimeSettings } from './production-employee-runtime.js';
 import type {
   ProductionHostConfiguration,
   readProductionHostConfiguration,
@@ -92,6 +93,10 @@ export async function productionInputsFixture() {
   const loaded: Awaited<ReturnType<typeof readProductionHostConfiguration>> = {
     configuration,
     platform,
+    employeeRuntimeSettings: resolveProductionEmployeeRuntimeSettings(
+      configuration.lifecycle,
+      platform.employeePortSlots,
+    ),
     applicationBuild: Object.freeze({
       sourceSha: 'a'.repeat(40),
       sourceTree: 'b'.repeat(40),

@@ -35,6 +35,15 @@ type DiskImageInfo = {
     'system-entities'?: { 'mount-point'?: string }[];
   }[];
 };
+export type PersonVmDiskIdentity = Readonly<{ device: string; inode: string }>;
+type MountState =
+  | Readonly<{ state: 'unknown' }>
+  | Readonly<{ state: 'absent' }>
+  | Readonly<{ state: 'attached'; mount: string }>;
+type PersonVmMountInspection =
+  | Readonly<{ state: 'unknown' }>
+  | (Exclude<MountState, { state: 'unknown' }> &
+      Readonly<{ image: PersonVmDiskIdentity }>);
 export interface PersonVmDiskPort {
   /** Host-only non-destructive reconciliation of this vmId's two storage locations. */
   inspect(vmId: string, signal: AbortSignal): Promise<PersonVmDiskInspection>;
@@ -51,8 +60,21 @@ export interface PersonVmDiskPort {
     disk: PersonDisk,
     signal: AbortSignal,
   ): Promise<string>;
-  create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
-  attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
+  inspectMount?(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    expected?: Readonly<{ image: PersonVmDiskIdentity; acrossTier?: true }>,
+  ): Promise<PersonVmMountInspection>;
+  /** Returns the creation identity only when this call formatted a new image. */
+  create(
+    disk: PersonDisk,
+    signal: AbortSignal,
+  ): Promise<PersonVmDiskIdentity | void>;
+  attach(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    beforeDispatch?: () => void,
+  ): Promise<string>;
   verifyAttachedMount?(
     disk: PersonDisk,
     signal: AbortSignal,
@@ -259,19 +281,43 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     }
     return state;
   }
-  private async isAttached(disk: PersonDisk, signal: AbortSignal) {
+  private async mountState(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    previous?: PersonDisk,
+  ): Promise<MountState> {
     const canonical = systemPathNormalizer();
-    const path = await canonical(this.image(disk));
-    const mount = await canonical(this.mount(disk));
-    const image = (await this.info(signal, canonical)).images?.find(
-      (item) => item['image-path'] === path,
+    const image = await canonical(this.image(disk));
+    const oldImage = previous && (await canonical(this.image(previous)));
+    const mount = this.mount(disk);
+    const canonicalMount = await canonical(mount);
+    const { images } = await this.info(signal, canonical);
+    signal.throwIfAborted();
+    if (!Array.isArray(images)) return { state: 'unknown' };
+    const matches = images.filter(
+      (entry) =>
+        entry['image-path'] === image ||
+        (oldImage !== undefined && entry['image-path'] === oldImage) ||
+        entry['system-entities']?.some(
+          (entity) => entity['mount-point'] === canonicalMount,
+        ),
     );
+    if (!matches.length) return { state: 'absent' };
     if (
-      image &&
-      !image['system-entities']?.some((item) => item['mount-point'] === mount)
+      matches.length !== 1 ||
+      matches[0]?.['image-path'] !== image ||
+      matches[0]['system-entities']?.filter(
+        (entity) => entity['mount-point'] === canonicalMount,
+      ).length !== 1
     )
+      return { state: 'unknown' };
+    return { state: 'attached', mount };
+  }
+  private async isAttached(disk: PersonDisk, signal: AbortSignal) {
+    const match = await this.mountState(disk, signal);
+    if (match.state === 'unknown')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
-    return Boolean(image);
+    return match.state === 'attached';
   }
   private async withKey<T>(
     disk: PersonDisk,
@@ -365,7 +411,10 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     signal.throwIfAborted();
     for (const directory of ['', 'warm', 'cold', 'manifests'])
       await privateDirectory(join(this.options.root, directory));
-    return this.inspectExisting(vmId, signal);
+    const observed = await this.inspectExisting(vmId, signal);
+    return observed.state === 'ready'
+      ? { state: 'ready', disk: observed.disk }
+      : observed;
   }
   async listFormalDiskIds(signal: AbortSignal) {
     const root = await privatePersonVmDirectory(this.options.root);
@@ -400,15 +449,36 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     vmId: string,
     signal: AbortSignal,
     erasingIdentity?: string,
-  ) {
-    return this.inspectExisting(vmId, signal, true, erasingIdentity);
+  ): Promise<PersonVmDiskInspection> {
+    const observed = await this.inspectExisting(
+      vmId,
+      signal,
+      true,
+      erasingIdentity,
+    );
+    if (observed.state !== 'ready') return observed;
+    return {
+      state: 'ready',
+      disk: observed.disk,
+      ...(observed.identitySha256 && {
+        identitySha256: observed.identitySha256,
+      }),
+    };
   }
   private async inspectExisting(
     vmId: string,
     signal: AbortSignal,
     includeIdentity = false,
     erasingIdentity?: string,
-  ): Promise<PersonVmDiskInspection> {
+  ): Promise<
+    | Readonly<{ state: 'absent' | 'unknown' }>
+    | Readonly<{
+        state: 'ready';
+        disk: PersonDisk;
+        image: PersonVmDiskIdentity;
+        identitySha256?: string;
+      }>
+  > {
     signal.throwIfAborted();
     const found: { disk: PersonDisk; device: string; inode: string }[] = [];
     for (const tier of ['warm', 'cold'] as const) {
@@ -484,6 +554,7 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     return {
       state: 'ready',
       disk: actual.disk,
+      image: Object.freeze({ device: actual.device, inode: actual.inode }),
       ...(includeIdentity && {
         // Fingerprint the verified creation receipt, not the user's bytes or key.
         identitySha256: identitySha256(),
@@ -491,29 +562,29 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     };
   }
 
-  /** An observation only, for an already running VM under its physical lease. */
-  async verifyAttachedMount(disk: PersonDisk, signal: AbortSignal) {
+  /** An observation only, under the disk's physical lease. */
+  async inspectMount(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    expected?: Readonly<{ image: PersonVmDiskIdentity; acrossTier?: true }>,
+  ): Promise<PersonVmMountInspection> {
     const observed = await this.inspectExisting(disk.vmId, signal);
-    if (observed.state !== 'ready' || observed.disk.tier !== disk.tier)
-      return null;
-    const canonical = systemPathNormalizer();
-    const mount = await canonical(this.mount(disk));
-    const image = await canonical(this.image(disk));
-    const matches = (await this.info(signal, canonical)).images?.filter(
-      (entry) =>
-        entry['image-path'] === image ||
-        entry['system-entities']?.some(
-          (entity) => entity['mount-point'] === mount,
-        ),
-    );
-    signal.throwIfAborted();
-    return matches?.length === 1 &&
-      matches[0]?.['image-path'] === image &&
-      matches[0]['system-entities']?.filter(
-        (entity) => entity['mount-point'] === mount,
-      ).length === 1
-      ? this.mount(disk)
-      : null;
+    if (
+      observed.state !== 'ready' ||
+      (observed.disk.tier !== disk.tier && !expected?.acrossTier) ||
+      (expected &&
+        (observed.image.device !== expected.image.device ||
+          observed.image.inode !== expected.image.inode))
+    )
+      return { state: 'unknown' };
+    const mounted = await this.mountState(observed.disk, signal, disk);
+    return mounted.state === 'unknown'
+      ? mounted
+      : { ...mounted, image: observed.image };
+  }
+  async verifyAttachedMount(disk: PersonDisk, signal: AbortSignal) {
+    const match = await this.inspectMount(disk, signal);
+    return match.state === 'attached' ? match.mount : null;
   }
   async create(
     disk: PersonDisk,
@@ -560,31 +631,35 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
         constants.O_NOFOLLOW,
       0o600,
     );
+    const identity = { device: String(stat.dev), inode: String(stat.ino) };
     try {
       await receipt.writeFile(
-        JSON.stringify({
-          version: 1,
-          vmId: disk.vmId,
-          device: String(stat.dev),
-          inode: String(stat.ino),
-        }),
+        JSON.stringify({ version: 1, vmId: disk.vmId, ...identity }),
       );
       await receipt.sync();
     } finally {
       await receipt.close();
     }
+    return Object.freeze(identity);
   }
-  async attach(disk: PersonDisk, signal: AbortSignal) {
+  async attach(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    beforeDispatch?: () => void,
+  ) {
     const inspected = await this.inspect(disk.vmId, signal);
     if (inspected.state !== 'ready' || inspected.disk.tier !== disk.tier)
       throw new PersonVmError('PROVIDER_FAILED');
-    await privateDirectory(this.mount(disk));
     const stat = await lstat(this.image(disk));
     if (!stat.isFile() || stat.isSymbolicLink())
       throw new PersonVmError('PROVIDER_FAILED');
     if (!(await this.isAttached(disk, signal))) {
-      await this.withKey(disk, false, (key) =>
-        this.command(
+      await privateDirectory(this.mount(disk));
+      await this.withKey(disk, false, async (key) => {
+        if (await this.isAttached(disk, signal)) return;
+        signal.throwIfAborted();
+        beforeDispatch?.();
+        await this.command(
           [
             'attach',
             this.image(disk),
@@ -595,8 +670,8 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
           ],
           signal,
           key,
-        ),
-      );
+        );
+      });
     }
     if (!(await this.isAttached(disk, signal)))
       throw new PersonVmError('PROVIDER_FAILED');

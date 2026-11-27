@@ -293,7 +293,10 @@ async function receiptFixture() {
     },
   );
   vi.spyOn(input.providers.disk, 'create').mockImplementation(
-    physical.disk.create,
+    async (disk, active) => {
+      const created = await physical.disk.create(disk, active);
+      return created ? created : undefined;
+    },
   );
   vi.spyOn(input.providers.disk, 'inspect').mockImplementation(
     physical.disk.inspect,

@@ -15,11 +15,13 @@ import {
   type PersonVmAuthority,
   type PersonVmBinding,
   type PersonVmDiskPreparationPort,
+  type PersonVmEmployeeSelection,
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
   type PersonVmPrewarmFence,
-  type PersonVmPrewarmTarget,
+  type PersonVmPrewarmInput,
+  type PersonVmPrewarmObserver,
   type PersonVmRuntimePort,
   type PersonVmView,
 } from './contract.ts';
@@ -38,11 +40,18 @@ import type {
   PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import type { PersonVmSqlFactory } from './store.ts';
-import type { PersonVmDiskPort } from './encrypted-disk.ts';
+import type {
+  PersonDisk,
+  PersonVmDiskIdentity,
+  PersonVmDiskPort,
+} from './encrypted-disk.ts';
 import type { PersonVmDiskPool } from './disk-pool.ts';
 import type { DiskPoolOwner } from './disk-pool-platform.ts';
 import type { PersonVmNativePort } from './microsandbox.ts';
-import { bootstrapPersonVm } from './guest-bootstrap.ts';
+import {
+  bootstrapPersonVm,
+  type PersonVmStartingScope,
+} from './guest-bootstrap.ts';
 import type {
   PlatformVmDeletionAuthorization,
   PlatformVmDeletionRequest,
@@ -51,6 +60,7 @@ import type {
 import {
   checkedWebRoster,
   type PersonVmWebRoster,
+  type PersonVmWebEndpointReceipt,
   type PersonVmWebRosterPort,
   type PersonVmWebStartup,
   type NativeWebSetupFailure,
@@ -149,6 +159,20 @@ async function assertPrewarmAuthority(
   }
 }
 
+type RetainedStartupMount = Readonly<{
+  binding: PersonVmBinding;
+  disk: PersonDisk;
+  image: PersonVmDiskIdentity;
+}>;
+type FirstPrewarmDisk = Readonly<{
+  vmId: string;
+  image: PersonVmDiskIdentity;
+}>;
+type SelectedStartup = Readonly<{
+  employee: PersonVmEmployeeSelection;
+  firstDisk?: FirstPrewarmDisk;
+}>;
+
 export class PersonVmService
   implements PersonVmHostPort, PersonVmAdmissionBindingPort
 {
@@ -156,6 +180,10 @@ export class PersonVmService
   private workerDrain = false;
   private readonly upgradePrewarms = new Map<string, Promise<PersonVmView>>();
   private idleAccessOrder = 0;
+  private readonly retainedStartupMounts = new Map<
+    string,
+    RetainedStartupMount
+  >();
   private admissionShared?: PostgresPersonVmAdmissionStore;
   private readonly now: () => Date;
   private readonly currentLease = new AsyncLocalStorage<{
@@ -168,6 +196,10 @@ export class PersonVmService
     private readonly options: {
       store: PersonVmStore;
       authority: PersonVmAuthority;
+      readUnusedEmployeeHomes?(
+        scope: PersonVmStartingScope,
+        mount: string,
+      ): Promise<boolean>;
       authorizePlatformDeletion?: (
         context: RequestContext,
         signal: AbortSignal,
@@ -342,7 +374,14 @@ export class PersonVmService
       identity: { personId: string; organizationId: string },
       signal: AbortSignal,
     ) => Promise<T>,
-    options: { allowClosed?: boolean; joinOfflinePreparation?: boolean } = {},
+    options: {
+      allowClosed?: boolean;
+      joinOfflinePreparation?: boolean;
+      beforeClaim?: Parameters<PersonVmStore['withLease']>[1]['beforeClaim'];
+      observeRelease?: Parameters<
+        PersonVmStore['withLease']
+      >[1]['observeRelease'];
+    } = {},
   ) {
     const identity = await this.identity(context, action, signal);
     const foreground =
@@ -353,6 +392,10 @@ export class PersonVmService
         {
           now: this.now,
           ttlMs: this.options.leaseTtlMs,
+          ...(options.beforeClaim && { beforeClaim: options.beforeClaim }),
+          ...(options.observeRelease && {
+            observeRelease: options.observeRelease,
+          }),
           ...(foreground &&
             options.joinOfflinePreparation && {
               offlinePreparation: {
@@ -407,6 +450,13 @@ export class PersonVmService
     };
     return this.currentLease.run(frame, async () => {
       try {
+        const pending = this.retainedStartupMounts.get(personId);
+        if (pending)
+          await this.joinRetainedStartupMount(
+            pending,
+            lease,
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
         return await work();
       } finally {
         frame.active = false;
@@ -449,11 +499,16 @@ export class PersonVmService
     );
   }
   private assertPrewarmTarget(
-    row: VmRecord | null,
-    target?: PersonVmPrewarmTarget,
+    row: Readonly<VmRecord> | null,
+    target?: PersonVmPrewarmFence,
     allowRetainedRestore = false,
   ) {
     if (!target) return;
+    if (
+      target.deletionFence !== undefined &&
+      (row?.prewarmDeletionFence ?? null) !== target.deletionFence
+    )
+      throw new PersonVmError('LEASE_LOST');
     const running = row?.phase === 'running' && !this.needsUpgradeStop(row);
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
     const purged =
@@ -472,6 +527,7 @@ export class PersonVmService
       (target.replacesVmId &&
         row?.phase !== 'deleted' &&
         target.vmId === null) ||
+      (running && (target.vmId === null || target.instanceId === null)) ||
       epoch !== target.leaseEpoch ||
       (target.vmId !== null && target.vmId !== row?.vmId) ||
       (target.instanceId !== null &&
@@ -479,10 +535,20 @@ export class PersonVmService
     )
       throw new PersonVmError('LEASE_LOST');
   }
-  async create(
+  create(
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
+  ) {
+    return this.createForStartup(context, signal, target, observer);
+  }
+  private createForStartup(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
+    observeFirstDisk?: (proof: FirstPrewarmDisk) => void,
   ) {
     return this.leased(
       context,
@@ -506,6 +572,7 @@ export class PersonVmService
             await target.assertAuthority(signal);
             signal.throwIfAborted();
           }
+          observer?.observeVmReservation?.(lease.row.vmId);
           return view(lease.row);
         }
         if (lease.row?.diskRetained && !retry) {
@@ -545,10 +612,25 @@ export class PersonVmService
               throw new PersonVmError('AUTHORIZATION_DENIED');
           },
           assertPrewarmAuthority: assertTicket,
+          observeVmReservation: observer?.observeVmReservation,
+          observeFirstDisk:
+            !lease.row && !lease.joinedOfflinePreparation
+              ? observeFirstDisk
+              : undefined,
         });
         return view(row);
       },
-      { joinOfflinePreparation: true },
+      {
+        joinOfflinePreparation: true,
+        ...(target && {
+          beforeClaim: (row, _owner, active) => {
+            active.throwIfAborted();
+            signal.throwIfAborted();
+            if (row) this.checkOrganization(row, context.organizationId);
+            this.assertPrewarmTarget(row, target, true);
+          },
+        }),
+      },
     );
   }
 
@@ -574,6 +656,7 @@ export class PersonVmService
       diskTier: 'warm',
       diskRetained: true,
       nativeCreated: false,
+      verifiedWebSlotCapacity: null,
       instanceId: null,
       leaseEpoch,
       leaseOwner: null,
@@ -651,6 +734,8 @@ export class PersonVmService
       lane: 'foreground' | 'admin';
       assertCurrent(): Promise<void>;
       assertPrewarmAuthority?: PersonVmPrewarmFence['assertAuthority'];
+      observeVmReservation?: PersonVmPrewarmObserver['observeVmReservation'];
+      observeFirstDisk?: (proof: FirstPrewarmDisk) => void;
     },
   ) {
     const pool = this.options.diskPool;
@@ -674,6 +759,7 @@ export class PersonVmService
       row.phase = 'starting';
       await lease.save(row);
       committed = true;
+      input.observeVmReservation?.(row.vmId);
       await lease.audit(row, { ...audit, result: 'started' });
     };
     if (!needsCandidate) await commitOwner(signal);
@@ -688,6 +774,7 @@ export class PersonVmService
         ...ownerGuard,
         ...(needsCandidate && { commitOwner }),
       });
+    let createdImage: PersonVmDiskIdentity | void = undefined;
     try {
       signal.throwIfAborted();
       if (committed) await lease.guard();
@@ -721,7 +808,7 @@ export class PersonVmService
             signal.throwIfAborted();
           }
           if (assertTicket) await assertTicket(signal);
-          await this.options.disk.create(
+          createdImage = await this.options.disk.create(
             { vmId: row.vmId, tier: row.diskTier },
             signal,
           );
@@ -742,6 +829,8 @@ export class PersonVmService
       row.stoppedAt = this.now().toISOString();
       await lease.save(row);
       await lease.audit(row, { ...audit, result: 'succeeded' });
+      if (createdImage && !signal.aborted)
+        input.observeFirstDisk?.({ vmId: row.vmId, image: createdImage });
       return 'prepared' as const;
     } catch (error) {
       const failure = safeError(error);
@@ -879,7 +968,12 @@ export class PersonVmService
     }
     return inspected;
   }
-  private async mounted(row: VmRecord, signal: AbortSignal, lease: VmLease) {
+  private async mounted(
+    row: VmRecord,
+    signal: AbortSignal,
+    lease: VmLease,
+    beforeAttach?: () => void,
+  ) {
     if ((await this.reconcileDisk(row, signal, lease)).state !== 'ready')
       throw new PersonVmError('PROVIDER_FAILED');
     const binding = bindingOf(row);
@@ -887,9 +981,19 @@ export class PersonVmService
     const mount = await this.options.disk.attach(
       { vmId: row.vmId, tier: row.diskTier },
       signal,
+      beforeAttach,
     );
     await this.options.native.prepare(binding, mount, signal);
     return mount;
+  }
+  private async pingRunning(row: VmRecord, signal: AbortSignal) {
+    if (!this.options.egress || !row.egressReceipt)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    const binding = bindingOf(row);
+    row.egressReceipt = this.receipt(binding, row.egressReceipt);
+    await this.options.egress.assertActive(row.egressReceipt, signal);
+    await this.options.native.ping(binding, signal);
+    return binding;
   }
   private async ready(
     row: VmRecord,
@@ -897,12 +1001,8 @@ export class PersonVmService
     context?: RequestContext,
     scheduled = false,
   ) {
-    if (!this.options.runtime || !this.options.egress || !row.egressReceipt)
-      throw new PersonVmError('RUNTIME_NOT_READY');
-    const binding = bindingOf(row);
-    row.egressReceipt = this.receipt(binding, row.egressReceipt);
-    await this.options.egress.assertActive(row.egressReceipt, signal);
-    await this.options.native.ping(binding, signal);
+    if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
+    const binding = await this.pingRunning(row, signal);
     if (scheduled) {
       if (!this.options.runtime.assertScheduledReady)
         throw new PersonVmError('RUNTIME_NOT_READY');
@@ -920,12 +1020,23 @@ export class PersonVmService
     )
       throw new PersonVmError('RUNTIME_NOT_READY');
   }
-  async start(
+  start(
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
+  ) {
+    return this.startForSelection(context, signal, target, observer);
+  }
+  private startForSelection(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmFence,
+    observer: PersonVmPrewarmObserver | undefined = target,
+    selectedStartup?: SelectedStartup,
     foregroundOpen = false,
   ) {
+    const startup = target?.orphanedStart;
     return this.leased(
       context,
       'start',
@@ -933,15 +1044,70 @@ export class PersonVmService
       async (lease, _identity, current) => {
         this.assertPrewarmTarget(lease.row, target);
         if (target) await target.assertAuthority(current);
-        return this.startOwned(
-          context,
-          lease,
-          current,
-          target && ((active) => assertPrewarmAuthority(target, active)),
-          foregroundOpen ? target?.dispatchUpgradeStop : undefined,
-        );
+        try {
+          return await this.startOwned(
+            context,
+            lease,
+            current,
+            target,
+            observer,
+            selectedStartup,
+            foregroundOpen ? target?.dispatchUpgradeStop : undefined,
+          );
+        } catch (error) {
+          const row = lease.row;
+          if (
+            startup &&
+            lease.ownerToken &&
+            !current.aborted &&
+            row?.instanceId &&
+            (row.phase === 'starting' ||
+              row.phase === 'stopped' ||
+              row.phase === 'failed') &&
+            sameVmBinding(bindingOf(row), startup.predecessor) &&
+            error instanceof PersonVmError &&
+            [
+              'ACTIVITY_UNKNOWN',
+              'CLEANUP_INCOMPLETE',
+              'PROVIDER_FAILED',
+              'RUNTIME_NOT_READY',
+              'VM_ACTIVE',
+              'EGRESS_UNAVAILABLE',
+              'WEB_ENDPOINTS_PREPARING',
+            ].includes(error.code)
+          )
+            startup.observeFailure?.(lease.ownerToken, row.phase);
+          throw error;
+        }
       },
-      { joinOfflinePreparation: true },
+      {
+        joinOfflinePreparation: true,
+        ...(target && {
+          beforeClaim: (row, ownerToken, active) => {
+            signal.throwIfAborted();
+            active.throwIfAborted();
+            if (row) this.checkOrganization(row, context.organizationId);
+            this.assertPrewarmTarget(row, target);
+            if (!startup) return;
+            if (
+              row?.phase !== 'starting' ||
+              !row.instanceId ||
+              !row.diskRetained ||
+              target?.vmId !== row.vmId ||
+              target.instanceId !== null ||
+              target.leaseEpoch !== row.leaseEpoch + 1 ||
+              !sameVmBinding(bindingOf(row), startup.predecessor)
+            )
+              throw new PersonVmError('LEASE_LOST');
+            startup.observeLease(ownerToken, active);
+          },
+        }),
+        ...(startup && {
+          observeRelease(ownerToken, rowVersion, stage) {
+            startup.observeRelease?.(ownerToken, rowVersion, stage);
+          },
+        }),
+      },
     );
   }
   /** Host-only retained resume. The claim and the sessionless authority read
@@ -1005,15 +1171,31 @@ export class PersonVmService
     intent: RequestContext | ScheduledStart,
     lease: VmLease,
     signal: AbortSignal,
-    assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
+    target?: PersonVmPrewarmFence,
+    observer?: PersonVmPrewarmObserver,
+    selectedStartup?: SelectedStartup,
     dispatchUpgradeStop?: PersonVmPrewarmFence['dispatchUpgradeStop'],
   ) {
     const scheduled = 'purpose' in intent ? intent : undefined;
     const context = 'actor' in intent ? intent : undefined;
     const action = scheduled ? 'scheduled-wake.start' : 'start';
+    const assertAuthority =
+      target &&
+      ((active: AbortSignal) => assertPrewarmAuthority(target, active));
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const accessOrder = ++this.idleAccessOrder;
     const row = this.required(lease.row);
+    const firstDisk =
+      row.phase === 'stopped' &&
+      row.diskTier === 'warm' &&
+      !row.instanceId &&
+      !row.nativeCreated &&
+      !row.egressReceipt &&
+      row.leaseEpoch === 0 &&
+      !lease.joinedOfflinePreparation &&
+      selectedStartup?.firstDisk?.vmId === row.vmId
+        ? selectedStartup.firstDisk
+        : undefined;
     await this.assertNoPendingDisk(row, signal);
     if (row.instanceId && this.options.hasUnconfirmedEgress?.(bindingOf(row)))
       throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -1031,6 +1213,8 @@ export class PersonVmService
         !this.options.runtime.retireAfterNativeStop)
     )
       throw new PersonVmError('RUNTIME_NOT_READY');
+    if (row.phase !== 'running')
+      await this.admissionHost?.recoverStoppedEntryPermits(lease, signal);
     const readRoster = (active: AbortSignal) =>
       scheduled
         ? scheduled.readRoster(active).then(checkedWebRoster)
@@ -1045,6 +1229,19 @@ export class PersonVmService
       roster &&
       (roster.personId !== row.personId ||
         roster.organizationId !== row.organizationId)
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const selectedEmployee = selectedStartup?.employee;
+    if (
+      roster &&
+      selectedEmployee &&
+      !roster.entries.some(
+        (employee) =>
+          selectedEmployee.workspaceId === employee.workspaceId &&
+          selectedEmployee.employeeInstanceId === employee.employeeInstanceId &&
+          selectedEmployee.employeeRevision === employee.employeeRevision &&
+          selectedEmployee.employeeVersionId === employee.employeeVersionId,
+      )
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
     if (await this.canStopPreviousWorkerVm(lease, row)) {
@@ -1079,6 +1276,7 @@ export class PersonVmService
           bindingOf(row),
           roster,
           signal,
+          { runningOnly: true },
         );
         await lease.guard();
       }
@@ -1114,6 +1312,7 @@ export class PersonVmService
     await lease.assertAdmissionOpen(true);
     if (assertAuthority) await assertAuthority(signal);
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
+    const previousBinding = row.instanceId ? bindingOf(row) : undefined;
     row.leaseEpoch += 1;
     row.instanceId = randomUUID();
     row.phase = 'starting';
@@ -1121,10 +1320,14 @@ export class PersonVmService
     row.idleSince = null;
     row.activityObservedAt = null;
     row.lastActivityAt = this.now().toISOString();
+    target?.orphanedStart?.observeInstance(bindingOf(row));
     let previousCapacityReleased = false;
     if (lease.reserveStartup)
       previousCapacityReleased = await lease.reserveStartup(row);
     else await lease.save(row);
+    observer?.observeVmStart?.(bindingOf(row));
+    if (previousBinding)
+      this.admissionHost?.forgetStoppedEntryRecovery(previousBinding);
     await lease.audit(row, {
       requestId: intent.requestId,
       action,
@@ -1146,8 +1349,25 @@ export class PersonVmService
         row.diskTier = 'warm';
         await lease.save(row);
       }
-      const mount = await this.mounted(row, signal, lease);
+      let attachedHere = false;
+      const mount = await this.mounted(
+        row,
+        signal,
+        lease,
+        firstDisk
+          ? () => {
+              attachedHere = true;
+            }
+          : undefined,
+      );
       await lease.guard();
+      if (
+        row.nativeCreated &&
+        roster &&
+        !this.options.native.assertRetainedStartup &&
+        (await this.options.native.status(binding, signal)) !== 'stopped'
+      )
+        throw new PersonVmError('PROVIDER_FAILED');
       const receipt = this.receipt(
         binding,
         await this.options.egress.prepare(
@@ -1175,6 +1395,7 @@ export class PersonVmService
           binding,
           roster,
           signal,
+          row.nativeCreated ? { retained: true } : undefined,
         );
         if (
           !sameVmBinding(endpoints.binding, binding) ||
@@ -1228,13 +1449,19 @@ export class PersonVmService
       if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
       let checkedWebAfterStart = false;
       let capacity: Awaited<ReturnType<PersonVmNativePort['start']>>;
+      let createdNative = false;
       if (!scheduled && state === 'absent' && !row.nativeCreated) {
         capacity = undefined;
         if (web) await native.create(binding, receipt, signal, web.receipt);
         else await native.create(binding, receipt, signal);
+        createdNative = true;
         row.nativeCreated = true;
         await lease.save(row);
-      } else if (state === 'stopped' && row.nativeCreated) {
+      } else if (
+        row.nativeCreated &&
+        (state === 'stopped' ||
+          (state === 'absent' && web?.receipt.upgrade === 'pending'))
+      ) {
         const start = async (active: AbortSignal) => {
           await lease.guard();
           active.throwIfAborted();
@@ -1243,6 +1470,7 @@ export class PersonVmService
             const fence = await native.startWithWebEndpoints(
               web.receipt,
               active,
+              receipt,
             );
             checkedWebAfterStart = true;
             return fence;
@@ -1300,6 +1528,39 @@ export class PersonVmService
         await capacity?.assertCurrent();
         startingSignal.throwIfAborted();
       };
+      if (web && selectedEmployee) {
+        const read = this.options.readUnusedEmployeeHomes;
+        let unusedEmployeeHomes = false;
+        if (firstDisk && attachedHere && createdNative && read) {
+          const hasExactMount = async () => {
+            await assertStarting();
+            const attached = await this.options.disk.inspectMount?.(
+              { vmId: row.vmId, tier: 'warm' },
+              startingSignal,
+              { image: firstDisk.image },
+            );
+            startingSignal.throwIfAborted();
+            return attached?.state === 'attached' && attached.mount === mount;
+          };
+          if (await hasExactMount()) {
+            await assertStarting();
+            unusedEmployeeHomes =
+              (await read(
+                {
+                  binding,
+                  signal: startingSignal,
+                  assertCurrent: assertStarting,
+                },
+                mount,
+              )) && (await hasExactMount());
+          }
+        }
+        web = Object.freeze({
+          ...web,
+          selectedEmployee,
+          ...(unusedEmployeeHomes && { unusedEmployeeHomes: true as const }),
+        });
+      }
       await bootstrapPersonVm({
         binding,
         signal: startingSignal,
@@ -1321,6 +1582,8 @@ export class PersonVmService
         }
         active.throwIfAborted();
         row.phase = 'running';
+        row.verifiedWebSlotCapacity =
+          web?.receipt.slots?.length ?? row.verifiedWebSlotCapacity;
         await lease.save(row, {
           audit: {
             requestId: intent.requestId,
@@ -1422,6 +1685,7 @@ export class PersonVmService
     context: RequestContext,
     binding: PersonVmBinding,
     signal: AbortSignal,
+    webSlots?: PersonVmWebEndpointReceipt,
   ) {
     const identity = await this.identity(context, 'start', signal);
     const row = this.required(await this.options.store.read(identity.personId));
@@ -1432,14 +1696,22 @@ export class PersonVmService
       !sameVmBinding(bindingOf(row), binding)
     )
       throw new PersonVmError('LEASE_CONFLICT');
-    await this.confirmRunning(row, context, signal);
+    if (!webSlots) return this.confirmRunning(row, context, signal);
+    // A running v2 pool has fixed physical ports even as other employees are
+    // added or removed. The caller pins the selected authenticated editor.
+    if (!webSlots.slots || !sameVmBinding(webSlots.binding, binding))
+      throw new PersonVmError('LEASE_LOST');
+    if (!this.options.native.assertWebEndpoints)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    await this.assertNoPendingDisk(row, signal);
+    await this.options.native.assertWebEndpoints(webSlots, signal);
+    await this.pingRunning(row, signal);
+    await this.assertCurrentBinding(context, binding, signal);
+    signal.throwIfAborted();
   }
   async prewarm(
     context: RequestContext,
-    input: {
-      trigger: 'page' | 'input' | 'open';
-      target?: PersonVmPrewarmFence;
-    },
+    input: PersonVmPrewarmInput,
     signal: AbortSignal,
   ) {
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
@@ -1450,6 +1722,8 @@ export class PersonVmService
         context,
         signal,
         input.target,
+        input.observer,
+        input.selectedEmployee,
         input.trigger === 'open',
       );
     return this.options.diskPool
@@ -1460,9 +1734,31 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    observer?: PersonVmPrewarmObserver,
+    selectedEmployee?: PersonVmEmployeeSelection,
     foregroundOpen = false,
   ): Promise<PersonVmView> {
     const identity = await this.identity(context, 'start', signal);
+    if (
+      selectedEmployee &&
+      (selectedEmployee.personId !== identity.personId ||
+        selectedEmployee.organizationId !== identity.organizationId ||
+        (context.workspaceId !== null &&
+          context.workspaceId !== selectedEmployee.workspaceId))
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const start = (
+      nextTarget?: PersonVmPrewarmFence,
+      firstDisk?: FirstPrewarmDisk,
+    ) =>
+      this.startForSelection(
+        context,
+        signal,
+        nextTarget,
+        observer,
+        selectedEmployee && { employee: selectedEmployee, firstDisk },
+        foregroundOpen,
+      );
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
     const takeover = this.upgradePrewarms.get(identity.personId);
@@ -1478,7 +1774,14 @@ export class PersonVmService
         });
       });
       signal.throwIfAborted();
-      return this.prewarmCurrent(context, signal, target, foregroundOpen);
+      return this.prewarmCurrent(
+        context,
+        signal,
+        target,
+        observer,
+        selectedEmployee,
+        foregroundOpen,
+      );
     }
     this.assertPrewarmTarget(row, target, true);
     if (
@@ -1491,22 +1794,43 @@ export class PersonVmService
         context.actor.type !== 'user'
       )
         throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
-      const opening = this.start(context, signal, target, true).finally(() => {
+      const opening = start(target).finally(() => {
         this.upgradePrewarms.delete(identity.personId);
       });
       this.upgradePrewarms.set(identity.personId, opening);
       return opening;
     }
+    // An exact orphan already has its retained disk and predecessor. Claim
+    // the start directly so a no-op create does not acquire a separate lease.
+    if (target?.orphanedStart) return start(target);
     if (row?.phase === 'running') {
       await this.confirmRunning(row, context, signal, target, true);
       return view(row, true);
     }
 
-    const created = await this.create(context, signal, target);
-    return this.start(
-      context,
-      signal,
+    let firstDisk: FirstPrewarmDisk | undefined;
+    const canProveFirstDisk =
+      selectedEmployee &&
+      this.options.readUnusedEmployeeHomes &&
+      target?.vmId === null &&
+      target.instanceId === null &&
+      target.leaseEpoch === 1 &&
+      !target.replacesVmId &&
+      !target.restoreRetained;
+    const created = canProveFirstDisk
+      ? await this.createForStartup(
+          context,
+          signal,
+          target,
+          observer,
+          (proof) => {
+            firstDisk = proof;
+          },
+        )
+      : await this.create(context, signal, target, observer);
+    return start(
       target && { ...target, vmId: target.vmId ?? created.vmId },
+      firstDisk,
     );
   }
   private async inactive(
@@ -1585,7 +1909,7 @@ export class PersonVmService
     const platformDetach = reason === 'delete' && onDetached !== undefined;
     let failed = false;
     let egressJoined = true;
-    let stopped = false;
+    let stopped: 'stopped' | 'absent' | undefined;
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
       if (stopNative && !completion?.nativeAlreadyJoined) {
@@ -1597,7 +1921,7 @@ export class PersonVmService
       }
       const state = await this.options.native.status(binding, signal);
       if (state === 'stopped') row.nativeCreated = true; // Native create may have committed before a failed host save/ack.
-      return state === 'stopped' || state === 'absent';
+      return state === 'stopped' || state === 'absent' ? state : undefined;
     };
     if (idle) {
       const signal = AbortSignal.any([
@@ -1646,7 +1970,7 @@ export class PersonVmService
         // Record the provider's completed, joined stop before any egress or
         // disk cleanup. A prior intent alone cannot activate its wake plan.
         if (!joinedRecorded) await recordJoin();
-        stopped = true;
+        stopped = 'stopped';
       } catch (error) {
         if (!dispatchApproved) {
           await lease.audit(row, { ...dispatch, result: 'denied' });
@@ -1693,7 +2017,8 @@ export class PersonVmService
           stopped = await stopAndConfirm(signal);
         } else {
           const inspected = await this.reconcileDisk(row, signal, lease);
-          stopped = !row.nativeCreated && inspected.state === 'ready';
+          if (!row.nativeCreated && inspected.state === 'ready')
+            stopped = 'absent';
         }
       } catch {
         failed = true;
@@ -1736,14 +2061,221 @@ export class PersonVmService
         Boolean(row.instanceId),
     });
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
-    if (row.instanceId && !idle && !completion?.nativeAlreadyJoined)
-      this.options.observeOwnedStop?.(bindingOf(row));
+    if (row.instanceId) {
+      const binding = bindingOf(row);
+      this.admissionHost?.forgetStoppedEntryRecovery(binding);
+      if (!idle && !completion?.nativeAlreadyJoined)
+        this.options.observeOwnedStop?.(binding);
+    }
+    return stopped;
   }
   fenceWorkerStartup() {
     this.workerDrain = true;
     return () => {
       this.workerDrain = false;
     };
+  }
+  /** Host maintenance can settle its own retained entry work before the
+   * read-only shutdown probe; the existing lifecycle lease rechecks the stop. */
+  async recoverStoppedEntryWork(binding: PersonVmBinding, signal: AbortSignal) {
+    const host = this.admissionHost;
+    if (!host?.hasStoppedEntryRecovery(binding)) return;
+    const state = await this.options.native.status(binding, signal);
+    if (state !== 'stopped' && state !== 'absent') return;
+    await this.options.store.withLease(
+      binding.personId,
+      { now: this.now, ttlMs: this.options.leaseTtlMs },
+      (lease) => host.recoverStoppedEntryPermits(lease, signal, binding),
+    );
+  }
+  private async joinRetainedStartupMount(
+    owned: RetainedStartupMount,
+    lease: VmLease,
+    signal: AbortSignal,
+  ) {
+    const { binding, disk } = owned;
+    if (this.retainedStartupMounts.get(binding.personId) !== owned) return;
+    const row = lease.row;
+    if (
+      !row?.instanceId ||
+      !row.diskRetained ||
+      row.egressReceipt ||
+      row.holds.length ||
+      row.personId !== binding.personId ||
+      row.organizationId !== binding.organizationId ||
+      row.vmId !== binding.vmId ||
+      !['stopped', 'cold', 'deleted'].includes(row.phase)
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const exact = sameVmBinding(bindingOf(row), binding);
+    if (!exact && row.leaseEpoch <= binding.leaseEpoch)
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    const active = AbortSignal.any([signal, lease.signal]);
+    const disks = this.options.disk;
+    // A completed rename may be ahead of the stored tier. Only the exact
+    // binding's recorded image and actual original layer can prove a detach.
+    const original = exact
+      ? await disks.inspectMount?.(disk, active, { image: owned.image })
+      : undefined;
+    if (original?.state !== 'attached' && original?.state !== 'absent') {
+      const across = await disks.inspectMount?.(disk, active, {
+        image: owned.image,
+        acrossTier: true,
+      });
+      if (across?.state !== 'absent')
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+    }
+    await (lease.assertPhysicalOwner?.() ?? lease.guard());
+    active.throwIfAborted();
+    if (original?.state === 'attached') await disks.detach(disk, active);
+    this.retainedStartupMounts.delete(binding.personId);
+  }
+
+  /** The Worker joins its own temporary mount receipts before going away.
+   * The disk provider proves attachment identity without the VM runtime. */
+  async settleRetainedStartupMounts(signal: AbortSignal) {
+    const failures: unknown[] = [];
+    for (const owned of [...this.retainedStartupMounts.values()]) {
+      try {
+        signal.throwIfAborted();
+        await this.options.store.withLease(
+          owned.binding.personId,
+          { now: this.now, ttlMs: this.options.leaseTtlMs },
+          (lease) => this.joinRetainedStartupMount(owned, lease, signal),
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length)
+      throw new PersonVmError('CLEANUP_INCOMPLETE', {
+        cause: new AggregateError(failures),
+      });
+  }
+
+  /** Verify the retained compute before fresh prewarm can reserve another
+   * epoch. Borrow an exact attachment, or join our own attach dispatch. */
+  private async assertRetainedStartup(
+    binding: PersonVmBinding,
+    lease: VmLease,
+    signal: AbortSignal,
+  ) {
+    const { native, disk } = this.options;
+    if (!native.assertRetainedStartup) {
+      if ((await native.status(binding, signal)) !== 'stopped')
+        throw new PersonVmError('PROVIDER_FAILED');
+      return;
+    }
+    const inspected = await disk.inspect(binding.vmId, signal);
+    if (inspected.state !== 'ready' || !disk.inspectMount)
+      throw new PersonVmError('PROVIDER_FAILED');
+    const attached = await disk.inspectMount(inspected.disk, signal);
+    if (attached.state === 'unknown')
+      throw new PersonVmError('PROVIDER_FAILED');
+    await lease.guard();
+    signal.throwIfAborted();
+    if (attached.state === 'attached') {
+      await native.assertRetainedStartup(binding, attached.mount, signal);
+      return;
+    }
+    const owned = Object.freeze({
+      binding: Object.freeze({ ...binding }),
+      disk: Object.freeze({ ...inspected.disk }),
+      image: attached.image,
+    });
+    let failure: { cause: unknown } | undefined;
+    try {
+      const mount = await disk.attach(owned.disk, signal, () => {
+        if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
+        this.retainedStartupMounts.set(binding.personId, owned);
+      });
+      await native.assertRetainedStartup(binding, mount, signal);
+    } catch (cause) {
+      failure = { cause };
+    }
+    try {
+      await this.joinRetainedStartupMount(
+        owned,
+        lease,
+        AbortSignal.timeout(this.options.cleanupTimeoutMs),
+      );
+    } catch (error) {
+      throw new PersonVmError('CLEANUP_INCOMPLETE', {
+        cause: failure ? new AggregateError([failure.cause, error]) : error,
+      });
+    }
+    if (failure) throw failure.cause;
+  }
+
+  /** A current user may prepare a new ticket after verifying the retained
+   * compute or reconciling their own old entry. No native start or stop. */
+  async reconcileStoppedEntryForPrewarm(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    retained = false,
+  ) {
+    if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
+    const host = this.admissionHost;
+    if (!retained && !host?.hasStoppedEntryRecovery(binding)) return false;
+    const identity = await this.identity(context, 'start', signal);
+    if (
+      identity.personId !== binding.personId ||
+      identity.organizationId !== binding.organizationId
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    if (!retained) {
+      const state = await this.options.native.status(binding, signal);
+      if (state !== 'stopped' && state !== 'absent') return false;
+    }
+    return this.leased(
+      context,
+      'start',
+      signal,
+      async (lease, _identity, current) => {
+        const row = lease.row;
+        if (!row?.diskRetained) throw new PersonVmError('NOT_FOUND');
+        if (!row.instanceId || !sameVmBinding(bindingOf(row), binding))
+          throw new PersonVmError('LEASE_LOST');
+        if (
+          row.phase === 'stopped' ||
+          row.phase === 'cold' ||
+          (retained && row.phase === 'deleted')
+        ) {
+          if (row.nativeCreated) {
+            if (row.egressReceipt || row.holds.length)
+              throw new PersonVmError('VM_ACTIVE');
+            await this.assertRetainedStartup(binding, lease, current);
+          }
+          await lease.guard();
+          return true;
+        }
+        if (retained) throw new PersonVmError('LEASE_LOST');
+        if (
+          row.phase !== 'running' ||
+          !(await host?.recoverStoppedEntryPermits(lease, current, binding))
+        )
+          return false;
+        await lease.assertAdmissionOpen(true);
+        await this.identity(context, 'start', current);
+        await lease.guard();
+        if (
+          row.egressReceipt &&
+          this.options.ownsEgressReceipt &&
+          !this.options.ownsEgressReceipt(
+            this.receipt(binding, row.egressReceipt),
+          )
+        )
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+        const stopped = await this.cleanup(row, lease, 'takeover', false);
+        if (row.nativeCreated && stopped !== 'stopped')
+          throw new PersonVmError('PROVIDER_FAILED');
+        return true;
+      },
+    );
+  }
+  hasStoppedEntryWork(binding: PersonVmBinding) {
+    return this.admissionHost?.hasStoppedEntryRecovery(binding) === true;
   }
   /** A shutdown probe is read-only. Unknown native activity leaves the
    * process and its current owners alive for a later stop attempt. */
@@ -1818,6 +2350,13 @@ export class PersonVmService
         const superseded =
           row.vmId !== binding.vmId || row.leaseEpoch > binding.leaseEpoch;
         const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+        const preparation = this.retainedStartupMounts.get(binding.personId);
+        if (preparation)
+          await this.joinRetainedStartupMount(
+            preparation,
+            lease,
+            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+          );
         if (
           (!stopNative && superseded) ||
           (current && row.phase === 'deleted')
@@ -1872,7 +2411,10 @@ export class PersonVmService
     signal: AbortSignal,
     admissionOwned = false,
   ) {
-    if (!admissionOwned) await lease.assertAdmissionOpen(true);
+    if (!admissionOwned) {
+      await this.admissionHost?.recoverStoppedEntryPermits(lease, signal);
+      await lease.assertAdmissionOpen(true);
+    }
     const row = this.required(lease.row);
     if (row.holds.length > 0) throw new PersonVmError('VM_ACTIVE');
     if (row.phase === 'running' || row.phase === 'failed')
@@ -2190,6 +2732,7 @@ export class PersonVmService
               signal,
             );
             row.diskRetained = false;
+            row.verifiedWebSlotCapacity = null;
           }
           row.phase = 'deleted';
           await lease.save(row);
@@ -2414,6 +2957,16 @@ export class PersonVmService
           }
           await lease.assertAdmissionOpen(true);
           await lease.guard();
+          const startupMount = this.retainedStartupMounts.get(row.personId);
+          if (startupMount)
+            await this.joinRetainedStartupMount(
+              startupMount,
+              lease,
+              AbortSignal.any([
+                active,
+                AbortSignal.timeout(this.options.cleanupTimeoutMs),
+              ]),
+            );
           if (
             row.egressReceipt &&
             !this.options.ownsEgressReceipt?.(
@@ -2470,6 +3023,7 @@ export class PersonVmService
               },
             );
             row.diskRetained = false;
+            row.verifiedWebSlotCapacity = null;
           }
           row.phase = 'deleted';
           if (!purge && retained)
@@ -2780,6 +3334,7 @@ export class PersonVmService
       { now: this.now, ttlMs: this.options.leaseTtlMs, signal },
       async (lease) => {
         const current = AbortSignal.any([signal, lease.signal]);
+        await this.admissionHost?.recoverStoppedEntryPermits(lease, current);
         await lease.assertAdmissionOpen(true);
         const row = this.required(lease.row);
         this.checkOrganization(row, identity.organizationId);

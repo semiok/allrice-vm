@@ -270,6 +270,7 @@ export async function ensureBootstrapPortalPrincipal(
       await synchronizeTenantMembershipAccess(transaction, {
         organizationId: organization.id,
         workspaceId: null,
+        personIds: [user.id],
       });
 
     return {

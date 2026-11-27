@@ -3,6 +3,7 @@ import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { RequestContext } from '@allrice/contracts';
 import {
+  confirmDEntryEmployeeArchive,
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   createPostgresPersonVmScheduledWakeStore,
@@ -14,6 +15,7 @@ import {
   readPersonVmDiskPreparationTarget,
   readPersonVmWakeRoster,
   requireCurrentPlatformAdmin,
+  subscribeDEntryEmployeeArchive,
 } from '@allrice/database';
 import {
   createModelGateway,
@@ -68,7 +70,10 @@ import {
   createProductionPersonVmAuthority,
 } from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
-import { createProductionCurrentPrewarm } from './production-prewarm.js';
+import {
+  createProductionCurrentPrewarm,
+  createProductionStoppedEntryReconciliation,
+} from './production-prewarm.js';
 import {
   assertNoPreviousWorker,
   withPreviousGatewayFenced,
@@ -433,19 +438,24 @@ export function createProductionPersonVmHost(input: {
     if (retired && sameVmBinding(retired.binding, binding))
       retiredReceipts.delete(binding.personId);
   }
-  function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
+  async function stopOwnedVms({ deferUnconfirmedEgress = false } = {}) {
     const vm = personVm;
-    if (!vm) return Promise.resolve([]);
+    if (!vm || !providers) return [];
+    const timeout = providers.configuration.lifecycle.cleanupTimeoutMs;
+    const mountFailures = await collectFailures([
+      () => vm.settleRetainedStartupMounts(AbortSignal.timeout(timeout)),
+    ]);
     const targets = [...ownedVms.values()].filter(
       ({ binding }) =>
         !deferUnconfirmedEgress || !hasUnconfirmedPreparation(binding),
     );
-    return collectFailures(
+    const vmFailures = await collectFailures(
       targets.map(({ binding, stopNative }) => async () => {
         await vm.shutdownOwned(binding, gracefulStop ? false : stopNative);
         ownedVms.delete(binding.personId);
       }),
     );
+    return [...mountFailures, ...vmFailures];
   }
   function close(): Promise<void> {
     clearTimeout(upgradeHandoff);
@@ -862,6 +872,11 @@ export function createProductionPersonVmHost(input: {
       const { native, web } = providers.configuration;
       startup = createAssignedNativeWebStartup({
         vm,
+        hotGuest: providers.native,
+        archive: {
+          subscribe: subscribeDEntryEmployeeArchive,
+          confirm: confirmDEntryEmployeeArchive,
+        },
         memoryGuestPlan: providers.memoryGuestPlan,
         commandMemory: {
           controls: native.readonlyCommandMemoryDirectory,
@@ -1115,8 +1130,13 @@ export function createProductionPersonVmHost(input: {
         vm,
         startup,
         lifetime,
+        isLiveSlottedBinding: startup.isLiveSlottedBinding,
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
         ownsRunningBinding,
+        reconcileStoppedEntry: createProductionStoppedEntryReconciliation({
+          vm,
+          current,
+        }),
       });
       lifetime.throwIfAborted();
       if (bound.scheduledWake) {
@@ -1554,8 +1574,11 @@ export function createProductionPersonVmHost(input: {
             // The current wake may already own the next epoch. Let it join
             // before closing the startup path it still needs.
             reopen = vm.fenceWorkerStartup();
-            for (const { binding } of ownedVms.values())
+            await vm.settleRetainedStartupMounts(signal);
+            for (const { binding } of ownedVms.values()) {
+              await vm.recoverStoppedEntryWork(binding, signal);
               await vm.assertWorkerShutdownSafe(binding, signal);
+            }
             await assertNoCommittedWake(signal);
             gracefulStop = true;
           } catch (error) {

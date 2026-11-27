@@ -7,6 +7,7 @@ import {
   type PersonVmEgressReceipt,
   type PersonVmView,
   type PersonVmHoldKind,
+  type PersonVmLeaseReleaseStage,
 } from './contract.ts';
 import type { PersonDisk } from './encrypted-disk.ts';
 import type { DiskPoolLocks, DiskPoolOwner } from './disk-pool-platform.ts';
@@ -32,6 +33,8 @@ export type VmRecord = {
   diskTier: 'warm' | 'cold';
   diskRetained: boolean;
   nativeCreated: boolean;
+  verifiedWebSlotCapacity: number | null;
+  prewarmDeletionFence?: string | null;
   instanceId: string | null;
   leaseEpoch: number;
   leaseOwner: string | null;
@@ -53,6 +56,8 @@ export type VmAudit = {
 export interface VmLease {
   row: VmRecord | null;
   joinedOfflinePreparation?: boolean;
+  /** Internal physical owner reference for exact shared-PG recovery. */
+  readonly ownerToken?: string;
   /** Loss cancels owned work; the holder still MUST join before releasing. */
   signal: AbortSignal;
   assertAdmissionOpen(generationChange?: boolean): Promise<void>;
@@ -94,6 +99,18 @@ type VmLeaseOptions = {
     organizationId: string;
     signal: AbortSignal;
   }>;
+  /** Under the advisory lock, before publishing the generated owner token. */
+  beforeClaim?(
+    row: Readonly<VmRecord> | null,
+    ownerToken: string,
+    signal: AbortSignal,
+  ): void;
+  /** The row version written by this exact token, with its join outcome. */
+  observeRelease?(
+    ownerToken: string,
+    rowVersion: string,
+    stage: PersonVmLeaseReleaseStage,
+  ): void;
 };
 export interface PersonVmStore {
   read(personId: string): Promise<VmRecord | null>;
@@ -379,6 +396,11 @@ function fromRow(row: Record<string, unknown>): VmRecord {
     diskTier: row.disk_tier as VmRecord['diskTier'],
     diskRetained: Boolean(row.disk_retained),
     nativeCreated: Boolean(row.native_created),
+    verifiedWebSlotCapacity: row.verified_web_slot_capacity as number | null,
+    prewarmDeletionFence:
+      typeof row.prewarm_deletion_fence === 'string'
+        ? row.prewarm_deletion_fence
+        : null,
     instanceId: row.instance_id === null ? null : String(row.instance_id),
     leaseEpoch: Number(row.lease_epoch),
     leaseOwner: row.lease_owner === null ? null : String(row.lease_owner),
@@ -782,6 +804,18 @@ export class PostgresPersonVmStore implements PersonVmStore {
     const reviewOnly = options.deletionAction === 'review';
     let ownsDurable = !options.deletionAction;
     let bodyError: unknown;
+    let releaseVersion: string | undefined;
+    let unlocked = false;
+    let endFailure: { error: unknown } | undefined;
+    const observeRelease = (stage: PersonVmLeaseReleaseStage) => {
+      if (!releaseVersion) return;
+      try {
+        options.observeRelease?.(token, releaseVersion, stage);
+      } catch (error) {
+        // Observers cannot strand the database lock or replace a body error.
+        bodyError ??= error;
+      }
+    };
     let result!: T;
     const expires = () =>
       new Date(options.now().getTime() + options.ttlMs).toISOString();
@@ -909,7 +943,10 @@ export class PostgresPersonVmStore implements PersonVmStore {
         );
         if (!claimed) throw new PersonVmError('LEASE_CONFLICT');
       }
-      if (row && ownsDurable) await claim();
+      if (ownsDurable) {
+        options.beforeClaim?.(row, token, session.signal);
+        if (row) await claim();
+      }
       const guard = async (
         requireAdmission = true,
         expected?: DiskPoolOwner,
@@ -940,6 +977,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         db: postgres.Sql | postgres.TransactionSql,
         audit?: VmAudit,
         capacityReleased?: boolean,
+        deletionFence: string | null = null,
       ) => {
         if (record.personId !== personId) throw new PersonVmError('LEASE_LOST');
         const values = {
@@ -949,7 +987,9 @@ export class PostgresPersonVmStore implements PersonVmStore {
           phase: record.phase,
           disk_tier: record.diskTier,
           disk_retained: record.diskRetained,
+          prewarm_deletion_fence: deletionFence,
           native_created: record.nativeCreated,
+          verified_web_slot_capacity: record.verifiedWebSlotCapacity,
           instance_id: record.instanceId,
           lease_epoch: record.leaseEpoch,
           lease_owner: token,
@@ -969,7 +1009,9 @@ export class PostgresPersonVmStore implements PersonVmStore {
           db`insert into person_virtual_machines ${db(values)}
             on conflict (person_id) do update set
               vm_id=excluded.vm_id,phase=excluded.phase,disk_tier=excluded.disk_tier,disk_retained=excluded.disk_retained,
-              native_created=excluded.native_created,instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
+              prewarm_deletion_fence=coalesce(excluded.prewarm_deletion_fence,person_virtual_machines.prewarm_deletion_fence),
+              native_created=excluded.native_created,verified_web_slot_capacity=excluded.verified_web_slot_capacity,
+              instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
               egress_receipt=excluded.egress_receipt,gateway_ports=excluded.gateway_ports,holds=excluded.holds,
               last_activity_at=excluded.last_activity_at,stopped_at=excluded.stopped_at,idle_since=excluded.idle_since,
               activity_observed_at=excluded.activity_observed_at,lease_expires_at=excluded.lease_expires_at,updated_at=now()
@@ -999,6 +1041,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
       const lease: VmLease = {
         row,
         joinedOfflinePreparation,
+        ownerToken: token,
         signal: session.signal,
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),
@@ -1073,6 +1116,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
           const retained =
             deletionAudit?.action === 'retain-disk' &&
             deletionAudit.result === 'succeeded';
+          const deletionFence =
+            erasureCheckpoint || retained ? randomUUID() : null;
           if (
             (erasureCheckpoint || deletionAudit?.action === 'retain-disk') &&
             !authorizeDeletion
@@ -1096,7 +1141,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
           const save = async () => {
             if (erasing) {
               const [erased] = await sql`update person_virtual_machines
-                set disk_retained=false,updated_at=now()
+                set disk_retained=false,verified_web_slot_capacity=null,updated_at=now()
                 where person_id=${personId} and vm_id=${record.vmId} and lease_epoch=${record.leaseEpoch}
                   and lease_owner is null and phase='deleted' and disk_retained and instance_id is null
                 returning vm_id`;
@@ -1106,7 +1151,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
             if (!ownsDurable) {
               if (!erasureCheckpoint) throw new PersonVmError('LEASE_LOST');
               const [detached] = await sql`update person_virtual_machines
-                set instance_id=null, native_created=false, disk_tier=${record.diskTier}, gateway_ports='[]'::jsonb, updated_at=now()
+                set instance_id=null, native_created=false, disk_tier=${record.diskTier}, gateway_ports='[]'::jsonb,
+                  prewarm_deletion_fence=${deletionFence}, updated_at=now()
                 where person_id=${personId} and vm_id=${record.vmId} and lease_epoch=${record.leaseEpoch}
                   and lease_owner is null and phase='deleted' and disk_retained and egress_receipt is null
                 returning vm_id`;
@@ -1118,6 +1164,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
               sql,
               lifecycle?.audit,
               lifecycle?.capacityReleased,
+              deletionFence,
             );
           };
           if (!deletionAudit) return session.query(save);
@@ -1193,15 +1240,31 @@ export class PostgresPersonVmStore implements PersonVmStore {
       try {
         // A broken session leaves a durable orphan for explicit fenced recovery.
         if (locked && !session.connectionFailure) {
-          if (ownsDurable)
-            await session.query(
-              () =>
-                sql`update person_virtual_machines set lease_owner=null,lease_expires_at=null where person_id=${personId} and lease_owner=${token}`,
+          if (ownsDurable) {
+            const writeRelease = async (
+              connection: postgres.Sql | postgres.TransactionSql,
+            ) => {
+              const [released] = await connection<{ rowVersion: string }[]>`
+                update person_virtual_machines
+                set lease_owner=null,lease_expires_at=null
+                where person_id=${personId} and lease_owner=${token}
+                returning xmin::text as "rowVersion"`;
+              releaseVersion = released?.rowVersion;
+              observeRelease('written');
+            };
+            // The ticket learns its candidate before COMMIT can expose the
+            // empty owner. Polls still require the same version in a fresh read.
+            await session.query(() =>
+              options.observeRelease
+                ? sql.begin(writeRelease)
+                : writeRelease(sql),
             );
-          await session.query(
+          }
+          const [lock] = await session.query(
             () =>
-              sql`select pg_advisory_unlock(hashtextextended(${physical},0))`,
+              sql`select pg_advisory_unlock(hashtextextended(${physical},0)) as unlocked`,
           );
+          unlocked = lock?.unlocked === true;
         }
       } catch (error) {
         bodyError ??= error;
@@ -1210,9 +1273,18 @@ export class PostgresPersonVmStore implements PersonVmStore {
         if (locked && ownsDurable && session.connectionFailure)
           this.settledOrphans.set(token, personId);
         bodyError ??= session.connectionFailure;
-        await session.end();
+        if (!unlocked || session.signal.aborted) observeRelease('unconfirmed');
+        try {
+          await session.end();
+        } catch (error) {
+          if (unlocked && !session.signal.aborted)
+            observeRelease('unconfirmed');
+          endFailure = { error };
+        }
       }
     }
+    if (endFailure) throw endFailure.error;
+    if (unlocked && !session.signal.aborted) observeRelease('joined');
     if (bodyError) throw bodyError;
     return result;
   }
@@ -1339,6 +1411,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
       };
       const result = await work({
         row,
+        ownerToken: token,
         signal: session.signal,
         assertAdmissionOpen: (change) =>
           assertAdmissionOpen(session, personId, change),

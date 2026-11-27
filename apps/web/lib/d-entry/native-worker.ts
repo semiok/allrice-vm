@@ -37,6 +37,7 @@ export async function requestDEntryWorker(
   fields: Record<string, unknown> = {},
 ) {
   input.signal.throwIfAborted();
+  const prewarm = path === 'native-prewarm';
   const response = await requestWorker(
     input.signal,
     new URL(`/internal/d-entry/${path}`, workerBase()),
@@ -52,7 +53,7 @@ export async function requestDEntryWorker(
         selection: input.selection,
       }),
     },
-    { short: path === 'native-prewarm' },
+    { short: prewarm, allowExpired: prewarm },
   );
   return response;
 }
