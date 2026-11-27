@@ -8,6 +8,14 @@ import {
 
 export const profileBundleTimeoutMs = 30_000;
 
+// These options are only for content-addressed JS from the verified release
+// index. A page refresh should reuse these bytes even if other requests recheck.
+export const sealedProfileBundleFetch = {
+  cache: 'force-cache',
+  credentials: 'omit',
+  redirect: 'error',
+} as const;
+
 const publicBundlePath =
   /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/bundles\/[a-f0-9]{64}\.js$/;
 
@@ -82,7 +90,7 @@ export const initialDocumentLifecycle = `(() => {
       const signal = AbortSignal.any([
         controller.signal, earlyRequest.signal, AbortSignal.timeout(${profileBundleTimeoutMs}),
       ]);
-      const response = await fetch(url, { credentials: 'omit', redirect: 'error', signal });
+      const response = await fetch(url, { ...${JSON.stringify(sealedProfileBundleFetch)}, signal });
       if (!response.ok) {
         await response.body?.cancel();
         throw Error('Employee profile bundle unavailable');

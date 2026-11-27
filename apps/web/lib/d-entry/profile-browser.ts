@@ -8,6 +8,7 @@ import {
 import { z } from 'zod';
 import {
   profileBundleTimeoutMs,
+  sealedProfileBundleFetch,
   type EarlyProfileBundles,
 } from './initial-document';
 import {
@@ -59,7 +60,7 @@ export class EmployeeProfileBundleTimeout extends Error {
 async function fetchProfileBundle(
   url: URL | string,
   parent: AbortSignal,
-  options: Pick<RequestInit, 'credentials' | 'cache'>,
+  options: Pick<RequestInit, 'credentials' | 'cache' | 'redirect'>,
 ) {
   parent.throwIfAborted();
   const timeout = new AbortController();
@@ -101,7 +102,7 @@ export async function readProfileBundle(
     signal.throwIfAborted();
     const bytes = await (publicUrl
       ? (preloaded ??
-        fetchProfileBundle(publicUrl, signal, { credentials: 'omit' }))
+        fetchProfileBundle(publicUrl, signal, sealedProfileBundleFetch))
       : read());
     signal.throwIfAborted();
     return bytes;
@@ -269,7 +270,7 @@ export function nativeProfileDocument(
             injection.src,
             owned(
               readEarly(publicUrl) ??
-                fetchProfileBundle(publicUrl, active, { credentials: 'omit' }),
+                fetchProfileBundle(publicUrl, active, sealedProfileBundleFetch),
             ),
           );
       }

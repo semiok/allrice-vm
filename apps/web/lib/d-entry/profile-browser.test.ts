@@ -56,6 +56,8 @@ it('falls back through the authenticated no-store path when the public body is i
   expect(request).toHaveBeenNthCalledWith(1, direct, {
     signal: expect.any(AbortSignal),
     credentials: 'omit',
+    cache: 'force-cache',
+    redirect: 'error',
   });
   expect(request).toHaveBeenNthCalledWith(2, scoped, {
     signal: expect.any(AbortSignal),

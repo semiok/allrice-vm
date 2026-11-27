@@ -84,6 +84,7 @@ it('hands off each download once and waits for a cancelled body before publishin
   expect(owner.earlyBundles.take().size).toBe(0);
   expect(fetch).toHaveBeenCalledExactlyOnceWith(url, {
     credentials: 'omit',
+    cache: 'force-cache',
     redirect: 'error',
     signal: expect.any(AbortSignal),
   });

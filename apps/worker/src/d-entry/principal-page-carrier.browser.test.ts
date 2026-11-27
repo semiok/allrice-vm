@@ -96,6 +96,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     let firstRpc: number | undefined;
     let applicationReads = 0;
     let browserBootstrapReads = 0;
+    let scopedBundleReads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -121,6 +122,7 @@ it.skipIf(!browserExecutable).each([false, true])(
         for (const kind of ['bootstrap', 'assets'] as const) {
           if (url.pathname !== '/api/v1/d-entry/profile/' + kind) continue;
           if (kind === 'bootstrap') browserBootstrapReads++;
+          else scopedBundleReads++;
           if (
             stall &&
             kind === 'assets' &&
@@ -409,6 +411,33 @@ it.skipIf(!browserExecutable).each([false, true])(
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
+    await page.evaluate(async () => {
+      const finish: unknown = Reflect.get(window, 'finishCarrier');
+      if (typeof finish !== 'function')
+        throw Error('Fixture carrier unavailable');
+      await finish();
+    });
+
+    const downloaded = () =>
+      traffic.filter(({ kind }) => kind.startsWith('public-')).length;
+    expect(downloaded()).toBe(2);
+    expect(scopedBundleReads).toBe(0);
+    const refreshedAt = performance.now();
+    await page.reload();
+    await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
+    expect(downloaded()).toBe(2);
+    expect(scopedBundleReads).toBe(0);
+    expect(browserBootstrapReads).toBe(0);
+    expect(socketCount).toBe(2);
+    console.info(
+      'SEALED_PROFILE_REFRESH ' +
+        JSON.stringify({
+          browser: browser.version(),
+          sealedBundleRequests: downloaded() - 2,
+          scopedBundleRequests: scopedBundleReads,
+          editableMs: Math.round(performance.now() - refreshedAt),
+        }),
+    );
     await page.evaluate(async () => {
       const finish: unknown = Reflect.get(window, 'finishCarrier');
       if (typeof finish !== 'function')
