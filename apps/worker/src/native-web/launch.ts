@@ -295,6 +295,19 @@ export function apply(ctx, config) {
             ? [
                 { id: 'llm-pi-ai', disabled: true },
                 { id: 'web-search-deepseek', disabled: true },
+                ...(!modelAdapter.webSearchEnabled
+                  ? [
+                      {
+                        id: 'tool-web',
+                        // rc.2 replaces the entire config. Keep the base preset values.
+                        config: {
+                          fetch: true,
+                          search: false,
+                          searchTimeoutMs: 60_000,
+                        },
+                      },
+                    ]
+                  : []),
                 {
                   id: 'agent-default-model',
                   config: {

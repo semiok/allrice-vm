@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { composeEntries } from '@deepseek-ai/dsh-app-boot';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeWebTools from '@deepseek-ai/dsh-tool-web';
+import Tools from '@deepseek-ai/dsh-tools';
+import Web from '@deepseek-ai/dsh-web';
 import type {
   PersonVmBootstrapScope,
   PersonVmJobExit,
@@ -49,8 +55,8 @@ it('生产compiler收集全部native Web产品而不emit测试；typecheck仍收
   expect(build.options.rootDir).toBe(join(worker, 'src'));
   expect(build.options.paths).toEqual({});
 });
-it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI；不写token或端口池', async () => {
-  const config = {
+function launchConfiguration() {
+  return {
     origin: 'http://127.0.0.1:32179/',
     publicUrl: 'https://e1.example.test/',
     guestPort: 8080,
@@ -66,9 +72,13 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
       employeeVersionId: randomUUID(),
     },
   };
-  const profile = [
-    { path: 'package.json', contents: '{"name":"fixture-profile"}' },
-  ] as const;
+}
+const profile = [
+  { path: 'package.json', contents: '{"name":"fixture-profile"}' },
+] as const;
+
+it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI；不写token或端口池', async () => {
+  const config = launchConfiguration();
   const staged = await prepareNativeWebLaunch(config, binding, profile);
   expect(staged.commandWithoutHost.args).not.toContain('--host');
   const a = nativeWebLaunchOnGuest(
@@ -216,6 +226,98 @@ it('stage实际native Host插件/patch，独立员工HOME并保原生no-open CLI
       ),
     ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
 });
+
+it.each([false, true])(
+  'advertises native Search only with a host provider (%s) and still executes WebFetch',
+  async (webSearchEnabled) => {
+    const provider = 'fixture-codex';
+    const model = 'fixture';
+    const staged = await prepareNativeWebLaunch(
+      launchConfiguration(),
+      binding,
+      profile,
+      undefined,
+      {
+        capability: 'synthetic-epoch-capability',
+        origin: 'http://172.16.0.5:52400/',
+        provider,
+        model,
+        modelInfo: { provider, id: model, name: model },
+        webSearchEnabled,
+      },
+    );
+    const patch = staged.files.find(({ path }) =>
+      path.endsWith('/owner.patch.json'),
+    );
+    if (!patch) throw Error('native owner patch missing');
+    const composed = composeEntries([
+      [
+        {
+          insert: [
+            {
+              id: 'tool-web',
+              name: '@deepseek-ai/dsh-tool-web',
+              config: { fetch: true, searchTimeoutMs: 60_000 },
+            },
+          ],
+        },
+      ],
+      JSON.parse(patch.contents),
+    ]);
+    const config = composed.find(({ id }) => id === 'tool-web')?.config;
+    expect(config).toEqual({
+      fetch: true,
+      searchTimeoutMs: 60_000,
+      ...(webSearchEnabled ? {} : { search: false }),
+    });
+
+    const ctx = new Context();
+    try {
+      await ctx.plugin(SystemPrompt);
+      await ctx.plugin(Tools);
+      await ctx.plugin(Web, {
+        searchProvider: 'deepseek-official',
+        fetchProvider: 'http',
+      });
+      if (webSearchEnabled)
+        ctx.web.registerSearchProvider({
+          id: 'deepseek-official',
+          available: () => true,
+          search: async () => ({ sources: [], truncated: false }),
+        });
+      ctx.web.registerFetchProvider({
+        id: 'http',
+        available: () => true,
+        fetch: async ({ url }) => ({
+          url,
+          statusCode: 200,
+          body: { kind: 'text', content: 'fixture fetch' },
+          truncated: false,
+        }),
+      });
+      await ctx.plugin(
+        NativeWebTools,
+        config as Parameters<typeof NativeWebTools.apply>[1],
+      );
+      const assembled = await ctx.systemPrompt.assemble();
+      expect(assembled.tools.map(({ name }) => name).sort()).toEqual(
+        webSearchEnabled ? ['web_fetch', 'web_search'] : ['web_fetch'],
+      );
+      const fetch = await ctx.tools.execute({
+        callId: ToolCallId('fixture-fetch'),
+        name: 'web_fetch',
+        arguments: { url: 'https://example.test/' },
+        signal: new AbortController().signal,
+      });
+      expect(fetch).toMatchObject({
+        isError: false,
+        value: { statusCode: 200 },
+      });
+    } finally {
+      await ctx.fiber.dispose();
+    }
+  },
+);
 
 it('真实Web启动缺有界auth capability时先拒绝，不launch或假ready', async () => {
   const launch = {
