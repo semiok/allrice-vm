@@ -332,7 +332,10 @@ export function EmployeeNativePage({
         event.data?.scopeId !== scopeId
       )
         return;
-      if (event.data.type === pageClosing) void close();
+      if (event.data.type === pageClosing) {
+        if (prepare && !navigating && !detached) finish('failed');
+        else void close();
+      }
       if (event.data.type === pageStartupFailed) {
         if (prepare) finish('failed');
         else {

@@ -12,9 +12,9 @@ import {
 import { deferred } from '../../../../../packages/d-entry-principal/test/host-fixture';
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
 import {
+  pageClosing,
   pageEditorMounted,
   pageNavigate,
-  pageStartupFailed,
 } from '../../../lib/d-entry/page-messages';
 
 const suite =
@@ -500,7 +500,7 @@ suite('4.0 browser cold entry', () => {
           const owner = Reflect.get(window, '__ALLRICE_EMPLOYEE_DOCUMENT__');
           owner.claim();
           parent.postMessage({ type, scopeId: owner.scopeId }, location.origin);
-        }, pageStartupFailed);
+        }, pageClosing);
         const failure = stalledClose.getByRole('heading', {
           name: '暂时打不开工作台',
           exact: true,
