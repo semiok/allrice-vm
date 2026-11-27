@@ -6,6 +6,7 @@ import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   getDatabase,
+  readContentPrincipal,
   readPersonNativeWebRoster,
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
@@ -932,6 +933,14 @@ export function createProductionPersonVmHost(input: {
                   context.requestId,
                   active,
                   stop,
+                  async (tx, checking) => {
+                    if (
+                      !context.sessionId ||
+                      !(await readContentPrincipal(context, tx, true))
+                    )
+                      throw new PersonVmError('AUTHORIZATION_DENIED');
+                    checking.throwIfAborted();
+                  },
                 ),
             };
           },
