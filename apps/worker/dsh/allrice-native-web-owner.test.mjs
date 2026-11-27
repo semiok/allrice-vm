@@ -496,6 +496,10 @@ it('only attests the sealed tool selected by this native prompt assembly, even w
   try {
     const [assemble] = f.events.listeners('system-prompt/assemble');
     const assembly = { tools: [schema] };
+    f.events.emit('session/event', f.agent.session, {
+      type: 'turn/start',
+      data: { turn: 1 },
+    });
     await assemble(assembly, { agent: f.agent }, async () => assembly);
     f.events.emit('agent/assistant-stream', {
       agent: f.agent,
@@ -510,6 +514,25 @@ it('only attests the sealed tool selected by this native prompt assembly, even w
     ).toBeNull();
     tools.set(schema.name, build('version-two'));
     expect(versions('active').memory_read).toBeNull();
+
+    // rc.2 projects the tool schema before emitting its assembly waterfall.
+    // A same-schema registry change after projection invalidates that step.
+    f.events.emit('session/event', f.agent.session, {
+      type: 'step/end',
+      data: { turn: 1, step: 1 },
+    });
+    f.events.emit('tools/change');
+    await assemble(assembly, { agent: f.agent }, async () => assembly);
+    f.events.emit('agent/assistant-stream', {
+      agent: f.agent,
+      frame: {
+        type: 'start',
+        attemptId: 'changed-during-assembly',
+        turn: 1,
+        step: 2,
+      },
+    });
+    expect(versions('changed-during-assembly').memory_read).toBeNull();
   } finally {
     f.lifetime.abort();
   }

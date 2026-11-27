@@ -587,6 +587,8 @@ export function observeNativePrompts(scope, lifetime, capture) {
   const turns = new WeakMap();
   const attempts = new WeakMap();
   const memoryAssemblies = new WeakMap();
+  const beforeMemoryAssembly = new WeakMap();
+  let toolRegistryRevision = 0;
   const inboxClaims = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
@@ -732,6 +734,13 @@ export function observeNativePrompts(scope, lifetime, capture) {
   );
   if (capture) {
     scope.on(
+      'tools/change',
+      () => {
+        toolRegistryRevision++;
+      },
+      { global: true },
+    );
+    scope.on(
       'system-prompt/assemble',
       (assembly, context, next) => {
         const agent = context.agent;
@@ -773,6 +782,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
             step: frame.step,
             cursor: session.seq - 1,
             memoryTools: memoryAssemblies.get(session),
+            memoryToolRevision: beforeMemoryAssembly.get(session),
             calls: new Map(),
             dispatched: new Set(),
           });
@@ -796,6 +806,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
       'session/event',
       (subject, event) => {
         const session = original(subject);
+        if (event.type === 'turn/start' || event.type === 'step/end')
+          beforeMemoryAssembly.set(session, toolRegistryRevision);
+        if (event.type === 'turn/end') beforeMemoryAssembly.delete(session);
         if (event.type === 'step/end' || event.type === 'turn/end') {
           attempts.delete(session);
           memoryAssemblies.delete(session);
@@ -1139,7 +1152,10 @@ export function observeNativePrompts(scope, lifetime, capture) {
         scope,
         session,
         toolSchemas,
-        attempt?.id === attemptId ? attempt.memoryTools : null,
+        attempt?.id === attemptId &&
+          attempt.memoryToolRevision === toolRegistryRevision
+          ? attempt.memoryTools
+          : null,
       );
     },
   });
