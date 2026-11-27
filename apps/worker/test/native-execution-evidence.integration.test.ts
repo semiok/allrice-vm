@@ -7,6 +7,7 @@ import { readLockedDEntryNativeRootPin } from '../../../packages/database/src/d-
 import { ensureGeneralEmployeeInstance } from '../../../packages/database/src/employees/employee-instances.ts';
 import { createRunAuthorityFixture } from '../../../packages/database/src/run-authority.fixture.ts';
 import { createRuntimeFixtureDatabase } from '../../../packages/database/src/runtime.fixture.ts';
+import { deferredPromptFact } from '../src/native-web/prompt-observation.js';
 import {
   nativeExecutionEvidenceSource,
   nativeAdoptedTextProofVersion,
@@ -407,17 +408,15 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             signal,
           ),
         ).resolves.toBeNull();
-        const { promise: locked, resolve: announceLock } =
-          Promise.withResolvers<void>();
-        const { promise: unlocked, resolve: releaseLock } =
-          Promise.withResolvers<void>();
+        const locked = deferredPromptFact<void>();
+        const unlocked = deferredPromptFact<void>();
         const blocker = db.begin(async (tx) => {
           await tx`select id from allrice_runs where id=${runId} for update`;
-          announceLock();
-          await unlocked;
+          locked.resolve();
+          await unlocked.promise;
         });
         try {
-          await Promise.race([locked, blocker]);
+          await Promise.race([locked.promise, blocker]);
           await expect(
             recordNativeMemoryToolCall(
               receipt,
@@ -430,7 +429,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             where run_id=${runId} and payload->>'kind'='memory-tool'`;
           expect(written).toBeUndefined();
         } finally {
-          releaseLock();
+          unlocked.resolve();
           await blocker;
         }
         const [toolRef, replay] = await Promise.all([
