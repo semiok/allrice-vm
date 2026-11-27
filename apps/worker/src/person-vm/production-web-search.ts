@@ -21,10 +21,10 @@ import { z } from 'zod';
 
 export const webSearchRoute = 'web-search';
 export const webSearchPath = '/v1/web/search';
+export const webSearchTimeoutMs = 55_000;
 
 const maxRequestBytes = 8_192;
 const maxResponseBytes = 256 * 1024;
-const searchTimeoutMs = 55_000;
 const quotaWindowMs = 60_000;
 const wireSearch = z
   .object({
@@ -133,11 +133,7 @@ export function createHostSearch({
     response: ServerResponse,
     caller: AbortSignal,
   ) {
-    const active = AbortSignal.any([
-      caller,
-      signal,
-      AbortSignal.timeout(searchTimeoutMs),
-    ]);
+    const active = AbortSignal.any([caller, signal]);
     active.throwIfAborted();
     const permit = await admission.admit(
       context,

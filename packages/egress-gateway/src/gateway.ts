@@ -151,6 +151,10 @@ export function createEgressGateway(
         !service.path.startsWith('/') ||
         /[?#\\]/.test(service.path) ||
         !['GET', 'POST'].includes(service.method) ||
+        (service.timeoutMs !== undefined &&
+          (!Number.isSafeInteger(service.timeoutMs) ||
+            service.timeoutMs <= 0 ||
+            service.timeoutMs > 2_147_483_647)) ||
         [...routes.values()].some(
           (route) =>
             route.path === service.path || route.matches?.(service.path),
@@ -494,10 +498,10 @@ export function createEgressGateway(
                 (item) => req.url === item.path && req.method === item.method,
               );
               if (service) {
-                const serviceSignal = AbortSignal.any([
-                  requestSignal,
-                  state.controller.signal,
-                ]);
+                const serviceSignals = [requestSignal, state.controller.signal];
+                if (service.timeoutMs !== undefined)
+                  serviceSignals.push(AbortSignal.timeout(service.timeoutMs));
+                const serviceSignal = AbortSignal.any(serviceSignals);
                 delete req.headers.authorization;
                 const resolved = await service.resolve?.(
                   req,

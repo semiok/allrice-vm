@@ -88,6 +88,8 @@ export type ManagedHostService = Readonly<{
   id: string;
   path: string;
   method: 'GET' | 'POST';
+  /** Optional budget for the full request, including resolution and authorization. */
+  timeoutMs?: number;
   /** Service owns admission AND complete call identity; local capability is insufficient. */
   admissionOwner: 'service';
 }> &

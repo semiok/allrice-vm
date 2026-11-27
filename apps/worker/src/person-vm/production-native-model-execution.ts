@@ -41,6 +41,7 @@ import {
   readGuestSearch,
   webSearchPath,
   webSearchRoute,
+  webSearchTimeoutMs,
 } from './production-web-search.js';
 import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 
@@ -973,6 +974,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             id: webSearchRoute,
             path: webSearchPath,
             method: 'POST',
+            timeoutMs: webSearchTimeoutMs,
             admissionOwner: 'service',
             async resolve(request, binding, signal, assertNoCapability) {
               return run(signal, async (active) => {

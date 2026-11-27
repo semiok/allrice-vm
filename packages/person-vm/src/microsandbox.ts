@@ -7,8 +7,6 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { isIP } from 'node:net';
-import { networkInterfaces } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
@@ -699,27 +697,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
         '--mount-dir',
         `${controls.hostDirectory}:${controls.guestDirectory}:ro`,
       );
-    // MSB's DNS shorthand is a Host:53 rule. Exclude physical host
-    // addresses before opening it, so only the virtual DNS gateway is usable.
-    const localAddresses = new Set(
-      Object.values(networkInterfaces())
-        .flatMap((interfaces) => interfaces ?? [])
-        .map(({ address }) => address.split('%', 1)[0]!),
-    );
-    for (const address of localAddresses) {
-      const family = isIP(address);
-      if (!family) throw new PersonVmError('PROVIDER_FAILED');
-      args.push(
-        '--net-rule',
-        `deny:egress@${family === 6 ? '[' + address + ']' : address}`,
-      );
-    }
-    args.push(
-      '--net-rule',
-      'allow:egress@dns',
-      '--net-rule',
-      'allow:egress@public',
-    );
     for (const port of receipt.gatewayPorts)
       args.push('--net-rule', `allow:egress@host:tcp:${port}`);
     if (web) {
