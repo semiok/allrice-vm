@@ -268,8 +268,13 @@ it('releases discarded offsets at item completion and accepts CR-only event fram
   ])
     .toString('utf8')
     .replaceAll('\r\n', '\r');
-  const result = projector.push(Buffer.from(second));
-  const done = Buffer.from(result)
+  const result = Buffer.concat([
+    ...Array.from(Buffer.from(second), (byte) =>
+      projector.push(Uint8Array.of(byte)),
+    ),
+    projector.finish(),
+  ]);
+  const done = result
     .toString('utf8')
     .split('event: response.output_item.done')
     .at(-1)!;

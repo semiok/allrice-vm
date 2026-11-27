@@ -238,12 +238,19 @@ export class OpenAiCitationProjection {
   private citations = new Map<string, Map<number, Citation[]>>();
 
   push(bytes: Uint8Array): Uint8Array {
+    return this.consume(bytes, false);
+  }
+
+  private consume(bytes: Uint8Array, eof: boolean): Uint8Array {
     const buffer = Buffer.concat([this.buffer, bytes]);
     const frames: Buffer[] = [];
     let offset = 0;
     // A CRLF token may not backtrack into two independent line endings.
     const blankLine = /(?:\r\n|\r(?!\n)|(?<!\r)\n){2}/g;
-    for (const match of buffer.toString('latin1').matchAll(blankLine)) {
+    const input = buffer.toString('latin1');
+    // At a transport boundary, a trailing CR may still belong to CRLF.
+    const scan = !eof && input.endsWith('\r') ? input.slice(0, -1) : input;
+    for (const match of scan.matchAll(blankLine)) {
       const end = match.index + match[0].length;
       const frame = buffer.subarray(offset, end);
       frames.push(
@@ -267,7 +274,8 @@ export class OpenAiCitationProjection {
   }
 
   finish(): Uint8Array {
-    const remaining = this.buffer;
+    const framed = this.consume(new Uint8Array(0), true);
+    const remaining = Buffer.concat([framed, this.buffer]);
     this.buffer = Buffer.alloc(0);
     this.citations.clear();
     return remaining;
