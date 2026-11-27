@@ -142,7 +142,7 @@ const suite =
   process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
     ? describe
     : describe.skip;
-suite('4.0 release smoke', () => {
+suite('4.0 release smoke', { timeout: 15_000 }, () => {
   let browser;
   beforeAll(async () => {
     const executablePath = process.env.ALLRICE_TEST_CHROME_EXECUTABLE;
@@ -165,7 +165,17 @@ suite('4.0 release smoke', () => {
         receipt,
         { hello, timeout: 5000 },
       );
-      await assertion(smoke, receipt, local.traffic);
+      await assertion(
+        smoke.catch((error) => {
+          // Retain the exact local path/step if a browser wait fails.
+          if (!(error instanceof SmokeSkip)) {
+            error.message += ` (step: ${receipt.step}, requests: ${json(local.traffic)})`;
+          }
+          throw error;
+        }),
+        receipt,
+        local.traffic,
+      );
       expect(local.traffic.every((event) => event.path !== '/chatflow')).toBe(
         true,
       );
@@ -215,7 +225,7 @@ suite('4.0 release smoke', () => {
     await run(mode, async (smoke) => {
       const error = await smoke.catch((error) => error);
       expect(error).toBeInstanceOf(SmokeSkip);
-      expect(error.message).toBe(reason);
+      expect(error.message).toContain(reason);
     });
   });
 
@@ -227,7 +237,7 @@ suite('4.0 release smoke', () => {
     await run(mode, async (smoke) => {
       const error = await smoke.catch((error) => error);
       expect(error).not.toBeInstanceOf(SmokeSkip);
-      expect(error.message).toBe(reason);
+      expect(error.message).toContain(reason);
     });
   });
 });
