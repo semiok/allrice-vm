@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type {} from '@deepseek-ai/dsh-client-connection/client';
+import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import {
   employeeChoice,
@@ -115,11 +115,16 @@ export function installEmployeeProductOwner(ctx: Context) {
     ['uiWorkspace', 'sessions', 'connection', 'sidebarRight'],
     (native) => {
       native.effect(() => {
+        // rc.2 exports the browser handle without augmenting Cordis Context.
+        // This effect is installed only while Cordis injects that service.
+        const { connection } = native as Context & {
+          connection: ConnectionHandle;
+        };
         let pending:
           | {
               scope: PageThreadScope;
               oldGeneration: ReturnType<
-                typeof native.connection.generation.getSnapshot
+                typeof connection.generation.getSnapshot
               >;
               opened: boolean;
             }
@@ -127,7 +132,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         const update = () => {
           if (!pending || signal.aborted) return;
           const request = pending;
-          const generation = native.connection.generation.getSnapshot();
+          const generation = connection.generation.getSnapshot();
           if (!generation || generation === pending.oldGeneration) return;
           const root = native.sessions.list
             .getSnapshot()
@@ -185,14 +190,14 @@ export function installEmployeeProductOwner(ctx: Context) {
           if (signal.aborted) return;
           pending = {
             scope: (event as CustomEvent<PageThreadScope>).detail,
-            oldGeneration: native.connection.generation.getSnapshot(),
+            oldGeneration: connection.generation.getSnapshot(),
             opened: false,
           };
-          native.connection.reconnect();
+          connection.reconnect();
         };
         document.addEventListener(pageThreadScope, onScope);
         const cleanup = [
-          native.connection.generation.subscribe(update),
+          connection.generation.subscribe(update),
           native.sessions.list.subscribe(update),
           native.sidebarRight.mounted.subscribe(update),
         ];
