@@ -1098,6 +1098,27 @@ export class PersonVmService
       throw failure;
     }
   }
+  /** Observe the same physical proof as the running prewarm without
+   * preparing or changing endpoints. The caller proves its exact roster. */
+  async assertRunningReadiness(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    const identity = await this.identity(context, 'start', signal);
+    const row = this.required(await this.options.store.read(identity.personId));
+    this.checkOrganization(row, identity.organizationId);
+    if (
+      row.phase !== 'running' ||
+      row.leaseOwner ||
+      !sameVmBinding(bindingOf(row), binding)
+    )
+      throw new PersonVmError('LEASE_CONFLICT');
+    await this.assertNoPendingDisk(row, signal);
+    await this.ready(row, signal);
+    await this.assertCurrentBinding(context, binding, signal);
+    signal.throwIfAborted();
+  }
   async prewarm(
     context: RequestContext,
     input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },

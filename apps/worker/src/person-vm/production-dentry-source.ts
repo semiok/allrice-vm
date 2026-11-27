@@ -84,6 +84,7 @@ export function installProductionDEntrySource(input: {
   startup: Startup;
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
+  confirmPhysical?: PersonVmService['assertRunningReadiness'];
   resolveSendRoute: ResolveProductionDEntrySendRoute;
 }) {
   input.lifetime.throwIfAborted();
@@ -163,6 +164,7 @@ export function installProductionDEntrySource(input: {
     },
     confirmVerifiedEditor(context, identity, signal) {
       return own(signal, async (active) => {
+        if (!input.confirmPhysical) return;
         try {
           const current = await currentDEntryNativeOwner(
             dEntryNativeOwnerPort,
@@ -185,8 +187,10 @@ export function installProductionDEntrySource(input: {
             binding,
             current.signal,
           );
-          sameHost(current.owner, identity);
           const confirmed = AbortSignal.any([current.signal, proof, group]);
+          await input.confirmPhysical(context, binding, confirmed);
+          await current.owner.assertCurrent(context, confirmed);
+          sameHost(current.owner, identity);
           confirmed.throwIfAborted();
           return { binding, proof: confirmed };
         } catch (error) {
