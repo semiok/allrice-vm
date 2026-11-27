@@ -786,16 +786,41 @@ suite(
           throw Error('current fence closed before it was observed');
         }),
       ]);
-      const withdraw = track(
-        updateDEntryReleasePolicy(f.context, {
-          ...policy,
-          selections: [],
-        }),
-      );
-      await blockedBy(callerPid);
-      release.resolve();
-      await caller;
-      await withdraw;
+      const applicationName = `memory-rollout-writer:${randomUUID().slice(0, 8)}`;
+      const writer = client.createDedicatedDatabase({
+        options: {
+          ...database.db.options,
+          connection: {
+            ...database.db.options.connection,
+            application_name: applicationName,
+          },
+        },
+      });
+      try {
+        vi.spyOn(client, 'getDatabase').mockReturnValueOnce(writer);
+        const withdraw = track(
+          updateDEntryReleasePolicy(f.context, {
+            ...policy,
+            selections: [],
+          }),
+        );
+        await expect
+          .poll(async () => {
+            const [blocked] = await database.db`
+            select 1 from pg_stat_activity
+            where application_name = ${applicationName}
+              and ${callerPid}=any(pg_blocking_pids(pid))
+          `;
+            return Boolean(blocked);
+          })
+          .toBe(true);
+        release.resolve();
+        await caller;
+        await withdraw;
+      } finally {
+        release.resolve();
+        await writer.end({ timeout: 2 });
+      }
 
       await expect(run(read)).rejects.toMatchObject({
         code: 'authorization_denied',
