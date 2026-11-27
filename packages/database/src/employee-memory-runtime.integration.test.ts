@@ -37,6 +37,11 @@ import {
   type NativeMemoryTarget,
 } from './employee-memory-runtime.ts';
 import { nativeMemorySource } from './memory-native-source.ts';
+import { readLockedNativeMemoryCurrent } from './memory-runtime-current.ts';
+import { readApplicationBuiltinModules } from './builtin-modules.ts';
+import { updateDEntryReleasePolicy } from './d-entry-release-policy.ts';
+import { authorizeFixturePlatformAdministrator } from './platform-authority.fixture.ts';
+import { approveSyntheticCurrentEmployeeExecution } from './current-execution.fixture.ts';
 import type * as MemoryRuntimeBinding from './memory-runtime-binding.ts';
 import {
   MemoryRuntimeModuleOriginSchema,
@@ -50,7 +55,10 @@ import {
 } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
-import { ensureDefaultEmployee } from './workspace/service.ts';
+import {
+  createChatSession,
+  ensureDefaultEmployee,
+} from './workspace/service.ts';
 import { insertEmployeeMemoryPair } from './workspace/employee-memory-mutation.ts';
 import type { EmployeeMemoryScope } from './workspace/employee-memory.ts';
 
@@ -704,6 +712,75 @@ suite(
         .toHaveLength(1);
       return ids[0]!;
     }
+
+    it('reads current memory execution authority on the owner transaction and fences the real rollout writer until commit', async () => {
+      const f = await setup();
+      await authorizeFixturePlatformAdministrator(database.db, f.scope.ownerId);
+      approveSyntheticCurrentEmployeeExecution();
+      const policy = {
+        revision: 'selected-by-publisher',
+        defaultGeneration: '3.x' as const,
+        selections: [
+          {
+            organizationId: f.scope.organizationId,
+            personId: f.scope.ownerId,
+          },
+        ],
+      };
+      await updateDEntryReleasePolicy(f.context, policy);
+      const thread = await createChatSession(
+        f.context,
+        {
+          workspaceId: f.scope.workspaceId,
+          employeeInstanceId: f.scope.instanceId,
+          title: 'Memory current fence',
+        },
+        { executionGeneration: '4.0' },
+      );
+      const target = {
+        workspaceId: f.scope.workspaceId,
+        employeeInstanceId: f.scope.instanceId,
+        threadId: thread.id,
+        access: 'execute' as const,
+        module: memoryModule,
+      };
+      const modules = await readApplicationBuiltinModules('worker');
+      const read = (tx: Sql) =>
+        readLockedNativeMemoryCurrent(tx, f.context, target, modules, live());
+      await expect(
+        database.db.begin((tx) =>
+          readLockedNativeMemoryCurrent(
+            tx,
+            f.context,
+            { ...target, threadId: randomUUID() },
+            modules,
+            live(),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+      await expect(database.db.begin(read)).resolves.toMatchObject({
+        scope: f.businessScope,
+        threadId: thread.id,
+        executionGeneration: '4.0',
+        module: memoryModule,
+      });
+      const caller = await hold(read);
+      const withdraw = track(
+        updateDEntryReleasePolicy(f.context, {
+          ...policy,
+          selections: [],
+        }),
+      );
+      await blockedBy(caller.pid);
+      caller.release();
+      await caller.done;
+      await withdraw;
+
+      await expect(database.db.begin(read)).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+    });
 
     it('pins the original adopted app version separately from current availability and config edits', async () => {
       const f = await setup([
