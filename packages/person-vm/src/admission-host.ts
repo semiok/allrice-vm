@@ -617,24 +617,31 @@ export class PersonVmAdmissionHost
       (permitId, owner) =>
         this.retainPublicEgressRelease(personId, permitId, owner),
     );
+    let failed: { error: unknown } | undefined;
     try {
       if (permit.disposition === 'deferred')
         throw new PersonVmError('RUNTIME_NOT_READY');
       await this.activate(permit, transfer, signal);
-    } finally {
-      try {
-        await this.finish(permit);
-      } catch (error) {
-        const owned = this.owned(permit);
-        if (owned.joined && !owned.unsafe)
-          this.retainPublicEgressRelease(
-            personId,
-            permit.permitId,
-            owned.owner,
-          );
-        throw error;
-      }
+    } catch (error) {
+      failed = { error };
     }
+    try {
+      await this.finish(permit);
+    } catch (cleanup) {
+      const owned = this.owned(permit);
+      if (owned.joined && !owned.unsafe)
+        this.retainPublicEgressRelease(personId, permit.permitId, owned.owner);
+      if (failed)
+        throw new AggregateError(
+          [failed.error, cleanup],
+          'PUBLIC_EGRESS_CLEANUP_INCOMPLETE',
+          {
+            cause: failed.error,
+          },
+        );
+      throw cleanup;
+    }
+    if (failed) throw failed.error;
   }
 
   private retainPublicEgressRelease(

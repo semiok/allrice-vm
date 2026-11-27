@@ -1584,6 +1584,10 @@ export function createProductionPersonVmHost(input: {
             reopen = vm.fenceWorkerStartup();
             await vm.settleRetainedStartupMounts(signal);
             for (const { binding } of ownedVms.values()) {
+              await admission.recoverJoinedPublicEgress(
+                binding.personId,
+                signal,
+              );
               await vm.recoverStoppedEntryWork(binding, signal);
               await vm.assertWorkerShutdownSafe(binding, signal);
             }
