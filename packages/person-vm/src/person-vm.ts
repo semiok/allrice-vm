@@ -43,6 +43,11 @@ import type { PersonVmDiskPool } from './disk-pool.ts';
 import type { DiskPoolOwner } from './disk-pool-platform.ts';
 import type { PersonVmNativePort } from './microsandbox.ts';
 import { bootstrapPersonVm } from './guest-bootstrap.ts';
+import type {
+  PlatformVmDeletionAuthorization,
+  PlatformVmDeletionRequest,
+  PlatformVmDeletionResult,
+} from './platform-deletion.ts';
 import {
   checkedWebRoster,
   type PersonVmWebRoster,
@@ -163,6 +168,11 @@ export class PersonVmService
     private readonly options: {
       store: PersonVmStore;
       authority: PersonVmAuthority;
+      authorizePlatformDeletion?: (
+        context: RequestContext,
+        signal: AbortSignal,
+        sql?: Parameters<PlatformVmDeletionAuthorization>[0],
+      ) => Promise<void>;
       disk: PersonVmDiskPort;
       diskPool?: PersonVmDiskPool;
       native: PersonVmNativePort;
@@ -435,12 +445,22 @@ export class PersonVmService
     if (!target) return;
     const running = row?.phase === 'running' && !this.needsUpgradeStop(row);
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
+    const purged =
+      row?.phase === 'deleted' &&
+      !row.diskRetained &&
+      target.replacesVmId === row.vmId &&
+      target.vmId === null &&
+      target.instanceId === null;
     if (
       (row?.phase === 'deleted' &&
         (!allowRetainedRestore ||
-          !target.restoreRetained ||
-          !row.diskRetained ||
-          target.vmId !== row.vmId)) ||
+          (!purged &&
+            (!target.restoreRetained ||
+              !row.diskRetained ||
+              target.vmId !== row.vmId)))) ||
+      (target.replacesVmId &&
+        row?.phase !== 'deleted' &&
+        target.vmId === null) ||
       epoch !== target.leaseEpoch ||
       (target.vmId !== null && target.vmId !== row?.vmId) ||
       (target.instanceId !== null &&
@@ -495,7 +515,9 @@ export class PersonVmService
           });
           return view(lease.row);
         }
-        const row = retry ? lease.row! : this.newVmRecord(identity);
+        const row = retry
+          ? lease.row!
+          : this.newVmRecord(identity, lease.row?.leaseEpoch);
         const assertTicket =
           target &&
           ((active: AbortSignal) => assertPrewarmAuthority(target, active));
@@ -531,6 +553,7 @@ export class PersonVmService
 
   private newVmRecord(
     identity: Pick<DiskPoolOwner, 'personId' | 'organizationId'>,
+    leaseEpoch = 0,
   ): VmRecord {
     return {
       vmId: randomUUID(),
@@ -541,7 +564,7 @@ export class PersonVmService
       diskRetained: true,
       nativeCreated: false,
       instanceId: null,
-      leaseEpoch: 0,
+      leaseEpoch,
       leaseOwner: null,
       leaseExpiresAt: null,
       egressReceipt: null,
@@ -1283,9 +1306,11 @@ export class PersonVmService
         active.throwIfAborted();
         row.phase = 'running';
         await lease.save(row, {
-          requestId: intent.requestId,
-          action,
-          result: 'succeeded',
+          audit: {
+            requestId: intent.requestId,
+            action,
+            result: 'succeeded',
+          },
         });
         // The row remains owned by this lease until the accepted prewarm
         // authority is confirmed after saving it.
@@ -1503,16 +1528,24 @@ export class PersonVmService
       nativeAlreadyJoined?: boolean;
       /** This attempt never dispatched, and the prior epoch already released. */
       unstartedCapacity?: boolean;
+      onDetached?: (mount: string, signal: AbortSignal) => Promise<void>;
     },
   ) {
-    const idle = completion?.idle;
+    const { idle, onDetached } = completion ?? {};
+    const retainedDeletion = reason === 'delete' && row.phase === 'deleted';
+    const platformDetach = reason === 'delete' && onDetached !== undefined;
     let failed = false;
     let egressJoined = true;
     let stopped = false;
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
-      if (stopNative && !completion?.nativeAlreadyJoined)
-        await this.options.native.stop(binding, signal);
+      if (stopNative && !completion?.nativeAlreadyJoined) {
+        if (platformDetach)
+          await this.options.native.stop(binding, signal, {
+            requireStopped: true,
+          });
+        else await this.options.native.stop(binding, signal);
+      }
       const state = await this.options.native.status(binding, signal);
       if (state === 'stopped') row.nativeCreated = true; // Native create may have committed before a failed host save/ack.
       return state === 'stopped' || state === 'absent';
@@ -1614,24 +1647,27 @@ export class PersonVmService
           );
         }
         // Keep the exact mount available to finish staged egress cleanup.
-        if (egressJoined)
+        if (egressJoined) {
+          const detaching = AbortSignal.timeout(this.options.cleanupTimeoutMs);
           await this.options.disk.detach(
             { vmId: row.vmId, tier: row.diskTier },
-            AbortSignal.timeout(this.options.cleanupTimeoutMs),
+            detaching,
+            onDetached ? (mount) => onDetached(mount, detaching) : undefined,
           );
+        }
       } catch {
         failed = true;
       }
     } else failed = true;
-    row.phase = failed ? 'failed' : 'stopped';
-    await lease.save(
-      row,
-      failed ? undefined : completion?.audit,
-      this.options.nativeCapacityAccounting === true &&
+    row.phase = failed ? 'failed' : retainedDeletion ? 'deleted' : 'stopped';
+    await lease.save(row, {
+      audit: failed ? undefined : completion?.audit,
+      capacityReleased:
+        (platformDetach || this.options.nativeCapacityAccounting === true) &&
         !failed &&
         (stopNative || completion?.unstartedCapacity === true) &&
         Boolean(row.instanceId),
-    );
+    });
     if (failed) throw new PersonVmError('CLEANUP_INCOMPLETE');
     if (row.instanceId && !idle && !completion?.nativeAlreadyJoined)
       this.options.observeOwnedStop?.(bindingOf(row));
@@ -2050,11 +2086,7 @@ export class PersonVmService
           result: 'started',
         });
         try {
-          if (row.instanceId && row.diskRetained) {
-            if (row.phase !== 'running')
-              await this.takeoverSafe(row, signal, lease);
-            await this.cleanup(row, lease, 'delete');
-          }
+          await this.retireForDeletion(row, lease, signal);
           if (input.deleteDisk && row.diskRetained) {
             await lease.guard();
             await this.options.disk.delete(
@@ -2081,6 +2113,286 @@ export class PersonVmService
             errorCode: safeError(error).code,
           });
           throw safeError(error);
+        }
+      },
+    );
+  }
+  private async retireForDeletion(
+    row: VmRecord,
+    lease: VmLease,
+    signal: AbortSignal,
+  ) {
+    if (row.instanceId && row.diskRetained) {
+      if (row.phase !== 'running') await this.takeoverSafe(row, signal, lease);
+      await this.cleanup(row, lease, 'delete');
+    }
+  }
+  /** Separate server-only authority. Never make a platform operator the
+   * target person or grant the target session ordinary delete authority. */
+  async deleteForPlatform(
+    context: RequestContext,
+    input: PlatformVmDeletionRequest,
+    signal: AbortSignal,
+  ): Promise<PlatformVmDeletionResult> {
+    const authorize = this.options.authorizePlatformDeletion;
+    if (!authorize || !UuidSchema.safeParse(input.personId).success)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    input =
+      input.action === 'review'
+        ? { ...input, personId: input.personId.toLowerCase() }
+        : {
+            ...input,
+            personId: input.personId.toLowerCase(),
+            vmId: input.vmId.toLowerCase(),
+            ...(input.action === 'purge-disk' && {
+              confirmationId: input.confirmationId.toLowerCase(),
+            }),
+          };
+    const operator = RequestContextSchema.parse(context);
+    if (operator.actor.type !== 'user')
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    await authorize(operator, signal);
+    signal.throwIfAborted();
+    return this.options.store.withLease(
+      input.personId,
+      {
+        now: this.now,
+        ttlMs: this.options.leaseTtlMs,
+        deletionAction: input.action,
+      },
+      async (lease) => {
+        const active = AbortSignal.any([signal, lease.signal]);
+        const row = lease.row;
+        const audit = lease.auditPlatformDeletion;
+        const inspect = this.options.disk.inspectDeletionTarget?.bind(
+          this.options.disk,
+        );
+        if (!audit || !inspect) throw new PersonVmError('RUNTIME_NOT_READY');
+        active.throwIfAborted();
+        if (!row) {
+          await authorize(operator, active);
+          throw new PersonVmError('NOT_FOUND');
+        }
+        const lockedOperator: PlatformVmDeletionAuthorization = (sql) =>
+          authorize(operator, active, sql);
+        const confirmationId =
+          input.action === 'purge-disk'
+            ? input.confirmationId
+            : input.action === 'review' && row.diskRetained
+              ? randomUUID()
+              : null;
+        const observed = {
+          vmId: row.vmId,
+          personId: row.personId,
+          organizationId: row.organizationId,
+          phase: row.phase,
+          instanceId: row.instanceId,
+          leaseEpoch: row.leaseEpoch,
+          diskTier: row.diskTier,
+          diskRetained: row.diskRetained,
+        };
+        const unverified = async (error: unknown): Promise<never> => {
+          const failure = safeError(error);
+          if (input.action !== 'review')
+            await audit({
+              context: operator,
+              target: { ...observed, diskIdentitySha256: null },
+              confirmationId,
+              action: input.action,
+              result:
+                failure.code === 'AUTHORIZATION_DENIED' ? 'denied' : 'failed',
+              diskUnverified: true,
+              requestedTarget: { vmId: input.vmId },
+              errorCode: failure.code,
+            });
+          throw failure;
+        };
+        await authorize(operator, active).catch(unverified);
+        active.throwIfAborted();
+        // An interrupted pool adoption may already expose formal filenames.
+        // Only the creation path can finish the claim under the same lease.
+        await this.assertNoPendingDisk(row, active).catch(unverified);
+        const erasing = await lease.readPlatformErasingDisk?.();
+        const disk = await inspect(
+          row.vmId,
+          active,
+          erasing?.diskIdentitySha256 ?? undefined,
+        ).catch(unverified);
+        const resumingErase = disk.state === 'absent' && !!erasing;
+        const neverCreatedDisk =
+          disk.state === 'absent' &&
+          row.phase === 'failed' &&
+          row.diskRetained &&
+          !row.instanceId &&
+          !row.nativeCreated &&
+          !row.egressReceipt;
+        if (
+          disk.state === 'unknown' ||
+          row.diskRetained !==
+            (disk.state === 'ready' || resumingErase || neverCreatedDisk) ||
+          (disk.state === 'ready' &&
+            (!disk.identitySha256 ||
+              (erasing &&
+                (erasing.diskIdentitySha256 !== disk.identitySha256 ||
+                  erasing.diskTier !== disk.disk.tier))))
+        )
+          return unverified(new PersonVmError('PROVIDER_FAILED'));
+        const target = {
+          ...observed,
+          diskTier:
+            disk.state === 'ready'
+              ? disk.disk.tier
+              : (erasing?.diskTier ?? row.diskTier),
+          diskIdentitySha256:
+            disk.state === 'ready'
+              ? (disk.identitySha256 ?? null)
+              : (erasing?.diskIdentitySha256 ?? null),
+        };
+        const entry = {
+          context: operator,
+          target,
+          confirmationId,
+          action: input.action,
+        };
+        try {
+          await authorize(operator, active);
+          active.throwIfAborted();
+        } catch (error) {
+          const failure = safeError(error);
+          if (input.action !== 'review')
+            await audit({
+              ...entry,
+              result:
+                failure.code === 'AUTHORIZATION_DENIED' ? 'denied' : 'failed',
+              errorCode: failure.code,
+            });
+          throw failure;
+        }
+        if (input.action === 'review') {
+          await audit({ ...entry, result: 'reviewed' });
+          return { target, confirmationId };
+        }
+        if (
+          input.vmId !== row.vmId ||
+          (input.action === 'retain-disk' &&
+            input.leaseEpoch !== row.leaseEpoch)
+        ) {
+          await audit({
+            ...entry,
+            result: 'denied',
+            errorCode: 'LEASE_LOST',
+            requestedTarget: {
+              vmId: input.vmId,
+              ...(input.action === 'retain-disk' && {
+                leaseEpoch: input.leaseEpoch,
+              }),
+            },
+          });
+          throw new PersonVmError('LEASE_LOST');
+        }
+        const purge = input.action === 'purge-disk';
+        try {
+          if (purge && !row.diskRetained)
+            throw new PersonVmError('DISK_DELETE_NOT_AUTHORIZED');
+          if (!purge && (erasing || disk.state !== 'ready'))
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          await audit({ ...entry, result: 'started' });
+        } catch (error) {
+          if (error instanceof PersonVmError)
+            await audit({ ...entry, result: 'denied', errorCode: error.code });
+          throw error;
+        }
+        try {
+          if (row.holds.length || row.phase === 'starting')
+            throw new PersonVmError('VM_ACTIVE');
+          if (!row.instanceId && (row.nativeCreated || row.egressReceipt))
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          await authorize(operator, active);
+          active.throwIfAborted();
+          const retained =
+            !erasing && (await lease.confirmRetainedDeletion?.()) === true;
+          if (!erasing && !retained) {
+            if (!lease.claimDeletionCleanup)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            await lease.claimDeletionCleanup();
+          }
+          await lease.assertAdmissionOpen(true);
+          await lease.guard();
+          if (
+            row.egressReceipt &&
+            !this.options.ownsEgressReceipt?.(
+              this.receipt(bindingOf(row), row.egressReceipt),
+            )
+          )
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          const releaseHome = this.options.native.releaseDiskHome?.bind(
+            this.options.native,
+          );
+          if (!releaseHome) throw new PersonVmError('RUNTIME_NOT_READY');
+          const release = (mount: string, cleanupSignal: AbortSignal) =>
+            releaseHome(row.vmId, mount, cleanupSignal);
+          if (retained) {
+            if (
+              disk.state !== 'ready' ||
+              !this.options.disk.verifyDeletionDetached
+            )
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            await this.options.disk.verifyDeletionDetached(disk.disk, active);
+          } else if (row.instanceId) {
+            await this.takeoverSafe(row, active, lease);
+            await this.cleanup(row, lease, 'delete', true, {
+              onDetached: release,
+            });
+          } else if (disk.state === 'ready' && !erasing) {
+            await this.options.disk.detach(disk.disk, active, (mount) =>
+              release(mount, active),
+            );
+          }
+          if (purge) {
+            await lease.guard();
+            // Once the compute and mount owners have joined, retain a
+            // recoverable database checkpoint until both image and key are gone.
+            if (erasing) {
+              await audit({ ...entry, result: 'erasing' }, lockedOperator);
+            } else {
+              row.phase = 'deleted';
+              row.nativeCreated = false;
+              row.instanceId = null;
+              row.gatewayPorts = [];
+              row.diskTier = target.diskTier;
+              await lease.save(row, {
+                deletionAudit: { ...entry, result: 'erasing' },
+                authorizeDeletion: lockedOperator,
+              });
+            }
+            await this.options.disk.delete(
+              { vmId: row.vmId, tier: target.diskTier },
+              active,
+              {
+                identitySha256: target.diskIdentitySha256,
+                beforeErase: (mount) => releaseHome(row.vmId, mount, active),
+              },
+            );
+            row.diskRetained = false;
+          }
+          row.phase = 'deleted';
+          if (!purge && retained)
+            await audit({ ...entry, result: 'succeeded' }, lockedOperator);
+          else
+            await lease.save(row, {
+              deletionAudit: { ...entry, result: 'succeeded' },
+              authorizeDeletion: purge ? undefined : lockedOperator,
+            });
+          return { vm: view(row) };
+        } catch (error) {
+          const failure = safeError(error);
+          await audit({
+            ...entry,
+            result:
+              failure.code === 'AUTHORIZATION_DENIED' ? 'denied' : 'failed',
+            errorCode: failure.code,
+          });
+          throw failure;
         }
       },
     );

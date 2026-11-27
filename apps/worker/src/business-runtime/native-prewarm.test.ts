@@ -821,56 +821,62 @@ it('uses both the selected editor proof and physical Host readiness on the real 
   expect(f.stop).not.toHaveBeenCalled();
 });
 
-it('expires the old ticket and restores the exact retained disk on a fresh POST', async () => {
-  const f = fixture(true);
-  const { context, identity, body } = f.base;
-  const installed = installDEntryNativePrewarm({
-    prewarmCurrent: f.prewarmCurrent,
-    lifetime: f.lifetime.signal,
-    readCoordination: f.readCoordination,
-  });
-  cleanups.push(installed.close);
-  const server = await nativeEntryServer(f.base);
-  cleanups.push(server.close);
-  const post = () =>
-    server.request('native-prewarm', { ...body, trigger: 'page' });
-  const first = await post();
-  expect(first.status).toBe(202);
-  const { ticket: old } = await first.json();
-  await vi.waitFor(async () =>
-    expect(await (await prewarmStatus(server, old.operationId)).json()).toEqual(
-      { state: 'ready' },
-    ),
-  );
-  const binding = await f.h.service.resolve(context, signal());
-  f.h.states.set(binding.vmId, 'stopped');
-  await f.h.service.delete(context, {}, signal());
-  const before = f.h.log.slice();
-  const expired = await prewarmStatus(server, old.operationId);
-  expect(expired.status).toBe(410);
-  expect(await expired.json()).toEqual({ state: 'expired' });
-  expect(f.h.log).toEqual(before);
-  expect(await f.h.store.read(identity.personId)).toMatchObject({
-    phase: 'deleted',
-    diskRetained: true,
-  });
-  const restored = await post();
-  expect(restored.status).toBe(202);
-  const { ticket } = await restored.json();
-  expect(ticket.operationId).not.toBe(old.operationId);
-  await vi.waitFor(async () =>
-    expect(
-      await (await prewarmStatus(server, ticket.operationId)).json(),
-    ).toEqual({ state: 'ready' }),
-  );
-  expect(await f.h.service.resolve(context, signal())).toMatchObject({
-    vmId: binding.vmId,
-    leaseEpoch: binding.leaseEpoch + 1,
-  });
-  expect(f.h.log.filter((event) => event === 'disk:create')).toHaveLength(1);
-  expect(f.start).toHaveBeenCalledTimes(2);
-  expect((await prewarmStatus(server, old.operationId)).status).toBe(410);
-});
+it.each([false, true])(
+  'expires the old ticket and prewarms after deletion (purge=%s)',
+  async (purge) => {
+    const f = fixture(true);
+    const { context, identity, body } = f.base;
+    const installed = installDEntryNativePrewarm({
+      prewarmCurrent: f.prewarmCurrent,
+      lifetime: f.lifetime.signal,
+      readCoordination: f.readCoordination,
+    });
+    cleanups.push(installed.close);
+    const server = await nativeEntryServer(f.base);
+    cleanups.push(server.close);
+    const post = () =>
+      server.request('native-prewarm', { ...body, trigger: 'page' });
+    const first = await post();
+    expect(first.status).toBe(202);
+    const { ticket: old } = await first.json();
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, old.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+    const binding = await f.h.service.resolve(context, signal());
+    f.h.states.set(binding.vmId, 'stopped');
+    f.h.authorizeDiskDelete(purge);
+    await f.h.service.delete(context, { deleteDisk: purge }, signal());
+    const before = f.h.log.slice();
+    const expired = await prewarmStatus(server, old.operationId);
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toEqual({ state: 'expired' });
+    expect(f.h.log).toEqual(before);
+    expect(await f.h.store.read(identity.personId)).toMatchObject({
+      phase: 'deleted',
+      diskRetained: !purge,
+    });
+    const restored = await post();
+    expect(restored.status).toBe(202);
+    const { ticket } = await restored.json();
+    expect(ticket.operationId).not.toBe(old.operationId);
+    await vi.waitFor(async () =>
+      expect(
+        await (await prewarmStatus(server, ticket.operationId)).json(),
+      ).toEqual({ state: 'ready' }),
+    );
+    expect(await f.h.service.resolve(context, signal())).toMatchObject({
+      vmId: purge ? expect.not.stringContaining(binding.vmId) : binding.vmId,
+      leaseEpoch: binding.leaseEpoch + 1,
+    });
+    expect(f.h.log.filter((event) => event === 'disk:create')).toHaveLength(
+      purge ? 2 : 1,
+    );
+    expect(f.start).toHaveBeenCalledTimes(2);
+    expect((await prewarmStatus(server, old.operationId)).status).toBe(410);
+  },
+);
 
 it('returns a ticket for a running VM with slow editor proof and keeps just one owned job', async () => {
   const f = fixture(),

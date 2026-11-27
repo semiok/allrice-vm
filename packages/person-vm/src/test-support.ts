@@ -100,11 +100,13 @@ export class MemoryStore implements PersonVmStore {
               (row) => row.vmId === id && row.diskRetained,
             ),
           ),
-        save: async (value, audit) => {
+        save: async (value, details) => {
           this.rows.set(personId, {
             ...structuredClone(value),
             leaseOwner: owner,
           });
+          const audit =
+            details && 'audit' in details ? details.audit : undefined;
           if (audit)
             this.audits.push({
               ...audit,

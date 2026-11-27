@@ -121,9 +121,17 @@ function targetGeneration(
   if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
   if (!Number.isSafeInteger(vm.leaseEpoch)) return;
   if (vm.phase === 'deleted') {
-    if (!allowRetainedRestore || !vm.diskRetained || !vm.vmId) return;
+    if (!allowRetainedRestore || !vm.vmId) return;
     const leaseEpoch = vm.leaseEpoch + 1;
     if (!Number.isSafeInteger(leaseEpoch)) return;
+    if (vm.diskRetained === false)
+      return {
+        vmId: null,
+        instanceId: null,
+        leaseEpoch,
+        replacesVmId: vm.vmId,
+      };
+    if (vm.diskRetained !== true) return;
     return {
       vmId: vm.vmId,
       instanceId: null,
@@ -349,7 +357,8 @@ export function createDEntryNativePrewarmPort(input: {
       );
     if (stamp.vm?.phase === 'deleted')
       return (
-        plan.target.restoreRetained === true &&
+        (plan.target.restoreRetained === true ||
+          plan.target.replacesVmId === stamp.vm.vmId) &&
         exact(plannedGeneration(stamp.vm))
       );
     return exact(stamp.vm) || exact(plannedGeneration(stamp.vm));

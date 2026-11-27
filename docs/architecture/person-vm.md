@@ -125,3 +125,13 @@ person-vm-drain --socket "$worker_socket" --boot-id "$worker_boot"
 命令通过当前 Worker 的私有 Unix socket 请求排空。仅在这台宿主的物理 VM 后端与账本由一个生产 Worker 服务时使用。先完成发布制品的准备，临切换再排空。成功回执包含 `bootId`、已停机数及 `expiresAt`。当前 Worker 在这 30 秒内禁止新启动，交接未开始则在过期后恢复预热和定时唤醒。离已有定时唤醒太近时返回失败。停止前检查活动任务并持久化后续唤醒。断开后，以 `stop.idle-dispatch` 和 `stop` 的同代回执核对实际完成阶段。下一次排空可接续已经确认的物理停机，完成余下的卸盘和账本写回。
 
 升级接管可识别数据库仍记录为运行中、当前 Worker 没有 Gateway 回执的保留 VM。取得精确物理租约、确认无受保护的准入且独占旧 Gateway 端口后，已物理停止的代次可卸盘并写入 `stop.upgrade`，随后按原盘开启新代次。旧 VM 仍运行且无法证实原生活动时保留现场。自动闲停仍使用既有持续采样策略。排空适用于切换 DSH 制品前，保留 VM 改换实际只读制品仍须独立验证原生挂载与封签的交接。
+
+### 平台管理员删除
+
+Worker 在本机提供 `POST /internal/platform/person-vm-delete`，用现有的有效平台管理员登录鉴权。运维入口为 `scripts/m1/person-vm-delete <Worker 端口> <person UUID> <review|retain-disk|purge-disk>`，从终端静默读取平台管理员会话 token。
+
+- `review` 显示指定人的 VM、当前代际和通过磁盘创建凭据校验的 SHA-256 标识。确认未成盘时摘要为空。它不读取或哈希用户内容，也不返回钥匙、路径或会话凭据。
+- `retain-disk` 核验当前 VM 的计算实例已停止，撤销入口、卸盘并移除宿主机别名，将 VM 记为 `deleted`。完整加密盘保存根文件系统和恢复所需的 Microsandbox 登记。
+- `purge-disk` 要求同一管理员和登录在五分钟内确认同一 VM 代际和盘标识。脚本要求再输入一次 VM UUID。核验已停止、入口已回收并卸盘后，删除包含原生登记的加密镜像及密钥。运行中或状态未知、仍有 hold、回收结果不明确时中止。
+
+审计记录在 `allrice_audit_events`，包括真实管理员、时间、目标人和 VM、盘标识及结果。保盘发布和擦除检查点在同一数据库事务里锁定并复核当前管理员会话。若擦除中断，保留盘旗标和审计检查点，下次由平台管理员重新确认并收尾。只有在原生资源和加密盘已清除后才写入 `deleted + disk_retained=false`，解除首建员工的 VM 限制。已有员工或有效分配仍由原首建规则核验。

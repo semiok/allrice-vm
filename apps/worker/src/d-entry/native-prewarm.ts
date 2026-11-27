@@ -26,6 +26,7 @@ export function compatiblePrewarmGeneration(
 ) {
   return (
     a.leaseEpoch === b.leaseEpoch &&
+    (!a.replacesVmId || !b.replacesVmId || a.replacesVmId === b.replacesVmId) &&
     (!a.vmId || !b.vmId || a.vmId === b.vmId) &&
     (!a.instanceId || !b.instanceId || a.instanceId === b.instanceId)
   );

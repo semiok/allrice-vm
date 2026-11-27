@@ -7,9 +7,10 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
 } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { basename, isAbsolute, join } from 'node:path';
 import { PersonVmError } from './contract.ts';
 import {
@@ -21,9 +22,13 @@ import {
 import { hostEnvironment, runCommand, type CommandRunner } from './process.ts';
 
 export type PersonDisk = Readonly<{ vmId: string; tier: 'warm' | 'cold' }>;
+type EraseOptions = Readonly<{
+  identitySha256: string | null;
+  beforeErase(mount: string): Promise<void>;
+}>;
 export type PersonVmDiskInspection =
   | Readonly<{ state: 'absent' | 'unknown' }>
-  | Readonly<{ state: 'ready'; disk: PersonDisk }>;
+  | Readonly<{ state: 'ready'; disk: PersonDisk; identitySha256?: string }>;
 type DiskImageInfo = {
   images?: {
     'image-path': string;
@@ -37,19 +42,36 @@ export interface PersonVmDiskPort {
   confirmAbsence?(vmId: string, signal: AbortSignal): Promise<boolean>;
   /** Formal Host references that need an owner before allocating new storage. */
   listFormalDiskIds?(signal: AbortSignal): Promise<string[]>;
+  inspectDeletionTarget?(
+    vmId: string,
+    signal: AbortSignal,
+    erasingIdentity?: string,
+  ): Promise<PersonVmDiskInspection>;
+  verifyDeletionDetached?(
+    disk: PersonDisk,
+    signal: AbortSignal,
+  ): Promise<string>;
   create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
   attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
   verifyAttachedMount?(
     disk: PersonDisk,
     signal: AbortSignal,
   ): Promise<string | null>;
-  detach(disk: PersonDisk, signal: AbortSignal): Promise<void>;
+  detach(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    onDetached?: (mount: string) => Promise<void>,
+  ): Promise<void>;
   move(
     disk: PersonDisk,
     tier: PersonDisk['tier'],
     signal: AbortSignal,
   ): Promise<PersonDisk>;
-  delete(disk: PersonDisk, signal: AbortSignal): Promise<void>;
+  delete(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    erase?: EraseOptions,
+  ): Promise<void>;
 }
 export interface PersonVmKeyStore {
   readOrCreate(
@@ -374,9 +396,18 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     signal.throwIfAborted();
     return true;
   }
+  async inspectDeletionTarget(
+    vmId: string,
+    signal: AbortSignal,
+    erasingIdentity?: string,
+  ) {
+    return this.inspectExisting(vmId, signal, true, erasingIdentity);
+  }
   private async inspectExisting(
     vmId: string,
     signal: AbortSignal,
+    includeIdentity = false,
+    erasingIdentity?: string,
   ): Promise<PersonVmDiskInspection> {
     signal.throwIfAborted();
     const found: { disk: PersonDisk; device: string; inode: string }[] = [];
@@ -415,13 +446,29 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       if (signal.aborted) throw error;
       return { state: 'unknown' };
     }
-    if (found.length !== 1 || !manifest || typeof manifest !== 'object')
-      return { state: 'unknown' };
-    const actual = found[0]!,
-      receipt = manifest as Record<string, unknown>;
+    if (!manifest || typeof manifest !== 'object') return { state: 'unknown' };
+    const receipt = manifest as Record<string, unknown>;
     if (
       receipt.version !== 1 ||
       receipt.vmId !== vmId ||
+      typeof receipt.device !== 'string' ||
+      typeof receipt.inode !== 'string'
+    )
+      return { state: 'unknown' };
+    const identitySha256 = () =>
+      createHash('sha256')
+        .update(JSON.stringify([1, vmId, receipt.device, receipt.inode]))
+        .digest('hex');
+    if (
+      found.length === 0 &&
+      erasingIdentity &&
+      identitySha256() === erasingIdentity
+    )
+      return { state: 'absent' };
+    const actual = found[0];
+    if (
+      found.length !== 1 ||
+      !actual ||
       receipt.device !== actual.device ||
       receipt.inode !== actual.inode
     )
@@ -434,7 +481,14 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       if (signal.aborted) throw error;
       return { state: 'unknown' };
     }
-    return { state: 'ready', disk: actual.disk };
+    return {
+      state: 'ready',
+      disk: actual.disk,
+      ...(includeIdentity && {
+        // Fingerprint the verified creation receipt, not the user's bytes or key.
+        identitySha256: identitySha256(),
+      }),
+    };
   }
 
   /** An observation only, for an already running VM under its physical lease. */
@@ -548,11 +602,22 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
       throw new PersonVmError('PROVIDER_FAILED');
     return this.mount(disk);
   }
-  async detach(disk: PersonDisk, signal: AbortSignal) {
+  async verifyDeletionDetached(disk: PersonDisk, signal: AbortSignal) {
+    for (const tier of ['warm', 'cold'] as const)
+      await this.verifyOffline({ vmId: disk.vmId, tier }, signal);
+    return this.mount(disk);
+  }
+  async detach(
+    disk: PersonDisk,
+    signal: AbortSignal,
+    onDetached?: (mount: string) => Promise<void>,
+  ) {
     if (await this.isAttached(disk, signal))
       await this.command(['detach', this.mount(disk)], signal);
     if (await this.isAttached(disk, signal))
       throw new PersonVmError('CLEANUP_INCOMPLETE');
+    if (onDetached)
+      await onDetached(await this.verifyDeletionDetached(disk, signal));
   }
   async move(disk: PersonDisk, tier: PersonDisk['tier'], signal: AbortSignal) {
     signal.throwIfAborted();
@@ -574,13 +639,36 @@ export class ApfsPersonVmDisk implements PersonVmDiskPort {
     }
     return next;
   }
-  async delete(disk: PersonDisk, signal: AbortSignal) {
-    const inspected = await this.inspect(disk.vmId, signal);
+  async delete(disk: PersonDisk, signal: AbortSignal, erase?: EraseOptions) {
+    const inspected = erase
+      ? await this.inspectDeletionTarget(
+          disk.vmId,
+          signal,
+          erase.identitySha256 ?? undefined,
+        )
+      : await this.inspect(disk.vmId, signal);
     if (inspected.state === 'unknown')
       throw new PersonVmError('PROVIDER_FAILED');
+    if (
+      erase &&
+      inspected.state === 'ready' &&
+      (inspected.identitySha256 !== erase.identitySha256 ||
+        inspected.disk.tier !== disk.tier)
+    )
+      throw new PersonVmError('LEASE_LOST');
     const actual = inspected.state === 'ready' ? inspected.disk : disk;
-    if (await this.isAttached(actual, signal))
+    if (erase) {
+      const mount = await this.verifyDeletionDetached(disk, signal);
+      await erase.beforeErase(mount);
+      try {
+        await rmdir(mount);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    } else if (await this.isAttached(actual, signal)) {
       throw new PersonVmError('CLEANUP_INCOMPLETE');
+    }
+    signal.throwIfAborted();
     await rm(this.image(actual), { force: true });
     // Never erase the completion receipt/key while either owned image remains,
     // including when the caller's persisted tier lagged a committed rename.

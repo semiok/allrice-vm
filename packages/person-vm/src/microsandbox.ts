@@ -1,5 +1,12 @@
 import { constants } from 'node:fs';
-import { lstat, open, readlink, symlink, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  open,
+  readlink,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
@@ -178,7 +185,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     receipt: PersonVmWebEndpointReceipt,
     signal: AbortSignal,
   ): Promise<NativeStartFence | void>;
-  stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  stop(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    options?: Readonly<{ requireStopped: true }>,
+  ): Promise<void>;
   /** Optional Host-only retirement operations. */
   stopIdle?(
     binding: PersonVmBinding,
@@ -187,6 +198,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     dispatch?: PersonVmIdleStopDispatch,
   ): Promise<void>;
   assertStopped?(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  releaseDiskHome?(
+    vmId: string,
+    mount: string,
+    signal: AbortSignal,
+  ): Promise<void>;
   ping(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
 }
 
@@ -1076,9 +1092,15 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
   ) {
     return this.startNative(receipt.binding, signal, receipt);
   }
-  async stop(binding: PersonVmBinding, signal: AbortSignal) {
+  async stop(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    options?: Readonly<{ requireStopped: true }>,
+  ) {
     const state = await this.status(binding, signal);
     if (state === 'absent') return;
+    if (options?.requireStopped && state !== 'stopped')
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
     // An exiting runtime can publish Stopped before releasing ownership.
     // The native stop operation joins the known runtime before we detach.
     await this.command(binding, ['stop', this.name(binding)], signal);
@@ -1120,6 +1142,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     if ((await this.rawStatus(binding, signal)) !== 'Stopped')
       throw new PersonVmError('ACTIVITY_UNKNOWN');
     signal.throwIfAborted();
+  }
+  async releaseDiskHome(vmId: string, mount: string, signal: AbortSignal) {
+    const home = join(this.options.socketRoot, vmId);
+    assertSocketHome(home);
+    signal.throwIfAborted();
+    try {
+      if ((await readlink(home)) !== join(mount, 'microsandbox'))
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      signal.throwIfAborted();
+      await unlink(home);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    signal.throwIfAborted();
+    this.homes.delete(vmId);
   }
   async ping(binding: PersonVmBinding, signal: AbortSignal) {
     await this.command(binding, ['ping', this.name(binding)], signal);

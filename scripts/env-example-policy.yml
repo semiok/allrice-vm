@@ -94,7 +94,7 @@ auditSources:
   apps/web/server/portal-hosts.mjs: e1aac7dc0735860478e564ff33dc77799452589d35ad4fd7744af5f74cf90901
   apps/worker/src/harness/dsh-egress-environment.ts: 315fc969e7e880f139ea06e3be3c8208e0f411fb6fa760e583bbccb6aefa5594
   apps/worker/src/harness/dsh-native-artifact.ts: ffe6bdf780cf13b1cc40666a5233d2a3e8b18df657195e9492a0bba56f5f71fe
-  apps/worker/src/index.ts: 909e02393ddf5cb03fb07f666e8ede79fe3a36495035163e93a33d0a6e16f475
+  apps/worker/src/index.ts: 70b55d784acaa76cba019a2e6cef7758b1e30989399845fd9264163947ab3d88
   packages/dsh-web-composition/build.mjs: 56422f0d218971943b05588bcd58a7c4a4e16859eb147e577601fcf58badca88
   packages/dsh-web-composition/build-web-entry.mjs: cb3ef610ec6131321f3e834180a0f254310e1b7430041d96793ad078df55f084
   packages/contracts/src/project-resolution-script.ts: d4261249ef18115e6293d804a0d14a770e2c0df5b14a5a6db133444dd76ff9ee
