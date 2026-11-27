@@ -58,6 +58,7 @@ import {
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
 import {
   createEmployee,
+  manageEmployeeAssignments,
   updateEmployeeStatus,
 } from './employees/employeehub.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
@@ -841,100 +842,109 @@ suite(
       });
     });
 
-    it('commits the admitted candidate before the real employee archive without a foreign-key lock inversion', async () => {
-      const f = await setup([], true);
-      const entered = gate();
-      const release = gate();
-      releases.push(() => release.resolve());
-      ownerFixture.assembly = {
-        current: f.current.bind(f),
-        async bind(...args) {
-          const reads = await f.bind(...args);
-          return {
-            ...reads,
-            async adopted(selector) {
-              const source = await reads.adopted(selector);
-              entered.resolve();
-              await release.promise;
-              return source;
-            },
-          };
-        },
-      };
-      const candidate = track(f.remember());
-      await Promise.race([
-        entered.promise,
-        candidate.then(() => {
-          throw Error('candidate returned before its insert was held');
-        }),
-      ]);
-
-      const applicationName = `memory-archive-writer:${randomUUID().slice(0, 8)}`;
-      const writer = client.createDedicatedDatabase({
-        options: {
-          ...database.db.options,
-          connection: {
-            ...database.db.options.connection,
-            application_name: applicationName,
+    it.each(['archive', 'assignment withdrawal'] as const)(
+      'commits the admitted candidate before real employee %s without a foreign-key lock inversion',
+      async (operation) => {
+        const f = await setup([], true);
+        const entered = gate();
+        const release = gate();
+        releases.push(() => release.resolve());
+        ownerFixture.assembly = {
+          current: f.current.bind(f),
+          async bind(...args) {
+            const reads = await f.bind(...args);
+            return {
+              ...reads,
+              async adopted(selector) {
+                const source = await reads.adopted(selector);
+                entered.resolve();
+                await release.promise;
+                return source;
+              },
+            };
           },
-        },
-      });
-      const connection = vi
-        .spyOn(client, 'getDatabase')
-        .mockReturnValue(writer);
-      try {
-        const archive = track(
-          updateEmployeeStatus(f.context, f.scope.employeeId, {
-            workspaceId: f.scope.workspaceId,
-            status: 'archived',
+        };
+        const candidate = track(f.remember());
+        await Promise.race([
+          entered.promise,
+          candidate.then(() => {
+            throw Error('candidate returned before its insert was held');
           }),
-        );
-        await expect
-          .poll(async () => {
-            const [blocked] = await database.db`
+        ]);
+
+        const applicationName = `memory-archive-writer:${randomUUID().slice(0, 8)}`;
+        const writer = client.createDedicatedDatabase({
+          options: {
+            ...database.db.options,
+            connection: {
+              ...database.db.options.connection,
+              application_name: applicationName,
+            },
+          },
+        });
+        const connection = vi
+          .spyOn(client, 'getDatabase')
+          .mockReturnValue(writer);
+        try {
+          const withdraw = track(
+            operation === 'archive'
+              ? updateEmployeeStatus(f.context, f.scope.employeeId, {
+                  workspaceId: f.scope.workspaceId,
+                  status: 'archived',
+                })
+              : manageEmployeeAssignments(f.context, {
+                  workspaceId: f.scope.workspaceId,
+                  employeeId: f.scope.employeeId,
+                  userIds: [],
+                }).then(() => undefined),
+          );
+          await expect
+            .poll(async () => {
+              const [blocked] = await database.db`
             select 1 from pg_stat_activity
             where application_name=${applicationName}
             and ${f.pids[0]!}=any(pg_blocking_pids(pid))
           `;
-            return Boolean(blocked);
-          })
-          .toBe(true);
-        release.resolve();
-        const outcomes = await Promise.allSettled([candidate, archive]);
-        expect(outcomes).toEqual([
-          {
-            status: 'fulfilled',
-            value: expect.objectContaining({
-              state: 'pending',
-              requiresConfirmation: true,
-            }),
-          },
-          { status: 'fulfilled', value: undefined },
-        ]);
-        connection.mockReturnValue(database.db);
-        expect(await effects(f)).toEqual({
-          memories: 1,
-          revisions: 1,
-          audits: 1,
-          operations: 1,
-        });
-        await expect(
-          f.remember({ summary: 'after archive', details: null }),
-        ).rejects.toMatchObject({
-          code: 'authorization_denied',
-        });
-        expect(await effects(f)).toEqual({
-          memories: 1,
-          revisions: 1,
-          audits: 1,
-          operations: 1,
-        });
-      } finally {
-        connection.mockReturnValue(database.db);
-        release.resolve();
-        await writer.end({ timeout: 2 });
-      }
-    });
+              return Boolean(blocked);
+            })
+            .toBe(true);
+          release.resolve();
+          const outcomes = await Promise.allSettled([candidate, withdraw]);
+          expect(outcomes).toEqual([
+            {
+              status: 'fulfilled',
+              value: expect.objectContaining({
+                state: 'pending',
+                requiresConfirmation: true,
+              }),
+            },
+            { status: 'fulfilled', value: undefined },
+          ]);
+          connection.mockReturnValue(database.db);
+          expect(await effects(f)).toEqual({
+            memories: 1,
+            revisions: 1,
+            audits: 1,
+            operations: 1,
+          });
+          await expect(
+            f.remember({ summary: 'after withdrawal', details: null }),
+          ).rejects.toMatchObject({
+            code: 'authorization_denied',
+          });
+          expect(await effects(f)).toEqual({
+            memories: 1,
+            revisions: 1,
+            audits: 1,
+            operations: 1,
+          });
+        } finally {
+          connection.mockReturnValue(database.db);
+          release.resolve();
+          await writer.end({ timeout: 2 });
+        }
+      },
+    );
 
     it('pins the original adopted app version separately from current availability and config edits', async () => {
       const f = await setup([
