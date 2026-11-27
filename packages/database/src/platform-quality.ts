@@ -255,6 +255,8 @@ export async function ensureQualityEmployee(
       on conflict(workspace_id) do update set employee_version_id=excluded.employee_version_id,employee_revision_id=excluded.employee_revision_id
       where allrice_platform_quality_deployments.owner_id=excluded.owner_id and allrice_platform_quality_deployments.assignment_id=excluded.assignment_id
       returning assignment_id`;
+    // Admission and historical runs use this reservation. Publish a new
+    // revision of the same employee to update quality in this workspace.
     if (!tracked) denied();
     return {
       internal,

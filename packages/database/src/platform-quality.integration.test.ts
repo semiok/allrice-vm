@@ -194,6 +194,27 @@ suite(
       ).toEqual(before);
     });
 
+    it('keeps the workspace reservation when configuration names a different published employee', async () => {
+      const previous = process.env.ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID;
+      const initial = await ensureQualityEmployee(admin);
+      const before =
+        await fixture.db`select * from allrice_platform_quality_deployments where assignment_id=${initial.assignmentId}`;
+      try {
+        await publishTestPlatformQualityEmployee();
+        await expect(ensureQualityEmployee(admin)).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+      } finally {
+        vi.stubEnv('ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID', previous);
+      }
+      expect(
+        await fixture.db`select * from allrice_platform_quality_deployments where workspace_id=${initial.internal.workspace_id}`,
+      ).toEqual(before);
+      await expect(ensureQualityEmployee(admin)).resolves.toMatchObject({
+        assignmentId: initial.assignmentId,
+      });
+    });
+
     it('concurrent identical requests produce one real private employee Run, preserving company rows and frozen pins', async () => {
       const before =
         await fixture.db`select * from allrice_memberships where organization_id=${company.org}`;
