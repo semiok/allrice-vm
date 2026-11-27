@@ -115,10 +115,15 @@ it('pins the platform selection to the current Host and reads newer settings for
       ),
     ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
     await expect(
-      host.readModelInfo(controller().signal),
+      host.readModelMetadata(controller().signal),
     ).resolves.toMatchObject({
-      name: 'GPT-6.2 Sol',
-      reasoning: { defaultEffort: 'high' },
+      modelInfo: { name: 'GPT-6.2 Sol', reasoning: { defaultEffort: 'high' } },
+      historicalModels: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'gpt-6.1-sol',
+          inputModalities: ['text', 'image'],
+        }),
+      ]),
     });
     const current = await state.settings.mock.results[0]!.value;
     state.settings.mockResolvedValue({
@@ -138,9 +143,9 @@ it('pins the platform selection to the current Host and reads newer settings for
       expect(host.route.model).toBe('gpt-6.2-sol');
       expect(next.route.model).toBe('gpt-6.1-sol');
       await expect(
-        next.readModelInfo(controller().signal),
+        next.readModelMetadata(controller().signal),
       ).resolves.toMatchObject({
-        reasoning: { defaultEffort: 'medium' },
+        modelInfo: { reasoning: { defaultEffort: 'medium' } },
       });
       expect(state.settings).toHaveBeenCalledTimes(2);
       expect(external).not.toHaveBeenCalled();

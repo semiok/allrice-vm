@@ -17,6 +17,7 @@ type ManagedGuestModelCall = {
   readonly provider: string;
   readonly model: string;
   readonly modelInfo?: LlmResolvedModelInfo;
+  readonly historicalModels?: readonly LlmResolvedModelInfo[];
   readonly lifetime?: AbortSignal;
   /** The authorized native invocation delivers a reference for this call
    * before the adapter sends its first request. The adapter never mints one. */
@@ -130,9 +131,21 @@ export class GatewayLlmAdapter extends LlmAdapter {
     if (!route) return super.resolveModel(provider, model, signal);
     signal?.throwIfAborted();
     route.lifetime?.throwIfAborted();
-    if (route.provider !== provider || route.model !== model)
+    if (route.provider !== provider)
       throw new ModelGatewayError('BINDING_INVALID');
-    return route.modelInfo ?? super.resolveModel(provider, model, signal);
+    if (route.model === model)
+      return route.modelInfo ?? super.resolveModel(provider, model, signal);
+    // Native image admission and compaction size retained history from its
+    // recorded model. Historical descriptors never appear in listModels or
+    // confer authority to stream against that model.
+    const historical = route.historicalModels?.find(
+      (info) => info.provider === provider && info.id === model,
+    );
+    if (!historical) throw new ModelGatewayError('BINDING_INVALID');
+    return {
+      ...historical,
+      inputModalities: route.modelInfo?.inputModalities,
+    };
   }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     let reference: string | undefined;

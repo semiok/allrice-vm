@@ -632,9 +632,7 @@ it.skipIf(!cli)(
         if (body.purpose !== 'session-title') assistantInputs.push(body);
         const text = 'Synthetic reply';
         const events = [
-          { type: 'block-start', index: 0, blockType: 'text' },
           { type: 'text-delta', index: 0, text },
-          { type: 'block-end', index: 0, block: { type: 'text', text } },
           { type: 'finish', reason: { kind: 'stop' } },
         ];
         response.writeHead(200, { 'content-type': 'application/x-ndjson' });
@@ -658,8 +656,13 @@ it.skipIf(!cli)(
           provider: 'openai-codex',
           id: model,
           name: model,
+          inputModalities: ['text', 'image'] as const,
+          context: { contextWindow: 272000 },
           reasoning: {
-            efforts: [{ id: level, name: effort }],
+            efforts: [
+              { id: ReasoningEffortId('low'), name: 'Low' },
+              { id: ReasoningEffortId('high'), name: 'High' },
+            ],
             defaultEffort: level,
           },
         },
@@ -685,29 +688,37 @@ it.skipIf(!cli)(
     const root = await f.owner.createRootFor(f.context, {}, signal);
     if (!root.ok) throw Error('Native session not created');
     const sessionId = root.value.sessionId;
-    async function prompt(owner: typeof f.owner, turn: number) {
+    async function rpc(method: string, args: object) {
       if (!transport) throw Error('Native fixture transport missing');
-      const response = await transport.fetch('api/session/prompt', {
+      const response = await transport.fetch('api/' + method, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request',
           rpcId: randomUUID(),
-          method: 'session/prompt',
-          payload: {
-            args: {
-              request: {
-                sessionId,
-                requestId: randomUUID(),
-                content: [{ type: 'text', text: 'Synthetic turn ' + turn }],
-                mode: 'queue',
-              },
-            },
-          },
+          method,
+          payload: { args },
         }),
       });
+      return serverResponseSchema.parse(await response.json()).result;
+    }
+    async function prompt(owner: typeof f.owner, turn: number) {
+      const png =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
       expect(
-        serverResponseSchema.parse(await response.json()).result,
+        await rpc('session/prompt', {
+          request: {
+            sessionId,
+            requestId: randomUUID(),
+            content: [
+              { type: 'text', text: 'Synthetic turn ' + turn },
+              ...(turn === 2
+                ? [{ type: 'image', mediaType: 'image/png', data: png }]
+                : []),
+            ],
+            mode: 'queue',
+          },
+        }),
       ).toMatchObject({
         ok: true,
         value: { accepted: true },
@@ -723,19 +734,50 @@ it.skipIf(!cli)(
     }
     await prompt(f.owner, 1);
     await f.owner.close();
-    const next = await f.restartRetained(route('gpt-6.2-sol', 'high'));
+    const next = await f.restartRetained({
+      ...route('gpt-6.2-sol', 'high'),
+      historicalModels: [route('gpt-6.1-sol', 'low').modelInfo],
+    });
     await prompt(next.owner, 2);
-    expect(assistantModels).toEqual(['gpt-6.1-sol', 'gpt-6.2-sol']);
+    expect(assistantInputs[1]!.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: 'user',
+          content: [{ type: 'text', text: 'Synthetic turn 1' }],
+        }),
+        expect.objectContaining({
+          role: 'user',
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'image',
+              attachment: expect.anything(),
+            }),
+          ]),
+        }),
+      ]),
+    );
+    expect(
+      await rpc('session/selectModel', {
+        request: {
+          sessionId,
+          provider: 'openai-codex',
+          model: 'gpt-6.2-sol',
+          reasoningEffort: 'low',
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: { selected: { reasoningEffort: 'low' } },
+    });
+    await prompt(next.owner, 3);
+    expect(assistantModels).toEqual([
+      'gpt-6.1-sol',
+      'gpt-6.2-sol',
+      'gpt-6.2-sol',
+    ]);
     expect(
       assistantInputs.map(({ reasoningEffort }) => reasoningEffort),
-    ).toEqual(['low', 'high']);
-    expect(assistantInputs[1]!.messages).toContainEqual(
-      expect.objectContaining({
-        role: 'assistant',
-        source: expect.objectContaining({ model: 'gpt-6.1-sol' }),
-        content: [{ type: 'text', text: 'Synthetic reply' }],
-      }),
-    );
+    ).toEqual(['low', 'high', 'low']);
   },
 );
 

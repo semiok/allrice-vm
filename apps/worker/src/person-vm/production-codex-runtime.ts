@@ -3,7 +3,10 @@ import { Context } from '@deepseek-ai/cordis';
 import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
-import type { PlatformModelConfiguration } from '@allrice/contracts';
+import {
+  PLATFORM_WORK_MODELS,
+  type PlatformModelConfiguration,
+} from '@allrice/contracts';
 import { getDatabase, readPlatformModelSettings } from '@allrice/database';
 import {
   ModelGatewayError,
@@ -95,7 +98,7 @@ async function openCodexGeneration(
   images: ReturnType<typeof createProductionModelImages> | undefined,
 ) {
   lifetime.throwIfAborted();
-  const modelMetadata = managedCodexModel(model);
+  const historicalIds = PLATFORM_WORK_MODELS.filter((id) => id !== model);
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
@@ -143,19 +146,28 @@ async function openCodexGeneration(
     await host
       .plugin(PiAi, {
         providers: {
-          [provider]: { transport: 'sse', models: [modelMetadata], reasoning },
+          [provider]: {
+            transport: 'sse',
+            models: [model, ...historicalIds].map(managedCodexModel),
+            reasoning,
+          },
         },
       })
       .await();
     const modelInfo = await host.llm.resolveModelInfo(provider, model, revoked);
     if (modelInfo.reasoning?.defaultEffort !== reasoning)
       throw new ModelGatewayError('BINDING_INVALID');
+    const historicalModels = await Promise.all(
+      historicalIds.map((id) =>
+        host.llm.resolveModelInfo(provider, id, revoked),
+      ),
+    );
     await assertCurrent(revoked);
     return {
       revoked,
       retain,
       close,
-      modelInfo,
+      modelMetadata: { modelInfo, historicalModels },
       llm: host.llm,
       assertCurrent,
     };
@@ -286,8 +298,8 @@ export async function createProductionCodexRuntime(
   return Object.freeze({
     llm,
     route,
-    async readModelInfo(signal: AbortSignal) {
-      return (await current(signal)).modelInfo;
+    async readModelMetadata(signal: AbortSignal) {
+      return (await current(signal)).modelMetadata;
     },
     scopeStream: images?.stream,
     revoked,

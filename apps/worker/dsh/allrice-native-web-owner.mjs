@@ -943,8 +943,15 @@ export function applyNativeWebOwner(
       if (typeof registerManagedGatewayAdapter !== 'function')
         throw Error('Native managed model module is unavailable');
       if (!current()) return;
-      const { id, origin, capability, provider, model, modelInfo } =
-        modelAdapter;
+      const {
+        id,
+        origin,
+        capability,
+        provider,
+        model,
+        modelInfo,
+        historicalModels,
+      } = modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       modelFiber = ctx.inject(
@@ -1100,6 +1107,7 @@ export function applyNativeWebOwner(
               provider,
               model,
               modelInfo,
+              historicalModels,
               lifetime: signal,
               async resolveCallReference(selection, active, purpose) {
                 const key = JSON.stringify([
@@ -1160,36 +1168,42 @@ export function applyNativeWebOwner(
             },
           });
           const reasoningEffort = modelInfo.reasoning?.defaultEffort;
-          // Retained sessions can propose their last recorded model and
-          // effort. The managed Guest has exactly the route licensed by its
-          // Host. Apply it to new requests without editing the old journal.
-          const outer = { global: true, prepend: true };
-          const offPrompt = scope.on(
-            'system-prompt/assemble',
-            async (_assembly, _context, next) => {
-              const prompt = await next();
-              signal.throwIfAborted();
-              return {
-                ...prompt,
-                variables: { ...prompt.variables, provider, model },
-              };
-            },
-            outer,
-          );
-          const offRequest = scope.on(
-            'agent/request',
-            async (request, next) => {
-              const config = await next();
-              request.signal.throwIfAborted();
-              signal.throwIfAborted();
-              return { ...config, provider, model, reasoningEffort };
-            },
-            outer,
-          );
+          const listeners = [];
+          if (reasoningEffort !== undefined) {
+            // A retained session can propose its previous route. Use the
+            // current Host route for new requests, preserving explicit effort
+            // choices on that route and leaving the journal intact.
+            const outer = { global: true, prepend: true };
+            listeners.push(
+              scope.on(
+                'system-prompt/assemble',
+                async (_assembly, _context, next) => {
+                  const prompt = await next();
+                  signal.throwIfAborted();
+                  return {
+                    ...prompt,
+                    variables: { ...prompt.variables, provider, model },
+                  };
+                },
+                outer,
+              ),
+              scope.on(
+                'agent/request',
+                async (request, next) => {
+                  const config = await next();
+                  request.signal.throwIfAborted();
+                  signal.throwIfAborted();
+                  if (config.provider === provider && config.model === model)
+                    return config;
+                  return { ...config, provider, model, reasoningEffort };
+                },
+                outer,
+              ),
+            );
+          }
           registeredModel = {
             dispose() {
-              offRequest();
-              offPrompt();
+              for (const off of listeners) off();
               dispose();
             },
             llm: original(scope.llm),

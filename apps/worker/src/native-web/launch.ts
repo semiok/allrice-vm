@@ -55,6 +55,7 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  historicalModels?: readonly LlmResolvedModelInfo[];
 }>;
 
 async function managedModelFiles(directory: string, cliPath: string) {
@@ -274,6 +275,17 @@ export function apply(ctx, config) {
                       modelAdapter.modelInfo.reasoning?.defaultEffort,
                   },
                 },
+                ...(modelAdapter.historicalModels?.length
+                  ? [
+                      {
+                        id: 'compaction-basic',
+                        config: {
+                          summarizationProvider: modelAdapter.provider,
+                          summarizationModel: modelAdapter.model,
+                        },
+                      },
+                    ]
+                  : []),
               ]
             : []),
         ]),

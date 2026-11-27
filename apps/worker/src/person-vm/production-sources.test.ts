@@ -63,10 +63,13 @@ function fixture() {
   io.codex.mockResolvedValue({
     revoked: codex.signal,
     route,
-    readModelInfo: vi.fn(async () => ({
-      id: route.model,
-      name: route.model,
-      provider: route.provider,
+    readModelMetadata: vi.fn(async () => ({
+      modelInfo: {
+        id: route.model,
+        name: route.model,
+        provider: route.provider,
+      },
+      historicalModels: [],
     })),
     scopeStream: undefined,
     transport: {
