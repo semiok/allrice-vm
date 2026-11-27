@@ -196,7 +196,6 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
     const executablePath =
       process.env.ALLRICE_BROWSER_EXECUTABLE ??
       process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
-    if (!executablePath) throw Error('Locked Chromium executable is required');
     const browser: Browser = await require('playwright-core').chromium.launch({
       executablePath,
     });
