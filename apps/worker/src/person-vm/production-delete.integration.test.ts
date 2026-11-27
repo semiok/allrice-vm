@@ -51,6 +51,7 @@ suite(
     let disconnectLeaseOnErase = false;
     let failImageCreation = false;
     let failDetach = false;
+    let loseDetachReceipt = false;
     let revokeBeforeErase: string | undefined;
     let revokeAfterCheckpoint: string | undefined;
     let revokeDuringDiskRead: string | undefined;
@@ -157,6 +158,7 @@ suite(
             if (failDetach) throw Error('synthetic detach failure');
             for (const [path, mount] of attachments)
               if (mount === args[1]) attachments.delete(path);
+            if (loseDetachReceipt) throw Error('synthetic detach reply lost');
           } else throw Error('Unexpected hdiutil operation');
           return '';
         },
@@ -182,6 +184,11 @@ suite(
             ...h.native,
             status: async (binding) =>
               nativeStates.get(binding.vmId) ?? 'absent',
+            assertRetainedStartup: async (binding, mount, active) => {
+              active.throwIfAborted();
+              expect(nativeStates.get(binding.vmId)).toBe('stopped');
+              expect([...attachments.values()]).toContain(mount);
+            },
             releaseDiskHome: async (vmId) => {
               releasedHomes.add(vmId);
             },
@@ -728,6 +735,99 @@ suite(
         diskRetained: true,
       });
     });
+    it.each(['retain-disk', 'purge-disk'] as const)(
+      'settles the retained startup mount before platform %s and preserves the verified width until erase',
+      async (action) => {
+        const owner = await createTarget();
+        const personId = owner.actor.id;
+        const { vmId } = await service.create(owner, signal());
+        const binding = {
+          personId,
+          organizationId: owner.organizationId,
+          vmId,
+          instanceId: randomUUID(),
+          leaseEpoch: 1,
+        };
+        const width = 8;
+        await fixture.db`update person_virtual_machines
+          set instance_id=${binding.instanceId},native_created=true,lease_epoch=${binding.leaseEpoch},verified_web_slot_capacity=${width}
+          where vm_id=${vmId}`;
+        nativeStates.set(vmId, 'stopped');
+        loseDetachReceipt = true;
+        try {
+          await expect(
+            service.reconcileStoppedEntryForPrewarm(
+              owner,
+              binding,
+              signal(),
+              true,
+            ),
+          ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+        } finally {
+          loseDetachReceipt = false;
+        }
+        expect(attachments.size).toBe(0);
+        const review = { action: 'review', personId };
+        const reviewed = await post(token, review);
+        expect(reviewed.status).toBe(200);
+        if (action === 'retain-disk') {
+          const retained = await post(token, {
+            action,
+            personId,
+            vmId,
+            leaseEpoch: binding.leaseEpoch,
+          });
+          expect(retained.status).toBe(200);
+          expect(await store.read(personId)).toMatchObject({
+            ...binding,
+            phase: 'deleted',
+            diskRetained: true,
+            verifiedWebSlotCapacity: width,
+          });
+          expect((await service.create(owner, signal())).vmId).toBe(vmId);
+        } else {
+          const purge = { action, personId, vmId };
+          failKeyRemoval = true;
+          try {
+            expect(
+              (
+                await post(token, {
+                  ...purge,
+                  confirmationId: reviewed.json.confirmationId,
+                })
+              ).status,
+            ).toBe(503);
+          } finally {
+            failKeyRemoval = false;
+          }
+          expect(await store.read(personId)).toMatchObject({
+            vmId,
+            phase: 'deleted',
+            diskRetained: true,
+            verifiedWebSlotCapacity: width,
+          });
+          const retry = await post(token, review);
+          expect(retry.status).toBe(200);
+          expect(
+            (
+              await post(token, {
+                ...purge,
+                confirmationId: retry.json.confirmationId,
+              })
+            ).status,
+          ).toBe(200);
+          expect(await store.read(personId)).toMatchObject({
+            vmId,
+            phase: 'deleted',
+            diskRetained: false,
+            verifiedWebSlotCapacity: null,
+          });
+          expect((await service.create(owner, signal())).vmId).not.toBe(vmId);
+        }
+        await service.settleRetainedStartupMounts(signal());
+        expect(attachments.size).toBe(0);
+      },
+    );
     it.each(['key removal failure', 'lease connection loss'] as const)(
       'recovers an interrupted physical purge after %s with normal creation fenced in between',
       async (failure) => {

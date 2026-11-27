@@ -10,6 +10,7 @@ import type {
   DEntryHistoryRootPin,
   DEntryOwnedActivity,
 } from '@allrice/database';
+import type { PersonVmBinding } from '@allrice/person-vm';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
 import {
   assertDEntryPrincipalIssueForOwner,
@@ -35,6 +36,7 @@ export interface DEntryNativeDataPort {
     context: RequestContext,
     identity: DEntryIdentity,
     signal: AbortSignal,
+    expectedBinding?: PersonVmBinding,
   ): Promise<AbortSignal>;
   /** Explicit editor open on a current running Host. The database owns the
    * durable claim and native root. Read-only discovery never calls this. */

@@ -18,6 +18,7 @@ import {
   listAdminTenantEmployees,
   TenantEmployeeError,
 } from './tenant-employees.ts';
+import { captureNativeWebRosterChange } from './employees/native-web-capacity.ts';
 import { materializePlatformEmployeeRevision } from './employees/platform-employees.ts';
 import { synchronizeTenantEmployeeAccess } from './tenant-employee-access.ts';
 import {
@@ -138,6 +139,61 @@ export async function changeOrganizationAiAssignments(
         platform.current_published_revision_id !== change.revisionId)
     )
       throw new TenantEmployeeError('employee_not_published');
+    // Default controls the whole workspace. A targeted choice is an addition
+    // only if include/default did not already grant this person that employee.
+    const newDefault =
+      change.action === 'default' &&
+      change.defaultEnabled === true &&
+      (!existing?.active || !existing.inherit_by_default);
+    const canGrantChoice =
+      change.action === 'include' ||
+      (change.action === 'inherit' &&
+        existing?.active &&
+        existing.inherit_by_default);
+    const newChoice = !canGrantChoice
+      ? []
+      : !existing?.active
+        ? people
+        : (
+            await tx<{ id: string }[]>`
+          select u.id from allrice_users u
+          left join allrice_employee_assignments a on a.organization_id=${organizationId}
+            and a.workspace_id=${change.workspaceId} and a.employee_id=${existing.tenant_employee_id} and a.user_id=u.id
+          where u.id=any(${tx.array(people)}::uuid[]) and not coalesce(a.active,false)
+            and coalesce(a.selection_mode,'inherit')<>'include'
+            and not (${Boolean(existing.inherit_by_default)} and coalesce(a.selection_mode,'inherit')='inherit')
+        `
+          ).map(({ id }) => id);
+    const candidateGrants =
+      newDefault || newChoice.length
+        ? await tx<{ user_id: string }[]>`
+        select distinct m.user_id from allrice_memberships m
+        left join allrice_employee_assignments a on a.organization_id=m.organization_id
+          and a.workspace_id=${change.workspaceId} and a.employee_id=${existing?.tenant_employee_id ?? null}
+          and a.user_id=m.user_id
+        where m.organization_id=${organizationId} and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=${change.workspaceId})
+          ${
+            newDefault
+              ? tx`and not coalesce(a.active,false) and coalesce(a.selection_mode,'inherit')='inherit'`
+              : tx`and m.user_id=any(${tx.array(newChoice)}::uuid[])`
+          }
+      `
+        : [];
+    const eligibleGrants = new Set(
+      candidateGrants.map(({ user_id }) => user_id),
+    );
+    const checkEntitlements = eligibleGrants.size
+      ? await captureNativeWebRosterChange(
+          tx,
+          {
+            organizationId,
+            workspaceId: change.workspaceId,
+            personIds: [...eligibleGrants],
+          },
+          { lockBeforeRead: true, whenEnabled: true },
+        )
+      : undefined;
     // An explicit per-person addition to a withdrawn company deployment must
     // not implicitly restore the other people's old personal additions.
     if (existing && !existing.active && change.action === 'include') {
@@ -181,33 +237,54 @@ export async function changeOrganizationAiAssignments(
       where employee_id=${change.employeeId} and organization_id=${organizationId} and workspace_id=${change.workspaceId}`;
     if (!deployment) throw new TenantEmployeeError('employee_not_assigned');
     let changedCount = 0;
+    let grantedPeople = new Set<string>();
     if (change.action === 'default') {
       const changed =
         await tx`update allrice_platform_employee_tenant_assignments set inherit_by_default=${change.defaultEnabled!},updated_at=clock_timestamp()
         where id=${deployment.id} and inherit_by_default<>${change.defaultEnabled!} returning id`;
       changedCount = changed.length;
+      if (newDefault && (changedCount || deployment.inherit_by_default))
+        grantedPeople = eligibleGrants;
     } else if (people.length) {
-      const changed = await tx`insert into allrice_employee_assignments
+      const changed = await tx<
+        { user_id: string }[]
+      >`insert into allrice_employee_assignments
         (organization_id,workspace_id,employee_id,employee_version_id,user_id,active,is_default,selection_mode,assigned_by)
         select ${organizationId},${change.workspaceId},${deployment.tenant_employee_id},${deployment.tenant_employee_version_id},u.id,false,false,${change.action},${context.actor.id}
         from allrice_users u where u.id=any(${tx.array(people)}::uuid[])
         on conflict(organization_id,workspace_id,user_id,employee_id) do update
           set selection_mode=excluded.selection_mode,assigned_by=excluded.assigned_by,updated_at=clock_timestamp()
-          where allrice_employee_assignments.selection_mode<>excluded.selection_mode returning id`;
+          where allrice_employee_assignments.selection_mode<>excluded.selection_mode returning user_id`;
       changedCount = changed.length;
+      for (const { user_id } of changed)
+        if (eligibleGrants.has(user_id)) grantedPeople.add(user_id);
       if (changedCount)
         await tx`update allrice_platform_employee_tenant_assignments set updated_at=clock_timestamp() where id=${deployment.id}`;
     }
-    await synchronizeTenantEmployeeAccess(tx, {
-      organizationId,
-      workspaceId: change.workspaceId,
-    });
+    const employeeId = deployment.tenant_employee_id;
+    const personIds = change.action === 'default' ? undefined : people;
+    await checkEntitlements?.({ employeeId, grantedPeople });
+    await synchronizeTenantEmployeeAccess(
+      tx,
+      {
+        organizationId,
+        workspaceId: change.workspaceId,
+      },
+      {
+        employeeId,
+        personIds,
+        // An explicit eligible choice may still be awaiting materialization.
+        newAssignmentPeople: canGrantChoice ? people : [...grantedPeople],
+      },
+    );
     const cancellationRequestedCount = await cancelEmployeeAccessRuns(
       tx,
       {
         organizationId,
         workspaceId: change.workspaceId,
-        employeeId: deployment.tenant_employee_id,
+        employeeId,
+        personIds:
+          change.action === 'default' && !changedCount ? [] : personIds,
         inactiveAssignmentsOnly: true,
       },
       '管理员已移除本人的 AI 员工',

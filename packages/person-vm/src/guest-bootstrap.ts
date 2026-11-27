@@ -58,6 +58,10 @@ export interface PersonVmGuestBootstrapPort {
   bootstrap(
     scope: PersonVmStartingScope,
     plan: PersonVmMemoryGuestPlan,
+    employee?: {
+      employeeInstanceId: string;
+      files: PersonVmMemoryGuestPlan['files'];
+    },
   ): Promise<
     Pick<
       PersonVmBootstrapScope,

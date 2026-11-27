@@ -10,7 +10,11 @@ import type {
   PersonVmBinding,
   ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
-import { PersonVmError, PersonVmService } from '@allrice/person-vm';
+import {
+  NativeWebGuestLaunchUnacknowledged,
+  PersonVmError,
+  PersonVmService,
+} from '@allrice/person-vm';
 import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { NativeWebOwner, openNativeWebOwner } from './owner.js';
@@ -48,6 +52,10 @@ function fixture(
     readonlyDshDirectory: string;
   },
   publicOrigin?: string,
+  hot?: Pick<
+    Parameters<typeof createAssignedNativeWebStartup>[0],
+    'hotGuest' | 'readRoster' | 'archive'
+  >,
 ) {
   const binding = {
     vmId: randomUUID(),
@@ -78,6 +86,12 @@ function fixture(
         hostPort,
         guestPort: hostPort,
       })),
+      ...(hot && {
+        slots: [32171, 32172, 32173].map((hostPort) => ({
+          hostPort,
+          guestPort: hostPort,
+        })),
+      }),
     },
   };
   const lifetime = new AbortController(),
@@ -102,6 +116,7 @@ function fixture(
     ],
     lifetime: lifetime.signal,
     cleanupTimeoutMs: 5000,
+    ...hot,
     configuration: {
       cliPath: commandMemory
         ? commandMemory.readonlyDshDirectory + '/lib/bin.js'
@@ -133,6 +148,476 @@ function fixture(
     lifetime,
   };
 }
+it.each([
+  'live owner',
+  'already exited',
+  'exit during close',
+  'unknown without exit',
+] as const)(
+  'reclaims a committed archive from a full pool with delayed notification: %s',
+  async (scenario) => {
+    const hotGuest = {
+      bootstrap:
+        vi.fn<
+          NonNullable<
+            Parameters<typeof createAssignedNativeWebStartup>[0]['hotGuest']
+          >['bootstrap']
+        >(),
+      assertWebEndpoints: vi.fn(async () => {}),
+    };
+    const readRoster =
+      vi.fn<
+        NonNullable<
+          Parameters<typeof createAssignedNativeWebStartup>[0]['readRoster']
+        >
+      >();
+    let notifyArchive: (id: string | null) => Promise<void> = async () => {};
+    const confirmed = latch();
+    const stopArchive = vi.fn(async () => {});
+    const archive = {
+      subscribe: vi.fn<
+        NonNullable<
+          Parameters<typeof createAssignedNativeWebStartup>[0]['archive']
+        >['subscribe']
+      >(async (_scope, notify) => {
+        notifyArchive = notify;
+        return stopArchive;
+      }),
+      confirm: vi.fn<
+        NonNullable<
+          Parameters<typeof createAssignedNativeWebStartup>[0]['archive']
+        >['confirm']
+      >(async () => {
+        confirmed.resolve();
+        return false;
+      }),
+    };
+    const f = fixture(undefined, undefined, { hotGuest, readRoster, archive });
+    const web = {
+      ...f.web,
+      receipt: { ...f.web.receipt, slots: f.web.receipt.slots!.slice(0, 2) },
+    };
+    const [kept, archived] = f.web.receipt.endpoints;
+    const replacement = {
+      workspaceId: archived!.workspaceId,
+      employeeInstanceId: randomUUID(),
+      employeeRevision: 1,
+      employeeVersionId: randomUUID(),
+    };
+    const keptOwner = catalogOwner();
+    const draining = latch(),
+      release = latch();
+    let observedExit = scenario === 'already exited';
+    const localExitJoin = vi.fn(async () => {
+      draining.resolve();
+      await release.promise;
+    });
+    const archivedOwner = {
+      ...catalogOwner(),
+      retireAfterJobExit: vi.fn(() =>
+        observedExit ? localExitJoin() : undefined,
+      ),
+      close: vi.fn(async () => {
+        draining.resolve();
+        await release.promise;
+        if (scenario === 'exit during close') observedExit = true;
+        if (scenario !== 'live owner')
+          throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }),
+    };
+    const replacementOwner = catalogOwner();
+    open
+      .mockResolvedValueOnce(keptOwner)
+      .mockResolvedValueOnce(archivedOwner)
+      .mockResolvedValueOnce(replacementOwner);
+    hotGuest.bootstrap.mockResolvedValue({
+      launch: f.scope.launch,
+      readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+    });
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, web);
+    await f.service.start(f.binding, f.scope.signal, f.scope, web);
+    const initial = f.service.catalog(f.binding, kept!.employeeInstanceId);
+    archivedOwner.controlReady.mockReturnValue(false);
+    expect(() =>
+      f.service.assertAuthenticatedGroup(f.binding, signal()),
+    ).toThrow('RUNTIME_NOT_READY');
+    expect(
+      f.service.assertAuthenticatedEntry(
+        f.binding,
+        kept!.employeeInstanceId,
+        signal(),
+      ).aborted,
+    ).toBe(false);
+    await notifyArchive(kept!.employeeInstanceId);
+    await confirmed.promise;
+    expect(keptOwner.close).not.toHaveBeenCalled();
+    archive.confirm.mockImplementation(
+      async (endpoint) =>
+        endpoint.employeeInstanceId === archived!.employeeInstanceId,
+    );
+    const identity = {
+      personId: f.binding.personId,
+      organizationId: f.binding.organizationId,
+      threadId: null,
+      ...replacement,
+    };
+    readRoster.mockResolvedValue({
+      personId: identity.personId,
+      organizationId: identity.organizationId,
+      entries: [kept!, replacement],
+      digest: 'replacement-roster',
+    });
+    const change = f.service.synchronizeEmployee(
+      f.web.context,
+      f.binding,
+      identity,
+      async () => {},
+      signal(),
+    );
+    let notification: Promise<void> | undefined;
+    try {
+      await draining.promise;
+      notification = notifyArchive(archived!.employeeInstanceId);
+      expect(hotGuest.bootstrap).not.toHaveBeenCalled();
+      expect(f.service.catalog(f.binding, kept!.employeeInstanceId).owner).toBe(
+        keptOwner,
+      );
+    } finally {
+      release.resolve();
+    }
+    if (scenario === 'unknown without exit') {
+      await expect(change).rejects.toMatchObject({
+        code: 'WEB_ENDPOINTS_PREPARING',
+      });
+      await notification;
+      expect(archivedOwner.close).toHaveBeenCalledOnce();
+      expect(localExitJoin).not.toHaveBeenCalled();
+      expect(hotGuest.bootstrap).not.toHaveBeenCalled();
+      expect(f.service.catalog(f.binding, kept!.employeeInstanceId).owner).toBe(
+        keptOwner,
+      );
+      await f.service.retireAfterNativeStop(f.binding, signal());
+      await f.service.close();
+      return;
+    }
+    await change;
+    await notification;
+    const current = f.service.catalog(
+      f.binding,
+      replacement.employeeInstanceId,
+    );
+    expect(current.endpoint.hostPort).toBe(archived!.hostPort);
+    expect(current.owner).toBe(replacementOwner);
+    expect(current.receipt.endpoints).toEqual([current.endpoint]);
+    expect(f.service.catalog(f.binding, kept!.employeeInstanceId).receipt).toBe(
+      initial.receipt,
+    );
+    expect(keptOwner.close).not.toHaveBeenCalled();
+    expect(archivedOwner.close).toHaveBeenCalledTimes(
+      scenario === 'already exited' ? 0 : 1,
+    );
+    expect(localExitJoin).toHaveBeenCalledTimes(
+      scenario === 'live owner' ? 0 : 1,
+    );
+    expect(archive.confirm).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        employeeInstanceId: archived!.employeeInstanceId,
+        employeeRevision: archived!.employeeRevision,
+        personId: f.binding.personId,
+        organizationId: f.binding.organizationId,
+      }),
+    );
+    expect(
+      hotGuest.bootstrap.mock.calls[0]?.[2]?.files.every(({ path }) =>
+        path.startsWith(
+          `/work/.allrice/employees/${replacement.employeeInstanceId}/dsh/`,
+        ),
+      ),
+    ).toBe(true);
+    await f.service.close();
+    expect(stopArchive).toHaveBeenCalledOnce();
+  },
+);
+it.each([
+  'revised sibling',
+  'same-revision exited',
+  'missing sibling with full pool',
+] as const)(
+  'never retires an existing owner from the B roster snapshot: %s',
+  async (scenario) => {
+    const bootstrap = vi.fn();
+    const readRoster = vi.fn();
+    const f = fixture(undefined, undefined, {
+      hotGuest: { bootstrap, assertWebEndpoints: async () => {} },
+      readRoster,
+    });
+    const [a, c] = f.web.receipt.endpoints;
+    const revised = {
+      ...a!,
+      employeeRevision:
+        a!.employeeRevision + (scenario === 'revised sibling' ? 1 : 0),
+    };
+    const newcomer = { ...a!, employeeInstanceId: randomUUID() };
+    const hasFreeSlot = scenario !== 'missing sibling with full pool';
+    const web = hasFreeSlot
+      ? f.web
+      : {
+          ...f.web,
+          receipt: {
+            ...f.web.receipt,
+            slots: f.web.receipt.slots!.slice(0, 2),
+          },
+        };
+    const owners = [
+      catalogOwner(),
+      catalogOwner(),
+      catalogOwner(),
+      catalogOwner(),
+    ];
+    owners.forEach((owner) => open.mockResolvedValueOnce(owner));
+    bootstrap.mockResolvedValue({
+      launch: f.scope.launch,
+      readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+    });
+    const snapshot = {
+      personId: f.binding.personId,
+      organizationId: f.binding.organizationId,
+      digest: 'new-roster',
+      entries: [...(hasFreeSlot ? [revised] : []), c!, newcomer],
+    };
+    readRoster.mockResolvedValue(snapshot);
+    const enroll = (employee: typeof revised) =>
+      f.service.synchronizeEmployee(
+        f.web.context,
+        f.binding,
+        {
+          ...employee,
+          personId: f.binding.personId,
+          organizationId: f.binding.organizationId,
+          threadId: null,
+        },
+        async () => {},
+        signal(),
+      );
+    try {
+      await f.service.memoryGuestPlan(f.binding, signal(), web);
+      await f.service.start(f.binding, signal(), f.scope, web);
+      if (hasFreeSlot) {
+        if (scenario === 'same-revision exited')
+          owners[0]!.controlReady.mockReturnValue(false);
+        await expect(enroll(revised)).rejects.toMatchObject({
+          code:
+            scenario === 'same-revision exited'
+              ? 'RUNTIME_NOT_READY'
+              : 'WEB_ENDPOINTS_PREPARING',
+        });
+        expect(bootstrap).not.toHaveBeenCalled();
+        await enroll(newcomer);
+        expect(
+          f.service.catalog(f.binding, newcomer.employeeInstanceId).endpoint
+            .hostPort,
+        ).toBe(32173);
+      } else {
+        await expect(enroll(newcomer)).rejects.toMatchObject({
+          code: 'WEB_ENDPOINTS_PREPARING',
+        });
+        expect(bootstrap).not.toHaveBeenCalled();
+      }
+      expect(owners[0]!.close).not.toHaveBeenCalled();
+      expect(owners[1]!.close).not.toHaveBeenCalled();
+      expect(f.service.owner(f.binding, a!.employeeInstanceId)).toBe(owners[0]);
+      expect(f.service.catalog(f.binding, c!.employeeInstanceId).owner).toBe(
+        owners[1],
+      );
+      if (hasFreeSlot) {
+        const exiting = latch();
+        const joined = latch();
+        owners[0]!.retireAfterJobExit.mockImplementationOnce(() => {
+          exiting.resolve();
+          return joined.promise;
+        });
+        const replacing = enroll(revised);
+        try {
+          await exiting.promise;
+          expect(bootstrap).toHaveBeenCalledTimes(1);
+          expect(owners[0]!.close).not.toHaveBeenCalled();
+          expect(
+            f.service.catalog(f.binding, newcomer.employeeInstanceId).owner,
+          ).toBe(owners[2]);
+        } finally {
+          joined.resolve();
+        }
+        await replacing;
+        expect(
+          f.service.catalog(f.binding, revised.employeeInstanceId),
+        ).toMatchObject({
+          endpoint: {
+            employeeRevision: revised.employeeRevision,
+            hostPort: a!.hostPort,
+          },
+          owner: owners[3],
+        });
+        expect(owners[1]!.close).not.toHaveBeenCalled();
+        expect(owners[2]!.close).not.toHaveBeenCalled();
+      }
+    } finally {
+      await f.service.close();
+    }
+  },
+);
+it.each([
+  'old owner',
+  'unknown dispatch',
+  'joined owner whose guest launch was unacknowledged',
+  'unjoined owner open',
+  'unpublished owner',
+])(
+  'fences the employee home and slot after an unjoined %s without blocking a sibling',
+  async (failure) => {
+    const bootstrap = vi.fn();
+    const readRoster = vi.fn();
+    let notifyArchive: (id: string | null) => Promise<void> = async () => {};
+    const f = fixture(undefined, undefined, {
+      hotGuest: { bootstrap, assertWebEndpoints: async () => {} },
+      readRoster,
+      archive: {
+        async subscribe(_identity, notify) {
+          notifyArchive = notify;
+          return async () => {};
+        },
+        confirm: vi.fn(async () => true),
+      },
+    });
+    const [kept, old] = f.web.receipt.endpoints;
+    const web = {
+      ...f.web,
+      receipt: {
+        ...f.web.receipt,
+        slots: [...f.web.receipt.slots!, { hostPort: 32174, guestPort: 32174 }],
+      },
+    };
+    const target = {
+      ...old!,
+      employeeInstanceId:
+        failure === 'old owner' ? old!.employeeInstanceId : randomUUID(),
+      employeeRevision: old!.employeeRevision + 1,
+    };
+    const sibling = { ...target, employeeInstanceId: randomUUID() };
+    const keptOwner = catalogOwner();
+    const oldOwner = catalogOwner();
+    const unpublishedOwner = catalogOwner();
+    const siblingOwner = catalogOwner();
+    const revision = {
+      personId: f.binding.personId,
+      organizationId: f.binding.organizationId,
+      digest: 'new-roster',
+      entries: [
+        ...(failure === 'old owner' ? [] : [old!]),
+        kept!,
+        target,
+        sibling,
+      ],
+    };
+    readRoster.mockResolvedValue(revision);
+    bootstrap.mockResolvedValue({
+      launch: f.scope.launch,
+      readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+    });
+    open.mockResolvedValueOnce(keptOwner).mockResolvedValueOnce(oldOwner);
+    await f.service.memoryGuestPlan(f.binding, f.scope.signal, web);
+    await f.service.start(f.binding, f.scope.signal, f.scope, web);
+    const unknown = new PersonVmError('CLEANUP_INCOMPLETE');
+    if (failure === 'old owner') {
+      oldOwner.close.mockRejectedValue(unknown);
+    } else if (failure === 'unknown dispatch') {
+      bootstrap.mockRejectedValueOnce(unknown);
+    } else if (
+      failure === 'joined owner whose guest launch was unacknowledged'
+    ) {
+      open.mockRejectedValueOnce(
+        new NativeWebGuestLaunchUnacknowledged(f.binding, unknown),
+      );
+    } else if (failure === 'unjoined owner open') {
+      open.mockRejectedValueOnce(unknown);
+    } else {
+      open.mockResolvedValueOnce(unpublishedOwner);
+      unpublishedOwner.close.mockRejectedValue(unknown);
+      readRoster.mockResolvedValueOnce(revision).mockResolvedValueOnce({
+        ...revision,
+        entries: [kept!, sibling],
+      });
+    }
+    open.mockResolvedValueOnce(siblingOwner);
+    const start = (employee: typeof target) =>
+      f.service.synchronizeEmployee(
+        f.web.context,
+        f.binding,
+        {
+          ...employee,
+          personId: f.binding.personId,
+          organizationId: f.binding.organizationId,
+          threadId: null,
+        },
+        async () => {},
+        signal(),
+      );
+    await expect(
+      failure === 'old owner'
+        ? notifyArchive(target.employeeInstanceId)
+        : start(target),
+    ).rejects.toMatchObject({
+      code: 'CLEANUP_INCOMPLETE',
+    });
+    const staged = bootstrap.mock.calls.length;
+    const launched = open.mock.calls.length;
+    await expect(start(target)).rejects.toMatchObject({
+      code: 'WEB_ENDPOINTS_PREPARING',
+    });
+    expect(bootstrap).toHaveBeenCalledTimes(staged);
+    expect(open).toHaveBeenCalledTimes(launched);
+    expect(() =>
+      f.service.catalog(f.binding, target.employeeInstanceId),
+    ).toThrow('WEB_ENDPOINTS_PREPARING');
+    expect(
+      f.service.owner(f.binding, target.employeeInstanceId),
+    ).toBeUndefined();
+
+    await start(sibling);
+    const added = f.service.catalog(f.binding, sibling.employeeInstanceId);
+    expect(added.endpoint.hostPort).toBe(
+      failure === 'old owner' ? 32173 : 32174,
+    );
+    expect(added.owner).toBe(siblingOwner);
+    expect(f.service.catalog(f.binding, kept!.employeeInstanceId).owner).toBe(
+      keptOwner,
+    );
+    expect(keptOwner.close).not.toHaveBeenCalled();
+    await expect(
+      f.service.retireAfterNativeStop(
+        { ...f.binding, instanceId: randomUUID() },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    const retired = f.service.retireAfterNativeStop(f.binding, signal());
+    if (failure === 'unjoined owner open') {
+      await expect(retired).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+      await expect(f.service.close()).rejects.toMatchObject({
+        code: 'CLEANUP_INCOMPLETE',
+      });
+    } else {
+      await retired;
+      if (failure === 'old owner')
+        expect(oldOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
+      if (failure === 'unpublished owner')
+        expect(unpublishedOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
+      expect(siblingOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
+      expect(f.service.hasLocalOwner(f.binding)).toBe(false);
+      await f.service.close();
+    }
+  },
+);
 it('实际DB producer直接绑定service roster，取消仍等待已发SQL结束；不接受请求体清单', async () => {
   const f = fixture(),
     entered = latch(),
@@ -924,6 +1409,9 @@ function catalogOwner() {
       throw new PersonVmError('RUNTIME_NOT_READY');
     }),
     close: vi.fn(async () => {}),
+    retireAfterJobExit: vi.fn<NativeWebOwner['retireAfterJobExit']>(
+      () => undefined,
+    ),
     retireAfterNativeStop: vi.fn(async () => {}),
   };
 }

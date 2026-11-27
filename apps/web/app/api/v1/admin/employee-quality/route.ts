@@ -3,6 +3,7 @@ import {
   DataAccessError,
   EmployeeQualityError,
   EmployeeAccessBusyError,
+  EmployeeInstanceError,
   createEmployeeEvalSuite,
   getEmployeeQualityDashboard,
   recordEmployeeEvalRun,
@@ -25,6 +26,16 @@ function errorResponse(error: unknown) {
       code: 'CONFLICT',
       message: '任务正在更新执行状态，本次修改未生效。请稍后重试。',
       retryable: true,
+    });
+  if (
+    error instanceof EmployeeInstanceError &&
+    error.code === 'employee_port_slots_full'
+  )
+    return apiProblem({
+      status: 409,
+      code: 'QUOTA_EXCEEDED',
+      message: error.message,
+      retryable: false,
     });
   if (error instanceof DataAccessError) {
     const status = error.code === 'authentication_required' ? 401 : 403;

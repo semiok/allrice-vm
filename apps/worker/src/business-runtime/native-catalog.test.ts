@@ -72,6 +72,7 @@ function fixture() {
         throw new DEntryNativeUnavailable();
       },
     ),
+    retireAfterJobExit: vi.fn(() => undefined),
     retireAfterNativeStop: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
   };
@@ -83,23 +84,15 @@ function fixture() {
     revoked: group.signal,
     owner: native,
   });
-  const roster = {
-    personId: base.identity.personId,
-    organizationId: base.identity.organizationId,
-    digest: base.owner.receipt.rosterDigest,
-    entries: [base.endpoint],
-  };
   const vm = {
     resolve: vi.fn(async () => base.binding),
     assertCurrentBinding: vi.fn(async () => {}),
   };
   const host = {
     vm,
-    readRoster: vi.fn(async () => roster),
     catalog: vi.fn(() => publication),
   };
   authority.identity.mockResolvedValue(base.identity);
-  authority.roster.mockResolvedValue(roster);
   const assembly = createDEntryNativeCatalogPort({
     host,
     lifetime: lifetime.signal,
@@ -108,7 +101,6 @@ function fixture() {
   return {
     base,
     native,
-    roster,
     vm,
     host,
     assembly,
@@ -127,7 +119,7 @@ function fixture() {
   };
 }
 
-it('uses each current Session RC, full readonly roster and exact original publication before and after Session/list', async () => {
+it('uses each current Session RC, selected employee authority and exact original publication before and after Session/list', async () => {
   const f = fixture(),
     owner = await f.resolve();
   expect(f.native.readSessionsFor).not.toHaveBeenCalled();
@@ -160,10 +152,6 @@ it('uses each current Session RC, full readonly roster and exact original public
     f.base.binding,
     expect.any(AbortSignal),
   );
-  expect(f.host.readRoster).toHaveBeenLastCalledWith(
-    current,
-    expect.any(AbortSignal),
-  );
   expect(f.native.close).not.toHaveBeenCalled();
   expect(owner).not.toHaveProperty('rpc');
   expect(owner).not.toHaveProperty('history');
@@ -187,8 +175,20 @@ it('denies a stale request before I/O and permits a later valid current RC witho
   expect(f.native.close).not.toHaveBeenCalled();
 });
 
+it('keeps the established owner when another employee is added', async () => {
+  const f = fixture();
+  const owner = await f.resolve();
+  authority.roster.mockRejectedValue(
+    Error('unrelated assignment not yet materialized'),
+  );
+  await expect(
+    owner.readSessions(new AbortController().signal),
+  ).resolves.toMatchObject({ ok: true });
+  expect(owner.revoked.aborted).toBe(false);
+  expect(f.native.close).not.toHaveBeenCalled();
+});
+
 it.each([
-  'roster',
   'person',
   'organization',
   'missing-entry',
@@ -199,23 +199,20 @@ it.each([
   async (change) => {
     const f = fixture(),
       owner = await f.resolve();
-    if (change === 'roster')
-      f.host.readRoster.mockResolvedValue({
-        ...f.roster,
-        digest: 'new-current-roster',
-      });
     if (change === 'person')
-      f.host.readRoster.mockResolvedValue({
-        ...f.roster,
+      authority.identity.mockResolvedValue({
+        ...f.base.identity,
         personId: randomUUID(),
       });
     if (change === 'organization')
-      f.host.readRoster.mockResolvedValue({
-        ...f.roster,
+      authority.identity.mockResolvedValue({
+        ...f.base.identity,
         organizationId: randomUUID(),
       });
     if (change === 'missing-entry')
-      f.host.readRoster.mockResolvedValue({ ...f.roster, entries: [] });
+      authority.identity.mockRejectedValue(
+        new DataAccessError('authorization_denied'),
+      );
     if (change === 'binding')
       f.replace({
         ...f.publication(),
@@ -294,10 +291,10 @@ it('close cancels new admission but waits for the actual readonly SQL guard', as
     entered = deferred<void>(),
     joined = deferred<void>(),
     caller = new AbortController();
-  f.host.readRoster.mockImplementationOnce(async () => {
+  authority.identity.mockImplementationOnce(async () => {
     entered.resolve();
     await joined.promise;
-    return f.roster;
+    return f.base.identity;
   });
   const resolving = f.assembly.port
     .resolve(f.base.context, f.base.identity, caller.signal)
@@ -411,7 +408,7 @@ it('the concrete installer binds real readonly producer calls; catalog installat
   });
   cleanups.push(server.close);
   expect((await server.request()).status).toBe(200);
-  expect(authority.roster).toHaveBeenCalledWith(f.base.context);
+  expect(authority.roster).not.toHaveBeenCalled();
   expect(startup.catalog).toHaveBeenCalledWith(
     f.base.binding,
     f.base.identity.employeeInstanceId,

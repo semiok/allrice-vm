@@ -13,6 +13,7 @@ import {
   DEntryNativePrewarmStatusQuerySchema,
   DEntryNativeResourceRequestSchema,
   sameDEntryIdentity,
+  type DEntryNativePrewarmStatus,
 } from '@allrice/contracts';
 import {
   authenticateSession,
@@ -146,6 +147,30 @@ export function sendDEntryHttpProblem(
   );
 }
 
+function sendPrewarmAccepted(
+  response: ServerResponse,
+  value: z.infer<typeof DEntryNativePrewarmAcceptedSchema>,
+) {
+  response
+    .writeHead(202, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    })
+    .end(JSON.stringify(DEntryNativePrewarmAcceptedSchema.parse(value)));
+}
+
+function sendPrewarmStatus(
+  response: ServerResponse,
+  value: DEntryNativePrewarmStatus,
+) {
+  response
+    .writeHead(value.state === 'expired' ? 410 : 200, {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+    })
+    .end(JSON.stringify(value));
+}
+
 export function createDEntryHttpHandler(
   deps = dEntryHttpDefaults,
   serviceSignal?: AbortSignal,
@@ -254,12 +279,7 @@ export function createDEntryHttpHandler(
           },
         );
         signal.throwIfAborted();
-        response
-          .writeHead(result.state === 'expired' ? 410 : 200, {
-            'content-type': 'application/json',
-            'cache-control': 'no-store',
-          })
-          .end(JSON.stringify(result));
+        sendPrewarmStatus(response, result);
         return true;
       }
       let size = 0;
@@ -306,6 +326,38 @@ export function createDEntryHttpHandler(
       const check = deps.prewarm.isCurrent?.bind(deps.prewarm);
       if (prewarmRequest && (!plan || !check))
         throw new DEntryNativeUnavailable();
+      const prior = plan && plan.reuse;
+      if (prewarmRequest && prior && check) {
+        const existing = prewarm.reuse(auth.context, auth.identity, prior);
+        if (!existing) {
+          sendPrewarmStatus(response, { state: 'expired' });
+          return true;
+        }
+        finishPrewarmReply = existing.finishReply;
+        const threadOpen = await existing.observeThread(signal);
+        const { context, identity } = await currentDEntryRequest(
+          deps,
+          token,
+          input,
+          signal,
+        );
+        const mayPublish =
+          threadOpen &&
+          (await existing.recheck(context, identity, (mode) =>
+            check(context, identity, prior, signal, mode),
+          ));
+        signal.throwIfAborted();
+        if (!threadOpen) existing.assertNotRevoked();
+        if (mayPublish && mayPublish()) {
+          existing.publish();
+          sendPrewarmAccepted(response, {
+            identity,
+            trigger: prewarmRequest.trigger,
+            ticket: existing.ticket,
+          });
+        } else sendPrewarmStatus(response, { state: 'expired' });
+        return true;
+      }
       // The job takes ownership of its subscription on acceptance. LISTEN
       // rechecks the captured revision even after a revoke/regrant.
       authority =
@@ -398,19 +450,10 @@ export function createDEntryHttpHandler(
         }
         if (!hot) {
           accepted.publish();
-          response
-            .writeHead(202, {
-              'content-type': 'application/json',
-              'cache-control': 'no-store',
-            })
-            .end(
-              JSON.stringify(
-                DEntryNativePrewarmAcceptedSchema.parse({
-                  ...receipt,
-                  ticket: accepted.ticket,
-                }),
-              ),
-            );
+          sendPrewarmAccepted(response, {
+            ...receipt,
+            ticket: accepted.ticket,
+          });
           return true;
         }
         response.writeHead(200, {

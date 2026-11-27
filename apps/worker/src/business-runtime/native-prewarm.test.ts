@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { CurrentSelectionPrewarm } from '../person-vm/production-prewarm.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import type * as Database from '@allrice/database';
-import { DataAccessError } from '@allrice/database';
-import { PersonVmError } from '@allrice/person-vm';
-import { harness } from '../../../../packages/person-vm/src/test-support.ts';
+import { DataAccessError, DEntryTicketObserverClosed } from '@allrice/database';
+import { PersonVmError, PersonVmService } from '@allrice/person-vm';
+import {
+  harness,
+  MemoryStore,
+} from '../../../../packages/person-vm/src/test-support.ts';
 import {
   deferred,
   nativeEntryFixture,
@@ -36,11 +39,18 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.resetAllMocks();
 });
-function fixture(coordinated = false) {
+function fixture(coordinated = false, withThread = true) {
   // Actual lifecycle service with synthetic disk/native/runtime providers only.
   // No production installation, Host process, VM or performance claim.
-  const base = nativeEntryFixture(),
-    h = harness(),
+  const initial = nativeEntryFixture();
+  const base = withThread
+    ? initial
+    : nativeEntryFixture({
+        context: initial.context,
+        identity: { ...initial.identity, threadId: null },
+      });
+  const store = new MemoryStore(),
+    h = harness(store),
     lifetime = new AbortController(),
     runPrewarm = h.service.prewarm.bind(h.service),
     runStart = h.runtime.start.bind(h.runtime),
@@ -53,7 +63,7 @@ function fixture(coordinated = false) {
     h.service.prewarm(args[0], args[2], args[3]);
   const readCoordination = vi.fn(async () => ({
     authorityRevision: 'release-1',
-    vm: await h.store.read(base.identity.personId),
+    vm: store.readWithVersion(base.identity.personId),
   }));
   const assembly = createDEntryNativePrewarmPort({
     prewarmCurrent,
@@ -653,8 +663,10 @@ function prewarmStatus(
   operationId: string,
   token = 'original_session_opaque_token',
 ) {
+  const { threadId, ...selection } = server.body.selection;
   const query = new URLSearchParams({
-    ...server.body.selection,
+    ...selection,
+    ...(threadId && { threadId }),
     organizationId: server.body.organizationId,
     operationId,
   });
@@ -665,6 +677,714 @@ function prewarmStatus(
     },
   );
 }
+
+async function seedOrphanedStart(f: ReturnType<typeof fixture>) {
+  const { context, identity } = f.base;
+  await f.runPrewarm(context, { trigger: 'page' }, signal());
+  const predecessor = await f.h.service.resolve(context, signal());
+  f.h.states.set(predecessor.vmId, 'stopped');
+  await f.h.service.stop(context, signal());
+  await f.h.store.withLease(
+    identity.personId,
+    { now: f.h.now, ttlMs: f.h.options.leaseTtlMs },
+    async ({ row, save }) => {
+      await save({ ...row!, phase: 'starting' });
+    },
+  );
+  f.start.mockClear();
+  f.stop.mockClear();
+  return predecessor;
+}
+
+it.each(['exact start', 'wrong VM', 'wrong epoch'] as const)(
+  'qualifies an accepted orphan-start HTTP ticket using %s',
+  async (mode) => {
+    const f = fixture(true);
+    const { context, identity, body, data } = f.base;
+    const original = await seedOrphanedStart(f);
+    const takeoverEntered = deferred<void>();
+    const allowTakeover = deferred<void>();
+    const oldStopped = deferred<void>();
+    const allowNewInstance = deferred<void>();
+    if (mode === 'exact start') {
+      const withLease = f.h.store.withLease.bind(f.h.store);
+      vi.spyOn(f.h.store, 'withLease').mockImplementationOnce(
+        (person, options, run) =>
+          withLease(person, options, (lease) =>
+            run({
+              ...lease,
+              async save(row) {
+                await lease.save(row);
+                if (
+                  row.phase === 'stopped' &&
+                  row.leaseEpoch === original.leaseEpoch
+                ) {
+                  oldStopped.resolve();
+                  await allowNewInstance.promise;
+                }
+              },
+            }),
+          ),
+      );
+    }
+    const physicalStatus = f.h.native.status;
+    const statusProbe = vi
+      .spyOn(f.h.native, 'status')
+      .mockImplementationOnce(async (...args) => {
+        takeoverEntered.resolve();
+        await allowTakeover.promise;
+        return physicalStatus(...args);
+      });
+    const assertEditorReady = vi.fn(async () => signal());
+    const uninstall = installDEntryNativeDataPort({
+      ...data,
+      assertEditorReady,
+    });
+    cleanups.push(async () => uninstall());
+    if (mode !== 'exact start')
+      f.vm.mockImplementationOnce(async (...args) => {
+        const actual = await f.runPrewarm(...args);
+        if (mode === 'wrong VM') return { ...actual, vmId: randomUUID() };
+        await f.h.store.withLease(
+          identity.personId,
+          { now: f.h.now, ttlMs: f.h.options.leaseTtlMs },
+          async ({ row, save }) => {
+            await save({ ...row!, leaseEpoch: original.leaseEpoch + 2 });
+          },
+        );
+        return actual;
+      });
+    const reconcile = vi.fn(async () => {
+      throw new PersonVmError('LEASE_CONFLICT');
+    });
+    const installed = installDEntryNativePrewarm({
+      prewarmCurrent: f.prewarmCurrent,
+      lifetime: f.lifetime.signal,
+      readCoordination: f.readCoordination,
+      requireEditorProof: true,
+      reconcileStoppedEntry: reconcile,
+    });
+    cleanups.push(installed.close);
+    const server = await nativeEntryServer(f.base);
+    cleanups.push(server.close);
+    let operationId: string;
+    const post = () =>
+      server.request('native-prewarm', { ...body, trigger: 'page' });
+    try {
+      const response = await post();
+      expect(response.status).toBe(202);
+      operationId = (await response.json()).ticket.operationId;
+      await takeoverEntered.promise;
+      const predecessor = (await f.h.store.read(identity.personId))!;
+      expect(predecessor).toMatchObject({
+        vmId: original.vmId,
+        instanceId: original.instanceId,
+        phase: 'starting',
+        leaseEpoch: original.leaseEpoch,
+        leaseOwner: expect.any(String),
+      });
+      const beforePoll = f.h.log.slice();
+      const poll = () => prewarmStatus(server, operationId);
+      const starting = await poll();
+      expect(starting.status).toBe(200);
+      expect(await starting.json()).toEqual({ state: 'starting' });
+      for (const changed of [
+        { leaseOwner: randomUUID() },
+        { vmId: randomUUID() },
+        { instanceId: randomUUID() },
+        { leaseEpoch: original.leaseEpoch + 2 },
+      ]) {
+        f.readCoordination.mockResolvedValueOnce({
+          authorityRevision: 'release-1',
+          vm: { ...predecessor, ...changed },
+        });
+        const expired = await poll();
+        expect(expired.status).toBe(410);
+        expect(await expired.json()).toEqual({ state: 'expired' });
+      }
+      const stillStarting = await poll();
+      expect(stillStarting.status).toBe(200);
+      expect(await stillStarting.json()).toEqual({ state: 'starting' });
+      expect(f.h.log).toEqual(beforePoll);
+      expect(statusProbe).toHaveBeenCalledOnce();
+      expect(f.vm).toHaveBeenCalledOnce();
+      expect(f.start).not.toHaveBeenCalled();
+      expect(assertEditorReady).not.toHaveBeenCalled();
+      if (mode === 'exact start') {
+        const repeat = async () => {
+          const response = await post();
+          expect(response.status).toBe(202);
+          expect((await response.json()).ticket.operationId).toBe(operationId);
+          expect(f.base.deps.watch).toHaveBeenCalledOnce();
+          expect(f.vm).toHaveBeenCalledOnce();
+          expect(reconcile).not.toHaveBeenCalled();
+        };
+        await repeat();
+        allowTakeover.resolve();
+        await Promise.race([
+          oldStopped.promise,
+          Promise.resolve(f.vm.mock.results[0]!.value).then(() => {
+            throw Error('prewarm ended before its stopped predecessor barrier');
+          }),
+        ]);
+        const stopped = (await f.h.store.read(identity.personId))!;
+        expect(stopped).toMatchObject({
+          phase: 'stopped',
+          instanceId: original.instanceId,
+          leaseOwner: predecessor.leaseOwner,
+        });
+        await repeat();
+        const waiting = await poll();
+        expect(waiting.status).toBe(200);
+        expect(await waiting.json()).toEqual({ state: 'starting' });
+        f.readCoordination.mockResolvedValueOnce({
+          authorityRevision: 'release-1',
+          vm: { ...stopped, leaseOwner: randomUUID() },
+        });
+        expect((await post()).status).toBe(503);
+        const alternate = { ...context, sessionId: randomUUID() };
+        f.base.deps.authenticate
+          .mockResolvedValueOnce(alternate)
+          .mockResolvedValueOnce(alternate);
+        const otherLogin = await server.request(
+          'native-prewarm',
+          { ...body, trigger: 'page' },
+          { authorization: 'Bearer another_valid_login_token' },
+        );
+        expect(otherLogin.status).toBe(503);
+        const otherThread = randomUUID();
+        f.base.deps.identity.mockResolvedValueOnce({
+          ...identity,
+          threadId: otherThread,
+        });
+        expect(
+          (
+            await server.request('native-prewarm', {
+              ...body,
+              selection: { ...body.selection, threadId: otherThread },
+              trigger: 'page',
+            })
+          ).status,
+        ).toBe(503);
+        expect(reconcile).toHaveBeenCalledTimes(3);
+        expect(f.vm).toHaveBeenCalledOnce();
+      }
+    } finally {
+      allowTakeover.resolve();
+      allowNewInstance.resolve();
+    }
+    const observed: number[] = [];
+    await vi.waitFor(async () => {
+      const status = await prewarmStatus(server, operationId);
+      observed.push(status.status);
+      if (mode === 'wrong epoch') expect(status.status).toBe(410);
+      else if (mode === 'wrong VM')
+        expect(await status.json()).toEqual({
+          state: 'failed',
+          code: 'START_UNAVAILABLE',
+        });
+      else expect(await status.json()).toEqual({ state: 'ready' });
+    });
+    if (mode !== 'wrong epoch')
+      expect(new Set(observed)).toEqual(new Set([200]));
+    // Join the real Worker task before asserting the negative side effects.
+    await server.close();
+    const running = await f.h.store.read(identity.personId);
+    expect(running).toMatchObject({
+      phase: 'running',
+      vmId: original.vmId,
+      leaseEpoch: original.leaseEpoch + (mode === 'wrong epoch' ? 2 : 1),
+    });
+    expect(running?.instanceId).not.toBe(original.instanceId);
+    expect(f.vm).toHaveBeenCalledOnce();
+    expect(f.start).toHaveBeenCalledOnce();
+    if (mode === 'exact start')
+      expect(assertEditorReady).toHaveBeenCalledExactlyOnceWith(
+        expect.anything(),
+        identity,
+        expect.any(AbortSignal),
+        await f.h.service.resolve(context, signal()),
+      );
+    else expect(assertEditorReady).not.toHaveBeenCalled();
+  },
+);
+
+it.each([
+  ['provider unknown', 'joined'],
+  ['cleanup failed', 'joined'],
+  ['cleanup failed', 'unconfirmed'],
+  ['cleanup failed', 'rolled back'],
+] as const)(
+  'keeps the same failed orphan ticket current during release after %s (%s)',
+  async (mode, join) => {
+    const f = fixture(true);
+    const { body, data, identity } = f.base;
+    const original = await seedOrphanedStart(f);
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const releaseWritten = deferred<void>();
+    const allowUnlock = deferred<void>();
+    const ending = deferred<void>();
+    const allowEnd = deferred<void>();
+    if (mode === 'provider unknown') {
+      vi.spyOn(f.h.native, 'status').mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return 'unknown';
+      });
+    } else {
+      vi.spyOn(f.h.disk, 'detach').mockRejectedValueOnce(
+        new PersonVmError('PROVIDER_FAILED'),
+      );
+    }
+    const withLease = f.h.store.withLease.bind(f.h.store);
+    vi.spyOn(f.h.store, 'withLease').mockImplementationOnce(
+      async (person, options, run) => {
+        let own: { token: string; version: string } | undefined;
+        try {
+          return await withLease(
+            person,
+            {
+              ...options,
+              observeRelease(token, version, stage) {
+                if (stage === 'written') {
+                  own = { token, version };
+                  options.observeRelease?.(token, version, stage);
+                }
+              },
+            },
+            (lease) =>
+              run({
+                ...lease,
+                async save(row) {
+                  await lease.save(row);
+                  if (mode === 'cleanup failed' && row.phase === 'failed') {
+                    entered.resolve();
+                    await release.promise;
+                  }
+                },
+              }),
+          );
+        } finally {
+          if (own) {
+            releaseWritten.resolve();
+            await allowUnlock.promise;
+            if (join !== 'joined')
+              options.observeRelease?.(own.token, own.version, 'unconfirmed');
+            ending.resolve();
+            await allowEnd.promise;
+            if (join === 'joined')
+              options.observeRelease?.(own.token, own.version, 'joined');
+          }
+        }
+      },
+    );
+    const proof = vi.fn(async () => signal());
+    const uninstall = installDEntryNativeDataPort({
+      ...data,
+      assertEditorReady: proof,
+    });
+    cleanups.push(async () => uninstall());
+    const installed = installDEntryNativePrewarm({
+      prewarmCurrent: f.prewarmCurrent,
+      lifetime: f.lifetime.signal,
+      readCoordination: f.readCoordination,
+      requireEditorProof: true,
+    });
+    cleanups.push(installed.close);
+    const verifyThread = vi.fn(async (active: AbortSignal) => {
+      active.throwIfAborted();
+      f.base.identityRevoked.signal.throwIfAborted();
+    });
+    const watch = f.base.deps.watch.getMockImplementation()!;
+    f.base.deps.watch.mockImplementation(async () => ({
+      ...(await watch()),
+      assertTicketThread: verifyThread,
+    }));
+    const joined = deferred<void>();
+    const server = await nativeEntryServer(f.base, {
+      ...f.base.deps,
+      prewarm: {
+        ...dEntryNativePrewarmPort,
+        async prewarm(...args) {
+          try {
+            return await dEntryNativePrewarmPort.prewarm(...args);
+          } finally {
+            joined.resolve();
+          }
+        },
+      },
+    });
+    cleanups.push(server.close);
+    const phase = mode === 'provider unknown' ? 'starting' : 'failed';
+    let operationId: string;
+    try {
+      const accepted = await server.request('native-prewarm', {
+        ...body,
+        trigger: 'page',
+      });
+      expect(accepted.status).toBe(202);
+      operationId = (await accepted.json()).ticket.operationId;
+      await Promise.race([
+        entered.promise,
+        joined.promise.then(() => {
+          throw Error('prewarm ended before its failure barrier');
+        }),
+      ]);
+      const held = await f.readCoordination();
+      expect(held.vm).toMatchObject({
+        ...original,
+        phase,
+        leaseOwner: expect.any(String),
+      });
+      const poll = () => prewarmStatus(server, operationId);
+      const pending = async () => {
+        const current = await poll();
+        expect(current.status).toBe(200);
+        expect(await current.json()).toEqual({ state: 'starting' });
+      };
+      await pending();
+      release.resolve();
+      await Promise.race([
+        releaseWritten.promise,
+        joined.promise.then(() => {
+          throw Error('prewarm joined before observing its release write');
+        }),
+      ]);
+      const written = await f.readCoordination();
+      // The handler has RETURNING's candidate. An independent PG snapshot
+      // still sees the old exact owner until COMMIT becomes visible.
+      f.readCoordination
+        .mockResolvedValueOnce(held)
+        .mockResolvedValueOnce(held);
+      await pending();
+      expect(written.vm).toMatchObject({
+        ...original,
+        phase,
+        leaseOwner: null,
+        rowVersion: expect.any(String),
+      });
+      await pending();
+      for (const stale of [
+        { rowVersion: randomUUID() },
+        { leaseOwner: randomUUID() },
+      ]) {
+        f.readCoordination.mockResolvedValueOnce({
+          ...written,
+          vm: { ...written.vm!, ...stale },
+        });
+        expect((await poll()).status).toBe(410);
+      }
+      allowUnlock.resolve();
+      await ending.promise;
+      if (join === 'joined') await pending();
+      else {
+        if (join === 'rolled back')
+          f.readCoordination.mockResolvedValueOnce(held);
+        expect((await poll()).status).toBe(410);
+      }
+    } finally {
+      release.resolve();
+      allowUnlock.resolve();
+      allowEnd.resolve();
+    }
+    await joined.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const failed = await prewarmStatus(server, operationId);
+    if (join !== 'joined') {
+      expect(failed.status).toBe(410);
+      expect(await failed.json()).toEqual({ state: 'expired' });
+      expect(f.vm).toHaveBeenCalledOnce();
+      expect(proof).not.toHaveBeenCalled();
+      return;
+    }
+    expect(failed.status).toBe(200);
+    expect(await failed.json()).toEqual({
+      state: 'failed',
+      code: 'START_UNAVAILABLE',
+    });
+    const row = (await f.h.store.read(identity.personId))!;
+    expect(row).toMatchObject({ ...original, phase, leaseOwner: null });
+    expect(f.base.authorityClose).not.toHaveBeenCalled();
+    expect(verifyThread).toHaveBeenCalled();
+    for (const facts of [
+      { leaseOwner: randomUUID() },
+      { leaseEpoch: original.leaseEpoch + 1 },
+    ]) {
+      f.readCoordination.mockResolvedValueOnce({
+        authorityRevision: 'release-1',
+        vm: { ...row, ...facts },
+      });
+      expect((await prewarmStatus(server, operationId)).status).toBe(410);
+    }
+    f.base.identityRevoked.abort(new DataAccessError('authorization_denied'));
+    expect((await prewarmStatus(server, operationId)).status).toBe(410);
+    expect(f.vm).toHaveBeenCalledOnce();
+    expect(f.start).not.toHaveBeenCalled();
+    expect(proof).not.toHaveBeenCalled();
+  },
+);
+
+it('expires a failed orphan ticket when another Worker claims and releases the same predecessor', async () => {
+  const f = fixture(true);
+  const { body, context } = f.base;
+  const original = await seedOrphanedStart(f);
+  const native = vi.spyOn(f.h.native, 'status').mockResolvedValue('unknown');
+  const secondService = new PersonVmService(f.h.options);
+  const secondPrewarm = vi.spyOn(secondService, 'prewarm');
+  const secondWorker = createDEntryNativePrewarmPort({
+    prewarmCurrent: (rc, _identity, input, active) =>
+      secondService.prewarm(rc, input, active),
+    lifetime: f.lifetime.signal,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(secondWorker.close);
+  const a = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: f.assembly.port,
+  });
+  cleanups.push(a.close);
+  const b = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: secondWorker.port,
+  });
+  cleanups.push(b.close);
+  async function fail(server: typeof a) {
+    const accepted = await server.request('native-prewarm', {
+      ...body,
+      trigger: 'page',
+    });
+    expect(accepted.status).toBe(202);
+    const operationId = (await accepted.json()).ticket.operationId;
+    await vi.waitFor(async () => {
+      const status = await prewarmStatus(server, operationId);
+      expect(status.status).toBe(200);
+      expect(await status.json()).toEqual({
+        state: 'failed',
+        code: 'START_UNAVAILABLE',
+      });
+    });
+    return operationId;
+  }
+  const first = await fail(a);
+  const firstRelease = await f.h.store.read(context.actor.id);
+  expect(firstRelease).toMatchObject({
+    ...original,
+    phase: 'starting',
+    leaseOwner: null,
+  });
+  // Worker A never polls during B's claim. A must see the changed durable
+  // release even if B returns the row to the same visible phase and binding.
+  const second = await fail(b);
+  expect(second).not.toBe(first);
+  expect(await f.h.store.read(context.actor.id)).toMatchObject(firstRelease!);
+  const old = await prewarmStatus(a, first);
+  expect(old.status).toBe(410);
+  expect(await old.json()).toEqual({ state: 'expired' });
+  const latest = await prewarmStatus(b, second);
+  expect(latest.status).toBe(200);
+  expect(await latest.json()).toEqual({
+    state: 'failed',
+    code: 'START_UNAVAILABLE',
+  });
+  expect(native).toHaveBeenCalledTimes(2);
+  expect(f.vm).toHaveBeenCalledOnce();
+  expect(secondPrewarm).toHaveBeenCalledOnce();
+  expect(f.start).not.toHaveBeenCalled();
+  expect(f.stop).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['thread', 'later generation'],
+  ['no thread', 'expiry'],
+  ['thread', 'original ready'],
+  ['thread', 'original failed'],
+  ['thread', 'expiry closes observer'],
+  ['thread', 'probe failed at expiry'],
+  ['thread', 'genuine revocation'],
+] as const)(
+  'rechecks a duplicate POST at reply time with %s and %s',
+  async (selectionKind, outcome) => {
+    const withThread = selectionKind === 'thread';
+    const f = fixture(true, withThread);
+    const { context, identity } = f.base;
+    const predecessor = await seedOrphanedStart(f);
+    const startEntered = deferred<void>();
+    const releaseStart = deferred<void>();
+    const replyEntered = deferred<void>();
+    const releaseReply = deferred<void>();
+    const oldStatus = f.h.native.status.bind(f.h.native);
+    let stopAtReply = false;
+    let observerClosed = false;
+    const observerClosing = deferred<void>();
+    const finishObserverClose = deferred<void>();
+    const deadline =
+      outcome === 'expiry closes observer' ||
+      outcome === 'probe failed at expiry'
+        ? new AbortController()
+        : undefined;
+    if (deadline) {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) =>
+        ms === 10 * 60_000 ? deadline.signal : timeout(ms),
+      );
+      f.base.authorityClose.mockImplementationOnce(async () => {
+        observerClosed = true;
+        observerClosing.resolve();
+        await finishObserverClose.promise;
+      });
+    }
+    vi.spyOn(f.h.native, 'status').mockImplementationOnce(
+      async (binding, active) => {
+        startEntered.resolve();
+        await releaseStart.promise;
+        return outcome === 'original failed'
+          ? 'unknown'
+          : oldStatus(binding, active);
+      },
+    );
+    async function waitBeforeReply() {
+      replyEntered.resolve();
+      await releaseReply.promise;
+    }
+    if (withThread) {
+      const watch = f.base.deps.watch.getMockImplementation()!;
+      f.base.deps.watch.mockImplementation(async () => ({
+        ...(await watch()),
+        async assertTicketThread(active: AbortSignal) {
+          if (stopAtReply) {
+            stopAtReply = false;
+            await waitBeforeReply();
+            if (outcome === 'probe failed at expiry')
+              throw Error('fixture authority marker failed');
+          }
+          active.throwIfAborted();
+          f.base.identityRevoked.signal.throwIfAborted();
+          if (observerClosed) throw new DEntryTicketObserverClosed();
+        },
+      }));
+    }
+    const server = await nativeEntryServer(f.base, {
+      ...f.base.deps,
+      prewarm: f.assembly.port,
+    });
+    cleanups.push(server.close);
+    const { threadId, ...selection } = f.base.body.selection;
+    const post = () =>
+      server.request('native-prewarm', {
+        organizationId: identity.organizationId,
+        selection: { ...selection, ...(threadId && { threadId }) },
+        trigger: 'page',
+      });
+    const accepted = await post();
+    expect(accepted.status).toBe(202);
+    const ticket = (await accepted.json()).ticket;
+    let duplicate: Promise<Response> | undefined;
+    try {
+      await startEntered.promise;
+      expect(await f.h.store.read(identity.personId)).toMatchObject({
+        ...predecessor,
+        phase: 'starting',
+        leaseOwner: expect.any(String),
+      });
+      if (withThread) stopAtReply = true;
+      else {
+        // The first authentication/selection passes. Hold the same late
+        // current identity read that threadless requests use before writing.
+        f.base.deps.identity
+          .mockResolvedValueOnce(identity)
+          .mockImplementationOnce(async () => {
+            await waitBeforeReply();
+            return identity;
+          });
+      }
+      duplicate = post();
+      await Promise.race([
+        replyEntered.promise,
+        duplicate.then(() => {
+          throw Error('duplicate replied before its final-check barrier');
+        }),
+      ]);
+      expect(f.vm).toHaveBeenCalledOnce();
+      expect(f.base.deps.watch).toHaveBeenCalledOnce();
+      const poll = () => prewarmStatus(server, ticket.operationId);
+      if (outcome !== 'expiry') {
+        releaseStart.resolve();
+        await vi.waitFor(async () => {
+          const status = await poll();
+          expect(status.status).toBe(200);
+          expect(await status.json()).toEqual(
+            outcome === 'original failed'
+              ? { state: 'failed', code: 'START_UNAVAILABLE' }
+              : { state: 'ready' },
+          );
+        });
+      }
+      if (outcome === 'later generation') {
+        f.h.states.set(predecessor.vmId, 'stopped');
+        await f.h.service.stop(context, signal());
+        await f.h.service.start(context, signal());
+        expect(await f.h.service.resolve(context, signal())).toMatchObject({
+          vmId: predecessor.vmId,
+          leaseEpoch: predecessor.leaseEpoch + 2,
+        });
+      }
+      if (deadline) {
+        deadline.abort(
+          new DOMException('fixture timer elapsed', 'TimeoutError'),
+        );
+        await observerClosing.promise;
+        expect(f.base.authorityClose).toHaveBeenCalledOnce();
+      }
+      if (outcome === 'genuine revocation')
+        f.base.identityRevoked.abort(
+          new DataAccessError('authorization_denied'),
+        );
+      const clock =
+        outcome === 'expiry'
+          ? vi
+              .spyOn(Date, 'now')
+              .mockReturnValue(Date.parse(ticket.expiresAt) + 1)
+          : undefined;
+      try {
+        releaseReply.resolve();
+        const response = await duplicate;
+        if (
+          outcome === 'later generation' ||
+          outcome === 'expiry' ||
+          outcome === 'expiry closes observer'
+        ) {
+          expect(response.status).toBe(410);
+          expect(await response.json()).toEqual({ state: 'expired' });
+          expect((await poll()).status).toBe(410);
+        } else if (outcome === 'genuine revocation') {
+          expect(response.status).toBe(404);
+        } else if (outcome === 'probe failed at expiry') {
+          expect(response.status).toBe(503);
+        } else {
+          expect(response.status).toBe(202);
+          expect((await response.json()).ticket).toEqual(ticket);
+        }
+      } finally {
+        clock?.mockRestore();
+      }
+      expect(f.vm).toHaveBeenCalledOnce();
+      expect(f.base.deps.watch).toHaveBeenCalledOnce();
+      expect(f.start).toHaveBeenCalledTimes(
+        outcome === 'later generation'
+          ? 2
+          : outcome === 'original failed' || outcome === 'expiry'
+            ? 0
+            : 1,
+      );
+    } finally {
+      releaseStart.resolve();
+      releaseReply.resolve();
+      finishObserverClose.resolve();
+      await duplicate;
+    }
+  },
+);
 
 it('the real Worker listener requires current release eligibility and the installed prewarm port, without resolving catalog/data', async () => {
   const f = fixture();
@@ -821,6 +1541,47 @@ it('uses both the selected editor proof and physical Host readiness on the real 
   expect(f.stop).not.toHaveBeenCalled();
 });
 
+it('uses the selected live slot after rechecking HTTP authority and never asks for its old VM roster', async () => {
+  const f = fixture(true);
+  const { context, body, data, identity, binding } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  f.h.setReadiness({ authenticated: true, editorReady: false, canSend: false });
+  const proof = vi.fn(async () => new AbortController().signal);
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    assertEditorReady: proof,
+  });
+  cleanups.push(async () => uninstall());
+  const slotted = vi.fn(() => true);
+  const prewarm = vi.fn(f.prewarmCurrent);
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent: prewarm,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
+    isLiveSlottedBinding: slotted,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+  const ping = vi.spyOn(f.h.native, 'ping');
+  const response = await server.request('native-prewarm', {
+    ...body,
+    trigger: 'page',
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ identity, trigger: 'page' });
+  expect(slotted).toHaveBeenCalledWith(
+    expect.objectContaining({
+      personId: binding.personId,
+      organizationId: binding.organizationId,
+    }),
+  );
+  expect(proof).toHaveBeenCalledOnce();
+  expect(ping).not.toHaveBeenCalled();
+  expect(prewarm).not.toHaveBeenCalled();
+});
+
 it.each([false, true])(
   'expires the old ticket and prewarms after deletion (purge=%s)',
   async (purge) => {
@@ -830,6 +1591,13 @@ it.each([false, true])(
       prewarmCurrent: f.prewarmCurrent,
       lifetime: f.lifetime.signal,
       readCoordination: f.readCoordination,
+      reconcileStoppedEntry: (context, _identity, binding, signal, retained) =>
+        f.h.service.reconcileStoppedEntryForPrewarm(
+          context,
+          binding,
+          signal,
+          retained,
+        ),
     });
     cleanups.push(installed.close);
     const server = await nativeEntryServer(f.base);

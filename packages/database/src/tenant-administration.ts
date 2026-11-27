@@ -11,6 +11,7 @@ import {
   synchronizeTenantMembershipAccess,
   lockTenantEmployeeWorkspaces,
 } from './tenant-employee-access.ts';
+import { captureNativeWebRosterChange } from './employees/native-web-capacity.ts';
 import { DataAccessError } from './data.ts';
 import { isPlatformAdmin } from './providers/model-pool.ts';
 
@@ -166,13 +167,31 @@ export async function updateAdminTenantMember(
     const role = requestedRole === 'viewer' ? 'viewer' : 'member';
     if (row.active === change.active && row.role === role)
       return { member: member(row), changed: false };
+    const grantsWrite =
+      change.active &&
+      role === 'member' &&
+      (!row.active || row.role === 'viewer');
+    const checkRoster = grantsWrite
+      ? await captureNativeWebRosterChange(
+          tx,
+          {
+            organizationId,
+            workspaceId: row.workspace_id ?? undefined,
+            personIds: [row.user_id],
+          },
+          { lockBeforeRead: true, whenEnabled: true },
+        )
+      : undefined;
     const [updated] = await tx`
       update allrice_memberships m set role=${role},active=${change.active},updated_at=clock_timestamp()
       where id=${membershipId} returning m.*,md5(to_jsonb(m)::text) as version`;
     await synchronizeTenantMembershipAccess(tx, {
       organizationId,
       workspaceId: row.workspace_id,
+      personIds: [row.user_id],
+      allowNewAssignments: grantsWrite,
     });
+    await checkRoster?.();
     await tx`
       insert into allrice_audit_events(organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
       values(${organizationId},${row.workspace_id},${context.actor.id},'tenant.member.updated','membership',${membershipId},'recorded',${change.reason || 'tenant_member_updated'},${context.requestId},

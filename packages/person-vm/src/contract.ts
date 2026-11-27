@@ -198,8 +198,26 @@ export type PersonVmPrewarmTarget = Readonly<{
   replacesVmId?: string;
 }>;
 
+/** Host-only stages. A written candidate proves nothing until independently visible. */
+export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
+
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
+  /** Host-only observations for this ticket's exact orphaned start. */
+  orphanedStart?: Readonly<{
+    predecessor: PersonVmBinding;
+    observeLease(ownerToken: string, signal: AbortSignal): void;
+    observeInstance(binding: PersonVmBinding): void;
+    observeFailure?(
+      ownerToken: string,
+      phase: 'starting' | 'stopped' | 'failed',
+    ): void;
+    observeRelease?(
+      ownerToken: string,
+      rowVersion: string,
+      stage: PersonVmLeaseReleaseStage,
+    ): void;
+  }>;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */

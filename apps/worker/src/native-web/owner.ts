@@ -24,6 +24,7 @@ import type {
   SessionCreateRequest,
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import {
+  NativeWebGuestLaunchUnacknowledged,
   PersonVmError,
   sameVmBinding,
   type PersonVmBinding,
@@ -242,7 +243,9 @@ export async function openNativeWebOwner(input: {
     hostClosing: Promise<void> | undefined;
   let job: Awaited<ReturnType<PersonVmBootstrapScope['launch']>> | undefined;
   let starting: Promise<NonNullable<typeof job>> | undefined;
+  let unacknowledgedLaunch: PersonVmError | undefined;
   let nativeWait: Promise<unknown> | undefined;
+  let nativeJobExited = false;
   let nativeStopConfirmed = false;
   const root = new Context();
   const principals = createDEntryPrincipalControl(root, {
@@ -276,7 +279,6 @@ export async function openNativeWebOwner(input: {
     recordFailure(reason);
     const abortCarrier = () => {
       carrier.abort(new PersonVmError('PROVIDER_FAILED'));
-      waitAbort.abort();
     };
     const audit = startupFailureAudit;
     // Publish before abort callbacks can reenter. Local drain is not remote ACK.
@@ -285,7 +287,9 @@ export async function openNativeWebOwner(input: {
         await audit;
         abortCarrier();
       }
-      await Promise.allSettled([starting, nativeWait]);
+      // A lost Web connection is not a guest exit. Keep the exact native
+      // waiter owned until it observes completion or final Host cleanup.
+      await Promise.allSettled([starting]);
       const results = await Promise.allSettled([
         principals.drainLocal(),
         transport.close(),
@@ -366,10 +370,12 @@ export async function openNativeWebOwner(input: {
         (async () => {
           await Promise.allSettled([starting]);
           // No await between this private stop-fact check and first dispatch.
-          if (job && !nativeStopConfirmed)
+          if (job && !nativeStopConfirmed && !nativeJobExited) {
             await job.cancelAndWait(
               AbortSignal.timeout(input.cleanupTimeoutMs),
             );
+            nativeJobExited = true;
+          }
         })(),
       ]);
       const failures = [scopes, ...results].flatMap((result) =>
@@ -383,6 +389,24 @@ export async function openNativeWebOwner(input: {
     ready = false;
     principals.fence(new PersonVmError('LEASE_LOST'));
     stale.abort(new PersonVmError('LEASE_LOST'));
+    return closing;
+  }
+  function retireExitedOwner() {
+    const previous = closing;
+    // The exact guest is gone. Join local children without asking its remote
+    // scopes for an ACK or sending a kill to the old job.
+    closing = Promise.resolve().then(async () => {
+      await Promise.allSettled([previous, hostClosing, disconnected]);
+      hostClosing = undefined;
+      await joinHost();
+      await principals.retireAfterNativeStop();
+      input.lifetime.removeEventListener('abort', aborted);
+    });
+    ready = false;
+    principals.fence(new PersonVmError('LEASE_LOST'));
+    stale.abort();
+    carrier.abort();
+    waitAbort.abort();
     return closing;
   }
   const aborted = () => {
@@ -564,9 +588,17 @@ export async function openNativeWebOwner(input: {
     await setup(() => input.scope.assertCurrent());
     stage('launch');
     starting = setup(async () => {
-      const opened = await input.scope.launch(input.launch.command);
-      job = opened;
-      return opened;
+      try {
+        job = await input.scope.launch(input.launch.command);
+        return job;
+      } catch (error) {
+        if (
+          error instanceof PersonVmError &&
+          error.code === 'CLEANUP_INCOMPLETE'
+        )
+          unacknowledgedLaunch = error;
+        throw error;
+      }
     });
     const started = await starting;
     if (!sameVmBinding(started.binding, binding))
@@ -575,7 +607,9 @@ export async function openNativeWebOwner(input: {
     nativeWait = Promise.resolve().then(() => started.wait(waitAbort.signal));
     void nativeWait.then(
       () => {
-        if (!waitAbort.signal.aborted) lost('NATIVE_JOB_EXITED');
+        if (waitAbort.signal.aborted) return;
+        nativeJobExited = true;
+        lost('NATIVE_JOB_EXITED');
       },
       (error: unknown) => {
         if (!waitAbort.signal.aborted) lost(error);
@@ -1154,8 +1188,13 @@ export async function openNativeWebOwner(input: {
           }),
         );
       },
-      /** Only the trusted runtime's confirmed-native-stop hook may use this.
-       * This does not manufacture a job exit or replace normal exact close. */
+      /** The retained managed job itself supplies the successful wait. */
+      retireAfterJobExit(current: PersonVmBinding) {
+        if (!sameVmBinding(binding, current))
+          throw new PersonVmError('LEASE_LOST');
+        if (nativeJobExited) return retireExitedOwner();
+      },
+      /** Only the trusted runtime's confirmed-native-stop hook may use this. */
       async retireAfterNativeStop(
         current: PersonVmBinding,
         cleanup: AbortSignal,
@@ -1165,22 +1204,8 @@ export async function openNativeWebOwner(input: {
         cleanup.throwIfAborted();
         // Trusted exact-stop fact only; it does not certify any local I/O join.
         nativeStopConfirmed = true;
-        const previous = closing;
-        // Publish before abort/disposer reentry; no further job cancellation.
-        closing = Promise.resolve().then(async () => {
-          await Promise.allSettled([previous, hostClosing, disconnected]);
-          hostClosing = undefined; // Fresh actual join; old rejection is no veto.
-          await joinHost();
-          await principals.retireAfterNativeStop(); // Local join + exact stop, no ACK.
-          input.lifetime.removeEventListener('abort', aborted);
-          cleanup.throwIfAborted();
-        });
-        ready = false;
-        principals.fence(new PersonVmError('LEASE_LOST'));
-        stale.abort();
-        carrier.abort(); // Unblocks a pending normal ACK wait for this dead Host.
-        waitAbort.abort();
-        await closing;
+        await retireExitedOwner();
+        cleanup.throwIfAborted();
       },
       async close() {
         try {
@@ -1197,6 +1222,13 @@ export async function openNativeWebOwner(input: {
     } finally {
       input.lifetime.removeEventListener('abort', aborted);
     }
+    if (unacknowledgedLaunch && error === unacknowledgedLaunch)
+      throw new NativeWebGuestLaunchUnacknowledged(
+        binding,
+        unacknowledgedLaunch,
+      );
+    if (error instanceof PersonVmError && error.code === 'CLEANUP_INCOMPLETE')
+      throw error;
     throw new PersonVmError('PROVIDER_FAILED');
   } finally {
     clearTimeout(startupTimer);

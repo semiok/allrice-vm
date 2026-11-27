@@ -99,6 +99,7 @@ export function createProductionPersonVmSources(
         lifetime.throwIfAborted();
         entry = installProductionDEntrySource({
           startup,
+          vm: host.vm,
           admission,
           lifetime,
           async resolveSendRoute(input, signal) {

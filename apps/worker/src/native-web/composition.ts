@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   PersonVmBinding,
   PersonVmBootstrapScope,
+  PersonVmGuestBootstrapPort,
   PersonVmPort,
   PersonVmRuntimePort,
   PersonVmWebEndpointReceipt,
@@ -9,21 +10,48 @@ import type {
   PersonVmWebRosterPort,
   ReadonlyCommandMemoryDirectory,
 } from '@allrice/person-vm';
-import { PersonVmError, sameVmBinding } from '@allrice/person-vm';
-import { preparePersonNativeWebRoster } from '@allrice/database';
-import type { RequestContext } from '@allrice/contracts';
+import {
+  NativeWebGuestLaunchUnacknowledged,
+  PersonVmError,
+  sameVmBinding,
+} from '@allrice/person-vm';
+import {
+  preparePersonNativeWebRoster,
+  readPersonNativeWebRoster,
+  type confirmDEntryEmployeeArchive,
+  type subscribeDEntryEmployeeArchive,
+} from '@allrice/database';
+import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
   nativeWebLaunchOnGuest,
   prepareNativeWebLaunch,
   type NativeWebConfiguration,
   type NativeWebGuestProfile,
+  type NativeWebLaunch,
   type NativeWebLaunchPlan,
   type NativeWebModelAdapter,
 } from './launch.js';
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
+function sameEmployee(
+  a: Pick<
+    Endpoint,
+    | 'employeeInstanceId'
+    | 'workspaceId'
+    | 'employeeRevision'
+    | 'employeeVersionId'
+  >,
+  b: typeof a,
+) {
+  return (
+    a.employeeInstanceId === b.employeeInstanceId &&
+    a.workspaceId === b.workspaceId &&
+    a.employeeRevision === b.employeeRevision &&
+    a.employeeVersionId === b.employeeVersionId
+  );
+}
 type StartingEditorProof = (
   input: Readonly<{
     binding: PersonVmBinding;
@@ -61,6 +89,18 @@ export const personNativeWebRoster: PersonVmWebRosterPort = {
 export function createAssignedNativeWebStartup(input: {
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   memoryGuestPlan: PersonVmRuntimePort['memoryGuestPlan'];
+  hotGuest?: {
+    bootstrap: PersonVmGuestBootstrapPort['bootstrap'];
+    assertWebEndpoints(
+      receipt: PersonVmWebEndpointReceipt,
+      signal: AbortSignal,
+    ): Promise<void>;
+  };
+  readRoster?: typeof readPersonNativeWebRoster;
+  archive?: {
+    subscribe: typeof subscribeDEntryEmployeeArchive;
+    confirm: typeof confirmDEntryEmployeeArchive;
+  };
   commandMemory?: Readonly<{
     controls: ReadonlyCommandMemoryDirectory;
     readonlyDshDirectory: string;
@@ -84,15 +124,22 @@ export function createAssignedNativeWebStartup(input: {
     {
       binding: PersonVmBinding;
       receipt: PersonVmWebEndpointReceipt;
+      slots?: PersonVmWebEndpointReceipt['slots'];
       bindingRef: string;
       revoked: AbortController;
       ready: boolean;
       verifiedBy?: StartingEditorProof;
       verifiedEmployees: Map<string, AbortSignal>;
       owners: Map<string, NativeWebOwner>;
+      added: Map<string, PersonVmWebEndpointReceipt>;
+      blockedEmployees: Map<string, number>;
+      unpublished: Map<number, NativeWebOwner>;
+      updating?: Promise<void>;
+      stopArchive?: () => Promise<void>;
       starting: Promise<void>;
       retiring?: Promise<void>;
       unjoinedOpen: boolean;
+      unjoinedGuest: boolean;
     }
   >();
   const stopped = new AbortController();
@@ -116,6 +163,155 @@ export function createAssignedNativeWebStartup(input: {
     );
     return operation;
   }
+  type RunningGroup = NonNullable<ReturnType<typeof running.get>>;
+  function update(group: RunningGroup, work: () => Promise<void>) {
+    const previous = group.updating;
+    const operation = track(async () => {
+      await previous?.catch(() => {});
+      await work();
+    });
+    group.updating = operation;
+    const settle = () => {
+      if (group.updating === operation) group.updating = undefined;
+    };
+    void operation.then(settle, settle);
+    return operation;
+  }
+  async function retireEmployee(
+    group: RunningGroup,
+    endpoint: Endpoint,
+    join: () => Promise<void>,
+  ) {
+    const id = endpoint.employeeInstanceId;
+    // Keep both the employee home and the slot reserved until its owner joins.
+    group.blockedEmployees.set(id, endpoint.hostPort);
+    group.verifiedEmployees.delete(id);
+    try {
+      await join();
+    } catch (cause) {
+      throw new PersonVmError('CLEANUP_INCOMPLETE', { cause });
+    }
+    group.owners.delete(id);
+    group.added.delete(id);
+    group.blockedEmployees.delete(id);
+  }
+  function ownerEndpoint(group: RunningGroup, employeeInstanceId: string) {
+    return (
+      group.added.get(employeeInstanceId) ?? group.receipt
+    ).endpoints.find(
+      (entry) => entry.employeeInstanceId === employeeInstanceId,
+    );
+  }
+  function confirmArchive(group: RunningGroup, endpoint: Endpoint) {
+    return input.archive?.confirm({
+      ...endpoint,
+      organizationId: group.binding.organizationId,
+      personId: group.binding.personId,
+    });
+  }
+  async function joinArchivedOwner(group: RunningGroup, owner: NativeWebOwner) {
+    const exited = owner.retireAfterJobExit(group.binding);
+    if (exited) return exited;
+    try {
+      await owner.close();
+    } catch (error) {
+      // A real job wait can arrive during normal close. It replaces the
+      // remote ACK only once local Host cleanup actually joins.
+      const exitedDuringClose = owner.retireAfterJobExit(group.binding);
+      if (!exitedDuringClose) throw error;
+      await exitedDuringClose;
+    }
+  }
+  function watchArchive(group: RunningGroup) {
+    const archive = input.archive;
+    if (!archive || !group.slots) return;
+    const signal = AbortSignal.any([lifetime, group.revoked.signal]);
+    return archive.subscribe(
+      group.binding,
+      async (id) => {
+        if (!group.ready || signal.aborted) return;
+        await update(group, async () => {
+          for (const [employeeId, owner] of group.owners) {
+            if (id !== null && id !== employeeId) continue;
+            if (!group.ready || signal.aborted) return;
+            const endpoint = ownerEndpoint(group, employeeId);
+            if (!endpoint || group.blockedEmployees.has(employeeId)) continue;
+            if (await confirmArchive(group, endpoint)) {
+              if (!group.ready || signal.aborted) return;
+              await retireEmployee(group, endpoint, () =>
+                joinArchivedOwner(group, owner),
+              );
+            }
+          }
+        });
+      },
+      signal,
+    );
+  }
+  async function prepareEmployee(
+    binding: PersonVmBinding,
+    endpoint: Endpoint,
+    profile: NativeWebGuestProfile,
+    memory: Awaited<ReturnType<PersonVmRuntimePort['memoryGuestPlan']>>,
+    model?: NativeWebModelAdapter,
+  ) {
+    const home = `/work/.allrice/employees/${endpoint.employeeInstanceId}`;
+    return prepareNativeWebLaunch(
+      {
+        ...input.configuration,
+        principalProfile: {
+          workspaceId: endpoint.workspaceId,
+          employeeInstanceId: endpoint.employeeInstanceId,
+          employeeRevision: endpoint.employeeRevision,
+          employeeVersionId: endpoint.employeeVersionId,
+        },
+        origin: `http://127.0.0.1:${endpoint.hostPort}/`,
+        publicUrl: input.configuration.publicUrl(endpoint, binding),
+        guestPort: endpoint.guestPort,
+        dshHome: `${home}/dsh`,
+        agentsHome: `${home}/agents`,
+        workdir: '/work',
+      },
+      binding,
+      profile,
+      input.commandMemory
+        ? createPersonVmDshCommandMemoryPatch(memory, {
+            ...input.commandMemory,
+            cliPath: input.configuration.cliPath,
+            cleanupTimeoutMs: input.cleanupTimeoutMs,
+          })
+        : undefined,
+      model,
+    );
+  }
+  function openEmployee(
+    scope: PersonVmBootstrapScope,
+    launch: NativeWebLaunch,
+    context: RequestContext,
+    startup?: Pick<
+      Parameters<typeof openNativeWebOwner>[0],
+      'recordStartupFailure' | 'startupPending'
+    >,
+  ) {
+    return openNativeWebOwner({
+      scope,
+      launch,
+      context,
+      vm: input.vm,
+      lifetime,
+      cleanupTimeoutMs: input.cleanupTimeoutMs,
+      ...startup,
+      ...(modelAdapter && {
+        async beforePrompt(
+          request: Parameters<NonNullable<typeof beforePrompt>>[0],
+          active: AbortSignal,
+        ) {
+          if (!beforePrompt) throw new PersonVmError('RUNTIME_NOT_READY');
+          return beforePrompt(request, active);
+        },
+      }),
+    });
+  }
   function current(binding: PersonVmBinding, web?: PersonVmWebStartup) {
     lifetime.throwIfAborted();
     if (
@@ -133,14 +329,21 @@ export function createAssignedNativeWebStartup(input: {
     if (closing) return closing;
     stopped.abort(new PersonVmError('LEASE_LOST'));
     closing = (async () => {
+      await Promise.allSettled(
+        [...running.values()].map((group) => group.stopArchive?.()),
+      );
       await Promise.allSettled([...pending]);
       const results = await Promise.allSettled(
         [...running.values()].flatMap((group) =>
-          [...group.owners.values()].map((owner) => owner.close()),
+          [...group.owners.values(), ...group.unpublished.values()].map(
+            (owner) => owner.close(),
+          ),
         ),
       );
       if (
-        [...running.values()].some((group) => group.unjoinedOpen) ||
+        [...running.values()].some(
+          (group) => group.unjoinedOpen || group.unjoinedGuest,
+        ) ||
         results.some((result) => result.status === 'rejected')
       )
         throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -188,42 +391,14 @@ export function createAssignedNativeWebStartup(input: {
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
-        const commandMemory = input.commandMemory
-          ? createPersonVmDshCommandMemoryPatch(memory, {
-              ...input.commandMemory,
-              cliPath: input.configuration.cliPath,
-              cleanupTimeoutMs: input.cleanupTimeoutMs,
-            })
-          : undefined;
         const profile = await input.readEmployeeProfile(signal);
         const model = await modelAdapter?.(binding, signal);
         current(binding, web);
         signal.throwIfAborted();
         const launches = await Promise.all(
-          web.receipt.endpoints.map((endpoint) => {
-            const home = `/work/.allrice/employees/${endpoint.employeeInstanceId}`;
-            return prepareNativeWebLaunch(
-              {
-                ...input.configuration,
-                principalProfile: {
-                  workspaceId: endpoint.workspaceId,
-                  employeeInstanceId: endpoint.employeeInstanceId,
-                  employeeRevision: endpoint.employeeRevision,
-                  employeeVersionId: endpoint.employeeVersionId,
-                },
-                origin: `http://127.0.0.1:${endpoint.hostPort}/`,
-                publicUrl: input.configuration.publicUrl(endpoint, binding),
-                guestPort: endpoint.guestPort,
-                dshHome: `${home}/dsh`,
-                agentsHome: `${home}/agents`,
-                workdir: '/work',
-              },
-              binding,
-              profile,
-              commandMemory,
-              model,
-            );
-          }),
+          web.receipt.endpoints.map((endpoint) =>
+            prepareEmployee(binding, endpoint, profile, memory, model),
+          ),
         );
         current(binding, web);
         signal.throwIfAborted();
@@ -263,23 +438,29 @@ export function createAssignedNativeWebStartup(input: {
             ),
           ),
         });
-        const group: NonNullable<ReturnType<typeof running.get>> = {
+        const group: RunningGroup = {
           binding,
           receipt,
+          slots: web.receipt.slots,
           bindingRef: randomUUID(),
           revoked: new AbortController(),
           ready: false,
           verifiedEmployees: new Map(),
           owners: new Map<string, NativeWebOwner>(),
+          added: new Map(),
+          blockedEmployees: new Map(),
+          unpublished: new Map(),
           starting: operation,
           retiring: undefined as Promise<void> | undefined,
           unjoinedOpen: false,
+          unjoinedGuest: false,
         };
         running.set(binding.vmId, group);
         let attemptedOwnerOpen = false;
         let awaitingGroupSetup = true;
         try {
           const prove = editorProof;
+          group.stopArchive = await watchArchive(group);
           signal.throwIfAborted();
           await scope.assertCurrent();
           if (!scope.readNativeWebGuestAddress)
@@ -298,27 +479,9 @@ export function createAssignedNativeWebStartup(input: {
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
             const boundLaunch = nativeWebLaunchOnGuest(launch, guestAddress);
             attemptedOwnerOpen = true;
-            const owner = await openNativeWebOwner({
-              scope,
-              launch: boundLaunch,
-              context: web.context,
-              vm: input.vm,
-              lifetime,
-              cleanupTimeoutMs: input.cleanupTimeoutMs,
+            const owner = await openEmployee(scope, boundLaunch, web.context, {
               recordStartupFailure: web.recordNativeFailure,
               startupPending: () => awaitingGroupSetup,
-              ...(modelAdapter
-                ? {
-                    async beforePrompt(
-                      request: Parameters<NonNullable<typeof beforePrompt>>[0],
-                      active: AbortSignal,
-                    ) {
-                      if (!beforePrompt)
-                        throw new PersonVmError('RUNTIME_NOT_READY');
-                      return beforePrompt(request, active);
-                    },
-                  }
-                : {}),
             });
             const endpoint = receipt.endpoints[index]!;
             group.owners.set(endpoint.employeeInstanceId, owner);
@@ -366,10 +529,14 @@ export function createAssignedNativeWebStartup(input: {
           awaitingGroupSetup = false;
           group.ready = false;
           group.revoked.abort(error);
+          await group.stopArchive?.();
           // The startup scope and native stop own address-probe cleanup.
           // Only an attempted DSH owner open can retain a Host resource here.
+          group.unjoinedGuest =
+            error instanceof NativeWebGuestLaunchUnacknowledged;
           group.unjoinedOpen =
             attemptedOwnerOpen &&
+            !group.unjoinedGuest &&
             error instanceof PersonVmError &&
             error.code === 'CLEANUP_INCOMPLETE';
           const joined = await Promise.allSettled(
@@ -379,7 +546,7 @@ export function createAssignedNativeWebStartup(input: {
             throw new PersonVmError('CLEANUP_INCOMPLETE', { cause: error });
           // An open that could not join its own resources cannot be certified
           // by the successfully returned owners. Keep that unknown group.
-          if (!group.unjoinedOpen && !group.retiring)
+          if (!group.unjoinedOpen && !group.unjoinedGuest && !group.retiring)
             running.delete(binding.vmId);
           throw error;
         }
@@ -394,10 +561,14 @@ export function createAssignedNativeWebStartup(input: {
       if (group.retiring) return group.retiring;
       const operation = (async () => {
         signal.throwIfAborted();
-        await Promise.allSettled([group.starting]);
+        await Promise.allSettled([
+          group.starting,
+          group.updating,
+          group.stopArchive?.(),
+        ]);
         const joined = await Promise.allSettled(
-          [...group.owners.values()].map((owner) =>
-            owner.retireAfterNativeStop(binding, signal),
+          [...group.owners.values(), ...group.unpublished.values()].map(
+            (owner) => owner.retireAfterNativeStop(binding, signal),
           ),
         );
         if (
@@ -442,6 +613,28 @@ export function createAssignedNativeWebStartup(input: {
         ...[...group.owners.values()].map((owner) => owner.revoked),
       ]);
     },
+    assertAuthenticatedEntry(
+      binding: PersonVmBinding,
+      employeeInstanceId: string,
+      signal: AbortSignal,
+    ) {
+      signal.throwIfAborted();
+      if (!running.get(binding.vmId)?.slots)
+        return this.assertAuthenticatedGroup(binding, signal);
+      const { revoked } = this.catalog(binding, employeeInstanceId);
+      revoked.throwIfAborted();
+      return revoked;
+    },
+    isLiveSlottedBinding(binding: PersonVmBinding) {
+      const group = running.get(binding.vmId);
+      return (
+        !!group?.slots &&
+        group.ready &&
+        !group.retiring &&
+        !group.revoked.signal.aborted &&
+        sameVmBinding(group.binding, binding)
+      );
+    },
     assertVerifiedEditor(
       binding: PersonVmBinding,
       signal: AbortSignal,
@@ -466,10 +659,220 @@ export function createAssignedNativeWebStartup(input: {
         !proof ||
         proof.aborted ||
         !group.owners.size ||
-        [...group.owners.values()].some((owner) => !owner.controlReady())
+        (employeeInstanceId !== undefined &&
+          !group.owners.get(employeeInstanceId)?.controlReady())
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
+    },
+    needsEmployee(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+    ) {
+      const group = running.get(binding.vmId);
+      if (
+        !input.hotGuest ||
+        !group?.slots ||
+        !group.ready ||
+        group.retiring ||
+        !sameVmBinding(group.binding, binding) ||
+        context.actor.type !== 'user' ||
+        context.actor.id !== binding.personId ||
+        context.organizationId !== binding.organizationId
+      )
+        return false;
+      const receipt =
+        group.added.get(identity.employeeInstanceId) ?? group.receipt;
+      return (
+        group.blockedEmployees.has(identity.employeeInstanceId) ||
+        !group.owners.get(identity.employeeInstanceId)?.controlReady() ||
+        !receipt.endpoints.some((endpoint) => sameEmployee(endpoint, identity))
+      );
+    },
+    synchronizeEmployee(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+      check: (signal: AbortSignal) => Promise<void>,
+      caller: AbortSignal,
+    ) {
+      const group = running.get(binding.vmId);
+      const slots = group?.slots;
+      const guest = input.hotGuest;
+      if (
+        !group ||
+        !slots ||
+        !guest ||
+        !this.needsEmployee(context, binding, identity)
+      )
+        return Promise.resolve();
+      return update(group, async () => {
+        const signal = AbortSignal.any([
+          caller,
+          lifetime,
+          group.revoked.signal,
+        ]);
+        const rosterFor = input.readRoster ?? readPersonNativeWebRoster;
+        const scope = {
+          binding,
+          signal,
+          async assertCurrent() {
+            signal.throwIfAborted();
+            if (
+              running.get(binding.vmId) !== group ||
+              !group.ready ||
+              group.retiring ||
+              !sameVmBinding(group.binding, binding)
+            )
+              throw new PersonVmError('LEASE_LOST');
+            await check(signal);
+            signal.throwIfAborted();
+          },
+        };
+        await scope.assertCurrent();
+        const employeeId = identity.employeeInstanceId;
+        if (group.blockedEmployees.has(employeeId))
+          throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+        const roster = await rosterFor(context);
+        const selected = roster.entries.find((entry) =>
+          sameEmployee(entry, identity),
+        );
+        if (
+          !selected ||
+          roster.personId !== binding.personId ||
+          roster.organizationId !== binding.organizationId
+        )
+          throw new PersonVmError('AUTHORIZATION_DENIED');
+        await guest.assertWebEndpoints({ ...group.receipt, slots }, signal);
+        await scope.assertCurrent();
+        const physicalSlot = (endpoint: Endpoint) =>
+          slots.find(
+            (slot) =>
+              slot.hostPort === endpoint.hostPort &&
+              slot.guestPort === endpoint.guestPort,
+          );
+        const existing = group.owners.get(employeeId);
+        let slot: (typeof slots)[number] | undefined;
+        if (existing) {
+          const prior = ownerEndpoint(group, employeeId);
+          if (!prior) throw new PersonVmError('CLEANUP_INCOMPLETE');
+          const sameRevision = sameEmployee(selected, prior);
+          if (sameRevision && existing.controlReady()) return;
+          slot = physicalSlot(prior);
+          if (!slot) throw new PersonVmError('CLEANUP_INCOMPLETE');
+          const joined = existing.retireAfterJobExit(binding);
+          if (!joined)
+            throw new PersonVmError(
+              sameRevision ? 'RUNTIME_NOT_READY' : 'WEB_ENDPOINTS_PREPARING',
+            );
+          await retireEmployee(group, prior, () => joined);
+          await scope.assertCurrent();
+        }
+        // A roster can omit an occupied sibling. Only an exact committed
+        // archive can retire a different employee under this allocation lock.
+        const occupied = new Set(group.blockedEmployees.values());
+        for (const id of group.owners.keys()) {
+          const endpoint = ownerEndpoint(group, id);
+          if (!endpoint) throw new PersonVmError('CLEANUP_INCOMPLETE');
+          occupied.add(endpoint.hostPort);
+        }
+        slot ??= slots.find((slot) => !occupied.has(slot.hostPort));
+        if (!slot && input.archive) {
+          for (const [id, owner] of group.owners) {
+            if (group.blockedEmployees.has(id)) continue;
+            const prior = ownerEndpoint(group, id);
+            if (!prior) throw new PersonVmError('CLEANUP_INCOMPLETE');
+            const candidate = physicalSlot(prior);
+            if (!candidate || !(await confirmArchive(group, prior))) continue;
+            await scope.assertCurrent();
+            try {
+              await retireEmployee(group, prior, () =>
+                joinArchivedOwner(group, owner),
+              );
+            } catch {
+              // The archived owner's quarantine retains this slot. B has not
+              // dispatched work and does not own A's unknown cleanup.
+              continue;
+            }
+            slot = candidate;
+            await scope.assertCurrent();
+            break;
+          }
+        }
+        if (!slot) throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+        const endpoint = Object.freeze({ ...selected, ...slot });
+        const profile = await input.readEmployeeProfile(signal);
+        const memory = await input.memoryGuestPlan(binding, signal);
+        const model = await modelAdapter?.(binding, signal);
+        const launch = await prepareEmployee(
+          binding,
+          endpoint,
+          profile,
+          memory,
+          model,
+        );
+        await scope.assertCurrent();
+        let owner: NativeWebOwner | undefined;
+        let openingOwner = false;
+        try {
+          const launcher = await guest.bootstrap(scope, memory, {
+            employeeInstanceId: endpoint.employeeInstanceId,
+            files: launch.files,
+          });
+          if (!launcher.readNativeWebGuestAddress)
+            throw new PersonVmError('PROVIDER_FAILED');
+          const guestAddress = await launcher.readNativeWebGuestAddress(
+            AbortSignal.any([
+              signal,
+              AbortSignal.timeout(input.configuration.startupTimeoutMs),
+            ]),
+          );
+          openingOwner = true;
+          owner = await openEmployee(
+            { ...scope, ...launcher },
+            nativeWebLaunchOnGuest(launch, guestAddress),
+            context,
+          );
+          await scope.assertCurrent();
+          const current = await rosterFor(context);
+          if (!current.entries.some((entry) => sameEmployee(entry, endpoint)))
+            throw new PersonVmError('AUTHORIZATION_DENIED');
+          await scope.assertCurrent();
+          group.added.set(
+            endpoint.employeeInstanceId,
+            Object.freeze({
+              binding: group.binding,
+              rosterDigest: roster.digest,
+              endpoints: Object.freeze([endpoint]),
+            }),
+          );
+          group.owners.set(endpoint.employeeInstanceId, owner);
+        } catch (error) {
+          try {
+            await owner?.close();
+          } catch (cause) {
+            group.blockedEmployees.set(employeeId, slot.hostPort);
+            if (owner) group.unpublished.set(slot.hostPort, owner);
+            throw new PersonVmError('CLEANUP_INCOMPLETE', { cause });
+          }
+          if (
+            error instanceof PersonVmError &&
+            error.code === 'CLEANUP_INCOMPLETE'
+          ) {
+            group.blockedEmployees.set(employeeId, slot.hostPort);
+            // A physical stop proves guest work exited, but cannot join local
+            // transport resources from an owner open that returned no handle.
+            if (
+              !openingOwner ||
+              error instanceof NativeWebGuestLaunchUnacknowledged
+            )
+              group.unjoinedGuest = true;
+            else if (!owner) group.unjoinedOpen = true;
+          }
+          throw error;
+        }
+      });
     },
     ensureVerifiedEditor(
       context: RequestContext,
@@ -540,15 +943,17 @@ export function createAssignedNativeWebStartup(input: {
         !sameVmBinding(group.binding, binding)
       )
         throw new PersonVmError('LEASE_LOST');
-      if (!group.ready) throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+      if (!group.ready || group.blockedEmployees.has(employeeInstanceId))
+        throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
       const owner = group.owners.get(employeeInstanceId);
-      const endpoint = group.receipt.endpoints.find(
+      const receipt = group.added.get(employeeInstanceId) ?? group.receipt;
+      const endpoint = receipt.endpoints.find(
         (entry) => entry.employeeInstanceId === employeeInstanceId,
       );
       if (!owner || !endpoint || !owner.controlReady())
         throw new PersonVmError('RUNTIME_NOT_READY');
       return Object.freeze({
-        receipt: group.receipt,
+        receipt,
         endpoint,
         bindingRef: group.bindingRef,
         revoked: AbortSignal.any([
@@ -566,10 +971,14 @@ export function createAssignedNativeWebStartup(input: {
       return [...running.values()].flatMap((group) => {
         if (!group.ready || group.retiring || group.revoked.signal.aborted)
           return [];
-        return group.receipt.endpoints.flatMap((endpoint) => {
-          const owner = group.owners.get(endpoint.employeeInstanceId);
-          if (!owner?.modelAdapterId || !owner.controlReady()) return [];
-          return [this.catalog(group.binding, endpoint.employeeInstanceId)];
+        return [...group.owners].flatMap(([employeeInstanceId, owner]) => {
+          if (
+            group.blockedEmployees.has(employeeInstanceId) ||
+            !owner.modelAdapterId ||
+            !owner.controlReady()
+          )
+            return [];
+          return [this.catalog(group.binding, employeeInstanceId)];
         });
       });
     },
@@ -591,6 +1000,7 @@ export function createAssignedNativeWebStartup(input: {
         !sameVmBinding(group.binding, binding)
       )
         throw new PersonVmError('LEASE_LOST');
+      if (group.blockedEmployees.has(employeeInstanceId)) return undefined;
       return group.owners.get(employeeInstanceId);
     },
     async close() {
@@ -614,6 +1024,18 @@ export function createAssignedNativeWebStartup(input: {
       signal: AbortSignal,
       employeeInstanceId?: string,
     ): AbortSignal;
+    needsEmployee(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+    ): boolean;
+    synchronizeEmployee(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+      check: (signal: AbortSignal) => Promise<void>,
+      caller: AbortSignal,
+    ): Promise<void>;
     ensureVerifiedEditor(
       context: RequestContext,
       binding: PersonVmBinding,
@@ -624,6 +1046,12 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       signal: AbortSignal,
     ): AbortSignal;
+    assertAuthenticatedEntry(
+      binding: PersonVmBinding,
+      employeeInstanceId: string,
+      signal: AbortSignal,
+    ): AbortSignal;
+    isLiveSlottedBinding(binding: PersonVmBinding): boolean;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,

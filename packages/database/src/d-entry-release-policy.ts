@@ -18,6 +18,7 @@ import {
   getEmployeeInstance,
   readEmployeeVersionPublication,
 } from './employees/employee-instances.ts';
+import { assertNativeWebRolloutCapacity } from './employees/native-web-capacity.ts';
 import { requireCurrentPlatformAdmin } from './platform-authority.ts';
 
 // The existing platform release store is shared by Web and Worker. No process
@@ -68,6 +69,18 @@ export async function updateDEntryReleasePolicy(
   await getDatabase().begin(async (tx) => {
     const actor = await requireCurrentPlatformAdmin(context, tx);
     await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
+    const [stored] = await tx`select value from allrice_settings
+      where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}`;
+    const previous = DEntryRolloutPolicySchema.safeParse(stored?.value);
+    // A valid replacement can repair an unreadable policy. In that case every
+    // candidate selection must pass the capacity check as a new release.
+    await assertNativeWebRolloutCapacity(
+      tx,
+      previous.success && previous.data.defaultGeneration === '3.x'
+        ? previous.data
+        : disabledPolicy,
+      policy,
+    );
     const [setting] =
       await tx`insert into allrice_settings(scope_type,key,value,updated_by)
       values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})

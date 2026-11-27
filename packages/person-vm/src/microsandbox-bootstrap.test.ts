@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
+import type * as Filesystem from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -11,6 +12,11 @@ import {
 } from './guest-bootstrap.ts';
 import { bootstrapMicrosandbox } from './microsandbox-bootstrap.ts';
 import { harness } from './test-support.ts';
+
+vi.mock('node:fs/promises', async (original) => {
+  const filesystem = await original<typeof Filesystem>();
+  return { ...filesystem, rm: vi.fn(filesystem.rm) };
+});
 
 const probeId = 'job_ethernet';
 const plan = {
@@ -244,4 +250,65 @@ it('joins the exact probe on scope retirement before the startup lease can close
     releaseCleanup.release();
   }
   await error;
+});
+
+it('keeps an unjoined hot stage classified as unsafe if the local directory cannot be removed', async () => {
+  const f = fixture();
+  const waitError = Error('original native wait failed');
+  const joinError = Error('exact job exit unknown');
+  const directoryError = Error('local stage removal failed');
+  const native = f.command.getMockImplementation()!;
+  let waited = false;
+  f.command.mockImplementation(async (args, signal) => {
+    if (args[0] === 'wait') {
+      expect(args[3]).toBe('job_init');
+      if (waited) throw joinError;
+      waited = true;
+      throw waitError;
+    }
+    if (args[0] === 'kill') {
+      expect(args[3]).toBe('job_init');
+      return '';
+    }
+    return native(args, signal);
+  });
+  vi.mocked(rm).mockRejectedValueOnce(directoryError);
+  const employeeInstanceId = randomUUID();
+  await expect(
+    bootstrapMicrosandbox({
+      scope: f.scope,
+      plan,
+      stagingRoot: root,
+      name: `allrice-${f.binding.vmId}`,
+      cleanupTimeoutMs: 2000,
+      command: f.command,
+      employee: {
+        employeeInstanceId,
+        files: [
+          {
+            path: `/work/.allrice/employees/${employeeInstanceId}/dsh/profile.json`,
+            contents: '{}',
+            mode: 0o600,
+          },
+        ],
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: 'CLEANUP_INCOMPLETE',
+    cause: {
+      errors: [
+        {
+          code: 'CLEANUP_INCOMPLETE',
+          cause: { errors: [waitError, joinError] },
+        },
+        directoryError,
+      ],
+    },
+  });
+  expect(f.command.mock.calls.map(([args]) => args[0])).toEqual([
+    'exec',
+    'wait',
+    'kill',
+    'wait',
+  ]);
 });

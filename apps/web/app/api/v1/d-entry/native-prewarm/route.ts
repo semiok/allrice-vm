@@ -2,6 +2,7 @@ import {
   DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmInputSchema,
   DEntryNativePrewarmResultSchema,
+  DEntryNativePrewarmStatusSchema,
   sameDEntryIdentity,
 } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
@@ -30,6 +31,18 @@ export async function POST(request: Request) {
     const response = await requestDEntryWorker(input, 'native-prewarm', {
       trigger,
     });
+    if (response.status === 410) {
+      const result = await readDEntryWorkerJson(
+        response,
+        DEntryNativePrewarmStatusSchema.parse,
+      );
+      if (result.state !== 'expired')
+        throw new DEntryDependencyUnavailable('native-route');
+      return Response.json(result, {
+        status: 410,
+        headers: { 'cache-control': 'private, no-store' },
+      });
+    }
     if (response.status !== 202 && response.status !== 200)
       throw new DEntryDependencyUnavailable('native-route');
     const result = await readDEntryWorkerJson(response, (value) =>

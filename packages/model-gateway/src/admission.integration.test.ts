@@ -562,6 +562,7 @@ suite('MET268 formal PG host with gateway HTTP/native composition', () => {
       '0247_person_virtual_machines.sql',
       '0248_model_gateway_attempts.sql',
       '0250_person_vm_admission.sql',
+      '0259_person_vm_verified_web_slot_capacity.sql',
     ])
       await db.unsafe(
         await readFile(

@@ -6,15 +6,21 @@ import {
   type DEntryNativePrewarmTicket,
   type RequestContext,
 } from '@allrice/contracts';
-import { DataAccessError } from '@allrice/database';
+import { DataAccessError, DEntryTicketObserverClosed } from '@allrice/database';
 import type { PersonVmPrewarmTarget } from '@allrice/person-vm';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
+export type PrewarmVerificationMode =
+  'authority' | 'operation' | 'ready' | 'reuse';
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
   running?: boolean;
+  /** In-process observations only. The HTTP response carries just the ticket. */
+  orphanedInstanceId?: string;
+  observeTerminalFailure?: true;
+  reuse?: PrewarmPlan;
   assertTicketThread?(signal: AbortSignal): Promise<void>;
 };
 
@@ -42,7 +48,7 @@ export interface DEntryNativePrewarmPort {
     identity: DEntryIdentity,
     plan: PrewarmPlan,
     signal: AbortSignal,
-    mode: 'authority' | 'operation' | 'ready',
+    mode: PrewarmVerificationMode,
   ): Promise<boolean>;
   prewarm(
     context: RequestContext,
@@ -89,6 +95,7 @@ export function createPrewarmOperations(
     plan: PrewarmPlan;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
+    deadline: AbortSignal;
     replies: number;
     published: boolean;
     state: DEntryNativePrewarmStatus;
@@ -96,13 +103,16 @@ export function createPrewarmOperations(
     proof?: AbortSignal;
     settled?: Promise<void>;
     closeJoin?: Promise<boolean>;
-    release(): Promise<boolean>;
+    closedOnDeadline?: true;
+    release(cause?: 'expired'): Promise<boolean>;
   };
   const tickets = new Map<string, Operation>();
   const pending = new Set<Promise<void>>();
   const lifetimeReleases = new Set<Promise<boolean>>();
   const active = (entry: Operation) =>
     entry.state.state === 'accepted' || entry.state.state === 'starting';
+  const expired = (entry: Operation, now = Date.now()) =>
+    entry.deadline.aborted || entry.expires <= now;
   const belongs = (
     entry: Operation,
     context: RequestContext,
@@ -134,6 +144,77 @@ export function createPrewarmOperations(
   }
 
   return {
+    reuse(
+      context: RequestContext,
+      identity: DEntryIdentity,
+      prior: PrewarmPlan,
+    ) {
+      const entry = [...tickets.values()].find((entry) => entry.plan === prior);
+      if (
+        !entry ||
+        expired(entry) ||
+        entry.revoked.aborted ||
+        !belongs(entry, context, identity)
+      )
+        return;
+      const mode = ():
+        Exclude<PrewarmVerificationMode, 'authority'> | undefined => {
+        if (active(entry)) return 'reuse';
+        if (entry.state.state === 'ready' && !entry.proof?.aborted)
+          return 'ready';
+        if (
+          entry.state.state === 'failed' &&
+          entry.state.code === 'START_UNAVAILABLE'
+        )
+          return 'operation';
+      };
+      return {
+        ...accepted(entry, false),
+        async observeThread(signal: AbortSignal) {
+          try {
+            await entry.plan.assertTicketThread?.(signal);
+            return true;
+          } catch (error) {
+            signal.throwIfAborted();
+            if (
+              error instanceof DEntryTicketObserverClosed &&
+              entry.closedOnDeadline
+            ) {
+              entry.revoked.throwIfAborted();
+              return false;
+            }
+            throw error;
+          }
+        },
+        assertNotRevoked() {
+          entry.revoked.throwIfAborted();
+        },
+        async recheck(
+          context: RequestContext,
+          identity: DEntryIdentity,
+          verify: (
+            mode: Exclude<PrewarmVerificationMode, 'authority'>,
+          ) => Promise<boolean>,
+        ) {
+          const live = () =>
+            tickets.get(entry.ticket.operationId) === entry &&
+            !expired(entry) &&
+            !entry.revoked.aborted &&
+            belongs(entry, context, identity);
+          const initial = mode();
+          if (!initial || !live()) return;
+          const verified = await verify(initial);
+          const current = mode();
+          // The original operation may settle while checking its live lease.
+          // Verify that exact terminal state before writing an accepted reply.
+          const valid =
+            current === initial
+              ? verified
+              : current && live() && (await verify(current));
+          if (valid) return () => live() && mode() === current;
+        },
+      };
+    },
     accept(
       context: RequestContext,
       identity: DEntryIdentity,
@@ -145,16 +226,18 @@ export function createPrewarmOperations(
       authority.revoked.throwIfAborted();
       const now = Date.now();
       for (const [id, entry] of tickets) {
-        if (entry.expires <= now) {
+        if (expired(entry, now)) {
           if (!active(entry)) {
             tickets.delete(id);
-            void entry.release();
+            void entry.release('expired');
           }
         } else if (
           active(entry) &&
           !entry.revoked.aborted &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
+          (!plan.orphanedInstanceId ||
+            entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
           (!plan.target.restoreRetained || entry.plan.target.restoreRetained) &&
           compatiblePrewarmGeneration(entry.plan.target, plan.target)
         ) {
@@ -177,23 +260,26 @@ export function createPrewarmOperations(
         expiresAt: new Date(expires).toISOString(),
         pollAfterMs: 1000,
       };
-      const signal = AbortSignal.any([
-        lifetime,
-        authority.revoked,
-        AbortSignal.timeout(lifetimeMs),
-      ]);
+      const deadline = AbortSignal.timeout(lifetimeMs);
+      const signal = AbortSignal.any([lifetime, authority.revoked, deadline]);
       const operation: Operation = {
         identity,
         sessionId: context.sessionId,
         plan,
         ticket,
         expires,
+        deadline,
         replies: 0,
         published: false,
         state: { state: 'accepted' },
         revoked: authority.revoked,
-        release() {
+        release(cause) {
           if (operation.closeJoin) return operation.closeJoin;
+          if (
+            cause === 'expired' ||
+            (deadline.aborted && signal.reason === deadline.reason)
+          )
+            operation.closedOnDeadline = true;
           signal.removeEventListener('abort', releaseExpired);
           const closing = Promise.resolve()
             .then(() => authority.close())
@@ -227,7 +313,11 @@ export function createPrewarmOperations(
         } catch {
           failed = true;
         }
-        if (!plan.assertTicketThread || failed || signal.aborted)
+        if (
+          signal.aborted ||
+          (!(failed && plan.observeTerminalFailure) &&
+            (!plan.assertTicketThread || failed))
+        )
           failed = !(await operation.release()) || failed;
         const reason: unknown = authority.revoked.reason;
         const denied =
@@ -259,18 +349,20 @@ export function createPrewarmOperations(
       verify: (plan: PrewarmPlan, ready: boolean) => Promise<boolean>,
     ): Promise<DEntryNativePrewarmStatus> {
       const entry = tickets.get(operationId);
-      if (!entry || entry.expires <= Date.now()) return { state: 'expired' };
+      if (!entry || expired(entry)) return { state: 'expired' };
       if (!belongs(entry, context, identity))
         throw new DataAccessError('not_found');
       const state = entry.state;
       const ready = state.state === 'ready';
+      const orphan = entry.plan.orphanedInstanceId !== undefined;
       if (
         !(await verify(entry.plan, ready)) ||
+        (orphan && entry.revoked.aborted) ||
         (ready && entry.proof?.aborted) ||
-        entry.expires <= Date.now()
+        expired(entry)
       )
         return { state: 'expired' };
-      if (state.state !== 'failed') {
+      if (state.state !== 'failed' || entry.plan.observeTerminalFailure) {
         try {
           await entry.plan.assertTicketThread?.(signal);
         } catch (error) {
@@ -278,11 +370,12 @@ export function createPrewarmOperations(
           // A normal failure joins and closes its observer. A concurrent poll
           // can have captured 'starting' immediately before that close.
           if (
+            !orphan &&
             !entry.revoked.aborted &&
             entry.closeJoin &&
             (entry.state.state === 'starting' ||
               entry.state.state === 'failed') &&
-            entry.expires > Date.now()
+            !expired(entry)
           )
             return entry.state;
           if (!entry.revoked.aborted && !(error instanceof DataAccessError))
@@ -290,7 +383,16 @@ export function createPrewarmOperations(
           return { state: 'expired' };
         }
       }
-      if (entry.expires <= Date.now() || (ready && entry.proof?.aborted))
+      // A release can be replaced or lose its unlock proof while the thread
+      // guard joins. Verify that exact orphan again after the async guard.
+      if (
+        (orphan &&
+          (entry.revoked.aborted ||
+            !(await verify(entry.plan, entry.state.state === 'ready')))) ||
+        expired(entry) ||
+        (orphan && entry.revoked.aborted) ||
+        (ready && entry.proof?.aborted)
+      )
         return { state: 'expired' };
       return entry.state.state === 'failed' ? entry.state : state;
     },

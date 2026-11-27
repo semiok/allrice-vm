@@ -1,6 +1,7 @@
 import type { RequestContext } from '@allrice/contracts';
 import { DataAccessError } from './data.ts';
 import {
+  NativeWebGuestLaunchUnacknowledged,
   PersonVmError,
   type PersonVmAdmissionBoundary,
   type PersonVmAdmissionPermit,
@@ -85,6 +86,9 @@ async function ownedOutcome<T>(
     try {
       await close();
     } catch (error) {
+      // Only the exact error from the actual close may carry trusted evidence
+      // of local join. Its guest work still requires the physical-stop owner.
+      if (error instanceof NativeWebGuestLaunchUnacknowledged) throw error;
       if (!outcome.ok || signal.aborted) {
         const original = outcome.ok ? signal.reason : outcome.error;
         throw new AggregateError(

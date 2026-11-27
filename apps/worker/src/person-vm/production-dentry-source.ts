@@ -17,6 +17,7 @@ import {
   PersonVmError,
   sameVmBinding,
   type PersonVmBinding,
+  type PersonVmPort,
   type PersonVmRuntimePort,
   type PersonVmService,
 } from '@allrice/person-vm';
@@ -79,7 +80,14 @@ function sameSession(a: RequestContext, b: RequestContext) {
  * send only generated operations on the admitted non-owner principal.
  */
 export function installProductionDEntrySource(input: {
-  startup: Startup;
+  startup: Startup &
+    Partial<
+      Pick<
+        ReturnType<typeof createAssignedNativeWebStartup>,
+        'needsEmployee' | 'synchronizeEmployee' | 'assertAuthenticatedEntry'
+      >
+    >;
+  vm?: Pick<PersonVmPort, 'resolve' | 'assertCurrentBinding'>;
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
@@ -132,13 +140,79 @@ export function installProductionDEntrySource(input: {
     return catalog.owner;
   }
 
+  async function startSelectedEmployee(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    signal: AbortSignal,
+    expectedBinding?: PersonVmBinding,
+  ) {
+    const vm = input.vm;
+    const start = input.startup.synchronizeEmployee?.bind(input.startup);
+    if (!vm || !start) return;
+    const binding = await vm.resolve(context, signal);
+    if (expectedBinding && !sameVmBinding(binding, expectedBinding))
+      throw new PersonVmError('LEASE_LOST');
+    if (!input.startup.needsEmployee?.(context, binding, identity)) return;
+    const selection = {
+      workspaceId: identity.workspaceId,
+      employeeInstanceId: identity.employeeInstanceId,
+      ...(identity.threadId && { threadId: identity.threadId }),
+    };
+    const check = async (active: AbortSignal) => {
+      const current = await requireDEntryNativeIdentity(context, selection);
+      if (!sameDEntryIdentity(current, identity)) denied();
+      await vm.assertCurrentBinding(context, binding, active);
+      active.throwIfAborted();
+    };
+    await runDEntryAdmittedActivity(
+      {
+        ports: port.admission,
+        signal,
+        owner: {
+          binding,
+          context,
+          operationId: randomUUID(),
+          revoked: lifetime,
+          assertCurrent: check,
+          assertUndispatched: check,
+        },
+      },
+      () => {
+        const stop = new AbortController();
+        let work: Promise<void> | undefined;
+        return {
+          run(active) {
+            return (work = start(
+              context,
+              binding,
+              identity,
+              check,
+              AbortSignal.any([active, stop.signal]),
+            ));
+          },
+          async close() {
+            stop.abort();
+            const [joined] = await Promise.allSettled([work]);
+            if (
+              joined.status === 'rejected' &&
+              joined.reason instanceof PersonVmError &&
+              joined.reason.code === 'CLEANUP_INCOMPLETE'
+            )
+              throw joined.reason;
+          },
+        };
+      },
+    );
+  }
+
   const port: DEntryNativeDataPort = {
     admission: {
       boundary: input.admission,
       participant: input.admission.participant('entry'),
     },
-    assertEditorReady(context, identity, signal) {
+    assertEditorReady(context, identity, signal, expectedBinding) {
       return own(signal, async (active) => {
+        await startSelectedEmployee(context, identity, active, expectedBinding);
         const current = await currentDEntryNativeOwner(
           dEntryNativeOwnerPort,
           context,
@@ -146,17 +220,22 @@ export function installProductionDEntrySource(input: {
           active,
         );
         const binding = current.view.receipt.binding;
+        if (expectedBinding && !sameVmBinding(binding, expectedBinding))
+          throw new PersonVmError('LEASE_LOST');
         const proof = await input.startup.ensureVerifiedEditor(
           context,
           binding,
           identity.employeeInstanceId,
           current.signal,
         );
-        const group = input.startup.assertAuthenticatedGroup(
-          binding,
-          current.signal,
-        );
-        return AbortSignal.any([current.signal, proof, group]);
+        const authenticated = input.startup.assertAuthenticatedEntry
+          ? input.startup.assertAuthenticatedEntry(
+              binding,
+              identity.employeeInstanceId,
+              current.signal,
+            )
+          : input.startup.assertAuthenticatedGroup(binding, current.signal);
+        return AbortSignal.any([current.signal, proof, authenticated]);
       });
     },
     resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {

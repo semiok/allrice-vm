@@ -81,7 +81,11 @@ export function employeeAccessTransaction<T>(
 export async function cancelEmployeeAccessRuns(
   tx: postgres.TransactionSql,
   scope: { organizationId: string; workspaceId: string } & (
-    | { employeeId: string; inactiveAssignmentsOnly?: boolean }
+    | {
+        employeeId: string;
+        inactiveAssignmentsOnly?: boolean;
+        personIds?: readonly string[];
+      }
     | { instanceId: string }
   ),
   reason: string,
@@ -96,7 +100,9 @@ export async function cancelEmployeeAccessRuns(
       and ${
         'instanceId' in scope
           ? tx`coalesce(s.employee_instance_id,a.id)=${scope.instanceId}`
-          : tx`a.employee_id=${scope.employeeId} ${scope.inactiveAssignmentsOnly ? tx`and not a.active` : tx``}`
+          : tx`a.employee_id=${scope.employeeId}
+            ${scope.inactiveAssignmentsOnly ? tx`and not a.active` : tx``}
+            ${scope.personIds ? tx`and a.user_id=any(${tx.array([...scope.personIds])}::uuid[])` : tx``}`
       }
       and (j.status not in ('succeeded','failed','dead_letter','canceled')
         or (j.status='succeeded' and j.payload->'input' ? 'repositoryReviewRequestId'))

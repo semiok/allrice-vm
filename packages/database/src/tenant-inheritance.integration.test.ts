@@ -176,6 +176,7 @@ suite(
             await synchronizeTenantMembershipAccess(tx, {
               organizationId: tenant.organizationId,
               workspaceId: historical.workspaceId,
+              personIds: [row!.id],
             });
             return row!;
           });
