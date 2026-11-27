@@ -24,7 +24,7 @@ export type PrewarmVerificationMode =
   | 'waiting';
 type PrewarmReadMode = Exclude<
   PrewarmVerificationMode,
-  'authority' | 'issue' | 'reuse' | 'waiting'
+  'authority' | 'issue' | 'reuse'
 >;
 type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
@@ -97,6 +97,7 @@ export function observedPrewarmTarget({
 function readMode(status: DEntryNativePrewarmStatus): PrewarmReadMode {
   if (status.state === 'ready') return 'ready';
   if (status.state === 'failed') return 'failed';
+  if (status.state === 'waiting_for_capacity') return 'waiting';
   return 'operation';
 }
 
@@ -200,10 +201,10 @@ export function createPrewarmOperations(
     entry.state.state === 'accepted' ||
     entry.state.state === 'starting' ||
     entry.state.state === 'waiting_for_capacity';
-  const expired = (entry: Operation, now = Date.now()) =>
-    entry.cancellation.signal.aborted ||
-    entry.deadline.aborted ||
-    entry.expires <= now;
+  const timedOut = (entry: Operation, now = Date.now()) =>
+    entry.deadline.aborted || entry.expires <= now;
+  const expired = (entry: Operation) =>
+    entry.cancellation.signal.aborted || timedOut(entry);
   const belongs = (
     entry: Operation,
     context: RequestContext,
@@ -420,7 +421,7 @@ export function createPrewarmOperations(
       authority.revoked.throwIfAborted();
       const now = Date.now();
       for (const [id, entry] of tickets) {
-        if (expired(entry, now)) {
+        if (timedOut(entry, now)) {
           if (!active(entry)) {
             tickets.delete(id);
             void entry.release('expired');
@@ -430,12 +431,13 @@ export function createPrewarmOperations(
       if (pending.size >= 256) throw new DEntryNativeUnavailable();
       if (tickets.size >= 2048) {
         for (const [id, entry] of tickets) {
-          if (active(entry)) continue;
+          if (active(entry) || entry.cancellationFailed) continue;
           tickets.delete(id);
           void entry.release();
           break;
         }
       }
+      if (tickets.size >= 2048) throw new DEntryNativeUnavailable();
       const lifetimeMs = 10 * 60_000;
       const expires = now + lifetimeMs;
       const ticket = {
@@ -520,8 +522,13 @@ export function createPrewarmOperations(
           signal.aborted ||
           (!(failed && plan.observeTerminalFailure) &&
             (!plan.assertTicketThread || failed))
-        )
-          failed = !(await operation.release()) || failed;
+        ) {
+          if (!(await operation.release())) {
+            failed = true;
+            if (cancellation.signal.aborted)
+              operation.cancellationFailed = true;
+          }
+        }
         const reason: unknown = authority.revoked.reason;
         const denied =
           reason instanceof DataAccessError &&
@@ -557,8 +564,19 @@ export function createPrewarmOperations(
       const state = entry.state;
       const ready = state.state === 'ready';
       const orphan = entry.plan.orphanedInstanceId !== undefined;
+      const verifyRead = async (sample: DEntryNativePrewarmStatus) => {
+        if (await verify(entry.plan, readMode(sample))) return sample;
+        // A lifecycle lease temporarily hides the capacity reason. The
+        // original operation may still be current and must not be expired.
+        if (
+          sample.state === 'waiting_for_capacity' &&
+          (await verify(entry.plan, 'operation'))
+        )
+          return { state: 'starting' } as const;
+      };
+      const observed = await verifyRead(state);
       if (
-        !(await verify(entry.plan, readMode(state))) ||
+        !observed ||
         ((orphan || state.state === 'waiting_for_capacity') &&
           entry.revoked.aborted) ||
         (ready && entry.proof?.aborted) ||
@@ -583,12 +601,10 @@ export function createPrewarmOperations(
             (active(entry) || closing.state === 'failed') &&
             !expired(entry)
           ) {
-            if (
-              !(await verify(entry.plan, readMode(closing))) ||
-              expired(entry)
-            )
-              return { state: 'expired' };
-            return closing;
+            const verified = await verifyRead(closing);
+            return verified && !expired(entry)
+              ? verified
+              : { state: 'expired' };
           }
           if (!entry.revoked.aborted && !(error instanceof DataAccessError))
             throw new DEntryNativeUnavailable();
@@ -598,8 +614,9 @@ export function createPrewarmOperations(
       // Deletion or an orphan release can advance while the thread guard joins.
       const latest = entry.state;
       const recheck = orphan || watchThread || latest !== state;
+      const verified = recheck ? await verifyRead(latest) : observed;
       if (
-        (recheck && !(await verify(entry.plan, readMode(latest)))) ||
+        !verified ||
         expired(entry) ||
         ((orphan || latest.state === 'waiting_for_capacity') &&
           entry.revoked.aborted) ||
@@ -611,7 +628,7 @@ export function createPrewarmOperations(
         state.state === 'waiting_for_capacity' ||
         latest.state === 'waiting_for_capacity'
       )
-        return entry.state === latest ? latest : { state: 'starting' };
+        return entry.state === latest ? verified : { state: 'starting' };
       return state;
     },
     async cancel(
@@ -630,7 +647,8 @@ export function createPrewarmOperations(
       );
       signal.throwIfAborted();
       const entry = tickets.get(operationId);
-      if (!entry || !belongs(entry, context, identity)) return status;
+      if (!entry || !belongs(entry, context, identity) || timedOut(entry))
+        return status;
       if (!entry.cancellation.signal.aborted) {
         if (status.state !== 'waiting_for_capacity') return status;
         if (expired(entry) || entry.revoked.aborted)

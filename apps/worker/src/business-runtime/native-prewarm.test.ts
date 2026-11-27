@@ -2141,6 +2141,7 @@ it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
     const aborted = deferred<void>();
     const joined = deferred<void>();
     let owned: AbortSignal | undefined;
+    let waitingCurrent = true;
     const otherToken = 'other_valid_login_token';
     const otherLogin = { ...f.base.context, sessionId: randomUUID() };
     const prewarm: DEntryNativePrewarmPort['prewarm'] = async (
@@ -2171,7 +2172,8 @@ it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
       authenticate: async (token) =>
         token === otherToken ? otherLogin : f.base.context,
       prewarm: {
-        isCurrent: async () => true,
+        isCurrent: async (_context, _identity, _plan, _signal, mode) =>
+          mode !== 'waiting' || waitingCurrent,
         prepare: async () => ({ key: 'exact-wait', target: f.base.binding }),
         prewarm,
       },
@@ -2197,6 +2199,13 @@ it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
         expect(foreign.status).toBe(410);
         expect(await foreign.json()).toEqual({ state: 'expired' });
       }
+      waitingCurrent = false;
+      for (const method of ['GET', 'DELETE'] as const) {
+        const guarded = await prewarmStatus(server, id, undefined, method);
+        expect(guarded.status).toBe(200);
+        expect(await guarded.json()).toEqual({ state: 'starting' });
+      }
+      waitingCurrent = true;
       expect(owned?.aborted).toBe(false);
       if (outcome === 'dispatch') {
         advance.resolve();
@@ -2217,12 +2226,28 @@ it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
         expect(f.base.authorityClose).not.toHaveBeenCalled();
         joined.resolve();
         const cancelled = await cancelling;
-        if (outcome === 'cleanup failure') expect(cancelled.status).toBe(503);
-        else {
+        if (outcome === 'cleanup failure') {
+          expect(cancelled.status).toBe(503);
+          expect(
+            (
+              await server.request(
+                'native-prewarm',
+                {
+                  ...f.base.body,
+                  trigger: 'page',
+                },
+                { authorization: `Bearer ${otherToken}` },
+              )
+            ).status,
+          ).toBe(202);
+          expect(
+            (await prewarmStatus(server, id, undefined, 'DELETE')).status,
+          ).toBe(503);
+        } else {
           expect(cancelled.status).toBe(410);
           expect(await cancelled.json()).toEqual({ state: 'expired' });
         }
-        expect(f.base.authorityClose).toHaveBeenCalledOnce();
+        expect(f.base.authorityClose).toHaveBeenCalled();
         expect((await prewarmStatus(server, id)).status).toBe(410);
       }
     } finally {
