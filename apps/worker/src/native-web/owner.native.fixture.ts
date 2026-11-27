@@ -473,7 +473,7 @@ export async function setupNativeWebFixture(
           const message = visible.slice(start);
           const safe =
             !visible.includes(root) &&
-            /^Native web auth publication failed \[(readiness|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
+            /^Native web auth publication failed \[(readiness|workspace|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
               message,
             );
           report(safe ? message : '<invalid auth diagnostic>');
