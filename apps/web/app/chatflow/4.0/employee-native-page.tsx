@@ -51,12 +51,51 @@ const closingNoticeMs = 10_000;
 type EntryWarmup = {
   lifetime: AbortController;
   result: Promise<void>;
+  readIdentity(): ReturnType<typeof readEmployeeEntryIdentity> | undefined;
   progress: {
     current?: EmployeePrewarmProgress;
     ticket?: DEntryNativePrewarmTicket;
     show?(state: EmployeePrewarmProgress): void;
   };
 };
+
+function startEntryWarmup(
+  selection: DEntrySelectionInput,
+  lifetime: AbortController,
+  ticket?: DEntryNativePrewarmTicket,
+): EntryWarmup {
+  const progress: EntryWarmup['progress'] = {};
+  let lookup:
+    | {
+        read: ReturnType<typeof readEmployeeEntryIdentity>;
+        cancel: AbortController;
+      }
+    | undefined;
+  const result = prewarmEmployeeEntry(selection, lifetime.signal, {
+    ticket,
+    accepted(accepted) {
+      // A cold or resumed operation needs a fresh identity after ready.
+      lookup?.cancel.abort();
+      lookup = undefined;
+      progress.ticket = accepted;
+    },
+    progress(state) {
+      progress.current = state;
+      progress.show?.(state);
+    },
+  });
+  void result.catch(() => {}); // setup reports the result for this selection.
+  if (selection.threadId && !ticket) {
+    const cancel = new AbortController();
+    const read = readEmployeeEntryIdentity(
+      selection,
+      AbortSignal.any([lifetime.signal, cancel.signal]),
+    );
+    void read.catch(() => {}); // hot ready can retry an earlier miss.
+    lookup = { read, cancel };
+  }
+  return { lifetime, result, progress, readIdentity: () => lookup?.read };
+}
 
 async function waitForVisibleEntry(signal: AbortSignal) {
   signal.throwIfAborted();
@@ -134,6 +173,7 @@ export function EmployeeNativePage({
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
+    let warmup = activation.warmup;
     let ticket = activation.ticket;
     let resumable = false;
     let superseded = false;
@@ -338,7 +378,7 @@ export function EmployeeNativePage({
         confirmedQuery: query === activeQuery ? selectedQuery : undefined,
         ticket:
           resumable && query === activeQuery
-            ? (ticket ?? activation.warmup?.progress.ticket)
+            ? (ticket ?? warmup?.progress.ticket)
             : undefined,
       });
     };
@@ -410,22 +450,9 @@ export function EmployeeNativePage({
           selectedEmployee?.workspaceId === next.data.workspaceId &&
           selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
         ) {
-          // A navigation from this verified employee can start qualification
-          // for the selected thread while the old page joins its transport.
-          // This request has no page-carrier or thread-creation side effect.
-          const lifetime = new AbortController();
-          const progress: EntryWarmup['progress'] = {};
-          const result = prewarmEmployeeEntry(next.data, lifetime.signal, {
-            accepted: (ticket) => {
-              progress.ticket = ticket;
-            },
-            progress(state) {
-              progress.current = state;
-              progress.show?.(state);
-            },
-          });
-          void result.catch(() => {}); // the next activation reports the result
-          nextWarmup = { lifetime, result, progress };
+          // Start exact-target reads while the old page joins. Neither read
+          // opens a carrier or creates a thread.
+          nextWarmup = startEntryWarmup(next.data, new AbortController());
         }
         // Both messages refer only to this exact iframe and page scope. The
         // carrier completion proves the remote side; terminate local entry
@@ -477,44 +504,14 @@ export function EmployeeNativePage({
     const showPrewarm = (state: EmployeePrewarmProgress) => {
       if (!lifetime.signal.aborted && !navigating) setStatus(state);
     };
-    let hotIdentity:
-      | {
-          read: ReturnType<typeof readEmployeeEntryIdentity>;
-          cancel: AbortController;
-        }
-      | undefined;
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
-          if (activation.warmup) {
-            const { progress, result } = activation.warmup;
-            progress.show = showPrewarm;
-            if (progress.current) showPrewarm(progress.current);
-            await result;
-          } else {
-            const warming = prewarmEmployeeEntry(selection, lifetime.signal, {
-              ticket,
-              accepted: (accepted) => {
-                // A cold start or resumed ticket needs a fresh identity
-                // after ready. Its first read may have preceded a long wait.
-                hotIdentity?.cancel.abort();
-                hotIdentity = undefined;
-                ticket = accepted;
-              },
-              progress: showPrewarm,
-            });
-            if (selection.threadId && !ticket) {
-              const cancel = new AbortController();
-              const read = readEmployeeEntryIdentity(
-                selection,
-                AbortSignal.any([lifetime.signal, cancel.signal]),
-              );
-              void read.catch(() => {}); // setup reports it after hot ready.
-              hotIdentity = { read, cancel };
-            }
-            await warming;
-          }
+          warmup ??= startEntryWarmup(selection, lifetime, ticket);
+          warmup.progress.show = showPrewarm;
+          if (warmup.progress.current) showPrewarm(warmup.progress.current);
+          await warmup.result;
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -526,8 +523,7 @@ export function EmployeeNativePage({
             lifetime.signal,
             () => {
               ticket = undefined;
-              if (activation.warmup)
-                activation.warmup.progress.ticket = undefined;
+              if (warmup) warmup.progress.ticket = undefined;
               setStatus('opening');
               timer = window.setTimeout(() => finish('failed'), entryWaitMs);
             },
@@ -539,7 +535,7 @@ export function EmployeeNativePage({
         params.set('threadId', selection.threadId);
         selectedQuery = params.toString();
       }
-      const speculative = await hotIdentity?.read.catch(() => undefined);
+      const speculative = await warmup?.readIdentity()?.catch(() => undefined);
       const identity =
         speculative ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
@@ -583,7 +579,7 @@ export function EmployeeNativePage({
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
-      if (activation.warmup) activation.warmup.progress.show = undefined;
+      if (warmup) warmup.progress.show = undefined;
       leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;

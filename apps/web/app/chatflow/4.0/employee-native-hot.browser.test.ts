@@ -10,7 +10,10 @@ import {
   sessionToken,
 } from '../../../../worker/src/d-entry/principal-page-carrier.fixture';
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
-import { pageEditorMounted } from '../../../lib/d-entry/page-messages';
+import {
+  pageEditorMounted,
+  pageNavigate,
+} from '../../../lib/d-entry/page-messages';
 
 const suite =
   process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
@@ -56,6 +59,7 @@ suite('4.0 browser entry with a running employee', () => {
       let readyPolls = 0;
       let hotTransient = false;
       let hotIdentities = 0;
+      let exerciseNavigation = false;
       const ticket = randomUUID();
       f.web.on('request', async (request, response) => {
         const address = new URL(request.url!, f.origin);
@@ -118,19 +122,50 @@ suite('4.0 browser entry with a running employee', () => {
                 }),
               );
           }
-          case '/api/v1/sessions':
+          case '/api/v1/sessions': {
             birthRequests++;
-            return response.writeHead(500).end();
+            if (!exerciseNavigation) return response.writeHead(500).end();
+            const timing = {
+              phase: 'new-thread',
+              start: performance.now(),
+              end: 0,
+            };
+            requests.push(timing);
+            const body: Buffer[] = [];
+            for await (const chunk of request) body.push(Buffer.from(chunk));
+            const { selection, operationId } = JSON.parse(
+              Buffer.concat(body).toString(),
+            );
+            expect(selection).toEqual({
+              workspaceId: f.selection.workspaceId,
+              employeeInstanceId: f.selection.employeeInstanceId,
+            });
+            expect(typeof operationId).toBe('string');
+            f.registerThread(operationId);
+            timing.end = performance.now();
+            return response
+              .writeHead(201, { 'content-type': 'application/json' })
+              .end(JSON.stringify({ ...selection, threadId: operationId }));
+          }
           case '/chatflow/4.0/document': {
             const scopeId = address.searchParams.get('scopeId');
             expect(scopeId).toBeTruthy();
-            expect(address.searchParams.get('threadId')).toBe(
-              f.selection.threadId,
-            );
+            const threadId = address.searchParams.get('threadId');
+            if (!exerciseNavigation)
+              expect(threadId).toBe(f.selection.threadId);
+            const selection = {
+              workspaceId: f.selection.workspaceId,
+              employeeInstanceId: f.selection.employeeInstanceId,
+            };
             requests.push({ phase: 'document', start: performance.now() });
             return html(`<!doctype html><head><script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script></head>
-            <body><div contenteditable="true" role="textbox" aria-label="消息"></div>
-            <script>parent.postMessage(${JSON.stringify({ type: pageEditorMounted, scopeId })}, location.origin)</script>`);
+            <body data-thread-id="${threadId}"><div contenteditable="true" role="textbox" aria-label="消息"></div>
+            <button id="create">新建对话</button><button id="previous">返回已有对话</button>
+            <script>
+              document.querySelector('#create').onclick = () => parent.postMessage(${JSON.stringify({ type: pageNavigate, scopeId, selection })}, location.origin);
+              document.querySelector('#previous').onclick = () => parent.postMessage(${JSON.stringify({ type: pageNavigate, scopeId, selection: f.selection })}, location.origin);
+              parent.postMessage(${JSON.stringify({ type: pageEditorMounted, scopeId })}, location.origin)
+            </script>`);
           }
           case '/outer.js':
           case '/outer.css': {
@@ -251,6 +286,151 @@ suite('4.0 browser entry with a running employee', () => {
             samples,
           }),
       );
+      exerciseNavigation = true;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const page = await context.newPage();
+        const cdp = await context.newCDPSession(page);
+        const wire = new Map<
+          string,
+          {
+            path: string;
+            start: number;
+            status?: number;
+            headers?: number;
+            end?: number;
+            bytes?: number;
+            cache?: boolean;
+          }
+        >();
+        const carriers: { event: string; at: number }[] = [];
+        cdp.on('Network.requestWillBeSent', (event) => {
+          const address = new URL(event.request.url);
+          if (address.origin !== f.origin) return;
+          wire.set(event.requestId, {
+            path: address.pathname,
+            start: performance.now(),
+          });
+        });
+        cdp.on('Network.responseReceived', (event) => {
+          const row = wire.get(event.requestId);
+          if (!row) return;
+          row.headers = performance.now();
+          row.status = event.response.status;
+          row.cache ||= event.response.fromDiskCache;
+        });
+        cdp.on('Network.requestServedFromCache', ({ requestId }) => {
+          const row = wire.get(requestId);
+          if (row) row.cache = true;
+        });
+        cdp.on(
+          'Network.loadingFinished',
+          ({ requestId, encodedDataLength }) => {
+            const row = wire.get(requestId);
+            if (!row) return;
+            row.end = performance.now();
+            row.bytes = encodedDataLength;
+          },
+        );
+        page.on('websocket', (socket) => {
+          carriers.push({ event: 'connect', at: performance.now() });
+          socket.on('framereceived', ({ payload }) => {
+            const frame = JSON.parse(payload.toString());
+            const event = frame.value?.type;
+            if (event === 'opened' || event === 'closed')
+              carriers.push({ event, at: performance.now() });
+          });
+        });
+        try {
+          await cdp.send('Network.enable');
+          await cdp.send('Network.emulateNetworkConditions', {
+            offline: false,
+            latency: 200,
+            downloadThroughput: 1_250_000,
+            uploadThroughput: 1_250_000,
+          });
+          await page.goto(url);
+          const iframe = page.locator('iframe[title="员工工作区"]');
+          const child = iframe.contentFrame();
+          await child.getByRole('textbox').waitFor();
+          await iframe.evaluate((node) => {
+            (node as HTMLElement).dataset.qaRetained = '1';
+          });
+          for (const action of ['新建对话', '返回已有对话']) {
+            wire.clear();
+            carriers.length = 0;
+            const previousThread = await child
+              .locator('body')
+              .getAttribute('data-thread-id');
+            const count = requests.length;
+            const start = performance.now();
+            await child.getByRole('button', { name: action }).click();
+            await page.waitForFunction((old) => {
+              const frame = document.querySelector<HTMLIFrameElement>(
+                'iframe[data-qa-retained="1"]',
+              );
+              const child = frame?.contentDocument;
+              return (
+                child?.body?.dataset.threadId &&
+                child.body.dataset.threadId !== old &&
+                child.querySelector<HTMLElement>('[contenteditable=true]')
+                  ?.isContentEditable &&
+                window.getComputedStyle(frame!).visibility === 'visible'
+              );
+            }, previousThread);
+            const elapsed = Math.round(performance.now() - start);
+            const phases = requests.slice(count);
+            const prewarm = phases.find(({ phase }) => phase === 'prewarm')!;
+            const identity = phases.find(({ phase }) => phase === 'identity')!;
+            const reopen = action === '返回已有对话';
+            expect(phases.map(({ phase }) => phase).sort()).toEqual(
+              reopen
+                ? ['document', 'identity', 'prewarm']
+                : ['document', 'identity', 'new-thread', 'prewarm'],
+            );
+            expect(identity.start < prewarm.end!).toBe(reopen);
+            expect(carriers.map(({ event }) => event)).toEqual([
+              'closed',
+              'connect',
+              'opened',
+            ]);
+            expect([...wire.values()].map(({ path }) => path)).not.toContain(
+              '/chatflow/4.0',
+            );
+            if (reopen)
+              expect(
+                await child.locator('body').getAttribute('data-thread-id'),
+              ).toBe(f.selection.threadId);
+            console.info(
+              'THREAD_SWITCH_LEDGER ' +
+                JSON.stringify({
+                  attempt: attempt + 1,
+                  action,
+                  elapsed,
+                  http: [...wire.values()].map(
+                    ({ start: sent, headers, end, ...row }) => ({
+                      ...row,
+                      start: Math.round(sent - start),
+                      headers:
+                        headers === undefined
+                          ? undefined
+                          : Math.round(headers - start),
+                      end:
+                        end === undefined ? undefined : Math.round(end - start),
+                    }),
+                  ),
+                  carrier: carriers.map(({ event, at }) => ({
+                    event,
+                    at: Math.round(at - start),
+                  })),
+                }),
+            );
+          }
+        } finally {
+          await page.close();
+        }
+      }
+      exerciseNavigation = false;
+      expect(birthRequests).toBe(3);
       cold = true;
       const offset = requests.length;
       const denied = await context.newPage();
