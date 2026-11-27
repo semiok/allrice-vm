@@ -49,7 +49,7 @@ export interface ProductionNativeModelExecution {
       confirmTransportStopped: ModelRuntime['confirmTransportStopped'];
       scoped?: Pick<
         ProductionModelRouting,
-        'select' | 'assertCurrent' | 'guestCatalog'
+        'select' | 'assertCurrent' | 'guestCatalog' | 'applies'
       >;
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
@@ -94,7 +94,7 @@ export function createProductionPersonVmSources(
           modelAuthority: authority,
           modelRoute: routing.scoped
             ? (call) =>
-                sameModelRoute(call, routing.select(call.vm, call.native))
+                sameModelRoute(call, routing.select(call.vm, call.native, call))
             : modelRuntime.route,
           lifetime,
         });
@@ -121,11 +121,12 @@ export function createProductionPersonVmSources(
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, modelLifetime, signal]);
-            const generation = routing.scoped
+            const configured = routing.applies(input.binding);
+            const generation = configured
               ? modelLifetime
               : await modelRuntime.assertCurrent(active);
             const guest = await owned.resolveSendRoute(input, active);
-            if (!routing.scoped) await modelRuntime.assertCurrent(active);
+            if (!configured) await modelRuntime.assertCurrent(active);
             active.throwIfAborted();
             generation.throwIfAborted();
             guest.revoked.throwIfAborted();
@@ -146,7 +147,8 @@ export function createProductionPersonVmSources(
         return {
           runtime: {
             async readiness(binding, signal) {
-              if (!routing.scoped) await modelRuntime.assertCurrent(signal);
+              if (!routing.applies(binding))
+                await modelRuntime.assertCurrent(signal);
               return installed.readiness(binding, signal);
             },
             activity: owned.activity.bind(owned),
@@ -178,6 +180,7 @@ export function createProductionPersonVmSources(
             ...(routing.scoped
               ? {
                   selectProvider: routing.provider,
+                  closeTransport: routing.close,
                   confirmTransportStopped: routing.confirmTransportStopped,
                 }
               : {}),

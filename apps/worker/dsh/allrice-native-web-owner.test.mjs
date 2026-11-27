@@ -2,7 +2,9 @@ import { expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
+import { selectScopedModel } from '@allrice/model-gateway';
 import {
+  managedModelRequest,
   nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
@@ -537,4 +539,38 @@ it('does not adopt a pending retry occurrence or another principal using the sam
   } finally {
     f.lifetime.abort();
   }
+});
+
+it('routes through the DSH agent/request payload with an opaque scoped receiver before selecting adapter controls', async () => {
+  const lifetime = new globalThis.AbortController();
+  const root = { provider: 'openai-codex', model: 'root-fixture' };
+  const child = { provider: 'deepseek', model: 'child-fixture' };
+  const next = () => Promise.resolve({ ...root, reasoningEffort: 'high' });
+  const waterfall = managedModelRequest(
+    selectScopedModel,
+    [{ ...child, parentSessionId: 'parent', scope: 'subagent' }],
+    root,
+    lifetime.signal,
+  );
+  const payload = {
+    agent: {
+      session: {
+        id: 'child',
+        header: { origin: 'subagent', parentSession: 'parent' },
+      },
+    },
+    signal: lifetime.signal,
+  };
+  const scopeCarrier = Object.freeze({});
+  await expect(waterfall.call(scopeCarrier, payload, next)).resolves.toEqual(
+    child,
+  );
+  payload.agent.session.header.parentSession = 'other';
+  await expect(waterfall.call(scopeCarrier, payload, next)).resolves.toEqual(
+    await next(),
+  );
+  lifetime.abort();
+  await expect(
+    waterfall.call(scopeCarrier, payload, next),
+  ).rejects.toMatchObject({ name: 'AbortError' });
 });

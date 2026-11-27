@@ -1,3 +1,6 @@
+import { constants, open } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import {
   createDshGatewayProvider,
@@ -88,9 +91,15 @@ function readConfig() {
       if (
         new Set(config.routes.map(({ id }) => id)).size !==
           config.routes.length ||
+        config.routes.some(({ id }) => id === 'default') ||
         config.rules.some(
           (rule) =>
             !config.routes.some(({ id }) => id === rule.route) ||
+            (rule.attempt !== undefined &&
+              rule.attempt !== 'assistant' &&
+              (rule.sessionId !== undefined ||
+                rule.parentSessionId !== undefined ||
+                rule.scope !== undefined)) ||
             (rule.scope === 'root' && rule.parentSessionId !== undefined) ||
             !(
               rule.sessionId ||
@@ -109,12 +118,38 @@ function readConfig() {
   throw new ModelGatewayError('BINDING_INVALID');
 }
 
+const revocationsSchema = z.array(identifier).max(17);
+
+async function readRevocations(path: string) {
+  const fd = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const info = await fd.stat();
+    if (!info.isFile() || info.mode & 0o077 || info.uid !== process.getuid?.())
+      throw new ModelGatewayError('AUTHORIZATION_DENIED');
+    const data = Buffer.alloc(8193);
+    const { bytesRead } = await fd.read(data, 0, data.length);
+    if (bytesRead === data.length)
+      throw new ModelGatewayError('AUTHORIZATION_DENIED');
+    return revocationsSchema.parse(
+      JSON.parse(data.subarray(0, bytesRead).toString('utf8')),
+    );
+  } finally {
+    await fd.close();
+  }
+}
+
 export async function createProductionModelRouting(
   lifetime: AbortSignal,
   ownerId: string,
   readModelImage: ReadProductionModelImage,
 ) {
   const config = readConfig();
+  const revocationPath = process.env.ALLRICE_DSH_MODEL_REVOCATIONS_FILE;
+  if (revocationPath !== undefined && (!config || !isAbsolute(revocationPath)))
+    throw new ModelGatewayError('BINDING_INVALID');
   const defaultProvider =
     process.env.ALLRICE_DSH_MODEL_PROVIDER ?? 'openai-codex';
   if (defaultProvider !== 'openai-codex' && defaultProvider !== 'openai')
@@ -123,17 +158,25 @@ export async function createProductionModelRouting(
     ? createProductionOpenAiRuntime(lifetime, ownerId, readModelImage)
     : createProductionCodexRuntime(lifetime, ownerId, readModelImage));
   const runtimes: Runtime[] = [fallback];
-  const definitions = new Map<string, ModelRouteKey>();
+  const definitions = new Map<string, ModelRouteKey>([
+    ['default', fallback.route],
+  ]);
   const retired = new Set<Runtime>();
-  async function close() {
-    const results = await Promise.allSettled(
-      runtimes.map((runtime) => runtime.close()),
-    );
-    const failures = results.flatMap((result) =>
-      result.status === 'rejected' ? [result.reason] : [],
-    );
-    if (failures.length)
-      throw new AggregateError(failures, 'MODEL_ROUTE_CLOSE_INCOMPLETE');
+  const watchStop = new AbortController();
+  let watching: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  function close() {
+    watchStop.abort();
+    return (closing ??= Promise.allSettled([
+      ...runtimes.map((runtime) => runtime.close()),
+      watching,
+    ]).then((results) => {
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length)
+        throw new AggregateError(failures, 'MODEL_ROUTE_CLOSE_INCOMPLETE');
+    }));
   }
   try {
     for (const route of config?.routes ?? []) {
@@ -180,13 +223,65 @@ export async function createProductionModelRouting(
       if (!found) throw new ModelGatewayError('BINDING_INVALID');
       return found;
     }
-    async function revokeRoute(route: ModelRouteKey) {
-      const runtime = runtimeFor(route);
-      retired.add(runtime);
-      await runtime.close();
+    function retire(routes: readonly ModelRouteKey[]) {
+      for (const route of routes) {
+        const runtime = runtimeFor(route);
+        if (retired.has(runtime)) continue;
+        retired.add(runtime);
+        // Stop admission and cancel synchronously. Global shutdown still joins
+        // this exact cached close and supplies proof for every pool.
+        void runtime.close().catch(() => {});
+      }
     }
-    function select(binding: VmOwner, native: ModelCallBinding['native']) {
-      return selectScopedModel(rulesFor(binding), native, fallback.route);
+    if (revocationPath !== undefined) {
+      async function refreshRevocations(path: string) {
+        const ids = await readRevocations(path);
+        const routes = ids.map((id) => {
+          const route = definitions.get(id);
+          if (!route) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+          return route;
+        });
+        retire(routes);
+      }
+      try {
+        await refreshRevocations(revocationPath);
+      } catch {
+        throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      }
+      const signal = AbortSignal.any([lifetime, watchStop.signal]);
+      watching = (async () => {
+        try {
+          for (;;) {
+            await wait(1000, undefined, { signal, ref: false });
+            await refreshRevocations(revocationPath);
+          }
+        } catch {
+          if (!signal.aborted) retire(runtimes.map(({ route }) => route));
+        }
+      })();
+    }
+    function select(
+      binding: VmOwner,
+      native: ModelCallBinding['native'],
+      requested?: ModelRouteKey,
+    ) {
+      const rules = rulesFor(binding);
+      const kind = native.attemptKind;
+      if (kind === 'compaction' || kind === 'session-title') {
+        const explicit = rules.find(({ attempt }) => attempt === kind);
+        if (explicit)
+          return { provider: explicit.provider, model: explicit.model };
+        // Native maintenance may inherit the last assistant route, or the
+        // configured fallback before any assistant request exists.
+        if (requested && sameModelRoute(requested, fallback.route))
+          return fallback.route;
+        return selectScopedModel(
+          rules,
+          { ...native, attemptKind: 'assistant' },
+          fallback.route,
+        );
+      }
+      return selectScopedModel(rules, native, fallback.route);
     }
     const providers = new Map(
       runtimes.map(
@@ -206,11 +301,11 @@ export async function createProductionModelRouting(
     return {
       fallback,
       close,
-      revokeRoute,
       scoped: config !== undefined,
       select,
+      applies: (binding: VmOwner) => rulesFor(binding).length > 0,
       provider(call: ModelCallBinding) {
-        if (!sameModelRoute(select(call.vm, call.native), call))
+        if (!sameModelRoute(select(call.vm, call.native, call), call))
           throw new ModelGatewayError('BINDING_INVALID');
         const runtime = runtimeFor(call);
         if (retired.has(runtime))
@@ -218,7 +313,7 @@ export async function createProductionModelRouting(
         return providers.get(runtime.route)!;
       },
       async assertCurrent(call: ModelCallBinding, signal: AbortSignal) {
-        if (!sameModelRoute(select(call.vm, call.native), call))
+        if (!sameModelRoute(select(call.vm, call.native, call), call))
           throw new ModelGatewayError('BINDING_INVALID');
         const runtime = runtimeFor(call);
         if (retired.has(runtime))
@@ -230,18 +325,26 @@ export async function createProductionModelRouting(
         if (!rules.length) return;
         const models = await Promise.all(
           runtimes
-            .filter(
-              (runtime) =>
-                !retired.has(runtime) &&
-                rules.some((rule) => sameModelRoute(rule, runtime.route)),
+            .filter(({ route }) =>
+              rules.some((rule) => sameModelRoute(rule, route)),
             )
             .map(async (runtime) => ({
               provider: runtime.route.provider,
               model: runtime.route.model,
-              modelInfo: await runtime.readModelInfo(signal),
+              modelInfo: await runtime.readCatalogModelInfo(signal),
             })),
         );
-        return { rules, models };
+        const maintenance = (attempt: 'compaction' | 'session-title') => {
+          const rule = rules.find((rule) => rule.attempt === attempt);
+          return rule && { provider: rule.provider, model: rule.model };
+        };
+        return {
+          defaultModelInfo: await fallback.readCatalogModelInfo(signal),
+          rules,
+          models,
+          compaction: maintenance('compaction'),
+          title: maintenance('session-title'),
+        };
       },
       async confirmTransportStopped(candidate: string, signal: AbortSignal) {
         const evidence = await Promise.all(

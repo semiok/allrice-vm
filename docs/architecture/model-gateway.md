@@ -163,8 +163,10 @@ producer 的 sticky unsafe 在 CLEANUP_INCOMPLETE 后保留 durable permit；首
 }
 ```
 
-每条规则都绑定组织和人。可组合精确原生 `sessionId`、直接父会话 `parentSessionId`、`root` 或 `subagent` 范围和原生任务档 `assistant`、`compaction`、`session-title`。第一条匹配生效，未匹配沿用默认路由。供应商和模型必须在宿主配置中注册且组合唯一。DSH 通过公开 `agent/request` 和 LLM adapter 记录普通对话实际选中的模型，宿主签发凭据前独立验证归属、调用阶段和选路。标题和压缩使用宿主验证到的阶段选路。
+每条规则都绑定组织和人。可组合精确原生 `sessionId`、直接父会话 `parentSessionId`、`root` 或 `subagent` 范围和原生任务档 `assistant`、`compaction`、`session-title`。第一条匹配生效，未匹配沿用默认路由。供应商和模型必须在宿主配置中注册且组合唯一。DSH 通过公开 `agent/request` 和 LLM adapter 记录普通对话实际选中的模型，宿主签发凭据前独立验证归属、调用阶段和选路。标题和压缩可按人指定独立档位，由 DSH 原生预设在准备请求前应用。维护档规则仅包含人和任务阶段，未指定时继承原生会话路由或启动默认。
 
-OpenAI Responses 的 `ALLRICE_OPENAI_API_KEY` 和 DeepSeek API 的 `ALLRICE_DEEPSEEK_API_KEY` 仅由 Worker 宿主加载。DeepSeek 路由只能使用官方 `/chat/completions` 或 `/responses`，每个路由严格固定一个协议。`search: true` 仅支持已批准的 OpenAI Responses 模型及 DeepSeek Responses 的 `deepseek-v4-pro`。启用宿主选路的 VM 通过 DSH 预设关闭独立 Search，保留 Fetch；批准的普通对话由网关注入供应商自带搜索，并沿用可验证的引用投影。
+OpenAI Responses 的 `ALLRICE_OPENAI_API_KEY` 和 DeepSeek API 的 `ALLRICE_DEEPSEEK_API_KEY` 仅由 Worker 宿主加载。DeepSeek 路由只能使用官方 `/chat/completions` 或 `/responses`，每个路由严格固定一个协议。`search: true` 仅支持已批准的 OpenAI Responses 模型及 DeepSeek Responses 的 `deepseek-v4-pro`。OpenAI 首批启用的精确型号为 `gpt-4.1-mini` 和 `gpt-6.2-astra`。DeepSeek 的 Chat 和 Responses 固定使用无推理状态回放的工具续跑模式，兼容 DSH 的普通函数工具。启用宿主选路的 VM 通过 DSH 预设关闭独立 Search，保留 Fetch；批准的普通对话由网关注入供应商自带搜索，并沿用可验证的引用投影。
 
 路由使用同一网关、每人并发槽与 PostgreSQL 账本。每笔 HTTP attempt 通过 `call_id` 关联宿主签发的真实 provider/model；原始账本无需数据迁移。路由使用独立连接池和撤权信号，宿主停止证明要等所有池真实关闭。
+
+可选择在 Worker 私有环境设置 `ALLRICE_DSH_MODEL_REVOCATIONS_FILE`。它指向由 Worker 用户持有、仅该用户可读写的普通文件，内容是路由 ID 的 JSON 数组，`default` 指默认路由。首次启用前写入 `[]`，之后原子替换文件。网关在一秒周期内停止指定路由的接单、取消在途调用并关闭相应连接池。文件缺失、权限错误或内容无法核实会停止受该文件管理的全部路由。已撤销的路由在该 Worker 生命周期内保持停用，需要校验后重启才能重新启用。

@@ -1,5 +1,5 @@
-import { nativeSearchToolPatches } from './search-tools.js';
-import type { ScopedModelRule } from '@allrice/model-gateway';
+import { nativeScopedModelPatches } from './model-task-presets.js';
+import type { ModelRouteKey, ScopedModelRule } from '@allrice/model-gateway';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -60,6 +60,8 @@ export type NativeWebModelAdapter = Readonly<{
   modelInfo: LlmResolvedModelInfo;
   scoped?: Readonly<{
     rules: readonly ScopedModelRule[];
+    compaction?: ModelRouteKey;
+    title?: ModelRouteKey;
     models: readonly {
       provider: string;
       model: string;
@@ -286,7 +288,7 @@ export function apply(ctx, config) {
           ...(modelAdapter?.scoped
             ? [
                 { id: 'web-search-deepseek', disabled: true },
-                ...nativeSearchToolPatches(false),
+                ...nativeScopedModelPatches(modelAdapter.scoped),
               ]
             : []),
           ...(modelAdapter

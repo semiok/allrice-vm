@@ -1,3 +1,11 @@
+import { mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  createAssistantMessage,
+  createToolResultMessage,
+  ToolCallId,
+} from '@deepseek-ai/dsh-llm';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -10,6 +18,7 @@ import {
   closeServer,
   deferred,
   gatewayFixture,
+  freshCall,
   listen,
   modelBinding,
 } from '../../../../packages/model-gateway/src/gateway.fixture.js';
@@ -66,6 +75,7 @@ function routeFixture() {
     personId: base.vm.personId,
   };
   vi.stubEnv('ALLRICE_DSH_MODEL_PROVIDER', undefined);
+  vi.stubEnv('ALLRICE_DSH_MODEL_REVOCATIONS_FILE', undefined);
   vi.stubEnv('ALLRICE_OPENAI_API_KEY', openAiKey);
   vi.stubEnv('ALLRICE_DEEPSEEK_API_KEY', deepSeekKey);
   vi.stubEnv(
@@ -101,6 +111,7 @@ function routeFixture() {
           attempt: 'assistant',
         },
         { ...scope, route: 'chat', attempt: 'session-title' },
+        { ...scope, route: 'responses', attempt: 'compaction' },
       ],
     }),
   );
@@ -127,7 +138,7 @@ it('selects only trusted tenant/person rules in order for exact sessions, child 
   ).toEqual(modelRoutes.chat);
   expect(
     routing.select(root.vm, { ...root.native, attemptKind: 'compaction' }),
-  ).toMatchObject(fallback);
+  ).toEqual(modelRoutes.responses);
   expect(
     routing.select({ ...root.vm, organizationId: randomUUID() }, root.native),
   ).toMatchObject(fallback);
@@ -139,6 +150,8 @@ it('selects only trusted tenant/person rules in order for exact sessions, child 
     new AbortController().signal,
   );
   expect(catalog?.models).toHaveLength(3);
+  expect(catalog?.title).toEqual(modelRoutes.chat);
+  expect(catalog?.compaction).toEqual(modelRoutes.responses);
   expect(JSON.stringify(catalog)).not.toContain(deepSeekKey);
   expect(JSON.stringify(catalog)).not.toContain(openAiKey);
   expect(selectScopedModel(catalog!.rules, chat.native, fallback)).toEqual(
@@ -159,6 +172,14 @@ it('exposes only approved hosted search with a matching protocol and model, on e
     createProductionOpenAiRuntime(signal, 'routing-fixture', undefined, {
       ...modelRoutes.chat,
       protocol: 'chat',
+      search: true,
+    }),
+  ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+  await expect(
+    createProductionOpenAiRuntime(signal, 'routing-fixture', undefined, {
+      provider: 'openai',
+      model: 'gpt-4.1-nano',
+      protocol: 'responses',
       search: true,
     }),
   ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
@@ -195,8 +216,44 @@ it('exposes only approved hosted search with a matching protocol and model, on e
   ).toBeNull();
 });
 
+it('advertises public model metadata and keeps a healthy route usable when a peer credential is absent', async () => {
+  const { root, chat } = routeFixture();
+  vi.stubEnv('ALLRICE_DEEPSEEK_API_KEY', undefined);
+  const signal = new AbortController().signal;
+  const routing = await createProductionModelRouting(
+    signal,
+    'routing-fixture',
+    async () => {
+      throw new Error('fixture does not read images');
+    },
+  );
+  cleanups.push(routing.close);
+  const catalog = await routing.guestCatalog(root.vm, signal);
+  expect(catalog?.defaultModelInfo).toMatchObject({
+    provider: 'openai-codex',
+    id: fallback.model,
+  });
+  expect(catalog?.models).toHaveLength(3);
+  await expect(routing.assertCurrent(chat, signal)).rejects.toMatchObject({
+    code: 'AUTHORIZATION_DENIED',
+  });
+  await expect(routing.assertCurrent(root, signal)).resolves.toMatchObject({
+    aborted: false,
+  });
+});
+
 it('uses native Chat and Responses adapters with one metering owner and joins only the revoked route', async () => {
   const calls = routeFixture();
+  const directory = await mkdtemp(join(tmpdir(), 'allrice-routing-fixture-'));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
+  const revocationPath = join(directory, 'revocations.json');
+  async function publishRevocations(ids: string[]) {
+    const staged = revocationPath + '.next';
+    await writeFile(staged, JSON.stringify(ids), { mode: 0o600, flag: 'wx' });
+    await rename(staged, revocationPath);
+  }
+  await publishRevocations([]);
+  vi.stubEnv('ALLRICE_DSH_MODEL_REVOCATIONS_FILE', revocationPath);
   const routing = await createProductionModelRouting(
     new AbortController().signal,
     'shared-fixture',
@@ -216,6 +273,7 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     openai: deferred(),
   };
   const chatClosed = deferred();
+  const chatBodies: Record<string, unknown>[] = [];
   const requests = new Map<
     string,
     { authorization?: string; body: Record<string, unknown> }
@@ -225,7 +283,7 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
       const source = request.url?.slice(1);
       if (source !== 'chat' && source !== 'responses' && source !== 'openai')
         throw new Error('wrong fixture target');
-      if (source === 'chat') response.once('close', () => chatClosed.resolve());
+
       const buffers: Buffer[] = [];
       for await (const chunk of request) buffers.push(Buffer.from(chunk));
       requests.set(source, {
@@ -234,6 +292,44 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
       });
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.flushHeaders();
+      if (source === 'chat') {
+        chatBodies.push(requests.get('chat')!.body);
+        if (chatBodies.length === 1) {
+          response.end(
+            'data: ' +
+              JSON.stringify({
+                id: 'chat-first',
+                object: 'chat.completion.chunk',
+                created: 1,
+                model: modelRoutes.chat.model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'call_fixture',
+                          type: 'function',
+                          function: { name: 'lookup', arguments: '{}' },
+                        },
+                      ],
+                    },
+                    finish_reason: 'tool_calls',
+                  },
+                ],
+                usage: {
+                  prompt_tokens: 3,
+                  completion_tokens: 2,
+                  total_tokens: 5,
+                },
+              }) +
+              '\n\ndata: [DONE]\n\n',
+          );
+          return;
+        }
+        response.once('close', () => chatClosed.resolve());
+      }
       opened[source].resolve();
       await finish[source].promise;
       if (response.destroyed) return;
@@ -316,12 +412,13 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
   });
   const queue = [
     calls.chat,
+    freshCall(calls.chat),
     calls.responses,
     calls.root,
     { ...calls.responses, model: 'unapproved' },
   ];
   const signals = new Map<string, AbortSignal>();
-  for (const call of queue.slice(0, 3))
+  for (const call of queue.slice(0, 4))
     signals.set(
       call.native.callId,
       await routing.assertCurrent(call, new AbortController().signal),
@@ -343,7 +440,32 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     },
   });
   cleanups.push(gateway.close);
-  const chat = gateway.collect().catch(() => null);
+  const firstChat = await gateway.collect();
+  expect(firstChat.at(-1)).toMatchObject({
+    type: 'finish',
+    reason: { kind: 'tool-calls' },
+  });
+  const callId = ToolCallId('call_fixture');
+  const input = gateway.input();
+  const chat = gateway
+    .collect({
+      ...input,
+      messages: [
+        ...input.messages,
+        createAssistantMessage({
+          content: [
+            { type: 'tool-call', id: callId, name: 'lookup', arguments: '{}' },
+          ],
+          source: { provider: 'deepseek', model: modelRoutes.chat.model },
+        }),
+        createToolResultMessage({
+          callId,
+          isError: false,
+          content: [{ type: 'text', text: 'synthetic result' }],
+        }),
+      ],
+    })
+    .catch(() => null);
   await opened.chat.promise;
   const responses = gateway.collect();
   void responses.catch(() => {});
@@ -352,9 +474,12 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
   void openai.catch(() => {});
   await opened.openai.promise;
   expect(gateway.store.slots.get(calls.base.vm.personId)?.size).toBe(3);
-  await routing.revokeRoute(calls.chat);
+  await publishRevocations(['chat']);
   await chatClosed.promise;
   await chat;
+  await expect(
+    routing.assertCurrent(calls.chat, new AbortController().signal),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
   expect(signals.get(calls.responses.native.callId)?.aborted).toBe(false);
   expect(signals.get(calls.root.native.callId)?.aborted).toBe(false);
   finish.chat.resolve();
@@ -380,6 +505,14 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     body: {
       model: modelRoutes.chat.model,
       stream: true,
+      thinking: { type: 'disabled' },
+      messages: expect.arrayContaining([
+        expect.objectContaining({
+          role: 'tool',
+          tool_call_id: 'call_fixture',
+          content: 'synthetic result',
+        }),
+      ]),
       tools: [{ type: 'function' }],
     },
   });
@@ -394,7 +527,7 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     authorization: 'Bearer ' + openAiKey,
     body: { model: modelRoutes.openai.model, tools: [{ type: 'function' }] },
   });
-  expect(gateway.store.rows.size).toBe(3);
+  expect(gateway.store.rows.size).toBe(4);
   expect(
     [...gateway.store.rows.values()].map((row) => {
       const binding = gateway.store.calls.get(row.callId)!.binding;
@@ -408,6 +541,13 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     }),
   ).toEqual(
     expect.arrayContaining([
+      [
+        'deepseek',
+        modelRoutes.chat.model,
+        'openai-chat-completions',
+        'closed',
+        5,
+      ],
       [
         'deepseek',
         modelRoutes.chat.model,

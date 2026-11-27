@@ -1,4 +1,8 @@
-import { DEEPSEEK_RESPONSES_URL } from './deepseek-api.ts';
+import {
+  DEEPSEEK_CHAT_URL,
+  DEEPSEEK_RESPONSES_URL,
+  prepareDeepSeekChatRequest,
+} from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
@@ -247,6 +251,16 @@ export function createMeteredTransport(options: {
             request,
             options.binding.model,
             hostedSearch,
+            options.binding.provider === 'deepseek',
+          );
+        else if (
+          options.binding.provider === 'deepseek' &&
+          request.url === DEEPSEEK_CHAT_URL &&
+          classification.protocol === 'openai-chat-completions'
+        )
+          request = await prepareDeepSeekChatRequest(
+            request,
+            options.binding.model,
           );
         const dispatchInit: RequestInit & { duplex: 'half' } = {
           body:

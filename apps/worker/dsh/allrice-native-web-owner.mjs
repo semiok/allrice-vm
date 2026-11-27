@@ -847,6 +847,31 @@ export function observeDelegatedInputs(scope) {
   return { root, claimed, rootWake };
 }
 
+export function managedModelRequest(select, rules, fallback, lifetime) {
+  return async ({ agent, signal }, next) => {
+    const config = await next();
+    signal.throwIfAborted();
+    lifetime.throwIfAborted();
+    const { session } = agent;
+    const route = select(
+      rules,
+      {
+        sessionId: session.id,
+        parentSessionId:
+          session.header.origin === 'subagent'
+            ? (session.header.parentSession ?? null)
+            : null,
+        attemptKind: 'assistant',
+      },
+      fallback,
+    );
+    // Controls chosen for an unrelated model are not portable.
+    return config.provider === route.provider && config.model === route.model
+      ? config
+      : route;
+  };
+}
+
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config);
 }
@@ -1296,31 +1321,12 @@ export function applyNativeWebOwner(
             disposers.push(
               scope.on(
                 'agent/request',
-                async function ({ signal: turn }, next) {
-                  const config = await next();
-                  turn.throwIfAborted();
-                  signal.throwIfAborted();
-                  const session = this.session;
-                  const route = selectScopedModel(
-                    scoped.rules,
-                    {
-                      sessionId: session.id,
-                      parentSessionId:
-                        session.header.origin === 'subagent'
-                          ? (session.header.parentSession ?? null)
-                          : null,
-                      attemptKind: 'assistant',
-                    },
-                    { provider, model },
-                  );
-                  // Reasoning effort from an unrelated model is not portable.
-                  if (
-                    config.provider !== route.provider ||
-                    config.model !== route.model
-                  )
-                    return route;
-                  return config;
-                },
+                managedModelRequest(
+                  selectScopedModel,
+                  scoped.rules,
+                  { provider, model },
+                  signal,
+                ),
                 { global: true },
               ),
             );

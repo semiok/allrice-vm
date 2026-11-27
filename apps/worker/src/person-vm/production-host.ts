@@ -127,6 +127,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       route: Parameters<typeof createDshGatewayProvider>[1];
       scopeStream?: DshGatewayStreamScope;
       selectProvider?(binding: ModelCallBinding): GatewayProvider;
+      closeTransport?(): Promise<void>;
       confirmTransportStopped?(
         ownerId: string,
         signal: AbortSignal,
@@ -433,9 +434,11 @@ export function createProductionPersonVmHost(input: {
       let modelFailures = modelOwner
         ? await collectFailures([() => modelOwner.close()])
         : [];
-      const transport = sourceOwner?.model.transport;
-      if (transport) await settle([transport.close]);
-      if (transport && modelOwner?.reconcileClosedOwner && providers) {
+      const closeTransport =
+        sourceOwner?.model.closeTransport ??
+        sourceOwner?.model.transport?.close;
+      if (closeTransport) await settle([closeTransport]);
+      if (closeTransport && modelOwner?.reconcileClosedOwner && providers) {
         const cleanup = AbortSignal.timeout(
           providers.configuration.lifecycle.cleanupTimeoutMs,
         );

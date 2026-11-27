@@ -430,12 +430,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const uninstall = host.startup.installModelAdapter(
         async (binding, signal) => {
           const active = AbortSignal.any([live, signal]);
-          const modelInfo = await input.readModelInfo(active);
+          const scoped = await input.scoped?.guestCatalog(binding, active);
+          const modelInfo =
+            scoped?.defaultModelInfo ?? (await input.readModelInfo(active));
           const access = await host.providers.egressInstallation.readAccess(
             binding,
             active,
           );
-          const scoped = await input.scoped?.guestCatalog(binding, active);
           active.throwIfAborted();
           return {
             ...access,
@@ -714,7 +715,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 mode,
                 active,
               );
-              const route = input.scoped
+              const route = input.scoped?.applies(binding)
                 ? live
                 : await input.assertRouteCurrent(active);
               const authority = acquirePromptWatch(authorityKey, (watching) =>
@@ -1031,7 +1032,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         async resolve(request, binding, signal) {
           return run(signal, async (active) => {
             const wanted = await readSelection(request, active);
-            if (!input.scoped && !sameModelRoute(wanted, input.route))
+            if (
+              !input.scoped?.applies(binding) &&
+              !sameModelRoute(wanted, input.route)
+            )
               return reject();
             let matched:
               | {
@@ -1160,24 +1164,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 attemptCursor: attempt.cursor,
               };
               const selectedRoute =
-                input.scoped?.select(binding, native) ?? input.route;
-              // Native assistant headers record the same route via agent/request.
-              // Maintenance plugins use their native model configuration; only
-              // an approved session or fallback route may present the request.
-              if (attempt.kind === 'assistant' || !input.scoped) {
-                if (!sameModelRoute(wanted, selectedRoute)) return reject();
-              } else {
-                const assistantRoute = input.scoped.select(binding, {
-                  ...native,
-                  attemptKind: 'assistant',
-                });
-                if (
-                  !sameModelRoute(wanted, selectedRoute) &&
-                  !sameModelRoute(wanted, assistantRoute) &&
-                  !sameModelRoute(wanted, input.route)
-                )
-                  return reject();
-              }
+                input.scoped?.select(binding, native, wanted) ?? input.route;
+              if (!sameModelRoute(wanted, selectedRoute)) return reject();
               matched = {
                 scope,
                 owner: profile.owner,
@@ -1387,9 +1375,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           entry.delivery = active;
           active.addEventListener('abort', entry.revoke, { once: true });
         },
-        async resolveSendRoute({ modelAdapterId }, signal) {
+        async resolveSendRoute({ modelAdapterId, binding }, signal) {
           const active = AbortSignal.any([signal, live]);
-          if (!input.scoped) await input.assertRouteCurrent(active);
+          if (!input.scoped?.applies(binding))
+            await input.assertRouteCurrent(active);
           if (!modelAdapterId) throw new PersonVmError('RUNTIME_NOT_READY');
           active.throwIfAborted();
           return {

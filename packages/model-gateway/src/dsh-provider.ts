@@ -68,9 +68,7 @@ export function createDshGatewayProvider(
           }),
         }
       : {}),
-    ...(route.provider === 'deepseek'
-      ? { requireTransportProof: true as const }
-      : {}),
+    ...(fetchOwned ? { requireTransportProof: true as const } : {}),
     fetchOwned,
     assertDispatchCurrent,
     async *stream(binding, input, signal) {

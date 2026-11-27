@@ -6,6 +6,8 @@
 
 `allrice-host-model-gateway-v1` 使用固定 `0.2.1-rc.2` 的公开 `LlmAdapter`、`LlmRuntime.prepareCall`、`GenerateOptions`、`StreamChunk`，保留原生消息、工具增量、工具结果和取消语义。开发注入现有订阅 loader 已初始化的宿主 LlmRuntime，生产注入同一 provider port；SSE 配置由宿主 loader 固定。没有凭据复制、账户路由、原生 loop 或 Agent 状态机；包需显式装配，本片没有启用4.0或改动现有3.x composition。
 
+宿主多路由沿用同一适配条目。普通会话通过原生 `agent/request`，维护任务通过原生标题和压缩预设在准备请求前选路。宿主按组织、人和已核原生调用决定获批 provider/model，继续使用统一计量及撤权。宿主按模型能力启用 OpenAI 或 DeepSeek Responses 的托管 Search，公开 DSH 预设关闭独立 Search 并保留 Fetch。没有新增 Guest 帧或模型任务状态机。
+
 DSH 不拥有 SaaS 当前本人/企业、受管VM instance/epoch、员工release、原生根/子会话与Run/call归属，也不证明每次HTTP retry/授权刷新或跨gateway的每人8路。AllRice在host-only上下文参数位置核现权；消息/header不能选择owner。宿主逐fetch记录实际响应及独立usage；redirect不跟随，缺usage为null；provider最终合成0不能成为计费。账本只单向输出既有RuntimeRunUsage，不添加价格、套餐、余额或第二个扣费权威。
 
 模型路由首批沿用此同一接缝。Worker 默认继续走 `openai-codex`。宿主显式配置 `ALLRICE_DSH_MODEL_PROVIDER=openai` 及 `ALLRICE_DSH_OPENAI_MODEL` 才用 OpenAI API Responses，`ALLRICE_OPENAI_API_KEY` 仅注入宿主私有进程环境，变更路由以重新装配宿主生效。仅 `ALLRICE_DSH_OPENAI_WEB_SEARCH_MODEL` 与该模型完全相同时，真人对话尝试在已授权的精确 Responses POST 追加托管 `web_search`。标题和压缩仍用当前路由的原生适配器，跳过搜索。Codex 沿用原路径。
