@@ -48,10 +48,12 @@ it('hands off each download once and waits for a cancelled body before publishin
     releaseBody = resolve;
   });
   const arrayBuffer = vi.fn(() => content);
-  const fetch = vi.fn(async (_url: string, _options: RequestInit) => ({
-    ok: true,
-    arrayBuffer,
-  }));
+  const fetch = vi.fn<
+    (
+      url: string,
+      options: RequestInit,
+    ) => Promise<Pick<Response, 'ok' | 'arrayBuffer'>>
+  >(async () => ({ ok: true, arrayBuffer }));
   const postMessage = vi.fn();
   const sandbox = {
     AbortController,
