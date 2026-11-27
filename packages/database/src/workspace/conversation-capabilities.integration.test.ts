@@ -38,19 +38,15 @@ suite(
       await f?.close();
     });
 
-    async function setup(rice = true, projectTool = true) {
+    async function setup(projectTool = true) {
       const source = await createEmployeeAdministrationFixture(f.db);
       const project = catalog.skills.find(
         (s) => s.name === 'project-development',
       )!;
-      const [platform] = rice
-        ? await f.db`select id from allrice_platform_employees where employee_key='rice'`
-        : [{ id: source.employeeId }];
-      const employeeId = platform!.id as string;
+      const employeeId = source.employeeId;
       await savePlatformEmployeeDraft(employeeId, {
         definition: {
           ...source.definition,
-          key: rice ? 'rice' : source.definition.key,
           capabilities: {
             ...source.definition.capabilities,
             nativeSkillIds: [
@@ -219,7 +215,7 @@ suite(
     });
 
     it('applies the same default and enabled configuration to another published employee without mutating publication', async () => {
-      const x = await setup(false);
+      const x = await setup();
       const [before] =
         await f.db`select manifest,config_checksum from allrice_employee_versions where id=${x.assignment.currentVersion.id}`;
       expect((await x.send((await x.create()).id)).tools).not.toContain(
@@ -239,7 +235,7 @@ suite(
     });
 
     it('never adds undeclared project tools even when enabled', async () => {
-      const x = await setup(false, false);
+      const x = await setup(false);
       await x.configure(true);
       const session = await x.create();
       expect((await x.snapshot(session.id)).enabled).toBe(true);

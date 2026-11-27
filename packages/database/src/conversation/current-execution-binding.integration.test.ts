@@ -434,9 +434,9 @@ integration(
         workspaceId: f.workspace,
       });
       if (!context) throw Error('isolated_login_required');
-      let assignment = f.assignment,
-        employee = f.employee,
-        version = f.version;
+      let assignment: string = f.assignment,
+        employee: string = f.employee,
+        version: string = f.version;
       if (kind === 'tenant-definition' && !legacyBirth) {
         const row = await createTestEmployeeAssignment(context, f.workspace);
         assignment = row.id;

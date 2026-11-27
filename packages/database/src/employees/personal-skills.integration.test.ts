@@ -400,8 +400,8 @@ suite(
         ).toBe(400);
       expect(await listPersonalSkills(x.context)).toEqual(before);
     });
-    it('E3 allows real Rice binding and HTTP enable with ordinary frozen reads and unchanged revocation', async () => {
-      const x = await setup(false, true);
+    it('E3 allows an existing employee binding and HTTP enable with ordinary frozen reads and unchanged revocation', async () => {
+      const x = await setup();
       const { item } = await install(x, x.custom.id);
       const task = await x.run(
         x.assignment.id,
