@@ -1,5 +1,6 @@
 import {
   readPlatformPersonVmConfiguration,
+  type DEntryIdentity,
   type RequestContext,
 } from '@allrice/contracts';
 import type {
@@ -66,6 +67,37 @@ export interface PersonVmAuthority {
     personId: string;
     organizationId: string;
   }>;
+}
+
+/** Host-derived storage target only. A rollout revision is not a user session
+ * or permission to start a VM. */
+export type PersonVmDiskPreparationTarget = Readonly<
+  Pick<
+    DEntryIdentity,
+    | 'personId'
+    | 'organizationId'
+    | 'workspaceId'
+    | 'employeeInstanceId'
+    | 'employeeRevision'
+    | 'employeeVersionId'
+  > & { platformRevisionId: string | null; policyRevision: string }
+>;
+
+export interface PersonVmDiskPreparationPort {
+  /** The provider owns the existing person lease and joins all disk I/O and
+   * cleanup before settling. Recheck current scope inside the lease before
+   * side effects and completion, and capacity before allocating bytes. This
+   * operation prepares only an offline disk and sealed public cache. Reject
+   * with PersonVmError('CLEANUP_INCOMPLETE') if cleanup remains unconfirmed,
+   * including when cancellation initiated that cleanup. */
+  prepare(
+    target: PersonVmDiskPreparationTarget,
+    guard: Readonly<{
+      signal: AbortSignal;
+      assertCurrent(): Promise<void>;
+      assertCapacity(): Promise<void>;
+    }>,
+  ): Promise<'prepared' | 'already-prepared' | 'deferred'>;
 }
 
 export type PersonVmActivity = Readonly<{

@@ -122,7 +122,24 @@ const configuration = z
           /^docker\.io\/library\/node@sha256:[a-f0-9]{64}$/.test(image),
       ),
     disk: z
-      .object({ root: absolute, keyRoot: absolute, capacityGiB: positive })
+      .object({
+        root: absolute,
+        keyRoot: absolute,
+        capacityGiB: positive,
+        preprovision: z
+          .discriminatedUnion('enabled', [
+            z.object({ enabled: z.literal(false) }).strict(),
+            z
+              .object({
+                enabled: z.literal(true),
+                platform: z.literal('macos'),
+                minimumFreeBytes: positive,
+                reserveBytes: positive,
+              })
+              .strict(),
+          ])
+          .optional(),
+      })
       .strict(),
     memory: z
       .object({
@@ -186,6 +203,11 @@ const configuration = z
       .strict(),
   })
   .strict()
+  .refine(
+    (value) =>
+      !value.disk.preprovision?.enabled ||
+      Boolean(value.native.publicImageCache),
+  )
   .refine((value) => {
     const platform = readPlatformPersonVmConfiguration();
     const policy = value.memory.policy;

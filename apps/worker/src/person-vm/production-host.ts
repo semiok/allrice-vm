@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import type { RequestContext } from '@allrice/contracts';
-import { createDedicatedDatabase, getDatabase } from '@allrice/database';
+import {
+  createDedicatedDatabase,
+  createDEntryAuthorityFeed,
+  getDatabase,
+  readPersonVmDiskPreparationForegroundBusy,
+  readPersonVmDiskPreparationRoster,
+  readPersonVmDiskPreparationTarget,
+} from '@allrice/database';
 import {
   createModelGateway,
   createDshGatewayProvider,
@@ -23,6 +30,7 @@ import {
 } from '@allrice/egress-gateway';
 import {
   PersonVmError,
+  PersonVmDiskPool,
   PersonVmService,
   PostgresPersonVmStore,
   sameVmBinding,
@@ -44,6 +52,7 @@ import {
 } from '../native-web/composition.js';
 import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
+import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
@@ -169,6 +178,8 @@ export function createProductionPersonVmHost(input: {
     { binding: PersonVmBinding; stopNative: boolean }
   >();
   let personVm: PersonVmService | undefined;
+  let diskPreprovision:
+    ReturnType<typeof startProductionDiskPreprovision> | undefined;
   let gracefulStop = false;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
@@ -378,11 +389,13 @@ export function createProductionPersonVmHost(input: {
       }
       // Each close fences its own ingress synchronously and joins owned work.
       const installation = installed,
+        preparation = diskPreprovision,
         authorityOwner = current,
         startupOwner = startup,
         sourceOwner = bound;
       await settle([
         ...(installation ? [() => installation.close()] : []),
+        ...(preparation ? [() => preparation.close()] : []),
         ...(authorityOwner ? [() => authorityOwner.close()] : []),
         ...(sourceOwner ? [() => sourceOwner.runtime.close()] : []),
         ...[...nativeSubscriptions].map(
@@ -547,6 +560,13 @@ export function createProductionPersonVmHost(input: {
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const store = new PostgresPersonVmStore(openSql);
+      const diskRoot = providers.configuration.disk.root;
+      const diskPool = new PersonVmDiskPool(
+        diskRoot,
+        store.diskPoolLocks(diskRoot),
+        (event) => console.warn('[person-vm.disk-pool]', event),
+        providers.diskPool,
+      );
       const runtime: PersonVmRuntimePort = {
         memoryGuestPlan: (...args) => requireStartup().memoryGuestPlan(...args),
         start: (...args) => requireStartup().start(...args),
@@ -577,6 +597,7 @@ export function createProductionPersonVmHost(input: {
         authority: current.authority,
         native: providers.native,
         disk: providers.disk,
+        diskPool,
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
@@ -804,6 +825,25 @@ export function createProductionPersonVmHost(input: {
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
       });
       lifetime.throwIfAborted();
+      const { disk } = providers.configuration;
+      if (disk.preprovision?.enabled) {
+        const databaseUrl = process.env.DATABASE_URL;
+        if (!databaseUrl) throw Error('DATABASE_URL is required');
+        diskPreprovision = startProductionDiskPreprovision({
+          lifetime,
+          openFeed: () => createDEntryAuthorityFeed(databaseUrl),
+          readRoster: readPersonVmDiskPreparationRoster,
+          readTarget: readPersonVmDiskPreparationTarget,
+          foregroundBusy: readPersonVmDiskPreparationForegroundBusy,
+          refill: (signal) => diskPool.refill(signal),
+          availableBytes: (signal) => diskPool.availableBytes(signal),
+          minimumFreeBytes: disk.preprovision.minimumFreeBytes,
+          reserveBytes: disk.preprovision.reserveBytes,
+          port: vm.diskPreparationPort(),
+          observe: (event) =>
+            console.warn('[person-vm.disk-preprovision]', event),
+        });
+      }
       return Object.freeze({
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;
