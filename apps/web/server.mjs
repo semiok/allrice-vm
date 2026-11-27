@@ -35,16 +35,22 @@ import { createNativeSubagentFollowGateway } from './server/native-subagent-foll
 import { createDEntryNativeGateway } from './server/d-entry-native.mjs';
 import { observePreviewHttp } from './server/preview-diagnostics.mjs';
 
-/** Next registers its own upgrade listener after the first HTTP request. Route
- * only the dedicated Bridge path before normal EventEmitter dispatch; every
- * other upgrade (including development HMR) remains Next's responsibility. */
+const upgradeNotFound =
+  'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n';
+/** Next registers its own upgrade listener after the first HTTP request.
+ * Route AllRice transports before it, or reject upgrades in HTTP-only mode. */
 export class AllRiceHttpServer extends Server {
+  httpOnly = false;
   bridgeGateway = null;
   previewGateway = null;
   terminalGateway = null;
   nativeFollowGateway = null;
   dEntryNativeGateway = null;
   emit(event, ...args) {
+    if (event === 'upgrade' && this.httpOnly) {
+      args[1].end(upgradeNotFound);
+      return true;
+    }
     if (event === 'upgrade' && this.dEntryNativeGateway?.matches(args[0])) {
       void this.dEntryNativeGateway.upgrade(...args);
       return true;
@@ -71,10 +77,7 @@ export class AllRiceHttpServer extends Server {
       args[0]?.url?.split('?')[0] === bridgeSocketPath
     ) {
       if (this.bridgeGateway) void this.bridgeGateway.upgrade(...args);
-      else
-        args[1].end(
-          'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
-        );
+      else args[1].end(upgradeNotFound);
       return true;
     }
     return super.emit(event, ...args);
@@ -85,17 +88,21 @@ export async function startAllRiceWeb({
   port = 3000,
   hostname = '0.0.0.0',
   dev = false,
+  httpOnly = false,
 } = {}) {
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error('INVALID_WEB_PORT');
   if (!dev) await readServicePersonVmEmployeePortSlots();
   const server = new AllRiceHttpServer();
+  server.httpOnly = httpOnly;
+  const transportServer = httpOnly ? null : server;
   const lifecycle = await installDevProducerLifecycle('web');
-  const cloudPreview = process.env.ALLRICE_CLOUD_PREVIEW_SOCKET
-    ? createCloudProjectPreviewTransport(
-        process.env.ALLRICE_CLOUD_PREVIEW_SOCKET,
-      )
-    : null;
+  const cloudPreview =
+    transportServer && process.env.ALLRICE_CLOUD_PREVIEW_SOCKET
+      ? createCloudProjectPreviewTransport(
+          process.env.ALLRICE_CLOUD_PREVIEW_SOCKET,
+        )
+      : null;
   const app = next({
     dev,
     dir: fileURLToPath(new URL('.', import.meta.url)),
@@ -108,37 +115,46 @@ export async function startAllRiceWeb({
   // host list stops startup here (requests refuse it too, in any start mode).
   portalEntries();
   const handle = createDevRequestHandler(lifecycle, app.getRequestHandler());
-  server.nativeFollowGateway = createNativeSubagentFollowGateway({ port });
-  server.dEntryNativeGateway = createDEntryNativeGateway({ port });
-  server.on('request', (req, res) => {
-    void observePreviewHttp(req, res, () => handle(req, res)).catch(() => {
-      if (!res.headersSent) res.writeHead(500);
-      res.end('Internal Server Error');
+  if (transportServer) {
+    transportServer.nativeFollowGateway = createNativeSubagentFollowGateway({
+      port,
     });
+    transportServer.dEntryNativeGateway = createDEntryNativeGateway({ port });
+  }
+  server.on('request', (req, res) => {
+    const run = () => handle(req, res);
+    void (transportServer ? observePreviewHttp(req, res, run) : run()).catch(
+      () => {
+        if (!res.headersSent) res.writeHead(500);
+        res.end('Internal Server Error');
+      },
+    );
   });
-  if (runtimeFeatureEnabled('ALLRICE_BRIDGE_WSS_ENABLED')) {
-    server.bridgeGateway = await createBridgeSocketGateway({
+  if (transportServer && runtimeFeatureEnabled('ALLRICE_BRIDGE_WSS_ENABLED')) {
+    transportServer.bridgeGateway = await createBridgeSocketGateway({
       authority: createBridgeConnectionAuthority(),
       enabled: () =>
         runtimeFeatureEnabled('ALLRICE_BRIDGE_WSS_ENABLED') &&
         runtimeFeatureEnabled('ALLRICE_BRIDGE_OPERATION_LEDGER_ENABLED'),
       dispatch: createBridgeLoopbackDispatch(port),
     });
-    server.terminalGateway = createWorkbenchTerminalGateway({
+    transportServer.terminalGateway = createWorkbenchTerminalGateway({
       resolveAccess: createTerminalLoopbackAuthorization(port),
       enabled: () =>
         runtimeFeatureEnabled('ALLRICE_BRIDGE_WSS_ENABLED') &&
         runtimeFeatureEnabled('ALLRICE_BRIDGE_OPERATION_LEDGER_ENABLED'),
       transport: {
-        openTerminal: (input) => server.bridgeGateway.openTerminal(input),
+        openTerminal: (input) =>
+          transportServer.bridgeGateway.openTerminal(input),
       },
     });
   }
   if (
+    transportServer &&
     process.env.ALLRICE_PROJECT_PREVIEW_SUFFIX &&
-    (server.bridgeGateway || cloudPreview)
+    (transportServer.bridgeGateway || cloudPreview)
   ) {
-    server.previewGateway = createProjectPreviewGateway({
+    transportServer.previewGateway = createProjectPreviewGateway({
       suffix: process.env.ALLRICE_PROJECT_PREVIEW_SUFFIX,
       mainOrigin: new URL(
         process.env.ALLRICE_PUBLIC_URL ?? 'https://allrice.bplabs.xyz',
@@ -153,7 +169,7 @@ export async function startAllRiceWeb({
           const adapter =
             input.target.backend === 'cloud'
               ? cloudPreview
-              : server.bridgeGateway;
+              : transportServer.bridgeGateway;
           if (!adapter) throw Error('PROJECT_PREVIEW_UNAVAILABLE');
           return adapter.openPreview(input);
         },
@@ -188,12 +204,18 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const problem = cloudArchitectureTranslationProblem();
     if (problem) throw new Error(problem);
   }
+  const httpOnly = args.includes('--http-only');
   const runtime = await startAllRiceWeb({
     port: Number(option('--port', process.env.ALLRICE_WEB_PORT ?? 3000)),
     hostname: option('--hostname', '0.0.0.0'),
     dev: args.includes('--dev'),
+    httpOnly,
   });
-  console.info('[AllRice Web] HTTP ready; Bridge WSS is explicitly opt-in');
+  console.info(
+    httpOnly
+      ? '[AllRice Web] HTTP ready; upgrades disabled'
+      : '[AllRice Web] HTTP ready; Bridge WSS is explicitly opt-in',
+  );
   let stopping = false;
   for (const signal of ['SIGTERM', 'SIGINT'])
     process.once(signal, () => {

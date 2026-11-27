@@ -565,8 +565,7 @@ export function readServiceBuildIdentity(
   return cache.get(service)!;
 }
 
-/** Read the one private Host file from a verified service release. */
-export async function readSealedPersonVmHostConfiguration(
+async function readSealedPersonVmHostFile(
   build: ServiceBuildIdentity,
   signal?: AbortSignal,
 ) {
@@ -652,6 +651,16 @@ export async function readSealedPersonVmHostConfiguration(
   }
 }
 
+/** The verified Worker entrypoint is the only consumer of private Host fields. */
+export async function readSealedPersonVmHostConfiguration(
+  build: ServiceBuildIdentity,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  if (build.service !== 'worker') throw Error('DEV_BUILD_IDENTITY_INVALID');
+  return readSealedPersonVmHostFile(build, signal);
+}
+
 /** Web and Worker enrollment use the same sealed scalar as the VM provider. */
 export async function readServicePersonVmEmployeePortSlots() {
   const fallback = readPlatformPersonVmConfiguration().employeePortSlots;
@@ -665,6 +674,6 @@ export async function readServicePersonVmEmployeePortSlots() {
   if (!service) return fallback;
   const build = await readServiceBuildIdentity(service);
   if (!build) return fallback;
-  const sealed = await readSealedPersonVmHostConfiguration(build);
+  const sealed = await readSealedPersonVmHostFile(build);
   return sealed?.employeePortSlots ?? fallback;
 }
