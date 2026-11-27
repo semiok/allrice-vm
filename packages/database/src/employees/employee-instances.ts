@@ -1131,7 +1131,7 @@ async function writeInstanceProfile(
     current: EmployeeInstanceProfile,
     before: EmployeeInstance,
   ) => EmployeeInstanceProfile,
-  authorize?: (before: EmployeeInstance) => Promise<void>,
+  authorize?: (before: EmployeeInstance) => Promise<void> | void,
 ) {
   await authority(scope, tx, true);
   const before = await getEmployeeInstance(scope, id, tx);
