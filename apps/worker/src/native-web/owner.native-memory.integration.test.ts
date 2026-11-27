@@ -118,11 +118,12 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         employeeVersionId: f.version,
         threadId: f.session,
       };
-      const context = await authenticateSession(login.token, {
+      const authenticated = await authenticateSession(login.token, {
         organizationId: f.org,
         workspaceId: f.workspace,
       });
-      if (!context) throw Error('Isolated owner did not authenticate');
+      if (!authenticated) throw Error('Isolated owner did not authenticate');
+      const context = authenticated;
       await db.begin(async (tx) => {
         await ensureGeneralEmployeeInstance(tx, f.assignment);
         const release = {
