@@ -7,7 +7,7 @@ import {
   type RuntimePolicyControls,
   type WorkAutomation,
 } from '@allrice/contracts';
-import styles from './tenant-administration.module.css';
+import styles from '../../app/runtime-console/tenant-administration.module.css';
 type Snapshot = {
   organizationId: string;
   workspaceId: string;

@@ -5,7 +5,7 @@ import type {
   AdminTenantEmployee,
   AdminTenantEmployees,
 } from '@allrice/contracts';
-import styles from './tenant-administration.module.css';
+import styles from '../../app/runtime-console/tenant-administration.module.css';
 
 const errors: Record<string, string> = {
   AUTHENTICATION_REQUIRED: '登录已失效，请重新登录。',
