@@ -124,6 +124,19 @@ it('reads the sealed language default and persists only a native language prefer
     });
     expect(await wrongField.json()).toMatchObject({ result: { ok: false } });
     expect(writes).not.toHaveBeenCalled();
+    const second = await open(f);
+    const eventPeer = f.connect(second.scopeId);
+    const events = messages(eventPeer);
+    await once(eventPeer, 'open');
+    send(eventPeer, {
+      type: 'open',
+      streamId: 'locale-events',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await events('locale-events')).toMatchObject({
+      value: { type: 'ready' },
+    });
     const changed = await call('settings/mutate', {
       ns: 'locale',
       ops,
@@ -143,8 +156,18 @@ it('reads the sealed language default and persists only a native language prefer
         value: { namespaces: [{ ns: 'locale', value: { preference: 'en' } }] },
       },
     });
+    f.host.emit({ event: 'settings/document-updated', args: ['llm-pi-ai', 3] });
+    f.host.emit({ event: 'settings/document-updated', args: ['locale', 3] });
+    expect(await events('locale-events')).toMatchObject({
+      value: {
+        type: 'emit',
+        event: 'settings/document-updated',
+        args: ['locale', 3],
+      },
+    });
     closePage(life.peer);
     expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    closePage(second.peer);
   } finally {
     dispatchSpy.mockRestore();
     dispose();

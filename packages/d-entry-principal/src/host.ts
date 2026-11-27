@@ -1020,6 +1020,12 @@ class PrincipalService extends TypertRemoteService {
           if (eventReady ? frame.type === 'ready' : frame.type !== 'ready')
             throw Error('PRINCIPAL_EVENT_GENERATION_INVALID');
           eventReady = true;
+          if (
+            frame.type === 'emit' &&
+            frame.event === 'settings/document-updated' &&
+            frame.args[0] !== 'locale'
+          )
+            continue;
           value = frame;
         } else if (raw.endpoint === 'remoteAccess/follow')
           value = Access.methods['remoteAccess/follow'].result
