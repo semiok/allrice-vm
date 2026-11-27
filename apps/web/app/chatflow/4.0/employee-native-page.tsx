@@ -559,7 +559,7 @@ const messages = {
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
   opening: ['工作台已就绪', '正在打开对话。'],
-  failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
+  failed: ['暂时打不开工作台', '可以点重试。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
@@ -607,9 +607,6 @@ function EntryStatus({
             {status === 'cancelled' ? '继续' : '重试'}
           </button>
         )}
-        {/* The existing employee selector accepts an empty value for the
-            default workspace view. Bare /chatflow reopens 4.0 on the trial host. */}
-        {status === 'failed' && <a href="/chatflow/4.0">返回员工页</a>}
       </section>
     </div>
   );

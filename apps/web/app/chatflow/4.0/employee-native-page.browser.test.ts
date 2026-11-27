@@ -241,7 +241,7 @@ suite('4.0 browser cold entry', () => {
       expect(
         await page
           .getByRole('alert')
-          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .getByText('可以点重试。', { exact: true })
           .isVisible(),
       ).toBe(true);
       expect(births).toEqual([]);
@@ -298,14 +298,14 @@ suite('4.0 browser cold entry', () => {
         .waitFor();
       expect(
         await pollingFailure
-          .getByText('可以点重试，或者返回员工页。', { exact: true })
+          .getByText('可以点重试。', { exact: true })
           .isVisible(),
       ).toBe(true);
       expect(
         await page
           .getByRole('link', { name: '返回员工页', exact: true })
-          .isVisible(),
-      ).toBe(true);
+          .count(),
+      ).toBe(0);
       expect(polls).toBe(2);
       expect(warmCalls).toHaveLength(4);
       expect(births).toEqual(birthsBeforePolling);
@@ -427,26 +427,6 @@ suite('4.0 browser cold entry', () => {
         { selection: f.selection, trigger: 'page' },
       ]);
       expect(births).toHaveLength(2);
-
-      const returnPage = await context.newPage();
-      await returnPage.route('**/api/v1/d-entry/native-prewarm', (route) =>
-        route.fulfill({ status: 503 }),
-      );
-      await returnPage.goto(
-        f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
-      );
-      const back = returnPage.getByRole('link', {
-        name: '返回员工页',
-        exact: true,
-      });
-      await back.press('Enter');
-      await returnPage.waitForURL(
-        (url) => url.pathname === '/chatflow/4.0' && !url.search,
-      );
-      await returnPage
-        .getByRole('heading', { name: '新建你的第一个员工', exact: true })
-        .waitFor();
-      await returnPage.close();
 
       const firstStart = await context.newPage();
       try {
