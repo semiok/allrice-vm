@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { connect, type Socket } from 'node:net';
-import { Agent, buildConnector } from 'undici';
+import { Agent, buildConnector, errors } from 'undici';
 import { ModelGatewayError, type GatewayProvider } from './contract.ts';
 
 /** Dedicated pool for the exact host. Track the underlying TCP socket
  * from creation, including before Undici has established a TLS context. */
 export function createOwnedModelTransport(ownerId: string) {
   const sockets = new Map<Socket, Promise<void>>();
-  const establishTls = buildConnector({ allowH2: false });
+  const establishTls = buildConnector({ allowH2: false, timeout: 0 });
   let closing: Promise<void> | undefined;
   const dispatcher = new Agent({
     allowH2: false,
@@ -23,9 +23,12 @@ export function createOwnedModelTransport(ownerId: string) {
         localAddress: options.localAddress ?? undefined,
       });
       let pending: typeof callback | undefined = callback;
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timer = setTimeout(
+        () => socket.destroy(new errors.ConnectTimeoutError()),
+        10_000,
+      ).unref();
       function settle(...result: Parameters<typeof callback>) {
-        if (timer) clearTimeout(timer);
+        clearTimeout(timer);
         const complete = pending;
         pending = undefined;
         if (complete) complete(...result);
@@ -42,8 +45,18 @@ export function createOwnedModelTransport(ownerId: string) {
           });
         }),
       );
-      if (secure) {
-        // Keep Undici's TLS settings, certificate validation and session cache.
+      socket.once('connect', () => {
+        if (closing) {
+          socket.destroy();
+          return;
+        }
+        if (!secure) {
+          socket.setNoDelay(true).setKeepAlive(true, 60_000);
+          settle(null, socket);
+          return;
+        }
+        // Node may replace the TCP handle during address fallback. Wrap only
+        // the winning connection, with Undici's original TLS validation/cache.
         try {
           establishTls({ ...options, httpSocket: socket }, settle);
         } catch (error) {
@@ -53,14 +66,7 @@ export function createOwnedModelTransport(ownerId: string) {
             null,
           );
         }
-      } else {
-        socket.setNoDelay(true).setKeepAlive(true, 60_000);
-        socket.once('connect', () => settle(null, socket));
-        timer = setTimeout(
-          () => socket.destroy(new Error('Connect timeout')),
-          10_000,
-        ).unref();
-      }
+      });
     },
   });
   let evidence: string | undefined;
