@@ -131,6 +131,93 @@ it('checks the exact adopted message occurrence for billing after the native tur
   await observer.close();
 });
 
+it('fences the private call result and joins actual publication when the native body cancels', async () => {
+  const source = {
+    adapterId: 'native-fixture',
+    sessionId: issue.root.nativeSessionId,
+    scopeId: issue.scopeId,
+    requestId: 'native-request',
+  };
+  const ticket = randomUUID();
+  const adopted = { messageId: 'native-message', turn: 2 };
+  const frame = {
+    ticket,
+    fact: {
+      attemptId: 'native-attempt',
+      assistantSequence: 4,
+      callId: 'native-call',
+      name: 'memory_read',
+      sequence: 5,
+      dispatch: { kind: 'sealed-handler', version: 'fixture-memory' },
+      human: {
+        occurrence: {
+          sessionId: source.sessionId,
+          requestId: source.requestId,
+          scopeId: source.scopeId,
+          ...adopted,
+        },
+        kind: 'ordinary-human-message',
+        sequence: 2,
+        digest: 'sha256:' + 'a'.repeat(64),
+      },
+    },
+  };
+  const start = deferredPromptFact<AbortSignal>();
+  const release = deferredPromptFact<void>();
+  const finish = deferredPromptFact<void>();
+  const send = deferredPromptFact<(chunk: Buffer) => void>();
+  const reply = vi.fn();
+  const observe = observeNativePrompt(
+    {
+      async readManagedModelProof(body, _signal, _image, receive) {
+        if (!receive) {
+          reply(body);
+          return null;
+        }
+        expect(JSON.parse(body)).toMatchObject({ memoryCalls: true });
+        receive(
+          Buffer.from(
+            `ready\ninserted ${JSON.stringify({ messageId: adopted.messageId })}\nclaimed ${JSON.stringify(adopted)}\n`,
+          ),
+        );
+        send.resolve(receive);
+        await finish.promise;
+        return null;
+      },
+    },
+    source,
+    new AbortController().signal,
+    5_000,
+    undefined,
+    async (fact, signal) => {
+      expect(fact).toEqual(frame.fact);
+      start.resolve(signal);
+      await release.promise;
+      return 'already-issued-ref';
+    },
+  );
+  try {
+    await observe.ready;
+    const receive = await send.promise;
+    receive(Buffer.from(`memory-call ${JSON.stringify(frame)}\n`));
+    const active = await start.promise;
+    receive(Buffer.from(`memory-call-cancel ${ticket}\nended\n`));
+    expect(active.aborted).toBe(true);
+    finish.resolve();
+    const settled = vi.fn();
+    void observe.settled.then(settled);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    await expect(observe.settled).resolves.toBe('ended');
+    expect(reply).not.toHaveBeenCalled();
+  } finally {
+    finish.resolve();
+    release.resolve();
+    await observe.close();
+  }
+});
+
 it.each([
   [null, 'PROVIDER_FAILED'],
   ['different-message', 'PROVIDER_FAILED'],

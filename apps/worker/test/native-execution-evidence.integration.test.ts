@@ -117,6 +117,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           value: ModelCallBinding,
           human: typeof adopted | null,
           retry = false,
+          moduleConfigRevisionRef = 'fixture-memory-config-v2',
         ) =>
           db.begin(async (tx) => {
             await tx`select id from allrice_runs where id=${runId} for update`;
@@ -130,15 +131,19 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               tx,
               run,
               value,
-              { ...origin, human },
+              { ...origin, human, moduleConfigRevisionRef },
               [userRequest],
               retry,
             );
           });
         const receipt = await write(first, adopted);
         if (!receipt) throw Error('First receipt missing');
-        expect(await write(first, adopted, true)).toEqual(receipt);
-        const ambiguous = await write(second, null);
+        expect(receipt.openedOrigin).toBe(true);
+        expect(await write(first, adopted, true, 'later-config')).toEqual({
+          ...receipt,
+          openedOrigin: false,
+        });
+        const ambiguous = await write(second, null, false, 'later-config');
         if (!ambiguous) throw Error('Second receipt missing');
         expect(ambiguous.request).toMatchObject({ b: runId, human: null });
         const tool = {
@@ -202,7 +207,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             b: runId,
             ...origin,
             originalExecutionId: first.execution.executionId,
-            moduleConfigRevisionRef: null,
+            moduleConfigRevisionRef: 'fixture-memory-config-v2',
           },
           receipt.request,
           ambiguous.request,

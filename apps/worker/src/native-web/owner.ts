@@ -61,6 +61,7 @@ import {
   observeNativePrompt,
   type NativePromptObservation,
   type NativeToolObservation,
+  type PublishNativeMemoryCall,
 } from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
 import { DEntryNativeRootRejected } from '../d-entry/native-owner.js';
@@ -182,6 +183,7 @@ export async function openNativeWebOwner(input: {
           observe(
             signal: AbortSignal,
             onTool?: (fact: NativeToolObservation) => void,
+            onMemoryCall?: PublishNativeMemoryCall,
           ): NativePromptObservation;
         }
       | {
@@ -924,7 +926,7 @@ export async function openNativeWebOwner(input: {
                     ? call.args.request.delivery
                     : call.args.request.mode,
                 child,
-                observe(current, onTool) {
+                observe(current, onTool, onMemoryCall) {
                   observed = observeNativePrompt(
                     transport,
                     {
@@ -937,6 +939,7 @@ export async function openNativeWebOwner(input: {
                     AbortSignal.any([signal, current]),
                     input.launch.auth.timeoutMs,
                     onTool,
+                    onMemoryCall,
                   );
                   own(observed.settled);
                   return observed;

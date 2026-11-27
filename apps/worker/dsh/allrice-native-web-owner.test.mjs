@@ -9,6 +9,7 @@ import {
   observeOriginalRequest,
   readPromptOrigins,
   withNativeToolEvidence,
+  withNativeMemoryToolPublication,
 } from './allrice-native-web-owner.mjs';
 
 const promptRoot = { id: 'root', header: {} };
@@ -581,6 +582,19 @@ it('keeps the model configuration and rejects competing or non-text input for th
       value,
     );
   const initial = observe([header, start, user]);
+  expect(initial.firstMemoryAttempt).toBe(true);
+  expect(
+    observe([
+      header,
+      start,
+      user,
+      {
+        seq: 3,
+        type: 'assistant/attempt',
+        data: {},
+      },
+    ]).firstMemoryAttempt,
+  ).toBe(false);
   expect(initial).toMatchObject({
     request: {
       provider: 'sealed',
@@ -688,99 +702,143 @@ it('binds the real same-ID steer and rejects a second claimed native input', asy
   }
 });
 
-it('separates a native successful short circuit from entry into the sealed tool implementation', async () => {
-  let runs = 0;
-  const tool = withNativeToolEvidence(
-    {
-      name: 'fixture_native_tool',
-      execute() {
-        runs++;
-        return { isError: false };
+it.each([false, true])(
+  'separates short circuit and sealed body, including a private memory publication %s',
+  async (memory) => {
+    let runs = 0;
+    const wrap = memory
+      ? withNativeMemoryToolPublication
+      : withNativeToolEvidence;
+    const tool = wrap(
+      {
+        name: memory ? 'memory_remember' : 'fixture_native_tool',
+        execute(_args, _exec, nativeRequestRef) {
+          expect(nativeRequestRef).toBe(
+            memory ? 'committed-call-ref' : undefined,
+          );
+          runs++;
+          return { isError: false };
+        },
       },
-    },
-    'fixture-release',
-  );
-  const sameName = withNativeToolEvidence({ ...tool }, 'different-release');
-  const f = promptFixture(true, new Map([[tool.name, tool]]));
-  const request = f.issue();
-  const reader = f.open(request);
-  try {
-    const text = 'synthetic original text';
-    const message = {
-      ...f.message(request),
-      content: [{ type: 'text', text }],
-    };
-    f.agent.inbox.nextTurn = [message];
-    f.emit('inserted', message);
-    f.agent.inbox.nextTurn = [];
-    f.emit('claimed', message, 1);
-    const attemptId = 'root:1';
-    f.events.emit('agent/assistant-stream', {
-      agent: f.agent,
-      frame: { type: 'start', attemptId, turn: 1, step: 1 },
-    });
-    const human = {
-      occurrence: nativePromptOccurrence(f.agent.session, message, 1),
-      sequence: 3,
-      digest:
-        'sha256:' +
-        createHash('sha256')
-          .update(JSON.stringify([text]))
-          .digest('hex'),
-    };
-    expect(
-      f.observe.attest(f.agent.session, attemptId, 4, 1, human).proofState,
-    ).toBe('adopted');
-    const faked = { id: 'short-circuit', name: tool.name, type: 'tool-call' };
-    const actual = { id: 'real-body', name: tool.name, type: 'tool-call' };
-    const append = (type, seq, data) =>
-      f.events.emit('session/event', f.agent.session, {
-        type,
-        seq,
-        data: { turn: 1, step: 1, ...data },
-      });
-    append('assistant/message', 7, { message: { content: [faked, actual] } });
-    f.events.emit('agent/assistant-stream', {
-      agent: f.agent,
-      frame: {
-        type: 'end',
-        attemptId,
-        outcome: { kind: 'committed', eventType: 'assistant/message', seq: 7 },
-      },
-    });
-    const [through] = f.events.listeners('tools/execute');
-    let sequence = 8;
-    const invoke = (block, next) => {
-      append('tool/call', sequence++, { callId: block.id, name: block.name });
-      const exec = {
-        callId: block.id,
-        name: block.name,
-        agent: f.agent,
-        signal: f.lifetime.signal,
-        token: Symbol(),
+      'fixture-release',
+    );
+    const sameName = withNativeToolEvidence({ ...tool }, 'different-release');
+    const f = promptFixture(true, new Map([[tool.name, tool]]));
+    const request = f.issue();
+    const reader = f.open({ ...request, memoryCalls: memory });
+    try {
+      const text = 'synthetic original text';
+      const message = {
+        ...f.message(request),
+        content: [{ type: 'text', text }],
       };
-      return through(exec, () => next(exec));
-    };
-    await invoke(faked, (exec) => {
-      expect(() => sameName.execute({}, exec)).toThrow();
-      return { isError: false };
-    });
-    expect(runs).toBe(0);
-    await invoke(actual, (exec) => tool.execute({}, exec));
-    expect(runs).toBe(1);
-    expect(() =>
-      tool.execute({}, { signal: f.lifetime.signal, token: Symbol() }),
-    ).toThrow();
-    const records = [];
-    for (let i = 0; i < 5; i++) records.push(await f.next(reader));
-    expect(
-      records.slice(3).map((record) => JSON.parse(record.slice(5)).dispatch),
-    ).toEqual([
-      { kind: 'registry-result' },
-      { kind: 'sealed-handler', version: 'fixture-release' },
-    ]);
-  } finally {
-    f.lifetime.abort();
-    await reader.cancel();
-  }
-});
+      f.agent.inbox.nextTurn = [message];
+      f.emit('inserted', message);
+      f.agent.inbox.nextTurn = [];
+      f.emit('claimed', message, 1);
+      const attemptId = 'root:1';
+      f.events.emit('agent/assistant-stream', {
+        agent: f.agent,
+        frame: { type: 'start', attemptId, turn: 1, step: 1 },
+      });
+      const human = {
+        occurrence: nativePromptOccurrence(f.agent.session, message, 1),
+        sequence: 3,
+        digest:
+          'sha256:' +
+          createHash('sha256')
+            .update(JSON.stringify([text]))
+            .digest('hex'),
+      };
+      expect(
+        f.observe.attest(f.agent.session, attemptId, 4, 1, human).proofState,
+      ).toBe('adopted');
+      const faked = { id: 'short-circuit', name: tool.name, type: 'tool-call' };
+      const actual = { id: 'real-body', name: tool.name, type: 'tool-call' };
+      const append = (type, seq, data) =>
+        f.events.emit('session/event', f.agent.session, {
+          type,
+          seq,
+          data: { turn: 1, step: 1, ...data },
+        });
+      append('assistant/message', 7, { message: { content: [faked, actual] } });
+      f.events.emit('agent/assistant-stream', {
+        agent: f.agent,
+        frame: {
+          type: 'end',
+          attemptId,
+          outcome: {
+            kind: 'committed',
+            eventType: 'assistant/message',
+            seq: 7,
+          },
+        },
+      });
+      const [through] = f.events.listeners('tools/execute');
+      let sequence = 8;
+      const invoke = (block, next) => {
+        append('tool/call', sequence++, { callId: block.id, name: block.name });
+        const exec = {
+          callId: block.id,
+          name: block.name,
+          agent: f.agent,
+          signal: f.lifetime.signal,
+          token: Symbol(),
+        };
+        return through(exec, () => next(exec));
+      };
+      await invoke(faked, (exec) => {
+        expect(() => sameName.execute({}, exec)).toThrow();
+        return { isError: false };
+      });
+      expect(runs).toBe(0);
+      const executed = invoke(actual, (exec) => tool.execute({}, exec));
+      const records = [];
+      for (let i = 0; i < (memory ? 4 : 5); i++)
+        records.push(await f.next(reader));
+      if (memory) {
+        expect(runs).toBe(0);
+        expect(records[3]).toMatch(/^memory-call /);
+        const { ticket, fact } = JSON.parse(records[3].slice(12));
+        expect(fact).toMatchObject({
+          attemptId,
+          callId: actual.id,
+          human,
+          dispatch: { kind: 'sealed-handler', version: 'fixture-release' },
+        });
+        const reply = {
+          ...request,
+          action: 'memory-call-result',
+          ticket,
+          nativeRequestRef: 'committed-call-ref',
+        };
+        const proofRequest = { signal: f.lifetime.signal };
+        expect(
+          f.observe({ ...reply, requestId: 'other' }, proofRequest).status,
+        ).toBe(404);
+        expect(f.observe(reply, proofRequest).status).toBe(200);
+        expect(f.observe(reply, proofRequest).status).toBe(404);
+        await expect(
+          tool.execute({}, { signal: f.lifetime.signal, token: Symbol() }),
+        ).rejects.toThrow();
+      } else {
+        expect(() =>
+          tool.execute({}, { signal: f.lifetime.signal, token: Symbol() }),
+        ).toThrow();
+        expect(
+          records
+            .slice(3)
+            .map((record) => JSON.parse(record.slice(5)).dispatch),
+        ).toEqual([
+          { kind: 'registry-result' },
+          { kind: 'sealed-handler', version: 'fixture-release' },
+        ]);
+      }
+      await executed;
+      expect(runs).toBe(1);
+    } finally {
+      f.lifetime.abort();
+      await reader.cancel();
+    }
+  },
+);

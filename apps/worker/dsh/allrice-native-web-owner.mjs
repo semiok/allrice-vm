@@ -413,6 +413,7 @@ async function observePromptOrigins(
 // arguments cross the owner carrier. An unsupported block has no proof.
 const nativeToolBodyClaims = new Map();
 const witnessedNativeTools = new WeakSet();
+const publishedMemoryTools = new WeakSet();
 
 // Only the exact, sealed registration may opt in. A successful around-dispatch
 // result, on its own, cannot mark entry into the registered implementation.
@@ -429,6 +430,35 @@ export function withNativeToolEvidence(tool, version) {
     },
   };
   witnessedNativeTools.add(wrapped);
+  return wrapped;
+}
+
+// The future sealed memory registration must use this wrapper around the
+// actual implementation. Merely returning from a waterfall cannot authorize it.
+export function withNativeMemoryToolPublication(tool, version) {
+  if (
+    !['memory_read', 'memory_remember'].includes(tool.name) ||
+    typeof version !== 'string' ||
+    !version ||
+    version.length > 256
+  )
+    throw Error('Invalid native memory tool registration');
+  const wrapped = {
+    ...tool,
+    async execute(args, exec) {
+      exec.signal.throwIfAborted();
+      const ref = await nativeToolBodyClaims.get(exec.token)?.(
+        wrapped,
+        version,
+      );
+      exec.signal.throwIfAborted();
+      if (typeof ref !== 'string')
+        throw Error('Native memory call unavailable');
+      return tool.execute(args, exec, ref);
+    },
+  };
+  witnessedNativeTools.add(wrapped);
+  publishedMemoryTools.add(wrapped);
   return wrapped;
 }
 
@@ -475,18 +505,21 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
       event.data.turn === turn,
   );
   if (!start) return empty;
-  const inputs = events
-    .slice(start.seq + 1, cursor + 1)
-    .filter(
-      (event) =>
-        event.type === 'user/message' && event.data.id === prompt.messageId,
-    );
+  const currentTurn = events.slice(start.seq + 1, cursor + 1);
+  const inputs = currentTurn.filter(
+    (event) =>
+      event.type === 'user/message' && event.data.id === prompt.messageId,
+  );
   if (inputs.length !== 1) return empty;
   const digest = adoptedTextDigest(inputs[0].data);
   return digest
     ? {
         ...empty,
         human: { occurrence: prompt, sequence: inputs[0].seq, digest },
+        firstMemoryAttempt: !currentTurn.some(
+          ({ type }) =>
+            type === 'assistant/message' || type === 'assistant/attempt',
+        ),
       }
     : empty;
 }
@@ -755,10 +788,40 @@ export function observeNativePrompts(scope, lifetime, capture) {
           exec.signal.aborted ||
           !capture() ||
           !observers.has(observer.id) ||
-          observer.handlerRecords >= 7
+          (!publishedMemoryTools.has(wrapped) && observer.handlerRecords >= 7)
         )
           return false;
         sealedVersion = version;
+        if (publishedMemoryTools.has(wrapped)) {
+          const claimed = inboxClaims.get(session);
+          if (
+            claimed?.turn !== attempt.turn ||
+            claimed.messageId !== attempt.human.occurrence.messageId
+          )
+            return false;
+          return observer
+            .publishMemoryCall(
+              {
+                attemptId: attempt.id,
+                assistantSequence: attempt.assistantSeq,
+                ...call,
+                human: attempt.human,
+                dispatch: { kind: 'sealed-handler', version },
+              },
+              exec.signal,
+            )
+            .then((ref) => {
+              if (
+                capture() &&
+                observers.has(observer.id) &&
+                attempts.get(session) === attempt &&
+                inboxClaims.get(session) === claimed &&
+                definition === original(scope.tools.get(exec.name, exec.agent))
+              )
+                return ref;
+              return null;
+            });
+        }
         observer.handlerRecords++;
         return true;
       });
@@ -772,6 +835,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
       // rc.2 also sends unregistered names and short-circuited failures
       // through the waterfall. Retain only a successful, still-registered call.
       if (
+        !publishedMemoryTools.has(definition) &&
         !result.isError &&
         !exec.signal.aborted &&
         capture() &&
@@ -856,6 +920,18 @@ export function observeNativePrompts(scope, lifetime, capture) {
       return notFound();
     const { id, sessionId, parentSessionId, scopeId, requestId } = value;
     const key = sourceKey(sessionId, parentSessionId, scopeId, requestId);
+    if (value.action === 'memory-call-result') {
+      const observer = observers.get(id);
+      const ref = value.nativeRequestRef;
+      if (
+        observer?.key !== key ||
+        (ref !== null &&
+          (typeof ref !== 'string' || !ref || ref.length > 256)) ||
+        !observer.memoryReplies.get(value.ticket)?.(ref)
+      )
+        return notFound();
+      return globalThis.Response.json({ accepted: true });
+    }
     if (value.action === 'prompt-outcome') {
       const observer = observers.get(id);
       return observer?.key === key
@@ -888,6 +964,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
         close = () => {
           if (!observers.delete(id)) return false;
           signal.removeEventListener('abort', abort);
+          for (const finish of observer.memoryReplies.values()) finish(null);
           group.delete(observer);
           if (group.size === 0) sources.delete(key);
           observer.unclaim?.();
@@ -902,6 +979,40 @@ export function observeNativePrompts(scope, lifetime, capture) {
           existing,
           handlerRecords: 0,
           registryResult: false,
+          memoryReplies: new Map(),
+          async publishMemoryCall(fact, nativeSignal) {
+            if (value.memoryCalls !== true) return null;
+            const ticket = randomUUID();
+            const frame = JSON.stringify({ ticket, fact });
+            if (Buffer.byteLength(frame) > 2500) return null;
+            const active = globalThis.AbortSignal.any([
+              nativeSignal,
+              signal,
+              globalThis.AbortSignal.timeout(30_000),
+            ]);
+            active.throwIfAborted();
+            return new Promise((resolve, reject) => {
+              const finish = (ref) => {
+                if (!observer.memoryReplies.delete(ticket)) return false;
+                active.removeEventListener('abort', cancel);
+                resolve(ref);
+                return true;
+              };
+              const cancel = () => {
+                if (finish(null) && observers.has(id) && !signal.aborted)
+                  send('memory-call-cancel ' + ticket);
+              };
+              observer.memoryReplies.set(ticket, finish);
+              active.addEventListener('abort', cancel, { once: true });
+              try {
+                send('memory-call ' + frame);
+              } catch (error) {
+                observer.memoryReplies.delete(ticket);
+                active.removeEventListener('abort', cancel);
+                reject(error);
+              }
+            });
+          },
           send,
           finish(type) {
             if (!close()) return;
@@ -1421,7 +1532,8 @@ export function applyNativeWebOwner(
               if (
                 value?.adapterId === id &&
                 (value.action === 'observe-prompt' ||
-                  value.action === 'prompt-outcome')
+                  value.action === 'prompt-outcome' ||
+                  value.action === 'memory-call-result')
               )
                 return promptFacts(value, request);
               if (
@@ -1491,6 +1603,8 @@ export function applyNativeWebOwner(
                         value.turn,
                         origin.request.human,
                       ),
+                      firstMemoryAttempt:
+                        origin.request.firstMemoryAttempt === true,
                     },
                     inheritedPromptIndexes: origin.prompts.flatMap(
                       (prompt, index) =>

@@ -1,7 +1,11 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { z } from 'zod';
-import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
+import {
+  memoryIndexPolicy,
+  type DEntryIdentity,
+  type RequestContext,
+} from '@allrice/contracts';
 import {
   DataAccessError,
   IdentityError,
@@ -41,6 +45,8 @@ import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/typ
 import type { ProductionNativeModelExecution } from './production-sources.js';
 import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 import {
+  matchNativeToolObservation,
+  nativeAdoptedTextProofVersion,
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
   type NativeExecutionBuild,
@@ -127,6 +133,7 @@ async function persistExecution(
     build: NativeExecutionBuild;
     observation: NativeRequestObservation | null;
     prompts: readonly NativePromptOccurrence[];
+    moduleConfigRevisionRef?: string;
   },
   signal: AbortSignal,
 ) {
@@ -241,6 +248,12 @@ async function persistExecution(
               nativeOwnerRef: native.instanceId,
               nativeProfileRef: native.profile,
               applicationBuild: provenance.build,
+              ...(human?.kind === 'ordinary-human-message' &&
+                observed?.proofState === 'adopted' &&
+                observed.firstMemoryAttempt &&
+                adoptedModelConfiguration && {
+                  moduleConfigRevisionRef: provenance.moduleConfigRevisionRef,
+                }),
               employeeInstanceId: identity.employeeInstanceId,
               employeeRelease: identity.employeeVersionId,
               employeeRevision: identity.employeeRevision,
@@ -418,6 +431,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           route: AbortSignal;
           delivery?: AbortSignal;
           persisted?: boolean;
+          memoryIndex?: string;
           delegated: boolean;
           prompts: readonly NativePromptOccurrence[];
           inheritedPromptIndexes: readonly number[];
@@ -431,6 +445,118 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         PromptOwner,
         Map<string, EvidenceReceipt>
       >();
+      const memory = host.nativeMemory;
+      const memoryRoots = new WeakMap<
+        PromptOwner,
+        Promise<
+          Readonly<{
+            executionRef: string;
+            memoryIndexDocument: string;
+          }>
+        >
+      >();
+      async function publishMemoryRoot(
+        scope: PromptOwner,
+        call: ModelCallBinding,
+        receipt: EvidenceReceipt,
+        active: AbortSignal,
+      ) {
+        if (
+          !memory ||
+          !receipt.request.human ||
+          receipt.moduleConfigRevisionRef !== memory.moduleConfigRevisionRef
+        )
+          return;
+        let root = memoryRoots.get(scope);
+        if (!root && receipt.openedOrigin) {
+          const { vmId, instanceId, leaseEpoch } = call.vm;
+          root = Promise.resolve().then(async () => {
+            await scope.assertObserved(active);
+            active.throwIfAborted();
+            const issued = await memory.publication.root(
+              scope.context,
+              {
+                runId: receipt.run.runId,
+                workspaceId: scope.identity.workspaceId,
+                employeeInstanceId: call.employeeInstanceId,
+                threadId: call.allriceThreadRef,
+                originalPromptRequestId: scope.requestId,
+                originalTurn: receipt.request.turn,
+                rootNativeSessionRef: call.native.rootSessionId,
+                nativeOwnerRef: call.native.instanceId,
+                nativeProfileRef: call.native.profile,
+                moduleConfigRevisionRef: memory.moduleConfigRevisionRef,
+                vm: { vmId, instanceId, leaseEpoch },
+              },
+              active,
+            );
+            await scope.assertObserved(active);
+            active.throwIfAborted();
+            if (
+              !issued.executionRef ||
+              issued.executionRef.length > 256 ||
+              Buffer.byteLength(issued.memoryIndexDocument) >
+                memoryIndexPolicy.maximumInitialBytes
+            )
+              return reject();
+            return Object.freeze({ ...issued });
+          });
+          memoryRoots.set(scope, root);
+        }
+        return root;
+      }
+      function publishMemoryCall(
+        prompt: PromptOwner,
+        fact: NativeToolObservation,
+        signal: AbortSignal,
+      ) {
+        return run(
+          AbortSignal.any([signal, prompt.revoked]),
+          async (active) => {
+            const receipt = toolRequests.get(prompt)?.get(fact.attemptId);
+            const root = memoryRoots.get(prompt);
+            const name = fact.name;
+            if (
+              !memory ||
+              !root ||
+              !receipt ||
+              (name !== 'memory_read' && name !== 'memory_remember') ||
+              fact.dispatch.kind !== 'sealed-handler' ||
+              fact.dispatch.version !== memory.toolVersions[name] ||
+              !matchNativeToolObservation(receipt.request, fact)
+            )
+              return null;
+            const { executionRef } = await root;
+            const { occurrence, kind, digest } = fact.human;
+            await prompt.assertObserved(active);
+            active.throwIfAborted();
+            const result = await memory.publication.call(
+              prompt.context,
+              {
+                executionRef,
+                nativeSessionRef: occurrence.sessionId,
+                parentSessionRef: occurrence.parentSessionId ?? null,
+                callRef: fact.callId,
+                toolId: name,
+                toolVersion: fact.dispatch.version,
+                humanSource: {
+                  kind,
+                  requestId: occurrence.requestId,
+                  occurrenceId: occurrence.messageId,
+                  sourceSessionRef: occurrence.sessionId,
+                  turn: occurrence.turn,
+                  proofVersion: nativeAdoptedTextProofVersion,
+                  proofDigest: digest,
+                },
+              },
+              active,
+            );
+            await prompt.assertObserved(active);
+            active.throwIfAborted();
+            return result.nativeRequestRef || null;
+          },
+        );
+      }
       function collectNativeTool(
         prompt: PromptOwner,
         fact: NativeToolObservation,
@@ -862,8 +988,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   admission,
                 );
               admission.throwIfAborted();
-              const observation = observe(revoked, (fact) =>
-                collectNativeTool(scope, fact),
+              const observation = observe(
+                revoked,
+                (fact) => collectNativeTool(scope, fact),
+                memory &&
+                  ((fact, active) => publishMemoryCall(scope, fact, active)),
               );
               const scope: PromptOwner = Object.freeze({
                 context: structuredClone(context),
@@ -1355,11 +1484,23 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                             build: host.nativeExecutionBuild ?? null,
                             observation,
                             prompts,
+                            moduleConfigRevisionRef: host.nativeExecutionBuild
+                              ? memory?.moduleConfigRevisionRef
+                              : undefined,
                           },
                           admitted,
                         );
                         entry.persisted = true;
                         await assertPersistedExecution(call, admitted);
+                        if (evidence) {
+                          const root = await publishMemoryRoot(
+                            scope,
+                            call,
+                            evidence,
+                            admitted,
+                          );
+                          entry.memoryIndex = root?.memoryIndexDocument;
+                        }
                         if (kind === 'assistant')
                           for (const member of direct)
                             sourceExecutions.set(member, call.execution);
@@ -1454,6 +1595,18 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           });
         },
         references,
+        async readMemoryIndex(call, signal) {
+          const entry = calls.get(call.native.callId);
+          if (!entry?.memoryIndex) return undefined;
+          await readAuthorizedCall(call, signal);
+          await entry.scope.assertObserved(signal);
+          const active = entry.delivery;
+          if (!active || calls.get(call.native.callId) !== entry)
+            return reject();
+          active.throwIfAborted();
+          signal.throwIfAborted();
+          return entry.memoryIndex;
+        },
         redeem(call, signal) {
           const entry = calls.get(call.native.callId);
           if (

@@ -40,10 +40,10 @@ afterEach(async () => {
     throw new AggregateError(failures, 'Fixture cleanup failed');
 });
 
-it.skipIf(!cli)(
-  'shares one durable native reminder between the non-owner schedules page and the Host wake reader',
+it.skipIf(!cli).each([false, true])(
+  'shares a native reminder with the Host wake reader and fences a fixture memory handler %s',
   { tags: ['manual:ALLRICE_NATIVE_WEB_TEST_CLI'], timeout: 30000 },
-  async () => {
+  async (fixtureMemory) => {
     const references = new Map<string, boolean>();
     const capability = 'a'.repeat(43);
     let assistantRequests = 0;
@@ -53,6 +53,14 @@ it.skipIf(!cli)(
     const nativeCallId = randomUUID();
     const handlerCallId = randomUUID();
     const handlerVersion = 'sealed-test-handler-v1';
+    const memoryCallId = randomUUID();
+    const memoryStarted = deferredPromptFact<NativeToolObservation>();
+    const commitMemory = deferredPromptFact<string>();
+    const memoryMarker = () =>
+      join(roots.at(-1)!, 'dsh/native-web/fixture-memory-marker');
+    cleanup.push(async () => {
+      commitMemory.resolve('fixture-closed');
+    });
     const nativeRequestId = randomUUID();
     const humanText = 'Create a test reminder in ten minutes.';
     const selected = deferredPromptFact<{
@@ -117,7 +125,7 @@ it.skipIf(!cli)(
               ? ['memory_read', 'memory_remember'].map((name, i) => ({
                   type: 'tool-call-delta',
                   index: i + 1,
-                  id: randomUUID(),
+                  id: name === 'memory_remember' ? memoryCallId : randomUUID(),
                   name,
                   argumentsDelta: '{}',
                 }))
@@ -155,7 +163,7 @@ it.skipIf(!cli)(
       {
         nativeToolEvidenceProbe: `
           import { writeFile } from 'node:fs/promises';
-          import { withNativeToolEvidence } from './owner.mjs';
+          import { withNativeToolEvidence, withNativeMemoryToolPublication } from './owner.mjs';
           export const inject = ['tools'];
           export function apply(ctx) {
             ctx.tools.register(withNativeToolEvidence({
@@ -168,6 +176,20 @@ it.skipIf(!cli)(
                 return true;
               },
             }, ${JSON.stringify(handlerVersion)}));
+            ${
+              fixtureMemory
+                ? `ctx.tools.register(withNativeMemoryToolPublication({
+              name: 'memory_remember',
+              description: 'Record an isolated test publication.',
+              parameters: { type: 'object', properties: {}, additionalProperties: false },
+              output: { schema: { type: 'boolean' }, render: value => [{ type: 'text', text: String(value) }] },
+              async execute(args, exec, nativeRequestRef) {
+                await writeFile(new URL('./fixture-memory-marker', import.meta.url), nativeRequestRef, { flag: 'wx' });
+                return true;
+              },
+            }, ${JSON.stringify(handlerVersion)}));`
+                : ''
+            }
           }
         `,
       },
@@ -186,10 +208,19 @@ it.skipIf(!cli)(
       async (request) => {
         if (request.endpoint !== 'session/prompt')
           throw Error('Unexpected native prompt');
-        const observation = request.observe(signal, (fact) => {
-          seen.push(fact);
-          if (fact.callId === nativeCallId) proofs.resolve(fact);
-        });
+        const observation = request.observe(
+          signal,
+          (fact) => {
+            seen.push(fact);
+            if (fact.callId === nativeCallId) proofs.resolve(fact);
+          },
+          fixtureMemory
+            ? async (fact, active) => {
+                memoryStarted.resolve(fact);
+                return waitForPromptFact(commitMemory.promise, active);
+              }
+            : undefined,
+        );
         await observation.ready;
         opened.resolve(observation);
         return {
@@ -224,6 +255,7 @@ it.skipIf(!cli)(
         model: 'fixture-codex',
         digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
+      expect(attempt.observation.firstMemoryAttempt).toBe(true);
       selected.resolve({
         id: attempt.id,
         cursor: attempt.cursor,
@@ -336,10 +368,26 @@ it.skipIf(!cli)(
         signal,
       ),
     ).toMatchObject({ value: { accepted: true } });
-    const [nativeAttempt, tool] = await Promise.all([
-      waitForPromptFact(selected.promise, signal),
-      waitForPromptFact(proofs.promise, signal),
-    ]);
+    const nativeAttempt = await waitForPromptFact(selected.promise, signal);
+    if (fixtureMemory) {
+      try {
+        expect(
+          await waitForPromptFact(memoryStarted.promise, signal),
+        ).toMatchObject({
+          callId: memoryCallId,
+          name: 'memory_remember',
+          attemptId: nativeAttempt.id,
+          human: nativeAttempt.observation,
+          dispatch: { kind: 'sealed-handler', version: handlerVersion },
+        });
+        await expect(readFile(memoryMarker(), 'utf8')).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      } finally {
+        commitMemory.resolve('committed-private-fixture-call');
+      }
+    }
+    const tool = await waitForPromptFact(proofs.promise, signal);
     const digest =
       'sha256:' +
       createHash('sha256')
@@ -368,6 +416,14 @@ it.skipIf(!cli)(
 
     const observation = await waitForPromptFact(opened.promise, signal);
     expect(await waitForPromptFact(observation.settled, signal)).toBe('ended');
+    if (fixtureMemory)
+      expect(await readFile(memoryMarker(), 'utf8')).toBe(
+        'committed-private-fixture-call',
+      );
+    else
+      await expect(readFile(memoryMarker(), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
     expect(seen.map(({ name }) => name).sort()).toEqual([
       'fixture_tool_evidence',
       'schedule_create',

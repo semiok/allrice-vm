@@ -363,6 +363,7 @@ export function nativeWebTransport(
       caller: AbortSignal,
       image = false,
       onChunk?: (chunk: Buffer) => void,
+      streamBytes?: number,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
@@ -371,7 +372,7 @@ export function nativeWebTransport(
         {
           maxBytes: image
             ? Math.ceil((20 * 1024 * 1024 * 4) / 3) + 16_384
-            : 24 * 1024,
+            : (streamBytes ?? 24 * 1024),
           credential: 'api',
           body,
           onChunk,

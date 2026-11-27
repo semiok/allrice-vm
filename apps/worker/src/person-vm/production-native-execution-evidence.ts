@@ -35,7 +35,7 @@ export type NativeExecutionOriginEvidence = Readonly<{
   nativeOwnerRef: string;
   nativeProfileRef: string;
   applicationBuild: NativeExecutionBuild;
-  moduleConfigRevisionRef: null;
+  moduleConfigRevisionRef: string | null;
   adoptedModelConfiguration: NativeRequestObservation['request'];
   employeeInstanceId: string;
   employeeRelease: string;
@@ -75,6 +75,8 @@ export type NativeExecutionEvidence =
 type Receipt = Readonly<{
   run: Run;
   request: NativeExecutionRequestEvidence;
+  openedOrigin: boolean;
+  moduleConfigRevisionRef: string | null;
 }>;
 
 async function append(
@@ -98,7 +100,7 @@ export async function recordNativeExecutionRequest(
   origin: Omit<
     NativeExecutionOriginEvidence,
     'source' | 'kind' | 'b' | 'originalExecutionId' | 'moduleConfigRevisionRef'
-  >,
+  > & { moduleConfigRevisionRef?: string },
   contributingRequestIds: readonly string[],
   alreadyPersisted: boolean,
 ): Promise<Receipt | null> {
@@ -133,7 +135,7 @@ export async function recordNativeExecutionRequest(
           kind: 'origin',
           b: run.runId,
           originalExecutionId: call.execution.executionId,
-          moduleConfigRevisionRef: null,
+          moduleConfigRevisionRef: origin.moduleConfigRevisionRef ?? null,
         });
       }
       const sameHuman =
@@ -171,9 +173,17 @@ export async function recordNativeExecutionRequest(
       where run_id=${run.runId} and event_type='harness.native'
         and payload->>'source'=${nativeExecutionEvidenceSource} and payload->>'kind'='request'
         and payload->>'executionId'=${request.executionId}`;
-      if (existing) return existing.exact ? { run, request } : null;
+      const receipt = {
+        run,
+        request,
+        openedOrigin: !saved,
+        moduleConfigRevisionRef: saved
+          ? saved.payload.moduleConfigRevisionRef
+          : (origin.moduleConfigRevisionRef ?? null),
+      };
+      if (existing) return existing.exact ? receipt : null;
       await append(tx, run, request);
-      return { run, request };
+      return receipt;
     })
     .catch(() => null);
 }

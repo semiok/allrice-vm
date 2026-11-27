@@ -56,6 +56,11 @@ export interface ProductionNativeModelExecution {
     resolveSendRoute: ResolveProductionDEntrySendRoute;
     references?: readonly ManagedHostService[];
     readModelImage?: ReadProductionModelImage;
+    readMemoryIndex?: NonNullable<
+      Awaited<
+        ReturnType<ProductionPersonVmHostSources['bind']>
+      >['model']['readMemoryIndex']
+    >;
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
@@ -170,6 +175,7 @@ export function createProductionPersonVmSources(
             route: codex.route,
             transport: codex.transport,
             scopeStream: codex.scopeStream,
+            readMemoryIndex: owned.readMemoryIndex,
             async resolveCall(headers, binding, signal) {
               await codex.assertCurrent(signal);
               const call = await calls.resolveCall(headers, binding, signal);
