@@ -24,7 +24,9 @@ const pin = ReferenceSelectionSchema.pick({
   revision: true,
   checksum: true,
   fileName: true,
-}).extend({ digest: ReferenceSelectionSchema.shape.digest.optional() });
+})
+  .strip()
+  .extend({ digest: ReferenceSelectionSchema.shape.digest.optional() });
 const occurrence = pin
   .extend({ version: z.literal(1), sessionId: z.string().min(1) })
   .strict();

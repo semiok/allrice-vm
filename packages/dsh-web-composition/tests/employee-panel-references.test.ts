@@ -142,6 +142,20 @@ it('uses the captured native span and reselects the immutable authorized revisio
   ).rejects.toThrow('引用已失效');
 });
 
+it('projects an exact prepared deliverable without retaining unrelated response fields', async () => {
+  const f = fixture();
+  expect(f.reference.insert({ ...f.request, reference: revision })).toBe(true);
+  const [{ ref }] = f.insertReference.mock.calls[0] as unknown as [
+    { ref: string },
+  ];
+  expect(JSON.parse(ref)).not.toHaveProperty('ownership');
+  expect(JSON.parse(ref)).not.toHaveProperty('publication');
+  expect(await f.codec.serialize(ref, f.lifetime.signal)).toContain(
+    revision.checksum,
+  );
+  f.cleanup.forEach((close) => close());
+});
+
 it.each(['denied', 'checksum moved', 'scope changed', 'session changed'])(
   'blocks submission after %s',
   async (change) => {
