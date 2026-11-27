@@ -147,6 +147,7 @@ export function createAssignedNativeWebStartup(input: {
     PersonVmWebStartup,
     {
       selectedId?: string;
+      runtimeLimit?: number;
       launches: readonly {
         endpoint: Endpoint;
         launch: NativeWebLaunchPlan;
@@ -159,6 +160,7 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding;
       receipt: PersonVmWebEndpointReceipt;
       slots?: PersonVmWebEndpointReceipt['slots'];
+      runtimeLimit?: number;
       bindingRef: string;
       revoked: AbortController;
       ready: boolean;
@@ -215,12 +217,12 @@ export function createAssignedNativeWebStartup(input: {
   }
   function employeeCapacityFull(group: RunningGroup) {
     return (
-      input.employeeRuntime !== undefined &&
+      group.runtimeLimit !== undefined &&
       new Set([
         ...group.owners.keys(),
         ...group.startingEmployees,
         ...group.blockedEmployees.keys(),
-      ]).size >= runtimeLimit
+      ]).size >= group.runtimeLimit
     );
   }
   function withEmployeeCapacity(
@@ -430,9 +432,12 @@ export function createAssignedNativeWebStartup(input: {
       ({ employeeInstanceId }) =>
         employeeInstanceId === selectedId || !deferred.has(employeeInstanceId),
     );
-    if (launches.length > runtimeLimit)
-      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
-    return { endpoints: launches, selectedId };
+    // A retained roster can have more mandatory profiles than the new limit.
+    // Keep this generation on the established eager path until its owners can
+    // be safely deferred. Only a plan that fits may enable the running limit.
+    return launches.length > runtimeLimit
+      ? { endpoints, selectedId }
+      : { endpoints: launches, selectedId, runtimeLimit };
   }
   async function close() {
     if (closing) return closing;
@@ -520,7 +525,11 @@ export function createAssignedNativeWebStartup(input: {
         );
         current(binding, web);
         signal.throwIfAborted();
-        prepared.set(web, { launches, selectedId: cold.selectedId });
+        prepared.set(web, {
+          launches,
+          selectedId: cold.selectedId,
+          runtimeLimit: cold.runtimeLimit,
+        });
         // The existing native bootstrap stages all files, initializes person
         // memory once, and only then exposes its launcher to start below.
         return {
@@ -560,6 +569,7 @@ export function createAssignedNativeWebStartup(input: {
           binding,
           receipt,
           slots: web.receipt.slots,
+          runtimeLimit: plan.runtimeLimit,
           bindingRef: randomUUID(),
           revoked: new AbortController(),
           ready: false,

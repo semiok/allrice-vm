@@ -18,6 +18,7 @@ import {
 import { createVmMemoryGuestPlan } from '@allrice/vm-memory/guest-plan';
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { NativeWebOwner, openNativeWebOwner } from './owner.js';
+import { createProductionEmployeeRuntime } from '../person-vm/production-employee-runtime.js';
 import {
   harness,
   MemoryStore,
@@ -284,24 +285,91 @@ it.each(['proved', 'unproved'] as const)(
     }
   },
 );
-it('applies the default four-owner cap before staging when cold evidence is absent', async () => {
-  const f = capacityFixture({ readColdSelection: async () => null });
+it('starts only the selected employee on a fresh five-profile disk and keeps all five usable after stop and restore', async () => {
+  const f = capacityFixture(
+    createProductionEmployeeRuntime({}, { readAttachedProbe: vi.fn() }, 20)!,
+  );
   const endpoints = Array.from({ length: 5 }, (_, index) => ({
     ...f.web.receipt.endpoints[0]!,
     employeeInstanceId: randomUUID(),
     hostPort: 32171 + index,
     guestPort: 32171 + index,
   }));
+  const selectedEmployee = { ...endpoints[0]!, ...f.binding };
   const web = {
     ...f.web,
+    selectedEmployee,
+    unusedEmployeeHomes: true as const,
     receipt: { ...f.web.receipt, endpoints, slots: endpoints },
   };
-  await expect(
-    f.service.memoryGuestPlan(f.binding, signal(), web),
-  ).rejects.toMatchObject({ code: 'WEB_ENDPOINTS_PREPARING' });
-  expect(f.memoryGuestPlan).not.toHaveBeenCalled();
-  expect(open).not.toHaveBeenCalled();
-  await f.service.close();
+  const oldOwner = {
+    ...catalogOwner(),
+    verifyStartingEditor: vi.fn(async () => signal()),
+  };
+  const restoredOwners = endpoints.map(() => ({
+    ...catalogOwner(),
+    verifyStartingEditor: vi.fn(async () => signal()),
+  }));
+  open.mockResolvedValueOnce(oldOwner);
+  restoredOwners.forEach((owner) => open.mockResolvedValueOnce(owner));
+  f.service.installStartingEditorProof(async () => signal());
+  try {
+    const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
+    expect(
+      plan.files.filter(({ path }) => path.endsWith('/owner.patch.json')),
+    ).toHaveLength(1);
+    await f.service.start(f.binding, signal(), f.scope, web);
+    expect(open).toHaveBeenCalledOnce();
+    expect(
+      f.service.catalog(f.binding, selectedEmployee.employeeInstanceId).owner,
+    ).toBe(oldOwner);
+    await f.service.retireAfterNativeStop(f.binding, signal());
+    expect(oldOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
+    expect(oldOwner.close).not.toHaveBeenCalled();
+
+    const retained = {
+      ...f.binding,
+      instanceId: randomUUID(),
+      leaseEpoch: f.binding.leaseEpoch + 1,
+    };
+    const restart = {
+      ...f.web,
+      selectedEmployee,
+      receipt: { ...web.receipt, binding: retained },
+    };
+    const restored = await f.service.memoryGuestPlan(
+      retained,
+      signal(),
+      restart,
+    );
+    expect(
+      restored.files.filter(({ path }) => path.endsWith('/owner.patch.json')),
+    ).toHaveLength(5);
+    await f.service.start(
+      retained,
+      signal(),
+      { ...f.scope, binding: retained },
+      restart,
+    );
+    expect(open).toHaveBeenCalledTimes(6);
+    expect(() =>
+      f.service.catalog(f.binding, selectedEmployee.employeeInstanceId),
+    ).toThrow('LEASE_LOST');
+    for (const [index, endpoint] of endpoints.entries()) {
+      expect(
+        f.service.catalog(retained, endpoint.employeeInstanceId).owner,
+      ).toBe(restoredOwners[index]);
+      expect(
+        f.service.assertVerifiedEditor(
+          retained,
+          signal(),
+          endpoint.employeeInstanceId,
+        ).aborted,
+      ).toBe(false);
+    }
+  } finally {
+    await f.service.close();
+  }
 });
 it('rejects a cold proof from another tenant or a previous profile before staging', async () => {
   for (const stale of ['organizationId', 'employeeVersionId'] as const) {
