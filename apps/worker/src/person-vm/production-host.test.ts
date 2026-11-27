@@ -23,6 +23,7 @@ import {
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
 import type * as ScheduledWake from './production-scheduled-wake.js';
+import type * as ReleasedProfile from '../d-entry/released-profile.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -75,6 +76,10 @@ const io = vi.hoisted(() => ({
         gateway: ReturnType<typeof Egress.createEgressGateway>,
       ) => void
     >(),
+}));
+vi.mock('../d-entry/released-profile.js', async (original) => ({
+  ...(await original<typeof ReleasedProfile>()),
+  primeWorkerEmployeeWebRelease: async () => {},
 }));
 vi.mock('./production-disk-preprovision.js', () => ({
   startProductionDiskPreprovision: io.diskPreprovision,
@@ -568,6 +573,7 @@ it('resumes startup and wake if a drain recovery makes a wake eligible', async (
     dispatchUpgradeStop: vi.fn(),
     prepareStopWithWake: vi.fn(),
     prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
   };
   io.upgradeWake.mockReturnValueOnce(wake);
   const list = vi
@@ -614,6 +620,7 @@ it('requires an exact explicit shutdown claim and leaves every committed wake wi
     dispatchUpgradeStop: vi.fn(),
     prepareStopWithWake: vi.fn(),
     prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
   };
   io.upgradeWake.mockReturnValueOnce(wake);
   const list = vi
@@ -670,6 +677,7 @@ it('joins the claimed wake before fencing its next epoch on ordinary shutdown', 
     dispatchUpgradeStop: vi.fn(),
     prepareStopWithWake: vi.fn(),
     prepareUpgradeStop: vi.fn(),
+    readyForRecovery: vi.fn(() => false),
   });
   vi.spyOn(
     PersonVmService.prototype,

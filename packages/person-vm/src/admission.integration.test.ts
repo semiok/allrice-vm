@@ -1401,7 +1401,10 @@ suite(
           ).rejects.toMatchObject({
             code: 'CLEANUP_INCOMPLETE',
           });
-          const restarted = new PersonVmService(h.options);
+          const restarted = new PersonVmService({
+            ...h.options,
+            store: new PostgresPersonVmStore(open),
+          });
           expect(
             (await store.listJoinedIdleStopCandidates(signal())).map(
               ({ vmId }) => vmId,
@@ -1487,7 +1490,10 @@ suite(
             ).toHaveLength(1);
             h.states.set(binding.vmId, 'stopped');
           }
-          const restarted = new PersonVmService(h.options);
+          const restarted = new PersonVmService({
+            ...h.options,
+            store: new PostgresPersonVmStore(open),
+          });
           await expect(
             restarted.recoverJoinedIdleStop(binding, signal()),
           ).resolves.toBe(true);

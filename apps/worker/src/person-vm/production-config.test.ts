@@ -108,6 +108,7 @@ function value() {
       cliPath: '/opt/allrice/dsh/synthetic/cli.mjs',
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
+      terminalEnabled: true,
     },
     lifecycle: {
       leaseTtlMs: 30000,
@@ -423,6 +424,18 @@ describe('private production Host configuration', () => {
     expect(source.build).toHaveBeenCalledWith('worker');
     expect(result).not.toHaveProperty('verified');
     expect(result).not.toHaveProperty('ready');
+  });
+  it('enables the terminal by default and honors an explicit sealed opt-out', async () => {
+    const config = value();
+    await seal({
+      ...config,
+      web: { ...config.web, terminalEnabled: undefined },
+    });
+    const defaults = await readProductionHostConfiguration(signal());
+    expect(defaults.configuration.web.terminalEnabled).toBe(true);
+    await seal({ ...config, web: { ...config.web, terminalEnabled: false } });
+    const disabled = await readProductionHostConfiguration(signal());
+    expect(disabled.configuration.web.terminalEnabled).toBe(false);
   });
   it.each([
     { label: 'missing', patch: null },

@@ -54,6 +54,7 @@ import {
 import { totalmem } from 'node:os';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
+  primeWorkerEmployeeWebRelease,
   readReleasedGuestProfile,
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
@@ -173,6 +174,7 @@ const UPGRADE_WAIT_MS = 120_000;
 type UpgradeDrainReceipt = Readonly<{ stopped: number; expiresAt: string }>;
 
 export interface ProductionPersonVmHost {
+  wakeRecoveryReady(): boolean;
   prepareStopWithWake(
     request: PersonVmWakePreparation,
     signal: AbortSignal,
@@ -669,6 +671,7 @@ export function createProductionPersonVmHost(input: {
           };
         },
       );
+      await primeWorkerEmployeeWebRelease(lifetime);
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every
@@ -1302,6 +1305,7 @@ export function createProductionPersonVmHost(input: {
         });
       }
       return Object.freeze({
+        wakeRecoveryReady: () => scheduledWake?.readyForRecovery() === true,
         async prepareStopWithWake(
           request: PersonVmWakePreparation,
           signal: AbortSignal,

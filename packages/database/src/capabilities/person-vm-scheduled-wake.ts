@@ -433,7 +433,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
                 and vm.egress_receipt is null, false) as stopped
             ) as source
             where p.state='claimed' and p.claim_until<=now()
-              and vm.lease_owner is null and (p.revoked_at is not null or not source.stopped)
+              and (p.revoked_at is not null or not source.stopped)
+              and (vm.lease_owner is null or (
+                vm.organization_id=p.organization_id and vm.vm_id=p.vm_id
+                and vm.lease_epoch>p.lease_epoch and vm.phase='starting'
+                and vm.lease_expires_at<=clock_timestamp()
+                and pg_try_advisory_xact_lock(hashtextextended('person-vm:' || p.person_id::text,0))
+              ))
             order by p.claim_until,p.plan_id
             limit 1 for update of p skip locked
           ) as expired where w.plan_id=expired.plan_id

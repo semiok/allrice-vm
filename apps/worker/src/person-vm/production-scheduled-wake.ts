@@ -155,6 +155,7 @@ export function createProductionScheduledWake(input: {
   const ledger = createPostgresNativeScheduleObservationLedger(input.database);
   let runner: Promise<void> | undefined;
   let tick: Promise<boolean> | undefined;
+  let lastCompletedTick: number | undefined;
   let paused = false;
   let closing: Promise<void> | undefined;
 
@@ -409,7 +410,9 @@ export function createProductionScheduledWake(input: {
             try {
               tick = wake.runDueOnce(lifetime);
               await tick;
+              lastCompletedTick = performance.now();
             } catch {
+              lastCompletedTick = undefined;
               if (!lifetime.aborted)
                 console.error('[person-vm] scheduled wake tick failed');
             } finally {
@@ -422,6 +425,14 @@ export function createProductionScheduledWake(input: {
         if (!lifetime.aborted) throw error;
       });
       void runner.catch(() => {});
+    },
+    readyForRecovery() {
+      return (
+        !lifetime.aborted &&
+        !paused &&
+        lastCompletedTick !== undefined &&
+        performance.now() - lastCompletedTick < 15_000
+      );
     },
     async pause(signal: AbortSignal) {
       signal.throwIfAborted();

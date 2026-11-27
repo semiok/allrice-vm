@@ -70,6 +70,17 @@ recovery_pair() { # Web plist, Worker plist, [expected SHA]
 }
 ready_sha() { # url role release -> prints a matching verified sourceSha
   curl -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
+worker_vm_recovery() { # release pid -> exact ready boot and ownership state
+  local port owners proof
+  port=$(worker_port) || return 1
+  owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
+  [ "$owners" = "$2" ] || return 1
+  proof=$(curl -fsS -m 5 "http://127.0.0.1:$port/health/ready" 2>/dev/null |
+    "$M1_PY" "$M1_TOOLS/service_target.py" ready worker "$1" "$2") || return 1
+  owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
+  [ "$owners" = "$2" ] && [ -n "$proof" ] || return 1
+  printf '%s\n' "$proof"
+}
 worker_boot() { # prints the bootId the ready Worker reports, or nothing; never fails
   { curl -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
 try: b=str(json.load(sys.stdin)["identity"]["bootId"])
@@ -191,7 +202,7 @@ record_worker_exit_intent() {
 }
 
 stop_release_worker() {
-  local plist rel port process boot receipt count target status i pid expire
+  local plist rel port process boot receipt count target status i pid expire owner
   local mode=${1:-release}
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
@@ -259,6 +270,9 @@ PYTHON
   fi
   [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
   pid=${process#running }
+  RELEASE_STOP_UNCONFIRMED=1
+  boot=$(worker_boot) || return 1
+  record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   # Only an agent staged with this policy stays loaded with no process after a
   # successful SIGTERM. Unconditional KeepAlive starts a replacement Worker.
   if ! "$M1_PY" -c 'import plistlib,sys
@@ -267,9 +281,22 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     say "Current Worker launch policy does not support a graceful release handoff. Release blocked."
     return 1
   fi
+  owner=""
+  if [ "$mode" = restore ]; then owner=$(worker_vm_recovery "$rel" "$pid") || owner=""; fi
+  if [ -n "$boot" ] && [ "$owner" = "$boot uninstalled" ]; then
+    # The identical sealed boot proved that its Host never installed and
+    # constructor cleanup has joined. Request graceful exit of that PID.
+    RELEASE_STOP_UNCONFIRMED=1
+    [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" = "$process" ] &&
+      [ "$(worker_vm_recovery "$rel" "$pid")" = "$owner" ] &&
+      kill -TERM "$pid" &&
+      wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
+    RELEASE_STOP_ATTEMPTED=1; RELEASE_STOP_UNCONFIRMED=""
+    "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$WORKER_LABEL" || return 1
+    [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" = gone ] && port_closed "$port"
+    return
+  fi
   verify_no_committed_vm_wakes || return 1
-  boot=$(worker_boot) || return 1
-  record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   if [ -z "$boot" ] || [ -z "$DRAIN_TOKEN" ] || ! receipt=$(read_drain_receipt "$boot" "$pid"); then
     if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ]; then
       RELEASE_STOP_UNCONFIRMED=1
@@ -454,6 +481,22 @@ refuse_restore() { # phase previous_sha reason
   log_deploy kind failed phase "$1" reason "$reason" restored no manualIntervention required log "$BLOG" || true
   return 1
 }
+verify_restored_vm_owner() { # original sealed release, required wake tick (yes/no)
+  local count process proof
+  verify_no_committed_vm_wakes || return 1
+  count=$(vm_upgrade_candidates) || return 1
+  if [ "$count" = 0 ] && [ "$2" != yes ]; then return 0; fi
+  process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1") || return 1
+  [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
+  proof=$(worker_vm_recovery "$1" "${process#running }") || return 1
+  if [[ "$proof" == *' wake-ready' ]] ||
+    { [ "$2" != yes ] && [[ "$proof" == *' host-ready' ]]; }; then
+    [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$process" ]
+    return
+  fi
+  say "Restored Worker VM ownership is unconfirmed. Recovery remains incomplete."
+  return 1
+}
 # Put the saved launchd files back, restart both and check they are healthy on the
 # previous SHA. Every step is checked: on any failure the saved files stay for a person.
 restore() {
@@ -461,12 +504,23 @@ restore() {
   local why rel; rel=$(release_of "$INFLIGHT/worker.plist") || return 1
   recovery_pair "$INFLIGHT/web.plist" "$INFLIGHT/worker.plist" "$prev" && dev_plist_pair || return 1
   say "restoring the previous version ${prev:0:8}"
-  local mode=release
+  local mode=release need_wake=no process proof
+  if ! verify_no_committed_vm_wakes; then need_wake=yes; fi
   # A loaded or absent Worker can be recovered with its original sealed
   # configuration. Replacing a different release must pass the wake guard.
   if cmp -s "$INFLIGHT/worker.plist" "$(dev_plist worker)" &&
     cmp -s "$INFLIGHT/web.plist" "$(dev_plist web)"; then
     mode=restore
+    process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$rel") || return 1
+    if [[ "$process" =~ ^running\ [1-9][0-9]*$ ]]; then
+      proof=$(worker_vm_recovery "$rel" "${process#running }") || proof=""
+      if [[ "$proof" == *' host-ready' || "$proof" == *' wake-ready' ]] &&
+        check_migrations_known "$rel" && check_contract_known "$rel" &&
+        [ "$(ready_sha "http://127.0.0.1:$(web_port)/api/health/ready" web "$rel")" = "$prev" ]; then
+        verify_restored_vm_owner "$rel" "$need_wake"
+        return
+      fi
+    fi
   fi
   stop_both "$mode" || { say "could not stop the services to restore them"; return 1; }
   if ! why=$(check_migrations_known "$rel"); then
@@ -482,7 +536,7 @@ restore() {
   start_both_on "$prev" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
   # Health alone does not prove this boot recovered its wake owner. Keep
   # the restored Worker running and retain the witness until plans settle.
-  verify_no_committed_vm_wakes || return 1
+  verify_restored_vm_owner "$rel" "$need_wake" || return 1
   say "previous version ${prev:0:8} is healthy again"
 }
 # Keep a final error/signal handler while the EXIT cleanup runs; replacing an

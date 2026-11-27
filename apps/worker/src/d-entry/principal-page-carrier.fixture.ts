@@ -9,6 +9,10 @@ import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, expect, vi } from 'vitest';
 import { WebSocket } from 'ws';
+import type {
+  registerDEntryPageNativeRoot,
+  getDEntryPageNativeRoot,
+} from '@allrice/database';
 import {
   deferred,
   hostFixture,
@@ -78,7 +82,12 @@ export async function buildProfileFixture(): Promise<ProfileProof> {
   };
 }
 
-export async function fixture(release?: ProfileProof, newRoot = false) {
+export async function fixture(
+  release?: ProfileProof,
+  newRoot = false,
+  rootless = false,
+  cleanupTimeoutMs = 3000,
+) {
   const selected = issue('execute');
   const f = nativeEntryFixture();
   const host = await hostFixture({
@@ -88,6 +97,12 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const roots = new Map([
     [f.selection.threadId, selected.root.nativeSessionId],
   ]);
+  const pageSelection = rootless
+    ? {
+        workspaceId: f.selection.workspaceId,
+        employeeInstanceId: f.selection.employeeInstanceId,
+      }
+    : f.selection;
   const registerThread = (threadId: string) => {
     const id = 'root-' + threadId;
     roots.set(threadId, id);
@@ -98,7 +113,9 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     const threadId = selection.threadId;
     return threadId && roots.has(threadId)
       ? { ...f.identity, threadId }
-      : f.identity;
+      : rootless
+        ? { ...f.identity, threadId: null }
+        : f.identity;
   };
   closes.push(() => host.close());
   const service = new AbortController();
@@ -107,7 +124,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const carrier = new AbortController();
   const control = createDEntryPrincipalControl(host.node, {
     carrier: carrier.signal,
-    cleanupTimeoutMs: 3000,
+    cleanupTimeoutMs,
   });
   let controlCloseChecked = false;
   closes.push(async () => {
@@ -197,6 +214,14 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     pinned = true;
     return selectedRoot(f.context, f.selection);
   });
+  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
+  const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
+  const watchTerminal = vi.fn<
+    NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
+  >(async (...args) => {
+    await args[4].verifyRoster(args[3]);
+    return f.deps.watch();
+  });
   const pages = createDEntryPageRequests({
     ...f.deps,
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
@@ -206,6 +231,9 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     },
     root: selectedRoot,
     historyIdentity,
+    registerRoot,
+    findRoot,
+    watchTerminal,
     historyRoot: (...args) =>
       pinned ? selectedRoot(...args) : Promise.resolve(null),
   });
@@ -335,7 +363,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     const query = new URLSearchParams({
       carrier: 'page',
       organizationId: f.identity.organizationId,
-      ...f.selection,
+      ...pageSelection,
       ...(scopeId && { scopeId }),
     });
     const client = new WebSocket(
@@ -352,6 +380,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const rpcBody = (scopeId: string, extra: object = {}) =>
     JSON.stringify({
       ...f.body,
+      selection: pageSelection,
       scopeId,
       rpcId: '',
       endpoint: 'session/page',
@@ -419,6 +448,9 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   return {
     ...f,
     prepareEditorRoot,
+    registerRoot,
+    findRoot,
+    watchTerminal,
     host,
     connect,
     invoke,
@@ -437,6 +469,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     pageSignals,
     profileCompletion,
     closeProfile: profile.close,
+    closeControl: control.close,
     async checkUnknownControlClose() {
       controlCloseChecked = true;
       await expect(control.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');

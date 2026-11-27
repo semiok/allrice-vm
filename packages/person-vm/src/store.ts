@@ -1191,7 +1191,12 @@ export class PostgresPersonVmStore implements PersonVmStore {
   }
   async recover<T>(
     requestedPersonId: string,
-    options: { now: () => Date; ttlMs: number; signal: AbortSignal },
+    options: {
+      now: () => Date;
+      ttlMs: number;
+      signal: AbortSignal;
+      joinedIdleStop?: { binding: PersonVmBinding; requestId: string };
+    },
     work: (lease: VmLease) => Promise<T>,
   ) {
     const personId = requestedPersonId.toLowerCase();
@@ -1223,7 +1228,27 @@ export class PostgresPersonVmStore implements PersonVmStore {
         Date.parse(row.leaseExpiresAt) > options.now().getTime()
       )
         throw new PersonVmError('LEASE_CONFLICT');
-      if (this.settledOrphans.get(previousToken) !== personId) {
+      let joined = false;
+      if (options.joinedIdleStop) {
+        const { binding, requestId } = options.joinedIdleStop;
+        // The final stop publishes the stopped row and its success audit in
+        // one statement, after the native command and cleanup have joined.
+        // A subsequent lease claim (even in the same epoch) rewrites this
+        // tuple and invalidates that proof. Expiry alone is never sufficient.
+        const [proof] = await session.query(
+          () => sql`select 1 from person_virtual_machines vm
+            join person_vm_audit a on a.vm_id=vm.vm_id
+              and a.person_id=vm.person_id and a.organization_id=vm.organization_id
+              and a.lease_epoch=vm.lease_epoch and a.xmin=vm.xmin
+            where vm.person_id=${personId} and vm.organization_id=${binding.organizationId}
+              and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+              and vm.lease_epoch=${binding.leaseEpoch} and vm.lease_owner=${previousToken}
+              and vm.phase in ('stopped','cold') and vm.disk_retained and vm.egress_receipt is null
+              and a.request_id=${requestId} and a.action='stop' and a.result='succeeded'`,
+        );
+        joined = proof !== undefined;
+      }
+      if (!joined && this.settledOrphans.get(previousToken) !== personId) {
         if (!this.fence) throw new PersonVmError('LEASE_CONFLICT');
         await this.fence.confirmSettled(
           {

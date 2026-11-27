@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { TransactionSql } from 'postgres';
 import {
@@ -17,7 +17,12 @@ import {
   resolveDEntryIdentity,
 } from './d-entry.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
-import { resolveEmployeeSessionInstance } from './employees/employee-instances.ts';
+import {
+  getEmployeeInstance,
+  resolveEmployeeSessionInstance,
+} from './employees/employee-instances.ts';
+import { readContentPrincipal } from './content-maintenance.ts';
+import { createAssignedChatSession } from './workspace/service.ts';
 
 const hostSchema = z
   .object({
@@ -41,6 +46,7 @@ const claimSchema = z
     host: hostSchema,
     operationId: UuidSchema,
     releaseRevision: z.string().min(1),
+    forkedFromNativeSessionId: z.string().min(1).optional(),
   })
   .strict();
 const pinSchema = claimSchema.extend({ nativeSessionId: z.string().min(1) });
@@ -58,6 +64,11 @@ export type DEntryHistoryRootPin = Readonly<{
   rootOriginDigest: string;
   rootBindingRef: string;
   vmId: string;
+  forkedFromNativeSessionId?: string;
+}>;
+export type DEntryPageForkSource = Readonly<{
+  nativeSessionId: string;
+  root: DEntryHistoryRootPin;
 }>;
 const deny = (): never => {
   throw new DataAccessError('authorization_denied');
@@ -92,6 +103,9 @@ function projectPin(raw: unknown, identity: DEntryIdentity) {
       createHash('sha256').update(JSON.stringify(pin)).digest('hex'),
     rootBindingRef: pin.operationId,
     vmId: pin.host.binding.vmId,
+    ...(pin.forkedFromNativeSessionId && {
+      forkedFromNativeSessionId: pin.forkedFromNativeSessionId,
+    }),
   };
 }
 async function readPin(
@@ -132,6 +146,187 @@ export async function getDEntryNativeRootPin(
   const pin = await readPin(getDatabase(), identity);
   if (!pin) throw Error('NATIVE_QUERY_BINDING_UNAVAILABLE');
   return pin;
+}
+
+async function findPageRoot(
+  sql: Sql | TransactionSql,
+  identity: DEntryIdentity,
+  vmId: string,
+  nativeSessionId: string,
+) {
+  const [row] =
+    await sql`select id,d_entry_native_root from allrice_chat_sessions
+    where organization_id=${identity.organizationId} and workspace_id=${identity.workspaceId}
+      and owner_id=${identity.personId} and visibility='private'
+      and coalesce(employee_instance_id,employee_assignment_id)=${identity.employeeInstanceId}
+      and execution_generation='4.0' and archived_at is null and d_entry_native_root is not null
+      and d_entry_native_root#>>'{host,binding,vmId}'=${vmId}
+      and d_entry_native_root->>'nativeSessionId'=${nativeSessionId}`;
+  return (
+    row &&
+    projectPin(row.d_entry_native_root, { ...identity, threadId: row.id })
+  );
+}
+
+/** Resolve a registered native root for page reuse or prompt admission. */
+export async function getDEntryPageNativeRoot(
+  context: RequestContext,
+  identity: DEntryIdentity,
+  vmId: string,
+  nativeSessionId: string,
+) {
+  const current = await requireDEntryNativeIdentity(context, {
+    workspaceId: identity.workspaceId,
+    employeeInstanceId: identity.employeeInstanceId,
+    ...(identity.threadId && { threadId: identity.threadId }),
+  });
+  if (!sameDEntryIdentity(identity, current)) return deny();
+  const registered = await findPageRoot(
+    getDatabase(),
+    identity,
+    vmId,
+    nativeSessionId,
+  );
+  if (!registered) return;
+  return getDEntryNativeRootPin(context, {
+    workspaceId: identity.workspaceId,
+    employeeInstanceId: identity.employeeInstanceId,
+    threadId: registered.identity.threadId,
+  });
+}
+
+/** Store a confirmed native create/fork reply against the same existing owner
+ * records. Both the claim and its result commit with the new private thread. */
+export async function registerDEntryPageNativeRoot(
+  context: RequestContext,
+  identity: DEntryIdentity,
+  receipt: DEntryNativeRootCreation & { forkSource?: DEntryPageForkSource },
+  signal: AbortSignal,
+) {
+  const host = hostSchema.parse(receipt.host);
+  const { binding } = host;
+  const { forkSource } = receipt;
+  const nativeSessionId = z
+    .string()
+    .min(1)
+    .max(256)
+    .parse(receipt.nativeSessionId);
+  if (
+    context.actor.type !== 'user' ||
+    context.actor.id !== identity.personId ||
+    context.organizationId !== identity.organizationId ||
+    context.workspaceId !== identity.workspaceId ||
+    binding.personId !== identity.personId ||
+    binding.organizationId !== identity.organizationId ||
+    forkSource?.nativeSessionId === nativeSessionId
+  )
+    return deny();
+  signal.throwIfAborted();
+  return getDatabase().begin(async (tx) => {
+    if (!(await readContentPrincipal(context, tx, 'update_user'))?.writable)
+      return deny();
+    const employee = await getEmployeeInstance(
+      context,
+      identity.employeeInstanceId,
+      tx,
+    );
+    const instance = await resolveEmployeeSessionInstance(
+      context,
+      employee.assignmentId,
+      employee.id,
+      tx,
+    );
+    if (
+      instance.revision !== identity.employeeRevision ||
+      instance.source.employeeVersionId !== identity.employeeVersionId
+    )
+      return deny();
+    if (
+      identity.threadId &&
+      !(
+        await tx`select id from allrice_chat_sessions
+      where id=${identity.threadId} and owner_id=${identity.personId}
+        and organization_id=${identity.organizationId} and workspace_id=${identity.workspaceId}
+        and coalesce(employee_instance_id,employee_assignment_id)=${instance.id}
+        and execution_generation='4.0' and archived_at is null for share`
+      ).length
+    )
+      return deny();
+    const policy = await readDEntryReleasePolicy(tx, true);
+    if (selectDEntryGeneration(policy, identity) !== '4.0') return deny();
+    const [vm] = await tx`select vm_id from person_virtual_machines
+      where person_id=${binding.personId} and organization_id=${binding.organizationId}
+        and vm_id=${binding.vmId} and instance_id=${binding.instanceId}
+        and lease_epoch=${binding.leaseEpoch} and phase='running' for share`;
+    if (!vm) return deny();
+    signal.throwIfAborted();
+    if (forkSource) {
+      const expected = forkSource.root;
+      const [row] =
+        await tx`select d_entry_native_root from allrice_chat_sessions
+        where id=${expected.identity.threadId} and organization_id=${identity.organizationId}
+          and workspace_id=${identity.workspaceId} and owner_id=${identity.personId}
+          and coalesce(employee_instance_id,employee_assignment_id)=${instance.id}
+          and visibility='private' and execution_generation='4.0' and archived_at is null
+          and d_entry_native_root is not null for share`;
+      if (!row) return deny();
+      const current = projectPin(row.d_entry_native_root, {
+        ...identity,
+        threadId: expected.identity.threadId,
+      });
+      if (
+        current.vmId !== binding.vmId ||
+        current.rootNativeSessionId !== expected.rootNativeSessionId ||
+        current.rootOriginDigest !== expected.rootOriginDigest ||
+        current.rootBindingRef !== expected.rootBindingRef
+      )
+        return deny();
+    }
+    const forkedFromNativeSessionId = forkSource?.nativeSessionId;
+    const existing = await findPageRoot(
+      tx,
+      identity,
+      binding.vmId,
+      nativeSessionId,
+    );
+    if (existing) {
+      if (
+        forkSource &&
+        forkedFromNativeSessionId !== existing.forkedFromNativeSessionId
+      )
+        return deny();
+      return existing;
+    }
+    const thread = await createAssignedChatSession(
+      context,
+      {
+        workspaceId: identity.workspaceId,
+        employeeInstanceId: instance.id,
+        employeeAssignmentId: instance.assignmentId,
+        title: '新建对话',
+      },
+      { executionGeneration: '4.0' },
+      tx,
+    );
+    const claim = claimSchema.parse({
+      schemaVersion: 1,
+      identity: { ...identity, threadId: thread.id },
+      host,
+      operationId: randomUUID(),
+      releaseRevision: policy.revision,
+      ...(forkedFromNativeSessionId && { forkedFromNativeSessionId }),
+    });
+    const pin = pinSchema.parse({ ...claim, nativeSessionId });
+    await tx`update allrice_chat_sessions set d_entry_native_root_claim=${tx.json(claim)} where id=${thread.id}`;
+    await tx`update allrice_chat_sessions set d_entry_native_root=${tx.json(pin)} where id=${thread.id}`;
+    await tx`insert into allrice_audit_events
+      (organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata)
+      values(${identity.organizationId},${identity.workspaceId},${identity.personId},'d_entry_root.bind',
+        'chat_session',${thread.id},'recorded',${forkSource ? 'host_native_fork' : 'host_native_create'},
+        ${context.requestId},${tx.json({ operationId: claim.operationId, releaseRevision: policy.revision })})`;
+    signal.throwIfAborted();
+    return projectPin(pin, claim.identity);
+  });
 }
 
 /** Host-only storage producer. Commit an immutable at-most-once claim BEFORE

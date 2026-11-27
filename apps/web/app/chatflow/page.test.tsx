@@ -64,7 +64,7 @@ describe('ChatFlow server local command capability', () => {
   it('opens 4.0 from the trial login destination for a released person with an empty roster', async () => {
     entry.host = 'allricevm.bplabs.xyz';
     entry.context.mockResolvedValue({ actor: { id: 'owner' } });
-    entry.released.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    entry.released.mockResolvedValue(true).mockResolvedValueOnce(false);
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({}) }),
     ).resolves.toHaveProperty('props');
@@ -78,8 +78,27 @@ describe('ChatFlow server local command capability', () => {
     ).resolves.toHaveProperty('props');
     await expect(
       ChatFlowPage({ searchParams: Promise.resolve({ employee: '' }) }),
+    ).rejects.toThrow('/chatflow/4.0');
+    await expect(
+      ChatFlowPage({ searchParams: Promise.resolve({ employee: 'selected' }) }),
     ).resolves.toHaveProperty('props');
-    expect(entry.released).toHaveBeenCalledTimes(2);
+    await expect(
+      ChatFlowPage({
+        searchParams: Promise.resolve({
+          employee: '',
+          session: 'legacy-bookmark',
+        }),
+      }),
+    ).resolves.toHaveProperty('props');
+    entry.released.mockResolvedValueOnce(false);
+    await expect(
+      ChatFlowPage({ searchParams: Promise.resolve({ employee: '' }) }),
+    ).resolves.toHaveProperty('props');
+    entry.host = 'allrice.bplabs.xyz';
+    await expect(
+      ChatFlowPage({ searchParams: Promise.resolve({ employee: '' }) }),
+    ).resolves.toHaveProperty('props');
+    expect(entry.released).toHaveBeenCalledTimes(4);
     expect(entry.find).not.toHaveBeenCalled();
   });
   it('shows the trial failure instead of defaulting to the legacy writer when policy is unavailable', async () => {

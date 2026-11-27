@@ -276,7 +276,8 @@ class DeployDevMigrations(unittest.TestCase):
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
 
-        for mode in ('before-wake-guard', 'before-first-read', 'early', 'late', 'pending-wake'):
+        for mode in ('before-wake-guard', 'before-first-read', 'late-wake-guard',
+                     'early', 'late', 'pending-wake', 'host-uninstalled'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r'''
                   mkdir -p "$STATE"
@@ -286,6 +287,11 @@ class DeployDevMigrations(unittest.TestCase):
                   esac
                   if [ "$MODE" = before-wake-guard ]; then
                     verify_no_committed_vm_wakes() { return 1; }
+                  elif [ "$MODE" = late-wake-guard ]; then
+                    verify_no_committed_vm_wakes() {
+                      if [ -f "$STATE/first-probe" ]; then return 1; fi
+                      touch "$STATE/first-probe"
+                    }
                   fi
                   job_state() {
                     if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
@@ -318,7 +324,15 @@ class DeployDevMigrations(unittest.TestCase):
                 p = self.run_dd(r'''
                   M1_LAUNCHCTL=test_launchctl
                   test_launchctl() { test "$1" = bootout; }
-                  job_state() { echo loaded; }
+                  job_state() { if [ -n "${restored:-}" ]; then echo 'running 73002'; else echo loaded; fi; }
+                  worker_vm_recovery() {
+                    [ "$2" = 73002 ] || return 1
+                    if [ "$MODE" = host-uninstalled ]; then
+                      echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 uninstalled'
+                    else
+                      echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 host-ready'
+                    fi
+                  }
                   wait_for_drained_worker_exit() {
                     if [[ "$MODE" = before-* ]]; then
                       test -z "$1" || return 1
@@ -336,15 +350,50 @@ class DeployDevMigrations(unittest.TestCase):
                   }
                   vm_upgrade_candidates() { echo 1; }
                   stop_job() { :; }
-                  start_both_on() { echo "restarted $1"; }
+                  start_both_on() { restored=yes; echo "restarted $1"; }
                   recover
                 ''', FILES, CONTRACT='row:1', MODE=mode)
-                if mode == 'pending-wake':
+                if mode in ('pending-wake', 'host-uninstalled'):
                     self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
                     self.assertIn('joined-original', p.stdout)
                     self.assertIn('restarted ' + 'a' * 40, p.stdout)
                     self.assertNotIn('is healthy again', p.stdout)
                     self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                    if mode == 'host-uninstalled':
+                        retry = r'''
+                          job_state() {
+                            if [ -n "${restored:-}" ]; then echo 'running 73003'
+                            elif [ -n "${removed:-}" ]; then echo gone
+                            else echo 'running 73002'
+                            fi
+                          }
+                          worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+                          worker_vm_recovery() {
+                            case "$2:$MODE" in
+                              73002:known) echo "$(worker_boot) uninstalled" ;;
+                              73003:known) echo "$(worker_boot) wake-ready" ;;
+                            esac
+                          }
+                          verify_no_committed_vm_wakes() { [ -n "${restored:-}" ]; }
+                          kill() { test "$*" = '-TERM 73002' && echo exact-worker-term; }
+                          wait_for_drained_worker_exit() { test "$1" = 73002; }
+                          M1_LAUNCHCTL=test_launchctl
+                          test_launchctl() { test "$1" = bootout && removed=yes; }
+                          stop_job() { :; }
+                          vm_upgrade_candidates() { echo 1; }
+                          start_both_on() { restored=yes; }
+                          recover
+                        '''
+                        unknown = self.run_dd(retry, FILES, CONTRACT='row:1', MODE='unknown')
+                        self.assertNotEqual(unknown.returncode, 0, (unknown.stdout, unknown.stderr))
+                        self.assertNotIn('exact-worker-term', unknown.stdout)
+                        self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                        resumed = self.run_dd(retry, FILES, CONTRACT='row:1', MODE='known')
+                        self.assertEqual(resumed.returncode, 0, (resumed.stdout, resumed.stderr))
+                        self.assertIn('exact-worker-term', resumed.stdout)
+                        self.assertFalse(os.path.exists(state))
+                    else:
+                        shutil.rmtree(state)
                     continue
                 self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
                 self.assertIn('joined-original', p.stdout)

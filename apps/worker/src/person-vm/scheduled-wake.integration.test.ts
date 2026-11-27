@@ -13,7 +13,15 @@ import {
 } from '@deepseek-ai/dsh-schedule';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { PersonVmError } from '@allrice/person-vm';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
 import { createProductionScheduledWake } from './production-scheduled-wake.js';
@@ -39,6 +47,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     database = await createRuntimeFixtureDatabase({ ownSchemaOnly: true });
     db = database.db;
   }, 120_000);
+
+  beforeEach(async () => {
+    // This suite owns its schema, but several cases intentionally leave
+    // claims in flight. A host-wide query must not see another case's claim.
+    await db`delete from person_vm_scheduled_wakes`;
+  });
 
   afterAll(async () => {
     await database?.close();
@@ -993,16 +1007,26 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await f.stop(planId);
       const claim = await f.store().claim(300_000);
       expect(claim).not.toBeNull();
+      const owner = randomUUID();
       await db`update person_virtual_machines
-      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting'
+      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting',
+        lease_owner=${owner},lease_expires_at=now()-interval '1 second'
       where person_id=${f.binding.personId}`;
       if (revoked) await f.invalidate(planId);
       expect(await f.store().nextCommittedWakeAt(signal)).toBeInstanceOf(Date);
       await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
       where plan_id=${planId}`;
+      await db.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${'person-vm:' + f.binding.personId},0))`;
+        expect(await f.store().recordExpiredUnrecoverableClaim()).toBe(false);
+      });
       expect(await f.module().runDueOnce(signal)).toBe(true);
       expect(await f.module().runDueOnce(signal)).toBe(false);
       expect(await f.store().nextCommittedWakeAt(signal)).toBeNull();
+      expect(
+        await db`select lease_owner from person_virtual_machines
+        where person_id=${f.binding.personId}`,
+      ).toEqual([{ lease_owner: owner }]);
       expect(f.start).not.toHaveBeenCalled();
       expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
       const [row] = await db`select w.state,a.error_code
