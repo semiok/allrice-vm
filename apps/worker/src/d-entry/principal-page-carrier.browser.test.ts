@@ -84,7 +84,15 @@ it.skipIf(!browserExecutable)(
             .end(asset);
           return;
         }
-        if (url.pathname !== '/') {
+        if (url.pathname === '/') {
+          response
+            .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            .end(
+              '<!doctype html><iframe src="/employee" style="width:100%;height:100vh"></iframe>',
+            );
+          return;
+        }
+        if (url.pathname !== '/employee') {
           response.writeHead(404).end();
           return;
         }
@@ -130,7 +138,8 @@ it.skipIf(!browserExecutable)(
       });
     });
     await page.goto(f.origin);
-    const editor = page
+    const workbench = page.frameLocator('iframe');
+    const editor = workbench
       .locator('textarea:visible,[contenteditable=true]:visible')
       .first();
     try {
@@ -141,7 +150,7 @@ it.skipIf(!browserExecutable)(
           unary,
           streamEndpoints,
           errors,
-          text: (await page.locator('body').innerText()).slice(0, 300),
+          text: (await workbench.locator('body').innerText()).slice(0, 300),
         }),
         { cause: error },
       );
