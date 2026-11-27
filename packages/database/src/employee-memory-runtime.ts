@@ -88,6 +88,11 @@ export const NativeMemoryTargetSchema =
     module: memoryModule,
   }).strict();
 export type NativeMemoryTarget = z.input<typeof NativeMemoryTargetSchema>;
+type NativeMemoryToolTarget = Omit<NativeMemoryTarget, 'module'>;
+const nativeMemoryModule = {
+  kind: 'builtin',
+  moduleId: 'employee-memory',
+} as const;
 const NativeMemoryRestoreTargetSchema =
   OriginalExecutionSelectorProjectionSchema.extend({ module: memoryModule });
 export type NativeMemoryRestoreTarget = z.input<
@@ -112,6 +117,18 @@ const CandidateReceiptSchema = z
     requiresConfirmation: z.literal(true),
   })
   .strict();
+/** The owner write has completed, but its result was not delivered. Retain the
+ * original operation key for reconciliation; this is not a definitive denial.
+ * The ordinary Error maps through existing HTTP INTERNAL_ERROR (500), while
+ * cause preserves the original validation/access/cancellation failure locally.
+ * Native cancellation remains on the caller's unchanged AbortSignal. */
+export class EmployeeMemoryWriteOutcomeUnknown extends Error {
+  constructor(cause: unknown) {
+    super('employee_memory_write_outcome_unknown', { cause });
+    this.name = 'EmployeeMemoryWriteOutcomeUnknown';
+  }
+}
+
 const denied = (): never => {
   throw new DataAccessError('authorization_denied');
 };
@@ -702,10 +719,7 @@ export function createNativeEmployeeMemoryHost() {
         workspaceId,
         employeeInstanceId,
         threadId,
-        module: {
-          kind: 'builtin' as const,
-          moduleId: 'employee-memory' as const,
-        },
+        module: nativeMemoryModule,
       };
       const assembly = workflowMemoryRuntime({ root: input });
       const memoryIndexDocument =
@@ -750,20 +764,17 @@ export function createNativeEmployeeMemoryHost() {
       signal.throwIfAborted();
       return { nativeRequestRef: target.nativeRequestRef };
     },
+    // The sealed tool body must supply its original Host-bound scope. The
+    // occurrence UUID selects an event inside that scope, never a new caller.
     async readOrdinal(
       context: RequestContext,
-      nativeRequestRef: string,
+      target: NativeMemoryToolTarget,
       input: unknown,
       signal: AbortSignal,
     ) {
-      const target = await locateNativeMemoryTool(
-        context,
-        nativeRequestRef,
-        signal,
-      );
       return readNativeEmployeeMemoryOrdinal(
         context,
-        target,
+        { ...target, module: nativeMemoryModule },
         input,
         signal,
         workflowMemoryRuntime(),
@@ -771,22 +782,59 @@ export function createNativeEmployeeMemoryHost() {
     },
     async remember(
       context: RequestContext,
-      nativeRequestRef: string,
+      target: NativeMemoryToolTarget,
       input: unknown,
       signal: AbortSignal,
     ) {
-      const target = await locateNativeMemoryTool(
+      const receipt = await rememberNativeEmployeeMemory(
         context,
-        nativeRequestRef,
-        signal,
-      );
-      return rememberNativeEmployeeMemory(
-        context,
-        target,
+        { ...target, module: nativeMemoryModule },
         input,
         signal,
         workflowMemoryRuntime(),
       );
+      try {
+        signal.throwIfAborted();
+        return receipt;
+      } catch (cause) {
+        throw new EmployeeMemoryWriteOutcomeUnknown(cause);
+      }
+    },
+    async reconcileRemember(
+      context: RequestContext,
+      input: NativeMemoryToolTarget & { b: string },
+      signal: AbortSignal,
+    ) {
+      const { b, ...locators } = input;
+      const originalB = UuidSchema.parse(b);
+      const target = NativeMemoryTargetSchema.parse({
+        ...locators,
+        module: nativeMemoryModule,
+      });
+      const selection = currentTarget(target);
+      const result = await caller(
+        context,
+        selection,
+        signal,
+        async (bound) => {
+          if (!bound.reads.storedCall) return denied();
+          const record = await bound.reads.storedCall(
+            originalB,
+            target.nativeRequestRef,
+          );
+          const execution = requireExecution(
+            bound.scope,
+            selection,
+            record.execution,
+          );
+          const source = requireSource(callSelector(execution), record.source);
+          return recordedNativeMemory(bound, execution, source, signal);
+        },
+        'read',
+        workflowMemoryRuntime(),
+      );
+      signal.throwIfAborted();
+      return result;
     },
   });
 }
@@ -839,58 +887,69 @@ export async function reconcileNativeEmployeeMemory(
         await bound.reads.storedSource(selector),
       );
       if (source.sourceRef !== selector.sourceRef) return denied();
-      const metadata = sourceMetadata(source, execution),
-        key = nativeMemoryOperationKey(metadata),
-        s = bound.scope;
-      await bound.tx`select pg_advisory_xact_lock(hashtextextended(${`employee-memory:${s.organizationId}:${s.workspaceId}:${s.ownerId}:${s.instanceId}:${key}`},0))`;
-      const [row] = await bound.tx<
-        {
-          id: string;
-          revision: number;
-          lifecycle_state: string;
-          trust_level: string;
-          archived_at: Date | null;
-          eligible: boolean;
-          response: unknown;
-          source_type: string;
-          source_id: string | null;
-          metadata: unknown;
-        }[]
-      >`select m.id,m.revision,m.lifecycle_state,m.trust_level,m.archived_at,
-        (m.expires_at is null or m.expires_at>clock_timestamp()) eligible,op.response,
-        m.source_type,m.source_id,m.metadata
-      from allrice_employee_memory_operations op join allrice_memories m on m.id=op.memory_id
-        and m.organization_id=op.organization_id and m.workspace_id=op.workspace_id
-        and m.owner_id=op.owner_id and m.instance_id=op.instance_id
-      where op.organization_id=${s.organizationId} and op.workspace_id=${s.workspaceId}
-        and op.owner_id=${s.ownerId} and op.instance_id=${s.instanceId} and op.operation_key=${key}
-        and ${memoryScopePredicate(bound.tx, s)} for share of m`;
-      if (!row) return unavailable();
-      if (!row.eligible) return unavailable();
-      const stored = nativeMemorySource(row.metadata);
-      if (
-        !stored ||
-        JSON.stringify(stored) !== JSON.stringify(metadata) ||
-        !(await qualifier(bound, signal)(row))
-      )
-        return denied();
-      const receipt = CandidateReceiptSchema.safeParse(row.response);
-      if (!receipt.success) throw new EmployeeMemoryContractChanged();
-      return {
-        status: 'recorded' as const,
-        id: row.id,
-        revision: row.revision,
-        state: row.archived_at
-          ? ('withdrawn' as const)
-          : row.lifecycle_state === 'durable' &&
-              row.trust_level === 'user_confirmed'
-            ? ('active' as const)
-            : ('pending' as const),
-        originalReceiptCurrent:
-          row.archived_at === null && row.revision === receipt.data.revision,
-      };
+      return recordedNativeMemory(bound, execution, source, signal);
     },
   );
   signal.throwIfAborted();
   return result;
+}
+
+/** A current projection of an already recorded outcome. No mutation or retry
+ * of the original write is performed. */
+async function recordedNativeMemory(
+  bound: BoundMemory,
+  execution: MemoryRuntimeExecution,
+  source: AdoptedHumanSourceProjection,
+  signal: AbortSignal,
+) {
+  const metadata = sourceMetadata(source, execution),
+    key = nativeMemoryOperationKey(metadata),
+    s = bound.scope;
+  await bound.tx`select pg_advisory_xact_lock(hashtextextended(${`employee-memory:${s.organizationId}:${s.workspaceId}:${s.ownerId}:${s.instanceId}:${key}`},0))`;
+  const [row] = await bound.tx<
+    {
+      id: string;
+      revision: number;
+      lifecycle_state: string;
+      trust_level: string;
+      archived_at: Date | null;
+      eligible: boolean;
+      response: unknown;
+      source_type: string;
+      source_id: string | null;
+      metadata: unknown;
+    }[]
+  >`select m.id,m.revision,m.lifecycle_state,m.trust_level,m.archived_at,
+    (m.expires_at is null or m.expires_at>clock_timestamp()) eligible,op.response,
+    m.source_type,m.source_id,m.metadata
+  from allrice_employee_memory_operations op join allrice_memories m on m.id=op.memory_id
+    and m.organization_id=op.organization_id and m.workspace_id=op.workspace_id
+    and m.owner_id=op.owner_id and m.instance_id=op.instance_id
+  where op.organization_id=${s.organizationId} and op.workspace_id=${s.workspaceId}
+    and op.owner_id=${s.ownerId} and op.instance_id=${s.instanceId} and op.operation_key=${key}
+    and ${memoryScopePredicate(bound.tx, s)} for share of m`;
+  if (!row) return unavailable();
+  if (!row.eligible) return unavailable();
+  const stored = nativeMemorySource(row.metadata);
+  if (
+    !stored ||
+    JSON.stringify(stored) !== JSON.stringify(metadata) ||
+    !(await qualifier(bound, signal)(row))
+  )
+    return denied();
+  const receipt = CandidateReceiptSchema.safeParse(row.response);
+  if (!receipt.success) throw new EmployeeMemoryContractChanged();
+  return {
+    status: 'recorded' as const,
+    id: row.id,
+    revision: row.revision,
+    state: row.archived_at
+      ? ('withdrawn' as const)
+      : row.lifecycle_state === 'durable' &&
+          row.trust_level === 'user_confirmed'
+        ? ('active' as const)
+        : ('pending' as const),
+    originalReceiptCurrent:
+      row.archived_at === null && row.revision === receipt.data.revision,
+  };
 }

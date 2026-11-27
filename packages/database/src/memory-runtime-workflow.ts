@@ -310,6 +310,17 @@ export function workflowMemoryRuntime(
             authority(),
           );
         },
+        async storedCall(b, nativeRequestRef) {
+          const evidence = await read({
+            mode: 'stored-call',
+            runId: b,
+            nativeRequestRef,
+          });
+          return {
+            execution: project(evidence, authority()),
+            source: source(evidence, authority()),
+          };
+        },
         async storedSource(selector) {
           return readWorkflowStoredMemorySource(
             tx,

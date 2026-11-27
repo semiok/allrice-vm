@@ -23,7 +23,10 @@ import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/
 import * as buildIdentity from '../../../../packages/database/src/service-build-identity.ts';
 import { insertEmployeeMemoryPair } from '../../../../packages/database/src/workspace/employee-memory-mutation.ts';
 import { memoryPairDigest } from '../../../../packages/database/src/workspace/employee-memory-primitives.ts';
-import { promoteManagedEmployeeMemory } from '../../../../packages/database/src/workspace/service.ts';
+import {
+  createChatSession,
+  promoteManagedEmployeeMemory,
+} from '../../../../packages/database/src/workspace/service.ts';
 import {
   listen,
   closeServer,
@@ -72,7 +75,7 @@ const build = {
 
 it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
   'commits both sealed rc.2 tool occurrences before native memory execution and denies revoked or mismatched evidence',
-  { tags: ['manual:ALLRICE_NATIVE_WEB_TEST_CLI'], timeout: 45_000 },
+  { tags: ['manual:NATIVE_MEMORY_POSTGRES'], timeout: 45_000 },
   async () => {
     const { db, close } = await createRuntimeFixtureDatabase({
       ownSchemaOnly: true,
@@ -124,6 +127,12 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       });
       if (!authenticated) throw Error('Isolated owner did not authenticate');
       const context = authenticated;
+      const target = (nativeRequestRef: string) => ({
+        workspaceId: f.workspace,
+        employeeInstanceId: f.assignment,
+        threadId: f.session,
+        nativeRequestRef,
+      });
       await db.begin(async (tx) => {
         await ensureGeneralEmployeeInstance(tx, f.assignment);
         const release = {
@@ -178,26 +187,22 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       const error = deferredPromptFact<never>();
       void error.promise.catch(() => {});
       const results = deferredPromptFact<void>();
-      const delivered = new Map<
-        string,
-        { nativeRequestRef: string; value: unknown }
-      >();
-      const receipts = new Map<
-        string,
-        Awaited<ReturnType<typeof recordNativeMemoryToolCall>>
-      >();
+      const delivered = new Map<string, { id: string; value: unknown }>();
+      const rememberCallId = randomUUID();
       const callbackInputs = new Map<
         string,
         Parameters<MemoryHostPublication['call']>[1]
       >();
-      let receipt:
-        | NonNullable<Awaited<ReturnType<typeof recordNativeExecutionRequest>>>
-        | undefined;
+      const attempts = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof recordNativeExecutionRequest>>>
+      >();
       let rootInput: MemoryRootObservation | undefined;
       let indexDocument: string | undefined;
       let assistantCalls = 0;
 
-      async function sealFirstRequest() {
+      async function sealRequest() {
+        const first = attempts.size === 0;
         const native = await owner.readNativeAttemptFor(
           context,
           { kind: 'session', sessionId: nativeSessionId },
@@ -212,7 +217,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         )
           throw Error('The actual adopted native request is unavailable');
         expect(observation.proofState).toBe('adopted');
-        expect(observation.firstMemoryAttempt).toBe(true);
+        expect(observation.firstMemoryAttempt).toBe(first);
         expect(observation.memoryToolVersions).toEqual(selected.toolVersions);
         const vm = owner.binding;
         const step: ModelCallBinding = {
@@ -241,26 +246,28 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         };
         const model = observation.request,
           human = observation.human;
-        receipt =
-          (await db.begin(async (tx) => {
-            const executionSpec = {
-              source: 'dsh-native-prompt',
-              generation: '4.0',
-              loginSessionId: login.id,
-              threadId: f.session,
-              employeeInstanceId: f.assignment,
-              employeeRelease: f.version,
-              nativeRequestId: nativePromptId,
-              rootSessionId: nativeSessionId,
-              adapterId: step.native.profile,
-              vmId: vm.vmId,
-              personId: f.user,
-            };
+        const receipt = await db.begin(async (tx) => {
+          const executionSpec = {
+            source: 'dsh-native-prompt',
+            generation: '4.0',
+            loginSessionId: login.id,
+            threadId: f.session,
+            employeeInstanceId: f.assignment,
+            employeeRelease: f.version,
+            nativeRequestId: nativePromptId,
+            rootSessionId: nativeSessionId,
+            adapterId: step.native.profile,
+            vmId: vm.vmId,
+            personId: f.user,
+          };
+          if (first)
             await tx`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec)
-          values (${run.runId},${f.org},${f.workspace},${f.user},'running',${tx.json(executionSpec)})`;
-            await tx`insert into allrice_run_events(id,run_id,organization_id,workspace_id,sequence,event_type,payload)
-          values (${step.execution.executionId},${run.runId},${f.org},${f.workspace},0,'step.started',${tx.json(
-            {
+                values (${run.runId},${f.org},${f.workspace},${f.user},'running',${tx.json(executionSpec)})`;
+          await tx`select id from allrice_runs where id=${run.runId} for update`;
+          await tx`insert into allrice_run_events(id,run_id,organization_id,workspace_id,sequence,event_type,payload)
+          values (${step.execution.executionId},${run.runId},${f.org},${f.workspace},
+            (select coalesce(max(sequence),-1)+1 from allrice_run_events where run_id=${run.runId}),
+            'step.started',${tx.json({
               source: 'dsh-native-attempt',
               kind: 'assistant',
               sessionId: nativeSessionId,
@@ -273,33 +280,48 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               turn: native.turn,
               attemptId: native.id,
               contributingRequestIds: native.promptIds,
+            })})`;
+          return recordNativeExecutionRequest(
+            tx,
+            run,
+            step,
+            {
+              originalRequestId: nativePromptId,
+              human,
+              rootOriginRef: nativePin.rootOriginDigest,
+              rootSessionRef: nativeSessionId,
+              nativeOwnerRef: step.native.instanceId,
+              nativeProfileRef: step.native.profile,
+              applicationBuild: build,
+              moduleConfigRevisionRef: selected.moduleConfigRevisionRef,
+              adoptedModelConfiguration: model,
+              employeeInstanceId: f.assignment,
+              employeeRelease: f.version,
+              employeeRevision: identity.employeeRevision,
+              threadId: f.session,
+              vm,
             },
-          )})`;
-            return recordNativeExecutionRequest(
-              tx,
-              run,
-              step,
-              {
-                originalRequestId: nativePromptId,
-                human,
-                rootOriginRef: nativePin.rootOriginDigest,
-                rootSessionRef: nativeSessionId,
-                nativeOwnerRef: step.native.instanceId,
-                nativeProfileRef: step.native.profile,
-                applicationBuild: build,
-                moduleConfigRevisionRef: selected.moduleConfigRevisionRef,
-                adoptedModelConfiguration: model,
-                employeeInstanceId: f.assignment,
-                employeeRelease: f.version,
-                employeeRevision: identity.employeeRevision,
-                threadId: f.session,
-                vm,
-              },
-              native.promptIds,
-              false,
-            );
-          })) ?? undefined;
+            native.promptIds,
+            false,
+          );
+        });
         if (!receipt) throw Error('Workflow evidence was not committed');
+        expect(receipt.firstIssue).toBe(first);
+        attempts.set(native.id, receipt);
+        if (!first) {
+          if (!rootInput) throw Error('No original root input');
+          await expect(
+            publication.root(
+              context,
+              { ...rootInput, mode: 'restore' },
+              signal,
+            ),
+          ).resolves.toEqual({
+            executionRef: run.runId,
+            memoryIndexDocument: indexDocument,
+          });
+          return;
+        }
         rootInput = {
           mode: 'issue',
           nativeRequestRef: step.execution.executionId,
@@ -360,13 +382,23 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               .parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
             const value =
               body.id === 'memory_read'
-                ? await host.readOrdinal(context, body.ref, body.args, signal)
-                : await host.remember(context, body.ref, body.args, signal);
-            delivered.set(body.id, { nativeRequestRef: body.ref, value });
+                ? await host.readOrdinal(
+                    context,
+                    target(body.ref),
+                    body.args,
+                    signal,
+                  )
+                : await host.remember(
+                    context,
+                    target(body.ref),
+                    body.args,
+                    signal,
+                  );
+            delivered.set(body.ref, { id: body.id, value });
             response
               .writeHead(200, { 'content-type': 'application/json' })
               .end(JSON.stringify(value));
-            if (delivered.size === 2) results.resolve();
+            if (delivered.size === 3) results.resolve();
             return;
           }
           if (
@@ -374,7 +406,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             request.url === '/v1/reference/session-title'
           ) {
             const title = request.url.endsWith('/session-title');
-            if (!title && !receipt) await sealFirstRequest();
+            if (!title && assistantCalls < 2) await sealRequest();
             const reference = randomBytes(32).toString('base64url');
             references.set(reference, title);
             response
@@ -387,12 +419,18 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           );
           if (request.url !== '/v1/stream' || title === undefined)
             throw Error('Unknown test model request');
-          const first = !title && ++assistantCalls === 1;
-          const deltas = first
-            ? tools.map(({ id, args }, index) => ({
+          if (!title) assistantCalls++;
+          const called =
+            title || assistantCalls > 2
+              ? []
+              : assistantCalls === 1
+                ? tools
+                : tools.filter(({ id }) => id === 'memory_remember');
+          const deltas = called.length
+            ? called.map(({ id, args }, index) => ({
                 type: 'tool-call-delta',
                 index,
-                id: randomUUID(),
+                id: id === 'memory_remember' ? rememberCallId : randomUUID(),
                 name: 'mcp__allrice__' + id,
                 argumentsDelta: JSON.stringify(args),
               }))
@@ -410,7 +448,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
                 ...deltas,
                 {
                   type: 'finish',
-                  reason: { kind: first ? 'tool-calls' : 'stop' },
+                  reason: { kind: called.length ? 'tool-calls' : 'stop' },
                 },
               ]
                 .map((value) => JSON.stringify(value) + '\n')
@@ -477,8 +515,9 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               undefined,
               async (fact, active) => {
                 try {
+                  const receipt = attempts.get(fact.attemptId);
                   if (!receipt)
-                    throw Error('Missing original authorized receipt');
+                    throw Error('Missing committed attempt receipt');
                   const ref = await recordNativeMemoryToolCall(
                     receipt,
                     run.runId,
@@ -510,8 +549,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
                       proofDigest: human.digest,
                     },
                   };
-                  receipts.set(toolId, ref);
-                  callbackInputs.set(toolId, input);
+                  callbackInputs.set(ref, input);
                   const { nativeRequestRef } = await publication.call(
                     context,
                     input,
@@ -603,48 +641,120 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         signal,
       );
 
-      expect(new Set(receipts.values()).size).toBe(2);
-      expect(delivered.get('memory_read')).toMatchObject({
-        nativeRequestRef: receipts.get('memory_read'),
-        value: expect.stringContaining(confirmed.details),
-      });
-      const remembered = delivered.get('memory_remember');
-      const ref = remembered!.nativeRequestRef;
-      expect(remembered).toMatchObject({
-        nativeRequestRef: receipts.get('memory_remember'),
-        value: {
-          summary: candidate.summary,
-          state: 'pending',
-          requiresConfirmation: true,
+      expect(callbackInputs.size).toBe(3);
+      expect(attempts.size).toBe(2);
+      const invoked = [...delivered.entries()];
+      const read = invoked.find(([, call]) => call.id === 'memory_read');
+      expect(read?.[1].value).toEqual(
+        expect.stringContaining(confirmed.details),
+      );
+      const writes = invoked.filter(
+        ([, call]) => call.id === 'memory_remember',
+      );
+      expect(writes).toHaveLength(2);
+      const [ref, remembered] = writes[0]!;
+      const [otherRef, otherRemembered] = writes[1]!;
+      expect(callbackInputs.get(ref)?.callRef).toBe(rememberCallId);
+      expect(callbackInputs.get(otherRef)?.callRef).toBe(rememberCallId);
+      const receiptShape = {
+        summary: candidate.summary,
+        state: 'pending',
+        requiresConfirmation: true,
+      };
+      expect(remembered.value).toMatchObject(receiptShape);
+      expect(otherRemembered.value).toMatchObject(receiptShape);
+      expect(otherRemembered.value).not.toEqual(remembered.value);
+      expect(
+        await host.remember(context, target(ref), candidate, signal),
+      ).toEqual(remembered.value);
+      const abort = new AbortController();
+      const canceled = Error('Canceled after the real candidate commit');
+      const createDedicated = client.createDedicatedDatabase;
+      vi.spyOn(client, 'createDedicatedDatabase').mockImplementationOnce(
+        (db) => {
+          const dedicated = createDedicated(db);
+          return new Proxy(dedicated, {
+            get(handle, key, receiver) {
+              if (key !== 'reserve') return Reflect.get(handle, key, receiver);
+              return async () => {
+                const session = await dedicated.reserve();
+                return new Proxy(session, {
+                  apply(handle, receiver, args) {
+                    const query: unknown = Reflect.apply(
+                      handle,
+                      receiver,
+                      args,
+                    );
+                    if (!(
+                      Array.isArray(args[0]) &&
+                      args[0].join('').trim() === 'commit'
+                    ))
+                      return query;
+                    return Promise.resolve(query).then(() =>
+                      abort.abort(canceled),
+                    );
+                  },
+                });
+              };
+            },
+          });
         },
-      });
-      expect(await host.remember(context, ref, candidate, signal)).toEqual(
-        remembered!.value,
       );
       await expect(
-        host.readOrdinal(context, ref, { number: 1 }, signal),
+        host.remember(context, target(ref), candidate, abort.signal),
+      ).rejects.toMatchObject({
+        name: 'EmployeeMemoryWriteOutcomeUnknown',
+        cause: canceled,
+      });
+      await expect(
+        host.readOrdinal(context, target(ref), { number: 1 }, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       await expect(
         publication.call(
           context,
-          { ...callbackInputs.get('memory_remember')!, callRef: 'forged' },
+          { ...callbackInputs.get(ref)!, callRef: 'forged' },
           signal,
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       await expect(
         publication.call(
           { ...context, actor: { type: 'user', id: randomUUID() } },
-          callbackInputs.get('memory_remember')!,
+          callbackInputs.get(ref)!,
           signal,
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       await expect(
-        host.remember(context, randomUUID(), candidate, signal),
+        host.remember(context, target(randomUUID()), candidate, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
-      const candidates = await db<{ id: string; revision: number }[]>`
-        select id,revision from allrice_memories where summary=${candidate.summary}`;
-      expect(candidates).toHaveLength(1);
-      const [pending] = candidates;
+      const other = await createChatSession(
+        context,
+        {
+          workspaceId: f.workspace,
+          employeeInstanceId: f.assignment,
+          title: 'Same owner, different caller scope',
+        },
+        { executionGeneration: '4.0' },
+      );
+      await expect(
+        host.remember(
+          context,
+          { ...target(ref), threadId: other.id },
+          candidate,
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      const candidates = await db<
+        { id: string; revision: number; call_ref: string }[]
+      >`
+        select id,revision,metadata#>>'{allriceEmployeeMemoryV4,nativeCall,callRef}' as call_ref
+        from allrice_memories where summary=${candidate.summary}`;
+      expect(candidates).toHaveLength(2);
+      expect(new Set(candidates.map(({ call_ref }) => call_ref))).toEqual(
+        new Set([ref, otherRef]),
+      );
+      const pending = candidates.find(({ call_ref }) => call_ref === ref);
+      expect(pending?.call_ref).toBe(ref);
+      expect(pending?.call_ref).not.toBe(callbackInputs.get(ref)?.callRef);
       const mutation = {
         instanceId: f.assignment,
         expectedRevision: pending!.revision,
@@ -677,9 +787,31 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       });
       expect(await savedIndex()).toEqual(spent);
       await expect(
-        host.remember(context, ref, candidate, signal),
+        host.remember(context, target(ref), candidate, signal),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      const reconcile = () =>
+        host.reconcileRemember(
+          context,
+          { ...target(ref), b: run.runId },
+          signal,
+        );
+      await expect(reconcile()).resolves.toMatchObject({
+        id: pending?.id,
+        status: 'recorded',
+        state: 'pending',
+        originalReceiptCurrent: true,
+      });
+      await expect(
+        host.reconcileRemember(
+          context,
+          { ...target(ref), b: randomUUID() },
+          signal,
+        ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       await db`update allrice_chat_sessions set archived_at=now() where id=${f.session}`;
+      await expect(reconcile()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
       await expect(confirm()).rejects.toMatchObject({
         code: 'authorization_denied',
       });
@@ -687,7 +819,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       await expect(confirm()).resolves.toMatchObject({ state: 'active' });
       await db`update allrice_sessions set revoked_at=now() where id=${login.id}`;
       await expect(
-        host.remember(context, ref, candidate, signal),
+        host.remember(context, target(ref), candidate, signal),
       ).rejects.toThrow();
       await expect(
         publication.root(context, { ...rootInput, mode: 'restore' }, signal),

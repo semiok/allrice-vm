@@ -71,6 +71,15 @@ export interface MemoryRuntimeOwnerReads {
   storedSource(
     input: StoredHumanSourceSelectorProjection,
   ): Promise<AdoptedHumanSourceProjection>;
+  /** Host-only receipt lookup. Uses original B and committed occurrence
+   * inside the already-bound caller scope, without live execution. */
+  storedCall?(
+    b: string,
+    nativeRequestRef: string,
+  ): Promise<{
+    execution: MemoryRuntimeExecution;
+    source: AdoptedHumanSourceProjection;
+  }>;
 }
 export interface MemoryRuntimeAssembly {
   /** Preflight must fail before opening a business transaction when a required
