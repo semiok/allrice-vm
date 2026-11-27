@@ -502,7 +502,8 @@ export function EmployeeNativePage({
               activateSelection(nextQuery.current);
             } else if (prepare && location.pathname === '/chatflow/4.0') {
               nextQuery.current = query;
-              history.pushState(null, '', '/chatflow/4.0?' + query);
+              if (location.search !== '?' + query)
+                history.pushState(null, '', '/chatflow/4.0?' + query);
               activateSelection(query, warmup);
             } else location.assign('/chatflow/4.0?' + query);
           } else {

@@ -102,6 +102,11 @@ async function exerciseMultiEmployeeNavigation(
       addEventListener('message', (event) => {
         if (event.origin === location.origin && event.data?.type === completion)
           document.documentElement.dataset.fixtureOldDocumentClosed = 'yes';
+        if (
+          event.origin === location.origin &&
+          event.data?.fixtureLate === true
+        )
+          document.documentElement.dataset.fixtureLateDelivered = 'yes';
       });
     }, pageCompletion);
     await page.route('**/api/v1/d-entry/native-prewarm', async (route) => {
@@ -218,6 +223,7 @@ async function exerciseMultiEmployeeNavigation(
             type: late.type,
             scopeId: (container as HTMLElement).dataset.scopeId,
             selection: late.selection,
+            fixtureLate: true,
           },
           location.origin,
         );
@@ -227,6 +233,9 @@ async function exerciseMultiEmployeeNavigation(
         selection: { workspaceId: identity.workspaceId, employeeInstanceId: d },
       },
     );
+    await page.locator('html[data-fixture-late-delivered="yes"]').waitFor({
+      state: 'attached',
+    });
     expect(warmups).toEqual([a]);
     releaseClose.resolve();
     await page
@@ -259,6 +268,26 @@ async function exerciseMultiEmployeeNavigation(
     }
     expect(opens).toEqual([a, c, b, d, e, a, c]);
     expect(creates).toEqual([c]);
+    const historyLength = await page.evaluate(() => history.length);
+    const currentScope = await frame
+      .locator('#app')
+      .getAttribute('data-scope-id');
+    await employeeButton(3).evaluate((row, current) => {
+      if (!(row instanceof HTMLElement))
+        throw Error('Expected an employee card');
+      row.click();
+      document
+        .querySelector<HTMLElement>(
+          '[aria-label="' + current + '"] [role=treeitem]',
+        )!
+        .click();
+    }, names[2]!);
+    await expect
+      .poll(() => frame.locator('#app').getAttribute('data-scope-id'))
+      .not.toBe(currentScope);
+    await editor.waitFor();
+    expect(opens).toEqual([a, c, b, d, e, a, c, c]);
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
     await page.route('**/api/v1/employee-instances', (route) =>
       route.fulfill({ status: 401 }),
     );
