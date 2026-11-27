@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 import { finished } from 'node:stream/promises';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
@@ -50,6 +51,8 @@ it.skipIf(!cli)(
     const seen: NativeToolObservation[] = [];
     const opened = deferredPromptFact<NativePromptObservation>();
     const nativeCallId = randomUUID();
+    const handlerCallId = randomUUID();
+    const handlerVersion = 'sealed-test-handler-v1';
     const nativeRequestId = randomUUID();
     const humanText = 'Create a test reminder in ten minutes.';
     const selected = deferredPromptFact<{
@@ -119,6 +122,17 @@ it.skipIf(!cli)(
                   argumentsDelta: '{}',
                 }))
               : []),
+            ...(create
+              ? [
+                  {
+                    type: 'tool-call-delta',
+                    index: 3,
+                    id: handlerCallId,
+                    name: 'fixture_tool_evidence',
+                    argumentsDelta: '{}',
+                  },
+                ]
+              : []),
             {
               type: 'finish',
               reason: { kind: create ? 'tool-calls' : 'stop' },
@@ -138,7 +152,25 @@ it.skipIf(!cli)(
       roots,
       cleanup,
       undefined,
-      undefined,
+      {
+        nativeToolEvidenceProbe: `
+          import { writeFile } from 'node:fs/promises';
+          import { withNativeToolEvidence } from './owner.mjs';
+          export const inject = ['tools'];
+          export function apply(ctx) {
+            ctx.tools.register(withNativeToolEvidence({
+              name: 'fixture_tool_evidence',
+              description: 'Record an isolated handler invocation.',
+              parameters: { type: 'object', properties: {}, additionalProperties: false },
+              output: { schema: { type: 'boolean' }, render: value => [{ type: 'text', text: String(value) }] },
+              async execute(args, exec) {
+                await writeFile(new URL('./fixture-tool-marker', import.meta.url), exec.callId, { flag: 'wx' });
+                return true;
+              },
+            }, ${JSON.stringify(handlerVersion)}));
+          }
+        `,
+      },
       {
         origin,
         capability,
@@ -336,7 +368,22 @@ it.skipIf(!cli)(
 
     const observation = await waitForPromptFact(opened.promise, signal);
     expect(await waitForPromptFact(observation.settled, signal)).toBe('ended');
-    expect(seen.map(({ name }) => name)).toEqual(['schedule_create']);
+    expect(seen.map(({ name }) => name).sort()).toEqual([
+      'fixture_tool_evidence',
+      'schedule_create',
+    ]);
+    expect(seen.find(({ callId }) => callId === handlerCallId)).toMatchObject({
+      name: 'fixture_tool_evidence',
+      attemptId: nativeAttempt.id,
+      human: nativeAttempt.observation,
+      dispatch: { kind: 'sealed-handler', version: handlerVersion },
+    });
+    expect(
+      await readFile(
+        join(roots.at(-1)!, 'dsh/native-web/fixture-tool-marker'),
+        'utf8',
+      ),
+    ).toBe(handlerCallId);
     await execution.close();
 
     const [task] = await hostCatalog();

@@ -162,6 +162,7 @@ export async function setupNativeWebFixture(
   isolated?: {
     resetProbe?: boolean;
     onPublicationDiagnostic?: (text: string) => void;
+    nativeToolEvidenceProbe?: string;
   },
   managedModel?: NativeWebModelAdapter,
   beforePrompt?: Parameters<typeof openNativeWebOwner>[0]['beforePrompt'],
@@ -205,6 +206,10 @@ export async function setupNativeWebFixture(
   const releaseSignal = new AbortController().signal;
   const profile = await readReleasedGuestProfile(seal, releaseSignal);
   const dshHome = join(root, 'dsh');
+  const toolEvidenceProbe = join(
+    dshHome,
+    'native-web/fixture-tool-evidence.mjs',
+  );
   await expect(access(dshHome)).rejects.toMatchObject({ code: 'ENOENT' });
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -268,12 +273,25 @@ export async function setupNativeWebFixture(
             },
           ],
         });
+        if (isolated.nativeToolEvidenceProbe)
+          patch.push({
+            insert: [
+              {
+                id: 'fixture-tool-evidence',
+                name: pathToFileURL(toolEvidenceProbe).href,
+              },
+            ],
+          });
         contents = JSON.stringify(patch);
       }
       await writeFile(file.path, contents, { mode: file.mode });
     }
   }
   await stage(launch);
+  if (isolated?.nativeToolEvidenceProbe)
+    await writeFile(toolEvidenceProbe, isolated.nativeToolEvidenceProbe, {
+      mode: 0o600,
+    });
   const tracePath = join(root, 'profile-patch-reads');
   const profileDirectory = join(dshHome, 'profiles/allrice-web');
   const profilePatch = join(

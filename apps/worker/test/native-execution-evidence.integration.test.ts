@@ -146,8 +146,11 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           assistantSequence: 9,
           sequence: 10,
           callId: 'tool-call-original',
-          name: 'schedule_create',
-          dispatch: { kind: 'registry-result' as const },
+          name: 'fixture_tool_evidence',
+          dispatch: {
+            kind: 'sealed-handler' as const,
+            version: 'sealed-test-handler-v1',
+          },
           human: adopted,
         };
         await recordNativeExecutionTool(
