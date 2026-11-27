@@ -13,9 +13,9 @@ import {
   observeNativeClose,
 } from './native-close.ts';
 import {
-  enableOpenAiHostedSearch,
   OPENAI_RESPONSES_URL,
   OpenAiCitationProjection,
+  prepareOpenAiResponsesRequest,
 } from './openai-responses.ts';
 
 type Fetch = typeof globalThis.fetch;
@@ -226,16 +226,23 @@ export function createMeteredTransport(options: {
         };
         let request = new Request(input, requestInit);
         const approved = options.provider.hostedWebSearch;
-        const hostedSearch =
+        const publicResponses =
           request.url === OPENAI_RESPONSES_URL &&
           request.method === 'POST' &&
           classification.kind === 'model' &&
           classification.protocol === 'openai-responses' &&
+          options.binding.provider === 'openai';
+        const hostedSearch =
+          publicResponses &&
           options.binding.native.attemptKind === 'assistant' &&
           approved?.provider === options.binding.provider &&
           approved.model === options.binding.model;
-        if (hostedSearch)
-          request = await enableOpenAiHostedSearch(request, approved.model);
+        if (publicResponses)
+          request = await prepareOpenAiResponsesRequest(
+            request,
+            options.binding.model,
+            hostedSearch,
+          );
         const dispatchInit: RequestInit & { duplex: 'half' } = {
           body:
             request.body ??
@@ -285,6 +292,8 @@ export function createMeteredTransport(options: {
             // reader.cancel is awaited; an abort request alone never releases a slot.
             try {
               await reader.cancel(requestSignal.reason);
+              if (publicResponses && !(await nativeClose.confirmed()))
+                throw new ModelGatewayError('LEDGER_UNAVAILABLE');
               transportJoined = true;
             } catch (error) {
               if (await nativeClose.confirmed()) {

@@ -1,4 +1,11 @@
 import { createServer } from 'node:http';
+import { channel } from 'node:diagnostics_channel';
+import type { Socket } from 'node:net';
+import {
+  createAssistantMessage,
+  createToolResultMessage,
+  ToolCallId,
+} from '@deepseek-ai/dsh-llm';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   createDshGatewayProvider,
@@ -73,7 +80,7 @@ async function fixture(
         type: 'url_citation',
         url: 'https://weather.example/',
         start_index: 0,
-        end_index: 3,
+        end_index: 2,
         title: 'Weather fixture',
       };
       event('response.created', {
@@ -221,14 +228,97 @@ it('leaves native requests unmodified when the host has not approved search for 
 
 it('joins the actual upstream body on VM revocation without delivering a pending citation', async () => {
   const { f, opened, closed } = await fixture('assistant', true);
-  const collecting = f.collect().catch((error: unknown) => error);
-  await opened.promise;
-  await f.gateway.revoke(f.binding.vm);
-  await closed.promise;
-  const result = await collecting;
-  expect(JSON.stringify(result)).not.toContain('weather.example');
-  expect([...f.store.rows.values()]).toMatchObject([{ outcome: 'canceled' }]);
-  expect(f.admission.records.size).toBe(0);
+  const headers = channel('undici:client:sendHeaders');
+  let upstreamSocket: Socket | undefined;
+  const capture = (value: unknown) => {
+    const { request, socket } = value as {
+      request: { path: string };
+      socket: Socket;
+    };
+    if (request.path === '/v1/responses') upstreamSocket = socket;
+  };
+  headers.subscribe(capture);
+  const finishAttempt = f.store.finishAttempt.bind(f.store);
+  const finish = vi
+    .spyOn(f.store, 'finishAttempt')
+    .mockImplementation((receipt) => {
+      expect(upstreamSocket?.closed).toBe(true);
+      return finishAttempt(receipt);
+    });
+  try {
+    const collecting = f.collect().catch((error: unknown) => error);
+    await opened.promise;
+    await f.gateway.revoke(f.binding.vm);
+    await closed.promise;
+    const result = await collecting;
+    expect(JSON.stringify(result)).not.toContain('weather.example');
+    expect([...f.store.rows.values()]).toMatchObject([{ outcome: 'canceled' }]);
+    expect(f.admission.records.size).toBe(0);
+  } finally {
+    finish.mockRestore();
+    headers.unsubscribe(capture);
+  }
+});
+
+it('uses provider-neutral history and retains native function results on a second turn', async () => {
+  const { f, requests } = await fixture();
+  const callId = ToolCallId('call_fixture|fc_fixture');
+  const input = f.input();
+  await f.collect({
+    ...input,
+    messages: [
+      ...input.messages,
+      createAssistantMessage({
+        content: [
+          { type: 'reasoning', text: 'Fixture reasoning' },
+          { type: 'tool-call', id: callId, name: 'lookup', arguments: '{}' },
+        ],
+        source: {
+          provider: 'openai',
+          model,
+          replayState: {
+            response: {
+              kind: 'pi-ai',
+              version: 2,
+              api: 'openai-responses',
+              provider: 'openai',
+              model,
+              stopReason: 'toolUse',
+            },
+            blocks: [
+              {
+                type: 'reasoning',
+                thinkingSignature: JSON.stringify({
+                  type: 'reasoning',
+                  id: 'rs_synthetic',
+                  summary: [],
+                  encrypted_content: 'synthetic-wire-state',
+                }),
+              },
+              { type: 'tool-call' },
+            ],
+          },
+        },
+      }),
+      createToolResultMessage({
+        callId,
+        content: [{ type: 'text', text: 'Fixture result' }],
+        isError: false,
+      }),
+    ],
+  });
+  expect(requests[0]?.body.input).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ type: 'function_call', name: 'lookup' }),
+      expect.objectContaining({
+        type: 'function_call_output',
+        output: 'Fixture result',
+      }),
+    ]),
+  );
+  expect(JSON.stringify(requests[0]?.body)).not.toMatch(
+    /rs_synthetic|synthetic-wire-state/,
+  );
 });
 
 it('refuses another approved model or a missing host credential and revokes a changed key', async () => {

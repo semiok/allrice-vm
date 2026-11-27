@@ -27,11 +27,40 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-/** The adapter receives the native SDK request only after gateway admission.
- * Keep the SDK's existing function tools and tool choice intact. */
-export async function enableOpenAiHostedSearch(
+const allowedInputTypes = new Set([
+  'message',
+  'function_call',
+  'function_call_output',
+  'custom_tool_call',
+  'custom_tool_call_output',
+]);
+const messageRoles = new Set(['user', 'assistant', 'system', 'developer']);
+
+function isNeutralContent(value: unknown, assistant = false): boolean {
+  if (typeof value === 'string') return true;
+  return (
+    Array.isArray(value) &&
+    value.every((entry: unknown) => {
+      const part = record(entry);
+      if (assistant)
+        return part.type === 'output_text' && typeof part.text === 'string';
+      if (part.type === 'input_text') return typeof part.text === 'string';
+      return (
+        part.type === 'input_image' &&
+        !('file_id' in part) &&
+        typeof part.image_url === 'string' &&
+        part.image_url.startsWith('data:image/')
+      );
+    })
+  );
+}
+
+/** Every host API attempt uses stateless, provider-neutral history. The SDK
+ * can supply local function calls/results, but cannot supply hosted state. */
+export async function prepareOpenAiResponsesRequest(
   request: Request,
   model: string,
+  hostedSearch: boolean,
 ) {
   if (
     !request.body ||
@@ -70,12 +99,52 @@ export async function enableOpenAiHostedSearch(
   if (
     payload.model !== model ||
     payload.stream !== true ||
+    payload.store !== false ||
+    'previous_response_id' in payload ||
+    'conversation' in payload ||
+    !Array.isArray(payload.input) ||
     (payload.tools !== undefined && !Array.isArray(payload.tools))
   )
     throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
   const tools: unknown[] = Array.isArray(payload.tools) ? payload.tools : [];
-  if (!tools.some((tool) => record(tool).type === 'web_search'))
-    payload.tools = [...tools, { type: 'web_search' }];
+  if (
+    tools.some(
+      (tool) => !['function', 'custom'].includes(String(record(tool).type)),
+    )
+  )
+    throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+  const calls = new Map<string, string>();
+  payload.input = payload.input.map((value: unknown) => {
+    const item = record(value);
+    const type = item.type ?? 'message';
+    if (
+      typeof type !== 'string' ||
+      !allowedInputTypes.has(type) ||
+      (type === 'message' &&
+        (!messageRoles.has(String(item.role)) ||
+          !isNeutralContent(item.content, item.role === 'assistant')))
+    )
+      throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+    if (type !== 'message') {
+      if (typeof item.call_id !== 'string' || !item.call_id)
+        throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+      const result = type.endsWith('_output');
+      if (result) {
+        if (
+          calls.get(item.call_id) + '_output' !== type ||
+          !isNeutralContent(item.output)
+        )
+          throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+      } else {
+        calls.set(item.call_id, type);
+      }
+    }
+    // Native function results correlate through call_id in this input. No
+    // provider item identifiers are needed when replaying neutral history.
+    delete item.id;
+    return item;
+  });
+  if (hostedSearch) payload.tools = [...tools, { type: 'web_search' }];
   const headers = new Headers(request.headers);
   headers.delete('content-length');
   return new Request(request.url, {
@@ -97,7 +166,8 @@ function readCitation(value: unknown): Citation | undefined {
     type !== 'url_citation' ||
     !index(start) ||
     !index(end) ||
-    end <= start ||
+    end < start ||
+    end >= maxEventBytes ||
     typeof url !== 'string' ||
     url.length > 2048 ||
     Array.from(url).some(
@@ -120,13 +190,16 @@ function readCitation(value: unknown): Citation | undefined {
   };
 }
 
-function linkText(text: string, candidates: readonly Citation[]): string {
-  if (!candidates.length) return text;
-  // Responses offsets count characters. Do not split a surrogate pair.
+function linkText(
+  text: string,
+  candidates: readonly Citation[],
+  limit: number,
+) {
+  // Responses documents end_index as the last included character.
   const chars = Array.from(text);
   const unique = new Map<string, Citation>();
   for (const citation of candidates) {
-    if (citation.end <= chars.length)
+    if (citation.end < chars.length)
       unique.set(
         JSON.stringify([citation.start, citation.end, citation.url]),
         citation,
@@ -134,13 +207,15 @@ function linkText(text: string, candidates: readonly Citation[]): string {
   }
   let tail = chars.length;
   let output = '';
-  for (const { end, url } of [...unique.values()].sort(
-    (a, b) => b.end - a.end,
-  )) {
-    output = ` [来源](${url})` + chars.slice(end, tail).join('') + output;
-    tail = end;
+  const citations = [...unique.values()].slice(0, limit);
+  for (const { end, url } of citations.sort((a, b) => b.end - a.end)) {
+    output = ` [来源](${url})` + chars.slice(end + 1, tail).join('') + output;
+    tail = end + 1;
   }
-  return chars.slice(0, tail).join('') + output;
+  return {
+    text: chars.slice(0, tail).join('') + output,
+    count: citations.length,
+  };
 }
 
 /** One projection per physical HTTP attempt. The native SDK keeps its own SSE
@@ -148,25 +223,34 @@ function linkText(text: string, candidates: readonly Citation[]): string {
  * text on output_item.done is projected into already supported DSH blocks. */
 export class OpenAiCitationProjection {
   private buffer: Buffer = Buffer.alloc(0);
-  private passthrough = false;
+  private skippingOversize = false;
   private count = 0;
+  private rendered = 0;
   private citations = new Map<string, Map<number, Citation[]>>();
 
   push(bytes: Uint8Array): Uint8Array {
-    if (this.passthrough) return bytes;
     const buffer = Buffer.concat([this.buffer, bytes]);
     const frames: Buffer[] = [];
     let offset = 0;
     for (const match of buffer.toString('latin1').matchAll(/\r?\n\r?\n/g)) {
       const end = match.index + match[0].length;
       const frame = buffer.subarray(offset, end);
-      frames.push(frame.length <= maxEventBytes ? this.project(frame) : frame);
+      frames.push(
+        this.skippingOversize || frame.length > maxEventBytes
+          ? frame
+          : this.project(frame),
+      );
+      this.skippingOversize = false;
       offset = end;
     }
     this.buffer = buffer.subarray(offset);
-    if (this.buffer.length > maxEventBytes) {
-      this.passthrough = true;
-      frames.push(Buffer.from(this.finish()));
+    if (this.skippingOversize || this.buffer.length > maxEventBytes) {
+      this.skippingOversize = true;
+      // Pass an oversized frame through, keeping only enough bytes to
+      // recognize a delimiter split across transport reads.
+      const flush = Math.max(0, this.buffer.length - 3);
+      frames.push(this.buffer.subarray(0, flush));
+      this.buffer = Buffer.from(this.buffer.subarray(flush));
     }
     return Buffer.concat(frames);
   }
@@ -248,15 +332,26 @@ export class OpenAiCitationProjection {
       const part = record(value);
       if (part.type !== 'output_text' || typeof part.text !== 'string')
         return value;
-      if (Array.isArray(part.annotations))
-        this.add(item.id, partIndex, part.annotations);
-      const text = linkText(
+      const final = Array.isArray(part.annotations)
+        ? part.annotations.slice(0, maxCitations).flatMap((value: unknown) => {
+            const citation = readCitation(value);
+            return citation ? [citation] : [];
+          })
+        : [];
+      const candidates = [
+        ...final,
+        ...(this.citations.get(item.id as string)?.get(partIndex) ?? []),
+      ];
+      if (!candidates.length || this.rendered === maxCitations) return value;
+      const linked = linkText(
         part.text,
-        this.citations.get(item.id as string)?.get(partIndex) ?? [],
+        candidates,
+        maxCitations - this.rendered,
       );
-      if (text === part.text) return value;
+      if (!linked.count) return value;
+      this.rendered += linked.count;
       changed = true;
-      return { ...part, text };
+      return { ...part, text: linked.text };
     });
     this.citations.delete(item.id);
     if (!changed) return frame;

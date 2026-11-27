@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import {
   classifyOpenAiResponses,
-  enableOpenAiHostedSearch,
+  prepareOpenAiResponsesRequest,
   OpenAiCitationProjection,
   OPENAI_RESPONSES_URL,
 } from './openai-responses.ts';
@@ -11,7 +11,7 @@ function frame(event: Record<string, unknown>) {
     `event: ${event.type}\r\ndata: ${JSON.stringify(event)}\r\n\r\n`,
   );
 }
-const citation = (url: string, start_index = 0, end_index = 2) => ({
+const citation = (url: string, start_index = 0, end_index = 1) => ({
   type: 'url_citation',
   url,
   start_index,
@@ -91,14 +91,96 @@ it('adds hosted search exactly once and preserves function tools, tool choice, a
     headers: { 'Content-Type': 'application/json', 'Content-Length': '10' },
     body: JSON.stringify(payload),
   });
-  const result = await enableOpenAiHostedSearch(request, 'fixture');
+  const result = await prepareOpenAiResponsesRequest(request, 'fixture', true);
   expect(result.redirect).toBe('manual');
   expect(result.headers.has('content-length')).toBe(false);
-  const once = await enableOpenAiHostedSearch(result, 'fixture');
-  expect(await once.json()).toEqual({
+  expect(await result.json()).toEqual({
     ...payload,
     tools: [tool, { type: 'web_search' }],
   });
+});
+
+it.each([false, true])(
+  'rejects raw provider session state and hosted history (search=%s)',
+  async (search) => {
+    for (const extra of [
+      { previous_response_id: 'synthetic-response' },
+      { conversation: 'synthetic-conversation' },
+      { store: true },
+      { input: [{ type: 'item_reference', id: 'synthetic-item' }] },
+      { input: [{ type: 'additional_tools', tools: [] }] },
+      {
+        input: [
+          {
+            role: 'user',
+            content: [{ type: 'input_image', file_id: 'synthetic-file' }],
+          },
+        ],
+      },
+      {
+        input: [
+          { type: 'function_call_output', call_id: 'unpaired', output: 'x' },
+        ],
+      },
+      { tools: [{ type: 'web_search' }] },
+    ]) {
+      const request = new Request(OPENAI_RESPONSES_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'fixture',
+          stream: true,
+          store: false,
+          input: [],
+          ...extra,
+        }),
+      });
+      await expect(
+        prepareOpenAiResponsesRequest(request, 'fixture', search),
+      ).rejects.toMatchObject({ code: 'UNSUPPORTED_UPSTREAM' });
+    }
+  },
+);
+
+it('keeps neutral function-result correlation without replaying upstream item IDs', async () => {
+  const input = [
+    {
+      type: 'function_call',
+      id: 'synthetic-item',
+      call_id: 'paired',
+      name: 'lookup',
+      arguments: '{}',
+    },
+    { type: 'function_call_output', call_id: 'paired', output: 'fixture' },
+  ];
+  const request = new Request(OPENAI_RESPONSES_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'fixture',
+      stream: true,
+      store: false,
+      input,
+    }),
+  });
+  const prepared = await prepareOpenAiResponsesRequest(
+    request,
+    'fixture',
+    false,
+  );
+  const payload = await prepared.json();
+  expect(payload).toMatchObject({
+    input: [
+      {
+        type: 'function_call',
+        call_id: 'paired',
+        name: 'lookup',
+        arguments: '{}',
+      },
+      input[1],
+    ],
+  });
+  expect(payload.input[0]).not.toHaveProperty('id');
 });
 
 it('links only valid actual citations at character offsets, with interleaved item and content identities', () => {
@@ -155,8 +237,18 @@ it('isolates attempt state and passes non-citation or oversized frames through',
   });
   expect(a.push(tool)).toEqual(tool);
   expect(parts(a.push(complete))).toEqual([`没有 [来源](${token})引用`]);
-  const large = Buffer.alloc(1024 * 1024 + 1, 120);
-  expect(a.push(large)).toEqual(large);
-  expect(a.push(complete)).toEqual(complete);
+  const large = Buffer.concat([
+    Buffer.alloc(1024 * 1024 + 1, 120),
+    Buffer.from('\r\n\r\n'),
+  ]);
+  a.push(annotation('new-id', 0, citation(token, 0, 0)));
+  const received = Buffer.concat([
+    a.push(large.subarray(0, -1)),
+    a.push(Buffer.concat([large.subarray(-1), answer('new-id', text('🙂好'))])),
+  ]);
+  expect(received.subarray(0, large.length)).toEqual(large);
+  expect(parts(received.subarray(large.length))).toEqual([
+    `🙂 [来源](${token})好`,
+  ]);
   expect(a.finish().byteLength).toBe(0);
 });

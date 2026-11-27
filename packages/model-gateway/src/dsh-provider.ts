@@ -93,6 +93,19 @@ export function createDshGatewayProvider(
       const stream = () =>
         prepared.stream({
           ...input,
+          // Guest replay metadata is never authority to replay native OpenAI
+          // items under a shared Host credential. Use DSH's normal neutral
+          // history conversion on this route, retaining text and tool history.
+          ...(route.provider === 'openai'
+            ? {
+                messages: input.messages.map((message) => {
+                  if (message.role !== 'assistant') return message;
+                  const source = { ...message.source };
+                  delete source.replayState;
+                  return { ...message, source };
+                }),
+              }
+            : {}),
           ...prepared.config,
           signal,
           sessionId: binding.native.sessionId as GenerateOptions['sessionId'],
