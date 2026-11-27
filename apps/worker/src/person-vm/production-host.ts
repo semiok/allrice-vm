@@ -60,7 +60,10 @@ import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
-import { withPreviousGatewayFenced } from './production-upgrade-fence.js';
+import {
+  assertNoPreviousWorker,
+  withPreviousGatewayFenced,
+} from './production-upgrade-fence.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
@@ -158,6 +161,7 @@ export type ProductionPersonVmHostSources = Readonly<{
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
 const UPGRADE_HANDOFF_MS = 30_000;
+const UPGRADE_WAIT_MS = 120_000;
 type UpgradeDrainReceipt = Readonly<{ stopped: number; expiresAt: string }>;
 
 export interface ProductionPersonVmHost {
@@ -801,7 +805,7 @@ export function createProductionPersonVmHost(input: {
             bound.nativeActivity.assertSampleCurrent(binding, cursor, active);
           },
         },
-        withPreviousGatewayFenced(binding, ports, signal, stop) {
+        async withPreviousGatewayFenced(binding, ports, signal, stop) {
           if (
             ownsRunningBinding(binding) ||
             requireStartup().hasLocalOwner(binding)
@@ -809,12 +813,14 @@ export function createProductionPersonVmHost(input: {
             throw new PersonVmError('LEASE_CONFLICT');
           const address = providers!.configuration.egress?.listenAddress;
           if (!address) throw new PersonVmError('EGRESS_UNAVAILABLE');
+          await assertNoPreviousWorker(diskRoot, signal);
           return withPreviousGatewayFenced(address, ports, signal, async () => {
             if (
               ownsRunningBinding(binding) ||
               requireStartup().hasLocalOwner(binding)
             )
               throw new PersonVmError('LEASE_CONFLICT');
+            await assertNoPreviousWorker(diskRoot, signal);
             return stop();
           });
         },
@@ -1127,6 +1133,50 @@ export function createProductionPersonVmHost(input: {
             console.error('[person-vm] idle owner failed', error);
         });
       }
+      void own(async () => {
+        const reported = new Set<string>();
+        while (!lifetime.aborted) {
+          await sleep(60_000, undefined, { signal: lifetime, ref: false });
+          try {
+            const active = AbortSignal.any([
+              lifetime,
+              AbortSignal.timeout(3000),
+            ]);
+            const running = await store.listUpgradeCandidates(active);
+            const unknown = new Set<string>();
+            for (const row of running) {
+              if (
+                row.phase !== 'running' ||
+                !row.instanceId ||
+                ownsRunningBinding({
+                  personId: row.personId,
+                  organizationId: row.organizationId,
+                  vmId: row.vmId,
+                  instanceId: row.instanceId,
+                  leaseEpoch: row.leaseEpoch,
+                })
+              )
+                continue;
+              const key = row.vmId + ':' + row.leaseEpoch;
+              unknown.add(key);
+              if (!reported.has(key))
+                console.warn(
+                  '[person-vm] previous VM activity unconfirmed; awaiting employee open',
+                  {
+                    vmId: row.vmId,
+                    leaseEpoch: row.leaseEpoch,
+                  },
+                );
+              reported.add(key);
+            }
+            for (const key of reported)
+              if (!unknown.has(key)) reported.delete(key);
+          } catch {
+            if (!lifetime.aborted)
+              console.warn('[person-vm] previous VM inventory unavailable');
+          }
+        }
+      }).catch(() => {}); // Host close aborts and joins the inventory loop.
       const { disk } = providers.configuration;
       if (disk.preprovision?.enabled) {
         const databaseUrl = process.env.DATABASE_URL;
@@ -1213,71 +1263,95 @@ export function createProductionPersonVmHost(input: {
               )
             )
               throw new PersonVmError('LEASE_CONFLICT');
+            const waitDeadline = Date.now() + UPGRADE_WAIT_MS;
             for (const row of candidates) {
-              active.throwIfAborted();
-              assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
               if (!row.instanceId) throw new PersonVmError('LEASE_LOST');
-              await vm.stopRunningForUpgrade(
-                {
-                  vmId: row.vmId,
-                  personId: row.personId,
-                  organizationId: row.organizationId,
-                  instanceId: row.instanceId,
-                  leaseEpoch: row.leaseEpoch,
-                },
-                randomUUID(),
-                active,
-                authorize,
-                async (request, reading) => {
-                  const wake = scheduledWake;
-                  if (!wake) throw new PersonVmError('ACTIVITY_UNKNOWN');
-                  await request.assertStopCurrent(reading);
-                  const catalogs = requireStartup().activityCatalogs(
-                    request.binding,
-                    reading,
-                  );
-                  const roster = await trustedDatabase.begin(
-                    'isolation level repeatable read read only',
-                    (tx) =>
-                      readPersonVmWakeRoster(
-                        tx,
-                        request.binding,
-                        catalogs.map(({ endpoint }) => endpoint),
-                      ),
-                  );
-                  reading.throwIfAborted();
-                  if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
-                  const plan = await wake.prepareUpgradeStop(
-                    { ...request, scheduledRoster: roster },
-                    reading,
-                  );
-                  if (!('ok' in plan))
-                    throw new PersonVmError('ACTIVITY_UNKNOWN');
-                  if (plan.nextWakeAt !== null)
-                    wakeDeadline = Math.min(
-                      wakeDeadline,
-                      Date.parse(plan.nextWakeAt),
+              const binding = {
+                vmId: row.vmId,
+                personId: row.personId,
+                organizationId: row.organizationId,
+                instanceId: row.instanceId,
+                leaseEpoch: row.leaseEpoch,
+              };
+              const requestId = randomUUID();
+              const drain = () =>
+                vm.stopRunningForUpgrade(
+                  binding,
+                  requestId,
+                  active,
+                  authorize,
+                  async (request, reading) => {
+                    const wake = scheduledWake;
+                    if (!wake) throw new PersonVmError('ACTIVITY_UNKNOWN');
+                    await request.assertStopCurrent(reading);
+                    const catalogs = requireStartup().activityCatalogs(
+                      request.binding,
+                      reading,
                     );
-                  assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
-                  return {
-                    nextWakeAt: plan.nextWakeAt,
-                    scheduleFingerprints: plan.scheduleFingerprints,
-                    dispatch: (checking, stop) =>
-                      wake.dispatchUpgradeStop(
-                        request.binding,
-                        roster,
-                        request.requestId,
-                        checking,
-                        stop,
-                        async (tx, fenced) => {
-                          await requireCurrentPlatformAdmin(context, tx);
-                          fenced.throwIfAborted();
-                          assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
-                        },
-                      ),
-                  };
-                },
-              );
+                    const roster = await trustedDatabase.begin(
+                      'isolation level repeatable read read only',
+                      (tx) =>
+                        readPersonVmWakeRoster(
+                          tx,
+                          request.binding,
+                          catalogs.map(({ endpoint }) => endpoint),
+                        ),
+                    );
+                    reading.throwIfAborted();
+                    if (!roster)
+                      throw new PersonVmError('AUTHORIZATION_DENIED');
+                    const plan = await wake.prepareUpgradeStop(
+                      { ...request, scheduledRoster: roster },
+                      reading,
+                    );
+                    if (!('ok' in plan))
+                      throw new PersonVmError('ACTIVITY_UNKNOWN');
+                    if (plan.nextWakeAt !== null)
+                      wakeDeadline = Math.min(
+                        wakeDeadline,
+                        Date.parse(plan.nextWakeAt),
+                      );
+                    assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+                    return {
+                      nextWakeAt: plan.nextWakeAt,
+                      scheduleFingerprints: plan.scheduleFingerprints,
+                      dispatch: (checking, stop) =>
+                        wake.dispatchUpgradeStop(
+                          request.binding,
+                          roster,
+                          request.requestId,
+                          checking,
+                          stop,
+                          async (tx, fenced) => {
+                            await requireCurrentPlatformAdmin(context, tx);
+                            fenced.throwIfAborted();
+                            assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+                          },
+                        ),
+                    };
+                  },
+                );
+              for (;;) {
+                active.throwIfAborted();
+                await authorize(active);
+                assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+                try {
+                  await drain();
+                  break;
+                } catch (error) {
+                  if (
+                    !(error instanceof PersonVmError) ||
+                    ![
+                      'VM_ACTIVE',
+                      'ACTIVITY_UNKNOWN',
+                      'LEASE_CONFLICT',
+                    ].includes(error.code) ||
+                    Date.now() >= waitDeadline
+                  )
+                    throw error;
+                  await sleep(1000, undefined, { signal: active, ref: false });
+                }
+              }
             }
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');

@@ -1353,11 +1353,24 @@ it('plans the next epoch before asking an old running binding for editor proof',
     await expect(
       assembly.port.isCurrent!(context, identity, plan, signal(), 'operation'),
     ).resolves.toBe(true);
+    expect(plan.upgradeRestart).toBe(true);
     await expect(
       assembly.port.prewarm(
         context,
         identity,
         'page',
+        signal(),
+        signal(),
+        plan,
+      ),
+    ).rejects.toMatchObject({ code: 'UPGRADE_OPEN_REQUIRED' });
+    expect(updated).toBe(false);
+    expect(proof).not.toHaveBeenCalled();
+    await expect(
+      assembly.port.prewarm(
+        context,
+        identity,
+        'open',
         signal(),
         signal(),
         plan,

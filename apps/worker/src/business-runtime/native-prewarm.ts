@@ -35,7 +35,11 @@ type VmStamp = Generation & {
   hasEgressReceipt?: boolean;
 };
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
-type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
+type Coordination = {
+  authorityRevision: string | null;
+  vm: VmStamp | null;
+  upgradeRestart?: boolean;
+};
 type ReadCoordination = (
   identity: DEntryIdentity,
   sessionId: string,
@@ -226,7 +230,11 @@ export function createDEntryNativePrewarmPort(input: {
       ) {
         // No local owner is only a planning fact. The VM service requires
         // its physical lease and independent prior-gateway fencing.
-        return { ...stamp, vm: { ...vm, phase: 'stopped' } };
+        return {
+          ...stamp,
+          vm: { ...vm, phase: 'stopped' },
+          upgradeRestart: true,
+        };
       }
       return stamp;
     });
@@ -365,6 +373,7 @@ export function createDEntryNativePrewarmPort(input: {
         key,
         target,
         running: stamp.vm?.phase === 'running' && !stamp.vm.leaseOwner,
+        ...(stamp.upgradeRestart && { upgradeRestart: true }),
       };
     },
     prewarm(context, identity, trigger, caller, revoked, plan) {
@@ -421,6 +430,11 @@ export function createDEntryNativePrewarmPort(input: {
         const read = readCoordination;
         const stamp = await read?.(identity, context.sessionId);
         active.throwIfAborted();
+        if (
+          (plan?.upgradeRestart || stamp?.upgradeRestart) &&
+          trigger !== 'open'
+        )
+          throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
         const revision = stamp?.authorityRevision;
         const target =
           stamp &&

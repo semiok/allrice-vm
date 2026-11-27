@@ -87,6 +87,7 @@ function safeError(error: unknown) {
     : new PersonVmError('PROVIDER_FAILED', { cause: error });
 }
 type IdleStopGuard = Readonly<{
+  auditAction?: 'stop.upgrade-dispatch';
   dispatch?: PersonVmIdleStopDispatch;
   requestId: string;
   signal: AbortSignal;
@@ -889,6 +890,7 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    foregroundOpen = false,
   ) {
     return this.leased(
       context,
@@ -902,6 +904,7 @@ export class PersonVmService
           lease,
           current,
           target && ((active) => assertPrewarmAuthority(target, active)),
+          foregroundOpen,
         );
       },
       { joinOfflinePreparation: true },
@@ -969,6 +972,7 @@ export class PersonVmService
     lease: VmLease,
     signal: AbortSignal,
     assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
+    foregroundOpen = false,
   ) {
     const scheduled = 'purpose' in intent ? intent : undefined;
     const context = 'actor' in intent ? intent : undefined;
@@ -1011,7 +1015,9 @@ export class PersonVmService
       throw new PersonVmError('AUTHORIZATION_DENIED');
     if (row.phase === 'running' && this.needsUpgradeStop(row)) {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
-      await assertAuthority?.(signal);
+      if (!foregroundOpen || context.actor.type !== 'user' || !assertAuthority)
+        throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
+      await assertAuthority(signal);
       await this.stopForUpgrade(
         lease,
         row,
@@ -1019,6 +1025,8 @@ export class PersonVmService
         signal,
         true,
         assertAuthority,
+        undefined,
+        true,
       );
     }
     if (row.phase === 'running') {
@@ -1321,13 +1329,22 @@ export class PersonVmService
   }
   async prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
+    input: {
+      trigger: 'page' | 'input' | 'open';
+      target?: PersonVmPrewarmFence;
+    },
     signal: AbortSignal,
   ) {
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
-    if (input.trigger !== 'page' && input.trigger !== 'input')
+    if (!['page', 'input', 'open'].includes(input.trigger))
       throw new PersonVmError('AUTHORIZATION_DENIED');
-    const work = () => this.prewarmCurrent(context, signal, input.target);
+    const work = () =>
+      this.prewarmCurrent(
+        context,
+        signal,
+        input.target,
+        input.trigger === 'open',
+      );
     return this.options.diskPool
       ? this.options.diskPool.inForeground(work)
       : work();
@@ -1336,6 +1353,7 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    foregroundOpen = false,
   ): Promise<PersonVmView> {
     const identity = await this.identity(context, 'start', signal);
     const row = await this.options.store.read(identity.personId);
@@ -1353,11 +1371,13 @@ export class PersonVmService
         });
       });
       signal.throwIfAborted();
-      return this.prewarmCurrent(context, signal, target);
+      return this.prewarmCurrent(context, signal, target, foregroundOpen);
     }
     this.assertPrewarmTarget(row, target, true);
     if (row?.phase === 'running' && this.needsUpgradeStop(row)) {
-      const opening = this.start(context, signal, target).finally(() => {
+      if (!foregroundOpen || !target || context.actor.type !== 'user')
+        throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
+      const opening = this.start(context, signal, target, true).finally(() => {
         this.upgradePrewarms.delete(identity.personId);
       });
       this.upgradePrewarms.set(identity.personId, opening);
@@ -1510,7 +1530,7 @@ export class PersonVmService
       const runDispatch = idle.dispatch;
       const dispatch = {
         requestId: idle.requestId,
-        action: 'stop.idle-dispatch',
+        action: idle.auditAction ?? 'stop.idle-dispatch',
       };
       await lease.audit(row, { ...dispatch, result: 'started' });
       let dispatchApproved = false;
@@ -1750,6 +1770,7 @@ export class PersonVmService
     previousWorker: boolean,
     assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
     prepareWake?: PrepareUpgradeWake,
+    foregroundOpen = false,
   ) {
     const binding = bindingOf(row);
     if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
@@ -1792,14 +1813,34 @@ export class PersonVmService
         mount,
         signal,
       );
-      // A lost host Gateway is not proof that the guest scheduler or a
-      // continuable child has stopped. An old generation with no readable
-      // control owner may only be reclaimed after terminal native readback.
-      if (state !== 'stopped' && state !== 'absent')
+      // Only a currently authorized foreground open permits restarting a
+      // running orphan. Release/admin drain never borrows this authority.
+      if (
+        state !== 'stopped' &&
+        state !== 'absent' &&
+        !(foregroundOpen && state === 'running')
+      )
         throw new PersonVmError('ACTIVITY_UNKNOWN');
-      await assertAuthority?.(signal);
-      await lease.guard();
-      return this.commitStop(requestId, lease, row, undefined, 'stop.upgrade');
+      const assertCurrent = async (active: AbortSignal) => {
+        await lease.guard();
+        await assertAuthority?.(active);
+        active.throwIfAborted();
+      };
+      await assertCurrent(signal);
+      return this.commitStop(
+        requestId,
+        lease,
+        row,
+        state === 'running'
+          ? {
+              requestId,
+              signal,
+              assertCurrent,
+              auditAction: 'stop.upgrade-dispatch',
+            }
+          : undefined,
+        'stop.upgrade',
+      );
     };
     if (previousWorker) {
       const receipt = this.receipt(binding, row.egressReceipt);

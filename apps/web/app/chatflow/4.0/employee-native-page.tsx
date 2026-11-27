@@ -34,6 +34,7 @@ type Status =
   | 'warming'
   | 'accepted'
   | 'starting'
+  | 'restarting'
   | 'opening'
   | 'ready'
   | 'cancelled'
@@ -422,15 +423,27 @@ export function EmployeeNativePage({
             const { progress, result } = activation.warmup;
             progress.show = showPrewarm;
             if (progress.current) showPrewarm(progress.current);
-            await result;
-          } else
-            await prewarmEmployeeEntry(selection, lifetime.signal, {
-              ticket,
-              accepted: (accepted) => {
-                ticket = accepted;
-              },
-              progress: showPrewarm,
-            });
+            try {
+              await result;
+              return;
+            } catch (error) {
+              if (
+                !(error instanceof EmployeeEntryError) ||
+                error.code !== 'UPGRADE_OPEN_REQUIRED'
+              )
+                throw error;
+              progress.ticket = undefined;
+              ticket = undefined;
+            }
+          }
+          await prewarmEmployeeEntry(selection, lifetime.signal, {
+            ticket,
+            trigger: 'open',
+            accepted: (accepted) => {
+              ticket = accepted;
+            },
+            progress: showPrewarm,
+          });
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -558,6 +571,7 @@ const messages = {
   warming: ['正在打开对话', '马上就好。'],
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  restarting: ['版本已更新，正在重新启动员工', '重启后会继续打开工作台。'],
   opening: ['工作台已就绪', '正在打开对话。'],
   failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
@@ -578,9 +592,13 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
-    status,
-  );
+  const starting = [
+    'warming',
+    'accepted',
+    'starting',
+    'restarting',
+    'opening',
+  ].includes(status);
   const resumable = status === 'cancelled' || status === 'failed';
   return (
     <div className={styles.status}>

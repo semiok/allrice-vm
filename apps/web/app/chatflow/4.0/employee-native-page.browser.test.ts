@@ -120,7 +120,7 @@ suite('4.0 browser cold entry', () => {
             return response.writeHead(404).end();
           if (++polls === 1) {
             await allowStarting.promise;
-            return json({ state: 'starting' });
+            return json({ state: 'restarting' });
           }
           await allowReady.promise;
           if (polls === 2) return response.writeHead(503).end();
@@ -286,8 +286,8 @@ suite('4.0 browser cold entry', () => {
         await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
         allowStarting.resolve();
         await assertWaiting(
-          '正在启动工作台',
-          '第一次启动需要一两分钟，留在这页就行。',
+          '版本已更新，正在重新启动员工',
+          '重启后会继续打开工作台。',
         );
         expect(
           await page.getByRole('button', { name: '取消等待' }).isEnabled(),
@@ -385,7 +385,10 @@ suite('4.0 browser cold entry', () => {
       ]);
       expect(warmCalls).toEqual(
         [employee, employee, employee, f.selection, employee].map(
-          (selection) => ({ selection, trigger: 'page' }),
+          (selection, index) => ({
+            selection,
+            trigger: index === 4 ? 'page' : 'open',
+          }),
         ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
@@ -406,7 +409,7 @@ suite('4.0 browser cold entry', () => {
       expect(births).toHaveLength(2);
       expect(warmCalls.slice(5)).toEqual([
         { selection: employee, trigger: 'page' },
-        { selection: { ...employee, threadId: next }, trigger: 'page' },
+        { selection: { ...employee, threadId: next }, trigger: 'open' },
       ]);
 
       expect(await claim()).toBe(true);
@@ -429,7 +432,7 @@ suite('4.0 browser cold entry', () => {
       await showEditor(f.selection.threadId);
       expect(warmCalls.slice(7)).toEqual([
         { selection: employee, trigger: 'page' },
-        { selection: f.selection, trigger: 'page' },
+        { selection: f.selection, trigger: 'open' },
       ]);
       expect(births).toHaveLength(2);
 

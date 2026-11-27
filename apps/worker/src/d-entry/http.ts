@@ -364,6 +364,7 @@ export function createDEntryHttpHandler(
               active,
               plan,
             ),
+          trigger,
         );
         transferred = accepted.owned;
         finishPrewarmReply = accepted.finishReply;

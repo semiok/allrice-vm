@@ -195,7 +195,7 @@ suite(
         },
       };
     }
-    it('reconciles an old running row only after terminal native readback and keeps the original disk', async () => {
+    it('restarts an orphan only for the current foreground open and keeps the original disk', async () => {
       const h = await setup();
       const store = new PostgresPersonVmStore(h.physical.open);
       const seen: string[] = [];
@@ -269,34 +269,14 @@ suite(
       vm.createAdmissionHost({ openSql: h.physical.open });
       const requestId = randomUUID();
       const events = h.log.length;
-      await expect(
-        vm.prewarm(h.rc, { trigger: 'page' }, signal()),
-      ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
-      expect(h.log.slice(events)).not.toContain('native:stop');
-      expect(await store.read(h.binding.personId)).toMatchObject({
-        phase: 'running',
-        leaseEpoch: h.binding.leaseEpoch,
-        leaseOwner: null,
-      });
-      previousStillListening = false;
-      await expect(
-        vm.prewarm(h.rc, { trigger: 'page' }, signal()),
-      ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
-      expect(h.log.slice(events)).not.toContain('native:stop');
-      expect(h.log.slice(events)).not.toContain('native:prepare');
-      expect(h.log.slice(events)).not.toContain('disk:attach');
-      expect(reconciled).toBe(false);
-      expect(await store.read(h.binding.personId)).toMatchObject({
-        phase: 'running',
-        leaseOwner: null,
-      });
-      h.states.set(h.binding.vmId, 'stopped');
-      joinParallel = true;
-      const warm = (rc: typeof h.rc) =>
+      const warm = (
+        rc: typeof h.rc,
+        trigger: 'page' | 'input' | 'open' = 'open',
+      ) =>
         vm.prewarm(
           rc,
           {
-            trigger: 'page',
+            trigger,
             target: {
               vmId: h.binding.vmId,
               instanceId: null,
@@ -306,6 +286,34 @@ suite(
           },
           signal(),
         );
+      for (const trigger of ['page', 'input'] as const)
+        await expect(warm(h.rc, trigger)).rejects.toMatchObject({
+          code: 'UPGRADE_OPEN_REQUIRED',
+        });
+      await expect(warm(h.rc)).rejects.toMatchObject({
+        code: 'LEASE_CONFLICT',
+      });
+      expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(await store.read(h.binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseEpoch: h.binding.leaseEpoch,
+        leaseOwner: null,
+      });
+      previousStillListening = false;
+      h.states.set(h.binding.vmId, 'unknown');
+      await expect(warm(h.rc)).rejects.toMatchObject({
+        code: 'ACTIVITY_UNKNOWN',
+      });
+      expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(h.log.slice(events)).not.toContain('native:prepare');
+      expect(h.log.slice(events)).not.toContain('disk:attach');
+      expect(reconciled).toBe(false);
+      expect(await store.read(h.binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseOwner: null,
+      });
+      h.states.set(h.binding.vmId, 'running');
+      joinParallel = true;
       const first = own(warm({ ...h.rc, requestId }));
       let second: typeof first;
       try {
