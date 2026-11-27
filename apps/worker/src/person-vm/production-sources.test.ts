@@ -86,6 +86,7 @@ function fixture(useOpenAi = false) {
       fetchOwned: vi.fn(),
       close: vi.fn(),
       stoppedEvidence: vi.fn(),
+      confirmClosed: vi.fn(async () => false),
       beforeDispatch: vi.fn(),
     },
     confirmTransportStopped: vi.fn(),
