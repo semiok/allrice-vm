@@ -1,6 +1,9 @@
 import type { RequestContext } from '@allrice/contracts';
 import { DataAccessError } from './data.ts';
+import { EmployeeInstanceError } from './employees/employee-instances.ts';
+import { IdentityError } from './identity.ts';
 import {
+  NativeWebGuestLaunchUnacknowledged,
   PersonVmError,
   type PersonVmAdmissionBoundary,
   type PersonVmAdmissionPermit,
@@ -27,8 +30,9 @@ export type DEntryOwnedActivity<T> = Readonly<{
 
 /** Host-only current owner of the immutable full business envelope. The entry
  * cannot manufacture Run/call/profile/release/route facts from browser JSON.
- * These checks include current login, employee, thread/root and execution;
- * they never create a Run/call, change a claim, or relabel an old envelope. */
+ * These checks include current login, employee, thread/root and execution.
+ * They await their current reads. They never acquire or dispatch native work,
+ * create a Run/call, change a claim, or relabel an old envelope. */
 export type DEntryAdmissionOwner = Readonly<{
   context: RequestContext;
   binding: PersonVmBinding;
@@ -60,9 +64,35 @@ async function ownedOutcome<T>(
   owner: DEntryAdmissionOwner,
   signal: AbortSignal,
 ): Promise<Outcome<T>> {
-  signal.throwIfAborted();
-  await owner.assertCurrent(signal);
-  signal.throwIfAborted();
+  if (signal.aborted) return { ok: false, error: signal.reason };
+  try {
+    await owner.assertCurrent(signal);
+  } catch (error) {
+    const denied =
+      (error instanceof DataAccessError &&
+        [
+          'authentication_required',
+          'authorization_denied',
+          'not_found',
+        ].includes(error.code)) ||
+      (error instanceof IdentityError &&
+        (error.code === 'authorization_denied' ||
+          error.code === 'tenant_context_invalid')) ||
+      (error instanceof EmployeeInstanceError &&
+        error.code === 'instance_archived') ||
+      (error instanceof PersonVmError &&
+        (error.code === 'AUTHORIZATION_DENIED' || error.code === 'LEASE_LOST'));
+    const cancelled =
+      signal.aborted &&
+      error === signal.reason &&
+      !(error instanceof AggregateError) &&
+      !(error instanceof NativeWebGuestLaunchUnacknowledged) &&
+      !(error instanceof PersonVmError && error.code === 'CLEANUP_INCOMPLETE');
+    // A settled current-read denial or cancellation owns no activity to close.
+    if (denied || cancelled) return { ok: false, error };
+    throw error;
+  }
+  if (signal.aborted) return { ok: false, error: signal.reason };
   const activity = acquire(signal); // Never classify a missing handle as joined.
   let closing: Promise<void> | undefined;
   const close = () =>
@@ -85,6 +115,9 @@ async function ownedOutcome<T>(
     try {
       await close();
     } catch (error) {
+      // Only the exact error from the actual close may carry trusted evidence
+      // of local join. Its guest work still requires the physical-stop owner.
+      if (error instanceof NativeWebGuestLaunchUnacknowledged) throw error;
       if (!outcome.ok || signal.aborted) {
         const original = outcome.ok ? signal.reason : outcome.error;
         throw new AggregateError(

@@ -88,6 +88,26 @@ it(
     });
     expect(f.owner.controlReady()).toBe(true);
     expect((await f.owner.readSessions(active)).ok).toBe(true);
+    const revoked = Error('fixture revoked catalogue caller');
+    await expect(
+      f.owner.readScheduleCatalog(async () => {
+        throw revoked;
+      }, active),
+    ).rejects.toBe(revoked);
+    const guard = (signal: AbortSignal) =>
+      f.current(f.context, f.launch.binding, signal);
+    await expect(f.owner.readScheduleCatalog(guard, active)).resolves.toEqual(
+      [],
+    );
+    await expect(f.owner.readNativeActivity(guard, active)).resolves.toEqual({
+      work: new Set(),
+      complete: true,
+    });
+    await f.owner.createRootFor(f.context, {}, active);
+    await expect(f.owner.readNativeActivity(guard, active)).resolves.toEqual({
+      work: new Set(),
+      complete: true,
+    });
     assertOneNativeLogin(await f.observeNativeStartup(f.child));
     const patch = await f.observedProfilePatch();
     expect(patch.actual).toEqual([patch.expected]);
@@ -167,6 +187,9 @@ it(
     expect(second.child.pid).not.toBe(f.child.pid);
     expect(second.owner.controlReady()).toBe(true);
     expect((await second.owner.readSessions(active)).ok).toBe(true);
+    await expect(
+      second.owner.readScheduleCatalog(guard, active),
+    ).resolves.toEqual([]);
     assertOneNativeLogin(await f.observeNativeStartup(second.child));
     const secondNonce = nativeWebAuthArtifact(second.launch.auth).path;
     await access(secondNonce);

@@ -21,6 +21,7 @@ import {
   pageSwitchReady,
   pageThreadScope,
   pageThreadSelected,
+  pageNativeThreadSelected,
   pageRevoked,
   pageStartupFailed,
 } from '../../../lib/d-entry/page-messages';
@@ -38,11 +39,16 @@ type Status =
   | 'warming'
   | 'accepted'
   | 'starting'
+  | 'restarting'
+  | 'restart-confirmation'
   | 'opening'
   | 'ready'
   | 'cancelled'
   | 'failed'
   | 'asset-timeout'
+  | 'selection-unavailable'
+  | 'sign-in'
+  | 'forbidden'
   | 'denied'
   | 'closing'
   | 'unknown';
@@ -51,6 +57,7 @@ type Status =
 const entryWaitMs = 5 * 60_000;
 const liveSwitchWaitMs = 10_000;
 const closingNoticeMs = 10_000;
+const closingConfirmationMs = 60_000;
 
 type ThreadHandoff = { selection: DEntrySelectionInput; scopeId?: string };
 
@@ -69,6 +76,7 @@ function startEntryWarmup(
   selection: DEntrySelectionInput,
   lifetime: AbortController,
   ticket?: DEntryNativePrewarmTicket,
+  foregroundOpen?: boolean,
 ): EntryWarmup {
   const progress: EntryWarmup['progress'] = {};
   let lookup:
@@ -79,6 +87,7 @@ function startEntryWarmup(
     | undefined;
   const result = prewarmEmployeeEntry(selection, lifetime.signal, {
     ticket,
+    trigger: foregroundOpen ? 'open' : 'page',
     accepted(accepted) {
       // A cold or resumed operation needs a fresh identity after ready.
       lookup?.cancel.abort();
@@ -139,6 +148,7 @@ export function EmployeeNativePage({
   const [activation, setActivation] = useState<{
     query: string;
     confirmedQuery?: string;
+    foregroundOpen?: boolean;
     warmup?: EntryWarmup;
     retainFrame?: boolean;
     ticket?: DEntryNativePrewarmTicket;
@@ -149,7 +159,9 @@ export function EmployeeNativePage({
   );
   const replace = useRef<(() => void) | undefined>(undefined);
   const cancel = useRef<(() => void) | undefined>(undefined);
-  const resume = useRef<(() => void) | undefined>(undefined);
+  const resume = useRef<((foregroundOpen?: boolean) => void) | undefined>(
+    undefined,
+  );
   const pendingWarmup = useRef<EntryWarmup | undefined>(undefined);
   const nextQuery = useRef(query);
   const displayedQuery = useRef(query);
@@ -186,6 +198,7 @@ export function EmployeeNativePage({
     const lifetime = activation.warmup?.lifetime ?? new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
+    let resourceScopeId: string | undefined;
     let navigating = false;
     let retired = false;
     let mounted = false;
@@ -201,6 +214,7 @@ export function EmployeeNativePage({
     let superseded = false;
     let timer: number | undefined;
     let closingNotice: number | undefined;
+    let closingConfirmation: number | undefined;
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     let switchReady = false;
@@ -248,7 +262,20 @@ export function EmployeeNativePage({
       );
     }
     function retire() {
-      return (replacing ??= (async () => {
+      if (replacing) return replacing;
+      if (prepare) {
+        closingNotice = window.setTimeout(
+          () => setStatus('closing'),
+          closingNoticeMs,
+        );
+        // Loss of either completion signal must not leave a perpetual spinner
+        // or enable a new page without the old page's actual close proof.
+        closingConfirmation = window.setTimeout(
+          () => setStatus('unknown'),
+          closingConfirmationMs,
+        );
+      }
+      replacing = (async () => {
         // A render change keeps the old iframe and its authenticated sender
         // attached until both halves have settled.
         if (!mounted || !frame.current) {
@@ -286,10 +313,23 @@ export function EmployeeNativePage({
         }
         const [remote, entry] = await Promise.all([close(), local.promise]);
         return remote === 'closed' && entry === 'closed';
-      })());
+      })()
+        .catch(() => false)
+        .finally(() => {
+          window.clearTimeout(closingNotice);
+          window.clearTimeout(closingConfirmation);
+        });
+      return replacing;
     }
     function finish(
-      status: 'cancelled' | 'failed' | 'asset-timeout' | 'denied',
+      status:
+        | 'cancelled'
+        | 'failed'
+        | 'asset-timeout'
+        | 'forbidden'
+        | 'selection-unavailable'
+        | 'sign-in'
+        | 'restart-confirmation',
       retainTicket = status === 'cancelled',
     ) {
       if (navigating || replace.current !== applyQuery) return;
@@ -297,12 +337,7 @@ export function EmployeeNativePage({
       resumable = retainTicket;
       window.clearTimeout(timer);
       setStatus(status);
-      closingNotice = window.setTimeout(
-        () => setStatus('closing'),
-        closingNoticeMs,
-      );
       void retire().then((closed) => {
-        window.clearTimeout(closingNotice);
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
@@ -396,12 +431,13 @@ export function EmployeeNativePage({
     };
     replace.current = applyQuery;
     cancel.current = () => finish('cancelled');
-    resume.current = () => {
+    resume.current = (foregroundOpen) => {
       const query = nextQuery.current;
       setActivation({
         query,
         confirmedQuery:
           query === displayedQuery.current ? selectedQuery : undefined,
+        foregroundOpen: query === displayedQuery.current && foregroundOpen,
         ticket:
           resumable && query === displayedQuery.current
             ? (ticket ?? warmup?.progress.ticket)
@@ -473,6 +509,7 @@ export function EmployeeNativePage({
         !remoteRevoked
       ) {
         const selection = switching.selection;
+        resourceScopeId = switching.scopeId;
         const query = new URLSearchParams({
           workspaceId: selection.workspaceId,
           employeeInstanceId: selection.employeeInstanceId,
@@ -487,7 +524,10 @@ export function EmployeeNativePage({
         nextQuery.current = displayedQuery.current = query;
         history.pushState(history.state, '', '/chatflow/4.0?' + query);
       }
-      if (event.data.type === pageClosing) void close();
+      if (event.data.type === pageClosing) {
+        if (prepare && !navigating && !detached) finish('failed');
+        else void close();
+      }
       if (event.data.type === pageStartupFailed) {
         if (prepare)
           finish(
@@ -526,6 +566,39 @@ export function EmployeeNativePage({
         ['closed', 'unknown'].includes(event.data.state)
       )
         local.resolve(event.data.state);
+      if (event.data.type === pageNativeThreadSelected) {
+        const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
+        if (
+          !prepare ||
+          !carrier ||
+          switching ||
+          event.data.resourceScopeId !== resourceScopeId ||
+          !next.success ||
+          !next.data.threadId ||
+          next.data.workspaceId !== selectedEmployee?.workspaceId ||
+          next.data.employeeInstanceId !==
+            selectedEmployee.employeeInstanceId ||
+          navigating ||
+          remoteRevoked ||
+          detached ||
+          nextQuery.current !== displayedQuery.current ||
+          location.pathname !== '/chatflow/4.0'
+        )
+          return;
+        const query = new URLSearchParams({
+          workspaceId: next.data.workspaceId,
+          employeeInstanceId: next.data.employeeInstanceId,
+          threadId: next.data.threadId,
+        }).toString();
+        // The live carrier and its authority stay pinned to the same document.
+        // This is the URL for reload, not a request to replace that document.
+        selectedEmployee = next.data;
+        frameSelection.current = next.data;
+        displayedQuery.current = query;
+        nextQuery.current = query;
+        selectedQuery = query;
+        history.replaceState(history.state, '', '/chatflow/4.0?' + query);
+      }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (!next.success || !carrier || navigating || switching) return;
@@ -603,13 +676,19 @@ export function EmployeeNativePage({
     );
     // The shell owns only its wait; the Worker owns an accepted cold start.
     const showPrewarm = (state: EmployeePrewarmProgress) => {
-      if (!lifetime.signal.aborted && !navigating) setStatus(state);
+      if (!lifetime.signal.aborted && !navigating)
+        setStatus(activation.retainFrame ? 'warming' : state);
     };
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
           lifetime.signal.throwIfAborted();
-          warmup ??= startEntryWarmup(selection, lifetime, ticket);
+          warmup ??= startEntryWarmup(
+            selection,
+            lifetime,
+            ticket,
+            activation.foregroundOpen,
+          );
           warmup.progress.show = showPrewarm;
           if (warmup.progress.current) showPrewarm(warmup.progress.current);
           await warmup.result;
@@ -641,6 +720,12 @@ export function EmployeeNativePage({
         speculative ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
+      if (
+        identity.workspaceId !== selection.workspaceId ||
+        identity.employeeInstanceId !== selection.employeeInstanceId ||
+        identity.threadId !== (selection.threadId ?? null)
+      )
+        throw new EmployeeEntryError(403, 'response-mismatch');
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         send(pageRevoked);
@@ -649,7 +734,7 @@ export function EmployeeNativePage({
         if (prepare && mounted) finish('failed');
       });
       const issued = (await carrier.ready).scopeReference;
-      scopeId = issued.scopeId;
+      scopeId = resourceScopeId = issued.scopeId;
       lifetime.signal.throwIfAborted();
       if (navigating) return;
       selectedEmployee = selection;
@@ -667,19 +752,21 @@ export function EmployeeNativePage({
     };
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;
-      if (!prepare) setFailed(true);
-      else
-        finish(
-          error instanceof EmployeeEntryError &&
-            [400, 401, 403, 404].includes(error.status)
-            ? 'denied'
-            : 'failed',
-          error instanceof EmployeeEntryError && error.status === 408,
-        );
+      if (!prepare) return setFailed(true);
+      if (!(error instanceof EmployeeEntryError)) return finish('failed');
+      if (error.reason === 'UPGRADE_OPEN_REQUIRED')
+        return finish('restart-confirmation');
+      const responseMismatch = error.reason === 'response-mismatch';
+      if (error.status === 401) finish('sign-in');
+      else if (error.status === 403 && !responseMismatch) finish('forbidden');
+      else if (responseMismatch || [400, 404].includes(error.status))
+        finish('selection-unavailable');
+      else finish('failed', error.status === 408);
     });
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
+      window.clearTimeout(closingConfirmation);
       window.clearTimeout(switchTimer);
       if (warmup) warmup.progress.show = undefined;
       leaving();
@@ -725,7 +812,7 @@ export function EmployeeNativePage({
           stop={() => cancel.current?.()}
           retry={() => {
             if (initialUnavailable) location.reload();
-            else resume.current?.();
+            else resume.current?.(status === 'restart-confirmation');
           }}
         />
       )}
@@ -738,6 +825,8 @@ const messages = {
   warming: ['正在打开对话', '马上就好。'],
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  restarting: ['版本已更新，正在重新启动员工', '重启后会继续打开工作台。'],
+  'restart-confirmation': ['版本已更新', '打开员工工作台需要先重启员工。'],
   opening: ['工作台已就绪', '正在打开对话。'],
   failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
   'asset-timeout': [
@@ -745,6 +834,9 @@ const messages = {
     '自动重试后仍未下载完成，可以点重试。',
   ],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
+  'selection-unavailable': ['暂时打不开这条对话', '可以返回员工页重选。'],
+  'sign-in': ['请重新登录', '登录后再打开工作台。'],
+  forbidden: ['当前请求未获授权', '请确认登录账号和工作区权限。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
   unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
@@ -762,28 +854,38 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
-    status,
-  );
+  const starting = [
+    'warming',
+    'accepted',
+    'starting',
+    'restarting',
+    'opening',
+  ].includes(status);
+  const failedOpening = status === 'failed' || status === 'asset-timeout';
   const resumable =
-    status === 'cancelled' || status === 'failed' || status === 'asset-timeout';
+    status === 'cancelled' ||
+    status === 'restart-confirmation' ||
+    failedOpening;
+  const canReturn = status === 'failed' || status === 'selection-unavailable';
+  const attention =
+    failedOpening ||
+    [
+      'selection-unavailable',
+      'sign-in',
+      'forbidden',
+      'denied',
+      'unknown',
+    ].includes(status);
   return (
     <div className={styles.status}>
       <section>
-        <div
-          role={
-            status === 'failed' ||
-            status === 'asset-timeout' ||
-            status === 'denied' ||
-            status === 'unknown'
-              ? 'alert'
-              : 'status'
-          }
-          aria-atomic="true"
-        >
+        <div role={attention ? 'alert' : 'status'} aria-atomic="true">
           {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
           <p>{description}</p>
+          {failedOpening && (
+            <p>如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试</p>
+          )}
         </div>
         {starting && (
           <button type="button" onClick={stop}>
@@ -792,12 +894,17 @@ function EntryStatus({
         )}
         {resumable && (
           <button type="button" disabled={!settled} onClick={retry}>
-            {status === 'cancelled' ? '继续' : '重试'}
+            {status === 'restart-confirmation'
+              ? '打开员工'
+              : status === 'cancelled'
+                ? '继续'
+                : '重试'}
           </button>
         )}
-        {/* The existing employee selector accepts an empty value for the
-            default workspace view. Bare /chatflow reopens 4.0 on the trial host. */}
-        {status === 'failed' && <a href="/chatflow?employee=">返回员工页</a>}
+        {canReturn && settled && <a href="/chatflow/4.0">返回员工页</a>}
+        {status === 'sign-in' && settled && (
+          <a href="/login?next=%2Fchatflow%2F4.0">重新登录</a>
+        )}
       </section>
     </div>
   );

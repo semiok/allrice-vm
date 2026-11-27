@@ -12,6 +12,7 @@ import {
 import { deferred } from '../../../../../packages/d-entry-principal/test/host-fixture';
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
 import {
+  pageClosing,
   pageEditorMounted,
   pageNavigate,
 } from '../../../lib/d-entry/page-messages';
@@ -72,7 +73,11 @@ suite('4.0 browser cold entry', () => {
       const allowStarting = deferred<void>();
       const allowReady = deferred<void>();
       const ticket = randomUUID();
+      const sameEmployeeTicket = randomUUID();
+      const sameEmployeeStarting = deferred<void>();
+      const sameEmployeeReady = deferred<void>();
       let polls = 0;
+      let sameEmployeePolls = 0;
       const warmCalls: unknown[] = [],
         births: unknown[] = [],
         documents: string[] = [];
@@ -88,24 +93,25 @@ suite('4.0 browser cold entry', () => {
             .end(body);
         if (address.pathname === '/api/v1/d-entry/native-prewarm') {
           warmCalls.push(await readJson(request));
-          if (warmCalls.length === 1 || warmCalls.length === 6)
+          if (warmCalls.length === 1 || warmCalls.length === 7)
             return response.writeHead(503).end();
           if (warmCalls.length === 2) {
             response.once('close', () => retryClosed.resolve());
             firstRetry.resolve(response);
             return;
           }
-          if (warmCalls.length === 4)
+          if (warmCalls.length >= 4 && warmCalls.length <= 6)
             return response
               .writeHead(202, { 'content-type': 'application/json' })
               .end(
                 JSON.stringify({
-                  operationId: ticket,
+                  operationId:
+                    warmCalls.length <= 5 ? ticket : sameEmployeeTicket,
                   expiresAt: new Date(Date.now() + 60_000).toISOString(),
                   pollAfterMs: 1000,
                 }),
               );
-          if (warmCalls.length === 8) {
+          if (warmCalls.length === 9) {
             response.once('close', () => supersededClosed.resolve());
             supersededWarmup.resolve(response);
             return;
@@ -113,17 +119,23 @@ suite('4.0 browser cold entry', () => {
           return response.writeHead(204).end();
         }
         if (address.pathname === '/api/v1/d-entry/native-prewarm/status') {
-          if (
-            request.method !== 'GET' ||
-            address.searchParams.get('operationId') !== ticket
-          )
+          if (request.method !== 'GET') return response.writeHead(404).end();
+          if (address.searchParams.get('operationId') === sameEmployeeTicket) {
+            if (++sameEmployeePolls === 1) return json({ state: 'starting' });
+            sameEmployeeStarting.resolve();
+            await sameEmployeeReady.promise;
+            return json({ state: 'ready' });
+          }
+          if (address.searchParams.get('operationId') !== ticket)
             return response.writeHead(404).end();
-          if (++polls === 1) {
+          if (++polls === 1)
+            return json({ state: 'failed', code: 'UPGRADE_OPEN_REQUIRED' });
+          if (polls === 2) {
             await allowStarting.promise;
-            return json({ state: 'starting' });
+            return json({ state: 'restarting' });
           }
           await allowReady.promise;
-          if (polls === 2) return response.writeHead(503).end();
+          if (polls === 3) return response.writeHead(503).end();
           return json({ state: 'ready' });
         }
         if (
@@ -170,13 +182,8 @@ suite('4.0 browser cold entry', () => {
               )!.text,
             );
         }
-        if (address.pathname === '/chatflow') {
-          if (!address.search)
-            return response.writeHead(307, { location: '/chatflow/4.0' }).end();
-          if (address.searchParams.get('employee') === '')
-            return html('<!doctype html><h1>员工</h1>');
-          return response.writeHead(404).end();
-        }
+        if (address.pathname === '/chatflow' && !address.search)
+          return response.writeHead(307, { location: '/chatflow/4.0' }).end();
         return html(
           '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
         );
@@ -221,6 +228,11 @@ suite('4.0 browser cold entry', () => {
         f.origin + '/chatflow/4.0?' + new URLSearchParams(employee),
       );
       await assertWaiting('正在打开对话', '马上就好。');
+      const extensionHint =
+        '如果一直打不开，请关闭浏览器扩展或者用无痕窗口再试';
+      expect(await page.getByText(extensionHint, { exact: true }).count()).toBe(
+        0,
+      );
       const animations = () =>
         spinner.evaluate(
           (element) => element.getAnimations({ subtree: true }).length,
@@ -243,6 +255,12 @@ suite('4.0 browser cold entry', () => {
         .getByRole('alert')
         .getByRole('heading', { name: '暂时打不开工作台', exact: true })
         .waitFor();
+      expect(
+        await page
+          .getByRole('alert')
+          .getByText(extensionHint, { exact: true })
+          .isVisible(),
+      ).toBe(true);
       expect(
         await page
           .getByRole('alert')
@@ -284,10 +302,17 @@ suite('4.0 browser cold entry', () => {
       await page.getByRole('button', { name: '继续' }).click();
       try {
         await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
+        await page
+          .getByRole('button', { name: '打开员工', exact: true })
+          .waitFor();
+        expect(warmCalls).toHaveLength(4);
+        await page
+          .getByRole('button', { name: '打开员工', exact: true })
+          .click();
         allowStarting.resolve();
         await assertWaiting(
-          '正在启动工作台',
-          '第一次启动需要一两分钟，留在这页就行。',
+          '版本已更新，正在重新启动员工',
+          '重启后会继续打开工作台。',
         );
         expect(
           await page.getByRole('button', { name: '取消等待' }).isEnabled(),
@@ -309,10 +334,10 @@ suite('4.0 browser cold entry', () => {
       expect(
         await page
           .getByRole('link', { name: '返回员工页', exact: true })
-          .isVisible(),
-      ).toBe(true);
-      expect(polls).toBe(2);
-      expect(warmCalls).toHaveLength(4);
+          .getAttribute('href'),
+      ).toBe('/chatflow/4.0');
+      expect(polls).toBe(3);
+      expect(warmCalls).toHaveLength(5);
       expect(births).toEqual(birthsBeforePolling);
       await page.getByRole('button', { name: '重试', exact: true }).click();
       async function showEditor(threadId: string) {
@@ -353,8 +378,8 @@ suite('4.0 browser cold entry', () => {
       await originalFrame.evaluate((node) => {
         (node as HTMLIFrameElement).dataset.retainedFrameProof = 'current';
       });
-      expect(polls).toBe(3);
-      expect(warmCalls).toHaveLength(4);
+      expect(polls).toBe(4);
+      expect(warmCalls).toHaveLength(5);
       const oldDocument = page.frameLocator('iframe').locator('body');
       const claim = () =>
         oldDocument.evaluate(() =>
@@ -377,7 +402,7 @@ suite('4.0 browser cold entry', () => {
         .frameLocator('iframe')
         .getByRole('button', { name: '新建对话' })
         .click();
-      await expect.poll(() => warmCalls.length).toBe(5);
+      await expect.poll(() => warmCalls.length).toBe(6);
       expect(births).toEqual([{ selection: employee }]);
       expect(documents).toEqual([f.selection.threadId]);
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(
@@ -387,12 +412,29 @@ suite('4.0 browser cold entry', () => {
       await page.waitForURL((url) => url.searchParams.has('new'));
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);
-      await showEditor(next);
+      try {
+        await sameEmployeeStarting.promise;
+        await assertWaiting('正在打开对话', '马上就好。');
+        expect(
+          await page.getByRole('heading', { name: '正在启动工作台' }).count(),
+        ).toBe(0);
+        expect(documents).toEqual([f.selection.threadId]);
+      } finally {
+        sameEmployeeReady.resolve();
+      }
+      const newScope = await showEditor(next);
+      expect(newScope).not.toBe(oldScope);
+      expect(
+        await originalFrame.getAttribute('data-retained-frame-proof'),
+      ).toBe('current');
       expect(
         await originalFrame.getAttribute('data-retained-frame-proof'),
       ).toBe('current');
       expect(
         (await f.invokeThread(oldScope, f.selection.threadId)).status,
+      ).toBe(404);
+      expect(
+        (await f.invokeThread(newScope, f.selection.threadId)).status,
       ).toBe(404);
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(next);
       expect(births).toEqual([
@@ -400,8 +442,11 @@ suite('4.0 browser cold entry', () => {
         { selection: employee, operationId: next },
       ]);
       expect(warmCalls).toEqual(
-        [employee, employee, employee, f.selection, employee].map(
-          (selection) => ({ selection, trigger: 'page' }),
+        [employee, employee, employee, f.selection, f.selection, employee].map(
+          (selection, index) => ({
+            selection,
+            trigger: index === 4 ? 'open' : 'page',
+          }),
         ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
@@ -420,7 +465,7 @@ suite('4.0 browser cold entry', () => {
       await page.waitForURL((url) => url.searchParams.get('threadId') === next);
       await showEditor(next);
       expect(births).toHaveLength(2);
-      expect(warmCalls.slice(5)).toEqual([
+      expect(warmCalls.slice(6)).toEqual([
         { selection: employee, trigger: 'page' },
         { selection: { ...employee, threadId: next }, trigger: 'page' },
       ]);
@@ -443,7 +488,7 @@ suite('4.0 browser cold entry', () => {
         await finish();
       }
       await showEditor(f.selection.threadId);
-      expect(warmCalls.slice(7)).toEqual([
+      expect(warmCalls.slice(8)).toEqual([
         { selection: employee, trigger: 'page' },
         { selection: f.selection, trigger: 'page' },
       ]);
@@ -462,13 +507,8 @@ suite('4.0 browser cold entry', () => {
       });
       await back.press('Enter');
       await returnPage.waitForURL(
-        (url) =>
-          url.pathname === '/chatflow' &&
-          url.searchParams.get('employee') === '',
+        (url) => url.pathname === '/chatflow/4.0' && !url.search,
       );
-      await returnPage
-        .getByRole('heading', { name: '员工', exact: true })
-        .waitFor();
       await returnPage.close();
 
       const stalledDocument = await context.newPage();
@@ -498,6 +538,180 @@ suite('4.0 browser cold entry', () => {
       } finally {
         releaseDocument.resolve();
         await stalledDocument.close();
+      }
+
+      for (const [code, title] of [
+        [400, '暂时打不开这条对话'],
+        [401, '请重新登录'],
+        [403, '当前请求未获授权'],
+        [404, '暂时打不开这条对话'],
+      ] as const) {
+        const unavailable = await context.newPage();
+        try {
+          await unavailable.route('**/api/v1/d-entry/native-prewarm', (route) =>
+            route.fulfill({ status: code }),
+          );
+          await unavailable.goto(
+            f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+          );
+          const signIn = code === 401;
+          await unavailable
+            .getByRole('alert')
+            .getByRole('heading', {
+              name: title,
+              exact: true,
+            })
+            .waitFor();
+          if (code !== 403)
+            expect(
+              await unavailable
+                .getByRole('link', {
+                  name: signIn ? '重新登录' : '返回员工页',
+                  exact: true,
+                })
+                .getAttribute('href'),
+            ).toBe(signIn ? '/login?next=%2Fchatflow%2F4.0' : '/chatflow/4.0');
+          expect(
+            await unavailable.getByText(extensionHint, { exact: true }).count(),
+          ).toBe(0);
+          expect(await unavailable.locator('iframe').count()).toBe(0);
+        } finally {
+          await unavailable.close();
+        }
+      }
+
+      for (const source of ['new-thread', 'identity'] as const) {
+        const mismatchedEntry = await context.newPage();
+        try {
+          await mismatchedEntry.route(
+            '**/api/v1/d-entry/native-prewarm',
+            (route) => route.fulfill({ status: 204 }),
+          );
+          const anotherThreadId = randomUUID();
+          const query = new URLSearchParams(employee);
+          if (source === 'new-thread') {
+            query.set('new', randomUUID());
+            await mismatchedEntry.route(
+              (url) =>
+                url.pathname === '/api/v1/sessions' &&
+                url.search === '?entry=4.0',
+              (route) =>
+                route.fulfill({
+                  json: { ...employee, threadId: anotherThreadId },
+                }),
+            );
+          } else {
+            query.set('threadId', f.selection.threadId);
+            await mismatchedEntry.route(
+              '**/api/v1/d-entry/identity?*',
+              (route) =>
+                route.fulfill({
+                  json: {
+                    identity: {
+                      ...f.selectionIdentity(f.selection),
+                      threadId: anotherThreadId,
+                    },
+                  },
+                }),
+            );
+          }
+          await mismatchedEntry.goto(f.origin + '/chatflow/4.0?' + query);
+          await mismatchedEntry
+            .getByRole('alert')
+            .getByRole('heading', {
+              name: '暂时打不开这条对话',
+              exact: true,
+            })
+            .waitFor();
+          expect(await mismatchedEntry.locator('iframe').count()).toBe(0);
+        } finally {
+          await mismatchedEntry.close();
+        }
+      }
+
+      const stalledDocument = await context.newPage();
+      const waitingDocument = deferred<URL>();
+      const releaseDocument = deferred<void>();
+      await stalledDocument.route('**/api/v1/d-entry/native-prewarm', (route) =>
+        route.fulfill({ status: 204 }),
+      );
+      await stalledDocument.route(
+        '**/chatflow/4.0/document?*',
+        async (route) => {
+          waitingDocument.resolve(new URL(route.request().url()));
+          await releaseDocument.promise;
+          await route.abort().catch(() => {});
+        },
+      );
+      try {
+        await stalledDocument.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+          { waitUntil: 'domcontentloaded' },
+        );
+        const documentUrl = await waitingDocument.promise;
+        const scopeId = documentUrl.searchParams.get('scopeId')!;
+        expect(
+          (await f.invokeThread(scopeId, f.selection.threadId)).status,
+        ).toBe(200);
+        await stalledDocument.getByRole('button', { name: '取消等待' }).click();
+        const resume = stalledDocument.getByRole('button', { name: '继续' });
+        await expect.poll(() => resume.isEnabled()).toBe(true);
+        expect(
+          (await f.invokeThread(scopeId, f.selection.threadId)).status,
+        ).toBe(404);
+        expect(await stalledDocument.locator('iframe').count()).toBe(0);
+      } finally {
+        releaseDocument.resolve();
+        await stalledDocument.close();
+      }
+
+      const stalledClose = await context.newPage();
+      try {
+        await stalledClose.route('**/api/v1/d-entry/native-prewarm', (route) =>
+          route.fulfill({ status: 204 }),
+        );
+        await stalledClose.clock.install();
+        await stalledClose.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        const child = stalledClose.frameLocator('iframe');
+        const body = child.locator('body[data-mount-ready=yes]');
+        await body.evaluate((_, type) => {
+          const owner = Reflect.get(window, '__ALLRICE_EMPLOYEE_DOCUMENT__');
+          owner.claim();
+          parent.postMessage({ type, scopeId: owner.scopeId }, location.origin);
+        }, pageClosing);
+        const failure = stalledClose.getByRole('heading', {
+          name: '暂时打不开工作台',
+          exact: true,
+        });
+        await failure.waitFor();
+        expect(
+          await stalledClose.getByRole('button', { name: '重试' }).isDisabled(),
+        ).toBe(true);
+        await stalledClose.clock.fastForward(10_000);
+        await stalledClose
+          .getByRole('heading', { name: '正在结束上一次连接' })
+          .waitFor();
+        await stalledClose.clock.fastForward(50_000);
+        await stalledClose
+          .getByRole('alert')
+          .getByText('无法确认旧连接已关闭。')
+          .waitFor();
+        expect(
+          await stalledClose.getByRole('button', { name: '重试' }).count(),
+        ).toBe(0);
+        await body.evaluate(() =>
+          Reflect.get(window, '__ALLRICE_EMPLOYEE_DOCUMENT__').finish('closed'),
+        );
+        await failure.waitFor();
+        await expect
+          .poll(() =>
+            stalledClose.getByRole('button', { name: '重试' }).isEnabled(),
+          )
+          .toBe(true);
+      } finally {
+        await stalledClose.close();
       }
 
       const firstStart = await context.newPage();

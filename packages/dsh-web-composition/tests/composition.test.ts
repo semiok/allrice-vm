@@ -10,7 +10,6 @@ import {
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import {
@@ -36,7 +35,7 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
 });
 
-it('shades only named employee controls and restores native occupants on unload/redeclaration', async () => {
+it('keeps native conversation controls and hides only the employee header entries', async () => {
   const ctx = new Context();
   contexts.push(ctx);
   const { SlotRegistry } = nativeClientModule(
@@ -90,20 +89,20 @@ it('shades only named employee controls and restores native occupants on unload/
       );
   };
   addDefaults();
-  const shaded = () => {
+  const checkSlots = () => {
     for (const name of [
       'conversation.input.permission',
       'conversation.input.model',
     ] as const) {
-      expect(ctx.slots.entriesOfSlot(name)[0]?.component()).toBeNull();
-      expect(ctx.slots.entries(name)).toHaveLength(2);
+      expect(ctx.slots.entriesOfSlot(name)[0]?.component).toBe(native);
+      expect(ctx.slots.entries(name)).toHaveLength(1);
     }
     expect(
       ctx.slots
         .entriesOfSlot('conversation.composer.dock')
         .filter((entry) => entry.component === native)
         .map((entry) => entry.options.id),
-    ).toEqual(['queue']);
+    ).toEqual(['activity', 'usage', 'queue']);
     expect(
       ctx.slots
         .entriesOfSlot('conversation.session.header.utilities')
@@ -114,11 +113,11 @@ it('shades only named employee controls and restores native occupants on unload/
       ctx.slots.entriesOfSlot('conversation.input.activity')[0]?.component,
     ).toBe(native);
   };
-  shaded();
+  checkSlots();
   remove();
   remove = declare();
   addDefaults();
-  shaded();
+  checkSlots();
   expect(layers.size).toBe(1);
   await plugin.dispose();
   expect(layers.size).toBe(0);
@@ -179,11 +178,16 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
   expect(entry('locale')?.config).toMatchObject({ preference: 'zh' });
-  expect(entry('ui-chat')?.config).toMatchObject({
-    performanceUsage: 'compact',
-  });
-  for (const id of ['terminal-controller', 'ui-sidebar-terminal'])
-    expect(entry(id)?.disabled, id).toBe(true);
+  expect(entry('ui-chat')).toBeDefined();
+  expect(entry('ui-chat')?.config ?? {}).not.toHaveProperty('performanceUsage');
+  for (const id of ['ui-model-selection', 'ui-permission', 'session-stats']) {
+    expect(entry(id), id).toBeDefined();
+    expect(entry(id)?.disabled, id).not.toBe(true);
+  }
+  for (const id of ['terminal-controller', 'ui-sidebar-terminal']) {
+    expect(entry(id), id).toBeDefined();
+    expect(entry(id)?.disabled, id).not.toBe(true);
+  }
   for (const id of [
     'agent-preset-registry',
     'permission',
@@ -193,41 +197,6 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
-  // A real native server dispatcher cannot invoke a controller that this
-  // profile never mounts, even for its owner. This does not assert the
-  // separate authenticated AllRice Host's tenant policy or old 3.x endpoints.
-  const hostRequire = createRequire(
-    require.resolve('@deepseek-ai/dsh/package.json'),
-  );
-  const load = (name: string) =>
-    import(pathToFileURL(hostRequire.resolve(name)).href);
-  const [
-    { TypertRegistry },
-    { RemoteAccessService },
-    { TypertGatewayService },
-  ] = await Promise.all([
-    load('@deepseek-ai/dsh-typert-registry'),
-    load('@deepseek-ai/dsh-api-remote-access'),
-    load('@deepseek-ai/dsh-api-gateway'),
-  ]);
-  const server = new Context();
-  contexts.push(server);
-  new TypertRegistry(server);
-  new RemoteAccessService(server);
-  const gateway = new TypertGatewayService(server, {});
-  expect(server.get('terminalController')).toBeUndefined();
-  const peer = {
-    id: 'terminal-disabled-profile-test',
-    ctx: server,
-    principal: { kind: 'owner' },
-    signal: new AbortController().signal,
-    interactions: 'none',
-    dispose: async () => {},
-  };
-  for (const method of ['environment', 'list', 'create', 'attach'])
-    await expect(
-      gateway.invoke({ namespace: 'terminal', method, args: {}, peer }),
-    ).rejects.toMatchObject({ code: 'gateway/invocation-unavailable' });
   expect(entry('allrice-web-composition')?.name).toBe(
     '@allrice/dsh-web-composition',
   );

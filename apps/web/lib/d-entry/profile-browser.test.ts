@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   EmployeeProfileBundleTimeout,
+  profileBundleReference,
   readProfileBundle,
   releasedBundleResolver,
 } from './profile-browser';
@@ -33,6 +34,27 @@ it('uses a public digest only for the exact graph resource and revision', () => 
       publicAssetRoot: 'https://other.example/',
     })({ url: row.reference, rev: 'r1' }),
   ).toBeUndefined();
+});
+
+it('routes a native package-local browser chunk only at its owning graph revision', () => {
+  const id = '@deepseek-ai/dsh-client-ui-sidebar-terminal';
+  const rev = '0a123ba325cd';
+  const graph = {
+    rev,
+    release: { version: '0.2.1-rc.2' },
+    entries: [{ id, url: `plugins/??${id}/client.js&rev=${rev}`, rev }],
+    batches: [],
+  };
+  const url = `plugins/${id}/client.terminal.js?rev=${rev}`;
+  expect(profileBundleReference(graph, url)).toEqual({ url, rev });
+  for (const bad of [
+    url.replace(id, '@deepseek-ai/other-package'),
+    url.replace(rev, 'other'),
+    url.replace('client.terminal.js', 'client.node.js'),
+    url.replace('client.terminal.js', '../client.terminal.js'),
+    url + '&rev=other',
+  ])
+    expect(profileBundleReference(graph, bad)).toBeUndefined();
 });
 
 it('falls back through the authenticated no-store path when the public body is interrupted', async () => {

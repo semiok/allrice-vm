@@ -473,7 +473,7 @@ export async function setupNativeWebFixture(
           const message = visible.slice(start);
           const safe =
             !visible.includes(root) &&
-            /^Native web auth publication failed \[(readiness|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
+            /^Native web auth publication failed \[(readiness|workspace|mux|artifact)\/(FAILED|E[A-Z]+)\]$/.test(
               message,
             );
           report(safe ? message : '<invalid auth diagnostic>');
@@ -643,14 +643,17 @@ export async function setupNativeWebFixture(
     lifetime,
     child,
     observeNativeStartup,
-    async restartRetained() {
-      if (
-        !isolateProfile ||
-        (child.exitCode === null && child.signalCode === null)
-      )
+    async restartRetained(nextModel?: NativeWebModelAdapter) {
+      if (child.exitCode === null && child.signalCode === null)
         throw Error('The original isolated Host must stop before restart');
       const next = launchOnTestHost(
-        await prepareNativeWebLaunch(configuration, binding, profile),
+        await prepareNativeWebLaunch(
+          configuration,
+          binding,
+          profile,
+          undefined,
+          nextModel,
+        ),
       );
       await stage(next);
       const restarted = await openNativeWebOwner({

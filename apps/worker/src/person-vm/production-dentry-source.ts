@@ -17,6 +17,7 @@ import {
   PersonVmError,
   sameVmBinding,
   type PersonVmBinding,
+  type PersonVmPort,
   type PersonVmRuntimePort,
   type PersonVmService,
 } from '@allrice/person-vm';
@@ -82,7 +83,14 @@ function sameSession(a: RequestContext, b: RequestContext) {
  * send only generated operations on the admitted non-owner principal.
  */
 export function installProductionDEntrySource(input: {
-  startup: Startup;
+  startup: Startup &
+    Partial<
+      Pick<
+        ReturnType<typeof createAssignedNativeWebStartup>,
+        'needsEmployee' | 'synchronizeEmployee' | 'assertAuthenticatedEntry'
+      >
+    >;
+  vm?: Pick<PersonVmPort, 'resolve' | 'assertCurrentBinding'>;
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
   confirmPhysical?(
@@ -141,32 +149,116 @@ export function installProductionDEntrySource(input: {
     return catalog.owner;
   }
 
+  async function proveSelectedEmployee(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    signal: AbortSignal,
+    expectedBinding?: PersonVmBinding,
+  ) {
+    async function readyProof(active: AbortSignal, expected?: PersonVmBinding) {
+      const current = await currentDEntryNativeOwner(
+        dEntryNativeOwnerPort,
+        context,
+        identity,
+        active,
+      );
+      const binding = current.view.receipt.binding;
+      if (expected && !sameVmBinding(binding, expected))
+        throw new PersonVmError('LEASE_LOST');
+      const proof = await input.startup.ensureVerifiedEditor(
+        context,
+        binding,
+        identity.employeeInstanceId,
+        current.signal,
+      );
+      const authenticated = input.startup.assertAuthenticatedEntry
+        ? input.startup.assertAuthenticatedEntry(
+            binding,
+            identity.employeeInstanceId,
+            current.signal,
+          )
+        : input.startup.assertAuthenticatedGroup(binding, current.signal);
+      // The read has finished. This observation follows the caller and exact
+      // owner, not the temporary permit used to perform it.
+      return AbortSignal.any([
+        signal,
+        current.owner.revoked,
+        proof,
+        authenticated,
+      ]);
+    }
+    const vm = input.vm;
+    if (!vm) return readyProof(signal, expectedBinding);
+    const binding = await vm.resolve(context, signal);
+    if (expectedBinding && !sameVmBinding(binding, expectedBinding))
+      throw new PersonVmError('LEASE_LOST');
+    const selection = {
+      workspaceId: identity.workspaceId,
+      employeeInstanceId: identity.employeeInstanceId,
+      ...(identity.threadId && { threadId: identity.threadId }),
+    };
+    const check = async (active: AbortSignal) => {
+      const current = await requireDEntryNativeIdentity(context, selection);
+      if (!sameDEntryIdentity(current, identity)) denied();
+      await vm.assertCurrentBinding(context, binding, active);
+      active.throwIfAborted();
+    };
+    return runDEntryAdmittedActivity(
+      {
+        ports: port.admission,
+        signal,
+        owner: {
+          binding,
+          context,
+          operationId: randomUUID(),
+          revoked: lifetime,
+          assertCurrent: check,
+          assertUndispatched: check,
+        },
+      },
+      () => {
+        const stop = new AbortController();
+        let work: Promise<AbortSignal> | undefined;
+        return {
+          run(active) {
+            const running = AbortSignal.any([active, stop.signal]);
+            work = (async () => {
+              if (input.startup.needsEmployee?.(context, binding, identity))
+                await input.startup.synchronizeEmployee?.(
+                  context,
+                  binding,
+                  identity,
+                  check,
+                  running,
+                );
+              return readyProof(running, binding);
+            })();
+            return work;
+          },
+          async close() {
+            stop.abort();
+            const [joined] = await Promise.allSettled([work]);
+            if (
+              joined.status === 'rejected' &&
+              joined.reason instanceof PersonVmError &&
+              joined.reason.code === 'CLEANUP_INCOMPLETE'
+            )
+              throw joined.reason;
+          },
+        };
+      },
+    );
+  }
+
   const port: DEntryNativeDataPort = {
     admission: {
       boundary: input.admission,
       participant: input.admission.participant('entry'),
     },
-    assertEditorReady(context, identity, signal) {
-      return own(signal, async (active) => {
-        const current = await currentDEntryNativeOwner(
-          dEntryNativeOwnerPort,
-          context,
-          identity,
-          active,
-        );
-        const binding = current.view.receipt.binding;
-        const proof = await input.startup.ensureVerifiedEditor(
-          context,
-          binding,
-          identity.employeeInstanceId,
-          current.signal,
-        );
-        const group = input.startup.assertAuthenticatedGroup(
-          binding,
-          current.signal,
-        );
-        return AbortSignal.any([current.signal, proof, group]);
-      });
+    assertEditorReady(context, identity, signal, expectedBinding) {
+      return own(signal, (active) =>
+        proveSelectedEmployee(context, identity, active, expectedBinding),
+      );
     },
     confirmVerifiedEditor(context, identity, signal) {
       return own(signal, async (active) => {
@@ -189,11 +281,18 @@ export function installProductionDEntrySource(input: {
             employee,
             current.signal,
           );
-          const group = input.startup.assertAuthenticatedGroup(
-            binding,
+          const authenticated = input.startup.assertAuthenticatedEntry
+            ? input.startup.assertAuthenticatedEntry(
+                binding,
+                employee,
+                current.signal,
+              )
+            : input.startup.assertAuthenticatedGroup(binding, current.signal);
+          const confirmed = AbortSignal.any([
             current.signal,
-          );
-          const confirmed = AbortSignal.any([current.signal, proof, group]);
+            proof,
+            authenticated,
+          ]);
           await input.confirmPhysical(context, identity, binding, confirmed);
           await current.owner.assertCurrent(context, confirmed);
           sameHost(current.owner, identity);
@@ -217,7 +316,14 @@ export function installProductionDEntrySource(input: {
         }
       });
     },
-    resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
+    resolveAdmissionOwner({
+      context,
+      identity,
+      owner,
+      operationId,
+      signal,
+      access,
+    }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
         if (
@@ -227,7 +333,7 @@ export function installProductionDEntrySource(input: {
           identity.organizationId !== binding.organizationId ||
           context.organizationId !== binding.organizationId ||
           context.workspaceId !== identity.workspaceId ||
-          !identity.threadId
+          (!identity.threadId && access !== 'page')
         )
           denied();
         const scope = structuredClone(context);

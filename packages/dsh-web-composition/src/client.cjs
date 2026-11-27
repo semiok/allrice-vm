@@ -10,15 +10,6 @@ exports.inject = ['slots', 'theme'];
  */
 exports.apply = function apply(ctx) {
   const Hidden = () => null;
-  const inputs = /** @type {const} */ ([
-    'conversation.input.permission',
-    'conversation.input.model',
-  ]);
-  for (const name of inputs) {
-    ctx.slots.inject(name, () =>
-      ctx.slots.register({ name, priority: -100 }, Hidden),
-    );
-  }
   const actions = 'conversation.session.header.actions';
   ctx.slots.inject(actions, () =>
     ctx.slots.register(
@@ -33,12 +24,6 @@ exports.apply = function apply(ctx) {
       Hidden,
     ),
   );
-  const dock = 'conversation.composer.dock';
-  ctx.slots.inject(dock, function* () {
-    for (const id of ['activity', 'usage']) {
-      yield ctx.slots.register({ name: dock, id, priority: -100 }, Hidden);
-    }
-  });
   // Existing packages/ui/src/tokens.css text colors. Dark mode follows the
   // native static palette, avoiding an alias referencing its own override.
   ctx.effect(

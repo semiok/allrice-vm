@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RequestContext } from '@allrice/contracts';
 import type { authenticateSession } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 
 export type ProductionShutdownStatus = Readonly<{
   bootId: string;
@@ -19,6 +20,19 @@ export async function openProductionRecoverySocket(input: {
   authenticate: typeof authenticateSession;
   recover(context: RequestContext, signal: AbortSignal): Promise<number>;
   pending(): boolean;
+  upgrade?: {
+    bootId: string;
+    authenticate(token: string): Promise<RequestContext | null>;
+    drain(
+      context: RequestContext,
+      signal: AbortSignal,
+    ): Promise<Readonly<{ stopped: number; expiresAt: string }>>;
+    claimShutdown?(
+      context: RequestContext,
+      expiresAt: string,
+      signal: AbortSignal,
+    ): Promise<() => void>;
+  };
   shutdown?: {
     authenticate(token: string): Promise<RequestContext | null>;
     authorize(context: RequestContext): Promise<unknown>;
@@ -33,12 +47,19 @@ export async function openProductionRecoverySocket(input: {
   const requests = new Set<Promise<void>>();
   const server = createServer({ maxHeaderSize: 8192 }, (request, response) => {
     const recovery = request.method === 'POST' && request.url === '/recover';
+    const claim = request.url === '/shutdown-after-drain';
+    const upgrade =
+      request.method === 'POST' &&
+      (request.url === '/drain-for-upgrade' ||
+        (claim && input.upgrade?.claimShutdown))
+        ? input.upgrade
+        : undefined;
     const shutdown =
       request.method === 'GET' && request.url === '/shutdown-status'
         ? input.shutdown
         : undefined;
     if (
-      (!recovery && !shutdown) ||
+      (!recovery && !shutdown && !upgrade) ||
       request.headers.origin ||
       request.headers['transfer-encoding'] ||
       (request.headers['content-length'] ?? '0') !== '0'
@@ -62,16 +83,49 @@ export async function openProductionRecoverySocket(input: {
     }
     const work = (async () => {
       const context = token
-        ? await (shutdown
-            ? shutdown.authenticate(token)
-            : input.authenticate(token))
+        ? await ((shutdown ?? upgrade)?.authenticate(token) ??
+            input.authenticate(token))
         : null;
       if (!context) {
         writeStatus(401);
         return;
       }
       disconnected.signal.throwIfAborted();
-      if (shutdown) {
+      if (upgrade) {
+        if (request.headers['x-allrice-worker-boot'] !== upgrade.bootId) {
+          writeStatus(409, { code: 'WORKER_BOOT_MISMATCH' });
+          return;
+        }
+        try {
+          if (claim) {
+            const expected = request.headers['x-allrice-drain-expires'];
+            if (typeof expected !== 'string' || !upgrade.claimShutdown) {
+              writeStatus(400);
+              return;
+            }
+            const shutdown = await upgrade.claimShutdown(
+              context,
+              expected,
+              disconnected.signal,
+            );
+            // The Host already owns the shutdown. Queue it after attempting
+            // the acknowledgement, even if the peer drops the response.
+            writeStatus(202);
+            setImmediate(shutdown);
+            return;
+          }
+          const drained = await upgrade.drain(context, disconnected.signal);
+          writeStatus(200, { ...drained, bootId: upgrade.bootId });
+        } catch (error) {
+          const code =
+            error instanceof PersonVmError ? error.code : 'DRAIN_UNCONFIRMED';
+          console.warn('[MET-273] upgrade drain declined', {
+            requestId: context.requestId,
+            code,
+          });
+          writeStatus(409, { requestId: context.requestId, code });
+        }
+      } else if (shutdown) {
         await shutdown.authorize(context);
         disconnected.signal.throwIfAborted();
         const current = shutdown.status();

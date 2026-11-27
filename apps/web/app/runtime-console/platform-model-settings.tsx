@@ -42,7 +42,7 @@ export function PlatformModelSettingsPanel() {
       if (!response.ok)
         throw new Error(body.error?.message ?? '保存失败，请重试');
       setSettings(body.settings);
-      setNotice('已保存，下一次任务开始生效。');
+      setNotice('已保存，原生员工工作台在 Worker 下次启动后使用此设置。');
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '保存失败');
     } finally {

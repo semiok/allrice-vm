@@ -84,7 +84,7 @@ function boot(
     const identity = readEmployeeDocument(container.dataset);
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
-    const registerDraft = installEmployeeDraftStorage(identity);
+    const drafts = installEmployeeDraftStorage(identity);
     const document = nativeProfileDocument(
       container,
       close,
@@ -94,11 +94,12 @@ function boot(
       },
       documentOwner.earlyBundles,
       (next) => {
-        registerDraft(next.nativeSessionId, next.threadId);
+        drafts.registerScope(next.nativeSessionId, next.threadId);
         container.ownerDocument.dispatchEvent(
           new CustomEvent(pageThreadScope, { detail: next }),
         );
       },
+      drafts.registerDraft,
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;

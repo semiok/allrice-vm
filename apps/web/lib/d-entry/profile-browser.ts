@@ -4,7 +4,11 @@ import {
   DEntryPageSwitchResultSchema,
   DEntryPageUnarySchema,
   DEntryProfileBootstrapSchema,
+  DEntryProfileChunkFilenameSchema,
+  type DEntryProfileGraphSchema,
   UuidSchema,
+  dEntryRegisteredThreadHeader,
+  decodeDEntryRegisteredThread,
 } from '@allrice/contracts';
 import { z } from 'zod';
 import {
@@ -19,7 +23,12 @@ import {
   pageRevoked,
   pendingPageResult,
 } from './page-carrier';
-import { pageThreadScope, type PageThreadScope } from './page-messages';
+import {
+  pageNativeThreadRegistered,
+  pageThreadScope,
+  type PageNativeThreadRegistration,
+  type PageThreadScope,
+} from './page-messages';
 
 const sender = z.strictObject({
   type: z.literal('client-request'),
@@ -27,6 +36,49 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+const createdSessionReply = z.object({
+  type: z.literal('server-response'),
+  rpcId: z.string(),
+  result: z.object({
+    ok: z.literal(true),
+    value: z.object({ sessionId: z.string().min(1).max(256) }),
+  }),
+});
+
+function publishNativeThread(
+  reply: Response,
+  bytes: ArrayBuffer,
+  scopeId: string,
+  rpcId: string,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+) {
+  const thread = decodeDEntryRegisteredThread(
+    reply.headers.get(dEntryRegisteredThreadHeader),
+  );
+  if (!reply.ok || !thread) return;
+  // Never replace or reinterpret the RPC result that DSH itself consumes.
+  try {
+    const parsed = createdSessionReply.safeParse(
+      JSON.parse(new TextDecoder().decode(bytes)),
+    );
+    if (!parsed.success || parsed.data.rpcId !== rpcId) return;
+    const receipt = {
+      scopeId,
+      thread,
+      nativeSessionId: parsed.data.result.value.sessionId,
+    };
+    onThreadRegistered?.(receipt);
+    document.dispatchEvent(
+      new CustomEvent<PageNativeThreadRegistration>(
+        pageNativeThreadRegistered,
+        { detail: receipt },
+      ),
+    );
+  } catch {
+    // A malformed optional sidebar receipt must not cause a native write retry.
+  }
+}
+
 const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
 const publicBundlesSchema = z.array(
   z.strictObject({
@@ -51,6 +103,29 @@ export function releasedBundleResolver(data: DOMStringMap) {
   } catch {
     return () => undefined;
   }
+}
+
+export function profileBundleReference(
+  graph: z.infer<typeof DEntryProfileGraphSchema>,
+  reference: string,
+) {
+  const bundle = [...graph.entries, ...graph.batches].find(
+    ({ url }) => url === reference,
+  );
+  if (bundle) return bundle;
+  // Native require.async requests a sibling of its current graph entry.
+  const [path, query, trailing] = reference.split('?');
+  if (!path || trailing !== undefined) return;
+  const slash = path.lastIndexOf('/');
+  if (
+    !DEntryProfileChunkFilenameSchema.safeParse(path.slice(slash + 1)).success
+  )
+    return;
+  const owner = graph.entries.find(
+    ({ id, rev }) =>
+      path.slice(0, slash) === `plugins/${id}` && query === `rev=${rev}`,
+  );
+  if (owner) return { url: reference, rev: owner.rev };
 }
 
 export class EmployeeProfileBundleTimeout extends Error {
@@ -146,6 +221,7 @@ export function nativeProfileDocument(
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
   earlyBundles?: EarlyProfileBundles,
   onThreadScope?: (scope: PageThreadScope) => void,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -355,6 +431,17 @@ export function nativeProfileDocument(
             }).then(async (reply) => {
               const bytes = await reply.arrayBuffer();
               signal.throwIfAborted();
+              if (
+                request.method === 'session/create' ||
+                request.method === 'session/fork'
+              )
+                publishNativeThread(
+                  reply,
+                  bytes,
+                  scopeId,
+                  request.rpcId,
+                  onThreadRegistered,
+                );
               return new Response(bytes, {
                 status: reply.status,
                 headers: reply.headers,
@@ -404,16 +491,19 @@ export function nativeProfileDocument(
       loadBundle(reference: string) {
         return owned(
           (async () => {
-            const signal = lifetime.signal;
+            const current = authority;
+            const signal = AbortSignal.any([
+              lifetime.signal,
+              current.lifetime.signal,
+            ]);
             signal.throwIfAborted();
             const graph = published?.graph;
-            const resource =
-              graph &&
-              [...graph.entries, ...graph.batches].find(
-                ({ url }) => url === reference,
-              );
+            const resource = graph && profileBundleReference(graph, reference);
             if (!resource) throw Error('Native bundle was not published');
             const target = profileUrl('assets');
+            target.searchParams.set('scopeId', current.scopeId);
+            if (current.selection.threadId)
+              target.searchParams.set('threadId', current.selection.threadId);
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);

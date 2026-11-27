@@ -1,15 +1,15 @@
 import {
-  DEntryPrincipalIssueSchema,
+  DEntryScopeIssueSchema,
   type DEntryPrincipalActivity,
-  type DEntryPrincipalIssue,
+  type DEntryScopeIssue,
 } from '@allrice/d-entry-principal/types';
 import type { ResolvedDEntryNativeOwner } from './native-owner.js';
 
 export function assertDEntryPrincipalIssueForOwner(
-  input: DEntryPrincipalIssue,
+  input: DEntryScopeIssue,
   owner: ResolvedDEntryNativeOwner,
 ) {
-  const { identity } = DEntryPrincipalIssueSchema.parse(input);
+  const { identity } = DEntryScopeIssueSchema.parse(input);
   if (
     identity.organizationId !== owner.receipt.binding.organizationId ||
     identity.personId !== owner.receipt.binding.personId ||

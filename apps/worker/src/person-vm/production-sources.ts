@@ -12,8 +12,15 @@ import {
   type ResolveProductionDEntrySendRoute,
 } from './production-dentry-source.js';
 import { createProductionEgressAuthority } from './production-egress-authority.js';
+import { createHostSearchProvider } from './production-web-search.js';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
+import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  createProductionNativeActivity,
+  getIdleScheduleGuardMs,
+} from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
 type CodexRuntime = Awaited<ReturnType<typeof createProductionCodexRuntime>>;
@@ -40,11 +47,17 @@ export interface ProductionNativeModelExecution {
     input: {
       route: CodexRuntime['route'];
       routeRevoked: AbortSignal;
-      readModelInfo: CodexRuntime['readModelInfo'];
+      readModelMetadata: CodexRuntime['readModelMetadata'];
       assertRouteCurrent: CodexRuntime['assertCurrent'];
       confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
       issueCall: CallReferences['issue'];
+      webSearch?: {
+        provider: NonNullable<ReturnType<typeof createHostSearchProvider>>;
+        bind: ReturnType<
+          typeof createProductionEgressAuthority
+        >['bindWebSearch'];
+      };
     },
   ): Promise<{
     resolveSendRoute: ResolveProductionDEntrySendRoute;
@@ -85,25 +98,35 @@ export function createProductionPersonVmSources(
           modelRoute: codex.route,
           lifetime,
         });
+        const provider = createHostSearchProvider(process.env.DEEPSEEK_API_KEY);
         native = await execution.attach(host, {
           route: codex.route,
           routeRevoked: codex.revoked,
-          readModelInfo: codex.readModelInfo,
+          readModelMetadata: codex.readModelMetadata,
           assertRouteCurrent: codex.assertCurrent,
           confirmTransportStopped: codex.confirmTransportStopped,
           bindReference: (call, signal) =>
             egress.bindModelCall(call, signal, 'model-reference'),
           issueCall: calls.issue,
+          ...(provider
+            ? { webSearch: { provider, bind: egress.bindWebSearch } }
+            : {}),
         });
         const owned = native;
         lifetime.throwIfAborted();
         entry = installProductionDEntrySource({
           startup,
+          vm: host.vm,
           admission,
           lifetime,
           confirmPhysical: (context, identity, binding, active) =>
             host.current.withCurrentSelection(context, identity, active, () =>
-              host.vm.assertRunningReadiness(context, binding, active),
+              host.vm.assertRunningReadiness(
+                context,
+                binding,
+                active,
+                startup.slottedEntryReceipt(binding, identity, active),
+              ),
             ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);
@@ -128,6 +151,15 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
+          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            sampleIntervalMs:
+              host.providers.configuration.lifecycle.idleSampleIntervalMs ??
+              DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+            scheduleGuardMs: getIdleScheduleGuardMs(
+              host.providers.configuration.lifecycle,
+            ),
+          }),
           runtime: {
             async readiness(binding, signal) {
               await codex.assertCurrent(signal);

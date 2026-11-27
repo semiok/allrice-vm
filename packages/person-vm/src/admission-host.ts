@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import type { RequestContext } from '@allrice/contracts';
+import { RequestContextSchema, type RequestContext } from '@allrice/contracts';
 import {
   PersonVmError,
   PERSON_VM_IDLE_MS,
@@ -9,9 +9,10 @@ import {
   type PersonVmBinding,
   type PersonVmView,
 } from './contract.ts';
-import type {
-  PersonVmAdmissionBoundary,
-  PersonVmAdmissionPermit,
+import {
+  NativeWebGuestLaunchUnacknowledged,
+  type PersonVmAdmissionBoundary,
+  type PersonVmAdmissionPermit,
 } from './admission-boundary.ts';
 import type {
   PersonVmActivityCursor,
@@ -21,8 +22,12 @@ import type {
   PersonVmAdmissionParticipant,
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
-  PersonVmIdleCoverage,
+  PersonVmNativeIdleCoverage,
+  PersonVmIdleStopDispatch,
+  PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
+  PersonVmPrepareIdleStop,
+  PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import {
   type PostgresPersonVmAdmissionStore,
@@ -33,10 +38,16 @@ import {
   sameLease,
   type AdmissionTransaction,
 } from './admission-store.ts';
-import type { PersonVmStore, VmLease, VmRecord } from './store.ts';
+import {
+  bindingOf,
+  type PersonVmStore,
+  type VmLease,
+  type VmRecord,
+} from './store.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
-  context: RequestContext;
+  authorize(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
   operationId: string;
   owner: string;
   source: string;
@@ -47,7 +58,8 @@ type OwnedPermit = {
   closing: boolean;
   activated: boolean;
   joined: boolean;
-  unsafe: boolean;
+  unsafe?: 'entry-guest-launch' | 'unknown';
+  entryLaunchListenerJoined?: true;
   detach(): void;
 };
 type Frame = { personId: string; lease: VmLease; active: boolean };
@@ -62,21 +74,21 @@ type IdleCandidate = { key: string; mono: number };
 export function advanceIdleCandidate(
   previous: IdleCandidate | undefined,
   binding: PersonVmBinding,
-  coverage: readonly PersonVmIdleCoverage[],
+  coverage: readonly PersonVmNativeIdleCoverage[],
   acceptedRevisions: readonly (string | undefined)[],
   row: Pick<VmRecord, 'holds' | 'lastActivityAt'> | null,
   mono: number,
 ): IdleCandidate | undefined {
   if (
     row?.holds.length ||
-    coverage.some((value) => value.state !== 'continuous' || !value.idleSince)
+    coverage.some((value) => value.state === 'unknown' || !value.idleSince)
   )
     return undefined;
   const key = JSON.stringify([
     binding,
     coverage.map((value) => [
       value.cursor?.sourceId,
-      value.state === 'continuous' ? value.idleSince : null,
+      value.state === 'unknown' ? null : value.idleSince,
     ]),
     acceptedRevisions,
     row?.lastActivityAt,
@@ -95,6 +107,16 @@ export class PersonVmAdmissionHost
   private readonly permits = new WeakMap<
     PersonVmAdmissionPermit,
     OwnedPermit
+  >();
+  private readonly stoppedEntryPermits = new Map<
+    string,
+    Set<PersonVmAdmissionPermit>
+  >();
+  // Exact local owners only. Retain releases after a failed DB acknowledgement
+  // if we never dispatched the transfer or have already joined it.
+  private readonly publicEgressReleases = new Map<
+    string,
+    Map<string, string>
   >();
   // Only failed admit calls that never returned a handle/callback. Not TTL takeover.
   private readonly unacknowledged = new Set<string>();
@@ -116,6 +138,15 @@ export class PersonVmAdmissionHost
       now: () => Date;
       monotonic?: () => number;
       nativeActivity?: PersonVmNativeActivityPort;
+      activityMaxAgeMs: number;
+      prepareIdleStop?: PersonVmPrepareIdleStop;
+      scheduledIdleAuthority?: PersonVmScheduledIdleAuthority;
+      recoverIdleStop(
+        binding: PersonVmBinding,
+        assertAuthority: (signal: AbortSignal) => Promise<void>,
+        signal: AbortSignal,
+      ): Promise<boolean>;
+      idleStopped(binding: PersonVmBinding): void;
       startOwned(
         context: RequestContext,
         lease: VmLease,
@@ -127,6 +158,13 @@ export class PersonVmAdmissionHost
         signal: AbortSignal,
       ): Promise<PersonVmView>;
       assertStopSafe(lease: VmLease, signal: AbortSignal): Promise<void>;
+      stopIdleOwned(
+        requestId: string,
+        lease: VmLease,
+        signal: AbortSignal,
+        assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+        dispatch?: PersonVmIdleStopDispatch,
+      ): Promise<PersonVmView>;
     },
   ) {
     this.idleMs =
@@ -554,11 +592,95 @@ export class PersonVmAdmissionHost
     input: { participant: PersonVmAdmissionParticipant; operationId: string },
     signal: AbortSignal,
   ) {
-    await this.authorize(context, binding, signal);
+    const authorize = (bound: PersonVmBinding, active: AbortSignal) =>
+      this.authorize(context, bound, active);
+    await authorize(binding, signal);
     if (!['gateway', 'entry'].includes(input.participant) || !input.operationId)
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    return this.admitBound(binding, input, signal, authorize);
+  }
+
+  /** Host-only lifetime for traffic already authenticated to the exact VM
+   * proxy. It can never wake a VM or authorize an actor or managed route. */
+  async withPublicEgress(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    transfer: (signal: AbortSignal) => Promise<void>,
+  ) {
+    const personId = binding.personId;
+    await this.recoverJoinedPublicEgress(personId, signal);
+    const permit = await this.admitBound(
+      binding,
+      { participant: 'gateway', operationId: randomUUID() },
+      signal,
+      async (_bound, active) => active.throwIfAborted(),
+      (permitId, owner) =>
+        this.retainPublicEgressRelease(personId, permitId, owner),
+    );
+    let failed: { error: unknown } | undefined;
+    try {
+      if (permit.disposition === 'deferred')
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      await this.activate(permit, transfer, signal);
+    } catch (error) {
+      failed = { error };
+    }
+    try {
+      await this.finish(permit);
+    } catch (cleanup) {
+      const owned = this.owned(permit);
+      if (owned.joined && !owned.unsafe)
+        this.retainPublicEgressRelease(personId, permit.permitId, owned.owner);
+      if (failed)
+        throw new AggregateError(
+          [failed.error, cleanup],
+          'PUBLIC_EGRESS_CLEANUP_INCOMPLETE',
+          {
+            cause: failed.error,
+          },
+        );
+      throw cleanup;
+    }
+    if (failed) throw failed.error;
+  }
+
+  private retainPublicEgressRelease(
+    personId: string,
+    permitId: string,
+    owner: string,
+  ) {
+    const releases = this.publicEgressReleases.get(personId) ?? new Map();
+    releases.set(permitId, owner);
+    this.publicEgressReleases.set(personId, releases);
+  }
+
+  async recoverJoinedPublicEgress(personId: string, signal: AbortSignal) {
+    const releases = this.publicEgressReleases.get(personId);
+    if (!releases) return;
+    for (const [permitId, owner] of [...releases]) {
+      await this.releasePermitRecord(
+        personId,
+        'gateway',
+        permitId,
+        owner,
+        signal,
+      );
+      releases.delete(permitId);
+    }
+    if (!releases.size && this.publicEgressReleases.get(personId) === releases)
+      this.publicEgressReleases.delete(personId);
+  }
+
+  private async admitBound(
+    binding: PersonVmBinding,
+    input: { participant: PersonVmAdmissionParticipant; operationId: string },
+    signal: AbortSignal,
+    authorize: OwnedPermit['authorize'],
+    retainUnknown?: (permitId: string, owner: string) => void,
+  ) {
     const owner = randomUUID(),
       permitId = randomUUID();
+    let inserting = false;
     let issued: {
       disposition: 'queued' | 'deferred';
       source: string;
@@ -590,6 +712,7 @@ export class PersonVmAdmissionHost
             await tx.sql`delete from person_vm_admission_permits where permit_id=${previous.permit_id}`;
           }
           const freeze = frozen ? tx.state.round!.lease : null;
+          inserting = true;
           await tx.sql`insert into person_vm_admission_permits(permit_id,person_id,vm_id,organization_id,instance_id,
         lease_epoch,participant,operation_id,owner_ref,disposition,freeze_id,freeze_version) values(${permitId},${binding.personId},${binding.vmId},
         ${binding.organizationId},${binding.instanceId},${binding.leaseEpoch},${input.participant},${input.operationId},${owner},${disposition},${freeze?.freezeId ?? null},${freeze?.version ?? null})`;
@@ -598,7 +721,8 @@ export class PersonVmAdmissionHost
         },
       );
     } catch (error) {
-      this.unacknowledged.add(owner);
+      if (inserting && retainUnknown) retainUnknown(permitId, owner);
+      else if (!retainUnknown) this.unacknowledged.add(owner);
       throw error;
     }
     const { disposition, source, freeze } = issued;
@@ -614,7 +738,7 @@ export class PersonVmAdmissionHost
       signal: controller.signal,
     });
     this.permits.set(permit, {
-      context,
+      authorize,
       operationId: input.operationId,
       owner,
       source,
@@ -624,7 +748,6 @@ export class PersonVmAdmissionHost
       closing: false,
       activated: false,
       joined: false,
-      unsafe: false,
       detach: () => signal.removeEventListener('abort', cancel),
     });
     return permit;
@@ -680,13 +803,13 @@ export class PersonVmAdmissionHost
         try {
           await listener.close();
         } catch (error) {
-          owned.unsafe = true;
+          owned.unsafe = 'unknown';
           throw error;
         }
       };
       let entered = false;
       try {
-        await this.authorize(owned.context, permit.binding, operationSignal);
+        await owned.authorize(permit.binding, operationSignal);
         await this.options.shared.transaction(
           permit.binding.personId,
           operationSignal,
@@ -711,13 +834,24 @@ export class PersonVmAdmissionHost
         // Rejection after entry is not proof that actual children joined.
         // Confirmed business failure/cancellation must fulfil a local outcome;
         // an outer catch (including another queued callback) cannot undo this.
-        if (entered) owned.unsafe = true;
+        if (entered) {
+          owned.unsafe =
+            !owned.unsafe &&
+            active &&
+            permit.participant === 'entry' &&
+            error instanceof NativeWebGuestLaunchUnacknowledged &&
+            sameBinding(error.binding, permit.binding)
+              ? 'entry-guest-launch'
+              : 'unknown';
+        }
         throw error;
       } finally {
         closing = true;
         listener.signal.removeEventListener('abort', lost);
         await checking;
         await closeListener();
+        if (active && owned.unsafe === 'entry-guest-launch')
+          owned.entryLaunchListenerJoined = true;
       }
     });
     owned.pending.add(promise);
@@ -745,7 +879,19 @@ export class PersonVmAdmissionHost
       owned.controller.abort(new PersonVmError('LEASE_LOST'));
       await Promise.allSettled([...owned.pending]);
       owned.detach();
-      if (owned.unsafe) throw new PersonVmError('CLEANUP_INCOMPLETE');
+      if (owned.unsafe) {
+        if (
+          owned.unsafe === 'entry-guest-launch' &&
+          owned.entryLaunchListenerJoined &&
+          !owned.pending.size
+        ) {
+          const personId = permit.binding.personId;
+          const permits = this.stoppedEntryPermits.get(personId) ?? new Set();
+          permits.add(permit);
+          this.stoppedEntryPermits.set(personId, permits);
+        }
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      }
       owned.joined = true;
       await this.releasePermit(permit, owned, new AbortController().signal);
     })());
@@ -755,15 +901,31 @@ export class PersonVmAdmissionHost
     owned: OwnedPermit,
     signal: AbortSignal,
   ) {
-    await this.options.shared.transaction(
+    return this.releasePermitRecord(
       permit.binding.personId,
+      permit.participant,
+      permit.permitId,
+      owned.owner,
+      signal,
+    );
+  }
+
+  private async releasePermitRecord(
+    personId: string,
+    participant: PersonVmAdmissionParticipant,
+    permitId: string,
+    owner: string,
+    signal: AbortSignal,
+  ) {
+    await this.options.shared.transaction(
+      personId,
       signal,
       async (tx) => {
         const records =
-          await tx.sql`delete from person_vm_admission_permits where permit_id=${permit.permitId}
-          and owner_ref=${owned.owner} returning disposition`;
+          await tx.sql`delete from person_vm_admission_permits where permit_id=${permitId}
+          and owner_ref=${owner} returning disposition`;
         if (records.length)
-          tx.touch(permit.participant, records[0]!.disposition !== 'deferred');
+          tx.touch(participant, records[0]!.disposition !== 'deferred');
       },
       true, // Actual join may finish after an authorized VM tombstone; never admit there.
     );
@@ -776,6 +938,79 @@ export class PersonVmAdmissionHost
     if (!owned.joined || owned.unsafe)
       throw new PersonVmError('CLEANUP_INCOMPLETE');
     await this.releasePermit(permit, owned, signal);
+  }
+  hasStoppedEntryRecovery(binding: PersonVmBinding) {
+    return [...(this.stoppedEntryPermits.get(binding.personId) ?? [])].some(
+      (permit) => sameBinding(binding, permit.binding),
+    );
+  }
+  forgetStoppedEntryRecovery(binding: PersonVmBinding) {
+    const permits = this.stoppedEntryPermits.get(binding.personId);
+    if (!permits) return;
+    for (const permit of permits)
+      if (sameBinding(permit.binding, binding)) permits.delete(permit);
+    if (!permits.size) this.stoppedEntryPermits.delete(binding.personId);
+  }
+  /** Runs under the existing physical lease with this Host's original handles.
+   * Generic unsafe entry callbacks and handles from another process stay put. */
+  async recoverStoppedEntryPermits(
+    lease: VmLease,
+    signal: AbortSignal,
+    expected?: PersonVmBinding,
+  ) {
+    if (!lease.row?.instanceId) return false;
+    const binding = bindingOf(lease.row);
+    if (expected && !sameBinding(expected, binding))
+      throw new PersonVmError('LEASE_LOST');
+    if (!this.hasStoppedEntryRecovery(binding)) return false;
+    const token = lease.ownerToken;
+    if (!token) throw new PersonVmError('LEASE_LOST');
+    const active = AbortSignal.any([signal, lease.signal]);
+    const guard = () => lease.assertPhysicalOwner?.() ?? lease.guard();
+    await guard();
+    try {
+      await this.options.assertStopSafe(lease, active);
+    } catch (error) {
+      if (error instanceof PersonVmError && error.code === 'ACTIVITY_UNKNOWN')
+        return false;
+      throw error;
+    }
+    await guard();
+    const permits = this.stoppedEntryPermits.get(binding.personId)!;
+    for (const permit of permits) {
+      if (!sameBinding(permit.binding, binding)) continue;
+      const owned = this.owned(permit);
+      if (
+        !owned.finish ||
+        !owned.closing ||
+        owned.unsafe !== 'entry-guest-launch'
+      )
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      await owned.finish.catch(() => {});
+      if (owned.pending.size) throw new PersonVmError('CLEANUP_INCOMPLETE');
+      await this.options.shared.transaction(
+        binding.personId,
+        active,
+        async (tx) => {
+          if (
+            tx.row.lease_owner !== token ||
+            !sameBinding(rowBinding(tx.row), binding) ||
+            tx.state.sourceId !== owned.source
+          )
+            throw new PersonVmError('LEASE_LOST');
+          const removed = await tx.sql`delete from person_vm_admission_permits
+          where permit_id=${permit.permitId} and owner_ref=${owned.owner} and operation_id=${owned.operationId}
+          and person_id=${binding.personId} and vm_id=${binding.vmId} and organization_id=${binding.organizationId}
+          and instance_id=${binding.instanceId} and lease_epoch=${binding.leaseEpoch}
+          and participant='entry' and disposition='active' returning permit_id`;
+          if (removed.length) tx.touch('entry', true);
+        },
+        true,
+      );
+    }
+    // Keep the original local witness until the lifecycle actually publishes
+    // a stopped row or a new generation. Other permits may still block stop.
+    return true;
   }
   /** Process-local recovery after the owning Gateway callbacks and its exact
    * dispatcher are stopped. Only that Gateway's original handle can settle. */
@@ -1027,6 +1262,7 @@ export class PersonVmAdmissionHost
       async (current) => {
         const owned = this.frames.getStore()!.lease;
         await this.options.assertStopSafe(owned, current);
+        await this.recoverStoppedEntryPermits(owned, current, lease.binding);
         await this.options.shared.transaction(
           lease.binding.personId,
           current,
@@ -1129,63 +1365,283 @@ export class PersonVmAdmissionHost
       },
     );
   }
-  async reconcileIdle(
-    context: RequestContext,
+  private async readIdleCandidate(
     binding: PersonVmBinding,
+    row: VmRecord | null,
+    previous: IdleCandidate | undefined,
     signal: AbortSignal,
-  ): Promise<void> {
-    await this.authorize(context, binding, signal);
-    if (!this.options.nativeActivity) {
-      this.idle.delete(binding.personId);
-      return;
-    }
-    const [[g, e, accepted], native, row] = await Promise.all([
-      this.options.shared.transaction(binding.personId, signal, async (tx) => {
+    purpose: 'inspection' | 'stop-guard',
+    onSample?: (cursor: PersonVmActivityCursor) => void,
+  ) {
+    if (
+      !this.options.nativeActivity ||
+      row?.phase !== 'running' ||
+      !sameBinding(bindingOf(row), binding)
+    )
+      return undefined;
+    await this.recoverJoinedPublicEgress(binding.personId, signal);
+    const observations = await this.options.shared.transaction(
+      binding.personId,
+      signal,
+      async (tx) => {
         this.check(tx, binding);
+        if (tx.state.round && !released(tx.state.round)) return undefined;
         return [
           await this.observation(tx, 'gateway'),
           await this.observation(tx, 'entry'),
           [tx.state.gateway.idleRevision, tx.state.entry.idleRevision],
         ] as const;
-      }),
-      this.options.nativeActivity.observe(binding, signal),
-      this.options.store.read(binding.personId),
-    ]);
-    const coverage = [g.coverage, e.coverage, native.coverage];
+      },
+    );
+    if (!observations) return undefined;
+    const [g, e, accepted] = observations;
+    const native = await this.options.nativeActivity.observe(
+      binding,
+      signal,
+      purpose,
+    );
+    const now = this.options.now().getTime();
+    const age = now - Date.parse(native.activity.observedAt);
+    const coverage = native.coverage;
+    const through =
+      coverage.state === 'unknown' ? NaN : Date.parse(coverage.through);
     if (
       g.state !== 'known' ||
       e.state !== 'known' ||
       g.active + g.queued + e.active + e.queued ||
       !sameBinding(native.activity.binding, binding) ||
       native.activity.state !== 'known' ||
+      coverage.state === 'unknown' ||
+      (coverage.state === 'sampled' &&
+        !this.options.nativeActivity.assertSampleCurrent) ||
+      !coverage.idleSince ||
+      !(Date.parse(coverage.from) <= Date.parse(coverage.idleSince)) ||
+      !(Date.parse(coverage.idleSince) <= through) ||
+      through > now ||
+      now - through > this.options.activityMaxAgeMs ||
+      !coverage.cursor.sourceId ||
+      !coverage.cursor.revision ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > this.options.activityMaxAgeMs ||
       native.activeScheduleDeliveries !== 0 ||
-      native.activity.activeTurns +
-        native.activity.activeJobs +
-        native.activity.activeSubtasks +
-        native.activity.pendingApprovals
+      ![
+        native.activity.activeTurns,
+        native.activity.activeJobs,
+        native.activity.activeSubtasks,
+        native.activity.pendingApprovals,
+      ].every((count) => count === 0)
+    )
+      return undefined;
+    const candidate = advanceIdleCandidate(
+      previous,
+      binding,
+      [g.coverage, e.coverage, native.coverage],
+      [...accepted, native.coverage.cursor?.revision],
+      row,
+      this.mono(),
+    );
+    if (candidate && coverage.state === 'sampled') onSample?.(coverage.cursor);
+    return candidate;
+  }
+  async reconcileIdle(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    RequestContextSchema.parse(context);
+    return this.reconcileOwnedIdle(
+      { binding, context },
+      (active) => this.authorize(context, binding, active),
+      signal,
+    );
+  }
+
+  async reconcileScheduledIdle(
+    binding: PersonVmBinding,
+    scheduledRoster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ) {
+    const authority = this.options.scheduledIdleAuthority;
+    if (!authority || !this.options.prepareIdleStop)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const requestId = randomUUID();
+    const assertOwned = async (active: AbortSignal) => {
+      active.throwIfAborted();
+      authority.assertOwned(binding, scheduledRoster);
+    };
+    await assertOwned(signal);
+    return this.reconcileOwnedIdle(
+      { binding, requestId, scheduledRoster },
+      async (active) => {
+        await assertOwned(active);
+        await authority.assertCurrent(binding, scheduledRoster, active);
+        await assertOwned(active);
+      },
+      signal,
+      {
+        assertOwned,
+        dispatch: (active, stop) =>
+          authority.dispatch(binding, scheduledRoster, requestId, active, stop),
+      },
+    );
+  }
+
+  private async reconcileOwnedIdle(
+    request: PersonVmIdleStopSource,
+    assertAuthority: (signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal,
+    scheduled?: {
+      assertOwned(signal: AbortSignal): Promise<void>;
+      dispatch: PersonVmIdleStopDispatch;
+    },
+  ) {
+    const { binding } = request;
+    const requestId =
+      'context' in request ? request.context.requestId : request.requestId;
+    // Only an exact joined native receipt enters this path; it closes
+    // existing resources without granting a new stop after revocation.
+    if (
+      scheduled &&
+      (await this.options.recoverIdleStop(
+        binding,
+        scheduled.assertOwned,
+        signal,
+      ))
     ) {
       this.idle.delete(binding.personId);
       return;
     }
-    const mono = this.mono();
-    const candidate = advanceIdleCandidate(
-      this.idle.get(binding.personId),
+    try {
+      await assertAuthority(signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      if ('scheduledRoster' in request) this.idle.delete(binding.personId);
+      throw error;
+    }
+    if (
+      !scheduled &&
+      this.options.prepareIdleStop &&
+      (await this.options.recoverIdleStop(binding, assertAuthority, signal))
+    ) {
+      this.idle.delete(binding.personId);
+      return;
+    }
+    const candidate = await this.readIdleCandidate(
       binding,
-      coverage,
-      [...accepted, native.coverage.cursor?.revision],
-      row,
-      mono,
-    );
+      await this.options.store.read(binding.personId),
+      this.idle.get(binding.personId),
+      signal,
+      'inspection',
+    ).catch((error: unknown) => {
+      this.idle.delete(binding.personId);
+      throw error;
+    });
     if (!candidate) {
       this.idle.delete(binding.personId);
       return;
     }
     this.idle.set(binding.personId, candidate);
-    if (mono - candidate.mono < this.idleMs) return;
-    // This composition has no native autonomous-admission barrier. Do not
-    // freeze users merely because an injected projection looks complete: it
-    // cannot commit a running stop. Keep the VM/open gates and the candidate.
-    // Explicit stopFrozen also enforces native stopped/absent before cleanup.
-    return;
+    const prepare = this.options.prepareIdleStop;
+    if (!prepare || this.mono() - candidate.mono < this.idleMs) return;
+    const stopped = await this.options.store
+      .withLease(
+        binding.personId,
+        { now: this.options.now, ttlMs: this.options.leaseTtlMs },
+        async (owned) => {
+          const current = AbortSignal.any([signal, owned.signal]);
+          return this.trackOwner(binding.personId, current, async (active) => {
+            let sample: PersonVmActivityCursor | undefined;
+            const checkIdle = async (checking: AbortSignal) => {
+              await owned.guard();
+              const latest = await this.readIdleCandidate(
+                binding,
+                owned.row,
+                candidate,
+                checking,
+                'stop-guard',
+                (cursor) => {
+                  sample = cursor;
+                },
+              );
+              if (
+                latest !== candidate ||
+                this.mono() - latest.mono < this.idleMs
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+              await assertAuthority(checking);
+              checking.throwIfAborted();
+            };
+            let pendingCheck: Promise<void> | undefined;
+            const assertStopCurrent = async (probe: AbortSignal) => {
+              const checking = AbortSignal.any([active, probe]);
+              checking.throwIfAborted();
+              // Schedule capture reads employee catalogs in parallel, all
+              // under this exact physical lease and with the same authority.
+              // Share only in-flight checks. Each later round reads live again.
+              pendingCheck ??= checkIdle(checking).finally(() => {
+                pendingCheck = undefined;
+              });
+              await pendingCheck;
+              checking.throwIfAborted();
+            };
+            await assertStopCurrent(active);
+            const preparation = { ...request, assertStopCurrent };
+            const plan = await prepare(preparation, active);
+            if (!('ok' in plan) || plan.ok !== true) return;
+            const assertWakeWindow = () => {
+              if (
+                plan.nextWakeAt !== null &&
+                !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+            };
+            await this.options.stopIdleOwned(
+              requestId,
+              owned,
+              active,
+              async (probe) => {
+                await assertStopCurrent(probe);
+                const checked = await prepare(preparation, probe);
+                if (
+                  !('ok' in checked) ||
+                  checked.nextWakeAt !== plan.nextWakeAt
+                )
+                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+                await assertStopCurrent(probe);
+                assertWakeWindow();
+              },
+              scheduled || plan.dispatch || sample
+                ? async (dispatchSignal, stop) => {
+                    await owned.guard();
+                    const dispatch = (fenced: AbortSignal) => {
+                      fenced.throwIfAborted();
+                      assertWakeWindow();
+                      if (sample)
+                        this.options.nativeActivity?.assertSampleCurrent?.(
+                          binding,
+                          sample,
+                          fenced,
+                        );
+                      return stop(fenced);
+                    };
+                    const authorizeDispatch =
+                      scheduled?.dispatch ?? plan.dispatch;
+                    if (authorizeDispatch)
+                      await authorizeDispatch(dispatchSignal, dispatch);
+                    else await dispatch(dispatchSignal);
+                  }
+                : undefined,
+            );
+            this.idle.delete(binding.personId);
+            return true;
+          });
+        },
+      )
+      .catch((error: unknown) => {
+        this.idle.delete(binding.personId);
+        throw error;
+      });
+    if (stopped) this.options.idleStopped(binding);
   }
 }

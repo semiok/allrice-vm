@@ -2,20 +2,36 @@ import { dEntryStartupTiming } from './startup-timing.js';
 import { sameDEntryIdentity } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
-import type {
-  RemoteStreamHandle,
-  TypertSchema,
+import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as Subagents } from '@deepseek-ai/dsh-subagent/remote';
+import {
+  RemoteError,
+  type RemoteStreamHandle,
+  type TypertSchema,
 } from '@deepseek-ai/dsh-typert-protocol';
 import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import {
-  DEntryPrincipalIssueSchema,
+  DEntryScopeIssueSchema,
+  type DEntryPageInput,
+  type DEntryPageNativeCall,
+  type DEntryPageNativeEnd,
+  type DEntryPageNativeError,
+  type DEntryPageNativeItem,
   type DEntryPrincipalActivity,
   type DEntryPrincipalControlScope,
-  type DEntryPrincipalIssue,
+  type DEntryScopeIssue,
+  type DEntryScopedStreamCall,
   type DEntryScopedStreamFrame,
   type DEntryScopedUnaryCall,
+  type InputOf,
   type ScopeFrame,
 } from '@allrice/d-entry-principal/types';
+
+type StreamFrame =
+  | DEntryScopedStreamFrame
+  | DEntryPageNativeItem
+  | DEntryPageNativeError
+  | DEntryPageNativeEnd;
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: unknown) => void;
@@ -32,12 +48,29 @@ export type PrincipalInvocationObservation = Readonly<{
   undispatched(): Promise<void>;
   accepted(): void;
   unknown(): void;
+  assertInserted?(messageId: string, signal: AbortSignal): Promise<void>;
 }>;
+type PrincipalInvocationCall =
+  | DEntryScopedUnaryCall
+  | Readonly<{
+      scopeId: string;
+      endpoint: 'subagents/prompt';
+      args: InputOf<(typeof Subagents.methods)['subagents/prompt']>;
+    }>;
 
 export function isCertainNativePromptRejection(
-  call: DEntryScopedUnaryCall,
+  call: PrincipalInvocationCall,
   code: string,
 ) {
+  if (call.endpoint === 'subagents/prompt')
+    return [
+      'subagent/invalid-time-zone',
+      'subagent/parent-unavailable',
+      'subagent/attachment-invalid',
+      'subagent/unauthorized',
+      'subagent/not-resumable',
+      'subagent/delivery-unavailable',
+    ].includes(code);
   if (call.endpoint !== 'session/prompt') return false;
   if (code === 'gateway/bad-request') {
     // rc.2's prompt rejects this exact shape before resolving an Agent or
@@ -55,9 +88,42 @@ export function isCertainNativePromptRejection(
     'session/writer-held',
   ].includes(code);
 }
+
+function pageModelInput(
+  call: DEntryPageNativeCall,
+): PrincipalInvocationCall | undefined {
+  const { scopeId, endpoint } = call;
+  if (endpoint === 'session/prompt')
+    return {
+      scopeId,
+      endpoint,
+      args: Native.methods[endpoint]
+        .input({ strict: true })
+        .create()
+        .parse(call.args),
+    };
+  if (endpoint === 'session/updateQueue')
+    return {
+      scopeId,
+      endpoint,
+      args: Native.methods[endpoint]
+        .input({ strict: true })
+        .create()
+        .parse(call.args),
+    };
+  if (endpoint === 'subagents/prompt')
+    return {
+      scopeId,
+      endpoint,
+      args: Subagents.methods[endpoint]
+        .input({ strict: true })
+        .create()
+        .parse(call.args),
+    };
+}
 /** One reader for a native duplex handle. One-item handoff applies backpressure;
  * close discards business delivery but keeps consuming exact closed/end. */
-class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
+class Relay<T extends ScopeFrame | StreamFrame> {
   private item?: T;
   private changed = deferred<void>();
   private consumed = deferred<void>();
@@ -75,6 +141,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     parser: TypertSchema<T>,
     receive: (frame: T) => boolean,
     fence?: (reason: unknown) => void,
+    private readonly shutdown?: AbortSignal,
   ) {
     this.done = (async () => {
       try {
@@ -106,6 +173,9 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     })();
     void this.done.catch(() => {});
   }
+  get acknowledgedClose() {
+    return this.closed;
+  }
   async next(): Promise<IteratorResult<T>> {
     while (true) {
       if (this.item) {
@@ -126,6 +196,7 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
     if (this.joined) return this.joined;
     this.joined = Promise.resolve().then(async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let startDeadline: (() => void) | undefined;
       const deliveryErrors: unknown[] = [];
       try {
         if (!this.ended && !this.closed && !this.withdrawn) {
@@ -142,7 +213,14 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
         await Promise.race([
           this.done,
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(unknown()), this.timeoutMs);
+            startDeadline = () => {
+              timer = setTimeout(() => reject(unknown()), this.timeoutMs);
+            };
+            if (this.shutdown && !this.shutdown.aborted)
+              this.shutdown.addEventListener('abort', startDeadline, {
+                once: true,
+              });
+            else startDeadline();
           }),
         ]);
         if (!this.closed) throw unknown();
@@ -166,6 +244,8 @@ class Relay<T extends ScopeFrame | DEntryScopedStreamFrame> {
         );
       } finally {
         if (timer) clearTimeout(timer);
+        if (startDeadline)
+          this.shutdown?.removeEventListener('abort', startDeadline);
       }
     });
     this.closing = true;
@@ -199,34 +279,41 @@ export function createDEntryPrincipalControl(
     DEntryPrincipalActivity & {
       local(): Promise<void>;
       fence(reason?: unknown): void;
+      hasUnconfirmedTerminalExit(): boolean;
     }
   >();
+  const shutdown = new AbortController();
   let stopped = false,
     closing: Promise<void> | undefined;
   const control = {
     acquire(
-      value: DEntryPrincipalIssue,
+      value: DEntryScopeIssue,
       caller: AbortSignal,
       beforeInvoke?: (
-        call: DEntryScopedUnaryCall,
+        call: PrincipalInvocationCall,
         signal: AbortSignal,
       ) => Promise<PrincipalInvocationObservation | undefined>,
     ): DEntryPrincipalActivity {
       if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
       caller.throwIfAborted();
       input.carrier.throwIfAborted();
-      const issue = DEntryPrincipalIssueSchema.parse(value);
+      const issue = DEntryScopeIssueSchema.parse(value);
       const revoked = new AbortController();
       let started = false;
       let relay: Relay<ScopeFrame> | undefined;
       let running: Promise<DEntryPrincipalControlScope> | undefined,
         joined: Promise<void> | undefined;
-      const children = new Set<Relay<DEntryScopedStreamFrame>>();
+      const children = new Set<Relay<StreamFrame>>();
       const operations = new Set<Promise<unknown>>();
+      const follows = new Map<string, AbortController>();
       let detachRun = () => {};
       let published = false;
+      let terminalDispatched = false;
       const opened = deferred<Extract<ScopeFrame, { type: 'opened' }>>();
       const activity = {
+        hasUnconfirmedTerminalExit() {
+          return terminalDispatched && !relay?.acknowledgedClose;
+        },
         fence(reason?: unknown) {
           revoked.abort(reason);
         },
@@ -256,6 +343,19 @@ export function createDEntryPrincipalControl(
                 'allricePrincipal/openScope'
               ].result.create(),
               (frame) => {
+                if (frame.type === 'follow-revoked' && published) {
+                  follows.get(frame.followId)?.abort(
+                    new RemoteError(
+                      'remote-access/denied',
+                      'Native session follow unavailable',
+                      {
+                        action: 'session/follow',
+                        reason: 'session-changed',
+                      },
+                    ),
+                  );
+                  return false;
+                }
                 if (frame.type === 'revoked' && published) {
                   revoked.abort(Error('PRINCIPAL_SCOPE_REVOKED'));
                   return false;
@@ -279,6 +379,12 @@ export function createDEntryPrincipalControl(
                 if (published) revoked.abort(reason);
                 else opened.reject(reason);
               },
+              // The terminal login owner is already fenced on revocation.
+              // A healthy guest may take longer than a page close to prove
+              // process exit. Bound the join once the shared Host retires.
+              issue.access === 'page' && issue.terminalOwner
+                ? shutdown.signal
+                : undefined,
             );
             if (business.aborted || joined) void relay.close().catch(() => {});
             const first = await timing.run(
@@ -290,138 +396,230 @@ export function createDEntryPrincipalControl(
               },
             );
             timing.ready();
+            function invoke(
+              call: DEntryScopedUnaryCall | DEntryPageNativeCall,
+              active: AbortSignal,
+            ) {
+              business.throwIfAborted();
+              active.throwIfAborted();
+              if (call.scopeId !== issue.scopeId)
+                throw Error('PRINCIPAL_SCOPE_MISMATCH');
+              const task = Promise.resolve().then(async () => {
+                business.throwIfAborted();
+                active.throwIfAborted();
+                const protectedCall =
+                  'kind' in call ? pageModelInput(call) : call;
+                const observation =
+                  protectedCall &&
+                  (await beforeInvoke?.(
+                    protectedCall,
+                    AbortSignal.any([active, business]),
+                  ));
+                try {
+                  business.throwIfAborted();
+                  active.throwIfAborted();
+                } catch (error) {
+                  await observation?.undispatched();
+                  throw error;
+                }
+                let known = false;
+                try {
+                  // A lost create reply can still leave a native PTY. The
+                  // owning scope's closed frame means the Guest joined it.
+                  if (
+                    issue.access === 'page' &&
+                    issue.terminalOwner &&
+                    call.endpoint === 'terminal/create'
+                  )
+                    terminalDispatched = true;
+                  const result = await TYPERT_REMOTE.methods[
+                    'allricePrincipal/invokeScoped'
+                  ].invoke(
+                    root.remote,
+                    { call },
+                    AbortSignal.any([active, business]),
+                  );
+                  if (!result.ok) {
+                    // These rc.2 prompt-specific failures precede inbox
+                    // admission. Generic gateway failures prove no outcome.
+                    if (
+                      protectedCall &&
+                      isCertainNativePromptRejection(
+                        protectedCall,
+                        String(result.error?.code),
+                      )
+                    ) {
+                      known = true;
+                      await observation?.undispatched();
+                    }
+                    throw result.error;
+                  }
+                  const value = TYPERT_REMOTE.methods[
+                    'allricePrincipal/invokeScoped'
+                  ].result
+                    .create()
+                    .parse(result.value);
+                  if (value.endpoint !== call.endpoint)
+                    throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+                  if (protectedCall?.endpoint === 'subagents/prompt') {
+                    if (!('kind' in value) || !observation?.assertInserted)
+                      throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+                    const receipt = Subagents.methods['subagents/prompt'].result
+                      .create()
+                      .parse(value.value);
+                    await observation.assertInserted(
+                      receipt.messageId,
+                      AbortSignal.any([active, business]),
+                    );
+                  }
+                  known = true;
+                  observation?.accepted();
+                  business.throwIfAborted();
+                  active.throwIfAborted();
+                  return value;
+                } finally {
+                  if (!known) observation?.unknown();
+                }
+              });
+              operations.add(task);
+              void task.then(
+                () => operations.delete(task),
+                () => operations.delete(task),
+              );
+              return task;
+            }
+            function stream(
+              call: DEntryScopedStreamCall | DEntryPageNativeCall,
+              active: AbortSignal,
+              observed?: Parameters<DEntryPrincipalControlScope['stream']>[2],
+            ) {
+              business.throwIfAborted();
+              active.throwIfAborted();
+              if (call.scopeId !== issue.scopeId)
+                throw Error('PRINCIPAL_SCOPE_MISMATCH');
+              const handle = TYPERT_REMOTE.methods[
+                'allricePrincipal/streamScoped'
+              ].invoke(root.remote, { call }, input.carrier);
+              const current = AbortSignal.any([business, active]);
+              const child = new Relay(
+                handle,
+                issue.scopeId,
+                input.cleanupTimeoutMs,
+                TYPERT_REMOTE.methods[
+                  'allricePrincipal/streamScoped'
+                ].result.create(),
+                (frame) => {
+                  if (!current.aborted && frame.type === 'item')
+                    observed?.item(frame);
+                  return true;
+                },
+                () => observed?.terminal(),
+              );
+              children.add(child);
+              const cancelled = () => {
+                void child.close().catch(() => {});
+              };
+              current.addEventListener('abort', cancelled, { once: true });
+              void child.done.then(
+                () => {
+                  children.delete(child);
+                  current.removeEventListener('abort', cancelled);
+                },
+                () => {
+                  current.removeEventListener('abort', cancelled);
+                },
+              );
+              if (current.aborted) cancelled();
+              let taken = false;
+              return {
+                close: () => child.close(),
+                send(command: DEntryPageInput) {
+                  current.throwIfAborted();
+                  handle.send(command);
+                },
+                async *[Symbol.asyncIterator]() {
+                  if (taken) throw Error('PRINCIPAL_STREAM_ALREADY_CONSUMED');
+                  taken = true;
+                  let failed = false;
+                  try {
+                    while (true) {
+                      current.throwIfAborted();
+                      const next = await child.next();
+                      current.throwIfAborted();
+                      if (next.done) return;
+                      if (next.value.type !== 'closed') yield next.value;
+                    }
+                  } catch (error) {
+                    failed = true;
+                    throw error;
+                  } finally {
+                    try {
+                      await (failed
+                        ? child.close().catch(() => {})
+                        : child.close());
+                    } finally {
+                      current.removeEventListener('abort', cancelled);
+                    }
+                  }
+                },
+              };
+            }
             return {
               opened: first,
               revoked: business,
-              invoke(call, active) {
-                business.throwIfAborted();
-                active.throwIfAborted();
-                if (call.scopeId !== issue.scopeId)
-                  throw Error('PRINCIPAL_SCOPE_MISMATCH');
-                const task = Promise.resolve().then(async () => {
-                  business.throwIfAborted();
-                  active.throwIfAborted();
-                  const observation = await beforeInvoke?.(
-                    call,
-                    AbortSignal.any([active, business]),
-                  );
-                  try {
-                    business.throwIfAborted();
-                    active.throwIfAborted();
-                  } catch (error) {
-                    await observation?.undispatched();
-                    throw error;
-                  }
-                  let known = false;
-                  try {
-                    const result = await TYPERT_REMOTE.methods[
-                      'allricePrincipal/invokeScoped'
-                    ].invoke(
-                      root.remote,
-                      { call },
-                      AbortSignal.any([active, business]),
-                    );
-                    if (!result.ok) {
-                      // These rc.2 prompt-specific failures precede inbox
-                      // admission. Generic gateway failures prove no outcome.
-                      if (
-                        isCertainNativePromptRejection(
-                          call,
-                          String(result.error?.code),
-                        )
-                      ) {
-                        known = true;
-                        await observation?.undispatched();
-                      }
-                      throw result.error;
-                    }
-                    const value = TYPERT_REMOTE.methods[
-                      'allricePrincipal/invokeScoped'
-                    ].result
-                      .create()
-                      .parse(result.value);
-                    if (value.endpoint !== call.endpoint)
-                      throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
-                    known = true;
-                    observation?.accepted();
-                    business.throwIfAborted();
-                    active.throwIfAborted();
-                    return value;
-                  } finally {
-                    if (!known) observation?.unknown();
-                  }
-                });
-                operations.add(task);
-                void task.then(
-                  () => operations.delete(task),
-                  () => operations.delete(task),
-                );
-                return task;
+              async invoke(call, active) {
+                const value = await invoke(call, active);
+                if ('kind' in value) throw unknown();
+                return value;
+              },
+              async invokePage(call, active) {
+                const value = await invoke(call, active);
+                if (!('kind' in value) || value.kind !== 'page')
+                  throw unknown();
+                return value;
               },
               stream(call, active, observed) {
-                business.throwIfAborted();
-                active.throwIfAborted();
-                if (call.scopeId !== issue.scopeId)
-                  throw Error('PRINCIPAL_SCOPE_MISMATCH');
-                const handle = TYPERT_REMOTE.methods[
-                  'allricePrincipal/streamScoped'
-                ].invoke(root.remote, { call }, input.carrier);
-                const current = AbortSignal.any([business, active]);
-                const child = new Relay(
-                  handle,
-                  issue.scopeId,
-                  input.cleanupTimeoutMs,
-                  TYPERT_REMOTE.methods[
-                    'allricePrincipal/streamScoped'
-                  ].result.create(),
-                  (frame) => {
-                    if (!current.aborted && frame.type === 'item')
-                      observed?.item(frame);
-                    return true;
-                  },
-                  () => observed?.terminal(),
-                );
-                children.add(child);
-                const cancelled = () => {
-                  void child.close().catch(() => {});
-                };
-                current.addEventListener('abort', cancelled, { once: true });
-                void child.done.then(
-                  () => {
-                    children.delete(child);
-                    current.removeEventListener('abort', cancelled);
-                  },
-                  () => {
-                    current.removeEventListener('abort', cancelled);
-                  },
-                );
-                if (current.aborted) cancelled();
-                let taken = false;
+                const child = stream(call, active, observed);
                 return {
-                  close: () => child.close(),
+                  close: child.close,
                   async *[Symbol.asyncIterator]() {
-                    if (taken) throw Error('PRINCIPAL_STREAM_ALREADY_CONSUMED');
-                    taken = true;
-                    let failed = false;
+                    for await (const frame of child) {
+                      if (frame.type !== 'item') throw unknown();
+                      yield frame;
+                    }
+                  },
+                };
+              },
+              streamPage(call, active) {
+                const followId = call.followId;
+                const follow = followId ? new AbortController() : undefined;
+                const child = stream(
+                  call,
+                  follow ? AbortSignal.any([active, follow.signal]) : active,
+                );
+                if (followId && follow) follows.set(followId, follow);
+                return {
+                  revoked: follow?.signal,
+                  send: child.send,
+                  async *[Symbol.asyncIterator]() {
                     try {
-                      while (true) {
-                        current.throwIfAborted();
-                        const next = await child.next();
-                        current.throwIfAborted();
-                        if (next.done) return;
-                        if (next.value.type === 'item') yield next.value;
+                      let failure: DEntryPageNativeError['error'] | undefined;
+                      for await (const frame of child) {
+                        if (failure || frame.type === 'item') throw unknown();
+                        if (frame.type === 'page-end') {
+                          if (!follow) throw unknown();
+                          break;
+                        }
+                        if (frame.type === 'page-error') {
+                          // Iterator close still joins the real child. Keep the
+                          // native failure primary if that join also fails.
+                          if (follow) throw frame.error;
+                          failure = frame.error;
+                        } else yield frame;
                       }
-                    } catch (error) {
-                      failed = true;
-                      throw error;
+                      if (failure) throw failure;
                     } finally {
-                      try {
-                        await (failed
-                          ? child.close().catch(() => {})
-                          : child.close());
-                      } finally {
-                        current.removeEventListener('abort', cancelled);
-                      }
+                      if (followId) follows.delete(followId);
                     }
                   },
                 };
@@ -486,6 +684,7 @@ export function createDEntryPrincipalControl(
     },
     fence(reason?: unknown) {
       stopped = true;
+      shutdown.abort(reason);
       for (const activity of activities) activity.fence(reason);
     },
     close() {
@@ -512,6 +711,16 @@ export function createDEntryPrincipalControl(
       );
       if (results.some((result) => result.status === 'rejected'))
         throw unknown();
+    },
+    hasUnconfirmedTerminalExit() {
+      return [...activities].some((activity) =>
+        activity.hasUnconfirmedTerminalExit(),
+      );
+    },
+    async retireAfterJobExit() {
+      await control.drainLocal();
+      if (control.hasUnconfirmedTerminalExit()) throw unknown();
+      activities.clear();
     },
     async retireAfterNativeStop() {
       await control.drainLocal();

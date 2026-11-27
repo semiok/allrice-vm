@@ -123,6 +123,26 @@ describe('Web original-cookie to fixed Worker adapters', () => {
     expect(options.method).toBe('GET');
     expect(options.headers).toEqual({ authorization: `Bearer ${ports.token}` });
   });
+  it('relays the expired duplicate POST without issuing a browser ticket', async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ state: 'expired' }, { status: 410 }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ state: 'starting' }, { status: 410 }),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const post = () => prewarm(request({ selection, trigger: 'page' }));
+    const gone = await post();
+    expect(gone.status).toBe(410);
+    expect(await gone.json()).toEqual({ state: 'expired' });
+    expect(gone.headers.get('cache-control')).toBe('private, no-store');
+    expect((await post()).status).toBe(503);
+    expect(ports.context).toHaveBeenCalledTimes(2);
+    expect(ports.identity).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
   it('prewarms page/input with only selectors and original Session, returning no readiness capability', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () =>
       Response.json({ identity, trigger: 'page' }),
@@ -363,5 +383,48 @@ describe('Web original-cookie to fixed Worker adapters', () => {
       ).status,
     ).toBe(400);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts native page endpoint names without a Web allowlist and keeps the original login', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+      Response.json({ type: 'server-response' }),
+    );
+    vi.stubGlobal('fetch', fetch);
+    const scopeId = randomUUID();
+    const payload = { args: { request: { query: 'meeting' } } };
+    const invoke = (endpoint: string) =>
+      rpc(
+        new Request(
+          'https://allrice.test/api/v1/d-entry/native-rpc?carrier=page',
+          {
+            method: 'POST',
+            headers: { host: 'allrice.test', origin: 'https://allrice.test' },
+            body: JSON.stringify({
+              selection,
+              scopeId,
+              endpoint,
+              rpcId: 'native-rpc-id',
+              payload,
+            }),
+          },
+        ),
+      );
+    expect((await invoke('session/search')).status).toBe(200);
+    expect((await invoke('session/search/other')).status).toBe(400);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, options] = fetch.mock.calls[0] as [URL, RequestInit];
+    expect(url.pathname + url.search).toBe(
+      '/internal/d-entry/native-rpc?carrier=page',
+    );
+    expect(options.headers).toMatchObject({
+      authorization: `Bearer ${ports.token}`,
+    });
+    expect(JSON.parse(String(options.body))).toMatchObject({
+      scopeId,
+      payload,
+      endpoint: 'session/search',
+      organizationId: identity.organizationId,
+      selection,
+    });
   });
 });

@@ -1,3 +1,4 @@
+import { ChatSessionSchema } from './workspace.ts';
 import { z } from 'zod';
 import { UuidSchema } from './common.ts';
 
@@ -169,18 +170,26 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
 });
-export const DEntryPageUnarySchema = z.enum([
-  'session/list',
-  'session/attachment',
-  'session/page',
-  'session/projections',
-  'skills/list',
-  'session/prompt',
-  'session/updateQueue',
-  'session/cancel',
-  'session/rename',
-  'session/selectModel',
-]);
+// Connection's canonical namespace/method syntax. A caller can name a method
+// here, but only the admitted guest can resolve and authorize its descriptor.
+export const DEntryPageUnarySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/u);
+// Only an acknowledged, currently authorized page create/fork may carry this
+// AllRice thread id. The DSH reply body and rpcId keep their original contract.
+export const dEntryRegisteredThreadHeader = 'x-allrice-d-entry-thread';
+export function decodeDEntryRegisteredThread(header: string | null) {
+  if (!header || header.length > 4096) return;
+  try {
+    const thread = ChatSessionSchema.safeParse(
+      JSON.parse(decodeURIComponent(header)),
+    );
+    if (thread.success) return thread.data;
+  } catch {
+    // Optional presentation receipt; the DSH response remains authoritative.
+  }
+}
+
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {
     selection: DEntrySelectionInputSchema,
@@ -201,6 +210,12 @@ export const DEntryProfileAssetSchema = DEntryProfileBindingSchema.extend({
   reference: z.string().min(1).max(16384),
   revision: profileToken,
 });
+export const DEntryProfileChunkFilenameSchema = z
+  .string()
+  .regex(/^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$/u)
+  .refine(
+    (file) => file !== 'client.node.js' && !file.startsWith('client.node.'),
+  );
 export const DEntryProfileAddressSchema = z.strictObject({
   bindingRef: profileToken,
   graphRev: profileToken,
@@ -267,7 +282,14 @@ export const DEntryProfileFilePathSchema = z
     path.split('/').every((part) => part && part !== '.' && part !== '..'),
   );
 
-export const DEntryNativePrewarmTriggerSchema = z.enum(['page', 'input']);
+export const DEntryNativePrewarmTriggerSchema = z.enum([
+  'page',
+  'input',
+  'open',
+]);
+export type DEntryNativePrewarmTrigger = z.infer<
+  typeof DEntryNativePrewarmTriggerSchema
+>;
 export const DEntryNativePrewarmInputSchema = z
   .object({
     selection: DEntrySelectionInputSchema,
@@ -300,12 +322,18 @@ export const DEntryNativePrewarmStatusQuerySchema =
   DEntrySelectionInputSchema.extend({ operationId: UuidSchema });
 export const DEntryNativePrewarmStatusSchema = z.discriminatedUnion('state', [
   z
-    .object({ state: z.enum(['accepted', 'starting', 'ready', 'expired']) })
+    .object({
+      state: z.enum(['accepted', 'starting', 'restarting', 'ready', 'expired']),
+    })
     .strict(),
   z
     .object({
       state: z.literal('failed'),
-      code: z.enum(['START_UNAVAILABLE', 'AUTHORITY_REVOKED']),
+      code: z.enum([
+        'START_UNAVAILABLE',
+        'AUTHORITY_REVOKED',
+        'UPGRADE_OPEN_REQUIRED',
+      ]),
     })
     .strict(),
 ]);

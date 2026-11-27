@@ -1,4 +1,7 @@
-import type { DEntryPageSwitchResultSchema } from '@allrice/contracts';
+import type {
+  ChatSessionSchema,
+  DEntryPageSwitchResultSchema,
+} from '@allrice/contracts';
 
 export const pageClosing = 'allrice:d-entry:close';
 export const pageCompletion = 'allrice:d-entry:completion';
@@ -15,3 +18,13 @@ export type PageThreadScope = Extract<
   ReturnType<typeof DEntryPageSwitchResultSchema.parse>,
   { type: 'switched' }
 >;
+
+export const pageNativeThreadRegistered =
+  'allrice:d-entry:native-thread-registered';
+export const pageNativeThreadSelected =
+  'allrice:d-entry:native-thread-selected';
+export type PageNativeThreadRegistration = {
+  scopeId: string;
+  nativeSessionId: string;
+  thread: ReturnType<typeof ChatSessionSchema.parse>;
+};

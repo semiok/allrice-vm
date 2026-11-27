@@ -1,9 +1,12 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { pageDownlink, pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
   Remote,
   TypertRemoteService,
   isTypertRemoteMethod,
   isRemoteJsonValue,
+  RemoteError,
   remoteErrorOf,
   type PeerScope,
   type RemoteStream,
@@ -16,6 +19,9 @@ import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-api-gateway';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { API_REMOTE_FORWARDED_EVENTS } from '@deepseek-ai/dsh-api-remotes';
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types';
+import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import { TYPERT_REMOTE as Access } from '@deepseek-ai/dsh-api-remote-access/remote';
 import {
   REMOTE_EVENT_STREAM_ENDPOINT,
@@ -28,23 +34,52 @@ import { TYPERT, TYPERT_REMOTE } from '#principal-artifacts';
 import { UuidSchema } from '@allrice/contracts';
 import {
   issueSchema,
+  pageEventRoles,
   principalPolicy,
   projectSessions,
+  projectPageSessions,
   writeEndpoints,
   type Projection,
 } from './policy.js';
 import type {
   CloseCommand,
+  DEntryPageInput,
   DEntryPrincipal,
-  DEntryPrincipalIssue,
+  DEntryScopeIssue,
+  DEntryPageNativeCall,
+  DEntryPageNativeEnd,
+  DEntryPageNativeError,
+  DEntryPageNativeItem,
+  DEntryPageNativeResult,
   DEntryScopedUnaryCall,
   DEntryScopedUnaryResult,
   DEntryScopedStreamCall,
   DEntryScopedStreamFrame,
   ScopeFrame,
 } from './types.js';
+import {
+  encodePageNativeResult,
+  requirePageNativeMethod,
+} from './page-native-method.js';
+import { pageSettingsNamespaces } from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
+const terminalId = z.string().min(1).max(128);
+const terminalCreate = z.object({
+  agentId: z.string().min(1),
+  request: z.object({ id: terminalId }),
+});
+const terminalRef = z.object({ agentId: z.string().min(1), id: terminalId });
+const terminalList = z.array(z.object({ id: z.string() }));
+type TerminalRef = z.infer<typeof terminalRef>;
+type TerminalReservation = {
+  ref: TerminalRef;
+  pending: number;
+  possiblyAllocated: boolean;
+};
+const terminalKey = ({ agentId, id }: TerminalRef) =>
+  JSON.stringify([agentId, id]);
+const eventRoles = pageEventRoles(API_REMOTE_FORWARDED_EVENTS);
 const configSchema = z
   .object({
     profile: z
@@ -171,13 +206,41 @@ function assertContribution(
   )
     throw Error('PRINCIPAL_METADATA_INVALID');
 }
+const followCatalogIntervalMs = 5000;
+
+function followAddress(args: unknown) {
+  try {
+    return Native.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(args).request.address;
+  } catch {
+    // The native Gateway owns malformed-input errors.
+    return;
+  }
+}
+
+function sameFollowSession(
+  current: SessionSummary | undefined,
+  original: SessionSummary,
+) {
+  return (
+    current !== undefined &&
+    current.origin === original.origin &&
+    current.parentSessionId === original.parentSessionId
+  );
+}
+
 class Scope implements Projection {
   active = false;
   bindings: Projection['bindings'] = [];
+  eventBindings: Projection['bindings'] = [];
+  private readonly eventSessions = new Set<SessionId>();
   peer?: PeerScope;
   readonly abort = new AbortController();
   readonly jobs = new Set<Promise<unknown>>();
   readonly children = new Set<{ close(): Promise<void> }>();
+  readonly terminals = new Map<string, TerminalReservation>();
   readonly ready: Promise<void>;
   private closing?: Promise<void>;
   private detach = () => {};
@@ -186,11 +249,21 @@ class Scope implements Projection {
   private catalogReading?: Promise<void>;
   private refreshQueue = Promise.resolve();
   private refreshGeneration = 0;
+  private sessions = new Map<SessionId, SessionSummary>();
+  private readonly follows = new Set<{
+    chain: ReadonlyMap<SessionId, SessionSummary>;
+    followId?: string;
+    stop: AbortController;
+  }>();
+  private followTimer?: ReturnType<typeof setTimeout>;
+  private followRead?: Promise<void>;
+  private readonly followWithdrawals = new Set<string>();
+  private wakeFollowWithdrawal?: () => void;
   constructor(
     readonly host: PrincipalService,
     private readonly ctx: Context,
     readonly parent: PeerScope,
-    readonly issue: DEntryPrincipalIssue,
+    readonly issue: DEntryScopeIssue,
   ) {
     // Public Host services use the constructor's owning Context. The Peer
     // Context below continues to own every scope registration and its join.
@@ -204,12 +277,19 @@ class Scope implements Projection {
       void this.close().catch(() => {});
     };
     parent.signal.addEventListener('abort', lost, { once: true });
-    const hint = () => {
+    const hint = (sessionId: SessionId) => {
       if (this.abort.signal.aborted) return;
+      if (this.eventBindings.length) this.rememberPageEvents([sessionId]);
       void this.refresh().catch(lost);
     };
-    const added = parent.ctx.on('api-session/added', hint);
-    const removed = parent.ctx.on('api-session/removed', hint);
+    const added = parent.ctx.on('api-session/added', (session) => {
+      this.fenceFollowSession(session.sessionId, session);
+      hint(session.sessionId);
+    });
+    const removed = parent.ctx.on('api-session/removed', (id) => {
+      this.fenceFollowSession(id);
+      hint(id);
+    });
     this.detach = () => {
       parent.signal.removeEventListener('abort', lost);
       added();
@@ -293,16 +373,35 @@ class Scope implements Projection {
       try {
         const catalog = await this.ctx.sessionController.list({}, signal);
         signal.throwIfAborted();
-        const bindings = projectSessions(this.issue, catalog.items);
+        this.abort.signal.throwIfAborted();
+        const bindings =
+          this.issue.access === 'page'
+            ? projectPageSessions(catalog.items, this.ctx.typert.local.list())
+            : projectSessions(this.issue, catalog.items);
         // A newer page-level read or hint owns the projection once it fences
         // this generation. A cancelled follower owns only its catalog read.
         if (generation === this.refreshGeneration) {
           this.refreshQueue = task;
-          this.publish(bindings);
+          if (this.issue.access === 'page') {
+            this.sessions = new Map(
+              catalog.items.map((item) => [item.sessionId, item]),
+            );
+            this.verifyFollows(this.sessions);
+            this.rememberPageEvents(
+              catalog.items.map(({ sessionId }) => sessionId),
+            );
+          }
+          this.publish(
+            bindings,
+            this.issue.access === 'page' || bindings.length > 0,
+          );
         }
       } catch (error) {
         if (!signal.aborted && generation === this.refreshGeneration) {
           this.refreshQueue = task;
+          this.eventBindings = [];
+          this.sessions.clear();
+          this.verifyFollows(this.sessions);
           this.publish([]);
         }
         throw error;
@@ -311,9 +410,140 @@ class Scope implements Projection {
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
   }
-  private publish(bindings: Projection['bindings']) {
+  withdrawFollow(stop: AbortController, followId?: string) {
+    if (stop.signal.aborted) return;
+    stop.abort(
+      new RemoteError(
+        'remote-access/denied',
+        'Native session follow unavailable',
+        {
+          action: 'session/follow',
+          reason: 'session-changed',
+        },
+      ),
+    );
+    if (followId && !this.abort.signal.aborted) {
+      this.followWithdrawals.add(followId);
+      this.wakeFollowWithdrawal?.();
+    }
+  }
+  async nextFollowWithdrawal(signal: AbortSignal) {
+    while (true) {
+      signal.throwIfAborted();
+      const id = this.followWithdrawals.values().next().value;
+      if (id !== undefined) {
+        this.followWithdrawals.delete(id);
+        return id;
+      }
+      try {
+        await waitForRead(
+          new Promise((resolve) => {
+            this.wakeFollowWithdrawal = resolve;
+          }),
+          signal,
+        );
+      } finally {
+        this.wakeFollowWithdrawal = undefined;
+      }
+    }
+  }
+  private fenceFollowSession(id: SessionId, current?: SessionSummary) {
+    for (const { chain, stop, followId } of this.follows) {
+      const original = chain.get(id);
+      if (original && !sameFollowSession(current, original))
+        this.withdrawFollow(stop, followId);
+    }
+  }
+  private verifyFollows(sessions: ReadonlyMap<SessionId, SessionSummary>) {
+    for (const { chain, stop, followId } of this.follows) {
+      for (const [id, original] of chain) {
+        if (sameFollowSession(sessions.get(id), original)) continue;
+        this.withdrawFollow(stop, followId);
+        break;
+      }
+    }
+  }
+  private scheduleFollowRead() {
+    if (
+      this.followTimer ||
+      this.followRead ||
+      !this.follows.size ||
+      this.abort.signal.aborted
+    )
+      return;
+    this.followTimer = setTimeout(() => {
+      this.followTimer = undefined;
+      const signal = this.abort.signal;
+      this.followRead = this.track(
+        this.readInOrder(signal, async () => {
+          const { items } = await this.ctx.sessionController.list({}, signal);
+          signal.throwIfAborted();
+          this.verifyFollows(new Map(items.map((row) => [row.sessionId, row])));
+        })
+          .catch(() => this.verifyFollows(new Map()))
+          .finally(() => {
+            this.followRead = undefined;
+            this.scheduleFollowRead();
+          }),
+      );
+    }, followCatalogIntervalMs);
+    this.followTimer.unref();
+  }
+  pendingFollowRead() {
+    return this.followRead;
+  }
+  watchFollow(args: unknown, stop: AbortController, followId?: string) {
+    const address = followAddress(args);
+    if (!address) return;
+    const chain = new Map<SessionId, SessionSummary>();
+    let item = this.sessions.get(
+      address.kind === 'session' ? address.sessionId : address.childSessionId,
+    );
+    // Let the native Gateway surface its exact validation error for an
+    // unbound address. Forwarding still requires positive ancestry proof.
+    if (
+      !item ||
+      (address.kind === 'subagent' &&
+        (item.origin !== 'subagent' ||
+          item.parentSessionId !== address.parentSessionId))
+    )
+      return;
+    while (item && !chain.has(item.sessionId)) {
+      chain.set(item.sessionId, { ...item });
+      if (item.origin !== 'subagent') {
+        const follow = { chain, stop, followId };
+        this.follows.add(follow);
+        this.scheduleFollowRead();
+        return () => {
+          this.follows.delete(follow);
+          if (!this.follows.size && this.followTimer) {
+            clearTimeout(this.followTimer);
+            this.followTimer = undefined;
+          }
+        };
+      }
+      item = item.parentSessionId
+        ? this.sessions.get(item.parentSessionId)
+        : undefined;
+    }
+  }
+  private rememberPageEvents(ids: readonly SessionId[]) {
+    const count = this.eventSessions.size;
+    for (const id of ids) this.eventSessions.add(id);
+    if (this.eventBindings.length && count === this.eventSessions.size) return;
+    // The native add/remove edge can reach the Gateway during a catalog
+    // refresh. Keep its exact IDs for this page's notification role only.
+    this.eventBindings = [
+      { role: eventRoles.global, resource: { kind: 'global' } },
+      ...Array.from(this.eventSessions, (id) => ({
+        role: eventRoles.session,
+        resource: { kind: 'session', id } as const,
+      })),
+    ];
+  }
+  private publish(bindings: Projection['bindings'], active = false) {
     this.bindings = bindings;
-    this.active = bindings.length > 0;
+    this.active = active;
     this.ctx.remoteAccess.invalidate();
   }
   async current<T>(
@@ -327,7 +557,7 @@ class Scope implements Projection {
       if (pending !== this.refreshQueue) continue;
       if (!this.active) throw closed();
       // No await between the stable projection and the native guard/dispatch.
-      // Hints extend the same owned read chain; they never grant from payload.
+      // Catalog hints extend the owned read chain for method permissions.
       return dispatch();
     }
   }
@@ -346,28 +576,39 @@ class Scope implements Projection {
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closing = Promise.resolve().then(async () => {
+    const attempt = (this.closing = Promise.resolve().then(async () => {
       await Promise.allSettled([this.ready]);
       const children = await Promise.allSettled(
         [...this.children].map((child) => child.close()),
       );
       while (this.jobs.size) await Promise.allSettled([...this.jobs]);
-      const peer = await Promise.allSettled([this.peer?.dispose()]);
-      if ([...children, ...peer].some((result) => result.status === 'rejected'))
+      const owner = await Promise.allSettled([
+        this.host.closeTerminals(this),
+        this.peer?.dispose(),
+      ]);
+      if (
+        [...children, ...owner].some((result) => result.status === 'rejected')
+      )
         throw Error('PRINCIPAL_JOIN_UNKNOWN');
       this.detach();
       this.host.scopes.delete(this.issue.scopeId);
       // The registration waits this very close; withdrawing it must not await
       // itself. It owns no additional I/O beyond the resources joined above.
       void this.unregister?.().catch(() => {});
-    });
+    }));
     this.active = false;
     this.bindings = [];
+    this.eventBindings = [];
+    this.eventSessions.clear();
+    this.followWithdrawals.clear();
+    if (this.followTimer) clearTimeout(this.followTimer);
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
-    return this.closing;
+    return attempt;
   }
 }
+
+type DefaultWorkspace = { path: string; ensure(): Promise<string> };
 
 /** Actual guest service; only the trusted Node API Peer can issue a scope.
  * The public Host face is the Cordis plugin, not a constructor for consumers. */
@@ -380,11 +621,14 @@ class PrincipalService extends TypertRemoteService {
     'sessionController',
   ];
   readonly scopes = new Map<string, Scope>();
+  private readonly terminalOwners = new Map<string, Scope>();
+  private readonly terminalStop = new AbortController();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: {
     ready: boolean;
     current(): boolean;
+    defaultWorkspace(): DefaultWorkspace | undefined;
     close(): Promise<void>;
   };
   private graphRetirement = Promise.resolve();
@@ -401,6 +645,7 @@ class PrincipalService extends TypertRemoteService {
     );
     hostContext.effect(() => async () => {
       this.stopped = true;
+      this.terminalStop.abort(closed());
       if (this.graphObserver) await this.graphObserver.close();
       else await this.graphRetirement;
     });
@@ -420,6 +665,72 @@ class PrincipalService extends TypertRemoteService {
         throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
     });
   }
+  async closeTerminals(scope: Scope) {
+    if (!scope.terminals.size) return;
+    // This is the actual guest Host, not the disconnected browser or its
+    // Worker peer. The local peer is used only for owned terminal cleanup.
+    const peer = this.hostContext.connection.createPeer({
+      principal: { kind: 'owner' },
+      interactions: 'answer',
+    });
+    const active = AbortSignal.any([peer.signal, this.terminalStop.signal]);
+    try {
+      const results = await Promise.allSettled(
+        [...scope.terminals.values()].map(async (reservation) => {
+          let backoff = 100;
+          // Preserve the same cleanup and downlink across provider failures.
+          // Only an exact confirmation completes the remote scope's close.
+          while (!active.aborted) {
+            if (await this.confirmTerminalClosed(reservation.ref, peer)) {
+              this.forgetTerminal(reservation);
+              return;
+            }
+            await delay(backoff, undefined, { signal: active, ref: false });
+            backoff = Math.min(backoff * 2, 1000);
+          }
+          throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
+        }),
+      );
+      if (results.some((result) => result.status === 'rejected'))
+        throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
+    } finally {
+      await peer.dispose();
+    }
+  }
+  private async confirmTerminalClosed(ref: TerminalRef, peer: PeerScope) {
+    try {
+      await this.ctx.typertGateway.invoke({
+        namespace: 'terminal',
+        method: 'close',
+        args: ref,
+        peer,
+      });
+      return true;
+    } catch {
+      // The native Agent may already have exited. Confirm against the
+      // controller's inventory after all dispatched creation jobs have joined.
+      try {
+        const remaining = terminalList.parse(
+          await this.ctx.typertGateway.invoke({
+            namespace: 'terminal',
+            method: 'list',
+            args: { sessionId: ref.agentId },
+            peer,
+          }),
+        );
+        return remaining.every(({ id }) => id !== ref.id);
+      } catch {
+        return false;
+      }
+    }
+  }
+  private forgetTerminal(reservation: TerminalReservation) {
+    const key = terminalKey(reservation.ref);
+    const scope = this.terminalOwners.get(key);
+    if (scope?.terminals.get(key) !== reservation) return;
+    scope.terminals.delete(key);
+    this.terminalOwners.delete(key);
+  }
   /** Internal Cordis consumer of the installed native graph revision. The
    * existing private stream reports withdrawal before any scope join. */
   observeProfileGraph(
@@ -429,6 +740,7 @@ class PrincipalService extends TypertRemoteService {
     },
     owner?: {
       current(): boolean;
+      defaultWorkspace?(): DefaultWorkspace | undefined;
       publish(): Promise<void>;
       retire(): Promise<void>;
     },
@@ -439,6 +751,7 @@ class PrincipalService extends TypertRemoteService {
     const observer = {
       ready: false,
       current: () => owner?.current() ?? true,
+      defaultWorkspace: () => owner?.defaultWorkspace?.(),
       close: () => {
         if (retiring) return retiring;
         observer.ready = false;
@@ -531,14 +844,14 @@ class PrincipalService extends TypertRemoteService {
   }
   @Remote({ mode: 'stream' })
   async *openScope(
-    issue: DEntryPrincipalIssue,
+    issue: DEntryScopeIssue,
     signal: AbortSignal,
   ): RemoteStream<ScopeFrame, CloseCommand> {
     const { args, invocation } = this.raw('allricePrincipal/openScope');
     issue = issueSchema.parse(args.issue);
     const { profile, binding } = this.config;
     if (
-      !issue.identity.threadId ||
+      (issue.access !== 'page' && !issue.identity.threadId) ||
       issue.identity.organizationId !== binding.organizationId ||
       issue.identity.personId !== binding.personId ||
       Object.keys(profile).some(
@@ -563,7 +876,7 @@ class PrincipalService extends TypertRemoteService {
       Object.freeze({
         ...issue,
         identity: Object.freeze({ ...issue.identity }),
-        root: Object.freeze({ ...issue.root }),
+        ...(issue.root && { root: Object.freeze({ ...issue.root }) }),
       }),
     );
     this.scopes.set(issue.scopeId, scope);
@@ -639,9 +952,20 @@ class PrincipalService extends TypertRemoteService {
           scopeId: issue.scopeId,
           principal: peer.principal,
           baseline,
+          ...(issue.access === 'page' && { followWithdrawals: true }),
         };
       }
-      await gate.done;
+      while (!gate.abort.signal.aborted) {
+        let followId: string;
+        try {
+          followId = await scope.nextFollowWithdrawal(gate.abort.signal);
+        } catch (error) {
+          if (!gate.abort.signal.aborted) throw error;
+          break;
+        }
+        if (!gate.abort.signal.aborted)
+          yield { type: 'follow-revoked', scopeId: issue.scopeId, followId };
+      }
       if (opened && withdrawn && !signal.aborted)
         yield { type: 'revoked', scopeId: issue.scopeId };
       await join();
@@ -695,9 +1019,16 @@ class PrincipalService extends TypertRemoteService {
       const item = catalog.items.find(
         (row) => String(row.sessionId) === sessionId,
       );
+      const bindings =
+        scope.issue.access === 'page' && scope.issue.root
+          ? projectSessions(
+              { ...scope.issue, access: 'execute', root: scope.issue.root },
+              catalog.items,
+            )
+          : scope.bindings;
       if (
         !item ||
-        !scope.bindings.some(
+        !bindings.some(
           (row) =>
             row.resource.kind === 'session' &&
             String(row.resource.id) === sessionId,
@@ -721,13 +1052,15 @@ class PrincipalService extends TypertRemoteService {
   }
   @Remote
   async invokeScoped(
-    call: DEntryScopedUnaryCall,
+    call: DEntryPageNativeCall | DEntryScopedUnaryCall,
     signal: AbortSignal,
-  ): Promise<DEntryScopedUnaryResult> {
+  ): Promise<DEntryPageNativeResult | DEntryScopedUnaryResult> {
     const { args: input, invocation } = this.raw(
       'allricePrincipal/invokeScoped',
     );
     const raw = object.parse(input.call);
+    const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
+    if (raw.kind === 'page') return this.invokePage(scope, raw, signal);
     const key = z
       .enum([
         'session/list',
@@ -741,7 +1074,11 @@ class PrincipalService extends TypertRemoteService {
     const args = object.parse(
       Native.methods[key].input({ strict: true }).create().parse(raw.args),
     );
-    const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
+    if (
+      scope.issue.access === 'page' &&
+      (key !== 'session/attachment' || !scope.issue.root)
+    )
+      throw Error('PRINCIPAL_RESOURCE_DENIED');
     return scope.own(async () => {
       const active = AbortSignal.any([signal, scope.abort.signal]);
       active.throwIfAborted();
@@ -816,26 +1153,270 @@ class PrincipalService extends TypertRemoteService {
       }
     });
   }
+  private pageMethod(
+    scope: Scope,
+    raw: Record<string, unknown>,
+    mode: 'stream' | 'unary',
+  ) {
+    if (scope.issue.access !== 'page') throw Error('PRINCIPAL_SCOPE_MISMATCH');
+    const endpoint = z.string().parse(raw.endpoint);
+    const args = object.parse(raw.args);
+    let providerSettings: Set<string> | undefined;
+    let pluginSettings: Set<string> | undefined;
+    if (endpoint.startsWith('settings/')) {
+      const llm:
+        | { listConfigurableProviders(): readonly { settingsNs: string }[] }
+        | undefined = this.ctx.get('llm');
+      const providers = llm?.listConfigurableProviders();
+      // Native settings addresses volatile Config fields by profile entry ID.
+      const editor:
+        | {
+            configuration(): Parameters<typeof pageSettingsNamespaces>[0];
+          }
+        | undefined = this.ctx.get('configEditor');
+      ({ providerSettings, pluginSettings } = pageSettingsNamespaces(
+        editor?.configuration() ?? [],
+        providers,
+      ));
+    }
+    const descriptor = requirePageNativeMethod(
+      this.ctx.typert.local,
+      endpoint,
+      mode,
+      args,
+      providerSettings,
+      pluginSettings,
+    );
+    return { endpoint, args, descriptor };
+  }
+  private invokePage(
+    scope: Scope,
+    raw: Record<string, unknown>,
+    signal: AbortSignal,
+  ) {
+    return scope.own(async (): Promise<DEntryPageNativeResult> => {
+      const active = AbortSignal.any([signal, scope.abort.signal]);
+      return scope.current(async () => {
+        const { endpoint, args, descriptor } = this.pageMethod(
+          scope,
+          raw,
+          'unary',
+        );
+        let nativeArgs = args;
+        const workspace = this.graphObserver?.defaultWorkspace();
+        if (endpoint === 'session/create' && workspace) {
+          const { request } = Native.methods[endpoint]
+            .input({ strict: true })
+            .create()
+            .parse(args);
+          if (
+            request.workspaceId === undefined &&
+            (request.cwd === undefined || request.cwd === workspace.path)
+          ) {
+            const workspaceId = await workspace.ensure();
+            active.throwIfAborted();
+            const create = { ...request, workspaceId };
+            delete create.cwd;
+            nativeArgs = { request: create };
+          }
+        }
+        // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
+        const modelInput =
+          endpoint === 'session/prompt' ||
+          endpoint === 'session/updateQueue' ||
+          endpoint === 'subagents/prompt';
+        if (endpoint === 'session/attachment')
+          throw Error('PRINCIPAL_RESOURCE_DENIED');
+        const closingKey =
+          endpoint === 'terminal/close'
+            ? terminalKey(terminalRef.parse(args))
+            : undefined;
+        const closingTerminal =
+          closingKey &&
+          this.terminalOwners.get(closingKey)?.terminals.get(closingKey);
+        let terminal: TerminalReservation | undefined;
+        if (endpoint === 'terminal/create') {
+          if (scope.issue.access !== 'page' || !scope.issue.terminalOwner)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
+          const { agentId, request } = terminalCreate.parse(args);
+          const ref = { agentId, id: request.id };
+          const key = terminalKey(ref);
+          const existing = this.terminalOwners.get(key);
+          if (existing && existing !== scope)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
+          // Reserve before native dispatch, even if its reply is later lost.
+          terminal = scope.terminals.get(key) ?? {
+            ref,
+            pending: 0,
+            possiblyAllocated: false,
+          };
+          terminal.pending++;
+          scope.terminals.set(key, terminal);
+          this.terminalOwners.set(key, scope);
+        }
+        let value: unknown;
+        try {
+          const dispatch = () =>
+            this.ctx.typertGateway.invoke({
+              namespace: descriptor.namespace,
+              method: descriptor.method,
+              args: nativeArgs,
+              peer: modelInput ? scope.currentPeer() : scope.parent,
+              signal: active,
+            });
+          // The registry call above can overlap a catalog refresh.
+          value = await (nativeArgs === args
+            ? dispatch()
+            : scope.current(dispatch, active));
+          if (terminal) terminal.possiblyAllocated = true;
+        } catch (error) {
+          // These rc.2 failures occur before any allocation. A success or
+          // ambiguous failure from a concurrent create still keeps ownership.
+          const code = String(remoteErrorOf(error)?.code);
+          if (
+            terminal &&
+            code !== 'terminal/limit-reached' &&
+            code !== 'gateway/arguments-invalid'
+          )
+            terminal.possiblyAllocated = true;
+          throw error;
+        } finally {
+          if (terminal) {
+            terminal.pending--;
+            if (!terminal.pending && !terminal.possiblyAllocated)
+              this.forgetTerminal(terminal);
+          }
+        }
+        if (closingTerminal) this.forgetTerminal(closingTerminal);
+        active.throwIfAborted();
+        const visible =
+          endpoint === 'settings/describe'
+            ? { ...object.parse(value), hasDocument: false }
+            : value;
+        return {
+          kind: 'page',
+          endpoint,
+          ...encodePageNativeResult(descriptor, visible),
+        };
+      }, active);
+    });
+  }
   @Remote({ mode: 'stream' })
   async *streamScoped(
-    call: DEntryScopedStreamCall,
+    call: DEntryScopedStreamCall | DEntryPageNativeCall,
     signal: AbortSignal,
-  ): RemoteStream<DEntryScopedStreamFrame, CloseCommand> {
+  ): RemoteStream<
+    | DEntryScopedStreamFrame
+    | DEntryPageNativeItem
+    | DEntryPageNativeError
+    | DEntryPageNativeEnd,
+    CloseCommand | DEntryPageInput
+  > {
     const { args, invocation } = this.raw('allricePrincipal/streamScoped');
     const raw = object.parse(args.call);
     const scope = this.scope(z.string().parse(raw.scopeId), invocation.peer);
     const gate = signalGate(signal);
-    const input = invocation.uplink<CloseCommand>()[Symbol.asyncIterator]();
-    const pump = commands(input, gate.stop);
-    void pump.catch(() => gate.stop());
+    const commands = invocation.uplink<CloseCommand | DEntryPageInput>();
+    const input = commands[Symbol.asyncIterator]();
     let iterator: AsyncIterator<unknown> | undefined,
       pending: Promise<IteratorResult<unknown>> | undefined;
     let closing: Promise<void> | undefined;
     let eventReady = false;
     const events = raw.kind === 'events';
-    const active = AbortSignal.any([scope.abort.signal, gate.abort.signal]);
+    const page = raw.kind === 'page';
+    const endpoint = page ? z.string().parse(raw.endpoint) : undefined;
+    const inbox = endpoint === undefined ? undefined : pageUplink(endpoint);
+    let pageMethod: ReturnType<PrincipalService['pageMethod']> | undefined;
+    let inputFailure: unknown;
+    const follow = new AbortController();
+    let unwatchFollow: (() => void) | undefined;
+    let followDeliveryId: string | undefined;
+    const delivery =
+      endpoint === 'session/follow'
+        ? signalGate(scope.abort.signal)
+        : undefined;
+    const fenceUnconfirmedFollow = () => {
+      if (followDeliveryId && delivery && !delivery.abort.signal.aborted) {
+        // A broken uplink cannot prove consumption. Fence this follow through
+        // its independent control stream before releasing its watch.
+        scope.withdrawFollow(follow, followDeliveryId);
+        delivery.stop();
+      }
+    };
+    const receiveInput = (command: DEntryPageInput) => {
+      if (
+        !inbox ||
+        (command.type === 'input' &&
+          pageMethod &&
+          !pageMethod.descriptor.uplink)
+      )
+        throw new RemoteError(
+          'gateway/protocol',
+          'Native stream does not accept input',
+          { endpoint: endpoint ?? '' },
+        );
+      inbox.add(command);
+    };
+    const pump = pumpPageInput(input, (command) => {
+      if (inputFailure !== undefined) return;
+      try {
+        receiveInput(command);
+      } catch (error) {
+        if (!followDeliveryId) throw error;
+        // Abort native input, but keep reading for the consumer's close.
+        inputFailure = error;
+        gate.stop();
+      }
+    })
+      .then((confirmed) => {
+        if (confirmed) delivery?.stop();
+        else fenceUnconfirmedFollow();
+      })
+      .catch((error: unknown) => {
+        inputFailure = error;
+        fenceUnconfirmedFollow();
+      })
+      .finally(gate.stop);
+    const active = AbortSignal.any([
+      scope.abort.signal,
+      gate.abort.signal,
+      follow.signal,
+    ]);
+    if (inbox) {
+      if (active.aborted) inbox.close();
+      else active.addEventListener('abort', inbox.close, { once: true });
+    }
     const setup = scope.own(async () => {
       active.throwIfAborted();
+      if (page) {
+        if (raw.endpoint === 'session/follow') await scope.refresh(active);
+        iterator = await scope.current(async () => {
+          pageMethod = this.pageMethod(scope, raw, 'stream');
+          const { endpoint, args, descriptor } = pageMethod;
+          if (!descriptor.uplink && inbox && inbox.hasItems())
+            throw new RemoteError(
+              'gateway/protocol',
+              'Native stream does not accept input',
+              { endpoint },
+            );
+          if (endpoint === 'session/follow') {
+            const followId = UuidSchema.optional().parse(raw.followId);
+            unwatchFollow = scope.watchFollow(args, follow, followId);
+            if (unwatchFollow) followDeliveryId = followId;
+          }
+          const values = await this.ctx.typertGateway.wireStream.open(
+            endpoint,
+            { args },
+            (descriptor.uplink && inbox) || empty,
+            endpoint === 'remoteAccess/follow'
+              ? scope.currentPeer()
+              : scope.parent,
+            active,
+          );
+          return values[Symbol.asyncIterator]();
+        }, active);
+        return;
+      }
       let nativeArgs: Record<string, unknown> | undefined;
       if (events)
         z.object({ args: z.object({}).strict() })
@@ -913,6 +1494,7 @@ class PrincipalService extends TypertRemoteService {
             throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
           scope.children.delete(child);
         });
+        if (inbox) inbox.close();
         gate.stop();
         return closing;
       },
@@ -954,8 +1536,41 @@ class PrincipalService extends TypertRemoteService {
             break;
           throw error;
         }
-        if (next.done) break;
-        if (gate.abort.signal.aborted || scope.abort.signal.aborted) break;
+        if (next.done && !followDeliveryId) break;
+        if (unwatchFollow) {
+          let checking;
+          while (!active.aborted && (checking = scope.pendingFollowRead())) {
+            try {
+              await waitForRead(checking, active);
+            } catch (error) {
+              if (!active.aborted) throw error;
+            }
+          }
+        }
+        if (active.aborted || next.done) break;
+        if (pageMethod) {
+          if (pageMethod.endpoint === 'session/follow' && !unwatchFollow)
+            throw new RemoteError(
+              'remote-access/denied',
+              'Native session follow unavailable',
+              {
+                action: 'session/follow',
+                reason: 'session-changed',
+              },
+            );
+          const { value, attachments } = encodePageNativeResult(
+            pageMethod.descriptor,
+            next.value,
+          );
+          if (value === undefined || attachments.length)
+            throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+          yield {
+            type: 'page-item',
+            scopeId: scope.issue.scopeId,
+            value: pageDownlink(pageMethod.endpoint, value),
+          };
+          continue;
+        }
         let value: Extract<DEntryScopedStreamFrame, { type: 'item' }>['value'];
         if (events) {
           const ready = z
@@ -997,15 +1612,52 @@ class PrincipalService extends TypertRemoteService {
             .parse(next.value);
         yield { type: 'item', scopeId: scope.issue.scopeId, value };
       }
+      if (inputFailure !== undefined) throw inputFailure;
+      follow.signal.throwIfAborted();
+      if (followDeliveryId && !active.aborted) {
+        // The Worker acknowledges once its last buffered item is delivered
+        // or discarded. Keep the independent withdrawal path alive until then.
+        yield { type: 'page-end', scopeId: scope.issue.scopeId };
+        await delivery!.done;
+      }
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
+      if (
+        page &&
+        !scope.abort.signal.aborted &&
+        !signal.aborted &&
+        (!active.aborted || error === inputFailure || follow.signal.aborted)
+      ) {
+        if (!followDeliveryId) await child.close();
+        const failure = this.ctx.typertGateway.wireStream.failure(
+          follow.signal.aborted ? follow.signal.reason : error,
+        );
+        yield {
+          type: 'page-error',
+          scopeId: scope.issue.scopeId,
+          error: {
+            ...failure,
+            details: isRemoteJsonValue(failure.details)
+              ? (failure.details as JsonValue)
+              : {},
+          },
+        };
+        if (followDeliveryId) {
+          await delivery!.done;
+          await child.close();
+        }
+        yield { type: 'closed', scopeId: scope.issue.scopeId };
+        return;
+      }
       failed = true;
       throw error;
     } finally {
       try {
         await (failed ? child.close().catch(() => {}) : child.close());
       } finally {
+        unwatchFollow?.();
+        delivery?.detach();
         gate.detach();
       }
     }

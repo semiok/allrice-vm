@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis';
+import { ChatSessionSchema } from '@allrice/contracts';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
@@ -11,6 +12,9 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import {
   pageNavigate,
+  pageNativeThreadRegistered,
+  pageNativeThreadSelected,
+  type PageNativeThreadRegistration,
   pageSwitchReady,
   pageThreadScope,
   pageThreadSelected,
@@ -56,7 +60,11 @@ export function installEmployeeProductOwner(ctx: Context) {
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
   let activeThreadId = threadId;
-  let activeNativeId = nativeSessionId;
+
+  const registered = new Map([[nativeSessionId, threadId]]);
+  let activeNativeSession: string | undefined;
+  let resourceScopeId = scopeId;
+  let switchingScope = false;
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -84,6 +92,77 @@ export function installEmployeeProductOwner(ctx: Context) {
       location.origin,
     );
   }
+  function selectThread(thread: string) {
+    activeThreadId = thread;
+    const previous = sidebar.getSnapshot();
+    if (previous?.tree && previous.tree.activeId !== thread)
+      sidebar.update({
+        ...previous,
+        tree: { ...previous.tree, activeId: thread },
+      });
+    const panel = panels.getSnapshot();
+    if (!panel || panel.files.sessionId === thread) return;
+    const panelKey = resourceScopeId + '/' + thread;
+    panels.update({
+      ...panel,
+      scopeKey: panelKey,
+      publicationManagement: {
+        organizationId,
+        employeeInstanceId: selection.employeeInstanceId,
+        threadId: thread,
+      },
+      materials: {
+        ...panel.materials,
+        ownerKey: panelKey,
+        sessionId: thread,
+      },
+      files: {
+        ...panel.files,
+        ownerKey: panelKey,
+        sessionId: thread,
+        refreshKey: panelKey,
+      },
+      filePreview: undefined,
+    });
+  }
+
+  function followSelection() {
+    if (signal!.aborted || switchingScope || !activeNativeSession) return;
+    const current = sidebar.getSnapshot();
+    const thread = registered.get(activeNativeSession);
+    if (
+      !thread ||
+      !current?.tree ||
+      current.tree.activeId === thread ||
+      !current.tree.sessions.some((row) => row.id === thread)
+    )
+      return;
+    selectThread(thread);
+    parent.postMessage(
+      {
+        type: pageNativeThreadSelected,
+        scopeId,
+        resourceScopeId,
+        selection: { ...selection, threadId: thread },
+      },
+      location.origin,
+    );
+  }
+
+  // rc.2 publishes the Session displayed by the Conversation through its
+  // native sidebar controller. A registered fork may never become selected.
+  ctx.inject(['sidebarRight'], (native) => {
+    native.effect(() => {
+      const update = () => {
+        activeNativeSession = native.sidebarRight.mounted.getSnapshot();
+        followSelection();
+      };
+      const unsubscribe = native.sidebarRight.mounted.subscribe(update);
+      update();
+      return unsubscribe;
+    }, 'AllRice selected native conversation');
+  });
+
   const clear = () => {
     sidebar.update(null);
     panels.update(null);
@@ -91,6 +170,7 @@ export function installEmployeeProductOwner(ctx: Context) {
   signal.addEventListener('abort', clear, { once: true });
   ctx.effect(() => () => {
     signal.removeEventListener('abort', clear);
+    document.removeEventListener(pageNativeThreadRegistered, registerThread);
     clear();
   });
   ctx.inject(['uiWorkspace', 'sessions'], (native) => {
@@ -146,37 +226,10 @@ export function installEmployeeProductOwner(ctx: Context) {
           if (native.sidebarRight.mounted.getSnapshot() !== root) return;
           const next = pending.scope;
           pending = undefined;
-          activeNativeId = next.nativeSessionId;
-          activeThreadId = next.threadId;
-          const old = sidebar.getSnapshot();
-          if (old?.tree)
-            sidebar.update({
-              ...old,
-              tree: { ...old.tree, activeId: activeThreadId },
-            });
-          const panel = panels.getSnapshot();
-          if (panel)
-            panels.update({
-              ...panel,
-              scopeKey: next.scopeId,
-              publicationManagement: {
-                organizationId,
-                employeeInstanceId: selection.employeeInstanceId,
-                threadId: activeThreadId,
-              },
-              materials: {
-                ...panel.materials,
-                ownerKey: next.scopeId,
-                sessionId: activeThreadId,
-              },
-              files: {
-                ...panel.files,
-                ownerKey: next.scopeId,
-                sessionId: activeThreadId,
-                refreshKey: next.scopeId,
-              },
-              filePreview: undefined,
-            });
+          switchingScope = false;
+          resourceScopeId = next.scopeId;
+          activeNativeSession = next.nativeSessionId;
+          selectThread(next.threadId);
           parent.postMessage(
             {
               type: pageThreadSelected,
@@ -188,8 +241,11 @@ export function installEmployeeProductOwner(ctx: Context) {
         };
         const onScope = (event: Event) => {
           if (signal.aborted) return;
+          const next = (event as CustomEvent<PageThreadScope>).detail;
+          registered.set(next.nativeSessionId, next.threadId);
+          switchingScope = true;
           pending = {
-            scope: (event as CustomEvent<PageThreadScope>).detail,
+            scope: next,
             oldGeneration: connection.generation.getSnapshot(),
             opened: false,
           };
@@ -241,6 +297,53 @@ export function installEmployeeProductOwner(ctx: Context) {
     return workspace;
   });
 
+  function registerThread(event: Event) {
+    if (signal!.aborted) return;
+    const receipt = (event as CustomEvent<PageNativeThreadRegistration>).detail;
+    if (
+      !receipt ||
+      receipt.scopeId !== scopeId ||
+      typeof receipt.nativeSessionId !== 'string' ||
+      !receipt.nativeSessionId
+    )
+      return;
+    if (registered.has(receipt.nativeSessionId)) return;
+    const parsed = ChatSessionSchema.safeParse(receipt.thread);
+    if (!parsed.success) return;
+    const session = parsed.data;
+    if (
+      session.ownerId !== viewerId ||
+      session.organizationId !== organizationId ||
+      session.workspaceId !== selection.workspaceId ||
+      sessionEmployeeKey(session) !== selection.employeeInstanceId ||
+      session.visibility !== 'private' ||
+      session.archivedAt !== null
+    )
+      return;
+    registered.set(receipt.nativeSessionId, session.id);
+    void workspaceTask
+      .then(() => {
+        if (signal!.aborted) return;
+        const current = sidebar.getSnapshot();
+        if (!current?.tree) return;
+        const sessions = [
+          session,
+          ...current.tree.sessions.filter(({ id }) => id !== session.id),
+        ];
+        sidebar.update({
+          ...current,
+          tree: {
+            ...current.tree,
+            sessions,
+            workspace: { ...current.tree.workspace, sessions },
+          },
+        });
+        followSelection();
+      })
+      .catch(() => {});
+  }
+  document.addEventListener(pageNativeThreadRegistered, registerThread);
+
   void workspaceTask
     .then((workspace) => {
       const sessions = workspace.sessions.filter(
@@ -253,9 +356,17 @@ export function installEmployeeProductOwner(ctx: Context) {
           sessions,
           activeId: activeThreadId,
           onSelectSession(id) {
-            if (id === activeThreadId) return;
-            const selected = sessions.find((session) => session.id === id);
-            if (selected) navigate(sessionEmployeeKey(selected), selected.id);
+            if (switchingScope) return;
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || id === tree.activeId) return;
+            const selected = tree.sessions.find((session) => session.id === id);
+            if (!selected) return;
+            const nativeId = ctx.sessions?.list
+              .getSnapshot()
+              .ids.find((candidate) => registered.get(candidate) === id);
+            if (nativeId !== undefined && ctx.uiWorkspace)
+              ctx.uiWorkspace.openSession(nativeId);
+            else navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
             if (
@@ -280,6 +391,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         if (!signal!.aborted && current) sidebar.update({ ...current, error });
       }
       sidebar.update(initial);
+      followSelection();
       bindEmployeeSidebar(ctx, {
         getSnapshot: sidebar.getSnapshot,
         subscribe: sidebar.subscribe,
@@ -354,7 +466,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         ownerKey,
         viewerId,
         workspaceId: selection.workspaceId,
-        sessionId: threadId,
+        sessionId: activeThreadId,
         headers: requestHeaders,
       };
       const initial: EmployeePanelsSnapshot = {
@@ -362,7 +474,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         publicationManagement: {
           organizationId,
           employeeInstanceId: selection.employeeInstanceId,
-          threadId,
+          threadId: activeThreadId,
         },
         filesUnread: null,
         filesUnreadSource: unread,
@@ -406,13 +518,13 @@ export function installEmployeeProductOwner(ctx: Context) {
         ctx,
         {
           getSnapshot: (id) =>
-            signal.aborted || id !== activeNativeId
+            signal.aborted || id !== activeNativeSession
               ? null
               : panels.getSnapshot(),
           subscribe: (_id, listener) => panels.subscribe(listener),
         },
         (id) =>
-          id === activeNativeId && !signal.aborted
+          id === activeNativeSession && !signal.aborted
             ? {
                 selection: { ...selection, threadId: activeThreadId },
                 viewerId,

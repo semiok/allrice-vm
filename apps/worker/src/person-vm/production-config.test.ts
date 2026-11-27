@@ -18,6 +18,7 @@ import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { ServiceBuildIdentity } from '@allrice/database';
 import { productionInputsFixture } from './production-inputs.fixture.js';
 import { createProductionEgressInstallation } from './production-egress.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 const source = vi.hoisted<{
   build: ReturnType<typeof vi.fn>;
@@ -35,10 +36,8 @@ vi.mock('node:fs/promises', async (original) => {
   };
 });
 vi.mock('@allrice/database', async () => ({
+  ...(await import('../../../../packages/database/src/service-build-identity.ts')),
   readServiceBuildIdentity: source.build,
-  ServiceBuildManifestSchema: (
-    await import('../../../../packages/database/src/service-build-identity.ts')
-  ).ServiceBuildManifestSchema,
 }));
 import {
   ProductionHostConfigurationUnavailable,
@@ -108,6 +107,7 @@ function value() {
       cliPath: '/opt/allrice/dsh/synthetic/cli.mjs',
       startupTimeoutMs: 10000,
       publicOrigin: 'https://example.test',
+      terminalEnabled: true,
     },
     lifecycle: {
       leaseTtlMs: 30000,
@@ -225,6 +225,96 @@ afterEach(async () => {
 });
 
 describe('private production Host configuration', () => {
+  it.each([1, 20])('uses the sealed employee pool width %s', async (width) => {
+    const original = value();
+    await seal({ ...original, employeePortSlots: width });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform.employeePortSlots).toBe(width);
+    expect(result.configuration).toEqual(original);
+    expect(result.employeeRuntimeSettings).toEqual({
+      employeeMaxRunning: Math.min(4, width),
+      employeeIdleMs: 1_200_000,
+    });
+  });
+
+  it.each([
+    { employeeMaxRunning: 1, employeeIdleMs: 60_000 },
+    { employeeMaxRunning: 20, employeeIdleMs: 86_400_000 },
+  ])(
+    'reads sealed employee runtime settings and passes the exact values to the pending runtime',
+    async (settings) => {
+      const original = value();
+      await seal({
+        ...original,
+        employeePortSlots: 20,
+        lifecycle: { ...original.lifecycle, ...settings },
+      });
+      const loaded = await readProductionHostConfiguration(signal());
+      expect(loaded.employeeRuntimeSettings).toEqual(settings);
+      expect(Object.isFrozen(loaded.employeeRuntimeSettings)).toBe(true);
+      const native = { readAttachedProbe: vi.fn() };
+      expect(
+        createProductionEmployeeRuntime(
+          loaded.employeeRuntimeSettings,
+          native,
+          loaded.platform.employeePortSlots,
+        ),
+      ).toMatchObject({
+        maxRunning: settings.employeeMaxRunning,
+        employeeIdleMs: settings.employeeIdleMs,
+      });
+      expect(native.readAttachedProbe).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { employeeMaxRunning: 0 },
+    { employeeMaxRunning: 1.5 },
+    { employeeMaxRunning: '4' },
+    { employeeMaxRunning: null },
+    { employeeMaxRunning: 6 },
+    { employeeMaxRunning: 21 },
+    { employeeIdleMs: 59_999 },
+    { employeeIdleMs: 60_000.5 },
+    { employeeIdleMs: 86_400_001 },
+    { employeeIdleMs: '1200000' },
+  ])(
+    'rejects invalid employee runtime settings in the verified lifecycle seal (%j)',
+    async (settings) => {
+      const original = value();
+      await seal({
+        ...original,
+        employeePortSlots: 5,
+        lifecycle: { ...original.lifecycle, ...settings },
+      });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
+
+  it.each([0, 21, 1.5, 'private-invalid-input', null])(
+    'defaults an invalid sealed width without logging the input',
+    async (width) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const original = value();
+      await seal({ ...original, employeePortSlots: width });
+      const result = await readProductionHostConfiguration(signal());
+      expect(result.platform.employeePortSlots).toBe(20);
+      expect(result.configuration).toEqual(original);
+      expect(warn.mock.calls).toEqual([
+        [
+          '[person-vm.host-configuration]',
+          {
+            field: 'employeePortSlots',
+            reason: 'invalid_slot_count',
+            fallback: 20,
+          },
+        ],
+      ]);
+    },
+  );
+
   it('keeps disk preprovision disabled when absent or explicitly off', async () => {
     const read = () => readProductionHostConfiguration(signal());
     expect((await read()).configuration.disk.preprovision).toBeUndefined();
@@ -424,6 +514,18 @@ describe('private production Host configuration', () => {
     expect(result).not.toHaveProperty('verified');
     expect(result).not.toHaveProperty('ready');
   });
+  it('enables the terminal by default and honors an explicit sealed opt-out', async () => {
+    const config = value();
+    await seal({
+      ...config,
+      web: { ...config.web, terminalEnabled: undefined },
+    });
+    const defaults = await readProductionHostConfiguration(signal());
+    expect(defaults.configuration.web.terminalEnabled).toBe(true);
+    await seal({ ...config, web: { ...config.web, terminalEnabled: false } });
+    const disabled = await readProductionHostConfiguration(signal());
+    expect(disabled.configuration.web.terminalEnabled).toBe(false);
+  });
   it.each([
     { label: 'missing', patch: null },
     {
@@ -553,19 +655,94 @@ describe('private production Host configuration', () => {
     },
   );
 
-  it('rejects a measured guest physical policy that differs from the platform cap without overwriting it', async () => {
+  it('uses platform defaults for omitted settings without warning', async () => {
+    const input = value();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await seal({
+      ...input,
+      memory: {
+        ...input.memory,
+        policy: { ...input.memory.policy, physicalBytes: undefined },
+      },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toBe(readPlatformPersonVmConfiguration());
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      2 * 1024 ** 3,
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('reads both overrides from a sealed host configuration', async () => {
     const input = value();
     input.memory.policy.physicalBytes = 3 * 1024 ** 3;
-    await seal(input);
-    await expect(
-      readProductionHostConfiguration(signal()),
-    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
-    expect(
-      JSON.parse(
-        await fs.readFile(join(root, '.local/person-vm-host.json'), 'utf8'),
-      ).memory.policy.physicalBytes,
-    ).toBe(input.memory.policy.physicalBytes);
-    expect(readPlatformPersonVmConfiguration().memoryMiB).toBe(2 * 1024);
+    await seal({
+      ...input,
+      lifecycle: { ...input.lifecycle, idleMs: 30 * 60_000 },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toEqual({
+      ...readPlatformPersonVmConfiguration(),
+      memoryMiB: 3072,
+      idleMs: 30 * 60_000,
+    });
+    expect(Object.isFrozen(result.platform)).toBe(true);
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      3 * 1024 ** 3,
+    );
+  });
+
+  it.each([
+    {
+      physicalBytes: 'private-invalid-value',
+      idleMs: 15 * 60_000,
+      memoryMiB: 2048,
+      minutes: 15,
+      field: 'memoryMiB',
+      fallback: 2048,
+    },
+    {
+      physicalBytes: 2 * 1024 ** 3 + 1,
+      idleMs: 15 * 60_000,
+      memoryMiB: 2048,
+      minutes: 15,
+      field: 'memoryMiB',
+      fallback: 2048,
+    },
+    {
+      physicalBytes: 3 * 1024 ** 3,
+      idleMs: 1,
+      memoryMiB: 3072,
+      minutes: 20,
+      field: 'idleMs',
+      fallback: 20 * 60_000,
+    },
+  ])('logs and defaults only the invalid $field setting', async (sample) => {
+    const input = value();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await seal({
+      ...input,
+      memory: {
+        ...input.memory,
+        policy: { ...input.memory.policy, physicalBytes: sample.physicalBytes },
+      },
+      lifecycle: { ...input.lifecycle, idleMs: sample.idleMs },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toMatchObject({
+      memoryMiB: sample.memoryMiB,
+      idleMs: sample.minutes * 60_000,
+    });
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      sample.memoryMiB * 1024 ** 2,
+    );
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      'PERSON_VM_PLATFORM_SETTING_INVALID',
+      {
+        field: sample.field,
+        fallback: sample.fallback,
+      },
+    );
   });
   it.each([
     'commandHighBytes',

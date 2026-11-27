@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { on } from 'node:events';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -14,13 +15,18 @@ import {
 } from '@deepseek-ai/dsh-typert-protocol';
 import {
   DEntryPageMuxQuerySchema,
+  DEntryPageRpcRequestSchema,
+  DEntryPageUnarySchema,
   DEntryPageSwitchSchema,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import {
+  D_ENTRY_PAGE_UPLINK_BYTES,
+  type DEntryPageInput,
+} from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
-import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
-import { authorizeDEntryNativeInvocation } from './native-invocation.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -219,6 +225,8 @@ async function runOwner(
     staged = begin(
       { ...input.selection, threadId: command.threadId },
       async (generation, page) => {
+        const root = page.root;
+        if (!root) throw denied();
         // New authority is watching before the old registration is fenced.
         // No stream or unary from the old document can use this new scope ID.
         await previousPage.assertCurrent(
@@ -243,7 +251,7 @@ async function runOwner(
             requestId: command.requestId,
             threadId: command.threadId,
             scopeId: page.scope.opened.scopeId,
-            nativeSessionId: page.root.rootNativeSessionId,
+            nativeSessionId: root.rootNativeSessionId,
           },
         });
       },
@@ -366,7 +374,14 @@ async function runOwner(
 }
 
 function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
-  const streams = new Map<string, { cancel(): void; work: Promise<void> }>();
+  const streams = new Map<
+    string,
+    {
+      cancel(): void;
+      sendInput(input: DEntryPageInput): void;
+      work: Promise<void>;
+    }
+  >();
   const scopeId = page.scope.opened.scopeId;
   const stop = new AbortController();
   const active = AbortSignal.any([signal, stop.signal]);
@@ -374,117 +389,148 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
-    const work = page.use(child, async () => {
-      try {
-        let call;
-        let check = () => page.assertCurrent(child);
-        if (frame.endpoint === '$events') {
-          emptyPayload.parse(frame.payload);
-          call = {
-            kind: 'events' as const,
-            scopeId,
-            payload: REMOTE_EVENT_STREAM_PAYLOAD,
-          };
-        } else if (frame.endpoint === 'remoteAccess/follow') {
-          const { args } = emptyPayload.parse(frame.payload);
-          call = { scopeId, endpoint: 'remoteAccess/follow' as const, args };
-        } else if (frame.endpoint === 'session/control') {
-          const { args } = emptyPayload.parse(frame.payload);
-          call = { scopeId, endpoint: 'session/control' as const, args };
-        } else if (frame.endpoint === 'session/follow') {
-          const authorize = () =>
-            authorizeDEntryNativeInvocation(
-              page.authorize,
-              frame.endpoint,
-              frame.payload,
-              'mux',
-              child,
-            );
-          const initial = await authorize();
-          check = async () => {
-            await page.assertCurrent(child);
-            const next = await authorize();
-            if (
-              next.resource.bindingRef !== initial.resource.bindingRef ||
-              next.resource.parentNativeSessionId !==
-                initial.resource.parentNativeSessionId
-            )
-              throw denied();
-          };
-          // The literal branch and existing strict native invocation codec
-          // establish this input's method/args pair before any guest dispatch.
-          call = {
-            scopeId,
-            endpoint: 'session/follow' as const,
-            args: initial.payload.args,
-          } as Parameters<DEntryPageHandle['scope']['stream']>[0];
-        } else {
-          throw denied();
-        }
-        await check();
-        for await (const item of page.scope.stream(call, child)) {
+    let settled = false;
+    let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
+    let buffered = 0;
+    let input = Promise.resolve();
+    let inputError = Promise.resolve();
+
+    function failInput(error: unknown) {
+      if (settled || child.aborted) return;
+      settled = true;
+      controller.abort();
+      inputError = page.assertCurrent(active).then(async () => {
+        active.throwIfAborted();
+        await send({
+          type: 'error',
+          streamId: id,
+          error: pageRemoteFailure(error),
+        });
+      });
+      void inputError.catch((error: unknown) => stop.abort(error));
+    }
+    const source = page.use(child, async (child) => {
+      if (frame.endpoint === 'session/follow')
+        follow = await page.watchFollow(child);
+      if (follow) {
+        if (!page.scope.opened.followWithdrawals)
+          throw new RemoteError(
+            'remote-access/denied',
+            'Native follow continuity unavailable',
+            { action: 'session/follow', reason: 'continuity-unavailable' },
+          );
+        let pending;
+        while ((pending = follow.pending())) await pending;
+        follow.signal.throwIfAborted();
+      } else await page.assertCurrent(child);
+      child.throwIfAborted();
+      if (frame.endpoint === '$events') {
+        emptyPayload.parse(frame.payload);
+        return page.scope.stream(
+          { kind: 'events', scopeId, payload: REMOTE_EVENT_STREAM_PAYLOAD },
+          child,
+        );
+      }
+      const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
+      const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
+        frame.payload,
+      );
+      if (!isRemoteJsonValue(args)) throw denied();
+      return page.scope.streamPage(
+        {
+          kind: 'page',
+          scopeId,
+          endpoint,
+          args: args as Record<string, JsonValue>,
+          ...(follow && { followId: randomUUID() }),
+        },
+        follow?.signal ?? child,
+      );
+    });
+    const work = page
+      .use(child, async (child) => {
+        const stream = await source;
+        for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
-          if (frame.endpoint === 'remoteAccess/follow') {
-            const { value } = item;
-            const grants =
-              value.type === 'baseline' && 'owner' in value && !value.owner
-                ? value.grants
-                : value.type === 'upsert' && 'grant' in value
-                  ? [value.grant]
-                  : undefined;
-            if (!grants && value.type !== 'remove') throw denied();
-            const sessionIds = grants?.map(({ resource }) => {
-              if (resource.kind !== 'session') throw denied();
-              return String(resource.id);
-            });
-            // A remove must still reach the client after the child has left
-            // the catalogue. Only frames granting access require child proof.
-            await page.assertCurrent(child, sessionIds);
-          } else if (frame.endpoint === 'session/control') {
-            const control = Native.methods['session/control'].result
-              .create()
-              .parse(item.value);
-            if (control.type === 'baseline') {
-              await page.assertCurrent(
-                child,
-                Object.keys(control.value.projections),
-              );
-            } else {
-              try {
-                await page.assertCurrent(child, [String(control.sessionId)]);
-              } catch (error) {
-                // A child can leave the catalog between guest filtering and
-                // delivery. A failed page/root check also revokes the page.
-                if (
-                  error instanceof DataAccessError &&
-                  error.code === 'not_found' &&
-                  !page.signal.aborted &&
-                  !child.aborted
-                )
-                  continue;
-                throw error;
-              }
-            }
-          } else await check();
+          if (follow) {
+            let pending;
+            while ((pending = follow.pending())) await pending;
+            follow.signal.throwIfAborted();
+          } else await page.assertCurrent(child);
+          if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
+        follow?.signal.throwIfAborted();
+        if ('revoked' in stream) stream.revoked?.throwIfAborted();
+        await page.assertCurrent(child);
+        if (follow) {
+          let pending;
+          while ((pending = follow.pending())) await pending;
+        }
+        follow?.signal.throwIfAborted();
+        if ('revoked' in stream) stream.revoked?.throwIfAborted();
         child.throwIfAborted();
+        settled = true;
         await send({ type: 'end', streamId: id });
-      } catch (error) {
-        if (!child.aborted) {
+      })
+      .catch(async (error) => {
+        if (child.aborted) return;
+        if (settled) throw error;
+        try {
+          await page.assertCurrent(child);
+          child.throwIfAborted();
+          settled = true;
           await send({
             type: 'error',
             streamId: id,
             error: pageRemoteFailure(error),
           });
+        } catch (failure) {
+          if (!child.aborted) throw failure;
         }
-      } finally {
+      })
+      .finally(async () => {
+        settled = true;
+        controller.abort();
+        await Promise.allSettled([input, inputError, follow?.close()]);
         streams.delete(id);
-      }
+      });
+    streams.set(id, {
+      work,
+      cancel: () => controller.abort(),
+      sendInput(command) {
+        if (settled || child.aborted) return;
+        const bytes = Buffer.byteLength(JSON.stringify(command));
+        if (buffered + bytes > D_ENTRY_PAGE_UPLINK_BYTES) {
+          failInput(
+            new RemoteError('gateway/uplink-overflow', 'Native input is full', {
+              endpoint: frame.endpoint,
+            }),
+          );
+          return;
+        }
+        buffered += bytes;
+        input = input
+          .then(async () => {
+            if (settled || child.aborted) return;
+            const stream = await source.catch(() => undefined);
+            if (!stream || settled || child.aborted) return;
+            if (!('send' in stream)) {
+              if (command.type === 'input') throw denied();
+              controller.abort();
+              return;
+            }
+            await page.assertCurrent(child);
+            if (!settled && !child.aborted) stream.send(command);
+          })
+          .catch(failInput)
+          .finally(() => {
+            buffered -= bytes;
+          });
+      },
     });
-    streams.set(id, { cancel: () => controller.abort(), work });
     void work.catch((error) => stop.abort(error));
   }
   return {
@@ -492,9 +538,21 @@ function pageStreams(page: DEntryPageHandle, send: Send, signal: AbortSignal) {
     accept(frame: Frame) {
       active.throwIfAborted();
       const prior = streams.get(frame.streamId);
-      if (frame.type === 'open' && !prior) open(frame);
-      else if (frame.type === 'cancel' || frame.type === 'end') prior?.cancel();
-      else throw denied();
+      if (frame.type === 'open') {
+        if (prior) throw denied();
+        open(frame);
+      } else if (frame.type === 'cancel') {
+        prior?.cancel();
+      } else if (frame.type === 'end') {
+        prior?.sendInput({ type: 'input-end' });
+      } else {
+        if (frame.value !== undefined && !isRemoteJsonValue(frame.value))
+          throw denied();
+        prior?.sendInput({
+          type: 'input',
+          value: frame.value as JsonValue | undefined,
+        });
+      }
     },
     async close() {
       stop.abort();

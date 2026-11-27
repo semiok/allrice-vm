@@ -8,6 +8,7 @@ import {
   readdir,
   realpath,
   rm,
+  rmdir,
   open,
   type FileHandle,
   writeFile,
@@ -26,7 +27,11 @@ import {
   verifyDshRuntimeDisk,
 } from './dsh-sandbox-bootstrap.ts';
 import { MicrosandboxPersonVm } from './microsandbox.ts';
-import { PersonVmError, PERSON_VM_MEMORY_MIB } from './contract.ts';
+import {
+  PersonVmError,
+  PERSON_VM_MEMORY_MIB,
+  type PersonVmBinding,
+} from './contract.ts';
 import { runCommand } from './process.ts';
 import { context, currentReceipt, harness, signal } from './test-support.ts';
 import { PersonVmService } from './person-vm.ts';
@@ -75,7 +80,10 @@ async function bootstrapFixture(
   jobCleanupTimeoutMs?: number,
   artifacts?: Pick<
     ConstructorParameters<typeof MicrosandboxPersonVm>[0],
-    'readonlyDshRuntimeDisk' | 'readonlyCommandMemoryDirectory'
+    | 'readonlyDshRuntimeDisk'
+    | 'readonlyCommandMemoryDirectory'
+    | 'employeePortSlots'
+    | 'restartMemory'
   >,
 ) {
   const root = await directory(),
@@ -90,15 +98,30 @@ const mode=${JSON.stringify(mode)};
 fs.appendFileSync(p.join(home,'calls.jsonl'),JSON.stringify(a)+'\\n');
 function save(){fs.writeFileSync(f,JSON.stringify(v));}
 if(a[0]==='--version')console.log('microsandbox 0.7.16');
-else if(a[0]==='list')console.log(JSON.stringify(v.name?[{name:v.name,status:v.status}]:[]));
+else if(a[0]==='list')console.log(JSON.stringify([...(v.name?[{name:v.name,status:v.status}]:[]), ...(v.legacy?[v.legacy]:[])]));
 else if(a[0]==='pull'){
  if(mode==='pull-fails-once'&&!v.pullFailed){v.pullFailed=true;save();process.exit(45);}
 }
-else if(a[0]==='create'){
+else if(a[0]==='snap'){
+ if(a[1]==='ls')console.log(JSON.stringify(v.snapshot?[v.snapshot]:[]));
+ if(a[1]==='create')v.snapshot={name:a[2],group:a[a.indexOf('--sandbox')+1]};
+ if(a[1]==='verify'&&a[2]!==v.snapshot?.group+':'+v.snapshot?.name)process.exit(42);
+}
+else if(a[0]==='create'||a[0]==='restore'){
+ if(a[0]==='restore'){
+  if(v.status!=='Stopped'||a[1]!==v.snapshot?.group+':'+v.snapshot?.name)process.exit(42);
+  if(mode==='restore-fails-once'&&!v.restoreFailed){v.restoreFailed=true;save();process.exit(45);}
+  v.legacy={name:v.name,status:v.status};
+ }
  v.name=a[a.indexOf('--name')+1];v.status='Running';
- v.mounts=a.flatMap((arg,i)=>arg==='--mount-dir'?[a[i+1].split(':')]:[]).map(([host,guest,ro])=>({type:'Bind',host,guest,options:{readonly:ro==='ro',noexec:false,nosuid:false,nodev:false},stat_virtualization:'strict',host_permissions:'private',follow_root_symlinks:false,quota_mib:null}));
+ v.mounts=a.flatMap((arg,i)=>arg==='--mount-dir'||arg==='--volume'?[a[i+1].split(':')]:[]).map(([host,guest,ro])=>({type:'Bind',host,guest,options:{readonly:ro==='ro',noexec:false,nosuid:false,nodev:false},stat_virtualization:'strict',host_permissions:'private',follow_root_symlinks:false,quota_mib:null}));
  v.mounts.push(...a.flatMap((arg,i)=>arg==='--mount-disk'?[a[i+1].split(':')]:[]).map(([host,guest,opts])=>({type:'DiskImage',host,guest,format:'Raw',fstype:'ext4',options:{readonly:opts==='format=raw,fstype=ext4,ro',noexec:false,nosuid:false,nodev:false}})));
  v.ports=a.flatMap((arg,i)=>arg==='-p'?[a[i+1].split(':')]:[]).map(([host_bind,h,g])=>({host_bind,host_port:Number(h),guest_port:Number(g),protocol:'tcp'}));
+ v.policy={default_egress:'deny',default_ingress:'deny',rules:a.flatMap((arg,i)=>{
+  if(arg!=='--net-rule'||!a[i+1].startsWith('allow:ingress@127.0.0.1/32:tcp:'))return [];
+  const port=Number(a[i+1].split(':').at(-1));
+  return [{action:'allow',direction:'ingress',destination:{cidr:'127.0.0.1/32'},protocols:['tcp'],ports:[{start:port,end:port}]}];
+ })};
 }
 else if(a[0]==='inspect'){
  if(a.includes('--job')){
@@ -107,7 +130,9 @@ else if(a[0]==='inspect'){
  }
  const ports=v.ports??[],active=(mode.startsWith('web-inspect')||(v.retained&&mode==='retained-web-drift'))?[]:ports;
  const mounts=v.mounts??[],activeMounts=(mode==='artifact-inspect-drift'||(v.retained&&mode==='retained-mount-drift'))?mounts.map(m=>({...m,options:{...m.options,readonly:false}})):mounts;
- console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports},mounts},active_config:{network:{ports:active},mounts:activeMounts},pending_changes:[]}));
+ const policy=v.policy;
+ const resources={memory_mib:2048,max_memory_mib:2048};
+ console.log(JSON.stringify({name:v.name,status:v.status,config:{network:{ports,policy},mounts,resources},active_config:v.status==='Running'?{network:{ports:active,policy},mounts:activeMounts,resources}:null,pending_changes:[]}));
 }
 else if(a[0]==='start'){v.retained=true;v.status='Running';}
 else if(a[0]==='stop'){if(!['lost-id-unknown-stop','workdir-lost-id-unknown-stop','auth-unknown-stop','web-inspect-unknown-stop'].includes(mode))v.status='Stopped';}
@@ -181,10 +206,15 @@ save();
   const native = new MicrosandboxPersonVm(nativeOptions);
   const h = harness(),
     rc = context(),
-    attach = h.disk.attach;
+    attach = h.disk.attach,
+    inspectMount = h.disk.inspectMount!;
   h.disk.attach = async (...args) => {
     await attach(...args);
     return mount;
+  };
+  h.disk.inspectMount = async (...args) => {
+    const observed = await inspectMount(...args);
+    return observed.state === 'attached' ? { ...observed, mount } : observed;
   };
   const plan: PersonVmMemoryGuestPlan = {
     files: [
@@ -221,10 +251,19 @@ save();
   return {
     h,
     native,
-    reloadNative: (disk?: ReadonlyDshRuntimeDisk) =>
+    reloadNative: (
+      disk?: ReadonlyDshRuntimeDisk,
+      employeePortSlots?: number,
+      policy?: Pick<
+        ConstructorParameters<typeof MicrosandboxPersonVm>[0],
+        'memoryMiB' | 'restartMemory'
+      >,
+    ) =>
       new MicrosandboxPersonVm({
         ...nativeOptions,
         ...(disk && { readonlyDshRuntimeDisk: disk }),
+        ...(employeePortSlots && { employeePortSlots }),
+        ...policy,
       }),
     rc,
     service,
@@ -361,6 +400,16 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     await f.service.start(f.rc, signal());
     const binding = await f.service.resolve(f.rc, signal());
     const fresh = f.reloadNative();
+    const config = join(f.mount, 'msb-config.json');
+    const saved = await readFile(config);
+    const statusStart = (await f.calls()).length;
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('running');
+    expect((await f.calls()).slice(statusStart)).toEqual([
+      ['list', '--format', 'json'],
+    ]);
+    expect(await readFile(config)).toEqual(saved);
     const guard = vi.fn(async () => undefined);
     const current = { binding, signal: signal(), assertCurrent: guard };
     const spec = { executable: 'node', args: ['journal-read-fixture'] };
@@ -381,6 +430,10 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     expect(reads[2]).toContain('10s');
 
     await f.native.stop(binding, signal());
+    await expect(
+      fresh.readAttachedStatus(binding, f.mount, signal()),
+    ).resolves.toBe('stopped');
+    expect(await readFile(config)).toEqual(saved);
     const stopped = (await f.calls()).length;
     await expect(
       fresh.readAttachedProbe(current, f.mount, spec),
@@ -880,7 +933,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
     };
   }
-  it('首次真实CLI create仅发布实际员工清单并核active inspect；0600 host manifest与scope receipt对应', async () => {
+  it('首次 CLI create 默认发布二十个回环槽，仅实际员工获得启动配置', async () => {
     const f = await bootstrapFixture(),
       assigned = roster(f);
     let startup: PersonVmWebStartup | undefined;
@@ -905,18 +958,19 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       arg === '-p' ? [creation[index + 1]] : [],
     );
     expect(mappings).toEqual(
-      startup!.receipt.endpoints.map(
+      startup!.receipt.slots!.map(
         (entry) => `127.0.0.1:${entry.hostPort}:${entry.guestPort}`,
       ),
     );
-    expect(mappings).toHaveLength(assigned.entries.length);
+    expect(mappings).toHaveLength(20);
+    expect(startup!.receipt.endpoints).toHaveLength(assigned.entries.length);
     expect(
       creation.flatMap((arg, index) =>
         arg === '--net-rule' ? [creation[index + 1]] : [],
       ),
     ).toEqual([
       'allow:egress@host:tcp:38990',
-      ...startup!.receipt.endpoints.map(
+      ...startup!.receipt.slots!.map(
         (entry) => `allow:ingress@127.0.0.1/32:tcp:${entry.guestPort}`,
       ),
     ]);
@@ -936,12 +990,14 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       personId: f.rc.actor.id,
       digest: assigned.digest,
       endpoints: startup!.receipt.endpoints,
+      slots: startup!.receipt.slots,
     });
     expect(Object.keys(manifest).sort()).toEqual([
       'digest',
       'endpoints',
       'organizationId',
       'personId',
+      'slots',
       'version',
       'vmId',
     ]);
@@ -979,8 +1035,13 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
     );
     const manifest = JSON.parse(await readFile(path, 'utf8'));
     const h = prior.endpoints[0]!.hostPort,
-      g = h === 18101 ? 18102 : 18101;
+      g = [18101, 18102, 18103].find(
+        (port) => !prior.slots!.some((slot) => slot.guestPort === port),
+      )!;
     manifest.endpoints[0].guestPort = g;
+    manifest.slots.find(
+      (slot: { hostPort: number }) => slot.hostPort === h,
+    ).guestPort = g;
     await writeFile(path, JSON.stringify(manifest));
     const web = await f.native.prepareWebEndpoints(binding, assigned, signal());
     await f.native.create(binding, currentReceipt(binding), signal(), web);
@@ -989,21 +1050,33 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       create.flatMap((arg, i) => (arg === '--net-rule' ? [create[i + 1]] : [])),
     ).toEqual([
       'allow:egress@host:tcp:38990',
-      `allow:ingress@127.0.0.1/32:tcp:${g}`,
+      ...web.slots!.map(
+        (slot) => `allow:ingress@127.0.0.1/32:tcp:${slot.guestPort}`,
+      ),
     ]);
     expect(create).toContain(`127.0.0.1:${h}:${g}`);
     expect(create).not.toContain(`allow:ingress@127.0.0.1/32:tcp:${h}`);
     expect(create[create.indexOf('--net-default') + 1]).toBe('deny');
   });
-  it.each([true, false])(
-    'retained start checks stopped and final ready separately; combined ports and mounts=%s',
-    async (combined) => {
-      const f = await bootstrapFixture('ok', await readonlyFixture());
-      const assigned = roster(f, 1);
-      if (!combined)
-        Object.defineProperty(f.native, 'startWithWebEndpoints', {
-          value: undefined,
-        });
+  it.each([
+    [true, 1],
+    [false, 20],
+  ] as const)(
+    'retained start still uses the verified physical pool; combined=%s, new config=%s',
+    async (combined, configured) => {
+      const f = await bootstrapFixture(
+        'ok',
+        await readonlyFixture(),
+        undefined,
+        {
+          employeePortSlots: 4,
+        },
+      );
+      let assigned = roster(f, 1);
+      let startup: PersonVmWebStartup | undefined;
+      f.h.runtime.start = async (_binding, _signal, _scope, web) => {
+        startup = web;
+      };
       const service = new PersonVmService({
         ...f.h.options,
         native: f.native,
@@ -1014,8 +1087,32 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       ).toBe(true);
       await f.native.stop(await service.resolve(f.rc, signal()), signal());
       await service.stop(f.rc, signal());
+      const previous = startup!.receipt;
+      expect(previous.slots).toHaveLength(4);
+      const newEmployee = roster(f, 1).entries[0]!;
+      const facts = {
+        personId: assigned.personId,
+        organizationId: assigned.organizationId,
+        entries: [...assigned.entries, newEmployee].sort((a, b) =>
+          a.employeeInstanceId.localeCompare(b.employeeInstanceId),
+        ),
+      };
+      assigned = {
+        ...facts,
+        digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+      };
+      const reopened = f.reloadNative(undefined, configured);
+      if (!combined)
+        Object.defineProperty(reopened, 'startWithWebEndpoints', {
+          value: undefined,
+        });
+      const resumed = new PersonVmService({
+        ...f.h.options,
+        native: reopened,
+        nativeWeb: { prepare: async () => assigned },
+      });
       const before = (await f.calls()).length;
-      expect((await service.start(f.rc, signal())).ready).toBe(true);
+      expect((await resumed.start(f.rc, signal())).ready).toBe(true);
       const calls = (await f.calls()).slice(before);
       const verbs = calls.map(([verb]) => verb);
       const start = verbs.indexOf('start');
@@ -1031,6 +1128,11 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         'inspect',
       ]);
       expect(verbs).not.toContain('create');
+      expect(startup!.receipt.slots).toEqual(previous.slots);
+      expect(startup!.receipt.endpoints).toContainEqual(previous.endpoints[0]);
+      expect(startup!.receipt.endpoints).toContainEqual(
+        expect.objectContaining(newEmployee),
+      );
     },
   );
   it.each(['retained-web-drift', 'retained-mount-drift'])(
@@ -1063,6 +1165,316 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(f.h.mounts.size).toBe(0);
     },
   );
+  it.each(['ok', 'restore-fails-once', 'reserved'])(
+    'converts a stopped legacy VM using a verified disk snapshot (%s)',
+    async (mode) => {
+      const assertCurrent = vi.fn(async () => {});
+      const commitRunning = vi.fn(async () => {});
+      const reserve = vi.fn(async () => ({
+        signal: signal(),
+        assertCurrent,
+        commitRunning,
+      }));
+      const f = await bootstrapFixture(
+        mode,
+        await readonlyFixture(),
+        undefined,
+        mode === 'reserved'
+          ? { restartMemory: { memoryMiB: 2048, reserve } }
+          : undefined,
+      );
+      const assigned = roster(f, 1);
+      const service = new PersonVmService({
+        ...f.h.options,
+        native: f.native,
+        nativeWeb: { prepare: async () => assigned },
+      });
+      await service.prewarm(f.rc, { trigger: 'page' }, signal());
+      const binding = await service.resolve(f.rc, signal());
+      await f.native.stop(binding, signal());
+      await service.stop(f.rc, signal());
+      const path = join(
+        f.mount,
+        'microsandbox/allrice-native-web-endpoints.json',
+      );
+      const manifest = JSON.parse(await readFile(path, 'utf8'));
+      manifest.version = 1;
+      delete manifest.slots;
+      await writeFile(path, JSON.stringify(manifest));
+      const before = (await f.calls()).length;
+      if (mode === 'restore-fails-once') {
+        await expect(service.start(f.rc, signal())).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(JSON.parse(await readFile(path, 'utf8')).upgrade).toBe(
+          'pending',
+        );
+        await expect(
+          f.reloadNative().assertRetainedStartup(binding, f.mount, signal()),
+        ).resolves.toBeUndefined();
+      }
+      expect((await service.start(f.rc, signal())).ready).toBe(true);
+      const used = (await f.calls()).slice(before);
+      const restores = used.filter(([verb]) => verb === 'restore');
+      expect(restores).toHaveLength(mode === 'restore-fails-once' ? 2 : 1);
+      expect(
+        used.filter(([verb, sub]) => verb === 'snap' && sub === 'create'),
+      ).toHaveLength(1);
+      expect(
+        used.filter(([verb, sub]) => verb === 'snap' && sub === 'verify'),
+      ).toHaveLength(restores.length);
+      const restored = restores.at(-1)!;
+      expect(restored).toContain(`allrice-${binding.vmId}-web`);
+      expect(restored.filter((arg) => arg === '-p')).toHaveLength(20);
+      expect(
+        restored.filter((arg) =>
+          arg.startsWith('allow:ingress@127.0.0.1/32:tcp:'),
+        ),
+      ).toHaveLength(20);
+      expect(restored).toContain('allow:egress@host:tcp:38990');
+      expect(restored).toContain('--volume');
+      expect(used.every(([verb]) => verb !== 'rm')).toBe(true);
+      expect(JSON.parse(await readFile(path, 'utf8')).upgrade).toBe('complete');
+      const next = await service.resolve(f.rc, signal());
+      expect(next.vmId).toBe(binding.vmId);
+      expect(next.leaseEpoch).toBeGreaterThan(binding.leaseEpoch);
+      if (mode === 'reserved') {
+        expect(reserve).toHaveBeenCalledExactlyOnceWith(
+          { binding: next, memoryMiB: 2048 },
+          expect.any(AbortSignal),
+        );
+        expect(assertCurrent).toHaveBeenCalled();
+        expect(commitRunning).toHaveBeenCalledExactlyOnceWith(
+          { binding: next, memoryMiB: 2048 },
+          expect.any(AbortSignal),
+        );
+      }
+      await f.native.stop(next, signal());
+      await service.stop(f.rc, signal());
+      const cold = (await f.calls()).length;
+      expect((await service.start(f.rc, signal())).ready).toBe(true);
+      expect((await f.calls()).slice(cold)).toContainEqual([
+        'start',
+        `allrice-${binding.vmId}-web`,
+      ]);
+    },
+  );
+  it.each([false, true])(
+    'preserves an absent retained compute and its manifest after conversion=%s',
+    async (converted) => {
+      const f = await bootstrapFixture('ok', await readonlyFixture());
+      const original = roster(f, 1);
+      let assigned = original;
+      const service = new PersonVmService({
+        ...f.h.options,
+        native: f.native,
+        nativeWeb: { prepare: async () => assigned },
+      });
+      await service.prewarm(f.rc, { trigger: 'page' }, signal());
+      let binding = await service.resolve(f.rc, signal());
+      await f.native.stop(binding, signal());
+      await service.stop(f.rc, signal());
+      const path = join(
+        f.mount,
+        'microsandbox/allrice-native-web-endpoints.json',
+      );
+      if (converted) {
+        const legacy = JSON.parse(await readFile(path, 'utf8'));
+        legacy.version = 1;
+        delete legacy.slots;
+        await writeFile(path, JSON.stringify(legacy));
+        await service.start(f.rc, signal());
+        binding = await service.resolve(f.rc, signal());
+        await f.native.stop(binding, signal());
+        await service.stop(f.rc, signal());
+      }
+
+      const preserved = await readFile(path);
+      expect(JSON.parse(preserved.toString('utf8')).upgrade).toBe(
+        converted ? 'complete' : undefined,
+      );
+      const statePath = join(f.mount, 'host-home/state.json');
+      const stopped = await readFile(statePath, 'utf8');
+      const absent = JSON.parse(stopped);
+      if (converted)
+        expect(absent.legacy).toEqual({
+          name: `allrice-${binding.vmId}`,
+          status: 'Stopped',
+        });
+      delete absent.name;
+      await writeFile(statePath, JSON.stringify(absent));
+      const retainedRoot = join(f.mount, 'microsandbox/previous-root-fixture');
+      await writeFile(retainedRoot, 'existing workspace and session bytes');
+      const calls = (await f.calls()).length;
+      assigned = roster(f, 2);
+
+      await expect(
+        service.reconcileStoppedEntryForPrewarm(f.rc, binding, signal(), true),
+      ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+      expect(f.h.mounts.size).toBe(0);
+      await expect(f.h.store.read(binding.personId)).resolves.toMatchObject({
+        phase: 'stopped',
+        vmId: binding.vmId,
+        instanceId: binding.instanceId,
+        leaseEpoch: binding.leaseEpoch,
+        nativeCreated: true,
+        diskRetained: true,
+      });
+      await expect(service.start(f.rc, signal())).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(await readFile(path)).toEqual(preserved);
+      expect(await readFile(retainedRoot, 'utf8')).toBe(
+        'existing workspace and session bytes',
+      );
+      expect(f.h.disks.has(binding.vmId)).toBe(true);
+      expect(f.h.mounts.size).toBe(0);
+      expect(await f.native.status(binding, signal())).toBe('absent');
+      expect(
+        (await f.calls())
+          .slice(calls)
+          .some(([verb]) =>
+            ['create', 'restore', 'start', 'stop', 'rm', 'snap'].includes(
+              verb!,
+            ),
+          ),
+      ).toBe(false);
+
+      await writeFile(statePath, stopped);
+      expect(await service.start(f.rc, signal())).toMatchObject({
+        vmId: binding.vmId,
+        ready: true,
+      });
+      expect((await f.calls()).slice(calls)).toContainEqual([
+        'start',
+        `allrice-${binding.vmId}${converted ? '-web' : ''}`,
+      ]);
+    },
+  );
+  it.each(['alias removed', 'root removed', 'conflicting alias'] as const)(
+    'preflights and reopens an exact retained VM after %s',
+    async (state) => {
+      const f = await bootstrapFixture();
+      const assigned = roster(f, 1);
+      const options = {
+        ...f.h.options,
+        nativeWeb: { prepare: async () => assigned },
+      };
+      const initial = new PersonVmService({ ...options, native: f.native });
+      await initial.prewarm(f.rc, { trigger: 'page' }, signal());
+      const prior = await initial.resolve(f.rc, signal());
+      await f.native.stop(prior, signal());
+      await initial.stop(f.rc, signal());
+      const alias = join(f.socketRoot, prior.vmId);
+      const target = join(f.mount, 'microsandbox');
+      const configuration = join(f.mount, 'msb-config.json');
+      const manifest = join(target, 'allrice-native-web-endpoints.json');
+      const contents = await Promise.all([
+        readFile(configuration),
+        readFile(manifest),
+      ]);
+      await rm(alias);
+      let foreign: string | undefined;
+      if (state === 'root removed') await rmdir(f.socketRoot);
+      if (state === 'conflicting alias') {
+        foreign = await directory();
+        await symlink(foreign, alias, 'dir');
+      }
+      const restarted = f.reloadNative();
+      const current = new PersonVmService({ ...options, native: restarted });
+      const before = (await f.calls()).length;
+      const preflight = current.reconcileStoppedEntryForPrewarm(
+        f.rc,
+        prior,
+        signal(),
+        true,
+      );
+      if (foreign) {
+        await expect(preflight).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(await readlink(alias)).toBe(foreign);
+        expect((await f.calls()).slice(before)).toEqual([]);
+      } else {
+        await expect(preflight).resolves.toBe(true);
+        expect(await readlink(alias)).toBe(target);
+        expect((await f.calls()).slice(before)).toEqual([
+          ['--version'],
+          ['list', '--format', 'json'],
+        ]);
+      }
+      expect(
+        await Promise.all([readFile(configuration), readFile(manifest)]),
+      ).toEqual(contents);
+      expect(f.h.mounts.size).toBe(0);
+      if (!foreign) {
+        await expect(current.start(f.rc, signal())).resolves.toMatchObject({
+          vmId: prior.vmId,
+          ready: true,
+        });
+        const calls = (await f.calls()).slice(before);
+        expect(calls).toContainEqual(['start', `allrice-${prior.vmId}`]);
+        expect(
+          calls.some(([verb]) => verb === 'create' || verb === 'restore'),
+        ).toBe(false);
+      }
+    },
+  );
+  it('preflights a retained VM with its previous memory default and rejects other configuration changes', async () => {
+    const f = await bootstrapFixture();
+    const assigned = roster(f, 1);
+    const options = {
+      ...f.h.options,
+      nativeWeb: { prepare: async () => assigned },
+    };
+    const initial = new PersonVmService({ ...options, native: f.native });
+    await initial.prewarm(f.rc, { trigger: 'page' }, signal());
+    const prior = await initial.resolve(f.rc, signal());
+    await f.native.stop(prior, signal());
+    await initial.stop(f.rc, signal());
+    const configuration = join(f.mount, 'msb-config.json');
+    const saved = await readFile(configuration, 'utf8');
+    const reserve = vi.fn();
+    const restarted = f.reloadNative(undefined, undefined, {
+      memoryMiB: 3072,
+      restartMemory: { memoryMiB: 3072, reserve },
+    });
+    const current = new PersonVmService({ ...options, native: restarted });
+    const before = (await f.calls()).length;
+    await expect(
+      current.reconcileStoppedEntryForPrewarm(f.rc, prior, signal(), true),
+    ).resolves.toBe(true);
+    expect(await readFile(configuration, 'utf8')).toBe(saved);
+    expect((await f.calls()).slice(before)).toEqual([
+      ['--version'],
+      ['list', '--format', 'json'],
+    ]);
+    expect(reserve).not.toHaveBeenCalled();
+
+    const invalid = f.reloadNative(undefined, undefined, {
+      memoryMiB: 3072,
+      restartMemory: { memoryMiB: 4097, reserve },
+    });
+    const invalidService = new PersonVmService({ ...options, native: invalid });
+    const beforeInvalid = (await f.calls()).length;
+    await expect(
+      invalidService.reconcileStoppedEntryForPrewarm(
+        f.rc,
+        prior,
+        signal(),
+        true,
+      ),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(await f.calls()).toHaveLength(beforeInvalid);
+
+    const bad = JSON.parse(saved);
+    bad.sandbox_defaults.cpus = 4;
+    await writeFile(configuration, JSON.stringify(bad));
+    await expect(
+      current.reconcileStoppedEntryForPrewarm(f.rc, prior, signal(), true),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(f.h.mounts.size).toBe(0);
+  });
   it.each(['success', 'cancel', 'write-failure'] as const)(
     'reservation真实接入立即关闭，manifest %s后service/lease与原H全部真实join',
     async (mode) => {
@@ -1686,6 +2098,7 @@ if(a[0]==='--version')console.log('microsandbox 0.7.16');
 else if(a[0]==='list')console.log(JSON.stringify(v.name?[{name:v.name,status:v.status}]:[]));
 else if(a[0]==='pull')v.image=a[1];
 else if(a[0]==='create'){if(v.image!==a[1])process.exit(27);v.name=a[a.indexOf('--name')+1];v.status='Running';}
+else if(a[0]==='inspect')console.log(JSON.stringify({name:v.name,status:v.status,config:{resources:{memory_mib:2048,max_memory_mib:2048}},active_config:null}));
 else if(a[0]==='stop')v.status='Stopped';
 else if(a[0]==='start')v.status='Running';
 else if(a[0]==='ping'){if(v.status!=='Running')process.exit(29);}
@@ -1837,6 +2250,483 @@ fs.writeFileSync(f,JSON.stringify(v));
       expect(runner).not.toHaveBeenCalled();
     },
   );
+  describe('retained start with a host memory reservation (mock CLI)', () => {
+    const resources = (memory: number) => ({
+      memory_mib: memory,
+      max_memory_mib: memory,
+    });
+
+    async function fixture(
+      memoryMiB = 3072,
+      mode:
+        'reserved' | 'missing-reservation' | 'legacy' | 'default' = 'reserved',
+    ) {
+      const binding = {
+        vmId: randomUUID(),
+        personId: randomUUID(),
+        organizationId: randomUUID(),
+        instanceId: randomUUID(),
+        leaseEpoch: 3,
+      };
+      const name = 'allrice-' + binding.vmId;
+      const owner = new AbortController();
+      const ports = [
+        {
+          host_bind: '127.0.0.1',
+          host_port: 38990,
+          guest_port: 39000,
+          protocol: 'tcp',
+        },
+      ];
+      const state = {
+        status: 'Stopped',
+        saved: resources(2048),
+        active: undefined as ReturnType<typeof resources> | undefined,
+        activeAfterCrash: false,
+        activePorts: ports,
+        persist: true,
+        applied: true,
+        settleModify: async () => {},
+      };
+      const assertCurrent = vi.fn(
+        async (
+          request: Readonly<{ binding: PersonVmBinding; memoryMiB: number }>,
+          active: AbortSignal,
+        ) => {
+          expect(request).toEqual({ binding, memoryMiB });
+          active.throwIfAborted();
+        },
+      );
+      const commitRunning = vi.fn(
+        async (
+          request: Readonly<{ binding: PersonVmBinding; memoryMiB: number }>,
+          active: AbortSignal,
+        ) => {
+          expect(request).toEqual({ binding, memoryMiB });
+          active.throwIfAborted();
+        },
+      );
+      const reserve = vi.fn(async () => ({
+        signal: owner.signal,
+        assertCurrent,
+        commitRunning,
+      }));
+      const runner = vi.fn(
+        async ({ args }: Parameters<typeof runCommand>[0]) => {
+          switch (args[0]) {
+            case '--version':
+              return 'microsandbox 0.7.16';
+            case 'list':
+              return JSON.stringify([{ name, status: state.status }]);
+            case 'stop':
+              state.status = 'Stopped';
+              return '';
+            case 'inspect':
+              return JSON.stringify({
+                name,
+                status: state.status,
+                config: { resources: state.saved, network: { ports } },
+                active_config:
+                  state.status === 'Running' || state.activeAfterCrash
+                    ? {
+                        resources: state.active ?? state.saved,
+                        network: { ports: state.activePorts },
+                      }
+                    : null,
+              });
+            case 'modify':
+              if (state.persist)
+                state.saved = {
+                  memory_mib: Number(args[3]?.slice(0, -1)),
+                  max_memory_mib: Number(args[5]?.slice(0, -1)),
+                };
+              await state.settleModify();
+              return JSON.stringify({
+                sandbox: name,
+                status: state.status.toLowerCase(),
+                policy: 'next_start',
+                applied: state.applied,
+                conflicts: [],
+              });
+            case 'start':
+              state.status = 'Running';
+              return '';
+            default:
+              throw Error('Unexpected mock CLI command');
+          }
+        },
+      );
+      const provider = new MicrosandboxPersonVm({
+        binary: '/fixture/msb',
+        libkrunfw: '/fixture/fw',
+        agentd: '/fixture/agentd',
+        image: 'registry/node@sha256:' + 'a'.repeat(64),
+        rootDiskGiB: 20,
+        socketRoot: await socketDirectory(),
+        ...(mode === 'legacy' || mode === 'default'
+          ? { memoryMiB: mode === 'legacy' ? memoryMiB : undefined }
+          : {
+              restartMemory: {
+                memoryMiB,
+                reserve: mode === 'reserved' ? reserve : undefined,
+              },
+            }),
+        runner,
+      });
+      await provider.prepare(binding, await directory(), signal());
+      runner.mockClear();
+      return {
+        joinStopped: () =>
+          provider.stop(binding, signal(), { requireStopped: true }),
+        stopIdle: (
+          assertCurrent: () => Promise<void>,
+          dispatch?: Parameters<typeof provider.stopIdle>[3],
+        ) => provider.stopIdle(binding, signal(), assertCurrent, dispatch),
+        assertStopped: () => provider.assertStopped(binding, signal()),
+        start: () => provider.start(binding, signal()),
+        startWithWeb: () =>
+          provider.startWithWebEndpoints(
+            {
+              binding,
+              rosterDigest: 'a'.repeat(64),
+              endpoints: [
+                {
+                  workspaceId: randomUUID(),
+                  employeeInstanceId: randomUUID(),
+                  employeeRevision: 1,
+                  employeeVersionId: randomUUID(),
+                  hostPort: 38990,
+                  guestPort: 39000,
+                },
+              ],
+            },
+            signal(),
+          ),
+        commands: () => runner.mock.calls.map(([{ args }]) => args),
+        name,
+        binding,
+        reserve,
+        assertCurrent,
+        commitRunning,
+        state,
+        owner,
+      };
+    }
+
+    it.each(['Running', 'Unknown', 'Stopped'])(
+      'joins a stopped VM for deletion without stopping a running or unknown VM (%s)',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        if (status === 'Stopped') {
+          await f.joinStopped();
+          expect(f.commands().map(([command]) => command)).toEqual([
+            'list',
+            'stop',
+            'list',
+          ]);
+        } else {
+          await expect(f.joinStopped()).rejects.toMatchObject({
+            code: 'ACTIVITY_UNKNOWN',
+          });
+          expect(f.commands().map(([command]) => command)).toEqual(['list']);
+          expect(f.state.status).toBe(status);
+        }
+      },
+    );
+
+    it('runs the last idle guard after the native state read and before dispatch', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      await expect(
+        f.stopIdle(async () => {
+          expect(f.commands().map(([command]) => command)).toEqual(['list']);
+          throw new PersonVmError('VM_ACTIVE');
+        }),
+      ).rejects.toMatchObject({ code: 'VM_ACTIVE' });
+      expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      expect(f.state.status).toBe('Running');
+    });
+
+    it('joins the stop and reads the exact terminal state after authority close fails', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const connectionLost = Error('injected authority close failure');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async (active, stop) => {
+            await stop(active);
+            expect(f.commands().map(([command]) => command)).toEqual([
+              'list',
+              'stop',
+            ]);
+            throw connectionLost;
+          },
+        ),
+      ).resolves.toBeUndefined();
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'list',
+        'stop',
+        'list',
+      ]);
+      expect(f.state.status).toBe('Stopped');
+    });
+
+    it('preserves a failed authority gate before native stop', async () => {
+      const f = await fixture();
+      f.state.status = 'Running';
+      const denied = new PersonVmError('AUTHORIZATION_DENIED');
+      await expect(
+        f.stopIdle(
+          async () => {},
+          async () => {
+            throw denied;
+          },
+        ),
+      ).rejects.toBe(denied);
+      expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      expect(f.state.status).toBe('Running');
+    });
+
+    it.each(['Running', 'Created', 'Crashed', 'Stopped'])(
+      'only accepts exact raw native Stopped as read-only recovery evidence: %s',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        if (status === 'Stopped') await f.assertStopped();
+        else {
+          await expect(f.assertStopped()).rejects.toMatchObject({
+            code: 'ACTIVITY_UNKNOWN',
+          });
+        }
+        expect(f.commands().map(([command]) => command)).toEqual(['list']);
+      },
+    );
+
+    it.each([
+      [1024, 'start'],
+      [4096, 'startWithWeb'],
+    ] as const)(
+      'persists %i MiB through %s and reads both saved and running fields',
+      async (memoryMiB, operation) => {
+        const f = await fixture(memoryMiB);
+        const capacity = await f[operation]();
+        expect(f.reserve).toHaveBeenCalledOnce();
+        expect(f.reserve).toHaveBeenCalledWith(
+          { binding: f.binding, memoryMiB },
+          expect.any(AbortSignal),
+        );
+        const inspect = ['inspect', f.name, '--format', 'json'];
+        expect(f.commands()).toEqual([
+          inspect,
+          inspect,
+          [
+            'modify',
+            f.name,
+            '--memory',
+            `${memoryMiB}M`,
+            '--max-memory',
+            `${memoryMiB}M`,
+            '--next-start',
+            '--format',
+            'json',
+          ],
+          inspect,
+          ['start', f.name],
+          inspect,
+        ]);
+        expect(f.state.saved).toEqual(resources(memoryMiB));
+        expect(f.state.status).toBe('Running');
+        expect(f.commitRunning).not.toHaveBeenCalled();
+        await capacity!.commitRunning();
+        expect(f.commitRunning).toHaveBeenCalledExactlyOnceWith(
+          { binding: f.binding, memoryMiB },
+          capacity!.signal,
+        );
+      },
+    );
+
+    it.each(['Running', 'Created', 'Starting', 'Unknown'])(
+      'rejects raw %s before making a reservation or mutating the sandbox',
+      async (status) => {
+        const f = await fixture();
+        f.state.status = status;
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.reserve).not.toHaveBeenCalled();
+        expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      },
+    );
+
+    it('recovers a terminal crashed VM only with current capacity and no active config', async () => {
+      const f = await fixture(4096);
+      f.state.status = 'Crashed';
+      f.state.activeAfterCrash = true;
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.reserve).not.toHaveBeenCalled();
+      f.state.activeAfterCrash = false;
+      const capacity = await f.start();
+      expect(f.reserve).toHaveBeenCalledOnce();
+      expect(f.state.status).toBe('Running');
+      expect(f.state.saved).toEqual(resources(4096));
+      const lost = new PersonVmError('LEASE_LOST');
+      f.owner.abort(lost);
+      expect(capacity?.signal.reason).toBe(lost);
+      await expect(capacity?.assertCurrent()).rejects.toBe(lost);
+    });
+
+    it('rechecks the raw stopped state after obtaining capacity', async () => {
+      const f = await fixture();
+      f.reserve.mockImplementationOnce(async () => {
+        f.state.status = 'Running';
+        return {
+          signal: f.owner.signal,
+          assertCurrent: f.assertCurrent,
+          commitRunning: f.commitRunning,
+        };
+      });
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+      ]);
+    });
+
+    it.each([1023, 4097, 1024.5, Infinity])(
+      'rejects a requested %s MiB cap before reservation or native operations',
+      async (memoryMiB) => {
+        const f = await fixture(memoryMiB);
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.reserve).not.toHaveBeenCalled();
+        expect(f.commands()).toEqual([]);
+      },
+    );
+
+    it('rejects an explicit restart policy with no capacity source', async () => {
+      const f = await fixture(3072, 'missing-reservation');
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands()).toEqual([]);
+    });
+
+    it('keeps an explicit legacy start only when its saved cap matches', async () => {
+      const f = await fixture(3072, 'legacy');
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      f.state.saved = resources(3072);
+      await f.start();
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'start',
+      ]);
+      expect(f.reserve).not.toHaveBeenCalled();
+    });
+
+    it('rejects a persisted 4096 MiB cap when the caller omits memory options', async () => {
+      const f = await fixture(2048, 'default');
+      f.state.saved = resources(4096);
+      await expect(f.start()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().map(([command]) => command)).toEqual(['inspect']);
+      f.state.saved = resources(2048);
+      await f.start();
+      expect(f.state.status).toBe('Running');
+    });
+
+    it('rejects a reservation that no longer covers the current request', async () => {
+      const f = await fixture();
+      const lost = Error('fixture stale reservation');
+      f.assertCurrent.mockRejectedValueOnce(lost);
+      await expect(f.start()).rejects.toBe(lost);
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+    });
+
+    it('requires a new reservation even when the target is already persisted', async () => {
+      const f = await fixture();
+      f.state.saved = resources(3072);
+      const full = Error('fixture capacity exhausted');
+      f.reserve.mockRejectedValueOnce(full);
+      await expect(f.start()).rejects.toBe(full);
+      expect(f.commands()).toEqual([['inspect', f.name, '--format', 'json']]);
+      await f.start();
+      expect(f.reserve).toHaveBeenCalledTimes(2);
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'inspect',
+        'start',
+        'inspect',
+      ]);
+    });
+
+    it.each(['plan', 'saved', 'active'] as const)(
+      'rejects incomplete %s evidence',
+      async (evidence) => {
+        const f = await fixture();
+        if (evidence === 'plan') f.state.applied = false;
+        if (evidence === 'saved') f.state.persist = false;
+        if (evidence === 'active')
+          f.state.active = { memory_mib: 3072, max_memory_mib: 4096 };
+        await expect(f.start()).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        expect(f.commands().some(([command]) => command === 'start')).toBe(
+          evidence === 'active',
+        );
+      },
+    );
+
+    it('rejects mismatched Web endpoints after starting with the expected memory', async () => {
+      const f = await fixture();
+      f.state.activePorts = [];
+      await expect(f.startWithWeb()).rejects.toMatchObject({
+        code: 'PROVIDER_FAILED',
+      });
+      expect(f.commands().slice(-2)).toEqual([
+        ['start', f.name],
+        ['inspect', f.name, '--format', 'json'],
+      ]);
+    });
+
+    it('joins a late modify before returning cancelled and never starts the sandbox', async () => {
+      const f = await fixture();
+      const dispatched = pendingRead<void>();
+      const result = pendingRead<void>();
+      f.state.settleModify = async () => {
+        dispatched.resolve(undefined);
+        await result.promise;
+      };
+      const settled = vi.fn();
+      const starting = f.start().catch(settled);
+      await dispatched.promise;
+      const revoked = Error('fixture reservation revoked');
+      f.owner.abort(revoked);
+      expect(settled).not.toHaveBeenCalled();
+      result.resolve(undefined);
+      await starting;
+      expect(settled).toHaveBeenCalledOnce();
+      expect(settled).toHaveBeenCalledWith(revoked);
+      expect(f.state.saved).toEqual(resources(3072));
+      expect(f.commands().map(([command]) => command)).toEqual([
+        'inspect',
+        'inspect',
+        'modify',
+      ]);
+    });
+  });
   it('不接可变镜像tag或不固定的运行版本', async () => {
     expect(
       () =>

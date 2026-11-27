@@ -241,6 +241,50 @@ it('refuses guessed and revoked references and does not fetch without an exact s
   lifetime.abort();
 });
 
+it('reads retained model context with current image capability without exposing an old route', async () => {
+  const modelInfo = {
+    provider: 'host-gateway',
+    id: 'fixture-model',
+    name: 'Current',
+    inputModalities: ['text'] as const,
+  };
+  const resolveCallReference = vi.fn(async () => '');
+  const adapter = new GatewayLlmAdapter(endpoint, 'synthetic', {
+    provider: modelInfo.provider,
+    model: modelInfo.id,
+    modelInfo,
+    historicalModels: [
+      {
+        ...modelInfo,
+        id: 'previous-model',
+        inputModalities: ['text', 'image'],
+        context: { contextWindow: 200000 },
+      },
+    ],
+    resolveCallReference,
+  });
+  await expect(adapter.listModels(modelInfo.provider)).resolves.toEqual([
+    modelInfo,
+  ]);
+  await expect(
+    adapter.resolveModel(modelInfo.provider, 'previous-model'),
+  ).resolves.toMatchObject({
+    id: 'previous-model',
+    inputModalities: ['text'],
+    context: { contextWindow: 200000 },
+  });
+  await expect(
+    collect(adapter, {
+      ...input(),
+      model: 'previous-model',
+      sessionId: modelBinding().native
+        .sessionId as GenerateOptions['sessionId'],
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+  expect(resolveCallReference).not.toHaveBeenCalled();
+});
+
 it('binds the one-use reference to its exact adapter response recipient', async () => {
   const controller = new AbortController();
   const binding = modelBinding();

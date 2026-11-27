@@ -21,6 +21,7 @@ import {
   requireTenantAdministrationAuthority,
   requireTenantAdministrationTarget,
 } from './tenant-administration.ts';
+import { captureNativeWebRosterChange } from './employees/native-web-capacity.ts';
 import { synchronizeTenantMembershipAccess } from './tenant-employee-access.ts';
 import { requireActiveOrganizationDepartment } from './organization-departments.ts';
 
@@ -271,6 +272,7 @@ export async function importOrganizationPeople(
       await synchronizeTenantMembershipAccess(tx, {
         organizationId: id,
         workspaceId: null,
+        personIds: prepared.map((person) => person.id),
       });
       return {
         created: prepared.map((p) => ({
@@ -355,10 +357,25 @@ export async function setOrganizationAccountStatus(
     userId = UuidSchema.parse(userInput),
     value = OrganizationAccountStatusSchema.parse(input);
   return getDatabase().begin(async (tx) => {
-    await lockPerson(tx, context, id, userId, value.expectedVersion);
+    const previous = await lockPerson(
+      tx,
+      context,
+      id,
+      userId,
+      value.expectedVersion,
+    );
+    const checkRoster =
+      value.active && previous.status !== 'active'
+        ? await captureNativeWebRosterChange(
+            tx,
+            { personId: userId },
+            { enrolling: false },
+          )
+        : undefined;
     await tx`update allrice_users set status=${value.active ? 'active' : 'disabled'},updated_at=now() where id=${userId}`;
     if (!value.active)
       await tx`update allrice_sessions set revoked_at=now() where user_id=${userId} and revoked_at is null`;
+    await checkRoster?.();
     await audit(tx, context, id, 'organization.employee.status', userId, {
       active: value.active,
     });

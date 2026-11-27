@@ -452,14 +452,22 @@ function refreshDshRuntimeInventory() {
 }
 
 const httpAborter = new AbortController();
+let personVmRecovery: () => string = () => 'pending';
 const personVmHost = createProductionPersonVmHost({
   lifetime: httpAborter.signal,
   sources: createProductionPersonVmSources(
     createProductionNativeModelExecution(),
   ),
 }).then(
-  (host) => ({ state: 'installed' as const, host }),
+  (host) => {
+    personVmRecovery = () => host.recoveryState();
+    return { state: 'installed' as const, host };
+  },
   (error: unknown) => {
+    // The constructor joins rollback before rejecting; an aggregate rollback
+    // failure cannot certify the absence of an owner.
+    if (!(error instanceof AggregateError))
+      personVmRecovery = () => 'uninstalled';
     console.info('[MET-273] person VM Host unavailable', {
       code:
         error instanceof ProductionPersonVmHostUnavailable
@@ -636,6 +644,11 @@ const server = createServer(async (request, response) => {
                         (stopping ? 'worker_stopping' : undefined)),
             ),
             ...(serviceBuildIdentity ? { identity: serviceBuildIdentity } : {}),
+            ...(['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(
+              request.socket.remoteAddress ?? '',
+            ) && {
+              personVmRecovery: { pid: process.pid, state: personVmRecovery() },
+            }),
             nativeCloseIdentity,
             nativeArtifact,
             nativeJournalContract,
@@ -1129,7 +1142,26 @@ async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
     authenticate: dEntryHttpDefaults.authenticate,
     recover: recoverProductionPersonVmModelOwner,
     pending: () =>
-      shutdownStatus !== undefined || host.modelOwnerMaintenancePending(),
+      !stopping ||
+      shutdownStatus !== undefined ||
+      host.modelOwnerMaintenancePending(),
+    upgrade: {
+      bootId: startup.bootId,
+      authenticate: authenticatePlatformSession,
+      drain: (context, signal) => {
+        if (shutdownProbe || stopping)
+          throw new PersonVmError('LEASE_CONFLICT');
+        return host.drainForUpgrade(context, signal);
+      },
+      async claimShutdown(context, expiresAt, signal) {
+        if (shutdownProbe || stopping)
+          throw new PersonVmError('LEASE_CONFLICT');
+        await requireCurrentPlatformAdmin(context, undefined, false);
+        signal.throwIfAborted();
+        await host.assertWorkerShutdownSafe(signal, expiresAt);
+        return () => stopWorker('release upgrade');
+      },
+    },
     shutdown: {
       authenticate: authenticatePlatformSession,
       authorize: (context) =>
@@ -1141,6 +1173,7 @@ async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
     const recovery = await listening;
     console.info('[MET-273] authorized local maintenance socket', {
       path: recovery.path,
+      bootId: startup.bootId,
     });
   } catch {
     if (recoveryEndpoint === listening) recoveryEndpoint = undefined;
@@ -1194,5 +1227,9 @@ const stopWorker = (signal: string) => {
       shutdownProbe = undefined;
     });
 };
+void personVmHost.then((result) => {
+  if (!stopping && result.state === 'installed')
+    return keepLocalShutdownMaintenance(result.host);
+});
 process.on('SIGINT', () => stopWorker('SIGINT'));
 process.on('SIGTERM', () => stopWorker('SIGTERM'));

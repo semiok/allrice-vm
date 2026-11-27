@@ -5,6 +5,7 @@ import { DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
 import { afterEach, expect, it, vi } from 'vitest';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
+import { deferred } from '../d-entry/native-entry.fixture.js';
 import {
   installDEntryNativeOwnerPort,
   resolveDEntryNativeResource,
@@ -39,7 +40,7 @@ afterEach(async () => {
   vi.resetAllMocks();
 });
 
-function fixture() {
+function fixture(holdAdmission = false) {
   const lifetime = new AbortController();
   const binding = {
     personId: randomUUID(),
@@ -108,7 +109,22 @@ function fixture() {
   const confirmPhysical = vi.fn(async () => {});
   const signal = lifetime.signal;
   const participant = { participant: 'entry' };
-  const admission = { participant: vi.fn(() => participant) };
+  const admitted = new AbortController();
+  const admission = {
+    participant: vi.fn(() => participant),
+    admit: vi.fn<Input['admission']['admit']>(async (_context, candidate) => ({
+      binding: candidate,
+      participant: 'entry',
+      permitId: randomUUID(),
+      disposition: 'queued',
+      signal: admitted.signal,
+    })),
+    activate: (async (_permit, callback, signal) =>
+      callback(
+        AbortSignal.any([signal, admitted.signal]),
+      )) satisfies Input['admission']['activate'],
+    finish: vi.fn<Input['admission']['finish']>(async () => admitted.abort()),
+  };
   const host = { createRootFor: vi.fn(), revoked: signal };
   const roster = {
     receipt: { binding, rosterDigest: 'roster', endpoints: [endpoint] },
@@ -129,6 +145,9 @@ function fixture() {
     verified = null;
   });
   const group = new AbortController();
+  const beforeProof = vi.fn<(active: AbortSignal) => Promise<void>>(
+    async () => {},
+  );
   const startup = {
     assertAuthenticatedGroup: vi.fn(() => group.signal),
     catalog: vi.fn(() => ({ ...roster, owner: host })),
@@ -145,13 +164,25 @@ function fixture() {
         throw Error('RUNTIME_NOT_READY');
       return verified;
     },
-    async ensureVerifiedEditor(_context: RequestContext, next: typeof binding) {
+    async ensureVerifiedEditor(
+      _context: RequestContext,
+      next: typeof binding,
+      _employee: string,
+      active: AbortSignal,
+    ) {
+      await beforeProof(active);
       return this.assertVerifiedEditor(next);
     },
   };
   const source = installProductionDEntrySource({
     startup: startup as unknown as Input['startup'],
     admission: admission as unknown as Input['admission'],
+    ...(holdAdmission && {
+      vm: {
+        resolve: vi.fn(async () => binding),
+        assertCurrentBinding: vi.fn(async () => {}),
+      },
+    }),
     lifetime: signal,
     confirmPhysical,
     resolveSendRoute,
@@ -188,6 +219,8 @@ function fixture() {
     context,
     signal,
     admit: admission.participant,
+    admission,
+    beforeProof,
     participant,
     prove,
     route,
@@ -303,6 +336,58 @@ it('ties the selected prewarm proof to the revocation of the authenticated Host 
     uninstall();
   }
 });
+
+it.each(['joined', 'cancelled'] as const)(
+  'keeps the selected editor prewarm admitted through actual evidence and join: %s',
+  async (outcome) => {
+    const f = fixture(true);
+    const uninstall = installDEntryNativeOwnerPort({
+      resolve: async () => f.owner,
+    });
+    const entered = deferred<AbortSignal>(),
+      release = deferred<void>();
+    const caller = new AbortController();
+    const revoked = new Error('fixture prewarm revoked');
+    let warming: Promise<AbortSignal> | undefined;
+    try {
+      await f.prove();
+      f.beforeProof.mockImplementationOnce(async (active) => {
+        entered.resolve(active);
+        await release.promise;
+      });
+      warming = f.port.assertEditorReady!(
+        f.context,
+        f.identity,
+        caller.signal,
+        f.binding,
+      );
+      void warming.catch(() => {});
+      const operation = await entered.promise;
+      expect(f.admission.admit).toHaveBeenCalledExactlyOnceWith(
+        f.context,
+        f.binding,
+        expect.objectContaining({ participant: 'entry' }),
+        expect.any(AbortSignal),
+      );
+      if (outcome === 'cancelled') caller.abort(revoked);
+      expect(f.admission.finish).not.toHaveBeenCalled();
+      release.resolve();
+      if (outcome === 'cancelled') await expect(warming).rejects.toBe(revoked);
+      else {
+        const proved = await warming;
+        expect(operation.aborted).toBe(true);
+        expect(proved.aborted).toBe(false);
+        f.group.abort(revoked);
+        expect(proved.reason).toBe(revoked);
+      }
+      expect(f.admission.finish).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await Promise.allSettled([warming]);
+      uninstall();
+    }
+  },
+);
 
 it('requires rollout authority, a routable exact model and a current employee after all async evidence', async () => {
   const f = fixture();
@@ -428,6 +513,14 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
             running,
             agentAvailable,
           },
+          {
+            sessionId: 'ordinary-fork',
+            parentSessionId: root,
+            updatedAt: 3,
+            blank: false,
+            running: true,
+            agentAvailable: true,
+          },
         ],
       },
     });
@@ -463,5 +556,27 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
       childSessionId: id,
       mode: 'unknown',
     },
+  });
+  await expect(
+    resolveDEntryNativeResource({
+      ...modelRequest,
+      nativeSessionId: 'ordinary-fork',
+    }),
+  ).rejects.toMatchObject({ code: 'authorization_denied' });
+  const forkPin = vi.fn(async () => ({
+    ...persisted,
+    rootNativeSessionId: 'ordinary-fork',
+    forkedFromNativeSessionId: root,
+  }));
+  await expect(
+    resolveDEntryNativeResource({
+      ...modelRequest,
+      nativeSessionId: 'ordinary-fork',
+      root: forkPin,
+    }),
+  ).resolves.toMatchObject({
+    parentNativeSessionId: null,
+    rootNativeSessionId: 'ordinary-fork',
+    nativeAddress: { kind: 'session', sessionId: 'ordinary-fork' },
   });
 });

@@ -1,8 +1,11 @@
+import { decodeDEntryRegisteredThread } from '@allrice/contracts';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { getEventListeners, on, once } from 'node:events';
 import { get, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -14,8 +17,12 @@ import {
 } from 'node:net';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
+import Llm from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime from '@deepseek-ai/dsh-tools';
 import {
   deferred,
   summary,
@@ -40,6 +47,144 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+it('reads the sealed language default and persists a native language preference without opening platform settings', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const gateway = host.typertGateway;
+  const dispatch = gateway.invoke.bind(gateway);
+  let preference = 'zh';
+  const writes = vi.fn();
+  const languageView = () => ({
+    ns: 'locale',
+    value: { preference },
+    revision: 2,
+  });
+  const settings = '@deepseek-ai/dsh-api-settings-controller';
+  host.provide('llm', {
+    listConfigurableProviders: () => [{ settingsNs: 'llm-pi-ai' }],
+  } as never);
+  const dispose = host.typert.register({
+    package: settings,
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: ['describe', 'mutate', 'openSettingsDocument'].map(
+      (method) => ({
+        id: `${settings}#settings/${method}`,
+        namespace: 'settings',
+        method,
+        service: 'settingsController',
+        invocation: { kind: 'direct' },
+        parameters: [],
+        result: {
+          mode: 'strict',
+          typeSymbol: 'test#NativeLocaleJson',
+          create: () => z.json(),
+          jsonSchema: {},
+        },
+      }),
+    ),
+  });
+  const dispatchSpy = vi
+    .spyOn(gateway, 'invoke')
+    .mockImplementation(async (request) => {
+      if (request.namespace !== 'settings') return dispatch(request);
+      if (request.method === 'describe')
+        return {
+          writable: true,
+          hasDocument: true,
+          namespaces: [languageView(), { ns: 'llm-pi-ai' }],
+        };
+      writes(request.args);
+      preference = 'en';
+      return languageView();
+    });
+  try {
+    const life = await open(f);
+    const call = (endpoint: string, args: object, token = sessionToken) =>
+      f.invoke(life.scopeId, token, { endpoint, payload: { args } });
+    const describe = async () => {
+      const response = await call('settings/describe', {});
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.result.ok, JSON.stringify(body.result)).toBe(true);
+      return body;
+    };
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          hasDocument: false,
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'zh' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    expect((await call('settings/describe', {}, otherToken)).status).toBe(404);
+    const ops = [{ op: 'set', path: ['preference'], value: 'en' }];
+    const denied = await call('settings/mutate', {
+      ns: 'llm-pi-ai',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await denied.json()).toMatchObject({ result: { ok: false } });
+    const fullDocument = await call('settings/openSettingsDocument', {});
+    expect(await fullDocument.json()).toMatchObject({ result: { ok: false } });
+    expect(writes).not.toHaveBeenCalled();
+    const second = await open(f);
+    const eventPeer = f.connect(second.scopeId);
+    const events = messages(eventPeer);
+    await once(eventPeer, 'open');
+    send(eventPeer, {
+      type: 'open',
+      streamId: 'locale-events',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await events('locale-events')).toMatchObject({
+      value: { type: 'ready' },
+    });
+    const changed = await call('settings/mutate', {
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await changed.json()).toMatchObject({
+      result: { ok: true, value: { ns: 'locale' } },
+    });
+    expect(writes).toHaveBeenCalledExactlyOnceWith({
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'en' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    f.host.emit({ event: 'settings/document-updated', args: ['locale', 3] });
+    expect(await events('locale-events')).toMatchObject({
+      value: {
+        type: 'emit',
+        event: 'settings/document-updated',
+        args: ['locale', 3],
+      },
+    });
+    closePage(life.peer);
+    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    closePage(second.peer);
+  } finally {
+    dispatchSpy.mockRestore();
+    dispose();
+  }
+});
 
 it('qualifies a new 4.0 editor without writing on upgrade, then prepares its root once on explicit open', async () => {
   const f = await fixture(undefined, true);
@@ -781,7 +926,7 @@ it.each(['full reply', 'peer disconnect'] as const)(
 );
 
 it.each(['baseline', 'upsert', 'remove'] as const)(
-  'checks live resource grants for %s while the original Mux keeps its page',
+  'rechecks page authority before sending the native %s and keeps its sibling page',
   { timeout: 30_000 },
   async (type) => {
     const f = await fixture();
@@ -801,7 +946,6 @@ it.each(['baseline', 'upsert', 'remove'] as const)(
     const releaseCheck = deferred();
     closes.push(async () => releaseCheck.resolve());
     let held = false;
-    let checking = false;
     let observed: unknown;
     const wire = f.host.host.typertGateway.wireStream;
     const openNative = wire.open.bind(wire);
@@ -821,21 +965,12 @@ it.each(['baseline', 'upsert', 'remove'] as const)(
             ) {
               held = true;
               observed = item;
-              vi.mocked(f.owner.readSessions).mockImplementation(async () => {
-                if (!checking) {
-                  checking = true;
+              vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+                async () => {
                   checkEntered.resolve();
                   await releaseCheck.promise;
-                }
-                return {
-                  ok: true,
-                  value: {
-                    items: f.host.catalog.items.filter(
-                      (row) => row.sessionId !== child.sessionId,
-                    ),
-                  },
-                };
-              });
+                },
+              );
             }
             yield item;
           }
@@ -881,9 +1016,7 @@ it.each(['baseline', 'upsert', 'remove'] as const)(
       await Promise.race([
         checkEntered.promise,
         next.then(() => {
-          throw Error(
-            'Mux sent its frame before checking the resource catalog',
-          );
+          throw Error('Mux sent its frame before checking page authority');
         }),
       ]);
       expect(observed).toMatchObject({ type });
@@ -892,17 +1025,7 @@ it.each(['baseline', 'upsert', 'remove'] as const)(
     } finally {
       releaseCheck.resolve();
     }
-    if (type === 'remove') {
-      expect(await next).toMatchObject({
-        type: 'item',
-        value: { type: 'remove', resource: { kind: 'session', id: 'child' } },
-      });
-    } else {
-      expect(await next).toMatchObject({
-        type: 'error',
-        error: { code: 'gateway/forbidden' },
-      });
-    }
+    expect(await next).toMatchObject({ type: 'item', value: observed });
     expect((await f.invoke(life.scopeId)).status).toBe(200);
     expect((await f.invoke(sibling.scopeId)).status).toBe(200);
   },
@@ -988,7 +1111,7 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
   expect((await cleanTransport)[0]).toBe(1000);
 });
 
-it('opens the native control baseline and lists only sessions in the current page scope', async () => {
+it('opens the native control baseline and lists every Session in the current VM', async () => {
   const f = await fixture();
   const life = await open(f);
   const peer = f.connect(life.scopeId);
@@ -1009,6 +1132,7 @@ it('opens the native control baseline and lists only sessions in the current pag
         projections: {
           root: { asOfSeq: 0, values: {} },
           child: { asOfSeq: 0, values: {} },
+          other: { asOfSeq: 0, values: {} },
         },
       },
     },
@@ -1024,7 +1148,9 @@ it('opens the native control baseline and lists only sessions in the current pag
     rpcId: '',
     result: {
       ok: true,
-      value: { items: [summary('root'), summary('child', 'root')] },
+      value: {
+        items: [summary('root'), summary('child', 'root'), summary('other')],
+      },
     },
   });
   expect((await f.invoke(life.scopeId, otherToken, request)).status).toBe(404);
@@ -1035,55 +1161,830 @@ it('opens the native control baseline and lists only sessions in the current pag
         payload: { args: { _request: {}, scopeId: 'foreign-page' } },
       })
     ).status,
-  ).toBe(400);
+  ).toBe(200);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
 
-it('refreshes a native list filtered during a concurrent catalog invalidation', async () => {
+it('delivers native page notifications on their declared resources and suppresses a revoked result', async () => {
   const f = await fixture();
+  await f.host.useNativeEvents();
   const life = await open(f);
-  const refresh = deferred();
-  closes.push(async () => refresh.resolve());
-  let reads = 0;
-  f.host.catalog.beforeList = async (_signal, scoped) => {
-    if (scoped && ++reads === 1)
-      f.host.host.emit('api-session/added', summary('root'));
-    else if (!scoped && reads === 1) await refresh.promise;
-  };
-  const gateway = f.host.host.typertGateway;
-  const invoke = gateway.invoke.bind(gateway);
-  vi.spyOn(gateway, 'invoke').mockImplementation(async (request) => {
-    const value = await invoke(request);
-    if (
-      request.namespace === 'session' &&
-      request.method === 'list' &&
-      reads === 1
-    ) {
-      try {
-        expect(value).toEqual({ items: [] });
-      } finally {
-        refresh.resolve();
-      }
-    }
-    return value;
+  const peer = f.connect(life.scopeId);
+  const next = messages(peer);
+  const delivered: unknown[] = [];
+  peer.on('message', (data) => {
+    const frame = JSON.parse(String(data));
+    if (frame.streamId === 'events' && frame.value?.type === 'emit')
+      delivered.push(frame.value);
   });
-  const response = await f.invoke(life.scopeId, sessionToken, {
-    endpoint: 'session/list',
-    payload: { args: { _request: {} } },
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'events',
+    endpoint: '$events',
+    payload: { args: {} },
   });
-  expect(await response.json()).toMatchObject({
-    result: {
-      ok: true,
-      value: { items: [summary('root'), summary('child', 'root')] },
+  expect(await next('events')).toMatchObject({ value: { type: 'ready' } });
+
+  const { host, catalog } = f.host;
+  const other = summary('other').sessionId;
+  host.emit('credentials/reference-updated', 'SYNTHETIC_REFERENCE' as never);
+  host.emit('api-session/status', summary('absent').sessionId, true);
+  host.emit('commands/change');
+  host.emit('api-session/status', other, true);
+  const notifications: { type: string; event: string; args: unknown[] }[] = [
+    { type: 'emit', event: 'commands/change', args: [] },
+    { type: 'emit', event: 'api-session/status', args: [other, true] },
+  ];
+  for (const value of notifications)
+    expect(await next('events')).toMatchObject({ type: 'item', value });
+
+  const releaseCatalog = deferred();
+  closes.push(async () => releaseCatalog.resolve());
+  catalog.beforeList = () => releaseCatalog.promise;
+  const added = summary('new-live-session');
+  try {
+    host.emit('api-session/added', added);
+    const addedFrame = {
+      type: 'emit',
+      event: 'api-session/added',
+      args: [added],
+    };
+    expect(await next('events')).toMatchObject({
+      type: 'item',
+      value: addedFrame,
+    });
+    notifications.push(addedFrame);
+    host.emit('api-session/removed', added.sessionId);
+    const removedFrame = {
+      type: 'emit',
+      event: 'api-session/removed',
+      args: [added.sessionId],
+    };
+    expect(await next('events')).toMatchObject({
+      type: 'item',
+      value: removedFrame,
+    });
+    notifications.push(removedFrame);
+  } finally {
+    releaseCatalog.resolve();
+  }
+
+  const checked = deferred();
+  vi.mocked(f.owner.assertCurrent).mockImplementation(async () => {
+    checked.resolve();
+    throw new DataAccessError('authorization_denied');
+  });
+  const closed = once(peer, 'close');
+  host.emit('commands/change');
+  await checked.promise;
+  await closed;
+  expect(delivered).toEqual(notifications);
+});
+
+it('relays a native Cordis inspect query and its ordinary scoped RPC reply', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  await f.host.useNativeEvents();
+  const composition = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  const runtime = createRequire(
+    composition.resolve('@deepseek-ai/dsh/package.json'),
+  );
+  const moduleName = '@deepseek-ai/dsh-cordis-host-runner';
+  const { default: CordisRunner, CordisInspectRegistryService } = await import(
+    pathToFileURL(runtime.resolve(moduleName)).href
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(runtime.resolve(`${moduleName}/typert`)).href
+  );
+  await host.plugin(SystemPrompt);
+  await host.plugin(ToolRuntime);
+  await host.plugin(CordisRunner);
+  host.typert.register(TYPERT);
+  const agentId = summary('other').sessionId;
+  const agent = { id: agentId, ctx: host };
+  host.typert.lookups.register('agent', {
+    parameter: 'agent',
+    wire: 'agentId',
+    resource: 'session',
+    hostTypeSymbol: '@deepseek-ai/dsh-agent#Agent',
+    wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
+    resolve: (id) => (id === agentId ? (agent as never) : undefined),
+  });
+  host.typert.contexts.registerHost('agent', {
+    wire: 'agentId',
+    resource: 'session',
+    wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
+    resolve: (id) => (id === agentId ? agent.ctx : undefined),
+  });
+  const life = await open(f);
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const next = messages(peer);
+  send(peer, {
+    type: 'open',
+    streamId: 'events',
+    endpoint: '$events',
+    payload: { args: {} },
+  });
+  expect(await next('events')).toMatchObject({ value: { type: 'ready' } });
+  expect(host.typertGateway.hasLiveClient()).toBe(false);
+
+  // rc.2 sources inspect queries only when an independent owner client is
+  // present. The page enters through its existing non-owner carrier below.
+  const companion = host.connection.createPeer({
+    principal: { kind: 'owner' },
+    interactions: 'answer',
+  });
+  const abort = new AbortController();
+  const ownerEvents = await host.typertGateway.wireStream.open(
+    '$events',
+    { args: {} },
+    { async *[Symbol.asyncIterator]() {} },
+    companion,
+    abort.signal,
+  );
+  const owner = ownerEvents[Symbol.asyncIterator]();
+  closes.push(async () => {
+    abort.abort();
+    await owner.return?.();
+    await companion.dispose();
+  });
+  expect(await owner.next()).toMatchObject({ value: { type: 'ready' } });
+  const invoke = async (method: string, args: Record<string, unknown>) =>
+    (
+      await f.invoke(life.scopeId, sessionToken, {
+        endpoint: 'dynamicCordisRunner/' + method,
+        payload: { args },
+      })
+    ).json();
+  const provider = 'fixture-inspector';
+  const method = 'read';
+  expect(
+    await invoke('syncInspectManifest', {
+      providers: [
+        {
+          id: provider,
+          description: 'Read a synthetic fixture value.',
+          methods: [
+            {
+              name: method,
+              description: 'Read a label.',
+              inputSchema: { type: 'object', additionalProperties: false },
+              outputSchema: { type: 'string' },
+            },
+          ],
+        },
+      ],
+    }),
+  ).toMatchObject({ result: { ok: true, value: null } });
+  const inspector = host.get('cordisInspect') as
+    InstanceType<typeof CordisInspectRegistryService> | undefined;
+  if (!(inspector instanceof CordisInspectRegistryService))
+    throw Error('Native Cordis inspect service unavailable');
+  const query = inspector.query(
+    'client',
+    provider,
+    method,
+    undefined,
+    agent,
+    abort.signal,
+  );
+  void query.catch(() => {});
+  const notification = await next('events');
+  expect(notification.value).toMatchObject({
+    type: 'emit',
+    event: 'cordis/inspect-query',
+    args: [{ requestId: expect.any(String), agentId, provider, method }],
+  });
+  const { requestId } = notification.value.args[0];
+  expect(
+    await invoke('resolveInspectQuery', {
+      agentId,
+      requestId,
+      resolution: { ok: true, data: 'fixture-label' },
+    }),
+  ).toMatchObject({ result: { ok: true, value: { accepted: true } } });
+  await expect(query).resolves.toBe('fixture-label');
+  expect(await next('events')).toMatchObject({
+    value: {
+      type: 'emit',
+      event: 'cordis/inspect-query-resolved',
+      args: [{ requestId }],
     },
   });
-  expect(reads).toBe(2);
+  expect(
+    await invoke('resolveRequestRun', {
+      requestId: 'synthetic-activation',
+      resolution: {
+        ok: false,
+        reason: 'rejected',
+        message: 'Synthetic decision',
+      },
+    }),
+  ).toMatchObject({
+    result: { ok: false, error: { details: { reason: 'plugin-management' } } },
+  });
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
 
-it('withholds an out-of-root native projection and continues delivering current ones', async () => {
+it('searches another Session using the native descriptor and preserves native argument failures', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const request = {
+    endpoint: 'session/search',
+    payload: { args: { request: { query: 'other' } } },
+  };
+  expect(
+    await (await f.invoke(life.scopeId, sessionToken, request)).json(),
+  ).toMatchObject({
+    result: {
+      ok: true,
+      value: { items: [{ sessionId: 'other', snippet: 'matching session' }] },
+    },
+  });
+  expect(
+    await (
+      await f.invoke(life.scopeId, sessionToken, {
+        ...request,
+        payload: { args: { request: { query: 0 } } },
+      })
+    ).json(),
+  ).toMatchObject({
+    result: { ok: false, error: { code: 'gateway/input-invalid' } },
+  });
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('updates ordinary settings and selects an authorized session model through the page carrier', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const composition = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  const runtime = createRequire(
+    composition.resolve('@deepseek-ai/dsh/package.json'),
+  );
+  const moduleName = '@deepseek-ai/dsh-api-settings-controller';
+  const { SettingsController } = await import(
+    pathToFileURL(runtime.resolve(moduleName)).href
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(runtime.resolve(`${moduleName}/typert`)).href
+  );
+  let setting = { theme: 'light' };
+  const update = vi.fn(async (_namespace: string, patch: typeof setting) => {
+    setting = patch;
+  });
+  host.provide('settings', {
+    update,
+    describe: () => [
+      {
+        ns: 'appearance',
+        schema: {},
+        value: setting,
+        autoGenerate: false,
+        applies: 'live',
+        secrets: [],
+        revision: 1,
+      },
+    ],
+  } as never);
+  await host.plugin(Llm);
+  await host.plugin(SettingsController);
+  host.typert.register(TYPERT);
+  const life = await open(f);
+  const request = async (endpoint: string, args: Record<string, unknown>) =>
+    (
+      await f.invoke(life.scopeId, sessionToken, {
+        endpoint,
+        payload: { args },
+      })
+    ).json();
+  const patch = { theme: 'dark' };
+  expect(
+    await request('settings/update', { ns: 'appearance', patch }),
+  ).toMatchObject({
+    result: { ok: true, value: { ns: 'appearance', value: patch } },
+  });
+  expect(update).toHaveBeenCalledWith('appearance', patch, undefined);
+  const selected = { provider: 'openai-codex', model: 'fixture-codex' };
+  expect(
+    await request('session/selectModel', {
+      request: { sessionId: 'other', ...selected },
+    }),
+  ).toMatchObject({
+    result: { ok: true, value: { selected } },
+  });
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('uses actual DSH replies for create and fork registration on a page without a pinned root', async () => {
+  const f = await fixture(undefined, false, true);
+  const life = await open(f);
+  const create = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/create',
+    payload: { args: { request: { sessionId: 'browser-forged-id' } } },
+  });
+  expect(await create.json()).toMatchObject({
+    result: { ok: true, value: { sessionId: 'native-created' } },
+  });
+  expect(
+    decodeDEntryRegisteredThread(create.headers.get('x-allrice-d-entry-thread'))
+      ?.id,
+  ).toBe((await f.registerRoot.mock.results[0]?.value)?.identity.threadId);
+  expect(f.host.catalog.creationRequests).toEqual([{}]);
+  expect(f.prepareEditorRoot).not.toHaveBeenCalled();
+  expect(f.registerRoot).toHaveBeenNthCalledWith(
+    1,
+    f.context,
+    { ...f.identity, threadId: null },
+    {
+      nativeSessionId: 'native-created',
+      forkSource: undefined,
+      host: {
+        binding: f.binding,
+        bindingRef: f.owner.bindingRef,
+        rosterDigest: f.owner.receipt.rosterDigest,
+      },
+    },
+    expect.any(AbortSignal),
+  );
+  const forkOther = () =>
+    f.invoke(life.scopeId, sessionToken, {
+      endpoint: 'session/fork',
+      payload: { args: { request: { sessionId: 'other' } } },
+    });
+  expect((await forkOther()).status).toBe(404);
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).not.toContain(
+    'native-forked',
+  );
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
+  f.findRoot.mockResolvedValue(root);
+  const fork = await forkOther();
+  expect(await fork.json()).toMatchObject({
+    result: { ok: true, value: { sessionId: 'native-forked' } },
+  });
+  expect(f.registerRoot.mock.calls[1]?.[2]).toMatchObject({
+    nativeSessionId: 'native-forked',
+    forkSource: { nativeSessionId: 'other', root },
+  });
+  expect(f.findRoot).toHaveBeenCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  expect(
+    f.findRoot.mock.calls.filter((call) => call[3] === 'other'),
+  ).toHaveLength(3);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('joins a fork from a registered ancestor but withholds registration after authority changes', async () => {
+  const f = await fixture(undefined, false, true);
+  const life = await open(f);
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
+  f.host.catalog.items.push(summary('other-child', 'other'));
+  f.findRoot.mockResolvedValueOnce(root).mockResolvedValueOnce(undefined);
+  const lost = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/fork',
+    payload: { args: { request: { sessionId: 'other-child' } } },
+  });
+  expect(lost.status).toBe(404);
+  expect(f.findRoot).toHaveBeenLastCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  expect(f.findRoot).toHaveBeenCalledTimes(2);
+  expect(f.registerRoot).not.toHaveBeenCalled();
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).toContain(
+    'native-forked',
+  );
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it.each(['login', 'vm binding'] as const)(
+  'retains the native terminal through a page reconnect and joins owner cleanup after loss of %s',
+  async (loss) => {
+    const f = await fixture(undefined, false, false, 250);
+    const revokedBinding = new AbortController();
+    const watch = f.watchTerminal.getMockImplementation()!;
+    f.watchTerminal.mockImplementationOnce(async (...args) => {
+      const subscription = await watch(...args);
+      return {
+        ...subscription,
+        revoked: AbortSignal.any([subscription.revoked, revokedBinding.signal]),
+      };
+    });
+    const { host } = f.host;
+    const web = createRequire(
+      new URL('../../../web/package.json', import.meta.url),
+    );
+    const { TYPERT } = await import(
+      pathToFileURL(
+        web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+      ).href
+    );
+    host.typert.register(TYPERT);
+    const terminal = {
+      id: 'retained-pty',
+      title: 'Shell',
+      cwd: '/work',
+      shell: { path: '/bin/sh', name: 'sh', args: [] },
+      cols: 80,
+      rows: 24,
+      state: 'running',
+      exitCode: null,
+    };
+    const closing = deferred();
+    const closed = deferred();
+    let closeAttempts = 0;
+    closes.push(async () => closed.resolve());
+    const invoke = host.typertGateway.invoke.bind(host.typertGateway);
+    const native = vi
+      .spyOn(host.typertGateway, 'invoke')
+      .mockImplementation(async (call) => {
+        if (call.namespace !== 'terminal') return invoke(call);
+        if (call.method === 'create') {
+          const request = z.object({ id: z.string() }).parse(call.args.request);
+          if (request.id !== terminal.id)
+            throw new RemoteError(
+              'gateway/arguments-invalid',
+              'Native validation rejected an unallocated terminal',
+              { endpoint: 'terminal/create' },
+            );
+          return terminal;
+        }
+        if (call.method === 'list') return [terminal];
+        if (call.method !== 'close') throw Error('Unexpected terminal RPC');
+        expect(call.peer.principal.kind).toBe('owner');
+        expect(call.peer.signal.aborted).toBe(false);
+        expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
+        if (++closeAttempts <= 3)
+          throw Error('Transient native termination failure');
+        closing.resolve();
+        await closed.promise;
+      });
+    const create = (page: Awaited<ReturnType<typeof open>>, id = terminal.id) =>
+      f.invoke(page.scopeId, sessionToken, {
+        endpoint: 'terminal/create',
+        payload: {
+          args: {
+            agentId: 'root',
+            request: { id, cols: 80, rows: 24 },
+          },
+        },
+      });
+    const first = await open(f);
+    expect(await (await create(first)).json()).toMatchObject({
+      result: { ok: true },
+    });
+    closePage(first.peer);
+    expect(await first.receive()).toMatchObject({ value: { type: 'closed' } });
+    const next = await open(f);
+    expect(await (await create(next)).json()).toMatchObject({
+      result: { ok: true },
+    });
+    expect(await (await create(next, 'unallocated-pty')).json()).toMatchObject({
+      result: { ok: false, error: { code: 'gateway/arguments-invalid' } },
+    });
+    expect(f.watchTerminal).toHaveBeenCalledTimes(1);
+    expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.
+    closePage(next.peer);
+    expect(await next.receive()).toMatchObject({ value: { type: 'closed' } });
+    expect(native.mock.calls.some(([call]) => call.method === 'close')).toBe(
+      false,
+    );
+
+    if (loss === 'login') {
+      f.identityRevoked.abort(new DataAccessError('authentication_required'));
+    } else {
+      const checks = f.watchTerminal.mock.calls[0]![4];
+      const stale = new DataAccessError('authorization_denied');
+      vi.mocked(f.owner.assertCurrent).mockRejectedValueOnce(stale);
+      await expect(checks.verifyBinding(revokedBinding.signal)).rejects.toBe(
+        stale,
+      );
+      revokedBinding.abort(stale);
+    }
+    await closing.promise;
+    const observed = f.closeControl();
+    let joined = false;
+    void observed.then(
+      () => {
+        joined = true;
+      },
+      () => {
+        joined = true;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(joined).toBe(false);
+    closed.resolve();
+    await observed;
+    expect(
+      native.mock.calls.filter(([call]) => call.method === 'close'),
+    ).toHaveLength(4);
+  },
+);
+
+it('withholds a successful native create reply after the page loses its VM authority', async () => {
+  const f = await fixture(undefined, false, true);
+  const life = await open(f);
+  const entered = deferred();
+  const finish = deferred();
+  closes.push(async () => finish.resolve());
+  f.host.catalog.beforeCreate = async () => {
+    entered.resolve();
+    await finish.promise;
+  };
+  const result = f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/create',
+    payload: { args: { request: {} } },
+  });
+  await entered.promise;
+  vi.mocked(f.owner.assertCurrent).mockRejectedValue(
+    new DataAccessError('authorization_denied'),
+  );
+  finish.resolve();
+  expect((await result).status).toBe(404);
+  expect(f.registerRoot).not.toHaveBeenCalled();
+});
+
+it('keeps workspace file preview and private relay calls out of native dispatch', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const invoke = vi.spyOn(f.host.host.typertGateway, 'invoke');
+  for (const endpoint of [
+    'workspaceFiles/readBytes',
+    'allricePrincipal/openScope',
+  ]) {
+    const response = await f.invoke(life.scopeId, sessionToken, {
+      endpoint,
+      payload: { args: {} },
+    });
+    expect(await response.json()).toMatchObject({
+      result: { ok: false, error: { code: 'remote-access/denied' } },
+    });
+  }
+  expect(
+    invoke.mock.calls.every(
+      ([request]) =>
+        request.namespace !== 'workspaceFiles' &&
+        request.method !== 'openScope',
+    ),
+  ).toBe(true);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('carries native terminal input, resize and output across the owned VM stream', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const web = createRequire(
+    new URL('../../../web/package.json', import.meta.url),
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(
+      web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+    ).href
+  );
+  host.typert.register(TYPERT);
+  const life = await open(f);
+  expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
+  const descriptor = host.typert.local.get('terminal/attach');
+  const codec = descriptor?.uplink?.codec;
+  if (codec?.mode !== 'strict')
+    throw Error('Native terminal input schema missing');
+  const inputCodec = codec.create();
+  const wire = host.typertGateway.wireStream;
+  const dispatch = wire.open.bind(wire);
+  const inputs: unknown[] = [];
+  const fault = deferred();
+  const brokenId = 'native-error';
+  closes.push(async () => fault.resolve());
+  const attach = vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    if (args[0] !== 'terminal/attach') return dispatch(...args);
+    return (async function* () {
+      yield {
+        type: 'snapshot',
+        sequence: 0,
+        screen: '',
+        writable: true,
+        info: {
+          id: 'terminal-fixture',
+          title: 'Terminal',
+          shell: { path: '/bin/sh', args: [], name: 'sh' },
+          cwd: '/work',
+          cols: 80,
+          rows: 24,
+          state: 'running',
+          exitCode: null,
+        },
+      };
+      if ((args[1] as typeof payload).args.id === brokenId) {
+        await fault.promise;
+        throw new RemoteError('gateway/service-unavailable', 'Fixture error', {
+          endpoint: 'terminal/attach',
+        });
+      }
+      for await (const raw of args[2]) {
+        inputs.push(inputCodec.parse(raw));
+      }
+      yield { type: 'ack', sequence: 2 };
+      yield { type: 'output', sequence: 3, data: 'guest-file\r\n' };
+    })();
+  });
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const receive = messages(peer);
+  const streamId = 'terminal';
+  const payload = { args: { agentId: 'root', id: 'terminal-fixture' } };
+  send(peer, { type: 'open', streamId, endpoint: 'terminal/attach', payload });
+  const frameOverheadBytes =
+    Buffer.byteLength(
+      JSON.stringify({
+        type: 'item',
+        streamId: '199c8160-f4ab-4f45-8b01-51b581fdffee',
+        value: { type: 'input', value: null },
+      }),
+    ) - 4;
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: {
+      type: 'snapshot',
+      inputWindow: { maxBytes: 262_144, frameOverheadBytes },
+    },
+  });
+  const write = { type: 'write', sequence: 1, data: 'ls\r' };
+  const resize = { type: 'resize', sequence: 2, cols: 100, rows: 32 };
+  send(peer, { type: 'item', streamId, value: write });
+  send(peer, { type: 'item', streamId, value: resize });
+  send(peer, { type: 'end', streamId });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'ack', sequence: 2 },
+  });
+  expect(await receive(streamId)).toMatchObject({
+    type: 'item',
+    value: { type: 'output', sequence: 3, data: 'guest-file\r\n' },
+  });
+  expect(await receive(streamId)).toMatchObject({ type: 'end' });
+  expect(inputs).toEqual([write, resize]);
+  expect(attach).toHaveBeenCalledWith(
+    'terminal/attach',
+    payload,
+    expect.any(Object),
+    expect.any(Object),
+    expect.any(AbortSignal),
+  );
+  // A late frame for an ended attachment cannot take down the page mux.
+  send(peer, { type: 'item', streamId, value: write });
+  const cancelled = 'cancelled-terminal';
+  send(peer, {
+    type: 'open',
+    streamId: cancelled,
+    endpoint: 'terminal/attach',
+    payload,
+  });
+  expect(await receive(cancelled)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  function holdCurrentCheck() {
+    const checking = deferred();
+    const interrupted = deferred();
+    vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+      async (_context, signal) => {
+        checking.resolve();
+        if (!signal.aborted) await once(signal, 'abort');
+        interrupted.resolve();
+        signal.throwIfAborted();
+      },
+    );
+    return { checking, interrupted };
+  }
+  const inputCheck = holdCurrentCheck();
+  send(peer, { type: 'item', streamId: cancelled, value: write });
+  await inputCheck.checking.promise;
+  send(peer, { type: 'cancel', streamId: cancelled });
+  await inputCheck.interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: brokenId,
+    endpoint: 'terminal/attach',
+    payload: { args: { ...payload.args, id: brokenId } },
+  });
+  expect(await receive(brokenId)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  const outputCheck = holdCurrentCheck();
+  fault.resolve();
+  await outputCheck.checking.promise;
+  send(peer, { type: 'cancel', streamId: brokenId });
+  await outputCheck.interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: 'still-open',
+    endpoint: 'session/control',
+    payload: { args: {} },
+  });
+  expect(await receive('still-open')).toMatchObject({
+    type: 'item',
+    value: { type: 'baseline' },
+  });
+  expect(inputs).toEqual([write, resize]);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('reattaches native binary reply bytes using the generated field path', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const codec = z.object({ result: z.array(z.instanceof(Uint8Array)) });
+  f.host.host.typert.register({
+    package: '@deepseek-ai/dsh-test-fixture',
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: [
+      {
+        id: '@deepseek-ai/dsh-test-fixture#session/fixtureBytes',
+        service: 'sessionController',
+        namespace: 'session',
+        method: 'fixtureBytes',
+        invocation: { kind: 'direct' },
+        parameters: [],
+        result: {
+          mode: 'strict',
+          typeSymbol: 'FixtureBytes',
+          create: () => codec,
+          encode(input, writeBytes) {
+            return {
+              result: codec
+                .parse(input)
+                .result.map((bytes, index) =>
+                  writeBytes(bytes, ['result', index]),
+                ),
+            };
+          },
+        },
+      },
+    ],
+  });
+  const response = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/fixtureBytes',
+    payload: { args: {} },
+  });
+  expect(
+    response.headers.get('content-type'),
+    await response.clone().text(),
+  ).toContain('multipart/form-data');
+  const multipart = await response.formData();
+  expect(JSON.parse(String(multipart.get('metadata')))).toMatchObject({
+    result: { ok: true, value: { result: [null] } },
+    attachments: [{ path: ['result', 0], codec: 'bytes', part: 'bytes-0' }],
+  });
+  const part = multipart.get('bytes-0');
+  expect(part).toBeInstanceOf(Blob);
+  expect(
+    Array.from(new Uint8Array(await (part as Blob).arrayBuffer())),
+  ).toEqual([0, 128, 255]);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('relays same-VM projection updates for other Sessions without filtering', async () => {
   const f = await fixture();
   const life = await open(f);
   const wire = f.host.host.typertGateway.wireStream;
@@ -1128,11 +2029,88 @@ it('withholds an out-of-root native projection and continues delivering current 
   });
   expect(await next()).toMatchObject({
     type: 'item',
+    value: {
+      type: 'projection',
+      sessionId: 'other',
+      seq: 1,
+      value: 'unrelated',
+    },
+  });
+  expect(await next()).toMatchObject({
+    type: 'item',
     value: { type: 'projection', sessionId: 'root', seq: 2, value: 'current' },
   });
   expect((await f.invoke(life.scopeId)).status).toBe(200);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('opens another live registry stream and withholds its next frame after authority is lost', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  f.host.host.typert.register({
+    package: '@deepseek-ai/dsh-api-job-controller',
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: [
+      {
+        id: '@deepseek-ai/dsh-api-job-controller#job/list',
+        service: 'jobController',
+        namespace: 'job',
+        method: 'list',
+        mode: 'stream',
+        invocation: { kind: 'direct' },
+        parameters: [],
+        result: {
+          mode: 'strict',
+          typeSymbol: 'FixtureJob',
+          create: () => z.object({ sessionId: z.string() }),
+        },
+      },
+    ],
+  });
+  const wire = f.host.host.typertGateway.wireStream;
+  const dispatch = wire.open.bind(wire);
+  const finish = deferred();
+  closes.push(async () => finish.resolve());
+  const returned = deferred();
+  vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    if (args[0] !== 'job/list') return dispatch(...args);
+    return (async function* () {
+      try {
+        yield { sessionId: 'other' };
+        await finish.promise;
+        yield { sessionId: 'unpublished-tail' };
+      } finally {
+        returned.resolve();
+      }
+    })();
+  });
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const receive = messages(peer);
+  send(peer, {
+    type: 'open',
+    streamId: 'job',
+    endpoint: 'job/list',
+    payload: { args: {} },
+  });
+  expect(await receive('job')).toEqual({
+    type: 'item',
+    streamId: 'job',
+    value: { sessionId: 'other' },
+  });
+  const tail = vi.fn();
+  peer.on('message', tail);
+  const closed = once(peer, 'close');
+  vi.mocked(f.owner.assertCurrent).mockRejectedValue(
+    new DataAccessError('authorization_denied'),
+  );
+  finish.resolve();
+  await closed;
+  await returned.promise;
+  expect(tail).not.toHaveBeenCalled();
 });
 
 it('refuses duplicate selectors, unauthorized login and cross-session borrow without disturbing the page', async () => {
@@ -1147,9 +2125,12 @@ it('refuses duplicate selectors, unauthorized login and cross-session borrow wit
   expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
   expect((await f.invoke(life.scopeId, otherToken)).status).toBe(404);
   expect(
-    (await f.invoke(life.scopeId, sessionToken, { endpoint: 'workspace/list' }))
-      .status,
-  ).toBe(400);
+    await (
+      await f.invoke(life.scopeId, sessionToken, { endpoint: 'workspace/list' })
+    ).json(),
+  ).toMatchObject({
+    result: { ok: false, error: { code: 'remote-access/denied' } },
+  });
   expect((await f.invoke(life.scopeId)).status).toBe(200);
   expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
   closePage(life.peer);
@@ -1304,12 +2285,7 @@ it.each(['HTTP disconnect', 'profile shutdown'] as const)(
   },
 );
 
-it.each([
-  'native update',
-  'catalog drift before any update',
-  'true terminal',
-  'native terminal error',
-] as const)(
+it.each(['native update', 'true terminal', 'native terminal error'] as const)(
   'rejects the second baseline when final verification sees %s',
   { timeout: 30_000 },
   async (mode) => {
@@ -1380,10 +2356,8 @@ it.each([
         f.host.catalog.items = f.host.catalog.items.filter(
           (row) => row.sessionId !== nativeChild.sessionId,
         );
-        if (mode === 'native update') {
-          f.host.host.emit('api-session/removed', nativeChild.sessionId);
-          expect(await nextFrame.promise).toBe('item');
-        } else expect(f.profileObserved.mock.calls).toEqual([['item']]);
+        f.host.host.emit('api-session/removed', nativeChild.sessionId);
+        expect(await nextFrame.promise).toBe('item');
       }
       expect(response.headersSent).toBe(false);
       expect(access).toBe(2);
@@ -1437,7 +2411,7 @@ it.each(['waiting to read', 'waiting for a newer projection'] as const)(
         await finishFirstChild.promise;
       }
     };
-    const predecessor = waitingToRead ? f.invoke(page.scopeId) : undefined;
+    const predecessor = waitingToRead ? scope.refresh() : undefined;
     void predecessor?.catch(() => {});
     if (predecessor) await unrelatedRead.promise;
 
@@ -1541,7 +2515,7 @@ it.each(['waiting to read', 'waiting for a newer projection'] as const)(
       finishFirstChild.resolve();
       finish.resolve();
     }
-    if (predecessor) expect((await predecessor).status).toBe(200);
+    await predecessor;
     await projection;
     expect(unrelatedReadDone).toBe(true);
     const retry = await f.publish('bootstrap', page.scopeId);
@@ -1787,6 +2761,34 @@ it(
     });
     expect(bad.status).toBe(404);
     await bad.body?.cancel();
+    const terminalModule = graph.entries.find(
+      ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
+    );
+    if (!terminalModule)
+      throw Error('Native terminal missing from sealed graph');
+    const chunk = `plugins/${terminalModule.id}/client.terminal.js?rev=${terminalModule.rev}`;
+    const loadChunk = (reference: string, revision = terminalModule.rev) =>
+      f.publish('assets', scopeId, {
+        bindingRef: f.owner.bindingRef,
+        reference,
+        revision,
+      });
+    const terminalScript = await loadChunk(chunk);
+    expect(terminalScript.status).toBe(200);
+    expect(terminalScript.headers.get('content-type')).toContain('javascript');
+    expect(Buffer.from(await terminalScript.arrayBuffer())).toEqual(
+      await read(chunk, source),
+    );
+    for (const response of [
+      await loadChunk(chunk, 'wrong'),
+      await loadChunk(
+        chunk.replace('client.terminal.js', 'client.unsealed.js'),
+      ),
+      await loadChunk(chunk.replace('client.terminal.js', 'client.node.js')),
+    ]) {
+      expect(response.status).toBe(404);
+      await response.body?.cancel();
+    }
 
     async function blockedAsset() {
       const serverResponse = deferred<ServerResponse>();

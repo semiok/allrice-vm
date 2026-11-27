@@ -3,27 +3,103 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import {
+  nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
   readPromptOrigins,
 } from './allrice-native-web-owner.mjs';
 
+const promptRoot = { id: 'root', header: {} };
+const principal = { kind: 'allrice-d-entry', scopeId: randomUUID() };
+function userPrompt(rpcId) {
+  return { id: `message-${rpcId}`, source: { kind: 'user', rpcId, principal } };
+}
+function readDirect(session) {
+  return (event, turn) => nativePromptOccurrence(session, event.data, turn);
+}
+
 it('keeps the admitted prompt of a long turn and excludes queued and future input', () => {
-  const user = (rpcId) => ({ source: { kind: 'user', rpcId } });
   const events = [
     { type: 'turn/start', data: { turn: 1 } },
-    { type: 'user/message', data: user('older') },
+    { type: 'user/message', data: userPrompt('older') },
     { type: 'turn/end', data: { turn: 1 } },
     { type: 'turn/start', data: { turn: 2 } },
-    { type: 'user/message', data: user('current') },
+    { type: 'user/message', data: userPrompt('current') },
+    { type: 'user/message', data: userPrompt('steered') },
     ...Array.from({ length: 48 }, () => ({ type: 'tool/result', data: {} })),
-    { type: 'agent/inbox/spliced', data: { inserted: [user('queued')] } },
-    { type: 'user/message', data: user('future') },
+    { type: 'agent/inbox/spliced', data: { inserted: [userPrompt('queued')] } },
+    { type: 'user/message', data: userPrompt('future') },
   ].map((event, seq) => ({ ...event, seq }));
 
-  expect(readPromptOrigins(events, events.length - 2, 2)).toEqual({
+  expect(
+    readPromptOrigins(
+      events,
+      events.length - 2,
+      2,
+      'assistant',
+      undefined,
+      0,
+      readDirect(promptRoot),
+    ),
+  ).toEqual({
     turn: 2,
-    ids: ['current'],
+    prompts: ['current', 'steered'].map((requestId) => ({
+      sessionId: 'root',
+      scopeId: principal.scopeId,
+      requestId,
+      messageId: `message-${requestId}`,
+      turn: 2,
+    })),
+    delegated: false,
+    inherited: [],
+  });
+});
+
+it('derives the first owned prompt on a native fork without assigning its seeded ancestor prompt', () => {
+  const fork = {
+    id: 'fork',
+    header: { id: 'fork', parentSession: 'root', isSeeded: true },
+  };
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: userPrompt('ancestor') },
+    { type: 'turn/end', data: { turn: 1 } },
+    { type: 'session/end-seed', data: {} },
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'user/message', data: userPrompt('first-fork-prompt') },
+  ].map((event, seq) => ({ ...event, seq }));
+  expect(
+    readPromptOrigins(
+      events,
+      1,
+      1,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toBeNull();
+  expect(
+    readPromptOrigins(
+      events,
+      5,
+      2,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toEqual({
+    turn: 2,
+    prompts: [
+      {
+        sessionId: 'fork',
+        scopeId: principal.scopeId,
+        requestId: 'first-fork-prompt',
+        messageId: 'message-first-fork-prompt',
+        turn: 2,
+      },
+    ],
     delegated: false,
     inherited: [],
   });
@@ -34,36 +110,57 @@ it('uses the native title source sequence after a later turn has started', () =>
     { type: 'turn/start', data: { turn: 1 } },
     {
       type: 'user/message',
-      data: { source: { kind: 'user', rpcId: 'first' } },
+      data: userPrompt('first'),
     },
     { type: 'turn/end', data: { turn: 1 } },
     { type: 'turn/start', data: { turn: 2 } },
     {
       type: 'user/message',
-      data: { source: { kind: 'user', rpcId: 'second' } },
+      data: userPrompt('second'),
     },
     { type: 'session/title-llm-request', data: { messageSeqs: [1] } },
   ].map((event, seq) => ({ ...event, seq }));
-  expect(readPromptOrigins(events, 5, null, 'session-title')).toEqual({
+  expect(
+    readPromptOrigins(
+      events,
+      5,
+      null,
+      'session-title',
+      undefined,
+      0,
+      readDirect(promptRoot),
+    ),
+  ).toEqual({
     turn: 1,
-    ids: ['first'],
+    prompts: [
+      {
+        sessionId: 'root',
+        scopeId: principal.scopeId,
+        requestId: 'first',
+        messageId: 'message-first',
+        turn: 1,
+      },
+    ],
     delegated: false,
     inherited: [],
   });
 });
 
-function fixture() {
+function fixture(claimed = () => true) {
   const callbacks = new Map();
   const agents = new Map();
   const sessions = new Map();
-  const delegations = observeDelegatedInputs({
-    on: (name, callback) => callbacks.set(name, callback),
-    sessions,
-    agents: {
-      get: (id) => agents.get(id),
-      isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+  const delegations = observeDelegatedInputs(
+    {
+      on: (name, callback) => callbacks.set(name, callback),
+      sessions,
+      agents: {
+        get: (id) => agents.get(id),
+        isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+      },
     },
-  });
+    claimed,
+  );
   function emit(name, payload) {
     callbacks.get(name)(payload);
   }
@@ -92,7 +189,12 @@ function fixture() {
   }
   function openRoot(root, turn, rpcId) {
     append(root, 'turn/start', { turn });
-    input(root, { id: rpcId, source: { kind: 'user', rpcId } }, turn);
+    const message = userPrompt(rpcId);
+    message.source.principal = {
+      kind: 'allrice-d-entry',
+      scopeId: 'scope-' + rpcId,
+    };
+    input(root, message, turn);
   }
   function createChild(root, id) {
     const child = agent(id, root);
@@ -112,13 +214,23 @@ function fixture() {
     return child;
   }
   function proof(agent, turn, cursor = agent.session.events.length - 1) {
-    return readPromptOrigins(
+    const origin = readPromptOrigins(
       agent.session.events,
       cursor,
       turn,
       'assistant',
       (event, number) =>
-        delegations.claimed(agent.session, event.data, number)?.ids,
+        delegations.claimed(agent.session, event.data, number)?.prompts,
+      0,
+      readDirect(agent.session),
+    );
+    return (
+      origin && {
+        turn: origin.turn,
+        delegated: origin.delegated,
+        ids: origin.prompts.map(({ requestId }) => requestId),
+        inherited: origin.inherited.map(({ requestId }) => requestId),
+      }
     );
   }
   function dispose(agent) {
@@ -136,13 +248,35 @@ function fixture() {
     input,
     openRoot,
     proof,
-    rootWake: delegations.rootWake,
+    searchOrigin: delegations.searchOrigin,
+    rootWake(id) {
+      const wake = delegations.rootWake(id);
+      if (wake.kind !== 'delegated') return wake;
+      return {
+        kind: wake.kind,
+        turn: wake.turn,
+        promptIds: wake.prompts.map(({ requestId }) => requestId),
+      };
+    },
   };
 }
 
 const relay = (id, sender) => ({
   id,
   source: { kind: 'agent-message', form: 'relay', senderSessionId: sender.id },
+});
+
+it('requires an adopted page source for every direct journal input', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'adopted');
+  expect(f.proof(root, 1)).toMatchObject({ ids: ['adopted'] });
+  f.input(
+    root,
+    { id: 'unbound-message', source: { kind: 'user', rpcId: 'unbound-input' } },
+    1,
+  );
+  expect(f.proof(root, 1)).toBeNull();
 });
 
 it('proves a continuable child at its own turn after both original and newer parent turns end', () => {
@@ -333,8 +467,39 @@ function promptFixture() {
     });
   const next = async (reader) =>
     new TextDecoder().decode((await reader.read()).value).trim();
-  return { agent, emit, end, issue, message, next, open, outcome, lifetime };
+  return {
+    agent,
+    emit,
+    end,
+    issue,
+    message,
+    next,
+    open,
+    outcome,
+    lifetime,
+    claimed: observe.claimed,
+  };
 }
+
+it('reads only the exact live prompt claim from the real observer', async () => {
+  const f = promptFixture();
+  const issue = f.issue();
+  const reader = f.open(issue);
+  const item = f.message(issue);
+  try {
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+    f.emit('inserted', item);
+    f.emit('claimed', item, 2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(true);
+    expect(f.claimed(f.agent.session, f.message(issue), 2)).toBe(false);
+    expect(f.claimed(f.agent.session, item, 3)).toBe(false);
+    f.end(2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+  } finally {
+    await reader.cancel();
+    f.lifetime.abort();
+  }
+});
 
 it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
   const f = promptFixture();
@@ -351,9 +516,15 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('claimed', first, 7);
     f.agent.inbox.nextTurn = [second];
     f.emit('inserted', second);
-    expect(await f.next(running)).toBe('inserted');
-    expect(await f.next(running)).toBe('claimed');
-    expect(await f.next(waiting)).toBe('inserted');
+    expect(await f.next(running)).toBe(
+      'inserted ' + JSON.stringify({ messageId: first.id }),
+    );
+    expect(await f.next(running)).toBe(
+      'claimed ' + JSON.stringify({ messageId: first.id, turn: 7 }),
+    );
+    expect(await f.next(waiting)).toBe(
+      'inserted ' + JSON.stringify({ messageId: second.id }),
+    );
     f.emit('discarded', second);
     f.emit('inserted', { ...second });
     f.agent.inbox.nextTurn = [];
@@ -361,7 +532,7 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('discarded', second);
     f.emit('inserted', second);
     await Promise.resolve();
-    expect(await f.outcome(queued)).toEqual({ inserted: true });
+    expect(await f.outcome(queued)).toEqual({ messageId: second.id });
     f.agent.inbox.nextStep = [];
     f.emit('discarded', second);
     expect(await f.next(waiting)).toBe('discarded');
@@ -389,17 +560,128 @@ it('does not adopt a pending retry occurrence or another principal using the sam
     expect(await f.next(different)).toBe('ready');
     f.emit('discarded', item);
     f.emit('inserted', item);
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
-    expect(await f.outcome(other)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
+    expect(await f.outcome(other)).toEqual({ messageId: null });
     const newItem = f.message(other);
     f.emit('inserted', newItem);
     f.emit('claimed', newItem, 1);
     f.end(1);
-    expect(await f.next(different)).toBe('inserted');
-    expect(await f.next(different)).toBe('claimed');
+    expect(await f.next(different)).toBe(
+      'inserted ' + JSON.stringify({ messageId: newItem.id }),
+    );
+    expect(await f.next(different)).toBe(
+      'claimed ' + JSON.stringify({ messageId: newItem.id, turn: 1 }),
+    );
     expect(await f.next(different)).toBe('ended');
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
   } finally {
     f.lifetime.abort();
   }
+});
+
+it('derives Search authority from the exact running turn and native child lineage', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  root.status = 'running';
+  f.openRoot(root, 1, 'original');
+  const child = f.createChild(root, 'child');
+  child.status = 'running';
+  expect(f.searchOrigin('root').proof).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
+  });
+  f.append(root, 'turn/end', { turn: 1 });
+  f.openRoot(root, 2, 'next-login');
+  expect(f.searchOrigin('child').proof).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
+  });
+  expect(f.searchOrigin('root')?.proof.claims).toEqual([
+    {
+      sessionId: 'root',
+      scopeId: 'scope-next-login',
+      requestId: 'next-login',
+      messageId: 'message-next-login',
+      turn: 2,
+    },
+  ]);
+  child.status = 'idle';
+  expect(f.searchOrigin('child')).toBeNull();
+  f.append(root, 'turn/end', { turn: 2 });
+  expect(f.searchOrigin('root')).toBeNull();
+});
+
+it('permits a native fork to search from its own adopted prompt and not from seed history', () => {
+  const f = fixture((_session, message) => message.id === 'message-own-prompt');
+  const fork = f.agent('fork');
+  Object.assign(fork.session.header, {
+    id: 'fork',
+    parentSession: 'ancestor',
+    isSeeded: true,
+  });
+  fork.status = 'running';
+  f.openRoot(fork, 1, 'seed-history');
+  expect(f.searchOrigin('fork')).toBeNull();
+  f.append(fork, 'turn/end', { turn: 1 });
+  f.openRoot(fork, 2, 'own-prompt');
+  expect(f.searchOrigin('fork')?.proof).toEqual({
+    rootSessionId: 'fork',
+    turn: 2,
+    claims: [
+      {
+        sessionId: 'fork',
+        scopeId: 'scope-own-prompt',
+        requestId: 'own-prompt',
+        messageId: 'message-own-prompt',
+        turn: 2,
+      },
+    ],
+  });
+});
+
+it('denies an unobserved direct root input and a same-ID direct child input', () => {
+  const rejected = fixture(() => false);
+  const noClaim = rejected.agent('root');
+  noClaim.status = 'running';
+  rejected.openRoot(noClaim, 1, 'same-rpc');
+  expect(rejected.searchOrigin('root')).toBeNull();
+
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'same-rpc');
+  const child = f.createChild(root, 'child');
+  child.session.header.origin = 'subagent';
+  child.status = 'running';
+  expect(f.searchOrigin('child')).not.toBeNull();
+  f.input(
+    child,
+    {
+      id: 'different-occurrence',
+      source: {
+        kind: 'user',
+        rpcId: 'same-rpc',
+        principal: { kind: 'allrice-d-entry', scopeId: 'scope-same-rpc' },
+      },
+    },
+    1,
+  );
+  expect(f.searchOrigin('child')).toBeNull();
 });

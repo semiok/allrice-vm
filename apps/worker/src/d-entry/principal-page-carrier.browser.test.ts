@@ -5,9 +5,13 @@ import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { gzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { chromium, type Page } from 'playwright-core';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import {
+  dEntryRegisteredThreadHeader,
   type DEntryPageOpenedSchema,
   DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
@@ -30,12 +34,26 @@ const browserExecutable =
 
 it
   .skipIf(!browserExecutable)
-  .each(['refresh', 'stall', 'switch', 'baseline'] as const)(
+  .each([
+    'refresh',
+    'stall',
+    'switch',
+    'baseline',
+    'attached',
+    'unattached',
+    'native-create',
+    ...(process.platform === 'darwin'
+      ? (['native-create-linux'] as const)
+      : []),
+  ] as const)(
   'rc.2 workbench composer (%s)',
   { timeout: 120_000 },
   async (scenario) => {
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
+    const nativeCreate = scenario.startsWith('native-create');
+    const createAfterSwitch = scenario === 'native-create-linux';
+    const realShell = switching || nativeCreate;
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
@@ -50,12 +68,91 @@ it
     };
     const f = await fixture(release);
     const otherThread = randomUUID();
-    const revokeOther = switching ? f.registerThread(otherThread) : undefined;
+    const revokeOther =
+      switching || createAfterSwitch
+        ? f.registerThread(otherThread)
+        : undefined;
     const cross =
       scenario === 'switch' ? await f.registerOtherEmployee() : undefined;
+    const fromComposition = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const fromCli = createRequire(
+      fromComposition.resolve('@deepseek-ai/dsh/package.json'),
+    );
+    const runnerModule = '@deepseek-ai/dsh-cordis-host-runner';
+    const { default: CordisRunner } = await import(
+      pathToFileURL(fromCli.resolve(runnerModule)).href
+    );
+    const { TYPERT } = await import(
+      pathToFileURL(fromCli.resolve(`${runnerModule}/typert`)).href
+    );
+    const workspaceModule = '@deepseek-ai/dsh-api-workspace-controller';
+    const { default: WorkspaceController } = await import(
+      pathToFileURL(fromCli.resolve(workspaceModule)).href
+    );
+    const { TYPERT: WorkspaceMetadata } = await import(
+      pathToFileURL(fromCli.resolve(`${workspaceModule}/typert`)).href
+    );
+    const nativeWorkspace = {
+      id: randomUUID(),
+      path: '/work',
+      title: 'Fixture work',
+      sessionIds:
+        scenario === 'unattached'
+          ? []
+          : [
+              'root',
+              ...(switching || createAfterSwitch
+                ? ['root-' + otherThread]
+                : []),
+            ],
+      archivedSessionIds: [],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    f.host.host.provide('workspaceRegistry', {
+      list: () => [nativeWorkspace],
+      get: (id: string) =>
+        id === nativeWorkspace.id ? nativeWorkspace : undefined,
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+    });
+    await f.host.host.plugin(WorkspaceController, {
+      documentsDirectory: '/work',
+    });
+    f.host.host.typert.register(WorkspaceMetadata);
+
+    await f.host.host.plugin(SystemPrompt);
+    await f.host.host.plugin(ToolRuntime);
+    await f.host.host.plugin(CordisRunner);
+    f.host.host.typert.register(TYPERT);
+    const runner = f.host.host.get('dynamicCordisRunner');
+    if (!runner) throw Error('The native Cordis runner did not start');
+    const { pluginId, packageId } = runner.define({
+      sessionId: 'other',
+      plugin: { kind: 'new', idPrefix: 'fixt' },
+      name: 'Fixture Cordis package',
+      purpose: 'Read-only inventory test',
+      code: { host: 'return { name: "fixture-host" }' },
+    });
+    const blockedMethods = [
+      'runHostHalf',
+      'resolveRequestRun',
+      'settleUserRun',
+    ] as const;
+    const blockedHandlers = blockedMethods.map((method) =>
+      vi.spyOn(CordisRunner.prototype, method),
+    );
+    closes.push(async () =>
+      blockedHandlers.forEach((handler) => handler.mockRestore()),
+    );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       ['root', 'root-' + otherThread].includes(String(row.sessionId))
-        ? { ...row, blank: true, cwd: '/work' }
+        ? { ...row, blank: !nativeCreate, cwd: '/work' }
         : row,
     );
     const require = createRequire(
@@ -74,7 +171,7 @@ it
         write: false,
       });
     const realParent:
-      { outputFiles: { path: string; text: string }[] } | undefined = switching
+      { outputFiles: { path: string; text: string }[] } | undefined = realShell
       ? await require('esbuild').build({
           stdin: {
             contents: `import { createRoot } from 'react-dom/client';
@@ -92,11 +189,64 @@ it
             '.woff': 'dataurl',
             '.woff2': 'dataurl',
             '.ttf': 'dataurl',
+            '.svg': 'dataurl',
           },
         })
       : undefined;
+    const createdThread = randomUUID();
+    const createdNativeId = 'native-created';
+    let registered = false;
+    const createReplies: unknown[] = [];
+    if (nativeCreate) {
+      const registerFixture = f.registerRoot.getMockImplementation()!;
+      f.registerRoot.mockImplementation(
+        async (context, identity, receipt, active) => {
+          expect(receipt.nativeSessionId).toBe(createdNativeId);
+          const registeredFixture = await registerFixture(
+            context,
+            identity,
+            receipt,
+            active,
+          );
+          const root = {
+            ...registeredFixture,
+            identity: { ...identity, threadId: createdThread },
+            thread: { ...registeredFixture.thread, id: createdThread },
+          };
+          registered = true;
+          f.rememberRoot(root);
+          f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+            id === createdNativeId ? root : undefined,
+          );
+          const created = f.host.catalog.items.find(
+            ({ sessionId }) => sessionId === createdNativeId,
+          );
+          if (created) Object.assign(created, { cwd: '/work', blank: true });
+          nativeWorkspace.sessionIds.push(createdNativeId);
+          f.host.host.emit('domain/changed', {
+            domain: 'workspace',
+            table: 'workspaces',
+            operation: 'put',
+            key: nativeWorkspace.id,
+            value: {
+              path: nativeWorkspace.path,
+              title: nativeWorkspace.title,
+              sessionIds: [...nativeWorkspace.sessionIds],
+              createdAt: nativeWorkspace.createdAt,
+              updatedAt: nativeWorkspace.updatedAt,
+            },
+          });
+          return root;
+        },
+      );
+    }
     const unary: string[] = [];
-    const listRead: unknown[] = [];
+    const startupReplies = new Map<string, unknown>();
+    const startupMethods = new Set([
+      'session/list',
+      'dynamicCordisRunner/inventory',
+      'dynamicCordisRunner/syncInspectManifest',
+    ]);
     const graph = DEntryProfileGraphSchema.parse(release.graph);
     const application = graph.batches.find(
       ({ phase }) => phase === 'application',
@@ -135,12 +285,17 @@ it
         response
           .writeHead(result.status, {
             'content-type': result.headers.get('content-type')!,
+            ...(result.headers.has(dEntryRegisteredThreadHeader) && {
+              [dEntryRegisteredThreadHeader]: result.headers.get(
+                dEntryRegisteredThreadHeader,
+              )!,
+            }),
           })
           .end(Buffer.from(await result.arrayBuffer()));
       };
       try {
         const scopeId = url.searchParams.get('scopeId');
-        if (switching) {
+        if (realShell) {
           if (url.pathname === '/api/v1/d-entry/identity') {
             return await copy(
               Response.json({
@@ -181,8 +336,17 @@ it
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
-          if (input.endpoint === 'session/list')
-            listRead.push((await result.clone().json()).result);
+          if (nativeCreate && input.endpoint === 'session/create')
+            createReplies.push({
+              status: result.status,
+              ...(await result.clone().json()),
+              thread: result.headers.get(dEntryRegisteredThreadHeader),
+            });
+          if (startupMethods.has(input.endpoint))
+            startupReplies.set(
+              input.endpoint,
+              (await result.clone().json()).result,
+            );
           return await copy(result);
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
@@ -331,7 +495,7 @@ it
             currentVersion: version,
             versions: [version],
           })),
-          sessions: (switching
+          sessions: (switching || createAfterSwitch
             ? [
                 f.selection.threadId,
                 otherThread,
@@ -391,9 +555,40 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (nativeCreate) {
+      // rc.2 restores its saved desktop selection before this test's shortcut.
+      await page.addInitScript((linuxProfile) => {
+        if (linuxProfile)
+          Object.defineProperty(navigator, 'platform', {
+            value: 'Linux x86_64',
+          });
+        localStorage.setItem(
+          'dsh.sessions.current',
+          JSON.stringify({ sessionId: 'root' }),
+        );
+        // rc.2 defines this native command on every platform but provides no
+        // default binding for web:linux. Use its own per-profile preferences.
+        localStorage.setItem(
+          'dsh.keybindings.v1',
+          JSON.stringify({
+            schemaVersion: 1,
+            profiles: {
+              'web:linux': {
+                'session.new': {
+                  code: 'Period',
+                  modifiers: ['primary', 'shift'],
+                },
+              },
+            },
+          }),
+        );
+      }, scenario === 'native-create-linux');
+    }
     const streams = new Map<string, string>();
     let socketCount = 0;
+    let lastScopeId: string | undefined;
     const firstItems: string[] = [];
+    const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('console', (message) => {
@@ -412,11 +607,19 @@ it
       });
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
+        if (frame.type === 'item' && frame.value.type === 'opened')
+          lastScopeId = frame.value.scopeReference.scopeId;
         if (
           frame.type === 'item' &&
           ['baseline', 'snapshot'].includes(frame.value.type)
         )
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
+        if (
+          frame.type === 'item' &&
+          frame.value.type === 'baseline' &&
+          streams.get(frame.streamId) === 'workspace/follow'
+        )
+          workspaceBaselines.push(frame.value.value);
       });
     });
     if (stall) {
@@ -443,7 +646,7 @@ it
     }
     started = performance.now();
     await page.goto(
-      switching
+      realShell
         ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
         : f.origin,
     );
@@ -465,6 +668,39 @@ it
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
     try {
+      // The iframe loads its native bundles before opening workspace/follow.
+      // Navigation alone does not mean the browser has even sent that open.
+      await expect
+        .poll(() => workspaceBaselines.length, { timeout: 15_000 })
+        .toBeGreaterThan(0);
+      expect(workspaceBaselines).toMatchObject([
+        {
+          items: [
+            {
+              workspaceId: nativeWorkspace.id,
+              sessionIds:
+                scenario === 'unattached'
+                  ? []
+                  : [
+                      'root',
+                      ...(switching || createAfterSwitch
+                        ? ['root-' + otherThread]
+                        : []),
+                    ],
+            },
+          ],
+        },
+      ]);
+      if (scenario === 'unattached') {
+        await workbench
+          .locator('[data-composer-input][contenteditable="false"]')
+          .waitFor({ timeout: 15_000 });
+        await workbench
+          .getByText(/选择一个工作区开始|Choose a workspace to start/)
+          .waitFor({ timeout: 15_000 });
+        await context.close();
+        return;
+      }
       await editor.fill('未发送的原生草稿', { timeout: 15_000 });
     } catch (error) {
       throw Error(
@@ -472,9 +708,15 @@ it
           unary,
           streamEndpoints: [...streams.values()],
           firstItems,
-          listRead,
+          workspaceBaselines,
+          startupReplies: Object.fromEntries(startupReplies),
           errors,
-          text: (await workbench.locator('body').innerText()).slice(0, 300),
+          text: (
+            await workbench
+              .locator('body')
+              .innerText({ timeout: 1_000 })
+              .catch(() => '')
+          ).slice(0, 300),
         }),
         { cause: error },
       );
@@ -655,6 +897,147 @@ it
           })),
         }),
     );
+    if (nativeCreate) {
+      const mark = randomUUID();
+      const frame = page.locator('iframe');
+      const initialSockets = socketCount;
+      await frame.evaluate((node, mark) => {
+        node.dataset.fixtureIdentity = mark;
+      }, mark);
+      await workbench.locator('#app').evaluate((node, mark) => {
+        node.dataset.fixtureDocument = mark;
+      }, mark);
+      if (createAfterSwitch) {
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        await editor.fill('切换后保留的草稿', { timeout: 15_000 });
+      }
+      const platform = await editor.evaluate(
+        (node) => node.ownerDocument.defaultView!.navigator.platform,
+      );
+      if (scenario === 'native-create-linux')
+        expect(platform).toBe('Linux x86_64');
+      const chord = /darwin|mac|iphone|ipad/iu.test(platform)
+        ? 'Meta+Alt+N'
+        : /win/iu.test(platform)
+          ? 'Control+Alt+N'
+          : 'Control+Shift+Period';
+      try {
+        await editor.press(chord, { timeout: 10_000 });
+        await expect
+          .poll(() => unary.includes('session/create'), { timeout: 15_000 })
+          .toBe(true);
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === createdThread,
+          { timeout: 20_000 },
+        );
+      } catch (error) {
+        throw new Error(
+          JSON.stringify({
+            platform,
+            chord,
+            registered,
+            createReplies,
+            unary,
+            errors,
+            nativeSessions: await workbench
+              .locator('[data-row-key^="session:"]')
+              .evaluateAll((nodes) =>
+                nodes.map((node) => node.getAttribute('data-row-key')),
+              ),
+            text: (
+              await workbench
+                .locator('body')
+                .innerText({ timeout: 1_000 })
+                .catch(() => '')
+            ).slice(0, 450),
+          }),
+          { cause: error },
+        );
+      }
+      const row = workbench.locator(
+        '[data-row-key="session:' + createdThread + '"]',
+      );
+      await row.waitFor({ timeout: 15_000 });
+      await expect
+        .poll(
+          () =>
+            editor.evaluate((node) =>
+              node
+                .closest('[data-conversation-session]')
+                ?.getAttribute('data-conversation-session'),
+            ),
+          { timeout: 10_000 },
+        )
+        .toBe(createdNativeId);
+      const draft = '原生新会话草稿';
+      await editor.fill(draft, { timeout: 15_000 });
+      const draftPrefix =
+        'allrice:d-entry:conversation:v1:' +
+        [
+          f.identity.organizationId,
+          f.identity.personId,
+          f.identity.workspaceId,
+          f.identity.employeeInstanceId,
+        ].join('/') +
+        '/';
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              (key) => localStorage.getItem(key),
+              draftPrefix +
+                createdThread +
+                '/dsh.conversation.' +
+                createdNativeId,
+            ),
+          { timeout: 10_000 },
+        )
+        .toContain(draft);
+      expect(
+        await page.evaluate(
+          (key) => localStorage.getItem(key),
+          draftPrefix +
+            f.selection.threadId +
+            '/dsh.conversation.' +
+            createdNativeId,
+        ),
+      ).toBeNull();
+      expect(await editor.isEditable()).toBe(true);
+      expect(await frame.getAttribute('data-fixture-identity')).toBe(mark);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+      expect(documentLoads).toBe(1);
+      expect(socketCount).toBe(initialSockets);
+      if (createAfterSwitch) {
+        await workbench
+          .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === f.selection.threadId,
+        );
+        await workbench
+          .locator('[data-row-key="session:' + createdThread + '"]')
+          .click();
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === createdThread,
+        );
+        await expect.poll(() => editor.textContent()).toBe(draft);
+        expect(documentLoads).toBe(1);
+        expect(socketCount).toBe(initialSockets);
+        expect(
+          await workbench.locator('#app').getAttribute('data-fixture-document'),
+        ).toBe(mark);
+      }
+      expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      await context.close();
+      return;
+    }
     await expect
       .poll(() => firstItems)
       .toEqual(
@@ -663,9 +1046,76 @@ it
           'session/follow:snapshot',
         ]),
       );
-    expect(unary).toContain('session/list');
-    expect(unary).not.toContain('dynamicCordisRunner/inventory');
-    expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
+    expect(startupReplies.get('session/list')).toMatchObject({
+      ok: true,
+      value: {
+        items: expect.arrayContaining([
+          expect.objectContaining({ sessionId: 'root', blank: true }),
+        ]),
+      },
+    });
+    await expect
+      .poll(() => startupReplies.get('dynamicCordisRunner/inventory'))
+      .toMatchObject({
+        ok: true,
+        value: [
+          {
+            pluginId,
+            agentId: 'other',
+            packages: [{ packageId, name: 'Fixture Cordis package' }],
+          },
+        ],
+      });
+    await expect
+      .poll(() => startupReplies.get('dynamicCordisRunner/syncInspectManifest'))
+      .toEqual({ ok: true, value: null });
+    expect(unary).not.toContain('session/prompt');
+
+    const refused = {
+      ok: false,
+      reason: 'rejected',
+      message: 'Synthetic decision',
+    };
+    const blockedArgs = {
+      runHostHalf: {
+        agentId: 'other',
+        pluginId,
+        packageId,
+        mode: 'run',
+        requestId: null,
+        approveFutureVersions: false,
+      },
+      resolveRequestRun: { requestId: 'fixture-request', resolution: refused },
+      settleUserRun: { agentId: 'other', pluginId, resolution: refused },
+    };
+    if (!lastScopeId) throw Error('Missing fixture page carrier');
+    for (const method of blockedMethods) {
+      const endpoint = `dynamicCordisRunner/${method}`;
+      const response = await page.request.post(
+        `${f.origin}/api/v1/d-entry/native-rpc`,
+        {
+          data: {
+            selection: f.selection,
+            scopeId: lastScopeId,
+            rpcId: randomUUID(),
+            endpoint,
+            payload: { args: blockedArgs[method] },
+          },
+        },
+      );
+      expect(unary).toContain(endpoint);
+      expect(await response.json()).toMatchObject({
+        result: {
+          ok: false,
+          error: {
+            code: 'remote-access/denied',
+            details: { action: endpoint, reason: 'plugin-management' },
+          },
+        },
+      });
+    }
+    for (const handler of blockedHandlers)
+      expect(handler).not.toHaveBeenCalled();
     expect(unary).not.toContain('session/prompt');
     await page.evaluate(async () => {
       const finish: unknown = Reflect.get(window, 'finishCarrier');
