@@ -48,7 +48,7 @@
 }
 
 /* Mobile B keeps the native title, catalog and sidebar corner in charge. */
-@media (max-width: 760px) {
+@media (width < 768px) {
   .header {
     display: none;
   }

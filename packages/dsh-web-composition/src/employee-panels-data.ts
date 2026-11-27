@@ -6,6 +6,7 @@ import {
   type EmployeePanelDataHandlers,
   type EmployeePanelDataMethod,
 } from '../../../apps/web/lib/chatflow/employee-panel-data';
+import { employeePanelReferences } from './employee-panel-references';
 import { EmployeePanelsUnavailableError } from './employee-panels-model';
 import type {
   EmployeePanelsPort,
@@ -26,10 +27,14 @@ export function createEmployeePanelsDataPort(
 ): EmployeePanelsPort & {
   dataClient(sessionId: SessionIdOf): EmployeePanelDataClient;
 } {
+  const references = source.useReference
+    ? undefined
+    : employeePanelReferences();
   const snapshots = new Map<
     SessionIdOf,
     {
       original: EmployeePanelsSnapshot;
+      referencing?: EmployeePanelsSnapshot;
       value: EmployeePanelsSnapshot;
       controller: AbortController;
       client: EmployeePanelDataClient;
@@ -57,7 +62,8 @@ export function createEmployeePanelsDataPort(
     clear(id);
     if (!original) return null;
     const controller = new AbortController();
-    const raw = resolve(id, original) ?? unboundEmployeePanelDataClient;
+    const resolved = resolve(id, original);
+    const raw = resolved ?? unboundEmployeePanelDataClient;
     if (signal.aborted) return null;
     const current = () => {
       if (
@@ -89,16 +95,25 @@ export function createEmployeePanelsDataPort(
       }),
     ) as EmployeePanelDataHandlers;
     const client = createEmployeePanelDataClient(handlers);
+    const value = {
+      ...original,
+      materials: { ...original.materials, dataClient: client },
+      files: { ...original.files, dataClient: client },
+    };
     const entry = {
       original,
+      value,
+      referencing:
+        resolved && references
+          ? {
+              ...value,
+              materials: { ...value.materials, readOnly: false },
+              files: { ...value.files, readOnly: false },
+            }
+          : undefined,
       controller,
       client,
       unsubscribe: () => {},
-      value: {
-        ...original,
-        materials: { ...original.materials, dataClient: client },
-        files: { ...original.files, dataClient: client },
-      },
     };
     snapshots.set(id, entry);
     // Independent preview/dialog/upload consumers keep this subscription even
@@ -125,17 +140,44 @@ export function createEmployeePanelsDataPort(
     }
     return entry;
   };
+  const ownerEpoch = references?.bindOwner(signal, (id) => {
+    const entry = read(id);
+    return entry?.referencing ? entry.original : null;
+  });
   return {
-    getSnapshot: (id) => read(id)?.value ?? null,
+    getSnapshot(id) {
+      const entry = read(id);
+      if (!entry) return null;
+      return entry.referencing &&
+        references?.current?.matches(id, entry.original)
+        ? entry.referencing
+        : entry.value;
+    },
     subscribe(id, listener) {
-      return source.subscribe(id, () => {
+      const unsubscribe = source.subscribe(id, () => {
         if (snapshots.get(id)?.original !== source.getSnapshot(id)) clear(id);
         listener();
       });
+      const unwatch = references?.subscribe(listener);
+      return () => {
+        unsubscribe();
+        unwatch?.();
+      };
     },
     useReference: source.useReference
       ? (request) => source.useReference!(request)
-      : undefined,
+      : references && ownerEpoch
+        ? (request) => {
+            const entry = read(request.sessionId);
+            const bridge = references.current;
+            return (
+              !!entry?.referencing &&
+              !!bridge?.matches(request.sessionId, entry.original) &&
+              entry.value.scopeKey === request.scopeKey &&
+              bridge.insert(request, ownerEpoch)
+            );
+          }
+        : undefined,
     // Preview/dialog and the existing upload intake must receive this same
     // scoped client, rather than reconstructing an old route from an object ID.
     dataClient: (id) => read(id)?.client ?? unboundEmployeePanelDataClient,
