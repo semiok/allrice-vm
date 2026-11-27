@@ -380,9 +380,7 @@ export function nativeWebTransport(
         caller,
         {
           maxBytes:
-            method === 'session/modelCatalog'
-              ? nativeIndexByteLimit
-              : 16 * 1024,
+            method === 'session/create' ? 16 * 1024 : nativeIndexByteLimit,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>

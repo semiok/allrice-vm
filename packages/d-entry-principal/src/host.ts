@@ -445,7 +445,6 @@ type DefaultWorkspace = { path: string; ensure(): Promise<string> };
 
 /** Actual guest service; only the trusted Node API Peer can issue a scope.
  * The public Host face is the Cordis plugin, not a constructor for consumers. */
-
 class PrincipalService extends TypertRemoteService {
   static inject = [
     'connection',
