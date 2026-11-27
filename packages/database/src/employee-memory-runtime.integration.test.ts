@@ -38,6 +38,7 @@ import {
 } from './employee-memory-runtime.ts';
 import { nativeMemorySource } from './memory-native-source.ts';
 import { readLockedNativeMemoryCurrent } from './memory-runtime-current.ts';
+import { withDedicatedCallerTransaction } from './business-runtime/caller-transaction.ts';
 import { readApplicationBuiltinModules } from './builtin-modules.ts';
 import { updateDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { authorizeFixturePlatformAdministrator } from './platform-authority.fixture.ts';
@@ -745,10 +746,12 @@ suite(
         module: memoryModule,
       };
       const modules = await readApplicationBuiltinModules('worker');
+      const run = <T>(work: (tx: Sql) => Promise<T>) =>
+        withDedicatedCallerTransaction(database.db, work, live());
       const read = (tx: Sql) =>
         readLockedNativeMemoryCurrent(tx, f.context, target, modules, live());
       await expect(
-        database.db.begin((tx) =>
+        run((tx) =>
           readLockedNativeMemoryCurrent(
             tx,
             f.context,
@@ -759,25 +762,42 @@ suite(
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
 
-      await expect(database.db.begin(read)).resolves.toMatchObject({
-        scope: f.businessScope,
-        threadId: thread.id,
-        executionGeneration: '4.0',
-        module: memoryModule,
-      });
-      const caller = await hold(read);
+      const reached = gate<number>();
+      const release = gate();
+      releases.push(() => release.resolve());
+      const caller = track(
+        run(async (tx) => {
+          expect(await read(tx)).toMatchObject({
+            scope: f.businessScope,
+            threadId: thread.id,
+            executionGeneration: '4.0',
+            module: memoryModule,
+          });
+          const [dbSession] = await tx<
+            { pid: number }[]
+          >`select pg_backend_pid() pid`;
+          reached.resolve(dbSession!.pid);
+          await release.promise;
+        }),
+      );
+      const callerPid = await Promise.race([
+        reached.promise,
+        caller.then(() => {
+          throw Error('current fence closed before it was observed');
+        }),
+      ]);
       const withdraw = track(
         updateDEntryReleasePolicy(f.context, {
           ...policy,
           selections: [],
         }),
       );
-      await blockedBy(caller.pid);
-      caller.release();
-      await caller.done;
+      await blockedBy(callerPid);
+      release.resolve();
+      await caller;
       await withdraw;
 
-      await expect(database.db.begin(read)).rejects.toMatchObject({
+      await expect(run(read)).rejects.toMatchObject({
         code: 'authorization_denied',
       });
     });
