@@ -263,8 +263,15 @@ async function withWakeAuthority<T>(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
-    async nextCommittedWakeAt(): Promise<Date | null> {
-      const [row] = await sql<{ earliest: Date | null }[]>`
+    nextCommittedWakeAt(signal: AbortSignal): Promise<Date | null> {
+      return withWakeAuthority(
+        sql,
+        'isolation level read committed',
+        signal,
+        async (tx, active) => {
+          await tx`set local statement_timeout = '2s'`;
+          active.throwIfAborted();
+          const [row] = await tx<{ earliest: Date | null }[]>`
         select min(greatest(p.wake_at,p.retry_at,p.claim_until)) as earliest
         from person_virtual_machines vm
         join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
@@ -277,7 +284,10 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
               and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
               and a.action='stop' and a.result='succeeded'
             order by a.id desc limit 1)`;
-      return row?.earliest ?? null;
+          active.throwIfAborted();
+          return row?.earliest ?? null;
+        },
+      );
     },
     stage(plan: WakePlan): Promise<boolean> {
       return sql.begin(async (tx) => {

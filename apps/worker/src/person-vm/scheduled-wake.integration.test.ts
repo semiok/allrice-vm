@@ -279,7 +279,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
         scheduleFingerprints: [expect.stringMatching(/^sha256:/)],
       });
-      await expect(host.nextCommittedWakeAt()).resolves.toBeNull();
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toBeNull();
       await db`update person_virtual_machines
         set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
         where person_id=${f.binding.personId}`;
@@ -316,7 +316,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       );
       expect(stop).toHaveBeenCalledTimes(1);
       await f.stop(requestId);
-      await expect(host.nextCommittedWakeAt()).resolves.toEqual(
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
         new Date(Date.parse(scheduledAt) - 120_000),
       );
       await db`update person_virtual_machines set lease_owner=null,lease_expires_at=null

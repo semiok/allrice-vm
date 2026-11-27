@@ -221,6 +221,7 @@ export function createProductionPersonVmHost(input: {
   let upgradeDraining = false;
   let shutdownChecking = false;
   let upgradeDrained: UpgradeDrainReceipt | undefined;
+  let upgradeDrainRequested = false;
   let upgradeHandoff: ReturnType<typeof setTimeout> | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
@@ -1182,6 +1183,7 @@ export function createProductionPersonVmHost(input: {
             return receipt;
           }
           upgradeDraining = true;
+          upgradeDrainRequested = true;
           pauseIdle = true;
           let reopen: (() => void) | undefined;
           const resume = () => {
@@ -1195,7 +1197,8 @@ export function createProductionPersonVmHost(input: {
             // Join an already claimed wake before fencing the next startup.
             // The new gate must not strand a claim staged in the next epoch.
             reopen = vm.fenceWorkerStartup();
-            const pendingWake = await scheduledWake?.nextCommittedWakeAt();
+            const pendingWake =
+              await scheduledWake?.nextCommittedWakeAt(active);
             const joinBudget = 4 * vmCleanupTimeoutMs + 5_000;
             let wakeDeadline = pendingWake?.getTime() ?? Infinity;
             const assertWakeWindow = (reserve: number) => {
@@ -1278,8 +1281,16 @@ export function createProductionPersonVmHost(input: {
             }
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
+            // Recovery of a joined stop can publish a previously invisible
+            // wake without preparing a plan during this drain attempt.
+            const committedWake =
+              await scheduledWake?.nextCommittedWakeAt(active);
+            wakeDeadline = Math.min(
+              wakeDeadline,
+              committedWake?.getTime() ?? Infinity,
+            );
             active.throwIfAborted();
-            assertWakeWindow(UPGRADE_HANDOFF_MS);
+            assertWakeWindow(UPGRADE_HANDOFF_MS + 5_000);
             const receipt = Object.freeze({
               stopped: candidates.length,
               expiresAt: new Date(
@@ -1310,6 +1321,10 @@ export function createProductionPersonVmHost(input: {
             gracefulStop = true;
             return;
           }
+          // An expired or failed release attempt cannot be treated as an
+          // ordinary process shutdown and bypass the whole-host drain.
+          if (upgradeDrainRequested)
+            throw new PersonVmError('RUNTIME_NOT_READY');
           shutdownChecking = true;
           pauseIdle = true;
           const reopen = vm.fenceWorkerStartup();
