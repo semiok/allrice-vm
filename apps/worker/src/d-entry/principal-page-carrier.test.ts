@@ -1323,7 +1323,7 @@ it('uses actual DSH replies for create and fork registration on a page without a
       endpoint: 'session/fork',
       payload: { args: { request: { sessionId: 'other' } } },
     });
-  expect(await status(forkOther())).toBe(404);
+  expect((await forkOther()).status).toBe(404);
   expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).not.toContain(
     'native-forked',
   );

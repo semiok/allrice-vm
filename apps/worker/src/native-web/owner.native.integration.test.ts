@@ -120,7 +120,6 @@ it.skipIf(!cli)(
     const f = await setup();
     const signal = AbortSignal.timeout(15000);
     const create = await f.owner.createRootFor(f.context, {}, signal);
-    if (!create.ok) throw create.error;
     const agentId = create.value.sessionId;
     const issue = {
       scopeId: randomUUID(),
