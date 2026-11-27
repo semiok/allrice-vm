@@ -536,33 +536,53 @@ suite('4.0 browser cold entry', () => {
         }
       }
 
-      const mismatchedEntry = await context.newPage();
-      try {
-        await mismatchedEntry.route(
-          '**/api/v1/d-entry/native-prewarm',
-          (route) => route.fulfill({ status: 204 }),
-        );
-        await mismatchedEntry.route(
-          (url) =>
-            url.pathname === '/api/v1/sessions' && url.search === '?entry=4.0',
-          (route) =>
-            route.fulfill({ json: { ...employee, threadId: randomUUID() } }),
-        );
-        await mismatchedEntry.goto(
-          f.origin +
-            '/chatflow/4.0?' +
-            new URLSearchParams({ ...employee, new: randomUUID() }),
-        );
-        await mismatchedEntry
-          .getByRole('alert')
-          .getByRole('heading', {
-            name: '暂时打不开这条对话',
-            exact: true,
-          })
-          .waitFor();
-        expect(await mismatchedEntry.locator('iframe').count()).toBe(0);
-      } finally {
-        await mismatchedEntry.close();
+      for (const source of ['new-thread', 'identity'] as const) {
+        const mismatchedEntry = await context.newPage();
+        try {
+          await mismatchedEntry.route(
+            '**/api/v1/d-entry/native-prewarm',
+            (route) => route.fulfill({ status: 204 }),
+          );
+          const anotherThreadId = randomUUID();
+          const query = new URLSearchParams(employee);
+          if (source === 'new-thread') {
+            query.set('new', randomUUID());
+            await mismatchedEntry.route(
+              (url) =>
+                url.pathname === '/api/v1/sessions' &&
+                url.search === '?entry=4.0',
+              (route) =>
+                route.fulfill({
+                  json: { ...employee, threadId: anotherThreadId },
+                }),
+            );
+          } else {
+            query.set('threadId', f.selection.threadId);
+            await mismatchedEntry.route(
+              '**/api/v1/d-entry/identity?*',
+              (route) =>
+                route.fulfill({
+                  json: {
+                    identity: {
+                      ...f.selectionIdentity(f.selection),
+                      threadId: anotherThreadId,
+                    },
+                  },
+                }),
+            );
+          }
+          await mismatchedEntry.goto(f.origin + '/chatflow/4.0?' + query);
+          await mismatchedEntry
+            .getByRole('alert')
+            .getByRole('heading', {
+              name: '暂时打不开这条对话',
+              exact: true,
+            })
+            .waitFor();
+          expect(await mismatchedEntry.locator('iframe').count()).toBe(0);
+        } finally {
+          await mismatchedEntry.close();
+        }
       }
 
       const stalledDocument = await context.newPage();
