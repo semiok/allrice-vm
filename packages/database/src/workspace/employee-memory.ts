@@ -95,13 +95,13 @@ export async function employeeMemoryScope(
   workspaceId: string,
   instanceId: string,
   tx: Sql,
-  write = false,
+  lock: boolean | 'read' = false,
 ): Promise<EmployeeMemoryScope> {
   if (context.actor.type !== 'user')
     throw new DataAccessError('authentication_required');
   const who = { ...context, workspaceId: UuidSchema.parse(workspaceId) };
-  const principal = await readContentPrincipal(who, tx, write);
-  if (!principal || (write && !principal.writable))
+  const principal = await readContentPrincipal(who, tx, lock !== false);
+  if (!principal || (lock && !principal.writable))
     throw new DataAccessError('authorization_denied');
   let [row] = await tx<{ assignment_id: string; employee_id: string }[]>`
     select i.assignment_id,a.employee_id from allrice_employee_instances i
@@ -109,7 +109,7 @@ export async function employeeMemoryScope(
       and a.organization_id=i.organization_id and a.workspace_id=i.workspace_id
     where i.id=${UuidSchema.parse(instanceId)} and i.organization_id=${context.organizationId}
       and i.workspace_id=${who.workspaceId} and i.owner_id=${context.actor.id}`;
-  if (write && !row) {
+  if (lock === true && !row) {
     // The existing general-instance resolver owns this mapping. This creates
     // no memory mapping and cannot select a different user's assignment.
     await resolveEmployeeSessionInstance(who, instanceId, undefined, tx, true);
@@ -122,7 +122,7 @@ export async function employeeMemoryScope(
     row.assignment_id,
     instanceId,
     tx,
-    write,
+    lock,
   );
   return {
     organizationId: context.organizationId,

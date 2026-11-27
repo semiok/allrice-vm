@@ -253,9 +253,8 @@ async function validateStored(
   };
 }
 
-/** Insert once, including the empty index. An existing (S,B) ignores a new
- * draft/config/profile and restores the original pins and consumed budget.
- * The caller must await its real transaction commit before disclosing text. */
+/** Initial admission only. An existing (S,B) makes a retry idempotent.
+ * Recovery must use restoreMemoryContextStorage and cannot supply a draft. */
 export async function issueMemoryContextStorage(
   tx: MemorySql,
   keyInput: MemoryContextStorageKey,
@@ -276,7 +275,6 @@ export async function issueMemoryContextStorage(
     signal.throwIfAborted();
     return { id, origin, document, state };
   }
-  // Recovery must not rebuild an old B from today's active rows or config.
   const draft =
     typeof draftInput === 'function' ? await draftInput() : draftInput;
   const origin = MemoryContextStorageOriginSchema.parse(draft.origin);
@@ -305,6 +303,28 @@ export async function issueMemoryContextStorage(
     returning id`;
   signal.throwIfAborted();
   return { id: inserted!.id, origin, document: draft.document, state };
+}
+
+/** Read-only recovery and final dispatch qualification. Lock against the same
+ * context and source writers, and return only the issued document and budget.
+ * Absence is terminal for this operation, even when the original Run exists. */
+export async function restoreMemoryContextStorage(
+  tx: MemorySql,
+  keyInput: MemoryContextStorageKey,
+  signal: AbortSignal,
+  qualifyOrigin: MemoryContextOriginQualifier,
+) {
+  const { key, row } = await lockContext(tx, keyInput, signal);
+  if (!row) return unavailable();
+  const { id, origin, document, state } = await validateStored(
+    tx,
+    key,
+    row,
+    signal,
+    qualifyOrigin,
+  );
+  signal.throwIfAborted();
+  return { id, origin, document, state };
 }
 
 /** No implicit issue, repair, reset or alternative budget key on refusal. Every

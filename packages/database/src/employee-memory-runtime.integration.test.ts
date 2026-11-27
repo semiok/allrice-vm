@@ -1,5 +1,5 @@
 /** Actual PG transactions, original memory writers and 990 caller lifecycle.
- * ONLY the missing module/B/call/human-source/restore producers are represented
+ * ONLY the missing module/B/call/human-source/first-admission producers are represented
  * by the explicitly named owner contract fixture below. Its relation and
  * private assembly mock are never installed in production or a public port. */
 import { randomUUID } from 'node:crypto';
@@ -29,6 +29,7 @@ import {
 } from '@allrice/contracts';
 import { z } from 'zod';
 import * as client from './core/client.ts';
+import { DataAccessError } from './data.ts';
 import {
   createEmployeeMemoryPort,
   EmployeeMemoryWriteOutcomeUnknown,
@@ -135,7 +136,7 @@ type AuthorityRow = {
   facts: unknown;
   observations: unknown;
   revoked_sources: string[];
-  restore_expected: boolean;
+  first_allowed: boolean;
   source_revision: number;
 };
 
@@ -159,7 +160,7 @@ suite(
       execution_live boolean not null default true,
       revision integer not null default 1,config_ref text not null,
       facts jsonb not null,observations jsonb not null,
-      restore_expected boolean not null default false,reject_receipt boolean not null default false,receipt_gate text,commit_gate text,context_gate text)`;
+      first_allowed boolean not null default true,reject_receipt boolean not null default false,receipt_gate text,commit_gate text,context_gate text)`;
       await database.db`create table memory_runtime_source_contract_fixture(
       id uuid primary key references memory_runtime_owner_contract_fixture(id),
       source_allowed boolean not null default true,revoked_sources text[] not null default '{}',revision integer not null default 1)`;
@@ -423,17 +424,24 @@ suite(
           return { ...row, ...source! };
         };
         return {
-          current: async () => {
+          current: async () => this.projection(target, await read()),
+          firstContext: async (selector) => {
             const row = await read();
-            // A synthetic restore producer is explicit about its consistency
-            // requirement. No missing snapshot is silently granted fresh budget.
-            if (row.restore_expected) {
-              const [stored] =
-                await tx`select id from allrice_employee_memory_contexts
-              where organization_id=${this.scope.organizationId} and instance_id=${this.scope.instanceId} and budget_ref=${this.root.binding.b}`;
-              if (!stored) throw Error('fixture_restore_collection_incomplete');
-            }
-            return this.projection(target, row);
+            if (
+              !row.execution_live ||
+              !row.first_allowed ||
+              selector.workspaceId !== this.scope.workspaceId ||
+              selector.employeeInstanceId !== this.scope.instanceId ||
+              selector.threadId !== this.threadId ||
+              selector.nativeRequestRef !== this.rootRequest
+            )
+              throw new DataAccessError('authorization_denied');
+            const observations = z
+              .record(z.string(), ExecutionSchema)
+              .parse(row.observations);
+            return ExecutionSchema.parse(
+              observations[selector.nativeRequestRef],
+            );
           },
           actual: async (selector) => {
             const row = await read(),
@@ -489,6 +497,19 @@ suite(
       }
       issue(signal = live()) {
         return this.port.issueContext(this.context, this.target(), signal);
+      }
+      restore(signal = live(), b = this.root.binding.b) {
+        return this.port.restoreContext(
+          this.context,
+          {
+            workspaceId: this.scope.workspaceId,
+            employeeInstanceId: this.scope.instanceId,
+            threadId: this.threadId,
+            b,
+            module: memoryModule,
+          },
+          signal,
+        );
       }
       read(number: number, signal = live(), request = this.readRequest) {
         return this.port.readOrdinal(
@@ -566,7 +587,7 @@ suite(
           execution_live: boolean;
           config_ref: string;
           revoked_sources: string[];
-          restore_expected: boolean;
+          first_allowed: boolean;
           reject_receipt: boolean;
           receipt_gate: string | null;
           commit_gate: string | null;
@@ -959,9 +980,9 @@ suite(
       });
       await f.change({
         config_ref: 'fixture-config-2',
-        restore_expected: true,
+        first_allowed: false,
       });
-      expect(await f.issue()).toBe(document);
+      expect(await f.restore()).toBe(document);
       expect((await f.state())!.module_release).toEqual(first.module_release);
       expect((await f.state())!.module_config_revision_ref).toBe(
         'fixture-config-1',
@@ -1209,8 +1230,15 @@ suite(
     it('restores old B/pins and consumed UTF-8 budget across fresh dedicated sessions/config/edit, and never repairs a missing restore collection', async () => {
       const original = { summary: '原摘要😀', details: '原完整条件😀' },
         f = await setup([original]);
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      expect(await f.state()).toBeNull();
       const document = await f.issue(),
         initial = (await f.state())!;
+      await expect(f.restore(live(), 'different-B')).rejects.toThrow(
+        'fixture_stored_execution_denied',
+      );
       expect(await f.read(1)).toBe(renderMemoryDetailV2(1, original));
       const spent = (await f.state())!;
       const id = initial.state.pins[0]!.id,
@@ -1241,9 +1269,9 @@ suite(
       );
       await f.change({
         config_ref: 'fixture-config-2',
-        restore_expected: true,
+        first_allowed: false,
       });
-      expect(await f.issue()).toBe(document);
+      expect(await f.restore()).toBe(document);
       expect((await f.state())!.state).toEqual(spent.state);
       expect((await f.state())!.module_config_revision_ref).toBe(
         'fixture-config-1',
@@ -1255,14 +1283,83 @@ suite(
         spent.state.spentBytes +
           Buffer.byteLength(renderMemoryDetailV2(1, original), 'utf8'),
       );
+      await f.change({ execution_live: false });
+      const afterRead = await f.state();
+      expect(await f.restore()).toBe(document);
+      expect(await f.state()).toEqual(afterRead);
       await database.db`delete from allrice_employee_memory_contexts where id=${initial.id}`;
-      await expect(f.read(1)).rejects.toThrow(
-        'fixture_restore_collection_incomplete',
-      );
-      await expect(f.issue()).rejects.toThrow(
-        'fixture_restore_collection_incomplete',
-      );
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      await f.change({ execution_live: true });
+      await expect(f.read(1)).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      await expect(f.issue()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
       expect(await f.state()).toBeNull();
+    });
+
+    it('rejects a different original config when reopening an unchanged context', async () => {
+      const f = await setup([{ summary: 'pinned', details: null }]);
+      await f.issue();
+      const before = await f.state();
+      await database.db`update memory_runtime_owner_contract_fixture
+        set facts=${database.db.json({ ...f.root, moduleConfigRevisionRef: 'other-config' })} where id=${f.id}`;
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'MEMORY_CONTEXT_UNAVAILABLE',
+      });
+      expect(await f.state()).toEqual(before);
+    });
+
+    it('rechecks pinned source authority at dispatch after a concurrent revoke, without the original VM', async () => {
+      const f = await setup();
+      const candidate = await f.remember();
+      await f.port.confirm(f.context, await mutation(f, candidate.id), live());
+      const document = await f.issue();
+      await f.read(1);
+      await f.change({ execution_live: false, first_allowed: false });
+      const before = await f.state();
+      expect(await f.restore()).toBe(document);
+      const writer = await hold(
+        (tx) => tx`
+        update memory_runtime_source_contract_fixture
+        set source_allowed=false,revision=revision+1 where id=${f.id}
+      `,
+      );
+      try {
+        const dispatch = track(f.restore());
+        expect(await blockedBy(writer.pid)).toBe(f.pids.at(-1));
+        writer.release();
+        await writer.done;
+        await expect(dispatch).rejects.toThrow(
+          'fixture_actual_human_source_denied',
+        );
+        expect(await f.state()).toEqual(before);
+      } finally {
+        writer.release();
+        await writer.done;
+      }
+    });
+
+    it('refuses an issued context after the employee is archived through the real management writer', async () => {
+      const f = await setup(
+        [{ summary: 'before retirement', details: null }],
+        true,
+      );
+      const document = await f.issue();
+      await f.change({ execution_live: false, first_allowed: false });
+      expect(await f.restore()).toBe(document);
+      const issued = await f.state();
+      await updateEmployeeStatus(f.context, f.scope.employeeId, {
+        workspaceId: f.scope.workspaceId,
+        status: 'archived',
+      });
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      expect(await f.state()).toEqual(issued);
     });
 
     it('shares root/child allowance, charges complete repeated reads and refuses the thirteenth without reset', async () => {

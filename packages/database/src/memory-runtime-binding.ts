@@ -50,12 +50,16 @@ export interface MemoryRuntimeExecution {
 export interface MemoryRuntimeOwnerReads {
   /** Current authority locks precede memory-order. */
   current(): Promise<CurrentEmployeeBusinessProjection>;
-  /** Actual/stored producers must reject an incomplete or unsupported restore
-   * collection for an existing B. Missing context cannot mean a fresh root;
-   * this caller never mints B or claims an independently consistent snapshot. */
+  /** Requires the owner's durable proof of first context admission for this
+   * adopted root attempt, under the caller transaction. An existing Run
+   * origin or a live VM alone never proves that this is the initial attempt. */
+  firstContext(
+    input: ActualNativeExecutionSelectorProjection,
+  ): Promise<MemoryRuntimeExecution>;
   actual(
     input: ActualNativeExecutionSelectorProjection,
   ): Promise<MemoryRuntimeExecution>;
+  /** Original B and configuration. Usable after the original VM has stopped. */
   stored(
     input: OriginalExecutionSelectorProjection,
   ): Promise<MemoryRuntimeExecution>;
