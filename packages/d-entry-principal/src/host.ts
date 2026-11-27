@@ -896,7 +896,9 @@ class PrincipalService extends TypertRemoteService {
         );
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
         const modelInput =
-          endpoint === 'session/prompt' || endpoint === 'session/updateQueue';
+          endpoint === 'session/prompt' ||
+          endpoint === 'session/updateQueue' ||
+          endpoint === 'subagents/prompt';
         if (endpoint === 'session/attachment')
           throw Error('PRINCIPAL_RESOURCE_DENIED');
         const value = await this.ctx.typertGateway.invoke({

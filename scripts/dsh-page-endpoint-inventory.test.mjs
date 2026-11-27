@@ -95,21 +95,27 @@ it('distinguishes an installed provider’s native settings namespace from ordin
   expect(sensitivePageCapability(mutation)).toBe('provider-configuration');
 });
 
-it('blocks native plugin activation and platform settings while leaving their reads available', () => {
-  expect(
-    sensitivePageCapability(endpoint('dynamicCordisRunner', 'inventory')),
-  ).toBeUndefined();
-  expect(
-    sensitivePageCapability(endpoint('dynamicCordisRunner', 'runHostHalf')),
-  ).toBe('plugin-management');
-  expect(
-    sensitivePageCapability(endpoint('dynamicCordisRunner', 'settleUserRun')),
-  ).toBe('plugin-management');
-  expect(
-    sensitivePageCapability(
-      endpoint('dynamicCordisRunner', 'resolveRequestRun'),
-    ),
-  ).toBe('plugin-management');
+it('keeps plugin lifecycle and platform settings managed while relaying inventory and inspection', () => {
+  for (const method of [
+    'inventory',
+    'syncInspectManifest',
+    'resolveInspectQuery',
+  ]) {
+    expect(
+      sensitivePageCapability(endpoint('dynamicCordisRunner', method)),
+    ).toBeUndefined();
+  }
+  for (const method of [
+    'runHostHalf',
+    'settleUserRun',
+    'resolveRequestRun',
+    'stopFromPanel',
+    'undefineFromPanel',
+  ]) {
+    expect(
+      sensitivePageCapability(endpoint('dynamicCordisRunner', method)),
+    ).toBe('plugin-management');
+  }
   expect(
     sensitivePageCapability(endpoint('pluginMarket', 'search')),
   ).toBeUndefined();

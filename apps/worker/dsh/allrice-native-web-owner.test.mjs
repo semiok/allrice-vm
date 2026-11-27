@@ -55,6 +55,56 @@ it('keeps the admitted prompt of a long turn and excludes queued and future inpu
   });
 });
 
+it('derives the first owned prompt on a native fork without assigning its seeded ancestor prompt', () => {
+  const fork = {
+    id: 'fork',
+    header: { id: 'fork', parentSession: 'root', isSeeded: true },
+  };
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: userPrompt('ancestor') },
+    { type: 'turn/end', data: { turn: 1 } },
+    { type: 'session/end-seed', data: {} },
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'user/message', data: userPrompt('first-fork-prompt') },
+  ].map((event, seq) => ({ ...event, seq }));
+  expect(
+    readPromptOrigins(
+      events,
+      1,
+      1,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toBeNull();
+  expect(
+    readPromptOrigins(
+      events,
+      5,
+      2,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toEqual({
+    turn: 2,
+    prompts: [
+      {
+        sessionId: 'fork',
+        scopeId: principal.scopeId,
+        requestId: 'first-fork-prompt',
+        messageId: 'message-first-fork-prompt',
+        turn: 2,
+      },
+    ],
+    delegated: false,
+    inherited: [],
+  });
+});
+
 it('uses the native title source sequence after a later turn has started', () => {
   const events = [
     { type: 'turn/start', data: { turn: 1 } },

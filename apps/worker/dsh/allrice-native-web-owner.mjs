@@ -234,8 +234,12 @@ function isNativeRpcPrompt(source) {
 
 export function nativePromptOccurrence(session, message, turn) {
   const { source } = message;
+  const parentSessionId =
+    session.header.origin === 'subagent'
+      ? session.header.parentSession
+      : undefined;
   if (
-    !isNativeOrdinaryRoot(session.header) ||
+    (!isNativeOrdinaryRoot(session.header) && !parentSessionId) ||
     !isNativeRpcPrompt(source) ||
     source.principal?.kind !== 'allrice-d-entry' ||
     typeof source.principal.scopeId !== 'string' ||
@@ -246,6 +250,7 @@ export function nativePromptOccurrence(session, message, turn) {
     return null;
   return {
     sessionId: session.id,
+    ...(parentSessionId && { parentSessionId }),
     scopeId: source.principal.scopeId,
     requestId: source.rpcId,
     messageId: message.id,
@@ -411,20 +416,35 @@ export function observeNativePrompts(scope, lifetime) {
     'content-type': 'text/plain; charset=utf-8',
   };
   const encoder = new TextEncoder();
-  const sourceKey = (root, principal, requestId) =>
-    JSON.stringify([root, principal, requestId]);
+  const sourceKey = (sessionId, parentSessionId, principal, requestId) =>
+    JSON.stringify([sessionId, parentSessionId, principal, requestId]);
   const pending = (agent) => [...agent.inbox.nextTurn, ...agent.inbox.nextStep];
   function messageKey(agent, message) {
     const { source } = message;
     const session = agent.session;
     if (
-      !isNativeOrdinaryRoot(session.header) ||
       source?.kind !== 'user' ||
       typeof source.rpcId !== 'string' ||
       source.principal?.kind !== 'allrice-d-entry'
     )
       return undefined;
-    return sourceKey(session.id, source.principal.scopeId, source.rpcId);
+    const parentSessionId =
+      session.header.origin === 'subagent'
+        ? session.header.parentSession
+        : undefined;
+    if (!isNativeOrdinaryRoot(session.header)) {
+      // Cold resume owns the inbox before it announces subagent/start.
+      const parent =
+        parentSessionId && original(scope.agents.get(parentSessionId));
+      if (!parent || !scope.agents.isOwnedBy(session.id, parent))
+        return undefined;
+    }
+    return sourceKey(
+      session.id,
+      parentSessionId,
+      source.principal.scopeId,
+      source.rpcId,
+    );
   }
   const matches = (agent, message) =>
     sources.get(messageKey(agent, message)) ?? [];
@@ -501,13 +521,17 @@ export function observeNativePrompts(scope, lifetime) {
       typeof value?.id !== 'string' ||
       value.id.length !== 36 ||
       typeof value.sessionId !== 'string' ||
+      (value.parentSessionId !== undefined &&
+        (typeof value.parentSessionId !== 'string' ||
+          !value.parentSessionId ||
+          value.parentSessionId === value.sessionId)) ||
       typeof value.scopeId !== 'string' ||
       value.scopeId.length !== 36 ||
       typeof value.requestId !== 'string'
     )
       return notFound();
-    const { id, sessionId, scopeId, requestId } = value;
-    const key = sourceKey(sessionId, scopeId, requestId);
+    const { id, sessionId, parentSessionId, scopeId, requestId } = value;
+    const key = sourceKey(sessionId, parentSessionId, scopeId, requestId);
     if (value.action === 'prompt-outcome') {
       const observer = observers.get(id);
       return observer?.key === key

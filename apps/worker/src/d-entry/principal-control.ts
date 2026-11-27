@@ -2,6 +2,7 @@ import { sameDEntryIdentity } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as Subagents } from '@deepseek-ai/dsh-subagent/remote';
 import type {
   RemoteStreamHandle,
   TypertSchema,
@@ -18,6 +19,7 @@ import {
   type DEntryScopedStreamCall,
   type DEntryScopedStreamFrame,
   type DEntryScopedUnaryCall,
+  type InputOf,
   type ScopeFrame,
 } from '@allrice/d-entry-principal/types';
 
@@ -40,11 +42,27 @@ export type PrincipalInvocationObservation = Readonly<{
   accepted(): void;
   unknown(): void;
 }>;
+type PrincipalInvocationCall =
+  | DEntryScopedUnaryCall
+  | Readonly<{
+      scopeId: string;
+      endpoint: 'subagents/prompt';
+      args: InputOf<(typeof Subagents.methods)['subagents/prompt']>;
+    }>;
 
 export function isCertainNativePromptRejection(
-  call: DEntryScopedUnaryCall,
+  call: PrincipalInvocationCall,
   code: string,
 ) {
+  if (call.endpoint === 'subagents/prompt')
+    return [
+      'subagent/invalid-time-zone',
+      'subagent/parent-unavailable',
+      'subagent/attachment-invalid',
+      'subagent/unauthorized',
+      'subagent/not-resumable',
+      'subagent/delivery-unavailable',
+    ].includes(code);
   if (call.endpoint !== 'session/prompt') return false;
   if (code === 'gateway/bad-request') {
     // rc.2's prompt rejects this exact shape before resolving an Agent or
@@ -65,7 +83,7 @@ export function isCertainNativePromptRejection(
 
 function pageModelInput(
   call: DEntryPageNativeCall,
-): DEntryScopedUnaryCall | undefined {
+): PrincipalInvocationCall | undefined {
   const { scopeId, endpoint } = call;
   if (endpoint === 'session/prompt')
     return {
@@ -81,6 +99,15 @@ function pageModelInput(
       scopeId,
       endpoint,
       args: Native.methods[endpoint]
+        .input({ strict: true })
+        .create()
+        .parse(call.args),
+    };
+  if (endpoint === 'subagents/prompt')
+    return {
+      scopeId,
+      endpoint,
+      args: Subagents.methods[endpoint]
         .input({ strict: true })
         .create()
         .parse(call.args),
@@ -239,7 +266,7 @@ export function createDEntryPrincipalControl(
       value: DEntryScopeIssue,
       caller: AbortSignal,
       beforeInvoke?: (
-        call: DEntryScopedUnaryCall,
+        call: PrincipalInvocationCall,
         signal: AbortSignal,
       ) => Promise<PrincipalInvocationObservation | undefined>,
     ): DEntryPrincipalActivity {

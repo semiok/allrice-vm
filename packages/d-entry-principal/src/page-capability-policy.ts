@@ -96,9 +96,11 @@ export function sensitivePageCapability(
     (inCategory(endpoint, pluginMarket) &&
       /^(?:set|update|replace|mutate)/u.test(method)) ||
     (inCategory(endpoint, dynamicPlugins) &&
-      /^(?:activate|approve|runHost|resolveRequestRun|settleUserRun)/u.test(
-        method,
-      ))
+      (method === 'stopFromPanel' ||
+        method === 'undefineFromPanel' ||
+        /^(?:activate|approve|runHost|resolveRequestRun|settleUserRun)/u.test(
+          method,
+        )))
   ) {
     return 'plugin-management';
   }

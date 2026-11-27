@@ -10,6 +10,7 @@ import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
+import { nativeSessionRoot } from '@allrice/d-entry-principal/policy';
 import {
   createDEntryPrincipalControl,
   type PrincipalInvocationObservation,
@@ -160,9 +161,10 @@ export async function openNativeWebOwner(input: {
       issue: DEntryPrincipalIssue;
     } & (
       | {
-          endpoint: 'session/prompt';
+          endpoint: 'session/prompt' | 'subagents/prompt';
           requestId: string;
           mode: 'queue' | 'steer';
+          child?: { sessionId: string; parentSessionId: string };
           observe(signal: AbortSignal): NativePromptObservation;
         }
       | { endpoint: 'session/updateQueue' }
@@ -748,6 +750,7 @@ export async function openNativeWebOwner(input: {
           async (call, active) => {
             if (
               call.endpoint !== 'session/prompt' &&
+              call.endpoint !== 'subagents/prompt' &&
               call.endpoint !== 'session/updateQueue'
             )
               return;
@@ -759,18 +762,51 @@ export async function openNativeWebOwner(input: {
             if (!context || !installedModelAdapter)
               throw new PersonVmError('AUTHORIZATION_DENIED');
             let authorized: DEntryPrincipalIssue;
-            const sessionId = call.args.request.sessionId;
+            let child:
+              { sessionId: string; parentSessionId: string } | undefined;
+            let rootSessionId: string;
+            if (call.endpoint === 'subagents/prompt') {
+              if (issue.access !== 'page')
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              const { childSessionId, parentSessionId } = call.args.request;
+              const result = await readCurrentSessions(active, (current) =>
+                input.vm.assertCurrentBinding(context, binding, current),
+              );
+              if (!result.ok) throw result.error;
+              const rows = result.value.items;
+              const entries = new Map(
+                rows.map((entry) => [String(entry.sessionId), entry]),
+              );
+              const parent = entries.get(parentSessionId);
+              const target = entries.get(childSessionId);
+              const rootEntry = nativeSessionRoot(entries, childSessionId);
+              if (
+                entries.size !== rows.length ||
+                !parent?.agentAvailable ||
+                target?.origin !== 'subagent' ||
+                target.parentSessionId !== parent.sessionId ||
+                !rootEntry
+              )
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              rootSessionId = rootEntry.sessionId;
+              child = {
+                sessionId: target.sessionId,
+                parentSessionId: parent.sessionId,
+              };
+            } else {
+              rootSessionId = call.args.request.sessionId;
+            }
             if (issue.access === 'page') {
               const pin = await getDEntryPageNativeRoot(
                 context,
                 issue.identity,
                 binding.vmId,
-                sessionId,
+                rootSessionId,
               );
               if (
                 !pin ||
                 pin.vmId !== binding.vmId ||
-                pin.rootNativeSessionId !== sessionId
+                pin.rootNativeSessionId !== rootSessionId
               )
                 throw new PersonVmError('AUTHORIZATION_DENIED');
               authorized = {
@@ -787,7 +823,7 @@ export async function openNativeWebOwner(input: {
                 },
               };
             } else {
-              if (sessionId !== issue.root.nativeSessionId)
+              if (rootSessionId !== issue.root.nativeSessionId)
                 throw new PersonVmError('AUTHORIZATION_DENIED');
               authorized = issue;
             }
@@ -806,13 +842,18 @@ export async function openNativeWebOwner(input: {
                 ...write,
                 endpoint: call.endpoint,
                 requestId,
-                mode: call.args.request.mode,
+                mode:
+                  call.endpoint === 'subagents/prompt'
+                    ? call.args.request.delivery
+                    : call.args.request.mode,
+                child,
                 observe(current) {
                   const observed = observeNativePrompt(
                     transport,
                     {
                       adapterId,
-                      sessionId,
+                      sessionId: child?.sessionId ?? rootSessionId,
+                      ...(child && { parentSessionId: child.parentSessionId }),
                       scopeId: issue.scopeId,
                       requestId,
                     },
@@ -927,7 +968,9 @@ export async function openNativeWebOwner(input: {
               wake.data.kind === 'delegated' &&
               (!wake.data.prompts.length ||
                 wake.data.prompts.some(
-                  (prompt) => prompt.sessionId !== sessionId,
+                  (prompt) =>
+                    (prompt.sessionId === sessionId) ===
+                    !!prompt.parentSessionId,
                 ))
             )
               throw new PersonVmError('PROVIDER_FAILED');
@@ -1028,18 +1071,29 @@ export async function openNativeWebOwner(input: {
                 (address.kind === 'subagent' && !value.delegated) ||
                 !prompts.success ||
                 !prompts.data.length ||
-                prompts.data.some(
-                  (prompt) => prompt.sessionId !== value.rootSessionId,
-                ) ||
                 !inherited.success ||
-                (value.delegated && !inherited.data.length)
+                (value.delegated &&
+                  address.kind === 'session' &&
+                  !inherited.data.length)
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               const ids = prompts.data.map(({ requestId }) => requestId);
               const references = new Set(ids);
               if (
                 new Set(inherited.data).size !== inherited.data.length ||
-                inherited.data.some((id) => !references.has(id))
+                inherited.data.some((id) => !references.has(id)) ||
+                prompts.data.some((prompt) => {
+                  if (inherited.data.includes(prompt.requestId))
+                    return (
+                      (prompt.sessionId === value.rootSessionId) ===
+                      !!prompt.parentSessionId
+                    );
+                  return address.kind === 'session'
+                    ? prompt.sessionId !== address.sessionId ||
+                        prompt.parentSessionId !== undefined
+                    : prompt.sessionId !== address.childSessionId ||
+                        prompt.parentSessionId !== address.parentSessionId;
+                })
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {

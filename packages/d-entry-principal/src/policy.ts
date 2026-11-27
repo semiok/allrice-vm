@@ -70,6 +70,22 @@ export interface Projection {
   active: boolean;
   bindings: readonly RemoteAccessBinding[];
 }
+
+/** Only child-origin edges participate in an existing thread's ancestry. */
+export function nativeSessionRoot(
+  entries: ReadonlyMap<string, SessionSummary>,
+  sessionId: string,
+) {
+  let entry = entries.get(sessionId);
+  const seen = new Set<string>();
+  while (entry?.origin === 'subagent') {
+    if (!entry.parentSessionId || seen.has(entry.sessionId)) return;
+    seen.add(entry.sessionId);
+    entry = entries.get(entry.parentSessionId);
+  }
+  return entry;
+}
+
 /** Native snapshots still describe a non-owner Peer. Page Session actions
  * come from the same generated registry and policy as page dispatch. */
 export function projectPageSessions(
@@ -98,10 +114,52 @@ export function projectPageSessions(
     resource: 'session',
     actions,
   };
-  return items.map(({ sessionId }) => ({
+  const bindings: RemoteAccessBinding[] = items.map(({ sessionId }) => ({
     role,
     resource: { kind: 'session', id: sessionId },
   }));
+  if (
+    descriptors.some((method) => pageEndpoint(method) === 'subagents/prompt')
+  ) {
+    const entries = new Map(
+      items.map((item) => [String(item.sessionId), item]),
+    );
+    const grant: Extract<
+      RemoteAccessBinding,
+      { resource: { kind: 'global' } }
+    > = {
+      role: {
+        name: 'allrice-current-vm-child-prompt',
+        resource: 'global',
+        actions: ['subagents/prompt'],
+      },
+      resource: { kind: 'global' },
+      condition: ({ args }) => {
+        const request = args?.request;
+        if (
+          entries.size === items.length &&
+          request &&
+          typeof request === 'object' &&
+          'childSessionId' in request &&
+          typeof request.childSessionId === 'string' &&
+          'parentSessionId' in request &&
+          typeof request.parentSessionId === 'string'
+        ) {
+          const parent = entries.get(request.parentSessionId);
+          const child = entries.get(request.childSessionId);
+          if (
+            parent?.agentAvailable &&
+            child?.origin === 'subagent' &&
+            child.parentSessionId === parent.sessionId
+          )
+            return { kind: 'allow' };
+        }
+        return { kind: 'deny', reason: 'child-address-required' };
+      },
+    };
+    bindings.push(grant);
+  }
+  return bindings;
 }
 export function principalPolicy(
   scopes: ReadonlyMap<string, Projection>,
@@ -140,16 +198,7 @@ export function projectSessions(
     throw Error('PRINCIPAL_ROOT_INVALID');
   const bindings: RemoteAccessBinding[] = [];
   for (const entry of items) {
-    let cursor = entry;
-    const seen = new Set<string>();
-    while (String(cursor.sessionId) !== issue.root.nativeSessionId) {
-      if (seen.has(String(cursor.sessionId)) || !cursor.parentSessionId) break;
-      seen.add(String(cursor.sessionId));
-      const next = entries.get(String(cursor.parentSessionId));
-      if (!next) break;
-      cursor = next;
-    }
-    if (String(cursor.sessionId) !== issue.root.nativeSessionId) continue;
+    if (nativeSessionRoot(entries, entry.sessionId) !== root) continue;
     bindings.push({
       role: issue.access === 'execute' ? editorReadRole : readRole,
       resource: { kind: 'session', id: entry.sessionId },

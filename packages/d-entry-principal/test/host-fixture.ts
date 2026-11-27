@@ -25,6 +25,7 @@ import Gateway, {
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import {
   Remote,
+  RemoteError,
   TypertRemoteService,
   type PeerScope,
 } from '@deepseek-ai/dsh-typert-protocol';
@@ -38,6 +39,7 @@ import type {
   SessionCreateRequest,
   SessionForkRequest,
   SessionSearchRequest,
+  SessionSelectModelRequest,
   SessionSummary,
 } from '@deepseek-ai/dsh-api-session-controller/types';
 import { TYPERT as NativeMetadata } from '@deepseek-ai/dsh-api-session-controller/typert';
@@ -207,6 +209,20 @@ class Catalog extends TypertRemoteService {
       parentSessionId: request.sessionId,
     });
     return { sessionId };
+  }
+  @Remote('selectModel')
+  selectModel({ sessionId, ...selected }: SessionSelectModelRequest) {
+    if (
+      !this.items.some((row) => row.sessionId === sessionId) ||
+      selected.provider !== 'openai-codex' ||
+      selected.model !== 'fixture-codex'
+    )
+      throw new RemoteError(
+        'session/model-unavailable',
+        'Unknown fixture model',
+        selected,
+      );
+    return { selected };
   }
   @Remote({ mode: 'stream' })
   async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {

@@ -53,6 +53,8 @@ type PromptOwner = NativeModelSelection &
     scopeId: string;
     adapterId: string;
     root: string;
+    sessionId: string;
+    parentSessionId?: string;
     forkedFromNativeSessionId?: string;
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
@@ -62,8 +64,8 @@ type PromptOwner = NativeModelSelection &
     ): Promise<void>;
   }>;
 
-const promptKey = (adapterId: string, root: string, requestId: string) =>
-  JSON.stringify([adapterId, root, requestId]);
+const promptKey = (adapterId: string, sessionId: string, requestId: string) =>
+  JSON.stringify([adapterId, sessionId, requestId]);
 
 export function readNativePromptContributors<
   T extends Pick<PromptOwner, 'authorityKey' | 'revoked'>,
@@ -349,7 +351,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       >();
       const operations = new Set<Promise<unknown>>();
       const executions = new WeakMap<PromptOwner, Map<string, string>>();
-      const rootExecutions = new WeakMap<
+      const sourceExecutions = new WeakMap<
         PromptOwner,
         ModelCallBinding['execution']
       >();
@@ -480,7 +482,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             scope.revoked.aborted ||
             !prompt ||
             prompt.scopeId !== scope.scopeId ||
-            prompt.sessionId !== scope.root
+            prompt.sessionId !== scope.sessionId ||
+            prompt.parentSessionId !== scope.parentSessionId
           )
             continue;
           const choices = candidates.get(scope.requestId) ?? [];
@@ -490,7 +493,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         return readNativePromptContributors(
           prompts.map(({ requestId }) => requestId),
           (id) => {
-            const choices = candidates.get(id) ?? [];
+            const { messageId } = requested.get(id)!;
+            const choices = (candidates.get(id) ?? []).filter(
+              ({ observation }) => {
+                const claimed = observation.claimedMessageId();
+                return !claimed || claimed === messageId;
+              },
+            );
             const inserted = choices.filter(({ observation }) =>
               observation.inserted(),
             );
@@ -621,12 +630,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 throw new PersonVmError('VM_ACTIVE');
               return;
             }
-            const { requestId, mode, observe } = request;
-            const requestKey = promptKey(
-              adapterId,
-              root.rootNativeSessionId,
-              requestId,
-            );
+            const { requestId, mode, observe, child } = request;
+            const sessionId = child?.sessionId ?? root.rootNativeSessionId;
+            const requestKey = promptKey(adapterId, sessionId, requestId);
             for (
               let previous = promptDispatches.get(requestKey);
               previous;
@@ -653,8 +659,11 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     unknown &&
                     !observation.inserted() &&
                     !scope.revoked.aborted &&
-                    promptKey(scope.adapterId, scope.root, scope.requestId) ===
-                      requestKey,
+                    promptKey(
+                      scope.adapterId,
+                      scope.sessionId,
+                      scope.requestId,
+                    ) === requestKey,
                 )
               )
                 return reject();
@@ -730,6 +739,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 binding,
                 adapterId,
                 root: root.rootNativeSessionId,
+                sessionId,
+                ...(child && { parentSessionId: child.parentSessionId }),
                 ...(root.forkedFromNativeSessionId && {
                   forkedFromNativeSessionId: root.forkedFromNativeSessionId,
                 }),
@@ -878,7 +889,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           Awaited<ReturnType<typeof readDEntryNativeExecution>>
         >();
         for (const member of contributing) {
-          const ids = rootExecutions.get(member);
+          const ids = sourceExecutions.get(member);
           if (!ids) return reject();
           let original = checked.get(ids.executionId);
           if (!original) {
@@ -907,8 +918,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             attempt.nativeInstanceId !== call.native.instanceId ||
             attempt.vmInstanceId !== call.vm.instanceId ||
             attempt.leaseEpoch !== call.vm.leaseEpoch ||
-            attempt.sessionId !== scope.root ||
-            attempt.parentSessionId !== null ||
+            attempt.sessionId !== member.sessionId ||
+            attempt.parentSessionId !== (member.parentSessionId ?? null) ||
             attempt.kind !== 'assistant' ||
             !attempt.contributingRequestIds.includes(member.requestId)
           )
@@ -1207,12 +1218,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                         );
                         entry.persisted = true;
                         await assertPersistedExecution(call, admitted);
-                        if (
-                          kind === 'assistant' &&
-                          !call.native.parentSessionId
-                        )
+                        if (kind === 'assistant')
                           for (const member of direct)
-                            rootExecutions.set(member, call.execution);
+                            sourceExecutions.set(member, call.execution);
                         if (!delegated)
                           trackTurn(
                             scope,

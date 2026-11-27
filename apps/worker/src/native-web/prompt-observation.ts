@@ -13,6 +13,7 @@ const adoptedMessage = z
   .strict();
 export const NativePromptOccurrenceSchema = adoptedMessage.extend({
   sessionId: z.string().min(1).max(256),
+  parentSessionId: z.string().min(1).max(256).optional(),
   scopeId: UuidSchema,
   requestId: z.string().min(1).max(256),
 });
@@ -54,6 +55,7 @@ export function observeNativePrompt(
   source: {
     adapterId: string;
     sessionId: string;
+    parentSessionId?: string;
     scopeId: string;
     requestId: string;
   },
@@ -68,6 +70,7 @@ export function observeNativePrompt(
   const failed = () => new PersonVmError('PROVIDER_FAILED');
   let state: 'opening' | 'ready' | 'inserted' | 'claimed' = 'opening';
   let terminal: 'discarded' | 'ended' | undefined;
+  let claimedMessageId: string | undefined;
   let tail = '';
   const settled = transport
     .readManagedModelProof(
@@ -90,6 +93,7 @@ export function observeNativePrompt(
             );
             if (!adopted.success) throw failed();
             state = 'claimed';
+            claimedMessageId = adopted.data.messageId;
             claim.resolve(adopted.data);
           } else if (
             (record === 'discarded' && state === 'inserted') ||
@@ -122,6 +126,7 @@ export function observeNativePrompt(
       await settled.catch(() => {});
     },
     inserted: () => state === 'inserted' || state === 'claimed',
+    claimedMessageId: () => claimedMessageId,
     async assertClaimed(
       active: AbortSignal,
       expected?: NativePromptOccurrence,
@@ -133,6 +138,7 @@ export function observeNativePrompt(
       if (
         expected &&
         (expected.sessionId !== source.sessionId ||
+          expected.parentSessionId !== source.parentSessionId ||
           expected.scopeId !== source.scopeId ||
           expected.requestId !== source.requestId ||
           expected.messageId !== adopted.messageId ||

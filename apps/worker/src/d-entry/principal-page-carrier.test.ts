@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { getEventListeners, on, once } from 'node:events';
 import { get, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -16,6 +18,7 @@ import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
+import Llm from '@deepseek-ai/dsh-llm';
 import { z } from 'zod';
 import {
   deferred,
@@ -847,6 +850,73 @@ it('searches another Session using the native descriptor and preserves native ar
     ).json(),
   ).toMatchObject({
     result: { ok: false, error: { code: 'gateway/input-invalid' } },
+  });
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('updates ordinary settings and selects an authorized session model through the page carrier', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const composition = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  const runtime = createRequire(
+    composition.resolve('@deepseek-ai/dsh/package.json'),
+  );
+  const moduleName = '@deepseek-ai/dsh-api-settings-controller';
+  const { SettingsController } = await import(
+    pathToFileURL(runtime.resolve(moduleName)).href
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(runtime.resolve(`${moduleName}/typert`)).href
+  );
+  let setting = { theme: 'light' };
+  const update = vi.fn(async (_namespace: string, patch: typeof setting) => {
+    setting = patch;
+  });
+  host.provide('settings', {
+    update,
+    describe: () => [
+      {
+        ns: 'appearance',
+        schema: {},
+        value: setting,
+        autoGenerate: false,
+        applies: 'live',
+        secrets: [],
+        revision: 1,
+      },
+    ],
+  } as never);
+  await host.plugin(Llm);
+  await host.plugin(SettingsController);
+  host.typert.register(TYPERT);
+  const life = await open(f);
+  const request = async (endpoint: string, args: Record<string, unknown>) =>
+    (
+      await f.invoke(life.scopeId, sessionToken, {
+        endpoint,
+        payload: { args },
+      })
+    ).json();
+  const patch = { theme: 'dark' };
+  expect(
+    await request('settings/update', { ns: 'appearance', patch }),
+  ).toMatchObject({
+    result: { ok: true, value: { ns: 'appearance', value: patch } },
+  });
+  expect(update).toHaveBeenCalledWith('appearance', patch, undefined);
+  const selected = { provider: 'openai-codex', model: 'fixture-codex' };
+  expect(
+    await request('session/selectModel', {
+      request: { sessionId: 'other', ...selected },
+    }),
+  ).toMatchObject({
+    result: { ok: true, value: { selected } },
   });
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });

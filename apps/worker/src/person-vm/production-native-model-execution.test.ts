@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import type { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +11,7 @@ import {
   type NativePromptObservation,
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
+import { installDEntryNativeOwnerPort } from '../d-entry/native-owner.js';
 import {
   createProductionNativeModelExecution,
   nativeRunExecutionIds,
@@ -66,6 +70,7 @@ const login = (sessionId = randomUUID()): RequestContext => ({
 });
 beforeEach(() => {
   mocks.pin.mockReset().mockResolvedValue({
+    identity,
     vmId: binding.vmId,
     rootNativeSessionId: issue.root.nativeSessionId,
     rootBindingRef: issue.root.rootBindingRef,
@@ -135,6 +140,7 @@ function nativeFacts() {
       closed.resolve();
     }),
     inserted: () => inserted,
+    claimedMessageId: vi.fn(() => undefined),
     assertClaimed: vi.fn(async () => {}),
     confirmedReplay: vi.fn(async () => false),
   } satisfies NativePromptObservation;
@@ -154,16 +160,37 @@ async function setup() {
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
     kind: 'clear',
   }));
+  const readNativeAttemptFor = vi.fn();
+  const adapterId = 'a'.repeat(64);
+  const model = 'fixture-codex';
+  const nativeInstanceId = randomUUID();
+  const endpoint = {
+    workspaceId: identity.workspaceId,
+    employeeInstanceId: identity.employeeInstanceId,
+    employeeVersionId: identity.employeeVersionId,
+    employeeRevision: identity.employeeRevision,
+    hostPort: 12345,
+    guestPort: 12346,
+  };
+  const receipt = { binding, rosterDigest: 'roster', endpoints: [endpoint] };
   const profile = {
-    owner: { modelAdapterId: 'adapter', readNativeRootWakeFor: readRootWake },
+    owner: {
+      modelAdapterId: adapterId,
+      readNativeRootWakeFor: readRootWake,
+      readNativeAttemptFor,
+      nativeInstanceId,
+    },
+    endpoint,
     bindingRef: 'binding',
-    receipt: { rosterDigest: 'roster' },
+    receipt,
     revoked: lifetime.signal,
   };
   const runJournalOwners = vi.fn(() => []);
+  const bindReference = vi.fn();
   const attached = await createProductionNativeModelExecution().attach(
     {
       lifetime: lifetime.signal,
+      providers: { applicationBuild: { manifestDigest: 'fixture-build' } },
       startup: {
         installModelAdapter: () => () => {},
         installModelPromptObserver(observer: Observer) {
@@ -177,26 +204,35 @@ async function setup() {
     {
       routeRevoked: lifetime.signal,
       assertRouteCurrent: async () => lifetime.signal,
+      route: { provider: 'openai-codex', model },
+      bindReference,
     } as unknown as Parameters<Attach>[1],
   );
   return {
     readRootWake,
     runJournalOwners,
+    readNativeAttemptFor,
+    bindReference,
+    resolveReference: attached.references?.[0]?.resolve,
+    selection: { adapterId, provider: 'openai-codex', model },
+    profile,
     async admit(
       context: RequestContext,
       requestId: string,
       native: ReturnType<typeof nativeFacts>,
       mode: 'queue' | 'steer' = 'queue',
+      child?: { sessionId: string; parentSessionId: string },
     ) {
       const result = await observed(
         {
-          endpoint: 'session/prompt',
+          endpoint: child ? 'subagents/prompt' : 'session/prompt',
           binding,
-          adapterId: 'adapter',
+          adapterId,
           context,
           issue,
           requestId,
           mode,
+          child,
           observe: () => native.observation,
         },
         lifetime.signal,
@@ -209,7 +245,7 @@ async function setup() {
         {
           endpoint: 'session/updateQueue',
           binding,
-          adapterId: 'adapter',
+          adapterId,
           context,
           issue,
         },
@@ -222,6 +258,116 @@ async function setup() {
     },
   };
 }
+
+it('binds a native child model reference to its adopted scoped contribution and owning root', async () => {
+  const f = await setup();
+  const context = login();
+  const root = SessionId(issue.root.nativeSessionId);
+  const child = { sessionId: SessionId('native-child'), parentSessionId: root };
+  const revoked = new AbortController().signal;
+  const uninstall = installDEntryNativeOwnerPort({
+    async resolve() {
+      return {
+        ...f.profile,
+        revoked,
+        controlReady: () => true,
+        assertCurrent: async () => {},
+        acquirePrincipal: () => {
+          throw Error('Unexpected scope creation');
+        },
+        async readSessions() {
+          const status = {
+            updatedAt: 1,
+            blank: false,
+            running: true,
+            agentAvailable: true,
+          };
+          return {
+            ok: true,
+            value: {
+              items: [
+                { ...status, sessionId: root },
+                { ...status, ...child, origin: 'subagent' },
+              ],
+            },
+          };
+        },
+      };
+    },
+  });
+  try {
+    const resolve = f.resolveReference;
+    if (!resolve) throw Error('Native reference service unavailable');
+    const native = nativeFacts();
+    const requestId = randomUUID();
+    const occurrence = {
+      ...child,
+      requestId,
+      scopeId: issue.scopeId,
+      messageId: 'adopted-child-message',
+      turn: 1,
+    };
+    const admission = await f.admit(context, requestId, native, 'queue', child);
+    native.insert();
+    admission.accepted();
+    const recipient = 'r'.repeat(43);
+    const attempt = {
+      kind: 'assistant',
+      id: randomUUID(),
+      turn: 1,
+      sourceTurn: 1,
+      cursor: 3,
+      recipient,
+      rootSessionId: root,
+      delegated: true,
+      delegatedPromptIds: [],
+    };
+    const resolveReference = () => {
+      const body = Buffer.from(
+        JSON.stringify({
+          ...f.selection,
+          sessionId: child.sessionId,
+          recipient,
+        }),
+      );
+      const request = Object.assign(Readable.from([body]), {
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      });
+      return resolve(request as unknown as IncomingMessage, binding, revoked);
+    };
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [{ ...occurrence, parentSessionId: 'different-parent' }],
+    });
+    await expect(resolveReference()).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(f.bindReference).not.toHaveBeenCalled();
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [occurrence],
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(native.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      occurrence,
+    );
+    expect(f.bindReference).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allriceThreadRef: identity.threadId,
+        native: expect.objectContaining({ ...child, rootSessionId: root }),
+      }),
+      expect.any(AbortSignal),
+    );
+  } finally {
+    uninstall();
+    await f.close();
+  }
+});
 
 it('attaches native terminal retry to the current Worker owner', async () => {
   const f = await setup();

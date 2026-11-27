@@ -10,6 +10,8 @@ describe('native resource projection is bounded by the original root and access'
       summary('root'),
       summary('child', 'root'),
       summary('grandchild', 'child'),
+      { ...summary('fork'), parentSessionId: summary('root').sessionId },
+      summary('fork-child', 'fork'),
       summary('other'),
       summary('orphan', 'absent'),
       summary('cycle-a', 'cycle-b'),
@@ -37,6 +39,22 @@ describe('native resource projection is bounded by the original root and access'
           binding.role.actions.some((action) => action.startsWith('event:')),
       ),
     ).toBe(false);
+    const forkIssue = {
+      ...selected,
+      root: {
+        ...selected.root,
+        nativeSessionId: 'fork',
+        forkedFromNativeSessionId: 'root',
+      },
+    };
+    expect(
+      projectSessions(forkIssue, rows)
+        .filter((binding) => binding.role.actions.includes('session/page'))
+        .map((binding) => binding.resource),
+    ).toEqual([
+      { kind: 'session', id: 'fork' },
+      { kind: 'session', id: 'fork-child' },
+    ]);
   });
   it('history/read projection cannot imply send, VM ownership, global list or control authority', () => {
     const values = projectSessions(issue('history'), [

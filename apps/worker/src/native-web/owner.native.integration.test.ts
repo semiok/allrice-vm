@@ -11,6 +11,7 @@ import { rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
+import * as Database from '@allrice/database';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
@@ -92,12 +93,15 @@ async function openPromptScope(
   return { activity, issue, scope: await activity.run(signal) };
 }
 
-function observeSinglePrompt(signal: AbortSignal) {
+function observeSinglePrompt(
+  signal: AbortSignal,
+  endpoint: 'session/prompt' | 'subagents/prompt' = 'session/prompt',
+) {
   const observed = deferred<NativePromptObservation>();
   const beforePrompt: NonNullable<
     Parameters<typeof setupNativeWebFixture>[6]
   > = async (request) => {
-    if (request.endpoint !== 'session/prompt')
+    if (request.endpoint !== endpoint)
       throw Error('Expected one scoped prompt');
     const observation = request.observe(signal);
     await observation.ready;
@@ -380,7 +384,7 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'proves a continuable child after the parent ends and both native wakeups on the idle parent',
+  'proves a continuable child, both idle parent wakeups, and a scoped browser follow-up',
   { tags: [tag], timeout: 30000 },
   async () => {
     const rootReady = deferred<{
@@ -396,8 +400,14 @@ it.skipIf(!cli)(
       void ready.promise.catch(() => {});
     const signal = AbortSignal.timeout(25000);
     const { beforePrompt, observed } = observeSinglePrompt(signal);
+    const childPrompt = observeSinglePrompt(signal, 'subagents/prompt');
     const capability = 'a'.repeat(43);
     const requestId = randomUUID();
+    const childRequestId = randomUUID();
+    const childScopeId = randomUUID();
+    let childSessionId: string | undefined;
+    const childWitness = deferred<string>();
+    void childWitness.promise.catch(() => {});
     const attempts = new Map<string, number>();
     const refs = new Map<
       string,
@@ -426,6 +436,8 @@ it.skipIf(!cli)(
           const ordinal = title ? 0 : (attempts.get(session) ?? 0) + 1;
           if (!title) attempts.set(session, ordinal);
           if (!isRoot) await (ordinal === 1 ? rootEnded : relayEnded).promise;
+          if (!isRoot && !title) childSessionId = session;
+          const browserFollowUp = !isRoot && !title && ordinal === 3;
           const proof = await owner.readNativeAttemptFor(
             context,
             address,
@@ -435,19 +447,27 @@ it.skipIf(!cli)(
           expect(proof).toMatchObject({
             recipient: payload.recipient,
             rootSessionId: root,
-            promptIds: [requestId],
+            promptIds: [browserFollowUp ? childRequestId : requestId],
             prompts: [
               {
-                sessionId: root,
-                scopeId,
-                requestId,
+                sessionId: browserFollowUp ? session : root,
+                ...(browserFollowUp && { parentSessionId: root }),
+                scopeId: browserFollowUp ? childScopeId : scopeId,
+                requestId: browserFollowUp ? childRequestId : requestId,
                 messageId: expect.any(String),
-                turn: 1,
+                turn: browserFollowUp ? proof?.turn : 1,
               },
             ],
             delegated: !isRoot || ordinal >= 3,
           });
-          await (await observed).assertClaimed(signal, proof!.prompts[0]!);
+          const witness = proof!.prompts[0]!;
+          await (
+            await (browserFollowUp ? childPrompt.observed : observed)
+          ).assertClaimed(signal, witness);
+          if (browserFollowUp) {
+            expect(proof!.delegatedPromptIds).toEqual([]);
+            childWitness.resolve(witness.messageId);
+          }
           if (isRoot && !title) {
             expect(
               await owner.readNativeRootWakeFor(context, root, signal),
@@ -529,6 +549,7 @@ it.skipIf(!cli)(
         rootEnded.reject(error);
         relayEnded.reject(error);
         finished.reject(error);
+        childWitness.reject(error);
       });
     });
     const origin = await listen(server);
@@ -550,7 +571,10 @@ it.skipIf(!cli)(
           name: 'fixture-codex',
         },
       },
-      beforePrompt,
+      (request, active) =>
+        (request.endpoint === 'subagents/prompt'
+          ? childPrompt.beforePrompt
+          : beforePrompt)(request, active),
     );
     const { owner, context } = f;
     const created = await owner.createRootFor(context, {}, signal);
@@ -604,6 +628,67 @@ it.skipIf(!cli)(
     expect(turns).toEqual([1, 1, 2, 3]);
     expect([...attempts.values()].sort()).toEqual([2, 4]);
     await activity.close();
+
+    if (!childSessionId) throw Error('Native continuable child unavailable');
+    const findRoot = vi
+      .spyOn(Database, 'getDEntryPageNativeRoot')
+      .mockResolvedValue({
+        identity: issue.identity,
+        rootNativeSessionId: sessionId,
+        rootBindingRef: issue.root.rootBindingRef,
+        rootOriginDigest: issue.root.rootOriginDigest,
+        vmId: owner.binding.vmId,
+      });
+    const pageActivity = owner.acquirePrincipal(
+      {
+        scopeId: childScopeId,
+        identity: { ...issue.identity, threadId: null },
+        access: 'page',
+      },
+      signal,
+      context,
+    );
+    const page = await pageActivity.run(signal);
+    const call = (parentSessionId: string) =>
+      page.invokePage(
+        {
+          kind: 'page',
+          endpoint: 'subagents/prompt',
+          scopeId: childScopeId,
+          args: {
+            request: {
+              requestId: childRequestId,
+              childSessionId: childSessionId!,
+              parentSessionId,
+              mode: 'continuable',
+              delivery: 'queue',
+              content: [
+                { type: 'text', text: 'Follow up on the completed catalog.' },
+              ],
+            },
+          },
+        },
+        signal,
+      );
+    await expect(call('no-current-parent')).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(findRoot).not.toHaveBeenCalled();
+    const reply = await call(sessionId);
+    expect(reply.value).toEqual({
+      messageId: await waitForPromptFact(childWitness.promise, signal),
+    });
+    expect(findRoot).toHaveBeenCalledWith(
+      context,
+      page.opened.principal.identity,
+      owner.binding.vmId,
+      sessionId,
+    );
+    await expect(
+      waitForPromptFact((await childPrompt.observed).settled, signal),
+    ).resolves.toBe('ended');
+    await pageActivity.close();
   },
 );
 
