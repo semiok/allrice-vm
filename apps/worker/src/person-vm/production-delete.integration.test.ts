@@ -409,11 +409,11 @@ suite(
         });
         return { entered, resume };
       }
-      function pauseAfterSuccessfulIssueRead() {
+      function pauseAfterSuccessfulIssueRead(purpose?: 'publish') {
         const { entered, resume } = gate();
         const check = isCurrent.getMockImplementation()!;
         isCurrent.mockImplementation(async (...args) => {
-          if (args[4] !== 'issue') return check(...args);
+          if (args[4] !== 'issue' || args[5] !== purpose) return check(...args);
           isCurrent.mockImplementation(check);
           // Hold delivery of the real repeatable-read result to the handler.
           const current = await check(...args);
@@ -599,6 +599,8 @@ suite(
         leaseRowVersion,
         purge,
         close,
+        shutdownOwned: (binding: PersonVmBinding) =>
+          vm.shutdownOwned(binding, false),
         create: () =>
           current.withCurrentSelection(owner, identity, signal(), () =>
             vm.create(owner, signal()),
@@ -1039,7 +1041,11 @@ suite(
       },
     );
 
-    it.each(['normal failure', 'thread revoked'] as const)(
+    it.each([
+      'normal failure',
+      'failure during waiting verification',
+      'thread revoked',
+    ] as const)(
       'checks a duplicate hot thread POST after the original observer closes (%s)',
       async (outcome) => {
         const f = await prewarmDeletionTarget(true);
@@ -1058,6 +1064,22 @@ suite(
           );
           const hot = await f.openTicket();
           await proving.promise;
+          const threadChecks = vi.fn();
+          if (outcome === 'failure during waiting verification') {
+            const watch = f.watch.getMockImplementation()!;
+            f.watch.mockImplementationOnce(async (...args) => {
+              const observation = await watch(...args);
+              const assertThread = observation.assertTicketThread;
+              if (!assertThread) throw Error('Expected a live thread observer');
+              return {
+                ...observation,
+                async assertTicketThread(active: AbortSignal) {
+                  await assertThread(active);
+                  threadChecks();
+                },
+              };
+            });
+          }
           const paused = f.pauseAfterSuccessfulIssueRead();
           const duplicate = f.open();
           await Promise.race([
@@ -1069,6 +1091,10 @@ suite(
             }),
           ]);
           const incoming = await f.watch.mock.results.at(-1)!.value;
+          const waiting =
+            outcome === 'failure during waiting verification'
+              ? f.pauseAfterSuccessfulIssueRead('publish')
+              : undefined;
           paused.resume.resolve();
           // Let the POST select the still pending ticket and await its proof.
           await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1079,9 +1105,27 @@ suite(
             expect(archived).toHaveLength(1);
             await vi.waitFor(() => expect(incoming.revoked.aborted).toBe(true));
           }
+          if (waiting) {
+            await Promise.race([
+              waiting.entered.promise,
+              duplicate.then((response) => {
+                throw Error(
+                  'POST ended before its waiting reply check: ' +
+                    response.status,
+                );
+              }),
+            ]);
+            expect(threadChecks).toHaveBeenCalledTimes(2);
+          }
           finish.resolve();
+          if (waiting) {
+            await vi.waitFor(async () =>
+              expect(await f.status(hot)).toEqual(failedTicket),
+            );
+            waiting.resume.resolve();
+          }
           const reply = await duplicate;
-          if (outcome === 'normal failure') {
+          if (outcome !== 'thread revoked') {
             expect(reply.status).toBe(202);
             expect(
               DEntryNativePrewarmAcceptedSchema.parse(await reply.json()),
@@ -1090,6 +1134,14 @@ suite(
               ticket: { operationId: hot },
             });
             expect(await f.status(hot)).toEqual(failedTicket);
+            if (waiting) {
+              expect(threadChecks).toHaveBeenCalledTimes(3);
+              expect(
+                f.isCurrent.mock.calls.filter(
+                  (call) => call[4] === 'failed' && call[5] === 'publish',
+                ),
+              ).toHaveLength(1);
+            }
           } else {
             expect(reply.status).toBe(404);
             expect(await reply.json()).toMatchObject({
@@ -1106,6 +1158,190 @@ suite(
         } finally {
           finish.resolve();
           await f.close();
+        }
+      },
+    );
+
+    it('issues a fresh hot ticket when the old thread observation ended before the new one began', async () => {
+      const f = await prewarmDeletionTarget(true);
+      const feed = createDEntryAuthorityFeed(process.env.DATABASE_URL!);
+      const detached = deferred<void>();
+      const joinOriginal = deferred<void>();
+      const failOriginal = deferred<void>();
+      const finishNewProof = deferred<void>();
+      f.watch.mockImplementation(
+        (context, selection, identity, active, _feed, verify) =>
+          dEntryHttpDefaults.watch(
+            context,
+            selection,
+            identity,
+            active,
+            feed,
+            verify,
+          ),
+      );
+      try {
+        const binding = await f.ready(await f.openTicket());
+        const healthy = await f.leaseRowVersion();
+        const watch = f.watch.getMockImplementation()!;
+        f.watch.mockImplementationOnce(async (...args) => {
+          const original = await watch(...args);
+          return {
+            ...original,
+            async close() {
+              await original.close();
+              detached.resolve();
+              await joinOriginal.promise;
+            },
+          };
+        });
+        const prove = f.proof.getMockImplementation()!;
+        f.proof.mockImplementationOnce(async () => {
+          await failOriginal.promise;
+          throw new PersonVmError('RUNTIME_NOT_READY');
+        });
+        const old = await f.openTicket();
+        const original = await f.watch.mock.results.at(-1)!.value;
+        failOriginal.resolve();
+        await detached.promise;
+
+        // A database fixture for the continuity boundary, with no restore route.
+        for (const archivedAt of [new Date(), null]) {
+          const changed =
+            await fixture.db`update allrice_chat_sessions set archived_at=${archivedAt}
+            where id=${f.identity.threadId} and owner_id=${f.personId} returning id`;
+          expect(changed).toHaveLength(1);
+          await feed.observeThroughCommit(signal());
+        }
+        expect(original.revoked.aborted).toBe(false);
+        f.proof.mockImplementationOnce(async (...args) => {
+          await finishNewProof.promise;
+          return prove(...args);
+        });
+        const paused = f.pauseAfterSuccessfulIssueRead();
+        const response = f.open();
+        await Promise.race([
+          paused.entered.promise,
+          response.then((reply) => {
+            throw Error('POST ended before fresh issue: ' + reply.status);
+          }),
+        ]);
+        paused.resume.resolve();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        joinOriginal.resolve();
+        const reply = await response;
+        expect(reply.status).toBe(202);
+        const { ticket } = DEntryNativePrewarmAcceptedSchema.parse(
+          await reply.json(),
+        );
+        expect(ticket.operationId).not.toBe(old);
+        expect(f.proof).toHaveBeenCalledTimes(3);
+        expect(await f.leaseRowVersion()).toEqual(healthy);
+        finishNewProof.resolve();
+        expect(await f.ready(ticket.operationId)).toEqual(binding);
+        expect(f.dispatch).toHaveBeenCalledTimes(2);
+      } finally {
+        failOriginal.resolve();
+        joinOriginal.resolve();
+        finishNewProof.resolve();
+        try {
+          await f.close();
+        } finally {
+          await feed.close();
+        }
+      }
+    });
+
+    it.each(['ready read', 'timeout fallback'] as const)(
+      'expires a shared hot reply with the ordinary stop lease during %s',
+      async (timing) => {
+        const f = await prewarmDeletionTarget();
+        const finishProof = deferred<void>();
+        const readyEntered = deferred<void>();
+        const allowReadyRead = deferred<void>();
+        let releaseStop: (() => void) | undefined;
+        let stopping: Promise<void> | undefined;
+        try {
+          const binding = await f.ready(await f.openTicket());
+          const prove = f.proof.getMockImplementation()!;
+          f.proof.mockImplementationOnce(async (...args) => {
+            await finishProof.promise;
+            return prove(...args);
+          });
+          const hot = await f.openTicket();
+          const paused = f.pauseAfterSuccessfulIssueRead();
+          const duplicate = f.open();
+          await Promise.race([
+            paused.entered.promise,
+            duplicate.then((response) => {
+              throw Error(
+                'POST ended before its issue barrier: ' + response.status,
+              );
+            }),
+          ]);
+          const check = f.isCurrent.getMockImplementation()!;
+          f.isCurrent.mockImplementation(async (...args) => {
+            if (args[4] !== 'ready' || args[5] !== 'publish')
+              return check(...args);
+            readyEntered.resolve();
+            await allowReadyRead.promise;
+            const current = await check(...args);
+            expect(current).toBe(false);
+            return current;
+          });
+          paused.resume.resolve();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          finishProof.resolve();
+          await Promise.race([
+            readyEntered.promise,
+            duplicate.then((response) => {
+              throw Error(
+                'POST ended before its ready read: ' + response.status,
+              );
+            }),
+          ]);
+
+          const stop = f.pauseAfterLeaseClaim();
+          releaseStop = stop.resume.resolve;
+          nativeStates.set(binding.vmId, 'stopped');
+          stopping = f.shutdownOwned(binding);
+          void stopping.catch(() => {});
+          await stop.entered.promise;
+          expect(await f.row()).toMatchObject({
+            ...binding,
+            phase: 'running',
+            leaseOwner: expect.any(String),
+          });
+          const claimed = await f.leaseRowVersion();
+          if (timing === 'ready read') allowReadyRead.resolve();
+          const reply = await duplicate;
+          expect({ status: reply.status, json: await reply.json() }).toEqual(
+            expiredTicket,
+          );
+          expect(await f.status(hot)).toEqual(expiredTicket);
+          expect(
+            f.isCurrent.mock.calls.filter(
+              (call) => call[4] === 'issue' && call[5] === 'publish',
+            ),
+          ).toHaveLength(0);
+          expect(
+            f.isCurrent.mock.calls.filter(
+              (call) => call[4] === 'waiting' && call[5] === 'publish',
+            ),
+          ).toHaveLength(timing === 'timeout fallback' ? 1 : 0);
+          expect(await f.leaseRowVersion()).toEqual(claimed);
+          expect(f.dispatch).toHaveBeenCalledTimes(2);
+          stop.resume.resolve();
+          await stopping;
+        } finally {
+          finishProof.resolve();
+          allowReadyRead.resolve();
+          releaseStop?.();
+          try {
+            await stopping;
+          } finally {
+            await f.close();
+          }
         }
       },
     );

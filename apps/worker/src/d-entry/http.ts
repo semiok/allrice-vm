@@ -354,11 +354,7 @@ export function createDEntryHttpHandler(
           active: AbortSignal,
           pendingReply = false,
         ) {
-          const threadCurrent = await ticket.observeThread(
-            active,
-            plan?.assertTicketThread,
-            pendingReply,
-          );
+          let threadCurrent = await ticket.observeThread(active, pendingReply);
           const { context, identity } = await currentDEntryRequest(
             deps,
             token,
@@ -367,7 +363,17 @@ export function createDEntryHttpHandler(
           );
           const ticketCurrent =
             threadCurrent &&
-            (await ticket.recheck(context, identity, (mode) => {
+            (await ticket.recheck(context, identity, async (mode) => {
+              // The original observer can close while the starting ticket's
+              // coordination read is in flight. Verify the terminal thread
+              // and the exact failed ticket in the same final check.
+              if (mode === 'failed' && threadCurrent && !threadCurrent()) {
+                threadCurrent = await ticket.observeThread(
+                  active,
+                  pendingReply,
+                );
+                if (!threadCurrent) return false;
+              }
               // A waiting reply checks the exact binding without repeating the
               // immediate-ready probe that has already used its time budget.
               if (pendingReply && plan && mode === 'ready')
@@ -376,7 +382,7 @@ export function createDEntryHttpHandler(
                   identity,
                   plan,
                   active,
-                  'issue',
+                  'waiting',
                   'publish',
                 );
               return verify(
@@ -390,10 +396,11 @@ export function createDEntryHttpHandler(
             }));
           active.throwIfAborted();
           if (!threadCurrent) ticket.assertNotRevoked();
-          if (threadCurrent && ticketCurrent)
+          const finalThread = threadCurrent;
+          if (finalThread && ticketCurrent)
             return {
               identity,
-              current: () => threadCurrent() && ticketCurrent(),
+              current: () => finalThread() && ticketCurrent(),
             };
         }
         if (preferReady) {
@@ -403,7 +410,10 @@ export function createDEntryHttpHandler(
             (async () => {
               await existing.settled;
               probe.throwIfAborted();
-              if (existing.ready()) return verifyExisting(existing, probe);
+              // Only an elapsed budget or an unsettled readiness result can
+              // take the waiting path. A completed negative check expires.
+              if (existing.ready())
+                return (await verifyExisting(existing, probe)) ?? false;
             })(),
           );
           let qualified: Awaited<typeof ready>;
@@ -416,11 +426,13 @@ export function createDEntryHttpHandler(
             budget.abort();
             signal.throwIfAborted();
           }
-          if (qualified?.current() && existing.ready()) {
-            sendPrewarmReady(response, {
-              identity: qualified.identity,
-              trigger,
-            });
+          if (qualified !== undefined) {
+            if (qualified && qualified.current() && existing.ready()) {
+              sendPrewarmReady(response, {
+                identity: qualified.identity,
+                trigger,
+              });
+            } else sendPrewarmStatus(response, { state: 'expired' });
             return;
           }
         }

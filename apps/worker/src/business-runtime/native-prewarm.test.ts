@@ -1878,7 +1878,7 @@ it.each([
           probing.resolve(active);
           await finishProbe.promise; // Simulate a read that has not joined on abort.
         }
-        return !(mode === 'issue' && purpose === 'publish' && changed);
+        return !(mode === 'waiting' && purpose === 'publish' && changed);
       },
     );
     const server = await nativeEntryServer(f.base, {
@@ -1918,7 +1918,7 @@ it.each([
       expect(currentThread).toHaveBeenCalledTimes(2);
       expect(
         check.mock.calls.filter(
-          (call) => call[4] === 'issue' && call[5] === 'publish',
+          (call) => call[4] === 'waiting' && call[5] === 'publish',
         ),
       ).toHaveLength(1);
       expect(

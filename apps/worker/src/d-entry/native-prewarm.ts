@@ -15,10 +15,16 @@ import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmVerificationMode =
-  'authority' | 'issue' | 'operation' | 'ready' | 'failed' | 'reuse';
+  | 'authority'
+  | 'issue'
+  | 'operation'
+  | 'ready'
+  | 'failed'
+  | 'reuse'
+  | 'waiting';
 type PrewarmReadMode = Exclude<
   PrewarmVerificationMode,
-  'authority' | 'issue' | 'reuse'
+  'authority' | 'issue' | 'reuse' | 'waiting'
 >;
 type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
@@ -252,11 +258,17 @@ export function createPrewarmOperations(
     ) {
       const prior = plan.reuse;
       let publishedInstance = false;
-      const entry = [...tickets.values()].find((entry) => {
+      const candidate = [...tickets.values()].find((entry) => {
         if (expired(entry) || entry.revoked.aborted) return false;
+        const observerOpen = !entry.plan.assertTicketThread || !entry.closeJoin;
         if (prior)
-          return entry.plan === prior && belongs(entry, context, identity);
+          return (
+            observerOpen &&
+            entry.plan === prior &&
+            belongs(entry, context, identity)
+          );
         if (
+          observerOpen &&
           active(entry) &&
           belongs(entry, context, identity) &&
           entry.plan.key === plan.key &&
@@ -276,7 +288,11 @@ export function createPrewarmOperations(
         }
         return false;
       });
-      if (!entry) return { existing: undefined, publishedInstance };
+      if (!candidate) return { existing: undefined, publishedInstance };
+      const entry = candidate;
+      // If present, this POST's observer was installed before selection,
+      // while the original observer was still open.
+      const assertCurrentThread = plan.assertTicketThread;
       const mode = (): PrewarmReuseMode | undefined => {
         if (active(entry)) {
           if (entry.plan.orphanedInstanceId === undefined) return 'issue';
@@ -293,7 +309,6 @@ export function createPrewarmOperations(
       };
       async function observeClosedThread(
         signal: AbortSignal,
-        assertCurrentThread: PrewarmPlan['assertTicketThread'],
         error: DEntryTicketObserverClosed,
       ) {
         entry.revoked.throwIfAborted();
@@ -316,11 +331,7 @@ export function createPrewarmOperations(
       const existing = {
         ...accepted(entry),
         plan: entry.plan,
-        async observeThread(
-          signal: AbortSignal,
-          assertCurrentThread?: PrewarmPlan['assertTicketThread'],
-          preferCurrent = false,
-        ) {
+        async observeThread(signal: AbortSignal, preferCurrent = false) {
           const assertOriginalThread = entry.plan.assertTicketThread;
           if (!assertOriginalThread) return () => true;
           if (preferCurrent && assertCurrentThread) {
@@ -328,7 +339,6 @@ export function createPrewarmOperations(
             if (entry.closeJoin)
               return observeClosedThread(
                 signal,
-                assertCurrentThread,
                 new DEntryTicketObserverClosed(),
               );
             return () => !entry.closeJoin;
@@ -339,7 +349,7 @@ export function createPrewarmOperations(
           } catch (error) {
             signal.throwIfAborted();
             if (!(error instanceof DEntryTicketObserverClosed)) throw error;
-            return observeClosedThread(signal, assertCurrentThread, error);
+            return observeClosedThread(signal, error);
           }
         },
         assertNotRevoked() {
