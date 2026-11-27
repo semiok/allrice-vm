@@ -725,7 +725,7 @@ suite(
           await openMemory.click();
           const memoryPane = page.getByRole('region', { name: '个人记忆' });
           const pending = memoryPane.getByRole('region', { name: '待确认' });
-          await pending.getByRole('button', { name: memory.summary }).click();
+          await pending.getByText(memory.summary, { exact: true }).click();
           const memoryDialog = page.getByRole('dialog');
           await memoryDialog
             .getByText(memory.details!, { exact: true })
