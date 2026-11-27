@@ -1066,7 +1066,7 @@ class PrincipalService extends TypertRemoteService {
         } catch (error) {
           // These rc.2 failures occur before any allocation. A success or
           // ambiguous failure from a concurrent create still keeps ownership.
-          const code = remoteErrorOf(error)?.code;
+          const code = String(remoteErrorOf(error)?.code);
           if (
             terminal &&
             code !== 'terminal/limit-reached' &&
