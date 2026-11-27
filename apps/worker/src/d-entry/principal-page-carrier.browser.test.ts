@@ -4,6 +4,7 @@ import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { gzipSync } from 'node:zlib';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it } from 'vitest';
 import {
@@ -163,14 +164,21 @@ it.skipIf(!browserExecutable).each([false, true])(
             publicBundle.reference,
             new AbortController().signal,
           );
+          // Match the production Next asset delivery. Chromium's cache limits
+          // apply to the encoded HTTP response, not the decoded bundle.
+          expect(request.headers['accept-encoding']).toContain('gzip');
+          const encoded = gzipSync(bytes);
           await delay(180);
           timing.end = performance.now();
           response
             .writeHead(200, {
               'content-type': 'text/javascript',
               'cache-control': 'public, max-age=31536000, immutable',
+              'content-encoding': 'gzip',
+              'content-length': encoded.length,
+              vary: 'accept-encoding',
             })
-            .end(bytes);
+            .end(encoded);
           return;
         }
         if (staticFiles.has(url.pathname)) {
@@ -419,13 +427,17 @@ it.skipIf(!browserExecutable).each([false, true])(
     });
 
     const downloaded = () =>
-      traffic.filter(({ kind }) => kind.startsWith('public-')).length;
-    expect(downloaded()).toBe(2);
+      traffic.filter(({ kind }) => kind.startsWith('public-'));
+    expect(downloaded()).toHaveLength(2);
     expect(scopedBundleReads).toBe(0);
     const refreshedAt = performance.now();
     await page.reload();
     await editor.fill('刷新后的原生编辑器', { timeout: 15_000 });
-    expect(downloaded()).toBe(2);
+    expect(
+      downloaded()
+        .map(({ kind }) => kind)
+        .sort(),
+    ).toEqual(['public-application', 'public-bootstrap']);
     expect(scopedBundleReads).toBe(0);
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(2);
@@ -433,7 +445,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       'SEALED_PROFILE_REFRESH ' +
         JSON.stringify({
           browser: browser.version(),
-          sealedBundleRequests: downloaded() - 2,
+          sealedBundleRequests: downloaded().length - 2,
           scopedBundleRequests: scopedBundleReads,
           editableMs: Math.round(performance.now() - refreshedAt),
         }),
