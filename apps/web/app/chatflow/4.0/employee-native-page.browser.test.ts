@@ -100,13 +100,14 @@ suite('4.0 browser cold entry', () => {
             firstRetry.resolve(response);
             return;
           }
-          if (warmCalls.length === 4 || warmCalls.length === 5)
+          // The foreground upgrade adds one ticket before switching chats.
+          if (warmCalls.length >= 4 && warmCalls.length <= 6)
             return response
               .writeHead(202, { 'content-type': 'application/json' })
               .end(
                 JSON.stringify({
                   operationId:
-                    warmCalls.length === 4 ? ticket : sameEmployeeTicket,
+                    warmCalls.length <= 5 ? ticket : sameEmployeeTicket,
                   expiresAt: new Date(Date.now() + 60_000).toISOString(),
                   pollAfterMs: 1000,
                 }),

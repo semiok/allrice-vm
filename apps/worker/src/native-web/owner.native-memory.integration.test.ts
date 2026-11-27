@@ -745,7 +745,9 @@ it.skipIf(
       expect(attempts.size).toBe(2);
       const invoked = [...delivered.entries()];
       const read = invoked.find(([, call]) => call.id === 'memory_read');
-      expect(read?.[1].value).toEqual(
+      if (!read) throw Error('The original memory read did not run');
+      const [readRef, readResult] = read;
+      expect(readResult.value).toEqual(
         expect.stringContaining(confirmed.details),
       );
       const writes = invoked.filter(
@@ -840,6 +842,14 @@ it.skipIf(
           signal,
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await expect(
+        host.readOrdinal(
+          context,
+          { ...peerTarget, nativeRequestRef: readRef },
+          { number: 1 },
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
       const candidates = await db<
         { id: string; revision: number; call_ref: string }[]
       >`
@@ -877,6 +887,9 @@ it.skipIf(
       await db`update allrice_runs set state='succeeded' where id=${run.runId}`;
       await expect(
         host.remember(context, target(ref), candidate, signal),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await expect(
+        host.readOrdinal(context, target(readRef), { number: 1 }, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
       if (!rootInput) throw Error('No original root input');
       const restore = { ...rootInput, mode: 'restore' as const };
@@ -971,6 +984,9 @@ it.skipIf(
       ).rejects.toMatchObject({
         code: 'instance_archived',
       });
+      await expect(
+        host.readOrdinal(current, target(readRef), { number: 1 }, signal),
+      ).rejects.toMatchObject({ code: 'instance_archived' });
       await expect(
         host.reconcileRemember(
           current,
