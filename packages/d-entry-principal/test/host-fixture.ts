@@ -34,6 +34,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type {
   SessionFollowFrame,
   SessionFollowRequest,
+  SessionControlFrame,
   SessionPage,
   SessionPageRequest,
   SessionSummary,
@@ -144,6 +145,7 @@ class Credentials extends CredentialProvider {
 /** Native catalog content is an explicit fixture. Peers, invocation scopes,
  * RemoteAccess snapshots/follow, event ready, codecs and carriers are real rc.2. */
 class Catalog extends TypertRemoteService {
+  static inject = ['remoteAccess'];
   items = [summary('root'), summary('child', 'root'), summary('other')];
   beforeList?: (signal: AbortSignal) => Promise<void>;
   beforeFollow?: () => Promise<void>;
@@ -159,7 +161,25 @@ class Catalog extends TypertRemoteService {
   async list(_request: object, signal: AbortSignal) {
     await this.beforeList?.(signal);
     signal.throwIfAborted();
-    return { items: this.items };
+    return {
+      items: this.items.filter(
+        ({ sessionId }) =>
+          !this.ctx.invocation ||
+          this.ctx.remoteAccess.allows({ kind: 'session', id: sessionId }),
+      ),
+    };
+  }
+  @Remote({ mode: 'stream' })
+  async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
+    signal.throwIfAborted();
+    const projections = Object.fromEntries(
+      this.items
+        .filter(({ sessionId }) =>
+          this.ctx.remoteAccess.allows({ kind: 'session', id: sessionId }),
+        )
+        .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
+    );
+    yield { type: 'baseline', value: { projections } };
   }
   @Remote({
     name: 'page',
@@ -246,7 +266,8 @@ export async function hostFixture(
   host.typert.resources.register('session', { field: 'sessionId' });
   await host.plugin(RemoteAccess);
   await host.plugin(Gateway);
-  const catalog = new Catalog(host);
+  await host.plugin(Catalog);
+  const catalog = host.get('sessionController') as unknown as Catalog;
   const dispatched: TypertRemoteEventDispatch[] = [];
   let wake = () => {};
   const source = (

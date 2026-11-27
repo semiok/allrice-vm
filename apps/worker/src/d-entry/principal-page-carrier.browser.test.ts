@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -12,13 +13,115 @@ import { deferred } from '../../../../packages/d-entry-principal/test/host-fixtu
 import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
 import {
   fixture,
+  buildProfileFixture,
   closes,
+  closePage,
+  open,
   sessionToken,
 } from './principal-page-carrier.fixture.js';
 
 const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
+
+it.skipIf(!browserExecutable)(
+  'enables the rc.2 composer via the scoped session list and control, with Cordis inspection still closed',
+  { timeout: 60_000 },
+  async () => {
+    const release = await buildProfileFixture();
+    const f = await fixture(release);
+    f.host.catalog.items = f.host.catalog.items.map((row) =>
+      String(row.sessionId) === 'root' ? { ...row, cwd: '/work' } : row,
+    );
+    const life = await open(f);
+    const unary: string[] = [];
+    const graph = DEntryProfileGraphSchema.parse(release.graph);
+    f.web.on('request', async (request, response) => {
+      const url = new URL(request.url!, f.origin);
+      const copy = async (result: Response) => {
+        response
+          .writeHead(result.status, {
+            'content-type': result.headers.get('content-type')!,
+          })
+          .end(Buffer.from(await result.arrayBuffer()));
+      };
+      try {
+        if (url.pathname === '/api/v1/d-entry/native-rpc') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(chunk);
+          const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          unary.push(input.endpoint);
+          return await copy(await f.invoke(input.scopeId, sessionToken, input));
+        }
+        for (const kind of ['bootstrap', 'assets'] as const) {
+          if (url.pathname === '/api/v1/d-entry/profile/' + kind)
+            return await copy(
+              await f.publish(
+                kind,
+                life.scopeId,
+                Object.fromEntries(url.searchParams),
+              ),
+            );
+        }
+        if (url.pathname === '/managed/employee-web-entry.js') {
+          const asset = await readFile(
+            join(release.directory, url.pathname.slice(1)),
+          );
+          response
+            .writeHead(200, { 'content-type': 'text/javascript' })
+            .end(asset);
+          return;
+        }
+        if (url.pathname !== '/') {
+          response.writeHead(404).end();
+          return;
+        }
+        const { identity, selection } = f;
+        response.writeHead(200, { 'content-type': 'text/html' })
+          .end(`<!doctype html>
+          <script data-scope-id="${life.scopeId}">${initialDocumentLifecycle}</script>
+          <div id="app" data-scope-id="${life.scopeId}" data-thread-id="${selection.threadId}"
+            data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
+            data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
+            data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
+          <script id="allrice-employee-directory" type="application/json">${JSON.stringify({ ...identity, employees: [], sessions: [] })}</script>
+          <script type="module" src="/managed/employee-web-entry.js"></script>`);
+      } catch {
+        response.writeHead(500).end();
+      }
+    });
+    const browser = await chromium.launch({
+      executablePath: browserExecutable,
+    });
+    closes.push(() => browser.close());
+    const context = await browser.newContext();
+    await context.addCookies([
+      { name: 'allrice_session', value: sessionToken, url: f.origin },
+    ]);
+    const page = await context.newPage();
+    const streamEndpoints: string[] = [];
+    page.on('websocket', (socket) => {
+      socket.on('framesent', ({ payload }) => {
+        const frame = JSON.parse(payload.toString());
+        if (frame.type === 'open') streamEndpoints.push(frame.endpoint);
+      });
+    });
+    await page.goto(f.origin);
+    const editor = page
+      .locator('textarea:visible,[contenteditable=true]:visible')
+      .first();
+    await editor.fill('未发送的原生草稿', { timeout: 15_000 });
+    expect(await editor.isEditable()).toBe(true);
+    expect(streamEndpoints).toContain('session/control');
+    expect(unary).toContain('session/list');
+    expect(unary).not.toContain('dynamicCordisRunner/inventory');
+    expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
+    expect(unary).not.toContain('session/prompt');
+    await context.close();
+    closePage(life.peer);
+    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+  },
+);
 
 it.skipIf(!browserExecutable)(
   'joins the native page carrier in Chromium with the original browser Cookie',

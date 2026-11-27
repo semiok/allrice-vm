@@ -789,6 +789,103 @@ it('issues only once, borrows the same actual native Peer for unary and stream a
   expect((await cleanTransport)[0]).toBe(1000);
 });
 
+it('opens the native control baseline and lists only sessions in the current page scope', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const peer = f.connect(life.scopeId);
+  const next = messages(peer);
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'control',
+    endpoint: 'session/control',
+    payload: { args: {} },
+  });
+  expect(await next('control')).toEqual({
+    type: 'item',
+    streamId: 'control',
+    value: {
+      type: 'baseline',
+      value: {
+        projections: {
+          root: { asOfSeq: 0, values: {} },
+          child: { asOfSeq: 0, values: {} },
+        },
+      },
+    },
+  });
+  const request = {
+    endpoint: 'session/list',
+    payload: { args: { _request: {} } },
+  };
+  const response = await f.invoke(life.scopeId, sessionToken, request);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    type: 'server-response',
+    rpcId: '',
+    result: {
+      ok: true,
+      value: { items: [summary('root'), summary('child', 'root')] },
+    },
+  });
+  expect((await f.invoke(life.scopeId, otherToken, request)).status).toBe(404);
+  expect(
+    (
+      await f.invoke(life.scopeId, sessionToken, {
+        ...request,
+        payload: { args: { _request: {}, scopeId: 'foreign-page' } },
+      })
+    ).status,
+  ).toBe(400);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('withholds a native control frame containing a session outside the authorized root', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const wire = f.host.host.typertGateway.wireStream;
+  const openNative = wire.open.bind(wire);
+  vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    const source = await openNative(...args);
+    if (args[0] !== 'session/control') return source;
+    return {
+      async *[Symbol.asyncIterator]() {
+        for await (const item of source) {
+          yield item;
+          yield {
+            type: 'projection',
+            sessionId: 'other',
+            key: 'fixture',
+            seq: 1,
+            value: 'unrelated',
+          };
+        }
+      },
+    };
+  });
+  const peer = f.connect(life.scopeId);
+  const next = messages(peer);
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'control',
+    endpoint: 'session/control',
+    payload: { args: {} },
+  });
+  expect(await next()).toMatchObject({
+    type: 'item',
+    value: { type: 'baseline' },
+  });
+  expect(await next()).toMatchObject({
+    type: 'error',
+    error: { message: 'ENTRY_ACTION_UNAVAILABLE' },
+  });
+  expect((await f.invoke(life.scopeId)).status).toBe(200);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
 it('refuses duplicate selectors, unauthorized login and cross-session borrow without disturbing the page', async () => {
   const f = await fixture();
   expect(
@@ -801,7 +898,7 @@ it('refuses duplicate selectors, unauthorized login and cross-session borrow wit
   expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
   expect((await f.invoke(life.scopeId, otherToken)).status).toBe(404);
   expect(
-    (await f.invoke(life.scopeId, sessionToken, { endpoint: 'session/list' }))
+    (await f.invoke(life.scopeId, sessionToken, { endpoint: 'workspace/list' }))
       .status,
   ).toBe(400);
   expect((await f.invoke(life.scopeId)).status).toBe(200);
