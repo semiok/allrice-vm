@@ -25,9 +25,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
     const f = await fixture(release);
     const { identity, selection } = f;
     f.host.catalog.items = f.host.catalog.items.map((row) =>
-      String(row.sessionId) === 'root'
-        ? { ...row, blank: true, cwd: '/work' }
-        : row,
+      String(row.sessionId) === 'root' ? { ...row, cwd: '/work' } : row,
     );
     const version = {
       id: identity.employeeVersionId,
@@ -225,6 +223,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       await editor.waitFor();
       await iframe.waitFor();
       await workbench.locator('#chat-sidebar').waitFor();
+      await workbench.locator('#app [data-phase="active"]').waitFor();
       expect(await editor.isEditable()).toBe(true);
     } catch (error) {
       throw Error(JSON.stringify(errors), { cause: error });
@@ -249,7 +248,11 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
         sidebar: document
           .getElementById('chat-sidebar')!
           .getBoundingClientRect().bottom,
-        editorBottom: input.getBoundingClientRect().bottom,
+        conversation: input
+          .closest('[data-phase="active"]')!
+          .getBoundingClientRect().bottom,
+        composer: input.closest('[data-composer-card]')!.getBoundingClientRect()
+          .bottom,
         scrollHeight: document.scrollingElement!.scrollHeight,
         height: innerHeight,
       }));
@@ -268,13 +271,14 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       expect(outer.bottom).toBeCloseTo(height, 0);
       expect(outer.width).toBeCloseTo(width, 0);
       expect(outer.scrollHeight).toBe(height);
-      expect(outer.overflowY).not.toBe('scroll');
       expect(inner.height).toBe(height);
       expect(inner.mount).toBeCloseTo(height, 0);
       expect(inner.sidebar).toBeCloseTo(height, 0);
-      expect(inner.editorBottom).toBeGreaterThan(height - 120);
-      expect(inner.editorBottom).toBeLessThanOrEqual(height);
+      expect(inner.conversation).toBeCloseTo(height, 0);
+      expect(inner.composer).toBeGreaterThan(height - 80);
+      expect(inner.composer).toBeLessThanOrEqual(height);
       expect(inner.scrollHeight).toBe(height);
+      expect(outer.overflowY).not.toBe('scroll');
     }
     await context.close();
   },
