@@ -75,7 +75,6 @@ export type NativeExecutionEvidence =
 type Receipt = Readonly<{
   run: Run;
   request: NativeExecutionRequestEvidence;
-  openedOrigin: boolean;
   moduleConfigRevisionRef: string | null;
 }>;
 
@@ -176,7 +175,6 @@ export async function recordNativeExecutionRequest(
       const receipt = {
         run,
         request,
-        openedOrigin: !saved,
         moduleConfigRevisionRef: saved
           ? saved.payload.moduleConfigRevisionRef
           : (origin.moduleConfigRevisionRef ?? null),

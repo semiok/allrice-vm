@@ -138,11 +138,9 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           });
         const receipt = await write(first, adopted);
         if (!receipt) throw Error('First receipt missing');
-        expect(receipt.openedOrigin).toBe(true);
-        expect(await write(first, adopted, true, 'later-config')).toEqual({
-          ...receipt,
-          openedOrigin: false,
-        });
+        expect(await write(first, adopted, true, 'later-config')).toEqual(
+          receipt,
+        );
         const ambiguous = await write(second, null, false, 'later-config');
         if (!ambiguous) throw Error('Second receipt missing');
         expect(ambiguous.request).toMatchObject({ b: runId, human: null });

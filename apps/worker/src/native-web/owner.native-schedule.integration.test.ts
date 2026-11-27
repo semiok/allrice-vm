@@ -122,10 +122,16 @@ it.skipIf(!cli).each([false, true])(
                 }
               : { type: 'text-delta', index: 0, text: 'Reminder scheduled.' },
             ...(create
-              ? ['memory_read', 'memory_remember'].map((name, i) => ({
+              ? [
+                  'mcp__allrice__memory_read',
+                  'mcp__allrice__memory_remember',
+                ].map((name, i) => ({
                   type: 'tool-call-delta',
                   index: i + 1,
-                  id: name === 'memory_remember' ? memoryCallId : randomUUID(),
+                  id:
+                    name === 'mcp__allrice__memory_remember'
+                      ? memoryCallId
+                      : randomUUID(),
                   name,
                   argumentsDelta: '{}',
                 }))
@@ -179,7 +185,7 @@ it.skipIf(!cli).each([false, true])(
             ${
               fixtureMemory
                 ? `ctx.tools.register(withNativeMemoryToolPublication({
-              name: 'memory_remember',
+              name: 'mcp__allrice__memory_remember',
               description: 'Record an isolated test publication.',
               parameters: { type: 'object', properties: {}, additionalProperties: false },
               output: { schema: { type: 'boolean' }, render: value => [{ type: 'text', text: String(value) }] },
@@ -375,7 +381,9 @@ it.skipIf(!cli).each([false, true])(
           await waitForPromptFact(memoryStarted.promise, signal),
         ).toMatchObject({
           callId: memoryCallId,
-          name: 'memory_remember',
+          name: 'mcp__allrice__memory_remember',
+          executionSessionRef: sessionId,
+          executionParentRef: null,
           attemptId: nativeAttempt.id,
           human: nativeAttempt.observation,
           dispatch: { kind: 'sealed-handler', version: handlerVersion },

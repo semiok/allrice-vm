@@ -146,8 +146,10 @@ it('fences the private call result and joins actual publication when the native 
       attemptId: 'native-attempt',
       assistantSequence: 4,
       callId: 'native-call',
-      name: 'memory_read',
+      name: 'mcp__allrice__memory_read',
       sequence: 5,
+      executionSessionRef: source.sessionId,
+      executionParentRef: null,
       dispatch: { kind: 'sealed-handler', version: 'fixture-memory' },
       human: {
         occurrence: {

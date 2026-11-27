@@ -437,7 +437,9 @@ export function withNativeToolEvidence(tool, version) {
 // actual implementation. Merely returning from a waterfall cannot authorize it.
 export function withNativeMemoryToolPublication(tool, version) {
   if (
-    !['memory_read', 'memory_remember'].includes(tool.name) ||
+    !['mcp__allrice__memory_read', 'mcp__allrice__memory_remember'].includes(
+      tool.name,
+    ) ||
     typeof version !== 'string' ||
     !version ||
     version.length > 256
@@ -806,6 +808,11 @@ export function observeNativePrompts(scope, lifetime, capture) {
                 assistantSequence: attempt.assistantSeq,
                 ...call,
                 human: attempt.human,
+                executionSessionRef: session.id,
+                executionParentRef:
+                  session.header.origin === 'subagent'
+                    ? session.header.parentSession
+                    : null,
                 dispatch: { kind: 'sealed-handler', version },
               },
               exec.signal,

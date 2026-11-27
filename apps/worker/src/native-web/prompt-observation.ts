@@ -79,12 +79,19 @@ const nativeToolObservation = z
   .strict();
 
 export type NativeToolObservation = z.infer<typeof nativeToolObservation>;
+const nativeMemoryToolObservation = nativeToolObservation.extend({
+  executionSessionRef: nativeMessageId,
+  executionParentRef: nativeMessageId.nullable(),
+});
+export type NativeMemoryToolObservation = z.infer<
+  typeof nativeMemoryToolObservation
+>;
 export type PublishNativeMemoryCall = (
-  fact: NativeToolObservation,
+  fact: NativeMemoryToolObservation,
   signal: AbortSignal,
 ) => Promise<string | null>;
 const memoryCallFrame = z
-  .object({ ticket: UuidSchema, fact: nativeToolObservation })
+  .object({ ticket: UuidSchema, fact: nativeMemoryToolObservation })
   .strict();
 export type NativeRequestObservation = z.infer<
   typeof NativeRequestObservationSchema

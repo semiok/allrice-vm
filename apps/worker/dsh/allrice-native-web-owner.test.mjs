@@ -711,7 +711,7 @@ it.each([false, true])(
       : withNativeToolEvidence;
     const tool = wrap(
       {
-        name: memory ? 'memory_remember' : 'fixture_native_tool',
+        name: memory ? 'mcp__allrice__memory_remember' : 'fixture_native_tool',
         execute(_args, _exec, nativeRequestRef) {
           expect(nativeRequestRef).toBe(
             memory ? 'committed-call-ref' : undefined,

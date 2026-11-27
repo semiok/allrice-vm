@@ -37,6 +37,7 @@ import {
   deferredPromptFact,
   waitForPromptFact,
   type NativePromptObservation,
+  type NativeMemoryToolObservation,
   type NativePromptOccurrence,
   type NativeRequestObservation,
   type NativeToolObservation,
@@ -443,18 +444,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       >;
       const toolRequests = new WeakMap<
         PromptOwner,
-        Map<string, EvidenceReceipt>
+        Map<string, EvidenceReceipt & { memoryExecutionRef?: string }>
       >();
       const memory = host.nativeMemory;
-      const memoryRoots = new WeakMap<
-        PromptOwner,
-        Promise<
-          Readonly<{
-            executionRef: string;
-            memoryIndexDocument: string;
-          }>
-        >
-      >();
+      const memoryExecutionRefs = new WeakMap<PromptOwner, string>();
       async function publishMemoryRoot(
         scope: PromptOwner,
         call: ModelCallBinding,
@@ -467,77 +460,79 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           receipt.moduleConfigRevisionRef !== memory.moduleConfigRevisionRef
         )
           return;
-        let root = memoryRoots.get(scope);
-        if (!root && receipt.openedOrigin) {
-          const { vmId, instanceId, leaseEpoch } = call.vm;
-          root = Promise.resolve().then(async () => {
-            await scope.assertObserved(active);
-            active.throwIfAborted();
-            const issued = await memory.publication.root(
-              scope.context,
-              {
-                runId: receipt.run.runId,
-                workspaceId: scope.identity.workspaceId,
-                employeeInstanceId: call.employeeInstanceId,
-                threadId: call.allriceThreadRef,
-                originalPromptRequestId: scope.requestId,
-                originalTurn: receipt.request.turn,
-                rootNativeSessionRef: call.native.rootSessionId,
-                nativeOwnerRef: call.native.instanceId,
-                nativeProfileRef: call.native.profile,
-                moduleConfigRevisionRef: memory.moduleConfigRevisionRef,
-                vm: { vmId, instanceId, leaseEpoch },
-              },
-              active,
-            );
-            await scope.assertObserved(active);
-            active.throwIfAborted();
-            if (
-              !issued.executionRef ||
-              issued.executionRef.length > 256 ||
-              Buffer.byteLength(issued.memoryIndexDocument) >
-                memoryIndexPolicy.maximumInitialBytes
-            )
-              return reject();
-            return Object.freeze({ ...issued });
-          });
-          memoryRoots.set(scope, root);
-        }
-        return root;
+        // The DB reopens the same immutable B in its caller transaction. It
+        // also rechecks its pinned sources before disclosing the original index.
+        const { vmId, instanceId, leaseEpoch } = call.vm;
+        await scope.assertObserved(active);
+        active.throwIfAborted();
+        const issued = await memory.publication.root(
+          scope.context,
+          {
+            runId: receipt.run.runId,
+            workspaceId: scope.identity.workspaceId,
+            employeeInstanceId: call.employeeInstanceId,
+            threadId: call.allriceThreadRef,
+            originalPromptRequestId: scope.requestId,
+            originalTurn: receipt.request.turn,
+            rootNativeSessionRef: call.native.rootSessionId,
+            nativeOwnerRef: call.native.instanceId,
+            nativeProfileRef: call.native.profile,
+            moduleConfigRevisionRef: memory.moduleConfigRevisionRef,
+            vm: { vmId, instanceId, leaseEpoch },
+          },
+          active,
+        );
+        await scope.assertObserved(active);
+        active.throwIfAborted();
+        const previous = memoryExecutionRefs.get(scope);
+        if (
+          !issued.executionRef ||
+          issued.executionRef.length > 256 ||
+          (previous !== undefined && previous !== issued.executionRef) ||
+          Buffer.byteLength(issued.memoryIndexDocument) >
+            memoryIndexPolicy.maximumInitialBytes
+        )
+          return reject();
+        memoryExecutionRefs.set(scope, issued.executionRef);
+        return issued;
       }
       function publishMemoryCall(
         prompt: PromptOwner,
-        fact: NativeToolObservation,
+        fact: NativeMemoryToolObservation,
         signal: AbortSignal,
       ) {
         return run(
           AbortSignal.any([signal, prompt.revoked]),
           async (active) => {
             const receipt = toolRequests.get(prompt)?.get(fact.attemptId);
-            const root = memoryRoots.get(prompt);
-            const name = fact.name;
+            const toolId =
+              fact.name === 'mcp__allrice__memory_read'
+                ? 'memory_read'
+                : fact.name === 'mcp__allrice__memory_remember'
+                  ? 'memory_remember'
+                  : undefined;
             if (
               !memory ||
-              !root ||
-              !receipt ||
-              (name !== 'memory_read' && name !== 'memory_remember') ||
+              !receipt?.memoryExecutionRef ||
+              !toolId ||
+              fact.executionSessionRef !== prompt.sessionId ||
+              fact.executionParentRef !== (prompt.parentSessionId ?? null) ||
               fact.dispatch.kind !== 'sealed-handler' ||
-              fact.dispatch.version !== memory.toolVersions[name] ||
+              fact.dispatch.version !== memory.toolVersions[toolId] ||
               !matchNativeToolObservation(receipt.request, fact)
             )
               return null;
-            const { executionRef } = await root;
             const { occurrence, kind, digest } = fact.human;
             await prompt.assertObserved(active);
             active.throwIfAborted();
             const result = await memory.publication.call(
               prompt.context,
               {
-                executionRef,
-                nativeSessionRef: occurrence.sessionId,
-                parentSessionRef: occurrence.parentSessionId ?? null,
+                executionRef: receipt.memoryExecutionRef,
+                nativeSessionRef: fact.executionSessionRef,
+                parentSessionRef: fact.executionParentRef,
                 callRef: fact.callId,
-                toolId: name,
+                toolId,
                 toolVersion: fact.dispatch.version,
                 humanSource: {
                   kind,
@@ -1492,15 +1487,15 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                         );
                         entry.persisted = true;
                         await assertPersistedExecution(call, admitted);
-                        if (evidence) {
-                          const root = await publishMemoryRoot(
+                        const root =
+                          evidence &&
+                          (await publishMemoryRoot(
                             scope,
                             call,
                             evidence,
                             admitted,
-                          );
-                          entry.memoryIndex = root?.memoryIndexDocument;
-                        }
+                          ));
+                        entry.memoryIndex = root?.memoryIndexDocument;
                         if (kind === 'assistant')
                           for (const member of direct)
                             sourceExecutions.set(member, call.execution);
@@ -1520,7 +1515,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                           // receipt before the prompt carrier has drained.
                           toolRequests
                             .get(scope)
-                            ?.set(evidence.request.nativeAttemptId, evidence);
+                            ?.set(evidence.request.nativeAttemptId, {
+                              ...evidence,
+                              memoryExecutionRef: root?.executionRef,
+                            });
                         }
                         return input.issueCall(
                           call,
