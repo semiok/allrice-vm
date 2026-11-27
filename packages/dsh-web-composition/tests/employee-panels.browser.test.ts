@@ -842,8 +842,16 @@ suite('installed native employee panels with synthetic business owner', () => {
             __ALLRICE_D_ENTRY_LIFETIME__: new AbortController().signal,
           });
           const bind = () => {
-            const app = document.getElementById('app');
-            if (!app) return;
+            if (!document.body) return;
+            // Standalone rc.2 boots at #root. Add the authenticated document
+            // carrier that the real AllRice iframe supplies at #app.
+            let app = document.getElementById('app');
+            if (!app) {
+              app = document.createElement('div');
+              app.id = 'app';
+              app.hidden = true;
+              document.body.prepend(app);
+            }
             Object.assign(app.dataset, identity);
             observer.disconnect();
           };
