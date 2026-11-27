@@ -461,6 +461,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         call: ModelCallBinding,
         receipt: EvidenceReceipt,
         active: AbortSignal,
+        phase: 'seal' | 'dispatch',
       ) {
         if (
           !memory ||
@@ -478,7 +479,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         const issued = await memory.publication.root(
           scope.context,
           {
-            mode: receipt.firstIssue ? 'issue' : 'restore',
+            mode: receipt.firstIssue && phase === 'seal' ? 'issue' : 'restore',
             runId: receipt.run.runId,
             workspaceId: scope.identity.workspaceId,
             employeeInstanceId: call.employeeInstanceId,
@@ -1691,7 +1692,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           });
         },
         references,
-        async readMemoryIndex(call, signal) {
+        async readMemoryIndex(call, signal, phase) {
           const entry = calls.get(call.native.callId);
           if (!memory || !entry?.memoryEvidence || !entry.memoryAuthor)
             return undefined;
@@ -1713,10 +1714,19 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             call,
             memoryEvidence,
             active,
+            phase,
           );
           active.throwIfAborted();
           if (calls.get(call.native.callId) !== entry) return reject();
-          if (issued)
+          const saved = toolRequests
+            .get(memoryAuthor)
+            ?.get(memoryEvidence.request.nativeAttemptId);
+          if (
+            phase === 'dispatch' &&
+            issued?.executionRef !== saved?.memoryExecutionRef
+          )
+            return reject();
+          if (phase === 'seal' && issued)
             toolRequests
               .get(memoryAuthor)
               ?.set(memoryEvidence.request.nativeAttemptId, {

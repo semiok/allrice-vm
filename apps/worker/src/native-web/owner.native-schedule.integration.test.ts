@@ -62,11 +62,16 @@ it.skipIf(!cli).each([false, true])(
       commitMemory.resolve('fixture-closed');
     });
     const nativeRequestId = randomUUID();
+    const steerRequestId = randomUUID();
     const humanText = 'Create a test reminder in ten minutes.';
     const selected = deferredPromptFact<{
       id: string;
       cursor: number;
       observation: NonNullable<NativeToolObservation['human']>;
+    }>();
+    const steered = deferredPromptFact<{
+      current: NativeToolObservation['human'];
+      original: Omit<NativeToolObservation['human'], 'kind'>;
     }>();
     const title = 'Synthetic reminder for the Host wake reader';
     const prompt = 'Acknowledge this synthetic reminder without using tools.';
@@ -81,14 +86,19 @@ it.skipIf(!cli).each([false, true])(
           request.url === '/v1/reference' ||
           request.url === '/v1/reference/session-title'
         ) {
-          if (request.url === '/v1/reference' && assistantRequests === 0) {
+          if (
+            request.url === '/v1/reference' &&
+            (assistantRequests === 0 ||
+              (fixtureMemory && assistantRequests === 1))
+          ) {
             const { sessionId } = JSON.parse(
               Buffer.concat(chunks).toString('utf8'),
             );
             try {
-              await readAttempt(sessionId);
+              await readAttempt(sessionId, assistantRequests === 1);
             } catch (error) {
-              selected.reject(error);
+              if (assistantRequests === 0) selected.reject(error);
+              else steered.reject(error);
               throw error;
             }
           }
@@ -237,7 +247,7 @@ it.skipIf(!cli).each([false, true])(
       },
     );
     const signal = AbortSignal.timeout(15000);
-    async function readAttempt(sessionId: string) {
+    async function readAttempt(sessionId: string, afterSteer: boolean) {
       const attempt = await owner.readNativeAttemptFor(
         context,
         {
@@ -261,7 +271,16 @@ it.skipIf(!cli).each([false, true])(
         model: 'fixture-codex',
         digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
-      expect(attempt.observation.firstMemoryAttempt).toBe(true);
+      expect(attempt.observation.firstMemoryAttempt).toBe(!afterSteer);
+      if (afterSteer) {
+        if (!attempt.observation.originalHuman)
+          throw Error('Original adopted occurrence unavailable');
+        steered.resolve({
+          current: attempt.observation.human,
+          original: attempt.observation.originalHuman,
+        });
+        return;
+      }
       selected.resolve({
         id: attempt.id,
         cursor: attempt.cursor,
@@ -354,8 +373,8 @@ it.skipIf(!cli).each([false, true])(
     );
     cleanup.push(() => execution.close());
     const promptScope = await execution.run(signal);
-    expect(
-      await promptScope.invoke(
+    const submit = (requestId: string, text: string, mode: 'queue' | 'steer') =>
+      promptScope.invoke(
         {
           endpoint: 'session/prompt',
           scopeId: executionId,
@@ -365,15 +384,17 @@ it.skipIf(!cli).each([false, true])(
             .parse({
               request: {
                 sessionId,
-                requestId: nativeRequestId,
-                content: [{ type: 'text', text: humanText }],
-                mode: 'queue',
+                requestId,
+                content: [{ type: 'text', text }],
+                mode,
               },
             }),
         },
         signal,
-      ),
-    ).toMatchObject({ value: { accepted: true } });
+      );
+    expect(await submit(nativeRequestId, humanText, 'queue')).toMatchObject({
+      value: { accepted: true },
+    });
     const nativeAttempt = await waitForPromptFact(selected.promise, signal);
     if (fixtureMemory) {
       try {
@@ -391,6 +412,13 @@ it.skipIf(!cli).each([false, true])(
         await expect(readFile(memoryMarker(), 'utf8')).rejects.toMatchObject({
           code: 'ENOENT',
         });
+        expect(
+          await submit(
+            steerRequestId,
+            'Keep the original reminder and include the category.',
+            'steer',
+          ),
+        ).toMatchObject({ value: { accepted: true } });
       } finally {
         commitMemory.resolve('committed-private-fixture-call');
       }
@@ -423,6 +451,21 @@ it.skipIf(!cli).each([false, true])(
     await nextChange();
 
     const observation = await waitForPromptFact(opened.promise, signal);
+    if (fixtureMemory) {
+      const proof = await waitForPromptFact(steered.promise, signal);
+      expect(proof.current).toMatchObject({
+        kind: 'adopted-steering',
+        occurrence: {
+          requestId: steerRequestId,
+          turn: nativeAttempt.observation.occurrence.turn,
+        },
+      });
+      expect(proof.original).toEqual({
+        occurrence: nativeAttempt.observation.occurrence,
+        sequence: nativeAttempt.observation.sequence,
+        digest: nativeAttempt.observation.digest,
+      });
+    }
     expect(await waitForPromptFact(observation.settled, signal)).toBe('ended');
     if (fixtureMemory)
       expect(await readFile(memoryMarker(), 'utf8')).toBe(

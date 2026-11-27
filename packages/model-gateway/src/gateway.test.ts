@@ -70,6 +70,32 @@ it('hashes the same trusted context that reaches the provider, and refuses stale
   expect(sent).toHaveBeenCalledTimes(1);
   expect(store.calls.size).toBe(1);
 });
+it('checks pinned context again after model capacity admits the request and before opening upstream', async () => {
+  const upstream = await upstreamFixture();
+  cleanup.push(() => upstream.close());
+  const native = await nativeProviderFixture(upstream.url);
+  cleanup.push(() => native.close());
+  const store = new FixtureStore();
+  let archived = false;
+  store.beforeStart = async () => {
+    archived = true;
+  };
+  const phases: string[] = [];
+  const f = await gatewayFixture({
+    provider: native.provider,
+    store,
+    async readTrustedContext(_binding, _signal, phase) {
+      phases.push(phase);
+      if (archived) throw new ModelGatewayError('AUTHORIZATION_DENIED');
+      return 'sealed memory index';
+    },
+  });
+  cleanup.push(() => f.close());
+  await f.collect();
+  expect(phases).toEqual(['seal', 'dispatch']);
+  expect(store.calls.size).toBe(1);
+  expect(upstream.requests).toHaveLength(0);
+});
 it('rejects a chunked oversized request without waiting for EOF or dispatching upstream', async () => {
   const f = await setup();
   const status = await new Promise<number | undefined>((resolve, reject) => {

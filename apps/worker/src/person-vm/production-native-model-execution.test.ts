@@ -12,15 +12,22 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
 import { installDEntryNativeOwnerPort } from '../d-entry/native-owner.js';
+import { selectNativeMemoryConfiguration } from './production-native-memory.js';
 import {
   createProductionNativeModelExecution,
   nativeRunExecutionIds,
   readNativePromptContributors,
 } from './production-native-model-execution.js';
 
-const mocks = vi.hoisted(() => ({ pin: vi.fn(), watch: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  pin: vi.fn(),
+  watch: vi.fn(),
+  query: vi.fn(),
+}));
 vi.mock('@allrice/database', () => ({
   getDEntryNativeRootPin: mocks.pin,
+  getDatabase: () =>
+    Object.assign(mocks.query, { json: (value: unknown) => value }),
   watchDEntryNativeRosterAuthority: mocks.watch,
 }));
 
@@ -69,6 +76,7 @@ const login = (sessionId = randomUUID()): RequestContext => ({
   authenticatedAt: new Date().toISOString(),
 });
 beforeEach(() => {
+  mocks.query.mockReset();
   mocks.pin.mockReset().mockResolvedValue({
     identity,
     vmId: binding.vmId,
@@ -288,7 +296,7 @@ function nativeFacts() {
   };
 }
 
-async function setup() {
+async function setup(nativeMemory?: Parameters<Attach>[0]['nativeMemory']) {
   const lifetime = new AbortController();
   let observed!: Observer;
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
@@ -324,6 +332,7 @@ async function setup() {
   const attached = await createProductionNativeModelExecution().attach(
     {
       lifetime: lifetime.signal,
+      nativeMemory,
       providers: { applicationBuild: { manifestDigest: 'fixture-build' } },
       startup: {
         installModelAdapter: () => () => {},
@@ -400,6 +409,152 @@ async function setup() {
     },
   };
 }
+
+it('in a new Host, selects the persisted B only after a newly adopted steer proves the same native turn', async () => {
+  const publication = { root: vi.fn(), call: vi.fn() };
+  const build = {
+    sourceSha: 'a'.repeat(40),
+    sourceTree: 'b'.repeat(40),
+    manifestDigest: 'sha256:' + 'c'.repeat(64),
+    webBuildId: 'fixture',
+  };
+  const source = {
+    publication,
+    toolVersions: { memory_read: 'read-v1', memory_remember: 'remember-v1' },
+  };
+  const memory = selectNativeMemoryConfiguration(source, build);
+  expect(
+    selectNativeMemoryConfiguration(source, build).moduleConfigRevisionRef,
+  ).toBe(memory.moduleConfigRevisionRef);
+  expect(
+    selectNativeMemoryConfiguration(
+      {
+        ...source,
+        toolVersions: { ...source.toolVersions, memory_read: 'read-v2' },
+      },
+      build,
+    ).moduleConfigRevisionRef,
+  ).not.toBe(memory.moduleConfigRevisionRef);
+  const f = await setup(memory);
+  const context = login();
+  const root = SessionId(issue.root.nativeSessionId);
+  const signal = new AbortController().signal;
+  const uninstall = installDEntryNativeOwnerPort({
+    async resolve() {
+      return {
+        ...f.profile,
+        controlReady: () => true,
+        assertCurrent: async () => {},
+        acquirePrincipal: () => {
+          throw Error('Unexpected scope creation');
+        },
+        async readSessions() {
+          return {
+            ok: true,
+            value: {
+              items: [
+                {
+                  sessionId: root,
+                  updatedAt: 1,
+                  blank: false,
+                  running: true,
+                  agentAvailable: true,
+                },
+              ],
+            },
+          };
+        },
+      };
+    },
+  });
+  try {
+    const prior = {
+      sessionId: root,
+      scopeId: randomUUID(),
+      requestId: 'original-prompt',
+      messageId: 'original-adoption',
+      turn: 1,
+    };
+    const steer = {
+      ...prior,
+      scopeId: issue.scopeId,
+      requestId: 'steer-request',
+      messageId: 'steer-adoption',
+    };
+    const native = nativeFacts();
+    const admission = await f.admit(context, steer.requestId, native, 'steer');
+    native.insert(steer.messageId);
+    admission.accepted();
+    const recipient = 'r'.repeat(43);
+    const attempt = {
+      kind: 'assistant',
+      id: randomUUID(),
+      turn: 1,
+      sourceTurn: 1,
+      cursor: 18,
+      recipient,
+      rootSessionId: root,
+      delegated: false,
+      inheritedPromptIndexes: [],
+      prompts: [prior, steer],
+      observation: {
+        proofState: 'adopted',
+        firstMemoryAttempt: false,
+        originalHuman: {
+          occurrence: prior,
+          sequence: 3,
+          digest: 'sha256:' + 'a'.repeat(64),
+        },
+        human: {
+          kind: 'adopted-steering',
+          occurrence: steer,
+          sequence: 14,
+          digest: 'sha256:' + 'b'.repeat(64),
+        },
+      },
+    };
+    f.readNativeAttemptFor.mockResolvedValue(attempt);
+    const resolve = () => {
+      const body = Buffer.from(
+        JSON.stringify({ ...f.selection, sessionId: root, recipient }),
+      );
+      const request = Object.assign(Readable.from([body]), {
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      });
+      return f.resolveReference!(
+        request as unknown as IncomingMessage,
+        binding,
+        signal,
+      );
+    };
+    const b = randomUUID();
+    mocks.query.mockResolvedValueOnce([{ id: b }]);
+    await expect(resolve()).resolves.toMatchObject({ context });
+    expect(f.bindReference.mock.lastCall?.[0].execution.runId).toBe(b);
+    expect(native.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      steer,
+    );
+    expect(mocks.query.mock.lastCall).toContainEqual(
+      expect.objectContaining({
+        loginSessionId: context.sessionId,
+        nativeRequestId: prior.requestId,
+      }),
+    );
+    mocks.query.mockResolvedValueOnce([]);
+    await expect(resolve()).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(publication.root).not.toHaveBeenCalled();
+  } finally {
+    uninstall();
+    await f.close();
+  }
+});
 
 it('binds only adopted child occurrences when pending and steered messages share a request ID', async () => {
   const f = await setup();

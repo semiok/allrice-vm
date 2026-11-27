@@ -160,6 +160,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       readMemoryIndex?(
         call: ModelCallBinding,
         signal: AbortSignal,
+        phase: 'seal' | 'dispatch',
       ): Promise<string | undefined>;
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;

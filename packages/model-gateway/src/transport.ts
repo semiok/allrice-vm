@@ -77,6 +77,7 @@ export function createMeteredTransport(options: {
   provider: GatewayProvider;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
+  assertContextCurrent?(signal: AbortSignal): Promise<void>;
   activate(): Promise<void>;
 }) {
   const controller = new AbortController();
@@ -209,6 +210,8 @@ export function createMeteredTransport(options: {
         // transport. The activation owns the entire request and final drain.
         await options.activate();
         if (!refreshing) await options.assertCurrent(requestSignal);
+        if (classification.kind === 'model')
+          await options.assertContextCurrent?.(requestSignal);
         requestSignal.throwIfAborted();
         // Construct only after admission and durable intent. A replayable body
         // (including null) lets native Fetch resend 421 inside one call. Use the
