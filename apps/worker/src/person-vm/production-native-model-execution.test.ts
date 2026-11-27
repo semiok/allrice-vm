@@ -500,6 +500,7 @@ it('in a new Host, selects the persisted B only after a newly adopted steer prov
       observation: {
         proofState: 'adopted',
         firstMemoryAttempt: false,
+        memoryToolVersions: source.toolVersions,
         originalHuman: {
           occurrence: prior,
           sequence: 3,

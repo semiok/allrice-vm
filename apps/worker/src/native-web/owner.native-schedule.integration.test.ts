@@ -272,6 +272,10 @@ it.skipIf(!cli).each([false, true])(
         digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(attempt.observation.firstMemoryAttempt).toBe(!afterSteer);
+      expect(attempt.observation.memoryToolVersions).toEqual({
+        memory_read: null,
+        memory_remember: fixtureMemory ? handlerVersion : null,
+      });
       if (afterSteer) {
         if (!attempt.observation.originalHuman)
           throw Error('Original adopted occurrence unavailable');

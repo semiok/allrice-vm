@@ -442,18 +442,20 @@ export function createModelGateway(options: {
                 signal,
                 assertCurrent,
                 activate,
-                async assertContextCurrent(active) {
-                  if (
-                    trustedContext &&
-                    trustedContext !==
-                      (await options.readTrustedContext?.(
-                        binding,
-                        active,
-                        'dispatch',
-                      ))
-                  )
-                    throw new ModelGatewayError('AUTHORIZATION_DENIED');
-                },
+                assertContextCurrent:
+                  trustedContext === undefined
+                    ? undefined
+                    : async (active) => {
+                        if (
+                          trustedContext !==
+                          (await options.readTrustedContext?.(
+                            binding,
+                            active,
+                            'dispatch',
+                          ))
+                        )
+                          throw new ModelGatewayError('AUTHORIZATION_DENIED');
+                      },
               });
               iterator = transport.run(() => {
                 const source = options.provider.stream(binding, input, signal);

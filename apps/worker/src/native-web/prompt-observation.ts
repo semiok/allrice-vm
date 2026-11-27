@@ -51,6 +51,14 @@ export const NativeRequestObservationSchema = z
       .nullable()
       .optional(),
     firstMemoryAttempt: z.boolean().optional(),
+    memoryToolVersions: z
+      .object({
+        memory_read: z.string().min(1).max(256).nullable(),
+        memory_remember: z.string().min(1).max(256).nullable(),
+      })
+      .strict()
+      .nullable()
+      .optional(),
     proofState: z.enum([
       'adopted',
       'no-unique-text',

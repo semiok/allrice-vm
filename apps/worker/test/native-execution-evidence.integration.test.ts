@@ -9,6 +9,7 @@ import {
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
   recoverNativeMemoryRun,
+  bindNativeMemoryExecutionRef,
   type NativeExecutionEvidence,
 } from '../src/person-vm/production-native-execution-evidence.js';
 
@@ -164,6 +165,16 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           firstIssue: false,
         });
         expect(receipt.firstIssue).toBe(true);
+        const executionRef = randomUUID();
+        await expect(
+          bindNativeMemoryExecutionRef(receipt, executionRef, signal),
+        ).resolves.toBe(true);
+        await expect(
+          bindNativeMemoryExecutionRef(receipt, executionRef, signal),
+        ).resolves.toBe(true);
+        await expect(
+          bindNativeMemoryExecutionRef(receipt, randomUUID(), signal),
+        ).resolves.toBe(false);
         const original = {
           occurrence: adopted.occurrence,
           sequence: adopted.sequence,
@@ -292,6 +303,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             moduleConfigRevisionRef: 'fixture-memory-config-v2',
           },
           receipt.request,
+          { kind: 'memory-root', b: runId, executionRef },
           ambiguous.request,
           steered?.request,
           {

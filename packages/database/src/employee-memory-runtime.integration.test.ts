@@ -1002,7 +1002,9 @@ suite(
         config_ref: 'fixture-config-2',
         restore_expected: true,
       });
-      expect(await f.issue()).toBe(document);
+      const restore = () =>
+        f.port.issueContext(f.context, f.target(), live(), 'restore');
+      expect(await restore()).toBe(document);
       expect((await f.state())!.state).toEqual(spent.state);
       expect((await f.state())!.module_config_revision_ref).toBe(
         'fixture-config-1',
@@ -1020,6 +1022,16 @@ suite(
       );
       await expect(f.issue()).rejects.toThrow(
         'fixture_restore_collection_incomplete',
+      );
+      // The DB restore boundary must refuse even if the producer only proves
+      // the old execution and does not know the context row was lost.
+      await f.change({
+        restore_expected: false,
+        config_ref: 'fixture-config-1',
+      });
+      await expect(restore()).rejects.toHaveProperty(
+        'code',
+        'MEMORY_CONTEXT_UNAVAILABLE',
       );
       expect(await f.state()).toBeNull();
     });

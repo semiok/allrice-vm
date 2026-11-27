@@ -71,7 +71,13 @@ export type NativeExecutionToolEvidence = Readonly<{
 export type NativeExecutionEvidence =
   | NativeExecutionOriginEvidence
   | NativeExecutionRequestEvidence
-  | NativeExecutionToolEvidence;
+  | NativeExecutionToolEvidence
+  | Readonly<{
+      source: typeof nativeExecutionEvidenceSource;
+      kind: 'memory-root';
+      b: string;
+      executionRef: string;
+    }>;
 type Receipt = Readonly<{
   run: Run;
   request: NativeExecutionRequestEvidence;
@@ -154,6 +160,45 @@ async function append(
     select ${run.organizationId},${run.workspaceId},${run.runId},coalesce(max(sequence)+1,0),
       'harness.native',${tx.json(fact)}
     from allrice_run_events where run_id=${run.runId}`;
+}
+
+/** Persist the DB's stable reference for B, without retaining the index text.
+ * A proven DB restore can fill this receipt after an earlier lost response. */
+export async function bindNativeMemoryExecutionRef(
+  { run, origin }: Pick<Receipt, 'run' | 'origin'>,
+  executionRef: string,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const accepted = await getDatabase().begin(async (tx) => {
+    const [locked] = await tx`
+      select id from allrice_runs where id=${run.runId}
+        and organization_id=${run.organizationId} and workspace_id=${run.workspaceId}
+        and owner_id=${run.ownerId} and visibility='private' and state='running'
+        and execution_spec->>'generation'='4.0' for update`;
+    signal.throwIfAborted();
+    if (!locked) return false;
+    const [bound] =
+      await tx`select id from allrice_run_events where run_id=${run.runId}
+      and event_type='harness.native' and payload=${tx.json(origin)}`;
+    if (!bound) return false;
+    const found = await tx<{ ref: string }[]>`
+      select payload->>'executionRef' as ref from allrice_run_events where run_id=${run.runId}
+        and event_type='harness.native' and payload->>'source'=${nativeExecutionEvidenceSource}
+        and payload->>'kind'='memory-root' and payload->>'b'=${run.runId} limit 2`;
+    if (found.length)
+      return found.length === 1 && found[0]!.ref === executionRef;
+    await append(tx, run, {
+      source: nativeExecutionEvidenceSource,
+      kind: 'memory-root',
+      b: run.runId,
+      executionRef,
+    });
+    signal.throwIfAborted();
+    return true;
+  });
+  signal.throwIfAborted();
+  return accepted;
 }
 
 /** Called under the original allrice_runs lock in persistExecution. The

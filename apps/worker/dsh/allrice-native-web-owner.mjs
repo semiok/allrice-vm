@@ -413,7 +413,7 @@ async function observePromptOrigins(
 // arguments cross the owner carrier. An unsupported block has no proof.
 const nativeToolBodyClaims = new Map();
 const witnessedNativeTools = new WeakSet();
-const publishedMemoryTools = new WeakSet();
+const publishedMemoryTools = new WeakMap();
 
 // Only the exact, sealed registration may opt in. A successful around-dispatch
 // result, on its own, cannot mark entry into the registered implementation.
@@ -460,8 +460,26 @@ export function withNativeMemoryToolPublication(tool, version) {
     },
   };
   witnessedNativeTools.add(wrapped);
-  publishedMemoryTools.add(wrapped);
+  publishedMemoryTools.set(wrapped, version);
   return wrapped;
+}
+
+function readMemoryToolVersions(scope, session, toolNames) {
+  const agent = scope.agents.get(session.id);
+  if (!agent || original(agent.session) !== original(session) || !toolNames)
+    return null;
+  const version = (toolId) => {
+    const name = 'mcp__allrice__' + toolId;
+    return (
+      (toolNames.includes(name) &&
+        publishedMemoryTools.get(original(scope.tools.get(name, agent)))) ||
+      null
+    );
+  };
+  return {
+    memory_read: version('memory_read'),
+    memory_remember: version('memory_remember'),
+  };
 }
 
 function adoptedTextDigest(message) {
@@ -496,7 +514,13 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
         .update(JSON.stringify([config.config, config.adapterDefaults ?? null]))
         .digest('hex'),
   };
-  const empty = { request: request ?? null, human: null };
+  const empty = {
+    request: request ?? null,
+    human: null,
+    ...(Array.isArray(config?.tools) && {
+      toolNames: config.tools.map(({ name }) => name),
+    }),
+  };
   if (origin.delegated || !origin.prompts.length) return empty;
   const start = events.findLast(
     (event) =>
@@ -1641,6 +1665,11 @@ export function applyNativeWebOwner(
                       firstMemoryAttempt:
                         origin.request.firstMemoryAttempt === true,
                       originalHuman: origin.request.originalHuman ?? null,
+                      memoryToolVersions: readMemoryToolVersions(
+                        scope,
+                        found.session,
+                        origin.request.toolNames,
+                      ),
                     },
                     inheritedPromptIndexes: origin.prompts.flatMap(
                       (prompt, index) =>

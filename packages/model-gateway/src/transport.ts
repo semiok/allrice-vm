@@ -210,8 +210,6 @@ export function createMeteredTransport(options: {
         // transport. The activation owns the entire request and final drain.
         await options.activate();
         if (!refreshing) await options.assertCurrent(requestSignal);
-        if (classification.kind === 'model')
-          await options.assertContextCurrent?.(requestSignal);
         requestSignal.throwIfAborted();
         // Construct only after admission and durable intent. A replayable body
         // (including null) lets native Fetch resend 421 inside one call. Use the
@@ -233,9 +231,11 @@ export function createMeteredTransport(options: {
             }),
           duplex: 'half',
         };
-        // No expensive native ancestry or credential read after this last
-        // selected-generation check, including before an unsent refresh.
+        // The memory check, when installed, runs after the selected-generation
+        // read and all other async gates. Refresh has no memory input.
         await options.provider.assertDispatchCurrent?.(requestSignal);
+        if (classification.kind === 'model' && options.assertContextCurrent)
+          await options.assertContextCurrent(requestSignal);
         requestSignal.throwIfAborted();
         dispatched = true;
         // Redirects are disabled in request; hidden 421 replay is disabled by

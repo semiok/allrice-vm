@@ -51,6 +51,7 @@ import {
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
   recoverNativeMemoryRun,
+  bindNativeMemoryExecutionRef,
   type NativeExecutionBuild,
 } from './production-native-execution-evidence.js';
 
@@ -456,6 +457,17 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         Map<string, EvidenceReceipt & { memoryExecutionRef?: string }>
       >();
       const memory = host.nativeMemory;
+      function matchesMemoryTools(
+        observation: NativeRequestObservation | null | undefined,
+      ) {
+        const actual = observation?.memoryToolVersions;
+        return (
+          !!memory &&
+          !!actual &&
+          actual.memory_read === memory.toolVersions.memory_read &&
+          actual.memory_remember === memory.toolVersions.memory_remember
+        );
+      }
       async function publishMemoryRoot(
         scope: PromptOwner,
         call: ModelCallBinding,
@@ -494,13 +506,22 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           },
           active,
         );
-        await scope.assertObserved(active);
+        if (phase === 'seal') await scope.assertObserved(active);
         active.throwIfAborted();
         if (
           !issued.executionRef ||
           issued.executionRef.length > 256 ||
           Buffer.byteLength(issued.memoryIndexDocument) >
             memoryIndexPolicy.maximumInitialBytes
+        )
+          return reject();
+        if (
+          phase === 'seal' &&
+          !(await bindNativeMemoryExecutionRef(
+            receipt,
+            issued.executionRef,
+            active,
+          ))
         )
           return reject();
         return issued;
@@ -1361,6 +1382,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               if (
                 !proven &&
                 memory &&
+                matchesMemoryTools(attempt.observation) &&
                 original &&
                 adopted?.kind === 'adopted-steering' &&
                 attempt.observation?.proofState === 'adopted' &&
@@ -1550,12 +1572,18 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       authorization,
                       async (admitted) => {
                         const inherited = new Set(inheritedPromptIndexes);
+                        const firstObservedIndex = recoveredOriginalRequestId
+                          ? 1
+                          : 0;
                         const direct = coalesced.filter(
-                          (_, index) => !inherited.has(index),
+                          (_, index) =>
+                            !inherited.has(index + firstObservedIndex),
                         );
                         await assertDelegatedOrigins(
                           scope,
-                          coalesced.filter((_, index) => inherited.has(index)),
+                          coalesced.filter((_, index) =>
+                            inherited.has(index + firstObservedIndex),
+                          ),
                           call,
                           admitted,
                         );
@@ -1569,7 +1597,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                             build: host.nativeExecutionBuild ?? null,
                             observation,
                             prompts,
-                            moduleConfigRevisionRef: host.nativeExecutionBuild
+                            moduleConfigRevisionRef: matchesMemoryTools(
+                              observation,
+                            )
                               ? memory?.moduleConfigRevisionRef
                               : undefined,
                             recoveredOriginalRequestId,
@@ -1592,7 +1622,10 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                               member.scopeId === human.scopeId &&
                               member.requestId === human.requestId,
                           );
-                        if (evidence && author) {
+                        if (
+                          evidence?.origin.moduleConfigRevisionRef &&
+                          author
+                        ) {
                           entry.memoryEvidence = evidence;
                           entry.memoryAuthor = author;
                         }
@@ -1704,6 +1737,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             memoryAuthor.revoked,
           ]);
           const { attempt } = await readAuthorizedCall(call, active);
+          if (!matchesMemoryTools(attempt.observation)) return reject();
           if (
             JSON.stringify(attempt.observation?.human) !==
             JSON.stringify(memoryEvidence.request.human)
