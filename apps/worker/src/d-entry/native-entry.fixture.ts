@@ -253,7 +253,7 @@ export function nativeEntryFixture(preset?: {
     root,
     owners: { resolve: vi.fn(async () => owner) },
     data: vi.fn(() => data as DEntryNativeDataPort | undefined),
-    watch: vi.fn(async () => ({
+    watch: vi.fn<DEntryHttpDependencies['watch']>(async () => ({
       revoked: identityRevoked.signal,
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       close: authorityClose,

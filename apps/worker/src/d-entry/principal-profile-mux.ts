@@ -280,6 +280,7 @@ async function runStreams(
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
     let settled = false;
+    let follow: Awaited<ReturnType<DEntryPageHandle['watchFollow']>>;
     let buffered = 0;
     let input = Promise.resolve();
     let inputError = Promise.resolve();
@@ -299,7 +300,13 @@ async function runStreams(
       void inputError.catch((error: unknown) => stop.abort(error));
     }
     const source = (async () => {
-      await page.assertCurrent(child);
+      if (frame.endpoint === 'session/follow')
+        follow = await page.watchFollow(child);
+      if (follow) {
+        let pending;
+        while ((pending = follow.pending())) await pending;
+        follow.signal.throwIfAborted();
+      } else await page.assertCurrent(child);
       child.throwIfAborted();
       if (frame.endpoint === '$events') {
         emptyPayload.parse(frame.payload);
@@ -320,7 +327,7 @@ async function runStreams(
           endpoint,
           args: args as Record<string, JsonValue>,
         },
-        child,
+        follow?.signal ?? child,
       );
     })();
     const work = source
@@ -328,10 +335,15 @@ async function runStreams(
         for await (const item of stream) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
-          await page.assertCurrent(child);
+          if (follow) {
+            let pending;
+            while ((pending = follow.pending())) await pending;
+            follow.signal.throwIfAborted();
+          } else await page.assertCurrent(child);
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
+        follow?.signal.throwIfAborted();
         await page.assertCurrent(child);
         child.throwIfAborted();
         settled = true;
@@ -356,7 +368,7 @@ async function runStreams(
       .finally(async () => {
         settled = true;
         controller.abort();
-        await Promise.allSettled([input, inputError]);
+        await Promise.allSettled([input, inputError, follow?.close()]);
         streams.delete(id);
       });
     streams.set(id, {

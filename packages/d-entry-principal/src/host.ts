@@ -20,6 +20,7 @@ import type {} from '@deepseek-ai/dsh-api-gateway';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { API_REMOTE_FORWARDED_EVENTS } from '@deepseek-ai/dsh-api-remotes';
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import { TYPERT_REMOTE as Access } from '@deepseek-ai/dsh-api-remote-access/remote';
 import {
@@ -204,6 +205,19 @@ function assertContribution(
   )
     throw Error('PRINCIPAL_METADATA_INVALID');
 }
+const followCatalogIntervalMs = 5000;
+
+function sameFollowSession(
+  current: SessionSummary | undefined,
+  original: SessionSummary,
+) {
+  return (
+    current !== undefined &&
+    current.origin === original.origin &&
+    current.parentSessionId === original.parentSessionId
+  );
+}
+
 class Scope implements Projection {
   active = false;
   bindings: Projection['bindings'] = [];
@@ -222,6 +236,13 @@ class Scope implements Projection {
   private catalogReading?: Promise<void>;
   private refreshQueue = Promise.resolve();
   private refreshGeneration = 0;
+  private sessions = new Map<SessionId, SessionSummary>();
+  private readonly follows = new Set<{
+    chain: ReadonlyMap<SessionId, SessionSummary>;
+    stop: AbortController;
+  }>();
+  private followTimer?: ReturnType<typeof setTimeout>;
+  private followRead?: Promise<void>;
   constructor(
     readonly host: PrincipalService,
     private readonly ctx: Context,
@@ -245,10 +266,14 @@ class Scope implements Projection {
       if (this.eventBindings.length) this.rememberPageEvents([sessionId]);
       void this.refresh().catch(lost);
     };
-    const added = parent.ctx.on('api-session/added', ({ sessionId }) =>
-      hint(sessionId),
-    );
-    const removed = parent.ctx.on('api-session/removed', hint);
+    const added = parent.ctx.on('api-session/added', (session) => {
+      this.fenceFollowSession(session.sessionId, session);
+      hint(session.sessionId);
+    });
+    const removed = parent.ctx.on('api-session/removed', (id) => {
+      this.fenceFollowSession(id);
+      hint(id);
+    });
     this.detach = () => {
       parent.signal.removeEventListener('abort', lost);
       added();
@@ -341,10 +366,15 @@ class Scope implements Projection {
         // this generation. A cancelled follower owns only its catalog read.
         if (generation === this.refreshGeneration) {
           this.refreshQueue = task;
-          if (this.issue.access === 'page')
+          if (this.issue.access === 'page') {
+            this.sessions = new Map(
+              catalog.items.map((item) => [item.sessionId, item]),
+            );
+            this.verifyFollows(this.sessions);
             this.rememberPageEvents(
               catalog.items.map(({ sessionId }) => sessionId),
             );
+          }
           this.publish(
             bindings,
             this.issue.access === 'page' || bindings.length > 0,
@@ -354,6 +384,8 @@ class Scope implements Projection {
         if (!signal.aborted && generation === this.refreshGeneration) {
           this.refreshQueue = task;
           this.eventBindings = [];
+          this.sessions.clear();
+          this.verifyFollows(this.sessions);
           this.publish([]);
         }
         throw error;
@@ -361,6 +393,100 @@ class Scope implements Projection {
     });
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
+  }
+  private stopFollow(stop: AbortController) {
+    stop.abort(
+      new RemoteError(
+        'remote-access/denied',
+        'Native session follow unavailable',
+        {
+          action: 'session/follow',
+          reason: 'session-changed',
+        },
+      ),
+    );
+  }
+  private fenceFollowSession(id: SessionId, current?: SessionSummary) {
+    for (const { chain, stop } of this.follows) {
+      const original = chain.get(id);
+      if (original && !sameFollowSession(current, original))
+        this.stopFollow(stop);
+    }
+  }
+  private verifyFollows(sessions: ReadonlyMap<SessionId, SessionSummary>) {
+    for (const { chain, stop } of this.follows) {
+      for (const [id, original] of chain) {
+        if (sameFollowSession(sessions.get(id), original)) continue;
+        this.stopFollow(stop);
+        break;
+      }
+    }
+  }
+  private scheduleFollowRead() {
+    if (
+      this.followTimer ||
+      this.followRead ||
+      !this.follows.size ||
+      this.abort.signal.aborted
+    )
+      return;
+    this.followTimer = setTimeout(() => {
+      this.followTimer = undefined;
+      const signal = this.abort.signal;
+      this.followRead = this.track(
+        this.readInOrder(signal, async () => {
+          const { items } = await this.ctx.sessionController.list({}, signal);
+          signal.throwIfAborted();
+          this.verifyFollows(new Map(items.map((row) => [row.sessionId, row])));
+        })
+          .catch(() => this.verifyFollows(new Map()))
+          .finally(() => {
+            this.followRead = undefined;
+            this.scheduleFollowRead();
+          }),
+      );
+    }, followCatalogIntervalMs);
+    this.followTimer.unref();
+  }
+  pendingFollowRead() {
+    return this.followRead;
+  }
+  watchFollow(args: unknown, stop: AbortController) {
+    const {
+      request: { address },
+    } = Native.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(args);
+    const chain = new Map<SessionId, SessionSummary>();
+    let item = this.sessions.get(
+      address.kind === 'session' ? address.sessionId : address.childSessionId,
+    );
+    if (
+      address.kind === 'subagent' &&
+      item?.parentSessionId !== address.parentSessionId
+    )
+      item = undefined;
+    while (item && !chain.has(item.sessionId)) {
+      chain.set(item.sessionId, { ...item });
+      if (item.origin !== 'subagent') {
+        const follow = { chain, stop };
+        this.follows.add(follow);
+        this.scheduleFollowRead();
+        return () => {
+          this.follows.delete(follow);
+          if (!this.follows.size && this.followTimer) {
+            clearTimeout(this.followTimer);
+            this.followTimer = undefined;
+          }
+        };
+      }
+      item = item.parentSessionId
+        ? this.sessions.get(item.parentSessionId)
+        : undefined;
+    }
+    this.stopFollow(stop);
+    throw stop.signal.reason;
   }
   private rememberPageEvents(ids: readonly SessionId[]) {
     const count = this.eventSessions.size;
@@ -435,6 +561,7 @@ class Scope implements Projection {
     this.bindings = [];
     this.eventBindings = [];
     this.eventSessions.clear();
+    if (this.followTimer) clearTimeout(this.followTimer);
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
     return attempt;
@@ -1119,6 +1246,8 @@ class PrincipalService extends TypertRemoteService {
     const inbox = endpoint === undefined ? undefined : pageUplink(endpoint);
     let pageMethod: ReturnType<PrincipalService['pageMethod']> | undefined;
     let inputFailure: unknown;
+    const follow = new AbortController();
+    let unwatchFollow: (() => void) | undefined;
     const pump = pumpPageInput(input, (command) => {
       if (
         !inbox ||
@@ -1137,7 +1266,11 @@ class PrincipalService extends TypertRemoteService {
         inputFailure = error;
       })
       .finally(gate.stop);
-    const active = AbortSignal.any([scope.abort.signal, gate.abort.signal]);
+    const active = AbortSignal.any([
+      scope.abort.signal,
+      gate.abort.signal,
+      follow.signal,
+    ]);
     if (inbox) {
       if (active.aborted) inbox.close();
       else active.addEventListener('abort', inbox.close, { once: true });
@@ -1145,6 +1278,7 @@ class PrincipalService extends TypertRemoteService {
     const setup = scope.own(async () => {
       active.throwIfAborted();
       if (page) {
+        if (endpoint === 'session/follow') await scope.refresh(active);
         iterator = await scope.current(async () => {
           pageMethod = this.pageMethod(scope, raw, 'stream');
           const { endpoint, args, descriptor } = pageMethod;
@@ -1154,6 +1288,8 @@ class PrincipalService extends TypertRemoteService {
               'Native stream does not accept input',
               { endpoint },
             );
+          if (endpoint === 'session/follow')
+            unwatchFollow = scope.watchFollow(args, follow);
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
@@ -1287,7 +1423,11 @@ class PrincipalService extends TypertRemoteService {
           throw error;
         }
         if (next.done) break;
-        if (gate.abort.signal.aborted || scope.abort.signal.aborted) break;
+        if (unwatchFollow) {
+          let checking;
+          while ((checking = scope.pendingFollowRead())) await checking;
+        }
+        if (active.aborted) break;
         if (pageMethod) {
           const { value, attachments } = encodePageNativeResult(
             pageMethod.descriptor,
@@ -1344,6 +1484,7 @@ class PrincipalService extends TypertRemoteService {
         yield { type: 'item', scopeId: scope.issue.scopeId, value };
       }
       if (inputFailure !== undefined) throw inputFailure;
+      follow.signal.throwIfAborted();
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
@@ -1351,10 +1492,12 @@ class PrincipalService extends TypertRemoteService {
         page &&
         !scope.abort.signal.aborted &&
         !signal.aborted &&
-        (!active.aborted || error === inputFailure)
+        (!active.aborted || error === inputFailure || follow.signal.aborted)
       ) {
         await child.close();
-        const failure = this.ctx.typertGateway.wireStream.failure(error);
+        const failure = this.ctx.typertGateway.wireStream.failure(
+          follow.signal.aborted ? follow.signal.reason : error,
+        );
         yield {
           type: 'page-error',
           scopeId: scope.issue.scopeId,
@@ -1374,6 +1517,7 @@ class PrincipalService extends TypertRemoteService {
       try {
         await (failed ? child.close().catch(() => {}) : child.close());
       } finally {
+        unwatchFollow?.();
         gate.detach();
       }
     }

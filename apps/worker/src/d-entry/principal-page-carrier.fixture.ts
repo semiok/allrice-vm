@@ -220,7 +220,7 @@ export async function fixture(
     NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
   >(async (...args) => {
     await args[4].verifyRoster(args[3]);
-    return f.deps.watch();
+    return f.deps.watch(args[0], args[1], args[2], args[3]);
   });
   const pages = createDEntryPageRequests({
     ...f.deps,

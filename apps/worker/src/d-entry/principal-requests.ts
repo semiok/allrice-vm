@@ -32,6 +32,7 @@ import {
   type ResolvedDEntryNativeOwner,
 } from './native-owner.js';
 import type { DEntryFixedProfileSource } from './released-profile.js';
+import { openFollowAuthority } from './follow-authority.js';
 import { dEntryStartupTiming } from './startup-timing.js';
 
 type Selection = { organizationId: string; selection: DEntrySelectionInput };
@@ -76,6 +77,9 @@ export type DEntryPageHandle = Readonly<{
   root: DEntryHistoryRootPin | null;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
+  watchFollow(
+    signal: AbortSignal,
+  ): Promise<Awaited<ReturnType<typeof openFollowAuthority>> | undefined>;
   canReuseNativeSession(
     nativeSessionId: string,
     signal: AbortSignal,
@@ -546,6 +550,14 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   identity: auth.identity,
                   root: pin,
                   signal: lifetime,
+                  async watchFollow(caller) {
+                    if (!authority.observation) return;
+                    return openFollowAuthority(
+                      authority.observation,
+                      AbortSignal.any([caller, lifetime]),
+                      (signal) => page.assertCurrent(signal),
+                    );
+                  },
                   async assertCurrent(caller) {
                     const active = AbortSignal.any([lifetime, caller]);
                     try {
