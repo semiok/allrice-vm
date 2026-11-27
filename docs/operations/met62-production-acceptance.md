@@ -10,15 +10,15 @@ rollout checks.
 ```bash
 pnpm format:check
 pnpm lint
-pnpm met62:verify
+pnpm acceptance:release-gate
 DATABASE_URL=... pnpm db:verify
-ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm met62:verify
-DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm met81:chatflow-smoke
-DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm met83:fallback-smoke
-DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm met86:ui-smoke
+ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm acceptance:release-gate
+DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm acceptance:chatflow
+DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm acceptance:routing
+DATABASE_URL=... ALLRICE_ACCEPTANCE_BASE_URL=https://dev.example.com pnpm acceptance:ui
 ```
 
-`met62:verify` validates the pinned DSH distribution, TypeScript boundaries,
+`acceptance:release-gate` validates the pinned DSH distribution, TypeScript boundaries,
 Codex authorization parser, model routing, explicit fallback, quota/circuit
 preflight, employee capability freezing, ChatFlow recovery contracts and a
 production build. When a base URL is supplied it also validates Web liveness,

@@ -164,7 +164,7 @@ Reusable employee capabilities are provided through DSH-native Skills. They
 are assembled by the platform administration plane and are not managed through
 a tenant-facing capability marketplace.
 
-Run the MET-62 product and runtime gate with `pnpm met62:verify`. Set
+Run the MET-62 product and runtime gate with `pnpm acceptance:release-gate`. Set
 `ALLRICE_ACCEPTANCE_BASE_URL=http://localhost:3000` to include deployed HTTP
 readiness and new-UI route checks.
 
