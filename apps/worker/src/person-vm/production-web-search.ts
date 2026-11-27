@@ -32,7 +32,10 @@ const wireSearch = z
     adapterId: z.string().regex(/^[a-f0-9]{64}$/),
     sessionId: z.string().min(1).max(256),
     ticket: z.uuid(),
-    query: z.string().trim().min(1).max(2_000),
+    query: z
+      .string()
+      .max(2_000)
+      .refine((query) => query.trim().length > 0),
     maxResults: z.number().int().min(1).max(20).optional(),
   })
   .strict();
@@ -116,6 +119,7 @@ type SearchAuthority = {
   binding: PersonVmBinding;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
+  closeProof(): Promise<void>;
 };
 
 export function createHostSearch({
@@ -148,7 +152,7 @@ export function createHostSearch({
     quota.set(personId, used + 1);
   }
   return async function dispatch(
-    { context, binding, signal, assertCurrent }: SearchAuthority,
+    { context, binding, signal, assertCurrent, closeProof }: SearchAuthority,
     { query, maxResults }: GuestSearchRequest,
     response: ServerResponse,
     caller: AbortSignal,
@@ -232,6 +236,7 @@ export function createHostSearch({
       );
       if (!outcome.ok) throw outcome.error;
     } finally {
+      await closeProof();
       await admission.finish(permit);
     }
   };

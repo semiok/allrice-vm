@@ -40,6 +40,9 @@ function body(value: unknown): IncomingMessage {
 it('gates query shape and never accepts a guest-selected credential or URL', async () => {
   const signal = new AbortController().signal;
   expect(await readGuestSearch(body(wire), signal)).toEqual(wire);
+  expect(
+    await readGuestSearch(body({ ...wire, query: '  weather  ' }), signal),
+  ).toMatchObject({ query: '  weather  ' });
   await expect(
     readGuestSearch(
       body({ ...wire, baseURL: 'https://other.example' }),
@@ -101,7 +104,13 @@ function fixture(limit = 1) {
   });
   return {
     dispatch,
-    authority: { binding, context, signal: stop.signal, assertCurrent },
+    authority: {
+      binding,
+      context,
+      signal: stop.signal,
+      assertCurrent,
+      closeProof: vi.fn(async () => {}),
+    },
     stop,
     admission,
     release,
@@ -259,4 +268,18 @@ it('leaves transport closure failures unknown instead of certifying the activati
   ).rejects.toBe(failure);
   expect(activationEscaped).toBe(true);
   expect(f.release).toHaveBeenCalledOnce();
+});
+
+it('closes the native proof before the admitted permit is finished', async () => {
+  const f = fixture();
+  f.search.mockResolvedValueOnce({ ok: false, error: new Error('upstream') });
+  await expect(
+    f.dispatch(
+      f.authority,
+      wire,
+      {} as ServerResponse,
+      new AbortController().signal,
+    ),
+  ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+  expect(f.authority.closeProof).toHaveBeenCalledBefore(f.release);
 });

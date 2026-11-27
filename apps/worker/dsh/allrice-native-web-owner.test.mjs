@@ -348,8 +348,39 @@ function promptFixture() {
     });
   const next = async (reader) =>
     new TextDecoder().decode((await reader.read()).value).trim();
-  return { agent, emit, end, issue, message, next, open, outcome, lifetime };
+  return {
+    agent,
+    emit,
+    end,
+    issue,
+    message,
+    next,
+    open,
+    outcome,
+    lifetime,
+    claimed: observe.claimed,
+  };
 }
+
+it('reads only the exact live prompt claim from the real observer', async () => {
+  const f = promptFixture();
+  const issue = f.issue();
+  const reader = f.open(issue);
+  const item = f.message(issue);
+  try {
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+    f.emit('inserted', item);
+    f.emit('claimed', item, 2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(true);
+    expect(f.claimed(f.agent.session, f.message(issue), 2)).toBe(false);
+    expect(f.claimed(f.agent.session, item, 3)).toBe(false);
+    f.end(2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+  } finally {
+    await reader.cancel();
+    f.lifetime.abort();
+  }
+});
 
 it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
   const f = promptFixture();

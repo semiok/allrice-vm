@@ -34,9 +34,7 @@ export function observeManagedSearchCalls(
         origin.signal,
       ]);
       const queries = Array.isArray(exec.arguments?.queries)
-        ? exec.arguments.queries
-            .filter((query) => typeof query === 'string')
-            .map((query) => query.trim())
+        ? exec.arguments.queries.filter((query) => typeof query === 'string')
         : [];
       try {
         return await calls.run(

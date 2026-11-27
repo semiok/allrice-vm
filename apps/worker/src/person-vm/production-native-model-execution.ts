@@ -1081,7 +1081,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       close: watch.close,
                       dispatch: (response, caller) =>
                         dispatchSearch(
-                          { context, binding, signal: revoked, assertCurrent },
+                          {
+                            context,
+                            binding,
+                            signal: revoked,
+                            assertCurrent,
+                            closeProof: watch.close,
+                          },
                           wanted,
                           response,
                           caller,

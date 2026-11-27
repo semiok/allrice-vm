@@ -521,13 +521,10 @@ export function observeNativePrompts(scope, lifetime) {
   }
   observe.claimed = (session, message, turn) => {
     const agent = scope.agents.get(session.id);
-    return (
-      !!agent &&
-      original(agent.session) === original(session) &&
-      matches(agent, message).some(
-        (entry) => entry.itemId === message.id && entry.turn === turn,
-      )
-    );
+    if (!agent || original(agent.session) !== original(session)) return false;
+    for (const entry of matches(agent, message))
+      if (entry.itemId === message.id && entry.turn === turn) return true;
+    return false;
   };
   return observe;
 }
@@ -1021,7 +1018,7 @@ export function applyNativeWebOwner(
           const promptFacts = observeNativePrompts(scope, signal);
           const delegations = observeDelegatedInputs(
             scope,
-            promptFacts.claimed,
+            modelAdapter.webSearchEnabled ? promptFacts.claimed : undefined,
           );
           let openSearch;
           if (modelAdapter.webSearchEnabled) {

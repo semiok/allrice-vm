@@ -90,14 +90,18 @@ export async function runWithOwnedNativeFetch<T>(
     async fetch(nativeFetch, input, init) {
       if (closed || pending) throw new ModelGatewayError('ADMISSION_CLOSED');
       const request = new Request(input, { ...init, redirect: 'error' });
-      if (request.method !== 'POST' || request.url !== endpoint.href)
+      const body = request.body;
+      if (request.method !== 'POST' || request.url !== endpoint.href || !body)
         throw new ModelGatewayError('UNCLASSIFIED_UPSTREAM');
       const active = AbortSignal.any([signal, request.signal]);
       active.throwIfAborted();
       pending = (async () => {
-        const response = await owner.fetchOwned(nativeFetch, request, {
+        const dispatch: RequestInit & { duplex: 'half' } = {
           signal: active,
-        });
+          body,
+          duplex: 'half',
+        };
+        const response = await owner.fetchOwned(nativeFetch, request, dispatch);
         if (!response.body) return response;
         const reader = response.body.getReader();
         const chunks: Uint8Array[] = [];
