@@ -381,7 +381,10 @@ async function relayTls(
     client.destroy();
     peer.destroy();
   });
-  const handshake = AbortSignal.any([active, AbortSignal.timeout(10_000)]);
+  const firstFlight = AbortSignal.timeout(10_000);
+  const handshakeDeadline = addAbortListener(firstFlight, () =>
+    close.abort(firstFlight.reason),
+  );
   let serverHello: boolean | undefined;
   let serverFlight!: (serverHello: boolean) => void;
   const serverReady = new Promise<boolean>((resolve) => {
@@ -392,6 +395,7 @@ async function relayTls(
       if (!first) return;
       const hello = record[0] === 22 && record[5] === 2;
       if (!hello && record[0] !== 21) throw denied();
+      if (hello) handshakeDeadline[Symbol.dispose]();
       serverHello = hello;
       serverFlight(hello);
     }),
@@ -408,7 +412,7 @@ async function relayTls(
         (record[0] === 20 || record[0] === 23)
       )
         return;
-      return waitFor(serverReady, handshake).then((hello) => {
+      return waitFor(serverReady, active).then((hello) => {
         if (!hello) throw denied();
       });
     }),
@@ -422,6 +426,7 @@ async function relayTls(
     throw error;
   } finally {
     await Promise.allSettled([ingress, egress]);
+    handshakeDeadline[Symbol.dispose]();
     stop[Symbol.dispose]();
   }
 }
@@ -436,7 +441,11 @@ async function httpInsideTunnel(
   signal: AbortSignal,
 ) {
   let request: Promise<void> | undefined;
+  let incoming: IncomingMessage | undefined;
   const parser = createServer({ connectionsCheckingInterval: 0 });
+  // In the pinned Node HTTP parser, request EOF then marks the pending
+  // response as last instead of ending the socket before it can be written.
+  Object.assign(parser, { httpAllowHalfOpen: true });
   const timeout = setTimeout(() => socket.destroy(), 10_000).unref();
   parser.maxRequestsPerSocket = 1;
   parser.on('connect', (_req, peer) => peer.destroy());
@@ -448,6 +457,7 @@ async function httpInsideTunnel(
       return;
     }
     clearTimeout(timeout);
+    incoming = req;
     request = (async () => {
       try {
         const path = req.url ?? '';
@@ -472,8 +482,14 @@ async function httpInsideTunnel(
   parser.on('checkContinue', relay);
   const joined = closed(socket);
   parser.emit('connection', socket);
-  socket.unshift(initial);
-  socket.resume();
+  if (socket.readableEnded) {
+    // The CONNECT head can contain the full request before this parser owns EOF.
+    socket.emit('data', initial);
+    if (!incoming?.complete) socket.destroy();
+  } else {
+    socket.unshift(initial);
+    socket.resume();
+  }
   try {
     await joined;
     await request;

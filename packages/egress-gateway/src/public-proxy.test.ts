@@ -344,6 +344,38 @@ it('uses validated fallback addresses and accepts only parsed HTTP inside a plai
   );
 });
 
+it('delivers a plaintext CONNECT response after the guest has sent the request and FIN', async () => {
+  const received = deferred<string>();
+  const respond = deferred<void>();
+  const port = await listen(
+    createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8').on('data', (chunk: string) => (body += chunk));
+      req.once('end', () => received.resolve(body));
+      void respond.promise.then(() => res.end('reply after guest FIN'));
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  try {
+    tunnel.end(
+      `POST /fixture HTTP/1.1\r\nHost: public.example:${port}\r\nContent-Length: 5\r\n\r\nhello`,
+    );
+    await vm.inputEnded;
+    expect(await received.promise).toBe('hello');
+    respond.resolve();
+    let body = '';
+    for await (const chunk of tunnel) body += String(chunk);
+    expect(body).toContain('reply after guest FIN');
+    await vm.drain();
+  } finally {
+    respond.resolve();
+    tunnel.destroy();
+  }
+});
+
 it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async () => {
   const received = deferred<Buffer>();
   const peerClosed = deferred<void>();
@@ -368,6 +400,41 @@ it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async
     await Promise.all([peerClosed.promise, ended.promise]);
   } finally {
     client.destroy();
+  }
+});
+
+it('closes and joins a silent TLS peer at the handshake deadline without guest input', async () => {
+  const hello = deferred<void>();
+  const peerClosed = deferred<void>();
+  const port = await listen(
+    createTcpServer((socket) => {
+      socket.once('data', () => hello.resolve());
+      socket.once('close', () => peerClosed.resolve());
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const deadline = new AbortController();
+  const originalTimeout = AbortSignal.timeout;
+  const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+    if (ms === 10_000 && network.captureDial.mock.calls.length)
+      return deadline.signal;
+    return originalTimeout(ms);
+  });
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  const client = startTls({ socket: tunnel, servername: 'public.example' });
+  client.on('error', () => {});
+  const closed = deferred<void>();
+  client.once('close', () => closed.resolve());
+  try {
+    await hello.promise;
+    deadline.abort();
+    await Promise.all([closed.promise, peerClosed.promise, vm.drain()]);
+    expect(vm.stop.signal.aborted).toBe(false);
+  } finally {
+    client.destroy();
+    timeout.mockRestore();
   }
 });
 
