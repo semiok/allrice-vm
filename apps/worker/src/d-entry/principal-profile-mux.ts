@@ -336,12 +336,27 @@ async function runStreams(
             const control = Native.methods['session/control'].result
               .create()
               .parse(item.value);
-            await page.assertCurrent(
-              child,
-              control.type === 'baseline'
-                ? Object.keys(control.value.projections)
-                : [String(control.sessionId)],
-            );
+            if (control.type === 'baseline') {
+              await page.assertCurrent(
+                child,
+                Object.keys(control.value.projections),
+              );
+            } else {
+              try {
+                await page.assertCurrent(child, [String(control.sessionId)]);
+              } catch (error) {
+                // A child can leave the catalog between guest filtering and
+                // delivery. A failed page/root check also revokes the page.
+                if (
+                  error instanceof DataAccessError &&
+                  error.code === 'not_found' &&
+                  !page.signal.aborted &&
+                  !child.aborted
+                )
+                  continue;
+                throw error;
+              }
+            }
           } else await check();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });

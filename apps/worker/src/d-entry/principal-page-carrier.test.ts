@@ -841,7 +841,50 @@ it('opens the native control baseline and lists only sessions in the current pag
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
 
-it('withholds a native control frame containing a session outside the authorized root', async () => {
+it('refreshes a native list filtered during a concurrent catalog invalidation', async () => {
+  const f = await fixture();
+  const life = await open(f);
+  const refresh = deferred();
+  closes.push(async () => refresh.resolve());
+  let reads = 0;
+  f.host.catalog.beforeList = async (_signal, scoped) => {
+    if (scoped && ++reads === 1)
+      f.host.host.emit('api-session/added', summary('root'));
+    else if (!scoped && reads === 1) await refresh.promise;
+  };
+  const gateway = f.host.host.typertGateway;
+  const invoke = gateway.invoke.bind(gateway);
+  vi.spyOn(gateway, 'invoke').mockImplementation(async (request) => {
+    const value = await invoke(request);
+    if (
+      request.namespace === 'session' &&
+      request.method === 'list' &&
+      reads === 1
+    ) {
+      try {
+        expect(value).toEqual({ items: [] });
+      } finally {
+        refresh.resolve();
+      }
+    }
+    return value;
+  });
+  const response = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/list',
+    payload: { args: { _request: {} } },
+  });
+  expect(await response.json()).toMatchObject({
+    result: {
+      ok: true,
+      value: { items: [summary('root'), summary('child', 'root')] },
+    },
+  });
+  expect(reads).toBe(2);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('withholds an out-of-root native projection and continues delivering current ones', async () => {
   const f = await fixture();
   const life = await open(f);
   const wire = f.host.host.typertGateway.wireStream;
@@ -859,6 +902,13 @@ it('withholds a native control frame containing a session outside the authorized
             key: 'fixture',
             seq: 1,
             value: 'unrelated',
+          };
+          yield {
+            type: 'projection',
+            sessionId: 'root',
+            key: 'fixture',
+            seq: 2,
+            value: 'current',
           };
         }
       },
@@ -878,8 +928,8 @@ it('withholds a native control frame containing a session outside the authorized
     value: { type: 'baseline' },
   });
   expect(await next()).toMatchObject({
-    type: 'error',
-    error: { message: 'ENTRY_ACTION_UNAVAILABLE' },
+    type: 'item',
+    value: { type: 'projection', sessionId: 'root', seq: 2, value: 'current' },
   });
   expect((await f.invoke(life.scopeId)).status).toBe(200);
   closePage(life.peer);

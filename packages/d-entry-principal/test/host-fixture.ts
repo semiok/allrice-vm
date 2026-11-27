@@ -149,7 +149,7 @@ class Credentials extends CredentialProvider {
 class Catalog extends TypertRemoteService {
   static inject = ['remoteAccess'];
   items = [summary('root'), summary('child', 'root'), summary('other')];
-  beforeList?: (signal: AbortSignal) => Promise<void>;
+  beforeList?: (signal: AbortSignal, scoped: boolean) => Promise<void>;
   beforeFollow?: () => Promise<void>;
   afterFollowSnapshot?: () => Promise<void>;
   afterFollow?: () => Promise<void>;
@@ -167,7 +167,10 @@ class Catalog extends TypertRemoteService {
   }
   @Remote('list')
   async list(_request: object, signal: AbortSignal) {
-    await this.beforeList?.(signal);
+    await this.beforeList?.(
+      signal,
+      this.ctx.invocation?.peer.principal.kind === 'allrice-d-entry',
+    );
     signal.throwIfAborted();
     return { items: this.items.filter((row) => this.allows(row)) };
   }

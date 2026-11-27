@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it } from 'vitest';
 import {
@@ -29,6 +29,15 @@ it.skipIf(!browserExecutable)(
   { timeout: 60_000 },
   async () => {
     const release = await buildProfileFixture();
+    const manifest: { files: { path: string }[] } = JSON.parse(
+      await readFile(join(release.directory, 'artifact.json'), 'utf8'),
+    );
+    const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
+    const mime: Record<string, string> = {
+      '.js': 'text/javascript',
+      '.css': 'text/css',
+      '.wasm': 'application/wasm',
+    };
     const f = await fixture(release);
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       String(row.sessionId) === 'root' ? { ...row, cwd: '/work' } : row,
@@ -63,12 +72,15 @@ it.skipIf(!browserExecutable)(
               ),
             );
         }
-        if (url.pathname === '/managed/employee-web-entry.js') {
+        if (staticFiles.has(url.pathname)) {
           const asset = await readFile(
             join(release.directory, url.pathname.slice(1)),
           );
           response
-            .writeHead(200, { 'content-type': 'text/javascript' })
+            .writeHead(200, {
+              'content-type':
+                mime[extname(url.pathname)] ?? 'application/octet-stream',
+            })
             .end(asset);
           return;
         }
@@ -79,12 +91,13 @@ it.skipIf(!browserExecutable)(
         const { identity, selection } = f;
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
+          <link rel="stylesheet" href="/managed/employee-web-entry.css">
           <script data-scope-id="${life.scopeId}">${initialDocumentLifecycle}</script>
           <div id="app" data-scope-id="${life.scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
-          <script id="allrice-employee-directory" type="application/json">${JSON.stringify({ ...identity, employees: [], sessions: [] })}</script>
+          <script id="allrice-employee-directory" type="application/json">${JSON.stringify({ ...identity, viewerId: identity.personId, employees: [], sessions: [] })}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
       } catch {
         response.writeHead(500).end();
