@@ -361,15 +361,22 @@ export function createDEntryHttpHandler(
             );
           return true;
         }
-        if (plan.running) {
-          const verified = await deps.prewarm.confirmRunning?.(
-            context,
-            identity,
-            plan,
-            signal,
-          );
-          signal.throwIfAborted();
-          if (verified && !verified.aborted) return sendReady();
+        if (plan.running && deps.prewarm.confirmRunning) {
+          const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
+          try {
+            const verify = track(
+              deps.prewarm.confirmRunning(context, identity, plan, probe),
+            );
+            const verified = await Promise.race([
+              verify,
+              delay(2000, undefined, { signal: probe, ref: false }),
+            ]);
+            signal.throwIfAborted();
+            if (verified && !verified.aborted) return sendReady();
+          } finally {
+            budget.abort();
+          }
         }
         const accepted = prewarm.accept(
           context,
