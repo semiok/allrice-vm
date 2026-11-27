@@ -246,14 +246,16 @@ suite('installed AllRice native Web composition', () => {
       const model = page.getByRole('button', {
         name: /^请?选择模型/,
       });
-      await permission.waitFor();
       await model.waitFor();
-      await permission.click();
+      await page
+        .getByRole('button', { name: '访问模式，当前：完全权限', exact: true })
+        .click();
       await page
         .getByRole('menuitem', { name: '仅可查看', exact: true })
         .click();
       await page
-        .getByRole('button', { name: '访问模式，当前：仅可查看' })
+        .getByRole('button', { name: '访问模式，当前：仅可查看', exact: true })
+        .and(page.locator('button:enabled'))
         .waitFor();
       await model.click();
       await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
