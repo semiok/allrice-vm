@@ -2157,15 +2157,14 @@ it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
       active.addEventListener('abort', () => aborted.resolve(), { once: true });
       reportCapacity?.(4);
       queued.resolve();
-      try {
-        await Promise.race([advance.promise, aborted.promise]);
-        active.throwIfAborted();
+      await Promise.race([advance.promise, aborted.promise]);
+      if (!active.aborted) {
         reportCapacity?.(undefined);
         dispatched.resolve();
-      } finally {
-        await joined.promise;
-        if (outcome === 'cleanup failure') throw Error('Join unconfirmed');
       }
+      await joined.promise;
+      if (outcome === 'cleanup failure') throw Error('Join unconfirmed');
+      active.throwIfAborted();
     };
     const server = await nativeEntryServer(f.base, {
       ...f.base.deps,
