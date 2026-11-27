@@ -68,6 +68,49 @@ function setup(
   return setupNativeWebFixture(cli, roots, cleanup, prepareScope);
 }
 
+async function openPromptScope(
+  f: Awaited<ReturnType<typeof setup>>,
+  sessionId: string,
+  signal: AbortSignal,
+) {
+  const issue: DEntryPrincipalIssue = {
+    scopeId: randomUUID(),
+    access: 'execute',
+    identity: {
+      ...f.principalProfile,
+      organizationId: f.owner.binding.organizationId,
+      personId: f.owner.binding.personId,
+      threadId: randomUUID(),
+    },
+    root: {
+      nativeSessionId: sessionId,
+      rootOriginDigest: 'manual-test-native-create-only',
+      rootBindingRef: 'manual-test-no-sql-permit',
+    },
+  };
+  const activity = f.owner.acquirePrincipal(issue, signal, f.context);
+  return { activity, issue, scope: await activity.run(signal) };
+}
+
+function observeSinglePrompt(signal: AbortSignal) {
+  const observed = deferred<NativePromptObservation>();
+  const beforePrompt: NonNullable<
+    Parameters<typeof setupNativeWebFixture>[6]
+  > = async (request) => {
+    if (request.endpoint !== 'session/prompt')
+      throw Error('Expected one scoped prompt');
+    const observation = request.observe(signal);
+    await observation.ready;
+    observed.resolve(observation);
+    return {
+      undispatched: () => observation.close(),
+      accepted() {},
+      unknown() {},
+    };
+  };
+  return { beforePrompt, observed: observed.promise };
+}
+
 it.skipIf(!cli)(
   '真实rc.2产物交换API Cookie→认证list/control baseline；scope结束不杀长期job，close实际join',
   { tags: [tag], timeout: 30000 },
@@ -198,23 +241,11 @@ it.skipIf(!cli)(
     const created = await f.owner.createRootFor(f.context, {}, signal);
     if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
-    const issue: DEntryPrincipalIssue = {
-      scopeId: randomUUID(),
-      access: 'execute',
-      identity: {
-        ...f.principalProfile,
-        organizationId: f.owner.binding.organizationId,
-        personId: f.owner.binding.personId,
-        threadId: randomUUID(),
-      },
-      root: {
-        nativeSessionId: sessionId,
-        rootOriginDigest: 'manual-test-native-create-only',
-        rootBindingRef: 'manual-test-no-sql-permit',
-      },
-    };
-    const activity = f.owner.acquirePrincipal(issue, signal, f.context);
-    const scope = await activity.run(signal);
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
     const prompt = (requestId: string, text: string) =>
       scope.invoke(
         {
@@ -354,6 +385,7 @@ it.skipIf(!cli)(
   async () => {
     const rootReady = deferred<{
       id: string;
+      scopeId: string;
       owner: Awaited<ReturnType<typeof setup>>['owner'];
       context: Awaited<ReturnType<typeof setup>>['context'];
     }>();
@@ -363,6 +395,7 @@ it.skipIf(!cli)(
     for (const ready of [rootReady, rootEnded, relayEnded, finished])
       void ready.promise.catch(() => {});
     const signal = AbortSignal.timeout(25000);
+    const { beforePrompt, observed } = observeSinglePrompt(signal);
     const capability = 'a'.repeat(43);
     const requestId = randomUUID();
     const attempts = new Map<string, number>();
@@ -373,7 +406,7 @@ it.skipIf(!cli)(
     const turns: number[] = [];
     const server = createServer((request, response) => {
       void (async () => {
-        const { id: root, owner, context } = await rootReady.promise;
+        const { id: root, scopeId, owner, context } = await rootReady.promise;
         const bytes: Buffer[] = [];
         for await (const chunk of request) bytes.push(Buffer.from(chunk));
         expect(request.headers.authorization).toBe('Bearer ' + capability);
@@ -403,8 +436,18 @@ it.skipIf(!cli)(
             recipient: payload.recipient,
             rootSessionId: root,
             promptIds: [requestId],
+            prompts: [
+              {
+                sessionId: root,
+                scopeId,
+                requestId,
+                messageId: expect.any(String),
+                turn: 1,
+              },
+            ],
             delegated: !isRoot || ordinal >= 3,
           });
+          await (await observed).assertClaimed(signal, proof!.prompts[0]!);
           if (isRoot && !title) {
             expect(
               await owner.readNativeRootWakeFor(context, root, signal),
@@ -413,7 +456,7 @@ it.skipIf(!cli)(
                 ? {
                     kind: 'delegated',
                     turn: proof!.turn!,
-                    promptIds: [requestId],
+                    prompts: proof!.prompts,
                   }
                 : { kind: 'clear' },
             );
@@ -490,12 +533,7 @@ it.skipIf(!cli)(
     });
     const origin = await listen(server);
     cleanup.push(() => closeServer(server));
-    const create = NativeTransport.nativeWebTransport;
-    let transport: ReturnType<typeof create> | undefined;
-    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
-      (...args) => (transport = create(...args)),
-    );
-    const { owner, context } = await setupNativeWebFixture(
+    const f = await setupNativeWebFixture(
       cli,
       roots,
       cleanup,
@@ -512,40 +550,49 @@ it.skipIf(!cli)(
           name: 'fixture-codex',
         },
       },
+      beforePrompt,
     );
+    const { owner, context } = f;
     const created = await owner.createRootFor(context, {}, signal);
-    if (!created.ok || !transport)
-      throw Error('Native owner fixture did not start');
+    if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
-    rootReady.resolve({ id: sessionId, owner, context });
-    const response = await transport.fetch('api/session/prompt', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'client-request',
-        rpcId: randomUUID(),
-        method: 'session/prompt',
-        payload: {
-          args: {
-            request: {
-              sessionId,
-              requestId,
-              content: [
-                {
-                  type: 'text',
-                  text: 'Have a background agent check the catalog and tell me when it reports back.',
-                },
-              ],
-              mode: 'queue',
-            },
-          },
-        },
-      }),
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
+    rootReady.resolve({
+      id: sessionId,
+      scopeId: issue.scopeId,
+      owner,
+      context,
     });
     expect(
-      serverResponseSchema.parse(await response.json()).result,
-    ).toMatchObject({
-      ok: true,
+      await scope.invoke(
+        {
+          endpoint: 'session/prompt',
+          scopeId: issue.scopeId,
+          args: NATIVE_REMOTE.methods['session/prompt']
+            .input({ strict: true })
+            .create()
+            .parse({
+              request: {
+                sessionId,
+                requestId,
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Have a background agent check the catalog and tell me when it reports back.',
+                  },
+                ],
+                mode: 'queue',
+              },
+            }),
+        },
+        signal,
+      ),
+    ).toEqual({
+      endpoint: 'session/prompt',
       value: { accepted: true },
     });
     await finished.promise;
@@ -556,6 +603,7 @@ it.skipIf(!cli)(
     });
     expect(turns).toEqual([1, 1, 2, 3]);
     expect([...attempts.values()].sort()).toEqual([2, 4]);
+    await activity.close();
   },
 );
 
@@ -698,14 +746,8 @@ it.skipIf(!cli)(
     });
     const browserlessOrigin = await listen(server);
     cleanup.push(() => closeServer(server));
-    const create = NativeTransport.nativeWebTransport;
-    let transport: ReturnType<typeof create> | undefined;
-    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
-      (...args) => {
-        transport = create(...args);
-        return transport;
-      },
-    );
+    const signal = AbortSignal.timeout(25000);
+    const { beforePrompt, observed } = observeSinglePrompt(signal);
     const f = await setupNativeWebFixture(
       cli,
       roots,
@@ -724,12 +766,16 @@ it.skipIf(!cli)(
           inputModalities: ['text', 'image'],
         },
       },
+      beforePrompt,
     );
-    const signal = new AbortController().signal;
     const created = await f.owner.createRootFor(f.context, {}, signal);
-    if (!created.ok || !transport)
-      throw Error('Native owner fixture did not start');
+    if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
     let journalRead:
       Parameters<typeof f.owner.readPersistedRunTerminalFor>[0] | undefined;
     const guard = async (active: AbortSignal) => active.throwIfAborted();
@@ -745,6 +791,16 @@ it.skipIf(!cli)(
           'DSH model attempt did not exist on the authenticated owner',
         );
       expect(attempt.recipient).toBe(recipients.get(kind));
+      expect(attempt.prompts).toEqual([
+        {
+          sessionId,
+          scopeId: issue.scopeId,
+          requestId: nativePrompt,
+          messageId: expect.any(String),
+          turn: 1,
+        },
+      ]);
+      await (await observed).assertClaimed(signal, attempt.prompts[0]!);
       if (kind === 'assistant') {
         expect(attempt.promptIds).toContain(nativePrompt);
         expect(attempt.turn).toBeGreaterThan(0);
@@ -813,19 +869,13 @@ it.skipIf(!cli)(
           mode: 'queue',
         },
       });
-    const response = await transport.fetch('api/session/prompt', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'client-request',
-        rpcId: randomUUID(),
-        method: 'session/prompt',
-        payload: { args },
-      }),
-    });
-    const receipt = serverResponseSchema.parse(await response.json());
-    expect(receipt.result).toMatchObject({
-      ok: true,
+    expect(
+      await scope.invoke(
+        { endpoint: 'session/prompt', scopeId: issue.scopeId, args },
+        signal,
+      ),
+    ).toEqual({
+      endpoint: 'session/prompt',
       value: { accepted: true },
     });
     await Promise.all([primary.promise, title.promise]);
@@ -856,6 +906,7 @@ it.skipIf(!cli)(
     expect(facts.assistant.attemptId).not.toBe(
       facts['session-title'].attemptId,
     );
+    await activity.close();
   },
 );
 

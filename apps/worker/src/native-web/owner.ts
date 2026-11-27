@@ -46,6 +46,7 @@ import type { NativeWebLaunch } from './launch.js';
 import { nativeWebTransport } from './transport.js';
 import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
+  NativePromptOccurrenceSchema,
   observeNativePrompt,
   type NativePromptObservation,
 } from './prompt-observation.js';
@@ -68,6 +69,14 @@ type EditorEvidence<T> = (
 export type NativeModelAttemptKind =
   'assistant' | 'compaction' | 'session-title';
 
+const nativePrompts = z
+  .array(NativePromptOccurrenceSchema)
+  .max(64)
+  .refine(
+    (prompts) =>
+      new Set(prompts.map(({ requestId }) => requestId)).size ===
+      prompts.length,
+  );
 const nativeRootWake = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('clear') }).strict(),
   z.object({ kind: z.literal('unproven') }).strict(),
@@ -75,11 +84,7 @@ const nativeRootWake = z.discriminatedUnion('kind', [
     .object({
       kind: z.literal('delegated'),
       turn: z.number().int().positive(),
-      promptIds: z
-        .array(z.string().min(1).max(256))
-        .min(1)
-        .max(64)
-        .refine((ids) => new Set(ids).size === ids.length),
+      prompts: nativePrompts,
     })
     .strict(),
 ]);
@@ -918,6 +923,14 @@ export async function openNativeWebOwner(input: {
             if (!proof) throw new PersonVmError('PROVIDER_FAILED');
             const wake = nativeRootWake.safeParse(JSON.parse(proof));
             if (!wake.success) throw new PersonVmError('PROVIDER_FAILED');
+            if (
+              wake.data.kind === 'delegated' &&
+              (!wake.data.prompts.length ||
+                wake.data.prompts.some(
+                  (prompt) => prompt.sessionId !== sessionId,
+                ))
+            )
+              throw new PersonVmError('PROVIDER_FAILED');
             return wake.data;
           },
         );
@@ -964,6 +977,7 @@ export async function openNativeWebOwner(input: {
                   ...attempt,
                   recipient: undefined,
                   promptIds: [] as string[],
+                  prompts: [],
                   sourceTurn: null,
                   rootSessionId: null,
                   delegated: false,
@@ -987,13 +1001,17 @@ export async function openNativeWebOwner(input: {
                 id?: unknown;
                 recipient?: unknown;
                 sourceTurn?: unknown;
-                promptIds?: unknown;
+                prompts?: unknown;
                 rootSessionId?: unknown;
                 delegated?: unknown;
                 delegatedPromptIds?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
-              const { promptIds, delegatedPromptIds } = value ?? {};
+              const prompts = nativePrompts.safeParse(value?.prompts);
+              const inherited = z
+                .array(z.string().min(1).max(256))
+                .max(64)
+                .safeParse(value?.delegatedPromptIds);
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
@@ -1008,19 +1026,20 @@ export async function openNativeWebOwner(input: {
                   value.rootSessionId !== address.sessionId) ||
                 typeof value.delegated !== 'boolean' ||
                 (address.kind === 'subagent' && !value.delegated) ||
-                !Array.isArray(promptIds) ||
-                promptIds.length === 0 ||
-                promptIds.length > 64 ||
-                promptIds.some(
-                  (id) => typeof id !== 'string' || !id || id.length > 256,
+                !prompts.success ||
+                !prompts.data.length ||
+                prompts.data.some(
+                  (prompt) => prompt.sessionId !== value.rootSessionId,
                 ) ||
-                new Set(promptIds).size !== promptIds.length ||
-                !Array.isArray(delegatedPromptIds) ||
-                delegatedPromptIds.length > promptIds.length ||
-                delegatedPromptIds.some((id) => !promptIds.includes(id)) ||
-                new Set(delegatedPromptIds).size !==
-                  delegatedPromptIds.length ||
-                (value.delegated && delegatedPromptIds.length === 0)
+                !inherited.success ||
+                (value.delegated && !inherited.data.length)
+              )
+                throw new PersonVmError('PROVIDER_FAILED');
+              const ids = prompts.data.map(({ requestId }) => requestId);
+              const references = new Set(ids);
+              if (
+                new Set(inherited.data).size !== inherited.data.length ||
+                inherited.data.some((id) => !references.has(id))
               )
                 throw new PersonVmError('PROVIDER_FAILED');
               return {
@@ -1030,8 +1049,9 @@ export async function openNativeWebOwner(input: {
                 sourceTurn: value.sourceTurn as number,
                 rootSessionId: value.rootSessionId,
                 delegated: value.delegated,
-                delegatedPromptIds: delegatedPromptIds as string[],
-                promptIds: promptIds as string[],
+                delegatedPromptIds: inherited.data,
+                promptIds: ids,
+                prompts: prompts.data,
               };
             } finally {
               // Dispose this logical read on its original carrier. The

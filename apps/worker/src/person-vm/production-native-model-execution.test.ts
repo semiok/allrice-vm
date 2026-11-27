@@ -4,6 +4,7 @@ import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deferredPromptFact,
+  observeNativePrompt,
   type NativePromptObservation,
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
@@ -79,6 +80,47 @@ beforeEach(() => {
         assertObserved: vi.fn(async () => {}),
       }),
     );
+});
+
+it('checks the exact adopted message occurrence for billing after the native turn has ended', async () => {
+  const source = {
+    adapterId: 'native-fixture',
+    sessionId: issue.root.nativeSessionId,
+    scopeId: issue.scopeId,
+    requestId: 'native-request',
+  };
+  const adopted = { messageId: 'native-message', turn: 2 };
+  const active = new AbortController().signal;
+  const observer = observeNativePrompt(
+    {
+      async readManagedModelProof(_body, _signal, _image, receive) {
+        receive?.(
+          Buffer.from(
+            `ready\ninserted\nclaimed ${JSON.stringify(adopted)}\nended\n`,
+          ),
+        );
+        return null;
+      },
+    },
+    source,
+    active,
+    1000,
+  );
+  await expect(observer.settled).resolves.toBe('ended');
+  const { sessionId, scopeId, requestId } = source;
+  const proof = { sessionId, scopeId, requestId, ...adopted };
+  await expect(observer.assertClaimed(active, proof)).resolves.toBeUndefined();
+  for (const mismatch of [
+    { sessionId: 'another-session' },
+    { scopeId: randomUUID() },
+    { messageId: 'another-message' },
+    { turn: 3 },
+  ]) {
+    await expect(
+      observer.assertClaimed(active, { ...proof, ...mismatch }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  }
+  await observer.close();
 });
 
 function nativeFacts() {
@@ -312,7 +354,15 @@ describe('native delegated execution', () => {
       f.readRootWake.mockResolvedValue({
         kind: 'delegated',
         turn: 2,
-        promptIds: ['original'],
+        prompts: [
+          {
+            sessionId: issue.root.nativeSessionId,
+            scopeId: issue.scopeId,
+            requestId: 'original',
+            messageId: 'adopted-original',
+            turn: 1,
+          },
+        ],
       });
       const otherSteer = nativeFacts();
       await expect(
@@ -329,6 +379,16 @@ describe('native delegated execution', () => {
         await f.admit(a, 'same-login', nativeFacts(), 'steer')
       ).undispatched();
       expect(original.observation.assertClaimed).toHaveBeenCalledTimes(2);
+      expect(original.observation.assertClaimed).toHaveBeenCalledWith(
+        expect.any(AbortSignal),
+        {
+          sessionId: issue.root.nativeSessionId,
+          scopeId: issue.scopeId,
+          requestId: 'original',
+          messageId: 'adopted-original',
+          turn: 1,
+        },
+      );
 
       f.readRootWake.mockResolvedValue({ kind: 'unproven' });
       await expect(

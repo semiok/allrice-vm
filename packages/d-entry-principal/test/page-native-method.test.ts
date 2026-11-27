@@ -1,6 +1,7 @@
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
 import { expect, it } from 'vitest';
 import { z } from 'zod';
+import { pageSettingsNamespaces } from '../src/page-capability-policy.js';
 import {
   encodePageNativeResult,
   requirePageNativeMethod,
@@ -137,6 +138,56 @@ it('keeps sensitive Host effects and file preview unavailable even when register
         new Set(['provider']),
       ),
     ).toThrow('DSH method');
+  }
+});
+
+it('protects the loaded default model entry under its profile ID while leaving ordinary settings available', () => {
+  const { providerSettings, pluginSettings } = pageSettingsNamespaces(
+    [
+      {
+        entry: {
+          options: {
+            id: 'profile-model',
+            name: '@deepseek-ai/dsh-agent-default-model',
+          },
+        },
+      },
+      {
+        entry: {
+          options: {
+            id: 'appearance',
+            name: '@deepseek-ai/dsh-client-ui-theme',
+          },
+        },
+      },
+    ],
+    [{ settingsNs: 'configured-provider' }],
+  );
+  for (const method of ['update', 'replace', 'mutate']) {
+    const native = descriptor('settings', method);
+    const endpoint = `settings/${method}`;
+    for (const ns of ['profile-model', 'configured-provider']) {
+      expect(() =>
+        requirePageNativeMethod(
+          { get: () => native },
+          endpoint,
+          'unary',
+          { ns },
+          providerSettings,
+          pluginSettings,
+        ),
+      ).toThrow('DSH method is platform managed');
+    }
+    expect(
+      requirePageNativeMethod(
+        { get: () => native },
+        endpoint,
+        'unary',
+        { ns: 'appearance' },
+        providerSettings,
+        pluginSettings,
+      ),
+    ).toBe(native);
   }
 });
 

@@ -228,13 +228,36 @@ function isNativeOrdinaryRoot(header) {
   );
 }
 
-function nativePromptId(source) {
-  return source?.kind === 'user' && typeof source.rpcId === 'string'
-    ? source.rpcId
-    : null;
+function isNativeRpcPrompt(source) {
+  return source?.kind === 'user' && typeof source.rpcId === 'string';
 }
 
-// The controller's follow window is for display. Read admitted input from the
+export function nativePromptOccurrence(session, message, turn) {
+  const { source } = message;
+  if (
+    !isNativeOrdinaryRoot(session.header) ||
+    !isNativeRpcPrompt(source) ||
+    source.principal?.kind !== 'allrice-d-entry' ||
+    typeof source.principal.scopeId !== 'string' ||
+    typeof message.id !== 'string' ||
+    !Number.isSafeInteger(turn) ||
+    turn < 1
+  )
+    return null;
+  return {
+    sessionId: session.id,
+    scopeId: source.principal.scopeId,
+    requestId: source.rpcId,
+    messageId: message.id,
+    turn,
+  };
+}
+
+function collectPrompt(occurrences, occurrence) {
+  occurrences.set(JSON.stringify(occurrence), occurrence);
+}
+
+// The controller's follow window is for display. Read adopted input from the
 // live journal at the exact cursor of the authenticated attempt.
 export function readPromptOrigins(
   events,
@@ -243,12 +266,9 @@ export function readPromptOrigins(
   purpose,
   readDelegated = () => null,
   ownFrom = 0,
+  readDirect = () => null,
 ) {
-  const addPrompt = (event, ids) => {
-    if (event?.type !== 'user/message') return;
-    const id = nativePromptId(event.data.source);
-    if (id !== null) ids.add(id);
-  };
+  const prompts = new Map();
   if (purpose === 'session-title') {
     const request = events[cursor];
     if (request?.type !== 'session/title-llm-request') return null;
@@ -260,23 +280,33 @@ export function readPromptOrigins(
       )
     )
       return null;
-    const ids = new Set();
     let sourceTurn = null;
     for (const seq of messageSeqs) {
-      const previousSize = ids.size;
-      addPrompt(events[seq], ids);
-      if (ids.size !== previousSize && sourceTurn === null)
-        sourceTurn =
-          events.findLast(
-            (event) =>
-              event.seq >= ownFrom &&
-              event.seq < seq &&
-              event.type === 'turn/start',
-          )?.data.turn ?? null;
+      const message = events[seq];
+      if (
+        message?.type !== 'user/message' ||
+        !isNativeRpcPrompt(message.data.source)
+      )
+        return null;
+      const start = events.findLast(
+        (event) =>
+          event.seq >= ownFrom &&
+          event.seq < seq &&
+          event.type === 'turn/start',
+      );
+      const occurrence = readDirect(message, start?.data.turn);
+      if (!occurrence) return null;
+      collectPrompt(prompts, occurrence);
+      sourceTurn ??= occurrence.turn;
     }
     return sourceTurn === null
       ? null
-      : { turn: sourceTurn, ids: [...ids], delegated: false, inherited: [] };
+      : {
+          turn: sourceTurn,
+          prompts: [...prompts.values()],
+          delegated: false,
+          inherited: [],
+        };
   }
   const start = events.findLast(
     (event) =>
@@ -286,28 +316,33 @@ export function readPromptOrigins(
       event.data.turn === turn,
   );
   if (!start) return null;
-  const ids = new Set();
-  const inherited = new Set();
+  const inherited = new Map();
   let delegated = false;
   for (let seq = start.seq + 1; seq <= cursor; seq++) {
     const event = events[seq];
     if (event.type === 'turn/end' || event.type === 'turn/start') return null;
     if (event.type !== 'user/message' || !nativeOriginInput(event.data.source))
       continue;
-    const id = nativePromptId(event.data.source);
-    if (id !== null) {
-      ids.add(id);
+    if (isNativeRpcPrompt(event.data.source)) {
+      const occurrence = readDirect(event, turn);
+      if (!occurrence) return null;
+      collectPrompt(prompts, occurrence);
       continue;
     }
     const source = readDelegated(event, turn);
     if (!source?.length) return null;
-    if (!ids.size) delegated = true;
-    for (const promptId of source) {
-      inherited.add(promptId);
-      ids.add(promptId);
+    if (!prompts.size) delegated = true;
+    for (const occurrence of source) {
+      collectPrompt(inherited, occurrence);
+      collectPrompt(prompts, occurrence);
     }
   }
-  return { turn, ids: [...ids], delegated, inherited: [...inherited] };
+  return {
+    turn,
+    prompts: [...prompts.values()],
+    delegated,
+    inherited: [...inherited.values()],
+  };
 }
 
 async function observePromptOrigins(
@@ -348,10 +383,12 @@ async function observePromptOrigins(
       turn,
       purpose,
       (event, sourceTurn) =>
-        delegations.claimed(live, event.data, sourceTurn)?.ids,
+        delegations.claimed(live, event.data, sourceTurn)?.prompts,
       observed.inheritedEventCount,
+      (event, sourceTurn) =>
+        nativePromptOccurrence(live, event.data, sourceTurn),
     );
-    return origin?.ids.length > 0 && origin.ids.length <= 64
+    return origin?.prompts.length > 0 && origin.prompts.length <= 64
       ? {
           ...origin,
           rootSessionId: root.id,
@@ -419,7 +456,9 @@ export function observeNativePrompts(scope, lifetime) {
           claimed.delete(observer);
           if (claimed.size === 0) active.delete(turn);
         };
-        observer.send('claimed');
+        observer.send(
+          'claimed ' + JSON.stringify({ messageId: message.id, turn }),
+        );
       }
     },
     { global: true },
@@ -568,12 +607,12 @@ export function observeDelegatedInputs(scope) {
   function collect(session, inputs) {
     const owner = root(session);
     if (!owner || !inputs?.length) return null;
-    const ids = new Set();
+    const prompts = new Map();
     for (const input of inputs) {
       if (input?.root !== owner) return null;
-      for (const id of input.ids) ids.add(id);
+      for (const prompt of input.prompts) collectPrompt(prompts, prompt);
     }
-    return { root: owner, ids: [...ids] };
+    return { root: owner, prompts: [...prompts.values()] };
   }
 
   function currentOrigin(session) {
@@ -608,9 +647,11 @@ export function observeDelegatedInputs(scope) {
       [...state.claimed.values()].map(({ origin }) => origin),
     );
     if (!origin || state.unprovenClaim) return { kind: 'unproven' };
-    const promptIds = [...new Set([...origin.ids, ...state.directClaims])];
-    return promptIds.length && promptIds.length <= 64
-      ? { kind: 'delegated', turn: state.turn, promptIds }
+    const prompts = new Map();
+    for (const prompt of [...origin.prompts, ...state.directClaims.values()])
+      collectPrompt(prompts, prompt);
+    return prompts.size && prompts.size <= 64
+      ? { kind: 'delegated', turn: state.turn, prompts: [...prompts.values()] }
       : { kind: 'unproven' };
   }
 
@@ -708,9 +749,9 @@ export function observeDelegatedInputs(scope) {
         isNativeOrdinaryRoot(session.header) &&
         nativeOriginInput(message.source)
       ) {
-        const id = nativePromptId(message.source);
-        state.firstInput ??= id === null ? 'delegated' : 'prompt';
-        if (id !== null) state.directClaims.add(id);
+        const direct = nativePromptOccurrence(session, message, turn);
+        state.firstInput ??= direct === null ? 'delegated' : 'prompt';
+        if (direct) collectPrompt(state.directClaims, direct);
         else if (!record) state.unprovenClaim = true;
       }
     },
@@ -734,7 +775,7 @@ export function observeDelegatedInputs(scope) {
           turn: event.data.turn,
           claimed: new Map(),
           inputs: [],
-          directClaims: new Set(),
+          directClaims: new Map(),
         });
         return;
       }
@@ -767,11 +808,10 @@ export function observeDelegatedInputs(scope) {
         !nativeOriginInput(event.data.source)
       )
         return;
-      const id = nativePromptId(event.data.source);
-      const origin =
-        id === null
-          ? claimed(session, event.data, state.turn)
-          : { root: root(session), ids: [id] };
+      const direct = nativePromptOccurrence(session, event.data, state.turn);
+      const origin = direct
+        ? { root: root(session), prompts: [direct] }
+        : claimed(session, event.data, state.turn);
       state.inputs.push(origin);
       const activation = activations.get(agent.id);
       if (activation?.child === agent) activation.inputs.push(origin);
@@ -1085,9 +1125,11 @@ export function applyNativeWebOwner(
                     recipient: found.recipient,
                     rootSessionId: origin.rootSessionId,
                     sourceTurn: origin.turn,
-                    promptIds: origin.ids,
+                    prompts: origin.prompts,
                     delegated: origin.delegated,
-                    delegatedPromptIds: origin.inherited,
+                    delegatedPromptIds: origin.inherited.map(
+                      ({ requestId }) => requestId,
+                    ),
                   },
                   { headers },
                 );

@@ -52,6 +52,7 @@ import {
   encodePageNativeResult,
   requirePageNativeMethod,
 } from './page-native-method.js';
+import { pageSettingsNamespaces } from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
 const configSchema = z
@@ -859,26 +860,16 @@ class PrincipalService extends TypertRemoteService {
         | { listConfigurableProviders(): readonly { settingsNs: string }[] }
         | undefined = this.ctx.get('llm');
       const providers = llm?.listConfigurableProviders();
-      providerSettings =
-        providers && new Set(providers.map(({ settingsNs }) => settingsNs));
-      // Both native settings and the market write use the same profile entry ID.
+      // Native settings addresses volatile Config fields by profile entry ID.
       const editor:
         | {
-            configuration(): Iterable<{
-              entry: { options: { id: string; name: string } };
-            }>;
+            configuration(): Parameters<typeof pageSettingsNamespaces>[0];
           }
         | undefined = this.ctx.get('configEditor');
-      pluginSettings = new Set();
-      for (const {
-        entry: { options },
-      } of editor?.configuration() ?? []) {
-        if (
-          options.name === '@deepseek-ai/dsh-plugin-market' ||
-          options.name === '@deepseek-ai/dsh-plugin-manager'
-        )
-          pluginSettings.add(options.id);
-      }
+      ({ providerSettings, pluginSettings } = pageSettingsNamespaces(
+        editor?.configuration() ?? [],
+        providers,
+      ));
     }
     const descriptor = requirePageNativeMethod(
       this.ctx.typert.local,

@@ -17,6 +17,29 @@ type Configuration = Readonly<{
   pluginSettings?: ReadonlySet<string>;
 }>;
 
+type ProfileEntry = { entry: { options: { id: string; name: string } } };
+
+export function pageSettingsNamespaces(
+  entries: Iterable<ProfileEntry>,
+  providers: readonly { settingsNs: string }[] | undefined,
+) {
+  const providerSettings =
+    providers && new Set(providers.map(({ settingsNs }) => settingsNs));
+  const pluginSettings = new Set<string>();
+  for (const {
+    entry: { options },
+  } of entries) {
+    if (options.name === '@deepseek-ai/dsh-agent-default-model')
+      providerSettings?.add(options.id);
+    if (
+      options.name === '@deepseek-ai/dsh-plugin-market' ||
+      options.name === '@deepseek-ai/dsh-plugin-manager'
+    )
+      pluginSettings.add(options.id);
+  }
+  return { providerSettings, pluginSettings };
+}
+
 const authentication = new Set([
   'account',
   'accountController',

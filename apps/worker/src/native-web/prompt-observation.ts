@@ -1,7 +1,24 @@
 import { addAbortListener } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { UuidSchema } from '@allrice/contracts';
 import { PersonVmError } from '@allrice/person-vm';
+import { z } from 'zod';
 import type { nativeWebTransport } from './transport.js';
+
+const adoptedMessage = z
+  .object({
+    messageId: z.string().min(1).max(256),
+    turn: z.number().int().positive(),
+  })
+  .strict();
+export const NativePromptOccurrenceSchema = adoptedMessage.extend({
+  sessionId: z.string().min(1).max(256),
+  scopeId: UuidSchema,
+  requestId: z.string().min(1).max(256),
+});
+export type NativePromptOccurrence = z.infer<
+  typeof NativePromptOccurrenceSchema
+>;
 
 export function deferredPromptFact<T>() {
   let resolve!: (value: T) => void;
@@ -47,7 +64,7 @@ export function observeNativePrompt(
   const current = AbortSignal.any([signal, close.signal]);
   const request = { ...source, id: randomUUID() };
   const ready = deferredPromptFact<void>();
-  const claim = deferredPromptFact<void>();
+  const claim = deferredPromptFact<z.infer<typeof adoptedMessage>>();
   const failed = () => new PersonVmError('PROVIDER_FAILED');
   let state: 'opening' | 'ready' | 'inserted' | 'claimed' = 'opening';
   let terminal: 'discarded' | 'ended' | undefined;
@@ -67,9 +84,13 @@ export function observeNativePrompt(
             ready.resolve();
           } else if (record === 'inserted' && state === 'ready') {
             state = 'inserted';
-          } else if (record === 'claimed' && state === 'inserted') {
+          } else if (record.startsWith('claimed ') && state === 'inserted') {
+            const adopted = adoptedMessage.safeParse(
+              JSON.parse(record.slice('claimed '.length)),
+            );
+            if (!adopted.success) throw failed();
             state = 'claimed';
-            claim.resolve();
+            claim.resolve(adopted.data);
           } else if (
             (record === 'discarded' && state === 'inserted') ||
             (record === 'ended' && state === 'claimed')
@@ -101,8 +122,24 @@ export function observeNativePrompt(
       await settled.catch(() => {});
     },
     inserted: () => state === 'inserted' || state === 'claimed',
-    assertClaimed: (active: AbortSignal) =>
-      waitForPromptFact(claim.promise, AbortSignal.any([active, current])),
+    async assertClaimed(
+      active: AbortSignal,
+      expected?: NativePromptOccurrence,
+    ) {
+      const adopted = await waitForPromptFact(
+        claim.promise,
+        AbortSignal.any([active, current]),
+      );
+      if (
+        expected &&
+        (expected.sessionId !== source.sessionId ||
+          expected.scopeId !== source.scopeId ||
+          expected.requestId !== source.requestId ||
+          expected.messageId !== adopted.messageId ||
+          expected.turn !== adopted.turn)
+      )
+        throw failed();
+    },
     /** Called only after a verified successful native prompt reply. The
      * native RPC commits any new inbox occurrence before acknowledging it. */
     async confirmedReplay() {

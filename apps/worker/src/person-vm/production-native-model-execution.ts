@@ -33,6 +33,7 @@ import {
   deferredPromptFact,
   waitForPromptFact,
   type NativePromptObservation,
+  type NativePromptOccurrence,
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
@@ -49,12 +50,16 @@ type PromptOwner = NativeModelSelection &
   Readonly<{
     runId: string;
     requestId: string;
+    scopeId: string;
     adapterId: string;
     root: string;
     forkedFromNativeSessionId?: string;
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
-    assertClaimed(signal: AbortSignal): Promise<void>;
+    assertClaimed(
+      signal: AbortSignal,
+      occurrence: NativePromptOccurrence,
+    ): Promise<void>;
   }>;
 
 const promptKey = (adapterId: string, root: string, requestId: string) =>
@@ -338,7 +343,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           delivery?: AbortSignal;
           persisted?: boolean;
           delegated: boolean;
-          promptIds: readonly string[];
+          prompts: readonly NativePromptOccurrence[];
           delegatedPromptIds: readonly string[];
         }
       >();
@@ -453,7 +458,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         adapterId: string,
         root: string,
         binding: PersonVmBinding,
-        ids: readonly string[],
+        prompts: readonly NativePromptOccurrence[],
       ) {
         const candidates = new Map<
           string,
@@ -462,31 +467,39 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             observation: NativePromptObservation;
           }>
         >();
-        const requested = new Set(ids);
+        const requested = new Map(
+          prompts.map((prompt) => [prompt.requestId, prompt]),
+        );
         for (const entry of selected.values()) {
           const { scope } = entry;
+          const prompt = requested.get(scope.requestId);
           if (
             scope.root !== root ||
             scope.adapterId !== adapterId ||
             !sameVmBinding(scope.binding, binding) ||
             scope.revoked.aborted ||
-            !requested.has(scope.requestId)
+            !prompt ||
+            prompt.scopeId !== scope.scopeId ||
+            prompt.sessionId !== scope.root
           )
             continue;
           const choices = candidates.get(scope.requestId) ?? [];
           choices.push(entry);
           candidates.set(scope.requestId, choices);
         }
-        return readNativePromptContributors(ids, (id) => {
-          const choices = candidates.get(id) ?? [];
-          const inserted = choices.filter(({ observation }) =>
-            observation.inserted(),
-          );
-          // DSH can return an accepted idempotent replay. Only the
-          // original occurrence's native claim carries execution authority.
-          const actual = inserted.length ? inserted : choices;
-          return actual.length === 1 ? actual[0]!.scope : undefined;
-        });
+        return readNativePromptContributors(
+          prompts.map(({ requestId }) => requestId),
+          (id) => {
+            const choices = candidates.get(id) ?? [];
+            const inserted = choices.filter(({ observation }) =>
+              observation.inserted(),
+            );
+            // DSH can return an accepted idempotent replay. Only the
+            // original occurrence's native claim carries execution authority.
+            const actual = inserted.length ? inserted : choices;
+            return actual.length === 1 ? actual[0]!.scope : undefined;
+          },
+        );
       }
       function conflictingLogin(
         adapterId: string,
@@ -577,19 +590,19 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 current,
               );
               if (wake.kind === 'clear') return;
-              const claimed =
-                wake.kind === 'delegated' &&
-                findPromptContributors(
-                  adapterId,
-                  root.rootNativeSessionId,
-                  binding,
-                  wake.promptIds,
-                );
+              if (wake.kind !== 'delegated')
+                throw new PersonVmError('VM_ACTIVE');
+              const claimed = findPromptContributors(
+                adapterId,
+                root.rootNativeSessionId,
+                binding,
+                wake.prompts,
+              );
               if (!claimed || claimed.first.authorityKey !== authorityKey)
                 throw new PersonVmError('VM_ACTIVE');
               await Promise.all(
-                claimed.contributors.map((member) =>
-                  member.assertClaimed(current),
+                claimed.contributors.map((member, index) =>
+                  member.assertClaimed(current, wake.prompts[index]!),
                 ),
               );
             }
@@ -723,6 +736,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 authorityKey,
                 revoked,
                 requestId,
+                scopeId: issue.scopeId,
                 assertObserved: watch.assertObserved,
                 assertClaimed: observation.assertClaimed,
                 runId: randomUUID(),
@@ -928,8 +942,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             attempt.cursor !== call.native.attemptCursor ||
             attempt.rootSessionId !== call.native.rootSessionId ||
             attempt.delegated !== owned.delegated ||
-            JSON.stringify(attempt.promptIds) !==
-              JSON.stringify(owned.promptIds) ||
+            JSON.stringify(attempt.prompts) !== JSON.stringify(owned.prompts) ||
             JSON.stringify(attempt.delegatedPromptIds) !==
               JSON.stringify(owned.delegatedPromptIds) ||
             resource.rootNativeSessionId !== call.native.rootSessionId ||
@@ -976,7 +989,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   sourceTurn: number;
                   coalesced: readonly PromptOwner[];
                   delegated: boolean;
-                  promptIds: readonly string[];
+                  prompts: readonly NativePromptOccurrence[];
                   delegatedPromptIds: readonly string[];
                 }
               | undefined;
@@ -1056,13 +1069,15 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 wanted.adapterId,
                 probe.root,
                 binding,
-                attempt.promptIds,
+                attempt.prompts,
               );
               if (!proven) return reject();
               const { first: scope, contributors: coalesced } = proven;
               if (scope.authorityKey !== probe.authorityKey) continue;
               await Promise.all(
-                coalesced.map((member) => member.assertClaimed(active)),
+                coalesced.map((member, index) =>
+                  member.assertClaimed(active, attempt.prompts[index]!),
+                ),
               );
               let scopeExecutions = executions.get(scope);
               if (!scopeExecutions) {
@@ -1084,7 +1099,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 address: resource.nativeAddress!,
                 sourceTurn: attempt.sourceTurn,
                 coalesced,
-                promptIds: attempt.promptIds,
+                prompts: attempt.prompts,
                 delegated: attempt.delegated,
                 delegatedPromptIds: attempt.delegatedPromptIds,
                 call: {
@@ -1123,7 +1138,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               address,
               sourceTurn,
               coalesced,
-              promptIds,
+              prompts,
               delegated,
               delegatedPromptIds,
             } = matched;
@@ -1146,7 +1161,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               redeemed: false,
               route,
               delegated,
-              promptIds,
+              prompts,
               delegatedPromptIds,
             };
             calls.set(callId, entry);
