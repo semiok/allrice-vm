@@ -88,7 +88,7 @@ export type DEntryPageHandle = Readonly<{
     nativeSessionId: string,
     forkSource: DEntryPageForkSource | undefined,
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<string>;
   invokeTerminal(
     call: DEntryPageNativeCall,
     signal: AbortSignal,
@@ -598,7 +598,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       if (!sameRoot(forkSource.root, confirmed.root))
                         throw denied();
                     }
-                    await (deps.registerRoot ?? pageRootStore.registerRoot)(
+                    const registered = await (
+                      deps.registerRoot ?? pageRootStore.registerRoot
+                    )(
                       auth.context,
                       auth.identity,
                       {
@@ -613,6 +615,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       active,
                     );
                     await assertCurrent(active);
+                    const threadId = registered.identity.threadId;
+                    if (!threadId) throw denied();
+                    return threadId;
                   },
                   async invokeTerminal(call, active) {
                     active.throwIfAborted();

@@ -5,3 +5,13 @@ export const pageRevoked = 'allrice:d-entry:revoked';
 export const pageStartupFailed = 'allrice:d-entry:startup-failed';
 export const pageDocumentReady = 'allrice:d-entry:document-ready';
 export const pageEditorMounted = 'allrice:d-entry:editor-mounted';
+
+export const pageNativeThreadRegistered =
+  'allrice:d-entry:native-thread-registered';
+export const pageNativeThreadSelected =
+  'allrice:d-entry:native-thread-selected';
+export type PageNativeThreadRegistration = {
+  scopeId: string;
+  nativeSessionId: string;
+  threadId: string;
+};

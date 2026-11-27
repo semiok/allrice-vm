@@ -9,6 +9,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { chromium, type Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 import {
+  dEntryRegisteredThreadHeader,
   type DEntryPageOpenedSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
@@ -29,11 +30,12 @@ const browserExecutable =
 
 it
   .skipIf(!browserExecutable)
-  .each(['attached', 'unattached', 'stall'] as const)(
+  .each(['attached', 'unattached', 'stall', 'native-create'] as const)(
   'rc.2 workspace/follow and the blank composer (%s)',
   { timeout: 60_000 },
   async (scenario) => {
     const stall = scenario === 'stall';
+    const nativeCreate = scenario === 'native-create';
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -118,7 +120,61 @@ it
         ? { ...row, blank: true, cwd: '/work' }
         : row,
     );
-    const life = await open(f);
+    const life = nativeCreate ? undefined : await open(f);
+    const createdThread = randomUUID();
+    const createdNativeId = 'native-created';
+    let documentLoads = 0;
+    let directoryReads = 0;
+    let registered = false;
+    if (nativeCreate) {
+      f.registerRoot.mockImplementation(async (_context, identity, receipt) => {
+        expect(receipt.nativeSessionId).toBe(createdNativeId);
+        const root = {
+          identity: { ...identity, threadId: createdThread },
+          rootOriginDigest: 'registered-root-origin',
+          rootBindingRef: receipt.host.bindingRef,
+          rootNativeSessionId: receipt.nativeSessionId,
+          vmId: receipt.host.binding.vmId,
+        };
+        registered = true;
+        f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+          id === createdNativeId ? root : undefined,
+        );
+        const created = f.host.catalog.items.find(
+          ({ sessionId }) => sessionId === createdNativeId,
+        );
+        if (created) Object.assign(created, { cwd: '/work', blank: true });
+        nativeWorkspace.sessionIds.push(createdNativeId);
+        f.host.host.emit('domain/changed', {
+          domain: 'workspace',
+          table: 'workspaces',
+          operation: 'put',
+          key: nativeWorkspace.id,
+        });
+        return root;
+      });
+    }
+    const shell = nativeCreate
+      ? ((await fromComposition('esbuild').build({
+          stdin: {
+            contents: `import { createRoot } from 'react-dom/client';
+            import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+            createRoot(document.getElementById('shell')).render(<EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+            loader: 'tsx',
+            resolveDir: join(process.cwd(), 'apps/web'),
+          },
+          bundle: true,
+          write: false,
+          outdir: '/employee-entry-native-create',
+          jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+            '.svg': 'dataurl',
+          },
+        })) as { outputFiles: Array<{ path: string; contents: Uint8Array }> })
+      : undefined;
     const unary: string[] = [];
     const startupReplies = new Map<string, unknown>();
     const startupMethods = new Set([
@@ -137,10 +193,69 @@ it
         response
           .writeHead(result.status, {
             'content-type': result.headers.get('content-type')!,
+            ...(result.headers.has(dEntryRegisteredThreadHeader) && {
+              [dEntryRegisteredThreadHeader]: result.headers.get(
+                dEntryRegisteredThreadHeader,
+              )!,
+            }),
           })
           .end(Buffer.from(await result.arrayBuffer()));
       };
       try {
+        if (nativeCreate && url.pathname === '/api/v1/d-entry/native-prewarm')
+          return response.writeHead(204).end();
+        if (nativeCreate && url.pathname === '/api/v1/d-entry/identity')
+          return await copy(Response.json({ identity: f.identity }));
+        if (
+          nativeCreate &&
+          url.pathname === '/api/v1/sessions/' + createdThread
+        ) {
+          directoryReads++;
+          if (
+            !registered ||
+            url.searchParams.get('workspaceId') !== f.identity.workspaceId
+          )
+            return response.writeHead(404).end();
+          const time = '2026-01-01T00:00:00.000Z';
+          return await copy(
+            Response.json({
+              history: {
+                session: {
+                  id: createdThread,
+                  ownerId: f.identity.personId,
+                  organizationId: f.identity.organizationId,
+                  workspaceId: f.identity.workspaceId,
+                  employeeInstanceId: f.identity.employeeInstanceId,
+                  employeeAssignmentId: randomUUID(),
+                  employeeVersionId: f.identity.employeeVersionId,
+                  visibility: 'private',
+                  title: 'New native conversation',
+                  createdAt: time,
+                  updatedAt: time,
+                  archivedAt: null,
+                },
+              },
+            }),
+          );
+        }
+        if (shell && url.pathname === '/chatflow/4.0')
+          return response
+            .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            .end(
+              '<!doctype html><link rel="stylesheet" href="/shell.css"><div id="shell"></div><script src="/shell.js"></script>',
+            );
+        if (
+          shell &&
+          (url.pathname === '/shell.js' || url.pathname === '/shell.css')
+        ) {
+          const type = extname(url.pathname);
+          return response
+            .writeHead(200, { 'content-type': mime[type]! })
+            .end(
+              shell.outputFiles.find((file) => file.path.endsWith(type))!
+                .contents,
+            );
+        }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           const chunks: Buffer[] = [];
           for await (const chunk of request) chunks.push(chunk);
@@ -169,7 +284,7 @@ it
           return await copy(
             await f.publish(
               kind,
-              life.scopeId,
+              life?.scopeId ?? url.searchParams.get('scopeId')!,
               Object.fromEntries(url.searchParams),
             ),
           );
@@ -194,10 +309,16 @@ it
             );
           return;
         }
-        if (url.pathname !== '/employee') {
+        if (
+          url.pathname !== '/employee' &&
+          url.pathname !== '/chatflow/4.0/document'
+        ) {
           response.writeHead(404).end();
           return;
         }
+        documentLoads++;
+        const scopeId = life?.scopeId ?? url.searchParams.get('scopeId');
+        if (!scopeId) return response.writeHead(404).end();
         const { identity, selection } = f;
         const version = {
           id: identity.employeeVersionId,
@@ -229,8 +350,8 @@ it
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
-          <script data-scope-id="${life.scopeId}">${initialDocumentLifecycle}</script>
-          <div id="app" data-scope-id="${life.scopeId}" data-thread-id="${selection.threadId}"
+          <script data-scope-id="${scopeId}">${initialDocumentLifecycle}</script>
+          <div id="app" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
@@ -295,7 +416,11 @@ it
         });
       });
     }
-    await page.goto(f.origin);
+    await page.goto(
+      nativeCreate
+        ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
+        : f.origin,
+    );
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
       await page.clock.fastForward(30_100);
@@ -358,6 +483,42 @@ it
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (nativeCreate) {
+      const mark = randomUUID();
+      const frame = page.locator('iframe');
+      await frame.evaluate((node, mark) => {
+        node.dataset.fixtureIdentity = mark;
+      }, mark);
+      await workbench.locator('#app').evaluate((node, mark) => {
+        node.dataset.fixtureDocument = mark;
+      }, mark);
+      await editor.focus();
+      await page.keyboard.press(
+        process.platform === 'darwin' ? 'Meta+Alt+N' : 'Control+Alt+N',
+      );
+      await expect
+        .poll(() => unary.includes('session/create'), { timeout: 15_000 })
+        .toBe(true);
+      await page.waitForURL(
+        (url) => url.searchParams.get('threadId') === createdThread,
+        { timeout: 20_000 },
+      );
+      const row = workbench.locator(
+        '[data-row-key="session:' + createdThread + '"]',
+      );
+      await row.waitFor({ timeout: 15_000 });
+      await editor.fill('原生新会话草稿', { timeout: 15_000 });
+      expect(await editor.isEditable()).toBe(true);
+      expect(await frame.getAttribute('data-fixture-identity')).toBe(mark);
+      expect(
+        await workbench.locator('#app').getAttribute('data-fixture-document'),
+      ).toBe(mark);
+      expect(documentLoads).toBe(1);
+      expect(directoryReads).toBe(1);
+      expect(f.registerRoot).toHaveBeenCalledTimes(1);
+      await context.close();
+      return;
+    }
     expect(
       await workbench
         .getByText(/选择一个工作区开始|Choose a workspace to start/)

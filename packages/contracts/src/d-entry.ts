@@ -156,6 +156,10 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
 export const DEntryPageUnarySchema = z
   .string()
   .regex(/^[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/u);
+// Only an acknowledged, currently authorized page create/fork may carry this
+// AllRice thread id. The DSH reply body and rpcId keep their original contract.
+export const dEntryRegisteredThreadHeader = 'x-allrice-d-entry-thread';
+
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {
     selection: DEntrySelectionInputSchema,

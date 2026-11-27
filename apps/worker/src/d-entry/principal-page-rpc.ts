@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEntryNativeOwnerRequestSchema,
   DEntryPageRpcRequestSchema,
+  dEntryRegisteredThreadHeader,
 } from '@allrice/contracts';
 import type {
   DEntryPrincipalControlScope,
@@ -225,8 +226,9 @@ export function createDEntryPageRpc(
                   reply(rpcId, { ok: false, error: failure }),
                 );
               }
-              if (created)
-                await page.registerNativeSession(created, forkSource, active);
+              const registeredThread = created
+                ? await page.registerNativeSession(created, forkSource, active)
+                : undefined;
               const bytes = Buffer.from(await native.arrayBuffer());
               await writeOwned(
                 active,
@@ -236,6 +238,9 @@ export function createDEntryPageRpc(
                       'content-type': native.headers.get('content-type')!,
                       'content-length': String(bytes.length),
                       'cache-control': 'private, no-store',
+                      ...(registeredThread && {
+                        [dEntryRegisteredThreadHeader]: registeredThread,
+                      }),
                     })
                     .end(bytes),
                 async () => {

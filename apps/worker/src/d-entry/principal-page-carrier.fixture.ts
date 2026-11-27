@@ -214,7 +214,15 @@ export async function fixture(
     pinned = true;
     return selectedRoot(f.context, f.selection);
   });
-  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
+  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>(
+    async (_context, identity, receipt) => ({
+      identity: { ...identity, threadId: randomUUID() },
+      rootNativeSessionId: receipt.nativeSessionId,
+      rootOriginDigest: 'registered-root-origin',
+      rootBindingRef: receipt.host.bindingRef,
+      vmId: receipt.host.binding.vmId,
+    }),
+  );
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
   const watchTerminal = vi.fn<
     NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
