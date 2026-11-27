@@ -785,11 +785,20 @@ it.skipIf(!cli)(
       async (_profile, readModels, _active, installed) => {
         const catalog = await readModels();
         expect(installed).toBe(f.owner.modelAdapterId);
-        expect(catalog.value.default).toMatchObject({
+        expect(catalog.value.default).toEqual({
           provider: route.provider,
           model: route.model,
-          reasoningEffort: 'high',
         });
+        const provider = catalog.value.groups.find(
+          ({ id }) => id === route.provider,
+        );
+        expect(provider?.models).toEqual([
+          {
+            id: route.model,
+            name: route.modelInfo.name,
+            reasoning: route.modelInfo.reasoning,
+          },
+        ]);
         expect(catalog.value.routableProviders).toContain(route.provider);
         expect(catalog.value.failures).not.toContainEqual(
           expect.objectContaining({ id: route.provider }),
