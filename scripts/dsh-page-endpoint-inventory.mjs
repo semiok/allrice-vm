@@ -112,7 +112,7 @@ if (
     console.log(`# ${manifest.version} ${manifest.commit}\n${rows.join('\n')}`);
   } else {
     const baseline = await readFile(
-      join(root, 'apps/worker/dsh/page-endpoints-baseline.tsv'),
+      join(import.meta.dirname, 'dsh-page-endpoints-baseline.tsv'),
       'utf8',
     );
     const previous = baseline.trimEnd().split('\n').slice(1);
