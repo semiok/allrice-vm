@@ -35,7 +35,7 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
 });
 
-it('shades only named employee controls and restores native occupants on unload/redeclaration', async () => {
+it('keeps native conversation controls and hides only the employee header entries', async () => {
   const ctx = new Context();
   contexts.push(ctx);
   const { SlotRegistry } = nativeClientModule(
@@ -89,20 +89,20 @@ it('shades only named employee controls and restores native occupants on unload/
       );
   };
   addDefaults();
-  const shaded = () => {
+  const checkSlots = () => {
     for (const name of [
       'conversation.input.permission',
       'conversation.input.model',
     ] as const) {
-      expect(ctx.slots.entriesOfSlot(name)[0]?.component()).toBeNull();
-      expect(ctx.slots.entries(name)).toHaveLength(2);
+      expect(ctx.slots.entriesOfSlot(name)[0]?.component).toBe(native);
+      expect(ctx.slots.entries(name)).toHaveLength(1);
     }
     expect(
       ctx.slots
         .entriesOfSlot('conversation.composer.dock')
         .filter((entry) => entry.component === native)
         .map((entry) => entry.options.id),
-    ).toEqual(['queue']);
+    ).toEqual(['activity', 'usage', 'queue']);
     expect(
       ctx.slots
         .entriesOfSlot('conversation.session.header.utilities')
@@ -113,11 +113,11 @@ it('shades only named employee controls and restores native occupants on unload/
       ctx.slots.entriesOfSlot('conversation.input.activity')[0]?.component,
     ).toBe(native);
   };
-  shaded();
+  checkSlots();
   remove();
   remove = declare();
   addDefaults();
-  shaded();
+  checkSlots();
   expect(layers.size).toBe(1);
   await plugin.dispose();
   expect(layers.size).toBe(0);
@@ -178,9 +178,12 @@ it('assembles the independent profile with native question/document/catalog and 
     expect(entry(id)?.disabled, id).not.toBe(true);
   }
   expect(entry('locale')?.config).toMatchObject({ preference: 'zh' });
-  expect(entry('ui-chat')?.config).toMatchObject({
-    performanceUsage: 'compact',
-  });
+  expect(entry('ui-chat')).toBeDefined();
+  expect(entry('ui-chat')?.config ?? {}).not.toHaveProperty('performanceUsage');
+  for (const id of ['ui-model-selection', 'ui-permission', 'session-stats']) {
+    expect(entry(id), id).toBeDefined();
+    expect(entry(id)?.disabled, id).not.toBe(true);
+  }
   for (const id of ['terminal-controller', 'ui-sidebar-terminal']) {
     expect(entry(id), id).toBeDefined();
     expect(entry(id)?.disabled, id).not.toBe(true);
