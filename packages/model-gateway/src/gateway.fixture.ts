@@ -26,7 +26,6 @@ import type {
   ModelGatewayAuthority,
   ModelGatewayAdmission,
   ModelGatewayStore,
-  GatewayProvider,
 } from './contract.ts';
 import { createModelGateway } from './gateway.ts';
 import { createDshGatewayProvider, GatewayLlmAdapter } from './dsh-provider.ts';
