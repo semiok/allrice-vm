@@ -251,11 +251,19 @@ save();
   return {
     h,
     native,
-    reloadNative: (disk?: ReadonlyDshRuntimeDisk, employeePortSlots?: number) =>
+    reloadNative: (
+      disk?: ReadonlyDshRuntimeDisk,
+      employeePortSlots?: number,
+      policy?: Pick<
+        ConstructorParameters<typeof MicrosandboxPersonVm>[0],
+        'memoryMiB' | 'restartMemory'
+      >,
+    ) =>
       new MicrosandboxPersonVm({
         ...nativeOptions,
         ...(disk && { readonlyDshRuntimeDisk: disk }),
         ...(employeePortSlots && { employeePortSlots }),
+        ...policy,
       }),
     rc,
     service,
@@ -1412,6 +1420,45 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       }
     },
   );
+  it('preflights a retained VM with its previous memory default and rejects other configuration changes', async () => {
+    const f = await bootstrapFixture();
+    const assigned = roster(f, 1);
+    const options = {
+      ...f.h.options,
+      nativeWeb: { prepare: async () => assigned },
+    };
+    const initial = new PersonVmService({ ...options, native: f.native });
+    await initial.prewarm(f.rc, { trigger: 'page' }, signal());
+    const prior = await initial.resolve(f.rc, signal());
+    await f.native.stop(prior, signal());
+    await initial.stop(f.rc, signal());
+    const configuration = join(f.mount, 'msb-config.json');
+    const saved = await readFile(configuration, 'utf8');
+    const reserve = vi.fn();
+    const restarted = f.reloadNative(undefined, undefined, {
+      memoryMiB: 3072,
+      restartMemory: { memoryMiB: 3072, reserve },
+    });
+    const current = new PersonVmService({ ...options, native: restarted });
+    const before = (await f.calls()).length;
+    await expect(
+      current.reconcileStoppedEntryForPrewarm(f.rc, prior, signal(), true),
+    ).resolves.toBe(true);
+    expect(await readFile(configuration, 'utf8')).toBe(saved);
+    expect((await f.calls()).slice(before)).toEqual([
+      ['--version'],
+      ['list', '--format', 'json'],
+    ]);
+    expect(reserve).not.toHaveBeenCalled();
+
+    const bad = JSON.parse(saved);
+    bad.sandbox_defaults.cpus = 4;
+    await writeFile(configuration, JSON.stringify(bad));
+    await expect(
+      current.reconcileStoppedEntryForPrewarm(f.rc, prior, signal(), true),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+    expect(f.h.mounts.size).toBe(0);
+  });
   it.each(['success', 'cancel', 'write-failure'] as const)(
     'reservation真实接入立即关闭，manifest %s后service/lease与原H全部真实join',
     async (mode) => {

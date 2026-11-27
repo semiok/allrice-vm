@@ -1,4 +1,4 @@
-import { UuidSchema } from '@allrice/contracts';
+import { PlatformPersonVmPolicySchema, UuidSchema } from '@allrice/contracts';
 import { constants } from 'node:fs';
 import {
   lstat,
@@ -565,7 +565,11 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       ).then((output): unknown => JSON.parse(output)),
     ]);
   }
-  private configurationBytes(home: string, target: string) {
+  private configurationBytes(
+    home: string,
+    target: string,
+    memoryMiB = this.memoryMiB,
+  ) {
     return JSON.stringify({
       version: 1,
       home,
@@ -582,7 +586,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       },
       sandbox_defaults: {
         cpus: 2,
-        memory_mib: this.memoryMiB,
+        memory_mib: memoryMiB,
         oci: {
           root_disk: {
             kind: 'flat',
@@ -667,10 +671,29 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       if (
         !stat.isFile() ||
         (stat.mode & 0o777) !== 0o600 ||
-        stat.size !== Buffer.byteLength(expected) ||
-        (await config.readFile('utf8')) !== expected
+        stat.size !== Buffer.byteLength(expected)
       )
         throw new PersonVmError('PROVIDER_FAILED');
+      const saved = await config.readFile('utf8');
+      if (saved !== expected) {
+        // Preflight opens the retained CLI configuration read-only. A sealed
+        // memory change takes effect later, under the startup reservation.
+        if (!this.options.restartMemory)
+          throw new PersonVmError('PROVIDER_FAILED');
+        let previous: unknown;
+        try {
+          previous = JSON.parse(saved)?.sandbox_defaults?.memory_mib;
+        } catch (cause) {
+          throw new PersonVmError('PROVIDER_FAILED', { cause });
+        }
+        const memory =
+          PlatformPersonVmPolicySchema.shape.memoryMiB.safeParse(previous);
+        if (
+          !memory.success ||
+          saved !== this.configurationBytes(home, target, memory.data)
+        )
+          throw new PersonVmError('PROVIDER_FAILED');
+      }
     } finally {
       await config.close();
     }
