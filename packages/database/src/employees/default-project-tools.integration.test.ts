@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import * as toolSelection from '@allrice/contracts';
+import { cloudProjectCapabilityId } from '@allrice/contracts';
+import { updateUserPreferences } from '../user-preferences.ts';
 import * as client from '../core/client.ts';
 import { createRuntimeFixtureDatabase } from '../runtime.fixture.ts';
 import { createEmployeeAdministrationFixture } from '../employee-administration.fixture.ts';
@@ -21,7 +22,7 @@ const suite =
     ? describe.sequential
     : describe.skip;
 
-suite('default Rice project tool admission', () => {
+suite('published employee project tool admission', () => {
   let f: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
   let catalog: Awaited<ReturnType<typeof loadPlatformContentCatalog>>;
   beforeAll(async () => {
@@ -79,14 +80,21 @@ suite('default Rice project tool admission', () => {
       requestId: randomUUID(),
       profile: { name: 'My development employee' },
     });
-    const send = async (kind: 'general' | 'custom') => {
-      const session = await createChatSession(context, {
-        workspaceId: source.workspaceId,
-        ...(kind === 'custom'
-          ? { employeeInstanceId: custom.id }
-          : { employeeAssignmentId: assignment.id }),
-        title: 'Project admission fixture',
-      });
+    const send = async (
+      kind: 'general' | 'custom',
+      freezeAccountCapabilities?: true,
+    ) => {
+      const session = await createChatSession(
+        context,
+        {
+          workspaceId: source.workspaceId,
+          ...(kind === 'custom'
+            ? { employeeInstanceId: custom.id }
+            : { employeeAssignmentId: assignment.id }),
+          title: 'Project admission fixture',
+        },
+        { freezeAccountCapabilities },
+      );
       const input = {
         text: '帮我开发一个用于检查表格的小工具。',
         clientMessageId: randomUUID(),
@@ -159,17 +167,7 @@ suite('default Rice project tool admission', () => {
 
   it('replays and resolves an old Run with its original project qualification', async () => {
     const x = await setup();
-    // Simulate the old tool selection at first INSERT, never rewrite a stored
-    // snapshot or disable its immutability trigger. All admission checks stay real.
-    const selectMemoryTools = toolSelection.freezeMemoryIndexToolNames;
-    const oldSelection = vi
-      .spyOn(toolSelection, 'freezeMemoryIndexToolNames')
-      .mockImplementation((...args) => [
-        ...new Set([...selectMemoryTools(...args), 'workspace.project']),
-      ]);
-    const original = await x
-      .send('general')
-      .finally(() => oldSelection.mockRestore());
+    const original = await x.send('general');
     const before = (await x.resolve(original.sent.run.id)).executionSnapshot;
     expect(before?.capabilitySnapshot.bindings.toolNames).toContain(
       'workspace.project',
@@ -182,7 +180,12 @@ suite('default Rice project tool admission', () => {
     );
     expect(replay.run.id).toBe(original.sent.run.id);
     expect((await x.resolve(replay.run.id)).executionSnapshot).toEqual(before);
-    const next = await x.resolve((await x.send('general')).sent.run.id);
+    await updateUserPreferences(x.context, {
+      capabilities: {
+        [cloudProjectCapabilityId]: { configVersion: 1, enabled: false },
+      },
+    });
+    const next = await x.resolve((await x.send('general', true)).sent.run.id);
     expect(
       next.executionSnapshot?.capabilitySnapshot.bindings.toolNames,
     ).not.toContain('workspace.project');
