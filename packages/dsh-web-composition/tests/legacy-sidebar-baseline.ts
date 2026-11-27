@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -56,7 +57,18 @@ export function createLegacySidebarSnapshot(
         const pinned = candidates.find((candidate) =>
           pinnedPaths.has(relative(repoRoot, candidate).replaceAll('\\', '/')),
         );
-        if (pinned) return { path: pinned };
+        // Preserve esbuild's normal metadata and import resolution whenever
+        // the file is still present.
+        if (pinned && !existsSync(pinned)) return { path: pinned };
+        const importer = relative(repoRoot, args.importer).replaceAll(
+          '\\',
+          '/',
+        );
+        if (onlyPinnedPaths && pinnedPaths.has(importer))
+          return plugin.resolve(path, {
+            kind: args.kind,
+            resolveDir: repoRoot,
+          });
       });
       plugin.onLoad({ filter: /\.(?:[cm]?[jt]sx?|css)$/ }, ({ path }) => {
         const key = relative(repoRoot, path).replaceAll('\\', '/');

@@ -72,10 +72,6 @@ suite(
             and d.tenant_employee_id=e.id and e.employee_key='rice'
           returning e.id`;
         expect(tenant?.id).toBeTruthy();
-        await f.db`
-          update allrice_employee_versions set
-            manifest=manifest || '{"key":"default-assistant","isDefaultRice":true}'::jsonb
-          where employee_id=${tenant!.id}`;
       }
       const context = (await authenticateSession(
         (await createSession(source.ownerId)).token,
