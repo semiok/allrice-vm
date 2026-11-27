@@ -29,7 +29,7 @@ const scopeKey = [organizationId, panelsViewer, panelsWorkspace, scopeId].join(
   '/',
 );
 const revision = createSyntheticPanelsData().references[0]!;
-const fixture = () => {
+const fixture = (deferred = false) => {
   const lifetime = new AbortController();
   const cleanup: (() => void)[] = [];
   const doc = {
@@ -77,7 +77,14 @@ const fixture = () => {
       register: registerSlot,
     },
   };
-  apply({ inject: (_, ready) => ready(native as never) } as Context);
+  let activate = () => {};
+  apply({
+    effect: native.effect,
+    inject: (_, ready) => {
+      activate = () => ready(native as never);
+      if (!deferred) activate();
+    },
+  } as Context);
   const reference = employeePanelReferences()!;
   const codec = (
     registerSource.mock.calls[0] as unknown as [
@@ -85,14 +92,15 @@ const fixture = () => {
         codec: { serialize(ref: string, signal: AbortSignal): Promise<string> };
       },
     ]
-  )[0].codec;
+  )[0]?.codec;
   return {
+    activate,
     fetch,
     result,
     lifetime,
     cleanup,
-    codec,
-    reference,
+    codec: codec!,
+    reference: reference.current!,
     currentBinding,
     binding,
     currentSession,
@@ -144,14 +152,24 @@ it('uses the captured native span and reselects the immutable authorized revisio
 
 it('projects an exact prepared deliverable without retaining unrelated response fields', async () => {
   const f = fixture();
-  expect(f.reference.insert({ ...f.request, reference: revision })).toBe(true);
+  expect(
+    f.reference.insert({
+      ...f.request,
+      reference: { ...revision, manifestDigest: f.result.selection.digest },
+    }),
+  ).toBe(true);
   const [{ ref }] = f.insertReference.mock.calls[0] as unknown as [
     { ref: string },
   ];
   expect(JSON.parse(ref)).not.toHaveProperty('ownership');
   expect(JSON.parse(ref)).not.toHaveProperty('publication');
+  expect(JSON.parse(ref).digest).toBe(f.result.selection.digest);
   expect(await f.codec.serialize(ref, f.lifetime.signal)).toContain(
     revision.checksum,
+  );
+  f.result.selection.digest = 'sha256:' + 'f'.repeat(64);
+  await expect(f.codec.serialize(ref, f.lifetime.signal)).rejects.toThrow(
+    '引用已失效',
   );
   f.cleanup.forEach((close) => close());
 });
@@ -182,7 +200,7 @@ it.each(['denied', 'checksum moved', 'scope changed', 'session changed'])(
 );
 
 it('enables references only for the current production data port and respects native refusal', () => {
-  const f = fixture();
+  const f = fixture(true);
   const source = syntheticPanelSnapshot(scopeKey, 'list', () => undefined);
   const snapshot = {
     ...source,
@@ -210,6 +228,14 @@ it('enables references only for the current production data port and respects na
     () => unboundEmployeePanelDataClient,
     f.lifetime.signal,
   );
+  const listener = vi.fn();
+  const stop = bound.subscribe(sessionId, listener);
+  expect(bound.getSnapshot(sessionId)?.materials.readOnly).toBe(true);
+  expect(bound.useReference?.(f.request)).toBe(false);
+  const data = bound.dataClient(sessionId);
+  f.activate();
+  expect(listener).toHaveBeenCalledOnce();
+  expect(bound.dataClient(sessionId)).toBe(data);
   expect(bound.getSnapshot(sessionId)?.materials.readOnly).toBe(false);
   expect(bound.getSnapshot(sessionId)?.files.readOnly).toBe(false);
   expect(bound.useReference?.({ ...f.request, scopeKey: 'stale' })).toBe(false);
@@ -220,5 +246,6 @@ it('enables references only for the current production data port and respects na
   f.insertReference.mockReturnValue(false);
   expect(bound.useReference?.(f.request)).toBe(false);
   expect(f.insertReference).toHaveBeenCalledOnce();
+  stop();
   f.cleanup.forEach((close) => close());
 });

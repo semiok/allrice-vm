@@ -27,6 +27,9 @@ const pin = ReferenceSelectionSchema.pick({
 })
   .strip()
   .extend({ digest: ReferenceSelectionSchema.shape.digest.optional() });
+const selectionPin = pin.extend({
+  manifestDigest: ReferenceSelectionSchema.shape.digest.optional(),
+});
 const occurrence = pin
   .extend({ version: z.literal(1), sessionId: z.string().min(1) })
   .strict();
@@ -41,7 +44,12 @@ interface DocumentReferences {
 // The sealed document and Cordis owner share this lifetime. Existing business
 // binders keep their own independent snapshots, without relying on a new
 // global auth source or a port added to the memory/capability owners.
-const documents = new WeakMap<Document, DocumentReferences>();
+interface ReferenceSource {
+  readonly current: DocumentReferences | undefined;
+  subscribe(listener: () => void): () => void;
+}
+
+const documents = new WeakMap<Document, ReferenceSource>();
 export function employeePanelReferences() {
   return typeof document === 'undefined' ? undefined : documents.get(document);
 }
@@ -65,9 +73,39 @@ export function apply(ctx: Context) {
     lifetimeSignal: lifetime,
   });
 
+  // Publish the document slot before the panels owner starts. Cordis may
+  // activate the input services later than the existing business binder.
+  let currentReferences: DocumentReferences | undefined;
+  const listeners = new Set<() => void>();
+  const referenceSource: ReferenceSource = {
+    get current() {
+      return currentReferences;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  const publish = (bridge: DocumentReferences | undefined) => {
+    if (currentReferences === bridge) return;
+    currentReferences = bridge;
+    for (const listener of listeners) listener();
+  };
+  const clear = () => publish(undefined);
+  documents.set(page.ownerDocument, referenceSource);
+  lifetime.addEventListener('abort', clear, { once: true });
+  ctx.effect(() => () => {
+    lifetime.removeEventListener('abort', clear);
+    if (documents.get(page.ownerDocument) === referenceSource)
+      documents.delete(page.ownerDocument);
+    clear();
+    listeners.clear();
+  });
+
   ctx.inject(
     ['slots', 'sessions', 'conversation', 'sidebarRight', 'inputTriggers'],
     (native) => {
+      if (lifetime.aborted) return;
       const owner = new AbortController();
       const active = AbortSignal.any([lifetime, owner.signal]);
       let actions: Header['inputActions'] | undefined;
@@ -198,8 +236,11 @@ export function apply(ctx: Context) {
             request.scopeKey !== scopeKey
           )
             return false;
-          const reference = pin.safeParse(request.reference);
+          const reference = selectionPin.safeParse(request.reference);
           if (!reference.success) return false;
+          const { manifestDigest, digest, ...exact } = reference.data;
+          if (manifestDigest && digest && manifestDigest !== digest)
+            return false;
           const span = actions.captureInsertion();
           if (request.signal.aborted || current(request.sessionId) !== binding)
             return false;
@@ -207,7 +248,8 @@ export function apply(ctx: Context) {
             {
               source,
               ref: JSON.stringify({
-                ...reference.data,
+                ...exact,
+                digest: digest ?? manifestDigest,
                 version: 1,
                 sessionId: request.sessionId,
               }),
@@ -219,12 +261,11 @@ export function apply(ctx: Context) {
           );
         },
       };
-      documents.set(page.ownerDocument, bridge);
       native.effect(() => () => {
         owner.abort();
-        if (documents.get(page.ownerDocument) === bridge)
-          documents.delete(page.ownerDocument);
+        if (referenceSource.current === bridge) clear();
       });
+      publish(bridge);
     },
   );
 }

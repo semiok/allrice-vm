@@ -34,7 +34,7 @@ export function createEmployeePanelsDataPort(
     SessionIdOf,
     {
       original: EmployeePanelsSnapshot;
-      canInsert: boolean;
+      referencing?: EmployeePanelsSnapshot;
       value: EmployeePanelsSnapshot;
       controller: AbortController;
       client: EmployeePanelDataClient;
@@ -64,7 +64,6 @@ export function createEmployeePanelsDataPort(
     const controller = new AbortController();
     const resolved = resolve(id, original);
     const raw = resolved ?? unboundEmployeePanelDataClient;
-    const canInsert = !!resolved && !!references?.matches(id, original);
     if (signal.aborted) return null;
     const current = () => {
       if (
@@ -96,25 +95,25 @@ export function createEmployeePanelsDataPort(
       }),
     ) as EmployeePanelDataHandlers;
     const client = createEmployeePanelDataClient(handlers);
+    const value = {
+      ...original,
+      materials: { ...original.materials, dataClient: client },
+      files: { ...original.files, dataClient: client },
+    };
     const entry = {
       original,
-      canInsert,
+      value,
+      referencing:
+        resolved && references
+          ? {
+              ...value,
+              materials: { ...value.materials, readOnly: false },
+              files: { ...value.files, readOnly: false },
+            }
+          : undefined,
       controller,
       client,
       unsubscribe: () => {},
-      value: {
-        ...original,
-        materials: {
-          ...original.materials,
-          ...(canInsert && { readOnly: false }),
-          dataClient: client,
-        },
-        files: {
-          ...original.files,
-          ...(canInsert && { readOnly: false }),
-          dataClient: client,
-        },
-      },
     };
     snapshots.set(id, entry);
     // Independent preview/dialog/upload consumers keep this subscription even
@@ -142,22 +141,36 @@ export function createEmployeePanelsDataPort(
     return entry;
   };
   return {
-    getSnapshot: (id) => read(id)?.value ?? null,
+    getSnapshot(id) {
+      const entry = read(id);
+      if (!entry) return null;
+      return entry.referencing &&
+        references?.current?.matches(id, entry.original)
+        ? entry.referencing
+        : entry.value;
+    },
     subscribe(id, listener) {
-      return source.subscribe(id, () => {
+      const unsubscribe = source.subscribe(id, () => {
         if (snapshots.get(id)?.original !== source.getSnapshot(id)) clear(id);
         listener();
       });
+      const unwatch = references?.subscribe(listener);
+      return () => {
+        unsubscribe();
+        unwatch?.();
+      };
     },
     useReference: source.useReference
       ? (request) => source.useReference!(request)
       : references &&
         ((request) => {
           const entry = read(request.sessionId);
+          const bridge = references.current;
           return (
-            !!entry?.canInsert &&
+            !!entry?.referencing &&
+            !!bridge?.matches(request.sessionId, entry.original) &&
             entry.value.scopeKey === request.scopeKey &&
-            references.insert(request)
+            bridge.insert(request)
           );
         }),
     // Preview/dialog and the existing upload intake must receive this same

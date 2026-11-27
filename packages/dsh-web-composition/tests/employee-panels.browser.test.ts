@@ -830,10 +830,19 @@ suite('installed native employee panels with synthetic business owner', () => {
           });
         else if (url.pathname.endsWith('/reference') && req.method() === 'POST')
           await route.fulfill({ json: { reference: selected } });
+        else if (url.pathname.endsWith('/materials/options'))
+          await route.fulfill({
+            json: { viewerId: panelsViewer, options: data.options },
+          });
         else if (url.pathname.endsWith('/materials'))
           await route.fulfill({ json: data.catalog });
         else if (url.pathname.endsWith('/deliverables'))
-          await route.fulfill({ json: data.files });
+          await route.fulfill({
+            json: {
+              ...data.files,
+              employees: [{ id: panelsEmployee, name: '虚拟哥' }],
+            },
+          });
         else await route.fulfill({ status: 404, json: {} });
       });
       await context.addInitScript(
@@ -917,6 +926,17 @@ suite('installed native employee panels with synthetic business owner', () => {
       await page.screenshot({
         path: join(artifacts, `formal-reference-${width}.png`),
       });
+      if (width === 390) {
+        await page
+          .getByRole('button', { name: '收起右侧边栏', exact: true })
+          .click();
+        await page
+          .getByText(selected.fileName, { exact: true })
+          .waitFor({ state: 'visible' });
+        await page.screenshot({
+          path: join(artifacts, 'formal-reference-390-editor.png'),
+        });
+      }
       revoked = true;
       await expect(command('serializeReference', 0)).rejects.toThrow(
         '引用已失效',

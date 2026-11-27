@@ -134,7 +134,12 @@ function installSyntheticPanelsOwner(ctx: Context, product: Product) {
               threadId: uid(7),
             },
             materials: { ...value.materials, readOnly: true },
-            files: { ...value.files, readOnly: true },
+            files: {
+              ...value.files,
+              currentEmployee: { id: panelsEmployee, name: '虚拟哥' },
+              employees: [{ id: panelsEmployee, name: '虚拟哥' }],
+              readOnly: true,
+            },
           }),
         });
       }
