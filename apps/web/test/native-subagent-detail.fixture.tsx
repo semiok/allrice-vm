@@ -3,11 +3,6 @@ import { Button } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { NativeSubagentSummary } from '@allrice/contracts';
 import { AssistantMarkdown } from '../app/chatflow/assistant-markdown';
 import type { ChatPresentationPolicy } from '../app/chatflow/dsh-upstream/presentation/presentation-policy';
-import {
-  NativeSubagentControls,
-  useNativeSubagentControls,
-  type nativeSubagentControlRoot,
-} from '../app/chatflow/native-subagent-controls';
 import { NativeSubagentProcess } from '../app/chatflow/native-subagent-process';
 import { useNativeSubagentFollow } from '../app/chatflow/use-native-subagent-follow';
 import type { useNativeSubagents } from '../app/chatflow/use-native-subagents';
@@ -46,9 +41,6 @@ export function LegacySubagentDetailFixture({
   headers,
   observation,
   presentation,
-  controlRoot,
-  canControl = false,
-  viewerId,
   selected,
   onClose: dismissDetail,
 }: {
@@ -57,18 +49,9 @@ export function LegacySubagentDetailFixture({
   headers: Record<string, string>;
   observation: ReturnType<typeof useNativeSubagents>;
   presentation: ChatPresentationPolicy;
-  controlRoot?: ReturnType<typeof nativeSubagentControlRoot>;
-  canControl?: boolean;
-  viewerId?: string | null;
   selected: string | null;
   onClose: () => void;
 }) {
-  const controls = useNativeSubagentControls(
-    workspaceId,
-    sessionId,
-    headers,
-    viewerId,
-  );
   const { reads, revision } = observation;
   const read = reads[sessionId];
   const summary = read && read !== 'error' ? read : null;
@@ -144,24 +127,6 @@ export function LegacySubagentDetailFixture({
                   ? '暂时无法读取摘要，请刷新。'
                   : '当前活动状态未知，请重新读取摘要。'}
               </p>
-            )}
-            {controlRoot !== undefined && (
-              <NativeSubagentControls
-                key={`${selected}/${child?.parentId}/${controlRoot?.rootRunId}/${controlRoot?.generation}`}
-                childId={selected}
-                child={child}
-                parentAvailable={
-                  summary?.descendants.find(
-                    (entry): entry is Child =>
-                      entry.kind === 'child' &&
-                      entry.id === selected &&
-                      entry.parentId === child?.parentId,
-                  )?.parentAvailable
-                }
-                root={controlRoot}
-                permitted={canControl}
-                controls={controls}
-              />
             )}
           </aside>,
           document.body,
