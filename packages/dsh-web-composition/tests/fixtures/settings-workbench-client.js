@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
                     .serializeReference(
                       source,
                       ref,
-                      new AbortController().signal,
+                      new window.AbortController().signal,
                     )
                     .then((text) => ({ label, text })),
                 ),

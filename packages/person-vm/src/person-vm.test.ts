@@ -1174,7 +1174,14 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       rc = context();
     const prepareEgress = vi.spyOn(h.egress, 'prepare');
     const first = await h.service.prewarm(rc, { trigger: 'page' }, signal());
+    const binding = await h.service.resolve(rc, signal());
+    const readiness = vi.spyOn(h.runtime, 'readiness');
     const second = await h.service.prewarm(rc, { trigger: 'input' }, signal());
+    await h.service.assertRunningReadiness(rc, binding, signal());
+    expect(readiness.mock.calls).toEqual([
+      [binding, expect.any(AbortSignal), rc],
+      [binding, expect.any(AbortSignal)],
+    ]);
     expect(first.ready).toBe(true);
     expect(second.vmId).toBe(first.vmId);
     expect(h.log.filter((item) => item === 'native:create')).toHaveLength(1);

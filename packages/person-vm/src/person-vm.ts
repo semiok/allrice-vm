@@ -1362,6 +1362,7 @@ export class PersonVmService
     context: RequestContext,
     signal: AbortSignal,
     target?: PersonVmPrewarmFence,
+    prepareForeground = false,
   ) {
     await this.assertNoPendingDisk(row, signal);
     if (target) await target.assertAuthority(signal);
@@ -1389,7 +1390,7 @@ export class PersonVmService
       )
         throw new PersonVmError('LEASE_LOST');
     }
-    await this.ready(row, signal, context);
+    await this.ready(row, signal, prepareForeground ? context : undefined);
     if (
       roster &&
       (await this.webRoster(context, signal))?.digest !== roster.digest
@@ -1483,7 +1484,7 @@ export class PersonVmService
       return opening;
     }
     if (row?.phase === 'running') {
-      await this.confirmRunning(row, context, signal, target);
+      await this.confirmRunning(row, context, signal, target, true);
       return view(row, true);
     }
 

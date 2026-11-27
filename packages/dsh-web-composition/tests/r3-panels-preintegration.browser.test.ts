@@ -77,7 +77,10 @@ async function fixtureApis(page: Page, requests: string[]) {
     if (url.pathname === '/api/v1/memories/manage') {
       expect(url.searchParams.get('workspaceId')).toBe(panelsWorkspace);
       expect(url.searchParams.get('instanceId')).toBe(panelsEmployee);
-      const rows = sample.memories.map(({ details: _details, ...row }) => row);
+      const rows = sample.memories.map((row) => ({
+        ...row,
+        details: undefined,
+      }));
       const active = rows.filter((row) => row.state === 'active');
       const pending = rows.filter((row) => row.state === 'pending');
       return route.fulfill({
