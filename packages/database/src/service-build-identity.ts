@@ -566,16 +566,27 @@ export function readServiceBuildIdentity(
 }
 
 async function readSealedPersonVmHostFile(
-  build: ServiceBuildIdentity,
+  service: ServiceBuildRole,
+  build: Pick<
+    ServiceBuildIdentity,
+    'mode' | 'manifestDigest' | 'sourceSha' | 'sourceTree'
+  >,
   signal?: AbortSignal,
 ) {
   signal?.throwIfAborted();
   try {
-    if (!process.argv[1] || build.mode !== 'production')
+    const launcher = process.argv[1];
+    const {
+      mode,
+      manifestDigest: expectedDigest,
+      sourceSha,
+      sourceTree,
+    } = build;
+    if (!launcher || mode !== 'production')
       throw Error('DEV_BUILD_IDENTITY_INVALID');
-    const entrypoint = await realpath(process.argv[1]);
+    const entrypoint = await realpath(launcher);
     signal?.throwIfAborted();
-    const ending = serviceEntrypoints[build.service];
+    const ending = serviceEntrypoints[service];
     if (!entrypoint.endsWith(ending)) throw Error('DEV_BUILD_IDENTITY_INVALID');
     const root = entrypoint.slice(0, -ending.length);
     const manifestBytes = await bytesAt(root, buildManifestPath);
@@ -587,9 +598,9 @@ async function readSealedPersonVmHostFile(
     );
     if (
       digest(JSON.stringify(manifest)) !== manifestDigest ||
-      manifestDigest !== build.manifestDigest ||
-      manifest.sourceSha !== build.sourceSha ||
-      manifest.sourceTree !== build.sourceTree
+      manifestDigest !== expectedDigest ||
+      manifest.sourceSha !== sourceSha ||
+      manifest.sourceTree !== sourceTree
     )
       throw Error('DEV_BUILD_IDENTITY_INVALID');
     const selected = manifest.files.filter(
@@ -658,7 +669,7 @@ export async function readSealedPersonVmHostConfiguration(
 ) {
   signal?.throwIfAborted();
   if (build.service !== 'worker') throw Error('DEV_BUILD_IDENTITY_INVALID');
-  return readSealedPersonVmHostFile(build, signal);
+  return readSealedPersonVmHostFile('worker', build, signal);
 }
 
 /** Web and Worker enrollment use the same sealed scalar as the VM provider. */
@@ -674,6 +685,6 @@ export async function readServicePersonVmEmployeePortSlots() {
   if (!service) return fallback;
   const build = await readServiceBuildIdentity(service);
   if (!build) return fallback;
-  const sealed = await readSealedPersonVmHostFile(build);
+  const sealed = await readSealedPersonVmHostFile(service, build);
   return sealed?.employeePortSlots ?? fallback;
 }

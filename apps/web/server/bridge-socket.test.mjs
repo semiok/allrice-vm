@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { readFile, readdir } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createRequire } from 'node:module';
+import { createConnection } from 'node:net';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { URL } from 'node:url';
@@ -689,6 +690,31 @@ suite(
           30_000,
         );
         expect(child.exitCode, output).toBeNull();
+        const coldUpgrade = httpOnly
+          ? createConnection({ host: '127.0.0.1', port, allowHalfOpen: true })
+          : undefined;
+        if (coldUpgrade) {
+          cleanups.push(async () => coldUpgrade.destroy());
+          coldUpgrade.on('error', () => undefined);
+          coldUpgrade.setEncoding('utf8');
+          let response = '';
+          coldUpgrade.on('data', (chunk) => {
+            response += chunk;
+          });
+          const eof = once(coldUpgrade, 'end', {
+            signal: globalThis.AbortSignal.timeout(5000),
+          });
+          coldUpgrade.write(
+            'GET /api/health/live HTTP/1.1\r\n' +
+              'Host: allrice-dsh.bplabs.xyz\r\n' +
+              'Connection: Upgrade\r\nUpgrade: allrice-test\r\n\r\n',
+          );
+          await eof;
+          expect(response).toBe(
+            'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+          );
+          expect(coldUpgrade.writable).toBe(true);
+        }
         const status = await new Promise((resolve, reject) => {
           const req = httpRequest(
             {
@@ -719,6 +745,12 @@ suite(
             await database`select device_id from allrice_bridge_connections
             where device_id=${d.id}`,
           ).toEqual([]);
+          expect(coldUpgrade?.writableEnded).toBe(false);
+          expect(child.kill('SIGTERM')).toBe(true);
+          await waitUntil(
+            () => child.exitCode !== null || child.signalCode !== null,
+          );
+          expect(child.exitCode, output).toBe(0);
           return;
         }
         const c = await connect(endpoint, d.token, 'allrice-dsh.bplabs.xyz');

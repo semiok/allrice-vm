@@ -382,8 +382,17 @@ it('gives Web and Worker the same sealed slot count and only Worker the private 
         await expect(
           readSealedPersonVmHostConfiguration(worker),
         ).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
+        const mutable = { ...worker };
+        const reading = readSealedPersonVmHostConfiguration(mutable);
+        mutable.service = 'web';
+        await expect(reading).rejects.toThrow('DEV_BUILD_IDENTITY_INVALID');
       } else {
-        expect(await readSealedPersonVmHostConfiguration(verified)).toEqual({
+        const mutable = { ...verified };
+        const reading = readSealedPersonVmHostConfiguration(mutable);
+        mutable.sourceSha = 'c'.repeat(40);
+        mutable.sourceTree = 'c'.repeat(40);
+        mutable.manifestDigest = 'sha256:' + '0'.repeat(64);
+        expect(await reading).toEqual({
           configuration: { synthetic: 'host configuration' },
           employeePortSlots: 7,
           manifestDigest: sealed.manifestDigest,

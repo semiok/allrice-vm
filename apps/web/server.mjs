@@ -37,18 +37,24 @@ import { observePreviewHttp } from './server/preview-diagnostics.mjs';
 
 const upgradeNotFound =
   'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n';
+function rejectHttpOnlyUpgrade(_request, socket) {
+  socket.on('error', () => undefined);
+  if (!socket.destroyed) socket.end(upgradeNotFound, () => socket.destroy());
+}
 /** Next registers its own upgrade listener after the first HTTP request.
  * Route AllRice transports before it, or reject upgrades in HTTP-only mode. */
 export class AllRiceHttpServer extends Server {
-  httpOnly = false;
   bridgeGateway = null;
   previewGateway = null;
   terminalGateway = null;
   nativeFollowGateway = null;
   dEntryNativeGateway = null;
   emit(event, ...args) {
-    if (event === 'upgrade' && this.httpOnly) {
-      args[1].end(upgradeNotFound);
+    if (
+      event === 'upgrade' &&
+      this.listenerCount('upgrade', rejectHttpOnlyUpgrade)
+    ) {
+      rejectHttpOnlyUpgrade(...args);
       return true;
     }
     if (event === 'upgrade' && this.dEntryNativeGateway?.matches(args[0])) {
@@ -94,7 +100,9 @@ export async function startAllRiceWeb({
     throw new Error('INVALID_WEB_PORT');
   if (!dev) await readServicePersonVmEmployeePortSlots();
   const server = new AllRiceHttpServer();
-  server.httpOnly = httpOnly;
+  // Node must dispatch even the first connection as an upgrade. The emit
+  // guard keeps any subsequently installed Next listener out of that path.
+  if (httpOnly) server.on('upgrade', rejectHttpOnlyUpgrade);
   const transportServer = httpOnly ? null : server;
   const lifecycle = await installDevProducerLifecycle('web');
   const cloudPreview =
