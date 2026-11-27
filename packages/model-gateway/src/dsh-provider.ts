@@ -33,7 +33,7 @@ type ManagedGuestModelCall = {
   >;
 };
 import type {
-  GatewayFetchClassification,
+  DshGatewayRoute,
   GatewayProvider,
   ModelCallBinding,
 } from './contract.ts';
@@ -49,21 +49,21 @@ export type DshGatewayStreamScope = (
  * The loader's pinned provider profile must use HTTP SSE, not websocket/auto. */
 export function createDshGatewayProvider(
   llm: Pick<LlmRuntime, 'prepareCall'>,
-  route: {
-    provider: string;
-    model: string;
-    transport: 'sse';
-    classify(
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ): GatewayFetchClassification | null;
-  },
+  route: DshGatewayRoute,
   fetchOwned?: GatewayProvider['fetchOwned'],
   assertDispatchCurrent?: GatewayProvider['assertDispatchCurrent'],
   scopeStream?: DshGatewayStreamScope,
 ): GatewayProvider {
   return {
     classify: route.classify,
+    ...(route.hostedWebSearch
+      ? {
+          hostedWebSearch: Object.freeze({
+            provider: route.provider,
+            model: route.model,
+          }),
+        }
+      : {}),
     fetchOwned,
     assertDispatchCurrent,
     async *stream(binding, input, signal) {
@@ -93,6 +93,19 @@ export function createDshGatewayProvider(
       const stream = () =>
         prepared.stream({
           ...input,
+          // Guest replay metadata is never authority to replay native OpenAI
+          // items under a shared Host credential. Use DSH's normal neutral
+          // history conversion on this route, retaining text and tool history.
+          ...(route.provider === 'openai'
+            ? {
+                messages: input.messages.map((message) => {
+                  if (message.role !== 'assistant') return message;
+                  const source = { ...message.source };
+                  delete source.replayState;
+                  return { ...message, source };
+                }),
+              }
+            : {}),
           ...prepared.config,
           signal,
           sessionId: binding.native.sessionId as GenerateOptions['sessionId'],

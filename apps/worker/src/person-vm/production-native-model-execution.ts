@@ -215,7 +215,7 @@ async function assertPersistedExecution(
 const wireSelection = z
   .object({
     sessionId: z.string().min(1).max(256),
-    provider: z.literal('openai-codex'),
+    provider: z.enum(['openai-codex', 'openai']),
     model: z.string().min(1).max(128),
     adapterId: z.string().regex(/^[a-f0-9]{64}$/),
     recipient: z.string().regex(/^[A-Za-z0-9_-]{43}$/),

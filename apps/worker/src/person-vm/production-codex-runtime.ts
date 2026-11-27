@@ -8,6 +8,7 @@ import {
   ModelGatewayError,
   createOwnedModelTransport,
   withGatewayAuthTransaction,
+  type DshGatewayRoute,
   type GatewayFetchClassification,
 } from '@allrice/model-gateway';
 import {
@@ -166,7 +167,7 @@ export async function createProductionCodexRuntime(
     throw new ModelGatewayError('BINDING_INVALID');
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
-  const route = Object.freeze({
+  const route: DshGatewayRoute = Object.freeze({
     provider,
     model,
     transport: 'sse' as const,

@@ -47,6 +47,23 @@ describe('wire usage facts, independent of provider synthesized totals', () => {
       cacheUsageKnown: false,
     });
   });
+  it('recognizes a bare CR event delimiter without double-counting a split CRLF', () => {
+    const observer = new WireUsageObserver('openai-responses');
+    observer.push(bytes('event: response.completed\r'));
+    observer.push(
+      bytes(
+        '\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1}}}\r',
+      ),
+    );
+    expect(observer.terminal).toBeNull();
+    observer.push(bytes('\r'));
+    expect(observer.terminal).toBe('completed');
+    expect(observer.usage).toMatchObject({
+      inputTokens: 2,
+      outputTokens: 1,
+      totalTokens: 3,
+    });
+  });
   it('oversized tool/content frames pass observation without retaining body or inventing missing usage', () => {
     const observer = new WireUsageObserver('openai-responses');
     observer.push(
