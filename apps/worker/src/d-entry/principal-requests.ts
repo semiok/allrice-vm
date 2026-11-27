@@ -296,8 +296,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       : null;
     if (
       previous &&
-      (!existing ||
-        existing.rootNativeSessionId === previous.root?.rootNativeSessionId ||
+      (!input.selection.threadId ||
+        !existing ||
+        !previous.root ||
+        existing.rootNativeSessionId === previous.root.rootNativeSessionId ||
         original.context.sessionId !== previous.sessionId ||
         !sameDEntryIdentity(original.identity, {
           ...previous.identity,

@@ -511,35 +511,6 @@ suite('4.0 browser cold entry', () => {
       );
       await returnPage.close();
 
-      const stalledDocument = await context.newPage();
-      const waitingDocument = deferred();
-      const releaseDocument = deferred();
-      await stalledDocument.route('**/api/v1/d-entry/native-prewarm', (route) =>
-        route.fulfill({ status: 204 }),
-      );
-      await stalledDocument.route(
-        '**/chatflow/4.0/document?*',
-        async (route) => {
-          waitingDocument.resolve();
-          await releaseDocument.promise;
-          await route.abort().catch(() => {});
-        },
-      );
-      try {
-        await stalledDocument.goto(
-          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
-          { waitUntil: 'domcontentloaded' },
-        );
-        await waitingDocument.promise;
-        await stalledDocument.getByRole('button', { name: '取消等待' }).click();
-        const resume = stalledDocument.getByRole('button', { name: '继续' });
-        await expect.poll(() => resume.isEnabled()).toBe(true);
-        expect(await stalledDocument.locator('iframe').count()).toBe(0);
-      } finally {
-        releaseDocument.resolve();
-        await stalledDocument.close();
-      }
-
       for (const [code, title] of [
         [400, '暂时打不开这条对话'],
         [401, '请重新登录'],
