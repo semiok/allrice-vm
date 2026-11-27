@@ -918,7 +918,9 @@ suite('installed native employee panels with synthetic business owner', () => {
         path: join(artifacts, `formal-reference-${width}.png`),
       });
       revoked = true;
-      await expect(command('serializeReference', 0)).rejects.toThrow();
+      await expect(command('serializeReference', 0)).rejects.toThrow(
+        '引用已失效',
+      );
     },
     35_000,
   );

@@ -50,6 +50,7 @@ export function createFixture(require: (name: string) => unknown) {
       'uiWorkspace',
       'sidebarRight',
       'conversation',
+      'inputTriggers',
     ],
     apply(ctx: Context) {
       installSyntheticPanelsOwner(ctx, product);
