@@ -143,7 +143,7 @@ describe('plain copy for a reply that did not finish', () => {
   });
 
   it('adds nothing when the person stopped or declined the work', () => {
-    expect(present(null, 'Rice 的这次执行已取消。')).toEqual({
+    expect(present(null, '本次执行已取消。')).toEqual({
       body: '这次任务已停止。',
       notice: null,
     });
@@ -181,10 +181,8 @@ describe('plain copy for a reply that did not finish', () => {
     );
     expect(replyFailureFallback).not.toContain('换个说法');
     expect(
-      present(
-        'EMPLOYEE_ENQUEUE_FAILED',
-        'Rice 暂时无法开始这次执行，请稍后重试。',
-      ).body,
+      present('EMPLOYEE_ENQUEUE_FAILED', '暂时无法开始这次执行，请稍后重试。')
+        .body,
     ).toBe(replyFailureCopy('EMPLOYEE_ENQUEUE_FAILED'));
   });
 

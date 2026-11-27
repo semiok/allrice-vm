@@ -34,7 +34,7 @@ function event(
       turnId: 'turn-2',
       presentation: 'context',
       status: 'started',
-      label: 'Rice 需要你确认',
+      label: '员工需要你确认',
     },
   };
 }

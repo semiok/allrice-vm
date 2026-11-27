@@ -127,12 +127,6 @@ import {
   defaultContextCompactThreshold,
   sessionCompactionStatus,
 } from '../conversation/usage.ts';
-// Bump when the built-in Rice prompt contract changes so existing assignments
-// receive the new version while historical Sessions remain pinned.
-// Built-in Rice manifests are immutable once published. Bump this whenever
-// the default employee capability contract changes so existing sessions stay
-// frozen while newly provisioned sessions receive the updated tool set.
-
 type ChatSession = z.infer<typeof ChatSessionSchema>;
 type ChatMessage = z.infer<typeof ChatMessageSchema>;
 type EmployeeAssignment = z.infer<typeof EmployeeAssignmentSchema>;
@@ -1684,7 +1678,7 @@ async function persistChatMessageInTransaction(
       ) values (
         ${context.organizationId}, ${workspaceId}, ${session.id},
         ${requireUser(context)}, 'assistant',
-        ${transaction.json({ text: 'Rice 正在处理…', citations: [] })},
+        ${transaction.json({ text: '员工正在处理…', citations: [] })},
         ${session.visibility}, ${userMessage.id}, 'pending', null
       )
       returning *
@@ -2175,7 +2169,7 @@ export async function sendChatMessage(
   if (result.assistantMessage.status === 'failed') {
     const retries = await sql<MessageRow[]>`
       update allrice_messages
-      set content = ${sql.json({ text: 'Rice 正在重试…', citations: [] })},
+      set content = ${sql.json({ text: '员工正在重试…', citations: [] })},
           status = 'pending', error_code = null, completed_at = null
       where id = ${result.assistantMessage.id}
       returning *
@@ -2229,7 +2223,7 @@ export async function sendChatMessage(
     await sql`
       update allrice_messages
       set content = ${sql.json({
-        text: 'Rice 暂时无法开始这次执行，请稍后重试。',
+        text: '暂时无法开始这次执行，请稍后重试。',
         citations: [],
       })}, status = 'failed', error_code = 'EMPLOYEE_ENQUEUE_FAILED',
         completed_at = now()

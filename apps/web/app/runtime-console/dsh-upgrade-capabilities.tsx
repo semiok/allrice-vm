@@ -33,7 +33,7 @@ export function DshUpgradeCapabilities(props: {
           ) : null}
         </div>
         <AdminButton variant="secondary" onClick={props.onOpenEmployees}>
-          配置 Rice 并试用
+          配置员工并试用
         </AdminButton>
       </header>
       {catalog.groups.map((group) => (

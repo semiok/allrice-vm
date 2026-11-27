@@ -310,7 +310,7 @@ suite(
           error_code: 'EMPLOYEE_ENQUEUE_FAILED',
           completed_at: expect.any(Date),
           content: {
-            text: 'Rice 暂时无法开始这次执行，请稍后重试。',
+            text: '暂时无法开始这次执行，请稍后重试。',
             citations: [],
           },
         });

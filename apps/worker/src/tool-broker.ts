@@ -72,7 +72,7 @@ export async function executeRiceTool(
   if (!input.capabilities.includes(requiredCapability)) {
     throw new HandlerError(
       'TOOL_CAPABILITY_DENIED',
-      `Rice 未被授予 ${requiredCapability} 能力`,
+      `员工未被授予 ${requiredCapability} 能力`,
       false,
     );
   }

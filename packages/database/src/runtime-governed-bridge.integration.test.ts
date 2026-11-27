@@ -2768,7 +2768,7 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
     ).toBe(false);
     expect(
       adoptedHistory.messages.some(
-        (m) => m.content.text === '已补充给正在工作的 Rice。',
+        (m) => m.content.text === '已补充给正在工作的员工。',
       ),
     ).toBe(false);
     const unanswered = {

@@ -87,7 +87,7 @@ suite(
           // Root contract ruling (2026-10-29): #645 removed the historical
           // assistantDiagnostics projection; the explicit failure code wins.
           expect(message!.content.text).toBe(
-            'Rice 暂时无法完成这次请求，请稍后重试。',
+            '暂时无法完成这次请求，请稍后重试。',
           );
           expect(message!.content.text).not.toContain('模型连接中断');
         } finally {
@@ -208,7 +208,7 @@ suite(
           expect(message!.content.text).toBe(
             kind === 'current'
               ? 'GitHub 正常；Linear 有 3 个项目。'
-              : 'Rice 暂时无法完成这次请求，请稍后重试。',
+              : '暂时无法完成这次请求，请稍后重试。',
           );
         } finally {
           await f.close();

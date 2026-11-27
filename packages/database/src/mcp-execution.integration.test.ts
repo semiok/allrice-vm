@@ -696,7 +696,7 @@ suite('P16 real approval → frozen MCP → HTTP operation ledger', () => {
         capabilities: ['storage:read'],
         frozenMcpTools: f.mcpTools,
       }),
-    ).rejects.toThrow('Rice 未被授予');
+    ).rejects.toThrow('员工未被授予');
     await expect(
       executeRiceTool({
         context: f.execution,

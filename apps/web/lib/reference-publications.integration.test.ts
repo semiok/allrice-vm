@@ -1492,7 +1492,7 @@ suite(
             type: 'native.event',
             presentation: 'context',
             status: 'started',
-            label: 'Rice 需要你确认',
+            label: '员工需要你确认',
             summary: 'NEW_NATIVE_BODY',
             sourceEventType: 'session/user-question',
             sourcePayload: question,
@@ -1618,7 +1618,7 @@ suite(
             sourceEventType: 'session/user-question',
             presentation: 'context',
             status: 'started',
-            label: 'Rice 需要你确认',
+            label: '员工需要你确认',
             sourcePayload: UserQuestionRequestSchema.parse({
               questionId: 'in-flight',
               questions: [{ id: 'choice', question: 'IN_FLIGHT_NATIVE_BODY' }],

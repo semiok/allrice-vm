@@ -99,7 +99,7 @@ export function replyFailureCopy(code: string | null | undefined) {
 }
 
 /** The server's catch-all text, stored when it has nothing more specific. */
-export const savedGenericFailure = 'Rice 暂时无法完成这次请求，请稍后重试。';
+export const savedGenericFailure = '暂时无法完成这次请求，请稍后重试。';
 // Fixed wording the server stores with a failed message (or contracts
 // return), mapped back to the failure it describes.
 const savedCodes = new Map<string, string>([
@@ -108,15 +108,15 @@ const savedCodes = new Map<string, string>([
     return text ? [[text, code] as [string, string]] : [];
   }),
   [
-    'Rice 暂时无法使用已引用的 Skill：Skill 文件在本地存储中缺失。请重新安装或刷新该 Skill 后重试。',
+    '暂时无法使用已引用的 Skill：Skill 文件在本地存储中缺失。请重新安装或刷新该 Skill 后重试。',
     'SKILL_ARTIFACT_MISSING',
   ],
   [
-    'Rice 暂时无法使用已引用的 Skill：Skill 文件校验失败。请重新安装或刷新该 Skill 后重试。',
+    '暂时无法使用已引用的 Skill：Skill 文件校验失败。请重新安装或刷新该 Skill 后重试。',
     'SKILL_ARTIFACT_INVALID',
   ],
-  ['Rice 暂时无法开始这次执行，请稍后重试。', 'EMPLOYEE_ENQUEUE_FAILED'],
-  ['Rice 的这次执行已取消。', 'CANCELED'],
+  ['暂时无法开始这次执行，请稍后重试。', 'EMPLOYEE_ENQUEUE_FAILED'],
+  ['本次执行已取消。', 'CANCELED'],
 ]);
 
 /**
