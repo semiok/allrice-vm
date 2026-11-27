@@ -496,6 +496,40 @@ suite('4.0 browser cold entry', () => {
       );
       await returnPage.close();
 
+      for (const code of [400, 401, 403, 404]) {
+        const unavailable = await context.newPage();
+        try {
+          await unavailable.route('**/api/v1/d-entry/native-prewarm', (route) =>
+            route.fulfill({ status: code }),
+          );
+          await unavailable.goto(
+            f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+          );
+          const signIn = code === 401;
+          await unavailable
+            .getByRole('alert')
+            .getByRole('heading', {
+              name: signIn ? '请重新登录' : '暂时打不开这条对话',
+              exact: true,
+            })
+            .waitFor();
+          expect(
+            await unavailable
+              .getByRole('link', {
+                name: signIn ? '重新登录' : '返回员工页',
+                exact: true,
+              })
+              .getAttribute('href'),
+          ).toBe(signIn ? '/login?next=%2Fchatflow%2F4.0' : '/chatflow/4.0');
+          expect(
+            await unavailable.getByText(extensionHint, { exact: true }).count(),
+          ).toBe(0);
+          expect(await unavailable.locator('iframe').count()).toBe(0);
+        } finally {
+          await unavailable.close();
+        }
+      }
+
       const stalledDocument = await context.newPage();
       const waitingDocument = deferred<URL>();
       const releaseDocument = deferred<void>();
