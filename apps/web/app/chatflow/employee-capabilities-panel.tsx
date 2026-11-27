@@ -1,21 +1,15 @@
 'use client';
 
 import { useEffect, useRef, type ReactNode } from 'react';
-import { useEmployeeSkillsHostView } from './employee-skills-host';
+import {
+  EmployeeSkillsHost,
+  useEmployeeSkillsHostView,
+  type EmployeeSkillsHostProps,
+} from './employee-skills-host';
 import css from './employee-capabilities-panel.module.css';
 import { useCapabilityEscape } from './use-capability-escape';
 
-/** The native Dock owns navigation/focus. This is the current employee's body;
- * its children consume the same U1 controllers as EmployeeDetailsDialog. */
-export function EmployeeCapabilitiesPanel({
-  employeeName,
-  scopeKey,
-  active,
-  onRead,
-  layer,
-  showSkills,
-  children,
-}: {
+type CapabilitiesBodyProps = {
   employeeName: string;
   scopeKey: string;
   active: boolean;
@@ -23,7 +17,37 @@ export function EmployeeCapabilitiesPanel({
   layer?: ReactNode;
   showSkills: boolean;
   children: ReactNode;
+};
+
+/** The native Dock owns navigation/focus. Both placements use the same Skill
+ * reader, list and detail components. */
+export function EmployeeCapabilitiesPanel({
+  skillsHost,
+  ...props
+}: CapabilitiesBodyProps & {
+  skillsHost?: Omit<EmployeeSkillsHostProps, 'children'>;
 }) {
+  if (!skillsHost) return <EmployeeCapabilitiesBody {...props} />;
+  return (
+    <EmployeeSkillsHost {...skillsHost}>
+      {(skills) => (
+        <EmployeeCapabilitiesBody {...props}>
+          {props.children ?? skills.section}
+        </EmployeeCapabilitiesBody>
+      )}
+    </EmployeeSkillsHost>
+  );
+}
+
+function EmployeeCapabilitiesBody({
+  employeeName,
+  scopeKey,
+  active,
+  onRead,
+  layer,
+  showSkills,
+  children,
+}: CapabilitiesBodyProps) {
   const read = useRef(onRead);
   const content = useRef<HTMLDivElement>(null);
   const listFocus = useRef<HTMLElement | null>(null);
