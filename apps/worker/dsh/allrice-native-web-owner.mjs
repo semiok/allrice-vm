@@ -8,7 +8,10 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
 import { TextEncoder } from 'node:util';
-import { createNativeRunTerminalAttestations } from './allrice-native-run-journal.mjs';
+import {
+  createNativeRunTerminalAttestations,
+  isNativeForkHeader,
+} from './allrice-native-run-journal.mjs';
 
 export const name = 'allrice-native-web-owner';
 export const inject = [
@@ -218,6 +221,13 @@ function nativeOriginInput(source) {
   return ['user', 'agent-message', 'subagent-settled'].includes(source?.kind);
 }
 
+function isNativeOrdinaryRoot(header) {
+  return (
+    isNativeForkHeader(header) ||
+    (!header.parentSession && !header.isSeeded && header.origin === undefined)
+  );
+}
+
 function nativePromptId(source) {
   return source?.kind === 'user' && typeof source.rpcId === 'string'
     ? source.rpcId
@@ -246,7 +256,7 @@ export function readPromptOrigins(
     if (
       !Array.isArray(messageSeqs) ||
       messageSeqs.some(
-        (seq) => !Number.isSafeInteger(seq) || seq < 0 || seq >= cursor,
+        (seq) => !Number.isSafeInteger(seq) || seq < ownFrom || seq >= cursor,
       )
     )
       return null;
@@ -258,7 +268,10 @@ export function readPromptOrigins(
       if (ids.size !== previousSize && sourceTurn === null)
         sourceTurn =
           events.findLast(
-            (event) => event.seq < seq && event.type === 'turn/start',
+            (event) =>
+              event.seq >= ownFrom &&
+              event.seq < seq &&
+              event.type === 'turn/start',
           )?.data.turn ?? null;
     }
     return sourceTurn === null
@@ -314,7 +327,7 @@ async function observePromptOrigins(
     return null;
   const { id, header } = live;
   const root = delegations.root(live);
-  if (!root || (header.parentSession && purpose === 'session-title'))
+  if (!root || (!isNativeOrdinaryRoot(header) && purpose === 'session-title'))
     return null;
   const observed = await scope.sessionQuery.observeSession(id, {
     signal,
@@ -342,7 +355,7 @@ async function observePromptOrigins(
       ? {
           ...origin,
           rootSessionId: root.id,
-          delegated: !!header.parentSession || origin.delegated,
+          delegated: !isNativeOrdinaryRoot(header) || origin.delegated,
         }
       : null;
   } finally {
@@ -368,8 +381,7 @@ export function observeNativePrompts(scope, lifetime) {
     const { source } = message;
     const session = agent.session;
     if (
-      session.header.parentSession ||
-      session.header.isSeeded ||
+      !isNativeOrdinaryRoot(session.header) ||
       source?.kind !== 'user' ||
       typeof source.rpcId !== 'string' ||
       source.principal?.kind !== 'allrice-d-entry'
@@ -539,7 +551,7 @@ export function observeDelegatedInputs(scope) {
     const seen = new Set();
     let agent = liveAgent(session.id);
     if (original(agent?.session) !== original(session)) return null;
-    while (agent.session.header.parentSession) {
+    while (!isNativeOrdinaryRoot(agent.session.header)) {
       if (seen.has(agent)) return null;
       seen.add(agent);
       const activation = activations.get(agent.id);
@@ -550,7 +562,7 @@ export function observeDelegatedInputs(scope) {
         return null;
       agent = activation.parent;
     }
-    return agent.session.header.isSeeded ? null : original(agent.session);
+    return original(agent.session);
   }
 
   function collect(session, inputs) {
@@ -692,7 +704,10 @@ export function observeDelegatedInputs(scope) {
       const state = turns.get(session);
       if (state?.turn !== turn) return;
       if (record) state.claimed.set(message.id, record);
-      if (!session.header.parentSession && nativeOriginInput(message.source)) {
+      if (
+        isNativeOrdinaryRoot(session.header) &&
+        nativeOriginInput(message.source)
+      ) {
         const id = nativePromptId(message.source);
         state.firstInput ??= id === null ? 'delegated' : 'prompt';
         if (id !== null) state.directClaims.add(id);

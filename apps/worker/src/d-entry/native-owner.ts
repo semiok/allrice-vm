@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type {
-  DEntryPrincipalIssue,
+  DEntryScopeIssue,
   DEntryPrincipalActivity,
 } from '@allrice/d-entry-principal/types';
 import {
@@ -78,7 +78,7 @@ export type ResolvedDEntryNativeOwner = Readonly<{
    * fixed generated control scope. No browser-provided principal or grants. */
   acquirePrincipal(
     context: RequestContext,
-    input: DEntryPrincipalIssue,
+    input: DEntryScopeIssue,
     signal: AbortSignal,
   ): DEntryPrincipalActivity;
 }>;
@@ -212,12 +212,16 @@ export async function resolveDEntryNativeResource(input: {
   );
   if (entries.size !== catalog.items.length) return deny();
   const root = entries.get(pin.rootNativeSessionId);
-  if (!root || root.parentSessionId || root.origin === 'subagent')
+  if (
+    !root ||
+    root.parentSessionId !== pin.forkedFromNativeSessionId ||
+    root.origin === 'subagent'
+  )
     return deny();
   function lineage(id: string) {
     let cursor = entries.get(id);
     if (!cursor) return;
-    const parent = cursor.parentSessionId ?? null;
+    const parent = cursor === root ? null : (cursor.parentSessionId ?? null);
     const visited = new Set<string>();
     while (cursor.sessionId !== pin.rootNativeSessionId) {
       if (visited.has(cursor.sessionId) || !cursor.parentSessionId) return;

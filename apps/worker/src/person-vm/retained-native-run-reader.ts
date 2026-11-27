@@ -26,6 +26,10 @@ export function dEntryNativeRunJournalSelection({
     turn: attempt.turn,
     delegated: prompt.source === 'dsh-native-delegation',
     parentSessionId: attempt.parentSessionId,
+    ...(attempt.sessionId === prompt.rootSessionId &&
+      prompt.forkedFromNativeSessionId && {
+        forkedFromNativeSessionId: prompt.forkedFromNativeSessionId,
+      }),
   };
 }
 

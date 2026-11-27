@@ -13,7 +13,8 @@ type Method = Readonly<{
 
 type Configuration = Readonly<{
   args: Readonly<Record<string, unknown>>;
-  providerSettings: ReadonlySet<string>;
+  providerSettings: ReadonlySet<string> | undefined;
+  pluginSettings?: ReadonlySet<string>;
 }>;
 
 const authentication = new Set([
@@ -26,18 +27,32 @@ const authentication = new Set([
   'tokenIssuer',
 ]);
 const pluginManagement = new Set(['pluginManager']);
+const pluginInventory = new Set([
+  'listBundles',
+  'listPlugins',
+  'listVersionExemptions',
+  'registries',
+]);
 const pluginMarket = new Set(['pluginMarket']);
 const dynamicPlugins = new Set(['dynamicCordisRunner']);
 const runtimeUpgrade = new Set(['runtimeUpgrade', 'updater', 'dshUpdater']);
 const credentialManagement = new Set(['credentials', 'credentialsController']);
 const interactiveTerminal = new Set(['terminal', 'terminalController']);
+const filePreview = new Set(['workspaceFiles', 'officeToPdf']);
 
 function inCategory(endpoint: Method, values: ReadonlySet<string>) {
   return values.has(endpoint.namespace) || values.has(endpoint.service);
 }
 
-/** A category rule for generated DSH methods. Session ownership is decided by
- * the native resource policy before any descriptor can be dispatched. */
+/** The sealed file preview controllers remain unavailable on the page. */
+export function isRetainedPageRestriction(endpoint: Method) {
+  return (
+    inCategory(endpoint, interactiveTerminal) ||
+    inCategory(endpoint, filePreview)
+  );
+}
+
+/** A category rule for generated DSH methods. */
 export function sensitivePageCapability(
   endpoint: Method,
   configuration?: Configuration,
@@ -54,7 +69,7 @@ export function sensitivePageCapability(
   }
   if (inCategory(endpoint, authentication)) return 'native-identity';
   if (
-    inCategory(endpoint, pluginManagement) ||
+    (inCategory(endpoint, pluginManagement) && !pluginInventory.has(method)) ||
     (inCategory(endpoint, pluginMarket) &&
       /^(?:set|update|replace|mutate)/u.test(method)) ||
     (inCategory(endpoint, dynamicPlugins) &&
@@ -84,7 +99,13 @@ export function sensitivePageCapability(
   if (namespace === 'settings' && /^(?:mutate|replace|update)/u.test(method)) {
     if (!configuration) return 'provider-configuration';
     const ns = configuration.args.ns;
-    if (typeof ns === 'string' && configuration.providerSettings.has(ns)) {
+    if (typeof ns === 'string' && configuration.pluginSettings?.has(ns)) {
+      return 'platform-settings';
+    }
+    if (
+      !configuration.providerSettings ||
+      (typeof ns === 'string' && configuration.providerSettings.has(ns))
+    ) {
       return 'provider-configuration';
     }
   }

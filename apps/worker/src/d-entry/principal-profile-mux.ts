@@ -12,11 +12,14 @@ import {
   RemoteError,
   isRemoteJsonValue,
 } from '@deepseek-ai/dsh-typert-protocol';
-import { DEntryPageMuxQuerySchema } from '@allrice/contracts';
+import {
+  DEntryPageMuxQuerySchema,
+  DEntryPageRpcRequestSchema,
+  DEntryPageUnarySchema,
+} from '@allrice/contracts';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import { DataAccessError } from '@allrice/database';
-import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
-import { authorizeDEntryNativeInvocation } from './native-invocation.js';
 import {
   DEntryNativeRootRejected,
   DEntryNativeUnavailable,
@@ -267,105 +270,49 @@ async function runStreams(
     const id = frame.streamId;
     const work = Promise.resolve()
       .then(async () => {
-        let call;
-        let check = () => page.assertCurrent(child);
+        await page.assertCurrent(child);
+        let source: AsyncIterable<{ scopeId: string; value: unknown }>;
         if (frame.endpoint === '$events') {
           emptyPayload.parse(frame.payload);
-          call = {
-            kind: 'events' as const,
-            scopeId,
-            payload: REMOTE_EVENT_STREAM_PAYLOAD,
-          };
-        } else if (frame.endpoint === 'remoteAccess/follow') {
-          const { args } = emptyPayload.parse(frame.payload);
-          call = { scopeId, endpoint: 'remoteAccess/follow' as const, args };
-        } else if (frame.endpoint === 'session/control') {
-          const { args } = emptyPayload.parse(frame.payload);
-          call = { scopeId, endpoint: 'session/control' as const, args };
-        } else if (frame.endpoint === 'session/follow') {
-          const authorize = () =>
-            authorizeDEntryNativeInvocation(
-              page.authorize,
-              frame.endpoint,
-              frame.payload,
-              'mux',
-              child,
-            );
-          const initial = await authorize();
-          check = async () => {
-            await page.assertCurrent(child);
-            const next = await authorize();
-            if (
-              next.resource.bindingRef !== initial.resource.bindingRef ||
-              next.resource.parentNativeSessionId !==
-                initial.resource.parentNativeSessionId
-            )
-              throw denied();
-          };
-          // The literal branch and existing strict native invocation codec
-          // establish this input's method/args pair before any guest dispatch.
-          call = {
-            scopeId,
-            endpoint: 'session/follow' as const,
-            args: initial.payload.args,
-          } as Parameters<DEntryPageHandle['scope']['stream']>[0];
+          source = page.scope.stream(
+            {
+              kind: 'events',
+              scopeId,
+              payload: REMOTE_EVENT_STREAM_PAYLOAD,
+            },
+            child,
+          );
         } else {
-          throw denied();
+          const endpoint = DEntryPageUnarySchema.parse(frame.endpoint);
+          const { args } = DEntryPageRpcRequestSchema.shape.payload.parse(
+            frame.payload,
+          );
+          if (!isRemoteJsonValue(args)) throw denied();
+          source = page.scope.streamPage(
+            {
+              kind: 'page',
+              scopeId,
+              endpoint,
+              args: args as Record<string, JsonValue>,
+            },
+            child,
+          );
         }
-        await check();
-        for await (const item of page.scope.stream(call, child)) {
+        for await (const item of source) {
           if (item.scopeId !== scopeId || !isRemoteJsonValue(item.value))
             throw denied();
-          if (frame.endpoint === 'remoteAccess/follow') {
-            const { value } = item;
-            const grants =
-              value.type === 'baseline' && 'owner' in value && !value.owner
-                ? value.grants
-                : value.type === 'upsert' && 'grant' in value
-                  ? [value.grant]
-                  : undefined;
-            if (!grants && value.type !== 'remove') throw denied();
-            const sessionIds = grants?.map(({ resource }) => {
-              if (resource.kind !== 'session') throw denied();
-              return String(resource.id);
-            });
-            // A remove must still reach the client after the child has left
-            // the catalogue. Only frames granting access require child proof.
-            await page.assertCurrent(child, sessionIds);
-          } else if (frame.endpoint === 'session/control') {
-            const control = Native.methods['session/control'].result
-              .create()
-              .parse(item.value);
-            if (control.type === 'baseline') {
-              await page.assertCurrent(
-                child,
-                Object.keys(control.value.projections),
-              );
-            } else {
-              try {
-                await page.assertCurrent(child, [String(control.sessionId)]);
-              } catch (error) {
-                // A child can leave the catalog between guest filtering and
-                // delivery. A failed page/root check also revokes the page.
-                if (
-                  error instanceof DataAccessError &&
-                  error.code === 'not_found' &&
-                  !page.signal.aborted &&
-                  !child.aborted
-                )
-                  continue;
-                throw error;
-              }
-            }
-          } else await check();
+          await page.assertCurrent(child);
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
+        await page.assertCurrent(child);
         child.throwIfAborted();
         await send({ type: 'end', streamId: id });
       })
       .catch(async (error) => {
         if (!child.aborted) {
+          await page.assertCurrent(child);
+          child.throwIfAborted();
           await send({
             type: 'error',
             streamId: id,

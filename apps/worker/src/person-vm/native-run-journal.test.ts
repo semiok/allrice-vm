@@ -406,6 +406,71 @@ it('requires the same attached rc.2 turn and terminal fact as the durable journa
   }
 });
 
+it('attests only a fork’s own physical turn with its registered source', () => {
+  const parentId = SessionId('native-parent');
+  const forkId = SessionId('native-fork');
+  const parent = Session.create(parentId, undefined, {
+    version: SESSION_FORMAT_VERSION,
+    id: parentId,
+    createdAt: 1,
+    isSeeded: false,
+  });
+  const source = { kind: 'user' as const, rpcId: selection.nativeRequestId };
+  const prefix = appendTurn(parent, 1, source, true);
+  const seed = buildForkSeed(prefix, SessionSeq(prefix.length - 1));
+  const fork = Session.create(
+    forkId,
+    seed,
+    {
+      ...parent.header,
+      id: forkId,
+      isSeeded: true,
+      parentSession: parentId,
+    },
+    SessionLogOffset(prefix.length),
+  );
+  const own = appendTurn(fork, 2, source, true);
+  const observed = {
+    header: fork.header,
+    events: [...seed, ...own],
+    inheritedEventCount: prefix.length,
+  };
+  const actual = {
+    ...selection,
+    sessionId: forkId,
+    turn: 2,
+    cursor: own[2]!.seq,
+  };
+  expect(
+    findDEntryNativeRunTerminal(
+      { ...actual, forkedFromNativeSessionId: parentId },
+      observed,
+    ),
+  ).toMatchObject({
+    sessionId: forkId,
+    turn: 2,
+    sequence: own.at(-1)!.seq,
+  });
+  expect(findDEntryNativeRunTerminal(actual, observed)).toBeNull();
+  expect(
+    findDEntryNativeRunTerminal(
+      { ...actual, forkedFromNativeSessionId: 'unregistered-parent' },
+      observed,
+    ),
+  ).toBeNull();
+  expect(
+    findDEntryNativeRunTerminal(
+      {
+        ...actual,
+        forkedFromNativeSessionId: parentId,
+        turn: 1,
+        cursor: prefix[2]!.seq,
+      },
+      observed,
+    ),
+  ).toBeNull();
+});
+
 it('matches a derived turn only inside its physical child or root-wake bracket', async () => {
   const root = await mkdtemp(
     join(tmpdir(), 'allrice-d-entry-derived-journal-'),

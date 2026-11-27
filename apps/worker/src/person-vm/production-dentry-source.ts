@@ -159,7 +159,14 @@ export function installProductionDEntrySource(input: {
         return AbortSignal.any([current.signal, proof, group]);
       });
     },
-    resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
+    resolveAdmissionOwner({
+      context,
+      identity,
+      owner,
+      operationId,
+      signal,
+      access,
+    }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
         if (
@@ -169,7 +176,7 @@ export function installProductionDEntrySource(input: {
           identity.organizationId !== binding.organizationId ||
           context.organizationId !== binding.organizationId ||
           context.workspaceId !== identity.workspaceId ||
-          !identity.threadId
+          (!identity.threadId && access !== 'page')
         )
           denied();
         const scope = structuredClone(context);

@@ -69,6 +69,16 @@ function turnEnd(sessionId, event, turn) {
 
 /** Project only a contiguous physical journal returned by native
  * sessionPersistence. session-query can synthesize a cold interrupted tail. */
+export function isNativeForkHeader(header) {
+  return (
+    header.origin === undefined &&
+    header.isSeeded === true &&
+    typeof header.parentSession === 'string' &&
+    header.parentSession.length > 0 &&
+    header.parentSession !== header.id
+  );
+}
+
 export function findDEntryNativeRunTerminal(
   {
     sessionId,
@@ -78,6 +88,7 @@ export function findDEntryNativeRunTerminal(
     purpose,
     delegated = false,
     parentSessionId = null,
+    forkedFromNativeSessionId,
   },
   { header, events, inheritedEventCount },
   witnessedStartSequence,
@@ -85,13 +96,18 @@ export function findDEntryNativeRunTerminal(
   const cursor = events[index];
   const child = parentSessionId !== null;
   const matchingHeader = child
-    ? delegated &&
+    ? forkedFromNativeSessionId === undefined &&
+      delegated &&
       header.origin === 'subagent' &&
       header.parentSession === parentSessionId
-    : !header.isSeeded &&
-      header.parentSession === undefined &&
-      header.origin === undefined &&
-      inheritedEventCount === 0;
+    : forkedFromNativeSessionId !== undefined
+      ? isNativeForkHeader(header) &&
+        header.parentSession === forkedFromNativeSessionId &&
+        inheritedEventCount > 0
+      : !header.isSeeded &&
+        header.parentSession === undefined &&
+        header.origin === undefined &&
+        inheritedEventCount === 0;
   if (
     sessionId !== header.id ||
     !matchingHeader ||
@@ -110,7 +126,11 @@ export function findDEntryNativeRunTerminal(
     if (!Array.isArray(seqs)) return null;
     const matching = new Set();
     for (const seq of seqs) {
-      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= cursor.seq)
+      if (
+        !Number.isSafeInteger(seq) ||
+        seq < inheritedEventCount ||
+        seq >= cursor.seq
+      )
         return null;
       const message = events[seq];
       if (message?.seq !== seq) return null;
@@ -192,6 +212,7 @@ export async function readPersistedRunTerminal(
     turn,
     delegated = false,
     parentSessionId = null,
+    forkedFromNativeSessionId,
   } = selection;
   if (
     typeof sessionId !== 'string' ||
@@ -204,6 +225,12 @@ export async function readPersistedRunTerminal(
     cursor < 0 ||
     !(turn === null || Number.isSafeInteger(turn)) ||
     typeof delegated !== 'boolean' ||
+    (forkedFromNativeSessionId !== undefined &&
+      (parentSessionId !== null ||
+        typeof forkedFromNativeSessionId !== 'string' ||
+        !forkedFromNativeSessionId.length ||
+        forkedFromNativeSessionId.length > 256 ||
+        forkedFromNativeSessionId === sessionId)) ||
     (parentSessionId !== null &&
       (!delegated ||
         typeof parentSessionId !== 'string' ||
@@ -341,11 +368,19 @@ export function createNativeRunTerminalAttestations() {
       if (receipts.size > 2048) receipts.delete(receipts.keys().next().value);
     },
     async read(currentSession, persistence, selection, active) {
-      const { sessionId, turn, cursor, purpose, parentSessionId } = selection;
+      const {
+        sessionId,
+        turn,
+        cursor,
+        purpose,
+        parentSessionId,
+        forkedFromNativeSessionId,
+      } = selection;
       const state = sessions.get(sessionId);
       if (
         !state ||
-        state.parentSessionId !== (parentSessionId ?? null) ||
+        state.parentSessionId !==
+          (parentSessionId ?? forkedFromNativeSessionId ?? null) ||
         !Number.isSafeInteger(turn) ||
         turn < 1 ||
         (purpose !== 'assistant' && purpose !== 'compaction')

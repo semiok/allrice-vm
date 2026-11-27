@@ -34,8 +34,17 @@ export type DEntryPrincipalIssue = Readonly<{
     nativeSessionId: string;
     rootOriginDigest: string;
     rootBindingRef: string;
+    forkedFromNativeSessionId?: string;
   }>;
 }>;
+export type DEntryScopeIssue =
+  | DEntryPrincipalIssue
+  | Readonly<{
+      scopeId: string;
+      identity: DEntryIdentity;
+      access: 'page';
+      root?: DEntryPrincipalIssue['root'];
+    }>;
 export type CloseCommand = 'close';
 export type NonOwnerBaseline = Extract<RemoteAccessBaseline, { owner: false }>;
 export type ScopeFrame =
@@ -82,6 +91,21 @@ export type DEntryScopedUnaryResult = {
     value: OutputOf<NativeMethods[E]>;
   }>;
 }[NativeUnary];
+export type DEntryPageNativeCall = Readonly<{
+  kind: 'page';
+  scopeId: string;
+  endpoint: string;
+  args: Readonly<Record<string, JsonValue>>;
+}>;
+export type DEntryPageNativeResult = Readonly<{
+  kind: 'page';
+  endpoint: string;
+  value?: JsonValue;
+  attachments: readonly Readonly<{
+    path: readonly (string | number)[];
+    bytes: Uint8Array;
+  }>[];
+}>;
 export type DEntryScopedStreamCall =
   | Calls<'session/control' | 'session/follow'>
   | Readonly<{
@@ -111,6 +135,16 @@ export type DEntryScopedStreamFrame =
         | ScopedEventFrame;
     }>;
 type StreamItem = Extract<DEntryScopedStreamFrame, { type: 'item' }>;
+export type DEntryPageNativeItem = Readonly<{
+  type: 'page-item';
+  scopeId: string;
+  value: JsonValue;
+}>;
+export type DEntryPageNativeError = Readonly<{
+  type: 'page-error';
+  scopeId: string;
+  error: Readonly<{ code: string; message: string; details: JsonValue }>;
+}>;
 export type DEntryPrincipalStream = AsyncIterable<StreamItem> & {
   close(): Promise<void>;
 };
@@ -121,6 +155,10 @@ export interface DEntryPrincipalControlScope {
     call: DEntryScopedUnaryCall,
     signal: AbortSignal,
   ): Promise<DEntryScopedUnaryResult>;
+  invokePage(
+    call: DEntryPageNativeCall,
+    signal: AbortSignal,
+  ): Promise<DEntryPageNativeResult>;
   stream(
     call: DEntryScopedStreamCall,
     signal: AbortSignal,
@@ -129,6 +167,10 @@ export interface DEntryPrincipalControlScope {
       terminal(): void;
     },
   ): DEntryPrincipalStream;
+  streamPage(
+    call: DEntryPageNativeCall,
+    signal: AbortSignal,
+  ): AsyncIterable<DEntryPageNativeItem>;
   close(): Promise<void>;
 }
 export interface DEntryPrincipalActivity {
@@ -137,7 +179,7 @@ export interface DEntryPrincipalActivity {
 }
 export type PrincipalClientContext = Context;
 
-export const DEntryPrincipalIssueSchema = z
+const scopeSchema = z
   .object({
     scopeId: UuidSchema,
     identity: DEntryIdentitySchema,
@@ -147,7 +189,16 @@ export const DEntryPrincipalIssueSchema = z
         nativeSessionId: z.string().min(1),
         rootOriginDigest: z.string().min(1),
         rootBindingRef: z.string().min(1),
+        forkedFromNativeSessionId: z.string().min(1).optional(),
       })
       .strict(),
   })
   .strict();
+export const DEntryPrincipalIssueSchema = scopeSchema;
+export const DEntryScopeIssueSchema = z.union([
+  scopeSchema,
+  scopeSchema.extend({
+    access: z.literal('page'),
+    root: scopeSchema.shape.root.optional(),
+  }),
+]);

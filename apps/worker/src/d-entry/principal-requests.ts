@@ -8,6 +8,8 @@ import {
 import {
   DataAccessError,
   getDEntryHistoryRootPin,
+  getDEntryPageNativeRoot,
+  registerDEntryPageNativeRoot,
   resolveDEntryIdentity,
   runDEntryAdmittedActivity,
   type DEntryHistoryRootPin,
@@ -30,6 +32,10 @@ type Selection = { organizationId: string; selection: DEntrySelectionInput };
 export type DEntryPageDependencies = DEntryHttpDependencies & {
   historyIdentity: typeof resolveDEntryIdentity;
   historyRoot: typeof getDEntryHistoryRootPin;
+} & Partial<typeof pageRootStore>;
+const pageRootStore = {
+  findRoot: getDEntryPageNativeRoot,
+  registerRoot: registerDEntryPageNativeRoot,
 };
 export const dEntryPageHistory = {
   historyIdentity: resolveDEntryIdentity,
@@ -58,11 +64,17 @@ export type DEntryPageHandle = Readonly<{
   bindingRef: string;
   fixedProfile?: DEntryFixedProfileSource;
   identity: DEntryIdentity;
-  root: DEntryHistoryRootPin;
+  root: DEntryHistoryRootPin | null;
   signal: AbortSignal;
-  assertCurrent(
+  assertCurrent(signal: AbortSignal): Promise<void>;
+  canReuseNativeSession(
+    nativeSessionId: string,
     signal: AbortSignal,
-    nativeSessionIds?: readonly string[],
+  ): Promise<boolean>;
+  registerNativeSession(
+    nativeSessionId: string,
+    forkedFrom: string | undefined,
+    signal: AbortSignal,
   ): Promise<void>;
   authorize(
     nativeSessionId: string,
@@ -135,12 +147,12 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
     const original = await history(token, input, signal);
-    if (!input.selection.threadId) throw new DEntryNativeUnavailable();
-    const existing = await deps.historyRoot(original.context, input.selection);
+    const existing = input.selection.threadId
+      ? await deps.historyRoot(original.context, input.selection)
+      : null;
     signal.throwIfAborted();
     const data = deps.data();
-    if (!data || (!existing && !data.prepareEditorRoot))
-      throw new DEntryNativeUnavailable();
+    if (!data) throw new DEntryNativeUnavailable();
     if (existing && !sameDEntryIdentity(existing.identity, original.identity))
       throw denied();
     const auth = await currentDEntryRequest(deps, token, input, signal);
@@ -172,15 +184,20 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         )
           throw denied();
         await current.owner.assertCurrent(next.context, caller);
-        if (current.owner.bindingRef !== current.view.bindingRef)
+        if (
+          current.owner.bindingRef !== current.view.bindingRef ||
+          !sameDEntryVmBinding(
+            current.owner.receipt.binding,
+            current.view.receipt.binding,
+          )
+        )
           throw denied();
         if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
         caller.throwIfAborted();
         return next.context;
       }
       let root = existing;
-      if (!root) {
-        if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
+      if (!root && input.selection.threadId && data.prepareEditorRoot) {
         root = await data.prepareEditorRoot({
           ...auth,
           owner: current.owner,
@@ -192,14 +209,15 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       }
       const pin = root;
       if (
-        !sameDEntryIdentity(pin.identity, auth.identity) ||
-        pin.vmId !== current.view.receipt.binding.vmId
+        pin &&
+        (!sameDEntryIdentity(pin.identity, auth.identity) ||
+          pin.vmId !== current.view.receipt.binding.vmId)
       )
         throw denied();
       async function assertCurrent(caller: AbortSignal) {
         const next = await assertHost(caller);
-        const root = await deps.root(next, input.selection);
-        if (!sameRoot(root, pin)) throw denied();
+        if (pin && !sameRoot(await deps.root(next, input.selection), pin))
+          throw denied();
         caller.throwIfAborted();
       }
       const operationId = randomUUID();
@@ -208,6 +226,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         owner: current.owner,
         operationId,
         signal: current.signal,
+        access: 'page',
       });
       if (
         owner.operationId !== operationId ||
@@ -289,17 +308,14 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   nativeSessionId: string,
                   effect: 'read' | 'write',
                   active: AbortSignal,
-                  checkGrants?: Parameters<
-                    typeof resolveDEntryNativeResource
-                  >[0]['checkGrants'],
                 ) => {
+                  if (!pin) throw denied();
                   const resource = await resolveDEntryNativeResource({
                     ...auth,
                     owner: catalog.owner,
                     nativeSessionId,
                     signal: active,
                     root: deps.root,
-                    checkGrants,
                   });
                   if (
                     resource.rootNativeSessionId !== pin.rootNativeSessionId ||
@@ -311,19 +327,24 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   return resource;
                 };
                 await assertCurrent(runningSignal);
-                await authorize(pin.rootNativeSessionId, 'read', runningSignal);
                 runningSignal.throwIfAborted();
                 principal = catalog.owner.acquirePrincipal(
                   auth.context,
                   {
                     scopeId,
                     identity: auth.identity,
-                    access: 'execute',
-                    root: {
-                      nativeSessionId: pin.rootNativeSessionId,
-                      rootOriginDigest: pin.rootOriginDigest,
-                      rootBindingRef: pin.rootBindingRef,
-                    },
+                    access: 'page',
+                    ...(pin && {
+                      root: {
+                        nativeSessionId: pin.rootNativeSessionId,
+                        rootOriginDigest: pin.rootOriginDigest,
+                        rootBindingRef: pin.rootBindingRef,
+                        ...(pin.forkedFromNativeSessionId && {
+                          forkedFromNativeSessionId:
+                            pin.forkedFromNativeSessionId,
+                        }),
+                      },
+                    }),
                   },
                   runningSignal,
                 );
@@ -343,7 +364,6 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                 )
                   throw denied();
                 await assertCurrent(runningSignal);
-                await authorize(pin.rootNativeSessionId, 'read', runningSignal);
                 runningSignal.throwIfAborted();
                 const page: DEntryPageHandle = {
                   scope,
@@ -352,29 +372,64 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   identity: auth.identity,
                   root: pin,
                   signal: lifetime,
-                  async assertCurrent(caller, nativeSessionIds) {
+                  async assertCurrent(caller) {
                     const active = AbortSignal.any([lifetime, caller]);
-                    let currentGrants = true;
                     try {
                       await assertCurrent(active);
-                      await authorize(
-                        pin.rootNativeSessionId,
-                        'read',
-                        active,
-                        nativeSessionIds && {
-                          nativeSessionIds,
-                          checked: (current) => {
-                            currentGrants = current;
-                          },
-                        },
-                      );
                     } catch (error) {
                       // A canceled finite request cannot revoke a live page.
                       if (!caller.aborted) invalidate(error);
                       throw error;
                     }
                     active.throwIfAborted();
-                    if (!currentGrants) throw new DataAccessError('not_found');
+                  },
+                  async canReuseNativeSession(nativeSessionId, active) {
+                    await assertCurrent(active);
+                    const binding = current.view.receipt.binding;
+                    const pin = await (deps.findRoot ?? pageRootStore.findRoot)(
+                      auth.context,
+                      auth.identity,
+                      binding.vmId,
+                      nativeSessionId,
+                    );
+                    if (
+                      !pin ||
+                      pin.rootNativeSessionId !== nativeSessionId ||
+                      pin.vmId !== binding.vmId
+                    )
+                      return false;
+                    const sessions = await catalog.owner.readSessions(active);
+                    active.throwIfAborted();
+                    return (
+                      sessions.ok &&
+                      sessions.value.items.some(
+                        (row) =>
+                          row.sessionId === nativeSessionId &&
+                          row.origin !== 'subagent',
+                      )
+                    );
+                  },
+                  async registerNativeSession(
+                    nativeSessionId,
+                    forkedFromNativeSessionId,
+                    active,
+                  ) {
+                    await assertCurrent(active);
+                    await (deps.registerRoot ?? pageRootStore.registerRoot)(
+                      auth.context,
+                      auth.identity,
+                      {
+                        nativeSessionId,
+                        forkedFromNativeSessionId,
+                        host: {
+                          binding: current.view.receipt.binding,
+                          bindingRef: current.view.bindingRef,
+                          rosterDigest: current.view.receipt.rosterDigest,
+                        },
+                      },
+                      active,
+                    );
+                    await assertCurrent(active);
                   },
                   authorize,
                   invalidate,
@@ -463,11 +518,11 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     ) {
       const auth = await history(token, input, signal);
       const data = deps.data();
-      if (!input.selection.threadId || !data)
-        throw new DEntryNativeUnavailable();
-      const root = await deps.historyRoot(auth.context, input.selection);
+      if (!data) throw new DEntryNativeUnavailable();
+      const root =
+        input.selection.threadId &&
+        (await deps.historyRoot(auth.context, input.selection));
       if (!root) {
-        if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
         // Qualification only. Opening the socket alone never creates a root.
         await currentDEntryRequest(deps, token, input, signal);
       }

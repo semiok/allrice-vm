@@ -4,11 +4,19 @@ import type {
   RemoteAccessPolicy,
   RemoteAccessRole,
 } from '@deepseek-ai/dsh-api-remote-access';
-import type { PeerScope } from '@deepseek-ai/dsh-typert-protocol';
+import type {
+  InvocationDescriptor,
+  PeerScope,
+} from '@deepseek-ai/dsh-typert-protocol';
 import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types';
-import type { DEntryPrincipal, DEntryPrincipalIssue } from './types.js';
+import type {
+  DEntryPrincipal,
+  DEntryPrincipalIssue,
+  DEntryScopeIssue,
+} from './types.js';
+import { pageEndpoint, requirePageNativeMethod } from './page-native-method.js';
 
-export { DEntryPrincipalIssueSchema as issueSchema } from './types.js';
+export { DEntryScopeIssueSchema as issueSchema } from './types.js';
 export const readEndpoints = [
   'session/attachment',
   'session/page',
@@ -57,10 +65,43 @@ const writeRole: RemoteAccessRole<'session'> = {
   actions: writeEndpoints,
 };
 export interface Projection {
-  readonly issue: DEntryPrincipalIssue;
+  readonly issue: DEntryScopeIssue;
   readonly parent: PeerScope;
   active: boolean;
   bindings: readonly RemoteAccessBinding[];
+}
+/** Native snapshots still describe a non-owner Peer. Page Session actions
+ * come from the same generated registry and policy as page dispatch. */
+export function projectPageSessions(
+  items: readonly SessionSummary[],
+  descriptors: readonly InvocationDescriptor[],
+): readonly RemoteAccessBinding[] {
+  const actions = descriptors.flatMap((method) => {
+    if (method.namespace !== 'session' && method.namespace !== 'skills')
+      return [];
+    const endpoint = pageEndpoint(method);
+    try {
+      requirePageNativeMethod(
+        { get: () => method },
+        endpoint,
+        method.mode ?? 'unary',
+        {},
+        undefined,
+      );
+      return [endpoint];
+    } catch {
+      return [];
+    }
+  });
+  const role: RemoteAccessRole<'session'> = {
+    name: 'allrice-current-vm-session',
+    resource: 'session',
+    actions,
+  };
+  return items.map(({ sessionId }) => ({
+    role,
+    resource: { kind: 'session', id: sessionId },
+  }));
 }
 export function principalPolicy(
   scopes: ReadonlyMap<string, Projection>,
@@ -91,7 +132,11 @@ export function projectSessions(
   );
   if (entries.size !== items.length) throw Error('PRINCIPAL_CATALOG_INVALID');
   const root = entries.get(issue.root.nativeSessionId);
-  if (!root || root.parentSessionId || root.origin === 'subagent')
+  if (
+    !root ||
+    root.parentSessionId !== issue.root.forkedFromNativeSessionId ||
+    root.origin === 'subagent'
+  )
     throw Error('PRINCIPAL_ROOT_INVALID');
   const bindings: RemoteAccessBinding[] = [];
   for (const entry of items) {

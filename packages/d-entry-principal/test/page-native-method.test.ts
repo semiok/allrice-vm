@@ -72,6 +72,74 @@ it('excludes the private AllRice registry and refuses managed operations before 
   ).toThrow('DSH method is platform managed');
 });
 
+it('allows inventories and ordinary settings through the same native boundary', () => {
+  for (const [namespace, method] of [
+    ['pluginManager', 'listPlugins'],
+    ['pluginInventory', 'list'],
+    ['dynamicCordisRunner', 'inventory'],
+    ['pluginMarket', 'search'],
+    ['settings', 'update'],
+    ['session', 'selectModel'],
+  ]) {
+    const native = descriptor(namespace!, method!);
+    expect(
+      requirePageNativeMethod(
+        { get: () => native },
+        `${namespace}/${method}`,
+        'unary',
+        { ns: 'general' },
+        new Set(['provider']),
+      ),
+    ).toBe(native);
+  }
+});
+
+it('keeps sensitive Host effects and file preview unavailable even when registered', () => {
+  const settings = descriptor('settings', 'update');
+  expect(() =>
+    requirePageNativeMethod(
+      { get: () => settings },
+      'settings/update',
+      'unary',
+      {
+        ns: 'the-profile-market-entry',
+      },
+      new Set(),
+      new Set(['the-profile-market-entry']),
+    ),
+  ).toThrow('DSH method is platform managed');
+  for (const [namespace, method, mode] of [
+    ['account', 'watch', 'stream'],
+    ['remoteAccess', 'pair', 'unary'],
+    ['credentials', 'set', 'unary'],
+    ['settings', 'openSettingsDocument', 'unary'],
+    ['settings', 'replace', 'unary'],
+    ['pluginManager', 'installBundle', 'unary'],
+    ['dynamicCordisRunner', 'settleUserRun', 'unary'],
+    ['pluginMarket', 'setIndexes', 'unary'],
+    ['runtimeUpgrade', 'install', 'unary'],
+    ['terminal', 'attach', 'stream'],
+    ['workspaceFiles', 'changes', 'stream'],
+    ['workspaceFiles', 'readBytes', 'unary'],
+    ['officeToPdf', 'render', 'unary'],
+  ] as const) {
+    const native = descriptor(
+      namespace,
+      method,
+      mode === 'stream' ? { mode } : {},
+    );
+    expect(() =>
+      requirePageNativeMethod(
+        { get: () => native },
+        `${namespace}/${method}`,
+        mode,
+        { ns: 'provider' },
+        new Set(['provider']),
+      ),
+    ).toThrow('DSH method');
+  }
+});
+
 it('retains native attachment bytes and paths, and validates results before returning them', () => {
   const attachment = descriptor('session', 'attachment', {
     result: {

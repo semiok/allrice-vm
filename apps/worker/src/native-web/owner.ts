@@ -14,9 +14,15 @@ import {
   createDEntryPrincipalControl,
   type PrincipalInvocationObservation,
 } from '../d-entry/principal-control.js';
-import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
+import type {
+  DEntryPrincipalIssue,
+  DEntryScopeIssue,
+} from '@allrice/d-entry-principal/types';
 import { UuidSchema, type RequestContext } from '@allrice/contracts';
-import { DEntryNativeTurnEndSchema } from '@allrice/database';
+import {
+  DEntryNativeTurnEndSchema,
+  getDEntryPageNativeRoot,
+} from '@allrice/database';
 import type {
   ModelCatalog,
   SessionFollowFrame,
@@ -725,7 +731,7 @@ export async function openNativeWebOwner(input: {
         );
       },
       acquirePrincipal(
-        issue: DEntryPrincipalIssue,
+        issue: DEntryScopeIssue,
         requestSignal: AbortSignal,
         context?: RequestContext,
       ) {
@@ -736,19 +742,54 @@ export async function openNativeWebOwner(input: {
           AbortSignal.any([requestSignal, signal]),
           async (call, active) => {
             if (
-              !input.beforePrompt ||
-              (call.endpoint !== 'session/prompt' &&
-                call.endpoint !== 'session/updateQueue')
+              call.endpoint !== 'session/prompt' &&
+              call.endpoint !== 'session/updateQueue'
             )
               return;
-            if (
-              !context ||
-              !installedModelAdapter ||
-              call.args.request.sessionId !== issue.root.nativeSessionId
-            )
+            if (!input.beforePrompt) {
+              if (issue.access === 'page')
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              return;
+            }
+            if (!context || !installedModelAdapter)
               throw new PersonVmError('AUTHORIZATION_DENIED');
+            let authorized: DEntryPrincipalIssue;
+            const sessionId = call.args.request.sessionId;
+            if (issue.access === 'page') {
+              const pin = await getDEntryPageNativeRoot(
+                context,
+                issue.identity,
+                binding.vmId,
+                sessionId,
+              );
+              if (
+                !pin ||
+                pin.vmId !== binding.vmId ||
+                pin.rootNativeSessionId !== sessionId
+              )
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              authorized = {
+                scopeId: issue.scopeId,
+                identity: pin.identity,
+                access: 'execute',
+                root: {
+                  nativeSessionId: pin.rootNativeSessionId,
+                  rootBindingRef: pin.rootBindingRef,
+                  rootOriginDigest: pin.rootOriginDigest,
+                  ...(pin.forkedFromNativeSessionId && {
+                    forkedFromNativeSessionId: pin.forkedFromNativeSessionId,
+                  }),
+                },
+              };
+            } else {
+              if (sessionId !== issue.root.nativeSessionId)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              authorized = issue;
+            }
+            await input.vm.assertCurrentBinding(context, binding, active);
+            active.throwIfAborted();
             const adapterId = installedModelAdapter;
-            const write = { binding, adapterId, context, issue };
+            const write = { binding, adapterId, context, issue: authorized };
             if (call.endpoint === 'session/updateQueue')
               return input.beforePrompt(
                 { ...write, endpoint: call.endpoint },
@@ -766,7 +807,7 @@ export async function openNativeWebOwner(input: {
                     transport,
                     {
                       adapterId,
-                      sessionId: issue.root.nativeSessionId,
+                      sessionId,
                       scopeId: issue.scopeId,
                       requestId,
                     },
@@ -1066,6 +1107,7 @@ export async function openNativeWebOwner(input: {
           turn: number | null;
           delegated?: boolean;
           parentSessionId?: string | null;
+          forkedFromNativeSessionId?: string;
         },
         assertCurrent: (active: AbortSignal) => Promise<void>,
         caller: AbortSignal,

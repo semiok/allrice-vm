@@ -51,6 +51,7 @@ type PromptOwner = NativeModelSelection &
     requestId: string;
     adapterId: string;
     root: string;
+    forkedFromNativeSessionId?: string;
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
     assertClaimed(signal: AbortSignal): Promise<void>;
@@ -116,7 +117,11 @@ async function persistExecution(
     employeeInstanceId: identity.employeeInstanceId,
     threadId: call.allriceThreadRef,
   });
-  if (pin.vmId !== vm.vmId || pin.rootNativeSessionId !== native.rootSessionId)
+  if (
+    pin.vmId !== vm.vmId ||
+    pin.rootNativeSessionId !== native.rootSessionId ||
+    pin.forkedFromNativeSessionId !== prompt.forkedFromNativeSessionId
+  )
     return reject();
   const runSource = {
     generation: '4.0',
@@ -130,6 +135,9 @@ async function persistExecution(
     adapterId: prompt.adapterId,
     loginSessionId: context.sessionId,
     nativeRequestId: prompt.requestId,
+    ...(pin.forkedFromNativeSessionId && {
+      forkedFromNativeSessionId: pin.forkedFromNativeSessionId,
+    }),
   };
   const invocation = {
     source: 'dsh-native-attempt',
@@ -535,7 +543,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               root.vmId !== binding.vmId ||
               root.rootNativeSessionId !== issue.root.nativeSessionId ||
               root.rootBindingRef !== issue.root.rootBindingRef ||
-              root.rootOriginDigest !== issue.root.rootOriginDigest
+              root.rootOriginDigest !== issue.root.rootOriginDigest ||
+              root.forkedFromNativeSessionId !==
+                issue.root.forkedFromNativeSessionId
             )
               return reject();
             const authorityKey = JSON.stringify([
@@ -707,6 +717,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 binding,
                 adapterId,
                 root: root.rootNativeSessionId,
+                ...(root.forkedFromNativeSessionId && {
+                  forkedFromNativeSessionId: root.forkedFromNativeSessionId,
+                }),
                 authorityKey,
                 revoked,
                 requestId,
