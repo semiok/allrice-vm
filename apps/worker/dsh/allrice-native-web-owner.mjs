@@ -22,6 +22,8 @@ export const inject = [
   'loader',
   'clientModules',
   'allricePrincipal',
+  'workspaceRegistry',
+  'sessionPersistence',
 ];
 const activeOwners = new WeakMap();
 const cordisOriginal = Symbol.for('cordis.original');
@@ -854,8 +856,14 @@ export function applyNativeWebOwner(
   config,
   registerManagedGatewayAdapter,
 ) {
-  const { artifactPath, nonce, baseUrl, commandMemoryPlugin, modelAdapter } =
-    config;
+  const {
+    artifactPath,
+    nonce,
+    baseUrl,
+    workdir,
+    commandMemoryPlugin,
+    modelAdapter,
+  } = config;
   const { fiber } = ctx;
   const providers = Object.entries(fiber.store ?? {}).map(
     ([name, provider]) => [name, provider.fiber, original(provider.value)],
@@ -869,6 +877,7 @@ export function applyNativeWebOwner(
   let publicationFailure;
   let stagingCleanupFailure;
   let commandMemory;
+  let workspace;
   let registeredModel;
   let modelFiber;
   let published = false;
@@ -883,6 +892,7 @@ export function applyNativeWebOwner(
     value?.artifactPath === artifactPath &&
     value?.nonce === nonce &&
     value?.baseUrl === baseUrl &&
+    value?.workdir === workdir &&
     value?.commandMemoryPlugin === commandMemoryPlugin &&
     JSON.stringify(value?.modelAdapter) === JSON.stringify(modelAdapter);
   const entry = fiber.entry;
@@ -900,6 +910,13 @@ export function applyNativeWebOwner(
     });
   const observed = ctx.allricePrincipal.observeProfileGraph(ctx.clientModules, {
     current,
+    defaultWorkspace: () =>
+      workspace && {
+        path: workspace.path,
+        async ensure() {
+          return (await ctx.workspaceRegistry.create(workdir)).id;
+        },
+      },
     publish() {
       return (publishing = publish().catch((error) => {
         if (error === canceled) return;
@@ -1258,6 +1275,20 @@ export function applyNativeWebOwner(
         return;
       if (!registeredModel)
         throw Error('Native managed model was not installed');
+    }
+    if (!current()) return;
+    publicationStage = 'workspace';
+    workspace = await ctx.workspaceRegistry.create(workdir);
+    // The native registry's first-run import predates sessions created by the
+    // old Worker. Repair membership using this employee Host's own headers.
+    const accounted = new Set(workspace.sessionIds);
+    for (const { header } of await ctx.sessionPersistence.list({ signal })) {
+      if (!current()) return;
+      if (
+        (header.cwd === workdir || header.cwd === workspace.path) &&
+        !accounted.has(header.id)
+      )
+        await workspace.attachSession(header.id);
     }
     if (!current()) return;
     publicationStage = 'mux';
