@@ -224,7 +224,9 @@ suite('R3 four-slice preintegration through the installed workbench', () => {
           exact: true,
         });
         const tab = (name: string) =>
-          page.getByRole('tab', { name: new RegExp(`^${name}(?:，|$)`) });
+          page
+            .getByRole('tab')
+            .filter({ has: page.getByText(name, { exact: true }) });
         const card = (name: string) =>
           page.getByRole('button').filter({
             has: page.locator('strong').getByText(name, { exact: true }),
