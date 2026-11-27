@@ -42,6 +42,8 @@ import {
 import { readDEntryReleasePolicy } from '../d-entry-release-policy.ts';
 import { platformEmployeeModelPolicy } from '../providers/platform-model-settings.ts';
 import { runtimePolicyDigest } from '../runtime-policy-digest.ts';
+import { assertNativeWebEmployeeCapacity } from './native-web-capacity.ts';
+import { readFirstEmployeeLimit } from './d-entry-first-employee-limit.ts';
 import { frozenPackageSkills } from '../skill-bundles.ts';
 import {
   runtimePackageChecksum,
@@ -679,9 +681,11 @@ export class EmployeeInstanceError extends Error {
       | 'instance_conflict'
       | 'instance_archived'
       | 'default_protected'
-      | 'd_entry_first_employee_limit',
+      | 'd_entry_first_employee_limit'
+      | 'employee_port_slots_full',
+    message: string = code,
   ) {
-    super(code);
+    super(message);
   }
 }
 
@@ -939,14 +943,7 @@ export async function hasExistingDEntryEmployeeOrVm(
   context: RequestContext,
   sql: Sql = getDatabase(),
 ) {
-  const personId = actorId(context);
-  const [row] = await sql<{ blocked: boolean }[]>`select
-    exists(select 1 from allrice_employee_instances where owner_id=${personId})
-    or exists(select 1 from allrice_employee_assignments where user_id=${personId} and active)
-    or exists(select 1 from person_virtual_machines
-      where person_id=${personId} and (phase<>'deleted' or disk_retained))
-    as blocked`;
-  return row?.blocked !== false;
+  return readFirstEmployeeLimit(sql, actorId(context));
 }
 
 export async function createEmployeeInstance(
@@ -1003,13 +1000,15 @@ export async function createEmployeeInstance(
         await tx`select response from allrice_employee_instance_revisions where instance_id=${prior.id} and revision=1`;
       return EmployeeInstanceSchema.parse(saved?.response);
     }
-    // A verified assignment already counts as an existing employee. Only the
-    // unassigned path can admit a new 4.0 employee, under its person row lock.
-    if (
-      released &&
-      (existingAssignment || (await hasExistingDEntryEmployeeOrVm(scope, tx)))
-    )
-      throw new EmployeeInstanceError('d_entry_first_employee_limit');
+    if (released) {
+      // Only the unassigned path can admit a first 4.0 employee.
+      if (
+        existingAssignment ||
+        (await hasExistingDEntryEmployeeOrVm(scope, tx))
+      )
+        throw new EmployeeInstanceError('d_entry_first_employee_limit');
+      await assertNativeWebEmployeeCapacity(scope, tx);
+    }
     const id = randomUUID();
     const current = assigned
       ? existingAssignment!
@@ -1290,8 +1289,19 @@ export async function changeEmployeeInstanceLifecycle(
     id = UuidSchema.parse(idInput),
     context = { ...contextInput, workspaceId: value.workspaceId };
   return employeeAccessTransaction(getDatabase(), async (tx) => {
-    await authority(context, tx, true);
+    await authority(
+      context,
+      tx,
+      value.operation === 'restore' ? 'update_user' : true,
+    );
     const before = await getEmployeeInstanceForHistory(context, id, tx);
+    const restoresNativeEmployee =
+      value.operation === 'restore' &&
+      before.archivedAt !== null &&
+      hasDEntryPersonRelease(await readDEntryReleasePolicy(tx, true), {
+        organizationId: context.organizationId,
+        personId: actorId(context),
+      });
     await assignment(context, before.assignmentId, tx, true);
     const [row] = await tx<
       InstanceRow[]
@@ -1309,6 +1319,8 @@ export async function changeEmployeeInstanceLifecycle(
     }
     if (!row || row.revision !== value.expectedRevision)
       throw new EmployeeInstanceError('instance_conflict');
+    if (restoresNativeEmployee)
+      await assertNativeWebEmployeeCapacity(context, tx);
     const revision = row.revision + 1;
     let profile = row.profile;
     if (value.operation === 'restore') {

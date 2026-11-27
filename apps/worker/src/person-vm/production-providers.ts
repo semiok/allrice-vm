@@ -52,6 +52,7 @@ export async function createProductionPersonVmProviders(signal: AbortSignal) {
   const native = new MicrosandboxPersonVm({
     ...nativeConfiguration,
     memoryMiB: loaded.platform.memoryMiB,
+    employeePortSlots: loaded.platform.employeePortSlots,
     seededPublicCache: poolPlatform?.hasSeededPublicCache.bind(poolPlatform),
     refreshBoundPublicCache:
       poolPlatform?.refreshBoundPublicCache.bind(poolPlatform),

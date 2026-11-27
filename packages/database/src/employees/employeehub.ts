@@ -8,6 +8,7 @@ import {
   freezeEmployeePersonaDocuments,
   assertFrozenEmployeePersona,
 } from './employee-documents.ts';
+import { captureNativeWebRosterChange } from './native-web-capacity.ts';
 import { isBaseRiceInstance } from './employee-instance-policy.ts';
 import { freezeConnectedLocalToolNames } from './local-tool-qualification.ts';
 import { readChatNativeRootOrigin } from '../conversation/native-session-binding.ts';
@@ -28,6 +29,7 @@ import { freezeManagedPythonBinding } from './managed-python-binding.ts';
 import { freezeManagedPdfBinding } from './managed-pdf-binding.ts';
 import {
   isPlatformAdmin,
+  requireCurrentPlatformAdmin,
   requirePlatformAdmin,
 } from '../platform-authority.ts';
 import { runtimeFeatureEnabled } from '@allrice/contracts';
@@ -308,6 +310,15 @@ async function requireEmployeeAdmin(
 ) {
   await resolveWorkspaceId(context, workspaceId);
   return requirePlatformAdmin(context);
+}
+
+async function recheckEmployeeAssignmentWriter(
+  context: RequestContext,
+  workspaceId: string,
+  tx: TransactionSql,
+) {
+  await resolveWorkspaceId(context, workspaceId, tx);
+  await requireCurrentPlatformAdmin(context, tx, false);
 }
 
 function runtimePolicy(manifest: EmployeeManifest) {
@@ -602,6 +613,20 @@ export async function createEmployee(context: RequestContext, input: unknown) {
     if (creation.skillVersionIds.length > 0) {
       throw new EmployeeHubError('skill_not_installed');
     }
+    const checkRoster = await captureNativeWebRosterChange(
+      transaction,
+      {
+        organizationId: context.organizationId,
+        workspaceId,
+        personIds: [actorId],
+      },
+      {
+        lockBeforeRead: true,
+        whenEnabled: true,
+        recheckWriter: () =>
+          recheckEmployeeAssignmentWriter(context, workspaceId, transaction),
+      },
+    );
     const employees = await transaction<{ id: string }[]>`
       insert into allrice_employees (
         organization_id, workspace_id, employee_key, name
@@ -635,6 +660,7 @@ export async function createEmployee(context: RequestContext, input: unknown) {
         ${actorId}, false, true, ${actorId}
       )
     `;
+    await checkRoster({ employeeId: createdId });
     await notifyNativeRosterInsert(
       transaction,
       'allrice_employee_assignments',
@@ -894,20 +920,43 @@ export async function manageEmployeeAssignments(
     if (employee.employee_key === riceEmployeeKey) {
       throw new EmployeeHubError('default_protected');
     }
+    const grantedPeople = new Set<string>();
     if (userIds.length > 0) {
-      const members = await transaction<{ user_id: string }[]>`
-        select distinct user_id
-        from allrice_memberships
-        where organization_id = ${context.organizationId}
-          and (workspace_id is null or workspace_id = ${workspaceId})
-          and active and user_id in ${transaction(userIds)}
+      const members = await transaction<
+        { user_id: string; already_active: boolean }[]
+      >`
+        select distinct m.user_id, exists (
+          select 1 from allrice_employee_assignments a
+          where a.organization_id=m.organization_id and a.workspace_id=${workspaceId}
+            and a.user_id=m.user_id and a.employee_id=${employee.id} and a.active
+        ) as already_active
+        from allrice_memberships m
+        where m.organization_id = ${context.organizationId}
+          and (m.workspace_id is null or m.workspace_id = ${workspaceId})
+          and m.active and m.user_id in ${transaction(userIds)}
       `;
       if (
         new Set(members.map((member) => member.user_id)).size !== userIds.length
       ) {
         throw new EmployeeHubError('assignment_invalid');
       }
+      for (const member of members)
+        if (!member.already_active) grantedPeople.add(member.user_id);
     }
+    const checkRoster = await captureNativeWebRosterChange(
+      transaction,
+      {
+        organizationId: context.organizationId,
+        workspaceId,
+        personIds: [...grantedPeople],
+      },
+      {
+        lockBeforeRead: true,
+        whenEnabled: true,
+        recheckWriter: () =>
+          recheckEmployeeAssignmentWriter(context, workspaceId, transaction),
+      },
+    );
     const removedDefaults =
       userIds.length === 0
         ? await transaction<{ user_id: string }[]>`
@@ -957,6 +1006,7 @@ export async function manageEmployeeAssignments(
       `;
       if (assigned) affectedPeople.push(assigned.user_id);
     }
+    await checkRoster({ employeeId: employee.id, grantedPeople });
     await notifyNativeRosterInserts(
       transaction,
       'allrice_employee_assignments',
@@ -1027,8 +1077,10 @@ export async function updateEmployeeStatus(
   const sql = getDatabase();
   await employeeAccessTransaction(sql, async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
-    const employees = await transaction<{ id: string; employee_key: string }[]>`
-      select id, employee_key from allrice_employees
+    const employees = await transaction<
+      { id: string; employee_key: string; status: string }[]
+    >`
+      select id, employee_key, status from allrice_employees
       where id = ${employeeId}
         and organization_id = ${context.organizationId}
         and workspace_id = ${workspaceId}
@@ -1042,10 +1094,38 @@ export async function updateEmployeeStatus(
     ) {
       throw new EmployeeHubError('default_protected');
     }
+    const affected =
+      update.status === 'active' && employee.status !== 'active'
+        ? await transaction<{ user_id: string }[]>`
+          select user_id from allrice_employee_assignments
+          where organization_id=${context.organizationId} and workspace_id=${workspaceId}
+            and employee_id=${employee.id} and active`
+        : [];
+    const checkRoster = affected.length
+      ? await captureNativeWebRosterChange(
+          transaction,
+          {
+            organizationId: context.organizationId,
+            workspaceId,
+            personIds: affected.map(({ user_id }) => user_id),
+          },
+          {
+            lockBeforeRead: true,
+            whenEnabled: true,
+            recheckWriter: () =>
+              recheckEmployeeAssignmentWriter(
+                context,
+                workspaceId,
+                transaction,
+              ),
+          },
+        )
+      : undefined;
     await transaction`
       update allrice_employees set status = ${update.status}, updated_at = now()
       where id = ${employee.id}
     `;
+    await checkRoster?.({ employeeId: employee.id });
     if (update.status === 'archived') {
       await transaction`update allrice_platform_employee_tenant_assignments
         set active=false,is_default=false,updated_at=clock_timestamp()

@@ -127,6 +127,7 @@ suite(
       for (const name of [
         '0247_person_virtual_machines.sql',
         '0250_person_vm_admission.sql',
+        '0259_person_vm_verified_web_slot_capacity.sql',
       ])
         await db.unsafe(
           await readFile(

@@ -36,6 +36,7 @@ export interface DEntryNativeDataPort {
     context: RequestContext,
     identity: DEntryIdentity,
     signal: AbortSignal,
+    expectedBinding?: PersonVmBinding,
   ): Promise<AbortSignal>;
   confirmVerifiedEditor?(
     context: RequestContext,
