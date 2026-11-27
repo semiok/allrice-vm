@@ -214,10 +214,8 @@ const configuration = z
         idleStopEnabled: z.boolean().optional(),
         idleMs: z
           .unknown()
-          .optional()
-          .transform((value) =>
-            value === undefined ? undefined : platformSetting('idleMs', value),
-          ),
+          .transform((value) => platformSetting('idleMs', value))
+          .optional(),
         idleSampleIntervalMs: z
           .number()
           .int()

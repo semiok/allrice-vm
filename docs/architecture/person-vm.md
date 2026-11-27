@@ -31,7 +31,7 @@ v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个
 
 **保守自动停机默认关闭。** 启用后，宿主每 60 秒采样当前 VM 的全部员工。持续看到空闲、没有漏采且未收到忙碌事件，才进入同一物理租约下的唤醒准备与停机。采样间隔可用 `lifecycle.idleSampleIntervalMs` 调整。原生读失败、漏采、Worker 重启或代次变化均重新计时。部分瞬态工作可在采样间发生。最后一次负向读取至原生停机之间也可能出现尚未被宿主观察到的工作。下一次定时触发落入停机预算与 `lifecycle.idleScheduleSafetyMarginMs` 的合计窗口时保留运行，默认安全余量为 30 秒。普通停机、删除和接管仍沿用各自的活动、租约和权限校验。
 
-内存和闲置时长从已封存的 `person-vm-host.json` 读取。内存使用 `memory.policy.physicalBytes`（整数 MiB 对应的字节数，1–4 GiB），闲置时长使用 `lifecycle.idleMs`（毫秒，5–60 分钟）。缺项使用 2 GiB、20 分钟。非法字段独立回落，并在 Worker 日志记录字段和默认值。配置随 Host 启动加载，已有 VM 改变内存上限需要配置 `lifecycle.hostVmBudgetMiB`，并在下一次启动时走既有的容量预留和原生配置读回。
+在 `~/allrice40-dev/config/person-vm-host.json` 设置内存和闲置时长，随常规发布重新封存，由 Worker 启动时读取。内存使用 `memory.policy.physicalBytes`（整数 MiB 对应的字节数，1–4 GiB），闲置时长使用 `lifecycle.idleMs`（毫秒，5–60 分钟）。缺项使用 2 GiB、20 分钟。非法字段独立回落，并在 Worker 日志记录字段和默认值。配置随 Host 启动加载，已有 VM 改变内存上限需要配置 `lifecycle.hostVmBudgetMiB`，并在下一次启动时走既有的容量预留和原生配置读回。
 
 仅 native 已真实 stopped/absent 时，可对账后清理并从确认的 stoppedAt 计算7天转冷。刚确认停止不能因旧 lastActivityAt 立即冷。自己本次启动失败的清理仍撤出口、尝试物理stop、确认后detach。权限撤销强制终止是另片已批需求，不作为普通 idle 回收证明。长周期测试只用时间夹具，未实等20min/7day；不做 Full 快照、不自动删盘。
 
