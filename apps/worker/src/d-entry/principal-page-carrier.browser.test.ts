@@ -15,8 +15,6 @@ import {
   fixture,
   buildProfileFixture,
   closes,
-  closePage,
-  open,
   sessionToken,
 } from './principal-page-carrier.fixture.js';
 
