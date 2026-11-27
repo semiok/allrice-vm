@@ -33,6 +33,7 @@ export type NativeWebConfiguration = Readonly<{
   workdir: string;
   cliPath: string;
   startupTimeoutMs: number;
+  terminalEnabled?: boolean;
   principalProfile: Pick<
     DEntryIdentity,
     | 'workspaceId'
@@ -212,12 +213,19 @@ export async function prepareNativeWebLaunch(
               path: modelOwner,
               mode: 0o600,
               contents: `import { applyNativeWebOwner } from './owner.mjs';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { registerManagedGatewayAdapter } from './model-gateway/dsh-provider.js';
 import { apply as applyManagedSearch, observeManagedSearchCalls } from './allrice-managed-web-search.mjs';
 export { inject, name } from './owner.mjs';
 export function apply(ctx, config) {
   return applyNativeWebOwner(ctx, config, registerManagedGatewayAdapter, {
-    applyManagedSearch, observeManagedSearchCalls,
+    async applyManagedSearch(scope, settings) {
+      const require = createRequire(settings.cliPath);
+      const { WebError } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-web')).href);
+      return applyManagedSearch(scope, settings, WebError);
+    },
+    observeManagedSearchCalls,
   });
 }
 `,
@@ -276,6 +284,12 @@ export function apply(ctx, config) {
               },
             ],
           },
+          ...(config.terminalEnabled === false
+            ? [
+                { id: 'terminal-controller', disabled: true },
+                { id: 'ui-sidebar-terminal', disabled: true },
+              ]
+            : []),
           ...(commandMemory ?? []),
           ...(modelAdapter
             ? [

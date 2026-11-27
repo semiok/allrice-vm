@@ -71,14 +71,11 @@ the native title, subagent catalog and sidebar corner remain intact. Mobile
 uses the same four Start cards, while desktop launchers remain visible. Native
 title ellipsis and narrow/fullscreen pane behavior retain their owners.
 
-The employee profile disables both `ui-sidebar-terminal` and the separate Host
-`terminal-controller`, so interactive terminals are closed at the server as
-well as absent from Start. This does not disable Agent shell tools or change
-their permissions. There is no developer-role authority in this composition
-to re-enable the terminal service. Any future debug opt-in must use the
-authenticated owner's existing permission contract; a browser preference alone
-cannot grant it. This profile does not establish denial by the active 3.x
-workbench-terminal endpoints or the authenticated MET-271 Host.
+The employee profile includes DSH's native terminal controller and sidebar.
+The sealed Host setting `web.terminalEnabled` defaults to true. Setting it to
+false removes both contributions in the release profile and the running guest.
+The page carrier serves terminal input and output through the current employee
+VM's native stream, with the same ownership checks used for other page methods.
 
 Panels props are derived from actual app `ComponentProps` in
 `src/employee-panels-port.ts`. That is a **monorepo source type boundary**, not a

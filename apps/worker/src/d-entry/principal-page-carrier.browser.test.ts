@@ -3,8 +3,11 @@ import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { extname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { chromium, type Page } from 'playwright-core';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import {
   type DEntryPageOpenedSchema,
   DEntryProfileGraphSchema,
@@ -24,10 +27,10 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable)(
-  'enables the rc.2 composer via the scoped session list and control, with Cordis inspection still closed',
+it.skipIf(!browserExecutable).each([false, true])(
+  'boots the rc.2 composer or reports a stalled application body (stall=%s)',
   { timeout: 60_000 },
-  async () => {
+  async (stall) => {
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -39,6 +42,46 @@ it.skipIf(!browserExecutable)(
       '.wasm': 'application/wasm',
     };
     const f = await fixture(release);
+    const fromComposition = createRequire(
+      new URL(
+        '../../../../packages/dsh-web-composition/package.json',
+        import.meta.url,
+      ),
+    );
+    const fromCli = createRequire(
+      fromComposition.resolve('@deepseek-ai/dsh/package.json'),
+    );
+    const runnerModule = '@deepseek-ai/dsh-cordis-host-runner';
+    const { default: CordisRunner } = await import(
+      pathToFileURL(fromCli.resolve(runnerModule)).href
+    );
+    const { TYPERT } = await import(
+      pathToFileURL(fromCli.resolve(`${runnerModule}/typert`)).href
+    );
+    await f.host.host.plugin(SystemPrompt);
+    await f.host.host.plugin(ToolRuntime);
+    await f.host.host.plugin(CordisRunner);
+    f.host.host.typert.register(TYPERT);
+    const runner = f.host.host.get('dynamicCordisRunner');
+    if (!runner) throw Error('The native Cordis runner did not start');
+    const { pluginId, packageId } = runner.define({
+      sessionId: 'other',
+      plugin: { kind: 'new', idPrefix: 'fixt' },
+      name: 'Fixture Cordis package',
+      purpose: 'Read-only inventory test',
+      code: { host: 'return { name: "fixture-host" }' },
+    });
+    const blockedMethods = [
+      'runHostHalf',
+      'resolveRequestRun',
+      'settleUserRun',
+    ] as const;
+    const blockedHandlers = blockedMethods.map((method) =>
+      vi.spyOn(CordisRunner.prototype, method),
+    );
+    closes.push(async () =>
+      blockedHandlers.forEach((handler) => handler.mockRestore()),
+    );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       String(row.sessionId) === 'root'
         ? { ...row, blank: true, cwd: '/work' }
@@ -46,8 +89,17 @@ it.skipIf(!browserExecutable)(
     );
     const life = await open(f);
     const unary: string[] = [];
-    const listRead: unknown[] = [];
+    const startupReplies = new Map<string, unknown>();
+    const startupMethods = new Set([
+      'session/list',
+      'dynamicCordisRunner/inventory',
+      'dynamicCordisRunner/syncInspectManifest',
+    ]);
     const graph = DEntryProfileGraphSchema.parse(release.graph);
+    const application = graph.batches.find(
+      ({ phase }) => phase === 'application',
+    )!;
+    let applicationReads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -64,19 +116,32 @@ it.skipIf(!browserExecutable)(
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
-          if (input.endpoint === 'session/list')
-            listRead.push((await result.clone().json()).result);
+          if (startupMethods.has(input.endpoint))
+            startupReplies.set(
+              input.endpoint,
+              (await result.clone().json()).result,
+            );
           return await copy(result);
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
-          if (url.pathname === '/api/v1/d-entry/profile/' + kind)
-            return await copy(
-              await f.publish(
-                kind,
-                life.scopeId,
-                Object.fromEntries(url.searchParams),
-              ),
-            );
+          if (url.pathname !== '/api/v1/d-entry/profile/' + kind) continue;
+          if (
+            stall &&
+            kind === 'assets' &&
+            url.searchParams.get('reference') === application.url
+          ) {
+            applicationReads++;
+            response.writeHead(200, { 'content-type': 'text/javascript' });
+            response.write('/* deliberately incomplete application');
+            return;
+          }
+          return await copy(
+            await f.publish(
+              kind,
+              life.scopeId,
+              Object.fromEntries(url.searchParams),
+            ),
+          );
         }
         if (staticFiles.has(url.pathname)) {
           const asset = await readFile(
@@ -179,7 +244,31 @@ it.skipIf(!browserExecutable)(
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
       });
     });
+    if (stall) {
+      await page.clock.install();
+      await page.addInitScript(() => {
+        if (window.parent !== window) return;
+        window.addEventListener('message', (event) => {
+          if (
+            event.origin === location.origin &&
+            event.data?.reason === 'asset-timeout'
+          )
+            document.documentElement.dataset.assetTimeout = event.data.reason;
+        });
+      });
+    }
     await page.goto(f.origin);
+    if (stall) {
+      await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
+      await page.clock.fastForward(30_100);
+      await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(2);
+      await page.clock.fastForward(30_100);
+      await page.locator('html[data-asset-timeout="asset-timeout"]').waitFor();
+      expect(applicationReads).toBe(2);
+      expect(unary).not.toContain('session/list');
+      await context.close();
+      return;
+    }
     const workbench = page.frameLocator('iframe');
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
@@ -192,7 +281,7 @@ it.skipIf(!browserExecutable)(
           unary,
           streamEndpoints: [...streams.values()],
           firstItems,
-          listRead,
+          startupReplies: Object.fromEntries(startupReplies),
           errors,
           text: (await workbench.locator('body').innerText()).slice(0, 300),
         }),
@@ -208,9 +297,75 @@ it.skipIf(!browserExecutable)(
           'session/follow:snapshot',
         ]),
       );
-    expect(unary).toContain('session/list');
-    expect(unary).not.toContain('dynamicCordisRunner/inventory');
-    expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
+    expect(startupReplies.get('session/list')).toMatchObject({
+      ok: true,
+      value: {
+        items: expect.arrayContaining([
+          expect.objectContaining({ sessionId: 'root', blank: true }),
+        ]),
+      },
+    });
+    await expect
+      .poll(() => startupReplies.get('dynamicCordisRunner/inventory'))
+      .toMatchObject({
+        ok: true,
+        value: [
+          {
+            pluginId,
+            agentId: 'other',
+            packages: [{ packageId, name: 'Fixture Cordis package' }],
+          },
+        ],
+      });
+    await expect
+      .poll(() => startupReplies.get('dynamicCordisRunner/syncInspectManifest'))
+      .toEqual({ ok: true, value: null });
+    expect(unary).not.toContain('session/prompt');
+
+    const refused = {
+      ok: false,
+      reason: 'rejected',
+      message: 'Synthetic decision',
+    };
+    const blockedArgs = {
+      runHostHalf: {
+        agentId: 'other',
+        pluginId,
+        packageId,
+        mode: 'run',
+        requestId: null,
+        approveFutureVersions: false,
+      },
+      resolveRequestRun: { requestId: 'fixture-request', resolution: refused },
+      settleUserRun: { agentId: 'other', pluginId, resolution: refused },
+    };
+    for (const method of blockedMethods) {
+      const endpoint = `dynamicCordisRunner/${method}`;
+      const response = await page.request.post(
+        `${f.origin}/api/v1/d-entry/native-rpc`,
+        {
+          data: {
+            selection: f.selection,
+            scopeId: life.scopeId,
+            rpcId: randomUUID(),
+            endpoint,
+            payload: { args: blockedArgs[method] },
+          },
+        },
+      );
+      expect(unary).toContain(endpoint);
+      expect(await response.json()).toMatchObject({
+        result: {
+          ok: false,
+          error: {
+            code: 'remote-access/denied',
+            details: { action: endpoint, reason: 'plugin-management' },
+          },
+        },
+      });
+    }
+    for (const handler of blockedHandlers)
+      expect(handler).not.toHaveBeenCalled();
     expect(unary).not.toContain('session/prompt');
     closePage(life.peer);
     expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
@@ -534,7 +689,11 @@ it.skipIf(!browserExecutable)(
       let found: string | undefined;
       await expect
         .poll(async () => {
-          const input = await page.locator('iframe').getAttribute('src');
+          const input = await page
+            .locator('iframe')
+            .evaluate(
+              (node) => (node as HTMLIFrameElement).contentDocument?.URL,
+            );
           if (!input) return false;
           const address = new URL(input, f.origin);
           const scope = address.searchParams.get('scopeId');

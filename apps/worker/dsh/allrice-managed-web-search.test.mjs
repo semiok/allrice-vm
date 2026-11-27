@@ -1,9 +1,9 @@
-import { fileURLToPath, URL } from 'node:url';
+import { URL } from 'node:url';
 import { TextDecoder } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import Tools from '@deepseek-ai/dsh-tools';
-import Web from '@deepseek-ai/dsh-web';
+import Web, { WebError } from '@deepseek-ai/dsh-web';
 import * as NativeWeb from '@deepseek-ai/dsh-tool-web';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
@@ -14,7 +14,6 @@ import {
 afterEach(() => vi.unstubAllGlobals());
 
 const settings = {
-  cliPath: fileURLToPath(new URL('../package.json', import.meta.url)),
   origin: 'http://172.16.0.5:52400',
   capability: 'synthetic-epoch-capability',
   adapterId: 'guest-profile',
@@ -54,7 +53,11 @@ async function stage(enabled = true) {
     turn.signal,
     () => origin(turn.signal),
   );
-  await apply({ web: { registerSearchProvider } }, { ...settings, enabled });
+  await apply(
+    { web: { registerSearchProvider } },
+    { ...settings, enabled },
+    WebError,
+  );
   expect(registerSearchProvider).toHaveBeenCalledOnce();
   return { provider: registerSearchProvider.mock.calls[0][0], run, open, turn };
 }
@@ -158,7 +161,7 @@ it('runs native web_search with the unchanged DeepSeek provider selection and ou
     observeManagedSearchCalls(ctx, settings.adapterId, turn.signal, () =>
       origin(turn.signal),
     );
-    await apply({ web: ctx.web }, settings);
+    await apply({ web: ctx.web }, settings, WebError);
     await ctx.plugin(NativeWeb, { fetch: false });
     const outcome = await ctx.tools.execute(execution('real-call'));
     expect(outcome.isError).toBe(false);
@@ -171,6 +174,22 @@ it('runs native web_search with the unchanged DeepSeek provider selection and ou
       query: 'test',
       maxResults: 8,
     });
+  } finally {
+    await ctx.fiber.dispose();
+  }
+});
+
+it('reports the unavailable registered provider without a host Search key or an upstream call', async () => {
+  const ctx = new Context();
+  const fetch = vi.fn();
+  vi.stubGlobal('fetch', fetch);
+  try {
+    await ctx.plugin(Web, { searchProvider: 'deepseek-official' });
+    await expect(ctx.web.search({ query: 'test' })).rejects.toMatchObject({
+      code: 'WEB_PROVIDER_CONFIGURED_MISSING',
+      message: 'configured web provider "deepseek-official" is not registered',
+    });
+    expect(fetch).not.toHaveBeenCalled();
   } finally {
     await ctx.fiber.dispose();
   }

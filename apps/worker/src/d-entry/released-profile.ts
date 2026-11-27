@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import {
   DEntryProfileAddressSchema,
+  DEntryProfileChunkFilenameSchema,
   DEntryProfileFilePathSchema,
   DEntryProfileGraphSchema,
   DEntryProfileInjectionSchema,
@@ -20,6 +21,8 @@ import { DEntryNativeUnavailable } from './native-owner.js';
  * immutable clientModules graph from the existing leased native profile. */
 export interface DEntryFixedProfileSource {
   readonly revoked: AbortSignal;
+  /** Opaque identity of the actual native owner for this employee and epoch. */
+  readonly verificationOwner?: object;
   readImmutableGraph(signal: AbortSignal): Promise<unknown>;
   readImmutableBundle(
     reference: string,
@@ -96,6 +99,14 @@ const manifestSchema = z.object({
     graph: DEntryProfileGraphSchema,
     bootInjections: z.array(DEntryProfileInjectionSchema).min(1),
     files: z.array(bytesEntry.extend({ reference: z.string().min(1) })).min(1),
+    chunks: z
+      .array(
+        z.strictObject({
+          module: z.string().min(1),
+          file: DEntryProfileChunkFilenameSchema,
+        }),
+      )
+      .default([]),
     sourceBuiltClient: z.literal(true),
   }),
   managedEntry: z.literal('managed/employee-web-entry.js'),
@@ -128,6 +139,69 @@ function verified<T>(values: readonly T[], key: (value: T) => string) {
 
 type Graph = z.infer<typeof DEntryProfileGraphSchema>;
 type Resource = { url: string; rev: string };
+const guestAttestations = new WeakMap<
+  object,
+  { key: string; verified: Promise<void> }
+>();
+async function waitForGuestProof(proof: Promise<void>, caller: AbortSignal) {
+  caller.throwIfAborted();
+  let cancel!: () => void;
+  const stopped = new Promise<never>((_, reject) => {
+    cancel = () => reject(caller.reason);
+    caller.addEventListener('abort', cancel, { once: true });
+  });
+  try {
+    await Promise.race([proof, stopped]);
+    caller.throwIfAborted();
+  } finally {
+    caller.removeEventListener('abort', cancel);
+  }
+}
+const parallelGuestEntries = 4;
+type SealedFiles = Map<string, Promise<Buffer>>;
+let loadedRelease: { key: string; files: SealedFiles } | undefined;
+
+function sealedFilesFor(frozenRoot: string, digest: string) {
+  const key = JSON.stringify([frozenRoot, digest]);
+  if (loadedRelease?.key !== key) loadedRelease = { key, files: new Map() };
+  return loadedRelease.files;
+}
+
+async function verifyReleaseBytes(
+  frozenRoot: string,
+  row: z.infer<typeof bytesEntry>,
+  signal: AbortSignal,
+  files?: SealedFiles,
+) {
+  signal.throwIfAborted();
+  async function readChecked() {
+    const selected = resolve(frozenRoot, row.path);
+    if (
+      !selected.startsWith(frozenRoot + sep) ||
+      (await realpath(selected)) !== selected
+    )
+      throw new DEntryNativeUnavailable();
+    const data = await readFile(selected, { signal });
+    signal.throwIfAborted();
+    if (data.length !== row.bytes || hash(data) !== row.sha256)
+      throw new DEntryNativeUnavailable();
+    return data;
+  }
+  if (!files) return readChecked();
+  let pending = files.get(row.path);
+  if (!pending) {
+    const read = readChecked();
+    files.set(row.path, read);
+    void read.catch(() => {
+      if (files.get(row.path) === read) files.delete(row.path);
+    });
+    pending = read;
+  }
+  const data = await pending;
+  signal.throwIfAborted();
+  return data;
+}
+
 const parserModule = '@deepseek-ai/dsh-client-modules';
 
 function topology({
@@ -253,9 +327,31 @@ async function readManifest(
     throw new DEntryNativeUnavailable();
   return {
     frozenRoot,
-    raw,
+    digest: manifestSha256 ?? hash(raw),
     manifest: manifestSchema.parse(JSON.parse(raw.toString('utf8'))),
   };
+}
+
+const isStatic = (path: string) =>
+  path.startsWith('managed/') ||
+  (path.startsWith('native/assets/') &&
+    (nativeAliases.has(path.slice('native/'.length)) ||
+      /\.(?:woff2?|ttf)$/.test(path)));
+
+/** Snapshot bytes from the installed, sealed Worker release before it can
+ * publish a page. All later consumers read the retained, checked bytes. */
+export async function primeWorkerEmployeeWebRelease(signal: AbortSignal) {
+  const seal = await readWorkerEmployeeWebSeal(signal);
+  const { frozenRoot, manifest } = await readManifest(
+    seal.directory,
+    signal,
+    seal.manifestSha256,
+  );
+  const files = sealedFilesFor(frozenRoot, seal.manifestSha256);
+  for (const file of verified(manifest.files, (row) => row.path).values()) {
+    if (isStatic(file.path) || file.path.startsWith('plugins/'))
+      await verifyReleaseBytes(frozenRoot, file, signal, files);
+  }
 }
 
 const guestFiles = [
@@ -302,12 +398,8 @@ export async function readReleasedGuestProfile(
   const staged = [];
   for (const [path, destination] of guestFiles) {
     const proof = inventory.get(path);
-    const absolute = join(frozenRoot, path);
-    if (!proof || (await realpath(absolute)) !== absolute)
-      throw new DEntryNativeUnavailable();
-    const bytes = await readFile(absolute, { signal });
-    if (bytes.length !== proof.bytes || hash(bytes) !== proof.sha256)
-      throw new DEntryNativeUnavailable();
+    if (!proof) throw new DEntryNativeUnavailable();
+    const bytes = await verifyReleaseBytes(frozenRoot, proof, signal);
     const contents = new TextDecoder('utf-8', {
       fatal: true,
       ignoreBOM: true,
@@ -325,11 +417,14 @@ export async function holdReleasedProfile(
   manifestSha256?: string,
 ) {
   const active = AbortSignal.any([signal, source.revoked]);
-  const { frozenRoot, raw, manifest } = await readManifest(
-    directory,
-    active,
-    manifestSha256,
-  );
+  const {
+    frozenRoot,
+    digest: manifestDigest,
+    manifest,
+  } = await readManifest(directory, active, manifestSha256);
+  const sealedFiles = manifestSha256
+    ? sealedFilesFor(frozenRoot, manifestSha256)
+    : undefined;
   const { graph: sealedGraph, bootInjections } = manifest.profile;
   const graph = DEntryProfileGraphSchema.parse(
     await source.readImmutableGraph(active),
@@ -410,19 +505,12 @@ export async function holdReleasedProfile(
     row: z.infer<typeof bytesEntry>,
     current: AbortSignal,
   ) {
-    const selected = resolve(frozenRoot, row.path);
     const media = mime.get(extname(row.path));
-    if (
-      !media ||
-      !selected.startsWith(frozenRoot + sep) ||
-      (await realpath(selected)) !== selected
-    )
-      throw new DEntryNativeUnavailable();
-    const data = await readFile(selected, { signal: current });
-    current.throwIfAborted();
-    if (data.byteLength !== row.bytes || hash(data) !== row.sha256)
-      throw new DEntryNativeUnavailable();
-    return { data, media };
+    if (!media) throw new DEntryNativeUnavailable();
+    return {
+      data: await verifyReleaseBytes(frozenRoot, row, current, sealedFiles),
+      media,
+    };
   }
   async function read(path: string | undefined, caller: AbortSignal) {
     const row = path && files.get(path);
@@ -431,20 +519,17 @@ export async function holdReleasedProfile(
     await assertCurrent(current);
     const result = await readBytes(row, current);
     await assertCurrent(current);
-    return result;
+    // The wire consumer must not be able to mutate the release snapshot.
+    return { ...result, data: Buffer.from(result.data) };
   }
-  const isStatic = (path: string) =>
-    path.startsWith('managed/') ||
-    (path.startsWith('native/assets/') &&
-      (nativeAliases.has(path.slice('native/'.length)) ||
-        /\.(?:woff2?|ttf)$/.test(path)));
-  const checked = new Map<
-    string,
-    {
-      revision: string;
-      read(signal: AbortSignal): ReturnType<typeof readBytes>;
-    }
-  >();
+  const checked = new Map(
+    [
+      ...graph.entries.map((entry) => ({ ...entry, entries: [entry.id] })),
+      ...graph.batches,
+    ].map((entry) => [entry.url, entry] as const),
+  );
+  if (checked.size !== graph.entries.length + graph.batches.length)
+    throw new DEntryNativeUnavailable();
   function proof(reference: string) {
     const row = bundles.get(reference);
     if (
@@ -459,6 +544,21 @@ export async function holdReleasedProfile(
       throw new DEntryNativeUnavailable();
     return row;
   }
+  const liveModules = verified(graph.entries, ({ id }) => id);
+  const chunks = verified(
+    manifest.profile.chunks.map(({ module, file }) => {
+      const live = liveModules.get(module);
+      const sealed = modules.get(module);
+      if (!live || !sealed) throw new DEntryNativeUnavailable();
+      const name = `plugins/${module}/${file}`;
+      return {
+        reference: `${name}?rev=${live.rev}`,
+        rev: live.rev,
+        row: proof(`${name}?rev=${sealed.rev}`),
+      };
+    }),
+    ({ reference }) => reference,
+  );
   async function readEntry(id: string, signal: AbortSignal) {
     const sealed = modules.get(id);
     if (!sealed) throw new DEntryNativeUnavailable();
@@ -515,21 +615,23 @@ export async function holdReleasedProfile(
   }
 
   // Check the sealer's native combos as well as the guest's exact orders.
-  for (const batch of sealedGraph.batches) {
-    const map = rc2Resource(batch.entries, batch.rev, true);
-    const expected = await readCombo(batch.entries, map, active);
-    const original = await readBytes(proof(batch.url), active);
-    const originalMap = await readBytes(proof(map), active);
-    if (
-      !original.data.equals(expected.data) ||
-      !originalMap.data.equals(await expected.sourceMap(active))
-    )
-      throw new DEntryNativeUnavailable();
+  async function attestGuest() {
+    for (const batch of sealedGraph.batches) {
+      const map = rc2Resource(batch.entries, batch.rev, true);
+      const expected = await readCombo(batch.entries, map, active);
+      const original = await readBytes(proof(batch.url), active);
+      const originalMap = await readBytes(proof(map), active);
+      if (
+        !original.data.equals(expected.data) ||
+        !originalMap.data.equals(await expected.sourceMap(active))
+      )
+        throw new DEntryNativeUnavailable();
+    }
+    await attestEntries();
   }
   async function attest(ids: readonly string[], current: Resource) {
     const map = rc2Resource(ids, current.rev, true);
-    const read = (signal: AbortSignal) => readCombo(ids, map, signal);
-    const expected = await read(active);
+    const expected = await readCombo(ids, map, active);
     const native = await source.readImmutableBundle(
       current.url,
       expected.data.byteLength,
@@ -545,18 +647,53 @@ export async function holdReleasedProfile(
     );
     active.throwIfAborted();
     if (!expectedMap.equals(nativeMap)) throw new DEntryNativeUnavailable();
-    if (checked.has(current.url)) throw new DEntryNativeUnavailable();
-    checked.set(current.url, {
-      revision: current.rev,
-      async read(signal) {
-        const { data, media } = await read(signal);
-        return { data, media };
-      },
-    });
   }
-
-  for (const entry of graph.entries) await attest([entry.id], entry);
-  for (const batch of graph.batches) await attest(batch.entries, batch);
+  async function attestEntries() {
+    // Keep large combined bodies serial. Smaller independent entries can
+    // overlap, but all dispatched reads join before failure or publication.
+    for (let i = 0; i < graph.entries.length; i += parallelGuestEntries) {
+      active.throwIfAborted();
+      const results = await Promise.allSettled(
+        graph.entries
+          .slice(i, i + parallelGuestEntries)
+          .map((entry) => attest([entry.id], entry)),
+      );
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
+    }
+    for (const batch of graph.batches) await attest(batch.entries, batch);
+  }
+  const key = JSON.stringify([frozenRoot, manifestDigest, graph]);
+  const owner = source.verificationOwner;
+  for (;;) {
+    active.throwIfAborted();
+    const held = owner && guestAttestations.get(owner);
+    if (owner && held?.key === key) {
+      try {
+        await waitForGuestProof(held.verified, active);
+        break;
+      } catch {
+        active.throwIfAborted();
+        // A rejected read may reflect the initiating page's authority rather
+        // than these bytes. Only successful equality is shared across scopes.
+        if (guestAttestations.get(owner) === held)
+          guestAttestations.delete(owner);
+        continue;
+      }
+    }
+    const verified = attestGuest();
+    if (owner) {
+      const checking = { key, verified };
+      guestAttestations.set(owner, checking);
+      void verified.catch(() => {
+        if (guestAttestations.get(owner) === checking)
+          guestAttestations.delete(owner);
+      });
+    }
+    await verified;
+    break;
+  }
+  active.throwIfAborted();
   for (const file of files.values()) {
     if (isStatic(file.path)) await readBytes(file, active);
   }
@@ -579,7 +716,7 @@ export async function holdReleasedProfile(
     { kind: 'global', name: '__DSH_BOOT__', value: graph },
   ].map((row) => DEntryProfileInjectionSchema.parse(row));
   return {
-    manifestSha256: hash(raw),
+    manifestSha256: manifestDigest,
     graph,
     injections,
     revoked: source.revoked,
@@ -589,14 +726,24 @@ export async function holdReleasedProfile(
       revision: string,
       caller: AbortSignal,
     ) {
-      const entry = checked.get(reference);
-      if (!entry || revision !== entry.revision)
+      const entry = checked.get(reference) ?? chunks.get(reference);
+      if (!entry || revision !== entry.rev)
         throw new DataAccessError('not_found');
       const current = AbortSignal.any([active, caller]);
       await assertCurrent(current);
-      const result = await entry.read(current);
+      const result =
+        'row' in entry
+          ? await readBytes(entry.row, current).then(({ data, media }) => ({
+              data: Buffer.from(data),
+              media,
+            }))
+          : await readCombo(
+              entry.entries,
+              rc2Resource(entry.entries, entry.rev, true),
+              current,
+            );
       await assertCurrent(current);
-      return result;
+      return { data: result.data, media: result.media };
     },
     readStatic(path: string, caller: AbortSignal) {
       if (isStatic(path)) return read(path, caller);

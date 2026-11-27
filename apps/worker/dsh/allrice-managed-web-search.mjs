@@ -1,9 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
 import { ReadableStream } from 'node:stream/web';
-import { pathToFileURL, URL } from 'node:url';
+import { URL } from 'node:url';
 import { TextEncoder } from 'node:util';
 
 export const name = 'allrice-managed-web-search';
@@ -119,12 +118,9 @@ export function observeManagedSearchCalls(
 
 export async function apply(
   ctx,
-  { cliPath, origin, capability, adapterId, enabled },
+  { origin, capability, adapterId, enabled },
+  WebError,
 ) {
-  const require = createRequire(cliPath);
-  const { WebError } = await import(
-    pathToFileURL(require.resolve('@deepseek-ai/dsh-web')).href
-  );
   const endpoint = new URL('/v1/web/search', origin);
   return ctx.web.registerSearchProvider({
     id: 'deepseek-official',
