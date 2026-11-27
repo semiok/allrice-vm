@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
@@ -10,6 +10,7 @@ import {
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
+import { skillTestCatalog } from '../../../web/test/employee-skills-host-data.js';
 import { initialDocumentLifecycle } from '../../../web/lib/d-entry/initial-document.js';
 import {
   fixture,
@@ -29,9 +30,20 @@ it.skipIf(!browserExecutable)(
   { timeout: 60_000 },
   async () => {
     const release = await buildProfileFixture();
-    const manifest: { files: { path: string }[] } = JSON.parse(
+    const manifest: {
+      files: { path: string }[];
+      source: { contributionInputs: { path: string; sha256: string }[] };
+    } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
     );
+    const ownerPath =
+      'packages/dsh-web-composition/src/employee-product-owner.ts';
+    expect(manifest.source.contributionInputs).toContainEqual({
+      path: ownerPath,
+      sha256: createHash('sha256')
+        .update(await readFile(ownerPath))
+        .digest('hex'),
+    });
     const staticFiles = new Set(manifest.files.map(({ path }) => '/' + path));
     const mime: Record<string, string> = {
       '.js': 'text/javascript',
@@ -148,11 +160,81 @@ it.skipIf(!browserExecutable)(
       executablePath: browserExecutable,
     });
     closes.push(() => browser.close());
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+    });
     await context.addCookies([
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    const skillsPath = `/api/v1/d-entry/panels/${f.identity.employeeInstanceId}/skills`;
+    const legacySkillsPath = `/api/v1/employee-instances/${f.identity.employeeInstanceId}/skills`;
+    const catalog = skillTestCatalog(
+      f.identity.employeeInstanceId,
+      f.identity.workspaceId,
+    );
+    const late = deferred();
+    const reads: unknown[] = [];
+    await page.route(
+      (url) =>
+        url.origin === f.origin &&
+        (url.pathname.startsWith(skillsPath) ||
+          url.pathname.startsWith(legacySkillsPath)),
+      async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        const ordinal = reads.push({
+          method: request.method(),
+          path: url.pathname,
+          workspace: url.searchParams.get('workspaceId'),
+          thread: url.searchParams.get('threadId'),
+          expectedViewer: request.headers()['x-allrice-expected-viewer-id'],
+          organization: request.headers()['x-allrice-organization-id'],
+          workspaceHeader: request.headers()['x-allrice-workspace-id'],
+        });
+        if (ordinal === 1) await late.promise;
+        await route.fulfill({
+          json:
+            ordinal === 1
+              ? {
+                  ...catalog,
+                  personalSkills: catalog.personalSkills.map((skill) => ({
+                    ...skill,
+                    displayName: '已关闭访次的技能',
+                  })),
+                }
+              : ordinal === 2
+                ? skillTestCatalog(randomUUID(), f.identity.workspaceId)
+                : catalog,
+        });
+      },
+    );
+    // Keep the first test response deliverable after abort so we exercise the
+    // Reader's late-result guard, independently of browser fetch cancellation.
+    await page.addInitScript((path) => {
+      const original = window.fetch.bind(window);
+      let held = false;
+      window.fetch = async (input, init) => {
+        if (held || typeof input !== 'string' || !input.startsWith(path + '?'))
+          return original(input, init);
+        held = true;
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            document.documentElement.dataset.skillReadAborted = 'true';
+          },
+          { once: true },
+        );
+        const reply = await original(input, { ...init, signal: undefined });
+        const parse = reply.json.bind(reply);
+        reply.json = async () => {
+          const result: unknown = await parse();
+          document.documentElement.dataset.lateSkillRead = 'true';
+          return result;
+        };
+        return reply;
+      };
+    }, skillsPath);
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
     const errors: string[] = [];
@@ -212,6 +294,109 @@ it.skipIf(!browserExecutable)(
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
+    const dock = workbench.locator(
+      '[data-sidebar-right-session="root"][data-sidebar-right-panel]',
+    );
+    // rc.2 keeps the corner on blank sessions while omitting title actions.
+    // Closing the guide's sole replacement collapses the original Dock again.
+    const openAbilities = async () => {
+      await workbench
+        .locator('[data-conversation-header-corner]')
+        .getByRole('button', { name: /^(打开右侧边栏|Open right sidebar)$/ })
+        .click({ timeout: 5000 });
+      await dock
+        .getByRole('button', { name: /^能力\s*打开这位员工的业务工作台$/ })
+        .click({ timeout: 5000 });
+    };
+    const panel = dock.getByRole('region', {
+      name: 'Fixture employee · 能力',
+    });
+    const closeAbilityTab = () =>
+      dock
+        .getByRole('tab', { name: /能力/ })
+        .getByRole('button', { name: /^(关闭|Close)$/ })
+        .click();
+    try {
+      expect(
+        await workbench.locator('html').evaluate(() => innerWidth),
+      ).toBeGreaterThan(760);
+      expect(await workbench.locator('[aria-label="工作台入口"]').count()).toBe(
+        0,
+      );
+      expect(reads).toHaveLength(0);
+      await openAbilities();
+      await expect.poll(() => reads.length).toBe(1);
+      await closeAbilityTab();
+      await workbench.locator('html[data-skill-read-aborted]').waitFor();
+      await panel.waitFor({ state: 'hidden' });
+
+      await openAbilities();
+      await panel.getByText('技能读取失败，请重试。').waitFor();
+      expect(
+        await panel.getByRole('button', { name: '翻译校对' }).count(),
+      ).toBe(0);
+      await panel.getByRole('button', { name: '重试', exact: true }).click();
+      await panel
+        .getByRole('button', { name: '翻译校对', exact: true })
+        .click();
+      await panel
+        .getByText('translation-review.zip', { exact: true })
+        .waitFor();
+      await panel.getByText('v0.3.0', { exact: true }).waitFor();
+      expect(
+        await panel
+          .getByRole('button', { name: /添加|更新|卸载|开始工作/ })
+          .count(),
+      ).toBe(0);
+      await panel
+        .getByRole('button', { name: '返回能力列表', exact: true })
+        .click();
+      late.resolve();
+      await workbench.locator('html[data-late-skill-read]').waitFor();
+      await panel
+        .getByRole('button', { name: '翻译校对', exact: true })
+        .waitFor();
+      expect(await panel.getByText('已关闭访次的技能').count()).toBe(0);
+      expect(
+        await panel.getByRole('button', { name: '添加技能' }).count(),
+      ).toBe(0);
+      expect(await panel.getByText('品牌自媒体').count()).toBe(0);
+      await closeAbilityTab();
+      expect((await editor.innerText()).trim()).toBe('未发送的原生草稿');
+      expect(unary).not.toContain('session/prompt');
+      expect(reads).toEqual(
+        Array.from({ length: 3 }, () => ({
+          method: 'GET',
+          path: skillsPath,
+          workspace: f.identity.workspaceId,
+          thread: f.selection.threadId,
+          expectedViewer: f.identity.personId,
+          organization: f.identity.organizationId,
+          workspaceHeader: f.identity.workspaceId,
+        })),
+      );
+    } catch (error) {
+      const state = await workbench.locator('html').evaluate(() => ({
+        viewportWidth: innerWidth,
+        toolbar: Boolean(document.querySelector('[aria-label="工作台入口"]')),
+        corner: document
+          .querySelector('[data-sidebar-right-expand]')
+          ?.getAttribute('aria-label'),
+        dock: document
+          .querySelector('[data-sidebar-right-panel]')
+          ?.getAttribute('data-sidebar-right-panel'),
+        tabs: [
+          ...document.querySelectorAll(
+            '[data-sidebar-right-panel] [role="tab"]',
+          ),
+        ].map((tab) => tab.textContent),
+      }));
+      throw Error(JSON.stringify({ state, reads: reads.length, errors }), {
+        cause: error,
+      });
+    } finally {
+      late.resolve();
+    }
     closePage(life.peer);
     expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
     await context.close();

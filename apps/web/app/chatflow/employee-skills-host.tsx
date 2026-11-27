@@ -196,6 +196,9 @@ export interface EmployeeSkillsHostProps {
   active?: boolean;
   activeEntry?: 'sidebar' | 'employee';
   backLabel?: string;
+  readOnlyCatalog?: (signal: AbortSignal) => Promise<EmployeeSkillCatalog>;
+  scopeSignal?: AbortSignal;
+  lifetimeSignal?: AbortSignal;
   /** The caller reports confirmed access loss through this reader's callback. */
   onStart?: (skill: EmployeeSkill, onAccessLost: () => void) => Promise<void>;
   navigationRef?: Ref<{ navigateHome: () => void }>;
@@ -246,7 +249,21 @@ export function EmployeeSkillConfirmationLayer({
 }
 
 export function EmployeeSkillsHost(props: EmployeeSkillsHostProps) {
-  const { children, ownerView, navigationRef, ...readerProps } = props;
+  const {
+    children,
+    ownerView,
+    navigationRef,
+    scopeSignal,
+    lifetimeSignal,
+    ...readerProps
+  } = props;
+  const readerSignal = useMemo(
+    () =>
+      scopeSignal && lifetimeSignal
+        ? AbortSignal.any([scopeSignal, lifetimeSignal])
+        : (scopeSignal ?? lifetimeSignal),
+    [scopeSignal, lifetimeSignal],
+  );
   // Account changes erase content even when a pending request identity remains.
   clearEmployeeSkillWriteContents(
     props.writes,
@@ -259,6 +276,7 @@ export function EmployeeSkillsHost(props: EmployeeSkillsHostProps) {
     props.scope.workspaceId,
     props.scope.instanceId,
     Object.entries(props.scope.headers).sort(),
+    props.readOnlyCatalog !== undefined,
   ]);
   const projectionScope = useMemo(() => ({ key, ownerView }), [key, ownerView]);
   const currentScope = useRef(projectionScope);
@@ -303,7 +321,12 @@ export function EmployeeSkillsHost(props: EmployeeSkillsHostProps) {
     children,
     projection.current?.view ?? emptyHostView,
     ownerView ? (
-      <EmployeeSkillsReader key={key} {...readerProps} onView={publish} />
+      <EmployeeSkillsReader
+        key={key}
+        {...readerProps}
+        lifetimeSignal={readerSignal}
+        onView={publish}
+      />
     ) : null,
   );
 }
@@ -378,12 +401,18 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
   active,
   activeEntry,
   backLabel,
+  readOnlyCatalog,
+  lifetimeSignal,
   onStart,
   onNotice,
   onView,
-}: Omit<EmployeeSkillsHostProps, 'children' | 'ownerView' | 'navigationRef'> & {
+}: Omit<
+  EmployeeSkillsHostProps,
+  'children' | 'ownerView' | 'navigationRef' | 'scopeSignal'
+> & {
   onView: (view: EmployeeSkillsHostView) => void;
 }) {
+  const readOnly = readOnlyCatalog !== undefined;
   const [view, setView] = useState<EmployeeSkillsView>({
     status: 'loading',
     label: copy.loading,
@@ -424,14 +453,21 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
   };
 
   const loadCatalog = async (signal: AbortSignal) => {
-    const result = await readEmployeeSkills(scope, signal);
-    if (signal.aborted || !mounted.current) return null;
+    const requestSignal = lifetimeSignal
+      ? AbortSignal.any([signal, lifetimeSignal])
+      : signal;
+    requestSignal.throwIfAborted();
+    const result = await (readOnlyCatalog
+      ? readOnlyCatalog(requestSignal)
+      : readEmployeeSkills(scope, requestSignal));
+    if (requestSignal.aborted || !mounted.current) return null;
     catalog.current = result;
     setView({ status: 'ready', catalog: result });
     return result;
   };
 
   const retryCatalog = () => {
+    if (lifetimeSignal?.aborted) return;
     read.current?.abort();
     const controller = new AbortController();
     read.current = controller;
@@ -446,12 +482,13 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
           sequence === readSequence.current
         ) {
           resumeAfterRead.current = false;
-          show(initialPage(scope, writes, copy));
+          if (!readOnly) show(initialPage(scope, writes, copy));
         }
       })
       .catch((error: unknown) => {
         if (
           !mounted.current ||
+          lifetimeSignal?.aborted ||
           controller.signal.aborted ||
           sequence !== readSequence.current
         )
@@ -523,7 +560,7 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
 
   const openSource = (skill?: EmployeePersonalSkill) => {
     const current = catalog.current;
-    if (!current?.canInstall) return;
+    if (readOnly || !current?.canInstall) return;
     const unresolved = blockingWrite(skill?.installationId);
     if (unresolved) {
       resume(unresolved);
@@ -768,7 +805,7 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
   };
 
   const openRemoval = (skill: EmployeePersonalSkill, fromDetail: boolean) => {
-    if (!skill.canUninstall || pending.current) return;
+    if (readOnly || !skill.canUninstall || pending.current) return;
     const unresolved = blockingWrite(skill.installationId);
     if (unresolved) {
       resume(unresolved);
@@ -952,9 +989,13 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
           skill={page.skill}
           canInstall={catalog.current?.canInstall ?? false}
           onBack={back}
-          onUpdate={openSource}
-          onUninstall={(skill) => openRemoval(skill, true)}
-          onStart={onStart ? () => void start(page.skill) : undefined}
+          onUpdate={readOnly ? undefined : openSource}
+          onUninstall={
+            readOnly ? undefined : (skill) => openRemoval(skill, true)
+          }
+          onStart={
+            !readOnly && onStart ? () => void start(page.skill) : undefined
+          }
           starting={starting}
           error={startError}
           backLabel={backLabel}
@@ -973,9 +1014,9 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
           skill={skill}
           canInstall={view.status === 'ready' && view.catalog.canInstall}
           onBack={back}
-          onUpdate={openSource}
-          onUninstall={(item) => openRemoval(item, true)}
-          onStart={onStart ? () => void start(skill) : undefined}
+          onUpdate={readOnly ? undefined : openSource}
+          onUninstall={readOnly ? undefined : (item) => openRemoval(item, true)}
+          onStart={!readOnly && onStart ? () => void start(skill) : undefined}
           starting={starting}
           error={startError}
           backLabel={backLabel}
@@ -1110,14 +1151,19 @@ const EmployeeSkillsReader = memo(function EmployeeSkillsReader({
       view={view}
       disabled={pending.current || starting}
       onOpen={(skill) => {
+        if (lifetimeSignal?.aborted) return;
         onNavigate?.();
         setStartError('');
         show({ kind: 'detail', skill });
       }}
-      onAdd={() => {
-        onNavigate?.();
-        openSource();
-      }}
+      onAdd={
+        readOnly
+          ? undefined
+          : () => {
+              onNavigate?.();
+              openSource();
+            }
+      }
     />
   );
   // Publish before paint. Memo prevents the projection's parent render from
