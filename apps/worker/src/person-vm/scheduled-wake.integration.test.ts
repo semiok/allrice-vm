@@ -318,6 +318,22 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         stop,
       );
       expect(stop).toHaveBeenCalledTimes(1);
+      // Before the physical stop is joined, a prepared plan alone is not a
+      // commitment. Once joined, even failed lifecycle publication must not
+      // let a release suspend its recovery and miss the wake.
+      const stopMarker = (result: 'started' | 'succeeded') =>
+        db`insert into person_vm_audit
+          (person_id,organization_id,vm_id,request_id,action,result,lease_epoch)
+          values (${f.binding.personId},${f.binding.organizationId},${f.binding.vmId},
+            ${requestId},'stop.idle-dispatch',${result},${f.binding.leaseEpoch})`;
+      await stopMarker('started');
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toBeNull();
+      await stopMarker('succeeded');
+      await db`update person_virtual_machines set phase='failed'
+        where person_id=${f.binding.personId}`;
+      await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
+        new Date(Date.parse(scheduledAt) - 120_000),
+      );
       await f.stop(requestId);
       await expect(host.nextCommittedWakeAt(signal)).resolves.toEqual(
         new Date(Date.parse(scheduledAt) - 120_000),

@@ -238,6 +238,7 @@ export function createProductionPersonVmHost(input: {
     ReturnType<typeof startProductionDiskPreprovision> | undefined;
   let gracefulStop = false;
   let pauseIdle = false;
+  const inspectingIdle = new Set<string>();
   let upgradeDraining = false;
   let shutdownChecking = false;
   let upgradeDrained: UpgradeDrainReceipt | undefined;
@@ -1136,7 +1137,6 @@ export function createProductionPersonVmHost(input: {
         const period =
           providers.configuration.lifecycle.idleSampleIntervalMs ??
           DEFAULT_IDLE_SAMPLE_INTERVAL_MS;
-        const inspecting = new Set<string>();
         void own(async () => {
           let slot = Math.floor(performance.now() / period);
           while (!lifetime.aborted) {
@@ -1156,8 +1156,8 @@ export function createProductionPersonVmHost(input: {
               idleContext,
               scheduledIdleRoster,
             } of ownedVms.values()) {
-              if (inspecting.has(binding.personId)) continue;
-              inspecting.add(binding.personId);
+              if (inspectingIdle.has(binding.personId)) continue;
+              inspectingIdle.add(binding.personId);
               void own(async () => {
                 try {
                   if (pauseIdle || lifetime.aborted) return;
@@ -1181,7 +1181,7 @@ export function createProductionPersonVmHost(input: {
                   if (!lifetime.aborted && !(error instanceof PersonVmError))
                     console.error('[person-vm] idle reconciliation failed');
                 } finally {
-                  inspecting.delete(binding.personId);
+                  inspectingIdle.delete(binding.personId);
                 }
               });
             }
@@ -1302,6 +1302,10 @@ export function createProductionPersonVmHost(input: {
             scheduledWake?.resume();
           };
           try {
+            // An older idle inspection can still publish its wake after
+            // dispatch. Let it finish with the scheduler running.
+            if (inspectingIdle.size)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
             await assertNoCommittedWake(active);
             await scheduledWake?.pause(active);
             // Join an already claimed wake before fencing the next startup.
@@ -1386,6 +1390,7 @@ export function createProductionPersonVmHost(input: {
               for (;;) {
                 deadline.throwIfAborted();
                 await authorize(deadline);
+                await assertNoCommittedWake(deadline);
                 try {
                   await drain();
                   break;
@@ -1407,6 +1412,8 @@ export function createProductionPersonVmHost(input: {
                   });
                 }
               }
+              // A joined stop can publish a wake while it is recovered.
+              await assertNoCommittedWake(deadline);
             }
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
@@ -1483,6 +1490,9 @@ export function createProductionPersonVmHost(input: {
           pauseIdle = true;
           const reopen = vm.fenceWorkerStartup();
           try {
+            if (inspectingIdle.size)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            await assertNoCommittedWake(signal);
             await scheduledWake?.pause(signal);
             signal.throwIfAborted();
             for (const { binding } of ownedVms.values())

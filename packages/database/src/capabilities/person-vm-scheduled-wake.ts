@@ -264,6 +264,8 @@ export async function withOwnedPersonVmAuthorityTransaction<T>(
  * lifecycle lease and establish current authority independently of this store. */
 export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
   return {
+    /** Includes joined native stops awaiting lifecycle publication. Release
+     * must leave their recovery and wake with the current Worker. */
     async nextCommittedWakeAt(signal: AbortSignal): Promise<Date | null> {
       const active = AbortSignal.any([signal, AbortSignal.timeout(3_000)]);
       active.throwIfAborted();
@@ -284,15 +286,19 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
         select min(greatest(p.wake_at,p.retry_at,p.claim_until)) as earliest
         from person_virtual_machines vm
         join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
-        where vm.phase in ('stopped','cold') and vm.disk_retained
-          and vm.egress_receipt is null and p.revoked_at is null
+        cross join lateral (
+          select a.request_id, a.result from person_vm_audit a
+          where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+            and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+            and (
+              (vm.phase in ('stopped','cold') and vm.egress_receipt is null
+                and a.action='stop' and a.result='succeeded')
+              or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch'))
+          order by a.id desc limit 1
+        ) stop
+        where vm.disk_retained and p.revoked_at is null
           and p.wake_at is not null and p.state in ('waiting','claimed')
-          and p.plan_id=(
-            select a.request_id from person_vm_audit a
-            where a.person_id=vm.person_id and a.organization_id=vm.organization_id
-              and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
-              and a.action='stop' and a.result='succeeded'
-            order by a.id desc limit 1)`;
+          and stop.request_id=p.plan_id and stop.result='succeeded'`;
           active.throwIfAborted();
           return row?.earliest ?? null;
         });

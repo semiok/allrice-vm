@@ -572,8 +572,7 @@ it('resumes startup and wake if a drain recovery makes a wake eligible', async (
   io.upgradeWake.mockReturnValueOnce(wake);
   const list = vi
     .spyOn(PostgresPersonVmStore.prototype, 'listUpgradeCandidates')
-    .mockResolvedValueOnce([row!])
-    .mockResolvedValueOnce([]);
+    .mockResolvedValueOnce([row!, { ...row!, vmId: randomUUID() }]);
   const recover = vi
     .spyOn(PersonVmService.prototype, 'stopRunningForUpgrade')
     .mockImplementationOnce(async () => {
@@ -587,9 +586,9 @@ it('resumes startup and wake if a drain recovery makes a wake eligible', async (
   await expect(host.drainForUpgrade(context, signal())).rejects.toMatchObject({
     code: 'ACTIVITY_UNKNOWN',
   });
-  expect(list).toHaveBeenCalledTimes(2);
+  expect(list).toHaveBeenCalledTimes(1);
   expect(recover).toHaveBeenCalledTimes(1);
-  expect(nextWake).toHaveBeenCalledTimes(3);
+  expect(nextWake).toHaveBeenCalledTimes(4);
   expect(reopen).toHaveBeenCalledTimes(1);
   expect(wake.resume).toHaveBeenCalledTimes(1);
   await expect(host.assertWorkerShutdownSafe(signal())).rejects.toMatchObject({

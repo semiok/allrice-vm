@@ -276,44 +276,50 @@ class DeployDevMigrations(unittest.TestCase):
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
 
-        p = self.run_dd(r'''
-          mkdir -p "$STATE"
-          job_state() {
-            if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
-          }
-          worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
-          read_drain_receipt() {
-            test -s "$INFLIGHT/worker-exit" || return 1
-            touch "$STATE/fixture-loaded"
-            echo '{"bootId":"661e00de-c0fc-45e6-a1db-bfd158aedad8","stopped":0,"expiresAt":"2099-01-01T00:00:00Z"}'
-          }
-          DRAIN_TOKEN=fixture
-          inflight_begin "$(penv "$WORKER_PLIST" ALLRICE_RELEASE_SHA)"
-          stop_both release
-        ''', FILES)
-        self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
-        self.assertIn('Worker exit unconfirmed', p.stdout)
-        state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
-        with open(os.path.join(state, 'worker-exit')) as f:
-            self.assertEqual(f.read().splitlines(), [
-                self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
-            ])
-        self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+        for mode in ('early', 'late'):
+            with self.subTest(mode=mode):
+                p = self.run_dd(r'''
+                  mkdir -p "$STATE"
+                  rm -f "$STATE/fixture-loaded"
+                  job_state() {
+                    if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
+                  }
+                  worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+                  read_drain_receipt() {
+                    test -s "$INFLIGHT/worker-exit" || return 1
+                    if [ "$MODE" = late ]; then return 1; fi
+                    touch "$STATE/fixture-loaded"
+                    echo '{"bootId":"661e00de-c0fc-45e6-a1db-bfd158aedad8","stopped":0,"expiresAt":"2099-01-01T00:00:00Z"}'
+                  }
+                  DRAIN_TOKEN=fixture
+                  inflight_begin "$(penv "$WORKER_PLIST" ALLRICE_RELEASE_SHA)"
+                  stop_both release
+                ''', FILES, MODE=mode)
+                self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+                self.assertIn('Worker exit unconfirmed', p.stdout)
+                state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
+                with open(os.path.join(state, 'worker-exit')) as f:
+                    self.assertEqual(f.read().splitlines(), [
+                        self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
+                    ])
+                self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+                # The original process can disappear after the refusal was recorded.
+                write(os.path.join(self.home, 'allrice40-dev/qa/fixture-loaded'), '')
 
-        p = self.run_dd(r'''
-          M1_LAUNCHCTL=test_launchctl
-          test_launchctl() { test "$1" = bootout; }
-          job_state() { echo loaded; }
-          wait_for_drained_worker_exit() { test "$1" = 73001 && echo joined-original; }
-          vm_upgrade_candidates() { echo 0; }
-          stop_job() { :; }
-          start_both_on() { echo "restarted $1"; }
-          recover
-        ''', FILES, CONTRACT='row:1')
-        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
-        self.assertIn('joined-original', p.stdout)
-        self.assertIn('restarted ' + 'a' * 40, p.stdout)
-        self.assertFalse(os.path.exists(state))
+                p = self.run_dd(r'''
+                  M1_LAUNCHCTL=test_launchctl
+                  test_launchctl() { test "$1" = bootout; }
+                  job_state() { echo loaded; }
+                  wait_for_drained_worker_exit() { test "$1" = 73001 && echo joined-original; }
+                  vm_upgrade_candidates() { echo 0; }
+                  stop_job() { :; }
+                  start_both_on() { echo "restarted $1"; }
+                  recover
+                ''', FILES, CONTRACT='row:1')
+                self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+                self.assertIn('joined-original', p.stdout)
+                self.assertIn('restarted ' + 'a' * 40, p.stdout)
+                self.assertFalse(os.path.exists(state))
 
     def test_archived_names_are_known(self):
         known, pending = self.check(self.release(), FILES + ARCHIVED)
@@ -514,6 +520,28 @@ class DeployDevMigrations(unittest.TestCase):
             with open(os.path.join(inflight, role + '.plist'), 'wb') as f:
                 plistlib.dump(self.plist(role, release=old), f)
         write(os.path.join(inflight, 'state'), 'switching\n' + 'a' * 40 + '\n')
+
+    def test_recovery_does_not_switch_to_another_release_with_a_committed_wake(self):
+        self.saved_release(self.release(store=False))
+        p = self.run_dd(r'''
+          dev_sql() {
+            case "$1" in
+              *to_regclass*) echo t ;;
+              *'select not exists'*) echo f ;;
+              *) return 1 ;;
+            esac
+          }
+          stop_release_worker() { echo unexpected-stop; }
+          start_both_on() { echo unexpected-start; }
+          recover
+        ''', FILES + ARCHIVED, CONTRACT='row:1')
+        self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn('outstanding Person VM wake', p.stdout)
+        self.assertNotIn('unexpected-stop', p.stdout)
+        self.assertNotIn('unexpected-start', p.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.home, 'allrice40-dev/qa/deploy-inflight/state',
+        )))
 
     def test_failed_deploy_does_not_restore_a_version_that_cannot_read_the_journals(self):
         self.saved_release(self.release(store=False))

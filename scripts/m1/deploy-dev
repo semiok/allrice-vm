@@ -127,15 +127,19 @@ verify_no_committed_vm_wakes() {
   clear=$(dev_sql "select not exists(
     select 1 from public.person_vm_scheduled_wakes p
     join public.person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
-    where vm.phase in ('stopped','cold') and vm.disk_retained
-      and vm.egress_receipt is null and p.revoked_at is null
+    cross join lateral (
+      select a.request_id, a.result from public.person_vm_audit a
+      where a.person_id=vm.person_id and a.organization_id=vm.organization_id
+        and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
+        and (
+          (vm.phase in ('stopped','cold') and vm.egress_receipt is null
+            and a.action='stop' and a.result='succeeded')
+          or (vm.phase in ('running','failed') and a.action='stop.idle-dispatch'))
+      order by a.id desc limit 1
+    ) stop
+    where vm.disk_retained and p.revoked_at is null
       and p.wake_at is not null and p.state in ('waiting','claimed')
-      and p.plan_id=(
-        select a.request_id from public.person_vm_audit a
-        where a.person_id=vm.person_id and a.organization_id=vm.organization_id
-          and a.vm_id=vm.vm_id and a.lease_epoch=vm.lease_epoch
-          and a.action='stop' and a.result='succeeded'
-        order by a.id desc limit 1))") || return 1
+      and stop.request_id=p.plan_id and stop.result='succeeded')") || return 1
   if [ "$clear" != t ]; then
     say "An outstanding Person VM wake must stay with the current Worker. Release blocked."
     return 1
@@ -185,7 +189,7 @@ record_worker_exit_intent() {
 }
 
 stop_release_worker() {
-  local mode=${1:-restore} plist rel port process boot receipt count target status i pid expire
+  local plist rel port process boot receipt count target status i pid expire
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
   port=$(worker_port) || return 1
@@ -210,6 +214,7 @@ PYTHON
       say "Person VMs require a current Worker drain receipt. Release blocked."
       return 1
     }
+    verify_no_committed_vm_wakes || return 1
     RELEASE_STOP_ATTEMPTED=1
     stop_job "$WORKER_LABEL" "$port" "$plist" "$rel"
     return
@@ -247,6 +252,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     say "Current Worker launch policy does not support a graceful release handoff. Release blocked."
     return 1
   fi
+  verify_no_committed_vm_wakes || return 1
   boot=$(worker_boot) || return 1
   record_worker_exit_intent "$rel" "$pid" "$boot" || return 1
   if [ -z "$boot" ] || [ -z "$DRAIN_TOKEN" ] || ! receipt=$(read_drain_receipt "$boot" "$pid"); then
@@ -265,7 +271,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     return 1
   fi
   validate_drain_receipt "$boot" <<<"$receipt" || return 1
-  if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
+  verify_no_committed_vm_wakes || return 1
   count=$(vm_upgrade_candidates) || return 1
   [ "$count" = 0 ] || return 1
   target="gui/$M1_UID/$WORKER_LABEL"
@@ -292,7 +298,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
 stop_both() {
   local mode=${1:-restore}
   if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
-  stop_release_worker "$mode" || return 1
+  stop_release_worker || return 1
   if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
   RELEASE_STOP_ATTEMPTED=1
   stop_job "$WEB_LABEL" "$(web_port)"
@@ -435,7 +441,14 @@ restore() {
   local why rel; rel=$(release_of "$INFLIGHT/worker.plist") || return 1
   recovery_pair "$INFLIGHT/web.plist" "$INFLIGHT/worker.plist" "$prev" && dev_plist_pair || return 1
   say "restoring the previous version ${prev:0:8}"
-  stop_both || { say "could not stop the services to restore them"; return 1; }
+  local mode=release
+  # A loaded or absent Worker can be recovered with its original sealed
+  # configuration. Replacing a different release must pass the wake guard.
+  if cmp -s "$INFLIGHT/worker.plist" "$(dev_plist worker)" &&
+    cmp -s "$INFLIGHT/web.plist" "$(dev_plist web)"; then
+    mode=restore
+  fi
+  stop_both "$mode" || { say "could not stop the services to restore them"; return 1; }
   if ! why=$(check_migrations_known "$rel"); then
     refuse_restore restore-migrations "$prev" "$why"; return 1
   fi
@@ -477,7 +490,8 @@ on_exit() { # rc
   if [ -n "$INFLIGHT_MINE" ] && [ -f "$INFLIGHT/state" ]; then
     local phase; phase=$(sed -n 1p "$INFLIGHT/state")
     say "did not finish (phase '$phase', exit $rc)"
-    if [ "$phase" = stopping ] && [ -n "$RELEASE_STOP_UNCONFIRMED" ]; then
+    if [ "$phase" = stopping ] && { [ -n "$RELEASE_STOP_UNCONFIRMED" ] ||
+      { [ -z "$RELEASE_STOP_ATTEMPTED" ] && [ -f "$INFLIGHT/worker-exit" ]; }; }; then
       log_deploy kind failed phase "$phase" reason "${FAIL_REASON:-exit $rc}" restored unconfirmed log "$BLOG" || true
       say "Worker exit unconfirmed. Saved launchd files: $INFLIGHT. Inspect the old Worker's shutdown status before recovery."
     elif [ "$phase" = stopping ] && [ -z "$RELEASE_STOP_ATTEMPTED" ]; then
