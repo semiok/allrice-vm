@@ -34,6 +34,7 @@ export type VmRecord = {
   diskRetained: boolean;
   nativeCreated: boolean;
   verifiedWebSlotCapacity: number | null;
+  prewarmDeletionFence?: string | null;
   instanceId: string | null;
   leaseEpoch: number;
   leaseOwner: string | null;
@@ -262,6 +263,10 @@ function fromRow(row: Record<string, unknown>): VmRecord {
     diskRetained: Boolean(row.disk_retained),
     nativeCreated: Boolean(row.native_created),
     verifiedWebSlotCapacity: row.verified_web_slot_capacity as number | null,
+    prewarmDeletionFence:
+      typeof row.prewarm_deletion_fence === 'string'
+        ? row.prewarm_deletion_fence
+        : null,
     instanceId: row.instance_id === null ? null : String(row.instance_id),
     leaseEpoch: Number(row.lease_epoch),
     leaseOwner: row.lease_owner === null ? null : String(row.lease_owner),
@@ -814,6 +819,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
           const retained =
             deletionAudit?.action === 'retain-disk' &&
             deletionAudit.result === 'succeeded';
+          const deletionFence =
+            erasureCheckpoint || retained ? randomUUID() : null;
           if (
             (erasureCheckpoint || deletionAudit?.action === 'retain-disk') &&
             !authorizeDeletion
@@ -841,6 +848,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
             phase: record.phase,
             disk_tier: record.diskTier,
             disk_retained: record.diskRetained,
+            prewarm_deletion_fence: deletionFence,
             native_created: record.nativeCreated,
             verified_web_slot_capacity: record.verifiedWebSlotCapacity,
             instance_id: record.instanceId,
@@ -870,7 +878,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
             if (!ownsDurable) {
               if (!erasureCheckpoint) throw new PersonVmError('LEASE_LOST');
               const [detached] = await sql`update person_virtual_machines
-                set instance_id=null, native_created=false, disk_tier=${record.diskTier}, gateway_ports='[]'::jsonb, updated_at=now()
+                set instance_id=null, native_created=false, disk_tier=${record.diskTier}, gateway_ports='[]'::jsonb,
+                  prewarm_deletion_fence=${deletionFence}, updated_at=now()
                 where person_id=${personId} and vm_id=${record.vmId} and lease_epoch=${record.leaseEpoch}
                   and lease_owner is null and phase='deleted' and disk_retained and egress_receipt is null
                 returning vm_id`;
@@ -881,6 +890,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
               await sql`insert into person_virtual_machines ${sql(values)}
             on conflict (person_id) do update set
               vm_id=excluded.vm_id,phase=excluded.phase,disk_tier=excluded.disk_tier,disk_retained=excluded.disk_retained,
+              prewarm_deletion_fence=coalesce(excluded.prewarm_deletion_fence,person_virtual_machines.prewarm_deletion_fence),
               native_created=excluded.native_created,verified_web_slot_capacity=excluded.verified_web_slot_capacity,
               instance_id=excluded.instance_id,lease_epoch=excluded.lease_epoch,
               egress_receipt=excluded.egress_receipt,gateway_ports=excluded.gateway_ports,holds=excluded.holds,

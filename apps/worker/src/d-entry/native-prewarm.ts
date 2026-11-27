@@ -7,14 +7,17 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import { DataAccessError, DEntryTicketObserverClosed } from '@allrice/database';
-import type { PersonVmPrewarmTarget } from '@allrice/person-vm';
+import type {
+  PersonVmBinding,
+  PersonVmPrewarmTarget,
+} from '@allrice/person-vm';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmVerificationMode =
   'authority' | 'operation' | 'ready' | 'failed' | 'reuse';
 type PrewarmReadMode = Exclude<PrewarmVerificationMode, 'authority' | 'reuse'>;
-export type PrewarmReservation = { vmId?: string };
+export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
@@ -43,14 +46,28 @@ export function canSharePrewarmTarget(
   existing: Pick<PrewarmPlan, 'target' | 'reservation'>,
   requested: PrewarmGeneration,
 ) {
-  const target = existing.target;
-  const vmId = target.vmId ?? existing.reservation?.vmId ?? null;
+  const target = observedPrewarmTarget(existing);
   return (
     (!requested.restoreRetained || target.restoreRetained === true) &&
     (target.replacesVmId === requested.replacesVmId ||
-      (!requested.replacesVmId && vmId !== null && vmId === requested.vmId)) &&
-    compatiblePrewarmGeneration({ ...target, vmId }, requested)
+      (!requested.replacesVmId &&
+        target.vmId !== null &&
+        target.vmId === requested.vmId)) &&
+    compatiblePrewarmGeneration(target, requested)
   );
+}
+
+/** An incomplete target gains specificity only from its own physical leases. */
+export function observedPrewarmTarget({
+  target,
+  reservation,
+}: Pick<PrewarmPlan, 'target' | 'reservation'>): PrewarmGeneration {
+  if (!reservation) return target;
+  return {
+    ...target,
+    vmId: target.vmId ?? reservation.vmId ?? null,
+    instanceId: target.instanceId ?? reservation.instance?.instanceId ?? null,
+  };
 }
 
 function readMode(status: DEntryNativePrewarmStatus): PrewarmReadMode {
@@ -384,9 +401,12 @@ export function createPrewarmOperations(
         expired(entry)
       )
         return { state: 'expired' };
-      if (state.state !== 'failed' || entry.plan.observeTerminalFailure) {
+      const watchThread =
+        (state.state !== 'failed' || entry.plan.observeTerminalFailure) &&
+        entry.plan.assertTicketThread;
+      if (watchThread) {
         try {
-          await entry.plan.assertTicketThread?.(signal);
+          await watchThread(signal);
         } catch (error) {
           signal.throwIfAborted();
           // A normal failure joins and closes its observer. A concurrent poll
@@ -400,8 +420,7 @@ export function createPrewarmOperations(
             !expired(entry)
           ) {
             if (
-              (closing.state === 'failed' &&
-                !(await verify(entry.plan, 'failed'))) ||
+              !(await verify(entry.plan, readMode(closing))) ||
               expired(entry)
             )
               return { state: 'expired' };
@@ -412,11 +431,9 @@ export function createPrewarmOperations(
           return { state: 'expired' };
         }
       }
-      // An orphan release or a newly failed reservation may have changed
-      // while the thread guard was joining.
+      // Deletion or an orphan release can advance while the thread guard joins.
       const latest = entry.state;
-      const recheck =
-        orphan || (latest.state === 'failed' && state.state !== 'failed');
+      const recheck = orphan || watchThread || latest !== state;
       if (
         (recheck && !(await verify(entry.plan, readMode(latest)))) ||
         expired(entry) ||

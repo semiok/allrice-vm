@@ -18,7 +18,6 @@ import {
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
   type PersonVmPrewarmFence,
-  type PersonVmPrewarmTarget,
   type PersonVmRuntimePort,
   type PersonVmView,
 } from './contract.ts';
@@ -368,10 +367,11 @@ export class PersonVmService
   }
   private assertPrewarmTarget(
     row: VmRecord | null,
-    target?: PersonVmPrewarmTarget,
+    target?: PersonVmPrewarmFence,
     allowRetainedRestore = false,
   ) {
     if (!target) return;
+    this.assertPrewarmDeletionFence(row, target);
     const running = row?.phase === 'running';
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
     const purged =
@@ -390,10 +390,21 @@ export class PersonVmService
       (target.replacesVmId &&
         row?.phase !== 'deleted' &&
         target.vmId === null) ||
+      (running && (target.vmId === null || target.instanceId === null)) ||
       epoch !== target.leaseEpoch ||
       (target.vmId !== null && target.vmId !== row?.vmId) ||
       (target.instanceId !== null &&
         (!running || target.instanceId !== row?.instanceId))
+    )
+      throw new PersonVmError('LEASE_LOST');
+  }
+  private assertPrewarmDeletionFence(
+    row: Readonly<VmRecord> | null,
+    target: PersonVmPrewarmFence,
+  ) {
+    if (
+      target.deletionFence !== undefined &&
+      (row?.prewarmDeletionFence ?? null) !== target.deletionFence
     )
       throw new PersonVmError('LEASE_LOST');
   }
@@ -424,6 +435,7 @@ export class PersonVmService
             await target.assertAuthority(signal);
             signal.throwIfAborted();
           }
+          target?.observeVmReservation?.(lease.row.vmId);
           return view(lease.row);
         }
         if (lease.row?.diskRetained && !retry) {
@@ -467,7 +479,12 @@ export class PersonVmService
         });
         return view(row);
       },
-      { joinOfflinePreparation: true },
+      {
+        joinOfflinePreparation: true,
+        ...(target && {
+          beforeClaim: (row) => this.assertPrewarmDeletionFence(row, target),
+        }),
+      },
     );
   }
 
@@ -595,7 +612,7 @@ export class PersonVmService
       row.phase = 'starting';
       await lease.save(row);
       committed = true;
-      if (newIdentity) input.observeVmReservation?.(row.vmId);
+      input.observeVmReservation?.(row.vmId);
       await lease.audit(row, { ...audit, result: 'started' });
     };
     if (!needsCandidate) await commitOwner(signal);
@@ -873,27 +890,30 @@ export class PersonVmService
       },
       {
         joinOfflinePreparation: true,
-        ...(startup &&
-          target && {
-            beforeClaim(row, ownerToken, active) {
-              signal.throwIfAborted();
-              active.throwIfAborted();
-              if (
-                row?.phase !== 'starting' ||
-                !row.instanceId ||
-                !row.diskRetained ||
-                target?.vmId !== row.vmId ||
-                target.instanceId !== null ||
-                target.leaseEpoch !== row.leaseEpoch + 1 ||
-                !sameVmBinding(bindingOf(row), startup.predecessor)
-              )
-                throw new PersonVmError('LEASE_LOST');
-              startup.observeLease(ownerToken, active);
-            },
-            observeRelease(ownerToken, rowVersion, stage) {
-              startup.observeRelease?.(ownerToken, rowVersion, stage);
-            },
-          }),
+        ...(target && {
+          beforeClaim: (row, ownerToken, active) => {
+            this.assertPrewarmDeletionFence(row, target);
+            if (!startup) return;
+            signal.throwIfAborted();
+            active.throwIfAborted();
+            if (
+              row?.phase !== 'starting' ||
+              !row.instanceId ||
+              !row.diskRetained ||
+              target?.vmId !== row.vmId ||
+              target.instanceId !== null ||
+              target.leaseEpoch !== row.leaseEpoch + 1 ||
+              !sameVmBinding(bindingOf(row), startup.predecessor)
+            )
+              throw new PersonVmError('LEASE_LOST');
+            startup.observeLease(ownerToken, active);
+          },
+        }),
+        ...(startup && {
+          observeRelease(ownerToken, rowVersion, stage) {
+            startup.observeRelease?.(ownerToken, rowVersion, stage);
+          },
+        }),
       },
     );
   }
@@ -1006,6 +1026,7 @@ export class PersonVmService
     row.lastActivityAt = this.now().toISOString();
     target?.orphanedStart?.observeInstance(bindingOf(row));
     await lease.save(row);
+    target?.observeVmStart?.(bindingOf(row));
     if (previousBinding)
       this.admissionHost?.forgetStoppedEntryRecovery(previousBinding);
     await lease.audit(row, {

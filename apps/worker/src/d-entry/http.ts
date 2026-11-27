@@ -400,6 +400,9 @@ export function createDEntryHttpHandler(
         const { context, identity } = next;
         plan.assertTicketThread = authority.assertTicketThread;
         await plan.assertTicketThread?.(signal);
+        if (!(await check(context, identity, plan, signal, 'authority')))
+          throw new DataAccessError('authorization_denied');
+        signal.throwIfAborted();
         const { trigger } = prewarmRequest;
         const receipt = { identity, trigger };
         const accepted = prewarm.accept(
@@ -430,13 +433,12 @@ export function createDEntryHttpHandler(
               (async () => {
                 await accepted.settled;
                 probe.throwIfAborted();
-                if (
-                  !accepted.ready() ||
-                  !(await check(context, identity, plan, probe, 'ready'))
-                )
-                  return false;
+                if (!accepted.ready()) return false;
                 await accepted.assertTicketThread?.(probe);
-                return accepted.ready();
+                return (
+                  (await check(context, identity, plan, probe, 'ready')) &&
+                  accepted.ready()
+                );
               })().catch(() => false),
             );
             hot = await Promise.race([
@@ -449,6 +451,14 @@ export function createDEntryHttpHandler(
           signal.throwIfAborted();
         }
         if (!hot) {
+          if (
+            plan.running &&
+            !(await check(context, identity, plan, signal, 'authority'))
+          ) {
+            sendPrewarmStatus(response, { state: 'expired' });
+            return true;
+          }
+          signal.throwIfAborted();
           accepted.publish();
           sendPrewarmAccepted(response, {
             ...receipt,

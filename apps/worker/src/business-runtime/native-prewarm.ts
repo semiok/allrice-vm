@@ -27,6 +27,7 @@ import {
   canSharePrewarmTarget,
   compatiblePrewarmGeneration as compatible,
   installDEntryNativePrewarmPort,
+  observedPrewarmTarget,
   type DEntryNativePrewarmPort,
   type PrewarmGeneration as Generation,
   type PrewarmPlan,
@@ -39,6 +40,7 @@ type VmStamp = Generation & {
   phase: PersonVmView['phase'];
   diskRetained?: boolean;
   nativeCreated?: boolean;
+  deletionFence?: string | null;
   leaseOwner: string | null;
   rowVersion?: string;
 };
@@ -68,6 +70,7 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
       select (select row_to_json(stamp) from (
         select vm_id as "vmId", instance_id as "instanceId", phase,
           disk_retained as "diskRetained", native_created as "nativeCreated",
+          prewarm_deletion_fence as "deletionFence",
           lease_owner as "leaseOwner", xmin::text as "rowVersion",
           lease_epoch::text as "leaseEpoch" from person_virtual_machines
         where person_id=${identity.personId} and organization_id=${identity.organizationId}
@@ -163,12 +166,10 @@ function plannedGeneration(vm: VmStamp | null) {
 
 function matchingGeneration(
   stamp: Coordination,
-  revision: string,
   result: PersonVmView,
   target: Generation,
 ) {
   if (
-    stamp.authorityRevision !== revision ||
     stamp.vm?.phase !== 'running' ||
     !stamp.vm.instanceId ||
     stamp.vm.leaseOwner ||
@@ -237,7 +238,7 @@ function ownsOrphanedLease(takeover: OrphanedStart, vm: VmStamp) {
 function prewarmKey(
   context: RequestContext,
   identity: DEntryIdentity,
-  revision: string,
+  stamp: Coordination,
 ) {
   return JSON.stringify([
     context.sessionId,
@@ -249,7 +250,8 @@ function prewarmKey(
     identity.employeeRevision,
     identity.employeeVersionId,
     identity.threadId,
-    revision,
+    stamp.authorityRevision,
+    stamp.vm?.deletionFence ?? null,
   ]);
 }
 
@@ -358,25 +360,31 @@ export function createDEntryNativePrewarmPort(input: {
   ) {
     const signal = AbortSignal.any([admission, caller]);
     signal.throwIfAborted();
+    // A reserve/instance receipt may arrive while this MVCC snapshot is read.
+    // Compare the snapshot with observations already available on entry.
+    const target = observedPrewarmTarget(plan);
+    const startedElsewhere =
+      plan.target.instanceId !== null && !plan.reservation?.instance;
     const stamp = await input.readCoordination?.(identity, context.sessionId);
     signal.throwIfAborted();
     if (
       !stamp?.authorityRevision ||
-      plan.key !== prewarmKey(context, identity, stamp.authorityRevision)
+      plan.key !== prewarmKey(context, identity, stamp)
     )
       return false;
     if (mode === 'authority') return true;
     const exact = (vm: Generation | null | undefined) =>
       !!vm &&
-      vm.leaseEpoch === plan.target.leaseEpoch &&
-      (!plan.target.vmId || vm.vmId === plan.target.vmId) &&
-      (!plan.target.instanceId || vm.instanceId === plan.target.instanceId);
+      vm.leaseEpoch === target.leaseEpoch &&
+      (!target.vmId || vm.vmId === target.vmId) &&
+      (!target.instanceId || vm.instanceId === target.instanceId);
     const takeover = orphanedStarts.get(plan);
     const vm = stamp.vm;
     if (mode === 'ready')
       return (
         vm?.phase === 'running' &&
-        !!vm.instanceId &&
+        target.vmId !== null &&
+        target.instanceId !== null &&
         !vm.leaseOwner &&
         exact(vm) &&
         (!takeover ||
@@ -419,30 +427,17 @@ export function createDEntryNativePrewarmPort(input: {
         (!vm.leaseOwner || ownsLease),
       );
     }
-    if (mode === 'failed' && plan.target.vmId === null) {
-      const reserved = plan.reservation?.vmId;
-      if (reserved) {
-        if (vm?.vmId !== reserved || vm.phase === 'deleted') return false;
-      } else if (plan.target.replacesVmId) {
-        return (
-          vm?.phase === 'deleted' &&
-          vm.diskRetained === false &&
-          vm.vmId === plan.target.replacesVmId &&
-          exact(plannedGeneration(vm))
-        );
-      } else {
-        return vm === null;
-      }
-    }
-    if (stamp.vm?.phase === 'deleted')
+    if (vm?.phase === 'deleted')
       return (
-        (plan.target.restoreRetained === true ||
-          plan.target.replacesVmId === stamp.vm.vmId) &&
-        exact(plannedGeneration(stamp.vm))
+        ((target.restoreRetained === true && vm.diskRetained === true) ||
+          (target.replacesVmId === vm.vmId && vm.diskRetained === false)) &&
+        exact(plannedGeneration(vm))
       );
-    if (stamp.vm?.phase === 'stopped' && plan.target.instanceId !== null)
-      return false;
-    return exact(stamp.vm) || exact(plannedGeneration(stamp.vm));
+    // Pending tickets can wait before their first lease. A failed ticket must
+    // still be on that exact original empty row or an observed reservation.
+    if (vm && !target.vmId && mode === 'failed') return false;
+    if (vm?.phase === 'stopped' && startedElsewhere) return false;
+    return exact(vm) || exact(plannedGeneration(vm));
   }
   const port: DEntryNativePrewarmPort = {
     isCurrent,
@@ -461,7 +456,7 @@ export function createDEntryNativePrewarmPort(input: {
         old &&
         (old.phase === 'starting' || old.phase === 'stopped')
       ) {
-        const key = prewarmKey(context, identity, stamp.authorityRevision);
+        const key = prewarmKey(context, identity, stamp);
         const prior = activeOrphanedPlans.get(key);
         const takeover = prior && orphanedStarts.get(prior);
         // Use the same snapshot for deduplication and retained preflight: a
@@ -502,7 +497,7 @@ export function createDEntryNativePrewarmPort(input: {
       const target = plannedGeneration(stamp.vm);
       if (!stamp.authorityRevision || !target)
         throw new DataAccessError('authorization_denied');
-      const key = prewarmKey(context, identity, stamp.authorityRevision);
+      const key = prewarmKey(context, identity, stamp);
       const plan: PrewarmPlan = {
         key,
         target,
@@ -557,6 +552,11 @@ export function createDEntryNativePrewarmPort(input: {
           : undefined;
         if (plan?.running && !runningBinding)
           throw new DEntryNativeUnavailable();
+        if (
+          plan?.running &&
+          !(await isCurrent(context, identity, plan, active, 'ready'))
+        )
+          throw new DEntryNativeUnavailable();
         const runningProof = runningBinding
           ? await prove?.(context, identity, active, runningBinding)
           : undefined;
@@ -592,16 +592,17 @@ export function createDEntryNativePrewarmPort(input: {
         const read = input.readCoordination;
         const stamp = await read?.(identity, context.sessionId);
         active.throwIfAborted();
-        const revision = stamp?.authorityRevision;
+        const key =
+          stamp?.authorityRevision && prewarmKey(context, identity, stamp);
         const target =
           stamp &&
           (plan ? plannedGeneration(stamp.vm) : targetGeneration(stamp.vm));
         if (
           plan &&
-          (!revision ||
+          (!key ||
             !target ||
             !canSharePrewarmTarget(plan, target) ||
-            plan.key !== prewarmKey(context, identity, revision))
+            plan.key !== key)
         )
           throw new DataAccessError('authorization_denied');
         if (
@@ -611,9 +612,28 @@ export function createDEntryNativePrewarmPort(input: {
             !matchesInstance(stamp.vm, takeover.predecessor))
         )
           throw new PersonVmError('LEASE_LOST');
-        const reservation: PrewarmReservation | undefined =
-          plan?.target.vmId === null ? {} : undefined;
+        const reservation: PrewarmReservation | undefined = plan
+          ? {}
+          : undefined;
         if (plan && reservation) plan.reservation = reservation;
+        async function currentGeneration(
+          result: PersonVmView,
+          expected: Generation,
+        ) {
+          if (
+            !read ||
+            !key ||
+            (plan && (!expected.vmId || !expected.instanceId))
+          )
+            return;
+          const next = await read(identity, context.sessionId);
+          if (
+            !next.authorityRevision ||
+            prewarmKey(context, identity, next) !== key
+          )
+            return;
+          return matchingGeneration(next, result, expected);
+        }
         const start = (signal: AbortSignal) =>
           input.prewarmCurrent(
             context,
@@ -623,9 +643,14 @@ export function createDEntryNativePrewarmPort(input: {
               ...(plan && {
                 target: {
                   ...plan.target,
+                  deletionFence: stamp?.vm?.deletionFence ?? null,
                   ...(reservation && {
                     observeVmReservation(vmId: string) {
                       reservation.vmId = vmId;
+                    },
+                    observeVmStart(binding: PersonVmBinding) {
+                      reservation.vmId = binding.vmId;
+                      reservation.instance = binding;
                     },
                   }),
                   ...(takeover && {
@@ -673,20 +698,18 @@ export function createDEntryNativePrewarmPort(input: {
             signal,
           );
         const ticket =
-          !takeover && read && revision && target
+          !takeover && read && key && target
             ? shared({
-                key: prewarmKey(context, identity, revision),
+                key,
                 target,
                 reservation,
                 starting: stamp?.vm?.phase === 'starting',
                 revoked,
                 start,
                 async confirm(result, flight) {
-                  return matchingGeneration(
-                    await read(identity, context.sessionId),
-                    revision,
+                  return currentGeneration(
                     result,
-                    flight.target,
+                    plan ? observedPrewarmTarget(plan) : flight.target,
                   );
                 },
               })
@@ -702,20 +725,22 @@ export function createDEntryNativePrewarmPort(input: {
             throw new DataAccessError('authorization_denied');
           const sameGeneration = async () => {
             const expected = generation ?? plan?.target;
-            if (!expected || !read || !revision) return true;
-            const actual = matchingGeneration(
-              await read(identity, context.sessionId),
-              revision,
-              result,
-              expected,
-            );
+            if (!expected || !read || !key) return true;
+            const actual = await currentGeneration(result, expected);
             if (actual && plan) plan.target = actual;
             return Boolean(actual);
           };
           const expected = exactPrewarmBinding(identity, generation);
           // A previously accepted cold ticket only uses the physical binding
           // published by its own start. No ticket is rebound during proof.
-          if (plan && !expected) return;
+          if (
+            plan &&
+            (!expected ||
+              (plan.target.instanceId === null &&
+                (!plan.reservation?.instance ||
+                  !matchesInstance(generation, plan.reservation.instance))))
+          )
+            return;
           let proof: AbortSignal | undefined;
           try {
             proof =
@@ -770,16 +795,8 @@ export function createDEntryNativePrewarmPort(input: {
         }
         // A takeover can succeed without a shared flight. Verify its fresh
         // persisted instance against the original ticket before opening it.
-        const expected = takeover ? takeover.instance : plan?.target;
-        const generation =
-          expected && read && revision
-            ? matchingGeneration(
-                await read(identity, context.sessionId),
-                revision,
-                own,
-                expected,
-              )
-            : undefined;
+        const expected = plan && observedPrewarmTarget(plan);
+        const generation = expected && (await currentGeneration(own, expected));
         const qualified = await qualify(own, generation);
         if (plan && !qualified) throw new DEntryNativeUnavailable();
         return qualified?.proof;

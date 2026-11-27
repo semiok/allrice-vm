@@ -203,8 +203,11 @@ export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
-  /** Host-only observation of a new VM row saved by this request's lease. */
+  /** Opaque deletion fact from the Worker snapshot, checked under the VM lease. */
+  readonly deletionFence?: string | null;
+  /** Host-only observations from this request's create and start leases. */
   observeVmReservation?(vmId: string): void;
+  observeVmStart?(binding: PersonVmBinding): void;
   /** Host-only observations for this ticket's exact orphaned start. */
   orphanedStart?: Readonly<{
     predecessor: PersonVmBinding;
