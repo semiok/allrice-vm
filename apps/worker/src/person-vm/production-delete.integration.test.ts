@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { lstat, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   DEntryNativePrewarmAcceptedSchema,
@@ -29,6 +29,7 @@ import {
   PersonVmService,
   PostgresPersonVmStore,
   type PersonVmAuthority,
+  type PersonVmBinding,
 } from '@allrice/person-vm';
 import * as client from '../../../../packages/database/src/core/client.ts';
 import { DiskPoolLedger } from '../../../../packages/person-vm/src/disk-pool-ledger.ts';
@@ -499,7 +500,7 @@ suite(
           vmId,
           confirmationId: review.json.confirmationId,
         });
-        expect(erased.status).toBe(status);
+        expect(erased.status, JSON.stringify(erased.json)).toBe(status);
         if (status === 200)
           expect(erased.json.vm).toMatchObject({
             vmId,
@@ -507,19 +508,38 @@ suite(
             diskRetained: false,
           });
       }
-      async function close() {
+      async function close(predecessor?: PersonVmBinding) {
         failImageCreation = false;
         failRuntimeStart = false;
         for (const release of releaseGates) release();
         try {
           await entry.close();
           await runtime.close();
-          const current = await store.read(personId);
-          if (current?.diskRetained) {
-            if (current.nativeCreated)
-              nativeStates.set(current.vmId, 'stopped');
-            await purge(current.vmId);
-            nativeStates.delete(current.vmId);
+          const persisted = await store.read(personId);
+          if (persisted?.diskRetained) {
+            if (predecessor && persisted.phase === 'starting') {
+              // The fixture seeded this stopped predecessor. Its cancelled
+              // takeover has joined and released the original lease.
+              expect(persisted).toMatchObject({
+                ...predecessor,
+                leaseOwner: null,
+              });
+              expect(nativeStates.get(predecessor.vmId)).toBe('stopped');
+              await vm.shutdownOwned(predecessor, false);
+              expect(await row()).toMatchObject({
+                ...predecessor,
+                phase: 'stopped',
+                leaseOwner: null,
+                egressReceipt: null,
+              });
+              expect(
+                [...attachments.values()].map((mount) => basename(mount)),
+              ).not.toContain(predecessor.vmId);
+            }
+            if (persisted.nativeCreated)
+              nativeStates.set(persisted.vmId, 'stopped');
+            await purge(persisted.vmId);
+            nativeStates.delete(persisted.vmId);
           }
         } finally {
           uninstallData();
@@ -910,14 +930,25 @@ suite(
         expect({ status: delayed.status, json: await delayed.json() }).toEqual(
           expiredTicket,
         );
-        expect(f.dispatch).toHaveBeenCalledTimes(2);
-        expect(await f.leaseRowVersion()).toEqual(healthy);
-        resume.resolve();
-        expect(await f.ready(hot)).toEqual(binding);
+        // Hot proof precedes a call to the existing VM lifecycle in this fixture.
+        expect(f.dispatch).toHaveBeenCalledOnce();
         expect(f.proof.mock.calls.map(([, , , current]) => current)).toEqual([
           binding,
           binding,
         ]);
+        expect(await f.leaseRowVersion()).toEqual(healthy);
+        resume.resolve();
+        expect(await f.ready(hot)).toEqual(binding);
+        expect(await f.ready(starter, independent)).toEqual(binding);
+        expect(f.dispatch).toHaveBeenCalledTimes(2);
+        const [, employee, input] = f.dispatch.mock.calls[1]!;
+        expect(employee).toEqual(f.identity);
+        expect(input.target).toMatchObject({
+          vmId: binding.vmId,
+          instanceId: binding.instanceId,
+          leaseEpoch: binding.leaseEpoch,
+        });
+        expect(await f.leaseRowVersion()).toEqual(healthy);
       } finally {
         resume.resolve();
         await f.close();
@@ -959,9 +990,12 @@ suite(
             ),
         );
         const productionCheck = dEntryHttpDefaults.prewarm.isCurrent!;
+        let withdraw = false;
+        let predecessor: PersonVmBinding | undefined;
         f.isCurrent.mockImplementation(async (...args) => {
           const active = args[3];
-          if (args[4] === mode) {
+          if (withdraw && args[4] === mode) {
+            withdraw = false;
             const withdrawn =
               await fixture.db`update allrice_memberships set active=false
                 where user_id=${f.personId} and organization_id=${f.owner.organizationId} and active
@@ -983,7 +1017,9 @@ suite(
         }
         try {
           if (mode === 'issue') {
+            withdraw = true;
             await expectDenied(await f.open());
+            expect(withdraw).toBe(false);
             expect(f.dispatch).not.toHaveBeenCalled();
             expect(await store.read(f.personId)).toBeNull();
             return;
@@ -999,6 +1035,7 @@ suite(
               and lease_epoch=${prior.leaseEpoch} and lease_owner is null
             returning instance_id`;
           expect(orphaned).toHaveLength(1);
+          predecessor = prior;
           const delayed = mode === 'reuse' ? f.pauseBeforeIssue() : undefined;
           const opening = delayed && f.open();
           if (delayed && opening)
@@ -1020,18 +1057,20 @@ suite(
             leaseOwner: expect.any(String),
           });
           const claimed = await f.leaseRowVersion();
+          withdraw = true;
           if (delayed && opening) {
             delayed.resume.resolve();
             await expectDenied(await opening);
           } else {
             expect(await f.status(original)).toEqual(expiredTicket);
           }
+          expect(withdraw).toBe(false);
           expect(await f.leaseRowVersion()).toEqual(claimed);
           expect(f.dispatch).toHaveBeenCalledTimes(2);
         } finally {
           for (const notify of blocked) notify();
           try {
-            await f.close();
+            await f.close(predecessor);
           } finally {
             await feed.close();
           }
