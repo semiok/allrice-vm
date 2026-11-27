@@ -24,16 +24,21 @@ const employeeKey = (employee: Employee) =>
 /** The outer page survives chat navigation. Hold only idempotency and CAS
  * metadata here so an uncertain write keeps its identity in the next iframe. */
 export function createEmployeeMemoryPageWrites() {
-  let owner: string | undefined;
-  let current: PageWrites | undefined;
+  let principal: string | undefined;
+  const stores = new Map<string, PageWrites>();
   return (host: Host, scopeId: string, employee: Employee) => {
-    const key = employeeKey(employee);
-    if (!current || owner !== key) {
-      current?.writes.clear();
-      owner = key;
-      current = { operationScopeId: scopeId, writes: new Map() };
+    const actor = JSON.stringify([employee.organizationId, employee.personId]);
+    if (principal !== actor) {
+      for (const state of stores.values()) state.writes.clear();
+      stores.clear();
+      principal = actor;
     }
-    const state = current;
+    const key = employeeKey(employee);
+    const state = stores.get(key) ?? {
+      operationScopeId: scopeId,
+      writes: new Map(),
+    };
+    stores.set(key, state);
     const read = (candidate: string, member: Employee) =>
       candidate === scopeId && employeeKey(member) === key ? state : undefined;
     host.__ALLRICE_EMPLOYEE_MEMORY_WRITES__ = read;

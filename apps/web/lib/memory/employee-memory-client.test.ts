@@ -195,6 +195,15 @@ describe('native memory across chat navigation', () => {
     expect(
       readEmployeeMemoryPageWrites(host, 'second-chat', other),
     ).toBeUndefined();
+    bind(host, 'return-to-first', employee);
+    expect(
+      readEmployeeMemoryPageWrites(host, 'return-to-first', employee),
+    ).toBe(owned);
+    bind(host, 'new-person', { ...employee, personId: id(99) });
+    bind(host, 'previous-person', employee);
+    expect(
+      readEmployeeMemoryPageWrites(host, 'previous-person', employee)?.writes,
+    ).not.toBe(owned?.writes);
   });
 });
 
