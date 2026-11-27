@@ -334,12 +334,14 @@ class Scope implements Projection {
   async readCatalog<T>(read: () => Promise<T>, signal: AbortSignal) {
     await this.refresh(signal);
     while (true) {
-      const generation = this.refreshGeneration;
-      const value = await this.current(read, signal);
+      const { cut, value } = await this.current(async () => {
+        const cut = this.refreshQueue;
+        return { cut, value: await read() };
+      }, signal);
       signal.throwIfAborted();
       // The native list filters after I/O. A concurrent hint can temporarily
       // remove permissions mid-read and return an incomplete, successful list.
-      if (generation === this.refreshGeneration) return value;
+      if (cut === this.refreshQueue) return value;
     }
   }
   close(): Promise<void> {
