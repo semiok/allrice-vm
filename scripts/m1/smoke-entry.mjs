@@ -9,9 +9,10 @@ const EDITOR = '[role="textbox"][data-composer-input]';
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
 
 export class SmokeSkip extends Error {}
+export class SmokeFailure extends Error {}
 
 function requireFact(condition, reason) {
-  if (!condition) throw new Error(reason);
+  if (!condition) throw new SmokeFailure(reason);
 }
 
 function sameEmployee(query, selection) {
@@ -72,7 +73,9 @@ export async function smokeNativeEntry(
       requireFact(
         ticket &&
           url.searchParams.get('operationId') === ticket &&
-          sameEmployee(url.searchParams, selection),
+          sameEmployee(url.searchParams, selection) &&
+          (url.searchParams.get('threadId') ?? undefined) ===
+            selection.threadId,
         '预热轮询与原票据不一致',
       );
       requireFact(status === 200, '预热状态请求失败');
@@ -111,6 +114,11 @@ export async function smokeNativeEntry(
         waitUntil: 'domcontentloaded',
         timeout,
       }),
+    );
+    requireFact(
+      new URL(page.url()).origin === origin &&
+        new URL(page.url()).pathname === '/login',
+      '登录页未保持同源',
     );
     await guarded(
       page.locator('input[name="username"]').fill(credentials.username),

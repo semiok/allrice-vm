@@ -907,6 +907,19 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertEqual(env['UNRELATED_SETTING'], 'keep')
                     self.assert_no_legacy_settings(env)
 
+    def test_smoke_prerequisite_skip_is_distinct_from_a_pass(self):
+        stubs, smoke = self.successful_deploy_stubs()
+        write(os.path.join(smoke, 'smoke-test'), '#!/bin/sh\necho "跳过：没有可用 VM"\nexit 77\n', 0o755)
+        self.seed_legacy_plists()
+        p = self.run_dd(stubs + 'deploy', FILES + ARCHIVED, CONTRACT='row:1',
+                        CANDIDATE=self.release(sha='b' * 40), ART='sha256:' + 'c' * 64, SMOKE=smoke)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('smoke skipped', p.stdout)
+        self.assertIn('跳过：没有可用 VM', p.stdout)
+        with open(os.path.join(self.home, 'allrice40-dev/qa/deploys.jsonl')) as f:
+            self.assertEqual(json.loads(f.readlines()[-1])['result'], 'skipped')
+        self.remove_deploy_build()
+
     def test_failed_smoke_only_offers_default_rollback_when_one_is_recorded(self):
         stubs, smoke = self.successful_deploy_stubs()
         write(os.path.join(smoke, 'smoke-test'), '#!/bin/sh\nexit 1\n', 0o755)

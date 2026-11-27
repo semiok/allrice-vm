@@ -11,7 +11,7 @@ import {
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
+import { SmokeFailure, SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
 
 const { values: args } = parseArgs({
   options: {
@@ -31,7 +31,6 @@ if (!args.url || !args['worker-url'] || !args.creds || !args.out) {
   process.exit(2);
 }
 
-class SmokeFailure extends Error {}
 const sha = /^[a-f0-9]{40}$/;
 const declaredLimit =
   args['vm-unavailable'] ?? process.env.ALLRICE_SMOKE_VM_UNAVAILABLE;
@@ -123,10 +122,7 @@ try {
   if (error instanceof SmokeSkip) receipt.status = 'skipped';
   // Dry operational evidence must not contain credentials, request bodies or scope URLs.
   receipt.reason =
-    error instanceof SmokeSkip ||
-    error instanceof SmokeFailure ||
-    (error.constructor === Error &&
-      /^[\p{Script=Han} 0-9A-Za-z（）]+$/u.test(error.message))
+    error instanceof SmokeSkip || error instanceof SmokeFailure
       ? error.message
       : '原生冒烟步骤失败';
 } finally {
