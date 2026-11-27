@@ -2,6 +2,7 @@ export type SensitivePageCapability =
   | 'native-identity'
   | 'plugin-management'
   | 'runtime-upgrade'
+  | 'platform-settings'
   | 'provider-configuration';
 
 type Method = Readonly<{
@@ -25,8 +26,11 @@ const authentication = new Set([
   'tokenIssuer',
 ]);
 const pluginManagement = new Set(['pluginManager']);
+const pluginMarket = new Set(['pluginMarket']);
+const dynamicPlugins = new Set(['dynamicCordisRunner']);
 const runtimeUpgrade = new Set(['runtimeUpgrade', 'updater', 'dshUpdater']);
 const credentialManagement = new Set(['credentials', 'credentialsController']);
+const interactiveTerminal = new Set(['terminal', 'terminalController']);
 
 function inCategory(endpoint: Method, values: ReadonlySet<string>) {
   return values.has(endpoint.namespace) || values.has(endpoint.service);
@@ -49,7 +53,17 @@ export function sensitivePageCapability(
     return;
   }
   if (inCategory(endpoint, authentication)) return 'native-identity';
-  if (inCategory(endpoint, pluginManagement)) return 'plugin-management';
+  if (
+    inCategory(endpoint, pluginManagement) ||
+    (inCategory(endpoint, pluginMarket) &&
+      /^(?:set|update|replace|mutate)/u.test(method)) ||
+    (inCategory(endpoint, dynamicPlugins) &&
+      /^(?:activate|approve|runHost|resolveRequestRun|settleUserRun)/u.test(
+        method,
+      ))
+  ) {
+    return 'plugin-management';
+  }
   if (inCategory(endpoint, runtimeUpgrade)) return 'runtime-upgrade';
   if (
     inCategory(endpoint, credentialManagement) ||
@@ -61,6 +75,10 @@ export function sensitivePageCapability(
     return 'provider-configuration';
   }
 
+  if (namespace === 'settings' && method === 'openSettingsDocument') {
+    return 'platform-settings';
+  }
+
   // Native settings controllers multiplex several independent Config owners.
   // Provider settings are named by the DSH configurable-provider directory.
   if (namespace === 'settings' && /^(?:mutate|replace|update)/u.test(method)) {
@@ -70,4 +88,15 @@ export function sensitivePageCapability(
       return 'provider-configuration';
     }
   }
+}
+
+/** The sealed employee profile does not register a terminal controller.
+ * Report its capability on an upgrade even though the profile owns disablement. */
+export function sensitivePageUpgradeCapability(endpoint: Method) {
+  return (
+    sensitivePageCapability(endpoint) ??
+    (inCategory(endpoint, interactiveTerminal)
+      ? 'interactive-shell'
+      : undefined)
+  );
 }

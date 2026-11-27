@@ -1,0 +1,99 @@
+import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
+import { expect, it } from 'vitest';
+import { z } from 'zod';
+import {
+  encodePageNativeResult,
+  requirePageNativeMethod,
+} from '../src/page-native-method.js';
+
+function descriptor(
+  namespace: string,
+  method: string,
+  options: Partial<InvocationDescriptor> = {},
+): InvocationDescriptor {
+  return {
+    id: `@deepseek-ai/dsh-fixture#${namespace}/${method}`,
+    namespace,
+    method,
+    service: namespace,
+    invocation: { kind: 'direct' },
+    parameters: [],
+    result: {
+      mode: 'strict',
+      typeSymbol: 'Fixture',
+      create: () => z.string(),
+    },
+    ...options,
+  };
+}
+
+it('uses a live DSH descriptor for new native methods and requires the matching carrier', () => {
+  const search = descriptor('session', 'search');
+  const registry = { get: () => search };
+  expect(
+    requirePageNativeMethod(registry, 'session/search', 'unary', {}, new Set()),
+  ).toBe(search);
+  expect(() =>
+    requirePageNativeMethod(
+      registry,
+      'session/search',
+      'stream',
+      {},
+      new Set(),
+    ),
+  ).toThrow('DSH method unavailable');
+  expect(() =>
+    requirePageNativeMethod(registry, 'session/other', 'unary', {}, new Set()),
+  ).toThrow('DSH method unavailable');
+});
+
+it('excludes the private AllRice registry and refuses managed operations before dispatch', () => {
+  const privateMethod = descriptor('allricePrincipal', 'openScope', {
+    id: '@allrice/d-entry-principal#allricePrincipal/openScope',
+  });
+  const activate = descriptor('dynamicCordisRunner', 'runHostHalf');
+  expect(() =>
+    requirePageNativeMethod(
+      { get: () => privateMethod },
+      'allricePrincipal/openScope',
+      'unary',
+      {},
+      new Set(),
+    ),
+  ).toThrow('DSH method unavailable');
+  expect(() =>
+    requirePageNativeMethod(
+      { get: () => activate },
+      'dynamicCordisRunner/runHostHalf',
+      'unary',
+      {},
+      new Set(),
+    ),
+  ).toThrow('DSH method is platform managed');
+});
+
+it('retains native attachment bytes and paths, and validates results before returning them', () => {
+  const attachment = descriptor('session', 'attachment', {
+    result: {
+      mode: 'strict',
+      typeSymbol: 'FixtureBytes',
+      create: () => z.object({ nested: z.array(z.instanceof(Uint8Array)) }),
+      encode: (input, writeBytes) => {
+        const { nested } = z
+          .object({ nested: z.array(z.instanceof(Uint8Array)) })
+          .parse(input);
+        return {
+          nested: nested.map((bytes, i) => writeBytes(bytes, ['nested', i])),
+        };
+      },
+    },
+  });
+  const bytes = new Uint8Array([1, 2, 3]);
+  expect(encodePageNativeResult(attachment, { nested: [bytes] })).toEqual({
+    value: { nested: [null] },
+    attachments: [{ bytes, path: ['nested', 0] }],
+  });
+  expect(() =>
+    encodePageNativeResult(attachment, { nested: [false] }),
+  ).toThrow();
+});

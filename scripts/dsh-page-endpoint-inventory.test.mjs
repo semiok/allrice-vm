@@ -95,6 +95,32 @@ it('distinguishes an installed provider’s native settings namespace from ordin
   expect(sensitivePageCapability(mutation)).toBe('provider-configuration');
 });
 
+it('blocks native plugin activation and platform settings while leaving their reads available', () => {
+  expect(
+    sensitivePageCapability(endpoint('dynamicCordisRunner', 'inventory')),
+  ).toBeUndefined();
+  expect(
+    sensitivePageCapability(endpoint('dynamicCordisRunner', 'runHostHalf')),
+  ).toBe('plugin-management');
+  expect(
+    sensitivePageCapability(endpoint('dynamicCordisRunner', 'settleUserRun')),
+  ).toBe('plugin-management');
+  expect(
+    sensitivePageCapability(
+      endpoint('dynamicCordisRunner', 'resolveRequestRun'),
+    ),
+  ).toBe('plugin-management');
+  expect(
+    sensitivePageCapability(endpoint('pluginMarket', 'search')),
+  ).toBeUndefined();
+  expect(sensitivePageCapability(endpoint('pluginMarket', 'setIndexes'))).toBe(
+    'plugin-management',
+  );
+  expect(
+    sensitivePageCapability(endpoint('settings', 'openSettingsDocument')),
+  ).toBe('platform-settings');
+});
+
 it('reports only additions matching sensitive capabilities and ignores removals and existing endpoints', () => {
   const row = (path, service, mode = 'unary') =>
     `@deepseek-ai/dsh-test\t${path}\t${service}\t${mode}`;
@@ -107,10 +133,12 @@ it('reports only additions matching sensitive capabilities and ignores removals 
         row('session/nextOrdinaryAction', 'sessionController'),
         row('pluginManager/installFromArchive', 'pluginManager'),
         row('credentials/watch', 'credentialsController', 'stream'),
+        row('terminal/create', 'terminalController'),
       ],
     ).map(({ endpoint, category }) => [endpoint, category]),
   ).toEqual([
     ['pluginManager/installFromArchive', 'plugin-management'],
     ['credentials/watch', 'provider-configuration'],
+    ['terminal/create', 'interactive-shell'],
   ]);
 });

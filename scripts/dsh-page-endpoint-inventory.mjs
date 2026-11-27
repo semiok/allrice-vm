@@ -2,7 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { sensitivePageCapability } from '../packages/d-entry-principal/src/page-capability-policy.ts';
+import { sensitivePageUpgradeCapability } from '../packages/d-entry-principal/src/page-capability-policy.ts';
 
 const upstreamRegistryPrefix = '@deepseek-ai+';
 const upstreamPackagePrefix = '@deepseek-ai/';
@@ -88,7 +88,7 @@ export function addedPageEndpoints(previous, current) {
 
 export function addedSensitivePageEndpoints(previous, current) {
   return addedPageEndpoints(previous, current).flatMap((entry) => {
-    const category = sensitivePageCapability(entry);
+    const category = sensitivePageUpgradeCapability(entry);
     return category ? [{ ...entry, category }] : [];
   });
 }
