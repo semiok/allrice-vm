@@ -542,7 +542,8 @@ export function EmployeeNativePage({
       if (event.data.type === pageSwitchReady) switchReady = true;
       if (
         event.data.type === pageThreadSwitchPrepared &&
-        switching?.requestId === event.data.requestId &&
+        switching &&
+        switching.requestId === event.data.requestId &&
         !switching.submitted &&
         !navigating &&
         !detached &&
