@@ -308,9 +308,16 @@ it
       return;
     }
     const workbench = page.frameLocator('iframe');
-    await expect
-      .poll(() => workspaceBaselines)
-      .toMatchObject([
+    const editor = workbench.locator(
+      '[role="textbox"][data-composer-input][contenteditable="true"]',
+    );
+    try {
+      // The iframe loads its native bundles before opening workspace/follow.
+      // Navigation alone does not mean the browser has even sent that open.
+      await expect
+        .poll(() => workspaceBaselines.length, { timeout: 15_000 })
+        .toBeGreaterThan(0);
+      expect(workspaceBaselines).toMatchObject([
         {
           items: [
             {
@@ -320,20 +327,16 @@ it
           ],
         },
       ]);
-    if (scenario === 'unattached') {
-      await workbench
-        .locator('[data-composer-input][contenteditable="false"]')
-        .waitFor();
-      await workbench
-        .getByText(/选择一个工作区开始|Choose a workspace to start/)
-        .waitFor();
-      await context.close();
-      return;
-    }
-    const editor = workbench.locator(
-      '[role="textbox"][data-composer-input][contenteditable="true"]',
-    );
-    try {
+      if (scenario === 'unattached') {
+        await workbench
+          .locator('[data-composer-input][contenteditable="false"]')
+          .waitFor({ timeout: 15_000 });
+        await workbench
+          .getByText(/选择一个工作区开始|Choose a workspace to start/)
+          .waitFor({ timeout: 15_000 });
+        await context.close();
+        return;
+      }
       await editor.fill('未发送的原生草稿', { timeout: 15_000 });
     } catch (error) {
       throw Error(
@@ -341,9 +344,15 @@ it
           unary,
           streamEndpoints: [...streams.values()],
           firstItems,
+          workspaceBaselines,
           startupReplies: Object.fromEntries(startupReplies),
           errors,
-          text: (await workbench.locator('body').innerText()).slice(0, 300),
+          text: (
+            await workbench
+              .locator('body')
+              .innerText({ timeout: 1_000 })
+              .catch(() => '')
+          ).slice(0, 300),
         }),
         { cause: error },
       );
