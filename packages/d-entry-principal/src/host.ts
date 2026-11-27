@@ -1278,7 +1278,7 @@ class PrincipalService extends TypertRemoteService {
     const setup = scope.own(async () => {
       active.throwIfAborted();
       if (page) {
-        if (endpoint === 'session/follow') await scope.refresh(active);
+        if (raw.endpoint === 'session/follow') await scope.refresh(active);
         iterator = await scope.current(async () => {
           pageMethod = this.pageMethod(scope, raw, 'stream');
           const { endpoint, args, descriptor } = pageMethod;
