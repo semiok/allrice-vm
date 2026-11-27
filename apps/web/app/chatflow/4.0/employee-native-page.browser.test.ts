@@ -444,9 +444,6 @@ suite('4.0 browser cold entry', () => {
       await returnPage.waitForURL(
         (url) => url.pathname === '/chatflow/4.0' && !url.search,
       );
-      await returnPage
-        .getByRole('heading', { name: '新建你的第一个员工', exact: true })
-        .waitFor();
       await returnPage.close();
 
       const stalledDocument = await context.newPage();

@@ -175,7 +175,20 @@ export function EmployeeNativePage({
       );
     }
     function retire() {
-      return (replacing ??= (async () => {
+      if (replacing) return replacing;
+      if (prepare) {
+        closingNotice = window.setTimeout(
+          () => setStatus('closing'),
+          closingNoticeMs,
+        );
+        // Loss of either completion signal must not leave a perpetual spinner
+        // or enable a new page without the old page's actual close proof.
+        closingConfirmation = window.setTimeout(
+          () => setStatus('unknown'),
+          closingConfirmationMs,
+        );
+      }
+      replacing = (async () => {
         // A render change keeps the old iframe and its authenticated sender
         // attached until both halves have settled.
         if (!mounted || !frame.current) {
@@ -211,7 +224,13 @@ export function EmployeeNativePage({
         }
         const [remote, entry] = await Promise.all([close(), local.promise]);
         return remote === 'closed' && entry === 'closed';
-      })());
+      })()
+        .catch(() => false)
+        .finally(() => {
+          window.clearTimeout(closingNotice);
+          window.clearTimeout(closingConfirmation);
+        });
+      return replacing;
     }
     function finish(
       status: 'cancelled' | 'failed' | 'denied',
@@ -222,19 +241,7 @@ export function EmployeeNativePage({
       resumable = retainTicket;
       window.clearTimeout(timer);
       setStatus(status);
-      closingNotice = window.setTimeout(
-        () => setStatus('closing'),
-        closingNoticeMs,
-      );
-      // Loss of either completion signal must not leave a perpetual spinner
-      // or enable a new page without the old page's actual close proof.
-      closingConfirmation = window.setTimeout(
-        () => setStatus('unknown'),
-        closingConfirmationMs,
-      );
       void retire().then((closed) => {
-        window.clearTimeout(closingNotice);
-        window.clearTimeout(closingConfirmation);
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
