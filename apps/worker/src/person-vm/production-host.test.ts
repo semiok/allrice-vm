@@ -23,6 +23,7 @@ import {
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
 import type * as ReleasedProfile from '../d-entry/released-profile.js';
+import * as EmployeeRuntime from './production-employee-runtime.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -530,6 +531,14 @@ it('constructs the real store/service/admission/startup with one SQL factory and
     'assertAdmissionFactory',
   );
   const admission = vi.spyOn(PersonVmService.prototype, 'createAdmissionHost');
+  const employeeRuntime = vi.spyOn(
+    EmployeeRuntime,
+    'createProductionEmployeeRuntime',
+  );
+  const settings = Object.freeze({
+    employeeMaxRunning: 2,
+    employeeIdleMs: 180_000,
+  });
   const platform = Object.freeze({
     ...f.loaded.platform,
     memoryMiB: 3072,
@@ -538,6 +547,7 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   io.read.mockResolvedValue({
     ...f.loaded,
     platform,
+    employeeRuntimeSettings: settings,
     configuration: {
       ...f.loaded.configuration,
       memory: {
@@ -556,6 +566,11 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   expect(actual.providers.native).toBeInstanceOf(MicrosandboxPersonVm);
   expect(actual.providers.disk).toBeInstanceOf(ApfsPersonVmDisk);
   expect(actual.providers.platform).toBe(platform);
+  expect(employeeRuntime).toHaveBeenCalledExactlyOnceWith(
+    settings,
+    actual.providers.native,
+    platform.employeePortSlots,
+  );
   expect(admission).toHaveBeenCalledExactlyOnceWith({
     openSql: expect.any(Function),
     idleMs: platform.idleMs,

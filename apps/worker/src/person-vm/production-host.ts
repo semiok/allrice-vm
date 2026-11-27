@@ -68,6 +68,7 @@ import {
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 type Providers = Awaited<ReturnType<typeof createProductionPersonVmProviders>>;
 type Startup = ReturnType<typeof createAssignedNativeWebStartup>;
@@ -582,6 +583,11 @@ export function createProductionPersonVmHost(input: {
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const store = new PostgresPersonVmStore(openSql);
+      const employeeRuntime = createProductionEmployeeRuntime(
+        providers.employeeRuntimeSettings,
+        providers.native,
+        providers.platform.employeePortSlots,
+      );
       const diskRoot = providers.configuration.disk.root;
       const diskPool = new PersonVmDiskPool(
         diskRoot,
@@ -616,6 +622,7 @@ export function createProductionPersonVmHost(input: {
       };
       const vm = new PersonVmService({
         authorizePlatformDeletion: authorizeProductionPersonVmDeletion,
+        readUnusedEmployeeHomes: employeeRuntime?.readUnusedEmployeeHomes,
         store,
         authority: current.authority,
         native: providers.native,
@@ -673,6 +680,7 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
+        employeeRuntime,
         archive: {
           subscribe: subscribeDEntryEmployeeArchive,
           confirm: confirmDEntryEmployeeArchive,

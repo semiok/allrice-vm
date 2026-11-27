@@ -41,6 +41,7 @@ import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
 type EmployeeProfile = Omit<DEntryIdentity, 'threadId'>;
+type ReportCapacity = (limit: number | undefined) => void;
 type ColdEmployeeSelection = Readonly<{
   selected: EmployeeProfile;
   neverStarted: readonly EmployeeProfile[];
@@ -215,33 +216,48 @@ export function createAssignedNativeWebStartup(input: {
     void operation.then(settle, settle);
     return operation;
   }
-  function employeeCapacityFull(group: RunningGroup) {
-    return (
-      group.runtimeLimit !== undefined &&
-      new Set([
-        ...group.owners.keys(),
-        ...group.startingEmployees,
-        ...group.blockedEmployees.keys(),
-      ]).size >= group.runtimeLimit
-    );
+  function fullEmployeeCapacity(group: RunningGroup) {
+    const limit = group.runtimeLimit;
+    if (limit === undefined) return;
+    const occupied = new Set([
+      ...group.owners.keys(),
+      ...group.startingEmployees,
+      ...group.blockedEmployees.keys(),
+    ]);
+    return occupied.size >= limit ? limit : undefined;
   }
   function withEmployeeCapacity(
     group: RunningGroup,
     signal: AbortSignal,
-    work: () => Promise<void | 'wait-for-capacity'>,
+    reportCapacity: ReportCapacity | undefined,
+    work: (setWaiting: ReportCapacity) => Promise<void | 'wait-for-capacity'>,
   ) {
     return track(async () => {
-      for (;;) {
-        signal.throwIfAborted();
-        // Capture before the attempt so a joined owner cannot release capacity
-        // between the attempt completing and the waiter attaching.
-        const changed = group.capacityChanged.signal;
-        if ((await update(group, work)) !== 'wait-for-capacity') return;
-        const exits = [...group.owners].flatMap(([id, owner]) =>
-          group.blockedEmployees.has(id) ? [] : [owner.jobExited],
-        );
-        const wake = AbortSignal.any([signal, changed, ...exits]);
-        if (!wake.aborted) await once(wake, 'abort');
+      let reported: number | undefined;
+      const setWaiting = (limit: number | undefined) => {
+        if (reported === limit) return;
+        reported = limit;
+        reportCapacity?.(limit);
+      };
+      try {
+        for (;;) {
+          signal.throwIfAborted();
+          // Capture before the attempt so a joined owner cannot release capacity
+          // between the attempt completing and the waiter attaching.
+          const changed = group.capacityChanged.signal;
+          if (
+            (await update(group, () => work(setWaiting))) !==
+            'wait-for-capacity'
+          )
+            return;
+          const exits = [...group.owners].flatMap(([id, owner]) =>
+            group.blockedEmployees.has(id) ? [] : [owner.jobExited],
+          );
+          const wake = AbortSignal.any([signal, changed, ...exits]);
+          if (!wake.aborted) await once(wake, 'abort');
+        }
+      } finally {
+        setWaiting(undefined);
       }
     });
   }
@@ -433,6 +449,7 @@ export function createAssignedNativeWebStartup(input: {
   async function coldEmployees(web: PersonVmWebStartup, signal: AbortSignal) {
     const { binding, endpoints, slots } = web.receipt;
     if (!slots || !input.employeeRuntime) return { endpoints };
+    const maxRunning = Math.min(runtimeLimit, slots.length);
     const selection = await input.employeeRuntime.readColdSelection?.(
       web,
       signal,
@@ -459,12 +476,9 @@ export function createAssignedNativeWebStartup(input: {
       ({ employeeInstanceId }) =>
         employeeInstanceId === selectedId || !deferred.has(employeeInstanceId),
     );
-    // A retained roster can have more mandatory profiles than the new limit.
-    // Keep this generation on the established eager path until its owners can
-    // be safely deferred. Only a plan that fits may enable the running limit.
-    return launches.length > runtimeLimit
-      ? { endpoints, selectedId }
-      : { endpoints: launches, selectedId, runtimeLimit };
+    // Retain the launch of existing homes because their native work can need
+    // restoration. That allowance cannot grant another hot-start slot.
+    return { endpoints: launches, selectedId, runtimeLimit: maxRunning };
   }
   async function close() {
     if (closing) return closing;
@@ -893,6 +907,7 @@ export function createAssignedNativeWebStartup(input: {
       identity: DEntryIdentity,
       check: (signal: AbortSignal) => Promise<void>,
       caller: AbortSignal,
+      reportCapacity?: ReportCapacity,
     ) {
       const group = running.get(binding.vmId);
       const slots = group?.slots;
@@ -905,7 +920,9 @@ export function createAssignedNativeWebStartup(input: {
       )
         return Promise.resolve();
       const signal = AbortSignal.any([caller, lifetime, group.revoked.signal]);
-      return withEmployeeCapacity(group, signal, async () => {
+      const startSelectedEmployee = async (
+        setWaiting: ReportCapacity,
+      ): Promise<void | 'wait-for-capacity'> => {
         const rosterFor = input.readRoster ?? readPersonNativeWebRoster;
         const scope = {
           binding,
@@ -965,7 +982,7 @@ export function createAssignedNativeWebStartup(input: {
           await scope.assertCurrent();
         }
         if (
-          employeeCapacityFull(group) &&
+          fullEmployeeCapacity(group) !== undefined &&
           (await retireOneExitedEmployee(group))
         )
           await scope.assertCurrent();
@@ -1002,7 +1019,13 @@ export function createAssignedNativeWebStartup(input: {
         }
         // Preserve exact archived physical-slot reclaim before a capacity
         // wait. Capacity alone grants no right to close another live owner.
-        if (employeeCapacityFull(group)) return 'wait-for-capacity';
+        const limit = fullEmployeeCapacity(group);
+        if (limit !== undefined) {
+          setWaiting(limit);
+          return 'wait-for-capacity';
+        }
+        setWaiting(undefined);
+        signal.throwIfAborted();
         if (!slot) throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
         const endpoint = Object.freeze({ ...selected, ...slot });
         const profile = await input.readEmployeeProfile(signal);
@@ -1082,7 +1105,13 @@ export function createAssignedNativeWebStartup(input: {
         } finally {
           group.startingEmployees.delete(employeeId);
         }
-      });
+      };
+      return withEmployeeCapacity(
+        group,
+        signal,
+        reportCapacity,
+        startSelectedEmployee,
+      );
     },
     ensureVerifiedEditor(
       context: RequestContext,
