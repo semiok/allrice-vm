@@ -120,7 +120,7 @@ PDF 直接加载官方已发布的 client.pdf.js（包括其 PDF.js Worker），
 
 Office 继续调用现有 LibreOffice 页面/公式服务，将其结果接入原生缩放视图，保留分页、重算提示、版本、下载和反馈；本次没有重新实现生成、解析或公式引擎，也没有宣称接入上游交互工作表。文件预览复用现有授权与内容服务，读取完成后再次核对文件可见性；快速切换和卸载取消旧请求。
 
-真实文档复核可将现有 `/render` 响应保存为 `docx.json`、`xlsx.json`、`pptx.json`，通过 `ALLRICE_OFFICE_PREVIEW_DIR=<目录> ALLRICE_RUN_BROWSER_INTEGRATION=1 pnpm exec vitest run apps/web/app/chatflow/workbench-layout.browser.test.ts -t 'MET160 real'` 验证真实图像、原生缩放及翻页；不提交租户文件或重新调用模型。常规 CI 使用合成 HTTP 覆盖真实 PDF 字节/Worker、文件目录刷新、删除失效、会话切换与既有 Office 公式/分页行为。
+真实文档复核可将现有 `/render` 响应保存为 `docx.json`、`xlsx.json`、`pptx.json`，通过 `ALLRICE_OFFICE_PREVIEW_DIR=<目录> ALLRICE_RUN_BROWSER_INTEGRATION=1 pnpm exec vitest run apps/web/app/chatflow/native-document-preview.browser.test.ts -t 'MET160 real'` 验证真实图像、原生缩放及翻页；不提交租户文件或重新调用模型。常规 CI 使用合成 HTTP 覆盖真实 PDF 字节/Worker、文件目录刷新、删除失效、会话切换与既有 Office 公式/分页行为。
 
 PR3 验证：52 个常规 Chromium 用例、3 个现有真实 Office 渲染结果用例、18 个内容/文件权限用例通过。Next 生产构建和启动实测 PDF 资源 SHA-256 与官方包一致。Shiki 固定上游锁文件的 4.3.1，官方发布包缺失的外部运行依赖通过 packageExtensions 补齐，不能依赖开发机偶然提升的依赖。后台浏览器夹具保留与生产一致的 ESM 静态/懒加载模块边界，避免单文件打包使共享扫描器尚未初始化。Worker 分发校验确认引擎仍为 0.1.5-rc.3。
 

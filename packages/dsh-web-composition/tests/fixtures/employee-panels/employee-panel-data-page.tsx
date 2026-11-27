@@ -55,6 +55,7 @@ let references = structuredClone(sample.references);
 let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
+let pdfBase64: string | undefined;
 let publicationReplyLost = false;
 let publicationRejected = false;
 let receiptReady = false;
@@ -198,6 +199,8 @@ const bound = createEmployeePanelDataClient({
   },
   async previewDeliverable(input, signal) {
     await call('previewDeliverable', input, signal);
+    if (pdfBase64)
+      return { kind: 'pdf', base64: pdfBase64, missingFonts: ['Fixture Sans'] };
     return textPage(input.offset);
   },
   async previewMaterial(input, signal) {
@@ -381,10 +384,14 @@ function Fixture() {
       mutateOriginal() {
         bytes.set(uid(300), '后续另存的内容');
       },
-      refusePreview(status, code) {
+      usePdf(base64) {
+        pdfBase64 = base64;
+      },
+      refusePreview(status, code, refresh = true) {
         metadataStatus = status;
         metadataCode = code;
-        window.dispatchEvent(new Event('allrice:workbench-files-changed'));
+        if (refresh)
+          window.dispatchEvent(new Event('allrice:workbench-files-changed'));
       },
       losePublicationReply() {
         publicationReplyLost = true;

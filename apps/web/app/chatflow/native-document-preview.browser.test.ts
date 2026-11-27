@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   afterAll,
   beforeAll,
@@ -18,6 +18,8 @@ import type {
   JSHandle,
   Page,
 } from '../../../worker/node_modules/playwright-core/index.js';
+import { OfficeRenderResponseSchema } from '@allrice/contracts';
+import { officePreview } from '@allrice/office-runtime';
 import { createFailureEvidence } from '../../../../scripts/test-failure-evidence.mjs';
 import { nativeExcelAssetResponse } from '../../lib/chatflow/native-document-asset';
 const suite =
@@ -1054,6 +1056,110 @@ suite('DSH native document previews', () => {
     },
     30_000,
   );
+  it
+    .skipIf(!process.env.ALLRICE_OFFICE_PREVIEW_DIR)
+    .each(['docx', 'xlsx', 'pptx'])(
+    'MET160 real %s renderer output opens in the native zoom viewport',
+    { tags: ['manual:ALLRICE_OFFICE_PREVIEW_DIR'], timeout: 25_000 },
+    async (format) => {
+      const rendered = OfficeRenderResponseSchema.parse(
+        JSON.parse(
+          await readFile(
+            join(process.env.ALLRICE_OFFICE_PREVIEW_DIR!, `${format}.json`),
+            'utf8',
+          ),
+        ),
+      );
+      const { page, errors } = await mount([
+        { name: `document.${format}`, preview: officePreview(rendered) },
+      ]);
+      try {
+        const preview = page.getByRole('region', { name: 'Office 文档预览' });
+        const image = preview.getByRole('img', { name: 'Office 文档第 1 页' });
+        await expect
+          .poll(() =>
+            image.evaluate((node: HTMLImageElement) => node.naturalWidth),
+          )
+          .toBeGreaterThan(500);
+        await image.hover();
+        const zoom = preview.getByRole('button', { name: '选择缩放比例' });
+        await zoom.click();
+        await page.getByRole('menuitem', { name: '150%', exact: true }).click();
+        await expect.poll(() => zoom.innerText()).toContain('150%');
+        await zoom.click();
+        await page
+          .getByRole('menuitem', { name: '适应宽度', exact: true })
+          .click();
+        if (rendered.pages.length > 1) {
+          await preview
+            .getByRole('img', { name: 'Office 文档第 2 页' })
+            .scrollIntoViewIfNeeded();
+        }
+        expect(errors).toEqual([]);
+      } finally {
+        await page.close();
+      }
+    },
+  );
+
+  it('preserves Office pagination and actual formula errors', async () => {
+    const png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXioAAAAASUVORK5CYII=';
+    const { page, errors } = await mount([
+      {
+        name: 'office.xlsx',
+        preview: {
+          kind: 'office',
+          checksum: `sha256:${'a'.repeat(64)}`,
+          format: 'xlsx',
+          pageCount: 3,
+          pages: [
+            { number: 1, base64: png },
+            { number: 2, base64: png },
+          ],
+          formulaCount: 2,
+          formulaErrorCount: 1,
+          formulas: [
+            {
+              sheet: '明细',
+              cell: 'C2',
+              formula: 'B2*2',
+              type: 'n',
+              value: 60,
+            },
+            {
+              sheet: '明细',
+              cell: 'D2',
+              formula: '1/0',
+              type: 'e',
+              value: '#DIV/0!',
+            },
+          ],
+        },
+      },
+    ]);
+    try {
+      const preview = page.getByRole('region', { name: 'Office 文档预览' });
+      await preview.waitFor();
+      expect(await preview.innerText()).toContain('发现 1 个公式错误');
+      expect(await preview.innerText()).toContain('展示前 2 页');
+      await preview.locator('summary').click();
+      expect(await preview.innerText()).toContain('#DIV/0!');
+      expect(await preview.innerText()).toContain('60');
+      await preview.getByRole('img', { name: 'Office 文档第 2 页' }).waitFor();
+      expect(
+        await preview.getByRole('button', { name: /上一页|下一页/ }).count(),
+      ).toBe(0);
+      expect(
+        await preview.locator('[data-document-zoom-scrollport]').count(),
+      ).toBe(1);
+      expect(await preview.innerText()).not.toContain('请检查分页');
+      expect(errors).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
+
   it.each(['csv', 'tsv'])(
     'opens quoted %s data as a spreadsheet',
     async (format) => {
