@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   createPostgresNativeScheduleObservationLedger,
   createPostgresPersonVmScheduledWakeStore,
+  readContentPrincipal,
   readPersonVmWakeRoster,
 } from '@allrice/database';
 import {
@@ -11,6 +12,7 @@ import {
   type ScheduleCatalogEntry,
 } from '@deepseek-ai/dsh-schedule';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { PersonVmError } from '@allrice/person-vm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { createPersonVmScheduledWake } from './scheduled-wake.js';
@@ -839,55 +841,69 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T05:28:00.000Z' });
   });
 
-  it('rejects a prepared ordinary idle stop once its live receipt is invalidated', async () => {
-    const f = await fixture();
-    await publishFixtureAuthority(f);
-    f.reviseTime(new Date(Date.now() + 600_000).toISOString());
-    const planId = randomUUID();
-    await expect(
-      f.module().prepareStopWithWake(f.binding, planId, signal),
-    ).resolves.toMatchObject({ ok: true });
-    const roster = await db.begin((tx) =>
-      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
-    );
-    expect(roster).not.toBeNull();
-    await db`update person_virtual_machines
+  it.each(['native snapshot', 'original login'] as const)(
+    'rejects a prepared ordinary idle stop after revoking the %s',
+    async (revoked) => {
+      const f = await fixture();
+      await publishFixtureAuthority(f);
+      f.reviseTime(new Date(Date.now() + 600_000).toISOString());
+      const planId = randomUUID();
+      await expect(
+        f.module().prepareStopWithWake(f.binding, planId, signal),
+      ).resolves.toMatchObject({ ok: true });
+      const roster = await db.begin((tx) =>
+        readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+      );
+      expect(roster).not.toBeNull();
+      await db`update person_virtual_machines
       set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
       where person_id=${f.binding.personId}`;
-    const host = createProductionScheduledWake({
-      startup: { catalog: vi.fn() },
-      database: db,
-      lifetime: signal,
-      source: { start: f.start, assertDeliverable: vi.fn() },
-    });
-    try {
-      const stop = vi.fn(async () => {});
-      await host.dispatchScheduledIdleStop(
-        f.binding,
-        roster!,
-        planId,
-        signal,
-        stop,
-      );
-      expect(stop).toHaveBeenCalledTimes(1);
-      await f.invalidate(planId);
-      await expect(
-        host.dispatchScheduledIdleStop(
-          f.binding,
-          roster!,
-          planId,
-          signal,
-          stop,
-        ),
-      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
-      expect(stop).toHaveBeenCalledTimes(1);
-      const [vm] = await db`select phase from person_virtual_machines
+      const context = {
+        actor: { type: 'user' as const, id: f.binding.personId },
+        sessionId: randomUUID(),
+        organizationId: f.binding.organizationId,
+        workspaceId: f.origin.workspaceId,
+      };
+      await db`insert into allrice_sessions (id, user_id, token_hash, expires_at)
+      values (${context.sessionId},${context.actor.id},${randomUUID().replaceAll('-', '').repeat(2)},now()+interval '1 hour')`;
+      const host = createProductionScheduledWake({
+        startup: { catalog: vi.fn() },
+        database: db,
+        lifetime: signal,
+        source: { start: f.start, assertDeliverable: vi.fn() },
+      });
+      try {
+        const stop = vi.fn(async () => {});
+        const dispatch = () =>
+          host.dispatchScheduledIdleStop(
+            f.binding,
+            roster!,
+            planId,
+            signal,
+            stop,
+            async (tx) => {
+              if (!(await readContentPrincipal(context, tx, true)))
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          );
+        await dispatch();
+        expect(stop).toHaveBeenCalledTimes(1);
+        if (revoked === 'native snapshot') await f.invalidate(planId);
+        else
+          await db`update allrice_sessions set revoked_at=clock_timestamp()
+        where id=${context.sessionId}`;
+        await expect(dispatch()).rejects.toMatchObject({
+          code: 'AUTHORIZATION_DENIED',
+        });
+        expect(stop).toHaveBeenCalledTimes(1);
+        const [vm] = await db`select phase from person_virtual_machines
         where person_id=${f.binding.personId}`;
-      expect(vm?.phase).toBe('running');
-    } finally {
-      await host.close();
-    }
-  });
+        expect(vm?.phase).toBe('running');
+      } finally {
+        await host.close();
+      }
+    },
+  );
 
   it('refuses to dispatch an explicitly invalidated snapshot', async () => {
     const f = await fixture();
