@@ -1,8 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
-import { setTimeout as delay } from 'node:timers/promises';
+import {
+  setImmediate as nextTurn,
+  setTimeout as delay,
+} from 'node:timers/promises';
 import { expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
+import { TYPERT_REMOTE } from '@allrice/d-entry-principal/remote';
 import type { DEntryAuthorityObservation } from '@allrice/database';
 import { openFollowAuthority } from './follow-authority.js';
 import type { SessionFollowFrame } from '@deepseek-ai/dsh-api-session-controller/types';
@@ -508,14 +513,41 @@ it('drains a normally completed follow and joins its close before reporting end'
   const f = await fixture();
   observe(f);
   const release = deferred();
-  const joined = vi.fn();
-  closes.push(async () => release.resolve());
+  const acknowledgement = deferred();
+  const releaseAcknowledgement = deferred();
+  closes.push(async () => {
+    release.resolve();
+    releaseAcknowledgement.resolve();
+  });
+  const wire = f.host.host.typertGateway.wireStream;
+  const open = wire.open.bind(wire);
+  vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+    const source = await open(...args);
+    if (
+      args[0] !== 'allricePrincipal/streamScoped' ||
+      !JSON.stringify(args[1]).includes('"followId":')
+    )
+      return source;
+    return (async function* () {
+      for await (const frame of source) {
+        if (
+          frame &&
+          typeof frame === 'object' &&
+          'type' in frame &&
+          frame.type === 'closed'
+        ) {
+          acknowledgement.resolve();
+          await releaseAcknowledgement.promise;
+        }
+        yield frame;
+      }
+    })();
+  });
   f.host.catalog.finishFollow = summary('root').sessionId;
   f.host.catalog.followFrames = async function* () {
     await release.promise;
     yield chunk(0);
   };
-  f.host.catalog.afterFollow = async () => joined();
   const channel = await connect(f);
   await channel.follow('root');
   release.resolve();
@@ -523,8 +555,53 @@ it('drains a normally completed follow and joins its close before reporting end'
     type: 'item',
     value: chunk(0),
   });
-  expect(await channel.next('root')).toMatchObject({ type: 'end' });
-  expect(joined).toHaveBeenCalledTimes(1);
+  const end = channel.next('root');
+  await acknowledgement.promise;
+  expect(await Promise.race([end.then(() => 'end'), nextTurn('pending')])).toBe(
+    'pending',
+  );
+  releaseAcknowledgement.resolve();
+  expect(await end).toMatchObject({ type: 'end' });
+});
+
+it('continues to await Worker close after rejecting guest follow input', async () => {
+  const f = await fixture();
+  const { scopeId } = await open(f);
+  const handle = TYPERT_REMOTE.methods['allricePrincipal/streamScoped'].invoke(
+    f.host.node.remote,
+    {
+      call: {
+        kind: 'page',
+        scopeId,
+        endpoint: 'session/follow',
+        args: { request: { address: { kind: 'session', sessionId: 'root' } } },
+        followId: randomUUID(),
+      },
+    },
+  );
+  const receive = handle[Symbol.asyncIterator]();
+  try {
+    expect(await receive.next()).toMatchObject({
+      value: { type: 'page-item' },
+    });
+    handle.send({ type: 'input', value: 'this stream is read only' });
+    expect(await receive.next()).toMatchObject({
+      value: {
+        type: 'page-error',
+        error: { code: 'gateway/protocol' },
+      },
+    });
+    const closed = receive.next();
+    expect(
+      await Promise.race([closed.then(() => 'closed'), nextTurn('pending')]),
+    ).toBe('pending');
+    handle.send('close');
+    handle.end();
+    expect(await closed).toMatchObject({ value: { type: 'closed' } });
+    expect(await receive.next()).toMatchObject({ done: true });
+  } finally {
+    handle.dispose();
+  }
 });
 
 it('refuses to follow on an owner that cannot report native child withdrawal', async () => {

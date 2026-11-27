@@ -1331,7 +1331,18 @@ class PrincipalService extends TypertRemoteService {
     const follow = new AbortController();
     let unwatchFollow: (() => void) | undefined;
     let confirmFollowDelivery = false;
-    const pump = pumpPageInput(input, (command) => {
+    const delivery =
+      endpoint === 'session/follow'
+        ? signalGate(scope.abort.signal)
+        : undefined;
+    const fenceUnconfirmedFollow = () => {
+      if (confirmFollowDelivery && !delivery!.abort.signal.aborted) {
+        // A broken control stream cannot prove consumption. Withdraw the
+        // scope through its independent control stream and join on retirement.
+        void scope.close().catch(() => {});
+      }
+    };
+    const receiveInput = (command: DEntryPageInput) => {
       if (
         !inbox ||
         (command.type === 'input' &&
@@ -1344,9 +1355,25 @@ class PrincipalService extends TypertRemoteService {
           { endpoint: endpoint ?? '' },
         );
       inbox.add(command);
+    };
+    const pump = pumpPageInput(input, (command) => {
+      if (inputFailure !== undefined) return;
+      try {
+        receiveInput(command);
+      } catch (error) {
+        if (!confirmFollowDelivery) throw error;
+        // Abort native input, but keep reading for the consumer's close.
+        inputFailure = error;
+        gate.stop();
+      }
     })
+      .then((confirmed) => {
+        if (confirmed) delivery?.stop();
+        else fenceUnconfirmedFollow();
+      })
       .catch((error: unknown) => {
         inputFailure = error;
+        fenceUnconfirmedFollow();
       })
       .finally(gate.stop);
     const active = AbortSignal.any([
@@ -1590,7 +1617,7 @@ class PrincipalService extends TypertRemoteService {
         // The Worker acknowledges once its last buffered item is delivered
         // or discarded. Keep the independent withdrawal path alive until then.
         yield { type: 'page-end', scopeId: scope.issue.scopeId };
-        await gate.done;
+        await delivery!.done;
       }
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
@@ -1616,7 +1643,7 @@ class PrincipalService extends TypertRemoteService {
           },
         };
         if (confirmFollowDelivery) {
-          await gate.done;
+          await delivery!.done;
           await child.close();
         }
         yield { type: 'closed', scopeId: scope.issue.scopeId };
@@ -1629,6 +1656,7 @@ class PrincipalService extends TypertRemoteService {
         await (failed ? child.close().catch(() => {}) : child.close());
       } finally {
         unwatchFollow?.();
+        delivery?.detach();
         gate.detach();
       }
     }

@@ -124,7 +124,8 @@ function createTlsHelloReader(hostname: string, publicProxy: boolean) {
   let recordRemaining = 0;
   let wireEnd = 0;
   let helloSize = 0;
-  let hello: Buffer | undefined;
+  let expectedSize = 0;
+  const hello: Buffer[] = [helloHeader];
 
   return (bytes: Buffer) => {
     let offset = 0;
@@ -153,7 +154,7 @@ function createTlsHelloReader(hostname: string, publicProxy: boolean) {
         recordRemaining = length;
       }
 
-      if (!hello) {
+      if (!expectedSize) {
         const size = Math.min(
           helloHeader.length - helloSize,
           recordRemaining,
@@ -166,22 +167,25 @@ function createTlsHelloReader(hostname: string, publicProxy: boolean) {
         if (helloSize < helloHeader.length) continue;
         const length = helloHeader.readUIntBE(1, 3);
         if (helloHeader[0] !== 1 || length > 60_000) invalidTlsHello();
-        hello = Buffer.allocUnsafe(helloHeader.length + length);
-        helloHeader.copy(hello);
+        expectedSize = helloHeader.length + length;
       }
 
       // Reject a record extending past ClientHello, even if it is incomplete.
-      if (recordRemaining > hello.length - helloSize) invalidTlsHello();
+      if (recordRemaining > expectedSize - helloSize) invalidTlsHello();
       const size = Math.min(recordRemaining, bytes.length - offset);
-      bytes.copy(hello, helloSize, offset, offset + size);
+      if (size) hello.push(bytes.subarray(offset, offset + size));
       helloSize += size;
       recordRemaining -= size;
       offset += size;
-      if (helloSize === hello.length) {
+      if (helloSize === expectedSize) {
         if (!publicProxy && offset !== bytes.length) invalidTlsHello();
         return {
           end: wireEnd,
-          earlyData: validateTlsHello(hello, hostname, publicProxy),
+          earlyData: validateTlsHello(
+            Buffer.concat(hello, expectedSize),
+            hostname,
+            publicProxy,
+          ),
         };
       }
     }

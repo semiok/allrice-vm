@@ -595,8 +595,10 @@ export function createDEntryPrincipalControl(
                           break;
                         }
                         if (frame.type === 'page-error') {
+                          // Iterator close still joins the real child. Keep the
+                          // native failure primary if that join also fails.
+                          if (follow) throw frame.error;
                           failure = frame.error;
-                          if (follow) break;
                         } else yield frame;
                       }
                       if (failure) throw failure;

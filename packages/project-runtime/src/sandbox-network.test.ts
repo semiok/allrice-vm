@@ -278,13 +278,13 @@ describe('sandbox outbound boundary', () => {
     let result;
     let early = false;
     let headerReads = 0;
-    let concatenations = 0;
+    let copies: (number | undefined)[] = [];
     try {
       for (let i = 0; i < wire.length - 1; i++)
         early ||= read(wire.subarray(i, i + 1)) !== null;
       result = read(final);
       headerReads = u16.mock.calls.length;
-      concatenations = concat.mock.calls.length;
+      copies = concat.mock.calls.map(([, size]) => size);
     } finally {
       concat.mockRestore();
       u16.mockRestore();
@@ -292,7 +292,7 @@ describe('sandbox outbound boundary', () => {
     expect(early).toBe(false);
     expect(result).toEqual({ end: wire.length, earlyData: false });
     expect(headerReads).toBe(records.length + 6);
-    expect(concatenations).toBe(0);
+    expect(copies).toEqual([payload.length]);
   });
   it('does not treat stderr or truncated Docker frames as protocol messages', async () => {
     const incoming = new PassThrough(),
