@@ -50,7 +50,6 @@ LOCK="$HOME/allrice40-dev/.local/deploy.lock"; SNAPSHOTS="$STATE/pre-migrate"; K
 export PATH="$HOME/.local/opt/node-22.23.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 RESULT_FILE=""; RESULT_ID=""
 DRAIN_SOCKET=""; RELEASE_STOP_ATTEMPTED=""; RELEASE_STOP_UNCONFIRMED=""
-STARTED_WORKER_PROCESS=""
 KEEP_RELEASES=3; BLOG=""; FAIL_REASON=""; INFLIGHT_MINE=""; LOCKED=""; BUILD_DIR=""; BUILT=""; PLIST_STAGE=""
 WEB_LABEL=ai.bplabs.allrice40-dev-web; WORKER_LABEL=ai.bplabs.allrice40-dev-worker
 WEB_PLIST="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
@@ -389,15 +388,19 @@ snapshot() ( # name -> 0 when $SNAPSHOTS/<name> is complete
     | while read -r old; do rm -rf -- "$old" || echo "could not prune $old" >&2; done
   exit 0
 )
-start_both_on() { # sha -> start Worker then Web, both must identify this release
+start_both_on() { # sha [restore wake evidence: yes/no]
   recovery_pair "$WEB_PLIST" "$WORKER_PLIST" "$1" || return 1
   local rel; rel=$(release_of) || return 1
   start_job "$WORKER_LABEL" "$WORKER_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 180 worker "$rel" || { say "worker did not become ready on ${1:0:8}"; return 1; }
-  STARTED_WORKER_PROCESS=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$rel") || return 1
-  [[ "$STARTED_WORKER_PROCESS" =~ ^running\ [1-9][0-9]*$ ]] || return 1
   start_job "$WEB_LABEL" "$WEB_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(web_port)/api/health/ready" "$1" 120 web "$rel" || { say "web did not become ready on ${1:0:8}"; return 1; }
+  # Recovery needs a fresh Worker response after Web startup. The Worker
+  # can already have closed the listener while launchd still shows a PID.
+  if [ "$#" -eq 2 ]; then
+    verify_restored_vm_owner "$rel" "$2" || return 1
+    wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 1 worker "$rel" || return 1
+  fi
 }
 
 # Point both plists at a release: script paths, working dirs, cordis config, SHA, and
@@ -561,10 +564,9 @@ restore() {
   cp -p "$INFLIGHT/web.plist" "$WEB_PLIST" && cp -p "$INFLIGHT/worker.plist" "$WORKER_PLIST" \
     && cmp -s "$INFLIGHT/web.plist" "$WEB_PLIST" && cmp -s "$INFLIGHT/worker.plist" "$WORKER_PLIST" \
     || { say "could not put back the saved launchd files from $INFLIGHT"; return 1; }
-  start_both_on "$prev" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
   # Health alone does not prove this boot recovered its wake owner. Keep
   # the restored Worker running and retain the witness until plans settle.
-  verify_restored_vm_owner "$rel" "$need_wake" "$STARTED_WORKER_PROCESS" || return 1
+  start_both_on "$prev" "$need_wake" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
   say "previous version ${prev:0:8} is healthy again"
 }
 # Keep a final error/signal handler while the EXIT cleanup runs; replacing an

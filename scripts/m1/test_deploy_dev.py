@@ -350,7 +350,11 @@ class DeployDevMigrations(unittest.TestCase):
                   }
                   vm_upgrade_candidates() { echo 1; }
                   stop_job() { :; }
-                  start_both_on() { restored=yes; echo "restarted $1"; }
+                  start_both_on() {
+                    restored=yes
+                    echo "restarted $1"
+                    verify_restored_vm_owner "$(release_of)" "$2"
+                  }
                   recover
                 ''', FILES, CONTRACT='row:1', MODE=mode)
                 if mode in ('pending-wake', 'host-uninstalled'):
@@ -381,7 +385,10 @@ class DeployDevMigrations(unittest.TestCase):
                           test_launchctl() { test "$1" = bootout && removed=yes; }
                           stop_job() { :; }
                           vm_upgrade_candidates() { echo 1; }
-                          start_both_on() { restored=yes; }
+                          start_both_on() {
+                            restored=yes
+                            verify_restored_vm_owner "$(release_of)" "$2"
+                          }
                           recover
                         '''
                         unknown = self.run_dd(retry, FILES, CONTRACT='row:1', MODE='unknown')
