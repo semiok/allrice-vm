@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
+import { flushSync } from 'react-dom';
 import {
   useLayoutEffect,
   useMemo,
@@ -140,7 +141,12 @@ function SettingsPane({
 /** SettingsRoot supplies the live launcher; the native Dock owns the right tab. */
 export function applyEmployeeSettingsPane(ctx: Context) {
   ctx.inject(
-    ['allriceEmployeeWorkbenchSettings', 'sidebarRightTabs', 'sidebarRight'],
+    [
+      'allriceEmployeeWorkbenchSettings',
+      'sidebarRightTabs',
+      'sidebarRight',
+      'layout',
+    ],
     (scope) => {
       const port = scope.allriceEmployeeWorkbenchSettings;
       const lifetime = new AbortController();
@@ -148,18 +154,23 @@ export function applyEmployeeSettingsPane(ctx: Context) {
       const right = scope.sidebarRight;
       const current = () =>
         !signal.aborted && right.mounted.getSnapshot() === port.nativeSessionId;
+      const globalPanel = () =>
+        scope.layout.panelInfo.getSnapshot().activePanelId !== null;
+      const canOpenPane = () => !signal.aborted && (current() || globalPanel());
       const subscribe = (listener: () => void) => {
         const dispose = right.mounted.subscribe(listener);
+        const disposeLayout = scope.layout.panelInfo.subscribe(listener);
         signal.addEventListener('abort', listener, { once: true });
         return () => {
           dispose();
+          disposeLayout();
           signal.removeEventListener('abort', listener);
         };
       };
       let launcher: { open: () => void } | undefined;
       scope.effect(() => () => lifetime.abort());
       function Launcher({ wide, openSettings }: SettingsLauncherOwnerProps) {
-        const live = useSyncExternalStore(subscribe, current);
+        const live = useSyncExternalStore(subscribe, canOpenPane);
         useLayoutEffect(() => {
           const binding = { open: openSettings };
           launcher = binding;
@@ -173,8 +184,12 @@ export function applyEmployeeSettingsPane(ctx: Context) {
             collapsed={!wide}
             dialog={false}
             onOpen={() => {
-              if (!current()) return;
-              right.openTab(settingsTab);
+              if (!canOpenPane()) return;
+              // The Dock belongs to the current conversation, even when
+              // the sidebar is showing a global page such as schedules.
+              if (globalPanel())
+                flushSync(() => scope.layout.selectPanel(null));
+              if (current()) right.openTab(settingsTab);
             }}
           />
         );

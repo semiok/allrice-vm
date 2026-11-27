@@ -478,6 +478,16 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         documentOwner,
       );
       const workbench = page;
+      const conversation = workbench.getByText(
+        '请核对三条销售记录，计算合计，并简要说明结果。',
+        { exact: true },
+      );
+      await conversation.waitFor();
+      await workbench
+        .locator('#chat-sidebar')
+        .getByRole('button', { name: '自动化任务', exact: true })
+        .click();
+      await conversation.waitFor({ state: 'hidden' });
       const trigger = workbench.locator('#chat-sidebar').getByRole('button', {
         name: '设置',
         exact: true,
@@ -500,6 +510,7 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       });
       const pane = workbench.getByRole('region', { name: '设置', exact: true });
       await pane.waitFor();
+      await conversation.waitFor();
       expect(await pane.getByRole('button').allTextContents()).toEqual([
         'AllRice 账号',
         '通用设置 ↗',
