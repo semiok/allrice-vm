@@ -96,6 +96,7 @@ async function exerciseMultiEmployeeNavigation(
       },
     );
     const page = await context.newPage();
+    page.setDefaultTimeout(10_000);
     await page.addInitScript((completion) => {
       if (window !== window.top) return;
       addEventListener('message', (event) => {
@@ -195,19 +196,16 @@ async function exerciseMultiEmployeeNavigation(
     );
     const frame = page.frameLocator('iframe');
     const employeeButton = (index: number) =>
-      frame
-        .getByRole('button', { name: new RegExp(names[index]!) })
-        .filter({ hasText: names[index]! })
-        .first();
+      frame.getByRole('treeitem').filter({ hasText: names[index]! }).first();
     const editor = frame.getByRole('textbox', { name: '消息' });
     await editor.waitFor();
     await editor.fill('甲的草稿');
     await employeeButton(1).evaluate((button, latest) => {
-      if (!(button instanceof HTMLButtonElement))
-        throw new Error('Expected an employee card button');
+      if (!(button instanceof HTMLElement))
+        throw new Error('Expected an employee card');
       button.click();
       const card = document.querySelector('[aria-label="' + latest + '"]')!;
-      card.querySelector('button')!.click();
+      card.querySelector<HTMLElement>('[role=treeitem]')!.click();
     }, names[2]!);
     await firstClose.promise;
     await page.locator('html[data-fixture-old-document-closed="yes"]').waitFor({
@@ -261,6 +259,19 @@ async function exerciseMultiEmployeeNavigation(
     }
     expect(opens).toEqual([a, c, b, d, e, a, c]);
     expect(creates).toEqual([c]);
+    await page.route('**/api/v1/employee-instances', (route) =>
+      route.fulfill({ status: 401 }),
+    );
+    await frame.getByRole('button', { name: '创建员工', exact: true }).click();
+    const dialog = frame.getByRole('dialog', { name: '创建 AI 员工' });
+    await dialog.locator('[data-employee-name]').fill('资料专员');
+    await dialog.getByRole('button', { name: '确认创建' }).click();
+    await dialog
+      .getByRole('alert')
+      .getByText('登录已过期，请重新登录')
+      .waitFor();
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    expect(await editor.inputValue()).toBe('丙的草稿');
   } finally {
     releaseClose.resolve();
     await context.close();
@@ -288,6 +299,7 @@ suite('4.0 browser cold entry', () => {
           import { useSyncExternalStore, useState } from 'react';
           import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
           import { EmployeeFirstStart } from './app/chatflow/4.0/employee-first-start';
+          import { EmployeeCreateDialog } from './app/chatflow/employee-create-dialog';
           import { EmployeeSidebarView } from './app/chatflow/employee-sidebar-view';
           import { installEmployeeProductOwner } from '../../packages/dsh-web-composition/src/employee-product-owner';
           import { installEmployeeDraftStorage } from '../../packages/dsh-web-composition/src/employee-draft-storage';
@@ -302,8 +314,11 @@ suite('4.0 browser cold entry', () => {
             function Sidebar({ port }) {
               const snapshot = useSyncExternalStore(port.subscribe, port.getSnapshot);
               const [draft, setDraft] = useState(() => localStorage.getItem(storageKey) ?? '');
+              const [creating, setCreating] = useState(false);
               return snapshot && <><EmployeeSidebarView {...snapshot.tree} collapsed={false}/>
                 {snapshot.error && <p role="alert">{snapshot.error}</p>}
+                <button onClick={() => setCreating(true)}>创建员工</button>
+                {creating && <EmployeeCreateDialog {...port.createEmployee} personal onClose={() => setCreating(false)}/>}
                 <label>消息<input value={draft} onChange={e => {
                   setDraft(e.target.value); localStorage.setItem(storageKey, e.target.value);
                 }}/></label></>;

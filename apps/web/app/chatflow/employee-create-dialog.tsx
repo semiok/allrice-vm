@@ -14,6 +14,7 @@ import {
   type EmployeeProfileFormValues,
 } from './employee-profile-form';
 import { readJson } from './chatflow-utils';
+import { requestFailureMessage } from '../../lib/chatflow/request-failure';
 
 async function personalEmployeeCapacityMessage(response: Response) {
   if (response.status !== 409) return;
@@ -97,6 +98,12 @@ export function EmployeeCreateDialog({
         }),
       });
       if (personal) {
+        if (response.status === 401 && window !== window.parent) {
+          // A login document inside the native frame cannot acknowledge its close.
+          if (!controller.signal.aborted)
+            setError(requestFailureMessage({ status: 401 }));
+          return;
+        }
         const capacity = await personalEmployeeCapacityMessage(response);
         if (capacity) {
           if (!controller.signal.aborted) setError(capacity);

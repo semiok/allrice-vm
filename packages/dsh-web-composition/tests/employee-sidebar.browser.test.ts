@@ -413,11 +413,21 @@ suite('real AllRice sidebar in installed native profiles', () => {
     legacyUrl: string;
   let readingAttempt: Record<string, unknown> | undefined;
 
-  const open = async (view: Page, host: (typeof hosts)[number]) => {
+  const open = async (
+    view: Page,
+    host: (typeof hosts)[number],
+    testingPersonalCreation = false,
+  ) => {
     view.setDefaultTimeout(15_000);
     view.on('pageerror', (error) => errors.push(error.message));
     view.on('request', (request) => {
       const path = new URL(request.url()).pathname;
+      if (
+        testingPersonalCreation &&
+        path === '/api/v1/employee-instances' &&
+        request.method() === 'POST'
+      )
+        return;
       if (path.startsWith('/api/v1/')) legacyRequests.push(path);
     });
     // Use the public launch-token exchange with the BrowserContext's Cookie
@@ -615,6 +625,9 @@ suite('real AllRice sidebar in installed native profiles', () => {
   it('opens the personal creation dialog and keeps the sidebar usable after server rejections', async ({
     onTestFinished,
   }) => {
+    const page = await context.newPage();
+    onTestFinished(() => page.close());
+    await open(page, hosts[0]!, true);
     const workspace = {
       organizationId: randomUUID(),
       workspaceId: randomUUID(),
@@ -663,12 +676,6 @@ suite('real AllRice sidebar in installed native profiles', () => {
           },
         },
       });
-    });
-    onTestFinished(async () => {
-      await page.unroute(createEndpoint);
-      await page.evaluate(() =>
-        window.__allriceSidebarTest!.setPersonalCreation(),
-      );
     });
     await page.evaluate(
       (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
