@@ -63,7 +63,7 @@ CallToolResultSchema 保原生 text/image/resource/structuredContent，不替业
 
 | 面               | M1 实际边界                                                                                                                                                       |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 后端/私有数据    | `allrice-server.ts` 与 owner 的三个公开薄出口；复用原资料、记忆、成果 carrier，不拥有其他模块全表；新增数据为 none。                                              |
+| 后端/私有数据    | `allrice-server.ts` 提供资料、记忆和成果接缝。旧测试载体只保留记忆和成果，资料直接复用 owner 的现有读取验证。无新增数据。                                         |
 | MCP              | 一个受管连接一个 SDK server；identity_read、reference_read、memory_read、deliverable_create；只公布已绑定 service 且当前模块有资格的工具。                        |
 | 员工 UI          | none：本卡没有 UI 变更；完整 rev2 业务面仍为 MET-282/284，不取消该需求。                                                                                          |
 | 后台 UI          | none：本卡不提供管理员管理/写入；完整管理仍由 MET-281/283/288 等交付。                                                                                            |

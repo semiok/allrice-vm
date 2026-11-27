@@ -119,8 +119,6 @@ suite('R3 actual-read receipts and private Run authority', () => {
       origin: { kind: 'tool', toolName: 'workspace.reference.search' },
       runId: run.scope.runId,
       generationId: run.runtime.generationId,
-      jobId: run.worker.jobId,
-      workerId: run.worker.workerId,
       citation: {
         reference: saved.pin,
         locator: { start: 6000, end: text.length },
@@ -152,11 +150,24 @@ suite('R3 actual-read receipts and private Run authority', () => {
         })
       ).modelContent,
     );
-    expect(next.citation.referenceLabel).toBe('R2');
-    expect(await receipts(run)).toHaveLength(2);
-    expect((await receipts(run))[1]!.origin).toEqual({
-      kind: 'tool',
-      toolName: 'workspace.reference.read',
+    expect(next).toMatchObject({
+      ...saved.pin,
+      content: text.slice(0, 100),
+      citation: { referenceLabel: 'R2' },
+    });
+    const after = await receipts(run);
+    expect(after).toHaveLength(2);
+    expect(after[1]).toMatchObject({
+      receiptId: next.citation.id,
+      origin: { kind: 'tool', toolName: 'workspace.reference.read' },
+      runId: run.scope.runId,
+      generationId: run.runtime.generationId,
+      jobId: run.worker.jobId,
+      workerId: run.worker.workerId,
+      contentChecksum:
+        'sha256:' +
+        createHash('sha256').update(text.slice(0, 100)).digest('hex'),
+      citation: { reference: saved.pin, locator: { start: 0, end: 100 } },
     });
     expect(JSON.stringify([found, reread, next])).not.toContain('file:');
     expect(reread.fileName).toBe('差旅规定.txt');
