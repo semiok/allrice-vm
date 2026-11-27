@@ -5,8 +5,8 @@ import type { Socket } from 'node:net';
 type RequestClose = {
   complete: boolean;
   socket?: Socket;
-  closed: Promise<void>;
-  onClose(): void;
+  settled: Promise<void>;
+  onSettled(): void;
 };
 type Observation = { requests: Map<object, RequestClose> };
 const dispatches = new AsyncLocalStorage<Observation>();
@@ -23,11 +23,11 @@ export function installNativeCloseObserver(): () => void {
     const observation = dispatches.getStore();
     if (!observation) return;
     const { request } = message as { request: object };
-    let onClose!: () => void;
-    const closed = new Promise<void>((resolve) => {
-      onClose = resolve;
+    let onSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      onSettled = resolve;
     });
-    const entry = { complete: false, closed, onClose };
+    const entry = { complete: false, settled, onSettled };
     observation.requests.set(request, entry);
     requests.set(request, entry);
   };
@@ -36,12 +36,15 @@ export function installNativeCloseObserver(): () => void {
     const entry = requests.get(request);
     if (!entry) return;
     entry.socket = socket;
-    if (socket.closed) entry.onClose();
-    else socket.once('close', entry.onClose);
+    if (socket.closed) entry.onSettled();
+    else socket.once('close', entry.onSettled);
   };
   const onTrailers = (message: unknown) => {
     const entry = requests.get((message as { request: object }).request);
-    if (entry) entry.complete = true;
+    if (entry) {
+      entry.complete = true;
+      entry.onSettled();
+    }
   };
   create.subscribe(onCreate);
   headers.subscribe(onHeaders);
@@ -66,14 +69,33 @@ export function observeNativeClose() {
         // Native Fetch abort destroys its HTTP/1 socket before closing it. Await
         // the real close event; an abort signal or rejected cancel is not proof.
         if (!entry.socket?.destroyed) return false;
-        await entry.closed;
+        await entry.settled;
+      }
+      return true;
+    },
+    /** A null Web body may be available at headers before the actual HTTP
+     * response ends. Join its raw completion or confirmed cancellation. */
+    async waitForSettlement(signal: AbortSignal): Promise<boolean> {
+      if (!observation.requests.size) return false;
+      for (const entry of observation.requests.values()) {
+        if (entry.complete) continue;
+        if (!entry.socket || signal.aborted) return false;
+        const known = await new Promise<boolean>((resolve) => {
+          const abort = () => resolve(false);
+          signal.addEventListener('abort', abort, { once: true });
+          void entry.settled.then(() => {
+            signal.removeEventListener('abort', abort);
+            resolve(true);
+          });
+        });
+        if (!known) return false;
       }
       return true;
     },
     dispose() {
       for (const [request, entry] of observation.requests) {
         requests.delete(request);
-        entry.socket?.off('close', entry.onClose);
+        entry.socket?.off('close', entry.onSettled);
       }
       observation.requests.clear();
     },

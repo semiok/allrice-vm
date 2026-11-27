@@ -267,6 +267,11 @@ export function createMeteredTransport(options: {
         );
         status = response.status;
         if (!response.body) {
+          if (
+            publicResponses &&
+            !(await nativeClose.waitForSettlement(requestSignal))
+          )
+            throw new ModelGatewayError('LEDGER_UNAVAILABLE');
           transportJoined = true;
           await finish('closed');
           return response;

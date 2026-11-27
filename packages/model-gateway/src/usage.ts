@@ -65,6 +65,7 @@ export class WireUsageObserver {
   private event = '';
   private oversized = false;
   private frameOversized = false;
+  private afterCR = false;
   private chatFinish = false;
   private done = false;
   terminal: ModelAttemptReceipt['terminal'] = null;
@@ -73,10 +74,12 @@ export class WireUsageObserver {
   constructor(private protocol: GatewayFetchClassification['protocol']) {}
   push(bytes: Uint8Array): void {
     // Iterate fragments rather than buffering the body; limits apply only to metadata capture.
-    for (const part of this.decoder
-      .decode(bytes, { stream: true })
-      .split(/(\n)/)) {
-      if (part !== '\n') {
+    let decoded = this.decoder.decode(bytes, { stream: true });
+    if (!decoded) return;
+    if (this.afterCR && decoded.startsWith('\n')) decoded = decoded.slice(1);
+    this.afterCR = decoded.endsWith('\r');
+    for (const part of decoded.split(/(\r\n|[\r\n])/)) {
+      if (part !== '\n' && part !== '\r' && part !== '\r\n') {
         if (
           !this.oversized &&
           this.line.length + part.length <= MAX_METER_FRAME_CHARS
@@ -88,7 +91,7 @@ export class WireUsageObserver {
         }
         continue;
       }
-      this.consumeLine(this.line.replace(/\r$/, ''), this.oversized);
+      this.consumeLine(this.line, this.oversized);
       this.line = '';
       this.oversized = false;
     }

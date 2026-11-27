@@ -113,6 +113,16 @@ export async function prepareOpenAiResponsesRequest(
     )
   )
     throw new ModelGatewayError('UNSUPPORTED_UPSTREAM');
+  if (type === 'message' && item.role === 'assistant') {
+    // output_text belongs to a provider-owned output item with a required
+    // id. EasyInputMessage accepts plain assistant text without that id.
+    return {
+      role: 'assistant',
+      content: Array.isArray(item.content)
+        ? item.content.map((part: { text: string }) => part.text).join('')
+        : item.content,
+    };
+  }
   const calls = new Map<string, string>();
   payload.input = payload.input.map((value: unknown) => {
     const item = record(value);
@@ -232,7 +242,9 @@ export class OpenAiCitationProjection {
     const buffer = Buffer.concat([this.buffer, bytes]);
     const frames: Buffer[] = [];
     let offset = 0;
-    for (const match of buffer.toString('latin1').matchAll(/\r?\n\r?\n/g)) {
+    // A CRLF token may not backtrack into two independent line endings.
+    const blankLine = /(?:\r\n|\r(?!\n)|(?<!\r)\n){2}/g;
+    for (const match of buffer.toString('latin1').matchAll(blankLine)) {
       const end = match.index + match[0].length;
       const frame = buffer.subarray(offset, end);
       frames.push(
@@ -299,7 +311,7 @@ export class OpenAiCitationProjection {
     try {
       lines = new TextDecoder('utf-8', { fatal: true })
         .decode(frame)
-        .split(/\r?\n/);
+        .split(/\r\n|[\r\n]/);
       const data = lines
         .filter((line) => line.startsWith('data:'))
         .map((line) => line.slice(5).replace(/^ /, ''))
@@ -327,6 +339,7 @@ export class OpenAiCitationProjection {
       !Array.isArray(item.content)
     )
       return frame;
+    const pending = this.citations.get(item.id);
     let changed = false;
     const content = item.content.map((value: unknown, partIndex: number) => {
       const part = record(value);
@@ -338,10 +351,7 @@ export class OpenAiCitationProjection {
             return citation ? [citation] : [];
           })
         : [];
-      const candidates = [
-        ...final,
-        ...(this.citations.get(item.id as string)?.get(partIndex) ?? []),
-      ];
+      const candidates = [...final, ...(pending?.get(partIndex) ?? [])];
       if (!candidates.length || this.rendered === maxCitations) return value;
       const linked = linkText(
         part.text,
@@ -354,6 +364,8 @@ export class OpenAiCitationProjection {
       return { ...part, text: linked.text };
     });
     this.citations.delete(item.id);
+    for (const citations of pending?.values() ?? [])
+      this.count -= citations.length;
     if (!changed) return frame;
     event.item = { ...item, content };
     const fields = lines.filter((line) => line && !line.startsWith('data:'));

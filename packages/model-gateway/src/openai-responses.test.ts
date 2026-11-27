@@ -252,3 +252,28 @@ it('isolates attempt state and passes non-citation or oversized frames through',
   ]);
   expect(a.finish().byteLength).toBe(0);
 });
+
+it('releases discarded offsets at item completion and accepts CR-only event framing', () => {
+  const projector = new OpenAiCitationProjection();
+  for (let i = 0; i < 128; i++) {
+    projector.push(
+      annotation('first', 0, citation('https://stale.example/' + i, 0, 99)),
+    );
+  }
+  const uncited = answer('first', text('好'));
+  expect(projector.push(uncited)).toEqual(uncited);
+  const second = Buffer.concat([
+    annotation('second', 0, citation('https://source.example/', 0, 0)),
+    answer('second', text('界。')),
+  ])
+    .toString('utf8')
+    .replaceAll('\r\n', '\r');
+  const result = projector.push(Buffer.from(second));
+  const done = Buffer.from(result)
+    .toString('utf8')
+    .split('event: response.output_item.done')
+    .at(-1)!;
+  expect(parts(Buffer.from(done))).toEqual([
+    '界 [来源](https://source.example/)。',
+  ]);
+});

@@ -40,14 +40,15 @@ afterEach(async () => {
 
 async function fixture(
   attemptKind: ModelCallBinding['native']['attemptKind'] = 'assistant',
-  hold = false,
+  mode?: 'hold-sse' | 'hold-empty',
 ) {
   const requests: Array<{
     authorization?: string;
     body: Record<string, unknown>;
   }> = [];
   const opened = deferred<void>(),
-    closed = deferred<void>();
+    closed = deferred<void>(),
+    releaseEmpty = deferred<void>();
   const sse = createServer((request, response) => {
     void (async () => {
       const body: Buffer[] = [];
@@ -57,6 +58,13 @@ async function fixture(
         body: JSON.parse(Buffer.concat(body).toString('utf8')),
       });
       response.once('close', () => closed.resolve());
+      if (mode === 'hold-empty') {
+        response.writeHead(205, { 'transfer-encoding': 'chunked' });
+        response.flushHeaders();
+        await releaseEmpty.promise;
+        response.end();
+        return;
+      }
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       const event = (type: string, fields: object) =>
         response.write(
@@ -108,7 +116,7 @@ async function fixture(
         annotation,
       });
       opened.resolve();
-      if (hold) return;
+      if (mode === 'hold-sse') return;
       const item = {
         ...answer,
         content: [
@@ -165,7 +173,7 @@ async function fixture(
     ),
   });
   cleanups.push(() => f.close());
-  return { f, host, requests, opened, closed };
+  return { f, host, requests, opened, closed, releaseEmpty };
 }
 
 it('uses the native public API adapter, meters the exact host call, and delivers actual citations without a guest key or search tool call', async () => {
@@ -227,7 +235,7 @@ it('leaves native requests unmodified when the host has not approved search for 
 });
 
 it('joins the actual upstream body on VM revocation without delivering a pending citation', async () => {
-  const { f, opened, closed } = await fixture('assistant', true);
+  const { f, opened, closed } = await fixture('assistant', 'hold-sse');
   const headers = channel('undici:client:sendHeaders');
   let upstreamSocket: Socket | undefined;
   const capture = (value: unknown) => {
@@ -260,6 +268,40 @@ it('joins the actual upstream body on VM revocation without delivering a pending
   }
 });
 
+it('keeps an empty Web body in flight until the raw HTTP response completes', async () => {
+  const { f, releaseEmpty } = await fixture('assistant', 'hold-empty');
+  const headers = channel('undici:request:headers');
+  const received = deferred<void>();
+  const capture = (value: unknown) => {
+    const { request, response } = value as {
+      request: { path: string };
+      response: { statusCode: number };
+    };
+    if (request.path === '/v1/responses' && response.statusCode === 205)
+      received.resolve();
+  };
+  headers.subscribe(capture);
+  const finish = vi.spyOn(f.store, 'finishAttempt');
+  const collecting = f.collect().catch(() => undefined);
+  try {
+    await received.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(finish).not.toHaveBeenCalled();
+    expect(f.admission.records.size).toBe(1);
+    releaseEmpty.resolve();
+    await collecting;
+    expect(finish).toHaveBeenCalledOnce();
+    expect([...f.store.rows.values()]).toMatchObject([
+      { httpStatus: 205, outcome: 'closed' },
+    ]);
+    expect(f.admission.records.size).toBe(0);
+  } finally {
+    releaseEmpty.resolve();
+    headers.unsubscribe(capture);
+    finish.mockRestore();
+  }
+});
+
 it('uses provider-neutral history and retains native function results on a second turn', async () => {
   const { f, requests } = await fixture();
   const callId = ToolCallId('call_fixture|fc_fixture');
@@ -271,6 +313,7 @@ it('uses provider-neutral history and retains native function results on a secon
       createAssistantMessage({
         content: [
           { type: 'reasoning', text: 'Fixture reasoning' },
+          { type: 'text', text: 'Previous assistant answer.' },
           { type: 'tool-call', id: callId, name: 'lookup', arguments: '{}' },
         ],
         source: {
@@ -295,6 +338,7 @@ it('uses provider-neutral history and retains native function results on a secon
                   encrypted_content: 'synthetic-wire-state',
                 }),
               },
+              { type: 'text', textSignature: 'msg_previous' },
               { type: 'tool-call' },
             ],
           },
@@ -309,6 +353,7 @@ it('uses provider-neutral history and retains native function results on a secon
   });
   expect(requests[0]?.body.input).toEqual(
     expect.arrayContaining([
+      { role: 'assistant', content: 'Previous assistant answer.' },
       expect.objectContaining({ type: 'function_call', name: 'lookup' }),
       expect.objectContaining({
         type: 'function_call_output',
@@ -317,7 +362,7 @@ it('uses provider-neutral history and retains native function results on a secon
     ]),
   );
   expect(JSON.stringify(requests[0]?.body)).not.toMatch(
-    /rs_synthetic|synthetic-wire-state/,
+    /rs_synthetic|synthetic-wire-state|msg_previous|output_text/,
   );
 });
 
