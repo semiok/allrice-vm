@@ -40,7 +40,7 @@ export interface ProductionNativeModelExecution {
     input: {
       route: CodexRuntime['route'];
       routeRevoked: AbortSignal;
-      readModelInfo: CodexRuntime['readModelInfo'];
+      readModelMetadata: CodexRuntime['readModelMetadata'];
       assertRouteCurrent: CodexRuntime['assertCurrent'];
       confirmTransportStopped: CodexRuntime['confirmTransportStopped'];
       bindReference(call: ModelCallBinding, signal: AbortSignal): void;
@@ -88,7 +88,7 @@ export function createProductionPersonVmSources(
         native = await execution.attach(host, {
           route: codex.route,
           routeRevoked: codex.revoked,
-          readModelInfo: codex.readModelInfo,
+          readModelMetadata: codex.readModelMetadata,
           assertRouteCurrent: codex.assertCurrent,
           confirmTransportStopped: codex.confirmTransportStopped,
           bindReference: (call, signal) =>

@@ -429,7 +429,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       const uninstall = host.startup.installModelAdapter(
         async (binding, signal) => {
           const active = AbortSignal.any([live, signal]);
-          const modelInfo = await input.readModelInfo(active);
+          const modelMetadata = await input.readModelMetadata(active);
           const access = await host.providers.egressInstallation.readAccess(
             binding,
             active,
@@ -439,7 +439,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             ...access,
             provider: input.route.provider,
             model: input.route.model,
-            modelInfo,
+            ...modelMetadata,
           };
         },
       );

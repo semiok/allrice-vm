@@ -18,6 +18,7 @@ import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/typ
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import { SessionId } from '@deepseek-ai/dsh-session';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type WebSocket from 'ws';
 import { hostFixture } from '../../../../packages/d-entry-principal/test/host-fixture.js';
@@ -825,11 +826,15 @@ it.skipIf(!cli)(
       origin: 'http://127.0.0.1:1',
       capability: 'a'.repeat(43),
       provider: 'openai-codex',
-      model: 'fixture-codex',
+      model: 'gpt-6.2-sol',
       modelInfo: {
         provider: 'openai-codex',
-        id: 'fixture-codex',
-        name: 'fixture-codex',
+        id: 'gpt-6.2-sol',
+        name: 'GPT-6.2 Sol',
+        reasoning: {
+          efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+          defaultEffort: ReasoningEffortId('high'),
+        },
       },
     };
     const f = await setupNativeWebFixture(
@@ -847,16 +852,199 @@ it.skipIf(!cli)(
       async (_profile, readModels, _active, installed) => {
         const catalog = await readModels();
         expect(installed).toBe(f.owner.modelAdapterId);
-        expect(catalog.value.default).toMatchObject({
+        expect(catalog.value.default).toEqual({
           provider: route.provider,
           model: route.model,
         });
+        const provider = catalog.value.groups.find(
+          ({ id }) => id === route.provider,
+        );
+        expect(provider?.models).toEqual([
+          {
+            id: route.model,
+            name: route.modelInfo.name,
+            reasoning: route.modelInfo.reasoning,
+          },
+        ]);
         expect(catalog.value.routableProviders).toContain(route.provider);
         expect(catalog.value.failures).not.toContainEqual(
           expect.objectContaining({ id: route.provider }),
         );
       },
     );
+  },
+);
+
+it.skipIf(!cli)(
+  'continues a retained native conversation using the new Host model and effort',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const capability = 'a'.repeat(43);
+    const assistantModels: string[] = [];
+    const assistantInputs: { reasoningEffort: string; messages: unknown[] }[] =
+      [];
+    const server = createServer((request, response) => {
+      void (async () => {
+        const bytes: Buffer[] = [];
+        for await (const chunk of request) bytes.push(Buffer.from(chunk));
+        expect(request.headers.authorization).toBe('Bearer ' + capability);
+        const body = JSON.parse(Buffer.concat(bytes).toString('utf8'));
+        if (request.url?.startsWith('/v1/reference')) {
+          if (request.url === '/v1/reference') assistantModels.push(body.model);
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ reference: 'b'.repeat(43) }));
+          return;
+        }
+        expect(request.url).toBe('/v1/stream');
+        if (body.purpose !== 'session-title') assistantInputs.push(body);
+        const text = 'Synthetic reply';
+        const events = [
+          { type: 'text-delta', index: 0, text },
+          { type: 'finish', reason: { kind: 'stop' } },
+        ];
+        response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        response.end(
+          events.map((event) => JSON.stringify(event) + '\n').join(''),
+        );
+      })().catch((error: unknown) => {
+        response.destroy(error as Error);
+      });
+    });
+    const origin = await listen(server);
+    cleanup.push(() => closeServer(server));
+    function route(model: string, effort: string) {
+      const level = ReasoningEffortId(effort);
+      return {
+        origin,
+        capability,
+        provider: 'openai-codex',
+        model,
+        modelInfo: {
+          provider: 'openai-codex',
+          id: model,
+          name: model,
+          inputModalities: ['text', 'image'] as const,
+          context: { contextWindow: 272000 },
+          reasoning: {
+            efforts: [
+              { id: ReasoningEffortId('low'), name: 'Low' },
+              { id: ReasoningEffortId('high'), name: 'High' },
+            ],
+            defaultEffort: level,
+          },
+        },
+      };
+    }
+    const create = NativeTransport.nativeWebTransport;
+    let transport: ReturnType<typeof create> | undefined;
+    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
+      (...args) => {
+        transport = create(...args);
+        return transport;
+      },
+    );
+    const f = await setupNativeWebFixture(
+      cli,
+      roots,
+      cleanup,
+      undefined,
+      undefined,
+      route('gpt-5.6-sol', 'low'),
+    );
+    const signal = AbortSignal.timeout(20_000);
+    const root = await f.owner.createRootFor(f.context, {}, signal);
+    if (!root.ok) throw Error('Native session not created');
+    const sessionId = root.value.sessionId;
+    async function rpc(method: string, args: object) {
+      if (!transport) throw Error('Native fixture transport missing');
+      const response = await transport.fetch('api/' + method, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: randomUUID(),
+          method,
+          payload: { args },
+        }),
+      });
+      return serverResponseSchema.parse(await response.json()).result;
+    }
+    async function prompt(owner: typeof f.owner, turn: number) {
+      const png =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+      expect(
+        await rpc('session/prompt', {
+          request: {
+            sessionId,
+            requestId: randomUUID(),
+            content: [
+              { type: 'text', text: 'Synthetic turn ' + turn },
+              ...(turn === 2
+                ? [{ type: 'image', mediaType: 'image/png', data: png }]
+                : []),
+            ],
+            mode: 'queue',
+          },
+        }),
+      ).toMatchObject({
+        ok: true,
+        value: { accepted: true },
+      });
+      await expect(
+        owner.waitNativeTurnEnd(
+          f.context,
+          { kind: 'session', sessionId: SessionId(sessionId) },
+          turn,
+          signal,
+        ),
+      ).resolves.toMatchObject({ reason: 'completed' });
+    }
+    await prompt(f.owner, 1);
+    await f.owner.close();
+    const next = await f.restartRetained({
+      ...route('gpt-6.2-sol', 'high'),
+      historicalModels: [route('gpt-5.6-sol', 'low').modelInfo],
+    });
+    await prompt(next.owner, 2);
+    expect(assistantInputs[1]!.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: 'user',
+          content: [{ type: 'text', text: 'Synthetic turn 1' }],
+        }),
+        expect.objectContaining({
+          role: 'user',
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'image',
+              attachment: expect.anything(),
+            }),
+          ]),
+        }),
+      ]),
+    );
+    expect(
+      await rpc('session/selectModel', {
+        request: {
+          sessionId,
+          provider: 'openai-codex',
+          model: 'gpt-6.2-sol',
+          reasoningEffort: 'low',
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: { selected: { reasoningEffort: 'low' } },
+    });
+    await prompt(next.owner, 3);
+    expect(assistantModels).toEqual([
+      'gpt-5.6-sol',
+      'gpt-6.2-sol',
+      'gpt-6.2-sol',
+    ]);
+    expect(
+      assistantInputs.map(({ reasoningEffort }) => reasoningEffort),
+    ).toEqual(['low', 'high', 'low']);
   },
 );
 

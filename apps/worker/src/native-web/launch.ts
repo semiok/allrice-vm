@@ -56,6 +56,7 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  historicalModels?: readonly LlmResolvedModelInfo[];
 }>;
 
 async function managedModelFiles(directory: string, cliPath: string) {

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { TransactionSql } from 'postgres';
 import {
+  PLATFORM_WORK_MODEL_LABELS,
   PlatformModelSettingsSchema,
   UpdatePlatformModelSettingsSchema,
   type PlatformEmployeeDefinition,
@@ -67,9 +68,10 @@ export async function updatePlatformModelSettings(
     if (!row) throw new PlatformModelSettingsConflict();
     await tx`insert into allrice_model_catalog_entries (
       id,provider_id,model,display_name,reasoning_efforts,default_reasoning_effort,input_modalities,output_modalities,enabled,stability
-    ) values (${randomUUID()},${connection.provider_id},${configuration.workModel},${configuration.workModel},
-      '["low","medium","high","xhigh"]'::jsonb,'xhigh','["text","image","file"]'::jsonb,'["text"]'::jsonb,true,'production')
-      on conflict (provider_id,model) do nothing`;
+    ) values (${randomUUID()},${connection.provider_id},${configuration.workModel},${PLATFORM_WORK_MODEL_LABELS[configuration.workModel]},
+      '["low","medium","high","xhigh"]'::jsonb,${configuration.reasoningEffort},'["text","image","file"]'::jsonb,'["text"]'::jsonb,true,'production')
+      on conflict (provider_id,model) do update
+        set default_reasoning_effort=excluded.default_reasoning_effort, updated_at=now()`;
     await tx`insert into allrice_audit_events (
       organization_id,workspace_id,actor_id,action,resource_type,resource_id,decision,reason,request_id,metadata
     ) values (${context.organizationId},${context.workspaceId},${actorId},'platform_models.update','model_connection',

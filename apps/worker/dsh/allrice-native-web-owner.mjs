@@ -1022,8 +1022,15 @@ export function applyNativeWebOwner(
       if (typeof registerManagedGatewayAdapter !== 'function')
         throw Error('Native managed model module is unavailable');
       if (!current()) return;
-      const { id, origin, capability, provider, model, modelInfo } =
-        modelAdapter;
+      const {
+        id,
+        origin,
+        capability,
+        provider,
+        model,
+        modelInfo,
+        historicalModels,
+      } = modelAdapter;
       if (!/^[a-f0-9]{64}$/.test(id))
         throw Error('Native managed model binding is invalid');
       modelFiber = ctx.inject(
@@ -1185,6 +1192,7 @@ export function applyNativeWebOwner(
               provider,
               model,
               modelInfo,
+              historicalModels,
               lifetime: signal,
               async resolveCallReference(selection, active, purpose) {
                 const key = JSON.stringify([
@@ -1244,7 +1252,52 @@ export function applyNativeWebOwner(
               },
             },
           });
-          registeredModel = { dispose, llm: original(scope.llm), id };
+          const listeners = [];
+          if (modelInfo.reasoning?.defaultEffort !== undefined) {
+            // A retained session can propose its previous route. Use the
+            // current Host route for new requests, preserving explicit effort
+            // choices on that route and leaving the journal intact.
+            const outer = { global: true, prepend: true };
+            listeners.push(
+              scope.on(
+                'system-prompt/assemble',
+                async (_assembly, _context, next) => {
+                  const prompt = await next();
+                  signal.throwIfAborted();
+                  return {
+                    ...prompt,
+                    variables: { ...prompt.variables, provider, model },
+                  };
+                },
+                outer,
+              ),
+              scope.on(
+                'agent/request',
+                async (request, next) => {
+                  const config = await next();
+                  request.signal.throwIfAborted();
+                  signal.throwIfAborted();
+                  if (config.provider === provider && config.model === model)
+                    return config;
+                  return {
+                    ...config,
+                    provider,
+                    model,
+                    reasoningEffort: undefined,
+                  };
+                },
+                outer,
+              ),
+            );
+          }
+          registeredModel = {
+            dispose() {
+              for (const off of listeners) off();
+              dispose();
+            },
+            llm: original(scope.llm),
+            id,
+          };
           const models = await scope.llm.listModels(provider);
           if (models.length !== 1 || models[0].id !== model)
             throw Error('Native managed model was not registered');
