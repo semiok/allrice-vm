@@ -5,6 +5,7 @@ import type { RequestContext } from '@allrice/contracts';
 import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
+  createPostgresPersonVmScheduledWakeStore,
   getDatabase,
   readContentPrincipal,
   readPersonNativeWebRoster,
@@ -672,6 +673,17 @@ export function createProductionPersonVmHost(input: {
       // The shared client supplies trusted connection options only. Every
       // actual store/admission operation opens its own dedicated SQL client.
       const trustedDatabase = getDatabase();
+      const wakeStore =
+        createPostgresPersonVmScheduledWakeStore(trustedDatabase);
+      const assertNoCommittedWake = async (signal: AbortSignal) => {
+        const wakeAt = await (scheduledWake ?? wakeStore).nextCommittedWakeAt(
+          signal,
+        );
+        signal.throwIfAborted();
+        // Snapshot, migration and restarting a release have no hard bound.
+        // Keep the current scheduler responsible for any committed wake.
+        if (wakeAt !== null) throw new PersonVmError('ACTIVITY_UNKNOWN');
+      };
       const openSql = () => createDedicatedDatabase(trustedDatabase);
       const storeModel = createPostgresModelGatewayStore(trustedDatabase);
       const budget = providers.configuration.lifecycle.hostVmBudgetMiB;
@@ -1269,6 +1281,7 @@ export function createProductionPersonVmHost(input: {
             throw new PersonVmError('LEASE_CONFLICT');
           if (upgradeDrained) {
             const receipt = upgradeDrained;
+            await assertNoCommittedWake(active);
             if ((await store.listUpgradeCandidates(active)).length)
               throw new PersonVmError('CLEANUP_INCOMPLETE');
             if (
@@ -1289,19 +1302,12 @@ export function createProductionPersonVmHost(input: {
             scheduledWake?.resume();
           };
           try {
+            await assertNoCommittedWake(active);
             await scheduledWake?.pause(active);
             // Join an already claimed wake before fencing the next startup.
             // The new gate must not strand a claim staged in the next epoch.
             reopen = vm.fenceWorkerStartup();
-            const pendingWake =
-              await scheduledWake?.nextCommittedWakeAt(active);
-            const joinBudget = 4 * vmCleanupTimeoutMs + 5_000;
-            let wakeDeadline = pendingWake?.getTime() ?? Infinity;
-            const assertWakeWindow = (reserve: number) => {
-              if (!(Date.now() + reserve < wakeDeadline))
-                throw new PersonVmError('ACTIVITY_UNKNOWN');
-            };
-            assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+            await assertNoCommittedWake(active);
             const deadline = AbortSignal.any([
               active,
               AbortSignal.timeout(UPGRADE_WAIT_MS),
@@ -1312,7 +1318,7 @@ export function createProductionPersonVmHost(input: {
                 (row) => row.phase === 'starting' || !row.instanceId,
               )
             ) {
-              assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+              await assertNoCommittedWake(deadline);
               await sleep(1000, undefined, { signal: deadline, ref: false });
               candidates = await store.listUpgradeCandidates(deadline);
             }
@@ -1358,11 +1364,7 @@ export function createProductionPersonVmHost(input: {
                     if (!('ok' in plan))
                       throw new PersonVmError('ACTIVITY_UNKNOWN');
                     if (plan.nextWakeAt !== null)
-                      wakeDeadline = Math.min(
-                        wakeDeadline,
-                        Date.parse(plan.nextWakeAt),
-                      );
-                    assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
+                      throw new PersonVmError('RUNTIME_NOT_READY');
                     return {
                       nextWakeAt: plan.nextWakeAt,
                       scheduleFingerprints: plan.scheduleFingerprints,
@@ -1376,7 +1378,6 @@ export function createProductionPersonVmHost(input: {
                           async (tx, fenced) => {
                             await requireCurrentPlatformAdmin(context, tx);
                             fenced.throwIfAborted();
-                            assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
                           },
                         ),
                     };
@@ -1385,7 +1386,6 @@ export function createProductionPersonVmHost(input: {
               for (;;) {
                 deadline.throwIfAborted();
                 await authorize(deadline);
-                assertWakeWindow(UPGRADE_HANDOFF_MS + joinBudget);
                 try {
                   await drain();
                   break;
@@ -1400,6 +1400,7 @@ export function createProductionPersonVmHost(input: {
                     deadline.aborted
                   )
                     throw error;
+                  await assertNoCommittedWake(deadline);
                   await sleep(1000, undefined, {
                     signal: deadline,
                     ref: false,
@@ -1411,14 +1412,7 @@ export function createProductionPersonVmHost(input: {
               throw new PersonVmError('CLEANUP_INCOMPLETE');
             // Recovery of a joined stop can publish a previously invisible
             // wake without preparing a plan during this drain attempt.
-            const committedWake =
-              await scheduledWake?.nextCommittedWakeAt(active);
-            wakeDeadline = Math.min(
-              wakeDeadline,
-              committedWake?.getTime() ?? Infinity,
-            );
-            active.throwIfAborted();
-            assertWakeWindow(UPGRADE_HANDOFF_MS + 5_000);
+            await assertNoCommittedWake(active);
             const receipt = Object.freeze({
               stopped: candidates.length,
               expiresAt: new Date(
@@ -1449,6 +1443,7 @@ export function createProductionPersonVmHost(input: {
           signal: AbortSignal,
           drainExpiresAt?: string,
         ) {
+          signal.throwIfAborted();
           if (
             drainExpiresAt !== undefined &&
             upgradeDrained?.expiresAt !== drainExpiresAt
@@ -1458,17 +1453,27 @@ export function createProductionPersonVmHost(input: {
           if (upgradeDraining || shutdownChecking)
             throw new PersonVmError('LEASE_CONFLICT');
           if (upgradeDrained) {
-            const receipt = upgradeDrained;
-            if ((await store.listUpgradeCandidates(signal)).length)
-              throw new PersonVmError('CLEANUP_INCOMPLETE');
-            if (
-              upgradeDrained !== receipt ||
-              Date.now() >= Date.parse(receipt.expiresAt)
-            )
+            // A signal may complete an already claimed shutdown. It cannot
+            // consume a release receipt before the launcher records its intent.
+            if (drainExpiresAt === undefined)
               throw new PersonVmError('RUNTIME_NOT_READY');
-            clearTimeout(upgradeHandoff);
-            gracefulStop = true;
-            return;
+            shutdownChecking = true;
+            const receipt = upgradeDrained;
+            try {
+              if ((await store.listUpgradeCandidates(signal)).length)
+                throw new PersonVmError('CLEANUP_INCOMPLETE');
+              await assertNoCommittedWake(signal);
+              if (
+                upgradeDrained !== receipt ||
+                Date.now() >= Date.parse(receipt.expiresAt)
+              )
+                throw new PersonVmError('RUNTIME_NOT_READY');
+              clearTimeout(upgradeHandoff);
+              gracefulStop = true;
+              return;
+            } finally {
+              shutdownChecking = false;
+            }
           }
           // An expired or failed release attempt cannot be treated as an
           // ordinary process shutdown and bypass the whole-host drain.
@@ -1482,6 +1487,7 @@ export function createProductionPersonVmHost(input: {
             signal.throwIfAborted();
             for (const { binding } of ownedVms.values())
               await vm.assertWorkerShutdownSafe(binding, signal);
+            await assertNoCommittedWake(signal);
             gracefulStop = true;
           } catch (error) {
             pauseIdle = false;

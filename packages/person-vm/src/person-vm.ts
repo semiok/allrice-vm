@@ -1036,7 +1036,10 @@ export class PersonVmService
         roster.organizationId !== row.organizationId)
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
-    if (row.phase === 'running' && this.needsUpgradeStop(row)) {
+    if (
+      (row.phase === 'running' || row.phase === 'failed') &&
+      this.needsUpgradeStop(row)
+    ) {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
       if (
         !dispatchUpgradeStop ||
@@ -1404,7 +1407,10 @@ export class PersonVmService
       return this.prewarmCurrent(context, signal, target, foregroundOpen);
     }
     this.assertPrewarmTarget(row, target, true);
-    if (row?.phase === 'running' && this.needsUpgradeStop(row)) {
+    if (
+      (row?.phase === 'running' || row?.phase === 'failed') &&
+      this.needsUpgradeStop(row)
+    ) {
       if (
         !foregroundOpen ||
         !target?.dispatchUpgradeStop ||
@@ -1535,6 +1541,7 @@ export class PersonVmService
       audit?: VmAudit;
       idle?: IdleStopGuard;
       nativeAlreadyJoined?: boolean;
+      requireNativeStopped?: boolean;
       /** This attempt never dispatched, and the prior epoch already released. */
       unstartedCapacity?: boolean;
       onDetached?: (mount: string, signal: AbortSignal) => Promise<void>;
@@ -1549,7 +1556,7 @@ export class PersonVmService
     const stopAndConfirm = async (signal: AbortSignal) => {
       const binding = bindingOf(row);
       if (stopNative && !completion?.nativeAlreadyJoined) {
-        if (platformDetach)
+        if (platformDetach || completion?.requireNativeStopped)
           await this.options.native.stop(binding, signal, {
             requireStopped: true,
           });
@@ -1608,6 +1615,15 @@ export class PersonVmService
         throw new PersonVmError('CLEANUP_INCOMPLETE', { cause: error });
       }
     }
+    if (completion?.requireNativeStopped) {
+      const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
+      // Keep the previous ownership receipt until the exact stopped native
+      // runtime has joined. A failed readback can be retried under its fence.
+      await this.mounted(row, signal, lease);
+      await lease.guard();
+      stopped = await stopAndConfirm(signal);
+      if (!stopped) throw new PersonVmError('CLEANUP_INCOMPLETE');
+    }
     if (row.egressReceipt) {
       try {
         if (!this.options.egress) throw new PersonVmError('EGRESS_UNAVAILABLE');
@@ -1627,7 +1643,7 @@ export class PersonVmService
       egressJoined = false;
     }
     // Revocation exhausting its budget must not pre-abort the physical stop attempt.
-    if (!idle) {
+    if (!idle && !stopped) {
       const signal = AbortSignal.timeout(this.options.cleanupTimeoutMs);
       try {
         if (row.instanceId) {
@@ -1893,6 +1909,7 @@ export class PersonVmService
             }
           : undefined,
         'stop.upgrade',
+        state !== 'running',
       );
       if (state === 'running') this.options.observeOwnedStop?.(binding);
       return stopped;
@@ -2011,14 +2028,18 @@ export class PersonVmService
         if (!sameVmBinding(bindingOf(row), binding))
           throw new PersonVmError('LEASE_LOST');
         if (row.phase === 'stopped' && !row.egressReceipt) return;
-        if (row.phase !== 'running')
+        const previousWorker = this.needsUpgradeStop(row);
+        if (
+          row.phase !== 'running' &&
+          !(row.phase === 'failed' && previousWorker)
+        )
           throw new PersonVmError('ACTIVITY_UNKNOWN');
         await this.stopForUpgrade(
           lease,
           row,
           requestId,
           active,
-          this.needsUpgradeStop(row),
+          previousWorker,
           assertAuthority,
           prepareWake,
         );
@@ -2031,6 +2052,7 @@ export class PersonVmService
     row: VmRecord,
     idle?: IdleStopGuard,
     action = 'stop',
+    requireNativeStopped = false,
   ) {
     await lease.audit(row, {
       requestId,
@@ -2047,6 +2069,7 @@ export class PersonVmService
         await this.cleanup(row, lease, 'stop', true, {
           audit: stoppedAudit,
           idle,
+          requireNativeStopped,
         });
       else await lease.audit(row, stoppedAudit);
       return view(row);

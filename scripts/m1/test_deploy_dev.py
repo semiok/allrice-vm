@@ -66,7 +66,7 @@ class DeployDevMigrations(unittest.TestCase):
         self.applied = os.path.join(self.tmp, 'applied.txt')
         # $CONTRACT_FILE holds psql's answer for the journal contract row ('row:<highWater>', empty: no row).
         write(os.path.join(self.stubs, 'psql'), '#!/bin/sh\n[ -z "$PSQL_FAIL" ] || exit 2\nfor a; do q=$a; done\n'
-              'case "$q" in *to_regclass*person_virtual_machines*) echo f ;; *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
+              'case "$q" in *to_regclass*person_virtual_machines*|*to_regclass*person_vm_scheduled_wakes*) echo f ;; *allrice_runtime_metadata*) [ -z "$CONTRACT_FAIL" ] || exit 2; cat "$CONTRACT_FILE" 2>/dev/null ;; *) cat "$APPLIED" ;; esac\n', 0o755)
         write(os.path.join(self.stubs, 'pg_dump'), '#!/bin/sh\n[ -z "$PG_DUMP_FAIL" ] || exit 1\necho "-- dump of $*"\n', 0o755)
         write(os.path.join(self.stubs, 'curl'), '#!/bin/sh\nexit 7\n', 0o755)
         write(os.path.join(self.stubs, 'launchctl'), '#!/bin/sh\nexit 113\n', 0o755)
@@ -207,7 +207,7 @@ class DeployDevMigrations(unittest.TestCase):
         plist['KeepAlive'] = {'SuccessfulExit': False}
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
-        for mode in ('missing', 'stale', 'expired', 'deferred', 'success'):
+        for mode in ('missing', 'stale', 'expired', 'deferred', 'wake-before', 'wake-during', 'wake-after', 'success'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r"""
                   M1_LAUNCHCTL=test_launchctl
@@ -219,6 +219,15 @@ class DeployDevMigrations(unittest.TestCase):
                     if [ "${stopped:-}" = yes ]; then echo gone; else echo 'running 73001'; fi
                   }
                   vm_upgrade_candidates() { echo 0; }
+                  dev_sql() {
+                    case "$1" in
+                      *to_regclass*) echo t ;;
+                      *'select not exists'*)
+                        if [ "$MODE" = wake-before ] ||
+                          [ -f "$STATE/fixture-wake" ]; then echo f; else echo t; fi ;;
+                      *) return 1 ;;
+                    esac
+                  }
                   worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
                   DRAIN_SOCKET=/test/owner
                   DRAIN_TOKEN=fixture
@@ -227,14 +236,19 @@ class DeployDevMigrations(unittest.TestCase):
                     local valid='661e00de-c0fc-45e6-a1db-bfd158aedad8' year=2099
                     [ "$MODE" != stale ] || valid='144d2c90-65c5-44a7-b3e2-54589ab0eb79'
                     [ "$MODE" != expired ] || year=2020
+                    if [ "$MODE" = wake-during ]; then touch "$STATE/fixture-wake"; fi
                     printf '{"bootId":"%s","stopped":2,"expiresAt":"%s-01-01T00:00:00Z"}\n' "$valid" "$year"
                   }
-                  claim_drained_worker() { echo claim; }
+                  claim_drained_worker() {
+                    echo claim
+                    if [ "$MODE" = wake-after ]; then touch "$STATE/fixture-wake"; fi
+                  }
                   wait_for_drained_worker_exit() { [ "$MODE" != deferred ]; }
                   port_closed() { return 0; }
                   stop_job() { echo "stop-web $1"; }
                   mkdir -p "$STATE"
-                  stop_both
+                  rm -f "$STATE/fixture-wake"
+                  stop_both release
                 """, FILES, MODE=mode)
                 lines = p.stdout.splitlines()
                 if mode == 'success':
@@ -244,9 +258,62 @@ class DeployDevMigrations(unittest.TestCase):
                     self.assertIn('stop-web', p.stdout)
                 else:
                     self.assertNotEqual(p.returncode, 0)
-                    self.assertNotIn('bootout', lines)
+                    self.assertEqual('bootout' in lines, mode == 'wake-after')
                     self.assertNotIn('stop-web', p.stdout)
-                    self.assertEqual('claim' in lines, mode == 'deferred')
+                    self.assertEqual('claim' in lines, mode in ('deferred', 'wake-after'))
+                    if mode.startswith('wake-'):
+                        self.assertIn('outstanding Person VM wake', p.stdout)
+
+    def test_early_worker_exit_preserves_recovery_files_and_original_pid(self):
+        write(os.path.join(self.initial_release, '.local/person-vm-host.json'), '{}', 0o600)
+        manifest = os.path.join(self.initial_release, '.local/dev-build-identity.json')
+        with open(manifest) as f:
+            identity = json.load(f)
+        identity['files'] = [{'path': '.local/person-vm-host.json', 'scope': 'worker'}]
+        write(manifest, json.dumps(identity))
+        plist = self.read_plist(self.live_plist('worker'))
+        plist['KeepAlive'] = {'SuccessfulExit': False}
+        with open(self.live_plist('worker'), 'wb') as f:
+            plistlib.dump(plist, f)
+
+        p = self.run_dd(r'''
+          mkdir -p "$STATE"
+          job_state() {
+            if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
+          }
+          worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+          read_drain_receipt() {
+            test -s "$INFLIGHT/worker-exit" || return 1
+            touch "$STATE/fixture-loaded"
+            echo '{"bootId":"661e00de-c0fc-45e6-a1db-bfd158aedad8","stopped":0,"expiresAt":"2099-01-01T00:00:00Z"}'
+          }
+          DRAIN_TOKEN=fixture
+          inflight_begin "$(penv "$WORKER_PLIST" ALLRICE_RELEASE_SHA)"
+          stop_both release
+        ''', FILES)
+        self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn('Worker exit unconfirmed', p.stdout)
+        state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
+        with open(os.path.join(state, 'worker-exit')) as f:
+            self.assertEqual(f.read().splitlines(), [
+                self.initial_release, '73001', '661e00de-c0fc-45e6-a1db-bfd158aedad8',
+            ])
+        self.assertTrue(os.path.isfile(os.path.join(state, 'state')))
+
+        p = self.run_dd(r'''
+          M1_LAUNCHCTL=test_launchctl
+          test_launchctl() { test "$1" = bootout; }
+          job_state() { echo loaded; }
+          wait_for_drained_worker_exit() { test "$1" = 73001 && echo joined-original; }
+          vm_upgrade_candidates() { echo 0; }
+          stop_job() { :; }
+          start_both_on() { echo "restarted $1"; }
+          recover
+        ''', FILES, CONTRACT='row:1')
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertIn('joined-original', p.stdout)
+        self.assertIn('restarted ' + 'a' * 40, p.stdout)
+        self.assertFalse(os.path.exists(state))
 
     def test_archived_names_are_known(self):
         known, pending = self.check(self.release(), FILES + ARCHIVED)

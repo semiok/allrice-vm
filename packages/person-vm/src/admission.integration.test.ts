@@ -349,6 +349,137 @@ suite(
       expect(stops).toEqual([{ result: 'started' }, { result: 'succeeded' }]);
     });
 
+    it.each(['foreground', 'release'] as const)(
+      'recovers a previous-worker stop after its terminal readback fails: %s',
+      async (entry) => {
+        const h = await setup();
+        const store = new PostgresPersonVmStore(h.physical.open);
+        let ownEpoch = 0;
+        let fenced = false;
+        const joins: boolean[] = [];
+        const vm = new PersonVmService({
+          ...h.options,
+          store,
+          disk: {
+            ...h.options.disk,
+            async verifyAttachedMount({ vmId }) {
+              return h.mounts.has(vmId) ? '/synthetic/' + vmId : null;
+            },
+          },
+          native: {
+            ...h.native,
+            async readAttachedStatus(binding, _mount, active) {
+              expect(fenced).toBe(true);
+              expect(binding).toEqual(h.binding);
+              return h.native.status(binding, active);
+            },
+            async stopIdle(...args) {
+              expect(fenced).toBe(true);
+              await h.native.stopIdle(...args);
+              throw new Error('synthetic failure after joined native stop');
+            },
+            async stop(binding, active, options) {
+              joins.push(options?.requireStopped === true);
+              expect(fenced).toBe(true);
+              await h.native.stop(binding, active);
+            },
+          },
+          ownsEgressReceipt: ({ binding }) => binding.leaseEpoch === ownEpoch,
+          observeOwnedStart(binding) {
+            ownEpoch = binding.leaseEpoch;
+          },
+          async withPreviousGatewayFenced(binding, ports, _signal, action) {
+            expect(binding).toEqual(h.binding);
+            expect(ports).toEqual([38990]);
+            expect(
+              (await store.read(binding.personId))?.leaseOwner,
+            ).toBeTruthy();
+            fenced = true;
+            try {
+              return await action();
+            } finally {
+              fenced = false;
+            }
+          },
+        });
+        vm.createAdmissionHost({ openSql: h.physical.open });
+        const authorize = async (active: AbortSignal) =>
+          active.throwIfAborted();
+        const open = (trigger: 'page' | 'open') =>
+          vm.prewarm(
+            h.rc,
+            {
+              trigger,
+              target: {
+                vmId: h.binding.vmId,
+                instanceId: null,
+                leaseEpoch: 2,
+                assertAuthority: authorize,
+                dispatchUpgradeStop: (_binding, active, stop) => {
+                  active.throwIfAborted();
+                  return stop();
+                },
+              },
+            },
+            signal(),
+          );
+        await expect(open('open')).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(h.states.get(h.binding.vmId)).toBe('stopped');
+        expect(await store.read(h.binding.personId)).toMatchObject({
+          phase: 'failed',
+          leaseEpoch: 1,
+          egressReceipt: expect.anything(),
+        });
+        await expect(open('page')).rejects.toMatchObject({
+          code: 'UPGRADE_OPEN_REQUIRED',
+        });
+        if (entry === 'foreground') {
+          await expect(open('open')).resolves.toMatchObject({
+            phase: 'running',
+            vmId: h.binding.vmId,
+          });
+        } else {
+          const reopen = vm.fenceWorkerStartup();
+          try {
+            const noWakePreparation = async () => {
+              throw Error(
+                'old Worker stop must be proven without adopting its runtime',
+              );
+            };
+            h.states.set(h.binding.vmId, 'running');
+            await expect(
+              vm.stopRunningForUpgrade(
+                h.binding,
+                randomUUID(),
+                signal(),
+                authorize,
+                noWakePreparation,
+              ),
+            ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+            expect(joins).toEqual([]);
+            h.states.set(h.binding.vmId, 'stopped');
+            await vm.stopRunningForUpgrade(
+              h.binding,
+              randomUUID(),
+              signal(),
+              authorize,
+              noWakePreparation,
+            );
+          } finally {
+            reopen();
+          }
+        }
+        expect(joins).toEqual([true]);
+        expect(await store.read(h.binding.personId)).toMatchObject({
+          diskRetained: true,
+          phase: entry === 'foreground' ? 'running' : 'stopped',
+          leaseEpoch: entry === 'foreground' ? 2 : 1,
+        });
+      },
+    );
+
     it('retries upgrade drain from the joined stop receipt and preserves the exact wake plan', async () => {
       const h = await setup();
       const store = new PostgresPersonVmStore(h.physical.open);
