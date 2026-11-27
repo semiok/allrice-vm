@@ -54,7 +54,7 @@ function fixture(
   publicOrigin?: string,
   hot?: Pick<
     Parameters<typeof createAssignedNativeWebStartup>[0],
-    'hotGuest' | 'readRoster' | 'archive'
+    'hotGuest' | 'readRoster' | 'archive' | 'employeeRuntime'
   >,
 ) {
   const binding = {
@@ -148,6 +148,299 @@ function fixture(
     lifetime,
   };
 }
+function capacityFixture(
+  employeeRuntime: NonNullable<
+    Parameters<typeof createAssignedNativeWebStartup>[0]['employeeRuntime']
+  >,
+) {
+  const bootstrap = vi.fn();
+  const assertWebEndpoints = vi.fn(async () => {});
+  const readRoster = vi.fn();
+  const confirmArchive = vi.fn(async () => false);
+  let notifyArchive: (id: string | null) => Promise<void> = async () => {};
+  const f = fixture(undefined, undefined, {
+    employeeRuntime,
+    hotGuest: { bootstrap, assertWebEndpoints },
+    readRoster,
+    archive: {
+      async subscribe(_identity, notify) {
+        notifyArchive = notify;
+        return async () => {};
+      },
+      confirm: confirmArchive,
+    },
+  });
+  bootstrap.mockResolvedValue({
+    launch: f.scope.launch,
+    readNativeWebGuestAddress: f.readNativeWebGuestAddress,
+  });
+  return {
+    ...f,
+    bootstrap,
+    assertWebEndpoints,
+    readRoster,
+    confirmArchive,
+    notifyArchive: (id: string) => notifyArchive(id),
+    enroll(
+      employee: PersonVmWebStartup['receipt']['endpoints'][number],
+      active = signal(),
+      check = async () => {},
+    ) {
+      return f.service.synchronizeEmployee(
+        f.web.context,
+        f.binding,
+        { ...employee, ...f.binding, threadId: null },
+        check,
+        active,
+      );
+    },
+  };
+}
+it.each(['proved', 'unproved'] as const)(
+  'cold plan only omits proved new profiles and requires selected editor proof: %s',
+  async (scenario) => {
+    const f = capacityFixture({
+      maxRunning: 2,
+      async readColdSelection({ receipt }) {
+        const [deferred, , selected] = receipt.endpoints;
+        return {
+          selected: { ...selected!, ...receipt.binding },
+          neverStarted: [{ ...deferred!, ...receipt.binding }],
+        };
+      },
+    });
+    const [deferred, unknown] = f.web.receipt.endpoints;
+    const selected = {
+      ...unknown!,
+      ...f.web.receipt.slots![2]!,
+      employeeInstanceId: randomUUID(),
+    };
+    const web = {
+      ...f.web,
+      receipt: { ...f.web.receipt, endpoints: [deferred!, unknown!, selected] },
+    };
+    const owner = {
+      ...catalogOwner(),
+      verifyStartingEditor: vi.fn<NativeWebOwner['verifyStartingEditor']>(
+        async (_scope, active, verify) =>
+          verify(
+            {
+              revoked: active,
+              readImmutableGraph: vi.fn(),
+              readImmutableBundle: vi.fn(),
+            },
+            vi.fn(),
+            active,
+          ),
+      ),
+    };
+    open.mockResolvedValue(owner);
+    f.service.installStartingEditorProof(async ({ endpoint }) =>
+      scenario === 'unproved' &&
+      endpoint.employeeInstanceId === selected.employeeInstanceId
+        ? null
+        : signal(),
+    );
+    try {
+      const plan = await f.service.memoryGuestPlan(f.binding, signal(), web);
+      const homes = plan.files.map(({ path }) => path);
+      expect(
+        homes.some((path) => path.includes(deferred!.employeeInstanceId)),
+      ).toBe(false);
+      expect(
+        homes.some((path) => path.includes(unknown!.employeeInstanceId)),
+      ).toBe(true);
+      expect(
+        homes.some((path) => path.includes(selected.employeeInstanceId)),
+      ).toBe(true);
+      const started = f.service.start(f.binding, signal(), f.scope, web);
+      if (scenario === 'unproved') {
+        await expect(started).rejects.toMatchObject({
+          code: 'RUNTIME_NOT_READY',
+        });
+      } else {
+        await started;
+        expect(
+          f.service.catalog(f.binding, selected.employeeInstanceId).endpoint,
+        ).toEqual(selected);
+        expect(
+          f.service.owner(f.binding, deferred!.employeeInstanceId),
+        ).toBeUndefined();
+        expect(() =>
+          f.service.assertVerifiedEditor(
+            f.binding,
+            signal(),
+            selected.employeeInstanceId,
+          ),
+        ).not.toThrow();
+      }
+      expect(open).toHaveBeenCalledTimes(2);
+      expect(open.mock.calls[1]![0].launch.command.env.DSH_HOME).toContain(
+        selected.employeeInstanceId,
+      );
+      expect(owner.verifyStartingEditor).toHaveBeenCalledTimes(2);
+    } finally {
+      await f.service.close();
+    }
+  },
+);
+it('applies the default four-owner cap before staging when cold evidence is absent', async () => {
+  const f = capacityFixture({ readColdSelection: async () => null });
+  const endpoints = Array.from({ length: 5 }, (_, index) => ({
+    ...f.web.receipt.endpoints[0]!,
+    employeeInstanceId: randomUUID(),
+    hostPort: 32171 + index,
+    guestPort: 32171 + index,
+  }));
+  const web = {
+    ...f.web,
+    receipt: { ...f.web.receipt, endpoints, slots: endpoints },
+  };
+  await expect(
+    f.service.memoryGuestPlan(f.binding, signal(), web),
+  ).rejects.toMatchObject({ code: 'WEB_ENDPOINTS_PREPARING' });
+  expect(f.memoryGuestPlan).not.toHaveBeenCalled();
+  expect(open).not.toHaveBeenCalled();
+  await f.service.close();
+});
+it('rejects a cold proof from another tenant or a previous profile before staging', async () => {
+  for (const stale of ['organizationId', 'employeeVersionId'] as const) {
+    const f = capacityFixture({
+      async readColdSelection({ receipt }) {
+        const [selected, deferred] = receipt.endpoints;
+        return {
+          selected: { ...selected!, ...receipt.binding },
+          neverStarted: [
+            { ...deferred!, ...receipt.binding, [stale]: randomUUID() },
+          ],
+        };
+      },
+    });
+    await expect(
+      f.service.memoryGuestPlan(f.binding, signal(), f.web),
+    ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+    expect(f.memoryGuestPlan).not.toHaveBeenCalled();
+    await f.service.close();
+  }
+});
+it('keeps full demand pending outside the update queue until the exact old job and Host join', async () => {
+  const f = capacityFixture({ maxRunning: 1 });
+  const [first, next] = f.web.receipt.endpoints;
+  const other = { ...next!, employeeInstanceId: randomUUID() };
+  const web = {
+    ...f.web,
+    receipt: { ...f.web.receipt, endpoints: [first!] },
+  };
+  f.readRoster.mockResolvedValue({
+    ...f.binding,
+    digest: 'current-roster',
+    entries: [first!, next!, other],
+  });
+  const joined = latch();
+  const joining = latch();
+  const firstOwner = catalogOwner();
+  firstOwner.retireAfterJobExit.mockImplementationOnce(() => {
+    joining.resolve();
+    return joined.promise;
+  });
+  const nextOwner = catalogOwner();
+  open.mockResolvedValueOnce(firstOwner).mockResolvedValueOnce(nextOwner);
+  const cancel = new AbortController();
+  const lost = new PersonVmError('AUTHORIZATION_DENIED');
+  const recheck = vi.fn(async () => {});
+  try {
+    await f.service.memoryGuestPlan(f.binding, signal(), web);
+    await f.service.start(f.binding, signal(), f.scope, web);
+    const nextStarted = f.enroll(next!, cancel.signal, recheck);
+    void nextStarted.catch(() => {});
+    await vi.waitFor(() =>
+      expect(f.assertWebEndpoints).toHaveBeenCalledTimes(1),
+    );
+    const extra = new AbortController();
+    const otherStarted = f.enroll(other, extra.signal);
+    void otherStarted.catch(() => {});
+    await vi.waitFor(() =>
+      expect(f.assertWebEndpoints).toHaveBeenCalledTimes(2),
+    );
+    expect(f.bootstrap).not.toHaveBeenCalled();
+    expect(firstOwner.retireAfterJobExit).not.toHaveBeenCalled();
+    expect(f.service.catalog(f.binding, first!.employeeInstanceId).owner).toBe(
+      firstOwner,
+    );
+    f.confirmArchive.mockResolvedValue(true);
+    const archive = f.notifyArchive(first!.employeeInstanceId);
+    void archive.catch(() => {});
+    await joining.promise;
+    expect(firstOwner.close).not.toHaveBeenCalled();
+    expect(f.bootstrap).not.toHaveBeenCalled();
+    // The second waiter loses current authority while queued. No guest job for it.
+    extra.abort(lost);
+    await expect(otherStarted).rejects.toBe(lost);
+    joined.resolve();
+    await archive;
+    await nextStarted;
+    expect(recheck.mock.calls.length).toBeGreaterThanOrEqual(4);
+    expect(f.bootstrap).toHaveBeenCalledOnce();
+    expect(f.service.catalog(f.binding, next!.employeeInstanceId).owner).toBe(
+      nextOwner,
+    );
+    expect(firstOwner.close).not.toHaveBeenCalled();
+    await f.enroll(next!);
+    expect(f.bootstrap).toHaveBeenCalledOnce();
+  } finally {
+    cancel.abort();
+    joined.resolve();
+    await f.service.close();
+  }
+});
+it('holds an unacknowledged start against the cap until exact stop and cancels its waiter', async () => {
+  const f = capacityFixture({ maxRunning: 2 });
+  const [first, attempted] = f.web.receipt.endpoints;
+  const other = { ...attempted!, employeeInstanceId: randomUUID() };
+  const web = {
+    ...f.web,
+    receipt: { ...f.web.receipt, endpoints: [first!] },
+  };
+  f.readRoster.mockResolvedValue({
+    ...f.binding,
+    digest: 'current-roster',
+    entries: [first!, attempted!, other],
+  });
+  const firstOwner = catalogOwner();
+  open.mockResolvedValueOnce(firstOwner);
+  const cancel = new AbortController();
+  try {
+    await f.service.memoryGuestPlan(f.binding, signal(), web);
+    await f.service.start(f.binding, signal(), f.scope, web);
+    const unknown = new PersonVmError('CLEANUP_INCOMPLETE');
+    f.bootstrap.mockRejectedValueOnce(unknown);
+    await expect(f.enroll(attempted!)).rejects.toBe(unknown);
+    const pending = f.enroll(other, cancel.signal);
+    void pending.catch(() => {});
+    await vi.waitFor(() =>
+      expect(f.assertWebEndpoints).toHaveBeenCalledTimes(2),
+    );
+    expect(f.bootstrap).toHaveBeenCalledOnce();
+    expect(firstOwner.close).not.toHaveBeenCalled();
+    await expect(
+      f.service.retireAfterNativeStop(
+        { ...f.binding, leaseEpoch: f.binding.leaseEpoch + 1 },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(f.service.catalog(f.binding, first!.employeeInstanceId).owner).toBe(
+      firstOwner,
+    );
+    await f.service.retireAfterNativeStop(f.binding, signal());
+    await expect(pending).rejects.toMatchObject({ code: 'LEASE_LOST' });
+    expect(firstOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
+    expect(f.bootstrap).toHaveBeenCalledOnce();
+    expect(f.service.hasLocalOwner(f.binding)).toBe(false);
+  } finally {
+    cancel.abort();
+    await f.service.close();
+  }
+});
 it.each([
   'live owner',
   'already exited',

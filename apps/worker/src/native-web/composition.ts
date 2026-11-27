@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import type {
   PersonVmBinding,
   PersonVmBootstrapScope,
@@ -21,7 +22,11 @@ import {
   type confirmDEntryEmployeeArchive,
   type subscribeDEntryEmployeeArchive,
 } from '@allrice/database';
-import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
+import {
+  MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS,
+  type DEntryIdentity,
+  type RequestContext,
+} from '@allrice/contracts';
 import { createPersonVmDshCommandMemoryPatch } from '@allrice/vm-memory/guest-plan';
 import {
   nativeWebLaunchOnGuest,
@@ -35,6 +40,11 @@ import {
 import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
+type EmployeeProfile = Omit<DEntryIdentity, 'threadId'>;
+type ColdEmployeeSelection = Readonly<{
+  selected: EmployeeProfile;
+  neverStarted: readonly EmployeeProfile[];
+}>;
 function sameEmployee(
   a: Pick<
     Endpoint,
@@ -101,6 +111,15 @@ export function createAssignedNativeWebStartup(input: {
     subscribe: typeof subscribeDEntryEmployeeArchive;
     confirm: typeof confirmDEntryEmployeeArchive;
   };
+  employeeRuntime?: Readonly<{
+    maxRunning?: number;
+    /** Host proof for this startup and exact employee profiles. Absence keeps
+     * the existing eager plan. A roster row alone cannot prove never started. */
+    readColdSelection?(
+      startup: PersonVmWebStartup,
+      signal: AbortSignal,
+    ): Promise<ColdEmployeeSelection | null>;
+  }>;
   commandMemory?: Readonly<{
     controls: ReadonlyCommandMemoryDirectory;
     readonlyDshDirectory: string;
@@ -115,9 +134,24 @@ export function createAssignedNativeWebStartup(input: {
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
 }) {
+  const runtimeLimit = input.employeeRuntime?.maxRunning ?? 4;
+  if (
+    input.employeeRuntime &&
+    (!Number.isSafeInteger(runtimeLimit) ||
+      runtimeLimit < 1 ||
+      runtimeLimit > MAX_PERSON_VM_EMPLOYEE_PORT_SLOTS ||
+      (input.employeeRuntime.readColdSelection && !input.hotGuest))
+  )
+    throw new PersonVmError('RUNTIME_NOT_READY');
   const prepared = new WeakMap<
     PersonVmWebStartup,
-    readonly NativeWebLaunchPlan[]
+    {
+      selectedId?: string;
+      launches: readonly {
+        endpoint: Endpoint;
+        launch: NativeWebLaunchPlan;
+      }[];
+    }
   >();
   const running = new Map<
     string,
@@ -132,9 +166,11 @@ export function createAssignedNativeWebStartup(input: {
       verifiedEmployees: Map<string, AbortSignal>;
       owners: Map<string, NativeWebOwner>;
       added: Map<string, PersonVmWebEndpointReceipt>;
+      startingEmployees: Set<string>;
       blockedEmployees: Map<string, number>;
       unpublished: Map<number, NativeWebOwner>;
-      updating?: Promise<void>;
+      capacityChanged: AbortController;
+      updating?: Promise<unknown>;
       stopArchive?: () => Promise<void>;
       starting: Promise<void>;
       retiring?: Promise<void>;
@@ -164,11 +200,11 @@ export function createAssignedNativeWebStartup(input: {
     return operation;
   }
   type RunningGroup = NonNullable<ReturnType<typeof running.get>>;
-  function update(group: RunningGroup, work: () => Promise<void>) {
+  function update<T>(group: RunningGroup, work: () => Promise<T>) {
     const previous = group.updating;
     const operation = track(async () => {
       await previous?.catch(() => {});
-      await work();
+      return work();
     });
     group.updating = operation;
     const settle = () => {
@@ -177,12 +213,48 @@ export function createAssignedNativeWebStartup(input: {
     void operation.then(settle, settle);
     return operation;
   }
+  function employeeCapacityFull(group: RunningGroup) {
+    return (
+      input.employeeRuntime !== undefined &&
+      new Set([
+        ...group.owners.keys(),
+        ...group.startingEmployees,
+        ...group.blockedEmployees.keys(),
+      ]).size >= runtimeLimit
+    );
+  }
+  function withEmployeeCapacity(
+    group: RunningGroup,
+    signal: AbortSignal,
+    work: () => Promise<void | 'wait-for-capacity'>,
+  ) {
+    return track(async () => {
+      for (;;) {
+        signal.throwIfAborted();
+        // Capture before the attempt so a joined owner cannot release capacity
+        // between the attempt completing and the waiter attaching.
+        const changed = group.capacityChanged.signal;
+        if ((await update(group, work)) !== 'wait-for-capacity') return;
+        const wake = AbortSignal.any([signal, changed]);
+        if (!wake.aborted) await once(wake, 'abort');
+      }
+    });
+  }
   async function retireEmployee(
     group: RunningGroup,
     endpoint: Endpoint,
+    owner: NativeWebOwner,
     join: () => Promise<void>,
   ) {
     const id = endpoint.employeeInstanceId;
+    const assertOwner = () => {
+      if (
+        running.get(group.binding.vmId) !== group ||
+        group.owners.get(id) !== owner
+      )
+        throw new PersonVmError('LEASE_LOST');
+    };
+    assertOwner();
     // Keep both the employee home and the slot reserved until its owner joins.
     group.blockedEmployees.set(id, endpoint.hostPort);
     group.verifiedEmployees.delete(id);
@@ -191,9 +263,13 @@ export function createAssignedNativeWebStartup(input: {
     } catch (cause) {
       throw new PersonVmError('CLEANUP_INCOMPLETE', { cause });
     }
+    assertOwner();
     group.owners.delete(id);
     group.added.delete(id);
     group.blockedEmployees.delete(id);
+    const changed = group.capacityChanged;
+    group.capacityChanged = new AbortController();
+    changed.abort();
   }
   function ownerEndpoint(group: RunningGroup, employeeInstanceId: string) {
     return (
@@ -238,7 +314,7 @@ export function createAssignedNativeWebStartup(input: {
             if (!endpoint || group.blockedEmployees.has(employeeId)) continue;
             if (await confirmArchive(group, endpoint)) {
               if (!group.ready || signal.aborted) return;
-              await retireEmployee(group, endpoint, () =>
+              await retireEmployee(group, endpoint, owner, () =>
                 joinArchivedOwner(group, owner),
               );
             }
@@ -325,6 +401,39 @@ export function createAssignedNativeWebStartup(input: {
       throw new PersonVmError('LEASE_LOST');
     return web;
   }
+  async function coldEmployees(web: PersonVmWebStartup, signal: AbortSignal) {
+    const { binding, endpoints, slots } = web.receipt;
+    if (!slots || !input.employeeRuntime) return { endpoints };
+    const selection = await input.employeeRuntime.readColdSelection?.(
+      web,
+      signal,
+    );
+    signal.throwIfAborted();
+    const selectedId = selection?.selected.employeeInstanceId;
+    const deferred = new Set<string>();
+    if (selection) {
+      const requireExactProfile = (profile: EmployeeProfile) => {
+        if (
+          profile.personId !== binding.personId ||
+          profile.organizationId !== binding.organizationId ||
+          !endpoints.some((employee) => sameEmployee(employee, profile))
+        )
+          throw new PersonVmError('AUTHORIZATION_DENIED');
+      };
+      requireExactProfile(selection.selected);
+      for (const profile of selection.neverStarted) {
+        requireExactProfile(profile);
+        deferred.add(profile.employeeInstanceId);
+      }
+    }
+    const launches = endpoints.filter(
+      ({ employeeInstanceId }) =>
+        employeeInstanceId === selectedId || !deferred.has(employeeInstanceId),
+    );
+    if (launches.length > runtimeLimit)
+      throw new PersonVmError('WEB_ENDPOINTS_PREPARING');
+    return { endpoints: launches, selectedId };
+  }
   async function close() {
     if (closing) return closing;
     stopped.abort(new PersonVmError('LEASE_LOST'));
@@ -390,26 +499,35 @@ export function createAssignedNativeWebStartup(input: {
         const web = current(binding, startup);
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
+        const cold = await coldEmployees(web, signal);
+        signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
         const profile = await input.readEmployeeProfile(signal);
         const model = await modelAdapter?.(binding, signal);
         current(binding, web);
         signal.throwIfAborted();
         const launches = await Promise.all(
-          web.receipt.endpoints.map((endpoint) =>
-            prepareEmployee(binding, endpoint, profile, memory, model),
-          ),
+          cold.endpoints.map(async (endpoint) => ({
+            endpoint,
+            launch: await prepareEmployee(
+              binding,
+              endpoint,
+              profile,
+              memory,
+              model,
+            ),
+          })),
         );
         current(binding, web);
         signal.throwIfAborted();
-        prepared.set(web, launches);
+        prepared.set(web, { launches, selectedId: cold.selectedId });
         // The existing native bootstrap stages all files, initializes person
         // memory once, and only then exposes its launcher to start below.
         return {
           ...memory,
           files: [
             ...memory.files,
-            ...launches.flatMap((launch) => launch.files),
+            ...launches.flatMap(({ launch }) => launch.files),
           ],
         };
       });
@@ -422,11 +540,11 @@ export function createAssignedNativeWebStartup(input: {
     ) {
       const operation: Promise<void> = track(async () => {
         const web = current(binding, startup),
-          launches = prepared.get(web);
+          plan = prepared.get(web);
         if (!sameVmBinding(scope.binding, binding))
           throw new PersonVmError('LEASE_LOST');
         signal = AbortSignal.any([signal, scope.signal, lifetime]);
-        if (!launches || running.has(binding.vmId))
+        if (!plan || running.has(binding.vmId))
           throw new PersonVmError('LEASE_CONFLICT');
         prepared.delete(web);
         const receipt = Object.freeze({
@@ -448,8 +566,10 @@ export function createAssignedNativeWebStartup(input: {
           verifiedEmployees: new Map(),
           owners: new Map<string, NativeWebOwner>(),
           added: new Map(),
+          startingEmployees: new Set(),
           blockedEmployees: new Map(),
           unpublished: new Map(),
+          capacityChanged: new AbortController(),
           starting: operation,
           retiring: undefined as Promise<void> | undefined,
           unjoinedOpen: false,
@@ -471,20 +591,29 @@ export function createAssignedNativeWebStartup(input: {
               AbortSignal.timeout(input.configuration.startupTimeoutMs),
             ]),
           );
-          for (const [index, launch] of launches.entries()) {
+          for (const { endpoint: planned, launch } of plan.launches) {
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
             current(binding, web);
+            const endpoint = receipt.endpoints.find(
+              (entry) =>
+                sameEmployee(entry, planned) &&
+                entry.hostPort === planned.hostPort &&
+                entry.guestPort === planned.guestPort,
+            );
+            if (!endpoint) throw new PersonVmError('LEASE_LOST');
             signal.throwIfAborted();
             await scope.assertCurrent();
             if (group.retiring) throw new PersonVmError('LEASE_LOST');
             const boundLaunch = nativeWebLaunchOnGuest(launch, guestAddress);
+            const employeeId = endpoint.employeeInstanceId;
+            group.startingEmployees.add(employeeId);
             attemptedOwnerOpen = true;
             const owner = await openEmployee(scope, boundLaunch, web.context, {
               recordStartupFailure: web.recordNativeFailure,
               startupPending: () => awaitingGroupSetup,
             });
-            const endpoint = receipt.endpoints[index]!;
-            group.owners.set(endpoint.employeeInstanceId, owner);
+            group.owners.set(employeeId, owner);
+            group.startingEmployees.delete(employeeId);
             if (prove) {
               const proof = await owner.verifyStartingEditor(
                 scope,
@@ -504,7 +633,7 @@ export function createAssignedNativeWebStartup(input: {
               );
               if (proof) {
                 proof.throwIfAborted();
-                group.verifiedEmployees.set(endpoint.employeeInstanceId, proof);
+                group.verifiedEmployees.set(employeeId, proof);
               }
             }
             current(binding, web);
@@ -513,10 +642,16 @@ export function createAssignedNativeWebStartup(input: {
           }
           await scope.assertCurrent();
           signal.throwIfAborted();
+          const provedSelected = plan.selectedId
+            ? group.verifiedEmployees.get(plan.selectedId)
+            : undefined;
           if (
             group.retiring ||
             editorProof !== prove ||
             (prove && !group.verifiedEmployees.size) ||
+            (prove &&
+              plan.selectedId &&
+              (!provedSelected || provedSelected.aborted)) ||
             [...group.owners.values()].some(
               (owner) => owner.revoked.aborted || !owner.controlReady(),
             )
@@ -707,12 +842,8 @@ export function createAssignedNativeWebStartup(input: {
         !this.needsEmployee(context, binding, identity)
       )
         return Promise.resolve();
-      return update(group, async () => {
-        const signal = AbortSignal.any([
-          caller,
-          lifetime,
-          group.revoked.signal,
-        ]);
+      const signal = AbortSignal.any([caller, lifetime, group.revoked.signal]);
+      return withEmployeeCapacity(group, signal, async () => {
         const rosterFor = input.readRoster ?? readPersonNativeWebRoster;
         const scope = {
           binding,
@@ -741,7 +872,9 @@ export function createAssignedNativeWebStartup(input: {
         if (
           !selected ||
           roster.personId !== binding.personId ||
-          roster.organizationId !== binding.organizationId
+          roster.organizationId !== binding.organizationId ||
+          identity.personId !== binding.personId ||
+          identity.organizationId !== binding.organizationId
         )
           throw new PersonVmError('AUTHORIZATION_DENIED');
         await guest.assertWebEndpoints({ ...group.receipt, slots }, signal);
@@ -766,9 +899,12 @@ export function createAssignedNativeWebStartup(input: {
             throw new PersonVmError(
               sameRevision ? 'RUNTIME_NOT_READY' : 'WEB_ENDPOINTS_PREPARING',
             );
-          await retireEmployee(group, prior, () => joined);
+          await retireEmployee(group, prior, existing, () => joined);
           await scope.assertCurrent();
         }
+        // A waiter releases the allocator while retaining its cancellable
+        // admission. Capacity alone grants no right to close another owner.
+        if (employeeCapacityFull(group)) return 'wait-for-capacity';
         // A roster can omit an occupied sibling. Only an exact committed
         // archive can retire a different employee under this allocation lock.
         const occupied = new Set(group.blockedEmployees.values());
@@ -787,7 +923,7 @@ export function createAssignedNativeWebStartup(input: {
             if (!candidate || !(await confirmArchive(group, prior))) continue;
             await scope.assertCurrent();
             try {
-              await retireEmployee(group, prior, () =>
+              await retireEmployee(group, prior, owner, () =>
                 joinArchivedOwner(group, owner),
               );
             } catch {
@@ -815,6 +951,7 @@ export function createAssignedNativeWebStartup(input: {
         await scope.assertCurrent();
         let owner: NativeWebOwner | undefined;
         let openingOwner = false;
+        group.startingEmployees.add(employeeId);
         try {
           const launcher = await guest.bootstrap(scope, memory, {
             employeeInstanceId: endpoint.employeeInstanceId,
@@ -836,7 +973,11 @@ export function createAssignedNativeWebStartup(input: {
           );
           await scope.assertCurrent();
           const current = await rosterFor(context);
-          if (!current.entries.some((entry) => sameEmployee(entry, endpoint)))
+          if (
+            current.personId !== binding.personId ||
+            current.organizationId !== binding.organizationId ||
+            !current.entries.some((entry) => sameEmployee(entry, endpoint))
+          )
             throw new PersonVmError('AUTHORIZATION_DENIED');
           await scope.assertCurrent();
           group.added.set(
@@ -871,6 +1012,8 @@ export function createAssignedNativeWebStartup(input: {
             else if (!owner) group.unjoinedOpen = true;
           }
           throw error;
+        } finally {
+          group.startingEmployees.delete(employeeId);
         }
       });
     },
