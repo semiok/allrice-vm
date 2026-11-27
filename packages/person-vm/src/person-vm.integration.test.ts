@@ -98,15 +98,17 @@ suite(
         // Fixture inspection/teardown must not borrow a lifecycle-owned client.
         connection: { search_path: schema },
       });
-      await db.unsafe(
-        await readFile(
-          new URL(
-            '../../database/migrations/0247_person_virtual_machines.sql',
-            import.meta.url,
+      for (const migration of [
+        '0002_identity.sql',
+        '0247_person_virtual_machines.sql',
+      ]) {
+        await db.unsafe(
+          await readFile(
+            new URL(`../../database/migrations/${migration}`, import.meta.url),
+            'utf8',
           ),
-          'utf8',
-        ),
-      );
+        );
+      }
       store = new PostgresPersonVmStore(openWorker);
     });
     afterEach(async () => {

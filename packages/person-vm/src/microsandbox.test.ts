@@ -229,6 +229,7 @@ save();
     rc,
     service,
     mount,
+    socketRoot: nativeOptions.socketRoot,
     calls: async () =>
       (await readFile(join(mount, 'host-home/calls.jsonl'), 'utf8'))
         .trim()
@@ -336,6 +337,24 @@ async function readonlyFixture(withSandbox = false) {
 }
 
 describe('Microsandbox public CLI protocol through real child processes (no actual VM)', () => {
+  it('releases only the exact owned mount alias and preserves recoverable native state', async () => {
+    const f = await bootstrapFixture();
+    await f.service.create(f.rc, signal());
+    await f.service.start(f.rc, signal());
+    const binding = await f.service.resolve(f.rc, signal());
+    await f.native.stop(binding, signal());
+    const alias = join(f.socketRoot, binding.vmId);
+    await expect(
+      f.native.releaseDiskHome(binding.vmId, f.mount + '-other', signal()),
+    ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+    expect(await readlink(alias)).toBe(join(f.mount, 'microsandbox'));
+    await f.native.releaseDiskHome(binding.vmId, f.mount, signal());
+    await f.native.releaseDiskHome(binding.vmId, f.mount, signal());
+    await expect(lstat(alias)).rejects.toMatchObject({ code: 'ENOENT' });
+    const restored = f.reloadNative();
+    await restored.prepare(binding, f.mount, signal());
+    expect(await restored.status(binding, signal())).toBe('stopped');
+  });
   it('reopens only an existing running VM configuration for a bounded detached read after restart', async () => {
     const f = await bootstrapFixture('ok', await readonlyFixture());
     await f.service.create(f.rc, signal());
