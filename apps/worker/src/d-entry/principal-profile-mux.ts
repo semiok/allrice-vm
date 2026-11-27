@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { on } from 'node:events';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -300,7 +301,10 @@ async function runStreams(
       void inputError.catch((error: unknown) => stop.abort(error));
     }
     const source = (async () => {
-      if (frame.endpoint === 'session/follow')
+      if (
+        frame.endpoint === 'session/follow' &&
+        page.scope.opened.followWithdrawals
+      )
         follow = await page.watchFollow(child);
       if (follow) {
         let pending;
@@ -326,6 +330,7 @@ async function runStreams(
           scopeId,
           endpoint,
           args: args as Record<string, JsonValue>,
+          ...(follow && { followId: randomUUID() }),
         },
         follow?.signal ?? child,
       );
@@ -340,10 +345,12 @@ async function runStreams(
             while ((pending = follow.pending())) await pending;
             follow.signal.throwIfAborted();
           } else await page.assertCurrent(child);
+          if ('revoked' in stream) stream.revoked?.throwIfAborted();
           child.throwIfAborted();
           await send({ type: 'item', streamId: id, value: item.value });
         }
         follow?.signal.throwIfAborted();
+        if ('revoked' in stream) stream.revoked?.throwIfAborted();
         await page.assertCurrent(child);
         child.throwIfAborted();
         settled = true;

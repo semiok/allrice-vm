@@ -61,14 +61,23 @@ async function connect(f: Awaited<ReturnType<typeof fixture>>) {
   return {
     peer,
     next,
-    async follow(sessionId: string) {
+    async follow(sessionId: string, parentSessionId?: string) {
       send(peer, {
         type: 'open',
         streamId: sessionId,
         endpoint: 'session/follow',
         payload: {
           args: {
-            request: { address: { kind: 'session', sessionId } },
+            request: {
+              address: parentSessionId
+                ? {
+                    kind: 'subagent',
+                    childSessionId: sessionId,
+                    parentSessionId,
+                    mode: 'unknown',
+                  }
+                : { kind: 'session', sessionId },
+            },
           },
         },
       });
@@ -211,7 +220,7 @@ it('fences a removed child before native join and leaves another approved root s
   };
   closes.push(async () => release.resolve());
   const channel = await connect(f);
-  await channel.follow('child');
+  await channel.follow('child', 'root');
   await channel.follow('other');
   const childId = summary('child', 'root').sessionId;
   f.host.catalog.items = f.host.catalog.items.filter(
@@ -265,3 +274,89 @@ it('pauses for periodic verification and fails closed on a missed change hint', 
     vi.useRealTimers();
   }
 });
+
+function watchChild(f: Awaited<ReturnType<typeof fixture>>) {
+  const pulled = deferred();
+  const revoked = deferred();
+  const mock = vi.mocked(f.owner.acquirePrincipal);
+  const acquire = mock.getMockImplementation()!;
+  mock.mockImplementation((...args) => {
+    const activity = acquire(...args);
+    return {
+      ...activity,
+      async run(signal) {
+        const scope = await activity.run(signal);
+        return {
+          ...scope,
+          streamPage(call, caller) {
+            const stream = scope.streamPage(call, caller);
+            if (
+              call.endpoint !== 'session/follow' ||
+              !JSON.stringify(call.args).includes('"childSessionId":"child"')
+            )
+              return stream;
+            stream.revoked?.addEventListener('abort', () => revoked.resolve(), {
+              once: true,
+            });
+            return {
+              ...stream,
+              async *[Symbol.asyncIterator]() {
+                for await (const frame of stream) {
+                  if (JSON.stringify(frame.value).includes('"type":"chunk"'))
+                    pulled.resolve();
+                  yield frame;
+                }
+              },
+            };
+          },
+        };
+      },
+    };
+  });
+  return { pulled, revoked };
+}
+
+it.each([true, false])(
+  'withdraws an already-buffered child while the DB marker is held (native hint: %s)',
+  async (nativeHint) => {
+    const f = await fixture();
+    const observation = observe(f);
+    const watch = watchChild(f);
+    const releaseChunk = deferred();
+    const atMarker = deferred();
+    const releaseMarker = deferred();
+    closes.push(async () => {
+      releaseChunk.resolve();
+      releaseMarker.resolve();
+    });
+    f.host.catalog.followFrames = async function* (id) {
+      if (id !== 'child') return;
+      await releaseChunk.promise;
+      yield chunk(0);
+    };
+    const channel = await connect(f);
+    await channel.follow('child', 'root');
+    await channel.follow('other');
+    observation.marker.mockImplementationOnce(async () => {
+      atMarker.resolve();
+      await releaseMarker.promise;
+    });
+    observation.invalidate();
+    await atMarker.promise;
+    releaseChunk.resolve();
+    await watch.pulled.promise;
+    const child = summary('child', 'root').sessionId;
+    f.host.catalog.items = f.host.catalog.items.filter(
+      (row) => row.sessionId !== child,
+    );
+    if (nativeHint) f.host.host.emit('api-session/removed', child);
+    await watch.revoked.promise;
+    releaseMarker.resolve();
+    expect(await channel.next('child')).toMatchObject({
+      type: 'error',
+      error: { code: 'remote-access/denied' },
+    });
+    expect(channel.peer.readyState).toBe(channel.peer.OPEN);
+  },
+  12_000,
+);

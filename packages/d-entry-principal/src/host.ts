@@ -207,6 +207,18 @@ function assertContribution(
 }
 const followCatalogIntervalMs = 5000;
 
+function followAddress(args: unknown) {
+  try {
+    return Native.methods['session/follow']
+      .input({ strict: true })
+      .create()
+      .parse(args).request.address;
+  } catch {
+    // The native Gateway owns malformed-input errors.
+    return;
+  }
+}
+
 function sameFollowSession(
   current: SessionSummary | undefined,
   original: SessionSummary,
@@ -239,10 +251,13 @@ class Scope implements Projection {
   private sessions = new Map<SessionId, SessionSummary>();
   private readonly follows = new Set<{
     chain: ReadonlyMap<SessionId, SessionSummary>;
+    followId?: string;
     stop: AbortController;
   }>();
   private followTimer?: ReturnType<typeof setTimeout>;
   private followRead?: Promise<void>;
+  private readonly followWithdrawals = new Set<string>();
+  private wakeFollowWithdrawal?: () => void;
   constructor(
     readonly host: PrincipalService,
     private readonly ctx: Context,
@@ -394,7 +409,8 @@ class Scope implements Projection {
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
   }
-  private stopFollow(stop: AbortController) {
+  private stopFollow(stop: AbortController, followId?: string) {
+    if (stop.signal.aborted) return;
     stop.abort(
       new RemoteError(
         'remote-access/denied',
@@ -405,19 +421,43 @@ class Scope implements Projection {
         },
       ),
     );
+    if (followId && !this.abort.signal.aborted) {
+      this.followWithdrawals.add(followId);
+      this.wakeFollowWithdrawal?.();
+    }
+  }
+  async nextFollowWithdrawal(signal: AbortSignal) {
+    while (true) {
+      signal.throwIfAborted();
+      const id = this.followWithdrawals.values().next().value;
+      if (id !== undefined) {
+        this.followWithdrawals.delete(id);
+        return id;
+      }
+      try {
+        await waitForRead(
+          new Promise((resolve) => {
+            this.wakeFollowWithdrawal = resolve;
+          }),
+          signal,
+        );
+      } finally {
+        this.wakeFollowWithdrawal = undefined;
+      }
+    }
   }
   private fenceFollowSession(id: SessionId, current?: SessionSummary) {
-    for (const { chain, stop } of this.follows) {
+    for (const { chain, stop, followId } of this.follows) {
       const original = chain.get(id);
       if (original && !sameFollowSession(current, original))
-        this.stopFollow(stop);
+        this.stopFollow(stop, followId);
     }
   }
   private verifyFollows(sessions: ReadonlyMap<SessionId, SessionSummary>) {
-    for (const { chain, stop } of this.follows) {
+    for (const { chain, stop, followId } of this.follows) {
       for (const [id, original] of chain) {
         if (sameFollowSession(sessions.get(id), original)) continue;
-        this.stopFollow(stop);
+        this.stopFollow(stop, followId);
         break;
       }
     }
@@ -451,26 +491,39 @@ class Scope implements Projection {
   pendingFollowRead() {
     return this.followRead;
   }
-  watchFollow(args: unknown, stop: AbortController) {
-    const {
-      request: { address },
-    } = Native.methods['session/follow']
-      .input({ strict: true })
-      .create()
-      .parse(args);
+  watchFollow(args: unknown, stop: AbortController, followId?: string) {
+    const address = followAddress(args);
+    if (!address) return;
     const chain = new Map<SessionId, SessionSummary>();
     let item = this.sessions.get(
       address.kind === 'session' ? address.sessionId : address.childSessionId,
     );
+    if (!item) {
+      if (address.kind === 'session')
+        throw new RemoteError('session/not-found', 'Session is unavailable', {
+          sessionId: address.sessionId,
+        });
+      throw new RemoteError('subagent/not-found', 'Subagent is unavailable', {
+        childSessionId: address.childSessionId,
+        parentSessionId: address.parentSessionId,
+      });
+    }
     if (
       address.kind === 'subagent' &&
-      item?.parentSessionId !== address.parentSessionId
+      (item.origin !== 'subagent' ||
+        item.parentSessionId !== address.parentSessionId)
     )
-      item = undefined;
+      throw new RemoteError(
+        'subagent/unauthorized',
+        'Subagent parent is unavailable',
+        {
+          childSessionId: address.childSessionId,
+        },
+      );
     while (item && !chain.has(item.sessionId)) {
       chain.set(item.sessionId, { ...item });
       if (item.origin !== 'subagent') {
-        const follow = { chain, stop };
+        const follow = { chain, stop, followId };
         this.follows.add(follow);
         this.scheduleFollowRead();
         return () => {
@@ -485,7 +538,7 @@ class Scope implements Projection {
         ? this.sessions.get(item.parentSessionId)
         : undefined;
     }
-    this.stopFollow(stop);
+    this.stopFollow(stop, followId);
     throw stop.signal.reason;
   }
   private rememberPageEvents(ids: readonly SessionId[]) {
@@ -561,6 +614,7 @@ class Scope implements Projection {
     this.bindings = [];
     this.eventBindings = [];
     this.eventSessions.clear();
+    this.followWithdrawals.clear();
     if (this.followTimer) clearTimeout(this.followTimer);
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
@@ -907,9 +961,20 @@ class PrincipalService extends TypertRemoteService {
           scopeId: issue.scopeId,
           principal: peer.principal,
           baseline,
+          ...(issue.access === 'page' && { followWithdrawals: true }),
         };
       }
-      await gate.done;
+      while (!gate.abort.signal.aborted) {
+        let followId: string;
+        try {
+          followId = await scope.nextFollowWithdrawal(gate.abort.signal);
+        } catch (error) {
+          if (!gate.abort.signal.aborted) throw error;
+          break;
+        }
+        if (!gate.abort.signal.aborted)
+          yield { type: 'follow-revoked', scopeId: issue.scopeId, followId };
+      }
       if (opened && withdrawn && !signal.aborted)
         yield { type: 'revoked', scopeId: issue.scopeId };
       await join();
@@ -1289,7 +1354,11 @@ class PrincipalService extends TypertRemoteService {
               { endpoint },
             );
           if (endpoint === 'session/follow')
-            unwatchFollow = scope.watchFollow(args, follow);
+            unwatchFollow = scope.watchFollow(
+              args,
+              follow,
+              UuidSchema.optional().parse(raw.followId),
+            );
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
@@ -1425,7 +1494,13 @@ class PrincipalService extends TypertRemoteService {
         if (next.done) break;
         if (unwatchFollow) {
           let checking;
-          while ((checking = scope.pendingFollowRead())) await checking;
+          while (!active.aborted && (checking = scope.pendingFollowRead())) {
+            try {
+              await waitForRead(checking, active);
+            } catch (error) {
+              if (!active.aborted) throw error;
+            }
+          }
         }
         if (active.aborted) break;
         if (pageMethod) {

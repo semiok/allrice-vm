@@ -58,8 +58,10 @@ export type ScopeFrame =
       scopeId: string;
       principal: DEntryPrincipal;
       baseline: NonOwnerBaseline;
+      followWithdrawals?: true;
     }>
   | Readonly<{ type: 'revoked'; scopeId: string }>
+  | Readonly<{ type: 'follow-revoked'; scopeId: string; followId: string }>
   | Readonly<{ type: 'closed'; scopeId: string }>;
 export type InputOf<M> = M extends {
   input(options?: TypertRemoteInputOptions): TypertRemoteValue<infer I>;
@@ -101,6 +103,7 @@ export type DEntryPageNativeCall = Readonly<{
   scopeId: string;
   endpoint: string;
   args: Readonly<Record<string, JsonValue>>;
+  followId?: string;
 }>;
 export type DEntryPageNativeResult = Readonly<{
   kind: 'page';
@@ -176,6 +179,7 @@ export interface DEntryPrincipalControlScope {
     call: DEntryPageNativeCall,
     signal: AbortSignal,
   ): AsyncIterable<DEntryPageNativeItem> & {
+    readonly revoked?: AbortSignal;
     send(input: DEntryPageInput): void;
   };
   close(): Promise<void>;
