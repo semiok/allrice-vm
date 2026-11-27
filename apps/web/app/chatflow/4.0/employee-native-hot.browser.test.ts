@@ -158,6 +158,29 @@ suite('4.0 browser entry with a running employee', () => {
       const context = await browser.newContext({
         viewport: { width: 1440, height: 900 },
       });
+      await context.addInitScript(() => {
+        if (window !== top) return;
+        function inspect() {
+          const frame = document.querySelector<HTMLIFrameElement>(
+            'iframe[title="员工工作区"]',
+          );
+          const input = frame?.contentDocument?.querySelector<HTMLElement>(
+            '[role="textbox"][contenteditable="true"]',
+          );
+          // Timestamp the actual browser frame, independent of Playwright's
+          // actionability polling cadence. The action below still checks input.
+          if (
+            frame &&
+            input?.isContentEditable &&
+            getComputedStyle(frame).visibility === 'visible'
+          ) {
+            document.documentElement.dataset.firstEditableMs = String(
+              performance.now(),
+            );
+          } else requestAnimationFrame(inspect);
+        }
+        requestAnimationFrame(inspect);
+      });
       await context.addCookies([
         { name: 'allrice_session', value: sessionToken, url: f.origin },
       ]);
@@ -175,8 +198,13 @@ suite('4.0 browser entry with a running employee', () => {
             else await page.goto(url, { waitUntil: 'domcontentloaded' });
             const frame = page.frameLocator('iframe[title="员工工作区"]');
             const input = frame.getByRole('textbox', { name: '消息' });
+            await page.waitForFunction(
+              () => document.documentElement.dataset.firstEditableMs,
+            );
+            const editableMs = await page.evaluate(() =>
+              Number(document.documentElement.dataset.firstEditableMs),
+            );
             await input.fill('只验证编辑器可编辑');
-            const editableMs = performance.now() - start;
             expect(await input.isEditable()).toBe(true);
             await expect.poll(() => page.getByRole('status').count()).toBe(0);
             const phases = requests.slice(offset);
