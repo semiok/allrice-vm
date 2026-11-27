@@ -62,7 +62,11 @@ const fixture = (deferred = false) => {
   const currentBinding = vi.fn(() => binding);
   const currentSession = vi.fn<() => string>(() => sessionId);
   const captureInsertion = vi.fn(() => ({ start: 1, end: 1, draftRev: 4 }));
-  const registerSource = vi.fn(() => () => undefined);
+  const registerSource = vi.fn<
+    (source: {
+      codec: { serialize(ref: string, signal: AbortSignal): Promise<string> };
+    }) => () => void
+  >(() => () => undefined);
   const registerSlot = vi.fn((_, render: (props: object) => void) => {
     render({ sessionId, inputActions: { captureInsertion } });
   });
@@ -86,21 +90,18 @@ const fixture = (deferred = false) => {
     },
   } as Context);
   const reference = employeePanelReferences()!;
-  const codec = (
-    registerSource.mock.calls[0] as unknown as [
-      {
-        codec: { serialize(ref: string, signal: AbortSignal): Promise<string> };
-      },
-    ]
-  )[0]?.codec;
   return {
     activate,
     fetch,
     result,
     lifetime,
     cleanup,
-    codec: codec!,
-    reference: reference.current!,
+    get codec() {
+      return registerSource.mock.calls[0]![0].codec;
+    },
+    get reference() {
+      return reference.current!;
+    },
     currentBinding,
     binding,
     currentSession,
