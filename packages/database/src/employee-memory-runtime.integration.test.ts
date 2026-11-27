@@ -18,6 +18,7 @@ import {
   AdoptedHumanSourceProjectionSchema,
   CurrentEmployeeBusinessProjectionSchema,
   DefaultPartnerProfile,
+  contextCheckpointChecksum,
   LogicalExecutionBindingProjectionSchema,
   RunMemoryContextV2StateSchema,
   renderMemoryDetailV2,
@@ -29,7 +30,11 @@ import {
 } from '@allrice/contracts';
 import { z } from 'zod';
 import * as client from './core/client.ts';
-import { DataAccessError } from './data.ts';
+import {
+  createStorageMetadata,
+  DataAccessError,
+  markStorageReady,
+} from './data.ts';
 import {
   createEmployeeMemoryPort,
   EmployeeMemoryWriteOutcomeUnknown,
@@ -66,6 +71,7 @@ import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 import {
   createChatSession,
   ensureDefaultEmployee,
+  updateChatSession,
 } from './workspace/service.ts';
 import { insertEmployeeMemoryPair } from './workspace/employee-memory-mutation.ts';
 import type { EmployeeMemoryScope } from './workspace/employee-memory.ts';
@@ -1301,17 +1307,25 @@ suite(
       expect(await f.state()).toBeNull();
     });
 
-    it('rejects a different original config when reopening an unchanged context', async () => {
-      const f = await setup([{ summary: 'pinned', details: null }]);
-      await f.issue();
-      const before = await f.state();
-      await database.db`update memory_runtime_owner_contract_fixture
-        set facts=${database.db.json({ ...f.root, moduleConfigRevisionRef: 'other-config' })} where id=${f.id}`;
-      await expect(f.restore()).rejects.toMatchObject({
-        code: 'MEMORY_CONTEXT_UNAVAILABLE',
-      });
-      expect(await f.state()).toEqual(before);
-    });
+    it.each([
+      ['a different original B', 'authorization_denied'],
+      ['a different original config', 'MEMORY_CONTEXT_UNAVAILABLE'],
+    ] as const)(
+      'rejects an owner reader returning %s for an existing context',
+      async (mismatch, code) => {
+        const f = await setup([{ summary: 'pinned', details: null }]);
+        await f.issue();
+        const before = await f.state();
+        const facts =
+          mismatch === 'a different original B'
+            ? { ...f.root, binding: { ...f.root.binding, b: 'other-B' } }
+            : { ...f.root, moduleConfigRevisionRef: 'other-config' };
+        await database.db`update memory_runtime_owner_contract_fixture
+        set facts=${database.db.json(facts)} where id=${f.id}`;
+        await expect(f.restore()).rejects.toMatchObject({ code });
+        expect(await f.state()).toEqual(before);
+      },
+    );
 
     it('rechecks pinned source authority at dispatch after a concurrent revoke, without the original VM', async () => {
       const f = await setup();
@@ -1360,6 +1374,125 @@ suite(
         code: 'authorization_denied',
       });
       expect(await f.state()).toEqual(issued);
+    });
+
+    it.each(['message', 'checkpoint'] as const)(
+      'refuses a pinned legacy %s when its separate source conversation is archived',
+      async (sourceType) => {
+        const f = await setup();
+        const { workspaceId, organizationId, ownerId } = f.scope;
+        const session = await createChatSession(
+          f.context,
+          {
+            workspaceId,
+            employeeInstanceId: f.scope.instanceId,
+            title: 'Legacy source',
+          },
+          { executionGeneration: '3.x' },
+        );
+        const message = randomUUID();
+        await database.db`insert into allrice_messages(id,organization_id,workspace_id,session_id,owner_id,role,content)
+          values(${message},${organizationId},${workspaceId},${session.id},${ownerId},'user','{"text":"Legacy source","citations":[]}')`;
+        let sourceId = message;
+        if (sourceType === 'checkpoint') {
+          sourceId = randomUUID();
+          const checkpoint = {
+            sessionId: session.id,
+            harness: 'dsh' as const,
+            threadId: null,
+            generation: 1,
+            coveredThroughMessageId: message,
+            summaryVersion: 'extractive-v1' as const,
+            summary: 'Legacy source checkpoint',
+            configChecksum: `sha256:${'b'.repeat(64)}`,
+            estimatedTokens: 1,
+            messageCount: 1,
+          };
+          await database.db`insert into allrice_context_checkpoints(id,organization_id,workspace_id,session_id,owner_id,harness,thread_generation,covered_through_message_id,summary_version,summary,checksum,config_checksum,estimated_tokens,message_count)
+            values(${sourceId},${organizationId},${workspaceId},${session.id},${ownerId},'dsh',1,${message},${checkpoint.summaryVersion},${checkpoint.summary},${contextCheckpointChecksum(checkpoint)},${checkpoint.configChecksum},1,1)`;
+        }
+        await database.db.begin((tx) =>
+          insertEmployeeMemoryPair(
+            tx,
+            f.context,
+            f.scope,
+            { summary: 'Pinned legacy source', details: null },
+            {
+              sourceType,
+              sourceId,
+              sourceLabel: 'Previously confirmed',
+              trust: 'user_confirmed',
+              confidence: 1,
+              lifecycleState: 'durable',
+              memoryClass: 'work_note',
+            },
+          ),
+        );
+        const document = await f.issue();
+        expect(document).toContain('Pinned legacy source');
+        await f.change({ execution_live: false, first_allowed: false });
+        expect(await f.restore()).toBe(document);
+        const before = await f.state();
+        await updateChatSession(f.context, workspaceId, session.id, {
+          archived: true,
+        });
+        await expect(f.restore()).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        await f.change({ execution_live: true });
+        await expect(f.read(1)).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        expect(await f.state()).toEqual(before);
+      },
+    );
+
+    it('refuses a pinned file whose resource access expired without changing the memory row', async () => {
+      const f = await setup();
+      const id = randomUUID();
+      await createStorageMetadata(f.context, {
+        id,
+        workspaceId: f.scope.workspaceId,
+        category: 'uploads',
+        mediaType: 'text/plain',
+        sizeBytes: 1,
+        checksum: `sha256:${'f'.repeat(64)}`,
+        visibility: 'private',
+        retentionUntil: null,
+        immutable: false,
+      });
+      await markStorageReady(f.context, id);
+      await database.db.begin((tx) =>
+        insertEmployeeMemoryPair(
+          tx,
+          f.context,
+          f.scope,
+          { summary: 'Pinned file source', details: null },
+          {
+            sourceType: 'file',
+            sourceId: id,
+            sourceLabel: 'Previously confirmed',
+            trust: 'user_confirmed',
+            confidence: 1,
+            lifecycleState: 'durable',
+            memoryClass: 'work_note',
+          },
+        ),
+      );
+      const document = await f.issue();
+      expect(document).toContain('Pinned file source');
+      await f.change({ execution_live: false, first_allowed: false });
+      expect(await f.restore()).toBe(document);
+      const before = await f.state();
+      await database.db`update allrice_storage_objects set retention_until=clock_timestamp()-interval '1 minute' where id=${id}`;
+      await expect(f.restore()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      await f.change({ execution_live: true });
+      await expect(f.read(1)).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      expect(await f.state()).toEqual(before);
     });
 
     it('shares root/child allowance, charges complete repeated reads and refuses the thirteenth without reset', async () => {

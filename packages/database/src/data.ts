@@ -19,7 +19,11 @@ import type { TransactionSql } from 'postgres';
 import { getDatabase } from './core/client.ts';
 import { lockWorkspaceStorageQuota } from './core/storage-quota.ts';
 import { readContentPrincipal } from './content-maintenance.ts';
-import { workbenchOriginFileAccess } from './workbench-file-access.ts';
+import {
+  readOrdinaryReadyStorageObject,
+  workbenchOriginFileAccess,
+  type StorageObjectRow,
+} from './workbench-file-access.ts';
 
 const CreateStorageMetadataSchema = z
   .object({
@@ -34,24 +38,6 @@ const CreateStorageMetadataSchema = z
     immutable: z.boolean(),
   })
   .strict();
-
-interface StorageObjectRow {
-  id: string;
-  organization_id: string;
-  workspace_id: string;
-  owner_id: string;
-  object_key: string;
-  category: string;
-  media_type: string;
-  size_bytes: number | string;
-  checksum: string;
-  visibility: Visibility;
-  state: 'pending' | 'ready' | 'deleted';
-  retention_until: Date | null;
-  immutable: boolean;
-  created_at: Date;
-  deleted_at: Date | null;
-}
 
 export interface StoredFile {
   object: StorageObject;
@@ -287,20 +273,7 @@ export async function getStoredFile(
   objectId: string,
   sql: ReturnType<typeof getDatabase> | TransactionSql = getDatabase(),
 ) {
-  const rows = await sql<StorageObjectRow[]>`
-    select * from allrice_storage_objects
-    where id = ${UuidSchema.parse(objectId)}
-      and organization_id = ${context.organizationId}
-      and (${context.workspaceId}::uuid is null or workspace_id = ${context.workspaceId})
-      and state = 'ready'
-      and deleted_at is null
-      and (retention_until is null or retention_until>clock_timestamp())
-      and not exists(select 1 from allrice_company_asset_revisions r where r.snapshot_object_id=allrice_storage_objects.id)
-      and not exists(select 1 from allrice_knowledge_revisions retained where retained.file_object_id=allrice_storage_objects.id)
-      and not exists(select 1 from allrice_company_asset_materials m where m.object_id=allrice_storage_objects.id)
-      and not exists(select 1 from allrice_company_run_assets r where r.material_object_id=allrice_storage_objects.id)
-  `;
-  const row = rows[0];
+  const row = await readOrdinaryReadyStorageObject(context, objectId, sql);
   if (!row) throw new DataAccessError('not_found');
   try {
     const access = await workbenchOriginFileAccess(context, row.id, sql);

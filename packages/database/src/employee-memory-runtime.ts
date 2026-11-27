@@ -43,6 +43,7 @@ import {
   memoryBusinessScope,
   nativeMemoryMetadataKey,
   nativeMemorySource,
+  requireLegacyMemorySourceForDispatch,
   requireStoredNativeMemorySource,
   sameMemoryBusinessScope,
   sourceMetadata,
@@ -300,7 +301,11 @@ async function caller<T>(
     signal,
   );
 }
-function qualifier(bound: BoundMemory, signal: AbortSignal) {
+function qualifier(
+  bound: BoundMemory,
+  signal: AbortSignal,
+  disclosureContext?: RequestContext,
+) {
   return async (origin: {
     source_type: string;
     source_id: string | null;
@@ -321,13 +326,20 @@ function qualifier(bound: BoundMemory, signal: AbortSignal) {
     )
       return denied();
     if (fact.excludedByMethodAuthoring) return false;
-    if (nativeMemorySource(origin.metadata))
-      await requireStoredNativeMemorySource(
-        bound.reads,
+    const native = await requireStoredNativeMemorySource(
+      bound.reads,
+      bound.scope,
+      origin,
+      signal,
+    );
+    if (disclosureContext && !native)
+      await requireLegacyMemorySourceForDispatch(
+        bound.tx,
+        disclosureContext,
         bound.scope,
         origin,
-        signal,
       );
+    signal.throwIfAborted();
     return true;
   };
 }
@@ -514,7 +526,7 @@ export async function restoreNativeEmployeeMemoryContext(
         bound.tx,
         storageKey(bound, execution),
         signal,
-        qualifier(bound, signal),
+        qualifier(bound, signal, context),
       );
       requireOriginalContextOrigin(saved.origin, execution);
       return saved.document;
@@ -545,7 +557,7 @@ export async function readNativeEmployeeMemoryOrdinal(
         storageKey(bound, execution),
         ordinal,
         signal,
-        qualifier(bound, signal),
+        qualifier(bound, signal, context),
         {
           nativeOwnerRef: execution.nativeOwnerRef,
           nativeProfileRef: execution.nativeProfileRef,

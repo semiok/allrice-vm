@@ -13,6 +13,10 @@ import type { Sql, TransactionSql } from 'postgres';
 import { z } from 'zod';
 import { DataAccessError } from './data.ts';
 import {
+  readOrdinaryReadyStorageObject,
+  workbenchOriginFileAccess,
+} from './workbench-file-access.ts';
+import {
   requireMemoryRuntimeAssembly,
   type MemoryRuntimeOwnerReads,
 } from './memory-runtime-binding.ts';
@@ -137,6 +141,48 @@ export async function requirePendingNativeMemorySource(
     signal,
   );
   return true;
+}
+
+type LegacyMemoryOrigin = { source_type: string; source_id: string | null };
+
+/** Reuse the pending-memory source owner gate for a pinned legacy Session.
+ * Session archive holds a conflicting row lock, including on a stopped VM. */
+export async function requireLegacyMemorySessionSource(
+  tx: Sql | TransactionSql,
+  scope: EmployeeMemoryScope,
+  origin: LegacyMemoryOrigin,
+) {
+  const [source] = await tx`select s.id from allrice_chat_sessions s
+    where s.organization_id=${scope.organizationId} and s.workspace_id=${scope.workspaceId}
+      and s.owner_id=${scope.ownerId} and coalesce(s.employee_instance_id,s.employee_assignment_id)=${scope.instanceId}
+      and s.archived_at is null
+      and ((${origin.source_type}='message' and exists(select 1 from allrice_messages m
+        where m.id=${origin.source_id} and m.organization_id=s.organization_id and m.workspace_id=s.workspace_id and m.owner_id=s.owner_id and m.session_id=s.id))
+        or (${origin.source_type}='checkpoint' and exists(select 1 from allrice_context_checkpoints cp
+          where cp.id=${origin.source_id} and cp.organization_id=s.organization_id and cp.workspace_id=s.workspace_id and cp.owner_id=s.owner_id and cp.session_id=s.id)))
+    for share of s`;
+  if (!source) throw new DataAccessError('authorization_denied');
+}
+
+/** Check only resource kinds with a real persisted owner relation. Ordinary
+ * self-recorded and opaque tool/connector origins retain owner confirmation. */
+export async function requireLegacyMemorySourceForDispatch(
+  tx: Sql,
+  context: RequestContext,
+  scope: EmployeeMemoryScope,
+  origin: LegacyMemoryOrigin,
+) {
+  if (['message', 'checkpoint'].includes(origin.source_type))
+    return requireLegacyMemorySessionSource(tx, scope, origin);
+  if (origin.source_type === 'file') {
+    const who = { ...context, workspaceId: scope.workspaceId };
+    const { source_id: id } = origin;
+    if (!id || !(await readOrdinaryReadyStorageObject(who, id, tx)))
+      throw new DataAccessError('authorization_denied');
+    const access = await workbenchOriginFileAccess(who, id, tx, true);
+    if (!access.canRead || !(await readOrdinaryReadyStorageObject(who, id, tx)))
+      throw new DataAccessError('authorization_denied');
+  }
 }
 
 export function sourceMetadata(
