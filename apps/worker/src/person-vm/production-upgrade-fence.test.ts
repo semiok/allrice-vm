@@ -25,7 +25,7 @@ it.each(['127.0.0.1', '::1'])(
     const stop = vi.fn(async () => 'stopped');
     try {
       await expect(
-        withPreviousGatewayFenced([port], signal, stop),
+        withPreviousGatewayFenced(host, [port], signal, stop),
       ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
       expect(previous.listening).toBe(true);
       expect(stop).not.toHaveBeenCalled();
@@ -34,7 +34,7 @@ it.each(['127.0.0.1', '::1'])(
     }
     const race = createServer();
     await expect(
-      withPreviousGatewayFenced([port], signal, async () => {
+      withPreviousGatewayFenced(host, [port], signal, async () => {
         try {
           await expect(listen(race, host, port)).rejects.toMatchObject({
             code: 'EADDRINUSE',
@@ -54,3 +54,22 @@ it.each(['127.0.0.1', '::1'])(
     }
   },
 );
+
+it('detects an older gateway on another listen address', async () => {
+  const previous = createServer();
+  const port = await listen(previous, '127.0.0.1');
+  const stop = vi.fn(async () => 'stopped');
+  try {
+    await expect(
+      withPreviousGatewayFenced(
+        '::1',
+        [port],
+        new AbortController().signal,
+        stop,
+      ),
+    ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+    expect(stop).not.toHaveBeenCalled();
+  } finally {
+    await close(previous);
+  }
+});

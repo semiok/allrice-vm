@@ -234,6 +234,84 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     }
   });
 
+  it('uses a durable wake handoff for the exact upgrade stop while ordinary wake work is paused', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    const scheduledAt = new Date(Date.now() + 600_000).toISOString();
+    f.reviseTime(scheduledAt);
+    const roster = await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+    );
+    expect(roster).not.toBeNull();
+    const catalog = vi.fn().mockReturnValue({
+      endpoint: f.origin,
+      receipt: { rosterDigest: roster!.digest, endpoints: [f.origin] },
+      revoked: signal,
+      bindingRef: f.origin.bindingRef,
+      owner: { readScheduleCatalog: f.catalog },
+    });
+    const host = createProductionScheduledWake({
+      startup: { catalog },
+      database: db,
+      lifetime: signal,
+      source: { start: f.start, assertDeliverable: vi.fn() },
+    });
+    const requestId = randomUUID();
+    const request = {
+      binding: f.binding,
+      requestId,
+      scheduledRoster: roster!,
+      assertStopCurrent: f.assertCurrent,
+    };
+    try {
+      await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
+        blocked: true,
+        reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+      });
+      await host.pause(signal);
+      await expect(host.prepareStopWithWake(request, signal)).resolves.toEqual({
+        blocked: true,
+        reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+      });
+      await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
+        ok: true,
+        nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
+      });
+      await db`update person_virtual_machines
+        set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+        where person_id=${f.binding.personId}`;
+      const stop = vi.fn(async () => {});
+      await expect(
+        host.dispatchUpgradeStop(
+          f.binding,
+          roster!,
+          randomUUID(),
+          signal,
+          stop,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      expect(stop).not.toHaveBeenCalled();
+      await host.dispatchUpgradeStop(
+        f.binding,
+        roster!,
+        requestId,
+        signal,
+        stop,
+      );
+      expect(stop).toHaveBeenCalledTimes(1);
+      await f.stop(requestId);
+      await db`update person_virtual_machines set lease_owner=null,lease_expires_at=null
+        where person_id=${f.binding.personId}`;
+      await db`update person_vm_scheduled_wakes set wake_at=now()-interval '1 second'
+        where plan_id=${requestId}`;
+      const claim = await f.store().claim(300_000);
+      expect(claim?.planId).toBe(requestId);
+      await expect(f.store().readClaimRoster(claim!)).resolves.toEqual(roster);
+    } finally {
+      await host.close();
+    }
+  });
+
   it.each(['qualification', 'ownership'] as const)(
     'orders the scheduled-idle dispatch against a concurrent change in %s',
     async (fact) => {

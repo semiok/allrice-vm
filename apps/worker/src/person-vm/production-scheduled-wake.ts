@@ -319,45 +319,66 @@ export function createProductionScheduledWake(input: {
         throw new PersonVmError('AUTHORIZATION_DENIED');
     };
 
-  const dispatchScheduledIdleStop: PersonVmScheduledIdleAuthority['dispatch'] =
-    async (binding, roster, requestId, caller, stop) => {
+  function dispatchPreparedStop(
+    isAvailable: () => boolean,
+  ): PersonVmScheduledIdleAuthority['dispatch'] {
+    return async (binding, roster, requestId, caller, stop) => {
       const signal = AbortSignal.any([caller, lifetime]);
       signal.throwIfAborted();
-      if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+      if (!isAvailable()) throw new PersonVmError('RUNTIME_NOT_READY');
       const dispatched = await store.withPreparedStopAuthority(
         binding,
         roster,
         requestId,
         signal,
         async (active) => {
-          if (paused) throw new PersonVmError('RUNTIME_NOT_READY');
+          if (!isAvailable()) throw new PersonVmError('RUNTIME_NOT_READY');
           await stop(active);
         },
       );
       if (!dispatched) throw new PersonVmError('AUTHORIZATION_DENIED');
     };
+  }
+
+  const dispatchScheduledIdleStop = dispatchPreparedStop(() => !paused);
+  const dispatchUpgradeStop = dispatchPreparedStop(() => paused);
+
+  function prepareOwnedStop(
+    request: PersonVmWakePreparation,
+    caller: AbortSignal,
+    whilePaused: boolean,
+  ): Promise<PrepareStopWithWakeResult> {
+    const signal = AbortSignal.any([caller, lifetime]);
+    signal.throwIfAborted();
+    if (paused !== whilePaused)
+      return Promise.resolve({
+        blocked: true,
+        reason: 'SCHEDULE_WAKE_UNAVAILABLE',
+      });
+    const operation = Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return prepare(request, signal);
+    });
+    pending.add(operation);
+    void operation.then(
+      () => pending.delete(operation),
+      () => pending.delete(operation),
+    );
+    return operation;
+  }
 
   return {
     assertScheduledIdleCurrent,
     dispatchScheduledIdleStop,
+    dispatchUpgradeStop,
     prepareStopWithWake(request: PersonVmWakePreparation, caller: AbortSignal) {
-      const signal = AbortSignal.any([caller, lifetime]);
-      signal.throwIfAborted();
-      if (paused)
-        return Promise.resolve({
-          blocked: true,
-          reason: 'SCHEDULE_WAKE_UNAVAILABLE',
-        } as const);
-      const operation = Promise.resolve().then(() => {
-        signal.throwIfAborted();
-        return prepare(request, signal);
-      });
-      pending.add(operation);
-      void operation.then(
-        () => pending.delete(operation),
-        () => pending.delete(operation),
-      );
-      return operation;
+      return prepareOwnedStop(request, caller, false);
+    },
+    prepareUpgradeStop(
+      request: Extract<PersonVmWakePreparation, { scheduledRoster: unknown }>,
+      caller: AbortSignal,
+    ) {
+      return prepareOwnedStop(request, caller, true);
     },
     start() {
       lifetime.throwIfAborted();

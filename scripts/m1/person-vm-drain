@@ -62,9 +62,22 @@ def main():
                 'Content-Length': '0',
             })
             response = connection.getresponse()
+            body = response.read(4097)
             if response.status != 200:
-                raise ValueError('Worker declined drain (HTTP %d)' % response.status)
-            payload = json.loads(response.read(4097))
+                status = 'Worker declined drain (HTTP %d)' % response.status
+                try:
+                    failure = json.loads(body)
+                except ValueError:
+                    failure = None
+                if isinstance(failure, dict):
+                    code = failure.get('code')
+                    if isinstance(code, str) and re.fullmatch(r'[A-Z_]{1,64}', code):
+                        status += ' ' + code
+                    request_id = failure.get('requestId')
+                    if isinstance(request_id, str):
+                        status += ' request=' + str(UUID(request_id))
+                raise ValueError(status)
+            payload = json.loads(body)
         finally:
             connection.close()
         if (

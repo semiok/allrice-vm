@@ -9,6 +9,7 @@ import {
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
+  readPersonVmWakeRoster,
   requireCurrentPlatformAdmin,
 } from '@allrice/database';
 import {
@@ -800,7 +801,9 @@ export function createProductionPersonVmHost(input: {
             requireStartup().hasLocalOwner(binding)
           )
             throw new PersonVmError('LEASE_CONFLICT');
-          return withPreviousGatewayFenced(ports, signal, async () => {
+          const address = providers!.configuration.egress?.listenAddress;
+          if (!address) throw new PersonVmError('EGRESS_UNAVAILABLE');
+          return withPreviousGatewayFenced(address, ports, signal, async () => {
             if (
               ownsRunningBinding(binding) ||
               requireStartup().hasLocalOwner(binding)
@@ -1162,17 +1165,23 @@ export function createProductionPersonVmHost(input: {
           await authorize(active);
           if (upgradeDraining || shutdownChecking || gracefulStop)
             throw new PersonVmError('LEASE_CONFLICT');
-          if (upgradeDrained) return upgradeDrained;
+          if (upgradeDrained) {
+            if ((await store.listUpgradeCandidates(active)).length)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            return upgradeDrained;
+          }
           upgradeDraining = true;
           pauseIdle = true;
-          const reopen = vm.fenceWorkerStartup();
+          let reopen: (() => void) | undefined;
           try {
             await scheduledWake?.pause(active);
+            // Join an already claimed wake before fencing the next startup.
+            // The new gate must not strand a claim staged in the next epoch.
+            reopen = vm.fenceWorkerStartup();
             const candidates = await store.listUpgradeCandidates(active);
             if (
               candidates.some(
-                (row) =>
-                  row.phase !== 'running' || row.leaseOwner || !row.instanceId,
+                (row) => row.phase === 'starting' || !row.instanceId,
               )
             )
               throw new PersonVmError('LEASE_CONFLICT');
@@ -1187,9 +1196,46 @@ export function createProductionPersonVmHost(input: {
                   instanceId: row.instanceId,
                   leaseEpoch: row.leaseEpoch,
                 },
-                context.requestId,
+                randomUUID(),
                 active,
                 authorize,
+                async (request, reading) => {
+                  const wake = scheduledWake;
+                  if (!wake) throw new PersonVmError('ACTIVITY_UNKNOWN');
+                  await request.assertStopCurrent(reading);
+                  const catalogs = requireStartup().activityCatalogs(
+                    request.binding,
+                    reading,
+                  );
+                  const roster = await trustedDatabase.begin(
+                    'isolation level repeatable read read only',
+                    (tx) =>
+                      readPersonVmWakeRoster(
+                        tx,
+                        request.binding,
+                        catalogs.map(({ endpoint }) => endpoint),
+                      ),
+                  );
+                  reading.throwIfAborted();
+                  if (!roster) throw new PersonVmError('AUTHORIZATION_DENIED');
+                  const plan = await wake.prepareUpgradeStop(
+                    { ...request, scheduledRoster: roster },
+                    reading,
+                  );
+                  if (!('ok' in plan))
+                    throw new PersonVmError('ACTIVITY_UNKNOWN');
+                  return {
+                    nextWakeAt: plan.nextWakeAt,
+                    dispatch: (checking, stop) =>
+                      wake.dispatchUpgradeStop(
+                        request.binding,
+                        roster,
+                        request.requestId,
+                        checking,
+                        stop,
+                      ),
+                  };
+                },
               );
             }
             if ((await store.listUpgradeCandidates(active)).length)
@@ -1201,7 +1247,7 @@ export function createProductionPersonVmHost(input: {
             upgradeDraining = false;
             if (!upgradeDrained) {
               pauseIdle = false;
-              reopen();
+              reopen?.();
               scheduledWake?.resume();
             }
           }
@@ -1211,6 +1257,8 @@ export function createProductionPersonVmHost(input: {
           if (upgradeDraining || shutdownChecking)
             throw new PersonVmError('LEASE_CONFLICT');
           if (upgradeDrained) {
+            if ((await store.listUpgradeCandidates(signal)).length)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
             gracefulStop = true;
             return;
           }

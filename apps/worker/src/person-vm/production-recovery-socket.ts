@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RequestContext } from '@allrice/contracts';
 import type { authenticateSession } from '@allrice/database';
+import { PersonVmError } from '@allrice/person-vm';
 
 export type ProductionShutdownStatus = Readonly<{
   bootId: string;
@@ -84,11 +85,21 @@ export async function openProductionRecoverySocket(input: {
       disconnected.signal.throwIfAborted();
       if (upgrade) {
         if (request.headers['x-allrice-worker-boot'] !== upgrade.bootId) {
-          writeStatus(409);
+          writeStatus(409, { code: 'WORKER_BOOT_MISMATCH' });
           return;
         }
-        const drained = await upgrade.drain(context, disconnected.signal);
-        writeStatus(200, { ...drained, bootId: upgrade.bootId });
+        try {
+          const drained = await upgrade.drain(context, disconnected.signal);
+          writeStatus(200, { ...drained, bootId: upgrade.bootId });
+        } catch (error) {
+          const code =
+            error instanceof PersonVmError ? error.code : 'DRAIN_UNCONFIRMED';
+          console.warn('[MET-273] upgrade drain declined', {
+            requestId: context.requestId,
+            code,
+          });
+          writeStatus(409, { requestId: context.requestId, code });
+        }
       } else if (shutdown) {
         await shutdown.authorize(context);
         disconnected.signal.throwIfAborted();

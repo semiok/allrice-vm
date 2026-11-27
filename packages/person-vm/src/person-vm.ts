@@ -29,7 +29,9 @@ import {
   PostgresPersonVmAdmissionStore,
 } from './admission-store.ts';
 import type {
+  PersonVmActivityCursor,
   PersonVmIdleStopDispatch,
+  PersonVmIdleStopRequest,
   PersonVmNativeActivityPort,
   PersonVmPrepareIdleStop,
   PersonVmScheduledIdleAuthority,
@@ -85,10 +87,19 @@ function safeError(error: unknown) {
 }
 type IdleStopGuard = Readonly<{
   dispatch?: PersonVmIdleStopDispatch;
-  dispatchAction?: 'stop.upgrade-dispatch';
   requestId: string;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
+}>;
+
+type PrepareUpgradeWake = (
+  request: Pick<PersonVmIdleStopRequest, 'binding' | 'assertStopCurrent'> & {
+    requestId: string;
+  },
+  signal: AbortSignal,
+) => Promise<{
+  nextWakeAt: string | null;
+  dispatch: PersonVmIdleStopDispatch;
 }>;
 
 type ScheduledStart = Readonly<{
@@ -135,6 +146,7 @@ export class PersonVmService
 {
   private admissionHost?: PersonVmAdmissionHost;
   private workerDrain = false;
+  private readonly upgradePrewarms = new Map<string, Promise<PersonVmView>>();
   private idleAccessOrder = 0;
   private admissionShared?: PostgresPersonVmAdmissionStore;
   private readonly now: () => Date;
@@ -1326,9 +1338,22 @@ export class PersonVmService
     const identity = await this.identity(context, 'start', signal);
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
+    const takeover = this.upgradePrewarms.get(identity.personId);
+    if (takeover) {
+      // Another employee or login on this same physical VM must still prove
+      // its own current authority and editor readiness after the transition.
+      await Promise.allSettled([takeover]);
+      signal.throwIfAborted();
+      return this.prewarmCurrent(context, signal, target);
+    }
     this.assertPrewarmTarget(row, target, true);
-    if (row?.phase === 'running' && this.needsUpgradeStop(row))
-      return this.start(context, signal, target);
+    if (row?.phase === 'running' && this.needsUpgradeStop(row)) {
+      const opening = this.start(context, signal, target).finally(() => {
+        this.upgradePrewarms.delete(identity.personId);
+      });
+      this.upgradePrewarms.set(identity.personId, opening);
+      return opening;
+    }
     if (row?.phase === 'running') {
       await this.assertNoPendingDisk(row, signal);
       if (target) await target.assertAuthority(signal);
@@ -1476,7 +1501,7 @@ export class PersonVmService
       const runDispatch = idle.dispatch;
       const dispatch = {
         requestId: idle.requestId,
-        action: idle.dispatchAction ?? 'stop.idle-dispatch',
+        action: 'stop.idle-dispatch',
       };
       await lease.audit(row, { ...dispatch, result: 'started' });
       let dispatchApproved = false;
@@ -1715,6 +1740,7 @@ export class PersonVmService
     signal: AbortSignal,
     previousWorker: boolean,
     assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
+    prepareWake?: PrepareUpgradeWake,
   ) {
     const binding = bindingOf(row);
     if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
@@ -1745,6 +1771,15 @@ export class PersonVmService
       await assertAuthority?.(signal);
       signal.throwIfAborted();
       await lease.guard();
+      await this.mounted(row, signal, lease);
+      const state = await this.options.native.status(binding, signal);
+      // A lost host Gateway is not proof that the guest scheduler or a
+      // continuable child has stopped. An old generation with no readable
+      // control owner may only be reclaimed after terminal native readback.
+      if (state !== 'stopped' && state !== 'absent')
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      await assertAuthority?.(signal);
+      await lease.guard();
       return this.commitStop(requestId, lease, row, undefined, 'stop.upgrade');
     };
     if (previousWorker) {
@@ -1768,59 +1803,77 @@ export class PersonVmService
         stop,
       );
     }
-    // Explicit release still checks the native VM for protected work. It
-    // doesn't wait out the automatic idle interval or arm a scheduled wake.
+    // Release can stop a quiescent VM without waiting out the normal idle
+    // interval. Its future native deliveries still need the same wake handoff.
     const activity = this.options.upgradeActivity;
-    const native =
-      activity && (await activity.observe(binding, signal, 'inspection'));
-    if (
-      !native ||
-      !sameVmBinding(native.activity.binding, binding) ||
-      native.activity.state !== 'known' ||
-      native.coverage.state === 'unknown' ||
-      native.activeScheduleDeliveries !== 0
-    )
+    const assertSample = activity?.assertSampleCurrent;
+    if (!activity || !assertSample || !prepareWake)
       throw new PersonVmError('ACTIVITY_UNKNOWN');
-    if (
-      [
-        native.activity.activeTurns,
-        native.activity.activeJobs,
-        native.activity.activeSubtasks,
-        native.activity.pendingApprovals,
-      ].some((value) => value !== 0)
-    )
-      throw new PersonVmError('VM_ACTIVE');
-    const cursor = native.coverage.cursor;
-    if (!activity?.assertSampleCurrent)
-      throw new PersonVmError('ACTIVITY_UNKNOWN');
-    await assertAuthority?.(signal);
-    signal.throwIfAborted();
-    await lease.guard();
-    return this.commitStop(
+    const assertStopCurrent = async (probe: AbortSignal) => {
+      const active = AbortSignal.any([probe, signal]);
+      await assertAuthority?.(active);
+      await lease.guard();
+      active.throwIfAborted();
+    };
+    const preparation = { binding, requestId, assertStopCurrent };
+    await assertStopCurrent(signal);
+    const wake = await prepareWake(preparation, signal);
+    let cursor: PersonVmActivityCursor | undefined;
+    const stopped = await this.commitStop(requestId, lease, row, {
       requestId,
-      lease,
-      row,
-      {
-        requestId,
-        signal,
-        dispatchAction: 'stop.upgrade-dispatch',
-        async assertCurrent(active) {
-          await assertAuthority?.(active);
-          await lease.guard();
-          active.throwIfAborted();
-          activity.assertSampleCurrent!(binding, cursor, active);
-        },
+      // The operator can cancel before dispatch. Once the exact native stop
+      // starts, the physical lease owns its bounded join and readback.
+      signal: lease.signal,
+      async assertCurrent(probe) {
+        const active = AbortSignal.any([probe, signal]);
+        await assertStopCurrent(active);
+        const checked = await prepareWake(preparation, active);
+        if (checked.nextWakeAt !== wake.nextWakeAt)
+          throw new PersonVmError('ACTIVITY_UNKNOWN');
+        const native = await activity.observe(binding, active, 'inspection');
+        if (
+          !sameVmBinding(native.activity.binding, binding) ||
+          native.activity.state !== 'known' ||
+          native.coverage.state === 'unknown' ||
+          native.activeScheduleDeliveries !== 0
+        )
+          throw new PersonVmError('ACTIVITY_UNKNOWN');
+        if (
+          [
+            native.activity.activeTurns,
+            native.activity.activeJobs,
+            native.activity.activeSubtasks,
+            native.activity.pendingApprovals,
+          ].some((value) => value !== 0)
+        )
+          throw new PersonVmError('VM_ACTIVE');
+        await assertStopCurrent(active);
+        cursor = native.coverage.cursor;
       },
-      'stop.upgrade',
-    );
+      dispatch: (active, stop) =>
+        wake.dispatch(active, (fenced) => {
+          signal.throwIfAborted();
+          if (!cursor) throw new PersonVmError('ACTIVITY_UNKNOWN');
+          assertSample(binding, cursor, fenced);
+          return stop(fenced);
+        }),
+    });
+    this.options.observeOwnedStop?.(binding);
+    return stopped;
   }
   async stopRunningForUpgrade(
     binding: PersonVmBinding,
     requestId: string,
     signal: AbortSignal,
     assertAuthority: PersonVmPrewarmFence['assertAuthority'],
+    prepareWake: PrepareUpgradeWake,
   ) {
     if (!this.workerDrain) throw new PersonVmError('AUTHORIZATION_DENIED');
+    if (
+      assertAuthority &&
+      (await this.recoverIdleStop(binding, assertAuthority, signal))
+    )
+      return;
     return this.options.store.withLease(
       binding.personId,
       { now: this.now, ttlMs: this.options.leaseTtlMs },
@@ -1840,6 +1893,7 @@ export class PersonVmService
           active,
           this.needsUpgradeStop(row),
           assertAuthority,
+          prepareWake,
         );
       },
     );
