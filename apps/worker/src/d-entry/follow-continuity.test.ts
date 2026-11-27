@@ -149,9 +149,9 @@ it.each(['login revoked', 'lease replaced', 'marker lost'] as const)(
       f.identityRevoked.abort();
     } else {
       if (scenario === 'lease replaced') {
+        f.binding.leaseEpoch++;
         vi.mocked(f.owner.assertCurrent).mockImplementation(async () => {
           rechecking.resolve();
-          throw Error('exact VM epoch no longer owned');
         });
       } else {
         observation.marker.mockImplementation(async () => {
@@ -337,7 +337,7 @@ it.each([true, false])(
     const channel = await connect(f);
     await channel.follow('child', 'root');
     await channel.follow('other');
-    observation.marker.mockImplementationOnce(async () => {
+    observation.marker.mockImplementation(async () => {
       atMarker.resolve();
       await releaseMarker.promise;
     });

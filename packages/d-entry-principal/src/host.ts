@@ -508,18 +508,14 @@ class Scope implements Projection {
         parentSessionId: address.parentSessionId,
       });
     }
+    // rc.2 owns its unauthorized-parent error. If it nevertheless yields
+    // a frame, the forwarding loop still requires a bound ancestry proof.
     if (
       address.kind === 'subagent' &&
       (item.origin !== 'subagent' ||
         item.parentSessionId !== address.parentSessionId)
     )
-      throw new RemoteError(
-        'subagent/unauthorized',
-        'Subagent parent is unavailable',
-        {
-          childSessionId: address.childSessionId,
-        },
-      );
+      return;
     while (item && !chain.has(item.sessionId)) {
       chain.set(item.sessionId, { ...item });
       if (item.origin !== 'subagent') {
@@ -1504,6 +1500,15 @@ class PrincipalService extends TypertRemoteService {
         }
         if (active.aborted) break;
         if (pageMethod) {
+          if (pageMethod.endpoint === 'session/follow' && !unwatchFollow)
+            throw new RemoteError(
+              'remote-access/denied',
+              'Native session follow unavailable',
+              {
+                action: 'session/follow',
+                reason: 'session-changed',
+              },
+            );
           const { value, attachments } = encodePageNativeResult(
             pageMethod.descriptor,
             next.value,
