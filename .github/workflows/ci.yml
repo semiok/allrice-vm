@@ -220,6 +220,8 @@ jobs:
           mkdir -p .local/integration-collection
           node scripts/ci-integration-tests.mjs inventory > .local/integration-collection/inventory.json
       - run: pnpm dsh:verify
+      - name: Report new DSH endpoints in managed capability categories
+        run: node --import tsx scripts/dsh-page-endpoint-inventory.mjs check
       - name: Reject retired native SQL references
         run: node scripts/verify-native-generation-sql.mjs
       - run: pnpm dsh-ui:verify
