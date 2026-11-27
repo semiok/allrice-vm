@@ -375,7 +375,7 @@ suite(
             },
             async stopIdle(...args) {
               expect(fenced).toBe(true);
-              await h.native.stopIdle(...args);
+              await h.native.stopIdle!(...args);
               throw new Error('synthetic failure after joined native stop');
             },
             async stop(binding, active, options) {

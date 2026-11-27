@@ -227,7 +227,7 @@ export function createDEntryNativePrewarmPort(input: {
       const stamp = await load(identity, sessionId);
       const vm = stamp.vm;
       if (
-        vm?.phase === 'running' &&
+        (vm?.phase === 'running' || vm?.phase === 'failed') &&
         vm.instanceId &&
         vm.vmId &&
         vm.hasEgressReceipt &&

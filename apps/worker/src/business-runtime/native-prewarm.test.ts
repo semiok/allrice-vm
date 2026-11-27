@@ -1311,6 +1311,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
   const oldInstance = randomUUID();
   const nextInstance = randomUUID();
   let updated = false;
+  let previousPhase: 'running' | 'failed' = 'running';
   const proof = vi.fn(async () => {
     expect(updated).toBe(true);
     return signal();
@@ -1329,7 +1330,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
         vmId,
         instanceId: updated ? nextInstance : oldInstance,
         leaseEpoch: updated ? 6 : 5,
-        phase: 'running',
+        phase: updated ? 'running' : previousPhase,
         leaseOwner: null,
         hasEgressReceipt: true,
       },
@@ -1360,6 +1361,13 @@ it('plans the next epoch before asking an old running binding for editor proof',
       assembly.port.isCurrent!(context, identity, plan, signal(), 'operation'),
     ).resolves.toBe(true);
     expect(plan.upgradeRestart).toBe(true);
+    previousPhase = 'failed';
+    const retryPlan = await assembly.port.prepare!(context, identity, signal());
+    expect(retryPlan).toMatchObject({
+      upgradeRestart: true,
+      running: false,
+      target: plan.target,
+    });
     await expect(
       assembly.port.prewarm(
         context,
