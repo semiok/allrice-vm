@@ -175,6 +175,7 @@ type SelectedStartup = Readonly<{
 type UpgradePrewarm = {
   work: Promise<PersonVmView>;
   receipt: { binding?: PersonVmBinding };
+  signal: AbortSignal;
 };
 
 export class PersonVmService
@@ -1803,6 +1804,7 @@ export class PersonVmService
         )
           throw new PersonVmError('LEASE_LOST');
         await this.confirmRunning(current, context, signal, joinedTarget, true);
+        takeover.signal.throwIfAborted();
         (observer ?? target).observeVmStart?.(exact);
         return view(current, true);
       }
@@ -1834,10 +1836,23 @@ export class PersonVmService
           receipt.binding = binding;
           startupObserver.observeVmStart?.(binding);
         },
-      }).finally(() => {
-        this.upgradePrewarms.delete(identity.personId);
+      })
+        .then(async (result) => {
+          // The persisted start can outlive the original ticket while its
+          // physical lease is releasing. Recheck before sharing the receipt.
+          signal.throwIfAborted();
+          await target.assertAuthority(signal);
+          signal.throwIfAborted();
+          return result;
+        })
+        .finally(() => {
+          this.upgradePrewarms.delete(identity.personId);
+        });
+      this.upgradePrewarms.set(identity.personId, {
+        work: opening,
+        receipt,
+        signal,
       });
-      this.upgradePrewarms.set(identity.personId, { work: opening, receipt });
       return opening;
     }
     // An exact orphan already has its retained disk and predecessor. Claim
