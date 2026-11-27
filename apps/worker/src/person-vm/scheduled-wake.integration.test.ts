@@ -216,9 +216,9 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(
       await db`select 1 from allrice_sessions where user_id=${f.binding.personId}`,
     ).toEqual([]);
-    const catalog = vi.fn();
+    const activityCatalogs = vi.fn();
     const host = createProductionScheduledWake({
-      startup: { catalog },
+      startup: { activityCatalogs },
       database: db,
       lifetime: signal,
       source: { start: f.start, assertDeliverable: vi.fn() },
@@ -245,7 +245,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await expect(
         host.assertScheduledIdleCurrent(current, roster!, signal),
       ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
-      expect(catalog).not.toHaveBeenCalled();
+      expect(activityCatalogs).not.toHaveBeenCalled();
     } finally {
       await host.close();
       await f.store().settle(claim!, { state: 'ready' });
@@ -261,15 +261,23 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       readPersonVmWakeRoster(tx, f.binding, [f.origin]),
     );
     expect(roster).not.toBeNull();
-    const catalog = vi.fn().mockReturnValue({
+    const catalog = {
       endpoint: f.origin,
-      receipt: { rosterDigest: roster!.digest, endpoints: [f.origin] },
+      receipt: {
+        binding: f.binding,
+        rosterDigest: 'original-receipt-of-a-slotted-owner',
+        endpoints: [
+          f.origin,
+          { ...f.origin, employeeInstanceId: randomUUID() },
+        ],
+      },
       revoked: signal,
       bindingRef: f.origin.bindingRef,
       owner: { readScheduleCatalog: f.catalog },
-    });
+    };
+    const activityCatalogs = vi.fn().mockReturnValue([]);
     const host = createProductionScheduledWake({
-      startup: { catalog },
+      startup: { activityCatalogs },
       database: db,
       lifetime: signal,
       source: { start: f.start, assertDeliverable: vi.fn() },
@@ -291,6 +299,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
         blocked: true,
         reason: 'SCHEDULE_WAKE_UNAVAILABLE',
       });
+      await expect(
+        host.prepareUpgradeStop(request, signal),
+      ).resolves.toMatchObject({
+        blocked: true,
+      });
+      activityCatalogs.mockReturnValue([catalog]);
       await expect(host.prepareUpgradeStop(request, signal)).resolves.toEqual({
         ok: true,
         nextWakeAt: new Date(Date.parse(scheduledAt) - 120_000).toISOString(),
@@ -897,7 +911,7 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await db`insert into allrice_sessions (id, user_id, token_hash, expires_at)
       values (${context.sessionId},${context.actor.id},${randomUUID().replaceAll('-', '').repeat(2)},now()+interval '1 hour')`;
       const host = createProductionScheduledWake({
-        startup: { catalog: vi.fn() },
+        startup: { activityCatalogs: vi.fn() },
         database: db,
         lifetime: signal,
         source: { start: f.start, assertDeliverable: vi.fn() },

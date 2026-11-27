@@ -1220,13 +1220,12 @@ export function createAssignedNativeWebStartup(input: {
       if (
         group.updating ||
         group.startingEmployees.size ||
-        group.blockedEmployees.size ||
-        group.owners.size !== group.receipt.endpoints.length
+        group.blockedEmployees.size
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
-      return group.receipt.endpoints.map(({ employeeInstanceId }) =>
-        this.catalog(binding, employeeInstanceId),
-      );
+      return [...group.owners.keys()]
+        .sort()
+        .map((employeeInstanceId) => this.catalog(binding, employeeInstanceId));
     },
     /** Authenticated owners already present in this Worker. Ledger reads
      * separately verify the durable scope and never start a profile. */

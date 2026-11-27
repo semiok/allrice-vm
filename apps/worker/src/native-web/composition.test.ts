@@ -732,6 +732,9 @@ it.each([
     try {
       await draining.promise;
       notification = notifyArchive(archived!.employeeInstanceId);
+      expect(() => f.service.activityCatalogs(f.binding, signal())).toThrow(
+        'RUNTIME_NOT_READY',
+      );
       expect(hotGuest.bootstrap).not.toHaveBeenCalled();
       expect(f.service.catalog(f.binding, kept!.employeeInstanceId).owner).toBe(
         keptOwner,
@@ -770,6 +773,9 @@ it.each([
     expect(current.endpoint.hostPort).toBe(archived!.hostPort);
     expect(current.owner).toBe(replacementOwner);
     expect(current.receipt.endpoints).toEqual([current.endpoint]);
+    expect(
+      f.service.activityCatalogs(f.binding, signal()).map(({ owner }) => owner),
+    ).toEqual(expect.arrayContaining([keptOwner, replacementOwner]));
     expect(f.service.catalog(f.binding, kept!.employeeInstanceId).receipt).toBe(
       initial.receipt,
     );
