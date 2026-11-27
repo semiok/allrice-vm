@@ -456,6 +456,9 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       await page.route('**/api/v1/auth/session', (route) =>
         route.fulfill({ status: 401 }),
       );
+      await page.route(host.origin + '/chatflow/4.0', (route) =>
+        route.fulfill({ status: 307, headers: { location: '/login' } }),
+      );
       await page.route(host.origin + '/login', (route) =>
         route.fulfill({ body: 'synthetic sign-in landing' }),
       );

@@ -46,7 +46,7 @@ async function goToLogin(signal: AbortSignal) {
     signal,
   });
   if (!signal.aborted && response.status === 401)
-    window.top?.location.replace('/login');
+    window.top?.location.replace('/chatflow/4.0');
   else if (!signal.aborted && !response.ok) throw Error('Login check failed');
 }
 

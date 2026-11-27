@@ -566,6 +566,9 @@ suite('4.0 browser cold entry', () => {
       await page.route('**/api/v1/auth/session', (route) =>
         route.fulfill({ status: 401 }),
       );
+      await page.route(f.origin + '/chatflow/4.0', (route) =>
+        route.fulfill({ status: 307, headers: { location: '/login' } }),
+      );
       await page.route('**/login', (route) =>
         route.fulfill({ body: 'synthetic login' }),
       );

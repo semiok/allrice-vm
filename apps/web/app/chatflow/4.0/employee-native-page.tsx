@@ -481,16 +481,21 @@ export function EmployeeNativePage({
         // responses reach the iframe. Only the current cookie decides where
         // the outer page goes.
         if (mounted)
-          void fetch('/api/v1/auth/session', {
-            credentials: 'same-origin',
-            cache: 'no-store',
-            signal: lifetime.signal,
-          })
-            .then(async (response) => {
-              if (response.status !== 401) return;
-              await retire();
-              if (!detached && replace.current === applyQuery)
-                location.replace('/login');
+          void retire()
+            .then(async () => {
+              if (detached || replace.current !== applyQuery) return;
+              const response = await fetch('/api/v1/auth/session', {
+                credentials: 'same-origin',
+                cache: 'no-store',
+                signal: lifetime.signal,
+              });
+              // The unqualified entry checks the cookie again on navigation.
+              if (
+                response.status === 401 &&
+                !detached &&
+                replace.current === applyQuery
+              )
+                location.replace('/chatflow/4.0');
             })
             .catch(() => {});
       });
