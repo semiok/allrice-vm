@@ -225,37 +225,33 @@ async function persistExecution(
       native.attemptKind === 'assistant' &&
       native.sessionId === native.rootSessionId &&
       native.parentSessionId === null
-        ? await tx
-            .savepoint((evidenceTx) =>
-              recordNativeExecutionRequest(
-                evidenceTx,
-                {
-                  runId: execution.runId,
-                  organizationId: vm.organizationId,
-                  workspaceId: identity.workspaceId,
-                  ownerId: vm.personId,
-                },
-                call,
-                {
-                  originalRequestId: prompt.requestId,
-                  rootOriginRef: pin.rootOriginDigest,
-                  rootSessionRef: native.rootSessionId,
-                  nativeOwnerRef: native.instanceId,
-                  nativeProfileRef: native.profile,
-                  applicationBuild: provenance.build,
-                  employeeInstanceId: identity.employeeInstanceId,
-                  employeeRelease: identity.employeeVersionId,
-                  employeeRevision: identity.employeeRevision,
-                  threadId: call.allriceThreadRef,
-                  vm,
-                  human,
-                  adoptedModelConfiguration,
-                },
-                contributingRequestIds,
-                !!event,
-              ),
-            )
-            .catch(() => null)
+        ? await recordNativeExecutionRequest(
+            tx,
+            {
+              runId: execution.runId,
+              organizationId: vm.organizationId,
+              workspaceId: identity.workspaceId,
+              ownerId: vm.personId,
+            },
+            call,
+            {
+              originalRequestId: prompt.requestId,
+              rootOriginRef: pin.rootOriginDigest,
+              rootSessionRef: native.rootSessionId,
+              nativeOwnerRef: native.instanceId,
+              nativeProfileRef: native.profile,
+              applicationBuild: provenance.build,
+              employeeInstanceId: identity.employeeInstanceId,
+              employeeRelease: identity.employeeVersionId,
+              employeeRevision: identity.employeeRevision,
+              threadId: call.allriceThreadRef,
+              vm,
+              human,
+              adoptedModelConfiguration,
+            },
+            contributingRequestIds,
+            !!event,
+          )
         : null;
     signal.throwIfAborted();
     return evidence;

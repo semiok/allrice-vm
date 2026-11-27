@@ -174,6 +174,21 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           recordNativeExecutionTool(receipt, tool, signal),
           recordNativeExecutionTool(receipt, tool, signal),
         ]);
+        const refused = call(3);
+        await db`create function refuse_native_evidence_fixture()
+          returns trigger language plpgsql as $body$
+          begin
+            raise exception 'synthetic native evidence failure';
+          end;
+          $body$`;
+        await db`create trigger refuse_native_evidence_fixture
+          before insert on allrice_run_events for each row
+          when ((new.payload->>'source')='dsh-native-execution-evidence-v1')
+          execute function refuse_native_evidence_fixture()`;
+        expect(await write(refused, adopted)).toBeNull();
+        const [priorAudit] = await db`select event_type from allrice_run_events
+          where run_id=${runId} and id=${refused.execution.executionId}`;
+        expect(priorAudit?.event_type).toBe('step.started');
         const rows = await db<{ payload: NativeExecutionEvidence }[]>`
           select payload from allrice_run_events
           where run_id=${runId} and payload->>'source'=${nativeExecutionEvidenceSource}
