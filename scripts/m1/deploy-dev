@@ -125,6 +125,8 @@ verify_no_committed_vm_wakes() {
     *) return 1 ;;
   esac
   clear=$(dev_sql "select not exists(
+    select 1 from public.person_vm_scheduled_wakes where state='claimed'
+    union all
     select 1 from public.person_vm_scheduled_wakes p
     join public.person_virtual_machines vm using (person_id,organization_id,vm_id,instance_id,lease_epoch)
     cross join lateral (
@@ -138,7 +140,7 @@ verify_no_committed_vm_wakes() {
       order by a.id desc limit 1
     ) stop
     where vm.disk_retained and p.revoked_at is null
-      and p.wake_at is not null and p.state in ('waiting','claimed')
+      and p.wake_at is not null and p.state='waiting'
       and stop.request_id=p.plan_id and stop.result='succeeded')") || return 1
   if [ "$clear" != t ]; then
     say "An outstanding Person VM wake must stay with the current Worker. Release blocked."
@@ -223,8 +225,11 @@ PYTHON
 
   process=$(job_state "$WORKER_LABEL" "$plist" "$rel") || return 1
   if [ "$process" = gone ]; then
-    count=$(vm_upgrade_candidates) || return 1
-    [ "$count" = 0 ] && port_closed "$port" || {
+    if [ "$mode" = release ]; then
+      count=$(vm_upgrade_candidates) || return 1
+      [ "$count" = 0 ] || return 1
+    fi
+    port_closed "$port" || {
       say "Worker absent and Person VM stop is unconfirmed. Release blocked."
       return 1
     }
@@ -244,8 +249,10 @@ PYTHON
       [ "$mode" = restore ] || return 1
       pid=""
     fi
-    count=$(vm_upgrade_candidates) || return 1
-    [ "$count" = 0 ] || return 1
+    if [ "$mode" = release ]; then
+      count=$(vm_upgrade_candidates) || return 1
+      [ "$count" = 0 ] || return 1
+    fi
     wait_for_drained_worker_exit "$pid" "$plist" "$rel" "$port" || return 1
     "$M1_LAUNCHCTL" bootout "gui/$M1_UID/$WORKER_LABEL" || return 1
     return
@@ -304,8 +311,13 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
 }
 
 stop_both() {
-  local mode=${1:-restore}
-  if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
+  local mode=${1:-release}
+  if [ "$mode" = release ] && ! verify_no_committed_vm_wakes; then
+    # The old protocol can exit on a concurrent signal before its first
+    # launchd read. Keep the original pair even on a wake-gate refusal.
+    RELEASE_STOP_UNCONFIRMED=1
+    return 1
+  fi
   stop_release_worker "$mode" || return 1
   if [ "$mode" = release ]; then verify_no_committed_vm_wakes || return 1; fi
   RELEASE_STOP_ATTEMPTED=1

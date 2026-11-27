@@ -283,7 +283,8 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           await tx`set local statement_timeout = '2s'`;
           active.throwIfAborted();
           const [row] = await tx<{ earliest: Date | null }[]>`
-        select min(greatest(p.wake_at,p.retry_at,p.claim_until)) as earliest
+        select min(at) as earliest from (
+        select greatest(p.wake_at,p.retry_at) as at
         from person_virtual_machines vm
         join person_vm_scheduled_wakes p using (person_id,organization_id,vm_id,instance_id,lease_epoch)
         cross join lateral (
@@ -297,8 +298,13 @@ export function createPostgresPersonVmScheduledWakeStore(sql: Sql) {
           order by a.id desc limit 1
         ) stop
         where vm.disk_retained and p.revoked_at is null
-          and p.wake_at is not null and p.state in ('waiting','claimed')
-          and stop.request_id=p.plan_id and stop.result='succeeded'`;
+          and p.wake_at is not null and p.state='waiting'
+          and stop.request_id=p.plan_id and stop.result='succeeded'
+        union all
+        -- An in-flight claim can already be starting the next epoch.
+        select greatest(wake_at,claim_until) as at
+          from person_vm_scheduled_wakes where state='claimed'
+        ) committed`;
           active.throwIfAborted();
           return row?.earliest ?? null;
         });

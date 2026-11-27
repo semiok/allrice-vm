@@ -1467,6 +1467,11 @@ suite(
           });
           expect(authorized?.sessionId).toBe(recoveryLogin.sessionId);
           h.advance(90_001);
+          expect(
+            (await store.listJoinedIdleStopCandidates(signal())).map(
+              (candidate) => candidate.vmId,
+            ),
+          ).toContain(binding.vmId);
           if (outcome === 'commit-rejected') {
             h.states.set(binding.vmId, 'unknown');
             await expect(
@@ -1482,11 +1487,10 @@ suite(
             ).toHaveLength(1);
             h.states.set(binding.vmId, 'stopped');
           }
-          await host.reconcileIdle(
-            { ...authorized!, requestId: randomUUID() },
-            binding,
-            signal(),
-          );
+          const restarted = new PersonVmService(h.options);
+          await expect(
+            restarted.recoverJoinedIdleStop(binding, signal()),
+          ).resolves.toBe(true);
           await db`update person_vm_scheduled_wakes set wake_at=least(now()-interval '1 second', target_at)
             where plan_id=${attempt.requestId}`;
           expect(await wake.claim(90_000)).toMatchObject({

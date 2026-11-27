@@ -997,10 +997,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting'
       where person_id=${f.binding.personId}`;
       if (revoked) await f.invalidate(planId);
+      expect(await f.store().nextCommittedWakeAt(signal)).toBeInstanceOf(Date);
       await db`update person_vm_scheduled_wakes set claim_until=now()-interval '1 second'
       where plan_id=${planId}`;
       expect(await f.module().runDueOnce(signal)).toBe(true);
       expect(await f.module().runDueOnce(signal)).toBe(false);
+      expect(await f.store().nextCommittedWakeAt(signal)).toBeNull();
       expect(f.start).not.toHaveBeenCalled();
       expect(await f.store().settle(claim!, { state: 'ready' })).toBe(false);
       const [row] = await db`select w.state,a.error_code

@@ -338,17 +338,17 @@ async function hasPreviousUpgradeStop(
       and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
       and vm.lease_epoch=${binding.leaseEpoch} and vm.phase='failed'
       and a.action='stop.upgrade-dispatch' and a.result in ('started','succeeded')
-      and not exists (
-        select 1 from person_vm_audit denial
-        where denial.vm_id=a.vm_id and denial.person_id=a.person_id
-          and denial.organization_id=a.organization_id and denial.lease_epoch=a.lease_epoch
-          and denial.action=a.action and denial.request_id=a.request_id
-          and denial.id>a.id and denial.result='denied'
-      )
+      and (a.result='succeeded' or (
+        select later.result from person_vm_audit later
+        where later.vm_id=a.vm_id and later.person_id=a.person_id
+          and later.organization_id=a.organization_id and later.lease_epoch=a.lease_epoch
+          and later.action=a.action and later.request_id=a.request_id and later.id>a.id
+        order by later.id limit 1
+      ) is distinct from 'denied')
     order by a.id desc limit 1`,
   );
-  // A denial cancels its own dispatch only. A later, unapproved retry
-  // cannot erase the need to join an earlier physical attempt.
+  // A denial cancels only the immediately preceding attempt, even when an
+  // idempotent retry reuses the caller's request ID.
   return attempt?.result === 'started' || attempt?.result === 'succeeded';
 }
 
@@ -594,7 +594,9 @@ export class PostgresPersonVmStore implements PersonVmStore {
               and a.action='stop.idle-dispatch'
             order by a.id desc limit 1
           ) idle
-          where vm.phase in ('running','failed') and vm.native_created and vm.disk_retained
+          where (vm.phase in ('running','failed')
+              or (vm.phase in ('stopped','cold') and vm.lease_owner is not null))
+            and vm.native_created and vm.disk_retained
             and vm.instance_id is not null and idle.result='succeeded'
             and (vm.lease_owner is null or vm.lease_expires_at<=now())
           order by vm.person_id`;

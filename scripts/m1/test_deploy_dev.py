@@ -276,12 +276,17 @@ class DeployDevMigrations(unittest.TestCase):
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
 
-        for mode in ('before-first-read', 'early', 'late', 'pending-wake'):
+        for mode in ('before-wake-guard', 'before-first-read', 'early', 'late', 'pending-wake'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r'''
                   mkdir -p "$STATE"
                   rm -f "$STATE/fixture-loaded"
-                  if [ "$MODE" = before-first-read ]; then touch "$STATE/fixture-loaded"; fi
+                  case "$MODE" in
+                    before-wake-guard|before-first-read) touch "$STATE/fixture-loaded" ;;
+                  esac
+                  if [ "$MODE" = before-wake-guard ]; then
+                    verify_no_committed_vm_wakes() { return 1; }
+                  fi
                   job_state() {
                     if [ -f "$STATE/fixture-loaded" ]; then echo loaded; else echo 'running 73001'; fi
                   }
@@ -299,7 +304,7 @@ class DeployDevMigrations(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0, (p.stdout, p.stderr))
                 self.assertIn('Worker exit unconfirmed', p.stdout)
                 state = os.path.join(self.home, 'allrice40-dev/qa/deploy-inflight')
-                if mode == 'before-first-read':
+                if mode.startswith('before-'):
                     self.assertFalse(os.path.exists(os.path.join(state, 'worker-exit')))
                 else:
                     with open(os.path.join(state, 'worker-exit')) as f:
@@ -315,7 +320,7 @@ class DeployDevMigrations(unittest.TestCase):
                   test_launchctl() { test "$1" = bootout; }
                   job_state() { echo loaded; }
                   wait_for_drained_worker_exit() {
-                    if [ "$MODE" = before-first-read ]; then
+                    if [[ "$MODE" = before-* ]]; then
                       test -z "$1" || return 1
                     else
                       test "$1" = 73001 || return 1
@@ -329,7 +334,7 @@ class DeployDevMigrations(unittest.TestCase):
                       *) command psql -X -At -c "$1" ;;
                     esac
                   }
-                  vm_upgrade_candidates() { echo 0; }
+                  vm_upgrade_candidates() { echo 1; }
                   stop_job() { :; }
                   start_both_on() { echo "restarted $1"; }
                   recover
