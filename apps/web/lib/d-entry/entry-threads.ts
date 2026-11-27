@@ -2,6 +2,7 @@ import {
   DEntryIdentitySchema,
   DEntrySelectionInputSchema,
   UuidSchema,
+  hasDEntryPersonRelease,
   selectDEntryGeneration,
   type RequestContext,
 } from '@allrice/contracts';
@@ -24,24 +25,47 @@ export const dEntryThreadRequest = z
   .object({ selection: employeeSelection, operationId: UuidSchema.optional() })
   .strict();
 
+export async function isDEntryPersonReleased(context: RequestContext) {
+  return (
+    context.actor.type === 'user' &&
+    hasDEntryPersonRelease(await readDEntryReleasePolicy(), {
+      organizationId: context.organizationId,
+      personId: context.actor.id,
+    })
+  );
+}
+
+/** Resolve an authorized creation workspace without provisioning an employee. */
+export async function findDEntryCreationWorkspace(context: RequestContext) {
+  if (context.actor.type !== 'user' || !(await isDEntryPersonReleased(context)))
+    return null;
+  const sql = getDatabase();
+  const [workspace] = await sql<{ id: string }[]>`
+    select w.id from allrice_workspaces w
+    where w.organization_id=${context.organizationId} and w.archived_at is null
+      and (${context.workspaceId}::uuid is null or w.id=${context.workspaceId})
+      and exists (select 1 from allrice_memberships m
+        where m.organization_id=w.organization_id and m.user_id=${context.actor.id}
+          and m.active and m.role in ('admin','member')
+          and (m.workspace_id is null or m.workspace_id=w.id))
+    order by w.created_at,w.id limit 1`;
+  if (!workspace) return null;
+  return (await readContentPrincipal({ ...context, workspaceId: workspace.id }))
+    ?.writable
+    ? workspace.id
+    : null;
+}
+
 /** Bare entry discovers only the current login's explicitly enabled employees. */
 export async function findDEntryEmployee(context: RequestContext) {
-  if (context.actor.type !== 'user') return null;
-  const policy = await readDEntryReleasePolicy();
-  const enabled = policy.selections.filter(
-    (item) =>
-      item.organizationId === context.organizationId &&
-      item.personId === context.actor.id &&
-      item.generation === '4.0',
-  );
-  if (!enabled.length) return null;
+  if (context.actor.type !== 'user' || !(await isDEntryPersonReleased(context)))
+    return null;
   const sql = getDatabase();
   const candidates = await sql<{ id: string; workspace_id: string }[]>`
     select id,workspace_id from allrice_employee_instances
     where organization_id=${context.organizationId} and owner_id=${context.actor.id}
       and (${context.workspaceId}::uuid is null or workspace_id=${context.workspaceId})
       and archived_at is null
-      and id=any(${sql.array(enabled.map(({ employeeInstanceId }) => employeeInstanceId))}::uuid[])
     order by (kind='general') desc,created_at,id`;
   for (const candidate of candidates) {
     const selection = {

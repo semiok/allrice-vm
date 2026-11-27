@@ -102,6 +102,72 @@ const feed = () => {
 };
 
 describe('authority subscription lifecycle (driver double; not PG commit proof)', () => {
+  it('retires a stuck marker connection at the deadline and waits for the actual query to settle', async () => {
+    const source = feed();
+    const controller = new AbortController();
+    const lost = vi.fn();
+    const detach = await source.subscribe(
+      { changed: vi.fn(), lost },
+      controller.signal,
+    );
+    const client = state.clients[0]!;
+    const query = deferred();
+    client.query.mockImplementationOnce(() => query.promise);
+    vi.useFakeTimers();
+    try {
+      let finished = false;
+      const reading = source
+        .observeThroughCommit(controller.signal)
+        .finally(() => {
+          finished = true;
+        });
+      const rejected = expect(reading).rejects.toThrow(
+        'D_ENTRY_AUTHORITY_FENCE_TIMEOUT',
+      );
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(lost).toHaveBeenCalledOnce();
+      expect(client.end).toHaveBeenCalledOnce();
+      expect(finished).toBe(false);
+      query.resolve();
+      await rejected;
+    } finally {
+      query.resolve();
+      vi.useRealTimers();
+      detach();
+    }
+  });
+  it('revokes an optional pinned grant revision even when the identity has been restored', async () => {
+    const original = new AbortController().signal;
+    const verify = vi.fn(async () => {});
+    const watch = await watchDEntryNativeAuthority(
+      context,
+      selection,
+      identity,
+      original,
+      feed(),
+      verify,
+    );
+    try {
+      expect(verify).toHaveBeenCalledOnce();
+      const stale = Error('accepted authority revision changed');
+      verify.mockRejectedValueOnce(stale);
+      state.clients[0]!.emit('notification', {
+        channel: 'allrice_d_entry_authority',
+        payload: JSON.stringify({
+          schema: 'isolated',
+          table: 'allrice_memberships',
+          id: randomUUID(),
+          personId: identity.personId,
+          organizationId: identity.organizationId,
+          workspaceId: identity.workspaceId,
+        }),
+      });
+      await vi.waitFor(() => expect(watch.revoked.reason).toBe(stale));
+      expect(state.identity).toHaveBeenCalledTimes(2);
+    } finally {
+      await watch.close();
+    }
+  });
   it('settles whole-roster and VM hints before delivery without rereading on quiet frames', async () => {
     const signal = new AbortController().signal;
     const source = feed();

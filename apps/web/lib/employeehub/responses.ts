@@ -1,5 +1,6 @@
 import { CodexSubscriptionError } from '@allrice/database';
 import { workflowSkillInvalidMessage } from '@allrice/contracts';
+import { dEntryFirstEmployeeLimitMessage } from '../d-entry/employee-creation';
 import {
   DataAccessError,
   EmployeeAccessBusyError,
@@ -67,6 +68,16 @@ export function employeeHubErrorResponse(error: unknown) {
       status: 409,
       code: 'DEFAULT_EMPLOYEE_PROTECTED',
       message: 'Rice is the protected default employee',
+      retryable: false,
+    });
+  if (
+    error instanceof EmployeeInstanceError &&
+    error.code === 'd_entry_first_employee_limit'
+  )
+    return apiProblem({
+      status: 409,
+      code: 'CONFLICT',
+      message: dEntryFirstEmployeeLimitMessage,
       retryable: false,
     });
   if (error instanceof EmployeeInstanceError)

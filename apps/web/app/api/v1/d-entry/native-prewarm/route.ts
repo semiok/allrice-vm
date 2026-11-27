@@ -1,4 +1,5 @@
 import {
+  DEntryNativePrewarmAcceptedSchema,
   DEntryNativePrewarmInputSchema,
   DEntryNativePrewarmResultSchema,
   sameDEntryIdentity,
@@ -12,6 +13,7 @@ import {
   requestDEntryWorker,
   readDEntryWorkerJson,
 } from '../../../../../lib/d-entry/native-worker';
+import { DEntryDependencyUnavailable } from '../../../../../lib/d-entry/release-policy';
 import { dEntryErrorResponse } from '../../../../../lib/d-entry/responses';
 
 export const runtime = 'nodejs';
@@ -28,14 +30,23 @@ export async function POST(request: Request) {
     const response = await requestDEntryWorker(input, 'native-prewarm', {
       trigger,
     });
+    if (response.status !== 202 && response.status !== 200)
+      throw new DEntryDependencyUnavailable('native-route');
     const result = await readDEntryWorkerJson(response, (value) =>
-      DEntryNativePrewarmResultSchema.parse(value),
+      response.status === 202
+        ? DEntryNativePrewarmAcceptedSchema.parse(value)
+        : DEntryNativePrewarmResultSchema.parse(value),
     );
     if (
       !sameDEntryIdentity(input.identity, result.identity) ||
       result.trigger !== trigger
     )
       throw new DataAccessError('authorization_denied');
+    if ('ticket' in result)
+      return Response.json(result.ticket, {
+        status: 202,
+        headers: { 'cache-control': 'private, no-store' },
+      });
     return new Response(null, {
       status: 204,
       headers: { 'cache-control': 'private, no-store' },

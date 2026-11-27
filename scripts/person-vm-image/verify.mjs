@@ -5,6 +5,7 @@ import {
   constants,
   copyFileSync,
   createReadStream,
+  createWriteStream,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -14,8 +15,10 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 
 const basePin =
@@ -60,14 +63,102 @@ export function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-async function hashFile(file) {
+/** The runtime artifact itself is verified again by the production native
+ * provider immediately before mounting it in the capture guest. */
+export function employeeProfileRuntime(native) {
+  const disk = native?.readonlyDshRuntimeDisk;
+  if (disk === undefined || disk?.provision === 'directory') return undefined;
+  ensure(disk?.provision === 'disk', 'Invalid Employee Web disk provision');
+  const nativeChecksums = {
+    binary: native.artifactChecksums?.binary,
+    libkrunfw: native.artifactChecksums?.libkrunfw,
+    agentd: native.artifactChecksums?.agentd,
+  };
+  ensure(
+    /^[a-f0-9]{64}$/.test(native.publicImageCache?.manifestSha256) &&
+      native.image === source.baseImage &&
+      native.readonlyDshDirectory?.artifactSha256 === source.artifactSha256 &&
+      /^[a-f0-9]{64}$/.test(disk.diskSha256) &&
+      /^[a-f0-9]{64}$/.test(disk.candidateSha256) &&
+      Object.values(nativeChecksums).every(
+        (checksum) =>
+          typeof checksum === 'string' &&
+          /^sha256:[a-f0-9]{64}$/.test(checksum),
+      ),
+    'Employee Web capture requires the sealed offline runtime',
+  );
+  return Object.freeze({
+    platform: 'linux/arm64',
+    binding: 'eth0',
+    diskSha256: disk.diskSha256,
+    candidateSha256: disk.candidateSha256,
+    cacheManifestSha256: native.publicImageCache.manifestSha256,
+    nativeChecksums: Object.freeze(nativeChecksums),
+  });
+}
+
+async function hashFile(file, signal) {
   ensure(lstatSync(file).isFile(), 'Expected a regular file');
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(file, {
-    flags: constants.O_RDONLY | constants.O_NOFOLLOW,
+    flags: constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    signal,
   }))
     hash.update(chunk);
   return hash.digest('hex');
+}
+
+// The release command executes only private snapshots of the configured
+// native files, so replacing a source after validation cannot change the VM.
+export async function stageEmployeeProfileNativeInputs(
+  native,
+  directory,
+  signal,
+) {
+  const paths = {};
+  for (const [key, name] of Object.entries({
+    binary: 'msb',
+    libkrunfw: 'libkrunfw.5.dylib',
+    agentd: 'agentd-aarch64',
+  })) {
+    signal.throwIfAborted();
+    const checksum = native.artifactChecksums?.[key];
+    const input = native[key];
+    ensure(
+      typeof checksum === 'string' &&
+        /^sha256:[a-f0-9]{64}$/.test(checksum) &&
+        typeof input === 'string' &&
+        isAbsolute(input),
+      'Invalid Employee Web capture native artifact',
+    );
+    const output = join(directory, name);
+    const file = await open(
+      input,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      ensure(
+        (await file.stat()).isFile(),
+        'Expected a regular native artifact',
+      );
+      await pipeline(
+        file.createReadStream({ autoClose: false }),
+        createWriteStream(output, {
+          flags: 'wx',
+          mode: key === 'libkrunfw' ? 0o400 : 0o500,
+        }),
+        { signal },
+      );
+    } finally {
+      await file.close();
+    }
+    ensure(
+      'sha256:' + (await hashFile(output, signal)) === checksum,
+      'Employee Web capture native artifact checksum mismatch',
+    );
+    paths[key] = output;
+  }
+  return paths;
 }
 
 function ensure(condition, message) {

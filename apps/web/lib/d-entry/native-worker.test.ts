@@ -8,6 +8,7 @@ import { POST as resource } from '../../app/api/v1/d-entry/native-resource/route
 import { POST as rpc } from '../../app/api/v1/d-entry/native-rpc/route';
 import { POST as root } from '../../app/api/v1/d-entry/native-root/route';
 import { POST as prewarm } from '../../app/api/v1/d-entry/native-prewarm/route';
+import { GET as prewarmStatus } from '../../app/api/v1/d-entry/native-prewarm/status/route';
 
 const ports = vi.hoisted(() => ({
   context: vi.fn(),
@@ -76,6 +77,52 @@ afterEach(() => {
 });
 
 describe('Web original-cookie to fixed Worker adapters', () => {
+  it('returns only the cold ticket and reauthenticates each status GET, including an expired ticket', async () => {
+    const ticket = {
+      operationId: randomUUID(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      pollAfterMs: 1000,
+    };
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ identity, trigger: 'page', ticket }, { status: 202 }),
+      )
+      .mockResolvedValueOnce(Response.json({ state: 'starting' }))
+      .mockResolvedValueOnce(
+        Response.json({ state: 'expired' }, { status: 410 }),
+      );
+    vi.stubGlobal('fetch', fetch);
+    const accepted = await prewarm(request({ selection, trigger: 'page' }));
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json()).toEqual(ticket);
+    const query = new URLSearchParams({
+      ...selection,
+      operationId: ticket.operationId,
+    });
+    const poll = () =>
+      prewarmStatus(
+        new Request(
+          'https://allrice.test/api/v1/d-entry/native-prewarm/status?' + query,
+        ),
+      );
+    expect(await (await poll()).json()).toEqual({ state: 'starting' });
+    const gone = await poll();
+    expect(gone.status).toBe(410);
+    expect(await gone.json()).toEqual({ state: 'expired' });
+    expect(gone.headers.get('cache-control')).toBe('private, no-store');
+    expect(ports.context).toHaveBeenCalledTimes(3);
+    expect(ports.identity).toHaveBeenCalledTimes(3);
+    const [target, options] = fetch.mock.calls[2]! as [URL, RequestInit];
+    expect(target.pathname).toBe('/internal/d-entry/native-prewarm/status');
+    expect(Object.fromEntries(target.searchParams)).toEqual({
+      ...selection,
+      organizationId: context.organizationId,
+      operationId: ticket.operationId,
+    });
+    expect(options.method).toBe('GET');
+    expect(options.headers).toEqual({ authorization: `Bearer ${ports.token}` });
+  });
   it('prewarms page/input with only selectors and original Session, returning no readiness capability', async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () =>
       Response.json({ identity, trigger: 'page' }),

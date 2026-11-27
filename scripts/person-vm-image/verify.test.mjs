@@ -13,10 +13,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  employeeProfileRuntime,
   loadBase,
   normalizeArchive,
   requireReadOnlyDisk,
   sha256,
+  source,
+  stageEmployeeProfileNativeInputs,
   withScratch,
 } from './verify.mjs';
 
@@ -304,4 +307,103 @@ it('rejects writable, hard-linked and symlinked runtime disk files', () => {
   rmSync(alias);
   symlinkSync(image, alias);
   expect(() => requireReadOnlyDisk(alias)).toThrow(/regular file/);
+});
+
+describe('Employee Web profile capture', () => {
+  const native = {
+    image: source.baseImage,
+    readonlyDshDirectory: { artifactSha256: source.artifactSha256 },
+    publicImageCache: { manifestSha256: '0'.repeat(64) },
+    artifactChecksums: {
+      binary: 'sha256:' + 'a'.repeat(64),
+      libkrunfw: 'sha256:' + 'b'.repeat(64),
+      agentd: 'sha256:' + 'c'.repeat(64),
+    },
+    readonlyDshRuntimeDisk: {
+      diskSha256: '1'.repeat(64),
+      candidateSha256: '2'.repeat(64),
+      provision: 'disk',
+    },
+  };
+
+  it('uses Linux only for disk provision and binds its exact disk and candidate', () => {
+    expect(employeeProfileRuntime({})).toBeUndefined();
+    expect(
+      employeeProfileRuntime({
+        ...native,
+        readonlyDshRuntimeDisk: { provision: 'directory' },
+      }),
+    ).toBeUndefined();
+    expect(employeeProfileRuntime(native)).toEqual({
+      platform: 'linux/arm64',
+      binding: 'eth0',
+      diskSha256: native.readonlyDshRuntimeDisk.diskSha256,
+      candidateSha256: native.readonlyDshRuntimeDisk.candidateSha256,
+      cacheManifestSha256: native.publicImageCache.manifestSha256,
+      nativeChecksums: native.artifactChecksums,
+    });
+    expect(
+      employeeProfileRuntime({
+        ...native,
+        artifactChecksums: {
+          ...native.artifactChecksums,
+          agentd: 'sha256:' + 'd'.repeat(64),
+        },
+      }),
+    ).not.toEqual(employeeProfileRuntime(native));
+    expect(
+      employeeProfileRuntime({
+        ...native,
+        publicImageCache: { manifestSha256: '9'.repeat(64) },
+      }),
+    ).not.toEqual(employeeProfileRuntime(native));
+    expect(() =>
+      employeeProfileRuntime({ ...native, publicImageCache: undefined }),
+    ).toThrow('sealed offline runtime');
+    expect(() =>
+      employeeProfileRuntime({ ...native, readonlyDshRuntimeDisk: null }),
+    ).toThrow('Invalid Employee Web disk provision');
+  });
+
+  it('stages only the expected native bytes and rejects changes and symbolic links', async () => {
+    const input = join(temp, 'inputs');
+    const output = join(temp, 'capture');
+    const failed = join(temp, 'failed');
+    mkdirSync(input);
+    mkdirSync(output);
+    mkdirSync(failed);
+    const nativePaths = {
+      binary: join(input, 'msb'),
+      libkrunfw: join(input, 'firmware'),
+      agentd: join(input, 'agent'),
+    };
+    const artifactChecksums = {};
+    for (const [key, path] of Object.entries(nativePaths)) {
+      writeFileSync(path, key);
+      artifactChecksums[key] = 'sha256:' + sha256(key);
+    }
+    const config = { ...nativePaths, artifactChecksums };
+    const signal = new globalThis.AbortController().signal;
+    const staged = await stageEmployeeProfileNativeInputs(
+      config,
+      output,
+      signal,
+    );
+    writeFileSync(nativePaths.agentd, 'changed');
+    expect(readFileSync(staged.agentd, 'utf8')).toBe('agentd');
+    await expect(
+      stageEmployeeProfileNativeInputs(config, failed, signal),
+    ).rejects.toThrow('checksum mismatch');
+    const link = join(temp, 'link');
+    const symlinkOutput = join(temp, 'symlink-output');
+    mkdirSync(symlinkOutput);
+    symlinkSync(nativePaths.binary, link);
+    await expect(
+      stageEmployeeProfileNativeInputs(
+        { ...config, binary: link },
+        symlinkOutput,
+        signal,
+      ),
+    ).rejects.toMatchObject({ code: 'ELOOP' });
+  });
 });

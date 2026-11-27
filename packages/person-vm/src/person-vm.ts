@@ -16,6 +16,8 @@ import {
   type PersonVmEgressPort,
   type PersonVmEgressReceipt,
   type PersonVmHostPort,
+  type PersonVmPrewarmFence,
+  type PersonVmPrewarmTarget,
   type PersonVmRuntimePort,
   type PersonVmView,
 } from './contract.ts';
@@ -34,6 +36,7 @@ import {
   checkedWebRoster,
   type PersonVmWebRosterPort,
   type PersonVmWebStartup,
+  type NativeWebSetupFailure,
 } from './web-endpoints.ts';
 import {
   bindingOf,
@@ -260,12 +263,39 @@ export class PersonVmService
     this.checkOrganization(row, identity.organizationId);
     return view(row); // A persisted running flag is not a readiness assertion.
   }
-  async create(context: RequestContext, signal: AbortSignal) {
+  private assertPrewarmTarget(
+    row: VmRecord | null,
+    target?: PersonVmPrewarmTarget,
+    allowRetainedRestore = false,
+  ) {
+    if (!target) return;
+    const running = row?.phase === 'running';
+    const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
+    if (
+      (row?.phase === 'deleted' &&
+        (!allowRetainedRestore ||
+          !target.restoreRetained ||
+          !row.diskRetained ||
+          target.vmId !== row.vmId)) ||
+      epoch !== target.leaseEpoch ||
+      (target.vmId !== null && target.vmId !== row?.vmId) ||
+      (target.instanceId !== null &&
+        (!running || target.instanceId !== row?.instanceId))
+    )
+      throw new PersonVmError('LEASE_LOST');
+  }
+  async create(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmFence,
+  ) {
     return this.leased(
       context,
       'create',
       signal,
       async (lease, identity, signal) => {
+        this.assertPrewarmTarget(lease.row, target, true);
+        if (target) await target.assertAuthority(signal);
         const retry =
           lease.row &&
           !lease.row.instanceId &&
@@ -319,6 +349,7 @@ export class PersonVmService
           if (inspected.state === 'unknown')
             throw new PersonVmError('PROVIDER_FAILED');
           if (inspected.state === 'absent') {
+            if (target) await target.assertAuthority(signal);
             await this.options.disk.create(
               { vmId: row.vmId, tier: row.diskTier },
               signal,
@@ -434,9 +465,25 @@ export class PersonVmService
     )
       throw new PersonVmError('RUNTIME_NOT_READY');
   }
-  async start(context: RequestContext, signal: AbortSignal) {
-    return this.leased(context, 'start', signal, (lease, _identity, current) =>
-      this.startOwned(context, lease, current),
+  async start(
+    context: RequestContext,
+    signal: AbortSignal,
+    target?: PersonVmPrewarmFence,
+  ) {
+    return this.leased(
+      context,
+      'start',
+      signal,
+      async (lease, _identity, current) => {
+        this.assertPrewarmTarget(lease.row, target);
+        if (target) await target.assertAuthority(current);
+        return this.startOwned(
+          context,
+          lease,
+          current,
+          target?.assertAuthority,
+        );
+      },
     );
   }
   private async webRoster(context: RequestContext, signal: AbortSignal) {
@@ -467,6 +514,7 @@ export class PersonVmService
     context: RequestContext,
     lease: VmLease,
     signal: AbortSignal,
+    assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
   ) {
     if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     const row = this.required(lease.row);
@@ -518,6 +566,9 @@ export class PersonVmService
       row.phase === 'starting' ||
       row.egressReceipt
     ) {
+      // Confirm the ticket before taking responsibility for the prior
+      // generation. Once reconciliation starts its owned cleanup must finish.
+      if (assertAuthority) await assertAuthority(signal);
       if ((await this.takeoverSafe(row, signal, lease)).state !== 'ready')
         throw new PersonVmError('PROVIDER_FAILED');
       if (
@@ -531,6 +582,7 @@ export class PersonVmService
       await this.cleanup(row, lease, 'takeover');
     }
     await lease.assertAdmissionOpen(true);
+    if (assertAuthority) await assertAuthority(signal);
     row.leaseEpoch += 1;
     row.instanceId = randomUUID();
     row.phase = 'starting';
@@ -549,6 +601,7 @@ export class PersonVmService
       this.options.observeOwnedStart?.(binding);
       signal.throwIfAborted();
       await lease.guard();
+      if (assertAuthority) await assertAuthority(signal);
       if (row.diskTier === 'cold') {
         await this.options.disk.move(
           { vmId: row.vmId, tier: 'cold' },
@@ -611,11 +664,30 @@ export class PersonVmService
           )
             throw new PersonVmError('PROVIDER_FAILED');
         }
-        web = Object.freeze({ context, receipt: endpoints });
+        web = Object.freeze({
+          context,
+          receipt: endpoints,
+          recordNativeFailure: (
+            failure: NativeWebSetupFailure,
+            signal: AbortSignal,
+          ) => {
+            const event = {
+              requestId: context.requestId,
+              action: 'start.native-web.' + failure.step,
+              result: 'failed' as const,
+              errorCode: JSON.stringify(failure),
+            };
+            const store = this.options.store;
+            return store.auditStartupFailure
+              ? store.auditStartupFailure(row, event, signal)
+              : lease.audit(row, event);
+          },
+        });
         await lease.guard();
       }
       const native = this.options.native;
       const state = await native.status(binding, signal);
+      if (assertAuthority) await assertAuthority(signal);
       let checkedWebAfterStart = false;
       if (state === 'absent' && !row.nativeCreated) {
         if (web) await native.create(binding, receipt, signal, web.receipt);
@@ -656,6 +728,7 @@ export class PersonVmService
             throw new PersonVmError('AUTHORIZATION_DENIED');
         }
         await lease.guard();
+        if (assertAuthority) await assertAuthority(signal);
       };
       await bootstrapPersonVm({
         binding,
@@ -675,6 +748,9 @@ export class PersonVmService
         action: 'start',
         result: 'succeeded',
       });
+      // The persisted running row still holds this lease and cannot be used
+      // by the running entrypoints until the admitted authority is confirmed.
+      if (assertAuthority) await assertAuthority(signal);
       return view(row, true);
     } catch (error) {
       const failure = safeError(error);
@@ -698,7 +774,7 @@ export class PersonVmService
   }
   async prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input' },
+    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
     signal: AbortSignal,
   ) {
     if (input.trigger !== 'page' && input.trigger !== 'input')
@@ -706,7 +782,9 @@ export class PersonVmService
     const identity = await this.identity(context, 'start', signal);
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
+    this.assertPrewarmTarget(row, input.target, true);
     if (row?.phase === 'running') {
+      if (input.target) await input.target.assertAuthority(signal);
       const binding = bindingOf(row);
       if (row.leaseOwner) throw new PersonVmError('LEASE_CONFLICT');
       const roster = await this.webRoster(context, signal);
@@ -747,8 +825,12 @@ export class PersonVmService
       return view(row, true);
     }
 
-    await this.create(context, signal);
-    return this.start(context, signal);
+    const created = await this.create(context, signal, input.target);
+    return this.start(
+      context,
+      signal,
+      input.target && { ...input.target, vmId: created.vmId },
+    );
   }
   private async inactive(
     row: VmRecord,
