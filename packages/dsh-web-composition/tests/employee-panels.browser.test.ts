@@ -931,6 +931,7 @@ suite('installed native employee panels with synthetic business owner', () => {
           .getByRole('button', { name: '收起右侧边栏', exact: true })
           .click();
         await page
+          .locator('[contenteditable="true"]')
           .getByText(selected.fileName, { exact: true })
           .waitFor({ state: 'visible' });
         await page.screenshot({
