@@ -14,6 +14,12 @@ import {
 import { createProductionEgressAuthority } from './production-egress-authority.js';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
+import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  createProductionNativeActivity,
+  getIdleScheduleGuardMs,
+} from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
 type CodexRuntime = Awaited<ReturnType<typeof createProductionCodexRuntime>>;
@@ -50,6 +56,11 @@ export interface ProductionNativeModelExecution {
     resolveSendRoute: ResolveProductionDEntrySendRoute;
     references?: readonly ManagedHostService[];
     readModelImage?: ReadProductionModelImage;
+    readMemoryIndex?: NonNullable<
+      Awaited<
+        ReturnType<ProductionPersonVmHostSources['bind']>
+      >['model']['readMemoryIndex']
+    >;
     redeem?(call: ModelCallBinding, signal: AbortSignal): void;
     activity: PersonVmRuntimePort['activity'];
     close(): Promise<void>;
@@ -124,6 +135,15 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
+          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            sampleIntervalMs:
+              host.providers.configuration.lifecycle.idleSampleIntervalMs ??
+              DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+            scheduleGuardMs: getIdleScheduleGuardMs(
+              host.providers.configuration.lifecycle,
+            ),
+          }),
           runtime: {
             async readiness(binding, signal) {
               await codex.assertCurrent(signal);
@@ -155,6 +175,7 @@ export function createProductionPersonVmSources(
             route: codex.route,
             transport: codex.transport,
             scopeStream: codex.scopeStream,
+            readMemoryIndex: owned.readMemoryIndex,
             async resolveCall(headers, binding, signal) {
               await codex.assertCurrent(signal);
               const call = await calls.resolveCall(headers, binding, signal);

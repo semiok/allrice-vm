@@ -3,6 +3,7 @@ import {
   FilePersonVmKeyStore,
   MacosPersonVmDiskPool,
   MicrosandboxPersonVm,
+  PersonVmError,
   type PersonVmDiskPoolOptions,
 } from '@allrice/person-vm';
 import { readVerifiedProductionPersonVmInputs } from './production-artifacts.js';
@@ -12,9 +13,17 @@ import { ProductionHostConfigurationUnavailable } from './production-config.js';
 /** Real inert provider construction only, not an installed Host or runtime.
  * Nothing boots or allocates a disk here. The final single-service composition
  * must pass this same platform snapshot to its shared admission host. */
-export async function createProductionPersonVmProviders(signal: AbortSignal) {
+export async function createProductionPersonVmProviders(
+  signal: AbortSignal,
+  reserve?: NonNullable<
+    ConstructorParameters<typeof MicrosandboxPersonVm>[0]['restartMemory']
+  >['reserve'],
+) {
   const loaded = await readVerifiedProductionPersonVmInputs(signal);
   signal.throwIfAborted();
+  const capacityEnabled =
+    loaded.configuration.lifecycle.hostVmBudgetMiB !== undefined;
+  if (capacityEnabled && !reserve) throw new PersonVmError('RUNTIME_NOT_READY');
   const {
     disk: configuration,
     native: nativeConfiguration,
@@ -52,6 +61,9 @@ export async function createProductionPersonVmProviders(signal: AbortSignal) {
   const native = new MicrosandboxPersonVm({
     ...nativeConfiguration,
     memoryMiB: loaded.platform.memoryMiB,
+    ...(capacityEnabled && {
+      restartMemory: { memoryMiB: loaded.platform.memoryMiB, reserve },
+    }),
     seededPublicCache: poolPlatform?.hasSeededPublicCache.bind(poolPlatform),
     refreshBoundPublicCache:
       poolPlatform?.refreshBoundPublicCache.bind(poolPlatform),

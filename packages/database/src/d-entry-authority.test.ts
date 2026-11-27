@@ -184,6 +184,7 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
     try {
       await watch.assertObserved(signal);
       await watch.assertObserved(signal);
+      expect(() => watch.assertObservedNow()).not.toThrow();
       expect(verify).toHaveBeenCalledTimes(1);
       const client = state.clients[0]!;
       client.emit('notification', {
@@ -194,7 +195,9 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
         channel: 'allrice_person_vm_admission',
         payload: identity.personId,
       });
+      expect(() => watch.assertObservedNow()).toThrow();
       await watch.assertObserved(signal);
+      expect(() => watch.assertObservedNow()).not.toThrow();
       expect(binding).toHaveBeenCalledTimes(1);
       expect(verify).toHaveBeenCalledTimes(1);
       verify.mockRejectedValueOnce(Error('published roster no longer current'));
@@ -210,6 +213,9 @@ describe('authority subscription lifecycle (driver double; not PG commit proof)'
         }),
       });
       await expect(watch.assertObserved(signal)).rejects.toThrow(
+        'published roster no longer current',
+      );
+      expect(() => watch.assertObservedNow()).toThrow(
         'published roster no longer current',
       );
       expect(watch.revoked.aborted).toBe(true);

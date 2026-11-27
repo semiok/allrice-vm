@@ -88,14 +88,14 @@ suite('4.0 browser cold entry', () => {
             .end(body);
         if (address.pathname === '/api/v1/d-entry/native-prewarm') {
           warmCalls.push(await readJson(request));
-          if (warmCalls.length === 1 || warmCalls.length === 6)
+          if (warmCalls.length === 1 || warmCalls.length === 7)
             return response.writeHead(503).end();
           if (warmCalls.length === 2) {
             response.once('close', () => retryClosed.resolve());
             firstRetry.resolve(response);
             return;
           }
-          if (warmCalls.length === 4)
+          if (warmCalls.length === 4 || warmCalls.length === 5)
             return response
               .writeHead(202, { 'content-type': 'application/json' })
               .end(
@@ -105,7 +105,7 @@ suite('4.0 browser cold entry', () => {
                   pollAfterMs: 1000,
                 }),
               );
-          if (warmCalls.length === 8) {
+          if (warmCalls.length === 9) {
             response.once('close', () => supersededClosed.resolve());
             supersededWarmup.resolve(response);
             return;
@@ -118,12 +118,14 @@ suite('4.0 browser cold entry', () => {
             address.searchParams.get('operationId') !== ticket
           )
             return response.writeHead(404).end();
-          if (++polls === 1) {
+          if (++polls === 1)
+            return json({ state: 'failed', code: 'UPGRADE_OPEN_REQUIRED' });
+          if (polls === 2) {
             await allowStarting.promise;
-            return json({ state: 'starting' });
+            return json({ state: 'restarting' });
           }
           await allowReady.promise;
-          if (polls === 2) return response.writeHead(503).end();
+          if (polls === 3) return response.writeHead(503).end();
           return json({ state: 'ready' });
         }
         if (
@@ -284,10 +286,17 @@ suite('4.0 browser cold entry', () => {
       await page.getByRole('button', { name: '继续' }).click();
       try {
         await assertWaiting('正在准备你的工作台', '准备好会自动打开对话。');
+        await page
+          .getByRole('button', { name: '打开员工', exact: true })
+          .waitFor();
+        expect(warmCalls).toHaveLength(4);
+        await page
+          .getByRole('button', { name: '打开员工', exact: true })
+          .click();
         allowStarting.resolve();
         await assertWaiting(
-          '正在启动工作台',
-          '第一次启动需要一两分钟，留在这页就行。',
+          '版本已更新，正在重新启动员工',
+          '重启后会继续打开工作台。',
         );
         expect(
           await page.getByRole('button', { name: '取消等待' }).isEnabled(),
@@ -311,8 +320,8 @@ suite('4.0 browser cold entry', () => {
           .getByRole('link', { name: '返回员工页', exact: true })
           .isVisible(),
       ).toBe(true);
-      expect(polls).toBe(2);
-      expect(warmCalls).toHaveLength(4);
+      expect(polls).toBe(3);
+      expect(warmCalls).toHaveLength(5);
       expect(births).toEqual(birthsBeforePolling);
       await page.getByRole('button', { name: '重试', exact: true }).click();
       async function showEditor(threadId: string) {
@@ -340,8 +349,8 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
-      expect(polls).toBe(3);
-      expect(warmCalls).toHaveLength(4);
+      expect(polls).toBe(4);
+      expect(warmCalls).toHaveLength(5);
       const oldDocument = page.frameLocator('iframe').locator('body');
       const claim = () =>
         oldDocument.evaluate(() =>
@@ -364,7 +373,7 @@ suite('4.0 browser cold entry', () => {
         .frameLocator('iframe')
         .getByRole('button', { name: '新建对话' })
         .click();
-      await expect.poll(() => warmCalls.length).toBe(5);
+      await expect.poll(() => warmCalls.length).toBe(6);
       expect(births).toEqual([{ selection: employee }]);
       expect(documents).toEqual([f.selection.threadId]);
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(
@@ -384,8 +393,11 @@ suite('4.0 browser cold entry', () => {
         { selection: employee, operationId: next },
       ]);
       expect(warmCalls).toEqual(
-        [employee, employee, employee, f.selection, employee].map(
-          (selection) => ({ selection, trigger: 'page' }),
+        [employee, employee, employee, f.selection, f.selection, employee].map(
+          (selection, index) => ({
+            selection,
+            trigger: index === 4 ? 'open' : 'page',
+          }),
         ),
       );
       expect(documents).toEqual([f.selection.threadId, next]);
@@ -404,7 +416,7 @@ suite('4.0 browser cold entry', () => {
       await page.waitForURL((url) => url.searchParams.get('threadId') === next);
       await showEditor(next);
       expect(births).toHaveLength(2);
-      expect(warmCalls.slice(5)).toEqual([
+      expect(warmCalls.slice(6)).toEqual([
         { selection: employee, trigger: 'page' },
         { selection: { ...employee, threadId: next }, trigger: 'page' },
       ]);
@@ -427,7 +439,7 @@ suite('4.0 browser cold entry', () => {
         await finish();
       }
       await showEditor(f.selection.threadId);
-      expect(warmCalls.slice(7)).toEqual([
+      expect(warmCalls.slice(8)).toEqual([
         { selection: employee, trigger: 'page' },
         { selection: f.selection, trigger: 'page' },
       ]);

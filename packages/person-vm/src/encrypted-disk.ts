@@ -53,6 +53,10 @@ export interface PersonVmDiskPort {
   ): Promise<string>;
   create(disk: PersonDisk, signal: AbortSignal): Promise<void>;
   attach(disk: PersonDisk, signal: AbortSignal): Promise<string>;
+  verifyAttachedMount?(
+    disk: PersonDisk,
+    signal: AbortSignal,
+  ): Promise<string | null>;
   detach(
     disk: PersonDisk,
     signal: AbortSignal,

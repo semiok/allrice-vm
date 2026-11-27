@@ -372,6 +372,10 @@ suite('4.0 native Run audit projection with real PostgreSQL', () => {
       completedAt: terminal.occurredAt,
     });
     expect(persisted).not.toHaveProperty('job');
+    await db`insert into allrice_run_events
+      (organization_id,workspace_id,run_id,sequence,event_type,payload)
+      values (${organizationId},${workspaceId},${runId},2,'harness.native',
+        '{"source":"dsh-native-execution-evidence-v1","kind":"tool","human":"private-fact"}'::jsonb)`;
     const events = await listRunEvents(context, workspaceId, runId);
     expect(events).toMatchObject([
       { eventId: executionId, runId, type: 'step.started', sequence: 0 },

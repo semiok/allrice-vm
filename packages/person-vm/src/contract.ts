@@ -139,10 +139,16 @@ export interface PersonVmRuntimePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<PersonVmActivity>;
+  /** Host-only proof of native scheduler startup, without editor/send rights. */
+  assertScheduledReady?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** 401/reachable is NOT ready. Must prove authenticated editor + send capability. */
   readiness(
     binding: PersonVmBinding,
     signal: AbortSignal,
+    context?: RequestContext,
   ): Promise<{
     binding: PersonVmBinding;
     authenticated: boolean;
@@ -172,6 +178,7 @@ export type PersonVmErrorCode =
   | 'EGRESS_BINDING_INVALID'
   | 'RUNTIME_NOT_READY'
   | 'ACTIVITY_UNKNOWN'
+  | 'UPGRADE_OPEN_REQUIRED'
   | 'VM_ACTIVE'
   | 'WEB_ENDPOINTS_PREPARING'
   | 'PROVIDER_FAILED'
@@ -200,6 +207,11 @@ export type PersonVmPrewarmTarget = Readonly<{
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
+  dispatchUpgradeStop?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    dispatch: () => Promise<void>,
+  ): Promise<void>;
 };
 
 /** Only a trusted server/BFF receives this port. There is no guest MCP restart tool. */
@@ -208,7 +220,10 @@ export interface PersonVmPort {
   start(context: RequestContext, signal: AbortSignal): Promise<PersonVmView>;
   prewarm(
     context: RequestContext,
-    input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
+    input: {
+      trigger: 'page' | 'input' | 'open';
+      target?: PersonVmPrewarmFence;
+    },
     signal: AbortSignal,
   ): Promise<PersonVmView>;
   read(

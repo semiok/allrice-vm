@@ -1,3 +1,20 @@
+import { z } from 'zod';
+
+const minuteMs = 60 * 1000;
+
+export const PlatformPersonVmPolicySchema = z.strictObject({
+  memoryMiB: z
+    .number()
+    .int()
+    .min(1024)
+    .max(4 * 1024),
+  idleMs: z
+    .number()
+    .int()
+    .min(5 * minuteMs)
+    .max(60 * minuteMs),
+});
+
 /** Application-versioned platform configuration. Operators change this file
  * and release the application to adjust these defaults for every person.
  * No request, environment, enterprise or employee override is read here. */
@@ -9,8 +26,10 @@ export type PlatformPersonVmConfiguration = Readonly<{
   commandSwapMaxBytes: number;
 }>;
 const configuration: PlatformPersonVmConfiguration = Object.freeze({
-  memoryMiB: 2 * 1024,
-  idleMs: 20 * 60 * 1000,
+  ...PlatformPersonVmPolicySchema.parse({
+    memoryMiB: 2 * 1024,
+    idleMs: 20 * minuteMs,
+  }),
   commandHighBytes: 1280 * 1024 ** 2,
   commandMaxBytes: 1280 * 1024 ** 2,
   commandSwapMaxBytes: 512 * 1024 ** 2,
