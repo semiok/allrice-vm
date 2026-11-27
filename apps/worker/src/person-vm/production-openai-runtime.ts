@@ -1,5 +1,8 @@
 import { Context } from '@deepseek-ai/cordis';
-import { createLaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment';
+import {
+  createLaunchEnvironmentSnapshot,
+  DSH_LAUNCH_ENVIRONMENT_KEY,
+} from '@deepseek-ai/dsh-launch-environment';
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
@@ -48,8 +51,8 @@ export async function createProductionOpenAiRuntime(
   const context = new Context();
   // Only this host Context sees the key. The native credential lookup cannot
   // fall back to a guest, project dotenv file or another provider's grant.
-  context.set(
-    'launchEnvironment',
+  context.provide(
+    DSH_LAUNCH_ENVIRONMENT_KEY,
     createLaunchEnvironmentSnapshot([
       { source: 'process', values: { [keyName]: key } },
     ]),
