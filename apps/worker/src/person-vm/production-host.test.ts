@@ -22,6 +22,7 @@ import {
 } from '@allrice/person-vm';
 import type * as ProductionAuthority from './production-authority.js';
 import type * as ProductionEgress from './production-egress.js';
+import type * as ReleasedProfile from '../d-entry/released-profile.js';
 import {
   DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
@@ -69,7 +70,7 @@ const io = vi.hoisted(() => ({
     >(),
 }));
 vi.mock('../d-entry/released-profile.js', async (original) => ({
-  ...(await original<typeof import('../d-entry/released-profile.js')>()),
+  ...(await original<typeof ReleasedProfile>()),
   primeWorkerEmployeeWebRelease: async () => {},
 }));
 vi.mock('./production-disk-preprovision.js', () => ({

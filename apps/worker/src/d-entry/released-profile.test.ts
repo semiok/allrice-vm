@@ -1060,6 +1060,54 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
     await holdReleasedProfile(directory, nextEpoch, lifetime, manifestSha256);
     expect(source.readImmutableBundle).toHaveBeenCalledTimes(nativeReads * 2);
 
+    const transientOwner = {};
+    const canceled = new AbortController();
+    const firstStarted = Promise.withResolvers<void>();
+    const first = holdReleasedProfile(
+      directory,
+      {
+        ...current,
+        verificationOwner: transientOwner,
+        async readImmutableBundle(_reference, _bytes, signal) {
+          signal.throwIfAborted();
+          firstStarted.resolve();
+          return new Promise((_, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), {
+              once: true,
+            }),
+          );
+        },
+      },
+      canceled.signal,
+      manifestSha256,
+    );
+    const interrupted = expect(first).rejects.toHaveProperty(
+      'name',
+      'AbortError',
+    );
+    await firstStarted.promise;
+    const independentGraph = Promise.withResolvers<void>();
+    const independent = holdReleasedProfile(
+      directory,
+      {
+        ...current,
+        verificationOwner: transientOwner,
+        async readImmutableGraph() {
+          independentGraph.resolve();
+          return native;
+        },
+      },
+      lifetime,
+      manifestSha256,
+    );
+    await independentGraph.promise;
+    canceled.abort();
+    await interrupted;
+    await expect(independent).resolves.toHaveProperty(
+      'manifestSha256',
+      manifestSha256,
+    );
+
     expect(serving.graph).toEqual(native);
     for (const { url, rev } of [...native.entries, ...native.batches]) {
       expect((await serving.readReference(url, rev, lifetime)).data).toEqual(

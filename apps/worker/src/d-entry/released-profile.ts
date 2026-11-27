@@ -132,7 +132,7 @@ type Graph = z.infer<typeof DEntryProfileGraphSchema>;
 type Resource = { url: string; rev: string };
 const guestAttestations = new WeakMap<
   object,
-  { key: string; verified: Promise<void> }
+  { key: string; active: AbortSignal; verified: Promise<void> }
 >();
 const parallelGuestEntries = 4;
 type SealedFiles = Map<string, Promise<Buffer>>;
@@ -309,6 +309,12 @@ async function readManifest(
   };
 }
 
+const isStatic = (path: string) =>
+  path.startsWith('managed/') ||
+  (path.startsWith('native/assets/') &&
+    (nativeAliases.has(path.slice('native/'.length)) ||
+      /\.(?:woff2?|ttf)$/.test(path)));
+
 /** Snapshot bytes from the installed, sealed Worker release before it can
  * publish a page. All later consumers read the retained, checked bytes. */
 export async function primeWorkerEmployeeWebRelease(signal: AbortSignal) {
@@ -319,8 +325,10 @@ export async function primeWorkerEmployeeWebRelease(signal: AbortSignal) {
     seal.manifestSha256,
   );
   const files = sealedFilesFor(frozenRoot, seal.manifestSha256);
-  for (const file of verified(manifest.files, (row) => row.path).values())
-    await verifyReleaseBytes(frozenRoot, file, signal, files);
+  for (const file of verified(manifest.files, (row) => row.path).values()) {
+    if (isStatic(file.path) || file.path.startsWith('plugins/'))
+      await verifyReleaseBytes(frozenRoot, file, signal, files);
+  }
 }
 
 const guestFiles = [
@@ -368,12 +376,7 @@ export async function readReleasedGuestProfile(
   for (const [path, destination] of guestFiles) {
     const proof = inventory.get(path);
     if (!proof) throw new DEntryNativeUnavailable();
-    const bytes = await verifyReleaseBytes(
-      frozenRoot,
-      proof,
-      signal,
-      sealedFilesFor(frozenRoot, seal.manifestSha256),
-    );
+    const bytes = await verifyReleaseBytes(frozenRoot, proof, signal);
     const contents = new TextDecoder('utf-8', {
       fatal: true,
       ignoreBOM: true,
@@ -496,11 +499,6 @@ export async function holdReleasedProfile(
     // The wire consumer must not be able to mutate the release snapshot.
     return { ...result, data: Buffer.from(result.data) };
   }
-  const isStatic = (path: string) =>
-    path.startsWith('managed/') ||
-    (path.startsWith('native/assets/') &&
-      (nativeAliases.has(path.slice('native/'.length)) ||
-        /\.(?:woff2?|ttf)$/.test(path)));
   const checked = new Map(
     [
       ...graph.entries.map((entry) => ({ ...entry, entries: [entry.id] })),
@@ -629,13 +627,24 @@ export async function holdReleasedProfile(
   }
   const key = JSON.stringify([frozenRoot, manifestDigest, graph]);
   const owner = source.verificationOwner;
-  const held = owner && guestAttestations.get(owner);
-  if (held && held.key === key) {
-    await held.verified;
-  } else {
+  for (;;) {
+    active.throwIfAborted();
+    const held = owner && guestAttestations.get(owner);
+    if (held?.key === key) {
+      try {
+        await held.verified;
+        break;
+      } catch (error) {
+        active.throwIfAborted();
+        if (!held.active.aborted) throw error;
+        // The originating request lost authority or disconnected. A different
+        // live page must prove the bytes with its own current scope.
+        continue;
+      }
+    }
     const verified = attestGuest();
     if (owner) {
-      const checking = { key, verified };
+      const checking = { key, active, verified };
       guestAttestations.set(owner, checking);
       void verified.catch(() => {
         if (guestAttestations.get(owner) === checking)
@@ -643,6 +652,7 @@ export async function holdReleasedProfile(
       });
     }
     await verified;
+    break;
   }
   active.throwIfAborted();
   for (const file of files.values()) {
