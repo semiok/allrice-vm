@@ -1,9 +1,10 @@
 import { access } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { argv } from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, URL } from 'node:url';
 
-const require = createRequire(process.argv[1]);
+const require = createRequire(argv[1]);
 const { LlmAdapter } = await import(
   pathToFileURL(require.resolve('@deepseek-ai/dsh-llm')).href
 );
