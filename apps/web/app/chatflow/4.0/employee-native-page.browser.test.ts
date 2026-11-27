@@ -194,6 +194,8 @@ async function exerciseMultiEmployeeNavigation(
     await editor.waitFor();
     await editor.fill('甲的草稿');
     await employeeButton(1).evaluate((button, latest) => {
+      if (!(button instanceof HTMLButtonElement))
+        throw new Error('Expected an employee card button');
       button.click();
       const card = document.querySelector('[aria-label="' + latest + '"]')!;
       card.querySelector('button')!.click();
@@ -223,6 +225,7 @@ async function exerciseMultiEmployeeNavigation(
       await expect
         .poll(() => new URL(page.url()).searchParams.get('employeeInstanceId'))
         .toBe(id);
+      await frame.locator(`#app[data-employee-instance-id="${id}"]`).waitFor();
       await editor.waitFor();
       expect(await editor.inputValue()).toBe(
         id === a ? '甲的草稿' : id === c ? '丙的草稿' : '',
