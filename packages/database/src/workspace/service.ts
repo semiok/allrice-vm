@@ -76,6 +76,7 @@ import {
   type MemoryRow,
 } from './employee-memory-mutation.ts';
 import {
+  preparePendingNativeMemorySource,
   requireLegacyMemorySessionSource,
   requirePendingNativeMemorySource,
 } from '../memory-native-source.ts';
@@ -3030,8 +3031,17 @@ async function assertPendingMemorySource(
   context: RequestContext,
   scope: EmployeeMemoryScope,
   current: MemoryRow,
+  nativeSource: Awaited<ReturnType<typeof preparePendingNativeMemorySource>>,
 ) {
-  if (await requirePendingNativeMemorySource(tx, context, scope, current))
+  if (
+    await requirePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      current,
+      nativeSource,
+    )
+  )
     return;
   if (['message', 'checkpoint'].includes(current.source_type)) {
     await requireLegacyMemorySessionSource(tx, scope, current);
@@ -3113,6 +3123,12 @@ async function correctEmployeeMemoryRecord<
       tx,
       true,
     );
+    const nativeSource = await preparePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      memoryId,
+    );
     await lockEmployeeMemoryOrder(tx, scope);
     await lockPersonalMemorySource(tx, scope, memoryId);
     return memoryOperation(
@@ -3136,7 +3152,13 @@ async function correctEmployeeMemoryRecord<
           current.lifecycle_state !== 'durable' ||
           current.trust_level !== 'user_confirmed'
         ) {
-          await assertPendingMemorySource(tx, context, scope, current);
+          await assertPendingMemorySource(
+            tx,
+            context,
+            scope,
+            current,
+            nativeSource,
+          );
           await assertEmployeeMemoryAdmission(tx, scope);
         }
         const [row] = await tx<MemoryRow[]>`update allrice_memories
@@ -3205,6 +3227,12 @@ async function promoteEmployeeMemoryRecord<
       tx,
       true,
     );
+    const nativeSource = await preparePendingNativeMemorySource(
+      tx,
+      context,
+      scope,
+      memoryId,
+    );
     await lockEmployeeMemoryOrder(tx, scope);
     await lockPersonalMemorySource(tx, scope, memoryId);
     return memoryOperation(
@@ -3229,7 +3257,13 @@ async function promoteEmployeeMemoryRecord<
           current.trust_level === 'user_confirmed'
         )
           return map(current, tx, scope);
-        await assertPendingMemorySource(tx, context, scope, current);
+        await assertPendingMemorySource(
+          tx,
+          context,
+          scope,
+          current,
+          nativeSource,
+        );
         await assertEmployeeMemoryAdmission(tx, scope);
         const [row] = await tx<MemoryRow[]>`update allrice_memories
           set lifecycle_state='durable',revision=revision+1,trust_level='user_confirmed',expires_at=null,

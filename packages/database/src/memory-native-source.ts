@@ -20,6 +20,9 @@ import {
   requireMemoryRuntimeAssembly,
   type MemoryRuntimeOwnerReads,
 } from './memory-runtime-binding.ts';
+import { readLockedNativeMemoryScopeAuthority } from './memory-runtime-current.ts';
+import { readWorkflowStoredMemorySource } from './memory-runtime-workflow.ts';
+import { ordinaryMemoryPredicate } from './workspace/employee-memory-primitives.ts';
 import type { EmployeeMemoryScope } from './workspace/employee-memory.ts';
 
 export const nativeMemoryMetadataKey = 'allriceEmployeeMemoryV4';
@@ -113,6 +116,54 @@ export async function requireStoredNativeMemorySource(
   return true;
 }
 
+type StoredSourceReader = Pick<MemoryRuntimeOwnerReads, 'storedSource'>;
+
+/** Take the current rollout and Session locks before memory-order. The
+ * selected metadata is only a locator; promotion verifies the locked row. */
+export async function preparePendingNativeMemorySource(
+  tx: TransactionSql,
+  context: RequestContext,
+  scope: EmployeeMemoryScope,
+  memoryId: string,
+): Promise<StoredSourceReader | undefined> {
+  const [origin] = await tx<{ metadata: unknown }[]>`
+    select metadata from allrice_memories m where m.id=${memoryId}
+      and ${ordinaryMemoryPredicate(tx, scope)} and m.archived_at is null
+      and (m.lifecycle_state<>'durable' or m.trust_level<>'user_confirmed')
+      and m.metadata ? ${nativeMemoryMetadataKey}`;
+  const stored = nativeMemorySource(origin?.metadata);
+  if (
+    !stored ||
+    !UuidSchema.safeParse(stored.b).success ||
+    !UuidSchema.safeParse(stored.nativeCall.callRef).success
+  )
+    return;
+  const signal = new AbortController().signal;
+  const authority = await readLockedNativeMemoryScopeAuthority(
+    tx,
+    context,
+    {
+      workspaceId: scope.workspaceId,
+      employeeInstanceId: scope.instanceId,
+      threadId: stored.threadId,
+    },
+    signal,
+  );
+  return {
+    async storedSource(selector) {
+      if (selector.threadId !== stored.threadId)
+        throw new DataAccessError('authorization_denied');
+      return readWorkflowStoredMemorySource(
+        tx,
+        context,
+        authority,
+        selector,
+        signal,
+      );
+    },
+  };
+}
+
 /** Called only after the original management transaction's identity -> memory
  * order -> source/row admission. Original execution liveness is irrelevant;
  * storedSource must independently prove CURRENT permission to that real source. */
@@ -121,19 +172,23 @@ export async function requirePendingNativeMemorySource(
   context: RequestContext,
   scope: EmployeeMemoryScope,
   origin: { source_type: string; source_id: string | null; metadata?: unknown },
+  reads?: StoredSourceReader,
 ) {
   const stored = nativeMemorySource(origin.metadata);
   if (!stored) return false;
   const signal = new AbortController().signal;
-  const assembly = requireMemoryRuntimeAssembly();
-  const target = {
-    workspaceId: UuidSchema.parse(scope.workspaceId).toLowerCase(),
-    employeeInstanceId: UuidSchema.parse(scope.instanceId).toLowerCase(),
-    threadId: stored.threadId,
-    access: 'management' as const,
-    module: { kind: 'not-applicable' as const },
-  };
-  const reads = await assembly.bind(tx, context, target, signal);
+  reads ??= await requireMemoryRuntimeAssembly().bind(
+    tx,
+    context,
+    {
+      workspaceId: UuidSchema.parse(scope.workspaceId).toLowerCase(),
+      employeeInstanceId: UuidSchema.parse(scope.instanceId).toLowerCase(),
+      threadId: stored.threadId,
+      access: 'management',
+      module: { kind: 'not-applicable' },
+    },
+    signal,
+  );
   await requireStoredNativeMemorySource(
     reads,
     scope,

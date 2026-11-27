@@ -878,8 +878,8 @@ suite(
         releases.push(() => release.resolve());
         ownerFixture.assembly = {
           current: f.current.bind(f),
-          async bind(...args) {
-            const reads = await f.bind(...args);
+          async bind(tx, context, target, signal) {
+            const reads = await f.bind(tx, context, target, signal);
             return {
               ...reads,
               async adopted(selector) {

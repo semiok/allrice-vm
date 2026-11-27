@@ -6,7 +6,9 @@ import {
   UuidSchema,
   type AdoptedHumanSourceProjection,
   type RequestContext,
+  type StoredHumanSourceSelectorProjection,
 } from '@allrice/contracts';
+import type { Sql, TransactionSql } from 'postgres';
 import { readEmployeeBusinessCurrentPreflight } from './business-runtime/current-preflight.ts';
 import { getDatabase } from './core/client.ts';
 import { DataAccessError } from './data.ts';
@@ -15,7 +17,10 @@ import type {
   MemoryRuntimeAssembly,
   MemoryRuntimeExecution,
 } from './memory-runtime-binding.ts';
-import { readLockedNativeMemoryAuthority } from './memory-runtime-current.ts';
+import {
+  readLockedNativeMemoryAuthority,
+  type readLockedNativeMemoryScopeAuthority,
+} from './memory-runtime-current.ts';
 import { runtimePolicyDigest } from './runtime-policy-digest.ts';
 
 export type NativeMemoryRootObservation = Readonly<
@@ -57,13 +62,16 @@ type Evidence = Awaited<
   ReturnType<typeof readLockedNativeMemoryExecutionEvidence>
 >;
 type Authority = Awaited<ReturnType<typeof readLockedNativeMemoryAuthority>>;
+type SourceAuthority = Awaited<
+  ReturnType<typeof readLockedNativeMemoryScopeAuthority>
+>;
 const deny = (): never => {
   throw new DataAccessError('authorization_denied');
 };
 
 function project(
   evidence: Evidence,
-  authority: Authority,
+  authority: SourceAuthority,
 ): MemoryRuntimeExecution {
   const { original, call, nativeRequestRef } = evidence;
   const nativeCall = call
@@ -81,7 +89,7 @@ function project(
     : null;
   return {
     binding: {
-      scope: authority.current.scope,
+      scope: authority.scope,
       threadId: original.threadId,
       executionGeneration: '4.0',
       b: original.b,
@@ -118,7 +126,7 @@ function observedHuman(call: NonNullable<Evidence['call']>) {
 
 function source(
   evidence: Evidence,
-  authority: Authority,
+  authority: SourceAuthority,
 ): AdoptedHumanSourceProjection {
   const { binding } = project(evidence, authority);
   if (!binding.nativeCall || !evidence.call) return deny();
@@ -146,6 +154,28 @@ function source(
   return human.kind === 'adopted-steering'
     ? { ...value, kind: human.kind, adoptedByExecution: true }
     : { ...value, kind: human.kind };
+}
+
+export async function readWorkflowStoredMemorySource(
+  tx: Sql | TransactionSql,
+  context: RequestContext,
+  authority: SourceAuthority,
+  selector: StoredHumanSourceSelectorProjection,
+  signal: AbortSignal,
+) {
+  if (!isDeepStrictEqual(selector.scope, authority.scope)) return deny();
+  const evidence = await readLockedNativeMemoryExecutionEvidence(
+    tx,
+    context,
+    { ...authority.identity, threadId: selector.threadId },
+    {
+      mode: 'stored-call',
+      runId: selector.b,
+      nativeRequestRef: selector.nativeCall.callRef,
+    },
+    signal,
+  );
+  return source(evidence, authority);
 }
 
 function checkRoot(evidence: Evidence, root: NativeMemoryRootObservation) {
@@ -207,12 +237,11 @@ export function workflowMemoryRuntime(
       }
       const read = (
         selector: Parameters<typeof readLockedNativeMemoryExecutionEvidence>[3],
-        threadId = authority().identity.threadId,
       ) =>
         readLockedNativeMemoryExecutionEvidence(
           tx,
           context,
-          { ...authority().identity, threadId },
+          authority().identity,
           selector,
           signal,
         );
@@ -282,18 +311,12 @@ export function workflowMemoryRuntime(
           );
         },
         async storedSource(selector) {
-          if (!isDeepStrictEqual(selector.scope, authority().current.scope))
-            return deny();
-          return source(
-            await read(
-              {
-                mode: 'stored-call',
-                runId: selector.b,
-                nativeRequestRef: selector.nativeCall.callRef,
-              },
-              selector.threadId,
-            ),
+          return readWorkflowStoredMemorySource(
+            tx,
+            context,
             authority(),
+            selector,
+            signal,
           );
         },
       };

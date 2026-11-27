@@ -1,6 +1,7 @@
 import {
   CurrentEmployeeBusinessProjectionSchema,
   DEntryIdentitySchema,
+  EmployeeBusinessScopeProjectionSchema,
   EmployeeBusinessTargetProjectionSchema,
   hasDEntryPersonRelease,
   type ApplicationBuiltinModulesProjection,
@@ -12,27 +13,23 @@ import { DataAccessError } from './data.ts';
 import { readDEntryReleasePolicy } from './d-entry-release-policy.ts';
 import { resolveEmployeeSessionInstance } from './employees/employee-instances.ts';
 
-/** Private to the database owner. The caller owns commit and cancellation.
- * Application build verification takes place before opening the transaction.
- * Historical source readers do not use this live execution gate. */
-export async function readLockedNativeMemoryAuthority(
+/** Same owner, assigned employee, active thread and rollout, held until commit.
+ * This verifies no VM liveness or original execution facts. */
+export async function readLockedNativeMemoryScopeAuthority(
   tx: Sql | TransactionSql,
   context: RequestContext,
-  input: EmployeeBusinessTargetProjection,
-  applicationModules: ApplicationBuiltinModulesProjection,
+  target: Pick<
+    EmployeeBusinessTargetProjection,
+    'workspaceId' | 'employeeInstanceId' | 'threadId'
+  >,
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const target = EmployeeBusinessTargetProjectionSchema.parse(input);
   if (
     context.actor.type !== 'user' ||
     (context.workspaceId !== null &&
       context.workspaceId.toLowerCase() !== target.workspaceId) ||
-    target.access !== 'execute' ||
-    target.threadId === null ||
-    target.module.kind !== 'builtin' ||
-    target.module.moduleId !== 'employee-memory' ||
-    applicationModules.builtinModules['employee-memory'] !== true
+    target.threadId === null
   )
     throw new DataAccessError('authorization_denied');
 
@@ -89,24 +86,50 @@ export async function readLockedNativeMemoryAuthority(
     employeeVersionId: employee.source.employeeVersionId,
     threadId: target.threadId,
   });
+  const scope = EmployeeBusinessScopeProjectionSchema.parse({
+    organizationId: employee.organizationId,
+    workspaceId: employee.workspaceId,
+    ownerId: employee.ownerId,
+    employeeInstanceId: employee.id,
+    employeeId: thread.employee_id,
+  });
+  return { identity, scope, releaseRevision: currentPolicy.revision };
+}
+
+/** The verified application build is read before opening the transaction. */
+export async function readLockedNativeMemoryAuthority(
+  tx: Sql | TransactionSql,
+  context: RequestContext,
+  input: EmployeeBusinessTargetProjection,
+  applicationModules: ApplicationBuiltinModulesProjection,
+  signal: AbortSignal,
+) {
+  const target = EmployeeBusinessTargetProjectionSchema.parse(input);
+  if (
+    target.access !== 'execute' ||
+    target.module.kind !== 'builtin' ||
+    target.module.moduleId !== 'employee-memory' ||
+    applicationModules.builtinModules['employee-memory'] !== true
+  )
+    throw new DataAccessError('authorization_denied');
+  const authority = await readLockedNativeMemoryScopeAuthority(
+    tx,
+    context,
+    target,
+    signal,
+  );
   const current = CurrentEmployeeBusinessProjectionSchema.parse({
-    scope: {
-      organizationId: employee.organizationId,
-      workspaceId: employee.workspaceId,
-      ownerId: employee.ownerId,
-      employeeInstanceId: employee.id,
-      employeeId: thread.employee_id,
-    },
+    scope: authority.scope,
     threadId: target.threadId,
     access: 'execute',
     executionGeneration: '4.0',
     identityRevisionRef: JSON.stringify({
-      instanceRevision: employee.revision,
-      employeeVersionId: employee.source.employeeVersionId,
+      instanceRevision: authority.identity.employeeRevision,
+      employeeVersionId: authority.identity.employeeVersionId,
     }),
     module: { ...target.module, applicationModules },
   });
-  return { identity, current, releaseRevision: currentPolicy.revision };
+  return { ...authority, current };
 }
 
 export async function readLockedNativeMemoryCurrent(

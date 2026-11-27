@@ -21,6 +21,8 @@ import { createRunAuthorityFixture } from '../../../../packages/database/src/run
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import * as buildIdentity from '../../../../packages/database/src/service-build-identity.ts';
 import { insertEmployeeMemoryPair } from '../../../../packages/database/src/workspace/employee-memory-mutation.ts';
+import { memoryPairDigest } from '../../../../packages/database/src/workspace/employee-memory-primitives.ts';
+import { promoteManagedEmployeeMemory } from '../../../../packages/database/src/workspace/service.ts';
 import {
   listen,
   closeServer,
@@ -650,9 +652,33 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       await expect(
         host.remember(context, randomUUID(), candidate, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
-      const [count] =
-        await db`select count(*)::int as value from allrice_memories where summary=${candidate.summary}`;
-      expect(count?.value).toBe(1);
+      const candidates = await db<{ id: string; revision: number }[]>`
+        select id,revision from allrice_memories where summary=${candidate.summary}`;
+      expect(candidates).toHaveLength(1);
+      const [pending] = candidates;
+      const mutation = {
+        instanceId: f.assignment,
+        expectedRevision: pending!.revision,
+        pairDigest: memoryPairDigest(candidate),
+        idempotencyKey: randomUUID(),
+      };
+      const confirm = () =>
+        promoteManagedEmployeeMemory(
+          context,
+          f.workspace,
+          pending!.id,
+          mutation,
+        );
+      await db`update person_virtual_machines set phase='stopped' where vm_id=${owner.binding.vmId}`;
+      await expect(
+        host.remember(context, ref, candidate, signal),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await db`update allrice_chat_sessions set archived_at=now() where id=${f.session}`;
+      await expect(confirm()).rejects.toMatchObject({
+        code: 'authorization_denied',
+      });
+      await db`update allrice_chat_sessions set archived_at=null where id=${f.session}`;
+      await expect(confirm()).resolves.toMatchObject({ state: 'active' });
       await db`update allrice_sessions set revoked_at=now() where id=${login.id}`;
       await expect(
         host.remember(context, ref, candidate, signal),
