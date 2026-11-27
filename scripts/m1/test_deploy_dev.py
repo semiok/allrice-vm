@@ -160,7 +160,9 @@ class DeployDevMigrations(unittest.TestCase):
         # The source helper imports service_target under this isolated environment.
         env = dict(HOME=self.home, PATH=path, TEST_PATH=path, APPLIED=self.applied,
                    PYTHONDONTWRITEBYTECODE='1', **env)
-        initial = 'source "$1"; PATH=$TEST_PATH; port_closed() { return 0; }; '
+        initial = ('source "$1"; PATH=$TEST_PATH; M1_LAUNCHCTL="$TEST_STUBS/launchctl"; '
+                   'port_closed() { return 0; }; ')
+        env['TEST_STUBS'] = self.stubs
         return subprocess.run(['/bin/bash', '-c', initial + script,
                                'test', DEPLOY_DEV], env=env, capture_output=True, text=True, timeout=60)
 
@@ -193,7 +195,7 @@ class DeployDevMigrations(unittest.TestCase):
         plist['KeepAlive'] = {'SuccessfulExit': False}
         with open(self.live_plist('worker'), 'wb') as f:
             plistlib.dump(plist, f)
-        for mode in ('missing', 'stale', 'deferred', 'success'):
+        for mode in ('missing', 'stale', 'expired', 'deferred', 'success'):
             with self.subTest(mode=mode):
                 p = self.run_dd(r"""
                   M1_LAUNCHCTL=test_launchctl
@@ -206,11 +208,14 @@ class DeployDevMigrations(unittest.TestCase):
                   }
                   vm_upgrade_candidates() { echo 0; }
                   worker_boot() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8'; }
+                  DRAIN_SOCKET=/test/owner
+                  DRAIN_TOKEN=fixture
                   read_drain_receipt() {
                     [ "$MODE" != missing ] || return 1
-                    local valid='661e00de-c0fc-45e6-a1db-bfd158aedad8'
+                    local valid='661e00de-c0fc-45e6-a1db-bfd158aedad8' year=2099
                     [ "$MODE" != stale ] || valid='144d2c90-65c5-44a7-b3e2-54589ab0eb79'
-                    printf '{"bootId":"%s","stopped":2,"expiresAt":"2099-01-01T00:00:00Z"}\n' "$valid"
+                    [ "$MODE" != expired ] || year=2020
+                    printf '{"bootId":"%s","stopped":2,"expiresAt":"%s-01-01T00:00:00Z"}\n' "$valid" "$year"
                   }
                   wait_for_drained_worker_exit() { [ "$MODE" != deferred ]; }
                   port_closed() { return 0; }
@@ -712,7 +717,7 @@ class DeployDevMigrations(unittest.TestCase):
                     p = self.run_dd('take_lock() { :; }; stop_job() { echo STOPPED:$2; }; '
                                     'start_both_on() { echo STARTED; }; ' + entry, FILES + ARCHIVED, CONTRACT=row, **extra)
                     self.assertNotEqual(p.returncode, 0)
-                    self.assertIn('STOPPED:3311\nSTOPPED:3312', p.stdout)
+                    self.assertIn('STOPPED:3312\nSTOPPED:3311', p.stdout)
                     self.assertNotIn('STARTED', p.stdout)
                     self.assert_parked()
                     with open(log) as f:
@@ -739,7 +744,7 @@ class DeployDevMigrations(unittest.TestCase):
             self.assert_parked()
         p = self.run_dd(script, FILES[:-1] + ARCHIVED, CONTRACT='row:1')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('STOPPED:3311\nSTOPPED:3312', p.stdout)
+        self.assertIn('STOPPED:3312\nSTOPPED:3311', p.stdout)
         self.assertIn('READY:' + 'a' * 40, p.stdout)
         for role in ('web', 'worker'):
             self.assertEqual(self.read_plist(self.live_plist(role)), self.plist(role, old))
@@ -1368,7 +1373,7 @@ class DeployDevMigrations(unittest.TestCase):
         directory = os.path.join(self.tmp, 'config-tools')
         with open(os.path.join(HERE, 'lib.sh')) as f:
             write(os.path.join(directory, 'lib.sh'), f.read() + '\n' +
-                  ('' if name == 'schedule-recover' else 'job_state() { echo gone; };\n') +
+                  ('' if name == 'schedule-recover' else 'job_state() { echo gone; };\nport_closed() { return 0; };\n') +
                   'stop_job() { export PROCESS_TREE_STOPPED=1; };\n'
                   'start_job() { echo UNEXPECTED_START >&2; return 90; };\n'
                   'M1_LAUNCHCTL="$TEST_STUBS/launchctl"\n')

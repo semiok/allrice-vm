@@ -107,15 +107,17 @@ vm_upgrade_candidates() {
   printf '%s\n' "$count"
 }
 
-read_drain_receipt() {
-  local boot=$1
+load_drain_token() {
   [ -n "$DRAIN_SOCKET" ] || return 1
   if [ -z "$DRAIN_TOKEN" ]; then
-    # Read once, without export or command-line arguments. Recovery may have
-    # to authenticate again if no Worker actually exited.
+    # Read once in the release shell. Recovery can authenticate again if
+    # its current Worker also needs a drain.
     { IFS= read -r -u 3 DRAIN_TOKEN || [ -n "$DRAIN_TOKEN" ]; } 2>/dev/null || return 1
   fi
-  "$M1_PY" "$BIN/person-vm-drain" --socket "$DRAIN_SOCKET" --boot-id "$boot" <<<"$DRAIN_TOKEN"
+}
+
+read_drain_receipt() {
+  "$M1_PY" "$BIN/person-vm-drain" --socket "$DRAIN_SOCKET" --boot-id "$1" <<<"$DRAIN_TOKEN"
 }
 
 validate_drain_receipt() {
@@ -149,15 +151,6 @@ stop_release_worker() {
   plist=$(dev_plist worker) || return 1
   rel=$(release_of "$plist") || return 1
   port=$(worker_port) || return 1
-  process=$(job_state "$WORKER_LABEL" "$plist" "$rel") || return 1
-  if [ "$process" = gone ]; then
-    count=$(vm_upgrade_candidates) || return 1
-    [ "$count" = 0 ] && port_closed "$port" || {
-      say "Worker absent and Person VM stop is unconfirmed. Release blocked."
-      return 1
-    }
-    return
-  fi
   local host
   host=$("$M1_PY" - "$rel" <<'PYTHON'
 from pathlib import Path
@@ -184,6 +177,15 @@ PYTHON
     return
   fi
 
+  process=$(job_state "$WORKER_LABEL" "$plist" "$rel") || return 1
+  if [ "$process" = gone ]; then
+    count=$(vm_upgrade_candidates) || return 1
+    [ "$count" = 0 ] && port_closed "$port" || {
+      say "Worker absent and Person VM stop is unconfirmed. Release blocked."
+      return 1
+    }
+    return
+  fi
   [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
   # Only an agent staged with this policy stays loaded with no process after a
   # successful SIGTERM. Unconditional KeepAlive starts a replacement Worker.
@@ -194,7 +196,7 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     return 1
   fi
   boot=$(worker_boot) || return 1
-  if [ -z "$boot" ] || ! receipt=$(read_drain_receipt "$boot"); then
+  if [ -z "$boot" ] || ! load_drain_token || ! receipt=$(read_drain_receipt "$boot"); then
     say "Person VM drain missing or refused. Verify the current Worker socket and active tasks before retrying."
     return 1
   fi

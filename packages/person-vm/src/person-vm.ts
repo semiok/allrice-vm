@@ -1827,7 +1827,7 @@ export class PersonVmService
         active.throwIfAborted();
       };
       await assertCurrent(signal);
-      return this.commitStop(
+      const stopped = await this.commitStop(
         requestId,
         lease,
         row,
@@ -1841,6 +1841,8 @@ export class PersonVmService
           : undefined,
         'stop.upgrade',
       );
+      if (state === 'running') this.options.observeOwnedStop?.(binding);
+      return stopped;
     };
     if (previousWorker) {
       const receipt = this.receipt(binding, row.egressReceipt);
