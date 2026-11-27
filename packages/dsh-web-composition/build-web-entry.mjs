@@ -106,7 +106,11 @@ async function publicNativeFiles() {
 
 /** Build code artifacts only. A code inventory never supplies production
  * principal, access baseline, graph events or authority to execute a document. */
-export async function buildEmployeeWebArtifact(outputDirectory, linuxCapture) {
+export async function buildEmployeeWebArtifact(
+  outputDirectory,
+  linuxCapture,
+  terminalEnabled = true,
+) {
   outputDirectory = resolve(outputDirectory);
   await mkdir(dirname(outputDirectory), { recursive: true });
   // A failed build must not leave an old success beside replaced new bytes.
@@ -201,6 +205,7 @@ export async function buildEmployeeWebArtifact(outputDirectory, linuxCapture) {
           '--profile-artifacts',
           outputDirectory,
           dshHome,
+          String(terminalEnabled),
         ],
         {
           cwd: join(state, 'work'),
@@ -255,6 +260,7 @@ export async function buildEmployeeWebArtifact(outputDirectory, linuxCapture) {
     ),
     // Full-profile bundle graph and the managed entry are separate proof items.
     profile,
+    terminalEnabled,
     ...(linuxCapture ? { profileRuntime: linuxCapture.identity } : {}),
     managedEntry: 'managed/employee-web-entry.js',
     closure: {
@@ -284,6 +290,7 @@ export async function prepareEmployeeWebServiceArtifact(
   directory,
   head,
   linuxCapture,
+  terminalEnabled = true,
 ) {
   let current;
   try {
@@ -295,7 +302,10 @@ export async function prepareEmployeeWebServiceArtifact(
     const existing = JSON.parse(current);
     if (existing.source?.head !== head || existing.source.dirty !== false)
       throw Error('Employee Web artifact belongs to another source');
-    if (!isDeepStrictEqual(existing.profileRuntime, linuxCapture?.identity))
+    if (
+      existing.terminalEnabled !== terminalEnabled ||
+      !isDeepStrictEqual(existing.profileRuntime, linuxCapture?.identity)
+    )
       throw Error('Employee Web artifact belongs to another runtime');
     await verifyEmployeeWebArtifact(directory, existing);
     return existing;
@@ -303,7 +313,11 @@ export async function prepareEmployeeWebServiceArtifact(
   const stage = await mkdtemp(join(dirname(directory), '.employee-web-'));
   try {
     const built = join(stage, 'contents');
-    const manifest = await buildEmployeeWebArtifact(built, linuxCapture);
+    const manifest = await buildEmployeeWebArtifact(
+      built,
+      linuxCapture,
+      terminalEnabled,
+    );
     if (manifest.source.head !== head || manifest.source.dirty)
       throw Error('Employee Web artifact requires the fixed service source');
     await verifyEmployeeWebArtifact(built, manifest);
@@ -465,6 +479,7 @@ if (
       installAnchor: require.resolve('@deepseek-ai/dsh/package.json'),
       resolutionAnchor: import.meta.url,
       host: '127.0.0.1',
+      terminalEnabled: process.argv[5] !== 'false',
     });
   } else {
     const directory = process.argv[2] ?? join(packageRoot, 'dist/web-entry');

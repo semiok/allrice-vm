@@ -217,7 +217,14 @@ export function installProductionDEntrySource(input: {
         }
       });
     },
-    resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
+    resolveAdmissionOwner({
+      context,
+      identity,
+      owner,
+      operationId,
+      signal,
+      access,
+    }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
         if (
@@ -227,7 +234,7 @@ export function installProductionDEntrySource(input: {
           identity.organizationId !== binding.organizationId ||
           context.organizationId !== binding.organizationId ||
           context.workspaceId !== identity.workspaceId ||
-          !identity.threadId
+          (!identity.threadId && access !== 'page')
         )
           denied();
         const scope = structuredClone(context);

@@ -11,7 +11,9 @@ import { rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
+import * as Database from '@allrice/database';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as SUBAGENTS_REMOTE } from '@deepseek-ai/dsh-subagent/remote';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -67,6 +69,49 @@ function setup(
   ) => void,
 ) {
   return setupNativeWebFixture(cli, roots, cleanup, prepareScope);
+}
+
+async function openPromptScope(
+  f: Awaited<ReturnType<typeof setup>>,
+  sessionId: string,
+  signal: AbortSignal,
+) {
+  const issue: DEntryPrincipalIssue = {
+    scopeId: randomUUID(),
+    access: 'execute',
+    identity: {
+      ...f.principalProfile,
+      organizationId: f.owner.binding.organizationId,
+      personId: f.owner.binding.personId,
+      threadId: randomUUID(),
+    },
+    root: {
+      nativeSessionId: sessionId,
+      rootOriginDigest: 'manual-test-native-create-only',
+      rootBindingRef: 'manual-test-no-sql-permit',
+    },
+  };
+  const activity = f.owner.acquirePrincipal(issue, signal, f.context);
+  return { activity, issue, scope: await activity.run(signal) };
+}
+
+function observeSinglePrompt(signal: AbortSignal) {
+  const observed = deferred<NativePromptObservation>();
+  const beforePrompt: NonNullable<
+    Parameters<typeof setupNativeWebFixture>[6]
+  > = async (request) => {
+    if (request.endpoint !== 'session/prompt')
+      throw Error('Expected one scoped prompt');
+    const observation = request.observe(signal);
+    await observation.ready;
+    observed.resolve(observation);
+    return {
+      undispatched: () => observation.close(),
+      accepted() {},
+      unknown() {},
+    };
+  };
+  return { beforePrompt, observed: observed.promise };
 }
 
 it.skipIf(!cli)(
@@ -199,23 +244,11 @@ it.skipIf(!cli)(
     const created = await f.owner.createRootFor(f.context, {}, signal);
     if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
-    const issue: DEntryPrincipalIssue = {
-      scopeId: randomUUID(),
-      access: 'execute',
-      identity: {
-        ...f.principalProfile,
-        organizationId: f.owner.binding.organizationId,
-        personId: f.owner.binding.personId,
-        threadId: randomUUID(),
-      },
-      root: {
-        nativeSessionId: sessionId,
-        rootOriginDigest: 'manual-test-native-create-only',
-        rootBindingRef: 'manual-test-no-sql-permit',
-      },
-    };
-    const activity = f.owner.acquirePrincipal(issue, signal, f.context);
-    const scope = await activity.run(signal);
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
     const prompt = (requestId: string, text: string) =>
       scope.invoke(
         {
@@ -350,11 +383,12 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'proves a continuable child after the parent ends and both native wakeups on the idle parent',
+  'proves a continuable child, idle parent wakeups, and repeated-ID child queue operations',
   { tags: [tag], timeout: 30000 },
   async () => {
     const rootReady = deferred<{
       id: string;
+      scopeId: string;
       owner: Awaited<ReturnType<typeof setup>>['owner'];
       context: Awaited<ReturnType<typeof setup>>['context'];
     }>();
@@ -364,8 +398,18 @@ it.skipIf(!cli)(
     for (const ready of [rootReady, rootEnded, relayEnded, finished])
       void ready.promise.catch(() => {});
     const signal = AbortSignal.timeout(25000);
+    const { beforePrompt, observed } = observeSinglePrompt(signal);
+    const childObservers: NativePromptObservation[] = [];
+    const queueActions = vi.fn();
+    const repeatedQueued = deferred();
+    const releaseChildTurn = deferred();
     const capability = 'a'.repeat(43);
     const requestId = randomUUID();
+    const childRequestId = randomUUID();
+    const childScopeId = randomUUID();
+    let childSessionId: string | undefined;
+    const childWitness = deferred<string>();
+    void childWitness.promise.catch(() => {});
     const attempts = new Map<string, number>();
     const refs = new Map<
       string,
@@ -374,7 +418,7 @@ it.skipIf(!cli)(
     const turns: number[] = [];
     const server = createServer((request, response) => {
       void (async () => {
-        const { id: root, owner, context } = await rootReady.promise;
+        const { id: root, scopeId, owner, context } = await rootReady.promise;
         const bytes: Buffer[] = [];
         for await (const chunk of request) bytes.push(Buffer.from(chunk));
         expect(request.headers.authorization).toBe('Bearer ' + capability);
@@ -394,6 +438,9 @@ it.skipIf(!cli)(
           const ordinal = title ? 0 : (attempts.get(session) ?? 0) + 1;
           if (!title) attempts.set(session, ordinal);
           if (!isRoot) await (ordinal === 1 ? rootEnded : relayEnded).promise;
+          if (!isRoot && !title) childSessionId = session;
+          const browserFollowUp = !isRoot && !title && ordinal === 3;
+          if (browserFollowUp) await repeatedQueued.promise;
           const proof = await owner.readNativeAttemptFor(
             context,
             address,
@@ -403,9 +450,27 @@ it.skipIf(!cli)(
           expect(proof).toMatchObject({
             recipient: payload.recipient,
             rootSessionId: root,
-            promptIds: [requestId],
+            promptIds: [browserFollowUp ? childRequestId : requestId],
+            prompts: [
+              {
+                sessionId: browserFollowUp ? session : root,
+                ...(browserFollowUp && { parentSessionId: root }),
+                scopeId: browserFollowUp ? childScopeId : scopeId,
+                requestId: browserFollowUp ? childRequestId : requestId,
+                messageId: expect.any(String),
+                turn: browserFollowUp ? proof?.turn : 1,
+              },
+            ],
             delegated: !isRoot || ordinal >= 3,
           });
+          const witness = proof!.prompts[0]!;
+          await (
+            browserFollowUp ? childObservers[0]! : await observed
+          ).assertClaimed(signal, witness);
+          if (browserFollowUp) {
+            expect(proof!.inheritedPromptIndexes).toEqual([]);
+            childWitness.resolve(witness.messageId);
+          }
           if (isRoot && !title) {
             expect(
               await owner.readNativeRootWakeFor(context, root, signal),
@@ -414,7 +479,7 @@ it.skipIf(!cli)(
                 ? {
                     kind: 'delegated',
                     turn: proof!.turn!,
-                    promptIds: [requestId],
+                    prompts: proof!.prompts,
                   }
                 : { kind: 'clear' },
             );
@@ -449,6 +514,7 @@ it.skipIf(!cli)(
         if (!entry)
           throw Error('The native adapter did not redeem its reference');
         const { session, ordinal, title: isTitle } = entry;
+        if (session !== root && ordinal === 3) await releaseChildTurn.promise;
         const tool = isTitle
           ? null
           : session === root && ordinal === 1
@@ -487,16 +553,16 @@ it.skipIf(!cli)(
         rootEnded.reject(error);
         relayEnded.reject(error);
         finished.reject(error);
+        childWitness.reject(error);
       });
     });
     const origin = await listen(server);
-    cleanup.push(() => closeServer(server));
-    const create = NativeTransport.nativeWebTransport;
-    let transport: ReturnType<typeof create> | undefined;
-    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
-      (...args) => (transport = create(...args)),
-    );
-    const { owner, context } = await setupNativeWebFixture(
+    cleanup.push(async () => {
+      repeatedQueued.resolve();
+      releaseChildTurn.resolve();
+      await closeServer(server);
+    });
+    const f = await setupNativeWebFixture(
       cli,
       roots,
       cleanup,
@@ -513,40 +579,64 @@ it.skipIf(!cli)(
           name: 'fixture-codex',
         },
       },
+      async (request, active) => {
+        if (request.endpoint === 'session/updateQueue') {
+          queueActions(request.child, request.itemId, request.action);
+          return;
+        }
+        if (request.endpoint !== 'subagents/prompt')
+          return beforePrompt(request, active);
+        const observation = request.observe(signal);
+        childObservers.push(observation);
+        await observation.ready;
+        return {
+          undispatched: () => observation.close(),
+          accepted() {},
+          unknown() {},
+        };
+      },
     );
+    const { owner, context } = f;
     const created = await owner.createRootFor(context, {}, signal);
-    if (!created.ok || !transport)
-      throw Error('Native owner fixture did not start');
+    if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
-    rootReady.resolve({ id: sessionId, owner, context });
-    const response = await transport.fetch('api/session/prompt', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'client-request',
-        rpcId: randomUUID(),
-        method: 'session/prompt',
-        payload: {
-          args: {
-            request: {
-              sessionId,
-              requestId,
-              content: [
-                {
-                  type: 'text',
-                  text: 'Have a background agent check the catalog and tell me when it reports back.',
-                },
-              ],
-              mode: 'queue',
-            },
-          },
-        },
-      }),
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
+    rootReady.resolve({
+      id: sessionId,
+      scopeId: issue.scopeId,
+      owner,
+      context,
     });
     expect(
-      serverResponseSchema.parse(await response.json()).result,
-    ).toMatchObject({
-      ok: true,
+      await scope.invoke(
+        {
+          endpoint: 'session/prompt',
+          scopeId: issue.scopeId,
+          args: NATIVE_REMOTE.methods['session/prompt']
+            .input({ strict: true })
+            .create()
+            .parse({
+              request: {
+                sessionId,
+                requestId,
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Have a background agent check the catalog and tell me when it reports back.',
+                  },
+                ],
+                mode: 'queue',
+              },
+            }),
+        },
+        signal,
+      ),
+    ).toEqual({
+      endpoint: 'session/prompt',
       value: { accepted: true },
     });
     await finished.promise;
@@ -557,6 +647,107 @@ it.skipIf(!cli)(
     });
     expect(turns).toEqual([1, 1, 2, 3]);
     expect([...attempts.values()].sort()).toEqual([2, 4]);
+    await activity.close();
+
+    if (!childSessionId) throw Error('Native continuable child unavailable');
+    const findRoot = vi
+      .spyOn(Database, 'getDEntryPageNativeRoot')
+      .mockImplementation(
+        async (_context, _identity, _vmId, nativeSessionId) =>
+          nativeSessionId === sessionId
+            ? {
+                identity: issue.identity,
+                rootNativeSessionId: sessionId,
+                rootBindingRef: issue.root.rootBindingRef,
+                rootOriginDigest: issue.root.rootOriginDigest,
+                vmId: owner.binding.vmId,
+              }
+            : undefined,
+      );
+    const pageActivity = owner.acquirePrincipal(
+      {
+        scopeId: childScopeId,
+        identity: { ...issue.identity, threadId: null },
+        access: 'page',
+      },
+      signal,
+      context,
+    );
+    const page = await pageActivity.run(signal);
+    const call = (parentSessionId: string) =>
+      page.invokePage(
+        {
+          kind: 'page',
+          endpoint: 'subagents/prompt',
+          scopeId: childScopeId,
+          args: {
+            request: {
+              requestId: childRequestId,
+              childSessionId: childSessionId!,
+              parentSessionId,
+              mode: 'continuable',
+              delivery: 'queue',
+              content: [
+                { type: 'text', text: 'Follow up on the completed catalog.' },
+              ],
+            },
+          },
+        },
+        signal,
+      );
+    await expect(call('no-current-parent')).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(findRoot).not.toHaveBeenCalled();
+    const first = await call(sessionId);
+    const pending = await call(sessionId);
+    const receipt =
+      SUBAGENTS_REMOTE.methods['subagents/prompt'].result.create();
+    const pendingId = receipt.parse(pending.value).messageId;
+    expect(pendingId).not.toBe(receipt.parse(first.value).messageId);
+    expect(childObservers).toHaveLength(2);
+    repeatedQueued.resolve();
+    expect(first.value).toEqual({
+      messageId: await waitForPromptFact(childWitness.promise, signal),
+    });
+    expect(findRoot).toHaveBeenCalledWith(
+      context,
+      page.opened.principal.identity,
+      owner.binding.vmId,
+      sessionId,
+    );
+    expect(
+      await page.invokePage(
+        {
+          kind: 'page',
+          endpoint: 'session/updateQueue',
+          scopeId: childScopeId,
+          args: {
+            request: {
+              sessionId: childSessionId,
+              itemId: pendingId,
+              action: { kind: 'remove' },
+            },
+          },
+        },
+        signal,
+      ),
+    ).toMatchObject({ value: { accepted: true } });
+    expect(queueActions).toHaveBeenCalledWith(
+      { sessionId: childSessionId, parentSessionId: sessionId },
+      pendingId,
+      'remove',
+    );
+    expect(childObservers).toHaveLength(2);
+    await expect(
+      waitForPromptFact(childObservers[1]!.settled, signal),
+    ).resolves.toBe('discarded');
+    releaseChildTurn.resolve();
+    await expect(
+      waitForPromptFact(childObservers[0]!.settled, signal),
+    ).resolves.toBe('ended');
+    await pageActivity.close();
   },
 );
 
@@ -877,14 +1068,8 @@ it.skipIf(!cli)(
     });
     const browserlessOrigin = await listen(server);
     cleanup.push(() => closeServer(server));
-    const create = NativeTransport.nativeWebTransport;
-    let transport: ReturnType<typeof create> | undefined;
-    vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
-      (...args) => {
-        transport = create(...args);
-        return transport;
-      },
-    );
+    const signal = AbortSignal.timeout(25000);
+    const { beforePrompt, observed } = observeSinglePrompt(signal);
     const f = await setupNativeWebFixture(
       cli,
       roots,
@@ -903,12 +1088,16 @@ it.skipIf(!cli)(
           inputModalities: ['text', 'image'],
         },
       },
+      beforePrompt,
     );
-    const signal = new AbortController().signal;
     const created = await f.owner.createRootFor(f.context, {}, signal);
-    if (!created.ok || !transport)
-      throw Error('Native owner fixture did not start');
+    if (!created.ok) throw Error('Native root unavailable');
     const sessionId = created.value.sessionId;
+    const { activity, issue, scope } = await openPromptScope(
+      f,
+      sessionId,
+      signal,
+    );
     let journalRead:
       Parameters<typeof f.owner.readPersistedRunTerminalFor>[0] | undefined;
     const guard = async (active: AbortSignal) => active.throwIfAborted();
@@ -924,6 +1113,16 @@ it.skipIf(!cli)(
           'DSH model attempt did not exist on the authenticated owner',
         );
       expect(attempt.recipient).toBe(recipients.get(kind));
+      expect(attempt.prompts).toEqual([
+        {
+          sessionId,
+          scopeId: issue.scopeId,
+          requestId: nativePrompt,
+          messageId: expect.any(String),
+          turn: 1,
+        },
+      ]);
+      await (await observed).assertClaimed(signal, attempt.prompts[0]!);
       if (kind === 'assistant') {
         expect(attempt.promptIds).toContain(nativePrompt);
         expect(attempt.turn).toBeGreaterThan(0);
@@ -992,19 +1191,13 @@ it.skipIf(!cli)(
           mode: 'queue',
         },
       });
-    const response = await transport.fetch('api/session/prompt', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'client-request',
-        rpcId: randomUUID(),
-        method: 'session/prompt',
-        payload: { args },
-      }),
-    });
-    const receipt = serverResponseSchema.parse(await response.json());
-    expect(receipt.result).toMatchObject({
-      ok: true,
+    expect(
+      await scope.invoke(
+        { endpoint: 'session/prompt', scopeId: issue.scopeId, args },
+        signal,
+      ),
+    ).toEqual({
+      endpoint: 'session/prompt',
       value: { accepted: true },
     });
     await Promise.all([primary.promise, title.promise]);
@@ -1035,6 +1228,7 @@ it.skipIf(!cli)(
     expect(facts.assistant.attemptId).not.toBe(
       facts['session-title'].attemptId,
     );
+    await activity.close();
   },
 );
 

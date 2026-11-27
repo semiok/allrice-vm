@@ -428,6 +428,14 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
             running,
             agentAvailable,
           },
+          {
+            sessionId: 'ordinary-fork',
+            parentSessionId: root,
+            updatedAt: 3,
+            blank: false,
+            running: true,
+            agentAvailable: true,
+          },
         ],
       },
     });
@@ -463,5 +471,27 @@ it('requires a live DSH agent in the current pinned ancestry before authorizing 
       childSessionId: id,
       mode: 'unknown',
     },
+  });
+  await expect(
+    resolveDEntryNativeResource({
+      ...modelRequest,
+      nativeSessionId: 'ordinary-fork',
+    }),
+  ).rejects.toMatchObject({ code: 'authorization_denied' });
+  const forkPin = vi.fn(async () => ({
+    ...persisted,
+    rootNativeSessionId: 'ordinary-fork',
+    forkedFromNativeSessionId: root,
+  }));
+  await expect(
+    resolveDEntryNativeResource({
+      ...modelRequest,
+      nativeSessionId: 'ordinary-fork',
+      root: forkPin,
+    }),
+  ).resolves.toMatchObject({
+    parentNativeSessionId: null,
+    rootNativeSessionId: 'ordinary-fork',
+    nativeAddress: { kind: 'session', sessionId: 'ordinary-fork' },
   });
 });
