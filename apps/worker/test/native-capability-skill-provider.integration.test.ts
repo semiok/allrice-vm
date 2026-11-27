@@ -235,12 +235,14 @@ suite(
         await requireEmployeePanelsAccess(context, target);
         signal.throwIfAborted();
       });
-      const { previewPersonalSkillSource } =
-        await import('../../web/lib/skills/personal-skill-preview');
-      const { POST } =
-        await import('../../web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/confirm/route');
-      const { DELETE } =
-        await import('../../web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills/[installationId]/route');
+      // Load the Web entrypoints at runtime, like the browser Skill DB suite.
+      // The Web package typechecks its relative imports with Bundler resolution.
+      const previewPath = '../../web/lib/skills/personal-skill-preview.ts';
+      const routes =
+        '../../web/app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/skills';
+      const { previewPersonalSkillSource } = await import(previewPath);
+      const { POST } = await import(routes + '/confirm/route.ts');
+      const { DELETE } = await import(routes + '/[installationId]/route.ts');
       const name = 'r3-weekly-summary';
       const content = 'Keep the source report scoped to this employee.';
       const originalText = [
