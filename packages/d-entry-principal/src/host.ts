@@ -1079,13 +1079,18 @@ class PrincipalService extends TypertRemoteService {
         }
         let value: unknown;
         try {
-          value = await this.ctx.typertGateway.invoke({
-            namespace: descriptor.namespace,
-            method: descriptor.method,
-            args: nativeArgs,
-            peer: modelInput ? scope.currentPeer() : scope.parent,
-            signal: active,
-          });
+          const dispatch = () =>
+            this.ctx.typertGateway.invoke({
+              namespace: descriptor.namespace,
+              method: descriptor.method,
+              args: nativeArgs,
+              peer: modelInput ? scope.currentPeer() : scope.parent,
+              signal: active,
+            });
+          // The registry call above can overlap a catalog refresh.
+          value = await (nativeArgs === args
+            ? dispatch()
+            : scope.current(dispatch, active));
           if (terminal) terminal.possiblyAllocated = true;
         } catch (error) {
           // These rc.2 failures occur before any allocation. A success or
