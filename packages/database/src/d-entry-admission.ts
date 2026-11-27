@@ -76,7 +76,8 @@ async function ownedOutcome<T>(
           'not_found',
         ].includes(error.code)) ||
       (error instanceof IdentityError &&
-        error.code === 'authorization_denied') ||
+        (error.code === 'authorization_denied' ||
+          error.code === 'tenant_context_invalid')) ||
       (error instanceof EmployeeInstanceError &&
         error.code === 'instance_archived') ||
       (error instanceof PersonVmError &&

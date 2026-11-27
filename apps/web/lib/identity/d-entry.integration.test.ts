@@ -3346,117 +3346,159 @@ suite(
       }
     });
 
-    it('releases the real active entry permit when the selected login is revoked before acquire', async () => {
-      await clearPublished();
-      const f = await setup();
-      await authorizeFixturePlatformAdministrator(fixture.db, f.user);
-      const openSql = () => client.createDedicatedDatabase(fixture.db);
-      const h = harness(new PostgresPersonVmStore(openSql));
-      const current = createProductionPersonVmAuthority(signal());
-      const vm = new PersonVmService({
-        ...h.options,
-        authority: current.authority,
-      });
-      const admission = vm.createAdmissionHost({ openSql });
-      const entry = admission.participant('entry');
-      const gateway = admission.participant('gateway');
-      const entered = deferred<void>();
-      const finishCurrentCheck = deferred<void>();
-      const active = signal();
-      let binding: PersonVmBinding | undefined;
-      let operation: Promise<unknown> | undefined;
-      try {
-        await updateDEntryReleasePolicy(f.context, {
-          revision: 'initial',
-          defaultGeneration: '3.x',
-          selections: [{ organizationId: f.org, personId: f.user }],
+    it.each([
+      ['login', 'authorization_denied'],
+      ['membership', 'tenant_context_invalid'],
+    ] as const)(
+      'releases the real active entry permit after pre-acquire %s revocation',
+      async (withdrawn, denial) => {
+        await clearPublished();
+        const f = await setup();
+        await authorizeFixturePlatformAdministrator(fixture.db, f.user);
+        const openSql = () => client.createDedicatedDatabase(fixture.db);
+        const h = harness(new PostgresPersonVmStore(openSql));
+        const current = createProductionPersonVmAuthority(signal());
+        const vm = new PersonVmService({
+          ...h.options,
+          authority: current.authority,
         });
-        await vm.create(f.context, active);
-        await vm.start(f.context, active);
-        binding = await vm.resolve(f.context, active);
-        await requireDEntryNativeIdentity(f.context, f.selection);
-        const operationId = randomUUID();
-        const rows = () => fixture.db`
+        const admission = vm.createAdmissionHost({ openSql });
+        const entry = admission.participant('entry');
+        const gateway = admission.participant('gateway');
+        const prewarmCurrent = createProductionCurrentPrewarm({ vm, current });
+        const entered = deferred<void>();
+        const finishCurrentCheck = deferred<void>();
+        const active = signal();
+        const tenant = { organizationId: f.org, workspaceId: f.workspace };
+        const selection = {
+          workspaceId: f.workspace,
+          employeeInstanceId: f.assignment,
+        };
+        let binding: PersonVmBinding | undefined;
+        let operation: Promise<unknown> | undefined;
+        let membershipWithdrawn = false;
+        const restoreMembership = async () => {
+          if (!membershipWithdrawn) return;
+          await fixture.db`update allrice_memberships set active=true where id=${f.membership}`;
+          membershipWithdrawn = false;
+        };
+        try {
+          await updateDEntryReleasePolicy(f.context, {
+            revision: 'initial',
+            defaultGeneration: '3.x',
+            selections: [{ organizationId: f.org, personId: f.user }],
+          });
+          const selected = await requireDEntryNativeIdentity(
+            f.context,
+            selection,
+          );
+          await prewarmCurrent(
+            f.context,
+            selected,
+            { trigger: 'page' },
+            active,
+          );
+          binding = await vm.resolve(f.context, active);
+          const operationId = randomUUID();
+          const rows = () => fixture.db`
           select operation_id, disposition from person_vm_admission_permits
           where person_id=${f.user} and participant='entry'`;
-        const run = vi.fn(async () => {});
-        const acquire = vi.fn(() => ({ run, close: async () => {} }));
-        let checks = 0;
-        let authorityError: unknown;
-        const check = async (caller: AbortSignal) => {
-          if (++checks === 2) {
-            entered.resolve(undefined);
-            await finishCurrentCheck.promise;
-          }
-          try {
-            await requireDEntryNativeIdentity(f.context, f.selection);
-          } catch (error) {
-            authorityError = error;
-            throw error;
-          }
-          caller.throwIfAborted();
-        };
-        operation = runDEntryAdmittedActivity(
-          {
-            ports: { boundary: admission, participant: entry },
-            owner: {
-              context: f.context,
-              binding,
-              operationId,
-              revoked: active,
-              assertCurrent: check,
-              assertUndispatched: check,
+          const run = vi.fn(async () => {});
+          const close = vi.fn(async () => {});
+          const acquire = vi.fn(() => ({ run, close }));
+          let checks = 0;
+          let authorityError: unknown;
+          const check = async (caller: AbortSignal) => {
+            if (++checks === 2) {
+              entered.resolve(undefined);
+              await finishCurrentCheck.promise;
+            }
+            try {
+              const authority =
+                withdrawn === 'membership'
+                  ? await authenticateSession(f.login.token, tenant)
+                  : f.context;
+              if (!authority) throw Error('fixture_expected_current_login');
+              await requireDEntryNativeIdentity(authority, selection);
+            } catch (error) {
+              authorityError = error;
+              throw error;
+            }
+            caller.throwIfAborted();
+          };
+          operation = runDEntryAdmittedActivity(
+            {
+              ports: { boundary: admission, participant: entry },
+              owner: {
+                context: f.context,
+                binding,
+                operationId,
+                revoked: active,
+                assertCurrent: check,
+                assertUndispatched: check,
+              },
+              signal: active,
             },
-            signal: active,
-          },
-          acquire,
-        );
-        await Promise.race([entered.promise, operation]);
-        expect(await rows()).toEqual([
-          { operation_id: operationId, disposition: 'active' },
-        ]);
-        expect(acquire).not.toHaveBeenCalled();
-        await revokeSession(f.login.token);
-        finishCurrentCheck.resolve(undefined);
-        await expect(operation).rejects.toMatchObject({
-          code: 'authorization_denied',
-        });
-        await expect(operation).rejects.toBe(authorityError);
-        expect(acquire).not.toHaveBeenCalled();
-        expect(run).not.toHaveBeenCalled();
-        expect(await rows()).toEqual([]);
-
-        const login = await createSession(f.user);
-        const authorized = await authenticateSession(login.token, {
-          organizationId: f.org,
-          workspaceId: f.workspace,
-        });
-        if (!authorized) throw Error('fixture_reauthentication_failed');
-        const lease = await admission.issue(authorized, binding, active);
-        try {
-          await gateway.freeze(lease, active);
-          expect(await entry.freeze(lease, active)).toMatchObject({
-            state: 'known',
-            active: 0,
-            queued: 0,
+            acquire,
+          );
+          await Promise.race([entered.promise, operation]);
+          expect(await rows()).toEqual([
+            { operation_id: operationId, disposition: 'active' },
+          ]);
+          expect(acquire).not.toHaveBeenCalled();
+          if (withdrawn === 'login') {
+            await revokeSession(f.login.token);
+          } else {
+            membershipWithdrawn = true;
+            expect(
+              await fixture.db`update allrice_memberships set active=false
+            where id=${f.membership} and active returning id`,
+            ).toEqual([{ id: f.membership }]);
+          }
+          finishCurrentCheck.resolve(undefined);
+          await expect(operation).rejects.toMatchObject({
+            code: denial,
           });
-          await gateway.assertFrozen(lease, active);
-          await entry.assertFrozen(lease, active);
+          await expect(operation).rejects.toBe(authorityError);
+          expect(acquire).not.toHaveBeenCalled();
+          expect(run).not.toHaveBeenCalled();
+          expect(close).not.toHaveBeenCalled();
+          expect(await rows()).toEqual([]);
+
+          await restoreMembership();
+          const login = await createSession(f.user);
+          const authorized = await authenticateSession(login.token, tenant);
+          if (!authorized) throw Error('fixture_reauthentication_failed');
+          // This fixture already supplies a separate physical lifecycle actor.
+          // Production entry itself must not gain stop authority.
+          const lifecycle = h.service.createAdmissionHost({ openSql });
+          const lease = await lifecycle.issue(authorized, binding, active);
+          try {
+            await gateway.freeze(lease, active);
+            expect(await entry.freeze(lease, active)).toMatchObject({
+              state: 'known',
+              active: 0,
+              queued: 0,
+            });
+            await gateway.assertFrozen(lease, active);
+            await entry.assertFrozen(lease, active);
+          } finally {
+            await gateway.thaw(lease, active);
+            await entry.thaw(lease, active);
+          }
         } finally {
-          await gateway.thaw(lease, active);
-          await entry.thaw(lease, active);
+          finishCurrentCheck.resolve(undefined);
+          await Promise.allSettled([operation]);
+          try {
+            await restoreMembership();
+            if (binding) await vm.shutdownOwned(binding);
+          } finally {
+            await current.close();
+            await clearPublished();
+          }
         }
-      } finally {
-        finishCurrentCheck.resolve(undefined);
-        await Promise.allSettled([operation]);
-        try {
-          if (binding) await vm.shutdownOwned(binding);
-        } finally {
-          await current.close();
-          await clearPublished();
-        }
-      }
-    });
+      },
+    );
 
     it.each([
       'guest receipt lost',
