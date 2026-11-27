@@ -121,8 +121,7 @@ suite(
       value: {
         expectedRevision: number;
         requestId: string;
-        profile?: EmployeeInstanceProfile;
-        operation?: 'reset_profile';
+        profile: EmployeeInstanceProfile;
       },
     ) {
       const routePath =
@@ -318,7 +317,7 @@ suite(
     it('keeps custom replacement, real owner authorization and shared privacy instead of granting permissions from a name or source DTO', async () => {
       const f = await setup();
       const custom = await f.custom({
-        name: 'Rice',
+        name: 'Test employee',
         mission: '本人职责',
         appearance: { accentColor: 'blue' },
       });
@@ -339,28 +338,10 @@ suite(
       });
       expect(
         (
-          await patch(f.viewer, custom.id, {
-            expectedRevision: 2,
-            requestId: randomUUID(),
-            operation: 'reset_profile',
-          })
-        ).status,
-      ).toBe(403);
-      expect(
-        (
           await patch(f.viewer, f.assignment.id, {
             expectedRevision: 1,
             requestId: randomUUID(),
-            profile: { name: 'Rice' },
-          })
-        ).status,
-      ).toBe(403);
-      expect(
-        (
-          await patch(f.viewer, f.assignment.id, {
-            expectedRevision: 1,
-            requestId: randomUUID(),
-            operation: 'reset_profile',
+            profile: { name: 'Test employee' },
           })
         ).status,
       ).toBe(403);

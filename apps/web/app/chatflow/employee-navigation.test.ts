@@ -417,7 +417,7 @@ it('keeps general employee list and details on published identity despite legacy
   });
 });
 
-it('U1 applies the proven Rice personal identity and appearance, leaving professional general identity and all capabilities intact', () => {
+it('applies custom employee identity and appearance without changing the published defaults', () => {
   const id = '00000000-0000-4000-8000-000000000001';
   const source = {
     kind: 'platform' as const,
@@ -433,7 +433,7 @@ it('U1 applies the proven Rice personal identity and appearance, leaving profess
     organizationId: id,
     workspaceId: id,
     ownerId: id,
-    kind: 'general',
+    kind: 'custom',
     revision: 2,
     profile: {
       name: 'My assistant',
@@ -485,14 +485,13 @@ it('U1 applies the proven Rice personal identity and appearance, leaving profess
     employees: [
       {
         ...employee(id),
-        employeeKey: 'default-assistant',
+        employeeKey: 'personal-employee',
         isDefault: false,
         currentVersion: {
           id,
           manifest: {
             schemaVersion: 2,
-            key: 'default-assistant',
-            isDefaultRice: true,
+            key: 'personal-employee',
             name: base.name,
             appearance: defaultAppearance,
             capabilityBindings: { toolNames: ['workspace.skill.read'] },
@@ -520,7 +519,6 @@ it('U1 applies the proven Rice personal identity and appearance, leaving profess
       workStyle: 'Personal method',
     },
   });
-  const originalProfile = structuredClone(instance.profile);
   const publishedAppearance = {
     avatarType: 'emoji' as const,
     avatarValue: '🌾',
@@ -566,50 +564,28 @@ it('U1 applies the proven Rice personal identity and appearance, leaving profess
       ] as Array<[string, string, string]>,
     })),
   ];
-  for (const kind of ['general', 'custom'] as const) {
-    instance.kind = kind;
-    for (const { profile, expected } of sparseProfiles) {
-      instance.profile = structuredClone(profile);
-      const raw = structuredClone(instance.profile);
-      // Reuse the same workspace after a publication: only absent raw leaves
-      // follow its new defaults, and neither display projection owns the raw.
-      for (const [index, defaults] of [
-        defaultAppearance,
-        publishedAppearance,
-      ].entries()) {
-        base.appearance = defaults;
-        view.employees[0]!.currentVersion.manifest.appearance = defaults;
-        const [avatarType, avatarValue, accentColor] = expected[index]!;
-        const appearance = { avatarType, avatarValue, accentColor };
-        expect(
-          employeeChoice(view, id)?.currentVersion.manifest.appearance,
-        ).toEqual(appearance);
-        expect(employeeChoiceProfile(view, id)?.appearance).toEqual(appearance);
-        expect(instance.profile).toEqual(raw);
-        expect(base.appearance).toEqual(defaults);
-        expect(view.employees[0]!.currentVersion.manifest.appearance).toEqual(
-          defaults,
-        );
-      }
+  for (const { profile, expected } of sparseProfiles) {
+    instance.profile = structuredClone(profile);
+    const raw = structuredClone(instance.profile);
+    // Reuse the same workspace after a publication: only absent raw leaves
+    // follow its new defaults, and neither display projection owns the raw.
+    for (const [index, defaults] of [
+      defaultAppearance,
+      publishedAppearance,
+    ].entries()) {
+      base.appearance = defaults;
+      view.employees[0]!.currentVersion.manifest.appearance = defaults;
+      const [avatarType, avatarValue, accentColor] = expected[index]!;
+      const appearance = { avatarType, avatarValue, accentColor };
+      expect(
+        employeeChoice(view, id)?.currentVersion.manifest.appearance,
+      ).toEqual(appearance);
+      expect(employeeChoiceProfile(view, id)?.appearance).toEqual(appearance);
+      expect(instance.profile).toEqual(raw);
+      expect(base.appearance).toEqual(defaults);
+      expect(view.employees[0]!.currentVersion.manifest.appearance).toEqual(
+        defaults,
+      );
     }
   }
-  instance.kind = 'general';
-  instance.profile = originalProfile;
-  base.appearance = defaultAppearance;
-  view.employees[0]!.currentVersion.manifest.appearance = defaultAppearance;
-  // A display name and assignment default flag cannot make a specialist Rice.
-  view.employees[0]!.employeeKey = 'professional';
-  view.employees[0]!.isDefault = true;
-  view.employees[0]!.currentVersion.manifest.name = 'Rice';
-  expect(employeeChoice(view, id)?.currentVersion.manifest.name).toBe('Rice');
-  expect(employeeChoice(view, id)?.currentVersion.manifest.appearance).toEqual(
-    defaultAppearance,
-  );
-  expect(employeeChoiceProfile(view, id)).toEqual(base);
-  view.employees[0]!.employeeKey = 'default-assistant';
-  instance.source = { kind: 'tenant_version', employeeVersionId: id };
-  expect(employeeChoiceProfile(view, id)).toEqual(base);
-  expect(employeeChoice(view, id)?.currentVersion.manifest.appearance).toEqual(
-    defaultAppearance,
-  );
 });

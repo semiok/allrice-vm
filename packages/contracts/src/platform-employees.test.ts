@@ -14,8 +14,8 @@ import {
 
 const riceDefinition = {
   schemaVersion: 1 as const,
-  key: 'rice',
-  name: 'Rice',
+  key: 'test-employee',
+  name: 'Test employee',
   description: 'AllRice 默认通用 AI 员工。',
   appearance: { avatarType: 'initials' as const, avatarValue: 'R' },
   identity: {
@@ -69,7 +69,7 @@ describe('platform employee production contract', () => {
   });
   it('accepts a platform-owned Rice definition', () => {
     expect(PlatformEmployeeDefinitionSchema.parse(riceDefinition).key).toBe(
-      'rice',
+      'test-employee',
     );
   });
 
@@ -104,7 +104,7 @@ describe('platform employee production contract', () => {
       schemaVersion: 1,
       harness: 'dsh',
       distributionGeneration: DSH_INSTALLED_DISTRIBUTION.generation,
-      employeeKey: 'rice',
+      employeeKey: 'test-employee',
       provider: 'openai-codex',
       model: 'gpt-5.6-luna',
       reasoningEffort: 'xhigh',

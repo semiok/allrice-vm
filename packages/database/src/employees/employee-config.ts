@@ -251,7 +251,6 @@ export function employeeManifest(input: {
     ...(input.taskSuggestions !== undefined
       ? { taskSuggestions: input.taskSuggestions }
       : {}),
-    isDefaultRice: false,
     identity,
     systemPrompt:
       input.systemPromptOverride ??

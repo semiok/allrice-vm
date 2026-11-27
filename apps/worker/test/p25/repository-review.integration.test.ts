@@ -1,3 +1,4 @@
+import { publishTestPlatformQualityEmployee } from '../../../../packages/database/src/platform-quality-employee.fixture.ts';
 import type { RepositoryReviewArtifactRef } from '../../../../packages/database/src/platform-repository-review-contracts.ts';
 import { createReadPathProbe } from '../../../../packages/database/src/read-path-probe.fixture.ts';
 import { readRetiredExecutionHistory } from './retired-execution-history.fixture.ts';
@@ -253,34 +254,15 @@ suite(
       await createCompletedRunFixture(f.db);
       await f.db`update allrice_model_connections set status='ready' where id='52000000-0000-4000-8000-000000000001'`;
       await f.db`update allrice_model_providers set enabled=true where provider_key='codex'`;
-      const [revision] =
-        await f.db`select r.* from allrice_platform_employee_revisions r join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-      platformEmployeeId = revision!.employee_id as string;
-      const toolNames = [
-        'workspace.project',
-        'browser.workspace',
-        'workspace.export.create',
-      ];
-      const definition = PlatformEmployeeDefinitionSchema.parse({
-        ...revision!.definition,
+      platformEmployeeId = await publishTestPlatformQualityEmployee({
         // The synthetic review workflow includes local.process.execute.
-        securityPolicy: {
-          ...revision!.definition.securityPolicy,
-          bridgeAccess: 'read_write',
-        },
-        capabilities: {
-          ...revision!.definition.capabilities,
-          nativeSkillIds: [],
-          explicitToolNames: toolNames,
-          toolNames,
-        },
+        bridgeAccess: 'read_write',
+        toolNames: [
+          'workspace.project',
+          'browser.workspace',
+          'workspace.export.create',
+        ],
       });
-      await savePlatformEmployeeDraft(revision!.employee_id, { definition });
-      const publication = await publishPlatformEmployee(revision!.employee_id, {
-        scope: 'assigned',
-      });
-      expect(publication.errors).toEqual([]);
-      expect(publication.valid).toBe(true);
     }, 120000);
     afterAll(async () => {
       try {

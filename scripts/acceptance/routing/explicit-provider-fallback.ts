@@ -59,7 +59,9 @@ const bindings = await sql<
 const binding = bindings[0];
 if (!binding) {
   await sql.end();
-  throw new Error(`default Rice assignment for ${platformEmail} was not found`);
+  throw new Error(
+    `default employee assignment for ${platformEmail} was not found`,
+  );
 }
 const fallbackRows = await sql<
   {

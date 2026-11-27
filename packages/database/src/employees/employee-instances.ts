@@ -1099,16 +1099,11 @@ export async function updateEmployeeInstance(
       scope,
       id,
       value,
-      (current, before) => {
-        if ('operation' in value)
-          throw new DataAccessError('authorization_denied');
-        return before.kind === 'general'
+      (current, before) =>
+        before.kind === 'general'
           ? { ...current, ...value.profile }
-          : value.profile;
-      },
+          : value.profile,
       (before) => {
-        if ('operation' in value)
-          throw new DataAccessError('authorization_denied');
         if (
           before.kind === 'general' &&
           (Object.keys(value.profile).length !== 1 ||

@@ -1773,15 +1773,6 @@ suite('MET179 employee instances (isolated PostgreSQL; no model)', () => {
     const ownCustom = (await getEmployeeDetails(f.a.context, custom.id))
       .profile;
     expect(ownCustom.editableFields).toContain('mission');
-    for (const target of [id, custom.id])
-      await expect(
-        updateEmployeeInstance(f.a.context, target, {
-          workspaceId: f.a.workspaceId,
-          expectedRevision: 1,
-          requestId: randomUUID(),
-          operation: 'reset_profile',
-        }),
-      ).rejects.toMatchObject({ code: 'authorization_denied' });
     await expect(
       updateEmployeeInstance(f.a.context, id, {
         workspaceId: f.a.workspaceId,

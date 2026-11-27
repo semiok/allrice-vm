@@ -17,7 +17,6 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   EmployeeKernelRequestSchema,
   EmployeePromptSnapshotSchema,
-  PlatformEmployeeDefinitionSchema,
   type RequestContext,
   cloudPlatform,
   cloudToolchainImageV1,
@@ -27,10 +26,7 @@ import * as client from './core/client.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 import { createCompletedRunFixture } from './completed-run.fixture.ts';
 import { ensureBootstrapPortalPrincipal } from './identity.ts';
-import {
-  savePlatformEmployeeDraft,
-  publishPlatformEmployee,
-} from './employees/platform-employees.ts';
+import { publishTestPlatformQualityEmployee } from './platform-quality-employee.fixture.ts';
 import {
   createPlatformRepairTask,
   getPlatformRepairTask,
@@ -203,31 +199,9 @@ suite('MET167 private repository repair normal Employee Run authority', () => {
       vi.stubEnv(`ALLRICE_${f}_ENABLED`, '1');
     await fixture.db`update allrice_model_connections set status='ready' where id='52000000-0000-4000-8000-000000000001'`;
     await fixture.db`update allrice_model_providers set enabled=true where provider_key='codex'`;
-    // Publish a new revision and preserve the original seed.
-    const [r] =
-      await fixture.db`select r.* from allrice_platform_employee_revisions r join allrice_platform_employees e on e.current_published_revision_id=r.id where e.employee_key='rice'`;
-    const definition = PlatformEmployeeDefinitionSchema.parse({
-      ...r!.definition,
-      identity: {
-        ...r!.definition.identity,
-        mission: 'FIXED_PERSONA_LITERAL {{missing}}',
-      },
-      capabilities: {
-        ...r!.definition.capabilities,
-        nativeSkillIds: [],
-        toolNames: [
-          'workspace.project',
-          'browser.workspace',
-          'cloud.process.execute',
-        ],
-      },
+    await publishTestPlatformQualityEmployee({
+      mission: 'FIXED_PERSONA_LITERAL {{missing}}',
     });
-    await savePlatformEmployeeDraft(r!.employee_id, { definition });
-    const publication = await publishPlatformEmployee(r!.employee_id, {
-      scope: 'assigned',
-    });
-    expect(publication.errors).toEqual([]);
-    expect(publication.valid).toBe(true);
     await fixture.db`insert into allrice_sessions(id,user_id,token_hash,expires_at) values(${admin.sessionId!},${admin.actor.id},${createHash('sha256').update(randomUUID()).digest('hex')},clock_timestamp()+interval '1 hour')`;
     catalogRoot = realpathSync(
       mkdtempSync(join(tmpdir(), 'allrice-repair-db-')),

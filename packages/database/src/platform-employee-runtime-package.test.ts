@@ -36,8 +36,8 @@ const previewSnapshotMigration = readFileSync(
 
 const definition: PlatformEmployeeDefinition = {
   schemaVersion: 1,
-  key: 'rice',
-  name: 'Rice',
+  key: 'test-employee',
+  name: 'Test employee',
   description: 'AllRice 默认通用 AI 员工。',
   appearance: { avatarType: 'initials', avatarValue: 'R' },
   identity: {
@@ -692,7 +692,7 @@ describe('platform employee runtime package', () => {
     expect(
       validatePlatformEmployeeTestExecutionSnapshot(snapshot),
     ).toMatchObject({
-      runtimeProfile: { employeeKey: 'rice', model: 'gpt-5.6-luna' },
+      runtimeProfile: { employeeKey: 'test-employee', model: 'gpt-5.6-luna' },
       nativeSkills: [{ name: 'web-research' }],
     });
     expect(
@@ -700,7 +700,7 @@ describe('platform employee runtime package', () => {
         jsonbLikeRoundTrip(snapshot) as typeof snapshot,
       ),
     ).toMatchObject({
-      runtimeProfile: { employeeKey: 'rice' },
+      runtimeProfile: { employeeKey: 'test-employee' },
       nativeSkills: [{ name: 'web-research' }],
     });
 
@@ -800,7 +800,7 @@ describe('platform employee runtime package', () => {
     });
 
     expect(second).toEqual(first);
-    expect(first.packageVersion).toBe('rice:r7');
+    expect(first.packageVersion).toBe('test-employee:r7');
     expect(first.runtimeManifest).toMatchObject({
       source: 'allrice-published-runtime',
       harness: 'dsh',
@@ -875,7 +875,7 @@ describe('platform employee runtime package', () => {
     });
     const systemPrompt = employeePersonaPlatformSystemPrompt(definition);
     const manifest = employeeManifest({
-      key: 'default-assistant',
+      key: 'test-employee',
       name: definition.name,
       description: definition.description,
       identity: {

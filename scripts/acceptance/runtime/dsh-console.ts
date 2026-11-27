@@ -69,7 +69,7 @@ const bindingRows = await sql<
   limit 1
 `;
 const binding = bindingRows[0];
-if (!binding) throw new Error('Snow default Rice assignment was not found');
+if (!binding) throw new Error('Snow default employee assignment was not found');
 
 const headers = {
   'content-type': 'application/json',
