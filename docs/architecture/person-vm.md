@@ -111,6 +111,7 @@ macOS 对原盘及原密钥建立无覆盖的正式文件引用，核实同 inod
 | 持久绑定和容量       | 适配器核对 inode，持久化正式引用并撤销临时引用。按实际卷的可用块及镜像分配块核算。                                                                                      | 以持久卷标识和密钥保管映射提交同一正式归属，读取对应文件系统或 thin pool 的实际预算。                                            |
 | 公开缓存和根盘       | stock 仅写封签缓存。正式启动沿用 `MicrosandboxPersonVm`。同一封签的领用盘首开对盘内缓存重新验哈希，已验证的本地字节直接供 MSB 用 `flat` 和 `clone=reflink` 建个人根盘。 | 核对同一公开来源，由正常启动适配器使用 XFS 或 btrfs reflink。后续可用公开只读 lower 加个人加密 upper，继续复用同一根盘准备位置。 |
 | Guest 地址和运行时   | 工作台继续用既有可信 Web 封签的 `web.guestAddress` 和实际 MSB 端点检查，库存过程无 guest 地址。生产装配保留现有 MSB provider 及 Darwin Unix socket 路径限制。           | 由对应虚拟化运行时按已启动的绑定和 epoch 返回实际地址，供同一工作台启动与就绪检查消费。                                          |
+
 ### 平台管理员删除
 
 Worker 在本机提供 `POST /internal/platform/person-vm-delete`，用现有的有效平台管理员登录鉴权。运维入口为 `scripts/m1/person-vm-delete <Worker 端口> <person UUID> <review|retain-disk|purge-disk>`，从终端静默读取平台管理员会话 token。
