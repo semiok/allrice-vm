@@ -46,3 +46,12 @@ export async function GET(request: Request) {
   response.headers.set('X-Content-Type-Options', 'nosniff');
   return response;
 }
+
+// Next otherwise falls back to GET for HEAD, which would consume the
+// page scope's one-shot bootstrap without returning its body.
+export function HEAD() {
+  return new Response(null, {
+    status: 405,
+    headers: { Allow: 'GET', 'Cache-Control': 'private, no-store' },
+  });
+}

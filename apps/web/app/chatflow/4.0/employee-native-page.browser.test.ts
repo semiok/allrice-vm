@@ -319,8 +319,13 @@ suite('4.0 browser cold entry', () => {
         await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
+        await expect
+          .poll(async () => {
+            const src = await iframe.getAttribute('src');
+            return src && new URL(src, f.origin).searchParams.get('threadId');
+          })
+          .toBe(threadId);
         const source = new URL((await iframe.getAttribute('src'))!, f.origin);
-        expect(source.searchParams.get('threadId')).toBe(threadId);
         expect(await iframe.isVisible()).toBe(false);
         const child = page.frameLocator('iframe');
         await child
@@ -340,6 +345,10 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      const originalFrame = page.locator('iframe');
+      await originalFrame.evaluate((node) => {
+        (node as HTMLIFrameElement).dataset.retainedFrameProof = 'current';
+      });
       expect(polls).toBe(3);
       expect(warmCalls).toHaveLength(4);
       const oldDocument = page.frameLocator('iframe').locator('body');
@@ -375,6 +384,9 @@ suite('4.0 browser cold entry', () => {
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);
       await showEditor(next);
+      expect(
+        await originalFrame.getAttribute('data-retained-frame-proof'),
+      ).toBe('current');
       expect(
         (await f.invokeThread(oldScope, f.selection.threadId)).status,
       ).toBe(404);

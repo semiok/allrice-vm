@@ -94,6 +94,7 @@ export function EmployeeNativePage({
     query: string;
     confirmedQuery?: string;
     warmup?: EntryWarmup;
+    retainFrame?: boolean;
     ticket?: DEntryNativePrewarmTicket;
   }>({ query });
   const activeQuery = activation.query;
@@ -139,7 +140,7 @@ export function EmployeeNativePage({
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
-    setSource(undefined);
+    if (!activation.retainFrame) setSource(undefined);
     setFailed(false);
     setStatus('warming');
     setSettled(false);
@@ -253,6 +254,20 @@ export function EmployeeNativePage({
       }
     };
     loaded.current = documentLoaded;
+    function activateSelection(query: string, warmup?: EntryWarmup) {
+      const params = new URLSearchParams(query);
+      const same = (key: 'workspaceId' | 'employeeInstanceId') =>
+        params.getAll(key).length === 1 &&
+        params.get(key) === selectedEmployee?.[key];
+      setActivation({
+        query,
+        warmup,
+        // Old local/remote resources have already joined. Keep the DOM frame
+        // while the new thread obtains its own page scope and document.
+        retainFrame:
+          !!frame.current && same('workspaceId') && same('employeeInstanceId'),
+      });
+    }
     const applyQuery = () => {
       if (navigating) {
         if (nextWarmup && nextQuery.current !== activeQuery) {
@@ -261,14 +276,14 @@ export function EmployeeNativePage({
           superseded = true;
         }
         if (retired && nextQuery.current !== activeQuery)
-          setActivation({ query: nextQuery.current });
+          activateSelection(nextQuery.current);
         return;
       }
       navigating = true;
       window.clearTimeout(timer);
       void retire().then((closed) => {
         if (replace.current !== applyQuery) return;
-        if (closed) setActivation({ query: nextQuery.current });
+        if (closed) activateSelection(nextQuery.current);
         else if (prepare) setStatus('unknown');
         else setFailed(true);
       });
@@ -381,12 +396,12 @@ export function EmployeeNativePage({
           if (closed) {
             if (superseded || nextQuery.current !== activeQuery) {
               warmup?.lifetime.abort();
-              setActivation({ query: nextQuery.current });
+              activateSelection(nextQuery.current);
             } else if (warmup) {
               const query = params.toString();
               nextQuery.current = query;
               history.pushState(null, '', '/chatflow/4.0?' + query);
-              setActivation({ query, warmup });
+              activateSelection(query, warmup);
             } else location.assign('/chatflow/4.0?' + params);
           } else {
             warmup?.lifetime.abort();

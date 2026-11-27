@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { GET } from './route';
+import { GET, HEAD } from './route';
 import {
   GET as documentAsset,
   POST as documentUpload,
@@ -161,6 +161,11 @@ it('preserves invalid empty/duplicate values on the page for the document parser
   expect(html).toContain('threadId=b');
 });
 
+it('does not let HEAD consume a page bootstrap', () => {
+  expect(HEAD().status).toBe(405);
+  expect(profileRequest).not.toHaveBeenCalled();
+});
+
 it('requires the issued scope in the document address and leaves the two exact native HTTP routes denied', async () => {
   const scopeId = '00000000-0000-4000-8000-000000000003';
   const threadId = '00000000-0000-4000-8000-000000000006';
@@ -300,7 +305,6 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }],
-    ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
   ]);
