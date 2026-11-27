@@ -12,10 +12,25 @@ import {
   readServiceBuildIdentity,
   readSealedPersonVmHostConfiguration,
 } from '@allrice/database';
-import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
+import {
+  PlatformPersonVmPolicySchema,
+  readPlatformPersonVmConfiguration,
+} from '@allrice/contracts';
 import { checkedReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
 import { z } from 'zod';
 import { resolveProductionEmployeeRuntimeSettings } from './production-employee-runtime.js';
+
+const platformDefaults = readPlatformPersonVmConfiguration();
+const bytesPerMiB = 1024 ** 2;
+
+function platformSetting(field: 'memoryMiB' | 'idleMs', value: unknown) {
+  const fallback = platformDefaults[field];
+  if (value === undefined) return fallback;
+  const parsed = PlatformPersonVmPolicySchema.shape[field].safeParse(value);
+  if (parsed.success) return parsed.data;
+  console.warn('PERSON_VM_PLATFORM_SETTING_INVALID', { field, fallback });
+  return fallback;
+}
 
 const checksum = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const bareHash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -144,7 +159,16 @@ const configuration = z
         policyRef: z.string().trim().min(1),
         policy: z
           .object({
-            physicalBytes: positive,
+            physicalBytes: z
+              .unknown()
+              .optional()
+              .transform(
+                (value) =>
+                  platformSetting(
+                    'memoryMiB',
+                    typeof value === 'number' ? value / bytesPerMiB : value,
+                  ) * bytesPerMiB,
+              ),
             swapBytes: positive,
             dshLowBytes: bytes,
             dshSwapMaxBytes: bytes,
@@ -197,6 +221,29 @@ const configuration = z
         leaseTtlMs: positive,
         activityMaxAgeMs: positive,
         cleanupTimeoutMs: positive,
+        idleStopEnabled: z.boolean().optional(),
+        idleMs: z
+          .unknown()
+          .transform((value) => platformSetting('idleMs', value))
+          .optional(),
+        idleSampleIntervalMs: z
+          .number()
+          .int()
+          .min(1_000)
+          .max(60_000)
+          .optional(),
+        idleScheduleSafetyMarginMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(600_000)
+          .optional(),
+        // Omitting the reserved VM budget disables the capacity policy.
+        hostVmBudgetMiB: z
+          .number()
+          .int()
+          .min(4096 + 512)
+          .optional(),
         employeeMaxRunning: z.number().optional(),
         employeeIdleMs: z.number().optional(),
       })
@@ -209,12 +256,11 @@ const configuration = z
       Boolean(value.native.publicImageCache),
   )
   .refine((value) => {
-    const platform = readPlatformPersonVmConfiguration();
     const policy = value.memory.policy;
     return (
-      policy.commandHighBytes === platform.commandHighBytes &&
-      policy.commandMaxBytes === platform.commandMaxBytes &&
-      policy.commandSwapMaxBytes === platform.commandSwapMaxBytes
+      policy.commandHighBytes === platformDefaults.commandHighBytes &&
+      policy.commandMaxBytes === platformDefaults.commandMaxBytes &&
+      policy.commandSwapMaxBytes === platformDefaults.commandSwapMaxBytes
     );
   })
   .refine((value) => {
@@ -230,12 +276,10 @@ const configuration = z
         : []),
     ];
     if (
-      value.memory.policy.physicalBytes !==
-        readPlatformPersonVmConfiguration().memoryMiB * 1024 ** 2 ||
-      (value.native.readonlyDshRuntimeDisk &&
-        value.web.cliPath !==
-          value.native.readonlyDshDirectory.guestDirectory +
-            '/node_modules/@deepseek-ai/dsh/lib/bin.js')
+      value.native.readonlyDshRuntimeDisk &&
+      value.web.cliPath !==
+        value.native.readonlyDshDirectory.guestDirectory +
+          '/node_modules/@deepseek-ai/dsh/lib/bin.js'
     )
       return false;
     return roots.every((root, i) =>
@@ -271,6 +315,8 @@ export async function readProductionHostConfiguration(signal: AbortSignal) {
     const value = configuration.parse(sealed.configuration);
     const defaults = readPlatformPersonVmConfiguration();
     signal.throwIfAborted();
+    const memoryMiB = value.memory.policy.physicalBytes / bytesPerMiB;
+    const idleMs = value.lifecycle.idleMs ?? platformDefaults.idleMs;
     return Object.freeze({
       configuration: value,
       employeeRuntimeSettings: resolveProductionEmployeeRuntimeSettings(
@@ -278,10 +324,14 @@ export async function readProductionHostConfiguration(signal: AbortSignal) {
         sealed.employeePortSlots,
       ),
       platform:
+        memoryMiB === defaults.memoryMiB &&
+        idleMs === defaults.idleMs &&
         sealed.employeePortSlots === defaults.employeePortSlots
           ? defaults
           : Object.freeze({
               ...defaults,
+              memoryMiB,
+              idleMs,
               employeePortSlots: sealed.employeePortSlots,
             }),
       applicationBuild: Object.freeze({

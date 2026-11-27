@@ -248,7 +248,14 @@ export const DEntryProfileFilePathSchema = z
     path.split('/').every((part) => part && part !== '.' && part !== '..'),
   );
 
-export const DEntryNativePrewarmTriggerSchema = z.enum(['page', 'input']);
+export const DEntryNativePrewarmTriggerSchema = z.enum([
+  'page',
+  'input',
+  'open',
+]);
+export type DEntryNativePrewarmTrigger = z.infer<
+  typeof DEntryNativePrewarmTriggerSchema
+>;
 export const DEntryNativePrewarmInputSchema = z
   .object({
     selection: DEntrySelectionInputSchema,
@@ -281,12 +288,18 @@ export const DEntryNativePrewarmStatusQuerySchema =
   DEntrySelectionInputSchema.extend({ operationId: UuidSchema });
 export const DEntryNativePrewarmStatusSchema = z.discriminatedUnion('state', [
   z
-    .object({ state: z.enum(['accepted', 'starting', 'ready', 'expired']) })
+    .object({
+      state: z.enum(['accepted', 'starting', 'restarting', 'ready', 'expired']),
+    })
     .strict(),
   z
     .object({
       state: z.literal('failed'),
-      code: z.enum(['START_UNAVAILABLE', 'AUTHORITY_REVOKED']),
+      code: z.enum([
+        'START_UNAVAILABLE',
+        'AUTHORITY_REVOKED',
+        'UPGRADE_OPEN_REQUIRED',
+      ]),
     })
     .strict(),
 ]);

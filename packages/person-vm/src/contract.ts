@@ -143,10 +143,16 @@ export interface PersonVmRuntimePort {
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<PersonVmActivity>;
+  /** Host-only proof of native scheduler startup, without editor/send rights. */
+  assertScheduledReady?(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** 401/reachable is NOT ready. Must prove authenticated editor + send capability. */
   readiness(
     binding: PersonVmBinding,
     signal: AbortSignal,
+    context?: RequestContext,
   ): Promise<{
     binding: PersonVmBinding;
     authenticated: boolean;
@@ -176,6 +182,7 @@ export type PersonVmErrorCode =
   | 'EGRESS_BINDING_INVALID'
   | 'RUNTIME_NOT_READY'
   | 'ACTIVITY_UNKNOWN'
+  | 'UPGRADE_OPEN_REQUIRED'
   | 'VM_ACTIVE'
   | 'WEB_ENDPOINTS_PREPARING'
   | 'PROVIDER_FAILED'
@@ -205,7 +212,8 @@ export type PersonVmPrewarmTarget = Readonly<{
 /** Host-only stages. A written candidate proves nothing until independently visible. */
 export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
 
-/** Host-only observations from this request's create and start leases. */
+/** Host-only observations of this request's create/start or the exact local
+ * upgrade start it joined and independently revalidated. */
 export type PersonVmPrewarmObserver = {
   observeVmReservation?(vmId: string): void;
   observeVmStart?(binding: PersonVmBinding): void;
@@ -214,6 +222,11 @@ export type PersonVmPrewarmObserver = {
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget &
   PersonVmPrewarmObserver & {
     assertAuthority(signal: AbortSignal): Promise<void>;
+    dispatchUpgradeStop?(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      dispatch: () => Promise<void>,
+    ): Promise<void>;
     /** Opaque deletion fact from the Worker snapshot, checked under the VM lease. */
     readonly deletionFence?: string | null;
     /** Host-only observations for this ticket's exact orphaned start. */
@@ -234,7 +247,7 @@ export type PersonVmPrewarmFence = PersonVmPrewarmTarget &
   };
 
 export type PersonVmPrewarmInput = {
-  trigger: 'page' | 'input';
+  trigger: 'page' | 'input' | 'open';
   target?: PersonVmPrewarmFence;
   observer?: PersonVmPrewarmObserver;
   selectedEmployee?: PersonVmEmployeeSelection;

@@ -3,13 +3,15 @@ import {
   sameDEntryIdentity,
   type DEntryIdentity,
   type DEntryNativePrewarmStatus,
+  type DEntryNativePrewarmTrigger,
   type DEntryNativePrewarmTicket,
   type RequestContext,
 } from '@allrice/contracts';
 import { DataAccessError, DEntryTicketObserverClosed } from '@allrice/database';
-import type {
-  PersonVmBinding,
-  PersonVmPrewarmTarget,
+import {
+  PersonVmError,
+  type PersonVmBinding,
+  type PersonVmPrewarmTarget,
 } from '@allrice/person-vm';
 import { DEntryNativeUnavailable } from './native-owner.js';
 
@@ -32,6 +34,7 @@ export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
   running?: boolean;
+  upgradeRestart?: boolean;
   /** In-process observations only. The HTTP response carries just the ticket. */
   orphanedInstanceId?: string;
   observeTerminalFailure?: true;
@@ -71,7 +74,8 @@ export function canSharePrewarmTarget(
   );
 }
 
-/** An incomplete target gains specificity only from its own physical leases. */
+/** An incomplete target gains specificity only from its own physical leases
+ * or the exact local upgrade start it joined and revalidated. */
 export function observedPrewarmTarget({
   target,
   reservation,
@@ -124,7 +128,7 @@ export interface DEntryNativePrewarmPort {
   prewarm(
     context: RequestContext,
     identity: DEntryIdentity,
-    trigger: 'page' | 'input',
+    trigger: DEntryNativePrewarmTrigger,
     signal: AbortSignal,
     revoked: AbortSignal,
     plan?: PrewarmPlan,
@@ -167,6 +171,7 @@ export function createPrewarmOperations(
     identity: DEntryIdentity;
     sessionId: string;
     plan: PrewarmPlan;
+    foreground: boolean;
     preparedTarget: PrewarmGeneration;
     ticket: DEntryNativePrewarmTicket;
     expires: number;
@@ -185,7 +190,9 @@ export function createPrewarmOperations(
   const pending = new Set<Promise<void>>();
   const lifetimeReleases = new Set<Promise<boolean>>();
   const active = (entry: Operation) =>
-    entry.state.state === 'accepted' || entry.state.state === 'starting';
+    entry.state.state === 'accepted' ||
+    entry.state.state === 'starting' ||
+    entry.state.state === 'restarting';
   const expired = (entry: Operation, now = Date.now()) =>
     entry.deadline.aborted || entry.expires <= now;
   const belongs = (
@@ -264,11 +271,17 @@ export function createPrewarmOperations(
       identity: DEntryIdentity,
       plan: PrewarmPlan,
       canIssue = false,
+      trigger: DEntryNativePrewarmTrigger = 'page',
     ) {
       const prior = plan.reuse;
       let publishedInstance = false;
       const candidate = [...tickets.values()].find((entry) => {
         if (expired(entry) || entry.revoked.aborted) return false;
+        if (
+          entry.plan.upgradeRestart !== plan.upgradeRestart ||
+          (plan.upgradeRestart && entry.foreground !== (trigger === 'open'))
+        )
+          return false;
         const observerOpen = !entry.plan.assertTicketThread || !entry.closeJoin;
         if (prior)
           return (
@@ -396,9 +409,11 @@ export function createPrewarmOperations(
       plan: PrewarmPlan,
       authority: { revoked: AbortSignal; close(): Promise<void> },
       start: (signal: AbortSignal) => Promise<AbortSignal | void>,
+      trigger: DEntryNativePrewarmTrigger = 'page',
     ) {
       lifetime.throwIfAborted();
       authority.revoked.throwIfAborted();
+      const foreground = trigger === 'open';
       const now = Date.now();
       for (const [id, entry] of tickets) {
         if (expired(entry, now)) {
@@ -430,6 +445,7 @@ export function createPrewarmOperations(
         identity,
         sessionId: context.sessionId,
         plan,
+        foreground,
         preparedTarget: plan.target,
         ticket,
         expires,
@@ -469,14 +485,21 @@ export function createPrewarmOperations(
       signal.addEventListener('abort', releaseExpired, { once: true });
       const task = Promise.resolve().then(async () => {
         let failed = false;
+        let explicitOpenRequired = false;
         try {
           signal.throwIfAborted();
-          operation.state = { state: 'starting' };
+          operation.state = {
+            state:
+              plan.upgradeRestart && foreground ? 'restarting' : 'starting',
+          };
           operation.proof = (await start(signal)) || undefined;
           operation.proof?.throwIfAborted();
           signal.throwIfAborted();
-        } catch {
+        } catch (error) {
           failed = true;
+          explicitOpenRequired =
+            error instanceof PersonVmError &&
+            error.code === 'UPGRADE_OPEN_REQUIRED';
         }
         if (
           signal.aborted ||
@@ -496,7 +519,11 @@ export function createPrewarmOperations(
           failed || signal.aborted || operation.proof?.aborted
             ? {
                 state: 'failed',
-                code: denied ? 'AUTHORITY_REVOKED' : 'START_UNAVAILABLE',
+                code: denied
+                  ? 'AUTHORITY_REVOKED'
+                  : explicitOpenRequired
+                    ? 'UPGRADE_OPEN_REQUIRED'
+                    : 'START_UNAVAILABLE',
               }
             : { state: 'ready' };
         discardUnpublished(operation);
@@ -542,7 +569,9 @@ export function createPrewarmOperations(
             !orphan &&
             !entry.revoked.aborted &&
             entry.closeJoin &&
-            (closing.state === 'starting' || closing.state === 'failed') &&
+            (closing.state === 'starting' ||
+              closing.state === 'restarting' ||
+              closing.state === 'failed') &&
             !expired(entry)
           ) {
             if (

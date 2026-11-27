@@ -127,6 +127,176 @@ suite(
         await admin.end({ timeout: 2 });
       }
     });
+    it('does not publish stopped when the matching successful stop audit is rejected', async () => {
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      const attempt = { ...rc, requestId: randomUUID() };
+      await db`alter table person_vm_audit
+        add constraint fixture_reject_stop_success
+        check (action <> 'stop' or result <> 'succeeded')`;
+      try {
+        await expect(h.service.stop(attempt, signal())).rejects.toMatchObject({
+          code: '23514',
+        });
+        expect(await store.read(binding.personId)).toMatchObject({
+          phase: 'running',
+          instanceId: binding.instanceId,
+          leaseEpoch: binding.leaseEpoch,
+        });
+        const rows = await db`select result from person_vm_audit
+          where request_id=${attempt.requestId} and action='stop' order by id`;
+        expect(rows).toEqual([{ result: 'started' }, { result: 'failed' }]);
+      } finally {
+        await db`alter table person_vm_audit drop constraint fixture_reject_stop_success`;
+      }
+      await expect(h.service.stop(attempt, signal())).resolves.toMatchObject({
+        phase: 'stopped',
+        diskRetained: true,
+      });
+      const [confirmed] = await db`select count(*)::int as count
+        from person_virtual_machines vm join person_vm_audit a
+          using (person_id, organization_id, vm_id, lease_epoch)
+        where vm.phase='stopped' and vm.person_id=${binding.personId}
+          and a.request_id=${attempt.requestId}
+          and a.action='stop' and a.result='succeeded'`;
+      expect(confirmed!.count).toBe(1);
+    });
+
+    it('serializes cross-person peak capacity and frees it only after a joined stop', async () => {
+      const store = new PostgresPersonVmStore(openWorker, undefined, 1);
+      const h = harness(store);
+      const vm = new PersonVmService({
+        ...h.options,
+        nativeCapacityAccounting: true,
+      });
+      const people = [context(), context()];
+      for (const rc of people) await vm.create(rc, signal());
+      const attempts = await Promise.allSettled(
+        people.map((rc) => vm.start(rc, signal())),
+      );
+      const winner = attempts.findIndex(
+        (attempt) => attempt.status === 'fulfilled',
+      );
+      expect(winner).toBeGreaterThanOrEqual(0);
+      expect(attempts[1 - winner]).toMatchObject({
+        status: 'rejected',
+        reason: { code: 'RUNTIME_NOT_READY' },
+      });
+      const active = people[winner]!;
+      const queued = people[1 - winner]!;
+      const binding = await vm.resolve(active, signal());
+      expect(h.log.filter((entry) => entry === 'native:create')).toHaveLength(
+        1,
+      );
+      h.states.set(binding.vmId, 'unknown');
+      await expect(vm.stop(active, signal())).rejects.toMatchObject({
+        code: 'ACTIVITY_UNKNOWN',
+      });
+      await expect(vm.start(queued, signal())).rejects.toMatchObject({
+        code: 'RUNTIME_NOT_READY',
+      });
+
+      h.states.set(binding.vmId, 'stopped');
+      await expect(vm.stop(active, signal())).resolves.toMatchObject({
+        phase: 'stopped',
+      });
+      const release = await db`select request_id from person_vm_audit
+        where vm_id=${binding.vmId} and lease_epoch=${binding.leaseEpoch}
+          and action='capacity.release' and result='succeeded'`;
+      expect(release.map((row) => row.request_id)).toEqual([active.requestId]);
+      await expect(vm.start(queued, signal())).resolves.toMatchObject({
+        ready: true,
+      });
+    });
+    it('uses the exact completed stop for retained rows created before capacity was enabled', async () => {
+      const old = harness(store);
+      const people = [context(), context()];
+      for (const rc of people) {
+        await old.service.create(rc, signal());
+        await old.service.start(rc, signal());
+        const binding = await old.service.resolve(rc, signal());
+        old.states.set(binding.vmId, 'stopped');
+        await old.service.stop(rc, signal());
+      }
+      const capacity = new PersonVmService({
+        ...old.options,
+        store: new PostgresPersonVmStore(openWorker, undefined, 1),
+        nativeCapacityAccounting: true,
+      });
+      await expect(capacity.start(people[0]!, signal())).resolves.toMatchObject(
+        {
+          ready: true,
+        },
+      );
+      await expect(capacity.start(people[1]!, signal())).rejects.toMatchObject({
+        code: 'RUNTIME_NOT_READY',
+      });
+    });
+
+    it('returns a scheduled startup reservation denied before native dispatch', async () => {
+      const store = new PostgresPersonVmStore(openWorker, undefined, 1);
+      const h = harness(store);
+      const { rc, binding } = await running(h);
+      h.states.set(binding.vmId, 'stopped');
+      await h.service.stop(rc, signal());
+      const endpoint = {
+        workspaceId: randomUUID(),
+        employeeInstanceId: randomUUID(),
+        employeeRevision: 1,
+        employeeVersionId: randomUUID(),
+      };
+      const facts = {
+        personId: binding.personId,
+        organizationId: binding.organizationId,
+        entries: [endpoint],
+      };
+      const roster = {
+        ...facts,
+        digest: `sha256:${createHash('sha256').update(JSON.stringify(facts)).digest('hex')}`,
+      };
+      h.runtime.assertScheduledReady = async () => {};
+      h.runtime.retireAfterNativeStop = async () => {};
+      h.native.prepareWebEndpoints = async (current, expected) => ({
+        binding: current,
+        rosterDigest: expected.digest,
+        endpoints: [{ ...endpoint, hostPort: 24444, guestPort: 24445 }],
+      });
+      h.native.assertWebEndpoints = async () => {};
+      const scheduled = new PersonVmService({
+        ...h.options,
+        nativeWeb: { prepare: async () => roster },
+        nativeCapacityAccounting: true,
+      });
+      const before = h.log.length;
+      await expect(
+        scheduled.startRetainedForSchedule(
+          binding,
+          randomUUID(),
+          {
+            readRoster: async () => roster,
+            withCurrentAuthority: async () => {
+              throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+          },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      expect(h.log.slice(before)).not.toContain('native:start');
+      expect(h.log.slice(before)).not.toContain('native:stop');
+      const released =
+        await db`select lease_epoch from person_vm_audit where vm_id=${binding.vmId}
+        and action='capacity.release' and result='succeeded'`;
+      expect(released.map((entry) => Number(entry.lease_epoch))).toEqual([
+        binding.leaseEpoch + 1,
+      ]);
+      const other = context();
+      await h.service.create(other, signal());
+      await expect(h.service.start(other, signal())).resolves.toMatchObject({
+        ready: true,
+      });
+    });
+
     async function terminateWorker(name = workerNames.at(-1)!) {
       const rows =
         await admin`select pid from pg_stat_activity where application_name=${name}`;

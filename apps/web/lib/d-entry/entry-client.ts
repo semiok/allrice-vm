@@ -5,12 +5,13 @@ import {
   DEntrySelectionInputSchema,
   UuidSchema,
   type DEntrySelectionInput,
+  type DEntryNativePrewarmTrigger,
 } from '@allrice/contracts';
 
 export class EmployeeEntryError extends Error {
   constructor(
     readonly status: number,
-    readonly reason?: 'response-mismatch',
+    public readonly reason?: 'response-mismatch' | 'UPGRADE_OPEN_REQUIRED',
   ) {
     super('Employee entry is unavailable');
   }
@@ -48,7 +49,7 @@ function postEmployeeEntry(path: string, data: object, signal: AbortSignal) {
   });
 }
 
-export type EmployeePrewarmProgress = 'accepted' | 'starting';
+export type EmployeePrewarmProgress = 'accepted' | 'starting' | 'restarting';
 const prewarmRequestMs = 20_000;
 const prewarmWaitMs = 5 * 60_000;
 
@@ -72,6 +73,7 @@ export async function prewarmEmployeeEntry(
   signal: AbortSignal,
   options: {
     ticket?: DEntryNativePrewarmTicket;
+    trigger?: DEntryNativePrewarmTrigger;
     accepted?(ticket: DEntryNativePrewarmTicket): void;
     progress?(state: EmployeePrewarmProgress): void;
   } = {},
@@ -80,7 +82,7 @@ export async function prewarmEmployeeEntry(
   if (!ticket) {
     const warm = await postEmployeeEntry(
       '/api/v1/d-entry/native-prewarm',
-      { selection, trigger: 'page' },
+      { selection, trigger: options.trigger ?? 'page' },
       AbortSignal.any([signal, AbortSignal.timeout(prewarmRequestMs)]),
     );
     signal.throwIfAborted();
@@ -145,6 +147,8 @@ export async function prewarmEmployeeEntry(
       const status = parsed.data;
       if (response.status === 410 || status.state === 'expired')
         throw new EmployeeEntryError(410);
+      if (status.state === 'failed' && status.code === 'UPGRADE_OPEN_REQUIRED')
+        throw new EmployeeEntryError(409, status.code);
       if (status.state === 'failed')
         throw new EmployeeEntryError(
           status.code === 'AUTHORITY_REVOKED' ? 403 : 503,

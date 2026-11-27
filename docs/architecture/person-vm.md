@@ -17,7 +17,7 @@
 
 prepare/assertActive/revoke 均 host-only，不是可让模型调用的工具。撤销必须幂等到精确 bindingId/epoch，不能把旧实例的延迟撤销作用到新实例。
 
-v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），20 分钟策略只由 host 依据活动事实执行。
+v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），闲置停机只由 host 依据活动事实执行，默认 20 分钟。
 
 员工端口位在新 VM 创建或旧 v1 VM 确认停止后的转换时一次发布，仅宿主回环可达。运维可在发布封存的 `.local/person-vm-host.json` 顶层设置 `employeePortSlots`。合法值为 1–20 的整数，缺字段默认 20，非法值记录字段名、原因和回退值后使用 20。Web 配额与 Worker 原生发布读同一封存值。已核实的 v2 物理槽宽随 VM 记录持久保存，配置上调或下调都不改变它。保盘保留槽宽，彻底擦除完成后清除原宽度。槽位总数独立于同时运行的员工数。
 
@@ -31,7 +31,9 @@ v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个
 
 后端 present；MCP none（模型不获 VM 管理权）；员工 UI none（本卡只提供页面/输入预开机服务接口，后续由已批界面接线）；后台 none（没有新增管理界面授权）；权限 present（每调用重查当前可信身份，删盘单独授权/审计，不默认删盘）。默认关闭/名单由发布入口控制，本包不新增产品开关。
 
-**20 分钟自动回收、运行中的普通安全 stop/delete/takeover 尚未实现。** 锁定 DSH 0.2.1-rc.2 的公开 `Agent.whenIdle/runMaintenance` 只覆盖单 agent；workspace 活动是瞬时快照，归档 stop 只发停止请求、不等收敛；未找到覆盖本人 VM 全域的连续活动水位与原子新任务准入冻结。采样之间可发生短 job，最后一次0之后也可产生工作，缩短轮询间隔不能补证明。当前 `reconcileIdle` 对 running 永远保留；普通停机/删除/接管在 running 瞬时0时仍拒绝 `ACTIVITY_UNKNOWN`，active/unknown/stale/host hold 继续拒绝。不会新增虚构 native gate 或第二套 Agent 状态机，不能把 fixture 通过当原生能力已接。
+**保守自动停机默认关闭。** 启用后，宿主每 60 秒采样当前 VM 的全部员工。持续看到空闲、没有漏采且未收到忙碌事件，才进入同一物理租约下的唤醒准备与停机。采样间隔可用 `lifecycle.idleSampleIntervalMs` 调整。原生读失败、漏采、Worker 重启或代次变化均重新计时。部分瞬态工作可在采样间发生。最后一次负向读取至原生停机之间也可能出现尚未被宿主观察到的工作。下一次定时触发落入停机预算与 `lifecycle.idleScheduleSafetyMarginMs` 的合计窗口时保留运行，默认安全余量为 30 秒。普通停机、删除和接管仍沿用各自的活动、租约和权限校验。
+
+在 `~/allrice40-dev/config/person-vm-host.json` 设置内存和闲置时长，随常规发布重新封存，由 Worker 启动时读取。内存使用 `memory.policy.physicalBytes`（整数 MiB 对应的字节数，1–4 GiB），闲置时长使用 `lifecycle.idleMs`（毫秒，5–60 分钟）。缺项使用 2 GiB、20 分钟。非法字段独立回落，并在 Worker 日志记录字段和默认值。配置随 Host 启动加载，已有 VM 改变内存上限需要配置 `lifecycle.hostVmBudgetMiB`，并在下一次启动时走既有的容量预留和原生配置读回。
 
 仅 native 已真实 stopped/absent 时，可对账后清理并从确认的 stoppedAt 计算7天转冷。刚确认停止不能因旧 lastActivityAt 立即冷。自己本次启动失败的清理仍撤出口、尝试物理stop、确认后detach。权限撤销强制终止是另片已批需求，不作为普通 idle 回收证明。长周期测试只用时间夹具，未实等20min/7day；不做 Full 快照、不自动删盘。
 
@@ -113,6 +115,18 @@ macOS 对原盘及原密钥建立无覆盖的正式文件引用，核实同 inod
 | 持久绑定和容量       | 适配器核对 inode，持久化正式引用并撤销临时引用。按实际卷的可用块及镜像分配块核算。                                                                                      | 以持久卷标识和密钥保管映射提交同一正式归属，读取对应文件系统或 thin pool 的实际预算。                                            |
 | 公开缓存和根盘       | stock 仅写封签缓存。正式启动沿用 `MicrosandboxPersonVm`。同一封签的领用盘首开对盘内缓存重新验哈希，已验证的本地字节直接供 MSB 用 `flat` 和 `clone=reflink` 建个人根盘。 | 核对同一公开来源，由正常启动适配器使用 XFS 或 btrfs reflink。后续可用公开只读 lower 加个人加密 upper，继续复用同一根盘准备位置。 |
 | Guest 地址和运行时   | 工作台继续用既有可信 Web 封签的 `web.guestAddress` 和实际 MSB 端点检查，库存过程无 guest 地址。生产装配保留现有 MSB provider 及 Darwin Unix socket 路径限制。           | 由对应虚拟化运行时按已启动的绑定和 epoch 返回实际地址，供同一工作台启动与就绪检查消费。                                          |
+
+### 升级时停机与接管
+
+发布负责人先完成候选构建。给 `deploy-dev` 的文件描述符 3 提供当前平台管理员会话令牌。发布脚本关闭这个描述符后才启动构建子进程。令牌留在发布进程内，只交给经过同 PID 和同 boot 核验的本机维护连接。
+
+```sh
+deploy-dev --release-manager --require-person-vm-config 3<"$private_session_file"
+```
+
+脚本在切换前调用 `person-vm-drain`，以当前 Worker 的实际 PID 定位其私有 Unix socket。遇到多个 socket、缺失回执、候选仍在运行或活动未知时，发布停止。Worker 只按原生停机门卫处理空闲 VM，忙碌时最多等待到发布排空期限。快照、迁移和新版启动耗时没有确定上界。有待执行的已承诺唤醒（包括原生停机已确认、生命周期记录仍待完成），或排空会产生新的唤醒义务时，发布、跨版本恢复和回退停止，现有 Worker 继续负责唤醒。回执包含 `bootId`、已停机数及 `expiresAt`。脚本先记录原进程和启动配置，再向同一进程提交有期限的关闭请求。普通信号不能消费回执。脚本确认正常退出、端口关闭、库存清空且没有遗留唤醒后才切换。恢复同样核对实际 Worker 和保存的退出记录。旧版 LaunchAgent 如不支持此协议，请由发布负责人先按旧版维护流程确认 VM 全部停机并停止旧 Worker，再开始首次迁移。
+
+数据库仍记录为运行中而当前 Worker 没有旧 Gateway 回执的 VM，会记录待接管告警。网页自动打开、恢复标签页和后台预热均不触发停机。本人点「打开员工」后，Worker 复核账号现权、独占物理租约、上一版 Worker 已退出及旧端口所有权，才停止确切 VM、读回、卸盘并写入 `stop.upgrade`。网页显示「版本已更新，正在重新启动员工」，随后以同一保留盘启动新代次。停机后的读回若失败，带有本代停机派发记录的 VM 可以在相同围栏下重新确认终态并完成清理。原生日程保留在盘上，由既有闲置停机流程重新登记。更换物理只读制品仍须验证原生挂载与封签的交接。
 
 ### 平台管理员删除
 

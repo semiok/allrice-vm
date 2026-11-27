@@ -70,6 +70,7 @@ async function host(options: { detail?: string; arrivals?: number } = {}) {
     createServer,
     process,
     makeHealthResponse,
+    personVmRecovery: () => 'wake-ready',
     personVmDeleteHttp: { handle: async () => false },
     dEntryProfile: { handle: async () => false },
     dEntryPageRpc: { handle: async () => false },
@@ -137,6 +138,7 @@ it('serves ready only after the actual configured platform images pass the shipp
     service: 'worker',
     status: 'ready',
     identity: { sourceSha: 'a'.repeat(40) },
+    personVmRecovery: { pid: process.pid, state: 'wake-ready' },
     nativeArtifact: { artifactId: `sha256:${'b'.repeat(64)}` },
     maintenance: { state: 'open' },
   });

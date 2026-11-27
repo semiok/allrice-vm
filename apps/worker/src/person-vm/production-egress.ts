@@ -338,6 +338,7 @@ export function createProductionEgressInstallation(
         const url = new URL(access.origin);
         const plan = await createVmMemoryGuestPlan({
           ...loaded.configuration.memory,
+          platformPhysicalBytes: loaded.platform.memoryMiB * 1024 ** 2,
           dshCommandMemory:
             loaded.configuration.native.readonlyCommandMemoryDirectory,
         });

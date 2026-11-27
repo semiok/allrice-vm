@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import type { RequestContext } from '@allrice/contracts';
+import { RequestContextSchema, type RequestContext } from '@allrice/contracts';
 import {
   PersonVmError,
   PERSON_VM_IDLE_MS,
@@ -22,8 +22,12 @@ import type {
   PersonVmAdmissionParticipant,
   PersonVmAdmissionPort,
   PersonVmAdmissionSubscription,
-  PersonVmIdleCoverage,
+  PersonVmNativeIdleCoverage,
+  PersonVmIdleStopDispatch,
+  PersonVmIdleStopSource,
   PersonVmNativeActivityPort,
+  PersonVmPrepareIdleStop,
+  PersonVmScheduledIdleAuthority,
 } from './admission-contract.ts';
 import {
   type PostgresPersonVmAdmissionStore,
@@ -40,6 +44,7 @@ import {
   type VmLease,
   type VmRecord,
 } from './store.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 type OwnedPermit = {
   context: RequestContext;
@@ -69,21 +74,21 @@ type IdleCandidate = { key: string; mono: number };
 export function advanceIdleCandidate(
   previous: IdleCandidate | undefined,
   binding: PersonVmBinding,
-  coverage: readonly PersonVmIdleCoverage[],
+  coverage: readonly PersonVmNativeIdleCoverage[],
   acceptedRevisions: readonly (string | undefined)[],
   row: Pick<VmRecord, 'holds' | 'lastActivityAt'> | null,
   mono: number,
 ): IdleCandidate | undefined {
   if (
     row?.holds.length ||
-    coverage.some((value) => value.state !== 'continuous' || !value.idleSince)
+    coverage.some((value) => value.state === 'unknown' || !value.idleSince)
   )
     return undefined;
   const key = JSON.stringify([
     binding,
     coverage.map((value) => [
       value.cursor?.sourceId,
-      value.state === 'continuous' ? value.idleSince : null,
+      value.state === 'unknown' ? null : value.idleSince,
     ]),
     acceptedRevisions,
     row?.lastActivityAt,
@@ -127,6 +132,15 @@ export class PersonVmAdmissionHost
       now: () => Date;
       monotonic?: () => number;
       nativeActivity?: PersonVmNativeActivityPort;
+      activityMaxAgeMs: number;
+      prepareIdleStop?: PersonVmPrepareIdleStop;
+      scheduledIdleAuthority?: PersonVmScheduledIdleAuthority;
+      recoverIdleStop(
+        binding: PersonVmBinding,
+        assertAuthority: (signal: AbortSignal) => Promise<void>,
+        signal: AbortSignal,
+      ): Promise<boolean>;
+      idleStopped(binding: PersonVmBinding): void;
       startOwned(
         context: RequestContext,
         lease: VmLease,
@@ -138,6 +152,13 @@ export class PersonVmAdmissionHost
         signal: AbortSignal,
       ): Promise<PersonVmView>;
       assertStopSafe(lease: VmLease, signal: AbortSignal): Promise<void>;
+      stopIdleOwned(
+        requestId: string,
+        lease: VmLease,
+        signal: AbortSignal,
+        assertStopCurrent: (signal: AbortSignal) => Promise<void>,
+        dispatch?: PersonVmIdleStopDispatch,
+      ): Promise<PersonVmView>;
     },
   ) {
     this.idleMs =
@@ -1236,63 +1257,282 @@ export class PersonVmAdmissionHost
       },
     );
   }
-  async reconcileIdle(
-    context: RequestContext,
+  private async readIdleCandidate(
     binding: PersonVmBinding,
+    row: VmRecord | null,
+    previous: IdleCandidate | undefined,
     signal: AbortSignal,
-  ): Promise<void> {
-    await this.authorize(context, binding, signal);
-    if (!this.options.nativeActivity) {
-      this.idle.delete(binding.personId);
-      return;
-    }
-    const [[g, e, accepted], native, row] = await Promise.all([
-      this.options.shared.transaction(binding.personId, signal, async (tx) => {
+    purpose: 'inspection' | 'stop-guard',
+    onSample?: (cursor: PersonVmActivityCursor) => void,
+  ) {
+    if (
+      !this.options.nativeActivity ||
+      row?.phase !== 'running' ||
+      !sameBinding(bindingOf(row), binding)
+    )
+      return undefined;
+    const observations = await this.options.shared.transaction(
+      binding.personId,
+      signal,
+      async (tx) => {
         this.check(tx, binding);
+        if (tx.state.round && !released(tx.state.round)) return undefined;
         return [
           await this.observation(tx, 'gateway'),
           await this.observation(tx, 'entry'),
           [tx.state.gateway.idleRevision, tx.state.entry.idleRevision],
         ] as const;
-      }),
-      this.options.nativeActivity.observe(binding, signal),
-      this.options.store.read(binding.personId),
-    ]);
-    const coverage = [g.coverage, e.coverage, native.coverage];
+      },
+    );
+    if (!observations) return undefined;
+    const [g, e, accepted] = observations;
+    const native = await this.options.nativeActivity.observe(
+      binding,
+      signal,
+      purpose,
+    );
+    const now = this.options.now().getTime();
+    const age = now - Date.parse(native.activity.observedAt);
+    const coverage = native.coverage;
+    const through =
+      coverage.state === 'unknown' ? NaN : Date.parse(coverage.through);
     if (
       g.state !== 'known' ||
       e.state !== 'known' ||
       g.active + g.queued + e.active + e.queued ||
       !sameBinding(native.activity.binding, binding) ||
       native.activity.state !== 'known' ||
+      coverage.state === 'unknown' ||
+      (coverage.state === 'sampled' &&
+        !this.options.nativeActivity.assertSampleCurrent) ||
+      !coverage.idleSince ||
+      !(Date.parse(coverage.from) <= Date.parse(coverage.idleSince)) ||
+      !(Date.parse(coverage.idleSince) <= through) ||
+      through > now ||
+      now - through > this.options.activityMaxAgeMs ||
+      !coverage.cursor.sourceId ||
+      !coverage.cursor.revision ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > this.options.activityMaxAgeMs ||
       native.activeScheduleDeliveries !== 0 ||
-      native.activity.activeTurns +
-        native.activity.activeJobs +
-        native.activity.activeSubtasks +
-        native.activity.pendingApprovals
+      ![
+        native.activity.activeTurns,
+        native.activity.activeJobs,
+        native.activity.activeSubtasks,
+        native.activity.pendingApprovals,
+      ].every((count) => count === 0)
+    )
+      return undefined;
+    const candidate = advanceIdleCandidate(
+      previous,
+      binding,
+      [g.coverage, e.coverage, native.coverage],
+      [...accepted, native.coverage.cursor?.revision],
+      row,
+      this.mono(),
+    );
+    if (candidate && coverage.state === 'sampled') onSample?.(coverage.cursor);
+    return candidate;
+  }
+  async reconcileIdle(
+    context: RequestContext,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ) {
+    RequestContextSchema.parse(context);
+    return this.reconcileOwnedIdle(
+      { binding, context },
+      (active) => this.authorize(context, binding, active),
+      signal,
+    );
+  }
+
+  async reconcileScheduledIdle(
+    binding: PersonVmBinding,
+    scheduledRoster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ) {
+    const authority = this.options.scheduledIdleAuthority;
+    if (!authority || !this.options.prepareIdleStop)
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    const requestId = randomUUID();
+    const assertOwned = async (active: AbortSignal) => {
+      active.throwIfAborted();
+      authority.assertOwned(binding, scheduledRoster);
+    };
+    await assertOwned(signal);
+    return this.reconcileOwnedIdle(
+      { binding, requestId, scheduledRoster },
+      async (active) => {
+        await assertOwned(active);
+        await authority.assertCurrent(binding, scheduledRoster, active);
+        await assertOwned(active);
+      },
+      signal,
+      {
+        assertOwned,
+        dispatch: (active, stop) =>
+          authority.dispatch(binding, scheduledRoster, requestId, active, stop),
+      },
+    );
+  }
+
+  private async reconcileOwnedIdle(
+    request: PersonVmIdleStopSource,
+    assertAuthority: (signal: AbortSignal) => Promise<void>,
+    signal: AbortSignal,
+    scheduled?: {
+      assertOwned(signal: AbortSignal): Promise<void>;
+      dispatch: PersonVmIdleStopDispatch;
+    },
+  ) {
+    const { binding } = request;
+    const requestId =
+      'context' in request ? request.context.requestId : request.requestId;
+    // Only an exact joined native receipt enters this path; it closes
+    // existing resources without granting a new stop after revocation.
+    if (
+      scheduled &&
+      (await this.options.recoverIdleStop(
+        binding,
+        scheduled.assertOwned,
+        signal,
+      ))
     ) {
       this.idle.delete(binding.personId);
       return;
     }
-    const mono = this.mono();
-    const candidate = advanceIdleCandidate(
-      this.idle.get(binding.personId),
+    try {
+      await assertAuthority(signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      if ('scheduledRoster' in request) this.idle.delete(binding.personId);
+      throw error;
+    }
+    if (
+      !scheduled &&
+      this.options.prepareIdleStop &&
+      (await this.options.recoverIdleStop(binding, assertAuthority, signal))
+    ) {
+      this.idle.delete(binding.personId);
+      return;
+    }
+    const candidate = await this.readIdleCandidate(
       binding,
-      coverage,
-      [...accepted, native.coverage.cursor?.revision],
-      row,
-      mono,
-    );
+      await this.options.store.read(binding.personId),
+      this.idle.get(binding.personId),
+      signal,
+      'inspection',
+    ).catch((error: unknown) => {
+      this.idle.delete(binding.personId);
+      throw error;
+    });
     if (!candidate) {
       this.idle.delete(binding.personId);
       return;
     }
     this.idle.set(binding.personId, candidate);
-    if (mono - candidate.mono < this.idleMs) return;
-    // This composition has no native autonomous-admission barrier. Do not
-    // freeze users merely because an injected projection looks complete: it
-    // cannot commit a running stop. Keep the VM/open gates and the candidate.
-    // Explicit stopFrozen also enforces native stopped/absent before cleanup.
-    return;
+    const prepare = this.options.prepareIdleStop;
+    if (!prepare || this.mono() - candidate.mono < this.idleMs) return;
+    const stopped = await this.options.store
+      .withLease(
+        binding.personId,
+        { now: this.options.now, ttlMs: this.options.leaseTtlMs },
+        async (owned) => {
+          const current = AbortSignal.any([signal, owned.signal]);
+          return this.trackOwner(binding.personId, current, async (active) => {
+            let sample: PersonVmActivityCursor | undefined;
+            const checkIdle = async (checking: AbortSignal) => {
+              await owned.guard();
+              const latest = await this.readIdleCandidate(
+                binding,
+                owned.row,
+                candidate,
+                checking,
+                'stop-guard',
+                (cursor) => {
+                  sample = cursor;
+                },
+              );
+              if (
+                latest !== candidate ||
+                this.mono() - latest.mono < this.idleMs
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+              await assertAuthority(checking);
+              checking.throwIfAborted();
+            };
+            let pendingCheck: Promise<void> | undefined;
+            const assertStopCurrent = async (probe: AbortSignal) => {
+              const checking = AbortSignal.any([active, probe]);
+              checking.throwIfAborted();
+              // Schedule capture reads employee catalogs in parallel, all
+              // under this exact physical lease and with the same authority.
+              // Share only in-flight checks. Each later round reads live again.
+              pendingCheck ??= checkIdle(checking).finally(() => {
+                pendingCheck = undefined;
+              });
+              await pendingCheck;
+              checking.throwIfAborted();
+            };
+            await assertStopCurrent(active);
+            const preparation = { ...request, assertStopCurrent };
+            const plan = await prepare(preparation, active);
+            if (!('ok' in plan) || plan.ok !== true) return;
+            const assertWakeWindow = () => {
+              if (
+                plan.nextWakeAt !== null &&
+                !(Date.parse(plan.nextWakeAt) > this.options.now().getTime())
+              )
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+            };
+            await this.options.stopIdleOwned(
+              requestId,
+              owned,
+              active,
+              async (probe) => {
+                await assertStopCurrent(probe);
+                const checked = await prepare(preparation, probe);
+                if (
+                  !('ok' in checked) ||
+                  checked.nextWakeAt !== plan.nextWakeAt
+                )
+                  throw new PersonVmError('ACTIVITY_UNKNOWN');
+                await assertStopCurrent(probe);
+                assertWakeWindow();
+              },
+              scheduled || plan.dispatch || sample
+                ? async (dispatchSignal, stop) => {
+                    await owned.guard();
+                    const dispatch = (fenced: AbortSignal) => {
+                      fenced.throwIfAborted();
+                      assertWakeWindow();
+                      if (sample)
+                        this.options.nativeActivity?.assertSampleCurrent?.(
+                          binding,
+                          sample,
+                          fenced,
+                        );
+                      return stop(fenced);
+                    };
+                    const authorizeDispatch =
+                      scheduled?.dispatch ?? plan.dispatch;
+                    if (authorizeDispatch)
+                      await authorizeDispatch(dispatchSignal, dispatch);
+                    else await dispatch(dispatchSignal);
+                  }
+                : undefined,
+            );
+            this.idle.delete(binding.personId);
+            return true;
+          });
+        },
+      )
+      .catch((error: unknown) => {
+        this.idle.delete(binding.personId);
+        throw error;
+      });
+    if (stopped) this.options.idleStopped(binding);
   }
 }

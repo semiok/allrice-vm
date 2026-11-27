@@ -1,6 +1,5 @@
 import postgres from 'postgres';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import {
   afterAll,
   afterEach,
@@ -10,7 +9,9 @@ import {
   expect,
   it,
 } from 'vitest';
-import { assertRuntimeFixtureDatabase } from '../../database/src/runtime-fixture-database.ts';
+import { createRuntimeFixtureDatabase } from '../../database/src/runtime.fixture.ts';
+import { createPostgresPersonVmScheduledWakeStore } from '../../database/src/capabilities/person-vm-scheduled-wake.ts';
+import { PersonVmError, type PersonVmBinding } from './contract.ts';
 import { PersonVmService } from './person-vm.ts';
 import { PostgresPersonVmStore, type PersonVmSqlFactory } from './store.ts';
 import { PERSON_VM_IDLE_MS } from './contract.ts';
@@ -34,7 +35,7 @@ const suite =
 suite(
   'shared PG admission through actual PersonVmService composition; synthetic native, no VM/model',
   () => {
-    const schema = 'vm_admit_' + randomUUID().replaceAll('-', '');
+    let schema: string;
     const prefix = 'vma-' + randomUUID(); // Keep exact PG application_name under 63 bytes, including role/counter.
     const clients = new Set<postgres.Sql>();
     const handles: [PersonVmAdmissionHost, PersonVmAdmissionPermit][] = [];
@@ -48,6 +49,7 @@ suite(
       return promise;
     }
     let admin: postgres.Sql, db: postgres.Sql;
+    let database: Awaited<ReturnType<typeof createRuntimeFixtureDatabase>>;
     function latch() {
       let resolve!: () => void;
       const promise = new Promise<void>((done) => {
@@ -115,26 +117,17 @@ suite(
       return { open, names, events };
     }
     beforeAll(async () => {
-      const url = new URL(process.env.ALLRICE_TEST_DATABASE_URL!);
-      assertRuntimeFixtureDatabase(url);
-      admin = postgres(url.toString(), { max: 2, onnotice: () => {} });
-      await admin.unsafe(`create schema "${schema}"`);
-      db = postgres(url.toString(), {
+      // Wake revocation is installed on the real tenant tables by 0258.
+      database = await createRuntimeFixtureDatabase({ ownSchemaOnly: true });
+      db = database.db;
+      const [current] = await db<
+        { schema: string }[]
+      >`select current_schema() as schema`;
+      schema = current!.schema;
+      admin = postgres(process.env.ALLRICE_TEST_DATABASE_URL!, {
         max: 2,
         onnotice: () => {},
-        connection: { search_path: schema },
       });
-      for (const name of [
-        '0247_person_virtual_machines.sql',
-        '0250_person_vm_admission.sql',
-        '0259_person_vm_verified_web_slot_capacity.sql',
-      ])
-        await db.unsafe(
-          await readFile(
-            new URL('../../database/migrations/' + name, import.meta.url),
-            'utf8',
-          ),
-        );
     });
     beforeEach(() => {
       caller = new AbortController();
@@ -154,14 +147,14 @@ suite(
       );
       await db.unsafe('drop function if exists fixture_block_delete()');
       await db.unsafe(
-        'truncate person_vm_admission_permits,person_vm_audit,person_virtual_machines',
+        'truncate person_vm_admission_permits,person_vm_audit,person_virtual_machines,person_vm_scheduled_wakes',
       );
     });
     afterAll(async () => {
-      await db?.end({ timeout: 2 });
-      if (admin) {
-        await admin.unsafe(`drop schema if exists "${schema}" cascade`);
-        await admin.end({ timeout: 2 });
+      try {
+        await database?.close();
+      } finally {
+        await admin?.end({ timeout: 2 });
       }
     });
     async function setup(sharedFactory?: PersonVmSqlFactory, idleMs?: number) {
@@ -202,6 +195,443 @@ suite(
         },
       };
     }
+    it('restarts an orphan only for the current foreground open and keeps the original disk', async () => {
+      const h = await setup();
+      const store = new PostgresPersonVmStore(h.physical.open);
+      const seen: string[] = [];
+      let currentEpoch = 0;
+      let previousStillListening = true;
+      let reconciled = false;
+      let joinParallel = false;
+      const entered = latch();
+      const release = latch();
+      const checkedLaterLogin = latch();
+      const later = context(h.binding.organizationId, h.binding.personId);
+      const vm = new PersonVmService({
+        ...h.options,
+        store,
+        disk: {
+          ...h.options.disk,
+          async verifyAttachedMount({ vmId }) {
+            return h.mounts.has(vmId) ? '/synthetic/' + vmId : null;
+          },
+        },
+        native: {
+          ...h.native,
+          async readAttachedStatus(binding, mount, signal) {
+            expect(mount).toBe('/synthetic/' + binding.vmId);
+            return h.native.status(binding, signal);
+          },
+        },
+        authority: {
+          async authorize(request, action, signal) {
+            const identity = await h.options.authority.authorize(
+              request,
+              action,
+              signal,
+            );
+            if (request.sessionId === later.sessionId)
+              checkedLaterLogin.resolve();
+            return identity;
+          },
+        },
+        ownsEgressReceipt: ({ binding }) => binding.leaseEpoch === currentEpoch,
+        observeOwnedStart(binding) {
+          currentEpoch = binding.leaseEpoch;
+          seen.push('start');
+        },
+        async withPreviousGatewayFenced(binding, ports, _signal, stop) {
+          expect(binding).toEqual(h.binding);
+          expect(ports).toEqual([38990]);
+          const row = await h.peerStore.read(binding.personId);
+          expect(row?.leaseOwner).toBeTruthy();
+          expect(row?.phase).toBe('running');
+          if (previousStillListening) throw new PersonVmError('LEASE_CONFLICT');
+          seen.push('fence');
+          if (joinParallel) {
+            entered.resolve();
+            await release.promise;
+          }
+          const result = await stop();
+          reconciled = true;
+          expect(h.states.get(binding.vmId)).toBe('stopped');
+          expect(h.mounts.has(binding.vmId)).toBe(false);
+          const stopped = await h.peerStore.read(binding.personId);
+          expect(stopped).toMatchObject({
+            phase: 'stopped',
+            diskRetained: true,
+            leaseEpoch: 1,
+          });
+          seen.push('release');
+          return result;
+        },
+      });
+      vm.createAdmissionHost({ openSql: h.physical.open });
+      const requestId = randomUUID();
+      const events = h.log.length;
+      const observed: [string, PersonVmBinding][] = [];
+      const warm = (
+        rc: typeof h.rc,
+        trigger: 'page' | 'input' | 'open' = 'open',
+      ) =>
+        vm.prewarm(
+          rc,
+          {
+            trigger,
+            target: {
+              vmId: h.binding.vmId,
+              instanceId: null,
+              leaseEpoch: 2,
+              observeVmStart(binding) {
+                observed.push([rc.sessionId, binding]);
+              },
+              assertAuthority: async () => {},
+              dispatchUpgradeStop: (_binding, active, stop) => {
+                active.throwIfAborted();
+                return stop();
+              },
+            },
+          },
+          signal(),
+        );
+      for (const trigger of ['page', 'input'] as const)
+        await expect(warm(h.rc, trigger)).rejects.toMatchObject({
+          code: 'UPGRADE_OPEN_REQUIRED',
+        });
+      await expect(warm(h.rc)).rejects.toMatchObject({
+        code: 'LEASE_CONFLICT',
+      });
+      expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(await store.read(h.binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseEpoch: h.binding.leaseEpoch,
+        leaseOwner: null,
+      });
+      previousStillListening = false;
+      h.states.set(h.binding.vmId, 'unknown');
+      await expect(warm(h.rc)).rejects.toMatchObject({
+        code: 'ACTIVITY_UNKNOWN',
+      });
+      expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(h.log.slice(events)).not.toContain('native:prepare');
+      expect(h.log.slice(events)).not.toContain('disk:attach');
+      expect(reconciled).toBe(false);
+      expect(await store.read(h.binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseOwner: null,
+      });
+      h.states.set(h.binding.vmId, 'running');
+      joinParallel = true;
+      const first = own(warm({ ...h.rc, requestId }));
+      let second: typeof first;
+      try {
+        await Promise.race([entered.promise, first]);
+        second = own(warm(later));
+        await Promise.race([checkedLaterLogin.promise, second]);
+      } finally {
+        release.resolve();
+      }
+      const expected = {
+        phase: 'running',
+        ready: true,
+        vmId: h.binding.vmId,
+      };
+      await expect(first).resolves.toMatchObject(expected);
+      await expect(second).resolves.toMatchObject(expected);
+      const binding = await vm.resolve(h.rc, signal());
+      expect(binding.leaseEpoch).toBe(2);
+      expect(observed).toEqual([
+        [h.rc.sessionId, binding],
+        [later.sessionId, binding],
+      ]);
+      expect(seen).toEqual(['fence', 'fence', 'release', 'start']);
+      expect(h.log.slice(events)).toContain('native:stop');
+      expect(h.log.slice(events)).toContain('native:start');
+      expect(h.log.slice(events)).not.toContain('native:create');
+      const audit = await db`select phase, lease_epoch, disk_retained
+        from person_virtual_machines where person_id=${h.binding.personId}`;
+      expect(audit).toEqual([
+        { phase: 'running', lease_epoch: '2', disk_retained: true },
+      ]);
+      const stops =
+        await db`select result from person_vm_audit where request_id=${requestId}
+        and action='stop.upgrade' order by id`;
+      expect(stops).toEqual([{ result: 'started' }, { result: 'succeeded' }]);
+    });
+
+    it.each(['foreground', 'release'] as const)(
+      'recovers a previous-worker stop after its terminal readback fails: %s',
+      async (entry) => {
+        const h = await setup();
+        const store = new PostgresPersonVmStore(h.physical.open);
+        let ownEpoch = 0;
+        let fenced = false;
+        let rejectRead = false;
+        const joins: boolean[] = [];
+        const vm = new PersonVmService({
+          ...h.options,
+          store,
+          disk: {
+            ...h.options.disk,
+            async verifyAttachedMount({ vmId }) {
+              return h.mounts.has(vmId) ? '/synthetic/' + vmId : null;
+            },
+          },
+          native: {
+            ...h.native,
+            async readAttachedStatus(binding, _mount, active) {
+              expect(fenced).toBe(true);
+              expect(binding).toEqual(h.binding);
+              return h.native.status(binding, active);
+            },
+            async stopIdle(...args) {
+              expect(fenced).toBe(true);
+              if (rejectRead) throw new PersonVmError('PROVIDER_FAILED');
+              await h.native.stopIdle!(...args);
+              throw new Error('synthetic failure after joined native stop');
+            },
+            async stop(binding, active, options) {
+              joins.push(options?.requireStopped === true);
+              expect(fenced).toBe(true);
+              await h.native.stop(binding, active);
+            },
+          },
+          ownsEgressReceipt: ({ binding }) => binding.leaseEpoch === ownEpoch,
+          observeOwnedStart(binding) {
+            ownEpoch = binding.leaseEpoch;
+          },
+          async withPreviousGatewayFenced(binding, ports, _signal, action) {
+            expect(binding).toEqual(h.binding);
+            expect(ports).toEqual([38990]);
+            expect(
+              (await store.read(binding.personId))?.leaseOwner,
+            ).toBeTruthy();
+            fenced = true;
+            try {
+              return await action();
+            } finally {
+              fenced = false;
+            }
+          },
+        });
+        vm.createAdmissionHost({ openSql: h.physical.open });
+        const authorize = async (active: AbortSignal) =>
+          active.throwIfAborted();
+        const open = (trigger: 'page' | 'open') =>
+          vm.prewarm(
+            h.rc,
+            {
+              trigger,
+              target: {
+                vmId: h.binding.vmId,
+                instanceId: null,
+                leaseEpoch: 2,
+                assertAuthority: authorize,
+                dispatchUpgradeStop: (_binding, active, stop) => {
+                  active.throwIfAborted();
+                  return stop();
+                },
+              },
+            },
+            signal(),
+          );
+        await expect(open('open')).rejects.toMatchObject({
+          code: 'CLEANUP_INCOMPLETE',
+        });
+        expect(h.states.get(h.binding.vmId)).toBe('stopped');
+        expect(await store.read(h.binding.personId)).toMatchObject({
+          phase: 'failed',
+          leaseEpoch: 1,
+          egressReceipt: expect.anything(),
+        });
+        await expect(open('page')).rejects.toMatchObject({
+          code: 'UPGRADE_OPEN_REQUIRED',
+        });
+        h.states.set(h.binding.vmId, 'running');
+        rejectRead = true;
+        await expect(open('open')).rejects.toMatchObject({
+          code: 'PROVIDER_FAILED',
+        });
+        rejectRead = false;
+        h.states.set(h.binding.vmId, 'stopped');
+        if (entry === 'foreground') {
+          await expect(open('open')).resolves.toMatchObject({
+            phase: 'running',
+            vmId: h.binding.vmId,
+          });
+        } else {
+          const reopen = vm.fenceWorkerStartup();
+          try {
+            const noWakePreparation = async () => {
+              throw Error(
+                'old Worker stop must be proven without adopting its runtime',
+              );
+            };
+            h.states.set(h.binding.vmId, 'running');
+            await expect(
+              vm.stopRunningForUpgrade(
+                h.binding,
+                randomUUID(),
+                signal(),
+                authorize,
+                noWakePreparation,
+              ),
+            ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+            expect(joins).toEqual([]);
+            h.states.set(h.binding.vmId, 'stopped');
+            await vm.stopRunningForUpgrade(
+              h.binding,
+              randomUUID(),
+              signal(),
+              authorize,
+              noWakePreparation,
+            );
+          } finally {
+            reopen();
+          }
+        }
+        expect(joins).toEqual([true]);
+        expect(await store.read(h.binding.personId)).toMatchObject({
+          diskRetained: true,
+          phase: entry === 'foreground' ? 'running' : 'stopped',
+          leaseEpoch: entry === 'foreground' ? 2 : 1,
+        });
+      },
+    );
+
+    it('retries upgrade drain from the joined stop receipt and preserves the exact wake plan', async () => {
+      const h = await setup();
+      const store = new PostgresPersonVmStore(h.physical.open);
+      const cursor = { sourceId: 'upgrade-activity', revision: 'quiescent' };
+      let rejectDetach = true;
+      let nativeSchedule = 'later-native-read';
+      const disconnected = new AbortController();
+      const stopNative = h.native.stop;
+      h.native.stop = async (binding, active) => {
+        disconnected.abort(new Error('operator disconnected after dispatch'));
+        active.throwIfAborted();
+        return stopNative(binding, active);
+      };
+      const vm = new PersonVmService({
+        ...h.options,
+        store,
+        disk: {
+          ...h.options.disk,
+          async detach(...args) {
+            if (rejectDetach) throw new Error('fixture detach failed');
+            return h.options.disk.detach(...args);
+          },
+        },
+        upgradeActivity: {
+          async observe(binding) {
+            const observedAt = h.now().toISOString();
+            return {
+              activity: {
+                binding,
+                observedAt,
+                state: 'known',
+                activeTurns: 0,
+                activeJobs: 0,
+                activeSubtasks: 0,
+                pendingApprovals: 0,
+              },
+              activeScheduleDeliveries: 0,
+              scheduleFingerprints: [nativeSchedule],
+              coverage: {
+                state: 'sampled',
+                cursor,
+                from: observedAt,
+                through: observedAt,
+                idleSince: observedAt,
+              },
+            };
+          },
+          assertSampleCurrent(binding, sampled) {
+            expect(binding).toEqual(h.binding);
+            expect(sampled).toEqual(cursor);
+          },
+        },
+      });
+      vm.createAdmissionHost({ openSql: h.physical.open });
+      const restore = vm.fenceWorkerStartup();
+      const planId = randomUUID();
+      const targetAt = new Date(h.now().getTime() + 3_600_000);
+      const receipt = randomUUID();
+      const prepare: Parameters<typeof vm.stopRunningForUpgrade>[4] = async (
+        request,
+        signal,
+      ) => {
+        expect(request.binding).toEqual(h.binding);
+        expect(request.requestId).toBe(planId);
+        await request.assertStopCurrent(signal);
+        const { binding } = request;
+        await db`insert into person_vm_scheduled_wakes
+            (person_id,organization_id,vm_id,instance_id,lease_epoch,plan_id,receipt_ids,
+            wake_at,target_at,state)
+            values (${binding.personId},${binding.organizationId},${binding.vmId},
+            ${binding.instanceId},${binding.leaseEpoch},${planId},
+            array[${receipt}]::uuid[],${targetAt},${targetAt},'waiting')
+            on conflict (plan_id) do nothing`;
+        return {
+          nextWakeAt: targetAt.toISOString(),
+          scheduleFingerprints: ['test-schedule'],
+          dispatch: (active, stop) => stop(active),
+        };
+      };
+      const authorize = async (active: AbortSignal) => active.throwIfAborted();
+      try {
+        await expect(
+          vm.stopRunningForUpgrade(
+            h.binding,
+            planId,
+            signal(),
+            authorize,
+            prepare,
+          ),
+        ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+        expect(h.log).not.toContain('native:stop');
+        expect((await store.read(h.binding.personId))?.phase).toBe('running');
+        nativeSchedule = 'test-schedule';
+        await expect(
+          vm.stopRunningForUpgrade(
+            h.binding,
+            planId,
+            disconnected.signal,
+            authorize,
+            prepare,
+          ),
+        ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+        expect(h.states.get(h.binding.vmId)).toBe('stopped');
+        expect(await store.idleStopReceipt(h.binding)).toEqual({
+          requestId: planId,
+          completed: false,
+        });
+        rejectDetach = false;
+        await vm.stopRunningForUpgrade(
+          h.binding,
+          randomUUID(),
+          signal(),
+          authorize,
+          prepare,
+        );
+        expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
+          1,
+        );
+        expect(h.mounts.has(h.binding.vmId)).toBe(false);
+        expect(await store.idleStopReceipt(h.binding)).toEqual({
+          requestId: planId,
+          completed: true,
+        });
+        expect(await store.read(h.binding.personId)).toMatchObject({
+          phase: 'stopped',
+          diskRetained: true,
+          leaseOwner: null,
+        });
+      } finally {
+        restore();
+      }
+    });
+
     it('takes a durable journal read lease only across idle admission and then releases it', async () => {
       const h = await setup();
       const store = new PostgresPersonVmStore(h.physical.open);
@@ -608,6 +1038,553 @@ suite(
         await h.peer.participant('entry').thaw(lease, signal());
       }
     });
+    it.each([
+      'off',
+      'blocked',
+      'active',
+      'changed',
+      'mount-change',
+      'wake-plan-changed',
+      'wake-plan-revoked-at-dispatch',
+      'ok',
+      'sampled-ok',
+      'commit-rejected',
+      'commit-ack-lost',
+      'native-proof-rejected',
+      'native-readback-failed',
+      'relogin',
+      'system-ok',
+      'system-revoked',
+      'system-late-revoked',
+      'system-wake-window',
+      'system-recovery',
+      'system-unknown',
+    ] as const)(
+      'idle wake preparation and stop under one physical lease: %s',
+      async (outcome) => {
+        const physical = factory('idle-wake');
+        let loseAcknowledgement = false;
+        const open: PersonVmSqlFactory = () => {
+          const sql = physical.open();
+          const name = physical.names.at(-1)!;
+          return new Proxy(sql, {
+            apply(
+              target,
+              receiver,
+              args: [TemplateStringsArray, ...unknown[]],
+            ) {
+              const query = Reflect.apply(
+                target,
+                receiver,
+                args,
+              ) as postgres.PendingQuery<postgres.Row[]>;
+              if (
+                !loseAcknowledgement ||
+                !args[0][0]?.startsWith('with saved as (')
+              )
+                return query;
+              return query.then(async () => {
+                loseAcknowledgement = false;
+                const [owner] =
+                  await admin`select pid from pg_stat_activity where application_name=${name}`;
+                expect(owner).toBeDefined();
+                const [closed] =
+                  await admin`select pg_terminate_backend(${owner!.pid}) as closed`;
+                expect(closed?.closed).toBe(true);
+                throw Object.assign(
+                  new Error('Lost committed stop acknowledgement'),
+                  {
+                    code: 'CONNECTION_CLOSED',
+                  },
+                );
+              });
+            },
+          });
+        };
+        const store = new PostgresPersonVmStore(open);
+        const h = harness(store);
+        let invalidSession: string | undefined;
+        let authorized: ReturnType<typeof context> | undefined;
+        const service = new PersonVmService({
+          ...h.options,
+          authority: {
+            async authorize(request, action, signal) {
+              if (request.sessionId === invalidSession)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              return h.options.authority.authorize(request, action, signal);
+            },
+          },
+          observeOwnedStart(_binding, request) {
+            authorized = request;
+          },
+          observeOwnedAccess(_binding, request) {
+            authorized = request;
+          },
+        });
+        const { rc, binding } = await running({ ...h, service });
+        let attempt = { ...rc, requestId: randomUUID() };
+        const scheduled = outcome.startsWith('system-');
+        const scheduledRoster = {
+          ...binding,
+          entries: [],
+          digest: 'system-fixture',
+        };
+        let scheduledRequestId: string | undefined;
+        let scheduledAuthority = true;
+        if (scheduled) invalidSession = rc.sessionId;
+        const since = h.now().toISOString();
+        const wakeAt = new Date(h.now().getTime() + 60 * 60_000);
+        const wake = createPostgresPersonVmScheduledWakeStore(db);
+        const commitRejected =
+          outcome === 'commit-rejected' || outcome === 'system-recovery';
+        const recovering = commitRejected || outcome === 'commit-ack-lost';
+        const nativeProofRejected = outcome === 'native-proof-rejected';
+        const nativeReadbackFailed = outcome === 'native-readback-failed';
+        if (nativeReadbackFailed) {
+          const stopIdle = h.native.stopIdle!;
+          h.native.stopIdle = async (...args) => {
+            await stopIdle(...args);
+            throw new PersonVmError('CLEANUP_INCOMPLETE');
+          };
+        }
+        const samplePurposes: (string | undefined)[] = [];
+        let mono = 0,
+          runningJobs = 0,
+          revision = 'first',
+          prepared = 0;
+        const mountNative = h.native.prepare;
+        h.native.prepare = async (...args) => {
+          await mountNative(...args);
+          if (outcome === 'mount-change' && prepared > 0)
+            revision = 'native-work-after-prepare';
+        };
+        const host = service.createAdmissionHost({
+          openSql: open,
+          idleMs: 5 * 60_000,
+          monotonic: () => mono,
+          scheduledIdleAuthority: {
+            assertOwned(current, roster) {
+              if (current.leaseEpoch !== binding.leaseEpoch)
+                throw new PersonVmError('LEASE_LOST');
+              expect(current).toEqual(binding);
+              expect(roster).toBe(scheduledRoster);
+            },
+            async assertCurrent() {
+              if (!scheduledAuthority)
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+            },
+            async dispatch(current, roster, requestId, active, stop) {
+              this.assertOwned(current, roster);
+              expect(requestId).toBe(scheduledRequestId);
+              if (outcome === 'system-late-revoked')
+                throw new PersonVmError('AUTHORIZATION_DENIED');
+              if (outcome === 'system-wake-window')
+                h.advance(wakeAt.getTime() - h.now().getTime());
+              await stop(active);
+            },
+          },
+          nativeActivity: {
+            async observe(current, _signal, purpose) {
+              if (outcome === 'sampled-ok') samplePurposes.push(purpose);
+              const observedAt = h.now().toISOString();
+              return {
+                activity: {
+                  binding: current,
+                  observedAt,
+                  state: outcome === 'system-unknown' ? 'unknown' : 'known',
+                  activeTurns: 0,
+                  activeJobs: runningJobs,
+                  activeSubtasks: 0,
+                  pendingApprovals: 0,
+                },
+                activeScheduleDeliveries: 0,
+                coverage: {
+                  cursor: { sourceId: 'native-fixture', revision },
+                  from: since,
+                  through: observedAt,
+                  ...(outcome === 'sampled-ok'
+                    ? { state: 'sampled', idleSince: since }
+                    : {
+                        state: 'continuous',
+                        idleSince: runningJobs ? null : since,
+                      }),
+                },
+              };
+            },
+            assertSampleCurrent(current, cursor, active) {
+              active.throwIfAborted();
+              expect(outcome).toBe('sampled-ok');
+              expect(current).toEqual(binding);
+              expect(cursor).toEqual({ sourceId: 'native-fixture', revision });
+              samplePurposes.push('dispatch');
+            },
+            async subscribe() {
+              throw new Error('unexpected subscription');
+            },
+          },
+          prepareIdleStop:
+            outcome === 'off'
+              ? undefined
+              : async (request, active) => {
+                  prepared++;
+                  if ('context' in request) {
+                    expect(scheduled).toBe(false);
+                    expect(request.context.requestId).toBe(attempt.requestId);
+                  } else {
+                    expect(scheduled).toBe(true);
+                    expect(request.scheduledRoster).toBe(scheduledRoster);
+                    scheduledRequestId ??= request.requestId;
+                    expect(request.requestId).toBe(scheduledRequestId);
+                  }
+                  expect(request.binding).toEqual(binding);
+                  expect(await store.read(binding.personId)).toMatchObject({
+                    leaseOwner: expect.any(String),
+                    phase: 'running',
+                  });
+                  await expect(
+                    store.withLease(
+                      binding.personId,
+                      { now: h.now, ttlMs: 90_000 },
+                      async () => {},
+                    ),
+                  ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+                  if (outcome === 'sampled-ok') {
+                    const before = samplePurposes.length;
+                    await Promise.all(
+                      [active, active].map((signal) =>
+                        request.assertStopCurrent(signal),
+                      ),
+                    );
+                    expect(samplePurposes.slice(before)).toEqual([
+                      'stop-guard',
+                    ]);
+                  } else await request.assertStopCurrent(active);
+                  if (outcome === 'system-revoked') scheduledAuthority = false;
+                  if (outcome === 'changed') revision = 'new-native-work';
+                  if (
+                    outcome === 'blocked' ||
+                    (outcome === 'wake-plan-changed' && prepared > 1)
+                  )
+                    return { blocked: true };
+                  if (
+                    recovering ||
+                    nativeProofRejected ||
+                    nativeReadbackFailed
+                  ) {
+                    // Model the durable plan returned by the Workflow port.
+                    await db`insert into person_vm_scheduled_wakes
+                      (person_id,organization_id,vm_id,instance_id,lease_epoch,plan_id,receipt_ids,
+                      wake_at,target_at,state)
+                      values (${binding.personId},${binding.organizationId},${binding.vmId},
+                      ${binding.instanceId},${binding.leaseEpoch},${scheduledRequestId ?? attempt.requestId},
+                      array[${randomUUID()}]::uuid[],${wakeAt},${wakeAt},'waiting')
+                      on conflict (plan_id) do nothing`;
+                    return {
+                      ok: true,
+                      nextWakeAt: wakeAt.toISOString(),
+                      ...(nativeReadbackFailed && {
+                        dispatch: (
+                          active: AbortSignal,
+                          stop: (signal: AbortSignal) => Promise<void>,
+                        ) => stop(active),
+                      }),
+                    };
+                  }
+                  if (outcome === 'wake-plan-revoked-at-dispatch')
+                    return {
+                      ok: true,
+                      nextWakeAt: wakeAt.toISOString(),
+                      async dispatch() {
+                        expect(prepared).toBe(2);
+                        throw new PersonVmError('AUTHORIZATION_DENIED');
+                      },
+                    };
+                  return {
+                    ok: true,
+                    nextWakeAt:
+                      outcome === 'system-wake-window'
+                        ? wakeAt.toISOString()
+                        : null,
+                  };
+                },
+        });
+        const reconcileOwned = () =>
+          scheduled
+            ? host.reconcileScheduledIdle(binding, scheduledRoster, signal())
+            : host.reconcileIdle(attempt, binding, signal());
+        if (scheduled)
+          await expect(
+            host.reconcileScheduledIdle(
+              { ...binding, leaseEpoch: binding.leaseEpoch - 1 },
+              scheduledRoster,
+              signal(),
+            ),
+          ).rejects.toMatchObject({ code: 'LEASE_LOST' });
+        await reconcileOwned();
+        mono += 5 * 60_000 - 1;
+        h.advance(mono);
+        await reconcileOwned();
+        expect(prepared).toBe(0);
+        mono++;
+        h.advance(1);
+        if (outcome === 'active') runningJobs++;
+        if (outcome === 'relogin') {
+          invalidSession = rc.sessionId;
+          await expect(
+            host.reconcileIdle(attempt, binding, signal()),
+          ).rejects.toMatchObject({
+            code: 'AUTHORIZATION_DENIED',
+          });
+          const newLogin = context(binding.organizationId, binding.personId);
+          expect(await service.resolve(newLogin, signal())).toEqual(binding);
+          expect(authorized?.sessionId).toBe(newLogin.sessionId);
+          attempt = { ...authorized!, requestId: randomUUID() };
+        }
+        if (commitRejected)
+          await db`alter table person_vm_audit add constraint fixture_reject_stop_commit
+            check (action<>'stop' or result<>'succeeded')`;
+        if (nativeProofRejected)
+          await db`alter table person_vm_audit add constraint fixture_reject_stop_commit
+            check (action<>'stop.idle-dispatch' or result<>'succeeded')`;
+        loseAcknowledgement = outcome === 'commit-ack-lost';
+        try {
+          const reconcile = reconcileOwned();
+          if (
+            [
+              'changed',
+              'mount-change',
+              'wake-plan-changed',
+              'system-wake-window',
+            ].includes(outcome)
+          )
+            await expect(reconcile).rejects.toMatchObject({
+              code: 'ACTIVITY_UNKNOWN',
+            });
+          else if (
+            outcome === 'system-revoked' ||
+            outcome === 'system-late-revoked' ||
+            outcome === 'wake-plan-revoked-at-dispatch'
+          )
+            await expect(reconcile).rejects.toMatchObject({
+              code: 'AUTHORIZATION_DENIED',
+            });
+          else if (recovering || nativeProofRejected || nativeReadbackFailed)
+            await expect(reconcile).rejects.toBeInstanceOf(Error);
+          else await reconcile;
+        } finally {
+          if (commitRejected || nativeProofRejected)
+            await db`alter table person_vm_audit drop constraint fixture_reject_stop_commit`;
+        }
+        if (nativeProofRejected) {
+          expect(h.states.get(binding.vmId)).toBe('stopped');
+          expect(await store.read(binding.personId)).toMatchObject({
+            phase: 'failed',
+            diskRetained: true,
+            leaseOwner: null,
+          });
+          expect(await store.idleStopReceipt(binding)).toBeUndefined();
+          await expect(
+            service.assertWorkerShutdownSafe(binding, signal()),
+          ).rejects.toMatchObject({ code: 'CLEANUP_INCOMPLETE' });
+          await host.reconcileIdle(
+            { ...attempt, requestId: randomUUID() },
+            binding,
+            signal(),
+          );
+          expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
+            1,
+          );
+          expect(h.log).not.toContain('egress:revoke');
+          await db`update person_vm_scheduled_wakes set wake_at=least(now()-interval '1 second', target_at)
+            where plan_id=${attempt.requestId}`;
+          const success = await db`select 1 from person_vm_audit
+            where vm_id=${binding.vmId} and request_id=${attempt.requestId}
+              and action='stop' and result='succeeded'`;
+          expect(success).toEqual([]);
+          expect(await wake.claim(90_000)).toBeNull();
+          return;
+        }
+        if (nativeReadbackFailed) {
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: attempt.requestId,
+            completed: false,
+          });
+          await expect(
+            service.assertWorkerShutdownSafe(binding, signal()),
+          ).rejects.toMatchObject({
+            code: 'CLEANUP_INCOMPLETE',
+          });
+          const restarted = new PersonVmService({
+            ...h.options,
+            store: new PostgresPersonVmStore(open),
+          });
+          expect(
+            (await store.listJoinedIdleStopCandidates(signal())).map(
+              ({ vmId }) => vmId,
+            ),
+          ).toContain(binding.vmId);
+          await expect(
+            restarted.recoverJoinedIdleStop(binding, signal()),
+          ).resolves.toBe(true);
+          expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
+            1,
+          );
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: attempt.requestId,
+            completed: true,
+          });
+          await db`update person_vm_scheduled_wakes set wake_at=least(now()-interval '1 second', target_at)
+            where plan_id=${attempt.requestId}`;
+          await expect(wake.claim(90_000)).resolves.toMatchObject({
+            planId: attempt.requestId,
+          });
+          return;
+        }
+        if (outcome === 'system-recovery') {
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: false,
+          });
+          scheduledAuthority = false;
+          await reconcileOwned();
+          expect(await store.idleStopReceipt(binding)).toEqual({
+            requestId: scheduledRequestId,
+            completed: true,
+          });
+        } else if (recovering) {
+          expect(h.states.get(binding.vmId)).toBe('stopped');
+          expect(await store.read(binding.personId)).toMatchObject(
+            outcome === 'commit-rejected'
+              ? { phase: 'running', leaseOwner: null }
+              : { phase: 'stopped', leaseOwner: expect.any(String) },
+          );
+          const original = await store.idleStopReceipt(binding);
+          expect(original).toEqual({
+            requestId: attempt.requestId,
+            completed: outcome === 'commit-ack-lost',
+          });
+          invalidSession = attempt.sessionId;
+          await expect(
+            host.reconcileIdle(attempt, binding, signal()),
+          ).rejects.toMatchObject({
+            code: 'AUTHORIZATION_DENIED',
+          });
+          const recoveryLogin = context(
+            binding.organizationId,
+            binding.personId,
+          );
+          await expect(
+            service.resolve(recoveryLogin, signal()),
+          ).rejects.toMatchObject({
+            code:
+              outcome === 'commit-ack-lost'
+                ? 'LEASE_CONFLICT'
+                : 'EGRESS_UNAVAILABLE',
+          });
+          expect(authorized?.sessionId).toBe(recoveryLogin.sessionId);
+          h.advance(90_001);
+          expect(
+            (await store.listJoinedIdleStopCandidates(signal())).map(
+              (candidate) => candidate.vmId,
+            ),
+          ).toContain(binding.vmId);
+          if (outcome === 'commit-rejected') {
+            h.states.set(binding.vmId, 'unknown');
+            await expect(
+              host.reconcileIdle(
+                { ...authorized!, requestId: randomUUID() },
+                binding,
+                signal(),
+              ),
+            ).rejects.toMatchObject({ code: 'ACTIVITY_UNKNOWN' });
+            expect(await store.idleStopReceipt(binding)).toEqual(original);
+            expect(
+              h.log.filter((entry) => entry === 'native:stop'),
+            ).toHaveLength(1);
+            h.states.set(binding.vmId, 'stopped');
+          }
+          const restarted = new PersonVmService({
+            ...h.options,
+            store: new PostgresPersonVmStore(open),
+          });
+          await expect(
+            restarted.recoverJoinedIdleStop(binding, signal()),
+          ).resolves.toBe(true);
+          await db`update person_vm_scheduled_wakes set wake_at=least(now()-interval '1 second', target_at)
+            where plan_id=${attempt.requestId}`;
+          expect(await wake.claim(90_000)).toMatchObject({
+            ...binding,
+            planId: attempt.requestId,
+          });
+          expect(await wake.claim(90_000)).toBeNull();
+        }
+        const stopped =
+          outcome === 'ok' ||
+          outcome === 'sampled-ok' ||
+          outcome === 'relogin' ||
+          outcome === 'system-ok' ||
+          recovering;
+        const rechecked =
+          stopped ||
+          outcome === 'wake-plan-changed' ||
+          outcome === 'wake-plan-revoked-at-dispatch' ||
+          outcome === 'system-late-revoked' ||
+          outcome === 'system-wake-window';
+        const checkedOnce = [
+          'blocked',
+          'changed',
+          'mount-change',
+          'system-revoked',
+        ].includes(outcome);
+        expect(prepared).toBe(rechecked ? 2 : checkedOnce ? 1 : 0);
+        expect(h.log.filter((entry) => entry === 'native:stop')).toHaveLength(
+          stopped ? 1 : 0,
+        );
+        expect(h.log.includes('egress:revoke')).toBe(stopped);
+        if (stopped)
+          expect(h.log.indexOf('native:stop')).toBeLessThan(
+            h.log.indexOf('egress:revoke'),
+          );
+        expect(await store.read(binding.personId)).toMatchObject({
+          phase: stopped ? 'stopped' : 'running',
+          diskRetained: true,
+          leaseOwner: null,
+        });
+        const success =
+          await db`select request_id, lease_epoch from person_vm_audit
+          where vm_id=${binding.vmId} and action='stop' and result='succeeded'`;
+        expect(success.map((row) => row.request_id)).toEqual(
+          stopped ? [scheduled ? scheduledRequestId : attempt.requestId] : [],
+        );
+        if (stopped)
+          expect(Number(success[0]!.lease_epoch)).toBe(binding.leaseEpoch);
+        if (outcome === 'sampled-ok') {
+          expect(samplePurposes.slice(0, 3)).toEqual([
+            'inspection',
+            'inspection',
+            'inspection',
+          ]);
+          expect(samplePurposes.slice(3, -1)).toEqual(
+            Array.from(
+              { length: samplePurposes.length - 4 },
+              () => 'stop-guard',
+            ),
+          );
+          expect(samplePurposes.at(-1)).toBe('dispatch');
+          expect(samplePurposes.length).toBeGreaterThan(4);
+        }
+        if (outcome === 'ok' || outcome === 'sampled-ok') {
+          expect(await service.start(rc, signal())).toMatchObject({
+            vmId: binding.vmId,
+            diskRetained: true,
+            ready: true,
+          });
+          expect(
+            (await service.resolve(rc, signal())).leaseEpoch,
+          ).toBeGreaterThan(binding.leaseEpoch);
+        }
+      },
+    );
     it('qualifier requires the original shared host and cannot replace its factory', async () => {
       const h = await setup();
       const other = factory('wrong').open;

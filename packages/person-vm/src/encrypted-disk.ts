@@ -75,6 +75,10 @@ export interface PersonVmDiskPort {
     signal: AbortSignal,
     beforeDispatch?: () => void,
   ): Promise<string>;
+  verifyAttachedMount?(
+    disk: PersonDisk,
+    signal: AbortSignal,
+  ): Promise<string | null>;
   detach(
     disk: PersonDisk,
     signal: AbortSignal,
