@@ -108,6 +108,7 @@ async function observerFixture(options?: {
   manualReady?: boolean;
   beforeLoader?: () => Promise<void>;
   listenHost?: string;
+  storedWorkSessions?: boolean;
   commandMemory?: {
     subprocess: 'missing' | 'stock' | 'managed';
     sandbox: 'missing' | 'owned' | 'unrelated';
@@ -115,6 +116,34 @@ async function observerFixture(options?: {
 }) {
   const directory = await mkdtemp(join(tmpdir(), 'allrice-observer-'));
   const local = await hostFixture(issue('execute'), true, null);
+  const nativeWorkspaceId = randomUUID();
+  const workspaceSessions = ['already-attached'];
+  const attachSession = vi.fn(async (id: string) => {
+    workspaceSessions.push(id);
+  });
+  local.host.provide('workspaceRegistry', {
+    async create(path: string) {
+      return {
+        id: nativeWorkspaceId,
+        path,
+        sessionIds: workspaceSessions,
+        attachSession,
+      };
+    },
+  });
+  local.host.provide('sessionPersistence', {
+    async list() {
+      return options?.storedWorkSessions
+        ? [
+            { header: { id: 'already-attached', cwd: directory } },
+            { header: { id: 'retained', cwd: directory } },
+            {
+              header: { id: 'other-workspace', cwd: join(directory, 'other') },
+            },
+          ]
+        : [];
+    },
+  });
   const lifetime = new AbortController().signal;
   const control = createDEntryPrincipalControl(local.node, {
     carrier: lifetime,
@@ -198,6 +227,7 @@ async function observerFixture(options?: {
           artifactPath: artifacts,
           nonce,
           baseUrl: web.baseUrl,
+          workdir: directory,
           ...(commandMemory ? { commandMemoryPlugin } : {}),
         });
         entered?.();
@@ -209,6 +239,8 @@ async function observerFixture(options?: {
     local,
     owner,
     artifacts,
+    attachSession,
+    nativeWorkspaceId,
     commands,
     mount,
     loader,
@@ -228,6 +260,20 @@ async function observerFixture(options?: {
     },
   };
 }
+
+it('repairs only previously unattached sessions in the employee work directory before auth', async () => {
+  const f = await observerFixture({ storedWorkSessions: true });
+  try {
+    await f.mount('retained-workspace');
+    await waitForAuthNonce(f.artifacts, 'retained-workspace');
+    expect(f.attachSession.mock.calls).toEqual([['retained']]);
+    expect(
+      JSON.parse(await readFile(f.artifacts, 'utf8')).nativeWorkspaceId,
+    ).toBe(f.nativeWorkspaceId);
+  } finally {
+    await f.close();
+  }
+});
 
 it('keeps the nonce private through appReady dispatch, loader settlement and actual mux registration', async () => {
   const entered = deferred(),
@@ -649,13 +695,23 @@ it('replaces a real Cordis loader entry updated during auth staging without publ
     const baseUrl = f.web.baseUrl;
     const id = await loader.create({
       name: 'cordis:observer-test-owner',
-      config: { artifactPath: f.artifacts, nonce: 'old', baseUrl },
+      config: {
+        artifactPath: f.artifacts,
+        nonce: 'old',
+        baseUrl,
+        workdir: f.directory,
+      },
     });
     const entry = loader.resolve(id)!;
     const exactFiber = entry.fiber!;
     await staging.promise;
     await entry.update({
-      config: { artifactPath: newArtifact, nonce: 'new', baseUrl },
+      config: {
+        artifactPath: newArtifact,
+        nonce: 'new',
+        baseUrl,
+        workdir: f.directory,
+      },
     });
     expect(entry.fiber).toBe(exactFiber);
     await expect(f.open()).rejects.toBeDefined();
@@ -1200,6 +1256,17 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       new URL('../../dsh/allrice-native-web-owner.mjs', import.meta.url).href
     );
     const artifactPath = join(root, 'guest-auth.json');
+    const nativeWorkspaceId = randomUUID();
+    local.host.provide('workspaceRegistry', {
+      async create(path: string) {
+        return { id: nativeWorkspaceId, path, sessionIds: [] };
+      },
+    });
+    local.host.provide('sessionPersistence', {
+      async list() {
+        return [];
+      },
+    });
     local.host.provide('loader', { entries: () => [], async await() {} });
     const web = await installObserverWeb(local.host, install);
     local.host.provide('clientModules', {
@@ -1215,6 +1282,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
             artifactPath,
             nonce,
             baseUrl: web.baseUrl,
+            workdir: root,
           });
           started?.();
           return loading;

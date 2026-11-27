@@ -114,6 +114,76 @@ function observeSinglePrompt(signal: AbortSignal) {
 }
 
 it.skipIf(!cli)(
+  'links outer and native blank sessions to the same real rc.2 workspace before workspace/follow',
+  { tags: [tag], timeout: 30000 },
+  async () => {
+    const f = await setup();
+    const signal = AbortSignal.timeout(15000);
+    const outer = await f.owner.createRootFor(f.context, {}, signal);
+    const scopeId = randomUUID();
+    const activity = f.owner.acquirePrincipal(
+      {
+        scopeId,
+        access: 'page',
+        identity: {
+          ...f.principalProfile,
+          organizationId: f.owner.binding.organizationId,
+          personId: f.owner.binding.personId,
+          threadId: null,
+        },
+      },
+      signal,
+      f.context,
+    );
+    const page = await activity.run(signal);
+    try {
+      const created = await page.invokePage(
+        {
+          kind: 'page',
+          scopeId,
+          endpoint: 'session/create',
+          args: { request: {} },
+        },
+        signal,
+      );
+      const native = NATIVE_REMOTE.methods['session/create'].result
+        .create()
+        .parse(created.value);
+      expect(native.sessionId).not.toBe(outer.value.sessionId);
+      const stream = page.streamPage(
+        { kind: 'page', scopeId, endpoint: 'workspace/follow', args: {} },
+        signal,
+      );
+      const feed = stream[Symbol.asyncIterator]();
+      try {
+        expect(await feed.next()).toMatchObject({
+          done: false,
+          value: {
+            value: {
+              type: 'baseline',
+              value: {
+                items: [
+                  {
+                    sessionIds: expect.arrayContaining([
+                      outer.value.sessionId,
+                      native.sessionId,
+                    ]),
+                  },
+                ],
+              },
+            },
+          },
+        });
+      } finally {
+        await feed.return?.();
+      }
+    } finally {
+      await activity.close();
+    }
+  },
+);
+
+it.skipIf(!cli)(
   'kills the real rc.2 PTY on login-owner withdrawal and keeps the DSH Host available',
   { tags: [tag], timeout: 30000 },
   async () => {

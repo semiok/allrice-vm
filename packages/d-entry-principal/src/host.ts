@@ -441,8 +441,11 @@ class Scope implements Projection {
   }
 }
 
+type DefaultWorkspace = { id: string; path: string };
+
 /** Actual guest service; only the trusted Node API Peer can issue a scope.
  * The public Host face is the Cordis plugin, not a constructor for consumers. */
+
 class PrincipalService extends TypertRemoteService {
   static inject = [
     'connection',
@@ -459,6 +462,7 @@ class PrincipalService extends TypertRemoteService {
   private graphObserver?: {
     ready: boolean;
     current(): boolean;
+    defaultWorkspace(): DefaultWorkspace | undefined;
     close(): Promise<void>;
   };
   private graphRetirement = Promise.resolve();
@@ -570,6 +574,7 @@ class PrincipalService extends TypertRemoteService {
     },
     owner?: {
       current(): boolean;
+      defaultWorkspace?(): DefaultWorkspace | undefined;
       publish(): Promise<void>;
       retire(): Promise<void>;
     },
@@ -580,6 +585,7 @@ class PrincipalService extends TypertRemoteService {
     const observer = {
       ready: false,
       current: () => owner?.current() ?? true,
+      defaultWorkspace: () => owner?.defaultWorkspace?.(),
       close: () => {
         if (retiring) return retiring;
         observer.ready = false;
@@ -1019,6 +1025,22 @@ class PrincipalService extends TypertRemoteService {
           raw,
           'unary',
         );
+        let nativeArgs = args;
+        const workspace = this.graphObserver?.defaultWorkspace();
+        if (endpoint === 'session/create' && workspace) {
+          const { request } = Native.methods[endpoint]
+            .input({ strict: true })
+            .create()
+            .parse(args);
+          if (
+            request.workspaceId === undefined &&
+            (request.cwd === undefined || request.cwd === workspace.path)
+          ) {
+            const create = { ...request, workspaceId: workspace.id };
+            delete create.cwd;
+            nativeArgs = { request: create };
+          }
+        }
         // Prompt attribution depends on the exact non-owner Peer in the DSH journal.
         const modelInput =
           endpoint === 'session/prompt' ||
@@ -1058,7 +1080,7 @@ class PrincipalService extends TypertRemoteService {
           value = await this.ctx.typertGateway.invoke({
             namespace: descriptor.namespace,
             method: descriptor.method,
-            args,
+            args: nativeArgs,
             peer: modelInput ? scope.currentPeer() : scope.parent,
             signal: active,
           });

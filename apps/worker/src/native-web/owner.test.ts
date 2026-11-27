@@ -440,6 +440,7 @@ it.each([
           }),
           readNativeWebAuth: async () => ({
             authenticatedUrl: origin + '?token=' + secrets.token,
+            nativeWorkspaceId: randomUUID(),
           }),
         },
         launch: {

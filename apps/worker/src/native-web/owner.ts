@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
+import { WorkspaceId } from '@deepseek-ai/dsh-workspace';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
   clientRequestSchema,
@@ -763,7 +764,12 @@ export async function openNativeWebOwner(input: {
             const args = method
               .input({ strict: true })
               .create()
-              .parse({ request });
+              .parse({
+                request: {
+                  ...request,
+                  workspaceId: WorkspaceId(auth.nativeWorkspaceId),
+                },
+              });
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.

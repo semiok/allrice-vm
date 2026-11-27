@@ -27,10 +27,13 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable).each([false, true])(
-  'boots the rc.2 composer or reports a stalled application body (stall=%s)',
+it
+  .skipIf(!browserExecutable)
+  .each(['attached', 'unattached', 'stall'] as const)(
+  'rc.2 workspace/follow and the blank composer (%s)',
   { timeout: 60_000 },
-  async (stall) => {
+  async (scenario) => {
+    const stall = scenario === 'stall';
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -58,6 +61,34 @@ it.skipIf(!browserExecutable).each([false, true])(
     const { TYPERT } = await import(
       pathToFileURL(fromCli.resolve(`${runnerModule}/typert`)).href
     );
+    const workspaceModule = '@deepseek-ai/dsh-api-workspace-controller';
+    const { default: WorkspaceController } = await import(
+      pathToFileURL(fromCli.resolve(workspaceModule)).href
+    );
+    const { TYPERT: WorkspaceMetadata } = await import(
+      pathToFileURL(fromCli.resolve(`${workspaceModule}/typert`)).href
+    );
+    const nativeWorkspace = {
+      id: randomUUID(),
+      path: '/work',
+      title: 'Fixture work',
+      sessionIds: scenario === 'unattached' ? [] : ['root'],
+      archivedSessionIds: [],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    f.host.host.provide('workspaceRegistry', {
+      list: () => [nativeWorkspace],
+      get: (id: string) =>
+        id === nativeWorkspace.id ? nativeWorkspace : undefined,
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+    });
+    await f.host.host.plugin(WorkspaceController, {
+      documentsDirectory: '/work',
+    });
+    f.host.host.typert.register(WorkspaceMetadata);
+
     await f.host.host.plugin(SystemPrompt);
     await f.host.host.plugin(ToolRuntime);
     await f.host.host.plugin(CordisRunner);
@@ -220,6 +251,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     const page = await context.newPage();
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
+    const workspaceBaselines: unknown[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('console', (message) => {
@@ -242,6 +274,12 @@ it.skipIf(!browserExecutable).each([false, true])(
           ['baseline', 'snapshot'].includes(frame.value.type)
         )
           firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
+        if (
+          frame.type === 'item' &&
+          frame.value.type === 'baseline' &&
+          streams.get(frame.streamId) === 'workspace/follow'
+        )
+          workspaceBaselines.push(frame.value.value);
       });
     });
     if (stall) {
@@ -270,6 +308,28 @@ it.skipIf(!browserExecutable).each([false, true])(
       return;
     }
     const workbench = page.frameLocator('iframe');
+    await expect
+      .poll(() => workspaceBaselines)
+      .toMatchObject([
+        {
+          items: [
+            {
+              workspaceId: nativeWorkspace.id,
+              sessionIds: scenario === 'unattached' ? [] : ['root'],
+            },
+          ],
+        },
+      ]);
+    if (scenario === 'unattached') {
+      await workbench
+        .locator('[data-composer-input][contenteditable="false"]')
+        .waitFor();
+      await workbench
+        .getByText(/选择一个工作区开始|Choose a workspace to start/)
+        .waitFor();
+      await context.close();
+      return;
+    }
     const editor = workbench.locator(
       '[role="textbox"][data-composer-input][contenteditable="true"]',
     );
@@ -289,6 +349,11 @@ it.skipIf(!browserExecutable).each([false, true])(
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    expect(
+      await workbench
+        .getByText(/选择一个工作区开始|Choose a workspace to start/)
+        .count(),
+    ).toBe(0);
     await expect
       .poll(() => firstItems)
       .toEqual(
