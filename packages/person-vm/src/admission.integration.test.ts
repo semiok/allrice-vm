@@ -895,6 +895,7 @@ suite(
       'changed',
       'mount-change',
       'wake-plan-changed',
+      'wake-plan-revoked-at-dispatch',
       'ok',
       'sampled-ok',
       'commit-rejected',
@@ -1117,6 +1118,15 @@ suite(
                       on conflict (plan_id) do nothing`;
                     return { ok: true, nextWakeAt: wakeAt.toISOString() };
                   }
+                  if (outcome === 'wake-plan-revoked-at-dispatch')
+                    return {
+                      ok: true,
+                      nextWakeAt: wakeAt.toISOString(),
+                      async dispatch() {
+                        expect(prepared).toBe(2);
+                        throw new PersonVmError('AUTHORIZATION_DENIED');
+                      },
+                    };
                   return {
                     ok: true,
                     nextWakeAt:
@@ -1180,7 +1190,8 @@ suite(
             });
           else if (
             outcome === 'system-revoked' ||
-            outcome === 'system-late-revoked'
+            outcome === 'system-late-revoked' ||
+            outcome === 'wake-plan-revoked-at-dispatch'
           )
             await expect(reconcile).rejects.toMatchObject({
               code: 'AUTHORIZATION_DENIED',
@@ -1298,6 +1309,7 @@ suite(
         const rechecked =
           stopped ||
           outcome === 'wake-plan-changed' ||
+          outcome === 'wake-plan-revoked-at-dispatch' ||
           outcome === 'system-late-revoked' ||
           outcome === 'system-wake-window';
         const checkedOnce = [

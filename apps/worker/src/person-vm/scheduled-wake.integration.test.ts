@@ -839,6 +839,56 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     ).resolves.toEqual({ ok: true, nextWakeAt: '2026-11-01T05:28:00.000Z' });
   });
 
+  it('rejects a prepared ordinary idle stop once its live receipt is invalidated', async () => {
+    const f = await fixture();
+    await publishFixtureAuthority(f);
+    f.reviseTime(new Date(Date.now() + 600_000).toISOString());
+    const planId = randomUUID();
+    await expect(
+      f.module().prepareStopWithWake(f.binding, planId, signal),
+    ).resolves.toMatchObject({ ok: true });
+    const roster = await db.begin((tx) =>
+      readPersonVmWakeRoster(tx, f.binding, [f.origin]),
+    );
+    expect(roster).not.toBeNull();
+    await db`update person_virtual_machines
+      set lease_owner=${randomUUID()},lease_expires_at=now()+interval '1 minute'
+      where person_id=${f.binding.personId}`;
+    const host = createProductionScheduledWake({
+      startup: { catalog: vi.fn() },
+      database: db,
+      lifetime: signal,
+      source: { start: f.start, assertDeliverable: vi.fn() },
+    });
+    try {
+      const stop = vi.fn(async () => {});
+      await host.dispatchScheduledIdleStop(
+        f.binding,
+        roster!,
+        planId,
+        signal,
+        stop,
+      );
+      expect(stop).toHaveBeenCalledTimes(1);
+      await f.invalidate(planId);
+      await expect(
+        host.dispatchScheduledIdleStop(
+          f.binding,
+          roster!,
+          planId,
+          signal,
+          stop,
+        ),
+      ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+      expect(stop).toHaveBeenCalledTimes(1);
+      const [vm] = await db`select phase from person_virtual_machines
+        where person_id=${f.binding.personId}`;
+      expect(vm?.phase).toBe('running');
+    } finally {
+      await host.close();
+    }
+  });
+
   it('refuses to dispatch an explicitly invalidated snapshot', async () => {
     const f = await fixture();
     const host = f.module();

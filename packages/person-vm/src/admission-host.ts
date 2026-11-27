@@ -1400,7 +1400,7 @@ export class PersonVmAdmissionHost
                 await assertStopCurrent(probe);
                 assertWakeWindow();
               },
-              scheduled || sample
+              scheduled || plan.dispatch || sample
                 ? async (dispatchSignal, stop) => {
                     await owned.guard();
                     const dispatch = (fenced: AbortSignal) => {
@@ -1414,8 +1414,10 @@ export class PersonVmAdmissionHost
                         );
                       return stop(fenced);
                     };
-                    if (scheduled)
-                      await scheduled.dispatch(dispatchSignal, dispatch);
+                    const authorizeDispatch =
+                      scheduled?.dispatch ?? plan.dispatch;
+                    if (authorizeDispatch)
+                      await authorizeDispatch(dispatchSignal, dispatch);
                     else await dispatch(dispatchSignal);
                   }
                 : undefined,

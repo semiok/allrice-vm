@@ -6,6 +6,7 @@ import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   getDatabase,
+  readPersonNativeWebRoster,
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
@@ -908,10 +909,32 @@ export function createProductionPersonVmHost(input: {
         idleMs: providers.platform.idleMs,
         ...(providers.configuration.lifecycle.idleStopEnabled === true && {
           scheduledIdleAuthority,
-          prepareIdleStop: (request, signal) =>
-            scheduledWake
-              ? scheduledWake.prepareStopWithWake(request, signal)
-              : Promise.resolve({ blocked: true } as const),
+          async prepareIdleStop(request, signal) {
+            const wake = scheduledWake;
+            if (!wake) return { blocked: true };
+            if (!('context' in request))
+              return wake.prepareStopWithWake(request, signal);
+
+            const { binding, context } = request;
+            const roster = await readPersonNativeWebRoster(
+              context,
+              trustedDatabase,
+            );
+            signal.throwIfAborted();
+            const plan = await wake.prepareStopWithWake(request, signal);
+            if ('blocked' in plan) return plan;
+            return {
+              ...plan,
+              dispatch: (active, stop) =>
+                wake.dispatchScheduledIdleStop(
+                  binding,
+                  roster,
+                  context.requestId,
+                  active,
+                  stop,
+                ),
+            };
+          },
         }),
         nativeActivity: {
           observe(binding, signal, purpose) {

@@ -214,7 +214,10 @@ export type PersonVmIdleStopRequest = PersonVmIdleStopSource &
 export type PersonVmPrepareIdleStop = (
   request: PersonVmIdleStopRequest,
   signal: AbortSignal,
-) => Promise<{ ok: true; nextWakeAt: string | null } | { blocked: true }>;
+) => Promise<
+  | { ok: true; nextWakeAt: string | null; dispatch?: PersonVmIdleStopDispatch }
+  | { blocked: true }
+>;
 
 /** Host only. A roster is usable only on the exact locally owned generation
  * that completed scheduled startup and while all profiles are still eligible. */
