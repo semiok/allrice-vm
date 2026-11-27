@@ -6,6 +6,7 @@ import { modelBinding } from '../../../../packages/model-gateway/src/gateway.fix
 import {
   PersonVmError,
   PersonVmService,
+  PostgresPersonVmStore,
   type PersonVmBootstrapScope,
   type PersonVmNativePort,
   type PersonVmNativeWebGuestAddress,
@@ -242,10 +243,6 @@ it.each(['ready', 'failed', 'waiting'] as const)(
     const signal = model.lifetime.signal;
     await h.service.prewarm(context, { trigger: 'page' }, signal);
     const binding = await h.service.resolve(context, signal);
-    vi.mocked(f.admission.boundary.admit).mockResolvedValue({
-      ...f.permit,
-      binding,
-    });
     const added = { ...identity, employeeInstanceId: randomUUID() };
     const receipt = {
       binding,
@@ -308,6 +305,22 @@ it.each(['ready', 'failed', 'waiting'] as const)(
       verifyStartingEditor: async () => signal,
       close: async () => {},
     }));
+    const openSql = () => {
+      throw Error('Admission in this fixture must use the supplied boundary');
+    };
+    const admission = new PersonVmService({
+      ...h.options,
+      store: new PostgresPersonVmStore(openSql),
+    }).createAdmissionHost({ openSql });
+    const { boundary, participant } = f.admission;
+    vi.spyOn(admission, 'participant').mockReturnValue(participant);
+    vi.spyOn(admission, 'admit').mockResolvedValue({ ...f.permit, binding });
+    vi.spyOn(admission, 'queued').mockImplementation(boundary.queued);
+    vi.spyOn(admission, 'activate').mockImplementation(boundary.activate);
+    vi.spyOn(admission, 'waitUntilReady').mockImplementation(
+      boundary.waitUntilReady,
+    );
+    vi.spyOn(admission, 'finish').mockImplementation(boundary.finish);
     const bound = await createProductionPersonVmSources({
       authority: model.authority,
       attach: model.attach,
@@ -315,10 +328,7 @@ it.each(['ready', 'failed', 'waiting'] as const)(
       ...model.host,
       vm,
       startup,
-      admission: {
-        ...f.admission.boundary,
-        participant: () => f.admission.participant,
-      } as typeof model.host.admission,
+      admission,
     });
     const finishPhysical = deferred<void>();
     const opened: (() => Promise<void>)[] = [];
