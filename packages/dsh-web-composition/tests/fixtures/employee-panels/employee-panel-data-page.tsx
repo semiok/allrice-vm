@@ -56,6 +56,7 @@ let state: PanelDataState = 'list';
 let metadataStatus: number | undefined;
 let metadataCode: string | undefined;
 let pdfBase64: string | undefined;
+let favoriteGate: PromiseWithResolvers<void> | undefined;
 let publicationReplyLost = false;
 let publicationRejected = false;
 let receiptReady = false;
@@ -173,6 +174,8 @@ const bound = createEmployeePanelDataClient({
   },
   async favorite(input, signal) {
     await call('favorite', input, signal);
+    if (favoriteGate) await favoriteGate.promise;
+    signal.throwIfAborted();
     files = files.map((f) =>
       f.objectId === input.objectId
         ? { ...f, favorite: input.body.favorite }
@@ -386,6 +389,13 @@ function Fixture() {
       },
       usePdf(base64) {
         pdfBase64 = base64;
+      },
+      holdFavorite() {
+        favoriteGate = Promise.withResolvers<void>();
+      },
+      finishFavorite() {
+        favoriteGate?.resolve();
+        favoriteGate = undefined;
       },
       refusePreview(status, code, refresh = true) {
         metadataStatus = status;

@@ -14,6 +14,8 @@ export interface PanelDataFixture {
   setKind(value: 'files' | 'materials'): void;
   mutateOriginal(): void;
   usePdf(base64: string): void;
+  holdFavorite(): void;
+  finishFavorite(): void;
   refusePreview(status?: number, code?: string, refresh?: boolean): void;
   losePublicationReply(): void;
   rejectNextPublication(): void;

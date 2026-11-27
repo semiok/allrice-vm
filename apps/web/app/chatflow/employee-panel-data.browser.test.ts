@@ -289,29 +289,48 @@ suite(
             ).length;
           const before = await reads();
 
-          await page.evaluate(() =>
-            window.__panelDataFixture.refusePreview(503, undefined, false),
-          );
+          await page.evaluate(() => window.__panelDataFixture.holdFavorite());
           await preview
             .getByRole('button', { name: '收藏', exact: true })
             .click();
+          await expect
+            .poll(
+              async () =>
+                (await evidence(page)).calls.filter(
+                  (call) => call.method === 'favorite',
+                ).length,
+            )
+            .toBe(1);
+          await fontNotice.click();
+          const fonts = page.getByRole('dialog', { name: '缺失的字体' });
+          const missing = fonts.getByText('Fixture Sans', { exact: true });
+          await missing.waitFor();
+
+          await page.evaluate(() => {
+            window.__panelDataFixture.refusePreview(503, undefined, false);
+            window.__panelDataFixture.finishFavorite();
+          });
           const warning = preview
             .getByRole('alert')
             .filter({ hasText: '预览加载失败' });
           await warning.waitFor();
-          const assertRetained = async () => {
+          const assertRetained = async (priorTop: number) => {
+            const reading = await reader!.evaluate((node) => ({
+              connected: node.isConnected,
+              top: node.scrollTop,
+              max: node.scrollHeight - node.clientHeight,
+            }));
+            expect(reading.connected).toBe(true);
             expect(
-              await reader!.evaluate((node) => ({
-                connected: node.isConnected,
-                top: node.scrollTop,
-              })),
-            ).toEqual({ connected: true, top });
-            expect(await fontNotice.count()).toBe(1);
+              Math.abs(reading.top - Math.min(priorTop, reading.max)),
+            ).toBeLessThanOrEqual(0.5);
             expect(await zoom.innerText()).toContain('150%');
             expect(await reads()).toBe(before);
           };
-          await assertRetained();
+          await assertRetained(top);
+          expect(await missing.isVisible()).toBe(true);
 
+          await fonts.press('Escape');
           await page.evaluate(() =>
             window.__panelDataFixture.refusePreview(
               undefined,
@@ -319,15 +338,20 @@ suite(
               false,
             ),
           );
-          // The footer control need not scroll the reader into view during this check.
-          await warning
-            .getByRole('button', { name: '重新加载' })
-            .evaluate((button: HTMLButtonElement) => button.click());
+          const retry = warning.getByRole('button', {
+            name: '重新加载',
+            exact: true,
+          });
+          await retry.scrollIntoViewIfNeeded();
+          const footerTop = await reader!.evaluate((node) => node.scrollTop);
+          await retry.click();
           await warning.waitFor({ state: 'hidden' });
           await preview
             .getByRole('button', { name: '取消收藏', exact: true })
             .waitFor();
-          await assertRetained();
+          await assertRetained(footerTop);
+          await fontNotice.click();
+          await missing.waitFor();
           expect(errors).toEqual([]);
         } finally {
           await page.close();
