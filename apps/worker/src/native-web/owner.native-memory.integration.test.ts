@@ -532,7 +532,7 @@ it.skipIf(
               name: 'mcp__allrice__' + tool.id,
               description: 'Validate the isolated native memory contract.',
               parameters: tool.schema,
-              output: { schema: {type:'string'}, render: text => [{type:'text',text}] },
+              output: { schema: {type:'string'}, render: (_ctx, text) => [{type:'text',text}] },
               async execute(args, exec, ref) {
                 const response = await fetch(${JSON.stringify(origin + '/fixture-memory-tool')}, {
                   method: 'POST', signal: exec.signal,
