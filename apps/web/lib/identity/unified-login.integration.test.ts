@@ -398,13 +398,16 @@ integration('shared portal HTTP identity with real PostgreSQL', () => {
     expect((await password(accountRequest('password', old))).status).toBe(401);
     expect((await logout(accountRequest('logout', old))).status).toBe(401);
     expect((await currentLogin())?.sessionId).toBe(active);
+    const originalCookie = jar.get('allrice_session');
     expect((await logout(accountRequest('logout', active))).status).toBe(204);
+    expect(jar.get('allrice_session')).toBe(originalCookie);
     expect(await currentLogin()).toBeNull();
     expect((await signIn(loginRequest())).status).toBe(200);
     const renewed = (await currentLogin())!.sessionId;
     expect((await password(accountRequest('password', renewed))).status).toBe(
       204,
     );
+    expect(jar.get('allrice_session')?.value).not.toBe('');
     expect(await currentLogin()).toBeNull();
     expect((await signIn(loginRequest())).status).toBe(401);
   });

@@ -394,12 +394,26 @@ suite('production settings owner in the installed rc.2 workbench', () => {
   });
 
   it('opens the two approved settings entries, calls native General and sends account actions for the exact login', async () => {
-    const context = await browser.newContext({ reducedMotion: 'reduce' });
+    const context = await browser.newContext({
+      reducedMotion: 'reduce',
+      viewport: { width: 1440, height: 1000 },
+      deviceScaleFactor: 1,
+    });
     try {
+      await context.addInitScript((origin) => {
+        if (location.origin !== origin || location.pathname !== '/') return;
+        const lifetime = new AbortController();
+        Object.assign(window, {
+          __ALLRICE_D_ENTRY_LIFETIME__: lifetime.signal,
+        });
+      }, host.origin);
       const page = await context.newPage();
+      const errors: string[] = [];
+      page.on('pageerror', (error) => errors.push(error.message));
       const authenticated = await context.request.get(host.authUrl);
       expect(authenticated.ok()).toBe(true);
       const employee = createSidebarFixtureData().employees[1]!;
+      employee.currentVersion.manifest.name = '虚拟哥';
       const roster = {
         organizationId: id(1),
         workspaceId: id(2),
@@ -416,8 +430,7 @@ suite('production settings owner in the installed rc.2 workbench', () => {
           },
         ],
       };
-      const documentOwner = `<script>const documentLifetime = new AbortController(); window.__ALLRICE_D_ENTRY_LIFETIME__ = documentLifetime.signal; window.revokeTestDocument = () => documentLifetime.abort();</script>
-        <div hidden id="app" data-organization-id="${id(1)}" data-workspace-id="${id(2)}" data-viewer-id="${id(3)}" data-employee-instance-id="${id(4)}" data-thread-id="${id(5)}" data-login-session-id="${loginSessionId}" data-scope-id="${id(7)}" data-native-session-id="session-00000000-0000-4000-8000-000000000036"></div>
+      const documentOwner = `        <div hidden id="app" data-organization-id="${id(1)}" data-workspace-id="${id(2)}" data-viewer-id="${id(3)}" data-employee-instance-id="${id(4)}" data-thread-id="${id(5)}" data-login-session-id="${loginSessionId}" data-scope-id="${id(7)}" data-native-session-id="session-00000000-0000-4000-8000-000000000036"></div>
         <script id="allrice-employee-directory" type="application/json">${JSON.stringify(roster).replaceAll('<', '\\u003c')}</script>`;
       await page.route(host.origin + '/', async (route) => {
         const upstream = await route.fetch();
@@ -445,28 +458,89 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         );
         return route.fulfill({ status: 204 });
       });
+      await page.route('**/api/v1/auth/session', (route) =>
+        route.fulfill({ status: 401 }),
+      );
       await page.route(host.origin + '/login', (route) =>
         route.fulfill({ body: 'synthetic sign-in landing' }),
       );
-      await page.goto(host.origin);
-      const trigger = page.locator('#chat-sidebar').getByRole('button', {
+      const workbenchUrl = host.origin + '/settings-parent';
+      await page.route(workbenchUrl, (route) =>
+        route.fulfill({
+          contentType: 'text/html',
+          body: '<body style="margin:0"><iframe title="员工工作区" src="/" style="display:block;border:0;width:100%;height:100dvh"></iframe></body>',
+        }),
+      );
+      await page.goto(workbenchUrl);
+      const workbench = page.frameLocator('iframe[title="员工工作区"]');
+      const trigger = workbench.locator('#chat-sidebar').getByRole('button', {
         name: '设置',
         exact: true,
       });
-      await trigger.click();
-      const pane = page.getByRole('region', { name: '设置', exact: true });
+      await trigger.click({ timeout: 12_000 }).catch(async (error) => {
+        await page.screenshot({
+          path: join(artifacts, 'production-settings-first-failure.png'),
+        });
+        throw new Error(
+          'Settings launcher was not visible: ' +
+            JSON.stringify({
+              errors,
+              artifacts,
+              frames: page
+                .frames()
+                .map((frame) => new URL(frame.url()).pathname),
+            }),
+          { cause: error },
+        );
+      });
+      const pane = workbench.getByRole('region', { name: '设置', exact: true });
       await pane.waitFor();
       expect(await pane.getByRole('button').allTextContents()).toEqual([
         'AllRice 账号',
         '通用设置 ↗',
       ]);
-      await page.screenshot({
-        path: join(artifacts, 'production-settings-1440.png'),
-      });
+      console.info('Production settings screenshots: ' + artifacts);
+      const capture = async (width: number) => {
+        await page.setViewportSize({
+          width,
+          height: width === 1440 ? 1000 : 844,
+        });
+        for (const theme of ['light', 'dark'] as const) {
+          await workbench.locator('body').evaluate((_, theme) => {
+            const fixture = window as unknown as {
+              __allriceCompositionTest: { setTheme: (theme: string) => void };
+            };
+            fixture.__allriceCompositionTest.setTheme(theme);
+          }, theme);
+          await workbench
+            .locator('body')
+            .evaluate(
+              () =>
+                new Promise<void>((resolve) =>
+                  requestAnimationFrame(() =>
+                    requestAnimationFrame(() => resolve()),
+                  ),
+                ),
+            );
+          await pane.waitFor();
+          expect(
+            await pane.evaluate(
+              (node) =>
+                node.getBoundingClientRect().right <=
+                document.documentElement.clientWidth,
+            ),
+          ).toBe(true);
+          await page.screenshot({
+            path: join(artifacts, `production-settings-${width}-${theme}.png`),
+            animations: 'disabled',
+          });
+        }
+      };
+      await capture(1440);
       await pane
         .getByRole('button', { name: '通用设置 ↗', exact: true })
         .click();
-      const native = page.locator('[data-shortcut-modal="settings"]');
+      const native = workbench.locator('[data-shortcut-modal="settings"]');
       await native.waitFor({ state: 'visible' });
       expect(
         await native
@@ -479,11 +553,7 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         ).toBe(0);
       await page.keyboard.press('Escape');
       await native.waitFor({ state: 'hidden' });
-      await page.setViewportSize({ width: 390, height: 844 });
-      await pane.waitFor();
-      await page.screenshot({
-        path: join(artifacts, 'production-settings-390.png'),
-      });
+      await capture(390);
       await pane
         .getByRole('button', { name: 'AllRice 账号', exact: true })
         .click();

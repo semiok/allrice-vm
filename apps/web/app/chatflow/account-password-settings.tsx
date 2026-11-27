@@ -16,7 +16,7 @@ const empty = { currentPassword: '', newPassword: '', confirmPassword: '' };
 type AccountPasswordScope = {
   readonly sessionId: string;
   readonly signal: AbortSignal;
-  readonly onChanged: () => void;
+  readonly onChanged: () => Promise<void>;
 };
 
 export function AccountPasswordSettings({
@@ -66,7 +66,7 @@ export function AccountPasswordSettings({
         );
         return;
       }
-      if (scope) scope.onChanged();
+      if (scope) await scope.onChanged();
       else window.location.assign('/login');
     } catch {
       if (!scope?.signal.aborted) setError(resultUnknown);

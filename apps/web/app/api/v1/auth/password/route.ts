@@ -26,6 +26,9 @@ export async function POST(request: Request) {
     )
       return authenticationRequiredProblem();
     await changePassword(context, await request.json());
+    // A scoped workbench response can arrive after another tab logs in.
+    // The database has revoked the exact login, so do not overwrite its cookies.
+    if (expectedSession !== null) return new Response(null, { status: 204 });
     const store = await cookies();
     store.set(sessionCookieName, '', {
       ...sessionCookieOptions,

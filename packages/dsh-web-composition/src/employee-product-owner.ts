@@ -8,7 +8,6 @@ import {
 import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
-import { bindEmployeeSettings } from './employee-settings-port';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
 import {
   bindEmployeeSidebar,
@@ -48,12 +47,6 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
-  if (data.loginSessionId && !signal.aborted)
-    bindEmployeeSettings(ctx, {
-      signal,
-      nativeSessionId,
-      loginSessionId: data.loginSessionId,
-    });
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -317,5 +310,4 @@ export function installEmployeeProductOwner(ctx: Context) {
       refreshUnread();
     })
     .catch(() => {});
-  return true;
 }

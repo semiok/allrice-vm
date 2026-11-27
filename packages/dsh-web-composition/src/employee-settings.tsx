@@ -20,6 +20,7 @@ import type {
 } from './employee-settings-port';
 import styles from './employee-settings.module.css';
 import { applyEmployeeSettingsPane } from './employee-settings-pane';
+export { bindEmployeeDocumentSettings } from './employee-settings-pane';
 
 export { bindEmployeeSettings } from './employee-settings-port';
 export type * from './employee-settings-port';
@@ -225,9 +226,7 @@ export function apply(ctx: Context, options: EmployeeSettingsOptions = {}) {
   const notificationsEnabled = options.notifications === true;
   const renderLauncher = options.renderLauncher;
   const Hidden = () => null;
-  const hiddenGeneral = ['developer-tools', 'session-log-deepseek'];
-  if (!options.workbench) hiddenGeneral.unshift('permission');
-  for (const id of hiddenGeneral)
+  for (const id of ['permission', 'developer-tools', 'session-log-deepseek'])
     ctx.slots.inject('settings.general.item', () =>
       ctx.slots.register(
         { name: 'settings.general.item', id, priority: -100 },

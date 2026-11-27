@@ -10,13 +10,44 @@ import {
 } from 'react';
 import { AccountPasswordSettings } from '../../../apps/web/app/chatflow/account-password-settings';
 import { SidebarSettingsButton } from '../../../apps/web/app/chatflow/sidebar-settings-trigger';
-import type { EmployeeWorkbenchSettingsPort } from './employee-settings-port';
+import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
+import {
+  bindEmployeeSettings,
+  type EmployeeWorkbenchSettingsPort,
+} from './employee-settings-port';
 import styles from './employee-settings.module.css';
 
 const settingsTab = 'allrice-employee-settings';
 
-function goToLogin() {
-  window.top?.location.replace('/login');
+/** Only the authenticated employee document owns account commands. */
+export function bindEmployeeDocumentSettings(ctx: Context) {
+  const documentScope = globalThis as typeof globalThis & {
+    __ALLRICE_D_ENTRY_LIFETIME__?: AbortSignal;
+  };
+  const signal = documentScope.__ALLRICE_D_ENTRY_LIFETIME__;
+  if (!signal) return false;
+  const data = document.getElementById('app')?.dataset;
+  if (data?.loginSessionId && !signal.aborted) {
+    const { nativeSessionId, selection } = readEmployeeDocument(data);
+    if (nativeSessionId && selection.threadId)
+      bindEmployeeSettings(ctx, {
+        signal,
+        nativeSessionId,
+        loginSessionId: data.loginSessionId,
+      });
+  }
+  return true;
+}
+
+async function goToLogin(signal: AbortSignal) {
+  const response = await fetch('/api/v1/auth/session', {
+    credentials: 'same-origin',
+    cache: 'no-store',
+    signal,
+  });
+  if (!signal.aborted && response.status === 401)
+    window.top?.location.replace('/login');
+  else if (!signal.aborted && !response.ok) throw Error('Login check failed');
 }
 
 function AccountActions({
@@ -41,7 +72,7 @@ function AccountActions({
       });
       if (signal.aborted) return;
       if (!response.ok) throw Error('Logout failed');
-      goToLogin();
+      await goToLogin(signal);
     } catch {
       if (signal.aborted) return;
       setFailed(true);
@@ -51,7 +82,11 @@ function AccountActions({
   return (
     <section aria-label="AllRice 账号">
       <AccountPasswordSettings
-        scope={{ sessionId: loginSessionId, signal, onChanged: goToLogin }}
+        scope={{
+          sessionId: loginSessionId,
+          signal,
+          onChanged: () => goToLogin(signal),
+        }}
       />
       <Button
         variant="outline"

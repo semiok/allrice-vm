@@ -25,6 +25,8 @@ export async function POST(request: Request) {
   const cookieStore = await cookies();
   const token = cookieStore.get(sessionCookieName)?.value;
   if (token) await revokeSession(token);
+  // A late response from the old workbench must leave a replacement login alone.
+  if (expectedSession !== null) return new Response(null, { status: 204 });
   cookieStore.set(sessionCookieName, '', {
     ...sessionCookieOptions,
     expires: new Date(0),
