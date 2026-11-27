@@ -3884,6 +3884,7 @@ suite(
                   readImmutableBundleFor: unexpectedOwnerOperation,
                   readNativeRootWakeFor: unexpectedOwnerOperation,
                   readNativeAttemptFor: unexpectedOwnerOperation,
+                  observeNativeSearchCallFor: unexpectedOwnerOperation,
                   waitNativeTurnEnd: unexpectedOwnerOperation,
                   readPersistedRunTerminalFor: unexpectedOwnerOperation,
                   readManagedModelImageFor: unexpectedOwnerOperation,
