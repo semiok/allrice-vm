@@ -84,6 +84,8 @@ export async function createVmMemoryGuestPlan(input: {
   persistentDirectory: string;
   /** Host platform configuration; no phase4 fallback or guest-selected limits. */
   policy: VmMemoryPolicy;
+  /** Expected cap from the same trusted platform snapshot as the VM provider. */
+  platformPhysicalBytes?: number;
   /** Actual approval/config release reference, not permission granted by a string. */
   policyRef: string;
   /** Explicit cooperative receipt setup. The real command owner supplies a
@@ -98,6 +100,7 @@ export async function createVmMemoryGuestPlan(input: {
   if (typeof input.policyRef !== 'string' || !input.policyRef.trim())
     throw new Error('approved_memory_policy_required');
   const policy = { ...input.policy };
+  const { platformPhysicalBytes = VM_PHYSICAL_MEMORY_BYTES } = input;
   const byteValues = [
     policy.physicalBytes,
     policy.swapBytes,
@@ -113,7 +116,8 @@ export async function createVmMemoryGuestPlan(input: {
     !scores.every(
       (value) => Number.isInteger(value) && value >= -1000 && value <= 1000,
     ) ||
-    policy.physicalBytes !== VM_PHYSICAL_MEMORY_BYTES ||
+    policy.physicalBytes <= 0 ||
+    policy.physicalBytes !== platformPhysicalBytes ||
     !(policy.swapBytes > 0) ||
     policy.commandOomGroup !== 0 ||
     policy.commandHighBytes > policy.commandMaxBytes
@@ -158,7 +162,7 @@ export async function createVmMemoryGuestPlan(input: {
     throw new Error('invalid_command_receipt_configuration');
   const config = {
     contractVersion: VM_MEMORY_CONTRACT_VERSION,
-    platformPhysicalBytes: VM_PHYSICAL_MEMORY_BYTES,
+    platformPhysicalBytes,
     cgroupRoot,
     dshGroup,
     commandsGroup,

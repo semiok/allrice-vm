@@ -19,8 +19,6 @@ import {
   VM_MEMORY_PHASE4_REFERENCE_POLICY,
   VM_PHYSICAL_MEMORY_BYTES,
 } from './contract.ts';
-import type * as Platform from '@allrice/contracts';
-import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { GuestMemorySample, VmMemoryPolicy } from './contract.ts';
 import {
   createPersonVmDshCommandMemoryPatch,
@@ -357,44 +355,24 @@ describe.sequential(
       );
     });
 
-    it('a non-default application platform snapshot flows through the actual plan into the initializer', async () => {
-      // Only the trusted static source boundary is varied; no request/env writer.
-      const platform = Object.freeze({
-        ...readPlatformPersonVmConfiguration(),
-        memoryMiB: 3072,
-        idleMs: 3333,
+    it('a non-default platform cap flows through the actual plan into the initializer', async () => {
+      const physicalBytes = 3072 * 1024 ** 2;
+      const input = {
+        persistentDirectory: '/fixture/encrypted',
+        policy: { ...VM_MEMORY_PHASE4_REFERENCE_POLICY, physicalBytes },
+        policyRef: 'fixture:nondefault-platform-snapshot',
+      };
+      const plan = await createPlan({
+        ...input,
+        platformPhysicalBytes: physicalBytes,
       });
-      vi.resetModules();
-      vi.doMock('@allrice/contracts', async (original) => ({
-        ...(await original<typeof Platform>()),
-        readPlatformPersonVmConfiguration: () => platform,
-      }));
-      try {
-        const { createVmMemoryGuestPlan: currentPlan } =
-          await import('./guest-config.ts');
-        const physicalBytes = platform.memoryMiB * 1024 ** 2;
-        const plan = await currentPlan({
-          persistentDirectory: '/fixture/encrypted',
-          policy: { ...VM_MEMORY_PHASE4_REFERENCE_POLICY, physicalBytes },
-          policyRef: 'fixture:nondefault-application-platform-snapshot',
-        });
-        const f = await virtualGuest(plan);
-        expect(f.config.platformPhysicalBytes).toBe(physicalBytes);
-        expect(f.config.policy.physicalBytes).toBe(physicalBytes);
-        expect(initialize(f.config, f.io, f.run).swapFileBytes).toBe(
-          f.config.policy.swapBytes,
-        );
-        await expect(
-          currentPlan({
-            persistentDirectory: '/fixture/encrypted',
-            policy: VM_MEMORY_PHASE4_REFERENCE_POLICY,
-            policyRef: 'fixture:wrong-platform-physical-policy',
-          }),
-        ).rejects.toThrow('invalid_memory_policy');
-      } finally {
-        vi.doUnmock('@allrice/contracts');
-        vi.resetModules();
-      }
+      const f = await virtualGuest(plan);
+      expect(f.config.platformPhysicalBytes).toBe(physicalBytes);
+      expect(f.config.policy.physicalBytes).toBe(physicalBytes);
+      expect(initialize(f.config, f.io, f.run).swapFileBytes).toBe(
+        f.config.policy.swapBytes,
+      );
+      await expect(createPlan(input)).rejects.toThrow('invalid_memory_policy');
     });
 
     it.each(['missing', 'zero', 'mismatch'] as const)(

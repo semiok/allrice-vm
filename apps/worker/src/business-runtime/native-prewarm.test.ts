@@ -2387,3 +2387,111 @@ it('combined production API rolls back its new catalog registration when prewarm
   ).toThrow(DEntryNativeUnavailable);
   expect(f.vm).not.toHaveBeenCalled();
 });
+
+it('plans the next epoch before asking an old running binding for editor proof', async () => {
+  const f = fixture();
+  const { context, identity } = f.base;
+  const vmId = randomUUID();
+  const oldInstance = randomUUID();
+  const nextInstance = randomUUID();
+  let updated = false;
+  let previousPhase: 'running' | 'failed' = 'running';
+  const proof = vi.fn(async () => {
+    expect(updated).toBe(true);
+    return signal();
+  });
+  const reconcileStoppedEntry = vi.fn(async () => false);
+  const uninstall = installDEntryNativeDataPort({
+    ...f.base.data,
+    assertEditorReady: proof,
+  });
+  const assembly = createDEntryNativePrewarmPort({
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    ownsRunningBinding: (binding) => binding.instanceId === nextInstance,
+    reconcileStoppedEntry,
+    readCoordination: async () => ({
+      authorityRevision: 'release-1',
+      vm: {
+        vmId,
+        instanceId: updated ? nextInstance : oldInstance,
+        leaseEpoch: updated ? 6 : 5,
+        phase: updated ? 'running' : previousPhase,
+        leaseOwner: null,
+        hasEgressReceipt: true,
+        nativeCreated: true,
+      },
+    }),
+    async prewarmCurrent(_context, _identity, input) {
+      expect(input.target).toMatchObject({
+        vmId,
+        instanceId: null,
+        leaseEpoch: 6,
+      });
+      expect(proof).not.toHaveBeenCalled();
+      input.target?.observeVmStart?.({
+        personId: identity.personId,
+        organizationId: identity.organizationId,
+        vmId,
+        instanceId: nextInstance,
+        leaseEpoch: 6,
+      });
+      updated = true;
+      return {
+        vmId,
+        personId: identity.personId,
+        organizationId: identity.organizationId,
+        phase: 'running',
+        ready: true,
+        diskRetained: true,
+        lastActivityAt: new Date().toISOString(),
+      };
+    },
+  });
+  try {
+    const plan = await assembly.port.prepare!(context, identity, signal());
+    expect(plan.running).toBe(false);
+    await expect(
+      assembly.port.isCurrent!(context, identity, plan, signal(), 'operation'),
+    ).resolves.toBe(true);
+    expect(plan.upgradeRestart).toBe(true);
+    previousPhase = 'failed';
+    const retryPlan = await assembly.port.prepare!(context, identity, signal());
+    expect(retryPlan).toMatchObject({
+      upgradeRestart: true,
+      running: false,
+      target: plan.target,
+    });
+    expect(reconcileStoppedEntry).not.toHaveBeenCalled();
+    await expect(
+      assembly.port.prewarm(
+        context,
+        identity,
+        'page',
+        signal(),
+        signal(),
+        plan,
+      ),
+    ).rejects.toMatchObject({ code: 'UPGRADE_OPEN_REQUIRED' });
+    expect(updated).toBe(false);
+    expect(proof).not.toHaveBeenCalled();
+    await expect(
+      assembly.port.prewarm(
+        context,
+        identity,
+        'open',
+        signal(),
+        signal(),
+        plan,
+      ),
+    ).resolves.toBeInstanceOf(AbortSignal);
+    expect(proof).toHaveBeenCalledOnce();
+    expect(plan.target.instanceId).toBe(nextInstance);
+    await expect(
+      assembly.port.isCurrent!(context, identity, plan, signal(), 'ready'),
+    ).resolves.toBe(true);
+  } finally {
+    uninstall();
+    await assembly.close();
+  }
+});

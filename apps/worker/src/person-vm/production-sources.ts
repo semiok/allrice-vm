@@ -14,6 +14,12 @@ import {
 import { createProductionEgressAuthority } from './production-egress-authority.js';
 import { createProductionCodexRuntime } from './production-codex-runtime.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
+import { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
+import {
+  DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+  createProductionNativeActivity,
+  getIdleScheduleGuardMs,
+} from './production-native-activity.js';
 
 type HostInput = Parameters<ProductionPersonVmHostSources['bind']>[0];
 type CodexRuntime = Awaited<ReturnType<typeof createProductionCodexRuntime>>;
@@ -134,6 +140,15 @@ export function createProductionPersonVmSources(
         const installed = entry;
         lifetime.throwIfAborted();
         return {
+          scheduledWake: createProductionScheduledWakeSource(host.vm),
+          nativeActivity: createProductionNativeActivity(startup, lifetime, {
+            sampleIntervalMs:
+              host.providers.configuration.lifecycle.idleSampleIntervalMs ??
+              DEFAULT_IDLE_SAMPLE_INTERVAL_MS,
+            scheduleGuardMs: getIdleScheduleGuardMs(
+              host.providers.configuration.lifecycle,
+            ),
+          }),
           runtime: {
             async readiness(binding, signal) {
               await codex.assertCurrent(signal);

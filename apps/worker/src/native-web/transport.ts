@@ -14,6 +14,22 @@ import type {
 import { PersonVmError } from '@allrice/person-vm';
 
 export const nativeIndexByteLimit = 1024 * 1024;
+// rc.2 includes retained projection previews in both session reads.
+const nativeActivityHistoryByteLimit = 8 * 1024 * 1024;
+const nativeUnaryByteLimits: Partial<Record<NativeOwnedUnary, number>> = {
+  'session/create': 16 * 1024,
+  'session/list': nativeActivityHistoryByteLimit,
+  'session/projections': nativeActivityHistoryByteLimit,
+};
+
+export type NativeOwnedUnary =
+  | 'session/create'
+  | 'session/modelCatalog'
+  | 'session/list'
+  | 'session/projections'
+  | 'workspace/create'
+  | 'goals/get'
+  | 'schedule/catalog';
 
 /** Dedicated outbound resources; never the global fetch pool or a listener. */
 export function nativeWebTransport(
@@ -369,8 +385,8 @@ export function nativeWebTransport(
       );
       return data.length ? data.toString('utf8') : null;
     },
-    async readNativeReply(
-      method: 'session/create' | 'session/modelCatalog' | 'workspace/create',
+    async readUnaryReply(
+      method: NativeOwnedUnary,
       body: string,
       caller: AbortSignal,
     ) {
@@ -379,8 +395,7 @@ export function nativeWebTransport(
         new URL('api/' + method, origin),
         caller,
         {
-          maxBytes:
-            method === 'session/create' ? 16 * 1024 : nativeIndexByteLimit,
+          maxBytes: nativeUnaryByteLimits[method] ?? nativeIndexByteLimit,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>

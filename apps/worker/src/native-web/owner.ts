@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { Context } from '@deepseek-ai/cordis';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { WorkspaceId } from '@deepseek-ai/dsh-workspace';
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry';
 import {
@@ -10,6 +12,9 @@ import {
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as JOB_REMOTE } from '@deepseek-ai/dsh-api-job-controller/remote';
+import { TYPERT_REMOTE as GOAL_REMOTE } from '@deepseek-ai/dsh-goal/remote';
+import { TYPERT_REMOTE as SCHEDULE_REMOTE } from '@deepseek-ai/dsh-schedule/remote';
 import { TYPERT_REMOTE as PRINCIPAL_REMOTE } from '@allrice/d-entry-principal/remote';
 import { nativeSessionRoot } from '@allrice/d-entry-principal/policy';
 import {
@@ -46,7 +51,11 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
-import { nativeWebTransport } from './transport.js';
+import {
+  isNativeActivityProjection,
+  readNativeProfileActivity,
+} from './activity.js';
+import { nativeWebTransport, type NativeOwnedUnary } from './transport.js';
 import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
   NativePromptOccurrenceSchema,
@@ -149,7 +158,7 @@ export function readNativeModelAttempt(
 export async function openNativeWebOwner(input: {
   scope: PersonVmBootstrapScope;
   launch: NativeWebLaunch;
-  context: RequestContext;
+  context?: RequestContext;
   vm: Pick<PersonVmPort, 'assertCurrentBinding'>;
   lifetime: AbortSignal;
   cleanupTimeoutMs: number;
@@ -210,7 +219,7 @@ export async function openNativeWebOwner(input: {
     };
     try {
       console.warn('[MET-273] native Web startup failed', {
-        requestId: UuidSchema.safeParse(input.context.requestId).data,
+        requestId: UuidSchema.safeParse(input.context?.requestId).data,
         vmId: UuidSchema.safeParse(input.scope.binding.vmId).data,
         leaseEpoch: input.scope.binding.leaseEpoch,
         ...diagnostic,
@@ -263,6 +272,10 @@ export async function openNativeWebOwner(input: {
   // typed close/closed/end until normal cleanup, actual loss or exact stop.
   const signal = AbortSignal.any([input.lifetime, stale.signal]);
   let installedModelAdapter: string | undefined;
+  let activityRevision = 0;
+  // job/list is a visibility filter, with unowned Jobs visible to every
+  // selector. This fresh selector creates no native Session.
+  const unownedJobSelector = SessionId(randomUUID());
   let ready = false,
     closing: Promise<void> | undefined,
     hostClosing: Promise<void> | undefined;
@@ -559,8 +572,8 @@ export async function openNativeWebOwner(input: {
       }),
     );
   }
-  async function readNativeReply(
-    method: 'session/create' | 'session/modelCatalog' | 'workspace/create',
+  async function readUnaryReply(
+    method: NativeOwnedUnary,
     args: object,
     signal: AbortSignal,
   ) {
@@ -573,12 +586,12 @@ export async function openNativeWebOwner(input: {
         payload: { args },
       }),
     );
-    const wire = await transport.readNativeReply(method, body, signal);
+    const wire = await transport.readUnaryReply(method, body, signal);
     const reply = serverResponseSchema.parse(JSON.parse(wire));
     if (reply.rpcId !== rpcId) throw new PersonVmError('PROVIDER_FAILED');
     return reply.result;
   }
-  function replyValue(result: Awaited<ReturnType<typeof readNativeReply>>) {
+  function replyValue(result: Awaited<ReturnType<typeof readUnaryReply>>) {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
@@ -630,7 +643,7 @@ export async function openNativeWebOwner(input: {
             readCurrent(active, guard, async (signal) => {
               const method = TYPERT_REMOTE.methods['session/modelCatalog'];
               const args = method.input({ strict: true }).create().parse({});
-              const result = await readNativeReply(
+              const result = await readUnaryReply(
                 'session/modelCatalog',
                 args,
                 signal,
@@ -712,6 +725,8 @@ export async function openNativeWebOwner(input: {
     await setup(() => root.plugin(GatewayClient));
     stage('mount-session');
     await setup(() => root.remote.$mount(TYPERT_REMOTE));
+    stage('mount-job');
+    await setup(() => root.remote.$mount(JOB_REMOTE));
     stage('mount-principal');
     await setup(() => root.remote.$mount(PRINCIPAL_REMOTE));
     stage('session-list');
@@ -732,7 +747,19 @@ export async function openNativeWebOwner(input: {
     own(
       (async () => {
         try {
-          while (!(await iterator.next()).done) signal.throwIfAborted();
+          for (
+            let next = await iterator.next();
+            !next.done;
+            next = await iterator.next()
+          ) {
+            signal.throwIfAborted();
+            const frame = next.value;
+            if (
+              frame.type === 'projection' &&
+              isNativeActivityProjection(frame.key, frame.value)
+            )
+              activityRevision++;
+          }
         } finally {
           // Expected business cancellation must leave cleanup carrier alive.
           if (!closing) lost();
@@ -803,7 +830,7 @@ export async function openNativeWebOwner(input: {
             // Native create is idempotent for the current real directory.
             // Resolve it from this authenticated Host rather than retaining a
             // workspace ID that may have been removed by the native UI.
-            const registration = await readNativeReply(
+            const registration = await readUnaryReply(
               'workspace/create',
               { request: { path } },
               AbortSignal.any([
@@ -831,7 +858,7 @@ export async function openNativeWebOwner(input: {
             // rc.2 create has no native cancellation slot. Let a dispatched
             // create settle independently of page cancellation. The scoped
             // transport confirms the matching reply AND physical HTTP close.
-            const result = await readNativeReply(
+            const result = await readUnaryReply(
               'session/create',
               args,
               AbortSignal.timeout(input.cleanupTimeoutMs),
@@ -995,19 +1022,18 @@ export async function openNativeWebOwner(input: {
         );
       },
       readSessions(requestSignal: AbortSignal) {
-        async function assertCurrent(current: AbortSignal) {
+        const context = input.context;
+        if (!context)
+          return Promise.reject(new PersonVmError('AUTHORIZATION_DENIED'));
+        const assertCurrent = async (current: AbortSignal) => {
           try {
-            await input.vm.assertCurrentBinding(
-              input.context,
-              binding,
-              current,
-            );
+            await input.vm.assertCurrentBinding(context, binding, current);
           } catch (error) {
             // Normal closing/retirement owns this business abort; keep ACK carrier.
             if (!closing && !requestSignal.aborted) lost();
             throw error;
           }
-        }
+        };
         return readCurrentSessions(requestSignal, assertCurrent);
       },
       /** Request denial does not certify loss of this shared native owner. */
@@ -1021,6 +1047,98 @@ export async function openNativeWebOwner(input: {
           (current) => input.vm.assertCurrentBinding(context, binding, current),
           notDispatched,
         );
+      },
+      nativeActivityRevision: () => activityRevision,
+      /** Activity samples from this authenticated, exact Host. None of
+       * these public queries activates or waits for a Session's runtime. */
+      readNativeActivity(
+        assertCurrent: (signal: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, (active) =>
+          readNativeProfileActivity(
+            {
+              sessions: async (signal) => {
+                const method = TYPERT_REMOTE.methods['session/list'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ _request: {} });
+                const result = await readUnaryReply(
+                  'session/list',
+                  args,
+                  signal,
+                );
+                return method.result.create().parse(replyValue(result)).items;
+              },
+              jobs: async (sessionId, signal) => {
+                const stream = root.remote.job.list(
+                  { sessionId: sessionId ?? unownedJobSelector },
+                  signal,
+                );
+                const rows = stream[Symbol.asyncIterator]();
+                try {
+                  const first = await rows.next();
+                  if (first.done) throw new PersonVmError('RUNTIME_NOT_READY');
+                  return JOB_REMOTE.methods['job/list'].result
+                    .create()
+                    .parse(first.value);
+                } finally {
+                  stream.dispose();
+                  await rows.return?.();
+                }
+              },
+              projections: async (sessionId, signal) => {
+                const method = TYPERT_REMOTE.methods['session/projections'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ request: { sessionId } });
+                const result = await readUnaryReply(
+                  'session/projections',
+                  args,
+                  signal,
+                );
+                return method.result.create().parse(replyValue(result));
+              },
+              goal: async (agentId, signal) => {
+                const method = GOAL_REMOTE.methods['goals/get'];
+                const args = method
+                  .input({ strict: true })
+                  .create()
+                  .parse({ agentId });
+                const result = await readUnaryReply('goals/get', args, signal);
+                return method.result.create().parse(replyValue(result));
+              },
+            },
+            active,
+          ),
+        );
+      },
+      /** The host supplies its guard under the current physical lease. */
+      readScheduleCatalog(
+        assertCurrent: (signal: AbortSignal) => Promise<void>,
+        caller: AbortSignal,
+      ) {
+        const method = SCHEDULE_REMOTE.methods['schedule/catalog'];
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(current, assertCurrent, async (active) => {
+          const args = method.input({ strict: true }).create().parse({});
+          const result = await readUnaryReply('schedule/catalog', args, active);
+          const value = replyValue(result);
+          const parsed = method.result.create().parse(value);
+          // Reject protocol normalization before the observer hashes rows.
+          if (!isDeepStrictEqual(value, parsed))
+            throw new PersonVmError('PROVIDER_FAILED');
+          return parsed;
+        });
       },
       /** The existing native index supplies the running Host's own graph.
        * The release publisher independently verifies its complete code graph and

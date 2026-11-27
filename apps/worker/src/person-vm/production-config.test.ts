@@ -655,19 +655,94 @@ describe('private production Host configuration', () => {
     },
   );
 
-  it('rejects a measured guest physical policy that differs from the platform cap without overwriting it', async () => {
+  it('uses platform defaults for omitted settings without warning', async () => {
+    const input = value();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await seal({
+      ...input,
+      memory: {
+        ...input.memory,
+        policy: { ...input.memory.policy, physicalBytes: undefined },
+      },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toBe(readPlatformPersonVmConfiguration());
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      2 * 1024 ** 3,
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('reads both overrides from a sealed host configuration', async () => {
     const input = value();
     input.memory.policy.physicalBytes = 3 * 1024 ** 3;
-    await seal(input);
-    await expect(
-      readProductionHostConfiguration(signal()),
-    ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
-    expect(
-      JSON.parse(
-        await fs.readFile(join(root, '.local/person-vm-host.json'), 'utf8'),
-      ).memory.policy.physicalBytes,
-    ).toBe(input.memory.policy.physicalBytes);
-    expect(readPlatformPersonVmConfiguration().memoryMiB).toBe(2 * 1024);
+    await seal({
+      ...input,
+      lifecycle: { ...input.lifecycle, idleMs: 30 * 60_000 },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toEqual({
+      ...readPlatformPersonVmConfiguration(),
+      memoryMiB: 3072,
+      idleMs: 30 * 60_000,
+    });
+    expect(Object.isFrozen(result.platform)).toBe(true);
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      3 * 1024 ** 3,
+    );
+  });
+
+  it.each([
+    {
+      physicalBytes: 'private-invalid-value',
+      idleMs: 15 * 60_000,
+      memoryMiB: 2048,
+      minutes: 15,
+      field: 'memoryMiB',
+      fallback: 2048,
+    },
+    {
+      physicalBytes: 2 * 1024 ** 3 + 1,
+      idleMs: 15 * 60_000,
+      memoryMiB: 2048,
+      minutes: 15,
+      field: 'memoryMiB',
+      fallback: 2048,
+    },
+    {
+      physicalBytes: 3 * 1024 ** 3,
+      idleMs: 1,
+      memoryMiB: 3072,
+      minutes: 20,
+      field: 'idleMs',
+      fallback: 20 * 60_000,
+    },
+  ])('logs and defaults only the invalid $field setting', async (sample) => {
+    const input = value();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await seal({
+      ...input,
+      memory: {
+        ...input.memory,
+        policy: { ...input.memory.policy, physicalBytes: sample.physicalBytes },
+      },
+      lifecycle: { ...input.lifecycle, idleMs: sample.idleMs },
+    });
+    const result = await readProductionHostConfiguration(signal());
+    expect(result.platform).toMatchObject({
+      memoryMiB: sample.memoryMiB,
+      idleMs: sample.minutes * 60_000,
+    });
+    expect(result.configuration.memory.policy.physicalBytes).toBe(
+      sample.memoryMiB * 1024 ** 2,
+    );
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      'PERSON_VM_PLATFORM_SETTING_INVALID',
+      {
+        field: sample.field,
+        fallback: sample.fallback,
+      },
+    );
   });
   it.each([
     'commandHighBytes',

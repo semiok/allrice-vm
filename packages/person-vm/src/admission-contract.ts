@@ -1,5 +1,6 @@
 import type { RequestContext } from '@allrice/contracts';
 import type { PersonVmActivity, PersonVmBinding } from './contract.ts';
+import type { PersonVmWebRoster } from './web-endpoints.ts';
 
 export const PERSON_VM_ADMISSION_CONTRACT_VERSION = 1 as const;
 
@@ -156,26 +157,86 @@ export interface PersonVmAdmissionAuthorityPort {
   ): Promise<PersonVmBinding>;
 }
 
-/** Existing instantaneous activity plus a proposed complete native projection.
- * Future enabled/armed reminders are NOT activeScheduleDeliveries. A missing
- * exact public delivery/execution/drain source is null + unknown, never zero.
- * Existing turn/approval and host hold protections remain mandatory. */
+/** Host observations from the autonomous stop inspector. The sampled arm
+ * covers successive host sampling slots and invalidates on observed activity.
+ * It does not certify a gapless stream of native transitions. */
+export type PersonVmNativeIdleCoverage =
+  | PersonVmIdleCoverage
+  | Readonly<{
+      state: 'sampled';
+      cursor: PersonVmActivityCursor;
+      from: string;
+      through: string;
+      idleSince: string;
+    }>;
+
 export type PersonVmNativeActivityObservation = Readonly<{
   activity: PersonVmActivity;
   activeScheduleDeliveries: number | null;
-  coverage: PersonVmIdleCoverage;
+  coverage: PersonVmNativeIdleCoverage;
+  /** Per-profile schedule catalogs in the authenticated roster's order. */
+  scheduleFingerprints?: readonly string[];
 }>;
 
-/** PROPOSED native-runtime-owner producer. Must account for all person's roots,
- * public pending/waking work and changes between observations; otherwise emit
- * unknown. No private native gate or alternate Agent state machine is implied. */
 export interface PersonVmNativeActivityPort {
   observe(
     binding: PersonVmBinding,
     signal: AbortSignal,
+    purpose?: 'inspection' | 'stop-guard',
   ): Promise<PersonVmNativeActivityObservation>;
+  /** The stop provider calls this synchronously at the final dispatch boundary
+   * for a sampled observation, after any asynchronous authority checks. */
+  assertSampleCurrent?(
+    binding: PersonVmBinding,
+    cursor: PersonVmActivityCursor,
+    signal: AbortSignal,
+  ): void;
   subscribe(
     binding: PersonVmBinding,
     signal: AbortSignal,
   ): Promise<PersonVmAdmissionSubscription>;
 }
+
+export type PersonVmIdleStopSource = Readonly<
+  { binding: PersonVmBinding } & (
+    | { context: RequestContext }
+    | { requestId: string; scheduledRoster: PersonVmWebRoster }
+  )
+>;
+
+export type PersonVmIdleStopRequest = PersonVmIdleStopSource &
+  Readonly<{
+    assertStopCurrent(signal: AbortSignal): Promise<void>;
+  }>;
+
+/** Trusted host callback, used while the exact physical lifecycle lease is
+ * held. The request ID is also the successful stop audit ID. */
+export type PersonVmPrepareIdleStop = (
+  request: PersonVmIdleStopRequest,
+  signal: AbortSignal,
+) => Promise<
+  | { ok: true; nextWakeAt: string | null; dispatch?: PersonVmIdleStopDispatch }
+  | { blocked: true }
+>;
+
+/** Host only. A roster is usable only on the exact locally owned generation
+ * that completed scheduled startup and while all profiles are still eligible. */
+export type PersonVmIdleStopDispatch = (
+  signal: AbortSignal,
+  stop: (signal: AbortSignal) => Promise<void>,
+) => Promise<void>;
+
+export type PersonVmScheduledIdleAuthority = Readonly<{
+  assertOwned(binding: PersonVmBinding, roster: PersonVmWebRoster): void;
+  assertCurrent(
+    binding: PersonVmBinding,
+    roster: PersonVmWebRoster,
+    signal: AbortSignal,
+  ): Promise<void>;
+  dispatch(
+    binding: PersonVmBinding,
+    roster: PersonVmWebRoster,
+    requestId: string,
+    ...args: Parameters<PersonVmIdleStopDispatch>
+  ): Promise<void>;
+}>;

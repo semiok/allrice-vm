@@ -14,6 +14,7 @@ import {
   DEntryNativeResourceRequestSchema,
   sameDEntryIdentity,
   type DEntryNativePrewarmStatus,
+  type DEntryNativePrewarmTrigger,
 } from '@allrice/contracts';
 import {
   authenticateSession,
@@ -340,7 +341,7 @@ export function createDEntryHttpHandler(
         throw new DEntryNativeUnavailable();
       async function publishExistingPrewarm(
         existing: ReturnType<typeof prewarm.reuse>['existing'],
-        trigger: 'page' | 'input',
+        trigger: DEntryNativePrewarmTrigger,
         verify: NonNullable<DEntryNativePrewarmPort['isCurrent']>,
         preferReady = false,
       ) {
@@ -448,7 +449,13 @@ export function createDEntryHttpHandler(
       }
       if (prewarmRequest && plan && plan.reuse && check) {
         await publishExistingPrewarm(
-          prewarm.reuse(auth.context, auth.identity, plan).existing,
+          prewarm.reuse(
+            auth.context,
+            auth.identity,
+            plan,
+            false,
+            prewarmRequest.trigger,
+          ).existing,
           prewarmRequest.trigger,
           check,
         );
@@ -504,13 +511,13 @@ export function createDEntryHttpHandler(
         while (true) {
           let canIssue = await check(context, identity, plan, signal, 'issue');
           signal.throwIfAborted();
-          let match = prewarm.reuse(context, identity, plan, canIssue);
+          let match = prewarm.reuse(context, identity, plan, canIssue, trigger);
           if (canIssue && !match.existing && match.publishedInstance) {
             // A compatible-looking instance can have appeared after this MVCC
             // read. Recheck before creating a ticket from the earlier cold plan.
             canIssue = await check(context, identity, plan, signal, 'issue');
             signal.throwIfAborted();
-            match = prewarm.reuse(context, identity, plan, canIssue);
+            match = prewarm.reuse(context, identity, plan, canIssue, trigger);
           }
           if (match.existing || !canIssue) {
             await publishExistingPrewarm(
@@ -558,6 +565,7 @@ export function createDEntryHttpHandler(
               active,
               plan,
             ),
+          trigger,
         );
         transferred = true;
         finishPrewarmReply = accepted.finishReply;

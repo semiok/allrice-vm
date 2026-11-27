@@ -121,11 +121,20 @@ export class MemoryStore implements PersonVmStore {
               (row) => row.vmId === id && row.diskRetained,
             ),
           ),
-        save: async (value) => {
+        save: async (value, details) => {
           this.rows.set(personId, {
             ...structuredClone(value),
             leaseOwner: owner,
           });
+          const audit =
+            details && 'audit' in details ? details.audit : undefined;
+          if (audit)
+            this.audits.push({
+              ...audit,
+              vmId: value.vmId,
+              personId: value.personId,
+              organizationId: value.organizationId,
+            });
           this.touch(personId);
         },
         audit: async (value, event) => {
@@ -258,6 +267,21 @@ export function harness(store: PersonVmStore = new MemoryStore()) {
     stop: async (binding) => {
       log.push('native:stop');
       if (states.has(binding.vmId)) states.set(binding.vmId, 'stopped');
+    },
+    async stopIdle(binding, signal, assertCurrent, dispatch) {
+      await assertCurrent();
+      signal.throwIfAborted();
+      const stop = (active: AbortSignal) => native.stop(binding, active);
+      if (dispatch) await dispatch(signal, stop);
+      else await stop(signal);
+      if (states.get(binding.vmId) !== 'stopped')
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+    },
+    async assertStopped(binding, signal) {
+      signal.throwIfAborted();
+      if (states.get(binding.vmId) !== 'stopped')
+        throw new PersonVmError('ACTIVITY_UNKNOWN');
+      log.push('native:assert-stopped');
     },
     ping: async (binding) => {
       if (states.get(binding.vmId) !== 'running')

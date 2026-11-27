@@ -27,6 +27,7 @@ import type * as NativeOwner from '../native-web/owner.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
 import type * as ProductionDEntrySource from './production-dentry-source.js';
 import type { createProductionEgressAuthority } from './production-egress-authority.js';
+import type { createProductionScheduledWakeSource } from './production-scheduled-wake.js';
 import type { createProductionCodexRuntime as loadCodexRuntime } from './production-codex-runtime.js';
 import {
   createProductionPersonVmSources,
@@ -37,6 +38,7 @@ const io = vi.hoisted(() => ({
   codex: vi.fn<typeof loadCodexRuntime>(),
   entry: vi.fn<typeof ProductionDEntrySource.installProductionDEntrySource>(),
   egress: vi.fn<typeof createProductionEgressAuthority>(),
+  wake: vi.fn<typeof createProductionScheduledWakeSource>(),
   identity: vi.fn(),
   openNativeWeb: vi.fn(),
 }));
@@ -56,6 +58,9 @@ vi.mock('./production-dentry-source.js', () => ({
 }));
 vi.mock('./production-egress-authority.js', () => ({
   createProductionEgressAuthority: io.egress,
+}));
+vi.mock('./production-scheduled-wake.js', () => ({
+  createProductionScheduledWakeSource: io.wake,
 }));
 afterEach(() => vi.resetAllMocks());
 
@@ -136,6 +141,8 @@ function fixture() {
       close: nativeClose,
       resolveSendRoute: resolve,
     });
+  const wake = { assertDeliverable: vi.fn(), start: vi.fn() };
+  io.wake.mockReturnValue(wake);
   let selectionActive = false;
   const physicalReady = vi.fn(async () => {
     expect(selectionActive).toBe(true);
@@ -155,6 +162,7 @@ function fixture() {
     current: Object.freeze({ withCurrentSelection }),
     startup: Object.freeze({ slottedEntryReceipt: vi.fn() }),
     admission: Object.freeze({}),
+    providers: { configuration: { lifecycle: { cleanupTimeoutMs: 10_000 } } },
     lifetime: lifetime.signal,
   }) as unknown as Parameters<ProductionPersonVmHostSources['bind']>[0];
   return {
@@ -174,6 +182,7 @@ function fixture() {
     physicalReady,
     withCurrentSelection,
     host,
+    wake,
   };
 }
 
@@ -184,6 +193,8 @@ it('shares the exact route and call association between A, B and the selected Co
     attach: f.attach,
   });
   const bound = await sources.bind(f.host);
+  expect(io.wake).toHaveBeenCalledExactlyOnceWith(f.host.vm);
+  expect(bound.scheduledWake).toBe(f.wake);
   const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
   const { context, identity, binding } = f.candidate;
   await confirmPhysical!(context, identity, binding, f.lifetime.signal);

@@ -162,6 +162,7 @@ export function createAssignedNativeWebStartup(input: {
       slots?: PersonVmWebEndpointReceipt['slots'];
       runtimeLimit?: number;
       bindingRef: string;
+      scheduledWake?: boolean;
       revoked: AbortController;
       ready: boolean;
       verifiedBy?: StartingEditorProof;
@@ -392,7 +393,7 @@ export function createAssignedNativeWebStartup(input: {
   function openEmployee(
     scope: PersonVmBootstrapScope,
     launch: NativeWebLaunch,
-    context: RequestContext,
+    context: RequestContext | undefined,
     startup?: Pick<
       Parameters<typeof openNativeWebOwner>[0],
       'recordStartupFailure' | 'startupPending'
@@ -423,9 +424,10 @@ export function createAssignedNativeWebStartup(input: {
       closing ||
       !web ||
       !sameVmBinding(web.receipt.binding, binding) ||
-      web.context.actor.type !== 'user' ||
-      web.context.actor.id !== binding.personId ||
-      web.context.organizationId !== binding.organizationId
+      (web.purpose !== 'scheduled-wake' &&
+        (web.context.actor.type !== 'user' ||
+          web.context.actor.id !== binding.personId ||
+          web.context.organizationId !== binding.organizationId))
     )
       throw new PersonVmError('LEASE_LOST');
     return web;
@@ -598,6 +600,7 @@ export function createAssignedNativeWebStartup(input: {
           slots: web.receipt.slots,
           runtimeLimit: plan.runtimeLimit,
           bindingRef: randomUUID(),
+          scheduledWake: web.purpose === 'scheduled-wake',
           revoked: new AbortController(),
           ready: false,
           verifiedEmployees: new Map(),
@@ -651,7 +654,8 @@ export function createAssignedNativeWebStartup(input: {
             });
             group.owners.set(employeeId, owner);
             group.startingEmployees.delete(employeeId);
-            if (prove) {
+            const context = web.context;
+            if (context && prove) {
               const proof = await owner.verifyStartingEditor(
                 scope,
                 signal,
@@ -660,7 +664,7 @@ export function createAssignedNativeWebStartup(input: {
                     {
                       binding: receipt.binding,
                       endpoint,
-                      context: web.context,
+                      context,
                       modelAdapterId,
                       profile,
                       readModels,
@@ -672,6 +676,11 @@ export function createAssignedNativeWebStartup(input: {
                 proof.throwIfAborted();
                 group.verifiedEmployees.set(employeeId, proof);
               }
+            } else if (group.scheduledWake) {
+              await owner.readScheduleCatalog(
+                () => scope.assertCurrent(),
+                signal,
+              );
             }
             current(binding, web);
             signal.throwIfAborted();
@@ -685,7 +694,7 @@ export function createAssignedNativeWebStartup(input: {
           if (
             group.retiring ||
             editorProof !== prove ||
-            (prove && !group.verifiedEmployees.size) ||
+            (prove && !group.scheduledWake && !group.verifiedEmployees.size) ||
             (prove &&
               plan.selectedId &&
               (!provedSelected || provedSelected.aborted)) ||
@@ -861,6 +870,36 @@ export function createAssignedNativeWebStartup(input: {
       )
         throw new PersonVmError('RUNTIME_NOT_READY');
       return proof;
+    },
+    async prepareForegroundEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      signal: AbortSignal,
+    ) {
+      const group = running.get(binding.vmId);
+      if (
+        !group?.scheduledWake ||
+        [...group.verifiedEmployees.values()].some((proof) => !proof.aborted)
+      )
+        return;
+      const results = await Promise.allSettled(
+        group.receipt.endpoints
+          .filter(
+            (entry) =>
+              !context.workspaceId || context.workspaceId === entry.workspaceId,
+          )
+          .map(({ employeeInstanceId }) =>
+            this.ensureVerifiedEditor(
+              context,
+              binding,
+              employeeInstanceId,
+              signal,
+            ),
+          ),
+      );
+      if (!results.some((result) => result.status === 'fulfilled'))
+        throw new PersonVmError('AUTHORIZATION_DENIED');
+      signal.throwIfAborted();
     },
     needsEmployee(
       context: RequestContext,
@@ -1175,6 +1214,19 @@ export function createAssignedNativeWebStartup(input: {
         owner,
       });
     },
+    activityCatalogs(binding: PersonVmBinding, signal: AbortSignal) {
+      this.assertAuthenticatedGroup(binding, signal);
+      const group = running.get(binding.vmId)!;
+      if (
+        group.updating ||
+        group.startingEmployees.size ||
+        group.blockedEmployees.size
+      )
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      return [...group.owners.keys()]
+        .sort()
+        .map((employeeInstanceId) => this.catalog(binding, employeeInstanceId));
+    },
     /** Authenticated owners already present in this Worker. Ledger reads
      * separately verify the durable scope and never start a profile. */
     runJournalOwners(): AssignedNativeWebCatalog[] {
@@ -1257,6 +1309,11 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       signal: AbortSignal,
     ): AbortSignal;
+    prepareForegroundEditor(
+      binding: PersonVmBinding,
+      context: RequestContext,
+      signal: AbortSignal,
+    ): Promise<void>;
     assertAuthenticatedEntry(
       binding: PersonVmBinding,
       employeeInstanceId: string,
@@ -1272,6 +1329,10 @@ export function createAssignedNativeWebStartup(input: {
       binding: PersonVmBinding,
       employeeInstanceId: string,
     ): AssignedNativeWebCatalog;
+    activityCatalogs(
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+    ): readonly AssignedNativeWebCatalog[];
     runJournalOwners(): AssignedNativeWebCatalog[];
     hasLocalOwner(binding: PersonVmBinding): boolean;
     owner(

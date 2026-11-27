@@ -1,5 +1,8 @@
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
-import { DataAccessError } from '@allrice/database';
+import {
+  DataAccessError,
+  type withOwnedPersonVmAuthorityTransaction,
+} from '@allrice/database';
 import {
   PersonVmError,
   type PersonVmBinding,
@@ -8,10 +11,21 @@ import {
 } from '@allrice/person-vm';
 import type { createProductionPersonVmAuthority } from './production-authority.js';
 
+export type PrewarmAuthorityTransaction = Parameters<
+  Parameters<typeof withOwnedPersonVmAuthorityTransaction>[3]
+>[0];
+
+type LockedUpgradeTicketCheck = (
+  sql: PrewarmAuthorityTransaction,
+  signal: AbortSignal,
+) => Promise<void>;
+
 export type CurrentSelectionPrewarm = (
   context: RequestContext,
   identity: DEntryIdentity,
-  input: Omit<Parameters<PersonVmPort['prewarm']>[1], 'selectedEmployee'>,
+  input: Omit<Parameters<PersonVmPort['prewarm']>[1], 'selectedEmployee'> & {
+    assertLockedUpgradeTicket?: LockedUpgradeTicketCheck;
+  },
   physicalSignal: AbortSignal,
 ) => ReturnType<PersonVmPort['prewarm']>;
 export type CurrentSelectionEntryRecovery = (
@@ -66,31 +80,61 @@ export function createProductionCurrentPrewarm(input: {
   current: Pick<
     ReturnType<typeof createProductionPersonVmAuthority>,
     'withCurrentSelection'
-  >;
+  > &
+    Partial<
+      Pick<
+        ReturnType<typeof createProductionPersonVmAuthority>,
+        'dispatchUpgradeStop'
+      >
+    >;
 }): CurrentSelectionPrewarm {
-  return async (context, identity, trigger, physicalSignal) => {
+  return async (context, identity, request, physicalSignal) => {
     const expected = Object.freeze({ ...identity });
     try {
       return await input.current.withCurrentSelection(
         context,
         expected,
         physicalSignal,
-        () =>
-          input.vm.prewarm(
+        () => {
+          const dispatch = input.current.dispatchUpgradeStop;
+          const { assertLockedUpgradeTicket, ...requestInput } = request;
+          const prewarm = {
+            ...requestInput,
+            selectedEmployee: Object.freeze({
+              personId: expected.personId,
+              organizationId: expected.organizationId,
+              workspaceId: expected.workspaceId,
+              employeeInstanceId: expected.employeeInstanceId,
+              employeeRevision: expected.employeeRevision,
+              employeeVersionId: expected.employeeVersionId,
+            }),
+          };
+          const target = prewarm.target;
+          return input.vm.prewarm(
             context,
-            {
-              ...trigger,
-              selectedEmployee: Object.freeze({
-                personId: expected.personId,
-                organizationId: expected.organizationId,
-                workspaceId: expected.workspaceId,
-                employeeInstanceId: expected.employeeInstanceId,
-                employeeRevision: expected.employeeRevision,
-                employeeVersionId: expected.employeeVersionId,
-              }),
-            },
+            prewarm.trigger === 'open' &&
+              target &&
+              dispatch &&
+              assertLockedUpgradeTicket
+              ? {
+                  ...prewarm,
+                  target: {
+                    ...target,
+                    dispatchUpgradeStop: (binding, signal, stop) =>
+                      dispatch(
+                        context,
+                        expected,
+                        binding,
+                        signal,
+                        assertLockedUpgradeTicket,
+                        stop,
+                      ),
+                  },
+                }
+              : prewarm,
             physicalSignal,
-          ),
+          );
+        },
       );
     } catch (error) {
       if (
