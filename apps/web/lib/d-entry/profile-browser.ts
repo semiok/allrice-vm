@@ -19,6 +19,59 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
+const publicBundlesSchema = z.array(
+  z.strictObject({
+    reference: z.string(),
+    revision: z.string(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+);
+export function releasedBundleResolver(data: DOMStringMap) {
+  const root = data.publicAssetRoot;
+  if (!root || !publicRoot.test(root)) return () => undefined;
+  try {
+    const bundles = publicBundlesSchema.parse(
+      JSON.parse(data.publicBundles ?? '[]'),
+    );
+    return ({ url, rev }: { url: string; rev: string }) => {
+      const entry = bundles.find(
+        ({ reference, revision }) => url === reference && rev === revision,
+      );
+      return entry ? root + 'bundles/' + entry.sha256 + '.js' : undefined;
+    };
+  } catch {
+    return () => undefined;
+  }
+}
+
+export async function readProfileBundle(
+  target: URL,
+  signal: AbortSignal,
+  publicUrl?: string,
+) {
+  if (publicUrl) {
+    try {
+      const asset = await fetch(publicUrl, { signal, credentials: 'omit' });
+      if (asset.ok) return await asset.arrayBuffer();
+      await asset.body?.cancel();
+    } catch {
+      // A public-cache or body-stream failure can use the original owner path.
+    }
+  }
+  signal.throwIfAborted();
+  const response = await fetch(target, {
+    signal,
+    credentials: 'same-origin',
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw Error('Employee profile bundle unavailable');
+  }
+  return response.arrayBuffer();
+}
+
 export function readEmployeeDocument(data: DOMStringMap) {
   const { scopeId, ...selection } = DEntryPageBorrowSchema.parse({
     scopeId: data.scopeId,
@@ -46,6 +99,7 @@ export function nativeProfileDocument(
   );
   const bindingRef = container.dataset.bindingRef!;
   const graphRev = container.dataset.graphRev!;
+  const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
   const pending = new Set<Promise<unknown>>();
   const channels = new Map<WebSocket, Promise<void>>();
@@ -214,16 +268,11 @@ export function nativeProfileDocument(
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);
-            const response = await fetch(target, {
+            const bytes = await readProfileBundle(
+              target,
               signal,
-              credentials: 'same-origin',
-              cache: 'no-store',
-            });
-            if (!response.ok) {
-              await response.body?.cancel();
-              throw Error('Employee profile bundle unavailable');
-            }
-            const bytes = await response.arrayBuffer();
+              releasedBundle(resource),
+            );
             signal.throwIfAborted();
             // rc.2 payloads are classic registration scripts. Download belongs
             // to the abortable request; only the received, certified bytes can
