@@ -331,6 +331,17 @@ class Scope implements Projection {
       return dispatch();
     }
   }
+  async readCatalog<T>(read: () => Promise<T>, signal: AbortSignal) {
+    await this.refresh(signal);
+    while (true) {
+      const generation = this.refreshGeneration;
+      const value = await this.current(read, signal);
+      signal.throwIfAborted();
+      // The native list filters after I/O. A concurrent hint can temporarily
+      // remove permissions mid-read and return an incomplete, successful list.
+      if (generation === this.refreshGeneration) return value;
+    }
+  }
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closing = Promise.resolve().then(async () => {
@@ -744,9 +755,8 @@ class PrincipalService extends TypertRemoteService {
         });
       };
       // rc.2 filters the catalog through RemoteAccess for this non-owner peer.
-      if (key === 'session/list') await scope.refresh(active);
       const value = await (key === 'session/list'
-        ? scope.current(dispatch, active)
+        ? scope.readCatalog(dispatch, active)
         : this.native(scope, key, args, dispatch));
       active.throwIfAborted();
       // Literal branches retain the source descriptor/result relationship.

@@ -180,6 +180,14 @@ class Catalog extends TypertRemoteService {
         .map(({ sessionId }) => [sessionId, { asOfSeq: 0, values: {} }]),
     );
     yield { type: 'baseline', value: { projections } };
+    await new Promise<void>((resolve) => {
+      const stop = () => {
+        signal.removeEventListener('abort', stop);
+        resolve();
+      };
+      signal.addEventListener('abort', stop, { once: true });
+      if (signal.aborted) stop();
+    });
   }
   @Remote({
     name: 'page',

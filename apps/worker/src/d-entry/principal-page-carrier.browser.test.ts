@@ -100,6 +100,16 @@ it.skipIf(!browserExecutable)(
     ]);
     const page = await context.newPage();
     const streamEndpoints: string[] = [];
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('console', (message) => {
+      if (message.type() === 'error' || message.type() === 'warning')
+        errors.push(message.text().split('\n')[0]!);
+    });
+    page.on('response', (response) => {
+      if (response.status() >= 400)
+        errors.push(`${response.status()} ${new URL(response.url()).pathname}`);
+    });
     page.on('websocket', (socket) => {
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
@@ -110,7 +120,19 @@ it.skipIf(!browserExecutable)(
     const editor = page
       .locator('textarea:visible,[contenteditable=true]:visible')
       .first();
-    await editor.fill('未发送的原生草稿', { timeout: 15_000 });
+    try {
+      await editor.fill('未发送的原生草稿', { timeout: 15_000 });
+    } catch (error) {
+      throw Error(
+        JSON.stringify({
+          unary,
+          streamEndpoints,
+          errors,
+          text: (await page.locator('body').innerText()).slice(0, 300),
+        }),
+        { cause: error },
+      );
+    }
     expect(await editor.isEditable()).toBe(true);
     expect(streamEndpoints).toContain('session/control');
     expect(unary).toContain('session/list');
