@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { afterEach, expect, it, vi } from 'vitest';
+import type * as Database from '@allrice/database';
 import { modelBinding } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import {
   PersonVmError,
@@ -21,11 +22,9 @@ import {
 import { installDEntryNativePrewarm } from '../business-runtime/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from '../business-runtime/native-catalog.js';
 import { createAssignedNativeWebStartup } from '../native-web/composition.js';
+import type * as NativeOwner from '../native-web/owner.js';
 import type { ProductionPersonVmHostSources } from './production-host.js';
-import type {
-  installProductionDEntrySource,
-  ResolveProductionDEntrySendRoute,
-} from './production-dentry-source.js';
+import type * as ProductionDEntrySource from './production-dentry-source.js';
 import type { createProductionEgressAuthority } from './production-egress-authority.js';
 import type { createProductionCodexRuntime as loadCodexRuntime } from './production-codex-runtime.js';
 import {
@@ -35,17 +34,17 @@ import {
 
 const io = vi.hoisted(() => ({
   codex: vi.fn<typeof loadCodexRuntime>(),
-  entry: vi.fn<typeof installProductionDEntrySource>(),
+  entry: vi.fn<typeof ProductionDEntrySource.installProductionDEntrySource>(),
   egress: vi.fn<typeof createProductionEgressAuthority>(),
   identity: vi.fn(),
   openNativeWeb: vi.fn(),
 }));
 vi.mock('@allrice/database', async (original) => ({
-  ...(await original<typeof import('@allrice/database')>()),
+  ...(await original<typeof Database>()),
   requireDEntryNativeIdentity: io.identity,
 }));
 vi.mock('../native-web/owner.js', async (original) => ({
-  ...(await original<typeof import('../native-web/owner.js')>()),
+  ...(await original<typeof NativeOwner>()),
   openNativeWebOwner: io.openNativeWeb,
 }));
 vi.mock('./production-codex-runtime.js', () => ({
@@ -78,7 +77,7 @@ function fixture() {
       employeeRevision: 1,
       threadId: issued.allriceThreadRef,
     },
-  } satisfies Parameters<ResolveProductionDEntrySendRoute>[0];
+  } satisfies Parameters<ProductionDEntrySource.ResolveProductionDEntrySendRoute>[0];
   const route = {
     provider: issued.provider,
     model: issued.model,
@@ -122,11 +121,13 @@ function fixture() {
     authorizeUsage: vi.fn(),
     confirmOwnerStopped: vi.fn(),
   };
-  const resolve = vi.fn<ResolveProductionDEntrySendRoute>().mockResolvedValue({
-    provider: route.provider,
-    model: route.model,
-    revoked: guest.signal,
-  });
+  const resolve = vi
+    .fn<ProductionDEntrySource.ResolveProductionDEntrySendRoute>()
+    .mockResolvedValue({
+      provider: route.provider,
+      model: route.model,
+      revoked: guest.signal,
+    });
   const attach = vi
     .fn<ProductionNativeModelExecution['attach']>()
     .mockResolvedValue({
@@ -231,9 +232,9 @@ it.each(['ready', 'failed', 'waiting'] as const)(
     const f = nativeEntryFixture();
     const { context, identity } = f;
     io.identity.mockResolvedValue(identity);
-    const actual = await vi.importActual<
-      typeof import('./production-dentry-source.js')
-    >('./production-dentry-source.js');
+    const actual = await vi.importActual<typeof ProductionDEntrySource>(
+      './production-dentry-source.js',
+    );
     io.entry.mockImplementation(actual.installProductionDEntrySource);
 
     const store = new MemoryStore();
