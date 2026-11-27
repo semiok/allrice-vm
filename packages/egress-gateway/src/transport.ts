@@ -1,43 +1,60 @@
 import { lookup } from 'node:dns/promises';
 import { request } from 'node:https';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { sandboxPublicAddress } from '@allrice/project-runtime';
-import { EgressError, type EgressTransport } from './contract.js';
+import {
+  EgressError,
+  type EgressResponse,
+  type EgressTransport,
+} from './contract.js';
 
-/** Validate all DNS answers and pin the socket. No proxy, second lookup or redirect. */
-export function createPublicHttpsTransport(): EgressTransport {
+const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+type PublicHttpsHop = EgressResponse | Readonly<{ location: string }>;
+
+function assertPublicHttpsTarget(target: URL) {
+  if (
+    target.protocol !== 'https:' ||
+    target.username ||
+    target.password ||
+    target.hash ||
+    (target.port && target.port !== '443') ||
+    isIP(target.hostname.replace(/^\[|\]$/g, ''))
+  )
+    throw new EgressError('DENIED');
+}
+
+/** Validate all DNS answers and pin each socket. No proxy or second lookup. */
+function createPublicHttpsHopTransport(mode: 'registry' | 'web') {
   return {
-    async read(url, { maxBytes, signal }) {
+    async read(
+      url: URL,
+      { maxBytes, signal }: { maxBytes: number; signal: AbortSignal },
+    ): Promise<PublicHttpsHop> {
       signal.throwIfAborted();
-      if (
-        url.protocol !== 'https:' ||
-        url.username ||
-        url.password ||
-        url.hash ||
-        (url.port && url.port !== '443') ||
-        isIP(url.hostname.replace(/^\[|\]$/g, ''))
-      )
-        throw new EgressError('DENIED');
+      assertPublicHttpsTarget(url);
       const answers = await lookup(url.hostname, { all: true, verbatim: true });
       signal.throwIfAborted();
-      const own = new Set(
-        Object.values(networkInterfaces()).flatMap(
-          (items) => items?.map((item) => item.address) ?? [],
-        ),
-      );
+      const own = new BlockList();
+      for (const item of Object.values(networkInterfaces()).flat()) {
+        if (!item) continue;
+        const address = item.address.split('%', 1)[0]!;
+        const family = isIP(address);
+        if (family) own.addAddress(address, family === 4 ? 'ipv4' : 'ipv6');
+      }
       if (
         !answers.length ||
         answers.some(
-          (answer) =>
-            !sandboxPublicAddress(answer.address) || own.has(answer.address),
+          ({ address, family }) =>
+            !sandboxPublicAddress(address) ||
+            own.check(address, family === 4 ? 'ipv4' : 'ipv6'),
         )
       )
         throw new EgressError('DENIED');
       const address = answers[0]!;
       return new Promise((resolve, reject) => {
         let failure: unknown;
-        let result: Awaited<ReturnType<EgressTransport['read']>> | undefined;
+        let result: PublicHttpsHop | undefined;
         let requestClosed = false,
           responseClosed = true;
         const settle = () => {
@@ -61,7 +78,10 @@ export function createPublicHttpsTransport(): EgressTransport {
             agent: false,
             family: address.family,
             headers: {
-              accept: 'application/json, application/octet-stream',
+              accept:
+                mode === 'web'
+                  ? 'text/html, text/plain, application/json'
+                  : 'application/json, application/octet-stream',
               'accept-encoding': 'identity',
             },
             lookup: (_hostname, _options, callback) =>
@@ -78,6 +98,18 @@ export function createPublicHttpsTransport(): EgressTransport {
               failed(new EgressError('UNAVAILABLE')),
             );
             const status = response.statusCode ?? 0;
+            if (mode === 'web' && redirectStatuses.has(status)) {
+              const location = response.headers.location;
+              if (
+                typeof location !== 'string' ||
+                !location ||
+                location.length > 4096
+              )
+                failed(new EgressError('INVALID_RESPONSE'));
+              else result = { location };
+              response.destroy();
+              return;
+            }
             if (
               status < 200 ||
               status >= 300 ||
@@ -118,4 +150,64 @@ export function createPublicHttpsTransport(): EgressTransport {
       });
     },
   };
+}
+
+export function createPublicHttpsTransport(): EgressTransport {
+  const transport = createPublicHttpsHopTransport('registry');
+  return {
+    async read(url, options) {
+      const result = await transport.read(url, options);
+      if ('location' in result) throw new EgressError('INVALID_RESPONSE');
+      return result;
+    },
+  };
+}
+
+/** A host-only transport. Callers supply authority and budgets for every hop. */
+export async function fetchPublicHttps(
+  input: string,
+  options: {
+    authorize(target: string, signal: AbortSignal): Promise<void>;
+    maxBytes: number;
+    maxRedirects: number;
+    timeoutMs: number;
+    signal: AbortSignal;
+  },
+): Promise<EgressResponse & Readonly<{ url: string }>> {
+  if (
+    !Number.isSafeInteger(options.maxBytes) ||
+    options.maxBytes <= 0 ||
+    !Number.isSafeInteger(options.maxRedirects) ||
+    options.maxRedirects < 0 ||
+    !Number.isInteger(options.timeoutMs) ||
+    options.timeoutMs <= 0 ||
+    options.timeoutMs > 2_147_483_647
+  )
+    throw new EgressError('POLICY_INVALID');
+  const signal = AbortSignal.any([
+    options.signal,
+    AbortSignal.timeout(options.timeoutMs),
+  ]);
+  function parse(value: string, base?: URL) {
+    if (value.length > 4096) throw new EgressError('DENIED');
+    const url = URL.parse(value, base);
+    if (!url) throw new EgressError('DENIED');
+    assertPublicHttpsTarget(url);
+    return url;
+  }
+  const transport = createPublicHttpsHopTransport('web');
+  let url = parse(input);
+  for (let hop = 0; ; hop += 1) {
+    signal.throwIfAborted();
+    await options.authorize(url.href, signal);
+    signal.throwIfAborted();
+    const result = await transport.read(url, {
+      maxBytes: options.maxBytes,
+      signal,
+    });
+    signal.throwIfAborted();
+    if (!('location' in result)) return { ...result, url: url.href };
+    if (hop >= options.maxRedirects) throw new EgressError('LIMIT_EXCEEDED');
+    url = parse(result.location, url);
+  }
 }

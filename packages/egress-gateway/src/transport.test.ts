@@ -2,7 +2,8 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { RequestOptions } from 'node:https';
-import { createPublicHttpsTransport } from './transport.js';
+import { EgressError } from './contract.js';
+import { createPublicHttpsTransport, fetchPublicHttps } from './transport.js';
 
 const io = vi.hoisted(() => ({
   lookup: vi.fn(),
@@ -29,8 +30,12 @@ function reply(
   status: number,
   body: string,
   headers: Record<string, string> = {},
+  once = false,
 ) {
-  io.request.mockImplementation((_options, receive) => {
+  const respond = (
+    _options: RequestOptions,
+    receive: (res: PassThrough) => void,
+  ) => {
     const req = new EventEmitter();
     return Object.assign(req, {
       end() {
@@ -43,7 +48,9 @@ function reply(
         response.end(Buffer.from(body));
       },
     });
-  });
+  };
+  if (once) io.request.mockImplementationOnce(respond);
+  else io.request.mockImplementation(respond);
 }
 it.each([
   'http://registry.example/pkg',
@@ -118,4 +125,69 @@ it('does not start a socket after authority aborts during DNS', async () => {
   });
   await expect(read(undefined, 16, controller.signal)).rejects.toThrow();
   expect(io.request).not.toHaveBeenCalled();
+});
+
+function webRead(
+  authorize: (target: string, signal: AbortSignal) => Promise<void>,
+  maxRedirects = 2,
+) {
+  return fetchPublicHttps('https://weather.example/shanghai', {
+    authorize,
+    maxBytes: 16,
+    maxRedirects,
+    signal: new AbortController().signal,
+    timeoutMs: 1_000,
+  });
+}
+
+it('reauthorizes and pins each redirect hop', async () => {
+  reply(307, '', { location: 'https://data.example/weather' }, true);
+  reply(200, 'weather', { 'content-type': 'text/plain' });
+  const authorize = vi.fn<(target: string) => Promise<void>>(async () => {});
+  expect(await webRead(authorize)).toMatchObject({
+    url: 'https://data.example/weather',
+    status: 200,
+    body: Buffer.from('weather'),
+  });
+  expect(authorize.mock.calls.map(([target]) => target)).toEqual([
+    'https://weather.example/shanghai',
+    'https://data.example/weather',
+  ]);
+  expect(io.lookup.mock.calls.map(([host]) => host)).toEqual([
+    'weather.example',
+    'data.example',
+  ]);
+});
+
+it('rejects an unauthorized redirect before resolving its host', async () => {
+  reply(302, '', { location: 'https://data.example/weather' }, true);
+  const authorize = async (target: string) => {
+    if (new URL(target).hostname !== 'weather.example')
+      throw new EgressError('DENIED');
+  };
+  await expect(webRead(authorize)).rejects.toMatchObject({ code: 'DENIED' });
+  expect(io.lookup).toHaveBeenCalledTimes(1);
+  expect(io.request).toHaveBeenCalledTimes(1);
+});
+
+it('rejects the host on a redirect even if DNS uses a different IPv6 spelling', async () => {
+  io.interfaces.mockReturnValue({
+    eth0: [{ address: '2001:4860:4860:0:0:0:0:8888' }],
+  });
+  io.lookup
+    .mockResolvedValueOnce([{ address: '8.8.8.8', family: 4 }])
+    .mockResolvedValueOnce([{ address: '2001:4860:4860::8888', family: 6 }]);
+  reply(302, '', { location: 'https://data.example' }, true);
+  await expect(webRead(async () => {})).rejects.toMatchObject({
+    code: 'DENIED',
+  });
+  expect(io.request).toHaveBeenCalledTimes(1);
+});
+
+it('rejects a redirect outside the budget before doing another lookup', async () => {
+  reply(302, '', { location: '/loop' });
+  await expect(webRead(async () => {}, 0)).rejects.toMatchObject({
+    code: 'LIMIT_EXCEEDED',
+  });
+  expect(io.lookup).toHaveBeenCalledTimes(1);
 });
