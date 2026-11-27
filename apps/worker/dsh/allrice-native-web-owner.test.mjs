@@ -3,27 +3,103 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import {
+  nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
   readPromptOrigins,
 } from './allrice-native-web-owner.mjs';
 
+const promptRoot = { id: 'root', header: {} };
+const principal = { kind: 'allrice-d-entry', scopeId: randomUUID() };
+function userPrompt(rpcId) {
+  return { id: `message-${rpcId}`, source: { kind: 'user', rpcId, principal } };
+}
+function readDirect(session) {
+  return (event, turn) => nativePromptOccurrence(session, event.data, turn);
+}
+
 it('keeps the admitted prompt of a long turn and excludes queued and future input', () => {
-  const user = (rpcId) => ({ source: { kind: 'user', rpcId } });
   const events = [
     { type: 'turn/start', data: { turn: 1 } },
-    { type: 'user/message', data: user('older') },
+    { type: 'user/message', data: userPrompt('older') },
     { type: 'turn/end', data: { turn: 1 } },
     { type: 'turn/start', data: { turn: 2 } },
-    { type: 'user/message', data: user('current') },
+    { type: 'user/message', data: userPrompt('current') },
+    { type: 'user/message', data: userPrompt('steered') },
     ...Array.from({ length: 48 }, () => ({ type: 'tool/result', data: {} })),
-    { type: 'agent/inbox/spliced', data: { inserted: [user('queued')] } },
-    { type: 'user/message', data: user('future') },
+    { type: 'agent/inbox/spliced', data: { inserted: [userPrompt('queued')] } },
+    { type: 'user/message', data: userPrompt('future') },
   ].map((event, seq) => ({ ...event, seq }));
 
-  expect(readPromptOrigins(events, events.length - 2, 2)).toEqual({
+  expect(
+    readPromptOrigins(
+      events,
+      events.length - 2,
+      2,
+      'assistant',
+      undefined,
+      0,
+      readDirect(promptRoot),
+    ),
+  ).toEqual({
     turn: 2,
-    ids: ['current'],
+    prompts: ['current', 'steered'].map((requestId) => ({
+      sessionId: 'root',
+      scopeId: principal.scopeId,
+      requestId,
+      messageId: `message-${requestId}`,
+      turn: 2,
+    })),
+    delegated: false,
+    inherited: [],
+  });
+});
+
+it('derives the first owned prompt on a native fork without assigning its seeded ancestor prompt', () => {
+  const fork = {
+    id: 'fork',
+    header: { id: 'fork', parentSession: 'root', isSeeded: true },
+  };
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: userPrompt('ancestor') },
+    { type: 'turn/end', data: { turn: 1 } },
+    { type: 'session/end-seed', data: {} },
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'user/message', data: userPrompt('first-fork-prompt') },
+  ].map((event, seq) => ({ ...event, seq }));
+  expect(
+    readPromptOrigins(
+      events,
+      1,
+      1,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toBeNull();
+  expect(
+    readPromptOrigins(
+      events,
+      5,
+      2,
+      'assistant',
+      undefined,
+      4,
+      readDirect(fork),
+    ),
+  ).toEqual({
+    turn: 2,
+    prompts: [
+      {
+        sessionId: 'fork',
+        scopeId: principal.scopeId,
+        requestId: 'first-fork-prompt',
+        messageId: 'message-first-fork-prompt',
+        turn: 2,
+      },
+    ],
     delegated: false,
     inherited: [],
   });
@@ -34,19 +110,37 @@ it('uses the native title source sequence after a later turn has started', () =>
     { type: 'turn/start', data: { turn: 1 } },
     {
       type: 'user/message',
-      data: { source: { kind: 'user', rpcId: 'first' } },
+      data: userPrompt('first'),
     },
     { type: 'turn/end', data: { turn: 1 } },
     { type: 'turn/start', data: { turn: 2 } },
     {
       type: 'user/message',
-      data: { source: { kind: 'user', rpcId: 'second' } },
+      data: userPrompt('second'),
     },
     { type: 'session/title-llm-request', data: { messageSeqs: [1] } },
   ].map((event, seq) => ({ ...event, seq }));
-  expect(readPromptOrigins(events, 5, null, 'session-title')).toEqual({
+  expect(
+    readPromptOrigins(
+      events,
+      5,
+      null,
+      'session-title',
+      undefined,
+      0,
+      readDirect(promptRoot),
+    ),
+  ).toEqual({
     turn: 1,
-    ids: ['first'],
+    prompts: [
+      {
+        sessionId: 'root',
+        scopeId: principal.scopeId,
+        requestId: 'first',
+        messageId: 'message-first',
+        turn: 1,
+      },
+    ],
     delegated: false,
     inherited: [],
   });
@@ -92,7 +186,7 @@ function fixture() {
   }
   function openRoot(root, turn, rpcId) {
     append(root, 'turn/start', { turn });
-    input(root, { id: rpcId, source: { kind: 'user', rpcId } }, turn);
+    input(root, userPrompt(rpcId), turn);
   }
   function createChild(root, id) {
     const child = agent(id, root);
@@ -112,13 +206,23 @@ function fixture() {
     return child;
   }
   function proof(agent, turn, cursor = agent.session.events.length - 1) {
-    return readPromptOrigins(
+    const origin = readPromptOrigins(
       agent.session.events,
       cursor,
       turn,
       'assistant',
       (event, number) =>
-        delegations.claimed(agent.session, event.data, number)?.ids,
+        delegations.claimed(agent.session, event.data, number)?.prompts,
+      0,
+      readDirect(agent.session),
+    );
+    return (
+      origin && {
+        turn: origin.turn,
+        delegated: origin.delegated,
+        ids: origin.prompts.map(({ requestId }) => requestId),
+        inherited: origin.inherited.map(({ requestId }) => requestId),
+      }
     );
   }
   function dispose(agent) {
@@ -136,13 +240,34 @@ function fixture() {
     input,
     openRoot,
     proof,
-    rootWake: delegations.rootWake,
+    rootWake(id) {
+      const wake = delegations.rootWake(id);
+      if (wake.kind !== 'delegated') return wake;
+      return {
+        kind: wake.kind,
+        turn: wake.turn,
+        promptIds: wake.prompts.map(({ requestId }) => requestId),
+      };
+    },
   };
 }
 
 const relay = (id, sender) => ({
   id,
   source: { kind: 'agent-message', form: 'relay', senderSessionId: sender.id },
+});
+
+it('requires an adopted page source for every direct journal input', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'adopted');
+  expect(f.proof(root, 1)).toMatchObject({ ids: ['adopted'] });
+  f.input(
+    root,
+    { id: 'unbound-message', source: { kind: 'user', rpcId: 'unbound-input' } },
+    1,
+  );
+  expect(f.proof(root, 1)).toBeNull();
 });
 
 it('proves a continuable child at its own turn after both original and newer parent turns end', () => {
@@ -351,9 +476,15 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('claimed', first, 7);
     f.agent.inbox.nextTurn = [second];
     f.emit('inserted', second);
-    expect(await f.next(running)).toBe('inserted');
-    expect(await f.next(running)).toBe('claimed');
-    expect(await f.next(waiting)).toBe('inserted');
+    expect(await f.next(running)).toBe(
+      'inserted ' + JSON.stringify({ messageId: first.id }),
+    );
+    expect(await f.next(running)).toBe(
+      'claimed ' + JSON.stringify({ messageId: first.id, turn: 7 }),
+    );
+    expect(await f.next(waiting)).toBe(
+      'inserted ' + JSON.stringify({ messageId: second.id }),
+    );
     f.emit('discarded', second);
     f.emit('inserted', { ...second });
     f.agent.inbox.nextTurn = [];
@@ -361,7 +492,7 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('discarded', second);
     f.emit('inserted', second);
     await Promise.resolve();
-    expect(await f.outcome(queued)).toEqual({ inserted: true });
+    expect(await f.outcome(queued)).toEqual({ messageId: second.id });
     f.agent.inbox.nextStep = [];
     f.emit('discarded', second);
     expect(await f.next(waiting)).toBe('discarded');
@@ -389,16 +520,20 @@ it('does not adopt a pending retry occurrence or another principal using the sam
     expect(await f.next(different)).toBe('ready');
     f.emit('discarded', item);
     f.emit('inserted', item);
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
-    expect(await f.outcome(other)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
+    expect(await f.outcome(other)).toEqual({ messageId: null });
     const newItem = f.message(other);
     f.emit('inserted', newItem);
     f.emit('claimed', newItem, 1);
     f.end(1);
-    expect(await f.next(different)).toBe('inserted');
-    expect(await f.next(different)).toBe('claimed');
+    expect(await f.next(different)).toBe(
+      'inserted ' + JSON.stringify({ messageId: newItem.id }),
+    );
+    expect(await f.next(different)).toBe(
+      'claimed ' + JSON.stringify({ messageId: newItem.id, turn: 1 }),
+    );
     expect(await f.next(different)).toBe('ended');
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
   } finally {
     f.lifetime.abort();
   }

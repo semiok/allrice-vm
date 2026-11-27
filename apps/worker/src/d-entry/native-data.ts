@@ -57,6 +57,7 @@ export interface DEntryNativeDataPort {
     owner: ResolvedDEntryNativeOwner;
     operationId: string;
     signal: AbortSignal;
+    access?: 'page';
   }): Promise<DEntryAdmissionOwner>;
   acquireRpc?(
     input: {

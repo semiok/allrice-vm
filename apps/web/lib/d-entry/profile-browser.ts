@@ -2,6 +2,8 @@ import {
   DEntryPageBorrowSchema,
   DEntryPageUnarySchema,
   DEntryProfileBootstrapSchema,
+  DEntryProfileChunkFilenameSchema,
+  type DEntryProfileGraphSchema,
   UuidSchema,
 } from '@allrice/contracts';
 import { z } from 'zod';
@@ -46,6 +48,29 @@ export function releasedBundleResolver(data: DOMStringMap) {
 }
 
 const profileBundleTimeoutMs = 30_000;
+
+export function profileBundleReference(
+  graph: z.infer<typeof DEntryProfileGraphSchema>,
+  reference: string,
+) {
+  const bundle = [...graph.entries, ...graph.batches].find(
+    ({ url }) => url === reference,
+  );
+  if (bundle) return bundle;
+  // Native require.async requests a sibling of its current graph entry.
+  const [path, query, trailing] = reference.split('?');
+  if (!path || trailing !== undefined) return;
+  const slash = path.lastIndexOf('/');
+  if (
+    !DEntryProfileChunkFilenameSchema.safeParse(path.slice(slash + 1)).success
+  )
+    return;
+  const owner = graph.entries.find(
+    ({ id, rev }) =>
+      path.slice(0, slash) === `plugins/${id}` && query === `rev=${rev}`,
+  );
+  if (owner) return { url: reference, rev: owner.rev };
+}
 
 export class EmployeeProfileBundleTimeout extends Error {
   constructor() {
@@ -298,11 +323,7 @@ export function nativeProfileDocument(
             const signal = lifetime.signal;
             signal.throwIfAborted();
             const graph = published?.graph;
-            const resource =
-              graph &&
-              [...graph.entries, ...graph.batches].find(
-                ({ url }) => url === reference,
-              );
+            const resource = graph && profileBundleReference(graph, reference);
             if (!resource) throw Error('Native bundle was not published');
             const target = profileUrl('assets');
             target.searchParams.set('bindingRef', bindingRef);

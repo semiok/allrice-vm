@@ -1,10 +1,7 @@
 import { z } from 'zod';
 import { DEntryIdentitySchema, UuidSchema } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
-import type {
-  DEntryIdentity,
-  DEntryPageLocaleSchema,
-} from '@allrice/contracts';
+import type { DEntryIdentity } from '@allrice/contracts';
 import type { RemoteAccessBaseline } from '@deepseek-ai/dsh-api-remote-access';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import type { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
@@ -37,9 +34,22 @@ export type DEntryPrincipalIssue = Readonly<{
     nativeSessionId: string;
     rootOriginDigest: string;
     rootBindingRef: string;
+    forkedFromNativeSessionId?: string;
   }>;
 }>;
+export type DEntryScopeIssue =
+  | DEntryPrincipalIssue
+  | Readonly<{
+      scopeId: string;
+      identity: DEntryIdentity;
+      access: 'page';
+      root?: DEntryPrincipalIssue['root'];
+    }>;
 export type CloseCommand = 'close';
+export const D_ENTRY_PAGE_UPLINK_BYTES = 262_144;
+export type DEntryPageInput =
+  | Readonly<{ type: 'input'; value?: JsonValue }>
+  | Readonly<{ type: 'input-end' }>;
 export type NonOwnerBaseline = Extract<RemoteAccessBaseline, { owner: false }>;
 export type ScopeFrame =
   | Readonly<{
@@ -78,25 +88,28 @@ type Calls<K extends keyof NativeMethods> = {
     args: InputOf<NativeMethods[E]>;
   }>;
 }[K];
-type LocaleUnary = z.infer<typeof DEntryPageLocaleSchema>;
-export type DEntryPageLocaleCall = Readonly<{
+export type DEntryScopedUnaryCall = Calls<NativeUnary>;
+export type DEntryScopedUnaryResult = {
+  [E in NativeUnary]: Readonly<{
+    endpoint: E;
+    value: OutputOf<NativeMethods[E]>;
+  }>;
+}[NativeUnary];
+export type DEntryPageNativeCall = Readonly<{
+  kind: 'page';
   scopeId: string;
-  endpoint: LocaleUnary;
+  endpoint: string;
   args: Readonly<Record<string, JsonValue>>;
 }>;
-export type DEntryPageLocaleResult = Readonly<{
-  endpoint: LocaleUnary;
-  value: JsonValue;
+export type DEntryPageNativeResult = Readonly<{
+  kind: 'page';
+  endpoint: string;
+  value?: JsonValue;
+  attachments: readonly Readonly<{
+    path: readonly (string | number)[];
+    bytes: Uint8Array;
+  }>[];
 }>;
-export type DEntryScopedUnaryCall = Calls<NativeUnary> | DEntryPageLocaleCall;
-export type DEntryScopedUnaryResult =
-  | DEntryPageLocaleResult
-  | {
-      [E in NativeUnary]: Readonly<{
-        endpoint: E;
-        value: OutputOf<NativeMethods[E]>;
-      }>;
-    }[NativeUnary];
 export type DEntryScopedStreamCall =
   | Calls<'session/control' | 'session/follow'>
   | Readonly<{
@@ -126,6 +139,16 @@ export type DEntryScopedStreamFrame =
         | ScopedEventFrame;
     }>;
 type StreamItem = Extract<DEntryScopedStreamFrame, { type: 'item' }>;
+export type DEntryPageNativeItem = Readonly<{
+  type: 'page-item';
+  scopeId: string;
+  value: JsonValue;
+}>;
+export type DEntryPageNativeError = Readonly<{
+  type: 'page-error';
+  scopeId: string;
+  error: Readonly<{ code: string; message: string; details: JsonValue }>;
+}>;
 export type DEntryPrincipalStream = AsyncIterable<StreamItem> & {
   close(): Promise<void>;
 };
@@ -136,6 +159,10 @@ export interface DEntryPrincipalControlScope {
     call: DEntryScopedUnaryCall,
     signal: AbortSignal,
   ): Promise<DEntryScopedUnaryResult>;
+  invokePage(
+    call: DEntryPageNativeCall,
+    signal: AbortSignal,
+  ): Promise<DEntryPageNativeResult>;
   stream(
     call: DEntryScopedStreamCall,
     signal: AbortSignal,
@@ -144,6 +171,12 @@ export interface DEntryPrincipalControlScope {
       terminal(): void;
     },
   ): DEntryPrincipalStream;
+  streamPage(
+    call: DEntryPageNativeCall,
+    signal: AbortSignal,
+  ): AsyncIterable<DEntryPageNativeItem> & {
+    send(input: DEntryPageInput): void;
+  };
   close(): Promise<void>;
 }
 export interface DEntryPrincipalActivity {
@@ -152,7 +185,7 @@ export interface DEntryPrincipalActivity {
 }
 export type PrincipalClientContext = Context;
 
-export const DEntryPrincipalIssueSchema = z
+const scopeSchema = z
   .object({
     scopeId: UuidSchema,
     identity: DEntryIdentitySchema,
@@ -162,7 +195,16 @@ export const DEntryPrincipalIssueSchema = z
         nativeSessionId: z.string().min(1),
         rootOriginDigest: z.string().min(1),
         rootBindingRef: z.string().min(1),
+        forkedFromNativeSessionId: z.string().min(1).optional(),
       })
       .strict(),
   })
   .strict();
+export const DEntryPrincipalIssueSchema = scopeSchema;
+export const DEntryScopeIssueSchema = z.union([
+  scopeSchema,
+  scopeSchema.extend({
+    access: z.literal('page'),
+    root: scopeSchema.shape.root.optional(),
+  }),
+]);
