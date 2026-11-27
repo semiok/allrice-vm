@@ -911,6 +911,47 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
     },
   );
 
+  it('keeps management scoped to an explicitly selected workspace the person belongs to', async () => {
+    const created = await api(
+      '',
+      write({
+        workspaceId: otherWorkspace,
+        instanceId: otherInstance,
+        summary: '第二工作区的本人记忆',
+        idempotencyKey: randomUUID(),
+      }),
+      ownerToken,
+      otherWorkspace,
+      otherInstance,
+    );
+    expect(created.status).toBe(201);
+    const { memory } = EmployeeMemoryWriteResponseSchema.parse(
+      await created.json(),
+    );
+    const request = {
+      headers: { 'x-allrice-workspace-id': identity.workspace },
+    };
+    for (const path of ['/manage', '/' + memory.id]) {
+      const response = await api(
+        path,
+        request,
+        ownerToken,
+        otherWorkspace,
+        otherInstance,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain(memory.id);
+    }
+    const source = await api(
+      '/' + memory.id + '/source',
+      request,
+      ownerToken,
+      otherWorkspace,
+      otherInstance,
+    );
+    expect(source.status).toBe(403);
+  });
+
   it('denies personal memory management and source after the employee instance is archived', async () => {
     const instance = await isolatedInstance();
     const pending = await pendingFor(instance, '归档后不再开放的候选');
@@ -963,7 +1004,7 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
       from allrice_memories where instance_id=${instance} order by id`;
     const before = await snapshot();
     await f.db`update allrice_employee_instances set archived_at=clock_timestamp() where id=${instance}`;
-    for (const [path, init, previousReadStatus] of requests) {
+    for (const [path, init] of requests) {
       const denied = await api(
         path,
         init,
@@ -971,9 +1012,14 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
         identity.workspace,
         instance,
       );
-      expect(denied.status, path).toBe(previousReadStatus === null ? 409 : 403);
+      const isSource = path.endsWith('/source');
+      expect(denied.status, path).toBe(isSource ? 403 : 409);
       expect(denied.headers.get('cache-control')).toBe('private, no-store');
-      expect(await denied.text()).not.toContain('本人正文');
+      const problem = await denied.json();
+      expect(problem.error.code).toBe(
+        isSource ? 'AUTHORIZATION_DENIED' : 'EMPLOYEE_INSTANCE_ARCHIVED',
+      );
+      expect(JSON.stringify(problem)).not.toContain('本人正文');
     }
     expect(await snapshot()).toEqual(before);
   });

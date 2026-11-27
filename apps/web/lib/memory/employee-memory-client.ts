@@ -131,6 +131,8 @@ async function rejectResponse(response: Response): Promise<never> {
     await response.json().catch(() => null),
   );
   const error = parsed.success ? parsed.data.error : null;
+  if (response.status === 409 && error?.code === 'EMPLOYEE_INSTANCE_ARCHIVED')
+    throw new MemoryAccessLost();
   const details =
     response.status === 409 &&
     error?.code === 'CONFLICT' &&
@@ -190,6 +192,16 @@ export function employeeMemoryClient(
       cache: 'no-store',
       signal,
     });
+    if (response.status === 409) {
+      const problem = ApiErrorSchema.safeParse(
+        await response.json().catch(() => null),
+      );
+      if (
+        problem.success &&
+        problem.data.error.code === 'EMPLOYEE_INSTANCE_ARCHIVED'
+      )
+        throw new MemoryAccessLost();
+    }
     if ([401, 403, 404].includes(response.status)) throw new MemoryAccessLost();
     if (response.status !== 200) throw new Error(memoryReadFailed);
     return response.json();

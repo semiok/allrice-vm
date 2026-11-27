@@ -78,6 +78,40 @@ const conflict = (reason: string, message = 'not a UI discriminator') =>
   );
 afterEach(() => vi.unstubAllGlobals());
 
+it('treats an archived employee as lost access without treating other 409 errors as revoked', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () =>
+      Response.json(
+        {
+          error: {
+            code: 'EMPLOYEE_INSTANCE_ARCHIVED',
+            message: 'archived',
+            retryable: false,
+            requestId: id(99),
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const client = employeeMemoryClient(target, new Map());
+  await expect(client.list()).rejects.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.detail(record)).rejects.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.save(pair, record)).rejects.toBeInstanceOf(
+    MemoryAccessLost,
+  );
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => conflict('cas_conflict')),
+  );
+  await expect(client.list()).rejects.not.toBeInstanceOf(MemoryAccessLost);
+  await expect(client.save(pair, record)).rejects.toMatchObject({
+    reason: 'cas_conflict',
+  });
+});
+
 describe('employee memory v2 consumer operation identity', () => {
   it('keeps a lost creation key through GET and later denial while allowing an explicitly different addition', async () => {
     const writes: MemoryWriteStore = new Map();
