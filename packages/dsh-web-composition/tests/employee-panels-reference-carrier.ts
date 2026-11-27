@@ -46,8 +46,7 @@ const externals = [
 // The historical TS/CSS resolver did not record JSON. The new executable pins
 // this additional actual input explicitly, without rewriting old metadata.
 const additionalSources: Record<string, string> = {
-  'apps/web/app/dsh-upstream/upstream.json':
-    '364bf6701201ec7fded9903131371d482a1affb31b6997f501f58c7bf5e70fd0',
+  [panelsRev2Manifest.path]: panelsRev2Manifest.sha256,
 };
 const sourceMap = (values: { path: string; sha256: string }[]) => {
   if (
