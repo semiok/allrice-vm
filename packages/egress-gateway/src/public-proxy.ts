@@ -10,7 +10,7 @@ import { addAbortListener } from 'node:events';
 import { BlockList, connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import type { Duplex } from 'node:stream';
-import { finished, pipeline } from 'node:stream/promises';
+import { pipeline } from 'node:stream/promises';
 import {
   resolvePublicAddresses,
   sandboxPublicAddress,
@@ -135,7 +135,7 @@ async function openPinned(
     expected.addAddress(address, kind);
     if (!peer || !expected.check(peer, kind) || !publicProxyAddress(peer))
       throw denied();
-    return { socket, joined, release };
+    return { socket, release };
   } catch (error) {
     await release();
     throw error;
@@ -221,8 +221,12 @@ async function relayHttp(
     });
     out.on('information', (message) => {
       const hint = forwarded(message.headers).link;
-      if (message.statusCode === 103 && hint)
+      if (message.statusCode !== 103 || !hint) return;
+      try {
         res.writeEarlyHints({ link: hint });
+      } catch {
+        // Optional hints must not interrupt the final response or escape this handler.
+      }
     });
     const response = new Promise<IncomingMessage>((resolve, reject) => {
       out.once('response', resolve);
@@ -287,6 +291,77 @@ async function firstBytes(
   }
 }
 
+/** CONNECT never forwards bytes outside a complete TLS record. This checks
+ * wire framing only; the client still validates certificates and ciphertext. */
+async function* tlsRecords(
+  source: AsyncIterable<Buffer>,
+  beforeFirst: (record: Buffer) => Promise<void> | void,
+) {
+  let pending = Buffer.alloc(0);
+  let first = true;
+  for await (const chunk of source) {
+    pending = Buffer.concat([pending, chunk]);
+    while (pending.length >= 5) {
+      const type = pending[0]!;
+      const length = pending.readUInt16BE(3);
+      if (
+        type < 20 ||
+        type > 23 ||
+        pending[1] !== 3 ||
+        pending[2]! > 3 ||
+        length === 0 ||
+        length > 18_432
+      )
+        throw denied();
+      if (pending.length < length + 5) break;
+      const record = pending.subarray(0, length + 5);
+      pending = pending.subarray(length + 5);
+      if (first) {
+        first = false;
+        await beforeFirst(record);
+      }
+      yield record;
+    }
+  }
+  if (pending.length) throw denied();
+}
+
+async function relayTls(client: Duplex, peer: Duplex, signal: AbortSignal) {
+  const close = new AbortController();
+  const active = AbortSignal.any([signal, close.signal]);
+  const handshake = AbortSignal.any([active, AbortSignal.timeout(10_000)]);
+  let serverFlight!: (serverHello: boolean) => void;
+  const serverReady = new Promise<boolean>((resolve) => {
+    serverFlight = resolve;
+  });
+  const ingress = pipeline(
+    peer,
+    (source) =>
+      tlsRecords(source, (record) => {
+        const hello = record[0] === 22 && record[5] === 2;
+        if (!hello && record[0] !== 21) throw denied();
+        serverFlight(hello);
+      }),
+    client,
+    { signal: active },
+  );
+  const egress = pipeline(
+    client,
+    (source) =>
+      tlsRecords(source, async () => {
+        if (!(await waitFor(serverReady, handshake))) throw denied();
+      }),
+    peer,
+    { signal: active },
+  );
+  try {
+    await Promise.all([ingress, egress]);
+  } finally {
+    close.abort();
+    await Promise.allSettled([ingress, egress]);
+  }
+}
+
 /** Reuse the Node HTTP parser on the already accepted socket. No listener is
  * opened, and only this CONNECT's exact, already resolved target is reachable. */
 async function httpInsideTunnel(
@@ -312,8 +387,7 @@ async function httpInsideTunnel(
     request = (async () => {
       try {
         const path = req.url ?? '';
-        if (!path.startsWith('/') || path.startsWith('//') || !req.headers.host)
-          throw denied();
+        if (!path.startsWith('/') || !req.headers.host) throw denied();
         const requestTarget = publicProxyTarget(
           'http://' + req.headers.host + path,
           false,
@@ -447,11 +521,7 @@ export function createVmPublicProxy(
         assertActive();
         signal.throwIfAborted();
         upstream.socket.write(initial);
-        client.pipe(upstream.socket);
-        upstream.socket.pipe(client);
-        await Promise.race([clientClosed, upstream.joined]);
-        if (!signal.aborted && upstream.socket.readableEnded)
-          await finished(client, { cleanup: true, readable: false, signal });
+        await relayTls(client, upstream.socket, signal);
       } catch (error) {
         const status = responseCode(error);
         counts[status === 403 ? 'denied' : 'unavailable']++;

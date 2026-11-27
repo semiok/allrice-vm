@@ -1,10 +1,16 @@
 import { once } from 'node:events';
-import { createServer, request } from 'node:http';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createServer, request, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import type * as Dns from 'node:dns/promises';
 import type * as Https from 'node:https';
 import { connect as startTls } from 'node:tls';
 import type * as Net from 'node:net';
 import { createServer as createTcpServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   createVmPublicProxy,
@@ -73,7 +79,7 @@ async function listen(server: Net.Server) {
   );
   return address.port;
 }
-const setup = async () => {
+const setup = async (rejectHint?: ServerResponse['writeEarlyHints']) => {
   const stop = new AbortController();
   const proxy = createVmPublicProxy(stop.signal, () =>
     stop.signal.throwIfAborted(),
@@ -83,7 +89,10 @@ const setup = async () => {
     requests.add(work);
     void work.finally(() => requests.delete(work)).catch(() => {});
   };
-  const server = createServer((req, res) => track(proxy.http(req, res)));
+  const server = createServer((req, res) => {
+    if (rejectHint) res.writeEarlyHints = rejectHint;
+    track(proxy.http(req, res));
+  });
   server.on('connect', (req, client, head) =>
     track(proxy.connect(req, client, head)),
   );
@@ -203,6 +212,24 @@ it('challenges before DNS and forwards plain HTTP once to the pinned answer with
   });
 });
 
+it('keeps the final HTTP response when the early-hints writer rejects a hint', async () => {
+  const rejectHint = vi.fn(() => {
+    throw new TypeError('fixture hint rejected');
+  });
+  const vm = await setup(rejectHint);
+  const port = await listen(
+    createServer((_req, res) => {
+      res.writeEarlyHints({ link: '</fixture.css>; rel=preload; as=style' });
+      res.end('final response');
+    }),
+  );
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  await expect(
+    get(vm.port, `http://public.example:${port}/`, vm.authorization),
+  ).resolves.toEqual({ status: 200, body: 'final response' });
+  expect(rejectHint).toHaveBeenCalledOnce();
+});
+
 it('denies a mixed DNS answer, private redirect target and a retired epoch before dialing', async () => {
   const vm = await setup();
   network.dns.mockResolvedValue([
@@ -247,7 +274,7 @@ function openTunnel(
 
 it('uses validated fallback addresses and accepts only parsed HTTP inside a plaintext CONNECT', async () => {
   const upstream = createServer((req, res) => {
-    expect(req.url).toBe('/protected-target?');
+    expect(req.url).toBe('//protected-target?');
     expect(req.headers['proxy-authorization']).toBeUndefined();
     res.end('plain HTTP over CONNECT');
   });
@@ -272,7 +299,7 @@ it('uses validated fallback addresses and accepts only parsed HTTP inside a plai
   const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
   expect(response.statusCode).toBe(200);
   tunnel.write(
-    `GET /protected-target? HTTP/1.1\r\nHost: public.example:${port}\r\nConnection: close\r\n\r\n`,
+    `GET //protected-target? HTTP/1.1\r\nHost: public.example:${port}\r\nConnection: close\r\n\r\n`,
   );
   let body = '';
   for await (const chunk of tunnel) body += String(chunk);
@@ -307,6 +334,116 @@ it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async
   } finally {
     client.destroy();
   }
+});
+
+it('streams a validated HTTPS response through multiple TLS records and preserves the tail', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'public-proxy-fixture-'));
+  cleanup.push(() => rm(directory, { recursive: true, force: true }));
+  const keyPath = join(directory, 'key.pem');
+  const certPath = join(directory, 'cert.pem');
+  await promisify(execFile)('openssl', [
+    'req',
+    '-x509',
+    '-newkey',
+    'ec',
+    '-pkeyopt',
+    'ec_paramgen_curve:P-256',
+    '-nodes',
+    '-subj',
+    '/CN=public.example',
+    '-addext',
+    'subjectAltName=DNS:public.example',
+    '-days',
+    '1',
+    '-keyout',
+    keyPath,
+    '-out',
+    certPath,
+  ]);
+  const [key, cert] = await Promise.all([
+    readFile(keyPath),
+    readFile(certPath),
+  ]);
+  const payload = 'record'.repeat(12_000) + 'complete tail';
+  const port = await listen(
+    createHttpsServer({ key, cert }, (req, res) => {
+      expect(req.url).toBe('/tls-body');
+      res
+        .writeHead(200, {
+          'content-length': payload.length,
+          connection: 'close',
+        })
+        .end(payload);
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  const client = startTls({
+    socket: tunnel,
+    servername: 'public.example',
+    ca: cert,
+    ALPNProtocols: ['http/1.1'],
+  });
+  try {
+    await once(client, 'secureConnect');
+    expect(client.authorized).toBe(true);
+    client.write(
+      'GET /tls-body HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n',
+    );
+    let body = '';
+    for await (const chunk of client) body += String(chunk);
+    expect(body.split('\r\n\r\n')[1]).toBe(payload);
+  } finally {
+    client.destroy();
+  }
+});
+
+it('discards non-TLS bytes after accepting a native ClientHello', async () => {
+  const hello = deferred<Buffer>();
+  const capture = createTcpServer((socket) => {
+    let buffer = Buffer.alloc(0);
+    socket.on('data', (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length >= 5 && buffer.length >= 5 + buffer.readUInt16BE(3)) {
+        hello.resolve(buffer);
+        socket.destroy();
+      }
+    });
+  });
+  const capturePort = await listen(capture);
+  const generator = startTls({
+    host: '127.0.0.1',
+    port: capturePort,
+    servername: 'public.example',
+  });
+  generator.on('error', () => {});
+  const initial = await hello.promise;
+  generator.destroy();
+  const crossed: Buffer[] = [];
+  const forwarded = deferred<void>();
+  const remoteClosed = deferred<void>();
+  const port = await listen(
+    createTcpServer((socket) => {
+      socket.on('data', (chunk) => {
+        crossed.push(chunk);
+        if (Buffer.concat(crossed).length >= initial.length)
+          forwarded.resolve();
+      });
+      socket.once('close', () => remoteClosed.resolve());
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  const closed = once(tunnel, 'close');
+  tunnel.write(initial);
+  await forwarded.promise;
+  tunnel.write('fixture bytes outside a record');
+  await Promise.all([closed, remoteClosed.promise]);
+  expect(Buffer.concat(crossed)).toEqual(initial);
 });
 
 it('joins a pending system lookup and never starts a synthetic DNS fallback after revoke', async () => {

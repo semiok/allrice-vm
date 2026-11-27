@@ -161,6 +161,16 @@ export function sandboxTlsClientHello(
         )
           return bad();
         sni = name.toString('ascii');
+      } else if (publicProxy && type === 16) {
+        if (length < 3 || u16() !== length - 2) return bad();
+        while (p < end) {
+          const protocolLength = body[take(1)]!;
+          const protocol = body
+            .subarray(take(protocolLength), p)
+            .toString('ascii');
+          if (!['http/1.0', 'http/1.1', 'h2'].includes(protocol)) return bad();
+        }
+        if (p !== end) return bad();
       } else p = end;
     }
     return sni !== undefined || (publicProxy && isIP(hostname))
