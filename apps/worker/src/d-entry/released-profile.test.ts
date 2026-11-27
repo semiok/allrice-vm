@@ -1041,8 +1041,18 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       lifetime,
       manifestSha256,
     );
-    const nativeReads = (graph.entries.length + graph.batches.length) * 2;
-    expect(source.readImmutableBundle).toHaveBeenCalledTimes(nativeReads);
+    const nativeReferences = [...native.entries, ...native.batches]
+      .flatMap(({ url }) => [
+        url,
+        url.replaceAll('/client.js', '/client.js.map'),
+      ])
+      .sort();
+    const nativeReads = nativeReferences.length;
+    expect(
+      source.readImmutableBundle.mock.calls
+        .map(([reference]) => reference)
+        .sort(),
+    ).toEqual(nativeReferences);
     const sameOwner = await holdReleasedProfile(
       directory,
       { ...source },
