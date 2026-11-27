@@ -242,7 +242,7 @@ export function EmployeeNativePage({
         if (closed) {
           retired = true;
           if (nextQuery.current !== activeQuery) {
-            setActivation({ query: nextQuery.current });
+            activateSelection(nextQuery.current);
             return;
           }
           frameSelection.current = undefined;
