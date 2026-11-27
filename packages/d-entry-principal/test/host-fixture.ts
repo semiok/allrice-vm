@@ -240,6 +240,7 @@ class Catalog extends TypertRemoteService {
         records: [],
         hasMore: false,
         projections: { asOfSeq: 0, values: {} },
+        ...(request.assistantStream && { assistantStream: { revision: 0 } }),
       };
       await this.afterFollowSnapshot?.();
       await new Promise<void>((resolve) => {

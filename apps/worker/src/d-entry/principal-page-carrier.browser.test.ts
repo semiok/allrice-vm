@@ -40,10 +40,13 @@ it.skipIf(!browserExecutable)(
     };
     const f = await fixture(release);
     f.host.catalog.items = f.host.catalog.items.map((row) =>
-      String(row.sessionId) === 'root' ? { ...row, cwd: '/work' } : row,
+      String(row.sessionId) === 'root'
+        ? { ...row, blank: true, cwd: '/work' }
+        : row,
     );
     const life = await open(f);
     const unary: string[] = [];
+    const listRead: unknown[] = [];
     const graph = DEntryProfileGraphSchema.parse(release.graph);
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
@@ -60,7 +63,10 @@ it.skipIf(!browserExecutable)(
           for await (const chunk of request) chunks.push(chunk);
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
-          return await copy(await f.invoke(input.scopeId, sessionToken, input));
+          const result = await f.invoke(input.scopeId, sessionToken, input);
+          if (input.endpoint === 'session/list')
+            listRead.push((await result.clone().json()).result);
+          return await copy(result);
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
           if (url.pathname === '/api/v1/d-entry/profile/' + kind)
@@ -97,6 +103,33 @@ it.skipIf(!browserExecutable)(
           return;
         }
         const { identity, selection } = f;
+        const version = {
+          id: identity.employeeVersionId,
+          manifest: { name: 'Fixture employee' },
+        };
+        const directory = {
+          ...identity,
+          viewerId: identity.personId,
+          employees: [
+            {
+              id: identity.employeeInstanceId,
+              employeeId: identity.employeeInstanceId,
+              isDefault: true,
+              currentVersion: version,
+              versions: [version],
+            },
+          ],
+          sessions: [
+            {
+              id: selection.threadId,
+              employeeInstanceId: identity.employeeInstanceId,
+              ownerId: identity.personId,
+              updatedAt: '2026-01-01T00:00:00.000Z',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              title: 'Fixture thread',
+            },
+          ],
+        };
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
@@ -105,7 +138,7 @@ it.skipIf(!browserExecutable)(
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
-          <script id="allrice-employee-directory" type="application/json">${JSON.stringify({ ...identity, viewerId: identity.personId, employees: [], sessions: [] })}</script>
+          <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
       } catch {
         response.writeHead(500).end();
@@ -120,7 +153,8 @@ it.skipIf(!browserExecutable)(
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
-    const streamEndpoints: string[] = [];
+    const streams = new Map<string, string>();
+    const firstItems: string[] = [];
     const errors: string[] = [];
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('console', (message) => {
@@ -134,7 +168,15 @@ it.skipIf(!browserExecutable)(
     page.on('websocket', (socket) => {
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(payload.toString());
-        if (frame.type === 'open') streamEndpoints.push(frame.endpoint);
+        if (frame.type === 'open') streams.set(frame.streamId, frame.endpoint);
+      });
+      socket.on('framereceived', ({ payload }) => {
+        const frame = JSON.parse(payload.toString());
+        if (
+          frame.type === 'item' &&
+          ['baseline', 'snapshot'].includes(frame.value.type)
+        )
+          firstItems.push(`${streams.get(frame.streamId)}:${frame.value.type}`);
       });
     });
     await page.goto(f.origin);
@@ -148,7 +190,9 @@ it.skipIf(!browserExecutable)(
       throw Error(
         JSON.stringify({
           unary,
-          streamEndpoints,
+          streamEndpoints: [...streams.values()],
+          firstItems,
+          listRead,
           errors,
           text: (await workbench.locator('body').innerText()).slice(0, 300),
         }),
@@ -156,14 +200,15 @@ it.skipIf(!browserExecutable)(
       );
     }
     expect(await editor.isEditable()).toBe(true);
-    expect(streamEndpoints).toContain('session/control');
+    expect(firstItems).toContain('session/control:baseline');
+    expect(firstItems).toContain('session/follow:snapshot');
     expect(unary).toContain('session/list');
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
     expect(unary).not.toContain('session/prompt');
-    await context.close();
     closePage(life.peer);
     expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    await context.close();
   },
 );
 
