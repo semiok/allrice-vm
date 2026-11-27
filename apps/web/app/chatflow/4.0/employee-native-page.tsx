@@ -84,6 +84,7 @@ export function EmployeeNativePage({
   initialUnavailable?: boolean;
 }) {
   const frame = useRef<HTMLIFrameElement>(null);
+  const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
@@ -140,7 +141,10 @@ export function EmployeeNativePage({
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
-    if (!activation.retainFrame) setSource(undefined);
+    if (!activation.retainFrame) {
+      frameSelection.current = undefined;
+      setSource(undefined);
+    }
     setFailed(false);
     setStatus('warming');
     setSettled(false);
@@ -203,6 +207,7 @@ export function EmployeeNativePage({
             setActivation({ query: nextQuery.current });
             return;
           }
+          frameSelection.current = undefined;
           setSource(undefined);
           setStatus(status);
           setSettled(true);
@@ -258,7 +263,7 @@ export function EmployeeNativePage({
       const params = new URLSearchParams(query);
       const same = (key: 'workspaceId' | 'employeeInstanceId') =>
         params.getAll(key).length === 1 &&
-        params.get(key) === selectedEmployee?.[key];
+        params.get(key) === frameSelection.current?.[key];
       setActivation({
         query,
         warmup,
@@ -505,6 +510,7 @@ export function EmployeeNativePage({
       lifetime.signal.throwIfAborted();
       if (navigating) return;
       selectedEmployee = selection;
+      frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
