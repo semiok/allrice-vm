@@ -360,8 +360,20 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
   finish.chat.resolve();
   finish.responses.resolve();
   finish.openai.resolve();
-  await Promise.all([responses, openai]);
-  await expect(gateway.collect()).rejects.toThrow();
+  for (const chunks of await Promise.all([responses, openai]))
+    expect(chunks.at(-1)).toMatchObject({
+      type: 'finish',
+      reason: { kind: 'stop' },
+    });
+  await expect(gateway.collect()).resolves.toEqual([
+    expect.objectContaining({
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: expect.objectContaining({ code: 'BINDING_INVALID' }),
+      },
+    }),
+  ]);
   expect([...requests.keys()]).toEqual(['chat', 'responses', 'openai']);
   expect(requests.get('chat')).toMatchObject({
     authorization: 'Bearer ' + deepSeekKey,
@@ -382,6 +394,7 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     authorization: 'Bearer ' + openAiKey,
     body: { model: modelRoutes.openai.model, tools: [{ type: 'function' }] },
   });
+  expect(gateway.store.rows.size).toBe(3);
   expect(
     [...gateway.store.rows.values()].map((row) => {
       const binding = gateway.store.calls.get(row.callId)!.binding;
@@ -393,17 +406,25 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
         row.usage.totalTokens,
       ];
     }),
-  ).toEqual([
-    [
-      'deepseek',
-      modelRoutes.chat.model,
-      'openai-chat-completions',
-      'canceled',
-      null,
-    ],
-    ['deepseek', modelRoutes.responses.model, 'openai-responses', 'closed', 10],
-    ['openai', modelRoutes.openai.model, 'openai-responses', 'closed', 10],
-  ]);
+  ).toEqual(
+    expect.arrayContaining([
+      [
+        'deepseek',
+        modelRoutes.chat.model,
+        'openai-chat-completions',
+        'canceled',
+        null,
+      ],
+      [
+        'deepseek',
+        modelRoutes.responses.model,
+        'openai-responses',
+        'closed',
+        10,
+      ],
+      ['openai', modelRoutes.openai.model, 'openai-responses', 'closed', 10],
+    ]),
+  );
   expect(gateway.store.slots.get(calls.base.vm.personId)?.size ?? 0).toBe(0);
   await routing.close();
   await expect(
