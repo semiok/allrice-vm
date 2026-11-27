@@ -11,11 +11,11 @@ import {
   type EmployeeMemorySourceReader,
   type MemorySourceRead,
 } from '../../lib/memory/employee-memory-client';
+import type { EmployeeMemoryPageWrites } from '../../lib/memory/employee-memory-page-writes';
 import { EmployeeMemorySidebar } from './employee-memory-sidebar';
 
 type Props = {
   scopeId: string;
-  operationScopeId?: string;
   workspaceId: string;
   instanceId: string;
   headers: Record<string, string>;
@@ -26,6 +26,7 @@ type Props = {
   assertCurrent?: () => void;
   active?: boolean;
   writes?: MemoryWriteStore;
+  pageWrites?: EmployeeMemoryPageWrites;
   readSource?: EmployeeMemorySourceReader;
 };
 
@@ -63,7 +64,6 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       }),
     [
       props.scopeId,
-      props.operationScopeId,
       props.workspaceId,
       props.instanceId,
       props.headers,
@@ -136,6 +136,10 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
     return () => controller.abort();
   }, [load, props.refreshKey]);
   useEffect(() => {
+    if (props.pageWrites)
+      return props.pageWrites.subscribe((origin) => {
+        if (source.current !== origin) void load();
+      });
     const listener = (event: Event) => {
       const detail = (event as CustomEvent).detail;
       if (detail?.scopeId === props.scopeId && detail.source !== source.current)
@@ -143,10 +147,20 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
     };
     window.addEventListener('allrice:memory-changed', listener);
     return () => window.removeEventListener('allrice:memory-changed', listener);
-  }, [load, props.scopeId]);
-  async function changed(operation: Promise<unknown>) {
+  }, [load, props.pageWrites, props.scopeId]);
+  function assertTab() {
+    if (!available())
+      throw new DOMException('Memory panel is closed', 'AbortError');
+  }
+  async function changed(
+    intent: Parameters<EmployeeMemoryPageWrites['mutate']>[0],
+  ) {
     try {
-      await operation;
+      if (props.pageWrites)
+        await props.pageWrites.mutate(intent, assertTab, source.current);
+      else if (intent.action === 'save')
+        await client.save(intent.pair, intent.row);
+      else await client[intent.action](intent.row);
     } catch (cause) {
       // Only a verified 201/200/204 receipt resolves.
       if (available() && cause instanceof MemoryAccessLost) clearPrivate();
@@ -162,18 +176,20 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
     }
     // The document owns write receipts across tab visits. A newer tab in the
     // same document must refresh even after the tab that sent the write closed.
-    if (!available() && (!props.ownerSignal || props.ownerSignal.aborted))
-      return;
-    window.dispatchEvent(
-      new CustomEvent('allrice:memory-changed', {
-        detail: {
-          scopeId: props.scopeId,
-          workspaceId: props.workspaceId,
-          instanceId: props.instanceId,
-          source: source.current,
-        },
-      }),
-    );
+    if (
+      !props.pageWrites &&
+      (available() || Boolean(props.ownerSignal && !props.ownerSignal.aborted))
+    )
+      window.dispatchEvent(
+        new CustomEvent('allrice:memory-changed', {
+          detail: {
+            scopeId: props.scopeId,
+            workspaceId: props.workspaceId,
+            instanceId: props.instanceId,
+            source: source.current,
+          },
+        }),
+      );
     // A failed read after acknowledged success is a read error, never a new write.
     if (available()) await load();
   }
@@ -205,9 +221,9 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
             throw cause;
           }
         }}
-        onSave={(pair, row) => changed(client.save(pair, row))}
-        onConfirm={(row) => changed(client.confirm(row))}
-        onDelete={(row) => changed(client.remove(row))}
+        onSave={(pair, row) => changed({ action: 'save', pair, row })}
+        onConfirm={(row) => changed({ action: 'confirm', row })}
+        onDelete={(row) => changed({ action: 'remove', row })}
       />
     </div>
   );

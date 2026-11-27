@@ -138,20 +138,19 @@ describe('native memory across chat navigation', () => {
         return ack();
       }),
     );
-    const client = (scopeId: string) => {
-      const state = readEmployeeMemoryPageWrites(host, scopeId, employee)!;
-      return employeeMemoryClient(
-        { ...target, scopeId, operationScopeId: state.operationScopeId },
-        state.writes,
+    const save = (scopeId: string, row: EmployeeMemoryRecord) =>
+      readEmployeeMemoryPageWrites(host, scopeId, employee)!.mutate(
+        { action: 'save', row, pair },
+        () => {},
+        {},
       );
-    };
-    await expect(client('first-chat').save(pair, record)).rejects.toThrow();
+    await expect(save('first-chat', record)).rejects.toThrow();
     first();
     bind(host, 'second-chat', employee);
     expect(
       readEmployeeMemoryPageWrites(host, 'first-chat', employee),
     ).toBeUndefined();
-    await client('second-chat').save(pair, {
+    await save('second-chat', {
       ...record,
       revision: 8,
       pairDigest: 'sha256:' + 'b'.repeat(64),
@@ -186,24 +185,57 @@ describe('native memory across chat navigation', () => {
       'second-chat',
       other,
     );
-    expect(replacement?.operationScopeId).toBe('second-chat');
-    expect(replacement?.writes).not.toBe(owned?.writes);
+    expect(replacement).toBeDefined();
     expect(
       readEmployeeMemoryPageWrites(host, 'second-chat', employee),
     ).toBeUndefined();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'first-chat', employee),
+    ).toBeUndefined();
+    expect(owned).toBeDefined();
     second();
     expect(
       readEmployeeMemoryPageWrites(host, 'second-chat', other),
     ).toBeUndefined();
-    bind(host, 'return-to-first', employee);
-    expect(
-      readEmployeeMemoryPageWrites(host, 'return-to-first', employee),
-    ).toBe(owned);
-    bind(host, 'new-person', { ...employee, personId: id(99) });
-    bind(host, 'previous-person', employee);
-    expect(
-      readEmployeeMemoryPageWrites(host, 'previous-person', employee)?.writes,
-    ).not.toBe(owned?.writes);
+  });
+
+  it('notifies a new same-employee document when a retired document commits', async () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const retire = bind(host, 'first-chat', employee);
+    const before = readEmployeeMemoryPageWrites(host, 'first-chat', employee)!;
+    const oldPane = vi.fn();
+    before.subscribe(oldPane);
+    const source = {};
+    const sent = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<Response>();
+    const fetcher = vi.fn(() => {
+      sent.resolve();
+      return response.promise;
+    });
+    vi.stubGlobal('fetch', fetcher);
+
+    const write = before.mutate(
+      { action: 'confirm', row: record },
+      () => {},
+      source,
+    );
+    await sent.promise;
+    retire();
+    bind(host, 'second-chat', employee);
+    const after = readEmployeeMemoryPageWrites(host, 'second-chat', employee)!;
+    const newPane = vi.fn();
+    const unsubscribe = after.subscribe(newPane);
+    expect(newPane).not.toHaveBeenCalled();
+    response.resolve(ack());
+    await write;
+    expect(newPane).toHaveBeenCalledExactlyOnceWith(source);
+    expect(oldPane).not.toHaveBeenCalled();
+    await expect(
+      before.mutate({ action: 'confirm', row: record }, () => {}, source),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 });
 

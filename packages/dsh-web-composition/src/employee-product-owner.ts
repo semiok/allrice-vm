@@ -49,12 +49,12 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
-  const memoryWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
+  const pageWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
     organizationId,
     personId: viewerId,
     workspaceId: selection.workspaceId,
     employeeInstanceId: selection.employeeInstanceId,
-  }) ?? { writes: new Map() };
+  });
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -299,18 +299,23 @@ export function installEmployeeProductOwner(ctx: Context) {
             });
           },
         },
-        experience: {
-          management: {
-            scopeId: ownerKey,
-            workspaceId: selection.workspaceId,
-            instanceId: selection.employeeInstanceId,
-            employeeName: employee.currentVersion.manifest.name,
-            headers: requestHeaders,
-            ownerSignal: signal,
-            ...memoryWrites,
-            readSource: personalEmployeeMemorySourceReader(requestHeaders),
-          },
-        },
+        experience:
+          pageWrites || parent === window
+            ? {
+                management: {
+                  scopeId: ownerKey,
+                  workspaceId: selection.workspaceId,
+                  instanceId: selection.employeeInstanceId,
+                  employeeName: employee.currentVersion.manifest.name,
+                  headers: requestHeaders,
+                  ownerSignal: signal,
+                  pageWrites,
+                  writes: pageWrites ? undefined : new Map(),
+                  readSource:
+                    personalEmployeeMemorySourceReader(requestHeaders),
+                },
+              }
+            : undefined,
       };
       panels.update(initial);
       await bindEmployeePanelsHttp(

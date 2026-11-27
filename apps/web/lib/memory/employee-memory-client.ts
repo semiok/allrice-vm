@@ -19,7 +19,6 @@ export type MemoryList = z.infer<typeof EmployeeMemoryListSchema>;
 export type MemoryPair = z.infer<typeof PersonalMemoryPairSchema>;
 export type MemoryTarget = {
   scopeId: string;
-  operationScopeId?: string;
   workspaceId: string;
   instanceId: string;
   headers: Record<string, string>;
@@ -244,7 +243,7 @@ export function employeeMemoryClient(
     // AND original CAS survive. Explicitly changed content is a different
     // operation; it must not lock unrelated additions for this employee.
     const scope = await digest([
-      target.operationScopeId ?? target.scopeId,
+      target.scopeId,
       target.workspaceId,
       target.instanceId,
       Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)),
