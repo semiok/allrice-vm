@@ -437,6 +437,17 @@ export class PersonVmService
       this.receipt(bindingOf(row), row.egressReceipt),
     );
   }
+  private async canStopPreviousWorkerVm(lease: VmLease, row: VmRecord) {
+    if (
+      (row.phase !== 'running' && row.phase !== 'failed') ||
+      !this.needsUpgradeStop(row)
+    )
+      return false;
+    return (
+      row.phase === 'running' ||
+      (await lease.hasPreviousUpgradeStop?.(bindingOf(row))) === true
+    );
+  }
   private assertPrewarmTarget(
     row: VmRecord | null,
     target?: PersonVmPrewarmTarget,
@@ -1036,10 +1047,7 @@ export class PersonVmService
         roster.organizationId !== row.organizationId)
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
-    if (
-      (row.phase === 'running' || row.phase === 'failed') &&
-      this.needsUpgradeStop(row)
-    ) {
+    if (await this.canStopPreviousWorkerVm(lease, row)) {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
       if (
         !dispatchUpgradeStop ||
@@ -2028,11 +2036,8 @@ export class PersonVmService
         if (!sameVmBinding(bindingOf(row), binding))
           throw new PersonVmError('LEASE_LOST');
         if (row.phase === 'stopped' && !row.egressReceipt) return;
-        const previousWorker = this.needsUpgradeStop(row);
-        if (
-          row.phase !== 'running' &&
-          !(row.phase === 'failed' && previousWorker)
-        )
+        const previousWorker = await this.canStopPreviousWorkerVm(lease, row);
+        if (row.phase !== 'running' && !previousWorker)
           throw new PersonVmError('ACTIVITY_UNKNOWN');
         await this.stopForUpgrade(
           lease,

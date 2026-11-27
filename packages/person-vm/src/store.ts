@@ -72,6 +72,7 @@ export interface VmLease {
   idleStopReceipt?(
     binding: PersonVmBinding,
   ): ReturnType<typeof readIdleStopReceipt>;
+  hasPreviousUpgradeStop?(binding: PersonVmBinding): Promise<boolean>;
   hasCompletedDiskDeletion?(owner: DiskPoolOwner): Promise<boolean>;
   hasRetainedDiskRows?(vmIds: readonly string[]): Promise<boolean>;
   audit(row: VmRecord, event: VmAudit): Promise<void>;
@@ -322,6 +323,26 @@ async function readIdleStopReceipt(
         completed: record.completed === true,
       }
     : undefined;
+}
+
+async function hasPreviousUpgradeStop(
+  session: VmSqlSession,
+  binding: PersonVmBinding,
+) {
+  const [attempt] = await session.query(
+    () => session.client`
+    select a.result
+    from person_virtual_machines vm
+    join person_vm_audit a using (person_id, organization_id, vm_id, lease_epoch)
+    where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+      and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+      and vm.lease_epoch=${binding.leaseEpoch} and vm.phase='failed'
+      and a.action='stop.upgrade-dispatch'
+    order by a.id desc limit 1`,
+  );
+  // When the last dispatch was denied, it never acquired native authority.
+  // An unconfirmed authorized attempt still needs an exact native join.
+  return attempt?.result === 'started' || attempt?.result === 'succeeded';
 }
 
 function fromRow(row: Record<string, unknown>): VmRecord {
@@ -952,6 +973,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
                 ),
             }),
         idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
+        hasPreviousUpgradeStop: (binding) =>
+          hasPreviousUpgradeStop(session, binding),
         hasCompletedDiskDeletion: async (owner) => {
           if (owner.personId !== personId)
             throw new PersonVmError('LEASE_LOST');
@@ -1241,6 +1264,8 @@ export class PostgresPersonVmStore implements PersonVmStore {
           if (!found) throw new PersonVmError('LEASE_LOST');
         },
         idleStopReceipt: (binding) => readIdleStopReceipt(session, binding),
+        hasPreviousUpgradeStop: (binding) =>
+          hasPreviousUpgradeStop(session, binding),
         audit: async (value, event) => {
           await session.query(() => insertVmAudit(sql, value, event));
         },
