@@ -59,12 +59,17 @@ export function installEmployeeProductOwner(ctx: Context) {
     'x-allrice-workspace-id': selection.workspaceId,
     'x-allrice-organization-id': organizationId,
   };
-  function navigate(employeeInstanceId: string, target?: string) {
+  function navigate(
+    employeeInstanceId: string,
+    target?: string,
+    reopen = false,
+  ) {
     signal!.throwIfAborted();
     parent.postMessage(
       {
         type: pageNavigate,
         scopeId,
+        ...(reopen && { reopen }),
         selection: {
           workspaceId: selection.workspaceId,
           employeeInstanceId,
@@ -145,20 +150,19 @@ export function installEmployeeProductOwner(ctx: Context) {
           sessions,
           activeId: threadId,
           onSelectSession(id) {
-            if (id === threadId) return;
             const selected = sessions.find((session) => session.id === id);
             if (selected) navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
-            if (
-              !employeeChoice(workspace, id) ||
-              id === selection.employeeInstanceId
-            )
+            if (!employeeChoice(workspace, id)) return;
+            if (id === selection.employeeInstanceId) {
+              navigate(id, threadId);
               return;
+            }
             const session = sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
-            navigate(id, session?.id);
+            navigate(id, session?.id, !session);
           },
           onNewSession(id) {
             if (employeeChoice(workspace, id)) navigate(id);
@@ -180,7 +184,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             viewerId,
           },
           headers: requestHeaders,
-          onCreated: (instance) => navigate(instance.id),
+          onCreated: (instance) => navigate(instance.id, undefined, true),
         },
         openArchive: () => notice('当前入口暂无法打开归档。'),
         openEmployeeSettings: () => notice('当前入口暂无法打开员工设置。'),

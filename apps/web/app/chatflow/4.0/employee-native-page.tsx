@@ -134,6 +134,7 @@ export function EmployeeNativePage({
     let mounted = false;
     let documentStarted = false;
     let discardingPendingDocument = false;
+    let navigationClosed = false;
     let remoteRevoked = false;
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
@@ -376,6 +377,7 @@ export function EmployeeNativePage({
       )
         return;
       if (event.data.type === pageClosing) {
+        navigationClosed = true;
         if (prepare && !navigating && !detached) finish('failed');
         else void close();
       }
@@ -415,17 +417,28 @@ export function EmployeeNativePage({
       if (
         event.data.type === pageCompletion &&
         ['closed', 'unknown'].includes(event.data.state)
-      )
+      ) {
+        navigationClosed = true;
         local.resolve(event.data.state);
+      }
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
         if (
           !next.success ||
           !carrier ||
           detached ||
+          navigationClosed ||
           remoteRevoked ||
           superseded ||
           (navigating && !pendingNavigation)
+        )
+          return;
+        if (
+          !pendingNavigation &&
+          next.data.threadId &&
+          selectedEmployee?.threadId === next.data.threadId &&
+          selectedEmployee.workspaceId === next.data.workspaceId &&
+          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
         )
           return;
         const params = new URLSearchParams(
@@ -433,10 +446,13 @@ export function EmployeeNativePage({
             (entry): entry is [string, string] => typeof entry[1] === 'string',
           ),
         );
-        const target = params.toString();
+        // Untagged rootless messages are the existing explicit New action.
+        // A card click or newly created employee reopens any concurrent first thread.
+        const newThread =
+          prepare && !next.data.threadId && event.data.reopen !== true;
+        const target = params.toString() + (newThread ? '&new' : '');
         if (pendingNavigation?.target === target) return;
-        if (prepare && !next.data.threadId)
-          params.set('new', crypto.randomUUID());
+        if (newThread) params.set('new', crypto.randomUUID());
         const duringClose = !!pendingNavigation;
         pendingNavigation = { target, query: params.toString() };
         if (duringClose) {

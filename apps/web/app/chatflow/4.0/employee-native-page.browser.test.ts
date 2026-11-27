@@ -14,6 +14,7 @@ import { deferred } from '../../../../../packages/d-entry-principal/test/host-fi
 import { initialDocumentLifecycle } from '../../../lib/d-entry/initial-document';
 import {
   pageClosing,
+  pageCompletion,
   pageEditorMounted,
   pageNavigate,
 } from '../../../lib/d-entry/page-messages';
@@ -95,6 +96,13 @@ async function exerciseMultiEmployeeNavigation(
       },
     );
     const page = await context.newPage();
+    await page.addInitScript((completion) => {
+      if (window !== window.top) return;
+      addEventListener('message', (event) => {
+        if (event.origin === location.origin && event.data?.type === completion)
+          document.documentElement.dataset.fixtureOldDocumentClosed = 'yes';
+      });
+    }, pageCompletion);
     await page.route('**/api/v1/d-entry/native-prewarm', async (route) => {
       const { selection } = route.request().postDataJSON();
       warmups.push(selection.employeeInstanceId);
@@ -109,10 +117,11 @@ async function exerciseMultiEmployeeNavigation(
         workspaceId: identity.workspaceId,
         employeeInstanceId: c,
       });
-      expect(operationId).toBeTruthy();
+      expect(operationId).toBeUndefined();
       creates.push(selection.employeeInstanceId);
-      threads.set(c, operationId);
-      await route.fulfill({ json: { ...selection, threadId: operationId } });
+      const threadId = randomUUID();
+      threads.set(c, threadId);
+      await route.fulfill({ json: { ...selection, threadId } });
     });
     await page.route('**/api/v1/d-entry/identity?**', async (route) => {
       const query = new URL(route.request().url()).searchParams;
@@ -201,6 +210,25 @@ async function exerciseMultiEmployeeNavigation(
       card.querySelector('button')!.click();
     }, names[2]!);
     await firstClose.promise;
+    await page.locator('html[data-fixture-old-document-closed="yes"]').waitFor({
+      state: 'attached',
+    });
+    await frame.locator('#app').evaluate(
+      (container, late) => {
+        parent.postMessage(
+          {
+            type: late.type,
+            scopeId: (container as HTMLElement).dataset.scopeId,
+            selection: late.selection,
+          },
+          location.origin,
+        );
+      },
+      {
+        type: pageNavigate,
+        selection: { workspaceId: identity.workspaceId, employeeInstanceId: d },
+      },
+    );
     expect(warmups).toEqual([a]);
     releaseClose.resolve();
     await page
