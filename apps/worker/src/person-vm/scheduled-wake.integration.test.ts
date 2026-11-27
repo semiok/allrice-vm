@@ -997,13 +997,16 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
   });
 
   it.each([
-    ['starting', false],
-    ['starting', true],
-    ['running', false],
-    ['running', true],
+    ['starting', false, 'retained'],
+    ['starting', true, 'retained'],
+    ['running', false, 'retained'],
+    ['running', true, 'retained'],
+    ['stopped', false, 'retained'],
+    ['stopped', true, 'retained'],
+    ['stopped', false, 'released'],
   ] as const)(
-    'audits an unconfirmed start after the VM advanced to %s (revoked: %s)',
-    async (phase, revoked) => {
+    'audits an unconfirmed start after the VM advanced to %s (revoked: %s, owner: %s)',
+    async (phase, revoked, lease) => {
       const f = await fixture(),
         planId = randomUUID();
       await expect(
@@ -1012,11 +1015,12 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       await f.stop(planId);
       const claim = await f.store().claim(300_000);
       expect(claim).not.toBeNull();
-      const owner = randomUUID();
+      const owner = lease === 'released' ? null : randomUUID();
       await db`update person_virtual_machines
       set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase=${phase},
         egress_receipt=${phase === 'running' ? db.json({}) : null},
-        lease_owner=${owner},lease_expires_at=now()-interval '1 second'
+        lease_owner=${owner},
+        lease_expires_at=case when ${owner}::uuid is null then null else now()-interval '1 second' end
       where person_id=${f.binding.personId}`;
       if (revoked) await f.invalidate(planId);
       expect(await f.store().nextCommittedWakeAt(signal)).toBeInstanceOf(Date);

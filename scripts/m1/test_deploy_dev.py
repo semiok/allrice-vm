@@ -623,7 +623,7 @@ class DeployDevMigrations(unittest.TestCase):
         )))
 
     def test_recovery_starts_missing_web_without_draining_the_restored_worker(self):
-        for mode in ('healthy', 'wake-pending', 'worker-exited'):
+        for mode in ('healthy', 'wake-pending', 'worker-exited', 'worker-stopping'):
             with self.subTest(mode=mode):
                 self.saved_release(self.initial_release)
                 p = self.run_dd(r'''
@@ -633,7 +633,10 @@ class DeployDevMigrations(unittest.TestCase):
                     else echo 'running 73002'
                     fi
                   }
-                  worker_vm_recovery() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 wake-ready'; }
+                  worker_vm_recovery() {
+                    if [ "$MODE" = worker-stopping ] && [ -f "$STATE/web-ready" ]; then return 1; fi
+                    echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 wake-ready'
+                  }
                   start_job() { test "$1" = "$WEB_LABEL" && echo web-started; }
                   wait_ready() { touch "$STATE/web-ready"; }
                   verify_no_committed_vm_wakes() { test "$MODE" != wake-pending; }

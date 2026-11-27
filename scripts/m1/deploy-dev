@@ -71,13 +71,15 @@ recovery_pair() { # Web plist, Worker plist, [expected SHA]
 }
 ready_sha() { # url role release -> prints a matching verified sourceSha
   curl -q --noproxy '*' -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
-worker_vm_recovery() { # release pid -> exact ready boot and ownership state
+worker_vm_recovery() { # release pid [ready] -> exact boot/owner or ready SHA
   local port owners proof
+  local args=(ready worker "$1")
+  if [ "${3:-}" != ready ]; then args+=("$2"); fi
   port=$(worker_port) || return 1
   owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
   [ "$owners" = "$2" ] || return 1
   proof=$(curl -q --noproxy '*' -fsS -m 5 "http://127.0.0.1:$port/health/ready" 2>/dev/null |
-    "$M1_PY" "$M1_TOOLS/service_target.py" ready worker "$1" "$2") || return 1
+    "$M1_PY" "$M1_TOOLS/service_target.py" "${args[@]}") || return 1
   owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
   [ "$owners" = "$2" ] && [ -n "$proof" ] || return 1
   printf '%s\n' "$proof"
@@ -493,7 +495,10 @@ verify_restored_vm_owner() { # original sealed release, required wake tick (yes/
   verify_no_committed_vm_wakes || return 1
   count=$(vm_upgrade_candidates) || return 1
   if [ "$count" = 0 ] && [ "$2" != yes ]; then
-    [ -z "${3:-}" ] || [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ]
+    [ -z "${3:-}" ] ||
+      { [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ] &&
+        worker_vm_recovery "$1" "${3#running }" ready >/dev/null &&
+        [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ]; }
     return
   fi
   process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1") || return 1
