@@ -19,6 +19,8 @@ import { expect, it, vi } from 'vitest';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import Llm from '@deepseek-ai/dsh-llm';
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import ToolRuntime from '@deepseek-ai/dsh-tools';
 import { z } from 'zod';
 import {
   deferred,
@@ -822,6 +824,235 @@ it('opens the native control baseline and lists every Session in the current VM'
       })
     ).status,
   ).toBe(200);
+  closePage(life.peer);
+  expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('delivers native page notifications on their declared resources and suppresses a revoked result', async () => {
+  const f = await fixture();
+  await f.host.useNativeEvents();
+  const life = await open(f);
+  const peer = f.connect(life.scopeId);
+  const next = messages(peer);
+  const delivered: unknown[] = [];
+  peer.on('message', (data) => {
+    const frame = JSON.parse(String(data));
+    if (frame.streamId === 'events' && frame.value?.type === 'emit')
+      delivered.push(frame.value);
+  });
+  await once(peer, 'open');
+  send(peer, {
+    type: 'open',
+    streamId: 'events',
+    endpoint: '$events',
+    payload: { args: {} },
+  });
+  expect(await next('events')).toMatchObject({ value: { type: 'ready' } });
+
+  const { host, catalog } = f.host;
+  const other = summary('other').sessionId;
+  host.emit('credentials/reference-updated', 'SYNTHETIC_REFERENCE' as never);
+  host.emit('api-session/status', summary('absent').sessionId, true);
+  host.emit('commands/change');
+  host.emit('api-session/status', other, true);
+  const notifications: { type: string; event: string; args: unknown[] }[] = [
+    { type: 'emit', event: 'commands/change', args: [] },
+    { type: 'emit', event: 'api-session/status', args: [other, true] },
+  ];
+  for (const value of notifications)
+    expect(await next('events')).toMatchObject({ type: 'item', value });
+
+  const releaseCatalog = deferred();
+  closes.push(async () => releaseCatalog.resolve());
+  catalog.beforeList = () => releaseCatalog.promise;
+  const added = summary('new-live-session');
+  try {
+    host.emit('api-session/added', added);
+    const addedFrame = {
+      type: 'emit',
+      event: 'api-session/added',
+      args: [added],
+    };
+    expect(await next('events')).toMatchObject({
+      type: 'item',
+      value: addedFrame,
+    });
+    notifications.push(addedFrame);
+    host.emit('api-session/removed', added.sessionId);
+    const removedFrame = {
+      type: 'emit',
+      event: 'api-session/removed',
+      args: [added.sessionId],
+    };
+    expect(await next('events')).toMatchObject({
+      type: 'item',
+      value: removedFrame,
+    });
+    notifications.push(removedFrame);
+  } finally {
+    releaseCatalog.resolve();
+  }
+
+  const checked = deferred();
+  vi.mocked(f.owner.assertCurrent).mockImplementation(async () => {
+    checked.resolve();
+    throw new DataAccessError('authorization_denied');
+  });
+  const closed = once(peer, 'close');
+  host.emit('commands/change');
+  await checked.promise;
+  await closed;
+  expect(delivered).toEqual(notifications);
+});
+
+it('relays a native Cordis inspect query and its ordinary scoped RPC reply', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  await f.host.useNativeEvents();
+  const composition = createRequire(
+    new URL(
+      '../../../../packages/dsh-web-composition/package.json',
+      import.meta.url,
+    ),
+  );
+  const runtime = createRequire(
+    composition.resolve('@deepseek-ai/dsh/package.json'),
+  );
+  const moduleName = '@deepseek-ai/dsh-cordis-host-runner';
+  const { default: CordisRunner, CordisInspectRegistryService } = await import(
+    pathToFileURL(runtime.resolve(moduleName)).href
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(runtime.resolve(`${moduleName}/typert`)).href
+  );
+  await host.plugin(SystemPrompt);
+  await host.plugin(ToolRuntime);
+  await host.plugin(CordisRunner);
+  host.typert.register(TYPERT);
+  const agentId = summary('other').sessionId;
+  const agent = { id: agentId, ctx: host };
+  host.typert.lookups.register('agent', {
+    parameter: 'agent',
+    wire: 'agentId',
+    resource: 'session',
+    hostTypeSymbol: '@deepseek-ai/dsh-agent#Agent',
+    wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
+    resolve: (id) => (id === agentId ? (agent as never) : undefined),
+  });
+  host.typert.contexts.registerHost('agent', {
+    wire: 'agentId',
+    resource: 'session',
+    wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
+    resolve: (id) => (id === agentId ? agent.ctx : undefined),
+  });
+  const life = await open(f);
+  const peer = f.connect(life.scopeId);
+  await once(peer, 'open');
+  const next = messages(peer);
+  send(peer, {
+    type: 'open',
+    streamId: 'events',
+    endpoint: '$events',
+    payload: { args: {} },
+  });
+  expect(await next('events')).toMatchObject({ value: { type: 'ready' } });
+  expect(host.typertGateway.hasLiveClient()).toBe(false);
+
+  // rc.2 sources inspect queries only when an independent owner client is
+  // present. The page enters through its existing non-owner carrier below.
+  const companion = host.connection.createPeer({
+    principal: { kind: 'owner' },
+    interactions: 'answer',
+  });
+  const abort = new AbortController();
+  const ownerEvents = await host.typertGateway.wireStream.open(
+    '$events',
+    { args: {} },
+    { async *[Symbol.asyncIterator]() {} },
+    companion,
+    abort.signal,
+  );
+  const owner = ownerEvents[Symbol.asyncIterator]();
+  closes.push(async () => {
+    abort.abort();
+    await owner.return?.();
+    await companion.dispose();
+  });
+  expect(await owner.next()).toMatchObject({ value: { type: 'ready' } });
+  const invoke = async (method: string, args: Record<string, unknown>) =>
+    (
+      await f.invoke(life.scopeId, sessionToken, {
+        endpoint: 'dynamicCordisRunner/' + method,
+        payload: { args },
+      })
+    ).json();
+  const provider = 'fixture-inspector';
+  const method = 'read';
+  expect(
+    await invoke('syncInspectManifest', {
+      providers: [
+        {
+          id: provider,
+          description: 'Read a synthetic fixture value.',
+          methods: [
+            {
+              name: method,
+              description: 'Read a label.',
+              inputSchema: { type: 'object', additionalProperties: false },
+              outputSchema: { type: 'string' },
+            },
+          ],
+        },
+      ],
+    }),
+  ).toMatchObject({ result: { ok: true, value: null } });
+  const inspector = host.get('cordisInspect') as
+    InstanceType<typeof CordisInspectRegistryService> | undefined;
+  if (!(inspector instanceof CordisInspectRegistryService))
+    throw Error('Native Cordis inspect service unavailable');
+  const query = inspector.query(
+    'client',
+    provider,
+    method,
+    undefined,
+    agent,
+    abort.signal,
+  );
+  void query.catch(() => {});
+  const notification = await next('events');
+  expect(notification.value).toMatchObject({
+    type: 'emit',
+    event: 'cordis/inspect-query',
+    args: [{ requestId: expect.any(String), agentId, provider, method }],
+  });
+  const { requestId } = notification.value.args[0];
+  expect(
+    await invoke('resolveInspectQuery', {
+      agentId,
+      requestId,
+      resolution: { ok: true, data: 'fixture-label' },
+    }),
+  ).toMatchObject({ result: { ok: true, value: { accepted: true } } });
+  await expect(query).resolves.toBe('fixture-label');
+  expect(await next('events')).toMatchObject({
+    value: {
+      type: 'emit',
+      event: 'cordis/inspect-query-resolved',
+      args: [{ requestId }],
+    },
+  });
+  expect(
+    await invoke('resolveRequestRun', {
+      requestId: 'synthetic-activation',
+      resolution: {
+        ok: false,
+        reason: 'rejected',
+        message: 'Synthetic decision',
+      },
+    }),
+  ).toMatchObject({
+    result: { ok: false, error: { details: { reason: 'plugin-management' } } },
+  });
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });

@@ -23,6 +23,7 @@ import Gateway, {
   type TypertRemoteEventDispatch,
 } from '@deepseek-ai/dsh-api-gateway';
 import * as GatewayClient from '@deepseek-ai/dsh-api-gateway/client';
+import * as NativeRemoteEvents from '@deepseek-ai/dsh-api-remotes';
 import {
   Remote,
   RemoteError,
@@ -352,7 +353,7 @@ export async function hostFixture(
       }
     },
   });
-  host.effect(() =>
+  const fixtureEvents = host.effect(() =>
     host.typertGateway.registerRemoteEvents(source, {
       home: '/home/native-fixture',
     }),
@@ -425,6 +426,10 @@ export async function hostFixture(
     selected,
     config,
     wire,
+    async useNativeEvents() {
+      await fixtureEvents();
+      await host.plugin(NativeRemoteEvents);
+    },
     emit(row: TypertRemoteEventDispatch) {
       dispatched.push(row);
       wake();

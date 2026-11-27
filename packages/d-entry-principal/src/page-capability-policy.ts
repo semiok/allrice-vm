@@ -146,3 +146,22 @@ export function sensitivePageUpgradeCapability(endpoint: Method) {
       : undefined)
   );
 }
+
+/** Notifications may refresh authorized reads. Platform lifecycle requests,
+ * installation output and credential notifications remain managed. */
+export function isManagedPageEvent(event: string) {
+  const [domain, action] = event.split('/');
+  if (!domain || !action) return true;
+  if (domain === 'plugin-manager' && action === 'changed') return false;
+  if (domain === 'cordis' && /^request-run(?:-|$)/u.test(action)) return true;
+  const camel = (value: string) =>
+    value.replace(/-([a-z])/gu, (_, letter: string) => letter.toUpperCase());
+  const namespace =
+    domain === 'deepseek-account'
+      ? 'account'
+      : domain === 'cordis'
+        ? 'dynamicCordisRunner'
+        : camel(domain);
+  const method = { namespace, service: namespace, method: camel(action) };
+  return isRetainedPageRestriction(method) || !!sensitivePageCapability(method);
+}

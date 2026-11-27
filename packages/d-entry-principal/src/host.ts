@@ -16,6 +16,8 @@ import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-api-gateway';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { API_REMOTE_FORWARDED_EVENTS } from '@deepseek-ai/dsh-api-remotes';
+import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import { TYPERT_REMOTE as Access } from '@deepseek-ai/dsh-api-remote-access/remote';
 import {
   REMOTE_EVENT_STREAM_ENDPOINT,
@@ -28,6 +30,7 @@ import { TYPERT, TYPERT_REMOTE } from '#principal-artifacts';
 import { UuidSchema } from '@allrice/contracts';
 import {
   issueSchema,
+  pageEventRoles,
   principalPolicy,
   projectSessions,
   projectPageSessions,
@@ -55,6 +58,7 @@ import {
 import { pageSettingsNamespaces } from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
+const eventRoles = pageEventRoles(API_REMOTE_FORWARDED_EVENTS);
 const configSchema = z
   .object({
     profile: z
@@ -184,6 +188,8 @@ function assertContribution(
 class Scope implements Projection {
   active = false;
   bindings: Projection['bindings'] = [];
+  eventBindings: Projection['bindings'] = [];
+  private readonly eventSessions = new Set<SessionId>();
   peer?: PeerScope;
   readonly abort = new AbortController();
   readonly jobs = new Set<Promise<unknown>>();
@@ -214,11 +220,14 @@ class Scope implements Projection {
       void this.close().catch(() => {});
     };
     parent.signal.addEventListener('abort', lost, { once: true });
-    const hint = () => {
+    const hint = (sessionId: SessionId) => {
       if (this.abort.signal.aborted) return;
+      if (this.eventBindings.length) this.rememberPageEvents([sessionId]);
       void this.refresh().catch(lost);
     };
-    const added = parent.ctx.on('api-session/added', hint);
+    const added = parent.ctx.on('api-session/added', ({ sessionId }) =>
+      hint(sessionId),
+    );
     const removed = parent.ctx.on('api-session/removed', hint);
     this.detach = () => {
       parent.signal.removeEventListener('abort', lost);
@@ -303,6 +312,7 @@ class Scope implements Projection {
       try {
         const catalog = await this.ctx.sessionController.list({}, signal);
         signal.throwIfAborted();
+        this.abort.signal.throwIfAborted();
         const bindings =
           this.issue.access === 'page'
             ? projectPageSessions(catalog.items, this.ctx.typert.local.list())
@@ -311,6 +321,10 @@ class Scope implements Projection {
         // this generation. A cancelled follower owns only its catalog read.
         if (generation === this.refreshGeneration) {
           this.refreshQueue = task;
+          if (this.issue.access === 'page')
+            this.rememberPageEvents(
+              catalog.items.map(({ sessionId }) => sessionId),
+            );
           this.publish(
             bindings,
             this.issue.access === 'page' || bindings.length > 0,
@@ -319,6 +333,7 @@ class Scope implements Projection {
       } catch (error) {
         if (!signal.aborted && generation === this.refreshGeneration) {
           this.refreshQueue = task;
+          this.eventBindings = [];
           this.publish([]);
         }
         throw error;
@@ -326,6 +341,20 @@ class Scope implements Projection {
     });
     if (pageRefresh) this.refreshQueue = task;
     return this.track(task);
+  }
+  private rememberPageEvents(ids: readonly SessionId[]) {
+    const count = this.eventSessions.size;
+    for (const id of ids) this.eventSessions.add(id);
+    if (this.eventBindings.length && count === this.eventSessions.size) return;
+    // The native add/remove edge can reach the Gateway during a catalog
+    // refresh. Keep its exact IDs for this page's notification role only.
+    this.eventBindings = [
+      { role: eventRoles.global, resource: { kind: 'global' } },
+      ...Array.from(this.eventSessions, (id) => ({
+        role: eventRoles.session,
+        resource: { kind: 'session', id } as const,
+      })),
+    ];
   }
   private publish(bindings: Projection['bindings'], active = false) {
     this.bindings = bindings;
@@ -343,7 +372,7 @@ class Scope implements Projection {
       if (pending !== this.refreshQueue) continue;
       if (!this.active) throw closed();
       // No await between the stable projection and the native guard/dispatch.
-      // Hints extend the same owned read chain; they never grant from payload.
+      // Catalog hints extend the owned read chain for method permissions.
       return dispatch();
     }
   }
@@ -379,6 +408,8 @@ class Scope implements Projection {
     });
     this.active = false;
     this.bindings = [];
+    this.eventBindings = [];
+    this.eventSessions.clear();
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
     return this.closing;

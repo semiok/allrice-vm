@@ -15,6 +15,7 @@ import type {
   DEntryScopeIssue,
 } from './types.js';
 import { pageEndpoint, requirePageNativeMethod } from './page-native-method.js';
+import { isManagedPageEvent } from './page-capability-policy.js';
 
 export { DEntryScopeIssueSchema as issueSchema } from './types.js';
 export const readEndpoints = [
@@ -69,6 +70,37 @@ export interface Projection {
   readonly parent: PeerScope;
   active: boolean;
   bindings: readonly RemoteAccessBinding[];
+  eventBindings?: readonly RemoteAccessBinding[];
+}
+
+/** Adapt the native Host forwarding declaration to exact DSH action names. */
+export function pageEventRoles(
+  descriptors: readonly {
+    event: string;
+    mode: string;
+    resources?: Readonly<Record<string, unknown>>;
+  }[],
+) {
+  const global = {
+    name: 'allrice-page-events',
+    resource: 'global',
+    actions: [] as `event:${string}`[],
+  } as const satisfies RemoteAccessRole<'global'>;
+  const session = {
+    name: 'allrice-page-session-events',
+    resource: 'session',
+    actions: [] as `event:${string}`[],
+  } as const satisfies RemoteAccessRole<'session'>;
+  for (const descriptor of descriptors) {
+    if (descriptor.mode !== 'emit' || isManagedPageEvent(descriptor.event))
+      continue;
+    const resources = Object.keys(descriptor.resources ?? {});
+    if (resources.length === 0)
+      global.actions.push(`event:${descriptor.event}`);
+    if (resources.length === 1 && resources[0] === 'session')
+      session.actions.push(`event:${descriptor.event}`);
+  }
+  return { global, session };
 }
 
 /** Only child-origin edges participate in an existing thread's ancestry. */
@@ -168,11 +200,16 @@ export function principalPolicy(
     bindings(principal) {
       const value = scopes.get(principal.scopeId);
       if (
-        !value?.active ||
+        !value ||
         value.parent.signal.aborted ||
         !sameDEntryIdentity(value.issue.identity, principal.identity)
       )
         return [];
+      if (value.issue.access === 'page') {
+        const events = value.eventBindings ?? [];
+        return value.active ? [...value.bindings, ...events] : events;
+      }
+      if (!value.active) return [];
       return value.issue.access === 'execute'
         ? [...value.bindings, editorCatalogEntry]
         : value.bindings;
