@@ -943,10 +943,14 @@ class PrincipalService extends TypertRemoteService {
           signal: active,
         });
         active.throwIfAborted();
+        const visible =
+          endpoint === 'settings/describe'
+            ? { ...object.parse(value), hasDocument: false }
+            : value;
         return {
           kind: 'page',
           endpoint,
-          ...encodePageNativeResult(descriptor, value),
+          ...encodePageNativeResult(descriptor, visible),
         };
       }, active);
     });

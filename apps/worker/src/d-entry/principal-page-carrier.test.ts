@@ -114,6 +114,7 @@ it('reads the sealed language default and persists a native language preference 
       result: {
         ok: true,
         value: {
+          hasDocument: false,
           namespaces: expect.arrayContaining([
             { ns: 'locale', value: { preference: 'zh' }, revision: 2 },
           ]),
@@ -1473,6 +1474,44 @@ it('carries native terminal input, resize and output across the owned VM stream'
     expect.any(Object),
     expect.any(AbortSignal),
   );
+  // A late frame for an ended attachment cannot take down the page mux.
+  send(peer, { type: 'item', streamId, value: write });
+  const cancelled = 'cancelled-terminal';
+  send(peer, {
+    type: 'open',
+    streamId: cancelled,
+    endpoint: 'terminal/attach',
+    payload,
+  });
+  expect(await receive(cancelled)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  const checking = deferred();
+  const interrupted = deferred();
+  vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+    async (_context, signal) => {
+      checking.resolve();
+      if (!signal.aborted) await once(signal, 'abort');
+      interrupted.resolve();
+      signal.throwIfAborted();
+    },
+  );
+  send(peer, { type: 'item', streamId: cancelled, value: write });
+  await checking.promise;
+  send(peer, { type: 'cancel', streamId: cancelled });
+  await interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: 'still-open',
+    endpoint: 'session/control',
+    payload: { args: {} },
+  });
+  expect(await receive('still-open')).toMatchObject({
+    type: 'item',
+    value: { type: 'baseline' },
+  });
+  expect(inputs).toEqual([write, resize]);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });

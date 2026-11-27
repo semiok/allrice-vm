@@ -46,6 +46,7 @@ export type DEntryScopeIssue =
       root?: DEntryPrincipalIssue['root'];
     }>;
 export type CloseCommand = 'close';
+export const D_ENTRY_PAGE_UPLINK_BYTES = 262_144;
 export type DEntryPageInput =
   | Readonly<{ type: 'input'; value?: JsonValue }>
   | Readonly<{ type: 'input-end' }>;

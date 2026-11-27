@@ -1,16 +1,17 @@
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
-import type { CloseCommand, DEntryPageInput } from './types.js';
-
-// Same byte budget as the rc.2 WebSocket Gateway's native uplink inbox.
-const maxBytes = 262_144;
+import {
+  D_ENTRY_PAGE_UPLINK_BYTES,
+  type CloseCommand,
+  type DEntryPageInput,
+} from './types.js';
 const done = { done: true, value: undefined } as const;
 
 // The rc.2 private Gateway carrier wraps the browser value in an input command
 // and uses a UUID stream ID. Its public in-process dispatcher has no window
 // argument, so advertise this transport's budget on the native snapshot.
 const terminalWindow = Object.freeze({
-  maxBytes,
+  maxBytes: D_ENTRY_PAGE_UPLINK_BYTES,
   frameOverheadBytes:
     Buffer.byteLength(
       JSON.stringify({
@@ -67,7 +68,7 @@ export function pageUplink(endpoint: string) {
           endpoint,
         });
       const bytes = Buffer.byteLength(JSON.stringify(command));
-      if (buffered + bytes > maxBytes)
+      if (buffered + bytes > D_ENTRY_PAGE_UPLINK_BYTES)
         throw new RemoteError(
           'gateway/uplink-overflow',
           'Native input is full',

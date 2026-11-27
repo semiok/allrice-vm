@@ -733,16 +733,17 @@ export async function holdReleasedProfile(
       await assertCurrent(current);
       const result =
         'row' in entry
-          ? await readBytes(entry.row, current)
+          ? await readBytes(entry.row, current).then(({ data, media }) => ({
+              data: Buffer.from(data),
+              media,
+            }))
           : await readCombo(
               entry.entries,
               rc2Resource(entry.entries, entry.rev, true),
               current,
             );
       await assertCurrent(current);
-      return 'row' in entry
-        ? { ...result, data: Buffer.from(result.data) }
-        : { data: result.data, media: result.media };
+      return { data: result.data, media: result.media };
     },
     readStatic(path: string, caller: AbortSignal) {
       if (isStatic(path)) return read(path, caller);

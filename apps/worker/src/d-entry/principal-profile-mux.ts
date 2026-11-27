@@ -18,7 +18,10 @@ import {
   DEntryPageUnarySchema,
 } from '@allrice/contracts';
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
-import type { DEntryPageInput } from '@allrice/d-entry-principal/types';
+import {
+  D_ENTRY_PAGE_UPLINK_BYTES,
+  type DEntryPageInput,
+} from '@allrice/d-entry-principal/types';
 import { DataAccessError } from '@allrice/database';
 import { dEntryBearer, dEntryHttpProblem } from './http.js';
 import {
@@ -265,7 +268,7 @@ async function runStreams(
     string,
     {
       cancel(): void;
-      sendInput(input: DEntryPageInput): Promise<void>;
+      sendInput(input: DEntryPageInput): void;
       work: Promise<void>;
     }
   >();
@@ -276,6 +279,25 @@ async function runStreams(
     const controller = new AbortController();
     const child = AbortSignal.any([active, controller.signal]);
     const id = frame.streamId;
+    let settled = false;
+    let buffered = 0;
+    let input = Promise.resolve();
+    let inputError = Promise.resolve();
+
+    function failInput(error: unknown) {
+      if (settled || child.aborted) return;
+      settled = true;
+      controller.abort();
+      inputError = page.assertCurrent(active).then(async () => {
+        active.throwIfAborted();
+        await send({
+          type: 'error',
+          streamId: id,
+          error: pageRemoteFailure(error),
+        });
+      });
+      void inputError.catch((error: unknown) => stop.abort(error));
+    }
     const source = (async () => {
       await page.assertCurrent(child);
       child.throwIfAborted();
@@ -312,12 +334,15 @@ async function runStreams(
         }
         await page.assertCurrent(child);
         child.throwIfAborted();
+        settled = true;
         await send({ type: 'end', streamId: id });
       })
       .catch(async (error) => {
         if (!child.aborted) {
+          if (settled) throw error;
           await page.assertCurrent(child);
           child.throwIfAborted();
+          settled = true;
           await send({
             type: 'error',
             streamId: id,
@@ -325,20 +350,44 @@ async function runStreams(
           });
         }
       })
-      .finally(() => streams.delete(id));
+      .finally(async () => {
+        settled = true;
+        controller.abort();
+        await Promise.allSettled([input, inputError]);
+        streams.delete(id);
+      });
     streams.set(id, {
       work,
       cancel: () => controller.abort(),
-      async sendInput(input) {
-        const stream = await source.catch(() => undefined);
-        if (!stream || child.aborted) return;
-        if (!('send' in stream)) {
-          if (input.type === 'input') throw denied();
-          controller.abort();
+      sendInput(command) {
+        if (settled || child.aborted) return;
+        const bytes = Buffer.byteLength(JSON.stringify(command));
+        if (buffered + bytes > D_ENTRY_PAGE_UPLINK_BYTES) {
+          failInput(
+            new RemoteError('gateway/uplink-overflow', 'Native input is full', {
+              endpoint: frame.endpoint,
+            }),
+          );
           return;
         }
-        await page.assertCurrent(child);
-        if (streams.has(id) && !child.aborted) stream.send(input);
+        buffered += bytes;
+        input = input
+          .then(async () => {
+            if (settled || child.aborted) return;
+            const stream = await source.catch(() => undefined);
+            if (!stream || settled || child.aborted) return;
+            if (!('send' in stream)) {
+              if (command.type === 'input') throw denied();
+              controller.abort();
+              return;
+            }
+            await page.assertCurrent(child);
+            if (!settled && !child.aborted) stream.send(command);
+          })
+          .catch(failInput)
+          .finally(() => {
+            buffered -= bytes;
+          });
       },
     });
     void work.catch((error) => stop.abort(error));
@@ -359,11 +408,11 @@ async function runStreams(
       } else if (frame.type === 'cancel') {
         prior?.cancel();
       } else if (frame.type === 'end') {
-        await prior?.sendInput({ type: 'input-end' });
+        prior?.sendInput({ type: 'input-end' });
       } else {
         if (frame.value !== undefined && !isRemoteJsonValue(frame.value))
           throw denied();
-        await prior?.sendInput({
+        prior?.sendInput({
           type: 'input',
           value: frame.value as JsonValue | undefined,
         });
