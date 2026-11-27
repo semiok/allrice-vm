@@ -321,10 +321,11 @@ async function readSelectedEmployeeAssignment(
     join allrice_employees e on e.id=a.employee_id and e.status='active'
     join allrice_employee_versions v on v.id=a.employee_version_id
     where a.organization_id=${context.organizationId} and a.workspace_id=${workspaceId}
-      and a.user_id=${userId} and a.active and a.is_default
+      and a.user_id=${userId} and a.active
       and not exists(select 1 from allrice_platform_employee_tenant_assignments d
         where d.organization_id=a.organization_id and d.workspace_id=a.workspace_id
           and d.tenant_employee_id=a.employee_id and not d.active)
+    order by a.is_default desc,a.assigned_at,a.id limit 1
   `;
   return row ? mapAssignment(row) : null;
 }
