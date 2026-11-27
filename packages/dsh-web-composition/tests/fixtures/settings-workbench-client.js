@@ -6,7 +6,14 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     const product = require('@allrice/dsh-web-composition');
     return {
-      inject: ['sessions', 'workspaces', 'uiWorkspace', 'theme'],
+      inject: [
+        'sessions',
+        'workspaces',
+        'uiWorkspace',
+        'theme',
+        'conversation',
+        'inputTriggers',
+      ],
       apply(ctx) {
         let opened = false;
         const nativeSession = 'session-00000000-0000-4000-8000-000000000036';
@@ -31,6 +38,25 @@ window.__ModuleLoader__.load({
             },
             setTheme(mode) {
               ctx.theme.setTheme(mode);
+            },
+            async references() {
+              const binding = ctx.sessions.binding(nativeSession);
+              if (!binding) throw Error('Missing native conversation binding');
+              const input = ctx.conversation.input
+                .for(binding.ctx)
+                .state.getSnapshot();
+              const codec = ctx.inputTriggers.sessionOf(binding.ctx);
+              return Promise.all(
+                input.occurrences.map(({ source, ref, label }) =>
+                  codec
+                    .serializeReference(
+                      source,
+                      ref,
+                      new AbortController().signal,
+                    )
+                    .then((text) => ({ label, text })),
+                ),
+              );
             },
           };
         };
