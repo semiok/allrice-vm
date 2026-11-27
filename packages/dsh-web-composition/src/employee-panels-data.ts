@@ -6,6 +6,7 @@ import {
   type EmployeePanelDataHandlers,
   type EmployeePanelDataMethod,
 } from '../../../apps/web/lib/chatflow/employee-panel-data';
+import { employeePanelReferences } from './employee-panel-references';
 import { EmployeePanelsUnavailableError } from './employee-panels-model';
 import type {
   EmployeePanelsPort,
@@ -26,10 +27,14 @@ export function createEmployeePanelsDataPort(
 ): EmployeePanelsPort & {
   dataClient(sessionId: SessionIdOf): EmployeePanelDataClient;
 } {
+  const references = source.useReference
+    ? undefined
+    : employeePanelReferences();
   const snapshots = new Map<
     SessionIdOf,
     {
       original: EmployeePanelsSnapshot;
+      canInsert: boolean;
       value: EmployeePanelsSnapshot;
       controller: AbortController;
       client: EmployeePanelDataClient;
@@ -57,7 +62,9 @@ export function createEmployeePanelsDataPort(
     clear(id);
     if (!original) return null;
     const controller = new AbortController();
-    const raw = resolve(id, original) ?? unboundEmployeePanelDataClient;
+    const resolved = resolve(id, original);
+    const raw = resolved ?? unboundEmployeePanelDataClient;
+    const canInsert = !!resolved && !!references?.matches(id, original);
     if (signal.aborted) return null;
     const current = () => {
       if (
@@ -91,13 +98,22 @@ export function createEmployeePanelsDataPort(
     const client = createEmployeePanelDataClient(handlers);
     const entry = {
       original,
+      canInsert,
       controller,
       client,
       unsubscribe: () => {},
       value: {
         ...original,
-        materials: { ...original.materials, dataClient: client },
-        files: { ...original.files, dataClient: client },
+        materials: {
+          ...original.materials,
+          ...(canInsert && { readOnly: false }),
+          dataClient: client,
+        },
+        files: {
+          ...original.files,
+          ...(canInsert && { readOnly: false }),
+          dataClient: client,
+        },
       },
     };
     snapshots.set(id, entry);
@@ -135,7 +151,15 @@ export function createEmployeePanelsDataPort(
     },
     useReference: source.useReference
       ? (request) => source.useReference!(request)
-      : undefined,
+      : references &&
+        ((request) => {
+          const entry = read(request.sessionId);
+          return (
+            !!entry?.canInsert &&
+            entry.value.scopeKey === request.scopeKey &&
+            references.insert(request)
+          );
+        }),
     // Preview/dialog and the existing upload intake must receive this same
     // scoped client, rather than reconstructing an old route from an object ID.
     dataClient: (id) => read(id)?.client ?? unboundEmployeePanelDataClient,

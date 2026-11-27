@@ -899,6 +899,9 @@ importers:
       '@deepseek-ai/dsh-client-ui-conversation':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)(@types/react@19.2.18)
+      '@deepseek-ai/dsh-client-ui-input-trigger':
+        specifier: 0.2.1-rc.2
+        version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
       '@deepseek-ai/dsh-client-ui-layout':
         specifier: 0.2.1-rc.2
         version: 0.2.1-rc.2(@deepseek-ai/cordis@4.0.5)
