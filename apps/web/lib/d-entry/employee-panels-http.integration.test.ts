@@ -12,8 +12,10 @@ import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
+import { brandMediaModule, brandMediaRelease } from '@allrice/contracts';
 import {
   DataAccessError,
+  addEmployeeInstanceModule,
   createChatSession,
   ensureDEntryNativeRoot,
   readDEntryEmployeeDirectory,
@@ -21,6 +23,8 @@ import {
   updateDEntryReleasePolicy,
   type BuiltinModuleId,
 } from '@allrice/database';
+import { GET as readCapabilityModules } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/modules/route';
+import { GET as readCapabilityBrandMedia } from '../../app/api/v1/d-entry/panels/[panelEmployeeInstanceId]/brand-media/route';
 import { authorizeFixturePlatformAdministrator } from '../../../../packages/database/src/platform-authority.fixture.ts';
 import * as database from '../../../../packages/database/src/core/client.ts';
 import {
@@ -2496,6 +2500,83 @@ suite(
       );
       expect(list.files).toEqual([]);
       expect(list.viewerId).toBe(p.context.actor.id);
+    });
+    it('reads the exact database module binding only from a current 4.0 thread and withholds saved brand data after revocation', async () => {
+      const p = await person();
+      const legacy = await createChatSession(p.context, p.selection, {
+        executionGeneration: '3.x',
+      });
+      await release(p);
+      const native = await createChatSession(p.context, p.selection, {
+        executionGeneration: '4.0',
+      });
+      const instanceId = p.selection.employeeInstanceId;
+      const read = (route: 'modules' | 'brand-media', threadId = native.id) => {
+        const query = new URLSearchParams({
+          workspaceId: p.selection.workspaceId,
+          threadId,
+        });
+        if (route === 'brand-media') query.set('view', 'topics');
+        const handler =
+          route === 'modules'
+            ? readCapabilityModules
+            : readCapabilityBrandMedia;
+        return cookieScope.run(`allrice_session=${p.login.token}`, () =>
+          handler(
+            new Request(
+              `${base}/api/v1/d-entry/panels/${instanceId}/${route}?${query}`,
+              {
+                headers: {
+                  'x-allrice-expected-viewer-id': p.context.actor.id,
+                  'x-allrice-organization-id': p.context.organizationId,
+                  'x-allrice-workspace-id': p.selection.workspaceId,
+                },
+              },
+            ),
+            {
+              params: Promise.resolve({ panelEmployeeInstanceId: instanceId }),
+            },
+          ),
+        );
+      };
+      expect((await read('brand-media')).status).toBe(403);
+      const { binding } = await addEmployeeInstanceModule(p.context, {
+        instanceId,
+        workspaceId: p.selection.workspaceId,
+        release: brandMediaRelease,
+        requestId: randomUUID(),
+      });
+      const installed = await read('modules');
+      expect(installed.status).toBe(200);
+      expect(await installed.json()).toEqual({
+        instanceId,
+        modules: [
+          {
+            displayName: brandMediaModule.displayName,
+            release: binding.release,
+            revision: binding.revision,
+          },
+        ],
+      });
+      expect((await read('modules', legacy.id)).status).toBe(403);
+      const topics = await read('brand-media');
+      expect(topics.status).toBe(200);
+      expect(await topics.json()).toEqual({
+        view: 'topics',
+        items: [],
+        nextCursor: null,
+      });
+
+      await f.db`update allrice_employee_module_bindings set revoked_at=clock_timestamp(),revision=revision+1
+        where organization_id=${p.context.organizationId} and workspace_id=${p.selection.workspaceId}
+          and owner_id=${p.context.actor.id} and instance_id=${instanceId} and module_id=${brandMediaRelease.moduleId}`;
+      const revoked = await read('brand-media');
+      expect(revoked.status).toBe(403);
+      expect(await revoked.json()).not.toHaveProperty('items');
+      expect(await (await read('modules')).json()).toEqual({
+        instanceId,
+        modules: [],
+      });
     });
     it('rejects retained Cookie after actual session or membership revocation', async () => {
       for (const kind of ['session', 'membership'] as const) {
