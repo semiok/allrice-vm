@@ -17,6 +17,7 @@ import {
 import {
   AdoptedHumanSourceProjectionSchema,
   CurrentEmployeeBusinessProjectionSchema,
+  DefaultPartnerProfile,
   LogicalExecutionBindingProjectionSchema,
   RunMemoryContextV2StateSchema,
   renderMemoryDetailV2,
@@ -55,6 +56,10 @@ import {
   ensureBootstrapPortalPrincipal,
 } from './identity.ts';
 import { ensureGeneralEmployeeInstance } from './employees/employee-instances.ts';
+import {
+  createEmployee,
+  updateEmployeeStatus,
+} from './employees/employeehub.ts';
 import { createRuntimeFixtureDatabase } from './runtime.fixture.ts';
 import {
   createChatSession,
@@ -598,7 +603,7 @@ suite(
       }
     }
 
-    async function setup(pairs: PersonalMemoryPair[] = []) {
+    async function setup(pairs: PersonalMemoryPair[] = [], custom = false) {
       const suffix = randomUUID();
       const principal = await ensureBootstrapPortalPrincipal({
         organizationSlug: `native-memory-${suffix}`,
@@ -607,17 +612,21 @@ suite(
         workspaceName: 'Default',
         email: `native-memory-${suffix}@example.test`,
         displayName: 'Owner',
-        role: 'member',
+        role: custom ? 'admin' : 'member',
       });
       const authenticated = (await authenticateSession(
         (await createSession(principal.user.id)).token,
         principal,
       ))!;
       const context = { ...authenticated, workspaceId: principal.workspaceId };
-      const assignment = await ensureDefaultEmployee(
-        context,
-        principal.workspaceId,
-      );
+      const assignment = custom
+        ? await createEmployee(context, {
+            workspaceId: principal.workspaceId,
+            name: 'Memory archive test employee',
+            description: 'Candidate write while the employee is archived',
+            partnerProfile: DefaultPartnerProfile,
+          })
+        : await ensureDefaultEmployee(context, principal.workspaceId);
       if (!assignment) throw Error('fixture_assignment_required');
       await ensureGeneralEmployeeInstance(database.db, assignment.id);
       const f = await new MissingProducerOwnerContractFixture(context, {
@@ -825,6 +834,97 @@ suite(
       await expect(run(read)).rejects.toMatchObject({
         code: 'authorization_denied',
       });
+    });
+
+    it('commits the admitted candidate before the real employee archive without a foreign-key lock inversion', async () => {
+      const f = await setup([], true);
+      const entered = gate();
+      const release = gate();
+      releases.push(() => release.resolve());
+      ownerFixture.assembly = {
+        current: f.current.bind(f),
+        async bind(...args) {
+          const reads = await f.bind(...args);
+          return {
+            ...reads,
+            async adopted(selector) {
+              const source = await reads.adopted(selector);
+              entered.resolve();
+              await release.promise;
+              return source;
+            },
+          };
+        },
+      };
+      const candidate = track(f.remember());
+      await Promise.race([
+        entered.promise,
+        candidate.then(() => {
+          throw Error('candidate returned before its insert was held');
+        }),
+      ]);
+
+      const applicationName = `memory-archive-writer:${randomUUID().slice(0, 8)}`;
+      const writer = client.createDedicatedDatabase({
+        options: {
+          ...database.db.options,
+          connection: {
+            ...database.db.options.connection,
+            application_name: applicationName,
+          },
+        },
+      });
+      try {
+        vi.spyOn(client, 'getDatabase').mockReturnValueOnce(writer);
+        const archive = track(
+          updateEmployeeStatus(f.context, f.scope.employeeId, {
+            workspaceId: f.scope.workspaceId,
+            status: 'archived',
+          }),
+        );
+        await expect
+          .poll(async () => {
+            const [blocked] = await database.db`
+            select 1 from pg_stat_activity
+            where application_name=${applicationName}
+            and ${f.pids[0]!}=any(pg_blocking_pids(pid))
+          `;
+            return Boolean(blocked);
+          })
+          .toBe(true);
+        release.resolve();
+        const outcomes = await Promise.allSettled([candidate, archive]);
+        expect(outcomes).toEqual([
+          {
+            status: 'fulfilled',
+            value: expect.objectContaining({
+              state: 'pending',
+              requiresConfirmation: true,
+            }),
+          },
+          { status: 'fulfilled', value: undefined },
+        ]);
+        expect(await effects(f)).toEqual({
+          memories: 1,
+          revisions: 1,
+          audits: 1,
+          operations: 1,
+        });
+        await expect(
+          f.remember({ summary: 'after archive', details: null }),
+        ).rejects.toMatchObject({
+          code: 'authorization_denied',
+        });
+        expect(await effects(f)).toEqual({
+          memories: 1,
+          revisions: 1,
+          audits: 1,
+          operations: 1,
+        });
+      } finally {
+        release.resolve();
+        await writer.end({ timeout: 2 });
+      }
     });
 
     it('pins the original adopted app version separately from current availability and config edits', async () => {
