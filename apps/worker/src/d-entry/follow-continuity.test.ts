@@ -60,9 +60,11 @@ function chunk(index: number): SessionFollowFrame {
   };
 }
 
-async function connect(f: Awaited<ReturnType<typeof fixture>>) {
-  const life = await open(f);
-  const peer = f.connect(life.scopeId);
+async function connect(
+  f: Awaited<ReturnType<typeof fixture>>,
+  scopeId?: string,
+) {
+  const peer = f.connect(scopeId ?? (await open(f)).scopeId);
   const next = messages(peer);
   await once(peer, 'open');
   return {
@@ -564,12 +566,25 @@ it('drains a normally completed follow and joins its close before reporting end'
   expect(await end).toMatchObject({ type: 'end' });
 });
 
-it('continues to await Worker close after rejecting guest follow input', async () => {
-  const f = await fixture();
-  const { scopeId } = await open(f);
-  const handle = TYPERT_REMOTE.methods['allricePrincipal/streamScoped'].invoke(
-    f.host.node.remote,
-    {
+it.each(['invalid input', 'uplink EOF'] as const)(
+  'fences a follow on %s without losing its sibling',
+  async (fault) => {
+    const f = await fixture();
+    observe(f);
+    const releaseSibling = deferred();
+    closes.push(async () => releaseSibling.resolve());
+    f.host.catalog.followFrames = async function* (id) {
+      if (id === 'other') {
+        await releaseSibling.promise;
+        yield chunk(7);
+      }
+    };
+    const { scopeId } = await open(f);
+    const channel = await connect(f, scopeId);
+    await channel.follow('other');
+    const handle = TYPERT_REMOTE.methods[
+      'allricePrincipal/streamScoped'
+    ].invoke(f.host.node.remote, {
       call: {
         kind: 'page',
         scopeId,
@@ -577,32 +592,49 @@ it('continues to await Worker close after rejecting guest follow input', async (
         args: { request: { address: { kind: 'session', sessionId: 'root' } } },
         followId: randomUUID(),
       },
-    },
-  );
-  const receive = handle[Symbol.asyncIterator]();
-  try {
-    expect(await receive.next()).toMatchObject({
-      value: { type: 'page-item' },
     });
-    handle.send({ type: 'input', value: 'this stream is read only' });
-    expect(await receive.next()).toMatchObject({
-      value: {
-        type: 'page-error',
-        error: { code: 'gateway/protocol' },
-      },
-    });
-    const closed = receive.next();
-    expect(
-      await Promise.race([closed.then(() => 'closed'), nextTurn('pending')]),
-    ).toBe('pending');
-    handle.send('close');
-    handle.end();
-    expect(await closed).toMatchObject({ value: { type: 'closed' } });
-    expect(await receive.next()).toMatchObject({ done: true });
-  } finally {
-    handle.dispose();
-  }
-});
+    const receive = handle[Symbol.asyncIterator]();
+    try {
+      expect(await receive.next()).toMatchObject({
+        value: { type: 'page-item' },
+      });
+      if (fault === 'invalid input')
+        handle.send({ type: 'input', value: 'this stream is read only' });
+      else handle.end();
+      expect(await receive.next()).toMatchObject({
+        value: {
+          type: 'page-error',
+          error: {
+            code:
+              fault === 'invalid input'
+                ? 'gateway/protocol'
+                : 'remote-access/denied',
+          },
+        },
+      });
+      const closed = receive.next();
+      if (fault === 'invalid input') {
+        expect(
+          await Promise.race([
+            closed.then(() => 'closed'),
+            nextTurn('pending'),
+          ]),
+        ).toBe('pending');
+        handle.send('close');
+        handle.end();
+      }
+      expect(await closed).toMatchObject({ value: { type: 'closed' } });
+      expect(await receive.next()).toMatchObject({ done: true });
+      releaseSibling.resolve();
+      expect(await channel.next('other')).toMatchObject({
+        type: 'item',
+        value: chunk(7),
+      });
+    } finally {
+      handle.dispose();
+    }
+  },
+);
 
 it('refuses to follow on an owner that cannot report native child withdrawal', async () => {
   const f = await fixture();
