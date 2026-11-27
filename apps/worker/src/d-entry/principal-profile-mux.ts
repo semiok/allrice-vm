@@ -338,8 +338,9 @@ async function runStreams(
         await send({ type: 'end', streamId: id });
       })
       .catch(async (error) => {
-        if (!child.aborted) {
-          if (settled) throw error;
+        if (child.aborted) return;
+        if (settled) throw error;
+        try {
           await page.assertCurrent(child);
           child.throwIfAborted();
           settled = true;
@@ -348,6 +349,8 @@ async function runStreams(
             streamId: id,
             error: pageRemoteFailure(error),
           });
+        } catch (failure) {
+          if (!child.aborted) throw failure;
         }
       })
       .finally(async () => {

@@ -1405,6 +1405,9 @@ it('carries native terminal input, resize and output across the owned VM stream'
   const wire = host.typertGateway.wireStream;
   const dispatch = wire.open.bind(wire);
   const inputs: unknown[] = [];
+  const fault = deferred();
+  const brokenId = 'native-error';
+  closes.push(async () => fault.resolve());
   const attach = vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
     if (args[0] !== 'terminal/attach') return dispatch(...args);
     return (async function* () {
@@ -1424,6 +1427,10 @@ it('carries native terminal input, resize and output across the owned VM stream'
           exitCode: null,
         },
       };
+      if ((args[1] as typeof payload).args.id === brokenId) {
+        await fault.promise;
+        throw new RemoteError('terminal/unavailable', 'Fixture error', {});
+      }
       for await (const raw of args[2]) {
         inputs.push(inputCodec.parse(raw));
       }
@@ -1487,20 +1494,39 @@ it('carries native terminal input, resize and output across the owned VM stream'
     type: 'item',
     value: { type: 'snapshot' },
   });
-  const checking = deferred();
-  const interrupted = deferred();
-  vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
-    async (_context, signal) => {
-      checking.resolve();
-      if (!signal.aborted) await once(signal, 'abort');
-      interrupted.resolve();
-      signal.throwIfAborted();
-    },
-  );
+  function holdCurrentCheck() {
+    const checking = deferred();
+    const interrupted = deferred();
+    vi.mocked(f.owner.assertCurrent).mockImplementationOnce(
+      async (_context, signal) => {
+        checking.resolve();
+        if (!signal.aborted) await once(signal, 'abort');
+        interrupted.resolve();
+        signal.throwIfAborted();
+      },
+    );
+    return { checking, interrupted };
+  }
+  const inputCheck = holdCurrentCheck();
   send(peer, { type: 'item', streamId: cancelled, value: write });
-  await checking.promise;
+  await inputCheck.checking.promise;
   send(peer, { type: 'cancel', streamId: cancelled });
-  await interrupted.promise;
+  await inputCheck.interrupted.promise;
+  send(peer, {
+    type: 'open',
+    streamId: brokenId,
+    endpoint: 'terminal/attach',
+    payload: { args: { ...payload.args, id: brokenId } },
+  });
+  expect(await receive(brokenId)).toMatchObject({
+    type: 'item',
+    value: { type: 'snapshot' },
+  });
+  const outputCheck = holdCurrentCheck();
+  fault.resolve();
+  await outputCheck.checking.promise;
+  send(peer, { type: 'cancel', streamId: brokenId });
+  await outputCheck.interrupted.promise;
   send(peer, {
     type: 'open',
     streamId: 'still-open',
@@ -2349,12 +2375,13 @@ it(
     });
     expect(bad.status).toBe(404);
     await bad.body?.cancel();
-    const terminal = graph.entries.find(
+    const terminalModule = graph.entries.find(
       ({ id }) => id === '@deepseek-ai/dsh-client-ui-sidebar-terminal',
     );
-    if (!terminal) throw Error('Native terminal missing from sealed graph');
-    const chunk = `plugins/${terminal.id}/client.terminal.js?rev=${terminal.rev}`;
-    const loadChunk = (reference: string, revision = terminal.rev) =>
+    if (!terminalModule)
+      throw Error('Native terminal missing from sealed graph');
+    const chunk = `plugins/${terminalModule.id}/client.terminal.js?rev=${terminalModule.rev}`;
+    const loadChunk = (reference: string, revision = terminalModule.rev) =>
       f.publish('assets', scopeId, {
         bindingRef: f.owner.bindingRef,
         reference,
