@@ -135,6 +135,7 @@ export type ProductionPersonVmHostSources = Readonly<{
       transport?: Readonly<{
         fetchOwned: NonNullable<GatewayProvider['fetchOwned']>;
         beforeDispatch?: GatewayProvider['assertDispatchCurrent'];
+        confirmClosed?: GatewayProvider['confirmTransportClosed'];
         close(): Promise<void>;
         stoppedEvidence(ownerId: string, signal: AbortSignal): Promise<string>;
       }>;
@@ -772,6 +773,7 @@ export function createProductionPersonVmHost(input: {
             modelSource.transport?.fetchOwned,
             modelSource.transport?.beforeDispatch,
             modelSource.scopeStream,
+            modelSource.transport?.confirmClosed,
           ),
         store: storeModel,
         confirmTransportStopped:

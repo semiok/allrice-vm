@@ -161,6 +161,9 @@ export function createMeteredTransport(options: {
       };
       const observer = new WireUsageObserver(classification.protocol);
       const nativeClose = observeNativeClose();
+      const confirmedClose = async () =>
+        (await nativeClose.confirmed()) ||
+        (await options.provider.confirmTransportClosed?.()) === true;
       let started = false;
       let dispatched = false;
       let transportJoined = false;
@@ -316,11 +319,11 @@ export function createMeteredTransport(options: {
             // reader.cancel is awaited; an abort request alone never releases a slot.
             try {
               await reader.cancel(requestSignal.reason);
-              if (requireCloseProof && !(await nativeClose.confirmed()))
+              if (requireCloseProof && !(await confirmedClose()))
                 throw new ModelGatewayError('LEDGER_UNAVAILABLE');
               transportJoined = true;
             } catch (error) {
-              if (await nativeClose.confirmed()) {
+              if (await confirmedClose()) {
                 transportJoined = true;
                 cleanup();
                 await finish(
@@ -431,7 +434,7 @@ export function createMeteredTransport(options: {
         // the dispatched request stopped. Use the same real native close facts
         // as the reader path; keep unknown wire facts and its exact slot.
         if (dispatched && !transportJoined) {
-          transportJoined = await nativeClose.confirmed();
+          transportJoined = await confirmedClose();
           if (!transportJoined) {
             closureKnown = false;
             ledgerFailure ??= error;

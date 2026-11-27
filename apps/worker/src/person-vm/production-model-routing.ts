@@ -82,12 +82,26 @@ type Runtime = Awaited<
 >;
 type VmOwner = Pick<PersonVmBinding, 'personId' | 'organizationId'>;
 
+function rejectCredentialText(value: string) {
+  const hostKeys = [
+    process.env.ALLRICE_OPENAI_API_KEY,
+    process.env.ALLRICE_DEEPSEEK_API_KEY,
+  ];
+  if (hostKeys.some((key) => key && key.trim() && value.includes(key.trim())))
+    throw new ModelGatewayError('BINDING_INVALID');
+}
+
 function readConfig() {
   const source = process.env.ALLRICE_DSH_MODEL_ROUTES;
   if (source === undefined) return;
   if (source.length <= 256 * 1024) {
     try {
       const config = routesSchema.parse(JSON.parse(source));
+      for (const route of config.routes) rejectCredentialText(route.model);
+      for (const rule of config.rules) {
+        if (rule.sessionId) rejectCredentialText(rule.sessionId);
+        if (rule.parentSessionId) rejectCredentialText(rule.parentSessionId);
+      }
       if (
         new Set(config.routes.map(({ id }) => id)).size !==
           config.routes.length ||
@@ -154,8 +168,20 @@ export async function createProductionModelRouting(
     process.env.ALLRICE_DSH_MODEL_PROVIDER ?? 'openai-codex';
   if (defaultProvider !== 'openai-codex' && defaultProvider !== 'openai')
     throw new ModelGatewayError('BINDING_INVALID');
+  const defaultModel =
+    defaultProvider === 'openai'
+      ? process.env.ALLRICE_DSH_OPENAI_MODEL
+      : (process.env.ALLRICE_DSH_CODEX_MODEL ??
+        process.env.ALLRICE_CODEX_MODEL);
+  if (defaultModel) rejectCredentialText(defaultModel);
   const fallback = await (defaultProvider === 'openai'
-    ? createProductionOpenAiRuntime(lifetime, ownerId, readModelImage)
+    ? createProductionOpenAiRuntime(
+        lifetime,
+        ownerId,
+        readModelImage,
+        undefined,
+        config !== undefined,
+      )
     : createProductionCodexRuntime(lifetime, ownerId, readModelImage));
   const runtimes: Runtime[] = [fallback];
   const definitions = new Map<string, ModelRouteKey>([
@@ -260,21 +286,15 @@ export async function createProductionModelRouting(
         }
       })();
     }
-    function select(
-      binding: VmOwner,
-      native: ModelCallBinding['native'],
-      requested?: ModelRouteKey,
-    ) {
+    function select(binding: VmOwner, native: ModelCallBinding['native']) {
       const rules = rulesFor(binding);
       const kind = native.attemptKind;
       if (kind === 'compaction' || kind === 'session-title') {
         const explicit = rules.find(({ attempt }) => attempt === kind);
         if (explicit)
           return { provider: explicit.provider, model: explicit.model };
-        // Native maintenance may inherit the last assistant route, or the
-        // configured fallback before any assistant request exists.
-        if (requested && sameModelRoute(requested, fallback.route))
-          return fallback.route;
+        // Inherited maintenance is only allowed on the same policy route as
+        // its native session. The Guest cannot request a different fallback.
         return selectScopedModel(
           rules,
           { ...native, attemptKind: 'assistant' },
@@ -294,6 +314,7 @@ export async function createProductionModelRouting(
               transport.fetchOwned,
               transport.beforeDispatch,
               scopeStream,
+              transport.confirmClosed,
             ),
           ] as const,
       ),
@@ -305,7 +326,7 @@ export async function createProductionModelRouting(
       select,
       applies: (binding: VmOwner) => rulesFor(binding).length > 0,
       provider(call: ModelCallBinding) {
-        if (!sameModelRoute(select(call.vm, call.native, call), call))
+        if (!sameModelRoute(select(call.vm, call.native), call))
           throw new ModelGatewayError('BINDING_INVALID');
         const runtime = runtimeFor(call);
         if (retired.has(runtime))
@@ -313,7 +334,7 @@ export async function createProductionModelRouting(
         return providers.get(runtime.route)!;
       },
       async assertCurrent(call: ModelCallBinding, signal: AbortSignal) {
-        if (!sameModelRoute(select(call.vm, call.native, call), call))
+        if (!sameModelRoute(select(call.vm, call.native), call))
           throw new ModelGatewayError('BINDING_INVALID');
         const runtime = runtimeFor(call);
         if (retired.has(runtime))

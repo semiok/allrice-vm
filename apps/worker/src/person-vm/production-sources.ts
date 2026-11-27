@@ -94,7 +94,7 @@ export function createProductionPersonVmSources(
           modelAuthority: authority,
           modelRoute: routing.scoped
             ? (call) =>
-                sameModelRoute(call, routing.select(call.vm, call.native, call))
+                sameModelRoute(call, routing.select(call.vm, call.native))
             : modelRuntime.route,
           lifetime,
         });

@@ -41,6 +41,7 @@ export async function createProductionOpenAiRuntime(
   ownerId: string,
   readModelImage?: ReadProductionModelImage,
   configured?: ManagedApiRoute,
+  allowUnavailable = false,
 ) {
   lifetime.throwIfAborted();
   const provider = configured?.provider ?? 'openai';
@@ -70,7 +71,8 @@ export async function createProductionOpenAiRuntime(
       : 'ALLRICE_DEEPSEEK_API_KEY';
   const key = process.env[keyName];
   const credential = key && key.trim() === key ? key : undefined;
-  if (!configured && !credential)
+  const requireCredentialAtBoot = !configured && !allowUnavailable;
+  if (requireCredentialAtBoot && !credential)
     throw new ModelGatewayError('AUTHORIZATION_DENIED');
 
   const route: DshGatewayRoute = Object.freeze({
@@ -158,6 +160,18 @@ export async function createProductionOpenAiRuntime(
                 ...(provider === 'deepseek'
                   ? { reasoningEfforts: false as const }
                   : {}),
+                ...(provider === 'openai' && model === 'gpt-6.2-astra'
+                  ? {
+                      contextWindow: 1050000,
+                      input: ['text', 'image'],
+                      reasoningEfforts: {
+                        low: 'low',
+                        medium: 'medium',
+                        high: 'high',
+                        xhigh: 'xhigh',
+                      },
+                    }
+                  : {}),
               },
             ],
           },
@@ -169,7 +183,7 @@ export async function createProductionOpenAiRuntime(
       model,
       revoked,
     );
-    if (!configured) await assertCurrent();
+    if (requireCredentialAtBoot) await assertCurrent();
     const llm: Pick<LlmRuntime, 'prepareCall'> = {
       async prepareCall(config, signal) {
         if (config.provider !== provider || config.model !== model)

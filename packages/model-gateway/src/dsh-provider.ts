@@ -57,6 +57,7 @@ export function createDshGatewayProvider(
   fetchOwned?: GatewayProvider['fetchOwned'],
   assertDispatchCurrent?: GatewayProvider['assertDispatchCurrent'],
   scopeStream?: DshGatewayStreamScope,
+  confirmTransportClosed?: GatewayProvider['confirmTransportClosed'],
 ): GatewayProvider {
   return {
     classify: route.classify,
@@ -71,6 +72,7 @@ export function createDshGatewayProvider(
     ...(fetchOwned ? { requireTransportProof: true as const } : {}),
     fetchOwned,
     assertDispatchCurrent,
+    confirmTransportClosed,
     async *stream(binding, input, signal) {
       if (
         binding.provider !== route.provider ||

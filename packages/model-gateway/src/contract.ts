@@ -128,6 +128,8 @@ export interface GatewayProvider {
   readonly hostedWebSearch?: ModelRouteKey;
   /** Require a confirmed native transport close on every cancellation. */
   readonly requireTransportProof?: true;
+  /** Exact owned dispatcher was destroyed and joined. False if still open. */
+  confirmTransportClosed?(): Promise<boolean>;
   /** Optional exact Host-owned transport. Only the gateway calls it after it
    * has committed the metered attempt. No Guest data selects the dispatcher. */
   assertDispatchCurrent?(signal: AbortSignal): Promise<void>;

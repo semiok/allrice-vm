@@ -1164,7 +1164,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 attemptCursor: attempt.cursor,
               };
               const selectedRoute =
-                input.scoped?.select(binding, native, wanted) ?? input.route;
+                input.scoped?.select(binding, native) ?? input.route;
               if (!sameModelRoute(wanted, selectedRoute)) return reject();
               matched = {
                 scope,

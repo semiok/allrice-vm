@@ -165,6 +165,100 @@ it('selects only trusted tenant/person rules in order for exact sessions, child 
   );
 });
 
+it('inherited maintenance follows the Host session route, with fallback only for an unmatched cold session', async () => {
+  const { root, base } = routeFixture();
+  const config = JSON.parse(process.env.ALLRICE_DSH_MODEL_ROUTES!);
+  config.rules = config.rules.filter(
+    ({ attempt }: { attempt?: string }) =>
+      attempt !== 'session-title' && attempt !== 'compaction',
+  );
+  vi.stubEnv('ALLRICE_DSH_MODEL_ROUTES', JSON.stringify(config));
+  const signal = new AbortController().signal;
+  const routing = await createProductionModelRouting(
+    signal,
+    'routing-fixture',
+    async () => {
+      throw new Error('fixture does not read images');
+    },
+  );
+  cleanups.push(routing.close);
+  for (const attemptKind of ['compaction', 'session-title'] as const) {
+    const native = { ...root.native, attemptKind };
+    expect(routing.select(root.vm, native)).toEqual(modelRoutes.openai);
+    await expect(
+      routing.assertCurrent({ ...root, ...fallback, native }, signal),
+    ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+    await expect(
+      routing.assertCurrent({ ...root, native }, signal),
+    ).resolves.toMatchObject({ aborted: false });
+    expect(
+      routing.select(base.vm, { ...base.native, attemptKind }),
+    ).toMatchObject(fallback);
+  }
+});
+
+it('refuses a configured Host key pasted into any Guest model or session selector', async () => {
+  routeFixture();
+  const config = JSON.parse(process.env.ALLRICE_DSH_MODEL_ROUTES!);
+  function mutate(field: 'model' | 'sessionId' | 'parentSessionId') {
+    const copy = structuredClone(config);
+    const row = field === 'model' ? copy.routes[0] : copy.rules[0];
+    row[field] = deepSeekKey;
+    vi.stubEnv('ALLRICE_DSH_MODEL_ROUTES', JSON.stringify(copy));
+    return createProductionModelRouting(
+      new AbortController().signal,
+      'routing-fixture',
+      async () => {
+        throw new Error('fixture does not read images');
+      },
+    );
+  }
+  for (const field of ['model', 'sessionId', 'parentSessionId'] as const)
+    await expect(mutate(field)).rejects.toMatchObject({
+      code: 'BINDING_INVALID',
+    });
+});
+
+it('isolates a missing opt-in OpenAI default key and publishes true Astra capabilities', async () => {
+  const { base, chat } = routeFixture();
+  vi.stubEnv('ALLRICE_DSH_MODEL_PROVIDER', 'openai');
+  vi.stubEnv('ALLRICE_DSH_OPENAI_MODEL', 'gpt-6.2-astra');
+  vi.stubEnv('ALLRICE_OPENAI_API_KEY', undefined);
+  const signal = new AbortController().signal;
+  const create = () =>
+    createProductionModelRouting(signal, 'routing-fixture', async () => {
+      throw new Error('fixture does not read images');
+    });
+  const routing = await create();
+  cleanups.push(routing.close);
+  expect(
+    (await routing.guestCatalog(base.vm, signal))?.defaultModelInfo,
+  ).toMatchObject({
+    provider: 'openai',
+    id: 'gpt-6.2-astra',
+    context: { contextWindow: 1050000 },
+    inputModalities: ['text', 'image'],
+    reasoning: {
+      efforts: expect.arrayContaining([
+        expect.objectContaining({ id: 'high' }),
+      ]),
+    },
+  });
+  await expect(
+    routing.assertCurrent(
+      { ...base, provider: 'openai', model: 'gpt-6.2-astra' },
+      signal,
+    ),
+  ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
+  await expect(routing.assertCurrent(chat, signal)).resolves.toMatchObject({
+    aborted: false,
+  });
+  vi.stubEnv('ALLRICE_DSH_MODEL_ROUTES', undefined);
+  await expect(create()).rejects.toMatchObject({
+    code: 'AUTHORIZATION_DENIED',
+  });
+});
+
 it('exposes only approved hosted search with a matching protocol and model, on exact official endpoints', async () => {
   const { chat, responses } = routeFixture();
   const signal = new AbortController().signal;
@@ -393,9 +487,23 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
   });
   const url = await listen(upstream);
   cleanups.push(() => closeServer(upstream));
+  const beforeConnect = deferred();
+  let holdBeforeConnect = false;
   const fixtureFetch = globalThis.fetch;
   vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
     const href = input instanceof Request ? input.url : String(input);
+    if (
+      href === origins.chat &&
+      input instanceof Request &&
+      holdBeforeConnect
+    ) {
+      beforeConnect.resolve();
+      return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(input.signal.reason);
+        if (input.signal.aborted) abort();
+        else input.signal.addEventListener('abort', abort, { once: true });
+      });
+    }
     const match = Object.entries(origins).find(
       ([, endpoint]) => endpoint === href,
     );
@@ -415,10 +523,11 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     freshCall(calls.chat),
     calls.responses,
     calls.root,
+    freshCall(calls.chat),
     { ...calls.responses, model: 'unapproved' },
   ];
   const signals = new Map<string, AbortSignal>();
-  for (const call of queue.slice(0, 4))
+  for (const call of queue.slice(0, 5))
     signals.set(
       call.native.callId,
       await routing.assertCurrent(call, new AbortController().signal),
@@ -473,10 +582,22 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
   const openai = gateway.collect();
   void openai.catch(() => {});
   await opened.openai.promise;
-  expect(gateway.store.slots.get(calls.base.vm.personId)?.size).toBe(3);
+  holdBeforeConnect = true;
+  const connecting = gateway.collect().catch(() => null);
+  await beforeConnect.promise;
+  expect(gateway.store.slots.get(calls.base.vm.personId)?.size).toBe(4);
   await publishRevocations(['chat']);
   await chatClosed.promise;
-  await chat;
+  await Promise.all([chat, connecting]);
+  expect(gateway.store.slots.get(calls.base.vm.personId)?.size).toBe(2);
+  const canceledChat = [...gateway.store.rows.values()].filter(
+    (row) =>
+      row.protocol === 'openai-chat-completions' && row.outcome === 'canceled',
+  );
+  expect(canceledChat).toHaveLength(2);
+  expect(
+    canceledChat.some((row) => row.httpStatus === null && row.dispatchObserved),
+  ).toBe(true);
   await expect(
     routing.assertCurrent(calls.chat, new AbortController().signal),
   ).rejects.toMatchObject({ code: 'AUTHORIZATION_DENIED' });
@@ -527,7 +648,7 @@ it('uses native Chat and Responses adapters with one metering owner and joins on
     authorization: 'Bearer ' + openAiKey,
     body: { model: modelRoutes.openai.model, tools: [{ type: 'function' }] },
   });
-  expect(gateway.store.rows.size).toBe(4);
+  expect(gateway.store.rows.size).toBe(5);
   expect(
     [...gateway.store.rows.values()].map((row) => {
       const binding = gateway.store.calls.get(row.callId)!.binding;
