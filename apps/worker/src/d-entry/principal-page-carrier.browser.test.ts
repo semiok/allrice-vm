@@ -28,14 +28,19 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it
-  .skipIf(!browserExecutable)
-  .each(['attached', 'unattached', 'stall', 'native-create'] as const)(
+it.skipIf(!browserExecutable).each([
+  'attached',
+  'unattached',
+  'stall',
+  'native-create',
+  // Exercise the Linux web profile on the Mac M5 browser as well as CI.
+  ...(process.platform === 'darwin' ? (['native-create-linux'] as const) : []),
+] as const)(
   'rc.2 workspace/follow and the blank composer (%s)',
   { timeout: 60_000 },
   async (scenario) => {
     const stall = scenario === 'stall';
-    const nativeCreate = scenario === 'native-create';
+    const nativeCreate = scenario.startsWith('native-create');
     const release = await buildProfileFixture();
     const manifest: { files: { path: string }[] } = JSON.parse(
       await readFile(join(release.directory, 'artifact.json'), 'utf8'),
@@ -360,12 +365,29 @@ it
     const page = await context.newPage();
     if (nativeCreate) {
       // rc.2 restores its saved desktop selection before this test's shortcut.
-      await page.addInitScript(() => {
+      await page.addInitScript((linuxProfile) => {
+        if (linuxProfile)
+          Object.defineProperty(navigator, 'platform', {
+            value: 'Linux x86_64',
+          });
         localStorage.setItem(
           'dsh.sessions.current',
           JSON.stringify({ sessionId: 'root' }),
         );
-      });
+        // rc.2 defines this native command on every platform but provides no
+        // default binding for web:linux. Use its own per-profile preferences.
+        localStorage.setItem(
+          'dsh.keybindings.v1',
+          JSON.stringify({
+            schemaVersion: 1,
+            profiles: {
+              'web:linux': {
+                'session.new': { code: 'KeyN', modifiers: ['primary', 'alt'] },
+              },
+            },
+          }),
+        );
+      }, scenario === 'native-create-linux');
     }
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
@@ -489,14 +511,19 @@ it
       await workbench.locator('#app').evaluate((node, mark) => {
         node.dataset.fixtureDocument = mark;
       }, mark);
-      await editor.focus();
-      await page.keyboard.press(
-        process.platform === 'darwin' ? 'Meta+Alt+N' : 'Control+Alt+N',
+      const platform = await editor.evaluate(
+        (node) => node.ownerDocument.defaultView!.navigator.platform,
       );
-      await expect
-        .poll(() => unary.includes('session/create'), { timeout: 15_000 })
-        .toBe(true);
+      if (scenario === 'native-create-linux')
+        expect(platform).toBe('Linux x86_64');
+      const chord = /darwin|mac|iphone|ipad/iu.test(platform)
+        ? 'Meta+Alt+N'
+        : 'Control+Alt+N';
       try {
+        await editor.press(chord, { timeout: 10_000 });
+        await expect
+          .poll(() => unary.includes('session/create'), { timeout: 15_000 })
+          .toBe(true);
         await page.waitForURL(
           (url) => url.searchParams.get('threadId') === createdThread,
           { timeout: 20_000 },
@@ -504,6 +531,8 @@ it
       } catch (error) {
         throw new Error(
           JSON.stringify({
+            platform,
+            chord,
             registered,
             createReplies,
             unary,
