@@ -63,7 +63,7 @@ CallToolResultSchema 保原生 text/image/resource/structuredContent，不替业
 
 | 面               | M1 实际边界                                                                                                                                                       |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 后端/私有数据    | `allrice-server.ts` 与 owner 的三个公开薄出口；复用原资料、记忆、成果 carrier，不拥有其他模块全表；新增数据为 none。                                              |
+| 后端/私有数据    | `allrice-server.ts` 提供资料、记忆和成果接缝。旧测试载体只保留记忆和成果，资料直接复用 owner 的现有读取验证。无新增数据。                                         |
 | MCP              | 一个受管连接一个 SDK server；identity_read、reference_read、memory_read、deliverable_create；只公布已绑定 service 且当前模块有资格的工具。                        |
 | 员工 UI          | none：本卡没有 UI 变更；完整 rev2 业务面仍为 MET-282/284，不取消该需求。                                                                                          |
 | 后台 UI          | none：本卡不提供管理员管理/写入；完整管理仍由 MET-281/283/288 等交付。                                                                                            |
@@ -73,14 +73,13 @@ CallToolResultSchema 保原生 text/image/resource/structuredContent，不替业
 
 ## 公开符号 allowlist 与既有合同映射
 
-这些是已批准三 Port 的 **M1 子集与 legacy 迁移适配**，不是整个 proposed Port 已完成。worker 只从 `@allrice/database` 导入以下符号；原有 barrel 的其他导出没有因此成为跨模块许可。
+以下是 3.x 锁定的记忆和成果测试载体仍需的公开符号。资料沿 owner 测试验证真实读取与回执，4.0 MCP 协议测试继续覆盖 `reference_read`。原有 barrel 的其他导出没有因此成为跨模块许可。
 
-| 允许符号/方法                                                                 | input/result/error 与实际 owner 原语                                                                                                                                                                                          |
-| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LegacyMcpExecution`                                                          | host-only 真 3.x ExecutionContext、session 与精确 worker/job/lease/attempt；schema parse 不认证，实际原语查持久权威。不能标成 4.0。                                                                                           |
-| `createLegacyEnterpriseMaterialsMcpPort().readExact`                          | ReferenceReadInputSchema → executeEmployeeReferenceTool 的原 modelContent（实际正文、精确 source/revision/manifest digest/file checksum、committed citation ID）。不新造 receipt；完整 ReferenceRead 仍在 owner 真实 ledger。 |
-| `createLegacyEmployeeMemoryMcpPort().readOrdinal`                             | MemoryOrdinalInputSchema → readRunMemoryOrdinal 的原 renderMemoryDetailV2 文本。issued pin、revision/pairDigest、active/current scope、真实 UTF-8 budget 均由原服务核验；MCP 不添加猜测的结构化 pin/hash。                    |
-| `PreparedMcpDeliverable`、`createLegacyDeliverablesMcpPort().publishPrepared` | host-only 真实生成 bytes、既有 source/Office receipt → publishWorkbenchArtifact 的真实 immutable object/series/version/receipt。返回 persisted normalized object.checksum，不把输入 hash 当落库 hash；不降为 user-upload。    |
+| 允许符号/方法                                                                 | input/result/error 与实际 owner 原语                                                                                                                                                                                       |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LegacyMcpExecution`                                                          | host-only 真 3.x ExecutionContext、session 与精确 worker/job/lease/attempt；schema parse 不认证，实际原语查持久权威。不能标成 4.0。                                                                                        |
+| `createLegacyEmployeeMemoryMcpPort().readOrdinal`                             | MemoryOrdinalInputSchema → readRunMemoryOrdinal 的原 renderMemoryDetailV2 文本。issued pin、revision/pairDigest、active/current scope、真实 UTF-8 budget 均由原服务核验；MCP 不添加猜测的结构化 pin/hash。                 |
+| `PreparedMcpDeliverable`、`createLegacyDeliverablesMcpPort().publishPrepared` | host-only 真实生成 bytes、既有 source/Office receipt → publishWorkbenchArtifact 的真实 immutable object/series/version/receipt。返回 persisted normalized object.checksum，不把输入 hash 当落库 hash；不降为 user-upload。 |
 
 公开 schema 全沿 `@allrice/contracts` ApiVersion=v1、ContractVersion=1、CompatibilityPolicy rolling [1]；业务记忆为既有 V2 schema，原生 DSH 为当前单代。ReferenceReadSchema 强制 Run/generation/job/worker，RunMemoryContextV2StateSchema 强制 issued pins/预算，WorkbenchArtifact publisher 强制当前 Run/call；没有为 4.0 伪造这些字段。真实源码基线 `ec13399e7abcff68a6fae419c46a5c61a64f214e`；新增符号的固定 SHA/tree 由任务最终回执绑定。
 
@@ -100,7 +99,7 @@ owner 配置/撤权变更调用原生 notifyCatalogChanged；即使客户端刷�
 
 ## 验证与剩余绑定
 
-新增单文件 SDK 协议测试覆盖缺失 carrier、3.x/4.0 拒绝、身份/路由与 call/config 切换、guest 权限字段、旧目录撤权、原生 cancel/close/drain、原生错误。新增 DB suite 使用明确 3.x gateway fixture，走 SDK → 新公开 owner 适配 → 实际 PG 服务与 storage：资料真实正文/pin/receipt、私有/撤权/改 hash、记忆 issued ordinal/预算/失效 lease、成果 immutable 字节/hash/版本/幂等冲突、实际存储写取消后收敛。没有调用模型、VM 或共享 Dev。
+新增单文件 SDK 协议测试覆盖缺失 carrier、3.x/4.0 拒绝、身份/路由与 call/config 切换、guest 权限字段、旧目录撤权、原生 cancel/close/drain、原生错误。新增 DB suite 使用明确 3.x gateway fixture，走 SDK → 新公开 owner 适配 → 实际 PG 服务与 storage：记忆 issued ordinal/预算/失效 lease、成果 immutable 字节/hash/版本/幂等冲突、实际存储写取消后收敛。企业资料的正文、精确 pin/receipt、私有范围与撤权直接由 `employees/reference-tools.integration.test.ts` 验证。没有调用模型、VM 或共享 Dev。
 
 成果租约回归还覆盖同 worker 的 token 轮换、错误 attempt、空/无效 token、worker/job 与 context 不符、真实生成等待期间换租约，以及持锁 storage IO 等待时真实 lease 到期后无新增版本/publication audit 且私有 blob 清理。已提交 receipt 在换租约并取消后可恢复，异内容仍冲突、新 call 仍拒绝，撤销当前成员资格后恢复也拒绝。这些用例由最终 SHA 的根线门禁执行，源码断言本身不是通过证据。
 
