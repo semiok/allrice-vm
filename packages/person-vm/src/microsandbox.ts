@@ -1128,7 +1128,8 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       return;
     }
 
-    const { memoryMiB } = policy;
+    const configured = this.restartMemoryPolicy();
+    const { memoryMiB } = configured;
     const name = this.name(binding);
     const inspect = async (active: AbortSignal, running: boolean) => {
       active.throwIfAborted();
@@ -1151,7 +1152,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       return value;
     };
     await inspect(signal, false);
-    const fence = await this.reserveRestartMemory(binding, signal);
+    const fence = await this.reserveRestartMemory(binding, signal, configured);
     const { signal: active, assertCurrent: assertCapacity } = fence;
 
     await assertCapacity();
@@ -1208,10 +1209,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     await assertCapacity();
     return fence;
   }
-  private async reserveRestartMemory(
-    binding: PersonVmBinding,
-    signal: AbortSignal,
-  ): Promise<NativeStartFence> {
+  private restartMemoryPolicy() {
     const { memoryMiB, reserve } = this.options.restartMemory ?? {};
     if (
       typeof memoryMiB !== 'number' ||
@@ -1221,6 +1219,13 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
       typeof reserve !== 'function'
     )
       throw new PersonVmError('PROVIDER_FAILED');
+    return { memoryMiB, reserve };
+  }
+  private async reserveRestartMemory(
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+    { memoryMiB, reserve } = this.restartMemoryPolicy(),
+  ): Promise<NativeStartFence> {
     const request = Object.freeze({
       binding: Object.freeze({ ...binding }),
       memoryMiB,

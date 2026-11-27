@@ -172,13 +172,17 @@ type SelectedStartup = Readonly<{
   employee: PersonVmEmployeeSelection;
   firstDisk?: FirstPrewarmDisk;
 }>;
+type UpgradePrewarm = {
+  work: Promise<PersonVmView>;
+  receipt: { binding?: PersonVmBinding };
+};
 
 export class PersonVmService
   implements PersonVmHostPort, PersonVmAdmissionBindingPort
 {
   private admissionHost?: PersonVmAdmissionHost;
   private workerDrain = false;
-  private readonly upgradePrewarms = new Map<string, Promise<PersonVmView>>();
+  private readonly upgradePrewarms = new Map<string, UpgradePrewarm>();
   private idleAccessOrder = 0;
   private readonly retainedStartupMounts = new Map<
     string,
@@ -1750,12 +1754,13 @@ export class PersonVmService
     const start = (
       nextTarget?: PersonVmPrewarmFence,
       firstDisk?: FirstPrewarmDisk,
+      startupObserver = observer,
     ) =>
       this.startForSelection(
         context,
         signal,
         nextTarget,
-        observer,
+        startupObserver,
         selectedEmployee && { employee: selectedEmployee, firstDisk },
         foregroundOpen,
       );
@@ -1765,15 +1770,31 @@ export class PersonVmService
     if (takeover) {
       // Another employee or login on this same physical VM must still prove
       // its own current authority and editor readiness after the transition.
-      const joined = Promise.allSettled([takeover]);
-      await new Promise<void>((resolve, reject) => {
-        const listener = addAbortListener(signal, () => reject(signal.reason));
-        void joined.then(() => {
-          listener[Symbol.dispose]();
-          resolve();
-        });
-      });
+      const joined = Promise.allSettled([takeover.work]);
+      const [outcome] = await new Promise<Awaited<typeof joined>>(
+        (resolve, reject) => {
+          const listener = addAbortListener(signal, () =>
+            reject(signal.reason),
+          );
+          void joined.then((result) => {
+            listener[Symbol.dispose]();
+            resolve(result);
+          });
+        },
+      );
       signal.throwIfAborted();
+      const exact = takeover.receipt.binding;
+      // Only the joined local start can complete an open ticket's partial
+      // target. The new login still rechecks its own authority and readiness.
+      if (
+        outcome.status === 'fulfilled' &&
+        foregroundOpen &&
+        target?.dispatchUpgradeStop &&
+        target.instanceId === null &&
+        exact?.vmId === target.vmId &&
+        exact.leaseEpoch === target.leaseEpoch
+      )
+        target = { ...target, instanceId: exact.instanceId };
       return this.prewarmCurrent(
         context,
         signal,
@@ -1794,10 +1815,17 @@ export class PersonVmService
         context.actor.type !== 'user'
       )
         throw new PersonVmError('UPGRADE_OPEN_REQUIRED');
-      const opening = start(target).finally(() => {
+      const receipt: UpgradePrewarm['receipt'] = {};
+      const opening = start(target, undefined, {
+        ...observer,
+        observeVmStart(binding) {
+          receipt.binding = binding;
+          observer?.observeVmStart?.(binding);
+        },
+      }).finally(() => {
         this.upgradePrewarms.delete(identity.personId);
       });
-      this.upgradePrewarms.set(identity.personId, opening);
+      this.upgradePrewarms.set(identity.personId, { work: opening, receipt });
       return opening;
     }
     // An exact orphan already has its retained disk and predecessor. Claim
