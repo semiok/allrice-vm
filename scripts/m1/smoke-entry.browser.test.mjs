@@ -1,6 +1,7 @@
 // Synthetic local service; exercises the release smoke runner in real Chromium.
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
+import { URLSearchParams } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
 
@@ -259,10 +260,14 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
     ['warm-disabled', '原生编辑器不可输入'],
     ['unexpected-prompt', '拦截了未经授权或重复的模型消息'],
   ])('fails %s', async (mode, reason) => {
-    await run(mode, async (smoke) => {
+    await run(mode, async (smoke, _receipt, traffic) => {
       const error = await smoke.catch((error) => error);
       expect(error).not.toBeInstanceOf(SmokeSkip);
       expect(error.message).toContain(reason);
+      if (mode === 'unexpected-prompt')
+        expect(traffic.some(({ path }) => path.endsWith('native-rpc'))).toBe(
+          false,
+        );
     });
   });
 });

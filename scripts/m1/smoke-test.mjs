@@ -1,15 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import {
-  access,
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  writeFile,
-} from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { SmokeFailure, SmokeSkip, smokeNativeEntry } from './smoke-entry.mjs';
@@ -25,9 +17,16 @@ const { values: args } = parseArgs({
     'worker-release': { type: 'string' },
   },
 });
-if (!args.url || !args['worker-url'] || !args.creds || !args.out) {
+if (
+  !args.url ||
+  !args['worker-url'] ||
+  !args.creds ||
+  !args.out ||
+  !args['worker-release'] ||
+  !isAbsolute(args['worker-release'])
+) {
   console.error(
-    'usage: smoke-test.mjs --url URL --worker-url URL --creds FILE --out DIR [--expect-sha SHA] [--hello] [--worker-release DIR]',
+    'usage: smoke-test.mjs --url URL --worker-url URL --creds FILE --out DIR [--expect-sha SHA] [--hello] --worker-release DIR',
   );
   process.exit(2);
 }
@@ -43,7 +42,7 @@ await mkdir(args.out, { recursive: true, mode: 0o700 });
 
 async function readyIdentity(base, path, service) {
   const response = await fetch(new URL(path, base), {
-    signal: AbortSignal.timeout(10_000),
+    signal: globalThis.AbortSignal.timeout(10_000),
   });
   const result = await response.json();
   const identity = result.identity;
@@ -83,7 +82,6 @@ async function versions() {
 
 async function missingVmHost() {
   const root = args['worker-release'];
-  if (!root || !isAbsolute(root)) return false;
   const { manifestDigest, ...manifest } = JSON.parse(
     await readFile(join(root, '.local/dev-build-identity.json'), 'utf8'),
   );
@@ -101,25 +99,18 @@ async function missingVmHost() {
   );
 }
 
-async function playwright() {
-  const installed = join(homedir(), 'allrice40-dev-releases');
-  for (const name of await readdir(installed).catch((error) => {
-    if (error.code === 'ENOENT') return [];
-    throw error;
-  })) {
-    const require = createRequire(
-      join(installed, name, 'apps/web/package.json'),
-    );
-    let module;
-    try {
-      module = require.resolve('playwright-core');
-    } catch (error) {
-      if (error.code !== 'MODULE_NOT_FOUND') throw error;
-      continue;
-    }
-    return require(module);
+function playwright() {
+  const require = createRequire(
+    join(args['worker-release'], 'apps/web/package.json'),
+  );
+  let module;
+  try {
+    module = require.resolve('playwright-core');
+  } catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+    throw new SmokeSkip('当前发布缺少浏览器依赖');
   }
-  throw new SmokeSkip('缺少可用的发布浏览器依赖');
+  return require(module);
 }
 
 let browser;
@@ -137,11 +128,12 @@ try {
       throw new SmokeSkip('找不到用于原生冒烟的 Chromium');
     throw error;
   }
-  const { chromium } = await playwright();
+  const { chromium } = playwright();
   browser = await chromium.launch({ executablePath, headless: true });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 900 },
     locale: 'zh-CN',
+    serviceWorkers: 'block',
   });
   const credentials = JSON.parse(await readFile(args.creds, 'utf8'));
   await smokeNativeEntry(page, args.url, credentials, receipt, {
@@ -163,8 +155,10 @@ try {
       if (
         receipt.versionStart.web !== receipt.versionEnd.web ||
         receipt.versionStart.manifest !== receipt.versionEnd.manifest
-      )
-        throw new SmokeFailure('冒烟期间发布提交变化');
+      ) {
+        receipt.status = 'failed';
+        receipt.reason = '冒烟期间发布提交变化';
+      }
     } catch {
       receipt.status = 'failed';
       receipt.reason = '冒烟结束时服务提交未通过复核';

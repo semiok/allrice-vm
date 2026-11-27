@@ -137,7 +137,8 @@ export async function smokeNativeEntry(
       sentPrompt ||
       body.scopeId !== allowedPrompt.scope ||
       !body.selection ||
-      !sameEmployee(new URLSearchParams(body.selection), selection) ||
+      body.selection.workspaceId !== selection.workspaceId ||
+      body.selection.employeeInstanceId !== selection.employeeInstanceId ||
       body.selection.threadId !== allowedPrompt.thread ||
       new URL(request.url()).search !== '?carrier=page' ||
       typeof body.rpcId !== 'string' ||
