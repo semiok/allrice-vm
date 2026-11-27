@@ -17,7 +17,6 @@ import {
   type WorkbenchModule,
 } from '../app/chatflow/workbench-modules';
 import { applyTheme } from '../lib/theme/theme';
-import { nativeSubagentControlRoot } from '../app/chatflow/native-subagent-controls';
 import { NativeSubagentWorkbench } from '../app/chatflow/native-subagent-workbench';
 import { WorkProcess } from '../app/chatflow/work-process';
 import type {
@@ -85,6 +84,7 @@ const headers = {
   'x-allrice-organization-id': 'org',
   'x-allrice-workspace-id': 'workspace',
 };
+const rootRunId = 'root-run';
 declare global {
   interface Window {
     nativeSubagentViewFixture: {
@@ -95,7 +95,7 @@ declare global {
     };
   }
 }
-// Drives the fixture-only summary and control interactions.
+// Drives the fixture-only summary interactions.
 function DetailFixture(
   props: Omit<
     ComponentProps<typeof LegacySubagentDetailFixture>,
@@ -146,13 +146,7 @@ function Page() {
   >({});
   const icons = query.has('icons');
   const [selected, setSelected] = useState<WorkbenchModule | null>(null);
-  const controls = query.has('controls');
-  const rootEvents = controls || query.has('root-events');
-  const [controlRunId, setControlRunId] = useState(
-    '44444444-4444-4444-8444-444444444444',
-  );
-  const rootRunId = controls ? controlRunId : 'root-run';
-  const [ownerId, setOwnerId] = useState('viewer');
+  const rootEvents = query.has('root-events');
   const stream = useMemo(
     () =>
       createSessionRunStream({
@@ -174,14 +168,14 @@ function Page() {
     stream.activate();
     if (rootEvents) void stream.streamRun(rootRunId);
     return stream.deactivate;
-  }, [stream, rootEvents, rootRunId]);
+  }, [stream, rootEvents]);
   const nativeReadyKey = nativeSubagentReadyKey(runViews[rootRunId]);
   const childScope: NativeSubagentViewScope = {
     organizationId: headers['x-allrice-organization-id'],
     workspaceId: headers['x-allrice-workspace-id'],
     sessionId: activeId,
     viewerId: workspace.viewerId ?? null,
-    ownerId,
+    ownerId: workspace.viewerId ?? null,
     rootRunId,
     generation: 1,
     bindingRevision: `initial/${nativeReadyKey}`,
@@ -305,20 +299,13 @@ function Page() {
             presentation={presentation}
           />
         )}
-        {!childView && (controls || query.has('details')) && (
+        {!childView && query.has('details') && (
           <DetailFixture
             key={activeId}
             workspaceId="workspace"
             sessionId={activeId}
             headers={headers}
             observation={observation}
-            viewerId={workspace.viewerId}
-            canControl={controls && ownerId === workspace.viewerId}
-            controlRoot={
-              controls
-                ? nativeSubagentControlRoot(runViews[rootRunId])
-                : undefined
-            }
             presentation={presentation}
           />
         )}
@@ -338,26 +325,6 @@ function Page() {
           <output aria-label="root事件游标">
             {runViews[rootRunId]?.cursor ?? 'empty'}
           </output>
-        )}
-        {controls && (
-          <button
-            style={{ position: 'fixed', top: 0, right: 0, zIndex: 90 }}
-            onClick={() =>
-              setControlRunId('55555555-5555-4555-8555-555555555555')
-            }
-          >
-            切换根运行
-          </button>
-        )}
-        {controls && (
-          <button
-            style={{ position: 'fixed', top: 32, right: 0, zIndex: 90 }}
-            onClick={() =>
-              setOwnerId((id) => (id === 'viewer' ? 'other' : 'viewer'))
-            }
-          >
-            切换会话所有者
-          </button>
         )}
       </section>
     </main>
