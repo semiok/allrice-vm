@@ -589,22 +589,72 @@ it('derives Search authority from the exact running turn and native child lineag
   expect(f.searchOrigin('root').proof).toEqual({
     rootSessionId: 'root',
     turn: 1,
-    claims: [{ scopeId: 'scope-original', requestId: 'original' }],
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
   });
   f.append(root, 'turn/end', { turn: 1 });
   f.openRoot(root, 2, 'next-login');
   expect(f.searchOrigin('child').proof).toEqual({
     rootSessionId: 'root',
     turn: 1,
-    claims: [{ scopeId: 'scope-original', requestId: 'original' }],
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
   });
   expect(f.searchOrigin('root')?.proof.claims).toEqual([
-    { scopeId: 'scope-next-login', requestId: 'next-login' },
+    {
+      sessionId: 'root',
+      scopeId: 'scope-next-login',
+      requestId: 'next-login',
+      messageId: 'message-next-login',
+      turn: 2,
+    },
   ]);
   child.status = 'idle';
   expect(f.searchOrigin('child')).toBeNull();
   f.append(root, 'turn/end', { turn: 2 });
   expect(f.searchOrigin('root')).toBeNull();
+});
+
+it('permits a native fork to search from its own adopted prompt and not from seed history', () => {
+  const f = fixture((_session, message) => message.id === 'message-own-prompt');
+  const fork = f.agent('fork');
+  Object.assign(fork.session.header, {
+    id: 'fork',
+    parentSession: 'ancestor',
+    isSeeded: true,
+  });
+  fork.status = 'running';
+  f.openRoot(fork, 1, 'seed-history');
+  expect(f.searchOrigin('fork')).toBeNull();
+  f.append(fork, 'turn/end', { turn: 1 });
+  f.openRoot(fork, 2, 'own-prompt');
+  expect(f.searchOrigin('fork')?.proof).toEqual({
+    rootSessionId: 'fork',
+    turn: 2,
+    claims: [
+      {
+        sessionId: 'fork',
+        scopeId: 'scope-own-prompt',
+        requestId: 'own-prompt',
+        messageId: 'message-own-prompt',
+        turn: 2,
+      },
+    ],
+  });
 });
 
 it('denies an unobserved direct root input and a same-ID direct child input', () => {
@@ -618,6 +668,7 @@ it('denies an unobserved direct root input and a same-ID direct child input', ()
   const root = f.agent('root');
   f.openRoot(root, 1, 'same-rpc');
   const child = f.createChild(root, 'child');
+  child.session.header.origin = 'subagent';
   child.status = 'running';
   expect(f.searchOrigin('child')).not.toBeNull();
   f.input(

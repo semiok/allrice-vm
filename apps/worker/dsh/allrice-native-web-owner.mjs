@@ -646,9 +646,7 @@ export function observeDelegatedInputs(scope, observedClaim = () => false) {
       if (input?.root !== owner) return null;
       for (const prompt of input.prompts) collectPrompt(prompts, prompt);
       if (!input.claims) searchProven = false;
-      else
-        for (const claim of input.claims)
-          claims.set(JSON.stringify(claim), claim);
+      else for (const claim of input.claims) collectPrompt(claims, claim);
     }
     return {
       root: owner,
@@ -863,9 +861,9 @@ export function observeDelegatedInputs(scope, observedClaim = () => false) {
             root: root(session),
             prompts: [direct],
             claims:
-              !session.header.parentSession &&
+              isNativeOrdinaryRoot(session.header) &&
               observedClaim(session, event.data, state.turn)
-                ? [{ requestId: direct.requestId, scopeId: direct.scopeId }]
+                ? [direct]
                 : null,
           }
         : claimed(session, event.data, state.turn);

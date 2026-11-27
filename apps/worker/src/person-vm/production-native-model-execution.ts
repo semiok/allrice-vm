@@ -68,7 +68,7 @@ type PromptOwner = NativeModelSelection &
     assertCurrent(signal: AbortSignal): Promise<void>;
     assertClaimed(
       signal: AbortSignal,
-      occurrence?: NativePromptOccurrence,
+      occurrence: NativePromptOccurrence,
     ): Promise<void>;
   }>;
 
@@ -1099,33 +1099,21 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   );
                   try {
                     const { claims, rootSessionId } = watch.proof;
-                    if (rootSessionId !== probe.root)
-                      throw new EgressError('DENIED');
-                    const key = (source: {
-                      scopeId: string;
-                      requestId: string;
-                    }) => JSON.stringify([source.scopeId, source.requestId]);
-                    const references = new Map<string, PromptOwner[]>();
-                    for (const entry of selected.values()) {
-                      const member = entry.scope;
-                      if (
-                        member.adapterId !== wanted.adapterId ||
-                        member.root !== rootSessionId ||
-                        !sameVmBinding(member.binding, binding) ||
-                        !entry.observation.inserted()
+                    if (
+                      rootSessionId !== probe.root ||
+                      claims.some(
+                        (claim) =>
+                          claim.sessionId !== rootSessionId ||
+                          claim.parentSessionId !== undefined,
                       )
-                        continue;
-                      const id = key(member);
-                      const entries = references.get(id) ?? [];
-                      entries.push(member);
-                      references.set(id, entries);
-                    }
-                    const proven = readNativePromptContributors(
-                      claims.map(key),
-                      (id) => {
-                        const entries = references.get(id);
-                        return entries?.length === 1 ? entries[0] : undefined;
-                      },
+                    )
+                      throw new EgressError('DENIED');
+                    const proven = await findPromptContributors(
+                      wanted.adapterId,
+                      rootSessionId,
+                      binding,
+                      claims,
+                      active,
                     );
                     if (!proven) throw new EgressError('DENIED');
                     const { first, contributors } = proven;
@@ -1140,8 +1128,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       const current = AbortSignal.any([caller, revoked]);
                       current.throwIfAborted();
                       await Promise.all(
-                        contributors.map(async (member) => {
-                          await member.assertClaimed(current);
+                        contributors.map(async (member, index) => {
+                          await member.assertClaimed(current, claims[index]!);
                           await member.assertCurrent(current);
                         }),
                       );

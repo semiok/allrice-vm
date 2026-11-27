@@ -101,17 +101,7 @@ const searchCallProof = z
     callId: z.string().min(1).max(256),
     sessionId: z.string().min(1).max(256),
     rootSessionId: z.string().min(1).max(256),
-    claims: z
-      .array(
-        z
-          .object({
-            scopeId: UuidSchema,
-            requestId: z.string().min(1).max(256),
-          })
-          .strict(),
-      )
-      .min(1)
-      .max(64),
+    claims: nativePrompts.refine((claims) => claims.length > 0),
     turn: z.number().int().positive(),
   })
   .strict();

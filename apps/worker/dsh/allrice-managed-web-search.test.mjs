@@ -26,7 +26,15 @@ const origin = (signal) => ({
   signal,
   proof: {
     rootSessionId: 'root',
-    claims: [{ scopeId: 'exact-principal', requestId: 'original-prompt' }],
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'exact-principal',
+        requestId: 'original-prompt',
+        messageId: 'adopted-message',
+        turn: 1,
+      },
+    ],
     turn: 1,
   },
 });
