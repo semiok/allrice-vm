@@ -296,13 +296,6 @@ export function createDEntryNativePrewarmPort(input: {
     const group = flights.get(key) ?? new Set<Flight>();
     for (const flight of group) {
       if (!canSharePrewarmTarget(flight, target)) continue;
-      // A later waiter may already know which physical start was published.
-      flight.target = {
-        ...flight.target,
-        vmId: flight.target.vmId ?? target.vmId,
-        instanceId: flight.target.instanceId ?? target.instanceId,
-        leaseEpoch: target.leaseEpoch,
-      };
       flight.join(revoked);
       return { flight, started: false };
     }
@@ -367,6 +360,8 @@ export function createDEntryNativePrewarmPort(input: {
       plan.target.instanceId !== null && !plan.reservation?.instance;
     const stamp = await input.readCoordination?.(identity, context.sessionId);
     signal.throwIfAborted();
+    if (mode === 'issue' && stamp?.authorityRevision === null)
+      throw new DataAccessError('authorization_denied');
     if (
       !stamp?.authorityRevision ||
       plan.key !== prewarmKey(context, identity, stamp)
@@ -627,10 +622,18 @@ export function createDEntryNativePrewarmPort(input: {
             !matchesInstance(stamp.vm, takeover.predecessor))
         )
           throw new PersonVmError('LEASE_LOST');
-        const reservation: PrewarmReservation | undefined = plan
-          ? {}
-          : undefined;
+        const reservation: PrewarmReservation | undefined =
+          plan || (key && target) ? {} : undefined;
         if (plan && reservation) plan.reservation = reservation;
+        const observer = reservation && {
+          observeVmReservation(vmId: string) {
+            reservation.vmId = vmId;
+          },
+          observeVmStart(binding: PersonVmBinding) {
+            reservation.vmId = binding.vmId;
+            reservation.instance = binding;
+          },
+        };
         async function currentGeneration(
           result: PersonVmView,
           expected: Generation,
@@ -655,19 +658,12 @@ export function createDEntryNativePrewarmPort(input: {
             identity,
             {
               trigger,
+              ...(!plan && observer && { observer }),
               ...(plan && {
                 target: {
                   ...plan.target,
                   deletionFence: stamp?.vm?.deletionFence ?? null,
-                  ...(reservation && {
-                    observeVmReservation(vmId: string) {
-                      reservation.vmId = vmId;
-                    },
-                    observeVmStart(binding: PersonVmBinding) {
-                      reservation.vmId = binding.vmId;
-                      reservation.instance = binding;
-                    },
-                  }),
+                  ...observer,
                   ...(takeover && {
                     orphanedStart: {
                       predecessor: takeover.predecessor,
@@ -724,7 +720,7 @@ export function createDEntryNativePrewarmPort(input: {
                 async confirm(result, flight) {
                   return currentGeneration(
                     result,
-                    plan ? observedPrewarmTarget(plan) : flight.target,
+                    observedPrewarmTarget(plan ?? flight),
                   );
                 },
               })

@@ -326,12 +326,14 @@ export function createDEntryHttpHandler(
       const check = deps.prewarm.isCurrent?.bind(deps.prewarm);
       if (prewarmRequest && (!plan || !check))
         throw new DEntryNativeUnavailable();
-      const prior = plan && plan.reuse;
-      if (prewarmRequest && prior && check) {
-        const existing = prewarm.reuse(auth.context, auth.identity, prior);
+      async function publishExistingPrewarm(
+        existing: ReturnType<typeof prewarm.reuse>,
+        trigger: 'page' | 'input',
+        verify: NonNullable<DEntryNativePrewarmPort['isCurrent']>,
+      ) {
         if (!existing) {
           sendPrewarmStatus(response, { state: 'expired' });
-          return true;
+          return;
         }
         finishPrewarmReply = existing.finishReply;
         const threadOpen = await existing.observeThread(signal);
@@ -344,7 +346,7 @@ export function createDEntryHttpHandler(
         const mayPublish =
           threadOpen &&
           (await existing.recheck(context, identity, (mode) =>
-            check(context, identity, prior, signal, mode),
+            verify(context, identity, existing.plan, signal, mode),
           ));
         signal.throwIfAborted();
         if (!threadOpen) existing.assertNotRevoked();
@@ -352,10 +354,17 @@ export function createDEntryHttpHandler(
           existing.publish();
           sendPrewarmAccepted(response, {
             identity,
-            trigger: prewarmRequest.trigger,
+            trigger,
             ticket: existing.ticket,
           });
         } else sendPrewarmStatus(response, { state: 'expired' });
+      }
+      if (prewarmRequest && plan && plan.reuse && check) {
+        await publishExistingPrewarm(
+          prewarm.reuse(auth.context, auth.identity, plan),
+          prewarmRequest.trigger,
+          check,
+        );
         return true;
       }
       // The job takes ownership of its subscription on acceptance. LISTEN
@@ -403,7 +412,11 @@ export function createDEntryHttpHandler(
         const canIssue = await check(context, identity, plan, signal, 'issue');
         signal.throwIfAborted();
         if (!canIssue) {
-          sendPrewarmStatus(response, { state: 'expired' });
+          await publishExistingPrewarm(
+            prewarm.reuse(context, identity, plan),
+            prewarmRequest.trigger,
+            check,
+          );
           return true;
         }
         const { trigger } = prewarmRequest;

@@ -12,6 +12,7 @@ import {
   authenticatePlatformSession,
   authenticateSession,
   closeDEntryAuthorityFeeds,
+  createDEntryAuthorityFeed,
   createDedicatedDatabase,
   createEmployeeInstance,
   createSession,
@@ -346,6 +347,7 @@ suite(
       const prewarm = createProductionCurrentPrewarm({ vm, current });
       const dispatch = vi.fn(prewarm);
       const watch = vi.fn(dEntryHttpDefaults.watch);
+      const isCurrent = vi.fn(dEntryHttpDefaults.prewarm.isCurrent!);
       const releaseGates: (() => void)[] = [];
       function gate() {
         const entered = deferred<void>();
@@ -411,6 +413,7 @@ suite(
       const entry = await nativeEntryServer(undefined, {
         ...dEntryHttpDefaults,
         watch,
+        prewarm: { ...dEntryHttpDefaults.prewarm, isCurrent },
       });
       const headers = (loginToken: string) => ({
         authorization: `Bearer ${loginToken}`,
@@ -517,6 +520,8 @@ suite(
         personId,
         proof,
         dispatch,
+        watch,
+        isCurrent,
         pauseDispatch,
         pauseCreate,
         pauseBeforeIssue,
@@ -787,31 +792,131 @@ suite(
       },
     );
 
-    it('reuses the cold ticket after its own start saves the exact running instance', async () => {
+    it.each(['same login', 'different login'] as const)(
+      'checks a cold POST prepared before the exact instance was saved by the %s',
+      async (login) => {
+        const f = await prewarmDeletionTarget();
+        const entered = deferred<void>();
+        const resume = deferred<void>();
+        const prove = f.proof.getMockImplementation()!;
+        f.proof.mockImplementationOnce(async (...args) => {
+          entered.resolve();
+          await resume.promise;
+          return prove(...args);
+        });
+        try {
+          const owner =
+            login === 'different login'
+              ? (await createSession(f.personId)).token
+              : undefined;
+          const paused = f.pauseBeforeIssue();
+          const opening = f.open();
+          await Promise.race([
+            paused.entered.promise,
+            opening.then((response) => {
+              throw Error(
+                'POST ended before its watch barrier: ' + response.status,
+              );
+            }),
+          ]);
+          const original = await f.openTicket(owner);
+          await entered.promise;
+          expect(await f.row()).toMatchObject({
+            phase: 'running',
+            instanceId: expect.any(String),
+            leaseOwner: null,
+          });
+          paused.resume.resolve();
+          const delayed = await opening;
+          const body = await delayed.json();
+          if (login === 'same login')
+            expect({ status: delayed.status, json: body }).toMatchObject({
+              status: 202,
+              json: {
+                ticket: { operationId: original },
+                identity: f.identity,
+              },
+            });
+          else
+            expect({ status: delayed.status, json: body }).toEqual(
+              expiredTicket,
+            );
+          // A new prepare after publication still joins its own exact ticket.
+          expect(await f.openTicket(owner)).toBe(original);
+          expect(f.dispatch).toHaveBeenCalledOnce();
+          resume.resolve();
+          expect(await f.ready(original, owner)).toMatchObject({
+            leaseEpoch: 1,
+          });
+        } finally {
+          resume.resolve();
+          await f.close();
+        }
+      },
+    );
+
+    it('returns the current authorization denial when issue SQL sees revocation before its notification is handled', async () => {
       const f = await prewarmDeletionTarget();
-      const entered = deferred<void>();
-      const resume = deferred<void>();
-      const prove = f.proof.getMockImplementation()!;
-      f.proof.mockImplementationOnce(async (...args) => {
-        entered.resolve();
-        await resume.promise;
-        return prove(...args);
+      const feed = createDEntryAuthorityFeed(process.env.DATABASE_URL!);
+      const subscribe = feed.subscribe.bind(feed);
+      const blocked: (() => void)[] = [];
+      vi.spyOn(feed, 'subscribe').mockImplementation((listener, active) =>
+        subscribe(
+          {
+            ...listener,
+            changed(change) {
+              if (
+                change.table === 'allrice_memberships' &&
+                change.personId === f.personId
+              )
+                blocked.push(() => listener.changed(change));
+              else listener.changed(change);
+            },
+          },
+          active,
+        ),
+      );
+      f.watch.mockImplementation(
+        (context, selection, identity, signal, _feed, verify) =>
+          dEntryHttpDefaults.watch(
+            context,
+            selection,
+            identity,
+            signal,
+            feed,
+            verify,
+          ),
+      );
+      const productionCheck = dEntryHttpDefaults.prewarm.isCurrent!;
+      f.isCurrent.mockImplementation(async (...args) => {
+        const active = args[3];
+        if (args[4] === 'issue') {
+          const withdrawn =
+            await fixture.db`update allrice_memberships set active=false
+            where user_id=${f.personId} and organization_id=${f.owner.organizationId} and active
+            returning id`;
+          expect(withdrawn.length).toBeGreaterThan(0);
+          await feed.observeThroughCommit(active);
+          expect(blocked).toHaveLength(withdrawn.length);
+          expect(active.aborted).toBe(false);
+        }
+        return productionCheck(...args);
       });
       try {
-        const original = await f.openTicket();
-        await entered.promise;
-        expect(await f.row()).toMatchObject({
-          phase: 'running',
-          instanceId: expect.any(String),
-          leaseOwner: null,
+        const response = await f.open();
+        expect(response.status).toBe(404);
+        expect(await response.json()).toMatchObject({
+          error: { code: 'RESOURCE_NOT_FOUND' },
         });
-        expect(await f.openTicket()).toBe(original);
-        expect(f.dispatch).toHaveBeenCalledOnce();
-        resume.resolve();
-        expect(await f.ready(original)).toMatchObject({ leaseEpoch: 1 });
+        expect(f.dispatch).not.toHaveBeenCalled();
+        expect(await store.read(f.personId)).toBeNull();
       } finally {
-        resume.resolve();
-        await f.close();
+        for (const notify of blocked) notify();
+        try {
+          await f.close();
+        } finally {
+          await feed.close();
+        }
       }
     });
 

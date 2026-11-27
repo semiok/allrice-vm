@@ -20,7 +20,7 @@ type PrewarmReadMode = Exclude<
   PrewarmVerificationMode,
   'authority' | 'issue' | 'reuse'
 >;
-type PrewarmReuseMode = PrewarmReadMode | 'reuse';
+type PrewarmReuseMode = PrewarmReadMode | 'issue' | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
 export type PrewarmPlan = {
   key: string;
@@ -71,10 +71,19 @@ export function observedPrewarmTarget({
   reservation,
 }: Pick<PrewarmPlan, 'target' | 'reservation'>): PrewarmGeneration {
   if (!reservation) return target;
+  const instance = reservation.instance;
+  if (instance) {
+    if (!compatiblePrewarmGeneration(target, instance)) return target;
+    return {
+      ...target,
+      vmId: instance.vmId,
+      instanceId: instance.instanceId,
+      leaseEpoch: instance.leaseEpoch,
+    };
+  }
   return {
     ...target,
     vmId: target.vmId ?? reservation.vmId ?? null,
-    instanceId: target.instanceId ?? reservation.instance?.instanceId ?? null,
   };
 }
 
@@ -168,6 +177,19 @@ export function createPrewarmOperations(
   ) =>
     entry.sessionId === context.sessionId &&
     sameDEntryIdentity(entry.identity, identity);
+  const sharesPending = (
+    entry: Operation,
+    context: RequestContext,
+    identity: DEntryIdentity,
+    plan: PrewarmPlan,
+  ) =>
+    active(entry) &&
+    !entry.revoked.aborted &&
+    belongs(entry, context, identity) &&
+    entry.plan.key === plan.key &&
+    (!plan.orphanedInstanceId ||
+      entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
+    canSharePrewarmTarget(entry.plan, plan.target);
   function discardUnpublished(entry: Operation) {
     if (entry.published || entry.replies || active(entry)) return;
     tickets.delete(entry.ticket.operationId);
@@ -195,9 +217,16 @@ export function createPrewarmOperations(
     reuse(
       context: RequestContext,
       identity: DEntryIdentity,
-      prior: PrewarmPlan,
+      plan: PrewarmPlan,
     ) {
-      const entry = [...tickets.values()].find((entry) => entry.plan === prior);
+      const prior = plan.reuse;
+      const entry = [...tickets.values()].find((entry) =>
+        prior
+          ? entry.plan === prior
+          : !expired(entry) &&
+            entry.plan.orphanedInstanceId === plan.orphanedInstanceId &&
+            sharesPending(entry, context, identity, plan),
+      );
       if (
         !entry ||
         expired(entry) ||
@@ -206,10 +235,12 @@ export function createPrewarmOperations(
       )
         return;
       const mode = (): PrewarmReuseMode | undefined => {
-        if (active(entry)) return 'reuse';
+        if (active(entry))
+          return entry.plan.orphanedInstanceId ? 'reuse' : 'issue';
         if (entry.state.state === 'ready' && !entry.proof?.aborted)
           return 'ready';
         if (
+          prior &&
           entry.state.state === 'failed' &&
           entry.state.code === 'START_UNAVAILABLE'
         )
@@ -217,6 +248,7 @@ export function createPrewarmOperations(
       };
       return {
         ...accepted(entry, false),
+        plan: entry.plan,
         async observeThread(signal: AbortSignal) {
           try {
             await entry.plan.assertTicketThread?.(signal);
@@ -276,15 +308,7 @@ export function createPrewarmOperations(
             tickets.delete(id);
             void entry.release('expired');
           }
-        } else if (
-          active(entry) &&
-          !entry.revoked.aborted &&
-          belongs(entry, context, identity) &&
-          entry.plan.key === plan.key &&
-          (!plan.orphanedInstanceId ||
-            entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
-          canSharePrewarmTarget(entry.plan, plan.target)
-        ) {
+        } else if (sharesPending(entry, context, identity, plan)) {
           return accepted(entry, false);
         }
       }
