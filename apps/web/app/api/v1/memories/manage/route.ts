@@ -1,22 +1,18 @@
-import {
-  DataAccessError,
-  listPersonalEmployeeMemories,
-} from '@allrice/database';
 import { EmployeeMemoryListQuerySchema } from '@allrice/contracts';
-import { getRequestContext } from '../../../../../lib/identity/session';
+import { requireRequestContext } from '../../../../../lib/identity/session';
 import { storageErrorResponse } from '../../../../../lib/storage/responses';
+import { personalEmployeeMemory } from '../../../../../lib/memory/employee-memory-personal-source';
 export const runtime = 'nodejs';
 export async function GET(request: Request) {
   try {
-    const context = await getRequestContext(request);
-    if (!context) throw new DataAccessError('authentication_required');
+    const context = await requireRequestContext(request);
     const query = EmployeeMemoryListQuerySchema.parse(
       Object.fromEntries(new URL(request.url).searchParams),
     );
-    const result = await listPersonalEmployeeMemories(
+    const result = await personalEmployeeMemory.list(
       context,
-      query.workspaceId,
-      query.instanceId,
+      query,
+      request.signal,
     );
     return Response.json(result, {
       headers: { 'cache-control': 'private, no-store' },

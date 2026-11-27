@@ -911,6 +911,72 @@ suite('candidate memory: real auth/API/PG + both product hosts', () => {
     },
   );
 
+  it('denies personal memory management and source after the employee instance is archived', async () => {
+    const instance = await isolatedInstance();
+    const pending = await pendingFor(instance, '归档后不再开放的候选');
+    const active = await createPair(
+      instance,
+      '归档后不再开放的记忆',
+      '本人正文',
+    );
+    const activePath = '/' + active.id;
+    const requests = [
+      ['/manage', {}, 200],
+      [activePath, {}, 200],
+      [activePath + '/source', {}, 200],
+      [
+        '',
+        write({
+          workspaceId: identity.workspace,
+          instanceId: instance,
+          summary: '不应建立的记忆',
+          details: null,
+          idempotencyKey: randomUUID(),
+        }),
+        null,
+      ],
+      [
+        activePath,
+        write(
+          {
+            ...exact(active, instance),
+            summary: '不应写入的更正',
+            details: '不应写入的正文',
+          },
+          'PATCH',
+        ),
+        null,
+      ],
+      [activePath, write(exact(active, instance), 'DELETE'), null],
+      ['/' + pending.id + '/promote', write(exact(pending, instance)), null],
+    ] as const;
+    for (const [path, init, status] of requests) {
+      if (status === null) continue;
+      expect(
+        (await api(path, init, ownerToken, identity.workspace, instance))
+          .status,
+      ).toBe(status);
+    }
+    const snapshot =
+      () => f.db`select id,revision,summary,details,lifecycle_state,archived_at
+      from allrice_memories where instance_id=${instance} order by id`;
+    const before = await snapshot();
+    await f.db`update allrice_employee_instances set archived_at=clock_timestamp() where id=${instance}`;
+    for (const [path, init] of requests) {
+      const denied = await api(
+        path,
+        init,
+        ownerToken,
+        identity.workspace,
+        instance,
+      );
+      expect(denied.status).toBe(403);
+      expect(denied.headers.get('cache-control')).toBe('private, no-store');
+      expect(await denied.text()).not.toContain('本人正文');
+    }
+    expect(await snapshot()).toEqual(before);
+  });
+
   it('keeps real cookie/same-origin/owner scope gates and replays one complete-pair confirmation', async () => {
     const row = await detail(candidate.id),
       path = '/' + candidate.id + '/promote';

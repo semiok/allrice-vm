@@ -11,8 +11,17 @@ import {
   resolveDEntryIdentity,
 } from '@allrice/database';
 
+function denyArchivedEmployee(error: unknown): never {
+  if (
+    error instanceof EmployeeInstanceError &&
+    error.code === 'instance_archived'
+  )
+    throw new DataAccessError('authorization_denied');
+  throw error;
+}
+
 const builtinAuthority = createApplicationBuiltinModuleAuthority('web');
-const personalMemory = createEmployeeMemoryPort({
+export const personalEmployeeMemory = createEmployeeMemoryPort({
   qualification: {
     async requireCurrentAccess(context, target, signal) {
       // Without a thread, the existing read identity still requires a current
@@ -24,7 +33,7 @@ const personalMemory = createEmployeeMemoryPort({
           employeeInstanceId: target.instanceId.toLowerCase(),
         },
         'history',
-      );
+      ).catch(denyArchivedEmployee);
       await builtinAuthority.require(
         { context, identity, moduleId: 'employee-memory' },
         signal,
@@ -39,15 +48,7 @@ export async function readPersonalEmployeeMemorySource(
   signal: AbortSignal,
 ) {
   const target = MemoryDetailQueryProjectionSchema.parse(input);
-  try {
-    return await personalMemory.source(context, target, signal);
-  } catch (error) {
-    // An archived employee has lost access to its current memory panel.
-    if (
-      error instanceof EmployeeInstanceError &&
-      error.code === 'instance_archived'
-    )
-      throw new DataAccessError('authorization_denied');
-    throw error;
-  }
+  return personalEmployeeMemory
+    .source(context, target, signal)
+    .catch(denyArchivedEmployee);
 }

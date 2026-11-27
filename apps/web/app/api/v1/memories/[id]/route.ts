@@ -1,18 +1,15 @@
-import {
-  DataAccessError,
-  correctManagedEmployeeMemory,
-  deleteManagedEmployeeMemory,
-  getPersonalEmployeeMemory,
-} from '@allrice/database';
+import { DataAccessError } from '@allrice/database';
 import {
   EmployeeMemoryListQuerySchema,
-  EmployeeMemoryDetailResponseSchema,
-  EmployeeMemoryWriteResponseSchema,
+  MemoryCorrectCommandProjectionSchema,
+  MemoryDetailQueryProjectionSchema,
+  MemoryMutationCommandProjectionSchema,
 } from '@allrice/contracts';
 
 import { getRequestContext } from '../../../../../lib/identity/session';
 import { sameOriginBrowserWrite } from '../../../../../lib/identity/request-origin';
 import { storageErrorResponse } from '../../../../../lib/storage/responses';
+import { personalEmployeeMemory } from '../../../../../lib/memory/employee-memory-personal-source';
 
 export const runtime = 'nodejs';
 
@@ -26,19 +23,17 @@ export async function GET(
     const query = EmployeeMemoryListQuerySchema.parse(
       Object.fromEntries(new URL(request.url).searchParams),
     );
-    return Response.json(
-      EmployeeMemoryDetailResponseSchema.parse(
-        await getPersonalEmployeeMemory(
-          context,
-          query.workspaceId,
-          query.instanceId,
-          (await route.params).id,
-        ),
-      ),
-      {
-        headers: { 'cache-control': 'private, no-store' },
-      },
+    const result = await personalEmployeeMemory.detail(
+      context,
+      MemoryDetailQueryProjectionSchema.parse({
+        ...query,
+        memoryId: (await route.params).id,
+      }),
+      request.signal,
     );
+    return Response.json(result, {
+      headers: { 'cache-control': 'private, no-store' },
+    });
   } catch (error) {
     const response = storageErrorResponse(error);
     response.headers.set('cache-control', 'private, no-store');
@@ -59,20 +54,17 @@ export async function PATCH(
     if (!workspaceId) throw new DataAccessError('not_found');
     const { id } = await route.params;
     const input = await request.json();
-    const { counts, ...memory } = await correctManagedEmployeeMemory(
+    const result = await personalEmployeeMemory.correct(
       context,
-      workspaceId,
-      id,
-      input,
-    );
-    return Response.json(
-      EmployeeMemoryWriteResponseSchema.parse({
-        schemaVersion: 2,
-        memory,
-        counts,
+      MemoryCorrectCommandProjectionSchema.parse({
+        target: { workspaceId, memoryId: id },
+        body: input,
       }),
-      { headers: { 'cache-control': 'private, no-store' } },
+      request.signal,
     );
+    return Response.json(result, {
+      headers: { 'cache-control': 'private, no-store' },
+    });
   } catch (error) {
     const response = storageErrorResponse(error);
     response.headers.set('cache-control', 'private, no-store');
@@ -93,11 +85,13 @@ export async function DELETE(
     if (!workspaceId) throw new DataAccessError('not_found');
     const { id } = await route.params;
     const body = await request.text();
-    await deleteManagedEmployeeMemory(
+    await personalEmployeeMemory.withdraw(
       context,
-      workspaceId,
-      id,
-      body ? JSON.parse(body) : undefined,
+      MemoryMutationCommandProjectionSchema.parse({
+        target: { workspaceId, memoryId: id },
+        body: body ? JSON.parse(body) : undefined,
+      }),
+      request.signal,
     );
     return new Response(null, {
       status: 204,
