@@ -298,13 +298,12 @@ async function firstBytes(
 /** CONNECT never forwards bytes outside a complete TLS record. This checks
  * wire framing only; the client still validates certificates and ciphertext. */
 async function* tlsRecords(
-  source: Duplex,
+  source: AsyncIterable<Buffer>,
   inspect: (record: Buffer, first: boolean) => Promise<void> | void,
 ) {
   let pending = Buffer.alloc(0);
   let first = true;
-  // The default iterator destroys a socket at EOF if its write side is open.
-  for await (const chunk of source.iterator({ destroyOnReturn: false })) {
+  for await (const chunk of source) {
     pending = Buffer.concat([pending, chunk]);
     while (pending.length >= 5) {
       const type = pending[0]!;
@@ -330,6 +329,14 @@ async function* tlsRecords(
   if (pending.length) throw denied();
 }
 
+async function* tlsInput(socket: Duplex, buffered?: Buffer) {
+  // The first read can include records after the ClientHello, even if the
+  // socket has reached EOF while the upstream connection was opening.
+  if (buffered?.length) yield buffered;
+  // The default iterator destroys a socket at EOF if its write side is open.
+  yield* socket.iterator({ destroyOnReturn: false });
+}
+
 function finishTlsWrite(destination: Duplex, signal: AbortSignal) {
   const flushed = finished(destination, {
     readable: false,
@@ -343,6 +350,7 @@ function finishTlsWrite(destination: Duplex, signal: AbortSignal) {
 async function relayTls(
   client: Duplex,
   peer: Duplex,
+  buffered: Buffer,
   earlyData: boolean,
   signal: AbortSignal,
 ) {
@@ -359,7 +367,7 @@ async function relayTls(
   const ingress = pipeline(
     peer,
     () =>
-      tlsRecords(peer, (record, first) => {
+      tlsRecords(tlsInput(peer), (record, first) => {
         if (!first) return;
         const hello = record[0] === 22 && record[5] === 2;
         if (!hello && record[0] !== 21) throw denied();
@@ -372,7 +380,7 @@ async function relayTls(
   const egress = pipeline(
     client,
     () =>
-      tlsRecords(client, (record) => {
+      tlsRecords(tlsInput(client, buffered), (record) => {
         if (serverHello === true) return;
         // A TLS 1.3 client can send framed early data before ServerHello.
         if (
@@ -562,9 +570,13 @@ export function createVmPublicProxy(
         signal.throwIfAborted();
         const { end, earlyData } = initial.hello;
         upstream.socket.write(initial.bytes.subarray(0, end));
-        if (end < initial.bytes.length)
-          client.unshift(initial.bytes.subarray(end));
-        await relayTls(client, upstream.socket, earlyData, signal);
+        await relayTls(
+          client,
+          upstream.socket,
+          initial.bytes.subarray(end),
+          earlyData,
+          signal,
+        );
       } catch (error) {
         const status = responseCode(error);
         counts[status === 403 ? 'denied' : 'unavailable']++;

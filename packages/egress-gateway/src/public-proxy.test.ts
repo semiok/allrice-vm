@@ -23,6 +23,7 @@ const network = vi.hoisted(() => ({
     (hostname: string) => Promise<{ address: string; family: 4 | 6 }[]>
   >(),
   attempted: vi.fn<(options: Net.TcpNetConnectOpts) => void>(),
+  beforeDial: vi.fn<() => Promise<void> | undefined>(),
   doh: vi.fn(() => {
     throw Error('DoH must not be dialed in this fixture');
   }),
@@ -49,7 +50,13 @@ vi.mock('node:net', async (original) => {
         return socket;
       }
       if (options.host !== '1.1.1.1') throw Error('unexpected test dial');
-      const socket = net.connect({ ...options, host: '127.0.0.1' });
+      const local = { ...options, host: '127.0.0.1' };
+      const gate = network.beforeDial();
+      const socket = gate ? new net.Socket(local) : net.connect(local);
+      if (gate)
+        void gate.then(() => {
+          if (!socket.destroyed) socket.connect(local);
+        });
       Object.defineProperty(socket, 'remoteAddress', { value: options.host });
       return socket;
     },
@@ -67,6 +74,7 @@ function deferred<T>() {
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((close) => close()));
   network.attempted.mockClear();
+  network.beforeDial.mockReset();
   network.dns.mockReset();
   network.doh.mockClear();
 });
@@ -93,9 +101,11 @@ const setup = async (rejectHint?: ServerResponse['writeEarlyHints']) => {
     if (rejectHint) res.writeEarlyHints = rejectHint;
     track(proxy.http(req, res));
   });
-  server.on('connect', (req, client, head) =>
-    track(proxy.connect(req, client, head)),
-  );
+  const inputEnded = deferred<void>();
+  server.on('connect', (req, client, head) => {
+    client.once('end', () => inputEnded.resolve());
+    track(proxy.connect(req, client, head));
+  });
   const port = await listen(server);
   cleanup.push(async () => {
     stop.abort();
@@ -110,6 +120,7 @@ const setup = async (rejectHint?: ServerResponse['writeEarlyHints']) => {
     stop,
     port,
     authorization,
+    inputEnded: inputEnded.promise,
     drain: () => Promise.allSettled([...requests]),
   };
 };
@@ -446,17 +457,24 @@ async function nativeClientHello() {
 }
 
 it.each(['guest FIN', 'epoch revoke'] as const)(
-  'joins the TLS relay after an upstream alert and FIN followed by %s',
+  'keeps the guest-to-upstream TLS tail writable after upstream FIN and joins on %s',
   async (completion) => {
     const initial = await nativeClientHello();
+    const hello = Buffer.from([22, 3, 3, 0, 1, 2]);
+    const tail = Buffer.from([23, 3, 3, 0, 3, 14, 15, 16]);
     const upstream = deferred<Net.Socket>();
     const peerClosed = deferred<void>();
+    let received = Buffer.alloc(0);
     const port = await listen(
       createTcpServer({ allowHalfOpen: true }, (socket) => {
         socket.once('close', () => peerClosed.resolve());
-        socket.once('data', () => {
-          socket.end(Buffer.from([21, 3, 3, 0, 2, 2, 40]));
-          upstream.resolve(socket);
+        socket.on('data', (chunk) => {
+          const hadHello = received.length >= initial.length;
+          received = Buffer.concat([received, chunk]);
+          if (!hadHello && received.length >= initial.length) {
+            socket.end(hello);
+            upstream.resolve(socket);
+          }
         });
       }),
     );
@@ -472,9 +490,12 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
     try {
       await ended;
       expect((await upstream.promise).readableEnded).toBe(false);
-      if (completion === 'guest FIN') tunnel.end();
+      if (completion === 'guest FIN') tunnel.end(tail);
       else vm.stop.abort();
       await Promise.all([peerClosed.promise, vm.drain()]);
+      expect(received).toEqual(
+        completion === 'guest FIN' ? Buffer.concat([initial, tail]) : initial,
+      );
       if (completion === 'epoch revoke') tunnel.destroy();
       await clientClosed;
     } finally {
@@ -483,7 +504,7 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
   },
 );
 
-it.each(['coalesced', 'split'] as const)(
+it.each(['coalesced', 'split', 'coalesced before EOF'] as const)(
   'relays %s early TLS records before the first server flight',
   async (transport) => {
     // Synthetic ClientHello and opaque records exercise framing only.
@@ -527,18 +548,26 @@ it.each(['coalesced', 'split'] as const)(
     );
     const vm = await setup();
     network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+    const dial = deferred<void>();
+    if (transport === 'coalesced before EOF')
+      network.beforeDial.mockReturnValueOnce(dial.promise);
     const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
     expect(response.statusCode).toBe(200);
     const clientClosed = once(tunnel, 'close');
     tunnel.resume();
-    if (transport === 'coalesced')
-      tunnel.write(Buffer.concat([wireHello, early]));
-    else {
-      tunnel.write(wireHello);
-      await helloReceived.promise;
-      tunnel.write(early);
-    }
     try {
+      if (transport === 'coalesced before EOF') {
+        tunnel.end(Buffer.concat([wireHello, early]));
+        await vm.inputEnded;
+        expect(network.beforeDial).toHaveBeenCalledOnce();
+        dial.resolve();
+      } else if (transport === 'coalesced') {
+        tunnel.write(Buffer.concat([wireHello, early]));
+      } else {
+        tunnel.write(wireHello);
+        await helloReceived.promise;
+        tunnel.write(early);
+      }
       expect(await received.promise).toEqual(Buffer.concat([wireHello, early]));
       await clientClosed;
       await vm.drain();
