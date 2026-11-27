@@ -590,8 +590,18 @@ suite(
           created,
           signal,
         );
+        const { thread: directoryRow, ...firstRoot } = first;
         expect(first.identity.threadId).toEqual(expect.any(String));
         expect(first.identity.threadId).not.toBe(f.thread.id);
+        expect(directoryRow).toMatchObject({
+          id: first.identity.threadId,
+          ownerId: f.user,
+          organizationId: f.org,
+          workspaceId: first.identity.workspaceId,
+          employeeInstanceId: first.identity.employeeInstanceId,
+          visibility: 'private',
+          archivedAt: null,
+        });
         expect(first).toMatchObject({
           rootNativeSessionId: created.nativeSessionId,
           vmId: binding.vmId,
@@ -611,7 +621,7 @@ suite(
             binding.vmId,
             created.nativeSessionId,
           ),
-        ).toEqual(first);
+        ).toEqual(firstRoot);
 
         const forked = {
           ...created,
@@ -638,7 +648,15 @@ suite(
           forked,
           signal,
         );
+        const { thread: forkDirectoryRow, ...forkRoot } = fork;
         expect(fork.identity.threadId).not.toBe(first.identity.threadId);
+        expect(forkDirectoryRow).toMatchObject({
+          id: fork.identity.threadId,
+          ownerId: f.user,
+          organizationId: f.org,
+          visibility: 'private',
+          archivedAt: null,
+        });
         expect(fork).toMatchObject({
           rootNativeSessionId: forked.nativeSessionId,
           forkedFromNativeSessionId: created.nativeSessionId,
@@ -665,7 +683,7 @@ suite(
             ...f.selection,
             threadId: fork.identity.threadId,
           }),
-        ).toEqual(fork);
+        ).toEqual(forkRoot);
 
         const other = await setup();
         await fixture.db`insert into allrice_memberships (organization_id, workspace_id, user_id, role)

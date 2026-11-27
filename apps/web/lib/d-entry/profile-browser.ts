@@ -5,8 +5,14 @@ import {
   DEntryProfileChunkFilenameSchema,
   type DEntryProfileGraphSchema,
   UuidSchema,
+  dEntryRegisteredThreadHeader,
+  decodeDEntryRegisteredThread,
 } from '@allrice/contracts';
 import { z } from 'zod';
+import {
+  pageNativeThreadRegistered,
+  type PageNativeThreadRegistration,
+} from './page-messages';
 import {
   nativeMuxUrl,
   pageClosing,
@@ -21,6 +27,49 @@ const sender = z.strictObject({
   rpcId: z.string(),
   payload: z.strictObject({ args: z.record(z.string(), z.unknown()) }),
 });
+const createdSessionReply = z.object({
+  type: z.literal('server-response'),
+  rpcId: z.string(),
+  result: z.object({
+    ok: z.literal(true),
+    value: z.object({ sessionId: z.string().min(1).max(256) }),
+  }),
+});
+
+function publishNativeThread(
+  reply: Response,
+  bytes: ArrayBuffer,
+  scopeId: string,
+  rpcId: string,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
+) {
+  const thread = decodeDEntryRegisteredThread(
+    reply.headers.get(dEntryRegisteredThreadHeader),
+  );
+  if (!reply.ok || !thread) return;
+  // Never replace or reinterpret the RPC result that DSH itself consumes.
+  try {
+    const parsed = createdSessionReply.safeParse(
+      JSON.parse(new TextDecoder().decode(bytes)),
+    );
+    if (!parsed.success || parsed.data.rpcId !== rpcId) return;
+    const receipt = {
+      scopeId,
+      thread,
+      nativeSessionId: parsed.data.result.value.sessionId,
+    };
+    onThreadRegistered?.(receipt);
+    document.dispatchEvent(
+      new CustomEvent<PageNativeThreadRegistration>(
+        pageNativeThreadRegistered,
+        { detail: receipt },
+      ),
+    );
+  } catch {
+    // A malformed optional sidebar receipt must not cause a native write retry.
+  }
+}
+
 const publicRoot = /^\/_next\/static\/dsh-profile\/[a-f0-9]{64}\/$/;
 const publicBundlesSchema = z.array(
   z.strictObject({
@@ -158,6 +207,7 @@ export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -278,13 +328,25 @@ export function nativeProfileDocument(
                 endpoint: request.method,
                 payload: request.payload,
               }),
-            }).then(
-              async (reply) =>
-                new Response(await reply.arrayBuffer(), {
-                  status: reply.status,
-                  headers: reply.headers,
-                }),
-            );
+            }).then(async (reply) => {
+              const bytes = await reply.arrayBuffer();
+              if (
+                !lifetime.signal.aborted &&
+                (request.method === 'session/create' ||
+                  request.method === 'session/fork')
+              )
+                publishNativeThread(
+                  reply,
+                  bytes,
+                  scopeId,
+                  request.rpcId,
+                  onThreadRegistered,
+                );
+              return new Response(bytes, {
+                status: reply.status,
+                headers: reply.headers,
+              });
+            });
           }),
         );
       },

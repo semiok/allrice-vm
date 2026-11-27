@@ -214,7 +214,33 @@ export async function fixture(
     pinned = true;
     return selectedRoot(f.context, f.selection);
   });
-  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
+  const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>(
+    async (_context, identity, receipt) => {
+      const threadId = randomUUID();
+      const timestamp = '2026-01-01T00:00:00.000Z';
+      return {
+        identity: { ...identity, threadId },
+        rootNativeSessionId: receipt.nativeSessionId,
+        rootOriginDigest: 'registered-root-origin',
+        rootBindingRef: receipt.host.bindingRef,
+        vmId: receipt.host.binding.vmId,
+        thread: {
+          id: threadId,
+          ownerId: identity.personId,
+          organizationId: identity.organizationId,
+          workspaceId: identity.workspaceId,
+          employeeInstanceId: identity.employeeInstanceId,
+          employeeAssignmentId: randomUUID(),
+          employeeVersionId: identity.employeeVersionId,
+          visibility: 'private' as const,
+          title: 'New native conversation',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: null,
+        },
+      };
+    },
+  );
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
   const watchTerminal = vi.fn<
     NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>

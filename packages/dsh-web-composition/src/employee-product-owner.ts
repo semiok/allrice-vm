@@ -1,5 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
+import { ChatSessionSchema } from '@allrice/contracts';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import {
   employeeChoice,
@@ -7,7 +9,12 @@ import {
 } from '../../../apps/web/app/chatflow/employee-instances';
 import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
-import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
+import {
+  pageNavigate,
+  pageNativeThreadRegistered,
+  pageNativeThreadSelected,
+  type PageNativeThreadRegistration,
+} from '../../../apps/web/lib/d-entry/page-messages';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
 import {
   bindEmployeeSidebar,
@@ -47,6 +54,8 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
+  const registered = new Map([[nativeSessionId, threadId]]);
+  let activeNativeSession: string | undefined;
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -74,6 +83,42 @@ export function installEmployeeProductOwner(ctx: Context) {
       location.origin,
     );
   }
+  function followSelection() {
+    if (signal!.aborted || !activeNativeSession) return;
+    const current = sidebar.getSnapshot();
+    const thread = registered.get(activeNativeSession);
+    if (
+      !thread ||
+      !current?.tree ||
+      current.tree.activeId === thread ||
+      !current.tree.sessions.some((row) => row.id === thread)
+    )
+      return;
+    sidebar.update({ ...current, tree: { ...current.tree, activeId: thread } });
+    parent.postMessage(
+      {
+        type: pageNativeThreadSelected,
+        scopeId,
+        selection: { ...selection, threadId: thread },
+      },
+      location.origin,
+    );
+  }
+
+  // rc.2 publishes the Session displayed by the Conversation through its
+  // native sidebar controller. A registered fork may never become selected.
+  ctx.inject(['sidebarRight'], (native) => {
+    native.effect(() => {
+      const update = () => {
+        activeNativeSession = native.sidebarRight.mounted.getSnapshot();
+        followSelection();
+      };
+      const unsubscribe = native.sidebarRight.mounted.subscribe(update);
+      update();
+      return unsubscribe;
+    }, 'AllRice selected native conversation');
+  });
+
   const clear = () => {
     sidebar.update(null);
     panels.update(null);
@@ -81,6 +126,7 @@ export function installEmployeeProductOwner(ctx: Context) {
   signal.addEventListener('abort', clear, { once: true });
   ctx.effect(() => () => {
     signal.removeEventListener('abort', clear);
+    document.removeEventListener(pageNativeThreadRegistered, registerThread);
     clear();
   });
   ctx.inject(['uiWorkspace', 'sessions'], (native) => {
@@ -133,6 +179,53 @@ export function installEmployeeProductOwner(ctx: Context) {
     return workspace;
   });
 
+  function registerThread(event: Event) {
+    if (signal!.aborted) return;
+    const receipt = (event as CustomEvent<PageNativeThreadRegistration>).detail;
+    if (
+      !receipt ||
+      receipt.scopeId !== scopeId ||
+      typeof receipt.nativeSessionId !== 'string' ||
+      !receipt.nativeSessionId
+    )
+      return;
+    if (registered.has(receipt.nativeSessionId)) return;
+    const parsed = ChatSessionSchema.safeParse(receipt.thread);
+    if (!parsed.success) return;
+    const session = parsed.data;
+    if (
+      session.ownerId !== viewerId ||
+      session.organizationId !== organizationId ||
+      session.workspaceId !== selection.workspaceId ||
+      sessionEmployeeKey(session) !== selection.employeeInstanceId ||
+      session.visibility !== 'private' ||
+      session.archivedAt !== null
+    )
+      return;
+    registered.set(receipt.nativeSessionId, session.id);
+    void workspaceTask
+      .then(() => {
+        if (signal!.aborted) return;
+        const current = sidebar.getSnapshot();
+        if (!current?.tree) return;
+        const sessions = [
+          session,
+          ...current.tree.sessions.filter(({ id }) => id !== session.id),
+        ];
+        sidebar.update({
+          ...current,
+          tree: {
+            ...current.tree,
+            sessions,
+            workspace: { ...current.tree.workspace, sessions },
+          },
+        });
+        followSelection();
+      })
+      .catch(() => {});
+  }
+  document.addEventListener(pageNativeThreadRegistered, registerThread);
+
   void workspaceTask
     .then((workspace) => {
       const sessions = workspace.sessions.filter(
@@ -145,9 +238,16 @@ export function installEmployeeProductOwner(ctx: Context) {
           sessions,
           activeId: threadId,
           onSelectSession(id) {
-            if (id === threadId) return;
-            const selected = sessions.find((session) => session.id === id);
-            if (selected) navigate(sessionEmployeeKey(selected), selected.id);
+            const tree = sidebar.getSnapshot()?.tree;
+            if (!tree || id === tree.activeId) return;
+            const selected = tree.sessions.find((session) => session.id === id);
+            if (!selected) return;
+            const nativeId = ctx.sessions?.list
+              .getSnapshot()
+              .ids.find((candidate) => registered.get(candidate) === id);
+            if (nativeId !== undefined && ctx.uiWorkspace)
+              ctx.uiWorkspace.openSession(nativeId);
+            else navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
             if (
@@ -168,9 +268,11 @@ export function installEmployeeProductOwner(ctx: Context) {
         },
       };
       function notice(error: string) {
-        if (!signal!.aborted) sidebar.update({ ...initial, error });
+        const current = sidebar.getSnapshot();
+        if (!signal!.aborted && current) sidebar.update({ ...current, error });
       }
       sidebar.update(initial);
+      followSelection();
       bindEmployeeSidebar(ctx, {
         getSnapshot: sidebar.getSnapshot,
         subscribe: sidebar.subscribe,

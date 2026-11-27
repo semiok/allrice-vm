@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   sameDEntryIdentity,
+  ChatSessionSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
   type RequestContext,
@@ -92,7 +93,9 @@ export type DEntryPageHandle = Readonly<{
     nativeSessionId: string,
     forkSource: DEntryPageForkSource | undefined,
     signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<
+    Awaited<ReturnType<typeof registerDEntryPageNativeRoot>>['thread']
+  >;
   invokeTerminal(
     call: DEntryPageNativeCall,
     signal: AbortSignal,
@@ -610,7 +613,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       if (!sameRoot(forkSource.root, confirmed.root))
                         throw denied();
                     }
-                    await (deps.registerRoot ?? pageRootStore.registerRoot)(
+                    const registered = await (
+                      deps.registerRoot ?? pageRootStore.registerRoot
+                    )(
                       auth.context,
                       auth.identity,
                       {
@@ -625,6 +630,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       active,
                     );
                     await assertCurrent(active);
+                    const thread = ChatSessionSchema.parse(registered.thread);
+                    if (thread.id !== registered.identity.threadId)
+                      throw denied();
+                    return thread;
                   },
                   async invokeTerminal(call, active) {
                     active.throwIfAborted();
