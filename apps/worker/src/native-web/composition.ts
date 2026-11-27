@@ -42,10 +42,6 @@ import { openNativeWebOwner, type NativeWebOwner } from './owner.js';
 type Endpoint = PersonVmWebEndpointReceipt['endpoints'][number];
 type EmployeeProfile = Omit<DEntryIdentity, 'threadId'>;
 type ReportCapacity = (limit: number | undefined) => void;
-type ColdEmployeeSelection = Readonly<{
-  selected: EmployeeProfile;
-  neverStarted: readonly EmployeeProfile[];
-}>;
 function sameEmployee(
   a: Pick<
     Endpoint,
@@ -114,12 +110,11 @@ export function createAssignedNativeWebStartup(input: {
   };
   employeeRuntime?: Readonly<{
     maxRunning?: number;
-    /** Host proof for this startup and exact employee profiles. Absence keeps
-     * the existing eager plan. A roster row alone cannot prove never started. */
+    /** Exact current selection for this startup lease. */
     readColdSelection?(
       startup: PersonVmWebStartup,
       signal: AbortSignal,
-    ): Promise<ColdEmployeeSelection | null>;
+    ): EmployeeProfile | null;
   }>;
   commandMemory?: Readonly<{
     controls: ReadonlyCommandMemoryDirectory;
@@ -446,39 +441,40 @@ export function createAssignedNativeWebStartup(input: {
       throw new PersonVmError('LEASE_LOST');
     return web;
   }
-  async function coldEmployees(web: PersonVmWebStartup, signal: AbortSignal) {
+  function coldEmployees(
+    web: PersonVmWebStartup,
+    signal: AbortSignal,
+  ): {
+    endpoints: PersonVmWebEndpointReceipt['endpoints'];
+    selectedId?: string;
+    runtimeLimit?: number;
+  } {
     const { binding, endpoints, slots } = web.receipt;
-    if (!slots || !input.employeeRuntime) return { endpoints };
+    if (!input.employeeRuntime) return { endpoints };
+    if (!slots?.length) throw new PersonVmError('RUNTIME_NOT_READY');
     const maxRunning = Math.min(runtimeLimit, slots.length);
-    const selection = await input.employeeRuntime.readColdSelection?.(
-      web,
-      signal,
-    );
-    signal.throwIfAborted();
-    const selectedId = selection?.selected.employeeInstanceId;
-    const deferred = new Set<string>();
-    if (selection) {
-      const requireExactProfile = (profile: EmployeeProfile) => {
-        if (
-          profile.personId !== binding.personId ||
-          profile.organizationId !== binding.organizationId ||
-          !endpoints.some((employee) => sameEmployee(employee, profile))
-        )
-          throw new PersonVmError('AUTHORIZATION_DENIED');
-      };
-      requireExactProfile(selection.selected);
-      for (const profile of selection.neverStarted) {
-        requireExactProfile(profile);
-        deferred.add(profile.employeeInstanceId);
-      }
+    const select = input.employeeRuntime.readColdSelection;
+    if (!select) {
+      if (endpoints.length > maxRunning)
+        throw new PersonVmError('RUNTIME_NOT_READY');
+      return { endpoints, runtimeLimit: maxRunning };
     }
-    const launches = endpoints.filter(
-      ({ employeeInstanceId }) =>
-        employeeInstanceId === selectedId || !deferred.has(employeeInstanceId),
+    const employee = select(web, signal);
+    if (!employee) throw new PersonVmError('RUNTIME_NOT_READY');
+    const selected = endpoints.find((endpoint) =>
+      sameEmployee(endpoint, employee),
     );
-    // Retain the launch of existing homes because their native work can need
-    // restoration. That allowance cannot grant another hot-start slot.
-    return { endpoints: launches, selectedId, runtimeLimit: maxRunning };
+    if (
+      !selected ||
+      employee.personId !== binding.personId ||
+      employee.organizationId !== binding.organizationId
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    return {
+      endpoints: [selected],
+      selectedId: selected.employeeInstanceId,
+      runtimeLimit: maxRunning,
+    };
   }
   async function close() {
     if (closing) return closing;
@@ -545,7 +541,7 @@ export function createAssignedNativeWebStartup(input: {
         const web = current(binding, startup);
         signal = AbortSignal.any([signal, lifetime]);
         signal.throwIfAborted();
-        const cold = await coldEmployees(web, signal);
+        const cold = coldEmployees(web, signal);
         signal.throwIfAborted();
         const memory = await input.memoryGuestPlan(binding, signal);
         const profile = await input.readEmployeeProfile(signal);
@@ -1017,8 +1013,9 @@ export function createAssignedNativeWebStartup(input: {
             break;
           }
         }
-        // Preserve exact archived physical-slot reclaim before a capacity
-        // wait. Capacity alone grants no right to close another live owner.
+        // The sealed employee idle timer stays disabled. Demand starts are
+        // capped, only exact exit or archive releases a running slot, and
+        // physical idle stop remains a separate conservative VM operation (#59).
         const limit = fullEmployeeCapacity(group);
         if (limit !== undefined) {
           setWaiting(limit);

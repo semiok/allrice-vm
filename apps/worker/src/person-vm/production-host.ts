@@ -585,7 +585,6 @@ export function createProductionPersonVmHost(input: {
       const store = new PostgresPersonVmStore(openSql);
       const employeeRuntime = createProductionEmployeeRuntime(
         providers.employeeRuntimeSettings,
-        providers.native,
         providers.platform.employeePortSlots,
       );
       const diskRoot = providers.configuration.disk.root;
@@ -622,7 +621,6 @@ export function createProductionPersonVmHost(input: {
       };
       const vm = new PersonVmService({
         authorizePlatformDeletion: authorizeProductionPersonVmDeletion,
-        readUnusedEmployeeHomes: employeeRuntime?.readUnusedEmployeeHomes,
         store,
         authority: current.authority,
         native: providers.native,

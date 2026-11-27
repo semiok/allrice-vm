@@ -568,7 +568,6 @@ it('constructs the real store/service/admission/startup with one SQL factory and
   expect(actual.providers.platform).toBe(platform);
   expect(employeeRuntime).toHaveBeenCalledExactlyOnceWith(
     settings,
-    actual.providers.native,
     platform.employeePortSlots,
   );
   expect(admission).toHaveBeenCalledExactlyOnceWith({
