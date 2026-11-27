@@ -8,12 +8,13 @@ import { chromium, type Page } from 'playwright-core';
 import { expect, it } from 'vitest';
 import {
   type DEntryPageOpenedSchema,
+  DEntryProfileBootstrapSchema,
   DEntryProfileGraphSchema,
 } from '@allrice/contracts';
 import { deferred } from '../../../../packages/d-entry-principal/test/host-fixture.js';
 import {
   initialDocumentLifecycle,
-  publicBootstrapUrl,
+  publicStartupBundleUrls,
 } from '../../../web/lib/d-entry/initial-document.js';
 import {
   fixture,
@@ -87,12 +88,8 @@ it.skipIf(!browserExecutable).each([false, true])(
         bundle,
       ]),
     );
-    const earlyUrl =
-      !stall &&
-      publicBootstrapUrl(graph.batches, {
-        root: publicRoot,
-        bundles,
-      });
+    let earlyUrls: string[] = [];
+    const seenEarly = new Set<string>();
     const earlyBootstrapSeen = deferred<void>();
     const traffic: { kind: string; start: number; end?: number }[] = [];
     let started = 0;
@@ -148,7 +145,11 @@ it.skipIf(!browserExecutable).each([false, true])(
         }
         const publicBundle = !stall && publicBundles.get(url.pathname);
         if (publicBundle) {
-          if (url.pathname === earlyUrl) earlyBootstrapSeen.resolve();
+          if (earlyUrls.includes(url.pathname)) {
+            seenEarly.add(url.pathname);
+            if (seenEarly.size === earlyUrls.length)
+              earlyBootstrapSeen.resolve();
+          }
           const timing = {
             kind: 'public-' + publicBundle.phase,
             start: performance.now(),
@@ -171,7 +172,10 @@ it.skipIf(!browserExecutable).each([false, true])(
           return;
         }
         if (staticFiles.has(url.pathname)) {
-          if (earlyUrl && url.pathname === '/managed/employee-web-entry.js')
+          if (
+            earlyUrls.length &&
+            url.pathname === '/managed/employee-web-entry.js'
+          )
             await earlyBootstrapSeen.promise;
           const asset = await readFile(
             join(release.directory, url.pathname.slice(1)),
@@ -252,11 +256,20 @@ it.skipIf(!browserExecutable).each([false, true])(
         if (!scopeId) return response.writeHead(404).end();
         const bootstrap = await f.publish('bootstrap', scopeId);
         if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
-        const bootJson = (await bootstrap.text()).replaceAll('<', '\\u003c');
+        const published = DEntryProfileBootstrapSchema.parse(
+          await bootstrap.json(),
+        );
+        earlyUrls = stall
+          ? []
+          : publicStartupBundleUrls(published, {
+              root: publicRoot,
+              bundles,
+            });
+        const bootJson = JSON.stringify(published).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
-          <script data-scope-id="${scopeId}"${earlyUrl ? ` data-public-bootstrap-url="${earlyUrl}"` : ''}>${initialDocumentLifecycle}</script>
+          <script data-scope-id="${scopeId}" data-public-startup-bundles='${JSON.stringify(earlyUrls)}'>${initialDocumentLifecycle}</script>
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
@@ -362,11 +375,13 @@ it.skipIf(!browserExecutable).each([false, true])(
     const applicationDownload = traffic.find(
       ({ kind }) => kind === 'public-application',
     );
-    expect(applicationDownload?.start).toBeGreaterThan(
-      bootstrapDownload!.start,
-    );
+    expect(earlyUrls).toHaveLength(2);
+    expect(applicationDownload?.start).toBeLessThan(bootstrapDownload!.end!);
     expect(
       traffic.filter(({ kind }) => kind === 'public-bootstrap'),
+    ).toHaveLength(1);
+    expect(
+      traffic.filter(({ kind }) => kind === 'public-application'),
     ).toHaveLength(1);
     console.info(
       'HOT_NATIVE_BENCHMARK ' +
@@ -667,7 +682,7 @@ it.skipIf(!browserExecutable)(
           .join(' ');
         return send(
           'text/html',
-          `<!doctype html><head><script data-scope-id="${scope}"${mode === 'pending-elements' ? ` data-public-bootstrap-url="${heldPublicUrl}"` : ''}>${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : mode === 'draft-storage' ? '<script>Object.defineProperty(Storage.prototype,"getItem",{value:Storage.prototype.getItem,writable:false,configurable:false})</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
+          `<!doctype html><head><script data-scope-id="${scope}"${mode === 'pending-elements' ? ` data-public-startup-bundles='["${heldPublicUrl}"]'` : ''}>${initialDocumentLifecycle}</script>${mode === 'style' || mode === 'pending-elements' ? '<link rel="stylesheet" data-allrice-document-asset="style" href="/first.css">' : ''}</head><body ${mode === 'claimed-async' ? 'data-auto-dispose="1"' : ''}><div id="app" ${attributes}></div>${mode === 'claimed-sync' ? '<script>globalThis.__DSH_BOOT_READY__ = {};</script>' : mode === 'draft-storage' ? '<script>Object.defineProperty(Storage.prototype,"getItem",{value:Storage.prototype.getItem,writable:false,configurable:false})</script>' : ''}<script type="module" data-allrice-document-asset="entry" src="/${mode === 'style' || mode === 'entry' || mode === 'pending-elements' ? 'first' : 'child'}.js"></script></body>`,
         );
       }
       if (url.pathname.startsWith('/chatflow/4.0/document/'))

@@ -261,11 +261,11 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(doc.headers.get('location')).toBeNull();
   const html = await doc.text();
   expect(html).toContain(
-    'data-public-bootstrap-url="' +
+    'data-public-startup-bundles="[&quot;' +
       assetRoot +
       'bundles/' +
       '2'.repeat(64) +
-      '.js"',
+      '.js&quot;]"',
   );
   expect(html).toContain('data-native-session-id="real-native-root"');
   expect(doc.headers.get('cache-control')).toBe('private, no-store');

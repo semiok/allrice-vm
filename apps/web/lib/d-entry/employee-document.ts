@@ -5,7 +5,7 @@ import {
 } from '@allrice/database';
 import {
   initialDocumentLifecycle,
-  publicBootstrapUrl,
+  publicStartupBundleUrls,
 } from './initial-document';
 import { readDEntryWorkerJson, requestDEntryProfile } from './native-worker';
 import { profileAddress, profileDirectory, type profileInput } from './profile';
@@ -66,12 +66,10 @@ export async function renderEmployeeDocument(
       safeJson(bootstrap) +
       '</script>'
     : '';
-  const earlyBootstrap =
-    bootstrap &&
-    released &&
-    publicBootstrapUrl(bootstrap.graph.batches, released);
-  const earlyAttribute = earlyBootstrap
-    ? ` data-public-bootstrap-url="${escapeAttribute(earlyBootstrap)}"`
+  const earlyBundles =
+    bootstrap && released ? publicStartupBundleUrls(bootstrap, released) : [];
+  const earlyAttribute = earlyBundles.length
+    ? ` data-public-startup-bundles="${escapeAttribute(JSON.stringify(earlyBundles))}"`
     : '';
   const staticAsset = (path: string, fallback: string) =>
     released?.paths.has(path) ? released.root + path : fallback;

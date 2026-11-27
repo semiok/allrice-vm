@@ -8,7 +8,7 @@ import {
 import { z } from 'zod';
 import {
   profileBundleTimeoutMs,
-  type EarlyProfileBootstrap,
+  type EarlyProfileBundles,
 } from './initial-document';
 import {
   nativeMuxUrl,
@@ -141,7 +141,7 @@ export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
-  earlyBootstrap?: EarlyProfileBootstrap,
+  earlyBundles?: EarlyProfileBundles,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -162,10 +162,9 @@ export function nativeProfileDocument(
     );
     return task;
   };
-  if (earlyBootstrap) owned(earlyBootstrap.bytes);
   const cancel = () => {
     lifetime.abort();
-    earlyBootstrap?.cancel();
+    earlyBundles?.cancel();
   };
   void done.promise.catch(() => {});
   const query = new URLSearchParams({
@@ -242,28 +241,21 @@ export function nativeProfileDocument(
       )
         throw Error('Employee profile changed during startup');
       published = result;
+      const earlyReads = inline ? earlyBundles?.take() : undefined;
+      const readEarly = (url: string) =>
+        earlyReads?.get(url)?.catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'TimeoutError')
+            throw new EmployeeProfileBundleTimeout();
+          throw error;
+        });
       const bootstrapBatch = result.graph.batches.find(
         ({ phase }) => phase === 'bootstrap',
       );
-      if (
-        inline &&
-        bootstrapBatch &&
-        earlyBootstrap &&
-        releasedBundle(bootstrapBatch) === earlyBootstrap.url
-      )
-        preloaded.set(
-          bootstrapBatch.url,
-          owned(
-            earlyBootstrap.bytes.catch((error: unknown) => {
-              if (
-                error instanceof DOMException &&
-                error.name === 'TimeoutError'
-              )
-                throw new EmployeeProfileBundleTimeout();
-              throw error;
-            }),
-          ),
-        );
+      if (bootstrapBatch) {
+        const url = releasedBundle(bootstrapBatch);
+        const bytes = url && readEarly(url);
+        if (bytes) preloaded.set(bootstrapBatch.url, owned(bytes));
+      }
       // The rc.2 injection interpreter leaves preload rows as hints. Fetch
       // only the co-sealed public bytes and let the native loader execute them.
       for (const injection of result.injections) {
@@ -276,7 +268,8 @@ export function nativeProfileDocument(
           preloaded.set(
             injection.src,
             owned(
-              fetchProfileBundle(publicUrl, active, { credentials: 'omit' }),
+              readEarly(publicUrl) ??
+                fetchProfileBundle(publicUrl, active, { credentials: 'omit' }),
             ),
           );
       }

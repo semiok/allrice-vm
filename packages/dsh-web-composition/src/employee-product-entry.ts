@@ -1,5 +1,5 @@
 import { applyIndexInjections } from '@deepseek-ai/dsh-client-web';
-import type { EarlyProfileBootstrap } from '../../../apps/web/lib/d-entry/initial-document';
+import type { EarlyProfileBundles } from '../../../apps/web/lib/d-entry/initial-document';
 import {
   EmployeeProfileBundleTimeout,
   nativeProfileDocument,
@@ -22,7 +22,7 @@ const scope = globalThis as typeof globalThis & {
   __ALLRICE_EMPLOYEE_DOCUMENT__?: {
     scopeId: string;
     signal: AbortSignal;
-    earlyBootstrap?: EarlyProfileBootstrap;
+    earlyBundles?: EarlyProfileBundles;
     claim(): boolean;
     finish(state: 'closed' | 'unknown'): void;
   };
@@ -91,7 +91,7 @@ function boot(
         fail(error);
         close();
       },
-      documentOwner.earlyBootstrap,
+      documentOwner.earlyBundles,
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
