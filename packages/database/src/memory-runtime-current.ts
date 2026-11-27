@@ -1,5 +1,6 @@
 import {
   CurrentEmployeeBusinessProjectionSchema,
+  DEntryIdentitySchema,
   EmployeeBusinessTargetProjectionSchema,
   hasDEntryPersonRelease,
   type ApplicationBuiltinModulesProjection,
@@ -14,7 +15,7 @@ import { resolveEmployeeSessionInstance } from './employees/employee-instances.t
 /** Private to the database owner. The caller owns commit and cancellation.
  * Application build verification takes place before opening the transaction.
  * Historical source readers do not use this live execution gate. */
-export async function readLockedNativeMemoryCurrent(
+export async function readLockedNativeMemoryAuthority(
   tx: Sql,
   context: RequestContext,
   input: EmployeeBusinessTargetProjection,
@@ -79,7 +80,16 @@ export async function readLockedNativeMemoryCurrent(
   )
     throw new DataAccessError('authorization_denied');
 
-  return CurrentEmployeeBusinessProjectionSchema.parse({
+  const identity = DEntryIdentitySchema.parse({
+    organizationId: employee.organizationId,
+    workspaceId: employee.workspaceId,
+    personId: employee.ownerId,
+    employeeInstanceId: employee.id,
+    employeeRevision: employee.revision,
+    employeeVersionId: employee.source.employeeVersionId,
+    threadId: target.threadId,
+  });
+  const current = CurrentEmployeeBusinessProjectionSchema.parse({
     scope: {
       organizationId: employee.organizationId,
       workspaceId: employee.workspaceId,
@@ -96,4 +106,11 @@ export async function readLockedNativeMemoryCurrent(
     }),
     module: { ...target.module, applicationModules },
   });
+  return { identity, current, releaseRevision: currentPolicy.revision };
+}
+
+export async function readLockedNativeMemoryCurrent(
+  ...args: Parameters<typeof readLockedNativeMemoryAuthority>
+) {
+  return (await readLockedNativeMemoryAuthority(...args)).current;
 }

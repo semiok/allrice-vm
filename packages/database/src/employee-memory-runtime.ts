@@ -1,8 +1,8 @@
 /** Memory-owned native operations. Workflow's original dedicated caller owns
  * begin/commit/rollback/end; its private source binding owns G5 join/cleanup.
- * No SQL/tx/registry/factory is exported through the business port. Production
- * assembly is absent; the complete path is exercised with explicit owner
- * contract fixtures, never claimed as a real module/B/native producer. */
+ * No SQL/tx/registry/factory is exported through the business port. Native
+ * Worker installation remains explicit. */
+import { isDeepStrictEqual } from 'node:util';
 import {
   ActualNativeCallSelectorProjectionSchema,
   ActualNativeExecutionSelectorProjectionSchema,
@@ -52,9 +52,16 @@ import {
 import {
   MemoryRuntimeModuleOriginSchema,
   requireMemoryRuntimeAssembly,
+  type MemoryRuntimeAssembly,
   type MemoryRuntimeExecution,
   type MemoryRuntimeOwnerReads,
 } from './memory-runtime-binding.ts';
+import {
+  locateNativeMemoryTool,
+  workflowMemoryRuntime,
+  type NativeMemoryRootObservation,
+  type NativeMemoryToolObservation,
+} from './memory-runtime-workflow.ts';
 import { runtimePolicyDigest } from './runtime-policy-digest.ts';
 import { MemoryContextError } from './run-memory-context.ts';
 import {
@@ -252,18 +259,24 @@ type BoundMemory = {
   sources: ReturnType<typeof bindCallerSourceQueries>;
   current: CurrentEmployeeBusinessProjection;
 };
+type MemoryOrigin = {
+  source_type: string;
+  source_id: string | null;
+  metadata: unknown;
+};
 async function caller<T>(
   context: RequestContext,
   target: EmployeeBusinessTargetProjection,
   signal: AbortSignal,
   work: (bound: BoundMemory) => Promise<T>,
   scopeLock: true | 'read' = true,
+  ownerAssembly?: MemoryRuntimeAssembly,
 ) {
   signal.throwIfAborted();
-  const assembly = requireMemoryRuntimeAssembly();
+  const assembly = ownerAssembly ?? requireMemoryRuntimeAssembly();
   // No business SQL is started if the real external module/current producer
   // is unavailable. A DTO precheck is not used as the transaction's authority.
-  requireCurrent(
+  const preflight = requireCurrent(
     context,
     target,
     await assembly.current(context, target, signal),
@@ -279,7 +292,7 @@ async function caller<T>(
         tx,
         scopeLock,
       );
-      const reads = await assembly.bind(tx, context, target, signal);
+      const reads = await assembly.bind(tx, context, target, signal, preflight);
       const current = requireCurrent(context, target, await reads.current());
       if (!sameMemoryBusinessScope(current.scope, memoryBusinessScope(scope)))
         return denied();
@@ -301,31 +314,34 @@ async function caller<T>(
     signal,
   );
 }
+async function isOrdinary(
+  bound: BoundMemory,
+  origin: { source_type: string; source_id: string | null },
+  signal: AbortSignal,
+) {
+  const fact = OrdinaryOriginClassificationProjectionSchema.parse(
+    await bound.sources.classifyMemoryOrigin({
+      sourceType: origin.source_type,
+      sourceId: origin.source_id,
+    }),
+  );
+  signal.throwIfAborted();
+  if (
+    fact.sourceCheck !==
+    (['message', 'checkpoint'].includes(origin.source_type)
+      ? 'checked'
+      : 'not-applicable')
+  )
+    return denied();
+  return !fact.excludedByMethodAuthoring;
+}
 function qualifier(
   bound: BoundMemory,
   signal: AbortSignal,
   disclosureContext?: RequestContext,
 ) {
-  return async (origin: {
-    source_type: string;
-    source_id: string | null;
-    metadata: unknown;
-  }) => {
-    const fact = OrdinaryOriginClassificationProjectionSchema.parse(
-      await bound.sources.classifyMemoryOrigin({
-        sourceType: origin.source_type,
-        sourceId: origin.source_id,
-      }),
-    );
-    signal.throwIfAborted();
-    if (
-      fact.sourceCheck !==
-      (['message', 'checkpoint'].includes(origin.source_type)
-        ? 'checked'
-        : 'not-applicable')
-    )
-      return denied();
-    if (fact.excludedByMethodAuthoring) return false;
+  return async (origin: MemoryOrigin) => {
+    if (!(await isOrdinary(bound, origin, signal))) return false;
     const native = await requireStoredNativeMemorySource(
       bound.reads,
       bound.scope,
@@ -469,12 +485,17 @@ async function draft(
 
 export async function issueNativeEmployeeMemoryContext(
   context: RequestContext,
-  ...[input, signal, mode]:
-    | [NativeMemoryTarget, AbortSignal, 'issue']
-    | [NativeMemoryRestoreTarget, AbortSignal, 'restore']
+  ...[input, signal, mode, assembly]:
+    | [NativeMemoryTarget, AbortSignal, 'issue', MemoryRuntimeAssembly?]
+    | [
+        NativeMemoryRestoreTarget,
+        AbortSignal,
+        'restore',
+        MemoryRuntimeAssembly?,
+      ]
 ) {
   if (mode === 'restore')
-    return restoreNativeEmployeeMemoryContext(context, input, signal);
+    return restoreNativeEmployeeMemoryContext(context, input, signal, assembly);
   if (mode !== 'issue') return denied();
   const target = NativeMemoryTargetSchema.parse(input);
   const document = await caller(
@@ -499,6 +520,8 @@ export async function issueNativeEmployeeMemoryContext(
       requireOriginalContextOrigin(saved.origin, execution);
       return saved.document;
     },
+    assembly ? 'read' : true,
+    assembly,
   );
   signal.throwIfAborted();
   return document;
@@ -510,6 +533,7 @@ async function restoreNativeEmployeeMemoryContext(
   context: RequestContext,
   input: NativeMemoryRestoreTarget,
   signal: AbortSignal,
+  assembly?: MemoryRuntimeAssembly,
 ) {
   const target = NativeMemoryRestoreTargetSchema.parse(input);
   const { module, ...selector } = target;
@@ -536,6 +560,7 @@ async function restoreNativeEmployeeMemoryContext(
       return saved.document;
     },
     'read',
+    assembly,
   );
   signal.throwIfAborted();
   return document;
@@ -546,6 +571,7 @@ export async function readNativeEmployeeMemoryOrdinal(
   input: NativeMemoryTarget,
   ordinal: unknown,
   signal: AbortSignal,
+  assembly?: MemoryRuntimeAssembly,
 ) {
   const target = NativeMemoryTargetSchema.parse(input);
   const text = await caller(
@@ -569,6 +595,8 @@ export async function readNativeEmployeeMemoryOrdinal(
         },
       );
     },
+    assembly ? 'read' : true,
+    assembly,
   );
   signal.throwIfAborted();
   return text;
@@ -578,64 +606,188 @@ export async function rememberNativeEmployeeMemory(
   input: NativeMemoryTarget,
   content: unknown,
   signal: AbortSignal,
+  assembly?: MemoryRuntimeAssembly,
 ) {
   const target = NativeMemoryTargetSchema.parse(input),
     pair = RememberPersonalMemoryInputSchema.parse(content);
-  return caller(context, currentTarget(target), signal, async (bound) => {
-    const execution = await executionFor(bound, target, signal);
-    const selector = callSelector(execution);
-    const source = requireSource(selector, await bound.reads.adopted(selector));
-    signal.throwIfAborted();
-    const metadata = sourceMetadata(source, execution);
-    const qualify = qualifier(bound, signal);
-    const origin = {
-      source_type: 'message',
-      source_id: null,
-      metadata: { [nativeMemoryMetadataKey]: metadata },
-    };
-    if (!(await qualify(origin))) return denied();
-    return memoryOperation(
-      bound.tx,
-      bound.scope,
-      'create',
-      nativeMemoryOperationKey(metadata),
-      {
-        version: 1,
-        canonicalTool: metadata.canonicalTool,
-        pair: { summary: pair.summary, details: pair.details },
-        memoryClass: pair.memoryClass,
-        source: metadata,
-      },
-      async () => {
-        const row = await insertEmployeeMemoryPair(
-          bound.tx,
-          context,
-          bound.scope,
-          pair,
-          {
-            sourceType: 'message',
-            sourceId: null,
-            sourceLabel: '模型提取候选',
-            trust: 'derived',
-            confidence: 0.8,
-            lifecycleState: 'candidate',
-            memoryClass: pair.memoryClass,
-            metadata: origin.metadata,
-          },
+  return caller(
+    context,
+    currentTarget(target),
+    signal,
+    async (bound) => {
+      const execution = await executionFor(bound, target, signal);
+      const selector = callSelector(execution);
+      const source = requireSource(
+        selector,
+        await bound.reads.adopted(selector),
+      );
+      signal.throwIfAborted();
+      const metadata = sourceMetadata(source, execution);
+      // The pending source is this actual witnessed adoption. Historical
+      // qualification cannot authorize this new tool invocation or its retry.
+      async function qualify(origin: MemoryOrigin) {
+        return (
+          origin.source_type === 'message' &&
+          origin.source_id === null &&
+          isDeepStrictEqual(nativeMemorySource(origin.metadata), metadata) &&
+          (await isOrdinary(bound, origin, signal))
         );
-        return CandidateReceiptSchema.parse({
-          id: row.id,
-          revision: row.revision,
-          pairDigest: memoryPairDigest(pair),
-          summary: pair.summary,
+      }
+      const origin = {
+        source_type: 'message',
+        source_id: null,
+        metadata: { [nativeMemoryMetadataKey]: metadata },
+      };
+      if (!(await qualify(origin))) return denied();
+      return memoryOperation(
+        bound.tx,
+        bound.scope,
+        'create',
+        nativeMemoryOperationKey(metadata),
+        {
+          version: 1,
+          canonicalTool: metadata.canonicalTool,
+          pair: { summary: pair.summary, details: pair.details },
           memoryClass: pair.memoryClass,
-          state: 'pending',
-          requiresConfirmation: true,
-        });
-      },
-      CandidateReceiptSchema,
-      qualify,
-    );
+          source: metadata,
+        },
+        async () => {
+          const row = await insertEmployeeMemoryPair(
+            bound.tx,
+            context,
+            bound.scope,
+            pair,
+            {
+              sourceType: 'message',
+              sourceId: null,
+              sourceLabel: '模型提取候选',
+              trust: 'derived',
+              confidence: 0.8,
+              lifecycleState: 'candidate',
+              memoryClass: pair.memoryClass,
+              metadata: origin.metadata,
+            },
+          );
+          return CandidateReceiptSchema.parse({
+            id: row.id,
+            revision: row.revision,
+            pairDigest: memoryPairDigest(pair),
+            summary: pair.summary,
+            memoryClass: pair.memoryClass,
+            state: 'pending',
+            requiresConfirmation: true,
+          });
+        },
+        CandidateReceiptSchema,
+        qualify,
+      );
+    },
+    assembly ? 'read' : true,
+    assembly,
+  );
+}
+
+/** Host-only named operations. No SQL or transaction capability crosses the
+ * package boundary. Worker still has to explicitly register the sealed tools. */
+export function createNativeEmployeeMemoryHost() {
+  return Object.freeze({
+    async root(
+      context: RequestContext,
+      input: NativeMemoryRootObservation,
+      signal: AbortSignal,
+    ) {
+      const { workspaceId, employeeInstanceId, threadId, mode } = input;
+      const runId = UuidSchema.parse(input.runId);
+      const target = {
+        workspaceId,
+        employeeInstanceId,
+        threadId,
+        module: {
+          kind: 'builtin' as const,
+          moduleId: 'employee-memory' as const,
+        },
+      };
+      const assembly = workflowMemoryRuntime({ root: input });
+      const memoryIndexDocument =
+        mode === 'issue'
+          ? await issueNativeEmployeeMemoryContext(
+              context,
+              { ...target, nativeRequestRef: input.nativeRequestRef },
+              signal,
+              mode,
+              assembly,
+            )
+          : mode === 'restore'
+            ? await issueNativeEmployeeMemoryContext(
+                context,
+                { ...target, b: runId },
+                signal,
+                mode,
+                assembly,
+              )
+            : denied();
+      signal.throwIfAborted();
+      return { executionRef: runId, memoryIndexDocument };
+    },
+    async call(
+      context: RequestContext,
+      input: NativeMemoryToolObservation,
+      signal: AbortSignal,
+    ) {
+      const target = await locateNativeMemoryTool(
+        context,
+        input.nativeRequestRef,
+        signal,
+      );
+      await caller(
+        context,
+        currentTarget(target),
+        signal,
+        (bound) => executionFor(bound, target, signal),
+        'read',
+        workflowMemoryRuntime({ call: input }),
+      );
+      signal.throwIfAborted();
+      return { nativeRequestRef: target.nativeRequestRef };
+    },
+    async readOrdinal(
+      context: RequestContext,
+      nativeRequestRef: string,
+      input: unknown,
+      signal: AbortSignal,
+    ) {
+      const target = await locateNativeMemoryTool(
+        context,
+        nativeRequestRef,
+        signal,
+      );
+      return readNativeEmployeeMemoryOrdinal(
+        context,
+        target,
+        input,
+        signal,
+        workflowMemoryRuntime(),
+      );
+    },
+    async remember(
+      context: RequestContext,
+      nativeRequestRef: string,
+      input: unknown,
+      signal: AbortSignal,
+    ) {
+      const target = await locateNativeMemoryTool(
+        context,
+        nativeRequestRef,
+        signal,
+      );
+      return rememberNativeEmployeeMemory(
+        context,
+        target,
+        input,
+        signal,
+        workflowMemoryRuntime(),
+      );
+    },
   });
 }
 

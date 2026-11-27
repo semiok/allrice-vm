@@ -88,6 +88,7 @@ export interface MemoryRuntimeAssembly {
     context: RequestContext,
     target: EmployeeBusinessTargetProjection,
     signal: AbortSignal,
+    preflight?: CurrentEmployeeBusinessProjection,
   ): Promise<MemoryRuntimeOwnerReads>;
 }
 

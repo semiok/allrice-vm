@@ -43,6 +43,7 @@ import {
   deleteManagedEmployeeMemory,
   promoteManagedEmployeeMemory,
 } from './workspace/service.ts';
+export { createNativeEmployeeMemoryHost } from './employee-memory-runtime.ts';
 
 type ListQuery = z.input<typeof EmployeeMemoryListQuerySchema>;
 type CreateCommand = z.input<typeof CreatePersonalEmployeeMemoryInputSchema>;
@@ -77,8 +78,18 @@ export interface EmployeeMemoryPort {
     input: NativeMemoryRestoreTarget,
     signal: AbortSignal,
   ): Promise<string>;
-  readOrdinal: typeof readNativeEmployeeMemoryOrdinal;
-  remember: typeof rememberNativeEmployeeMemory;
+  readOrdinal(
+    context: RequestContext,
+    target: NativeMemoryTarget,
+    ordinal: unknown,
+    signal: AbortSignal,
+  ): ReturnType<typeof readNativeEmployeeMemoryOrdinal>;
+  remember(
+    context: RequestContext,
+    target: NativeMemoryTarget,
+    input: unknown,
+    signal: AbortSignal,
+  ): ReturnType<typeof rememberNativeEmployeeMemory>;
   reconcileRemember: typeof reconcileNativeEmployeeMemory;
   source(
     context: RequestContext,
@@ -223,7 +234,8 @@ export function createEmployeeMemoryPort(
       issueNativeEmployeeMemoryContext(context, input, signal, 'issue'),
     restoreContext: (context, input, signal) =>
       issueNativeEmployeeMemoryContext(context, input, signal, 'restore'),
-    readOrdinal: readNativeEmployeeMemoryOrdinal,
+    readOrdinal: (context, input, ordinal, signal) =>
+      readNativeEmployeeMemoryOrdinal(context, input, ordinal, signal),
     async remember(context, target, input, signal) {
       const receipt = await rememberNativeEmployeeMemory(
         context,
