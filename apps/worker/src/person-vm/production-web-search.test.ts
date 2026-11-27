@@ -7,6 +7,7 @@ import {
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import type { RequestContext } from '@allrice/contracts';
+import { EgressError } from '@allrice/egress-gateway';
 import type {
   PersonVmAdmissionBoundary,
   PersonVmBinding,
@@ -107,8 +108,14 @@ async function local<T>(
   run: (origin: string) => Promise<T>,
 ) {
   const server = createServer((_request, response) => {
-    void handle(response).catch((error: { code?: string }) => {
-      response.writeHead(403).end(error.code ?? '');
+    void handle(response).catch((error: unknown) => {
+      const failure =
+        error instanceof EgressError
+          ? error.code
+          : error instanceof Error
+            ? error.name
+            : 'UNKNOWN';
+      response.writeHead(403).end(failure);
     });
   });
   server.listen(0, '127.0.0.1');
@@ -182,7 +189,7 @@ it('cancels the upstream and does not emit a result after revocation', async () 
     async (origin) => {
       const response = await fetch(origin);
       expect(response.status).toBe(403);
-      await response.text();
+      expect(await response.text()).toBe('AbortError');
     },
   );
   expect(upstreamAborted).toBe(true);
