@@ -31,14 +31,22 @@ const selectionPin = pin.extend({
   manifestDigest: ReferenceSelectionSchema.shape.digest.optional(),
 });
 const occurrence = pin
-  .extend({ version: z.literal(1), sessionId: z.string().min(1) })
+  .extend({
+    version: z.literal(1),
+    sessionId: z.string().min(1),
+    documentId: z.uuid(),
+    ownerEpoch: z.number().int().positive(),
+  })
   .strict();
 const unavailable = () => new Error('这条引用已失效，请从工作台重新选择。');
 type Header = PropsRuntime<'conversation.session.header.actions'>;
+type ReferenceRequest = Parameters<
+  NonNullable<EmployeePanelsPort['useReference']>
+>[0];
 
 interface DocumentReferences {
   matches(sessionId: SessionIdOf, snapshot: EmployeePanelsSnapshot): boolean;
-  insert: NonNullable<EmployeePanelsPort['useReference']>;
+  insert(request: ReferenceRequest, ownerEpoch: number): boolean;
 }
 
 // The sealed document and Cordis owner share this lifetime. Existing business
@@ -47,6 +55,10 @@ interface DocumentReferences {
 interface ReferenceSource {
   readonly current: DocumentReferences | undefined;
   subscribe(listener: () => void): () => void;
+  bindOwner(
+    signal: AbortSignal,
+    read: (id: SessionIdOf) => EmployeePanelsSnapshot | null,
+  ): number;
 }
 
 const documents = new WeakMap<Document, ReferenceSource>();
@@ -68,6 +80,7 @@ export function apply(ctx: Context) {
   const { threadId, workspaceId, employeeInstanceId } = selection;
   if (!threadId || !nativeSessionId) return;
   const scopeKey = [organizationId, viewerId, workspaceId, scopeId].join('/');
+  const documentId = crypto.randomUUID();
   const data = createEmployeePanelsHttpClient(selection, {
     expectedViewerId: viewerId,
     lifetimeSignal: lifetime,
@@ -76,6 +89,15 @@ export function apply(ctx: Context) {
   // Publish the document slot before the panels owner starts. Cordis may
   // activate the input services later than the existing business binder.
   let currentReferences: DocumentReferences | undefined;
+  let ownerEpoch = 0;
+  let panelOwner:
+    | {
+        epoch: number;
+        signal: AbortSignal;
+        replace: AbortController;
+        read: (id: SessionIdOf) => EmployeePanelsSnapshot | null;
+      }
+    | undefined;
   const listeners = new Set<() => void>();
   const referenceSource: ReferenceSource = {
     get current() {
@@ -84,6 +106,26 @@ export function apply(ctx: Context) {
     subscribe(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    bindOwner(signal, read) {
+      if (signal.aborted || lifetime.aborted) return 0;
+      panelOwner?.replace.abort();
+      const replace = new AbortController();
+      const next = {
+        epoch: ++ownerEpoch,
+        signal: AbortSignal.any([signal, lifetime, replace.signal]),
+        replace,
+        read,
+      };
+      panelOwner = next;
+      next.signal.addEventListener(
+        'abort',
+        () => {
+          if (panelOwner === next) panelOwner = undefined;
+        },
+        { once: true },
+      );
+      return next.epoch;
     },
   };
   const publish = (bridge: DocumentReferences | undefined) => {
@@ -98,6 +140,7 @@ export function apply(ctx: Context) {
     lifetime.removeEventListener('abort', clear);
     if (documents.get(page.ownerDocument) === referenceSource)
       documents.delete(page.ownerDocument);
+    panelOwner?.replace.abort();
     clear();
     listeners.clear();
   });
@@ -142,6 +185,17 @@ export function apply(ctx: Context) {
         if (value.sessionId !== nativeSessionId) throw unavailable();
         return value;
       };
+      const currentPanelOwner = (id: SessionIdOf) => {
+        const bound = panelOwner;
+        const snapshot = bound?.read(id);
+        return bound &&
+          bound === panelOwner &&
+          !bound.signal.aborted &&
+          snapshot &&
+          referenceSource.current?.matches(id, snapshot)
+          ? bound
+          : undefined;
+      };
 
       native.effect(() =>
         native.inputTriggers.registerSource({
@@ -154,9 +208,18 @@ export function apply(ctx: Context) {
             clipboardText: (raw) => `@${parse(raw).fileName}`,
             async serialize(raw, signal) {
               const selected = parse(raw);
-              const binding = current(selected.sessionId);
-              if (!binding) throw unavailable();
-              const attempt = AbortSignal.any([signal, active]);
+              const binding = current(nativeSessionId);
+              const bound = currentPanelOwner(nativeSessionId as SessionIdOf);
+              if (
+                !binding ||
+                !bound ||
+                (selected.documentId === documentId &&
+                  selected.ownerEpoch !== bound.epoch)
+              )
+                throw unavailable();
+              // A reloaded draft may requalify in its scoped document. A live
+              // document must continue under the exact owner that inserted it.
+              const attempt = AbortSignal.any([signal, active, bound.signal]);
               attempt.throwIfAborted();
               const result = await data.selectMaterial(
                 {
@@ -169,6 +232,7 @@ export function apply(ctx: Context) {
               const actual = result.selection;
               if (
                 current(selected.sessionId) !== binding ||
+                currentPanelOwner(nativeSessionId as SessionIdOf) !== bound ||
                 result.viewerId !== viewerId ||
                 result.workspaceId !== workspaceId ||
                 result.canReference !== true ||
@@ -227,10 +291,13 @@ export function apply(ctx: Context) {
             snapshot.files.viewerId === viewerId
           );
         },
-        insert(request) {
+        insert(request, epoch) {
           const binding = current(request.sessionId);
+          const bound = currentPanelOwner(request.sessionId);
           if (
             !binding ||
+            !bound ||
+            bound.epoch !== epoch ||
             !actions ||
             request.signal.aborted ||
             request.scopeKey !== scopeKey
@@ -242,7 +309,11 @@ export function apply(ctx: Context) {
           if (manifestDigest && digest && manifestDigest !== digest)
             return false;
           const span = actions.captureInsertion();
-          if (request.signal.aborted || current(request.sessionId) !== binding)
+          if (
+            request.signal.aborted ||
+            current(request.sessionId) !== binding ||
+            currentPanelOwner(request.sessionId) !== bound
+          )
             return false;
           return native.conversation.input.for(binding.ctx).insertReference(
             {
@@ -252,6 +323,8 @@ export function apply(ctx: Context) {
                 digest: digest ?? manifestDigest,
                 version: 1,
                 sessionId: request.sessionId,
+                documentId,
+                ownerEpoch: bound.epoch,
               }),
               label: reference.data.fileName,
               appearance: 'file',

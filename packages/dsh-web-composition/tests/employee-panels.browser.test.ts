@@ -551,7 +551,7 @@ suite('installed native employee panels with synthetic business owner', () => {
       name: new RegExp(`^${labels[kind]}(?:，|$)`),
     });
     let entry = launcher;
-    if (page.viewportSize()!.width <= 760) {
+    if (page.viewportSize()!.width < 768) {
       // The compact native header exposes only its right-bar control. The
       // guide supplies the same actions inside the authorized native pane.
       const expand = page.getByRole('button', {
@@ -798,15 +798,18 @@ suite('installed native employee panels with synthetic business owner', () => {
     ).toBe(1);
   });
 
-  it('opens all four original entries through the native compact guide', async () => {
-    await page.setViewportSize({ width: 390, height: 1000 });
-    expect(await page.getByLabel('工作台入口').isVisible()).toBe(false);
-    for (const kind of kinds) {
-      await open(kind);
-      expect((await evidence()).expanded).toBe(true);
-      expect(await body(page, kind).count()).toBe(1);
-    }
-  });
+  it.each([390, 767])(
+    'opens all four original entries through the native compact guide at %ipx',
+    async (width) => {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await page.getByLabel('工作台入口').isVisible()).toBe(false);
+      for (const kind of kinds) {
+        await open(kind);
+        expect((await evidence()).expanded).toBe(true);
+        expect(await body(page, kind).count()).toBe(1);
+      }
+    },
+  );
 
   it.each([1440, 390])(
     'uses the installed production reference bridge at %ipx',
@@ -939,6 +942,13 @@ suite('installed native employee panels with synthetic business owner', () => {
         });
       }
       revoked = true;
+      await expect(command('serializeReference', 0)).rejects.toThrow(
+        '引用已失效',
+      );
+      revoked = false;
+      await command('unload');
+      await command('rebind');
+      expect((await command('input')).occurrences[0]).toEqual(inserted);
       await expect(command('serializeReference', 0)).rejects.toThrow(
         '引用已失效',
       );

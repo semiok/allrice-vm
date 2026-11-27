@@ -29,6 +29,14 @@ const scopeKey = [organizationId, panelsViewer, panelsWorkspace, scopeId].join(
   '/',
 );
 const revision = createSyntheticPanelsData().references[0]!;
+const ownerSnapshot = () => ({
+  ...syntheticPanelSnapshot(scopeKey, 'list', () => undefined),
+  publicationManagement: {
+    organizationId,
+    employeeInstanceId: panelsEmployee,
+    threadId,
+  },
+});
 const fixture = (deferred = false) => {
   const lifetime = new AbortController();
   const cleanup: (() => void)[] = [];
@@ -89,7 +97,15 @@ const fixture = (deferred = false) => {
       if (!deferred) activate();
     },
   } as Context);
-  const reference = employeePanelReferences()!;
+  const bindOwner = (signal: AbortSignal) => {
+    const snapshot = ownerSnapshot();
+    return createEmployeePanelsDataPort(
+      { getSnapshot: () => snapshot, subscribe: () => () => undefined },
+      () => unboundEmployeePanelDataClient,
+      signal,
+    );
+  };
+  const port = !deferred ? bindOwner(lifetime.signal) : undefined;
   return {
     activate,
     fetch,
@@ -99,9 +115,8 @@ const fixture = (deferred = false) => {
     get codec() {
       return registerSource.mock.calls[0]![0].codec;
     },
-    get reference() {
-      return reference.current!;
-    },
+    reference: { insert: port?.useReference! },
+    bindOwner,
     currentBinding,
     binding,
     currentSession,
@@ -199,6 +214,56 @@ it.each(['denied', 'checksum moved', 'scope changed', 'session changed'])(
     f.cleanup.forEach((close) => close());
   },
 );
+
+it('rejects an old draft reference after disposing and replacing its owner without changing the native session', async () => {
+  const f = fixture();
+  const owner = new AbortController();
+  const old = f.bindOwner(owner.signal);
+  expect(old.useReference?.(f.request)).toBe(true);
+  const [[oldChip]] = f.insertReference.mock.calls as unknown as [
+    [{ ref: string }],
+  ];
+  let release!: () => void;
+  f.fetch.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = () => resolve(new Response(JSON.stringify(f.result)));
+      }),
+  );
+  const pending = f.codec.serialize(oldChip.ref, f.lifetime.signal);
+  owner.abort();
+  const replacement = f.bindOwner(f.lifetime.signal);
+  expect(replacement.useReference?.(f.request)).toBe(true);
+  release();
+  await expect(pending).rejects.toBeInstanceOf(Error);
+  await expect(
+    f.codec.serialize(oldChip.ref, f.lifetime.signal),
+  ).rejects.toThrow('引用已失效');
+  expect(f.fetch).toHaveBeenCalledOnce();
+  const [, [newChip]] = f.insertReference.mock.calls as unknown as [
+    [{ ref: string }],
+    [{ ref: string }],
+  ];
+  await expect(
+    f.codec.serialize(newChip.ref, f.lifetime.signal),
+  ).resolves.toContain(revision.revisionId);
+  f.cleanup.forEach((close) => close());
+});
+
+it('restores a reference in a new authorized document for the same native session', async () => {
+  const first = fixture();
+  expect(first.reference.insert(first.request)).toBe(true);
+  const [[chip]] = first.insertReference.mock.calls as unknown as [
+    [{ ref: string }],
+  ];
+  first.cleanup.forEach((close) => close());
+
+  const restored = fixture();
+  await expect(
+    restored.codec.serialize(chip.ref, restored.lifetime.signal),
+  ).resolves.toContain(revision.revisionId);
+  restored.cleanup.forEach((close) => close());
+});
 
 it('enables references only for the current production data port and respects native refusal', () => {
   const f = fixture(true);

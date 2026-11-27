@@ -140,6 +140,10 @@ export function createEmployeePanelsDataPort(
     }
     return entry;
   };
+  const ownerEpoch = references?.bindOwner(signal, (id) => {
+    const entry = read(id);
+    return entry?.referencing ? entry.original : null;
+  });
   return {
     getSnapshot(id) {
       const entry = read(id);
@@ -162,17 +166,18 @@ export function createEmployeePanelsDataPort(
     },
     useReference: source.useReference
       ? (request) => source.useReference!(request)
-      : references &&
-        ((request) => {
-          const entry = read(request.sessionId);
-          const bridge = references.current;
-          return (
-            !!entry?.referencing &&
-            !!bridge?.matches(request.sessionId, entry.original) &&
-            entry.value.scopeKey === request.scopeKey &&
-            bridge.insert(request)
-          );
-        }),
+      : references && ownerEpoch
+        ? (request) => {
+            const entry = read(request.sessionId);
+            const bridge = references.current;
+            return (
+              !!entry?.referencing &&
+              !!bridge?.matches(request.sessionId, entry.original) &&
+              entry.value.scopeKey === request.scopeKey &&
+              bridge.insert(request, ownerEpoch)
+            );
+          }
+        : undefined,
     // Preview/dialog and the existing upload intake must receive this same
     // scoped client, rather than reconstructing an old route from an object ID.
     dataClient: (id) => read(id)?.client ?? unboundEmployeePanelDataClient,
