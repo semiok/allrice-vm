@@ -5,6 +5,10 @@ export {
 } from './contract.ts';
 export type {
   ModelCallBinding,
+  ModelRouteKey,
+  ModelRouteScope,
+  ResolveModelRoute,
+  DshGatewayRoute,
   ModelGatewayAuthority,
   ModelGatewayAdmission,
   GatewayModelInput,
@@ -29,4 +33,8 @@ export { createNativeModelCallReferences } from './native-call-reference.ts';
 export { createPostgresModelGatewayStore } from './postgres-store.ts';
 export { withGatewayAuthTransaction } from './transport.ts';
 export { createOwnedModelTransport } from './owned-transport.ts';
+export {
+  classifyOpenAiResponses,
+  OPENAI_RESPONSES_BASE_URL,
+} from './openai-responses.ts';
 export type { DshGatewayStreamScope } from './dsh-provider.ts';

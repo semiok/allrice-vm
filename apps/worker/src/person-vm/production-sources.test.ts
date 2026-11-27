@@ -8,6 +8,7 @@ import type {
 } from './production-dentry-source.js';
 import type { createProductionEgressAuthority } from './production-egress-authority.js';
 import type { createProductionCodexRuntime as loadCodexRuntime } from './production-codex-runtime.js';
+import type { createProductionOpenAiRuntime as loadOpenAiRuntime } from './production-openai-runtime.js';
 import {
   createProductionPersonVmSources,
   type ProductionNativeModelExecution,
@@ -15,11 +16,15 @@ import {
 
 const io = vi.hoisted(() => ({
   codex: vi.fn<typeof loadCodexRuntime>(),
+  openai: vi.fn<typeof loadOpenAiRuntime>(),
   entry: vi.fn<typeof installProductionDEntrySource>(),
   egress: vi.fn<typeof createProductionEgressAuthority>(),
 }));
 vi.mock('./production-codex-runtime.js', () => ({
   createProductionCodexRuntime: io.codex,
+}));
+vi.mock('./production-openai-runtime.js', () => ({
+  createProductionOpenAiRuntime: io.openai,
 }));
 vi.mock('./production-dentry-source.js', () => ({
   installProductionDEntrySource: io.entry,
@@ -27,13 +32,20 @@ vi.mock('./production-dentry-source.js', () => ({
 vi.mock('./production-egress-authority.js', () => ({
   createProductionEgressAuthority: io.egress,
 }));
-afterEach(() => vi.resetAllMocks());
+afterEach(() => {
+  vi.resetAllMocks();
+  vi.unstubAllEnvs();
+});
 
-function fixture() {
+function fixture(useOpenAi = false) {
+  vi.stubEnv('ALLRICE_DSH_MODEL_PROVIDER', useOpenAi ? 'openai' : undefined);
   const lifetime = new AbortController();
   const guest = new AbortController();
   const codex = new AbortController();
-  const issued = { ...modelBinding(), provider: 'openai-codex' as const };
+  const issued = {
+    ...modelBinding(),
+    provider: useOpenAi ? 'openai' : 'openai-codex',
+  };
   const workspaceId = randomUUID();
   issued.context.workspaceId = workspaceId;
   const candidate = {
@@ -56,7 +68,7 @@ function fixture() {
     classify: () => null,
   };
   const codexClose = vi.fn(async () => {});
-  io.codex.mockResolvedValue({
+  const runtime = {
     revoked: codex.signal,
     route,
     readModelInfo: vi.fn(async () => ({
@@ -72,13 +84,15 @@ function fixture() {
       beforeDispatch: vi.fn(),
     },
     confirmTransportStopped: vi.fn(),
-    assertCurrent: vi.fn(async (signal) => {
+    assertCurrent: vi.fn(async (signal?: AbortSignal) => {
       signal?.throwIfAborted();
       return codex.signal;
     }),
     llm: { prepareCall: vi.fn() },
     close: codexClose,
-  });
+  };
+  if (useOpenAi) io.openai.mockResolvedValue(runtime);
+  else io.codex.mockResolvedValue(runtime);
   const entryClose = vi.fn(async () => {});
   io.entry.mockReturnValue({ close: entryClose, readiness: vi.fn() });
   const bindModelCall = vi.fn();
@@ -145,52 +159,57 @@ function fixture() {
   };
 }
 
-it('shares the exact route and call association between A, B and the selected Codex owner', async () => {
-  const f = fixture();
-  const sources = createProductionPersonVmSources({
-    authority: f.authority,
-    attach: f.attach,
-  });
-  const bound = await sources.bind(f.host);
-  const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
-  const { context, identity, binding } = f.candidate;
-  await confirmPhysical!(context, identity, binding, f.lifetime.signal);
-  expect(f.withCurrentSelection).toHaveBeenCalledWith(
-    context,
-    identity,
-    f.lifetime.signal,
-    expect.any(Function),
-  );
-  expect(f.physicalReady).toHaveBeenCalledWith(
-    context,
-    binding,
-    f.lifetime.signal,
-  );
-  const issuance = f.attach.mock.calls[0]![1];
-  expect(issuance.route).toBe(f.route);
-  const ref = await issuance.issueCall(f.issued, f.lifetime.signal);
-  await expect(
-    bound.model.resolveCall(
-      { 'x-allrice-model-call-reference': ref },
-      f.issued.vm,
+it.each([false, true])(
+  'shares the exact route and call association (OpenAI API=%s)',
+  async (useOpenAi) => {
+    const f = fixture(useOpenAi);
+    const sources = createProductionPersonVmSources({
+      authority: f.authority,
+      attach: f.attach,
+    });
+    const bound = await sources.bind(f.host);
+    expect(io.openai).toHaveBeenCalledTimes(useOpenAi ? 1 : 0);
+    expect(io.codex).toHaveBeenCalledTimes(useOpenAi ? 0 : 1);
+    const { confirmPhysical, resolveSendRoute } = io.entry.mock.calls[0]![0];
+    const { context, identity, binding } = f.candidate;
+    await confirmPhysical!(context, identity, binding, f.lifetime.signal);
+    expect(f.withCurrentSelection).toHaveBeenCalledWith(
+      context,
+      identity,
       f.lifetime.signal,
-    ),
-  ).resolves.toEqual(f.issued);
-  expect(bound.egress.bindModelCall).toBe(f.bindModelCall);
-  const result = await resolveSendRoute(f.candidate, f.lifetime.signal);
-  f.resolve.mockResolvedValueOnce({ ...result, model: 'other' });
-  await expect(
-    resolveSendRoute(f.candidate, f.lifetime.signal),
-  ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
-  f.guest.abort();
-  expect(result.revoked.aborted).toBe(true);
-  await bound.runtime.close();
-  expect(f.entryClose).toHaveBeenCalledTimes(1);
-  expect(f.nativeClose).toHaveBeenCalledTimes(1);
-  expect(f.codexClose).not.toHaveBeenCalled();
-  await bound.egress.close();
-  expect(f.codexClose).toHaveBeenCalledTimes(1);
-});
+      expect.any(Function),
+    );
+    expect(f.physicalReady).toHaveBeenCalledWith(
+      context,
+      binding,
+      f.lifetime.signal,
+    );
+    const issuance = f.attach.mock.calls[0]![1];
+    expect(issuance.route).toBe(f.route);
+    const ref = await issuance.issueCall(f.issued, f.lifetime.signal);
+    await expect(
+      bound.model.resolveCall(
+        { 'x-allrice-model-call-reference': ref },
+        f.issued.vm,
+        f.lifetime.signal,
+      ),
+    ).resolves.toEqual(f.issued);
+    expect(bound.egress.bindModelCall).toBe(f.bindModelCall);
+    const result = await resolveSendRoute(f.candidate, f.lifetime.signal);
+    f.resolve.mockResolvedValueOnce({ ...result, model: 'other' });
+    await expect(
+      resolveSendRoute(f.candidate, f.lifetime.signal),
+    ).rejects.toMatchObject({ code: 'BINDING_INVALID' });
+    f.guest.abort();
+    expect(result.revoked.aborted).toBe(true);
+    await bound.runtime.close();
+    expect(f.entryClose).toHaveBeenCalledTimes(1);
+    expect(f.nativeClose).toHaveBeenCalledTimes(1);
+    expect(f.codexClose).not.toHaveBeenCalled();
+    await bound.egress.close();
+    expect(f.codexClose).toHaveBeenCalledTimes(1);
+  },
+);
 
 it('joins already attached native and Codex owners on source construction failure', async () => {
   const f = fixture();

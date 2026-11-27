@@ -8,6 +8,10 @@
 
 DSH 不拥有 SaaS 当前本人/企业、受管VM instance/epoch、员工release、原生根/子会话与Run/call归属，也不证明每次HTTP retry/授权刷新或跨gateway的每人8路。AllRice在host-only上下文参数位置核现权；消息/header不能选择owner。宿主逐fetch记录实际响应及独立usage；redirect不跟随，缺usage为null；provider最终合成0不能成为计费。账本只单向输出既有RuntimeRunUsage，不添加价格、套餐、余额或第二个扣费权威。
 
+模型路由首批沿用此同一接缝。Worker 默认继续走 `openai-codex`。宿主显式配置 `ALLRICE_DSH_MODEL_PROVIDER=openai` 及 `ALLRICE_DSH_OPENAI_MODEL` 才用 OpenAI API Responses，`ALLRICE_OPENAI_API_KEY` 仅注入宿主私有进程环境，变更路由以重新装配宿主生效。仅 `ALLRICE_DSH_OPENAI_WEB_SEARCH_MODEL` 与该模型完全相同时，真人对话尝试在已授权的精确 Responses POST 追加托管 `web_search`。标题、压缩和 Codex 沿用原路径。
+
+rc.2 不公开 pi-ai 的请求及原始事件钩子。宿主在已有计量 Fetch 接缝处理公开 Responses JSON/SSE，读真实 `url_citation` 后在同一次 HTTP 尝试的文本段定稿时投影为现有文本 Markdown 链接。SSE 账本仍观察原始字节，Guest 继续只收 DSH 原有块。请求改写限 32 MiB，引用观察以 1 MiB 单事件和 128 条每尝试为界。升级时核 native SDK 的工具形状、字符偏移、定稿事件和实际取消。每会话/子会话选路的扩展点只接收受管 native 身份，首批生产固定路由。
+
 新三表分别为不可变native-call幂等关联、实际上游尝试账本、全局person的8格准入租约，均在MET-268授权和写前四类检查内。排队重查现权，真实reader收尾与receipt提交后才放slot；crash/DB失败保留unknown及占位，无TTL释放/自动重放。`reconcileOwner`只能凭可信宿主死进程/全部transport停止事实恢复，guest回执无效。原生pi-ai正常terminal后会取消私有consumer signal，因此不把该信号等同真人取消；实际host/client/revoke信号与raw terminal、awaited reader close共同决定回执。
 
 升级须核公开消息/stream/replay词汇、pi-ai HTTP transport及fetch接缝、原生私有consumer close语义、wire终止/usage字段和缓存子集口径。上游若能直接提供host可信身份/逐HTTP attempt/全局person准入合同，可替换相应薄适配；租户授权和实际费用审计不能随替换删除。当前fixture证明loopback HTTP文本/工具往返、失败/取消/重连/8路隔离；数据库、多进程恢复及真实VM/模型验收另列，不把fixture当上线通过。完整owner合同见[model-gateway.md](model-gateway.md)。MET-225待主会话登记同名行。
