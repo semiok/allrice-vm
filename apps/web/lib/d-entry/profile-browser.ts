@@ -203,13 +203,21 @@ export function nativeProfileDocument(
     cancel: () => lifetime.abort(),
     async bootstrap(signal: AbortSignal) {
       const active = AbortSignal.any([lifetime.signal, signal]);
-      const response = await fetch(profileUrl('bootstrap'), {
-        signal: active,
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!response.ok) throw Error('Employee profile unavailable');
-      const result = DEntryProfileBootstrapSchema.parse(await response.json());
+      const inline = container.ownerDocument.getElementById(
+        'allrice-employee-bootstrap',
+      );
+      async function fetchBootstrap() {
+        const response = await fetch(profileUrl('bootstrap'), {
+          signal: active,
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        if (!response.ok) throw Error('Employee profile unavailable');
+        return response.json();
+      }
+      const result = DEntryProfileBootstrapSchema.parse(
+        inline ? JSON.parse(inline.textContent ?? '') : await fetchBootstrap(),
+      );
       active.throwIfAborted();
       if (
         result.scopeReference.scopeId !== scopeId ||

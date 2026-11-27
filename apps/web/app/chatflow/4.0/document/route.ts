@@ -9,8 +9,8 @@ import { resolveDEntryIdentity } from '../../../../lib/d-entry/identity';
 import {
   exactProfileQuery,
   profileAddress,
-  profileDirectory,
 } from '../../../../lib/d-entry/profile';
+import { renderEmployeeDocument } from '../../../../lib/d-entry/employee-document';
 import { dEntryErrorResponse } from '../../../../lib/d-entry/responses';
 
 export const runtime = 'nodejs';
@@ -36,13 +36,8 @@ export async function GET(request: Request) {
       context,
       'history',
     );
-    const location = await profileAddress(input, scopeId);
-    response = new Response(null, {
-      status: 307,
-      headers: {
-        location: profileDirectory('document', location) + '/native/index.html',
-      },
-    });
+    const address = await profileAddress(input, scopeId);
+    response = await renderEmployeeDocument(request, input, address, true);
   } catch (error) {
     response = dEntryErrorResponse(error);
   }

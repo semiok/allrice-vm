@@ -52,6 +52,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       ({ phase }) => phase === 'application',
     )!;
     let applicationReads = 0;
+    let browserBootstrapReads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -74,6 +75,7 @@ it.skipIf(!browserExecutable).each([false, true])(
         }
         for (const kind of ['bootstrap', 'assets'] as const) {
           if (url.pathname !== '/api/v1/d-entry/profile/' + kind) continue;
+          if (kind === 'bootstrap') browserBootstrapReads++;
           if (
             stall &&
             kind === 'assets' &&
@@ -144,6 +146,9 @@ it.skipIf(!browserExecutable).each([false, true])(
             },
           ],
         };
+        const bootstrap = await f.publish('bootstrap', life.scopeId);
+        if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
+        const bootJson = (await bootstrap.text()).replaceAll('<', '\\u003c');
         response.writeHead(200, { 'content-type': 'text/html' })
           .end(`<!doctype html>
           <link rel="stylesheet" href="/managed/employee-web-entry.css">
@@ -153,6 +158,7 @@ it.skipIf(!browserExecutable).each([false, true])(
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
             data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
+          <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
           <script type="module" src="/managed/employee-web-entry.js"></script>`);
       } catch {
         response.writeHead(500).end();
@@ -214,6 +220,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       await page.clock.fastForward(30_100);
       await page.locator('html[data-asset-timeout="asset-timeout"]').waitFor();
       expect(applicationReads).toBe(2);
+      expect(browserBootstrapReads).toBe(0);
       expect(unary).not.toContain('session/list');
       await context.close();
       return;
@@ -238,6 +245,7 @@ it.skipIf(!browserExecutable).each([false, true])(
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    expect(browserBootstrapReads).toBe(0);
     await expect
       .poll(() => firstItems)
       .toEqual(

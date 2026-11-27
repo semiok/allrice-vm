@@ -173,20 +173,42 @@ it('requires the issued scope in the document address and leaves the two exact n
     graphRev: 'verified-graph',
     manifestSha256: '1'.repeat(64),
   };
-  profileRequest.mockImplementation(async () =>
-    Response.json({ ...claims, nativeSessionId: 'real-native-root' }),
+  const bundle = 'plugins/??fixture/client.js&rev=r1';
+  profileRequest.mockImplementation(async (_input, _type, _selectors, mode) =>
+    mode === 'document'
+      ? Response.json({ ...claims, nativeSessionId: 'real-native-root' })
+      : Response.json({
+          version: 1,
+          scopeReference: { scopeId },
+          bindingRef: claims.bindingRef,
+          graph: {
+            rev: claims.graphRev,
+            release: { version: '0.2.1-rc.2' },
+            entries: [{ id: 'fixture', url: bundle, rev: 'r1' }],
+            batches: [
+              {
+                phase: 'bootstrap',
+                url: bundle,
+                rev: 'r1',
+                entries: ['fixture'],
+              },
+            ],
+          },
+          injections: [
+            {
+              kind: 'script',
+              placement: 'head',
+              text: '/* </script><script>unexpected</script> */',
+            },
+          ],
+        }),
   );
   directory.mockResolvedValue({
     sessions: [{ id: threadId, title: '</script><script>unexpected</script>' }],
     employees: [],
   });
-  const entry = await GET(
-    request(query + '&scopeId=' + scopeId + '&threadId=' + threadId),
-  );
-  expect(entry.status).toBe(307);
-  const location = entry.headers.get('location')!;
-  const parts = location.split('/').slice(4);
-  expect(parts).toEqual([
+  const location = [
+    '/chatflow/4.0/document',
     scopeId,
     selection.workspaceId,
     selection.employeeInstanceId,
@@ -196,7 +218,7 @@ it('requires the issued scope in the document address and leaves the two exact n
     claims.manifestSha256,
     'native',
     'index.html',
-  ]);
+  ].join('/');
   const call = (path: string, method = 'GET') => {
     const target = new URL(location, 'https://allrice.test');
     target.pathname = target.pathname.replace(
@@ -225,8 +247,11 @@ it('requires the issued scope in the document address and leaves the two exact n
       },
     ],
   });
-  const doc = await call('index.html');
+  const doc = await GET(
+    request(query + '&scopeId=' + scopeId + '&threadId=' + threadId),
+  );
   expect(doc.status).toBe(200);
+  expect(doc.headers.get('location')).toBeNull();
   const html = await doc.text();
   expect(html).toContain('data-native-session-id="real-native-root"');
   expect(doc.headers.get('cache-control')).toBe('private, no-store');
@@ -237,7 +262,11 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(html).toContain(
     'href="' + assetRoot + 'native/assets/index-BxpfOGf3.css"',
   );
-  expect(html).toContain('href="assets/vendor-DV2921Zo.css"');
+  expect(html).toContain(
+    'href="' +
+      location.replace('index.html', 'assets/vendor-DV2921Zo.css') +
+      '"',
+  );
   expect(html).toContain('data-public-asset-root="' + assetRoot + '"');
   expect(html).toContain('&amp;rev=r1');
   const lifecycle = html.indexOf('__ALLRICE_EMPLOYEE_DOCUMENT__');
@@ -254,6 +283,10 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect(html).toContain(
     'id="allrice-employee-directory" type="application/json"',
   );
+  expect(html).toContain(
+    'id="allrice-employee-bootstrap" type="application/json"',
+  );
+  expect(html).toContain('"scopeReference":{"scopeId":"' + scopeId + '"}');
   expect(html).not.toContain('<script>unexpected</script>');
   expect(directory).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({
@@ -266,7 +299,7 @@ it('requires the issued scope in the document address and leaves the two exact n
   expect((await call('api/session/uploadFileBinary', 'POST')).status).toBe(403);
   expect(profileRequest.mock.calls.map((args) => args.slice(1))).toEqual([
     ['bootstrap', { scopeId }, 'document'],
-    ['bootstrap', { scopeId }, 'document'],
+    ['bootstrap', { scopeId }],
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
     ['bootstrap', { scopeId }, 'document'],
@@ -303,20 +336,8 @@ it(
       ...worker.selection,
       scopeId: issued.scopeId,
     });
-    const outer = await GET(request(query.toString()));
-    expect(outer.status).toBe(307);
-    const location = new URL(
-      outer.headers.get('location')!,
-      'https://allrice.test',
-    );
-    const definitive = new Request(location, {
-      headers: { cookie: 'allrice_session=' + sessionToken },
-    });
-    const pending = documentAsset(definitive, {
-      params: Promise.resolve({
-        publicationPath: location.pathname.split('/').slice(4),
-      }),
-    });
+    const definitive = request(query.toString());
+    const pending = GET(definitive);
     try {
       await Promise.race([
         readDirectory.promise,
@@ -341,7 +362,7 @@ it(
     expect(await denied.text()).not.toMatch(
       /private employee|private session|<script/,
     );
-    expect(profileRequest).toHaveBeenCalledTimes(3);
+    expect(profileRequest).toHaveBeenCalledTimes(2);
     expect(
       profileRequest.mock.calls.every(
         ([input]) =>
