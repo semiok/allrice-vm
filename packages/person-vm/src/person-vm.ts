@@ -51,6 +51,7 @@ import type {
 } from './platform-deletion.ts';
 import {
   checkedWebRoster,
+  type PersonVmWebEndpointReceipt,
   type PersonVmWebRosterPort,
   type PersonVmWebStartup,
   type NativeWebSetupFailure,
