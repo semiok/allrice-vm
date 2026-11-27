@@ -7,9 +7,9 @@ import type {
   AdminTenantMember,
   AdminTenantMembers,
 } from '@allrice/contracts';
-import styles from './tenant-administration.module.css';
+import styles from '../../app/runtime-console/tenant-administration.module.css';
 import { TenantPolicyEditor } from './tenant-policy-editor';
-import { TenantResourceEditor } from './tenant-resource-editor';
+import { TenantResourceEditor } from '../../app/runtime-console/tenant-resource-editor';
 import { TenantEmployeeEditor } from './tenant-employee-editor';
 
 const errors: Record<string, string> = {
