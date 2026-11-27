@@ -52,6 +52,7 @@ async function readyIdentity(base, path, service) {
     identity?.repository !== 'semiok/allrice-vm' ||
     String(identity.repositoryId) !== '1469490636' ||
     identity.service !== service ||
+    identity.environment !== 'dev' ||
     identity.mode !== 'production' ||
     !sha.test(identity.sourceSha ?? '') ||
     !sha.test(identity.sourceTree ?? '') ||

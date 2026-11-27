@@ -251,6 +251,25 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
     });
   });
 
+  it('sends one opt-in greeting on a warm VM but retains the cold skip', async () => {
+    await run(
+      'warm',
+      async (smoke, receipt, traffic) => {
+        await expect(smoke).rejects.toBeInstanceOf(SmokeSkip);
+        expect(receipt.stages).toMatchObject({
+          prewarm: 204,
+          bootstrap: 200,
+          editor: true,
+          hello: 'accepted',
+        });
+        expect(
+          traffic.filter(({ path }) => path.endsWith('native-rpc')),
+        ).toHaveLength(1);
+      },
+      true,
+    );
+  });
+
   it.each([
     ['failure', '预热未返回 202'],
     ['bad-css', '原生 css 未返回 200'],

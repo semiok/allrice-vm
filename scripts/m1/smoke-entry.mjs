@@ -377,6 +377,7 @@ export async function smokeNativeEntry(
       allowedPrompt = undefined;
       fact.hello = 'accepted';
     }
+    if (warm) throw new SmokeSkip('当前 VM 已预热，缺少冷启动 202 证据');
   } finally {
     page.off('response', observe);
   }
