@@ -9,6 +9,7 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
+import { readEmployeeMemoryPageWrites } from '../../../apps/web/lib/memory/employee-memory-page-writes';
 import { personalEmployeeMemorySourceReader } from '../../../apps/web/lib/memory/employee-memory-client';
 import {
   bindEmployeeSidebar,
@@ -48,6 +49,12 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
+  const memoryWrites = readEmployeeMemoryPageWrites(parent, scopeId, {
+    organizationId,
+    personId: viewerId,
+    workspaceId: selection.workspaceId,
+    employeeInstanceId: selection.employeeInstanceId,
+  }) ?? { writes: new Map() };
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -300,7 +307,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             employeeName: employee.currentVersion.manifest.name,
             headers: requestHeaders,
             ownerSignal: signal,
-            writes: new Map(),
+            ...memoryWrites,
             readSource: personalEmployeeMemorySourceReader(requestHeaders),
           },
         },

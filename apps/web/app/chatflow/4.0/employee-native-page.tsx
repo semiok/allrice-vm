@@ -28,6 +28,7 @@ import {
   prewarmEmployeeEntry,
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
+import { createEmployeeMemoryPageWrites } from '../../../lib/memory/employee-memory-page-writes';
 import styles from './employee-native-page.module.css';
 
 type Status =
@@ -83,6 +84,7 @@ export function EmployeeNativePage({
 }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [source, setSource] = useState<string>();
+  const [bindMemoryWrites] = useState(createEmployeeMemoryPageWrites);
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
     initialUnavailable ? 'failed' : prepare && !query ? 'denied' : 'warming',
@@ -121,6 +123,7 @@ export function EmployeeNativePage({
     const lifetime = activation.warmup?.lifetime ?? new AbortController();
     let carrier: ReturnType<typeof openNativePageCarrier> | undefined;
     let scopeId: string | undefined;
+    let unbindMemoryWrites: (() => void) | undefined;
     let navigating = false;
     let retired = false;
     let mounted = false;
@@ -473,6 +476,7 @@ export function EmployeeNativePage({
         throw Error('Employee selection changed');
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
+        unbindMemoryWrites?.();
         send(pageRevoked);
         if (!prepare && !lifetime.signal.aborted) setFailed(true);
         // Before issuance, ready's rejection is handled by setting below.
@@ -484,6 +488,7 @@ export function EmployeeNativePage({
       if (navigating) return;
       selectedEmployee = selection;
       params.set('scopeId', issued.scopeId);
+      unbindMemoryWrites = bindMemoryWrites(window, issued.scopeId, identity);
       mounted = true;
       setSource('/chatflow/4.0/document?' + params);
     };
@@ -504,6 +509,7 @@ export function EmployeeNativePage({
       window.clearTimeout(closingNotice);
       if (activation.warmup) activation.warmup.progress.show = undefined;
       leaving();
+      unbindMemoryWrites?.();
       if (loaded.current === documentLoaded) loaded.current = undefined;
       if (replace.current === applyQuery) replace.current = undefined;
       cancel.current = undefined;
@@ -512,7 +518,7 @@ export function EmployeeNativePage({
       window.removeEventListener('pagehide', leaving);
       window.removeEventListener('popstate', restoreQuery);
     };
-  }, [activation, activeQuery, prepare, initialUnavailable]);
+  }, [activation, activeQuery, bindMemoryWrites, prepare, initialUnavailable]);
 
   useEffect(() => {
     if (nextQuery.current !== activeQuery) replace.current?.();

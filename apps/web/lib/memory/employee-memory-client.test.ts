@@ -12,6 +12,11 @@ import {
   type MemoryWriteStore,
 } from './employee-memory-client';
 
+import {
+  createEmployeeMemoryPageWrites,
+  readEmployeeMemoryPageWrites,
+} from './employee-memory-page-writes';
+
 const id = (n: number) =>
   `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const target = {
@@ -109,6 +114,87 @@ it('treats an archived employee as lost access without treating other 409 errors
   await expect(client.list()).rejects.not.toBeInstanceOf(MemoryAccessLost);
   await expect(client.save(pair, record)).rejects.toMatchObject({
     reason: 'cas_conflict',
+  });
+});
+
+describe('native memory across chat navigation', () => {
+  const employee = {
+    organizationId: id(101),
+    personId: id(102),
+    workspaceId: target.workspaceId,
+    employeeInstanceId: target.instanceId,
+  };
+
+  it('retries an uncertain edit with its original key and CAS after a replacement document', async () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const first = bind(host, 'first-chat', employee);
+    const sent: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit) => {
+        sent.push(JSON.parse(String(init.body)));
+        if (sent.length === 1) throw Error('receipt lost');
+        return ack();
+      }),
+    );
+    const client = (scopeId: string) => {
+      const state = readEmployeeMemoryPageWrites(host, scopeId, employee)!;
+      return employeeMemoryClient(
+        { ...target, scopeId, operationScopeId: state.operationScopeId },
+        state.writes,
+      );
+    };
+    await expect(client('first-chat').save(pair, record)).rejects.toThrow();
+    first();
+    bind(host, 'second-chat', employee);
+    expect(
+      readEmployeeMemoryPageWrites(host, 'first-chat', employee),
+    ).toBeUndefined();
+    await client('second-chat').save(pair, {
+      ...record,
+      revision: 8,
+      pairDigest: 'sha256:' + 'b'.repeat(64),
+    });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+  });
+
+  it('isolates the bridge by issued document and full employee scope', () => {
+    const host = {} as Window;
+    const bind = createEmployeeMemoryPageWrites();
+    const first = bind(host, 'first-chat', employee);
+    const owned = readEmployeeMemoryPageWrites(host, 'first-chat', employee);
+    for (const field of [
+      'organizationId',
+      'workspaceId',
+      'personId',
+      'employeeInstanceId',
+    ] as const) {
+      expect(
+        readEmployeeMemoryPageWrites(host, 'first-chat', {
+          ...employee,
+          [field]: id(98),
+        }),
+      ).toBeUndefined();
+    }
+    const other = { ...employee, employeeInstanceId: id(42) };
+    const second = bind(host, 'second-chat', other);
+    first();
+    const replacement = readEmployeeMemoryPageWrites(
+      host,
+      'second-chat',
+      other,
+    );
+    expect(replacement?.operationScopeId).toBe('second-chat');
+    expect(replacement?.writes).not.toBe(owned?.writes);
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second-chat', employee),
+    ).toBeUndefined();
+    second();
+    expect(
+      readEmployeeMemoryPageWrites(host, 'second-chat', other),
+    ).toBeUndefined();
   });
 });
 

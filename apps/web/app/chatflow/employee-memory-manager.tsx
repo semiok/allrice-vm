@@ -15,6 +15,7 @@ import { EmployeeMemorySidebar } from './employee-memory-sidebar';
 
 type Props = {
   scopeId: string;
+  operationScopeId?: string;
   workspaceId: string;
   instanceId: string;
   headers: Record<string, string>;
@@ -62,6 +63,7 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       }),
     [
       props.scopeId,
+      props.operationScopeId,
       props.workspaceId,
       props.instanceId,
       props.headers,
