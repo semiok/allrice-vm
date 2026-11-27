@@ -7,7 +7,6 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import type { ModelCallBinding } from '@allrice/model-gateway';
-import { SessionId } from '@deepseek-ai/dsh-session';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { expect, it, vi } from 'vitest';
 import { z } from 'zod';
@@ -101,6 +100,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       });
     const roots: string[] = [];
     const cleanup: (() => Promise<void>)[] = [];
+    const failures: unknown[] = [];
     try {
       const f = await createRunAuthorityFixture(db, {
         configure: false,
@@ -195,12 +195,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         | NonNullable<Awaited<ReturnType<typeof recordNativeExecutionRequest>>>
         | undefined;
       let rootInput: MemoryRootObservation | undefined;
-      let nativeSessionId: SessionId;
-      let nativePin: NonNullable<
-        Awaited<ReturnType<typeof readLockedDEntryNativeRootPin>>
-      >;
       let assistantCalls = 0;
-      let owner: Awaited<ReturnType<typeof setupNativeWebFixture>>['owner'];
 
       async function sealFirstRequest() {
         const native = await owner.readNativeAttemptFor(
@@ -320,18 +315,15 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           moduleConfigRevisionRef: selected.moduleConfigRevisionRef,
           vm,
         };
-        const {
-          nativeRequestRef: firstStep,
-          mode: _mode,
-          ...origin
-        } = rootInput;
+        const firstStep = rootInput.nativeRequestRef;
+        const restore = { ...rootInput, mode: 'restore' as const };
         await expect(
-          publication.root(context, { ...origin, mode: 'restore' }, signal),
+          publication.root(context, restore, signal),
         ).rejects.toMatchObject({ code: 'MEMORY_CONTEXT_UNAVAILABLE' });
         await expect(
           publication.root(
             context,
-            { ...origin, mode: 'issue', nativeRequestRef: randomUUID() },
+            { ...rootInput, nativeRequestRef: randomUUID() },
             signal,
           ),
         ).rejects.toMatchObject({ code: 'authorization_denied' });
@@ -345,13 +337,9 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             signal,
           ),
         ).toBe(true);
-        expect(
-          await publication.root(
-            context,
-            { ...origin, mode: 'restore' },
-            signal,
-          ),
-        ).toEqual(issued);
+        expect(await publication.root(context, restore, signal)).toEqual(
+          issued,
+        );
       }
 
       const server = createServer((request, response) => {
@@ -457,7 +445,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           }
         }
       `;
-      owner = (
+      const owner = (
         await setupNativeWebFixture(
           cli,
           roots,
@@ -547,8 +535,8 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
 
       const created = await owner.createRootFor(context, {}, signal);
       if (!created.ok) throw Error('Root was not created');
-      nativeSessionId = created.value.sessionId;
-      nativePin = await db.begin(async (tx) => {
+      const nativeSessionId = created.value.sessionId;
+      const nativePin = await db.begin(async (tx) => {
         const creation = {
           schemaVersion: 1,
           identity,
@@ -687,25 +675,27 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       await expect(
         publication.root(context, { ...rootInput, mode: 'restore' }, signal),
       ).rejects.toThrow();
+    } catch (cause) {
+      failures.push(cause);
     } finally {
-      const failures: unknown[] = [];
-      for (const dispose of cleanup.reverse()) {
+      for (const dispose of [
+        ...cleanup.reverse(),
+        ...roots.map(
+          (root) => () => rm(root, { recursive: true, force: true }),
+        ),
+        close,
+      ]) {
         try {
           await dispose();
         } catch (cause) {
           failures.push(cause);
         }
       }
-      for (const root of roots)
-        await rm(root, { recursive: true, force: true });
       seal.mockRestore();
       database.mockRestore();
-      await close();
-      if (failures.length)
-        throw new AggregateError(
-          failures,
-          'Native memory fixture cleanup failed',
-        );
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1)
+      throw new AggregateError(failures, 'Native memory fixture failed');
   },
 );
