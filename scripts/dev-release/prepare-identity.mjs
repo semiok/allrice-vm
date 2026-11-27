@@ -5,6 +5,7 @@ import { mkdir, open, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { stagePersonVmConfiguration } from './stage-person-vm-config.mjs';
 import { resolveServiceBuildSource } from './prepare-identity-root.mjs';
+import { stageDshProfileAssets } from './stage-dsh-profile-assets.mjs';
 import { prepareServiceBuildManifest } from '../../packages/database/dist/service-build-identity.js';
 import {
   measureDshNativeArtifact,
@@ -76,6 +77,7 @@ if (hostConfiguration) {
     sourceSha,
     linuxCapture,
   );
+  await stageDshProfileAssets(root, sourceSha);
 }
 const manifest = await prepareServiceBuildManifest(source);
 // The build inventory reopens the staged file. Its bytes must be the ones
