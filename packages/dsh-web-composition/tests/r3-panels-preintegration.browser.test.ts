@@ -130,7 +130,7 @@ async function fixtureApis(page: Page, requests: string[]) {
   return sample;
 }
 
-suite('R3 four-slice preintegration through the installed workbench', () => {
+suite('R3 preintegration through the installed workbench', () => {
   let host: Awaited<ReturnType<typeof startInstalledProfile>>;
   let browser: Browser;
   let artifacts: string;
@@ -317,6 +317,20 @@ suite('R3 four-slice preintegration through the installed workbench', () => {
         const settingsTrigger = page
           .locator('#chat-sidebar')
           .getByRole('button', { name: '设置', exact: true });
+        if (!(await settingsTrigger.isVisible()))
+          await page
+            .getByRole('button', { name: '打开侧边栏', exact: true })
+            .click();
+        await page
+          .locator('#chat-sidebar')
+          .getByRole('button', { name: '自动化任务', exact: true })
+          .click();
+        await page
+          .getByText('还没有自动化任务，在会话中创建的任务会显示在这里', {
+            exact: true,
+          })
+          .waitFor();
+        await shot('schedule');
         if (!(await settingsTrigger.isVisible()))
           await page
             .getByRole('button', { name: '打开侧边栏', exact: true })

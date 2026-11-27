@@ -13,7 +13,11 @@ import * as client from '../../../../packages/database/src/core/client.ts';
 import { readLockedDEntryNativeRootPin } from '../../../../packages/database/src/d-entry-native-root.ts';
 import { dEntryReleasePolicyKey } from '../../../../packages/database/src/d-entry-release-policy.ts';
 import { createNativeEmployeeMemoryHost } from '../../../../packages/database/src/employee-memory-runtime.ts';
-import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src/employees/employee-instances.ts';
+import {
+  changeEmployeeInstanceLifecycle,
+  createEmployeeInstance,
+  ensureGeneralEmployeeInstance,
+} from '../../../../packages/database/src/employees/employee-instances.ts';
 import {
   authenticateSession,
   createSession,
@@ -116,29 +120,60 @@ it.skipIf(
         executionGeneration: '4.0',
       });
       const login = await createSession(f.user);
-      const identity = {
-        organizationId: f.org,
-        workspaceId: f.workspace,
-        personId: f.user,
-        employeeInstanceId: f.assignment,
-        employeeRevision: 1,
-        employeeVersionId: f.version,
-        threadId: f.session,
-      };
       const authenticated = await authenticateSession(login.token, {
         organizationId: f.org,
         workspaceId: f.workspace,
       });
       if (!authenticated) throw Error('Isolated owner did not authenticate');
       const context = authenticated;
+      // Create two independent employee records before opting the existing
+      // member into 4.0, which restricts new employee creation.
+      const employee = await createEmployeeInstance(context, {
+        workspaceId: f.workspace,
+        assignmentId: f.assignment,
+        requestId: randomUUID(),
+        profile: { name: 'Original memory employee' },
+      });
+      const peer = {
+        employee: randomUUID(),
+        assignment: randomUUID(),
+        version: randomUUID(),
+      };
+      await db.begin(async (tx) => {
+        await tx`insert into allrice_employees(id,organization_id,workspace_id,employee_key,name)
+          values(${peer.employee},${f.org},${f.workspace},'memory-scope-peer','Peer employee')`;
+        await tx`insert into allrice_employee_versions(id,organization_id,workspace_id,employee_id,version,name,model,system_prompt,capabilities,config_checksum,manifest,provider_snapshot)
+          select ${peer.version},organization_id,workspace_id,${peer.employee},version,name,model,system_prompt,capabilities,config_checksum,manifest,provider_snapshot
+          from allrice_employee_versions where id=${f.version}`;
+        await tx`insert into allrice_employee_assignments(id,organization_id,workspace_id,employee_id,employee_version_id,user_id,is_default)
+          values(${peer.assignment},${f.org},${f.workspace},${peer.employee},${peer.version},${f.user},false)`;
+        await ensureGeneralEmployeeInstance(tx, peer.assignment);
+      });
+      const primary = await createChatSession(
+        context,
+        {
+          workspaceId: f.workspace,
+          employeeInstanceId: employee.id,
+          title: 'Original native memory thread',
+        },
+        { executionGeneration: '4.0' },
+      );
+      const identity = {
+        organizationId: f.org,
+        workspaceId: f.workspace,
+        personId: f.user,
+        employeeInstanceId: employee.id,
+        employeeRevision: employee.revision,
+        employeeVersionId: f.version,
+        threadId: primary.id,
+      };
       const target = (nativeRequestRef: string) => ({
         workspaceId: f.workspace,
-        employeeInstanceId: f.assignment,
-        threadId: f.session,
+        employeeInstanceId: employee.id,
+        threadId: primary.id,
         nativeRequestRef,
       });
       await db.begin(async (tx) => {
-        await ensureGeneralEmployeeInstance(tx, f.assignment);
         const release = {
           revision: randomUUID(),
           defaultGeneration: '3.x',
@@ -152,7 +187,7 @@ it.skipIf(
             organizationId: f.org,
             workspaceId: f.workspace,
             ownerId: f.user,
-            instanceId: f.assignment,
+            instanceId: employee.id,
             employeeId: f.employee,
           },
           confirmed,
@@ -228,9 +263,9 @@ it.skipIf(
           execution: { runId: run.runId, executionId: randomUUID() },
           context,
           vm,
-          employeeInstanceId: f.assignment,
+          employeeInstanceId: employee.id,
           employeeRelease: f.version,
-          allriceThreadRef: f.session,
+          allriceThreadRef: primary.id,
           native: {
             instanceId: owner.nativeInstanceId,
             profile: owner.modelAdapterId,
@@ -255,8 +290,8 @@ it.skipIf(
             source: 'dsh-native-prompt',
             generation: '4.0',
             loginSessionId: login.id,
-            threadId: f.session,
-            employeeInstanceId: f.assignment,
+            threadId: primary.id,
+            employeeInstanceId: employee.id,
             employeeRelease: f.version,
             nativeRequestId: nativePromptId,
             rootSessionId: nativeSessionId,
@@ -299,10 +334,10 @@ it.skipIf(
               applicationBuild: build,
               moduleConfigRevisionRef: selected.moduleConfigRevisionRef,
               adoptedModelConfiguration: model,
-              employeeInstanceId: f.assignment,
+              employeeInstanceId: employee.id,
               employeeRelease: f.version,
               employeeRevision: identity.employeeRevision,
-              threadId: f.session,
+              threadId: primary.id,
               vm,
             },
             native.promptIds,
@@ -331,8 +366,8 @@ it.skipIf(
           nativeRequestRef: step.execution.executionId,
           runId: run.runId,
           workspaceId: f.workspace,
-          employeeInstanceId: f.assignment,
-          threadId: f.session,
+          employeeInstanceId: employee.id,
+          threadId: primary.id,
           originalPromptRequestId: nativePromptId,
           originalTurn: human.occurrence.turn,
           rootNativeSessionRef: nativeSessionId,
@@ -641,9 +676,9 @@ it.skipIf(
       await db`insert into person_virtual_machines
         (person_id,vm_id,organization_id,phase,disk_tier,native_created,instance_id,lease_epoch,egress_receipt)
         values (${f.user},${vmId},${f.org},'running','warm',true,${instanceId},${leaseEpoch},'{}')`;
-      const pinRoot = (threadId: string, root: string) =>
+      const pinRoot = (threadId: string, root: string, member = identity) =>
         db.begin(async (tx) => {
-          const selected = { ...identity, threadId };
+          const selected = { ...member, threadId };
           const creation = {
             schemaVersion: 1,
             identity: selected,
@@ -661,7 +696,7 @@ it.skipIf(
           if (!pin) throw Error('No original root pin');
           return pin;
         });
-      const nativePin = await pinRoot(f.session, nativeSessionId);
+      const nativePin = await pinRoot(primary.id, nativeSessionId);
       const scopeId = randomUUID();
       const owned = owner.acquirePrincipal(
         {
@@ -755,7 +790,7 @@ it.skipIf(
         context,
         {
           workspaceId: f.workspace,
-          employeeInstanceId: f.assignment,
+          employeeInstanceId: employee.id,
           title: 'Same owner, different caller scope',
         },
         { executionGeneration: '4.0' },
@@ -772,6 +807,39 @@ it.skipIf(
           signal,
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
+      const peerThread = await createChatSession(
+        context,
+        {
+          workspaceId: f.workspace,
+          employeeInstanceId: peer.assignment,
+          title: 'Different employee for the same owner',
+        },
+        { executionGeneration: '4.0' },
+      );
+      const peerRoot = await owner.createRootFor(context, {}, signal);
+      if (!peerRoot.ok) throw Error('Peer native root was not created');
+      await pinRoot(peerThread.id, peerRoot.value.sessionId, {
+        ...identity,
+        employeeInstanceId: peer.assignment,
+        employeeRevision: 1,
+        employeeVersionId: peer.version,
+        threadId: peerThread.id,
+      });
+      const peerTarget = {
+        ...target(ref),
+        employeeInstanceId: peer.assignment,
+        threadId: peerThread.id,
+      };
+      await expect(
+        host.remember(context, peerTarget, candidate, signal),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
+      await expect(
+        host.reconcileRemember(
+          context,
+          { ...peerTarget, b: run.runId },
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
       const candidates = await db<
         { id: string; revision: number; call_ref: string }[]
       >`
@@ -785,7 +853,7 @@ it.skipIf(
       expect(pending?.call_ref).toBe(ref);
       expect(pending?.call_ref).not.toBe(callbackInputs.get(ref)?.callRef);
       const mutation = {
-        instanceId: f.assignment,
+        instanceId: employee.id,
         expectedRevision: pending!.revision,
         pairDigest: memoryPairDigest(candidate),
         idempotencyKey: randomUUID(),
@@ -806,8 +874,20 @@ it.skipIf(
           document: indexDocument,
         },
       ]);
-      await db`update person_virtual_machines set phase='stopped' where vm_id=${owner.binding.vmId}`;
+      await db`update allrice_runs set state='succeeded' where id=${run.runId}`;
+      await expect(
+        host.remember(context, target(ref), candidate, signal),
+      ).rejects.toMatchObject({ code: 'authorization_denied' });
       if (!rootInput) throw Error('No original root input');
+      const restore = { ...rootInput, mode: 'restore' as const };
+      await expect(publication.root(context, restore, signal)).resolves.toEqual(
+        {
+          executionRef: run.runId,
+          memoryIndexDocument: indexDocument,
+        },
+      );
+      expect(await savedIndex()).toEqual(spent);
+      await db`update person_virtual_machines set phase='stopped' where vm_id=${owner.binding.vmId}`;
       await expect(
         publication.root(context, { ...rootInput, mode: 'restore' }, signal),
       ).resolves.toEqual({
@@ -849,22 +929,56 @@ it.skipIf(
           signal,
         ),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
-      await db`update allrice_chat_sessions set archived_at=now() where id=${f.session}`;
+      await db`update allrice_chat_sessions set archived_at=now() where id=${primary.id}`;
       await expect(reconcile()).rejects.toMatchObject({
         code: 'authorization_denied',
       });
       await expect(confirm()).rejects.toMatchObject({
         code: 'authorization_denied',
       });
-      await db`update allrice_chat_sessions set archived_at=null where id=${f.session}`;
+      await db`update allrice_chat_sessions set archived_at=null where id=${primary.id}`;
       await expect(confirm()).resolves.toMatchObject({ state: 'active' });
       await db`update allrice_sessions set revoked_at=now() where id=${login.id}`;
       await expect(
         host.remember(context, target(ref), candidate, signal),
       ).rejects.toThrow();
       await expect(
-        publication.root(context, { ...rootInput, mode: 'restore' }, signal),
+        publication.root(context, restore, signal),
       ).rejects.toThrow();
+      const newLogin = await createSession(f.user);
+      const current = await authenticateSession(newLogin.token, {
+        organizationId: f.org,
+        workspaceId: f.workspace,
+      });
+      if (!current) throw Error('Current login was not authenticated');
+      await expect(
+        host.reconcileRemember(
+          current,
+          { ...target(otherRef), b: run.runId },
+          signal,
+        ),
+      ).resolves.toMatchObject({ status: 'recorded', state: 'pending' });
+      await expect(
+        changeEmployeeInstanceLifecycle(current, employee.id, {
+          workspaceId: f.workspace,
+          requestId: randomUUID(),
+          expectedRevision: employee.revision,
+          operation: 'archive',
+        }),
+      ).resolves.toMatchObject({ archivedAt: expect.any(String) });
+      await expect(
+        publication.root(current, restore, signal),
+      ).rejects.toMatchObject({
+        code: 'instance_archived',
+      });
+      await expect(
+        host.reconcileRemember(
+          current,
+          { ...target(otherRef), b: run.runId },
+          signal,
+        ),
+      ).rejects.toMatchObject({ code: 'instance_archived' });
+      expect(await savedIndex()).toEqual(spent);
     } catch (cause) {
       failures.push(cause);
     } finally {
