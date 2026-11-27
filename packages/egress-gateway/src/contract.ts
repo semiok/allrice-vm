@@ -110,7 +110,7 @@ export type ManagedHostService = Readonly<{
           request: IncomingMessage,
           binding: PersonVmBinding,
           signal: AbortSignal,
-          assertNoCapability: (value: string) => void,
+          assertNoCapability?: (value: string) => void,
         ): Promise<{
           context: RequestContext;
           dispatch(

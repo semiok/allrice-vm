@@ -981,6 +981,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   AbortSignal.timeout(5_000),
                 ]);
                 const wanted = await readGuestSearch(request, reading);
+                if (!assertNoCapability) throw new EgressError('DENIED');
                 assertNoCapability(wanted.query);
                 const checked = new Set<string>();
                 for (const { scope: probe, observation } of selected.values()) {
