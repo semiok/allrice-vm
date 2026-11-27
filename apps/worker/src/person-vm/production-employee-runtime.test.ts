@@ -14,8 +14,8 @@ it('keeps omission off, with defaults and limits only when the Host enables empl
     employeeIdleMs: 1_200_000,
   });
   for (const settings of [
-    { maxRunning: 21 },
-    { maxRunning: 1.5 },
+    { employeeMaxRunning: 21 },
+    { employeeMaxRunning: 1.5 },
     { employeeIdleMs: 59_999 },
     { employeeIdleMs: 86_400_001 },
   ])

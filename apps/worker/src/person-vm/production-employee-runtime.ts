@@ -6,12 +6,12 @@ import {
 } from '@allrice/person-vm';
 
 export type ProductionEmployeeRuntimeSettings = Readonly<{
-  maxRunning?: number;
+  employeeMaxRunning?: number;
   employeeIdleMs?: number;
 }>;
 
 const defaults = Object.freeze({
-  maxRunning: 4,
+  employeeMaxRunning: 4,
   employeeIdleMs: 20 * 60 * 1000,
 });
 
@@ -34,26 +34,35 @@ function homesNeverCreated() {
 if (homesNeverCreated()) console.log(${JSON.stringify(unused)});
 `;
 
+export function resolveProductionEmployeeRuntimeSettings(
+  settings: ProductionEmployeeRuntimeSettings,
+  slots: number,
+) {
+  const employeeMaxRunning =
+    settings.employeeMaxRunning ?? Math.min(defaults.employeeMaxRunning, slots);
+  const employeeIdleMs = settings.employeeIdleMs ?? defaults.employeeIdleMs;
+  if (
+    !Number.isSafeInteger(employeeMaxRunning) ||
+    employeeMaxRunning < 1 ||
+    employeeMaxRunning > slots ||
+    !Number.isSafeInteger(employeeIdleMs) ||
+    employeeIdleMs < 60_000 ||
+    employeeIdleMs > 86_400_000
+  )
+    throw new PersonVmError('RUNTIME_NOT_READY');
+  return Object.freeze({ employeeMaxRunning, employeeIdleMs });
+}
+
 export function createProductionEmployeeRuntime(
   settings: ProductionEmployeeRuntimeSettings | undefined,
   native: Pick<MicrosandboxPersonVm, 'readAttachedProbe'>,
   slots: number,
 ) {
   if (!settings) return undefined;
-  const maxRunning =
-    settings.maxRunning ?? Math.min(defaults.maxRunning, slots);
-  const employeeIdleMs = settings.employeeIdleMs ?? defaults.employeeIdleMs;
-  if (
-    !Number.isSafeInteger(maxRunning) ||
-    maxRunning < 1 ||
-    maxRunning > slots ||
-    !Number.isSafeInteger(employeeIdleMs) ||
-    employeeIdleMs < 60_000 ||
-    employeeIdleMs > 86_400_000
-  )
-    throw new PersonVmError('RUNTIME_NOT_READY');
+  const { employeeMaxRunning, employeeIdleMs } =
+    resolveProductionEmployeeRuntimeSettings(settings, slots);
   return Object.freeze({
-    maxRunning,
+    maxRunning: employeeMaxRunning,
     employeeIdleMs,
     async readUnusedEmployeeHomes(scope: PersonVmStartingScope, mount: string) {
       const output = await native.readAttachedProbe(scope, mount, {

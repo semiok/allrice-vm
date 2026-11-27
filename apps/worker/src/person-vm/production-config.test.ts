@@ -18,6 +18,7 @@ import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import type { ServiceBuildIdentity } from '@allrice/database';
 import { productionInputsFixture } from './production-inputs.fixture.js';
 import { createProductionEgressInstallation } from './production-egress.js';
+import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 const source = vi.hoisted<{
   build: ReturnType<typeof vi.fn>;
@@ -229,7 +230,67 @@ describe('private production Host configuration', () => {
     const result = await readProductionHostConfiguration(signal());
     expect(result.platform.employeePortSlots).toBe(width);
     expect(result.configuration).toEqual(original);
+    expect(result.employeeRuntimeSettings).toEqual({
+      employeeMaxRunning: Math.min(4, width),
+      employeeIdleMs: 1_200_000,
+    });
   });
+
+  it.each([
+    { employeeMaxRunning: 1, employeeIdleMs: 60_000 },
+    { employeeMaxRunning: 20, employeeIdleMs: 86_400_000 },
+  ])(
+    'reads sealed employee runtime settings and passes the exact values to the pending runtime',
+    async (settings) => {
+      const original = value();
+      await seal({
+        ...original,
+        employeePortSlots: 20,
+        lifecycle: { ...original.lifecycle, ...settings },
+      });
+      const loaded = await readProductionHostConfiguration(signal());
+      expect(loaded.employeeRuntimeSettings).toEqual(settings);
+      expect(Object.isFrozen(loaded.employeeRuntimeSettings)).toBe(true);
+      const native = { readAttachedProbe: vi.fn() };
+      expect(
+        createProductionEmployeeRuntime(
+          loaded.employeeRuntimeSettings,
+          native,
+          loaded.platform.employeePortSlots,
+        ),
+      ).toMatchObject({
+        maxRunning: settings.employeeMaxRunning,
+        employeeIdleMs: settings.employeeIdleMs,
+      });
+      expect(native.readAttachedProbe).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { employeeMaxRunning: 0 },
+    { employeeMaxRunning: 1.5 },
+    { employeeMaxRunning: '4' },
+    { employeeMaxRunning: null },
+    { employeeMaxRunning: 6 },
+    { employeeMaxRunning: 21 },
+    { employeeIdleMs: 59_999 },
+    { employeeIdleMs: 60_000.5 },
+    { employeeIdleMs: 86_400_001 },
+    { employeeIdleMs: '1200000' },
+  ])(
+    'rejects invalid employee runtime settings in the verified lifecycle seal (%j)',
+    async (settings) => {
+      const original = value();
+      await seal({
+        ...original,
+        employeePortSlots: 5,
+        lifecycle: { ...original.lifecycle, ...settings },
+      });
+      await expect(
+        readProductionHostConfiguration(signal()),
+      ).rejects.toBeInstanceOf(ProductionHostConfigurationUnavailable);
+    },
+  );
 
   it.each([0, 21, 1.5, 'private-invalid-input', null])(
     'defaults an invalid sealed width without logging the input',

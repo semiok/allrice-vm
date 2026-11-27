@@ -15,6 +15,7 @@ import {
 import { readPlatformPersonVmConfiguration } from '@allrice/contracts';
 import { checkedReadonlyCommandMemoryDirectory } from '@allrice/person-vm';
 import { z } from 'zod';
+import { resolveProductionEmployeeRuntimeSettings } from './production-employee-runtime.js';
 
 const checksum = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const bareHash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -195,6 +196,8 @@ const configuration = z
         leaseTtlMs: positive,
         activityMaxAgeMs: positive,
         cleanupTimeoutMs: positive,
+        employeeMaxRunning: z.number().optional(),
+        employeeIdleMs: z.number().optional(),
       })
       .strict(),
   })
@@ -269,6 +272,10 @@ export async function readProductionHostConfiguration(signal: AbortSignal) {
     signal.throwIfAborted();
     return Object.freeze({
       configuration: value,
+      employeeRuntimeSettings: resolveProductionEmployeeRuntimeSettings(
+        value.lifecycle,
+        sealed.employeePortSlots,
+      ),
       platform:
         sealed.employeePortSlots === defaults.employeePortSlots
           ? defaults

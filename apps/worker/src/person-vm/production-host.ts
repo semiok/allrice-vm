@@ -61,10 +61,6 @@ import {
 } from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import {
-  createProductionEmployeeRuntime,
-  type ProductionEmployeeRuntimeSettings,
-} from './production-employee-runtime.js';
-import {
   createProductionCurrentPrewarm,
   createProductionStoppedEntryReconciliation,
 } from './production-prewarm.js';
@@ -175,8 +171,6 @@ export interface ProductionPersonVmHost {
 export function createProductionPersonVmHost(input: {
   lifetime: AbortSignal;
   sources?: ProductionPersonVmHostSources;
-  /** Trusted configuration from Host assembly. Omission preserves eager startup. */
-  employeeRuntime?: ProductionEmployeeRuntimeSettings;
 }): Promise<ProductionPersonVmHost> {
   if (!input.sources)
     return Promise.reject(
@@ -579,11 +573,6 @@ export function createProductionPersonVmHost(input: {
       lifetime.throwIfAborted();
       providers = await createProductionPersonVmProviders(lifetime);
       lifetime.throwIfAborted();
-      const employeeRuntime = createProductionEmployeeRuntime(
-        input.employeeRuntime,
-        providers.native,
-        providers.platform.employeePortSlots,
-      );
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every
       // actual store/admission operation opens its own dedicated SQL client.
@@ -630,9 +619,6 @@ export function createProductionPersonVmHost(input: {
         native: providers.native,
         disk: providers.disk,
         diskPool,
-        ...(employeeRuntime && {
-          readUnusedEmployeeHomes: employeeRuntime.readUnusedEmployeeHomes,
-        }),
         nativeWeb: personNativeWebRoster,
         runtime,
         egress,
@@ -685,7 +671,6 @@ export function createProductionPersonVmHost(input: {
       startup = createAssignedNativeWebStartup({
         vm,
         hotGuest: providers.native,
-        ...(employeeRuntime && { employeeRuntime }),
         archive: {
           subscribe: subscribeDEntryEmployeeArchive,
           confirm: confirmDEntryEmployeeArchive,
