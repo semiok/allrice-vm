@@ -18,10 +18,12 @@ import {
 import {
   ApfsPersonVmDisk,
   FilePersonVmKeyStore,
+  PersonVmDiskPool,
   PersonVmService,
   PostgresPersonVmStore,
 } from '@allrice/person-vm';
 import * as client from '../../../../packages/database/src/core/client.ts';
+import { DiskPoolLedger } from '../../../../packages/person-vm/src/disk-pool-ledger.ts';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import { authorizeFixturePlatformAdministrator } from '../../../../packages/database/src/platform-authority.fixture.ts';
 import {
@@ -42,7 +44,8 @@ suite(
     let worker: ReturnType<typeof createServer>;
     let origin: string;
     let service: PersonVmService;
-    let newService: () => PersonVmService;
+    let newService: (usePool?: boolean) => PersonVmService;
+    let ledger: DiskPoolLedger;
     let store: PostgresPersonVmStore;
     let failKeyRemoval = false;
     let disconnectLeaseOnErase = false;
@@ -120,8 +123,10 @@ suite(
         if (failKeyRemoval) throw Error('synthetic interruption after unlink');
         await eraseKey(vmId);
       };
+      const diskRoot = join(root, 'volume');
+      ledger = new DiskPoolLedger(diskRoot);
       const disk = new ApfsPersonVmDisk({
-        root: join(root, 'volume'),
+        root: diskRoot,
         keys,
         capacityGiB: 1,
         runner: async ({ args, input, executable }) => {
@@ -156,7 +161,7 @@ suite(
           return '';
         },
       });
-      newService = () => {
+      newService = (usePool = true) => {
         store = new PostgresPersonVmStore(() => {
           leaseClient = createDedicatedDatabase(fixture.db);
           return leaseClient;
@@ -165,6 +170,13 @@ suite(
         return new PersonVmService({
           store,
           disk,
+          ...(usePool && {
+            diskPool: new PersonVmDiskPool(
+              diskRoot,
+              store.diskPoolLocks(diskRoot),
+              () => {},
+            ),
+          }),
           authority: h.options.authority,
           native: {
             ...h.native,
@@ -631,6 +643,90 @@ suite(
         });
       }
       expect(JSON.stringify(audit)).not.toContain(token);
+    });
+    it('refuses an unfinished pool claim and allows a fresh VM after the committed claim is purged', async () => {
+      const owner = await createTarget();
+      const personId = owner.actor.id;
+      // Stage the formal disk separately to model a crash after the disk name
+      // was published but before the pool committed the ownership transition.
+      const legacyService = newService(false);
+      const { vmId } = await legacyService.create(owner, signal());
+      await fixture.db`update person_virtual_machines set lease_epoch=2
+        where vm_id=${vmId}`;
+      service = newService();
+      const claim = {
+        ref: randomUUID(),
+        source: 'isolated-test-source',
+        proof: 'isolated-test-image',
+        intent: {
+          id: randomUUID(),
+          requestId: randomUUID(),
+          owner: { personId, organizationId: owner.organizationId, vmId },
+        },
+      };
+      const slot = (await ledger.read(signal())).slots[0]!;
+      const filling = {
+        ref: claim.ref,
+        source: claim.source,
+        state: 'filling',
+      } as const;
+      const ready = { ...filling, proof: claim.proof, state: 'ready' } as const;
+      const claiming = { ...claim, state: 'claiming' } as const;
+      await ledger.append(slot, filling, signal());
+      await ledger.append(
+        { ...slot, entry: filling, revision: slot.revision + 1 },
+        ready,
+        signal(),
+      );
+      await ledger.append(
+        { ...slot, entry: ready, revision: slot.revision + 2 },
+        claiming,
+        signal(),
+      );
+      const review = { action: 'review', personId };
+      expect(await post(token, review)).toEqual({
+        status: 409,
+        json: { error: 'CLEANUP_INCOMPLETE' },
+      });
+      const retain = { action: 'retain-disk', personId, vmId, leaseEpoch: 2 };
+      expect(await post(token, retain)).toEqual({
+        status: 409,
+        json: { error: 'CLEANUP_INCOMPLETE' },
+      });
+      expect(await store.read(personId)).toMatchObject({
+        vmId,
+        phase: 'stopped',
+        diskRetained: true,
+        leaseOwner: null,
+      });
+
+      await ledger.append(
+        { ...slot, entry: claiming, revision: slot.revision + 3 },
+        { ...claim, state: 'bound' },
+        signal(),
+      );
+      expect((await post(token, retain)).status).toBe(200);
+      const reviewed = await post(token, review);
+      expect(reviewed.status).toBe(200);
+      expect(
+        (
+          await post(token, {
+            action: 'purge-disk',
+            personId,
+            vmId,
+            confirmationId: reviewed.json.confirmationId,
+          })
+        ).json.vm,
+      ).toMatchObject({ phase: 'deleted', diskRetained: false });
+      expect((await ledger.read(signal())).bound.has(vmId)).toBe(true);
+
+      const fresh = await service.create(owner, signal());
+      expect(fresh.vmId).not.toBe(vmId);
+      expect(await store.read(personId)).toMatchObject({
+        vmId: fresh.vmId,
+        leaseEpoch: 2,
+        diskRetained: true,
+      });
     });
     it.each(['key removal failure', 'lease connection loss'] as const)(
       'recovers an interrupted physical purge after %s with normal creation fenced in between',
