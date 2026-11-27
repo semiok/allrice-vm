@@ -598,7 +598,15 @@ suite(
           forked,
           signal,
         );
+        const { thread: forkDirectoryRow, ...forkRoot } = fork;
         expect(fork.identity.threadId).not.toBe(first.identity.threadId);
+        expect(forkDirectoryRow).toMatchObject({
+          id: fork.identity.threadId,
+          ownerId: f.user,
+          organizationId: f.org,
+          visibility: 'private',
+          archivedAt: null,
+        });
         expect(fork).toMatchObject({
           rootNativeSessionId: forked.nativeSessionId,
           forkedFromNativeSessionId: created.nativeSessionId,
@@ -625,7 +633,7 @@ suite(
             ...f.selection,
             threadId: fork.identity.threadId,
           }),
-        ).toEqual(fork);
+        ).toEqual(forkRoot);
 
         const other = await setup();
         await fixture.db`insert into allrice_memberships (organization_id, workspace_id, user_id, role)
