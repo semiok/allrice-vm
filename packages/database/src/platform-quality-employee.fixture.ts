@@ -9,12 +9,14 @@ import {
 
 export async function publishTestPlatformQualityEmployee(
   input: {
+    name?: string;
     mission?: string;
+    workStyle?: string;
     bridgeAccess?: 'read_only' | 'read_write';
     toolNames?: string[];
   } = {},
 ) {
-  const name = 'Isolated quality employee';
+  const name = input.name ?? 'Isolated quality employee';
   const created = await createPlatformEmployeeDraft({
     key: 'quality-test-' + randomUUID(),
     name,
@@ -32,6 +34,7 @@ export async function publishTestPlatformQualityEmployee(
       identity: {
         ...draft.definition.identity,
         mission: input.mission ?? draft.definition.identity.mission,
+        workStyle: input.workStyle ?? draft.definition.identity.workStyle,
       },
       capabilities: {
         ...draft.definition.capabilities,
