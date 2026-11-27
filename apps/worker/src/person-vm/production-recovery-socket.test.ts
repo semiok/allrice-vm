@@ -199,7 +199,7 @@ it('only drains through the private socket for the authenticated and exact Worke
   const context = modelBinding().context;
   const expiresAt = '2099-01-01T00:00:00.000Z';
   const drain = vi.fn(async () => ({ stopped: 2, expiresAt }));
-  const afterClaim = Promise.withResolvers<void>();
+  const afterClaim = deferred();
   let drained = false;
   drain.mockImplementation(async () => {
     drained = true;
