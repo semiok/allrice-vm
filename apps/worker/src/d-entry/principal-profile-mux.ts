@@ -182,7 +182,13 @@ async function runOwner(
       generation.operation,
     ]);
     if (streams.status === 'rejected') throw streams.reason;
-    if (scope.status === 'rejected') throw scope.reason;
+    if (
+      scope.status === 'rejected' &&
+      (generation.page ||
+        !generation.setup.signal.aborted ||
+        scope.reason !== generation.setup.signal.reason)
+    )
+      throw scope.reason;
   }
 
   function mount(generation: OwnedPage, page: DEntryPageHandle) {
@@ -199,21 +205,22 @@ async function runOwner(
     id: string,
   ) {
     const previous = current;
-    if (!previous?.page || staged || requestedClose) throw denied();
-    previous.page.signal.throwIfAborted();
+    const previousPage = previous?.page;
+    if (!previousPage || staged || requestedClose) throw denied();
+    previousPage.signal.throwIfAborted();
     const decline = () =>
       send({
         type: 'item',
         streamId: id,
         value: { type: 'switch-unavailable', requestId: command.requestId },
       });
-    if (command.threadId === previous.page.identity.threadId) return decline();
+    if (command.threadId === previousPage.identity.threadId) return decline();
     staged = begin(
       { ...input.selection, threadId: command.threadId },
       async (generation, page) => {
         // New authority is watching before the old registration is fenced.
         // No stream or unary from the old document can use this new scope ID.
-        await previous.page!.assertCurrent(connected);
+        await previousPage.assertCurrent(connected);
         generation.stop.signal.throwIfAborted();
         page.signal.throwIfAborted();
         endPage(previous);
@@ -236,7 +243,7 @@ async function runOwner(
           },
         });
       },
-      previous.page,
+      previousPage,
     );
     // Wait only for publication. The stage operation itself stays owned until
     // its authorization is revoked or the next generation joins it.
@@ -311,7 +318,9 @@ async function runOwner(
         if (!requestedClose) break;
         const scopeId = current?.page?.scope.opened.scopeId;
         try {
-          await Promise.all([join(staged), join(current)]);
+          const joins = await Promise.allSettled([join(staged), join(current)]);
+          for (const result of joins)
+            if (result.status === 'rejected') throw result.reason;
           connected.throwIfAborted();
           if (!scopeId) {
             await send({
@@ -332,22 +341,7 @@ async function runOwner(
             await send({ type: 'end', streamId: frame.streamId });
           }
         } catch (error) {
-          if (
-            current?.setup.signal.aborted &&
-            !scopeId &&
-            error === current.setup.signal.reason &&
-            !connected.aborted
-          ) {
-            await send({
-              type: 'error',
-              streamId: frame.streamId,
-              error: {
-                code: 'gateway/cancelled',
-                message: 'Page closed during setup',
-                details: {},
-              },
-            });
-          } else await notify(error);
+          await notify(error);
         }
         break;
       } else if (frame.type === 'cancel') {

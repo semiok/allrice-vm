@@ -112,6 +112,35 @@ it('replaces the bound root on the same page socket and only the target watch re
   expect((await f.invokeThread(nextScope, target)).status).toBe(404);
 });
 
+it('joins a cancelled target lookup and the old page on close during a handoff', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const entered = deferred();
+  const allow = deferred();
+  f.authenticate.mockImplementationOnce(async () => {
+    entered.resolve();
+    await allow.promise;
+    return f.context;
+  });
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId: randomUUID(), threadId: target },
+  });
+  await entered.promise;
+  const fenced = once(revoked, 'abort');
+  closePage(peer);
+  await fenced;
+  allow.resolve();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledTimes(1);
+});
+
 it.each(['employee', 'login', 'epoch'] as const)(
   'refuses native reuse when the %s changes and leaves the exact old scope joinable',
   async (change) => {
