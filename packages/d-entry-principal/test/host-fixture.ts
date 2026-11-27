@@ -156,6 +156,7 @@ class Catalog extends TypertRemoteService {
   beforeCreate?: () => Promise<void>;
   afterFollowSnapshot?: () => Promise<void>;
   followFrames?: (sessionId: SessionId) => AsyncIterable<SessionFollowFrame>;
+  finishFollow?: SessionId;
   afterFollow?: () => Promise<void>;
   pageRecords: SessionPage['records'] = [];
   readonly pages: PeerScope[] = [];
@@ -296,6 +297,7 @@ class Catalog extends TypertRemoteService {
       };
       await this.afterFollowSnapshot?.();
       if (this.followFrames) yield* this.followFrames(sessionId);
+      if (sessionId === this.finishFollow) return;
       await new Promise<void>((resolve) => {
         const stop = () => {
           signal.removeEventListener('abort', stop);

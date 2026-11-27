@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
@@ -426,6 +427,104 @@ it('honors browser backpressure and suppresses a child withdrawn before the next
     type: 'error',
     error: { code: 'remote-access/denied' },
   });
+});
+
+it.each(['error', 'end'] as const)(
+  'keeps watching a finished native child while its final queued frame awaits authority (%s)',
+  async (terminal) => {
+    const f = await fixture();
+    const observation = observe(f);
+    const watch = watchChild(f);
+    const release = deferred();
+    const atMarker = deferred();
+    const releaseMarker = deferred();
+    const nativeFinished = deferred();
+    const nativeClosed = vi.fn();
+    closes.push(async () => {
+      release.resolve();
+      releaseMarker.resolve();
+    });
+    const wire = f.host.host.typertGateway.wireStream;
+    const open = wire.open.bind(wire);
+    vi.spyOn(wire, 'open').mockImplementation(async (...args) => {
+      const source = await open(...args);
+      if (
+        args[0] !== 'allricePrincipal/streamScoped' ||
+        !JSON.stringify(args[1]).includes('"childSessionId":"child"')
+      )
+        return source;
+      // Like the remote carrier, buffer guest output independently of the
+      // Worker's current browser write or database check.
+      const buffered = Readable.from(
+        (async function* () {
+          for await (const frame of source) {
+            if (frame && typeof frame === 'object' && 'type' in frame) {
+              if (frame.type === `page-${terminal}`) nativeFinished.resolve();
+              if (frame.type === 'closed') nativeClosed();
+            }
+            yield frame;
+          }
+        })(),
+        { highWaterMark: 8 },
+      );
+      return buffered;
+    });
+    const child = summary('child', 'root').sessionId;
+    if (terminal === 'end') f.host.catalog.finishFollow = child;
+    f.host.catalog.followFrames = async function* (id) {
+      if (id !== child) return;
+      await release.promise;
+      yield chunk(0);
+      if (terminal === 'error') throw Error('fixture native sequence gap');
+    };
+    const channel = await connect(f);
+    await channel.follow('child', 'root');
+    await channel.follow('other');
+    observation.marker.mockImplementation(async () => {
+      atMarker.resolve();
+      await releaseMarker.promise;
+    });
+    observation.invalidate();
+    await atMarker.promise;
+    release.resolve();
+    await Promise.all([watch.pulled.promise, nativeFinished.promise]);
+    expect(nativeClosed).not.toHaveBeenCalled();
+    f.host.catalog.items = f.host.catalog.items.filter(
+      (row) => row.sessionId !== child,
+    );
+    f.host.host.emit('api-session/removed', child);
+    await watch.revoked.promise;
+    releaseMarker.resolve();
+    expect(await channel.next('child')).toMatchObject({
+      type: 'error',
+      error: { code: 'remote-access/denied' },
+    });
+    await vi.waitFor(() => expect(nativeClosed).toHaveBeenCalledTimes(1));
+    expect(channel.peer.readyState).toBe(channel.peer.OPEN);
+  },
+);
+
+it('drains a normally completed follow and joins its close before reporting end', async () => {
+  const f = await fixture();
+  observe(f);
+  const release = deferred();
+  const joined = vi.fn();
+  closes.push(async () => release.resolve());
+  f.host.catalog.finishFollow = summary('root').sessionId;
+  f.host.catalog.followFrames = async function* () {
+    await release.promise;
+    yield chunk(0);
+  };
+  f.host.catalog.afterFollow = async () => joined();
+  const channel = await connect(f);
+  await channel.follow('root');
+  release.resolve();
+  expect(await channel.next('root')).toMatchObject({
+    type: 'item',
+    value: chunk(0),
+  });
+  expect(await channel.next('root')).toMatchObject({ type: 'end' });
+  expect(joined).toHaveBeenCalledTimes(1);
 });
 
 it('refuses to follow on an owner that cannot report native child withdrawal', async () => {

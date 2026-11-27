@@ -20,6 +20,7 @@ import {
 } from './sandbox-network-docker.js';
 import {
   sandboxPublicAddress,
+  createSandboxPublicTlsClientHelloReader,
   sandboxTlsClientHello,
   assertSandboxDestination,
   SandboxNetworkError,
@@ -260,6 +261,38 @@ describe('sandbox outbound boundary', () => {
         'registry.npmjs.org',
       ),
     ).toBe('valid');
+  });
+  it('reads each TLS record header once across socket chunks and stops before the tail', () => {
+    const hostname = 'registry.npmjs.org';
+    const payload = hello(hostname).subarray(5);
+    const header = Buffer.from([22, 3, 1, 0, 1]);
+    const records = Array.from(payload, (byte) =>
+      Buffer.concat([header, Buffer.from([byte])]),
+    );
+    const wire = Buffer.concat(records);
+    const tail = Buffer.from([23, 3, 3, 0, 1, 0]);
+    const read = createSandboxPublicTlsClientHelloReader(hostname);
+    const final = Buffer.concat([wire.subarray(-1), tail]);
+    const u16 = vi.spyOn(Buffer.prototype, 'readUInt16BE');
+    const concat = vi.spyOn(Buffer, 'concat');
+    let result;
+    let early = false;
+    let headerReads = 0;
+    let concatenations = 0;
+    try {
+      for (let i = 0; i < wire.length - 1; i++)
+        early ||= read(wire.subarray(i, i + 1)) !== null;
+      result = read(final);
+      headerReads = u16.mock.calls.length;
+      concatenations = concat.mock.calls.length;
+    } finally {
+      concat.mockRestore();
+      u16.mockRestore();
+    }
+    expect(early).toBe(false);
+    expect(result).toEqual({ end: wire.length, earlyData: false });
+    expect(headerReads).toBe(records.length + 6);
+    expect(concatenations).toBe(0);
   });
   it('does not treat stderr or truncated Docker frames as protocol messages', async () => {
     const incoming = new PassThrough(),

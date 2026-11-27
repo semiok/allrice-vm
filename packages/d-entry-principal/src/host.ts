@@ -47,6 +47,7 @@ import type {
   DEntryPrincipal,
   DEntryScopeIssue,
   DEntryPageNativeCall,
+  DEntryPageNativeEnd,
   DEntryPageNativeError,
   DEntryPageNativeItem,
   DEntryPageNativeResult,
@@ -1305,7 +1306,10 @@ class PrincipalService extends TypertRemoteService {
     call: DEntryScopedStreamCall | DEntryPageNativeCall,
     signal: AbortSignal,
   ): RemoteStream<
-    DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError,
+    | DEntryScopedStreamFrame
+    | DEntryPageNativeItem
+    | DEntryPageNativeError
+    | DEntryPageNativeEnd,
     CloseCommand | DEntryPageInput
   > {
     const { args, invocation } = this.raw('allricePrincipal/streamScoped');
@@ -1326,6 +1330,7 @@ class PrincipalService extends TypertRemoteService {
     let inputFailure: unknown;
     const follow = new AbortController();
     let unwatchFollow: (() => void) | undefined;
+    let confirmFollowDelivery = false;
     const pump = pumpPageInput(input, (command) => {
       if (
         !inbox ||
@@ -1366,12 +1371,11 @@ class PrincipalService extends TypertRemoteService {
               'Native stream does not accept input',
               { endpoint },
             );
-          if (endpoint === 'session/follow')
-            unwatchFollow = scope.watchFollow(
-              args,
-              follow,
-              UuidSchema.optional().parse(raw.followId),
-            );
+          if (endpoint === 'session/follow') {
+            const followId = UuidSchema.optional().parse(raw.followId);
+            unwatchFollow = scope.watchFollow(args, follow, followId);
+            confirmFollowDelivery = followId !== undefined && !!unwatchFollow;
+          }
           const values = await this.ctx.typertGateway.wireStream.open(
             endpoint,
             { args },
@@ -1504,7 +1508,7 @@ class PrincipalService extends TypertRemoteService {
             break;
           throw error;
         }
-        if (next.done) break;
+        if (next.done && !confirmFollowDelivery) break;
         if (unwatchFollow) {
           let checking;
           while (!active.aborted && (checking = scope.pendingFollowRead())) {
@@ -1515,7 +1519,7 @@ class PrincipalService extends TypertRemoteService {
             }
           }
         }
-        if (active.aborted) break;
+        if (active.aborted || next.done) break;
         if (pageMethod) {
           if (pageMethod.endpoint === 'session/follow' && !unwatchFollow)
             throw new RemoteError(
@@ -1582,6 +1586,12 @@ class PrincipalService extends TypertRemoteService {
       }
       if (inputFailure !== undefined) throw inputFailure;
       follow.signal.throwIfAborted();
+      if (confirmFollowDelivery && !active.aborted) {
+        // The Worker acknowledges once its last buffered item is delivered
+        // or discarded. Keep the independent withdrawal path alive until then.
+        yield { type: 'page-end', scopeId: scope.issue.scopeId };
+        await gate.done;
+      }
       await child.close();
       yield { type: 'closed', scopeId: scope.issue.scopeId };
     } catch (error) {
@@ -1591,7 +1601,7 @@ class PrincipalService extends TypertRemoteService {
         !signal.aborted &&
         (!active.aborted || error === inputFailure || follow.signal.aborted)
       ) {
-        await child.close();
+        if (!confirmFollowDelivery) await child.close();
         const failure = this.ctx.typertGateway.wireStream.failure(
           follow.signal.aborted ? follow.signal.reason : error,
         );
@@ -1605,6 +1615,10 @@ class PrincipalService extends TypertRemoteService {
               : {},
           },
         };
+        if (confirmFollowDelivery) {
+          await gate.done;
+          await child.close();
+        }
         yield { type: 'closed', scopeId: scope.issue.scopeId };
         return;
       }

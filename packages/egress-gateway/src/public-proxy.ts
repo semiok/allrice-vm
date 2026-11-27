@@ -12,9 +12,9 @@ import { networkInterfaces } from 'node:os';
 import type { Duplex } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
 import {
+  createSandboxPublicTlsClientHelloReader,
   resolvePublicAddresses,
   sandboxPublicAddress,
-  sandboxPublicTlsClientHello,
 } from '@allrice/project-runtime';
 import { EgressError } from './contract.js';
 
@@ -253,11 +253,13 @@ async function firstBytes(
   hostname: string,
   signal: AbortSignal,
 ) {
+  const readHello = createSandboxPublicTlsClientHelloReader(hostname);
   type Initial = {
     bytes: Buffer;
-    hello: ReturnType<typeof sandboxPublicTlsClientHello>;
+    hello: ReturnType<typeof readHello>;
   };
-  let bytes = Buffer.from(head);
+  const chunks: Buffer[] = [];
+  let tls: boolean | undefined;
   let complete = false;
   let ready!: (initial: Initial) => void;
   let invalid!: (error: unknown) => void;
@@ -265,28 +267,28 @@ async function firstBytes(
     ready = resolve;
     invalid = reject;
   });
-  function inspect() {
-    if (!bytes.length) return;
+  function data(chunk: Buffer) {
+    if (!chunk.length || complete) return;
     try {
-      const tls = bytes[0] === 22;
-      const hello = tls ? sandboxPublicTlsClientHello(bytes, hostname) : null;
+      tls ??= chunk[0] === 22;
+      chunks.push(chunk);
+      const hello = tls ? readHello(chunk) : null;
       if (tls && !hello) return;
       complete = true;
       socket.pause();
-      ready({ bytes, hello });
+      ready({
+        bytes: chunks.length === 1 ? chunk : Buffer.concat(chunks),
+        hello,
+      });
     } catch {
       complete = true;
       socket.pause();
       invalid(denied());
     }
   }
-  const data = (chunk: Buffer) => {
-    bytes = Buffer.concat([bytes, chunk]);
-    inspect();
-  };
   try {
     socket.on('data', data);
-    inspect();
+    data(head);
     if (!complete) socket.resume();
     return await waitFor(request, signal);
   } finally {

@@ -355,6 +355,10 @@ async function runStreams(
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
         await page.assertCurrent(child);
+        if (follow) {
+          let pending;
+          while ((pending = follow.pending())) await pending;
+        }
         follow?.signal.throwIfAborted();
         if ('revoked' in stream) stream.revoked?.throwIfAborted();
         child.throwIfAborted();

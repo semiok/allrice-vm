@@ -14,6 +14,7 @@ import {
   DEntryScopeIssueSchema,
   type DEntryPageInput,
   type DEntryPageNativeCall,
+  type DEntryPageNativeEnd,
   type DEntryPageNativeError,
   type DEntryPageNativeItem,
   type DEntryPrincipalActivity,
@@ -27,7 +28,10 @@ import {
 } from '@allrice/d-entry-principal/types';
 
 type StreamFrame =
-  DEntryScopedStreamFrame | DEntryPageNativeItem | DEntryPageNativeError;
+  | DEntryScopedStreamFrame
+  | DEntryPageNativeItem
+  | DEntryPageNativeError
+  | DEntryPageNativeEnd;
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (error: unknown) => void;
@@ -586,8 +590,14 @@ export function createDEntryPrincipalControl(
                       let failure: DEntryPageNativeError['error'] | undefined;
                       for await (const frame of child) {
                         if (failure || frame.type === 'item') throw unknown();
-                        if (frame.type === 'page-error') failure = frame.error;
-                        else yield frame;
+                        if (frame.type === 'page-end') {
+                          if (!follow) throw unknown();
+                          break;
+                        }
+                        if (frame.type === 'page-error') {
+                          failure = frame.error;
+                          if (follow) break;
+                        } else yield frame;
                       }
                       if (failure) throw failure;
                     } finally {

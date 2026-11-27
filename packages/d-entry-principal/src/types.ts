@@ -153,6 +153,11 @@ export type DEntryPageNativeError = Readonly<{
   scopeId: string;
   error: Readonly<{ code: string; message: string; details: JsonValue }>;
 }>;
+/** Native follow EOF. The consumer still requests close and joins its ACK. */
+export type DEntryPageNativeEnd = Readonly<{
+  type: 'page-end';
+  scopeId: string;
+}>;
 export type DEntryPrincipalStream = AsyncIterable<StreamItem> & {
   close(): Promise<void>;
 };

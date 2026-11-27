@@ -697,32 +697,46 @@ it.each(['coalesced', 'split', 'coalesced before EOF'] as const)(
   },
 );
 
-it('discards non-TLS bytes after accepting a native ClientHello', async () => {
-  const initial = await nativeClientHello();
-  const crossed: Buffer[] = [];
-  const forwarded = deferred<void>();
-  const remoteClosed = deferred<void>();
-  const port = await listen(
-    createTcpServer((socket) => {
-      socket.on('data', (chunk) => {
-        crossed.push(chunk);
-        if (Buffer.concat(crossed).length >= initial.length)
-          forwarded.resolve();
-      });
-      socket.once('close', () => remoteClosed.resolve());
-    }),
-  );
-  const vm = await setup();
-  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
-  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
-  expect(response.statusCode).toBe(200);
-  const closed = once(tunnel, 'close');
-  tunnel.write(initial);
-  await forwarded.promise;
-  tunnel.write('fixture bytes outside a record');
-  await Promise.all([closed, remoteClosed.promise]);
-  expect(Buffer.concat(crossed)).toEqual(initial);
-});
+it.each([false, true])(
+  'discards non-TLS bytes after accepting a native ClientHello (split records: %s)',
+  async (split) => {
+    const initial = await nativeClientHello();
+    const record = (payload: Buffer) => {
+      const header = Buffer.from(initial.subarray(0, 5));
+      header.writeUInt16BE(payload.length, 3);
+      return Buffer.concat([header, payload]);
+    };
+    const prefix = split
+      ? Buffer.concat([
+          record(initial.subarray(5, 8)),
+          record(initial.subarray(8)),
+        ])
+      : initial;
+    const crossed: Buffer[] = [];
+    const forwarded = deferred<void>();
+    const remoteClosed = deferred<void>();
+    const port = await listen(
+      createTcpServer((socket) => {
+        socket.on('data', (chunk) => {
+          crossed.push(chunk);
+          if (Buffer.concat(crossed).length >= prefix.length)
+            forwarded.resolve();
+        });
+        socket.once('close', () => remoteClosed.resolve());
+      }),
+    );
+    const vm = await setup();
+    network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+    const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+    expect(response.statusCode).toBe(200);
+    const closed = once(tunnel, 'close');
+    tunnel.write(prefix);
+    await forwarded.promise;
+    tunnel.write('fixture bytes outside a record');
+    await Promise.all([closed, remoteClosed.promise]);
+    expect(Buffer.concat(crossed)).toEqual(prefix);
+  },
+);
 
 it('joins a pending system lookup and never starts a synthetic DNS fallback after revoke', async () => {
   const vm = await setup();
