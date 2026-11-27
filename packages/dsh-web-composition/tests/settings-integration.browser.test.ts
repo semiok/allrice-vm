@@ -377,7 +377,9 @@ suite('production settings owner in the installed rc.2 workbench', () => {
 
   beforeAll(async () => {
     artifacts = await createBrowserArtifacts();
-    host = await startInstalledProfile();
+    host = await startInstalledProfile(
+      new URL('./fixtures/settings-workbench-client.js', import.meta.url),
+    );
     browser = await chromium.launch({
       headless: true,
       ...(process.env.ALLRICE_BROWSER_EXECUTABLE
@@ -434,15 +436,6 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       };
       const documentOwner = `        <div hidden id="app" data-organization-id="${id(1)}" data-workspace-id="${id(2)}" data-viewer-id="${id(3)}" data-employee-instance-id="${id(4)}" data-thread-id="${id(5)}" data-login-session-id="${loginSessionId}" data-scope-id="${id(7)}" data-native-session-id="session-00000000-0000-4000-8000-000000000036"></div>
         <script id="allrice-employee-directory" type="application/json">${JSON.stringify(roster).replaceAll('<', '\\u003c')}</script>`;
-      await page.route(host.origin + '/', async (route) => {
-        const upstream = await route.fetch();
-        const html = await upstream.text();
-        expect(html).toContain('</body>');
-        await route.fulfill({
-          response: upstream,
-          body: html.replace('</body>', documentOwner + '</body>'),
-        });
-      });
       await page.route('**/api/v1/d-entry/panels/**', (route) =>
         route.fulfill({ status: 403, json: {} }),
       );
@@ -466,20 +459,22 @@ suite('production settings owner in the installed rc.2 workbench', () => {
       await page.route(host.origin + '/login', (route) =>
         route.fulfill({ body: 'synthetic sign-in landing' }),
       );
-      const workbenchUrl = host.origin + '/settings-parent';
-      await page.route(workbenchUrl, (route) =>
-        route.fulfill({
-          contentType: 'text/html',
-          body: '<body style="margin:0"><iframe title="员工工作区" src="/" style="display:block;border:0;width:100%;height:100dvh"></iframe></body>',
-        }),
+      await page.goto(host.origin);
+      await page.waitForFunction(() =>
+        Object.hasOwn(window, '__allriceSettingsWorkbench'),
       );
-      await page.goto(workbenchUrl);
-      const workbench = page.frameLocator('iframe[title="员工工作区"]');
-      const resume = workbench.getByRole('button', {
-        name: /^(Continue|继续)$/,
-      });
-      await resume.waitFor({ timeout: 5_000 }).catch(() => {});
-      if (await resume.isVisible()) await resume.click();
+      await page.evaluate(
+        (markup) =>
+          (
+            window as unknown as {
+              __allriceSettingsWorkbench: {
+                mount(markup: string): Promise<void>;
+              };
+            }
+          ).__allriceSettingsWorkbench.mount(markup),
+        documentOwner,
+      );
+      const workbench = page;
       const trigger = workbench.locator('#chat-sidebar').getByRole('button', {
         name: '设置',
         exact: true,
@@ -515,9 +510,9 @@ suite('production settings owner in the installed rc.2 workbench', () => {
         for (const theme of ['light', 'dark'] as const) {
           await workbench.locator('body').evaluate((_, theme) => {
             const fixture = window as unknown as {
-              __allriceCompositionTest: { setTheme: (theme: string) => void };
+              __allriceSettingsWorkbench: { setTheme: (theme: string) => void };
             };
-            fixture.__allriceCompositionTest.setTheme(theme);
+            fixture.__allriceSettingsWorkbench.setTheme(theme);
           }, theme);
           await workbench
             .locator('body')
