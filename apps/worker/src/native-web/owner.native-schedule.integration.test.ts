@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { finished } from 'node:stream/promises';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Schedule } from '@deepseek-ai/dsh-schedule/remote';
+import { isRemoteJsonValue } from '@deepseek-ai/dsh-typert-protocol';
 import { afterEach, expect, it } from 'vitest';
 import {
   closeServer,
@@ -133,8 +134,9 @@ it.skipIf(!cli)(
     expect(scope.opened.baseline.owner).toBe(false);
     async function invoke(
       endpoint: keyof typeof Schedule.methods,
-      args: Parameters<typeof scope.invokePage>[0]['args'],
+      args: Record<string, unknown>,
     ) {
+      if (!isRemoteJsonValue(args)) throw Error('Expected native wire JSON');
       const result = await scope.invokePage(
         { kind: 'page', endpoint, scopeId: pageId, args },
         signal,
