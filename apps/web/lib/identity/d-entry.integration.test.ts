@@ -27,11 +27,11 @@ import {
   authenticateSession,
   revokeSession,
 } from '../../../../packages/database/src/identity.ts';
+import { listEmployeeHub } from '../../../../packages/database/src/employees/employeehub.ts';
 import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src/employees/employee-instances.ts';
 import {
   createChatSession,
   getSessionExecutionGeneration,
-  ensureDefaultEmployee,
   sendChatMessage,
   updateChatSession,
   linkFileToSession,
@@ -1959,7 +1959,7 @@ suite(
         await updateDEntryReleasePolicy(f.context, initial);
         expect(await findDEntryCreationWorkspace(owner)).toBe(f.workspace);
         expect(await findDEntryEmployee(owner)).toBeNull();
-        expect(await ensureDefaultEmployee(owner)).toBeNull();
+        expect((await listEmployeeHub(owner)).assignments).toEqual([]);
         expect((await readPersonNativeWebRoster(owner)).entries).toEqual([]);
         expect(await hasExistingDEntryEmployeeOrVm(owner)).toBe(false);
         expect(

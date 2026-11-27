@@ -11,7 +11,7 @@ if (!baseUrl || !stateEncoded) {
 const state = JSON.parse(
   Buffer.from(stateEncoded, 'base64url').toString('utf8'),
 );
-const { organizationId, workspaceId } = state;
+const { organizationId, workspaceId, employeeId } = state;
 
 async function jsonRequest(path, init = {}, expectedStatus = 200) {
   const response = await fetch(`${baseUrl}${path}`, init);
@@ -56,10 +56,11 @@ const employeeResponse = await jsonRequest(
   { headers: tenantHeaders(admin.cookie) },
 );
 const employeeHub = (await employeeResponse.json()).employeeHub;
-const rice = employeeHub.directory.find(
-  (employee) => employee.employeeKey === 'default-assistant',
+const employee = employeeHub.directory.find(
+  (candidate) => candidate.employeeId === employeeId,
 );
-if (!rice) throw new Error('Rice is missing from the admin directory');
+if (!employee)
+  throw new Error('The explicit employee is missing from the admin directory');
 
 // The retired creation endpoint must fail even for an administrator.
 await jsonRequest(
@@ -133,7 +134,7 @@ if (
   throw new Error('capability catalog omitted a published revision');
 }
 
-await jsonRequest(`/api/v1/employees/${rice.employeeId}/capabilities`, {
+await jsonRequest(`/api/v1/employees/${employee.employeeId}/capabilities`, {
   method: 'PUT',
   headers: {
     ...tenantHeaders(admin.cookie),
@@ -152,7 +153,7 @@ await jsonRequest(`/api/v1/employees/${rice.employeeId}/capabilities`, {
 });
 
 const directoryResponse = await jsonRequest(
-  `/api/v1/employees/${rice.employeeId}/capabilities?workspaceId=${workspaceId}`,
+  `/api/v1/employees/${employee.employeeId}/capabilities?workspaceId=${workspaceId}`,
   { headers: tenantHeaders(admin.cookie) },
 );
 const directory = (await directoryResponse.json()).capabilities;
@@ -160,12 +161,12 @@ if (directory.workflows.length !== 0 || directory.knowledge.length !== 2) {
   throw new Error('employee capability binding did not persist');
 }
 await jsonRequest(
-  `/api/v1/employees/${rice.employeeId}/capabilities?workspaceId=${workspaceId}`,
+  `/api/v1/employees/${employee.employeeId}/capabilities?workspaceId=${workspaceId}`,
   { headers: tenantHeaders(member.cookie) },
   403,
 );
 await jsonRequest(
-  `/api/v1/employees/${rice.employeeId}/capabilities`,
+  `/api/v1/employees/${employee.employeeId}/capabilities`,
   {
     method: 'PUT',
     headers: {
@@ -184,7 +185,7 @@ await jsonRequest(
 
 // The retired binding/publication/status branches reject without changing data.
 await jsonRequest(
-  `/api/v1/employees/${rice.employeeId}/capabilities`,
+  `/api/v1/employees/${employee.employeeId}/capabilities`,
   {
     method: 'PUT',
     headers: {
@@ -247,7 +248,7 @@ await jsonRequest(
   },
 );
 const archivedDirectory = await jsonRequest(
-  `/api/v1/employees/${rice.employeeId}/capabilities?workspaceId=${workspaceId}`,
+  `/api/v1/employees/${employee.employeeId}/capabilities?workspaceId=${workspaceId}`,
   { headers: tenantHeaders(admin.cookie) },
 );
 const archivedKnowledge = (await archivedDirectory.json()).capabilities
@@ -282,12 +283,12 @@ const memberEmployeesResponse = await jsonRequest(
   `/api/v1/employees?workspaceId=${workspaceId}`,
   { headers: tenantHeaders(member.cookie) },
 );
-const memberRice = (
+const memberEmployee = (
   await memberEmployeesResponse.json()
 ).employeeHub.assignments.find(
-  (employee) => employee.employeeKey === 'default-assistant',
+  (candidate) => candidate.employeeId === employeeId,
 );
-if (!memberRice) throw new Error('member Rice assignment is missing');
+if (!memberEmployee) throw new Error('member employee assignment is missing');
 const sessionResponse = await jsonRequest(
   '/api/v1/sessions',
   {
@@ -296,7 +297,11 @@ const sessionResponse = await jsonRequest(
       ...tenantHeaders(member.cookie),
       'content-type': 'application/json',
     },
-    body: JSON.stringify({ workspaceId, title: 'MET-68 snapshot smoke' }),
+    body: JSON.stringify({
+      workspaceId,
+      employeeAssignmentId: memberEmployee.id,
+      title: 'MET-68 snapshot smoke',
+    }),
   },
   201,
 );
@@ -327,7 +332,7 @@ console.info(
     JSON.stringify({
       runId: message.run.id,
       memberUserId: member.userId,
-      employeeId: memberRice.employeeId,
+      employeeId: memberEmployee.employeeId,
       workspaceKnowledgeRevisionId: workspaceKnowledge.id,
       adminOnlyKnowledgeRevisionId: adminOnlyKnowledge.id,
     }),
