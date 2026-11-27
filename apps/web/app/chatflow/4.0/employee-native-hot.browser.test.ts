@@ -23,7 +23,7 @@ const suite =
 suite('4.0 browser entry with a running employee', () => {
   it(
     'records warm opens and refreshes through the real shell and issued carrier',
-    { timeout: 60_000 },
+    { timeout: 90_000 },
     async () => {
       const f = await fixture();
       const require = createRequire(
@@ -52,7 +52,12 @@ suite('4.0 browser entry with a running employee', () => {
             '.ttf': 'dataurl',
           },
         });
-      const requests: { phase: string; start: number; end?: number }[] = [];
+      const requests: {
+        phase: string;
+        start: number;
+        end?: number;
+        selection?: unknown;
+      }[] = [];
       let birthRequests = 0;
       let cold = false;
       let coldIdentities = 0;
@@ -76,9 +81,14 @@ suite('4.0 browser entry with a running employee', () => {
               phase: 'prewarm',
               start: performance.now(),
               end: 0,
+              selection: undefined as unknown,
             };
             requests.push(timing);
-            request.resume();
+            const body: Buffer[] = [];
+            for await (const chunk of request) body.push(Buffer.from(chunk));
+            timing.selection = JSON.parse(
+              Buffer.concat(body).toString(),
+            ).selection;
             await delay(300);
             timing.end = performance.now();
             if (cold)
@@ -104,6 +114,7 @@ suite('4.0 browser entry with a running employee', () => {
               phase: 'identity',
               start: performance.now(),
               end: 0,
+              selection: Object.fromEntries(address.searchParams),
             };
             requests.push(timing);
             const reject = cold && ++coldIdentities === 2;
@@ -396,10 +407,16 @@ suite('4.0 browser entry with a running employee', () => {
             expect([...wire.values()].map(({ path }) => path)).not.toContain(
               '/chatflow/4.0',
             );
-            if (reopen)
-              expect(
-                await child.locator('body').getAttribute('data-thread-id'),
-              ).toBe(f.selection.threadId);
+            const threadId = await child
+              .locator('body')
+              .getAttribute('data-thread-id');
+            const employee = {
+              workspaceId: f.selection.workspaceId,
+              employeeInstanceId: f.selection.employeeInstanceId,
+            };
+            expect(prewarm.selection).toEqual(reopen ? f.selection : employee);
+            expect(identity.selection).toEqual({ ...employee, threadId });
+            if (reopen) expect(threadId).toBe(f.selection.threadId);
             console.info(
               'THREAD_SWITCH_LEDGER ' +
                 JSON.stringify({
@@ -431,6 +448,52 @@ suite('4.0 browser entry with a running employee', () => {
       }
       exerciseNavigation = false;
       expect(birthRequests).toBe(3);
+      const abandoned = await context.newPage();
+      await abandoned.goto(url);
+      const abandonedFrame = abandoned
+        .locator('iframe[title="员工工作区"]')
+        .contentFrame();
+      await abandonedFrame.getByRole('textbox').waitFor();
+      await expect.poll(() => abandoned.getByRole('status').count()).toBe(0);
+      const target = {
+        ...f.selection,
+        threadId: randomUUID(),
+      };
+      f.registerThread(target.threadId);
+      await abandoned.evaluate((threadId) => {
+        const fetchEntry = window.fetch;
+        window.fetch = (input, init) => {
+          const endpoint = new URL(String(input), location.origin);
+          if (
+            endpoint.pathname === '/api/v1/d-entry/identity' &&
+            endpoint.searchParams.get('threadId') === threadId
+          ) {
+            init?.signal?.addEventListener('abort', () => {
+              document.documentElement.dataset.abandonedIdentity = 'true';
+            });
+          }
+          return fetchEntry(input, init);
+        };
+        const pushState = window.history.pushState.bind(window.history);
+        window.history.pushState = (...args) => {
+          pushState(...args);
+          window.dispatchEvent(new Event('pagehide'));
+        };
+      }, target.threadId);
+      await abandonedFrame.locator('body').evaluate(
+        (_, message) => {
+          const scopeId = document.querySelector<HTMLScriptElement>(
+            'script[data-scope-id]',
+          )?.dataset.scopeId;
+          window.parent.postMessage({ ...message, scopeId }, location.origin);
+        },
+        { type: pageNavigate, selection: target },
+      );
+      await abandoned.waitForFunction(
+        () => document.documentElement.dataset.abandonedIdentity === 'true',
+      );
+      await abandoned.close();
+
       cold = true;
       const offset = requests.length;
       const denied = await context.newPage();

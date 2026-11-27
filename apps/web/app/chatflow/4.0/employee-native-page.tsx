@@ -144,6 +144,7 @@ export function EmployeeNativePage({
   const replace = useRef<(() => void) | undefined>(undefined);
   const cancel = useRef<(() => void) | undefined>(undefined);
   const resume = useRef<(() => void) | undefined>(undefined);
+  const pendingWarmup = useRef<EntryWarmup | undefined>(undefined);
   const nextQuery = useRef(query);
   const lastPropQuery = useRef(query);
   if (lastPropQuery.current !== query) {
@@ -152,7 +153,20 @@ export function EmployeeNativePage({
   }
 
   useEffect(() => {
+    const discardPending = () => pendingWarmup.current?.lifetime.abort();
+    window.addEventListener('pagehide', discardPending);
+    return () => {
+      window.removeEventListener('pagehide', discardPending);
+      discardPending();
+    };
+  }, []);
+
+  useEffect(() => {
+    const pending = pendingWarmup.current;
+    pendingWarmup.current = undefined;
+    if (pending && pending !== activation.warmup) pending.lifetime.abort();
     if (initialUnavailable || (prepare && !activeQuery)) {
+      activation.warmup?.lifetime.abort();
       setStatus(initialUnavailable ? 'failed' : 'denied');
       setSettled(true);
       const changeSelection = () => setActivation({ query: nextQuery.current });
@@ -468,6 +482,8 @@ export function EmployeeNativePage({
             } else if (warmup) {
               const query = params.toString();
               nextQuery.current = query;
+              // Keep cancellation owned until the next effect claims it.
+              pendingWarmup.current = warmup;
               history.pushState(null, '', '/chatflow/4.0?' + query);
               activateSelection(query, warmup);
             } else location.assign('/chatflow/4.0?' + params);
