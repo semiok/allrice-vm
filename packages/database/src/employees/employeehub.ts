@@ -1027,12 +1027,14 @@ export async function updateEmployeeStatus(
   const sql = getDatabase();
   await employeeAccessTransaction(sql, async (transaction) => {
     await transaction`select pg_advisory_xact_lock(hashtextextended(${`employee-deployments:${context.organizationId}:${workspaceId}`},0))`;
+    // The employee key stays unchanged. Keep status writers serialized while
+    // allowing the memory INSERT's foreign-key check to take KEY SHARE.
     const employees = await transaction<{ id: string; employee_key: string }[]>`
       select id, employee_key from allrice_employees
       where id = ${employeeId}
         and organization_id = ${context.organizationId}
         and workspace_id = ${workspaceId}
-      for update
+      for no key update
     `;
     const employee = employees[0];
     if (!employee) throw new EmployeeHubError('not_found');
