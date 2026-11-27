@@ -26,10 +26,46 @@ const sha256 = (value: string) =>
 /** Preserve CSS module exports while reading the exact baseline source bytes. */
 export function createLegacySidebarSnapshot(
   readBase: (path: string) => string,
+  revision: string,
 ): Plugin {
+  const paths = new Set(
+    execFileSync(
+      'git',
+      [
+        'ls-tree',
+        '-rz',
+        '--name-only',
+        revision,
+        '--',
+        'apps/web',
+        'packages/ui',
+        'packages/contracts',
+      ],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    ).split('\0'),
+  );
+  const extensions = ['.tsx', '.ts', '.jsx', '.js', '.css', '.json'];
   return {
     name: 'pinned-allrice-sidebar-base',
     setup(plugin) {
+      // esbuild normally resolves on disk before onLoad. Historical source
+      // files may no longer exist in the product checkout.
+      plugin.onResolve({ filter: /^\.\.?\// }, (request) => {
+        const stem = resolve(request.resolveDir, request.path);
+        const candidates = [
+          stem,
+          ...extensions.map((suffix) => stem + suffix),
+          ...extensions.map((suffix) => join(stem, 'index' + suffix)),
+        ];
+        const file = candidates.find((path) =>
+          paths.has(relative(repoRoot, path)),
+        );
+        return file ? { path: file } : undefined;
+      });
       plugin.onLoad({ filter: /\.(?:[cm]?[jt]sx?|css)$/ }, ({ path }) => {
         const key = relative(repoRoot, path).replaceAll('\\', '/');
         if (!/^(?:apps\/web\/|packages\/(?:ui|contracts)\/)/.test(key)) return;
@@ -119,7 +155,7 @@ export async function writeLegacySidebarBaseline(
     }
     return text;
   };
-  const snapshot = createLegacySidebarSnapshot(readBase);
+  const snapshot = createLegacySidebarSnapshot(readBase, sidebarBaselineHead);
   const common = {
     absWorkingDir: repoRoot,
     nodePaths: [resolve(repoRoot, 'apps/web/node_modules')],
