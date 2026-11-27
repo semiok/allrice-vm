@@ -88,34 +88,25 @@ export async function readProfileBundle(
   signal: AbortSignal,
   publicUrl?: string,
 ) {
-  let timedOut = false;
-  if (publicUrl) {
-    try {
-      return await fetchProfileBundle(publicUrl, signal, {
-        credentials: 'omit',
-      });
-    } catch (error) {
-      signal.throwIfAborted();
-      // The original scoped route remains the fallback for a failed public copy.
-      timedOut = error instanceof EmployeeProfileBundleTimeout;
-    }
-  }
   const read = () =>
     fetchProfileBundle(target, signal, {
       credentials: 'same-origin',
       cache: 'no-store',
     });
   try {
-    return await read();
+    return await (publicUrl
+      ? fetchProfileBundle(publicUrl, signal, { credentials: 'omit' })
+      : read());
   } catch (error) {
     signal.throwIfAborted();
-    if (timedOut) throw new EmployeeProfileBundleTimeout();
-    if (!(error instanceof EmployeeProfileBundleTimeout)) throw error;
+    if (!publicUrl && !(error instanceof EmployeeProfileBundleTimeout))
+      throw error;
     try {
       return await read();
-    } catch {
+    } catch (retryError) {
       signal.throwIfAborted();
-      throw error;
+      if (error instanceof EmployeeProfileBundleTimeout) throw error;
+      throw retryError;
     }
   }
 }

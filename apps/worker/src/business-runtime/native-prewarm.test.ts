@@ -775,6 +775,50 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
   expect(prewarm).toHaveBeenCalledTimes(2);
 });
 
+it('returns ready for an exact verified running editor without opening a prewarm job', async () => {
+  const f = fixture(true);
+  const { context, body, data } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  const binding = await f.h.service.resolve(context, signal());
+  const verified = new AbortController();
+  const confirmVerifiedEditor = vi.fn(async () => ({
+    binding,
+    proof: verified.signal,
+  }));
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    confirmVerifiedEditor,
+    assertEditorReady: async () => signal(),
+  });
+  cleanups.push(async () => uninstall());
+  const prewarmCurrent = vi.fn(f.prewarmCurrent);
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(confirmVerifiedEditor).toHaveBeenCalledOnce();
+  expect(prewarmCurrent).not.toHaveBeenCalled();
+  expect(f.start).toHaveBeenCalledOnce();
+
+  verified.abort();
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(prewarmCurrent).toHaveBeenCalledOnce();
+  expect(f.start).toHaveBeenCalledOnce();
+});
+
 it('uses both the selected editor proof and physical Host readiness on the real hot HTTP path', async () => {
   const f = fixture(true);
   const { context, body, data } = f.base;

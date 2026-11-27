@@ -19,6 +19,12 @@ export function dEntryStartupTiming(operation: 'page-open' | 'editor-proof') {
     }
   }
   return {
+    begin(phase: string) {
+      const start = performance.now();
+      return () => {
+        phases[phase] = Math.round(performance.now() - start);
+      };
+    },
     async run<T>(phase: string, read: () => Promise<T>): Promise<T> {
       const start = performance.now();
       try {

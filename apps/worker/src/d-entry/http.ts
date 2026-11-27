@@ -350,6 +350,27 @@ export function createDEntryHttpHandler(
         await plan.assertTicketThread?.(signal);
         const { trigger } = prewarmRequest;
         const receipt = { identity, trigger };
+        function sendReady() {
+          response
+            .writeHead(200, {
+              'content-type': 'application/json',
+              'cache-control': 'no-store',
+            })
+            .end(
+              JSON.stringify(DEntryNativePrewarmResultSchema.parse(receipt)),
+            );
+          return true;
+        }
+        if (plan.running) {
+          const verified = await deps.prewarm.confirmRunning?.(
+            context,
+            identity,
+            plan,
+            signal,
+          );
+          signal.throwIfAborted();
+          if (verified && !verified.aborted) return sendReady();
+        }
         const accepted = prewarm.accept(
           context,
           identity,
@@ -413,14 +434,7 @@ export function createDEntryHttpHandler(
             );
           return true;
         }
-        response.writeHead(200, {
-          'content-type': 'application/json',
-          'cache-control': 'no-store',
-        });
-        response.end(
-          JSON.stringify(DEntryNativePrewarmResultSchema.parse(receipt)),
-        );
-        return true;
+        return sendReady();
       }
       const current = await currentDEntryNativeOwner(
         deps.owners,

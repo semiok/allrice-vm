@@ -32,6 +32,12 @@ export function compatiblePrewarmGeneration(
 
 /** Trusted composition only. This port grants no catalog or execution access. */
 export interface DEntryNativePrewarmPort {
+  confirmRunning?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    plan: PrewarmPlan,
+    signal: AbortSignal,
+  ): Promise<AbortSignal | undefined>;
   prepare?(
     context: RequestContext,
     identity: DEntryIdentity,
@@ -64,6 +70,9 @@ export function installDEntryNativePrewarmPort(port: DEntryNativePrewarmPort) {
 }
 
 export const dEntryNativePrewarmPort: DEntryNativePrewarmPort = {
+  async confirmRunning(context, identity, plan, signal) {
+    return installed?.confirmRunning?.(context, identity, plan, signal);
+  },
   prepare(context, identity, signal) {
     if (!installed?.prepare) throw new DEntryNativeUnavailable();
     return installed.prepare(context, identity, signal);

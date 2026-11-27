@@ -161,6 +161,52 @@ export function installProductionDEntrySource(input: {
         return AbortSignal.any([current.signal, proof, group]);
       });
     },
+    confirmVerifiedEditor(context, identity, signal) {
+      return own(signal, async (active) => {
+        try {
+          const current = await currentDEntryNativeOwner(
+            dEntryNativeOwnerPort,
+            context,
+            identity,
+            active,
+          );
+          const { binding } = current.view.receipt;
+          const employee = identity.employeeInstanceId;
+          // Gate on the existing proof for this exact local owner/employee.
+          // The refresh uses its actual authenticated graph and current route.
+          input.startup.assertVerifiedEditor(binding, current.signal, employee);
+          const proof = await input.startup.ensureVerifiedEditor(
+            context,
+            binding,
+            employee,
+            current.signal,
+          );
+          const group = input.startup.assertAuthenticatedGroup(
+            binding,
+            current.signal,
+          );
+          sameHost(current.owner, identity);
+          const confirmed = AbortSignal.any([current.signal, proof, group]);
+          confirmed.throwIfAborted();
+          return { binding, proof: confirmed };
+        } catch (error) {
+          active.throwIfAborted();
+          if (
+            error instanceof DEntryNativeUnavailable ||
+            (error instanceof PersonVmError &&
+              [
+                'NOT_FOUND',
+                'LEASE_CONFLICT',
+                'LEASE_LOST',
+                'RUNTIME_NOT_READY',
+                'WEB_ENDPOINTS_PREPARING',
+              ].includes(error.code))
+          )
+            return;
+          throw error;
+        }
+      });
+    },
     resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
