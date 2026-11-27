@@ -97,11 +97,24 @@ export function sandboxTlsClientHello(
   bytes: Buffer,
   hostname: string,
 ): 'pending' | 'valid' {
+  return initialTlsHello(bytes, hostname, false) ? 'valid' : 'pending';
+}
+
+/** Return the validated ClientHello boundary, independent of TCP chunking. */
+export function sandboxPublicTlsClientHello(bytes: Buffer, hostname: string) {
+  return initialTlsHello(bytes, hostname, true);
+}
+
+function initialTlsHello(
+  bytes: Buffer,
+  hostname: string,
+  publicProxy: boolean,
+) {
   const bad = () => {
     throw new SandboxNetworkError('SANDBOX_NETWORK_PROTOCOL');
   };
-  if (bytes.length > 65_536) return bad();
-  if (bytes.length < 5) return 'pending';
+  if (!publicProxy && bytes.length > 65_536) return bad();
+  if (bytes.length < 5) return null;
   const chunks: Buffer[] = [];
   let offset = 0,
     size = 0;
@@ -114,7 +127,8 @@ export function sandboxTlsClientHello(
       return bad();
     const length = bytes.readUInt16BE(offset + 3);
     if (length > 18_432 || length === 0) return bad();
-    if (offset + 5 + length > bytes.length) return 'pending';
+    if (offset + 5 + length > 65_536) return bad();
+    if (offset + 5 + length > bytes.length) return null;
     chunks.push(bytes.subarray(offset + 5, offset + 5 + length));
     size += length;
     offset += 5 + length;
@@ -123,7 +137,8 @@ export function sandboxTlsClientHello(
     if (body[0] !== 1 || body.readUIntBE(1, 3) > 60_000) return bad();
     const expected = body.readUIntBE(1, 3) + 4;
     if (body.length < expected) continue;
-    if (body.length !== expected || offset !== bytes.length) return bad();
+    if (body.length !== expected || (!publicProxy && offset !== bytes.length))
+      return bad();
     let p = 4;
     const take = (count: number) => {
       const start = p;
@@ -152,12 +167,30 @@ export function sandboxTlsClientHello(
         if (u16() !== length - 2 || body[take(1)] !== 0) return bad();
         const nameLength = u16(),
           name = body.subarray(take(nameLength), p);
-        if (p !== end || !name.equals(Buffer.from(hostname, 'ascii')))
+        if (
+          p !== end ||
+          (publicProxy
+            ? name.toString('ascii').toLowerCase() !== hostname.toLowerCase()
+            : !name.equals(Buffer.from(hostname, 'ascii')))
+        )
           return bad();
         sni = name.toString('ascii');
+      } else if (publicProxy && type === 16) {
+        if (length < 3 || u16() !== length - 2) return bad();
+        while (p < end) {
+          const protocolLength = body[take(1)]!;
+          const protocol = body
+            .subarray(take(protocolLength), p)
+            .toString('ascii');
+          if (!['http/1.0', 'http/1.1', 'h2'].includes(protocol)) return bad();
+        }
+        if (p !== end) return bad();
+      } else if (publicProxy && type === 42) {
+        if (length !== 0) return bad();
       } else p = end;
     }
-    return sni === hostname ? 'valid' : bad();
+    if (sni === undefined && !(publicProxy && isIP(hostname))) return bad();
+    return { end: offset, earlyData: seen.has(41) && seen.has(42) };
   }
-  return 'pending';
+  return null;
 }

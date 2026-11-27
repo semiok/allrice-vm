@@ -517,7 +517,7 @@ export function observeNativePrompts(scope, lifetime) {
     },
     { global: true },
   );
-  return (value, request) => {
+  function observe(value, request) {
     const notFound = () => new globalThis.Response(null, { status: 404 });
     if (
       typeof value?.id !== 'string' ||
@@ -595,11 +595,19 @@ export function observeNativePrompts(scope, lifetime) {
       },
     });
     return new globalThis.Response(body, { headers });
+  }
+  observe.claimed = (session, message, turn) => {
+    const agent = scope.agents.get(session.id);
+    if (!agent || original(agent.session) !== original(session)) return false;
+    for (const entry of matches(agent, message))
+      if (entry.itemId === message.id && entry.turn === turn) return true;
+    return false;
   };
+  return observe;
 }
 
 // Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
-export function observeDelegatedInputs(scope) {
+export function observeDelegatedInputs(scope, observedClaim = () => false) {
   const turns = new WeakMap();
   const inboxes = new WeakMap();
   const activations = new Map();
@@ -634,11 +642,19 @@ export function observeDelegatedInputs(scope) {
     const owner = root(session);
     if (!owner || !inputs?.length) return null;
     const prompts = new Map();
+    const claims = new Map();
+    let searchProven = true;
     for (const input of inputs) {
       if (input?.root !== owner) return null;
       for (const prompt of input.prompts) collectPrompt(prompts, prompt);
+      if (!input.claims) searchProven = false;
+      else for (const claim of input.claims) collectPrompt(claims, claim);
     }
-    return { root: owner, prompts: [...prompts.values()] };
+    return {
+      root: owner,
+      prompts: [...prompts.values()],
+      claims: searchProven ? [...claims.values()] : null,
+    };
   }
 
   function currentOrigin(session) {
@@ -699,6 +715,7 @@ export function observeDelegatedInputs(scope) {
       const agent = original(subject);
       const activation = activations.get(agent.id);
       if (activation?.child === agent) activation.disposed = true;
+      turns.get(original(agent.session))?.stop.abort();
     },
     global,
   );
@@ -707,7 +724,8 @@ export function observeDelegatedInputs(scope) {
     ({ id, runId, local }) => {
       const activation = activations.get(id);
       if (!local || activation?.runId !== runId) return;
-      const { notice, parent } = activation;
+      const { notice, parent, child } = activation;
+      turns.get(original(child.session))?.stop.abort();
       if (notice && liveAgent(parent.id) === parent)
         notice.origin = collect(parent.session, activation.inputs);
       activations.delete(id);
@@ -797,8 +815,10 @@ export function observeDelegatedInputs(scope) {
       const agent = liveAgent(session.id);
       if (original(agent?.session) !== session) return;
       if (event.type === 'turn/start') {
+        turns.get(session)?.stop.abort();
         turns.set(session, {
           turn: event.data.turn,
+          stop: new globalThis.AbortController(),
           claimed: new Map(),
           inputs: [],
           directClaims: new Map(),
@@ -808,7 +828,10 @@ export function observeDelegatedInputs(scope) {
       const state = turns.get(session);
       if (!state) return;
       if (event.type === 'turn/end') {
-        if (event.data.turn === state.turn) turns.delete(session);
+        if (event.data.turn === state.turn) {
+          state.stop.abort();
+          turns.delete(session);
+        }
         return;
       }
       if (event.type === 'subagent/catalog') {
@@ -836,7 +859,15 @@ export function observeDelegatedInputs(scope) {
         return;
       const direct = nativePromptOccurrence(session, event.data, state.turn);
       const origin = direct
-        ? { root: root(session), prompts: [direct] }
+        ? {
+            root: root(session),
+            prompts: [direct],
+            claims:
+              isNativeOrdinaryRoot(session.header) &&
+              observedClaim(session, event.data, state.turn)
+                ? [direct]
+                : null,
+          }
         : claimed(session, event.data, state.turn);
       state.inputs.push(origin);
       const activation = activations.get(agent.id);
@@ -844,7 +875,25 @@ export function observeDelegatedInputs(scope) {
     },
     global,
   );
-  return { root, claimed, rootWake };
+  function searchOrigin(sessionId) {
+    const agent = liveAgent(sessionId);
+    if (!agent || agent.status !== 'running') return null;
+    const session = original(agent.session);
+    const state = turns.get(session);
+    const origin = currentOrigin(session);
+    if (!state || !origin?.claims?.length || origin.claims.length > 64)
+      return null;
+    return {
+      signal: state.stop.signal,
+      proof: {
+        rootSessionId: origin.root.id,
+        claims: origin.claims,
+        turn: state.turn,
+      },
+    };
+  }
+
+  return { root, claimed, rootWake, searchOrigin };
 }
 
 export function apply(ctx, config) {
@@ -855,6 +904,7 @@ export function applyNativeWebOwner(
   ctx,
   config,
   registerManagedGatewayAdapter,
+  managedSearch,
 ) {
   const {
     artifactPath,
@@ -1059,12 +1109,36 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
+          ...(modelAdapter.webSearchEnabled ? ['tools', 'web'] : []),
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
-          const delegations = observeDelegatedInputs(scope);
           const promptFacts = observeNativePrompts(scope, signal);
+          const delegations = observeDelegatedInputs(
+            scope,
+            modelAdapter.webSearchEnabled ? promptFacts.claimed : undefined,
+          );
+          let openSearch;
+          if (modelAdapter.webSearchEnabled) {
+            const disposeSearch = await managedSearch.applyManagedSearch(
+              scope,
+              {
+                cliPath: modelAdapter.cliPath,
+                origin,
+                capability,
+                adapterId: id,
+                enabled: true,
+              },
+            );
+            scope.on('dispose', disposeSearch);
+            openSearch = managedSearch.observeManagedSearchCalls(
+              scope,
+              id,
+              signal,
+              delegations.searchOrigin,
+            );
+          }
           const terminalAttestations = createNativeRunTerminalAttestations();
           const currentSession = (sessionId) =>
             original(scope.sessions.get(sessionId));
@@ -1114,6 +1188,12 @@ export function applyNativeWebOwner(
                   delegations.rootWake(value.sessionId),
                   { headers: { 'cache-control': 'no-store' } },
                 );
+              if (
+                value?.adapterId === id &&
+                value.action === 'observe-search-call' &&
+                openSearch
+              )
+                return openSearch(value, request);
               if (
                 value?.adapterId === id &&
                 (value.action === 'observe-prompt' ||

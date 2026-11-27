@@ -92,6 +92,7 @@ function fixture() {
   io.egress.mockReturnValue({
     authority: { context: vi.fn(), allow: vi.fn() },
     bindModelCall,
+    bindWebSearch: vi.fn(),
   });
   const nativeClose = vi.fn(async () => {});
   const authority = {

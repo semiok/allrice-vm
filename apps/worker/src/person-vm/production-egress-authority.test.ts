@@ -398,3 +398,31 @@ it('dispatches through real HTTP only with a managed call, and holds unowned rea
     await gateway.revoke(receipt, 'stop', signal());
   }
 });
+
+it('uses the original web search context once for the same VM epoch and gateway signal', async () => {
+  const { owner, call } = fixture();
+  const context = structuredClone(call.context);
+  const active = signal();
+  const verify = vi.fn(async () => {});
+  owner.bindWebSearch(context, call.vm, active, verify);
+  await expect(
+    owner.authority.allow(
+      context,
+      { ...call.vm, leaseEpoch: call.vm.leaseEpoch + 1 },
+      'web-search',
+      active,
+    ),
+  ).rejects.toMatchObject({ code: 'DENIED' });
+  expect(verify).not.toHaveBeenCalled();
+  owner.bindWebSearch(context, call.vm, active, verify);
+  await expect(
+    owner.authority.allow(context, call.vm, 'web-search', signal()),
+  ).rejects.toMatchObject({ code: 'DENIED' });
+  expect(verify).not.toHaveBeenCalled();
+  owner.bindWebSearch(context, call.vm, active, verify);
+  await owner.authority.allow(context, call.vm, 'web-search', active);
+  expect(verify).toHaveBeenCalledExactlyOnceWith(active);
+  await expect(
+    owner.authority.allow(context, call.vm, 'web-search', active),
+  ).rejects.toMatchObject({ code: 'DENIED' });
+});

@@ -45,11 +45,14 @@ import type {
 } from '@deepseek-ai/dsh-attachment';
 import { decodeProductionModelImage } from '../person-vm/production-model-images.js';
 import type { NativeWebLaunch } from './launch.js';
+import type { GuestSearchRequest } from '../person-vm/production-web-search.js';
 import { nativeWebTransport } from './transport.js';
 import { nativeSetupError, nativeSetupTarget } from './startup-diagnostic.js';
 import {
+  deferredPromptFact,
   NativePromptOccurrenceSchema,
   observeNativePrompt,
+  waitForPromptFact,
   type NativePromptObservation,
 } from './prompt-observation.js';
 import type { DEntryFixedProfileSource } from '../d-entry/released-profile.js';
@@ -93,6 +96,16 @@ const nativeRootWake = z.discriminatedUnion('kind', [
     })
     .strict(),
 ]);
+
+const searchCallProof = z
+  .object({
+    callId: z.string().min(1).max(256),
+    sessionId: z.string().min(1).max(256),
+    rootSessionId: z.string().min(1).max(256),
+    claims: nativePrompts.refine((claims) => claims.length > 0),
+    turn: z.number().int().positive(),
+  })
+  .strict();
 
 export function readNativeModelAttempt(
   snapshot: Pick<
@@ -1063,6 +1076,80 @@ export async function openNativeWebOwner(input: {
             return wake.data;
           },
         );
+      },
+      async observeNativeSearchCallFor(
+        context: RequestContext,
+        wanted: GuestSearchRequest,
+        caller: AbortSignal,
+      ) {
+        const stop = new AbortController();
+        const ended = new AbortController();
+        const observed = deferredPromptFact<z.infer<typeof searchCallProof>>();
+        const failure = () => new PersonVmError('AUTHORIZATION_DENIED');
+        let settled: Promise<unknown> | undefined;
+        let proofSeen = false;
+        let tail = Buffer.alloc(0);
+        const current = AbortSignal.any([signal, caller, stop.signal]);
+        const setup = AbortSignal.any([
+          current,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        const close = async () => {
+          stop.abort();
+          await settled?.catch(() => {});
+        };
+        try {
+          const proof = await readCurrent(
+            setup,
+            (active) => input.vm.assertCurrentBinding(context, binding, active),
+            async (active) => {
+              if (installedModelAdapter !== wanted.adapterId) throw failure();
+              settled = own(
+                transport.readManagedModelProof(
+                  JSON.stringify({ ...wanted, action: 'observe-search-call' }),
+                  current,
+                  false,
+                  (chunk) => {
+                    tail = Buffer.concat([tail, chunk]);
+                    for (
+                      let split = tail.indexOf(10);
+                      split >= 0;
+                      split = tail.indexOf(10)
+                    ) {
+                      const line = tail.subarray(0, split).toString('utf8');
+                      tail = tail.subarray(split + 1);
+                      if (ended.signal.aborted) throw failure();
+                      if (!proofSeen) {
+                        const parsed = searchCallProof.parse(JSON.parse(line));
+                        if (parsed.sessionId !== wanted.sessionId)
+                          throw failure();
+                        proofSeen = true;
+                        observed.resolve(parsed);
+                      } else if (line === 'ended') ended.abort(failure());
+                      else throw failure();
+                    }
+                  },
+                ),
+              );
+              void settled.then(
+                () => {
+                  ended.abort(failure());
+                  observed.reject(failure());
+                },
+                () => {
+                  ended.abort(failure());
+                  observed.reject(failure());
+                },
+              );
+              return waitForPromptFact(observed.promise, active);
+            },
+          );
+          ended.signal.throwIfAborted();
+          return { proof, signal: ended.signal, close };
+        } catch (error) {
+          await close();
+          throw error;
+        }
       },
       readNativeAttemptFor(
         context: RequestContext,

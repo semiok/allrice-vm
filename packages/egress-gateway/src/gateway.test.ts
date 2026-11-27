@@ -480,6 +480,36 @@ describe('trusted VM HTTP egress (VM and identity owners are explicit fixtures)'
     });
   });
 
+  it('expires a managed request while it is still resolving authorization', async () => {
+    const expired = vi.fn();
+    const f = await fixture({
+      services: [
+        {
+          id: 'timed-search',
+          path: '/timed-search',
+          method: 'POST',
+          admissionOwner: 'service',
+          timeoutMs: 25,
+          async resolve(_request, _binding, active) {
+            await new Promise<void>((done) => {
+              if (active.aborted) done();
+              else
+                active.addEventListener('abort', () => done(), { once: true });
+            });
+            expired(active.reason);
+            throw new EgressError('UNAVAILABLE');
+          },
+        },
+      ],
+    });
+    const response = await f.read('/timed-search', { method: 'POST' });
+    expect(response.status).toBe(502);
+    expect(expired).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ name: 'TimeoutError' }),
+    );
+    expect(f.authority.allow).not.toHaveBeenCalled();
+  });
+
   it('terminates a failed native stream without writing a second response or hanging drain', async () => {
     let cancelled!: () => void;
     const cancellation = new Promise<void>((resolve) => {

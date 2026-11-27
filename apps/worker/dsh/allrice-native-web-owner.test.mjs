@@ -146,18 +146,21 @@ it('uses the native title source sequence after a later turn has started', () =>
   });
 });
 
-function fixture() {
+function fixture(claimed = () => true) {
   const callbacks = new Map();
   const agents = new Map();
   const sessions = new Map();
-  const delegations = observeDelegatedInputs({
-    on: (name, callback) => callbacks.set(name, callback),
-    sessions,
-    agents: {
-      get: (id) => agents.get(id),
-      isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+  const delegations = observeDelegatedInputs(
+    {
+      on: (name, callback) => callbacks.set(name, callback),
+      sessions,
+      agents: {
+        get: (id) => agents.get(id),
+        isOwnedBy: (id, parent) => agents.get(id)?.parent === parent,
+      },
     },
-  });
+    claimed,
+  );
   function emit(name, payload) {
     callbacks.get(name)(payload);
   }
@@ -186,7 +189,12 @@ function fixture() {
   }
   function openRoot(root, turn, rpcId) {
     append(root, 'turn/start', { turn });
-    input(root, userPrompt(rpcId), turn);
+    const message = userPrompt(rpcId);
+    message.source.principal = {
+      kind: 'allrice-d-entry',
+      scopeId: 'scope-' + rpcId,
+    };
+    input(root, message, turn);
   }
   function createChild(root, id) {
     const child = agent(id, root);
@@ -240,6 +248,7 @@ function fixture() {
     input,
     openRoot,
     proof,
+    searchOrigin: delegations.searchOrigin,
     rootWake(id) {
       const wake = delegations.rootWake(id);
       if (wake.kind !== 'delegated') return wake;
@@ -458,8 +467,39 @@ function promptFixture() {
     });
   const next = async (reader) =>
     new TextDecoder().decode((await reader.read()).value).trim();
-  return { agent, emit, end, issue, message, next, open, outcome, lifetime };
+  return {
+    agent,
+    emit,
+    end,
+    issue,
+    message,
+    next,
+    open,
+    outcome,
+    lifetime,
+    claimed: observe.claimed,
+  };
 }
+
+it('reads only the exact live prompt claim from the real observer', async () => {
+  const f = promptFixture();
+  const issue = f.issue();
+  const reader = f.open(issue);
+  const item = f.message(issue);
+  try {
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+    f.emit('inserted', item);
+    f.emit('claimed', item, 2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(true);
+    expect(f.claimed(f.agent.session, f.message(issue), 2)).toBe(false);
+    expect(f.claimed(f.agent.session, item, 3)).toBe(false);
+    f.end(2);
+    expect(f.claimed(f.agent.session, item, 2)).toBe(false);
+  } finally {
+    await reader.cancel();
+    f.lifetime.abort();
+  }
+});
 
 it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
   const f = promptFixture();
@@ -537,4 +577,111 @@ it('does not adopt a pending retry occurrence or another principal using the sam
   } finally {
     f.lifetime.abort();
   }
+});
+
+it('derives Search authority from the exact running turn and native child lineage', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  root.status = 'running';
+  f.openRoot(root, 1, 'original');
+  const child = f.createChild(root, 'child');
+  child.status = 'running';
+  expect(f.searchOrigin('root').proof).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
+  });
+  f.append(root, 'turn/end', { turn: 1 });
+  f.openRoot(root, 2, 'next-login');
+  expect(f.searchOrigin('child').proof).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    claims: [
+      {
+        sessionId: 'root',
+        scopeId: 'scope-original',
+        requestId: 'original',
+        messageId: 'message-original',
+        turn: 1,
+      },
+    ],
+  });
+  expect(f.searchOrigin('root')?.proof.claims).toEqual([
+    {
+      sessionId: 'root',
+      scopeId: 'scope-next-login',
+      requestId: 'next-login',
+      messageId: 'message-next-login',
+      turn: 2,
+    },
+  ]);
+  child.status = 'idle';
+  expect(f.searchOrigin('child')).toBeNull();
+  f.append(root, 'turn/end', { turn: 2 });
+  expect(f.searchOrigin('root')).toBeNull();
+});
+
+it('permits a native fork to search from its own adopted prompt and not from seed history', () => {
+  const f = fixture((_session, message) => message.id === 'message-own-prompt');
+  const fork = f.agent('fork');
+  Object.assign(fork.session.header, {
+    id: 'fork',
+    parentSession: 'ancestor',
+    isSeeded: true,
+  });
+  fork.status = 'running';
+  f.openRoot(fork, 1, 'seed-history');
+  expect(f.searchOrigin('fork')).toBeNull();
+  f.append(fork, 'turn/end', { turn: 1 });
+  f.openRoot(fork, 2, 'own-prompt');
+  expect(f.searchOrigin('fork')?.proof).toEqual({
+    rootSessionId: 'fork',
+    turn: 2,
+    claims: [
+      {
+        sessionId: 'fork',
+        scopeId: 'scope-own-prompt',
+        requestId: 'own-prompt',
+        messageId: 'message-own-prompt',
+        turn: 2,
+      },
+    ],
+  });
+});
+
+it('denies an unobserved direct root input and a same-ID direct child input', () => {
+  const rejected = fixture(() => false);
+  const noClaim = rejected.agent('root');
+  noClaim.status = 'running';
+  rejected.openRoot(noClaim, 1, 'same-rpc');
+  expect(rejected.searchOrigin('root')).toBeNull();
+
+  const f = fixture();
+  const root = f.agent('root');
+  f.openRoot(root, 1, 'same-rpc');
+  const child = f.createChild(root, 'child');
+  child.session.header.origin = 'subagent';
+  child.status = 'running';
+  expect(f.searchOrigin('child')).not.toBeNull();
+  f.input(
+    child,
+    {
+      id: 'different-occurrence',
+      source: {
+        kind: 'user',
+        rpcId: 'same-rpc',
+        principal: { kind: 'allrice-d-entry', scopeId: 'scope-same-rpc' },
+      },
+    },
+    1,
+  );
+  expect(f.searchOrigin('child')).toBeNull();
 });

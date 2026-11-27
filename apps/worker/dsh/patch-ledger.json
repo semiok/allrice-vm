@@ -26,6 +26,14 @@
       "reason": "SaaS current-session/employee/release and immutable thread-root guard on existing Web/Worker listeners. Reuse public rc.2 generated Remote strict codecs and Mux frame parsers, with an explicit source-verified endpoint/effect map. Each logical stream is authorized; child browser writes, unclassified global/plugin methods and arbitrary uplink are denied. Harmless late cancel/end tails follow native Mux semantics. Transactional PG authority notifications trigger current SQL rechecks after subscribe-before-recheck; real session expiry or notification disconnect aborts idle I/O and joins pending checks. Native authentication and actual joined-close handles must be injected by their trusted owner; discovery controlReady never grants editor/send readiness. No new listener, provider, identity authority, VM table or Agent state machine."
     },
     {
+      "id": "allrice-managed-web-search-v1",
+      "issue": "MET-268",
+      "upstreamVersion": "0.2.1-rc.2",
+      "kind": "protocol-extension",
+      "path": "apps/worker/dsh/allrice-managed-web-search.mjs",
+      "reason": "Register the existing deepseek-official provider ID through public DSH Web APIs. The Person VM capability is scoped to its current host gateway, and the host rechecks the native prompt, user and epoch. DeepSeek provider and credential live only on the host. Native web tool, output and rendering remain DSH-owned."
+    },
+    {
       "id": "allrice-host-model-gateway-v1",
       "issue": "MET-268",
       "upstreamVersion": "0.2.1-rc.2",

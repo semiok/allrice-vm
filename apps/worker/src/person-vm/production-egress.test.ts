@@ -76,9 +76,10 @@ async function installedFile() {
   if (!path) throw Error('missing actual staging file');
   return path;
 }
-function gateway(owner = installation) {
+function gateway(owner = installation, publicProxy = false) {
   const value = createEgressGateway({
     provisioner: owner.provisioner,
+    publicProxy,
     admission: admissionFixture(),
     vm: { assertAdmissionBinding: async () => {} },
     authority: { context: async () => rc, allow: async () => {} },
@@ -127,6 +128,31 @@ async function readHttp() {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ ok: true });
 }
+
+it('stages a private epoch proxy file with a credential separate from the managed routes', async () => {
+  await prepare(gateway(installation, true));
+  const stored = JSON.parse(await fs.readFile(await installedFile(), 'utf8'));
+  const proxy = new URL(stored.access.publicProxyUrl);
+  expect(proxy.origin).toBe(stored.access.origin);
+  expect(proxy.username).toBe('vm-proxy');
+  expect(proxy.password).not.toBe(stored.access.capability);
+  expect(await installation.readAccess(binding, signal())).toEqual({
+    origin: stored.access.origin,
+    capability: stored.access.capability,
+  });
+  const plan = await installation.memoryGuestPlan(binding, signal());
+  const config = plan.files.find(
+    ({ path }) => path === plan.env.ALLRICE_PUBLIC_PROXY_CONFIG,
+  );
+  expect(config).toMatchObject({
+    contents: proxy.href + '\n' + proxy.hostname + '\n',
+    mode: 0o600,
+  });
+  expect(JSON.stringify(plan.env).includes(proxy.password)).toBe(false);
+  expect(plan.env).not.toHaveProperty('PIP_CONFIG_FILE');
+  expect(plan.env).not.toHaveProperty('npm_config_userconfig');
+  await readHttp();
+});
 
 it('uses actual bind0 origin in receipt, real private readback and public memory plan', async () => {
   const { receipt } = await prepare();

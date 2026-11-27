@@ -88,6 +88,8 @@ export type ManagedHostService = Readonly<{
   id: string;
   path: string;
   method: 'GET' | 'POST';
+  /** Optional budget for the full request, including resolution and authorization. */
+  timeoutMs?: number;
   /** Service owns admission AND complete call identity; local capability is insufficient. */
   admissionOwner: 'service';
 }> &
@@ -110,8 +112,10 @@ export type ManagedHostService = Readonly<{
           request: IncomingMessage,
           binding: PersonVmBinding,
           signal: AbortSignal,
+          assertNoCapability?: (value: string) => void,
         ): Promise<{
           context: RequestContext;
+          close?(): Promise<void>;
           dispatch(
             response: ServerResponse,
             signal: AbortSignal,
@@ -124,6 +128,7 @@ export type ManagedHostService = Readonly<{
 export type GuestEgressAccess = Readonly<{
   origin: string;
   capability: string;
+  publicProxyUrl?: string;
 }>;
 export interface EgressProvisioner {
   /** Configured addressing only. Empty lease ports select port 0 for actual
