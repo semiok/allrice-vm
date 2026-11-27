@@ -710,7 +710,6 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
   ) {
     signal.throwIfAborted();
-    if (this.options.restartMemory) this.restartMemoryPolicy();
     const paths = await this.readAttachedPaths(binding, mount);
     return this.namedStatus(binding, this.name(binding, paths), signal, paths);
   }
@@ -847,6 +846,7 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     signal: AbortSignal,
   ) {
     signal.throwIfAborted();
+    if (this.options.restartMemory) this.restartMemoryPolicy();
     const paths = await this.readAttachedPaths(binding, mount, true);
     if (
       !/\b0\.7\.16\b/.test(
