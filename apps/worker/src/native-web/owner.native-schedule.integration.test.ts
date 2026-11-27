@@ -1,7 +1,8 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { finished } from 'node:stream/promises';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Schedule } from '@deepseek-ai/dsh-schedule/remote';
 import { afterEach, expect, it } from 'vitest';
@@ -11,6 +12,11 @@ import {
   listen,
 } from '../../../../packages/model-gateway/src/gateway.fixture.js';
 import { setupNativeWebFixture } from './owner.native.fixture.js';
+import {
+  deferredPromptFact,
+  waitForPromptFact,
+  type NativeToolObservation,
+} from './prompt-observation.js';
 
 const cli = process.env.ALLRICE_NATIVE_WEB_TEST_CLI;
 const wireArguments = z.record(z.string(), z.json());
@@ -39,11 +45,22 @@ it.skipIf(!cli)(
     const references = new Map<string, boolean>();
     const capability = 'a'.repeat(43);
     let assistantRequests = 0;
+    let readAttempt!: (sessionId: string) => Promise<void>;
+    const proofs = deferredPromptFact<NativeToolObservation>();
+    const nativeCallId = randomUUID();
+    const nativeRequestId = randomUUID();
+    const humanText = 'Create a test reminder in ten minutes.';
+    const selected = deferredPromptFact<{
+      id: string;
+      cursor: number;
+      observation: NonNullable<NativeToolObservation['human']>;
+    }>();
     const title = 'Synthetic reminder for the Host wake reader';
     const prompt = 'Acknowledge this synthetic reminder without using tools.';
     const server = createServer((request, response) => {
       void (async () => {
-        request.resume();
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
         await finished(request);
         if (request.headers.authorization !== 'Bearer ' + capability)
           throw Error('Wrong fixture capability');
@@ -51,6 +68,17 @@ it.skipIf(!cli)(
           request.url === '/v1/reference' ||
           request.url === '/v1/reference/session-title'
         ) {
+          if (request.url === '/v1/reference' && assistantRequests === 0) {
+            const { sessionId } = JSON.parse(
+              Buffer.concat(chunks).toString('utf8'),
+            );
+            try {
+              await readAttempt(sessionId);
+            } catch (error) {
+              selected.reject(error);
+              throw error;
+            }
+          }
           const reference = randomBytes(32).toString('base64url');
           references.set(reference, request.url.endsWith('/session-title'));
           response.writeHead(200, { 'content-type': 'application/json' });
@@ -71,7 +99,7 @@ it.skipIf(!cli)(
               ? {
                   type: 'tool-call-delta',
                   index: 0,
-                  id: randomUUID(),
+                  id: nativeCallId,
                   name: 'schedule_create',
                   argumentsDelta: JSON.stringify({
                     title,
@@ -112,8 +140,41 @@ it.skipIf(!cli)(
           inputModalities: ['text'],
         },
       },
+      async (request, signal) => {
+        if (request.endpoint !== 'session/prompt')
+          throw Error('Unexpected native prompt');
+        const observation = request.observe(signal, proofs.resolve);
+        await observation.ready;
+        return {
+          undispatched: () => observation.close(),
+          accepted() {},
+          unknown() {},
+        };
+      },
     );
     const signal = AbortSignal.timeout(15000);
+    readAttempt = async (sessionId) => {
+      const attempt = await owner.readNativeAttemptFor(
+        context,
+        {
+          kind: 'session',
+          sessionId: SessionId(sessionId),
+        },
+        signal,
+      );
+      if (!attempt?.observation?.human)
+        throw Error('No unique adopted input proof');
+      expect(attempt.observation.request).toMatchObject({
+        provider: 'openai-codex',
+        model: 'fixture-codex',
+        digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      selected.resolve({
+        id: attempt.id,
+        cursor: attempt.cursor,
+        observation: attempt.observation.human,
+      });
+    };
     const created = await owner.createRootFor(context, {}, signal);
     if (!created.ok) throw Error('Native root unavailable');
     const { sessionId } = created.value;
@@ -211,13 +272,8 @@ it.skipIf(!cli)(
             .parse({
               request: {
                 sessionId,
-                requestId: randomUUID(),
-                content: [
-                  {
-                    type: 'text',
-                    text: 'Create a test reminder in ten minutes.',
-                  },
-                ],
+                requestId: nativeRequestId,
+                content: [{ type: 'text', text: humanText }],
                 mode: 'queue',
               },
             }),
@@ -225,6 +281,33 @@ it.skipIf(!cli)(
         signal,
       ),
     ).toMatchObject({ value: { accepted: true } });
+    const [nativeAttempt, tool] = await Promise.all([
+      waitForPromptFact(selected.promise, signal),
+      waitForPromptFact(proofs.promise, signal),
+    ]);
+    const digest =
+      'sha256:' +
+      createHash('sha256')
+        .update(JSON.stringify([humanText]))
+        .digest('hex');
+    expect(tool).toMatchObject({
+      attemptId: nativeAttempt.id,
+      callId: nativeCallId,
+      name: 'schedule_create',
+      human: {
+        occurrence: {
+          sessionId,
+          scopeId: executionId,
+          requestId: nativeRequestId,
+          messageId: expect.any(String),
+          turn: 1,
+        },
+        digest,
+      },
+    });
+    expect(tool.human).toEqual(nativeAttempt.observation);
+    expect(tool.assistantSequence).toBeGreaterThan(nativeAttempt.cursor);
+    expect(tool.sequence).toBeGreaterThan(tool.assistantSequence);
     await nextChange();
 
     await execution.close();

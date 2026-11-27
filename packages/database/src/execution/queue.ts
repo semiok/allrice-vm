@@ -1883,6 +1883,7 @@ export async function listRunEvents(
       and workspace_id = ${run.workspaceId}
       and run_id = ${run.id}
       and sequence > ${afterSequence}
+      ${'generation' in run ? sql`and (payload->>'source') is distinct from 'dsh-native-execution-evidence-v1'` : sql``}
     order by sequence
   `;
   return 'generation' in run

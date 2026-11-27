@@ -1,5 +1,6 @@
 import { addAbortListener } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { TextDecoder } from 'node:util';
 import { UuidSchema } from '@allrice/contracts';
 import { PersonVmError } from '@allrice/person-vm';
 import { z } from 'zod';
@@ -24,6 +25,44 @@ export const NativePromptOccurrenceSchema = adoptedMessage.extend({
 });
 export type NativePromptOccurrence = z.infer<
   typeof NativePromptOccurrenceSchema
+>;
+
+export const NativeAdoptedTextSchema = z
+  .object({
+    occurrence: NativePromptOccurrenceSchema,
+    sequence: z.number().int().nonnegative(),
+    digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export const NativeRequestObservationSchema = z
+  .object({
+    request: z
+      .object({
+        provider: z.string().min(1).max(128),
+        model: z.string().min(1).max(128),
+        digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+      })
+      .strict()
+      .nullable(),
+    human: NativeAdoptedTextSchema.nullable(),
+  })
+  .strict();
+
+const nativeToolObservation = z
+  .object({
+    attemptId: z.string().min(1).max(512),
+    assistantSequence: z.number().int().nonnegative(),
+    callId: z.string().min(1).max(256),
+    name: z.string().min(1).max(256),
+    sequence: z.number().int().nonnegative(),
+    human: NativeAdoptedTextSchema,
+  })
+  .strict();
+
+export type NativeToolObservation = z.infer<typeof nativeToolObservation>;
+export type NativeRequestObservation = z.infer<
+  typeof NativeRequestObservationSchema
 >;
 
 export function deferredPromptFact<T>() {
@@ -66,6 +105,7 @@ export function observeNativePrompt(
   },
   signal: AbortSignal,
   setupTimeoutMs: number,
+  onTool?: (fact: NativeToolObservation) => void,
 ) {
   const close = new AbortController();
   const current = AbortSignal.any([signal, close.signal]);
@@ -78,6 +118,7 @@ export function observeNativePrompt(
   let terminal: 'discarded' | 'ended' | undefined;
   let insertedMessageId: string | undefined;
   let tail = '';
+  const decoder = new TextDecoder('utf-8', { fatal: true });
   function recordInsertion(messageId: string) {
     if (insertedMessageId && insertedMessageId !== messageId) throw failed();
     insertedMessageId = messageId;
@@ -110,7 +151,9 @@ export function observeNativePrompt(
       current,
       false,
       (chunk) => {
-        const records = (tail + chunk.toString('latin1')).split('\n');
+        const records = (tail + decoder.decode(chunk, { stream: true })).split(
+          '\n',
+        );
         tail = records.pop()!;
         for (const record of records) {
           if (terminal) throw failed();
@@ -135,6 +178,21 @@ export function observeNativePrompt(
               throw failed();
             state = 'claimed';
             claim.resolve(adopted.data);
+          } else if (record.startsWith('tool ') && state === 'claimed') {
+            const fact = nativeToolObservation.safeParse(
+              JSON.parse(record.slice(5)),
+            );
+            if (
+              fact.success &&
+              fact.data.human.occurrence.messageId === insertedMessageId &&
+              fact.data.human.occurrence.sessionId === source.sessionId &&
+              fact.data.human.occurrence.parentSessionId ===
+                source.parentSessionId &&
+              fact.data.human.occurrence.scopeId === source.scopeId &&
+              fact.data.human.occurrence.requestId === source.requestId
+            ) {
+              onTool?.(fact.data);
+            }
           } else if (
             (record === 'discarded' && state === 'inserted') ||
             (record === 'ended' && state === 'claimed')
@@ -145,7 +203,7 @@ export function observeNativePrompt(
       },
     )
     .then(() => {
-      if (tail || !terminal) throw failed();
+      if (decoder.decode() || tail || !terminal) throw failed();
       if (terminal === 'discarded') claim.reject(failed());
       return terminal;
     });

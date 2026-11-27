@@ -1,11 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { RequestContext } from '@allrice/contracts';
+import type {
+  ApplicationBuiltinModulesProjection,
+  RequestContext,
+} from '@allrice/contracts';
 import {
   createDedicatedDatabase,
   createDEntryAuthorityFeed,
   getDatabase,
+  readApplicationBuiltinModules,
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
@@ -119,6 +123,7 @@ export type ProductionPersonVmHostSources = Readonly<{
     current: Current;
     lifetime: AbortSignal;
     modelOwnerId: string;
+    nativeExecutionBuild: ApplicationBuiltinModulesProjection['applicationBuild'];
     reserveNativeModelCall(call: ModelCallBinding): Promise<void>;
     issueReference<T>(
       call: ModelCallBinding,
@@ -960,6 +965,16 @@ export function createProductionPersonVmHost(input: {
           },
         },
       });
+      const verifiedBuild = await readApplicationBuiltinModules('worker');
+      lifetime.throwIfAborted();
+      const build = verifiedBuild.applicationBuild;
+      const nativeExecutionBuild =
+        build &&
+        build.sourceSha === providers.applicationBuild.sourceSha &&
+        build.sourceTree === providers.applicationBuild.sourceTree &&
+        build.manifestDigest === providers.applicationBuild.manifestDigest
+          ? build
+          : null;
       bound = await sources.bind({
         vm,
         admission,
@@ -968,6 +983,7 @@ export function createProductionPersonVmHost(input: {
         providers,
         lifetime,
         modelOwnerId,
+        nativeExecutionBuild,
         async issueReference(call, signal, issue) {
           if (!model?.issueReference)
             throw new ProductionPersonVmHostUnavailable(

@@ -6,6 +6,7 @@ import {
   nativePromptOccurrence,
   observeDelegatedInputs,
   observeNativePrompts,
+  observeOriginalRequest,
   readPromptOrigins,
 } from './allrice-native-web-owner.mjs';
 
@@ -537,4 +538,84 @@ it('does not adopt a pending retry occurrence or another principal using the sam
   } finally {
     f.lifetime.abort();
   }
+});
+
+it('keeps the model configuration and rejects competing or non-text input for the same assistant request', () => {
+  const first = {
+    ...userPrompt('first'),
+    content: [{ type: 'text', text: 'original input' }],
+  };
+  const occurrence = nativePromptOccurrence(promptRoot, first, 1);
+  const origin = { prompts: [occurrence], delegated: false };
+  const header = {
+    seq: 0,
+    type: 'request/header',
+    data: {
+      header: {
+        config: { provider: 'sealed', model: 'fixture', temperature: 0.4 },
+      },
+    },
+  };
+  const start = { seq: 1, type: 'turn/start', data: { turn: 1 } };
+  const user = { seq: 2, type: 'user/message', data: first };
+  const observe = (events, value = origin) =>
+    observeOriginalRequest(
+      { events, inheritedEventCount: 0 },
+      events.length - 1,
+      1,
+      value,
+    );
+  const initial = observe([header, start, user]);
+  expect(initial).toMatchObject({
+    request: {
+      provider: 'sealed',
+      model: 'fixture',
+      digest: expect.stringMatching(/^sha256:/),
+    },
+    human: {
+      occurrence,
+      sequence: 2,
+      digest: expect.stringMatching(/^sha256:/),
+    },
+  });
+  expect(
+    observe([
+      header,
+      start,
+      user,
+      {
+        seq: 3,
+        type: 'user/message',
+        data: userPrompt('steer'),
+      },
+    ]),
+  ).toEqual({ request: initial.request, human: null });
+  expect(
+    observe([
+      header,
+      start,
+      user,
+      {
+        seq: 3,
+        type: 'user/message',
+        data: { source: { kind: 'schedule' } },
+      },
+    ]).human,
+  ).toBeNull();
+  expect(
+    observe([
+      header,
+      start,
+      {
+        ...user,
+        data: {
+          ...first,
+          content: [{ type: 'image', mediaType: 'image/png' }],
+        },
+      },
+    ]).human,
+  ).toBeNull();
+  expect(
+    observe([header, start, user], { ...origin, delegated: true }).human,
+  ).toBeNull();
 });

@@ -34,10 +34,17 @@ import {
   waitForPromptFact,
   type NativePromptObservation,
   type NativePromptOccurrence,
+  type NativeRequestObservation,
+  type NativeToolObservation,
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
 import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
+import {
+  recordNativeExecutionRequest,
+  recordNativeExecutionTool,
+  type NativeExecutionBuild,
+} from './production-native-execution-evidence.js';
 
 type NativeModelSelection = Readonly<{
   context: RequestContext;
@@ -116,6 +123,11 @@ async function persistExecution(
   contributingRequestIds: readonly string[],
   directRequestIds: readonly string[],
   delegated: boolean,
+  provenance: {
+    build: NativeExecutionBuild;
+    observation: NativeRequestObservation | null;
+    prompts: readonly NativePromptOccurrence[];
+  },
   signal: AbortSignal,
 ) {
   const { context, vm, native, execution } = call;
@@ -163,7 +175,7 @@ async function persistExecution(
     ...(delegated && directRequestIds.length ? { directRequestIds } : {}),
   };
   signal.throwIfAborted();
-  await getDatabase().begin(async (tx) => {
+  const receipt = await getDatabase().begin(async (tx) => {
     signal.throwIfAborted();
     await tx`insert into allrice_runs(id,organization_id,workspace_id,owner_id,state,execution_spec,started_at)
       values (${execution.runId},${vm.organizationId},${identity.workspaceId},${vm.personId},'running',${tx.json(runSource)},clock_timestamp())
@@ -182,9 +194,70 @@ async function persistExecution(
           coalesce(max(sequence)+1,0),'step.started',${tx.json(invocation)}
         from allrice_run_events where run_id=${execution.runId}`;
     }
+    const observed = provenance.observation;
+    const humanObservation = observed?.human;
+    const claimed = humanObservation?.occurrence;
+    const adopted = provenance.prompts[0];
+    const human =
+      claimed &&
+      adopted &&
+      provenance.prompts.length === 1 &&
+      claimed.sessionId === native.rootSessionId &&
+      claimed.parentSessionId === undefined &&
+      claimed.sessionId === adopted.sessionId &&
+      claimed.scopeId === prompt.scopeId &&
+      claimed.scopeId === adopted.scopeId &&
+      claimed.requestId === prompt.requestId &&
+      claimed.requestId === adopted.requestId &&
+      claimed.messageId === adopted.messageId &&
+      claimed.turn === native.attemptTurn &&
+      claimed.turn === adopted.turn &&
+      humanObservation.sequence <= native.attemptCursor!
+        ? humanObservation
+        : null;
+    const config = observed?.request;
+    const adoptedModelConfiguration =
+      config?.provider === call.provider && config.model === call.model
+        ? config
+        : null;
+    const evidence =
+      !delegated &&
+      native.attemptKind === 'assistant' &&
+      native.sessionId === native.rootSessionId &&
+      native.parentSessionId === null
+        ? await recordNativeExecutionRequest(
+            tx,
+            {
+              runId: execution.runId,
+              organizationId: vm.organizationId,
+              workspaceId: identity.workspaceId,
+              ownerId: vm.personId,
+            },
+            call,
+            {
+              originalRequestId: prompt.requestId,
+              rootOriginRef: pin.rootOriginDigest,
+              rootSessionRef: native.rootSessionId,
+              nativeOwnerRef: native.instanceId,
+              nativeProfileRef: native.profile,
+              applicationBuild: provenance.build,
+              employeeInstanceId: identity.employeeInstanceId,
+              employeeRelease: identity.employeeVersionId,
+              employeeRevision: identity.employeeRevision,
+              threadId: call.allriceThreadRef,
+              vm,
+              human,
+              adoptedModelConfiguration,
+            },
+            contributingRequestIds,
+            !!event,
+          )
+        : null;
     signal.throwIfAborted();
+    return evidence;
   });
   signal.throwIfAborted();
+  return receipt;
 }
 
 async function assertPersistedExecution(
@@ -351,6 +424,26 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         }
       >();
       const operations = new Set<Promise<unknown>>();
+      type EvidenceReceipt = NonNullable<
+        Awaited<ReturnType<typeof persistExecution>>
+      >;
+      const toolRequests = new WeakMap<
+        PromptOwner,
+        Map<string, EvidenceReceipt>
+      >();
+      function collectNativeTool(
+        prompt: PromptOwner,
+        fact: NativeToolObservation,
+      ) {
+        const receipt = toolRequests.get(prompt)?.get(fact.attemptId);
+        if (!receipt || prompt.revoked.aborted) return;
+        void run(prompt.revoked, (active) =>
+          recordNativeExecutionTool(receipt, fact, active),
+        ).catch(() => {
+          // Missing evidence makes this call unavailable to a future consumer.
+          // It does not change the outcome of the native tool.
+        });
+      }
       const executions = new WeakMap<PromptOwner, Map<string, string>>();
       const sourceExecutions = new WeakMap<
         PromptOwner,
@@ -769,7 +862,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   admission,
                 );
               admission.throwIfAborted();
-              const observation = observe(revoked);
+              const observation = observe(revoked, (fact) =>
+                collectNativeTool(scope, fact),
+              );
               const scope: PromptOwner = Object.freeze({
                 context: structuredClone(context),
                 identity,
@@ -1035,6 +1130,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   owner: ReturnType<typeof host.startup.catalog>['owner'];
                   address: SessionAddress;
                   sourceTurn: number;
+                  observation: NativeRequestObservation | null;
                   coalesced: readonly PromptOwner[];
                   delegated: boolean;
                   prompts: readonly NativePromptOccurrence[];
@@ -1147,6 +1243,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 owner: profile.owner,
                 address: resource.nativeAddress!,
                 sourceTurn: attempt.sourceTurn,
+                observation: attempt.observation ?? null,
                 coalesced,
                 prompts: attempt.prompts,
                 delegated: attempt.delegated,
@@ -1186,6 +1283,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               owner: profileOwner,
               address,
               sourceTurn,
+              observation,
               coalesced,
               prompts,
               delegated,
@@ -1244,12 +1342,17 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                           call,
                           admitted,
                         );
-                        await persistExecution(
+                        const evidence = await persistExecution(
                           call,
                           scope,
                           coalesced.map((member) => member.requestId).sort(),
                           direct.map((member) => member.requestId).sort(),
                           delegated,
+                          {
+                            build: host.nativeExecutionBuild ?? null,
+                            observation,
+                            prompts,
+                          },
                           admitted,
                         );
                         entry.persisted = true;
@@ -1267,6 +1370,16 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                           );
                         await host.reserveNativeModelCall(call);
                         admitted.throwIfAborted();
+                        if (evidence?.request.human) {
+                          // Only this native assistant attempt can emit current
+                          // tool proof on the corresponding prompt carrier.
+                          toolRequests.set(
+                            scope,
+                            new Map([
+                              [evidence.request.nativeAttemptId, evidence],
+                            ]),
+                          );
+                        }
                         return input.issueCall(
                           call,
                           effective,

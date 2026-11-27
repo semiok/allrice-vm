@@ -4,7 +4,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { isIP } from 'node:net';
 import { dirname } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ReadableStream } from 'node:stream/web';
 import { URL } from 'node:url';
 import { TextEncoder } from 'node:util';
@@ -398,6 +398,10 @@ async function observePromptOrigins(
           ...origin,
           rootSessionId: root.id,
           delegated: !isNativeOrdinaryRoot(header) || origin.delegated,
+          request:
+            purpose === 'assistant'
+              ? observeOriginalRequest(observed, cursor, turn, origin)
+              : null,
         }
       : null;
   } finally {
@@ -405,12 +409,76 @@ async function observePromptOrigins(
   }
 }
 
+// Version 1 covers ordered, exact text blocks only. No content or tool
+// arguments cross the owner carrier. An unsupported block has no proof.
+function adoptedTextDigest(message) {
+  const blocks = message.content;
+  if (
+    !Array.isArray(blocks) ||
+    !blocks.length ||
+    blocks.some(
+      (block) => block.type !== 'text' || typeof block.text !== 'string',
+    )
+  )
+    return null;
+  return (
+    'sha256:' +
+    createHash('sha256')
+      .update(JSON.stringify(blocks.map(({ text }) => text)))
+      .digest('hex')
+  );
+}
+
+export function observeOriginalRequest(observed, cursor, turn, origin) {
+  const { events, inheritedEventCount } = observed;
+  const config = events.findLast(
+    (event) => event.seq <= cursor && event.type === 'request/header',
+  )?.data.header;
+  const request = config && {
+    provider: config.config.provider,
+    model: config.config.model,
+    digest:
+      'sha256:' +
+      createHash('sha256')
+        .update(JSON.stringify([config.config, config.adapterDefaults ?? null]))
+        .digest('hex'),
+  };
+  const empty = { request: request ?? null, human: null };
+  if (origin.delegated || origin.prompts.length !== 1) return empty;
+  const [prompt] = origin.prompts;
+  const start = events.findLast(
+    (event) =>
+      event.seq >= inheritedEventCount &&
+      event.seq <= cursor &&
+      event.type === 'turn/start' &&
+      event.data.turn === turn,
+  );
+  if (!start) return empty;
+  const inputs = events
+    .slice(start.seq + 1, cursor + 1)
+    .filter(
+      (event) =>
+        event.type === 'user/message' &&
+        event.data.source?.kind !== 'runtime-context',
+    );
+  if (inputs.length !== 1 || inputs[0].data.id !== prompt.messageId)
+    return empty;
+  const digest = adoptedTextDigest(inputs[0].data);
+  return digest
+    ? {
+        ...empty,
+        human: { occurrence: prompt, sequence: inputs[0].seq, digest },
+      }
+    : empty;
+}
+
 /** Carry only the inbox facts for an exact scoped prompt through the existing
  * authenticated owner transport. A waiter is registered before dispatch. */
-export function observeNativePrompts(scope, lifetime) {
+export function observeNativePrompts(scope, lifetime, capture) {
   const observers = new Map();
   const sources = new Map();
   const turns = new WeakMap();
+  const attempts = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
     'content-type': 'text/plain; charset=utf-8',
@@ -466,6 +534,7 @@ export function observeNativePrompts(scope, lifetime) {
         if (observer.itemId !== message.id || observer.turn !== undefined)
           continue;
         observer.turn = turn;
+        if (capture?.()) observer.contentDigest = adoptedTextDigest(message);
         const session = original(agent.session);
         let active = turns.get(session);
         if (!active) turns.set(session, (active = new Map()));
@@ -515,7 +584,147 @@ export function observeNativePrompts(scope, lifetime) {
     },
     { global: true },
   );
-  return (value, request) => {
+  if (capture) {
+    scope.on(
+      'agent/assistant-stream',
+      ({ agent, frame }) => {
+        const session = original(agent.session);
+        if (frame.type === 'start') {
+          attempts.set(session, {
+            id: frame.attemptId,
+            turn: frame.turn,
+            step: frame.step,
+            cursor: session.seq - 1,
+            calls: new Map(),
+          });
+        } else if (frame.type === 'end') {
+          const attempt = attempts.get(session);
+          if (attempt?.id !== frame.attemptId || !attempt.human) return;
+          if (
+            frame.outcome.kind === 'committed' &&
+            frame.outcome.eventType === 'assistant/message' &&
+            attempt.assistant?.seq === frame.outcome.seq
+          ) {
+            attempt.assistantSeq = frame.outcome.seq;
+          } else {
+            attempts.delete(session);
+          }
+        }
+      },
+      { global: true },
+    );
+    scope.on(
+      'session/event',
+      (subject, event) => {
+        const session = original(subject);
+        if (event.type === 'step/end' || event.type === 'turn/end')
+          attempts.delete(session);
+        const attempt = attempts.get(session);
+        if (!attempt?.human) return;
+        if (
+          event.type === 'assistant/message' &&
+          event.data.turn === attempt.turn &&
+          event.data.step === attempt.step
+        ) {
+          attempt.assistant = event;
+        }
+        if (event.type !== 'tool/call') return;
+        const { turn, step, callId, name } = event.data;
+        if (
+          attempt.assistantSeq === undefined ||
+          attempt.assistantSeq >= event.seq ||
+          turn !== attempt.turn ||
+          step !== attempt.step
+        )
+          return;
+        const blocks = attempt.assistant.data.message.content.filter(
+          (block) => block.type === 'tool-call' && block.id === callId,
+        );
+        if (blocks.length !== 1 || blocks[0].name !== name) return;
+        // More calls than can fit in the authenticated stream are unsupported.
+        if (attempt.calls.size >= 8) return;
+        attempt.calls.set(
+          callId,
+          attempt.calls.has(callId)
+            ? null
+            : {
+                callId,
+                name,
+                sequence: event.seq,
+              },
+        );
+      },
+      { global: true },
+    );
+    scope.on('tools/execute', (exec, next) => {
+      if (
+        capture() &&
+        !lifetime.aborted &&
+        !exec.signal.aborted &&
+        exec.parent === undefined &&
+        exec.agent
+      ) {
+        const session = original(exec.agent.session);
+        const attempt = attempts.get(session);
+        const call = attempt?.calls.get(exec.callId);
+        const observer = attempt?.observer;
+        if (
+          call?.name === exec.name &&
+          observer &&
+          original(scope.agents.get(session.id)) === original(exec.agent) &&
+          observers.has(observer.id) &&
+          observer.toolRecords < 8
+        ) {
+          attempt.calls.set(exec.callId, null);
+          const fact = JSON.stringify({
+            attemptId: attempt.id,
+            assistantSequence: attempt.assistantSeq,
+            ...call,
+            human: attempt.human,
+          });
+          if (Buffer.byteLength(fact) <= 2400) {
+            try {
+              observer.send('tool ' + fact);
+              observer.toolRecords++;
+            } catch {
+              // Losing collection cannot turn into a failed native tool.
+            }
+          }
+        }
+      }
+      return next();
+    });
+  }
+  function attest(session, id, cursor, turn, human) {
+    const attempt = attempts.get(original(session));
+    if (
+      !human ||
+      !attempt ||
+      attempt.id !== id ||
+      attempt.cursor !== cursor ||
+      attempt.turn !== turn ||
+      human.occurrence.parentSessionId
+    )
+      return null;
+    const { occurrence } = human;
+    const key = sourceKey(
+      occurrence.sessionId,
+      undefined,
+      occurrence.scopeId,
+      occurrence.requestId,
+    );
+    const claims = [...(sources.get(key) ?? [])].filter(
+      (observer) =>
+        observer.turn === turn &&
+        observer.itemId === occurrence.messageId &&
+        observer.contentDigest === human.digest,
+    );
+    if (claims.length !== 1) return null;
+    attempt.human = human;
+    attempt.observer = claims[0];
+    return human;
+  }
+  const read = (value, request) => {
     const notFound = () => new globalThis.Response(null, { status: 404 });
     if (
       typeof value?.id !== 'string' ||
@@ -576,6 +785,7 @@ export function observeNativePrompts(scope, lifetime) {
           id,
           key,
           existing,
+          toolRecords: 0,
           send,
           finish(type) {
             if (!close()) return;
@@ -594,6 +804,7 @@ export function observeNativePrompts(scope, lifetime) {
     });
     return new globalThis.Response(body, { headers });
   };
+  return Object.assign(read, { attest });
 }
 
 // Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
@@ -1035,12 +1246,13 @@ export function applyNativeWebOwner(
           'agents',
           'sessions',
           'sessionQuery',
+          'tools',
         ],
         async (scope) => {
           if (!current()) return;
           const modelCalls = new Map();
           const delegations = observeDelegatedInputs(scope);
-          const promptFacts = observeNativePrompts(scope, signal);
+          const promptFacts = observeNativePrompts(scope, signal, current);
           const terminalAttestations = createNativeRunTerminalAttestations();
           const currentSession = (sessionId) =>
             original(scope.sessions.get(sessionId));
@@ -1141,7 +1353,7 @@ export function applyNativeWebOwner(
                   delegations,
                   globalThis.AbortSignal.any([found.signal, request.signal]),
                 );
-                if (!origin)
+                if (!origin || !current())
                   return new globalThis.Response(null, { status: 404 });
                 const inherited = new Set(
                   origin.inherited.map((prompt) => JSON.stringify(prompt)),
@@ -1154,6 +1366,16 @@ export function applyNativeWebOwner(
                     sourceTurn: origin.turn,
                     prompts: origin.prompts,
                     delegated: origin.delegated,
+                    observation: origin.request && {
+                      request: origin.request.request,
+                      human: promptFacts.attest(
+                        found.session,
+                        value.nativeAttemptId,
+                        value.cursor,
+                        value.turn,
+                        origin.request.human,
+                      ),
+                    },
                     inheritedPromptIndexes: origin.prompts.flatMap(
                       (prompt, index) =>
                         inherited.has(JSON.stringify(prompt)) ? [index] : [],
