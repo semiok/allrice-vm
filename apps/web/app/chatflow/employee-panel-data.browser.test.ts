@@ -351,15 +351,19 @@ suite(
             name: '重新加载',
             exact: true,
           });
-          await retry.scrollIntoViewIfNeeded();
-          const footerTop = await reader!.evaluate((node) => node.scrollTop);
-          await retry.click();
+          // Keyboard activation of the retry button should not move the
+          // reader to the PDF footer before the recovery assertion.
+          await retry.evaluate((button) =>
+            (button as HTMLButtonElement).focus({ preventScroll: true }),
+          );
+          const retryTop = await reader!.evaluate((node) => node.scrollTop);
+          await page.keyboard.press('Enter');
           await warning.waitFor({ state: 'hidden' });
           await toolbar
             .getByRole('button', { name: '取消收藏', exact: true })
             .waitFor();
           expect(await metadataReads()).toBe(initialMetadataReads + 2);
-          await assertRetained(footerTop);
+          await assertRetained(retryTop);
           await fontNotice.click();
           await missing.waitFor();
           expect(errors).toEqual([]);
