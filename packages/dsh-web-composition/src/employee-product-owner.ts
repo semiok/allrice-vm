@@ -61,7 +61,8 @@ export function installEmployeeProductOwner(ctx: Context) {
   const threadId = selection.threadId;
   let activeThreadId = threadId;
 
-  const registered = new Map([[nativeSessionId, threadId]]);
+  const registered = new Map([[nativeSessionId, { threadId, scopeId }]]);
+  let openRegisteredSession: ((thread: string) => boolean) | undefined;
   let activeNativeSession: string | undefined;
   let resourceScopeId = scopeId;
   let switchingScope = false;
@@ -129,8 +130,10 @@ export function installEmployeeProductOwner(ctx: Context) {
   function followSelection() {
     if (signal!.aborted || switchingScope || !activeNativeSession) return;
     const current = sidebar.getSnapshot();
-    const thread = registered.get(activeNativeSession);
+    const root = registered.get(activeNativeSession);
+    const thread = root?.threadId;
     if (
+      root?.scopeId !== resourceScopeId ||
       !thread ||
       !current?.tree ||
       current.tree.activeId === thread ||
@@ -176,6 +179,17 @@ export function installEmployeeProductOwner(ctx: Context) {
   ctx.inject(['uiWorkspace', 'sessions'], (native) => {
     native.effect(() => {
       const list = native.sessions.list;
+      const select = (thread: string) => {
+        if (signal.aborted || switchingScope) return false;
+        const session = list.getSnapshot().ids.find((candidate) => {
+          const root = registered.get(candidate);
+          return root?.scopeId === resourceScopeId && root.threadId === thread;
+        });
+        if (session === undefined) return false;
+        native.uiWorkspace.openSession(session);
+        return true;
+      };
+      openRegisteredSession = select;
       const open = () => {
         if (signal.aborted) return;
         // rc.2 cannot retain a Session until its native summary has arrived.
@@ -188,7 +202,10 @@ export function installEmployeeProductOwner(ctx: Context) {
       };
       const unsubscribe = list.subscribe(open);
       open();
-      return unsubscribe;
+      return () => {
+        if (openRegisteredSession === select) openRegisteredSession = undefined;
+        unsubscribe();
+      };
     }, 'AllRice employee native root');
   });
   ctx.inject(
@@ -227,7 +244,6 @@ export function installEmployeeProductOwner(ctx: Context) {
           const next = pending.scope;
           pending = undefined;
           switchingScope = false;
-          resourceScopeId = next.scopeId;
           activeNativeSession = next.nativeSessionId;
           selectThread(next.threadId);
           parent.postMessage(
@@ -242,7 +258,11 @@ export function installEmployeeProductOwner(ctx: Context) {
         const onScope = (event: Event) => {
           if (signal.aborted) return;
           const next = (event as CustomEvent<PageThreadScope>).detail;
-          registered.set(next.nativeSessionId, next.threadId);
+          resourceScopeId = next.scopeId;
+          registered.set(next.nativeSessionId, {
+            threadId: next.threadId,
+            scopeId: next.scopeId,
+          });
           switchingScope = true;
           pending = {
             scope: next,
@@ -303,11 +323,13 @@ export function installEmployeeProductOwner(ctx: Context) {
     if (
       !receipt ||
       receipt.scopeId !== scopeId ||
+      receipt.resourceScopeId !== resourceScopeId ||
       typeof receipt.nativeSessionId !== 'string' ||
       !receipt.nativeSessionId
     )
       return;
-    if (registered.has(receipt.nativeSessionId)) return;
+    if (registered.get(receipt.nativeSessionId)?.scopeId === resourceScopeId)
+      return;
     const parsed = ChatSessionSchema.safeParse(receipt.thread);
     if (!parsed.success) return;
     const session = parsed.data;
@@ -320,7 +342,10 @@ export function installEmployeeProductOwner(ctx: Context) {
       session.archivedAt !== null
     )
       return;
-    registered.set(receipt.nativeSessionId, session.id);
+    registered.set(receipt.nativeSessionId, {
+      threadId: session.id,
+      scopeId: receipt.resourceScopeId,
+    });
     void workspaceTask
       .then(() => {
         if (signal!.aborted) return;
@@ -361,12 +386,8 @@ export function installEmployeeProductOwner(ctx: Context) {
             if (!tree || id === tree.activeId) return;
             const selected = tree.sessions.find((session) => session.id === id);
             if (!selected) return;
-            const nativeId = ctx.sessions?.list
-              .getSnapshot()
-              .ids.find((candidate) => registered.get(candidate) === id);
-            if (nativeId !== undefined && ctx.uiWorkspace)
-              ctx.uiWorkspace.openSession(nativeId);
-            else navigate(sessionEmployeeKey(selected), selected.id);
+            if (!openRegisteredSession?.(id))
+              navigate(sessionEmployeeKey(selected), selected.id);
           },
           onEmployeeNavigate(id) {
             if (

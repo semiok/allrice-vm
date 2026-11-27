@@ -428,9 +428,6 @@ suite('4.0 browser cold entry', () => {
         await originalFrame.getAttribute('data-retained-frame-proof'),
       ).toBe('current');
       expect(
-        await originalFrame.getAttribute('data-retained-frame-proof'),
-      ).toBe('current');
-      expect(
         (await f.invokeThread(oldScope, f.selection.threadId)).status,
       ).toBe(404);
       expect(

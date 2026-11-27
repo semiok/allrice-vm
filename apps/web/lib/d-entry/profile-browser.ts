@@ -49,6 +49,7 @@ function publishNativeThread(
   reply: Response,
   bytes: ArrayBuffer,
   scopeId: string,
+  resourceScopeId: string,
   rpcId: string,
   onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
@@ -64,6 +65,7 @@ function publishNativeThread(
     if (!parsed.success || parsed.data.rpcId !== rpcId) return;
     const receipt = {
       scopeId,
+      resourceScopeId,
       thread,
       nativeSessionId: parsed.data.result.value.sessionId,
     };
@@ -439,6 +441,7 @@ export function nativeProfileDocument(
                   reply,
                   bytes,
                   scopeId,
+                  current.scopeId,
                   request.rpcId,
                   onThreadRegistered,
                 );

@@ -720,12 +720,6 @@ export function EmployeeNativePage({
         speculative ??
         (await readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      if (
-        identity.workspaceId !== selection.workspaceId ||
-        identity.employeeInstanceId !== selection.employeeInstanceId ||
-        identity.threadId !== (selection.threadId ?? null)
-      )
-        throw new EmployeeEntryError(403, 'response-mismatch');
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         send(pageRevoked);

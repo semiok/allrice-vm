@@ -54,7 +54,7 @@ export async function readEmployeeEntryIdentity(
     identity.employeeInstanceId !== selection.employeeInstanceId ||
     identity.threadId !== (selection.threadId ?? null)
   )
-    throw Error('Employee selection changed');
+    throw new EmployeeEntryError(403, 'response-mismatch');
   return identity;
 }
 

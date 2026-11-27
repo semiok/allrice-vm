@@ -25,6 +25,7 @@ export const pageNativeThreadSelected =
   'allrice:d-entry:native-thread-selected';
 export type PageNativeThreadRegistration = {
   scopeId: string;
+  resourceScopeId: string;
   nativeSessionId: string;
   thread: ReturnType<typeof ChatSessionSchema.parse>;
 };
