@@ -1443,8 +1443,8 @@ it.each(['login', 'vm binding'] as const)(
         expect(call.peer.principal.kind).toBe('owner');
         expect(call.peer.signal.aborted).toBe(false);
         expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
-        if (++closeAttempts === 1)
-          throw Error('First native termination failed');
+        if (++closeAttempts <= 3)
+          throw Error('Transient native termination failure');
         closing.resolve();
         await closed.promise;
       });
@@ -1507,7 +1507,7 @@ it.each(['login', 'vm binding'] as const)(
     await observed;
     expect(
       native.mock.calls.filter(([call]) => call.method === 'close'),
-    ).toHaveLength(2);
+    ).toHaveLength(4);
   },
 );
 

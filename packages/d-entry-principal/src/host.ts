@@ -431,12 +431,6 @@ class Scope implements Projection {
       // itself. It owns no additional I/O beyond the resources joined above.
       void this.unregister?.().catch(() => {});
     }));
-    void attempt.catch(() => {
-      if (!this.terminals.size) return;
-      // Keep failed PTY cleanup owned and retryable, without reopening the scope.
-      if (this.closing === attempt) this.closing = undefined;
-      this.host.retryTerminalCleanup(this);
-    });
     this.active = false;
     this.bindings = [];
     this.eventBindings = [];
@@ -459,10 +453,7 @@ class PrincipalService extends TypertRemoteService {
   ];
   readonly scopes = new Map<string, Scope>();
   private readonly terminalOwners = new Map<string, Scope>();
-  private readonly terminalRetries = new Map<
-    Scope,
-    ReturnType<typeof setTimeout>
-  >();
+  private readonly terminalStop = new AbortController();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: {
@@ -484,8 +475,7 @@ class PrincipalService extends TypertRemoteService {
     );
     hostContext.effect(() => async () => {
       this.stopped = true;
-      for (const timer of this.terminalRetries.values()) clearTimeout(timer);
-      this.terminalRetries.clear();
+      this.terminalStop.abort(closed());
       if (this.graphObserver) await this.graphObserver.close();
       else await this.graphRetirement;
     });
@@ -513,17 +503,20 @@ class PrincipalService extends TypertRemoteService {
       principal: { kind: 'owner' },
       interactions: 'answer',
     });
+    const active = AbortSignal.any([peer.signal, this.terminalStop.signal]);
     try {
       const results = await Promise.allSettled(
-        [...scope.terminals.values()].map(async ({ ref }) => {
-          // rc.2 keeps the ID closed after a failed provider termination.
-          // Retry promptly to return a real ACK without waiting for its idle timer.
-          for (const wait of [0, 100, 250]) {
-            if (wait) await delay(wait, undefined, { ref: false });
-            if (await this.confirmTerminalClosed(ref, peer)) {
-              this.forgetTerminal(ref);
+        [...scope.terminals.values()].map(async (reservation) => {
+          let backoff = 100;
+          // Preserve the same cleanup and downlink across provider failures.
+          // Only an exact confirmation completes the remote scope's close.
+          while (!active.aborted) {
+            if (await this.confirmTerminalClosed(reservation.ref, peer)) {
+              this.forgetTerminal(reservation);
               return;
             }
+            await delay(backoff, undefined, { signal: active, ref: false });
+            backoff = Math.min(backoff * 2, 1000);
           }
           throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
         }),
@@ -561,23 +554,11 @@ class PrincipalService extends TypertRemoteService {
       }
     }
   }
-  retryTerminalCleanup(scope: Scope) {
-    if (this.stopped || this.terminalRetries.has(scope)) return;
-    const timer = setTimeout(() => {
-      this.terminalRetries.delete(scope);
-      if (this.stopped || !scope.terminals.size) return;
-      void scope.close().then(
-        () =>
-          this.hostContext.logger.info('D_ENTRY_TERMINAL_CLEANUP_CONFIRMED'),
-        () => {},
-      ); // Scope retains and reschedules any remaining unconfirmed terminal.
-    }, 5000);
-    timer.unref();
-    this.terminalRetries.set(scope, timer);
-  }
-  private forgetTerminal(ref: TerminalRef) {
-    const key = terminalKey(ref);
-    this.terminalOwners.get(key)?.terminals.delete(key);
+  private forgetTerminal(reservation: TerminalReservation) {
+    const key = terminalKey(reservation.ref);
+    const scope = this.terminalOwners.get(key);
+    if (scope?.terminals.get(key) !== reservation) return;
+    scope.terminals.delete(key);
     this.terminalOwners.delete(key);
   }
   /** Internal Cordis consumer of the installed native graph revision. The
@@ -1045,6 +1026,13 @@ class PrincipalService extends TypertRemoteService {
           endpoint === 'subagents/prompt';
         if (endpoint === 'session/attachment')
           throw Error('PRINCIPAL_RESOURCE_DENIED');
+        const closingKey =
+          endpoint === 'terminal/close'
+            ? terminalKey(terminalRef.parse(args))
+            : undefined;
+        const closingTerminal =
+          closingKey &&
+          this.terminalOwners.get(closingKey)?.terminals.get(closingKey);
         let terminal: TerminalReservation | undefined;
         if (endpoint === 'terminal/create') {
           const { agentId, request } = terminalCreate.parse(args);
@@ -1088,11 +1076,10 @@ class PrincipalService extends TypertRemoteService {
           if (terminal) {
             terminal.pending--;
             if (!terminal.pending && !terminal.possiblyAllocated)
-              this.forgetTerminal(terminal.ref);
+              this.forgetTerminal(terminal);
           }
         }
-        if (endpoint === 'terminal/close')
-          this.forgetTerminal(terminalRef.parse(args));
+        if (closingTerminal) this.forgetTerminal(closingTerminal);
         active.throwIfAborted();
         const visible =
           endpoint === 'settings/describe'
