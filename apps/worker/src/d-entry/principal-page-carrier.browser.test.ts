@@ -181,7 +181,9 @@ it.skipIf(!browserExecutable)(
     });
     await page.goto(f.origin);
     const workbench = page.frameLocator('iframe');
-    const editor = workbench.locator('[role="textbox"][data-composer-input]');
+    const editor = workbench.locator(
+      '[role="textbox"][data-composer-input][contenteditable="true"]',
+    );
     try {
       await editor.fill('未发送的原生草稿', { timeout: 15_000 });
     } catch (error) {
