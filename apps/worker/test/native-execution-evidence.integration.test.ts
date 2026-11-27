@@ -2,12 +2,18 @@ import { randomUUID } from 'node:crypto';
 import type { ModelCallBinding } from '@allrice/model-gateway';
 import { describe, expect, it, vi } from 'vitest';
 import * as client from '../../../packages/database/src/core/client.ts';
+import { readLockedNativeMemoryExecutionEvidence } from '../../../packages/database/src/d-entry-native-memory-evidence.ts';
+import { readLockedDEntryNativeRootPin } from '../../../packages/database/src/d-entry-native-root.ts';
+import { ensureGeneralEmployeeInstance } from '../../../packages/database/src/employees/employee-instances.ts';
 import { createRunAuthorityFixture } from '../../../packages/database/src/run-authority.fixture.ts';
 import { createRuntimeFixtureDatabase } from '../../../packages/database/src/runtime.fixture.ts';
+import { deferredPromptFact } from '../src/native-web/prompt-observation.js';
 import {
   nativeExecutionEvidenceSource,
+  nativeAdoptedTextProofVersion,
   recordNativeExecutionRequest,
   recordNativeExecutionTool,
+  recordNativeMemoryToolCall,
   recoverNativeMemoryRun,
   bindNativeMemoryExecutionRef,
   type NativeExecutionEvidence,
@@ -42,6 +48,43 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           instanceId: randomUUID(),
           leaseEpoch: 1,
         };
+        const identity = {
+          organizationId,
+          workspaceId,
+          personId: ownerId,
+          employeeInstanceId: f.assignment,
+          employeeRevision: 1,
+          employeeVersionId: f.version,
+          threadId: f.session,
+        };
+        const pin = await db.begin(async (tx) => {
+          await ensureGeneralEmployeeInstance(tx, f.assignment);
+          const creation = {
+            schemaVersion: 1,
+            identity,
+            host: {
+              binding: vm,
+              bindingRef: randomUUID(),
+              rosterDigest: 'roster',
+            },
+            operationId: randomUUID(),
+            releaseRevision: 'fixture',
+          };
+          await tx`update allrice_chat_sessions set d_entry_native_root_claim=${tx.json(creation)}
+            where id=${f.session}`;
+          await tx`update allrice_chat_sessions set d_entry_native_root=${tx.json(
+            {
+              ...creation,
+              nativeSessionId: 'native-root',
+            },
+          )} where id=${f.session}`;
+          await tx`insert into person_virtual_machines
+            (person_id,vm_id,organization_id,phase,disk_tier,native_created,instance_id,lease_epoch,egress_receipt)
+            values (${ownerId},${vm.vmId},${organizationId},'running','warm',true,
+              ${vm.instanceId},${vm.leaseEpoch},'{}')`;
+          return readLockedDEntryNativeRootPin(tx, identity);
+        });
+        if (!pin) throw Error('Root pin is missing');
         const adopted = {
           kind: 'ordinary-human-message' as const,
           occurrence: {
@@ -57,7 +100,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         const origin = {
           originalRequestId: userRequest,
           human: adopted,
-          rootOriginRef: 'root-pin',
+          rootOriginRef: pin.rootOriginDigest,
           rootSessionRef: 'native-root',
           nativeOwnerRef: randomUUID(),
           nativeProfileRef: 'profile',
@@ -137,7 +180,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               })
             | null,
           retry = false,
-          moduleConfigRevisionRef = 'fixture-memory-config-v2',
+          moduleConfigRevisionRef = 'sha256:' + '2'.repeat(64),
           originalHuman?: Omit<typeof adopted, 'kind'>,
         ) =>
           db.begin(async (tx) => {
@@ -146,7 +189,20 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
               await tx`insert into allrice_run_events
               (id,run_id,organization_id,workspace_id,sequence,event_type,payload)
               select ${value.execution.executionId},${runId},${organizationId},${workspaceId},
-                coalesce(max(sequence)+1,0),'step.started','{"source":"dsh-native-attempt","kind":"assistant"}'::jsonb
+                coalesce(max(sequence)+1,0),'step.started',${tx.json({
+                  source: 'dsh-native-attempt',
+                  kind: 'assistant',
+                  profile: value.native.profile,
+                  sessionId: value.native.sessionId,
+                  parentSessionId: value.native.parentSessionId,
+                  nativeInstanceId: value.native.instanceId,
+                  vmInstanceId: vm.instanceId,
+                  leaseEpoch: vm.leaseEpoch,
+                  attemptId: value.native.attemptId!,
+                  cursor: value.native.attemptCursor!,
+                  turn: value.native.attemptTurn!,
+                  contributingRequestIds: [userRequest],
+                })}
               from allrice_run_events where run_id=${runId}`;
             return recordNativeExecutionRequest(
               tx,
@@ -165,7 +221,56 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           firstIssue: false,
         });
         expect(receipt.firstIssue).toBe(true);
-        const executionRef = randomUUID();
+        const executionRef = first.execution.executionId;
+        const firstSelection = {
+          mode: 'issue' as const,
+          runId,
+          nativeRequestRef: executionRef,
+        };
+        const read = (
+          select: Parameters<typeof readLockedNativeMemoryExecutionEvidence>[3],
+          context = first.context,
+        ) =>
+          db.begin((tx) =>
+            readLockedNativeMemoryExecutionEvidence(
+              tx,
+              context,
+              identity,
+              select,
+              signal,
+            ),
+          );
+        await expect(read(firstSelection)).resolves.toMatchObject({
+          original: receipt.origin,
+          first: receipt.request,
+          nativeRequestRef: executionRef,
+          call: null,
+        });
+        await expect(
+          read({ ...firstSelection, runId: randomUUID() }),
+        ).rejects.toThrow();
+        await expect(
+          read(firstSelection, { ...first.context, sessionId: randomUUID() }),
+        ).rejects.toThrow();
+        const rolledBack = Error('fixture transaction rollback');
+        await expect(
+          db.begin(async (tx) => {
+            await tx`update person_virtual_machines set lease_epoch=2 where vm_id=${vm.vmId}`;
+            await expect(
+              readLockedNativeMemoryExecutionEvidence(
+                tx,
+                first.context,
+                identity,
+                firstSelection,
+                signal,
+              ),
+            ).rejects.toThrow('authorization_denied');
+            throw rolledBack;
+          }),
+        ).rejects.toBe(rolledBack);
+        await expect(read(firstSelection)).resolves.toMatchObject({
+          first: receipt.request,
+        });
         await expect(
           bindNativeMemoryExecutionRef(receipt, executionRef, signal),
         ).resolves.toBe(true);
@@ -186,7 +291,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           workspaceId,
           ownerId,
           loginSessionId,
-          moduleConfigRevisionRef: 'fixture-memory-config-v2',
+          moduleConfigRevisionRef: 'sha256:' + '2'.repeat(64),
           original,
         };
         await expect(recoverNativeMemoryRun(selector, signal)).resolves.toBe(
@@ -216,6 +321,12 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         const ambiguous = await write(second, null, false, 'later-config');
         if (!ambiguous) throw Error('Second receipt missing');
         expect(ambiguous.request).toMatchObject({ b: runId, human: null });
+        await expect(
+          read({
+            ...firstSelection,
+            nativeRequestRef: second.execution.executionId,
+          }),
+        ).rejects.toThrow();
         const steer = {
           ...adopted,
           kind: 'adopted-steering' as const,
@@ -275,6 +386,124 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           recordNativeExecutionTool(receipt, tool, signal),
           recordNativeExecutionTool(receipt, tool, signal),
         ]);
+        const memoryTool = {
+          ...tool,
+          name: 'mcp__allrice__memory_remember',
+          callId: 'memory-call-1',
+          sequence: 11,
+          executionSessionRef: origin.rootSessionRef,
+          executionParentRef: null,
+        };
+        await expect(
+          recordNativeMemoryToolCall(receipt, randomUUID(), memoryTool, signal),
+        ).resolves.toBeNull();
+        await expect(
+          recordNativeMemoryToolCall(
+            receipt,
+            executionRef,
+            {
+              ...memoryTool,
+              executionSessionRef: 'other-session',
+            },
+            signal,
+          ),
+        ).resolves.toBeNull();
+        const locked = deferredPromptFact<void>();
+        const unlocked = deferredPromptFact<void>();
+        const blocker = db.begin(async (tx) => {
+          await tx`select id from allrice_runs where id=${runId} for update`;
+          locked.resolve();
+          await unlocked.promise;
+        });
+        try {
+          await Promise.race([locked.promise, blocker]);
+          await expect(
+            recordNativeMemoryToolCall(
+              receipt,
+              executionRef,
+              memoryTool,
+              signal,
+            ),
+          ).rejects.toMatchObject({ code: '55P03' });
+          const [written] = await db`select id from allrice_run_events
+            where run_id=${runId} and payload->>'kind'='memory-tool'`;
+          expect(written).toBeUndefined();
+        } finally {
+          unlocked.resolve();
+          await blocker;
+        }
+        const [toolRef, replay] = await Promise.all([
+          recordNativeMemoryToolCall(receipt, executionRef, memoryTool, signal),
+          recordNativeMemoryToolCall(receipt, executionRef, memoryTool, signal),
+        ]);
+        if (!toolRef) throw Error('Memory tool fact is missing');
+        expect(replay).toBe(toolRef);
+        const toolSelection = {
+          mode: 'call' as const,
+          nativeRequestRef: toolRef,
+        };
+        await expect(read(toolSelection)).resolves.toMatchObject({
+          nativeRequestRef: toolRef,
+          original: receipt.origin,
+          first: receipt.request,
+          call: {
+            executionId: executionRef,
+            executionRef,
+            proofVersion: nativeAdoptedTextProofVersion,
+            tool: memoryTool,
+          },
+        });
+        await expect(
+          read({ mode: 'call', nativeRequestRef: executionRef }),
+        ).rejects.toThrow();
+        await expect(
+          recordNativeMemoryToolCall(
+            receipt,
+            executionRef,
+            {
+              ...memoryTool,
+              sequence: 12,
+            },
+            signal,
+          ),
+        ).resolves.toBeNull();
+        await expect(
+          recordNativeMemoryToolCall(
+            receipt,
+            executionRef,
+            {
+              ...memoryTool,
+              callId: 'duplicate-sequence',
+            },
+            signal,
+          ),
+        ).resolves.toBeNull();
+        await db`update person_virtual_machines set phase='stopped' where vm_id=${vm.vmId}`;
+        await expect(read(toolSelection)).rejects.toThrow();
+        await expect(read(firstSelection)).rejects.toThrow();
+        const storedToolSelection = {
+          ...toolSelection,
+          mode: 'stored-call' as const,
+          runId,
+        };
+        await expect(
+          read(storedToolSelection, {
+            ...first.context,
+            sessionId: randomUUID(),
+          }),
+        ).resolves.toMatchObject({
+          nativeRequestRef: toolRef,
+          call: { tool: memoryTool },
+        });
+        await expect(
+          read({ ...storedToolSelection, runId: randomUUID() }),
+        ).rejects.toThrow();
+        await expect(read({ mode: 'restore', runId })).resolves.toMatchObject({
+          original: receipt.origin,
+          first: receipt.request,
+          nativeRequestRef: null,
+        });
+        await db`update person_virtual_machines set phase='running' where vm_id=${vm.vmId}`;
         const refused = call(4);
         await db`create function refuse_native_evidence_fixture()
           returns trigger language plpgsql as $body$
@@ -300,7 +529,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             b: runId,
             ...origin,
             originalExecutionId: first.execution.executionId,
-            moduleConfigRevisionRef: 'fixture-memory-config-v2',
+            moduleConfigRevisionRef: 'sha256:' + '2'.repeat(64),
           },
           receipt.request,
           { kind: 'memory-root', b: runId, executionRef },
@@ -312,6 +541,13 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             executionId: first.execution.executionId,
             proofVersion: 'dsh-adopted-text-v1',
             tool,
+          },
+          {
+            kind: 'memory-tool',
+            b: runId,
+            executionId: executionRef,
+            executionRef,
+            tool: memoryTool,
           },
         ]);
       } finally {
