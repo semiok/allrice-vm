@@ -39,6 +39,8 @@ type Status =
   | 'cancelled'
   | 'failed'
   | 'asset-timeout'
+  | 'selection-unavailable'
+  | 'sign-in'
   | 'denied'
   | 'closing'
   | 'unknown';
@@ -243,7 +245,12 @@ export function EmployeeNativePage({
       return replacing;
     }
     function finish(
-      status: 'cancelled' | 'failed' | 'asset-timeout' | 'denied',
+      status:
+        | 'cancelled'
+        | 'failed'
+        | 'asset-timeout'
+        | 'selection-unavailable'
+        | 'sign-in',
       retainTicket = status === 'cancelled',
     ) {
       if (navigating || replace.current !== applyQuery) return;
@@ -573,15 +580,12 @@ export function EmployeeNativePage({
     };
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;
-      if (!prepare) setFailed(true);
-      else
-        finish(
-          error instanceof EmployeeEntryError &&
-            [400, 401, 403, 404].includes(error.status)
-            ? 'denied'
-            : 'failed',
-          error instanceof EmployeeEntryError && error.status === 408,
-        );
+      if (!prepare) return setFailed(true);
+      const status = error instanceof EmployeeEntryError ? error.status : 0;
+      if (status === 401) finish('sign-in');
+      else if ([400, 403, 404].includes(status))
+        finish('selection-unavailable');
+      else finish('failed', status === 408);
     });
     return () => {
       window.clearTimeout(timer);
@@ -650,6 +654,8 @@ const messages = {
     '自动重试后仍未下载完成，可以点重试。',
   ],
   cancelled: ['已取消等待', '可以继续打开工作台。'],
+  'selection-unavailable': ['暂时打不开这条对话', '可以返回员工页重选。'],
+  'sign-in': ['请重新登录', '登录后再打开工作台。'],
   denied: ['当前账号无法打开这个工作台', '请确认登录账号和工作区权限。'],
   closing: ['正在结束上一次连接', '旧连接结束后可以继续。'],
   unknown: ['暂时无法打开工作台', '无法确认旧连接已关闭。'],
@@ -672,17 +678,14 @@ function EntryStatus({
   );
   const failedOpening = status === 'failed' || status === 'asset-timeout';
   const resumable = status === 'cancelled' || failedOpening;
+  const canReturn = status === 'failed' || status === 'selection-unavailable';
+  const attention =
+    failedOpening ||
+    ['selection-unavailable', 'sign-in', 'denied', 'unknown'].includes(status);
   return (
     <div className={styles.status}>
       <section>
-        <div
-          role={
-            failedOpening || status === 'denied' || status === 'unknown'
-              ? 'alert'
-              : 'status'
-          }
-          aria-atomic="true"
-        >
+        <div role={attention ? 'alert' : 'status'} aria-atomic="true">
           {starting && <StateDot state="ongoing" size={28} />}
           <h1>{title}</h1>
           <p>{description}</p>
@@ -700,8 +703,9 @@ function EntryStatus({
             {status === 'cancelled' ? '继续' : '重试'}
           </button>
         )}
-        {status === 'failed' && settled && (
-          <a href="/chatflow/4.0">返回员工页</a>
+        {canReturn && settled && <a href="/chatflow/4.0">返回员工页</a>}
+        {status === 'sign-in' && settled && (
+          <a href="/login?next=%2Fchatflow%2F4.0">重新登录</a>
         )}
       </section>
     </div>
