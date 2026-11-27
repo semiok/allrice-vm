@@ -146,6 +146,24 @@ export const DEntryPageOpenedSchema = z
 export const DEntryPageClosedSchema = z
   .object({ type: z.literal('closed'), scopeId: UuidSchema })
   .strict();
+export const DEntryPageSwitchSchema = z.strictObject({
+  type: z.literal('switch'),
+  requestId: UuidSchema,
+  threadId: UuidSchema,
+});
+export const DEntryPageSwitchResultSchema = z.discriminatedUnion('type', [
+  z.strictObject({
+    type: z.literal('switched'),
+    requestId: UuidSchema,
+    threadId: UuidSchema,
+    scopeId: UuidSchema,
+    nativeSessionId: z.string().min(1),
+  }),
+  z.strictObject({
+    type: z.literal('switch-unavailable'),
+    requestId: UuidSchema,
+  }),
+]);
 export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   carrier: z.literal('page'),
   organizationId: UuidSchema,

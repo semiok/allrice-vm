@@ -1,6 +1,7 @@
 import {
   DEntryPageClosedSchema,
   DEntryPageOpenedSchema,
+  DEntryPageSwitchResultSchema,
   type DEntryIdentity,
   type DEntrySelectionInput,
 } from '@allrice/contracts';
@@ -8,6 +9,11 @@ import {
   parseRemoteStreamClientMessage,
   parseRemoteStreamServerMessage,
 } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
+
+type SwitchedPage = Extract<
+  ReturnType<typeof DEntryPageSwitchResultSchema.parse>,
+  { type: 'switched' }
+>;
 
 export {
   pageClosing,
@@ -62,6 +68,13 @@ export function openNativePageCarrier(
   );
   let scopeId: string | undefined;
   let nativeMux: MessagePort | undefined;
+  let switching:
+    | {
+        id: string;
+        threadId: string;
+        result: ReturnType<typeof pendingPageResult<SwitchedPage | undefined>>;
+      }
+    | undefined;
   let requested = false,
     complete = false,
     dispatched = false,
@@ -87,6 +100,8 @@ export function openNativePageCarrier(
     closeMux();
     onRevoked();
     ready.reject(reason);
+    switching?.result.reject(reason);
+    switching = undefined;
     // Local transport closure is still observed independently below.
     socket.close();
     return reason;
@@ -116,7 +131,7 @@ export function openNativePageCarrier(
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
       if (frame.streamId !== id) {
-        if (requested) return;
+        if (requested || switching) return;
         if (!nativeMux) throw Error('Unexpected native page stream');
         nativeMux.postMessage({ type: 'frame', data: event.data });
         return;
@@ -143,6 +158,27 @@ export function openNativePageCarrier(
       if (frame.type !== 'item' || gotClosed)
         throw Error('Unexpected native page terminal');
       if (scopeId) {
+        if (switching) {
+          const decoded = DEntryPageSwitchResultSchema.safeParse(frame.value);
+          if (decoded.success) {
+            const value = decoded.data;
+            if (
+              value.requestId !== switching.id ||
+              (value.type === 'switched' &&
+                value.threadId !== switching.threadId)
+            )
+              throw Error('Unexpected native page switch acknowledgement');
+            const { result } = switching;
+            switching = undefined;
+            if (value.type === 'switched') {
+              scopeId = value.scopeId;
+              nativeMux?.close();
+              nativeMux = undefined;
+            }
+            result.resolve(value.type === 'switched' ? value : undefined);
+            return;
+          }
+        }
         if (
           !requested ||
           DEntryPageClosedSchema.parse(frame.value).scopeId !== scopeId
@@ -188,6 +224,7 @@ export function openNativePageCarrier(
   function close() {
     if (!requested && !complete) {
       requested = true;
+      switching?.result.reject(new DOMException('Page closed', 'AbortError'));
       closeMux();
       ready.reject(new DOMException('Page closed', 'AbortError'));
       if (socket.readyState === WebSocket.OPEN) end();
@@ -200,9 +237,30 @@ export function openNativePageCarrier(
     get dispatched() {
       return dispatched;
     },
-    attachMux(port: MessagePort) {
+    switchThread(threadId: string) {
       if (
         !scopeId ||
+        !nativeMux ||
+        switching ||
+        requested ||
+        complete ||
+        socket.readyState !== WebSocket.OPEN
+      )
+        return Promise.resolve(undefined);
+      const result = pendingPageResult<SwitchedPage | undefined>();
+      const requestId = crypto.randomUUID();
+      switching = { id: requestId, threadId, result };
+      try {
+        send({ type: 'item', value: { type: 'switch', requestId, threadId } });
+      } catch (error) {
+        failure = fail(error);
+      }
+      return result.promise;
+    },
+    attachMux(port: MessagePort, requestedScope = scopeId) {
+      if (
+        !scopeId ||
+        scopeId !== requestedScope ||
         nativeMux ||
         requested ||
         complete ||
@@ -220,6 +278,7 @@ export function openNativePageCarrier(
             void close().catch(() => {});
             return;
           }
+          if (switching) return;
           if (
             event.data?.type !== 'frame' ||
             typeof event.data.data !== 'string'

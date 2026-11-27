@@ -1,6 +1,7 @@
 import { borrowPageMux, type NativePageSocket } from './page-mux-client';
 import {
   DEntryPageBorrowSchema,
+  DEntryPageSwitchResultSchema,
   DEntryPageUnarySchema,
   DEntryProfileBootstrapSchema,
   UuidSchema,
@@ -18,6 +19,7 @@ import {
   pageRevoked,
   pendingPageResult,
 } from './page-carrier';
+import { pageThreadScope, type PageThreadScope } from './page-messages';
 
 const sender = z.strictObject({
   type: z.literal('client-request'),
@@ -143,6 +145,7 @@ export function nativeProfileDocument(
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
   earlyBundles?: EarlyProfileBundles,
+  onThreadScope?: (scope: PageThreadScope) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -151,6 +154,11 @@ export function nativeProfileDocument(
   const graphRev = container.dataset.graphRev!;
   const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
+  let authority = {
+    scopeId,
+    selection,
+    lifetime: new AbortController(),
+  };
   const pending = new Set<Promise<unknown>>();
   const preloaded = new Map<string, Promise<ArrayBuffer>>();
   const channels = new Map<NativePageSocket, Promise<void>>();
@@ -165,6 +173,7 @@ export function nativeProfileDocument(
   };
   const cancel = () => {
     lifetime.abort();
+    authority.lifetime.abort();
     earlyBundles?.cancel();
   };
   void done.promise.catch(() => {});
@@ -194,6 +203,36 @@ export function nativeProfileDocument(
     if (event.data.type === pageCompletion) {
       if (event.data.state === 'closed') done.resolve();
       else done.reject(Error('Native page close is unconfirmed'));
+    }
+    if (
+      event.data.type === pageThreadScope &&
+      onThreadScope &&
+      !lifetime.signal.aborted &&
+      container.dataset.sharedMux === '1'
+    ) {
+      const result = DEntryPageSwitchResultSchema.safeParse(event.data.issued);
+      if (
+        !result.success ||
+        result.data.type !== 'switched' ||
+        result.data.scopeId === authority.scopeId
+      )
+        return;
+      const next = result.data;
+      const old = peer;
+      peer = undefined;
+      authority.lifetime.abort();
+      authority = {
+        scopeId: next.scopeId,
+        selection: { ...selection, threadId: next.threadId },
+        lifetime: new AbortController(),
+      };
+      old?.close();
+      try {
+        onThreadScope(next);
+      } catch {
+        cancel();
+        onRevoked();
+      }
     }
   };
   window.addEventListener('message', receive);
@@ -278,9 +317,15 @@ export function nativeProfileDocument(
     },
     transport: {
       fetch(input: string | URL, init: RequestInit) {
+        const current = authority;
+        const signal = AbortSignal.any(
+          init.signal
+            ? [lifetime.signal, current.lifetime.signal, init.signal]
+            : [lifetime.signal, current.lifetime.signal],
+        );
         return owned(
           Promise.resolve().then(() => {
-            lifetime.signal.throwIfAborted();
+            signal.throwIfAborted();
             const endpoint =
               typeof input === 'string' && input.startsWith('api/')
                 ? DEntryPageUnarySchema.safeParse(input.slice(4))
@@ -298,24 +343,23 @@ export function nativeProfileDocument(
               method: 'POST',
               credentials: 'same-origin',
               cache: 'no-store',
-              signal: init.signal
-                ? AbortSignal.any([lifetime.signal, init.signal])
-                : lifetime.signal,
+              signal,
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({
-                selection,
-                scopeId,
+                selection: current.selection,
+                scopeId: current.scopeId,
                 rpcId: request.rpcId,
                 endpoint: request.method,
                 payload: request.payload,
               }),
-            }).then(
-              async (reply) =>
-                new Response(await reply.arrayBuffer(), {
-                  status: reply.status,
-                  headers: reply.headers,
-                }),
-            );
+            }).then(async (reply) => {
+              const bytes = await reply.arrayBuffer();
+              signal.throwIfAborted();
+              return new Response(bytes, {
+                status: reply.status,
+                headers: reply.headers,
+              });
+            });
           }),
         );
       },
@@ -328,7 +372,7 @@ export function nativeProfileDocument(
         const socket =
           container.dataset.sharedMux === '1' &&
           window.frameElement?.getAttribute('data-page-mux') === 'v1'
-            ? borrowPageMux(scopeId)
+            ? borrowPageMux(scopeId, authority.scopeId)
             : new WebSocket(
                 nativeMuxUrl(
                   location.origin,
@@ -346,7 +390,7 @@ export function nativeProfileDocument(
               () => {
                 channels.delete(socket);
                 resolve();
-                if (!lifetime.signal.aborted) {
+                if (peer === socket && !lifetime.signal.aborted) {
                   lifetime.abort();
                   onRevoked();
                 }

@@ -8,7 +8,10 @@ export type NativePageSocket = Pick<
 
 /** Expose the rc.2 text-stream socket interface to the owned iframe without
  * opening another connection or handing it the parent page protocol. */
-export function borrowPageMux(scopeId: string): NativePageSocket {
+export function borrowPageMux(
+  scopeId: string,
+  resourceScopeId = scopeId,
+): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
   let readyState: number = WebSocket.CONNECTING;
@@ -33,9 +36,11 @@ export function borrowPageMux(scopeId: string): NativePageSocket {
     }
   };
   port1.onmessageerror = finish;
-  parent.postMessage({ type: pageMuxAttach, scopeId }, location.origin, [
-    port2,
-  ]);
+  parent.postMessage(
+    { type: pageMuxAttach, scopeId, resourceScopeId },
+    location.origin,
+    [port2],
+  );
   return {
     get readyState() {
       return readyState;

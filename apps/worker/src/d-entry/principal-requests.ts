@@ -38,6 +38,7 @@ export const dEntryPageHistory = {
 };
 
 const denied = () => new DataAccessError('authorization_denied');
+export class DEntryPageSwitchUnavailable extends Error {}
 function sameRoot(a: DEntryHistoryRootPin, b: DEntryHistoryRootPin) {
   return (
     sameDEntryIdentity(a.identity, b.identity) &&
@@ -60,6 +61,10 @@ export type DEntryPageHandle = Readonly<{
   fixedProfile?: DEntryFixedProfileSource;
   identity: DEntryIdentity;
   root: DEntryHistoryRootPin;
+  sessionId: RequestContext['sessionId'];
+  vmBinding: Awaited<
+    ReturnType<typeof currentDEntryNativeOwner>
+  >['view']['receipt']['binding'];
   signal: AbortSignal;
   assertCurrent(
     signal: AbortSignal,
@@ -132,6 +137,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     stop: AbortSignal,
     opened: (page: DEntryPageHandle) => Promise<void>,
     revoked: (reason: unknown) => void,
+    previous?: DEntryPageHandle,
   ) {
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
@@ -143,6 +149,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
     const existing = await timing.run('history-root', () =>
       deps.historyRoot(original.context, input.selection),
     );
+    if (
+      previous &&
+      (!existing ||
+        existing.rootNativeSessionId === previous.root.rootNativeSessionId ||
+        original.context.sessionId !== previous.sessionId ||
+        !sameDEntryIdentity(original.identity, {
+          ...previous.identity,
+          threadId: input.selection.threadId,
+        }))
+    )
+      throw new DEntryPageSwitchUnavailable();
     signal.throwIfAborted();
     const data = deps.data();
     if (!data || (!existing && !data.prepareEditorRoot))
@@ -171,6 +188,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         ),
       );
       if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
+      if (
+        previous &&
+        (previous.signal.aborted ||
+          current.view.bindingRef !== previous.bindingRef ||
+          !sameDEntryVmBinding(
+            current.view.receipt.binding,
+            previous.vmBinding,
+          ) ||
+          existing?.vmId !== previous.vmBinding.vmId)
+      )
+        throw new DEntryPageSwitchUnavailable();
       async function assertSession(caller: AbortSignal) {
         const next = await currentDEntryRequest(deps, token, input, caller);
         if (
@@ -401,6 +429,8 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   fixedProfile: current.owner.fixedProfile,
                   identity: auth.identity,
                   root: pin,
+                  sessionId: auth.context.sessionId,
+                  vmBinding: current.view.receipt.binding,
                   signal: lifetime,
                   async assertCurrent(caller, nativeSessionIds) {
                     const active = AbortSignal.any([lifetime, caller]);

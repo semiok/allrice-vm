@@ -13,6 +13,7 @@ import {
 import {
   pageEditorMounted,
   pageStartupFailed,
+  pageThreadScope,
 } from '../../../apps/web/lib/d-entry/page-messages';
 
 const container = document.getElementById('app');
@@ -83,7 +84,7 @@ function boot(
     const identity = readEmployeeDocument(container.dataset);
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
-    installEmployeeDraftStorage(identity);
+    const registerDraft = installEmployeeDraftStorage(identity);
     const document = nativeProfileDocument(
       container,
       close,
@@ -92,6 +93,12 @@ function boot(
         close();
       },
       documentOwner.earlyBundles,
+      (next) => {
+        registerDraft(next.nativeSessionId, next.threadId);
+        container.ownerDocument.dispatchEvent(
+          new CustomEvent(pageThreadScope, { detail: next }),
+        );
+      },
     );
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;

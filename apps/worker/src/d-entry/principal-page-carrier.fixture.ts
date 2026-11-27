@@ -88,10 +88,14 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const roots = new Map([
     [f.selection.threadId, selected.root.nativeSessionId],
   ]);
+  const threadRevocations = new Map<string, AbortController>();
   const registerThread = (threadId: string) => {
     const id = 'root-' + threadId;
     roots.set(threadId, id);
     host.catalog.items.push(summary(id));
+    const revoked = new AbortController();
+    threadRevocations.set(threadId, revoked);
+    return revoked;
   };
   const selectionIdentity = (value: unknown) => {
     const selection = DEntrySelectionInputSchema.parse(value);
@@ -201,6 +205,17 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
     ...f.deps,
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
     authenticate,
+    async watch(_context, selection) {
+      const authority = await f.deps.watch();
+      const revoked =
+        selection.threadId && threadRevocations.get(selection.threadId);
+      return revoked
+        ? {
+            ...authority,
+            revoked: AbortSignal.any([authority.revoked, revoked.signal]),
+          }
+        : authority;
+    },
     async identity(_context, selection) {
       return selectionIdentity(selection);
     },
@@ -213,7 +228,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
   const mux = createDEntryPageMux(
     {
       ...pages,
-      own(token, selection, active, stop, opened, revoked) {
+      own(token, selection, active, stop, opened, revoked, previous) {
         return pages.own(
           token,
           selection,
@@ -224,6 +239,7 @@ export async function fixture(release?: ProfileProof, newRoot = false) {
             return opened(page);
           },
           revoked,
+          previous,
         );
       },
     },

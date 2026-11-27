@@ -18,6 +18,9 @@ import {
   pageEditorMounted,
   pageMuxAttach,
   pageNavigate,
+  pageSwitchReady,
+  pageThreadScope,
+  pageThreadSelected,
   pageRevoked,
   pageStartupFailed,
 } from '../../../lib/d-entry/page-messages';
@@ -146,6 +149,7 @@ export function EmployeeNativePage({
   const resume = useRef<(() => void) | undefined>(undefined);
   const pendingWarmup = useRef<EntryWarmup | undefined>(undefined);
   const nextQuery = useRef(query);
+  const displayedQuery = useRef(query);
   const lastPropQuery = useRef(query);
   if (lastPropQuery.current !== query) {
     lastPropQuery.current = query;
@@ -162,6 +166,7 @@ export function EmployeeNativePage({
   }, []);
 
   useEffect(() => {
+    displayedQuery.current = activeQuery;
     const pending = pendingWarmup.current;
     pendingWarmup.current = undefined;
     if (pending && pending !== activation.warmup) pending.lifetime.abort();
@@ -195,6 +200,10 @@ export function EmployeeNativePage({
     let closingNotice: number | undefined;
     let replacing: Promise<boolean> | undefined;
     let detached = false;
+    let switchReady = false;
+    let switching:
+      { selection: DEntrySelectionInput; scopeId?: string } | undefined;
+    let switchTimer: number | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
     const retainedDocument = activation.retainFrame
       ? frame.current?.contentDocument
@@ -295,7 +304,7 @@ export function EmployeeNativePage({
         if (replace.current !== applyQuery) return;
         if (closed) {
           retired = true;
-          if (nextQuery.current !== activeQuery) {
+          if (nextQuery.current !== displayedQuery.current) {
             activateSelection(nextQuery.current);
             return;
           }
@@ -365,12 +374,12 @@ export function EmployeeNativePage({
     }
     const applyQuery = () => {
       if (navigating) {
-        if (nextWarmup && nextQuery.current !== activeQuery) {
+        if (nextWarmup && nextQuery.current !== displayedQuery.current) {
           nextWarmup.lifetime.abort();
           nextWarmup = undefined;
           superseded = true;
         }
-        if (retired && nextQuery.current !== activeQuery)
+        if (retired && nextQuery.current !== displayedQuery.current)
           activateSelection(nextQuery.current);
         return;
       }
@@ -389,13 +398,56 @@ export function EmployeeNativePage({
       const query = nextQuery.current;
       setActivation({
         query,
-        confirmedQuery: query === activeQuery ? selectedQuery : undefined,
+        confirmedQuery:
+          query === displayedQuery.current ? selectedQuery : undefined,
         ticket:
-          resumable && query === activeQuery
+          resumable && query === displayedQuery.current
             ? (ticket ?? warmup?.progress.ticket)
             : undefined,
       });
     };
+    function navigate(selection: DEntrySelectionInput) {
+      if (navigating || detached || remoteRevoked) return;
+      navigating = true;
+      window.clearTimeout(timer);
+      const params = new URLSearchParams(
+        Object.entries(selection).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        ),
+      );
+      if (prepare && !selection.threadId)
+        params.set('new', crypto.randomUUID());
+      if (
+        prepare &&
+        !document.hidden &&
+        location.pathname === '/chatflow/4.0' &&
+        selectedEmployee?.workspaceId === selection.workspaceId &&
+        selectedEmployee.employeeInstanceId === selection.employeeInstanceId
+      ) {
+        nextWarmup = startEntryWarmup(selection, new AbortController());
+      }
+      void retire().then((closed) => {
+        if (replace.current !== applyQuery || detached) return;
+        const warmup = nextWarmup;
+        nextWarmup = undefined;
+        if (closed) {
+          if (superseded || nextQuery.current !== displayedQuery.current) {
+            warmup?.lifetime.abort();
+            activateSelection(nextQuery.current);
+          } else if (warmup) {
+            const query = params.toString();
+            nextQuery.current = query;
+            pendingWarmup.current = warmup;
+            history.pushState(null, '', '/chatflow/4.0?' + query);
+            activateSelection(query, warmup);
+          } else location.assign('/chatflow/4.0?' + params);
+        } else {
+          warmup?.lifetime.abort();
+          if (prepare) setStatus('unknown');
+          else setFailed(true);
+        }
+      });
+    }
     const receive = (event: MessageEvent) => {
       if (
         event.origin !== location.origin ||
@@ -405,7 +457,34 @@ export function EmployeeNativePage({
       )
         return;
       if (event.data.type === pageMuxAttach && event.ports.length === 1)
-        carrier?.attachMux(event.ports[0]!);
+        carrier?.attachMux(
+          event.ports[0]!,
+          event.data.resourceScopeId ?? scopeId,
+        );
+      if (event.data.type === pageSwitchReady) switchReady = true;
+      if (
+        event.data.type === pageThreadSelected &&
+        switching?.scopeId &&
+        event.data.resourceScopeId === switching.scopeId &&
+        !navigating &&
+        !detached &&
+        !remoteRevoked
+      ) {
+        const selection = switching.selection;
+        const query = new URLSearchParams({
+          workspaceId: selection.workspaceId,
+          employeeInstanceId: selection.employeeInstanceId,
+          threadId: selection.threadId!,
+        }).toString();
+        if (nextQuery.current !== displayedQuery.current) return;
+        switching = undefined;
+        window.clearTimeout(switchTimer);
+        selectedEmployee = selection;
+        frameSelection.current = selection;
+        selectedQuery = query;
+        nextQuery.current = displayedQuery.current = query;
+        history.pushState(history.state, '', '/chatflow/4.0?' + query);
+      }
       if (event.data.type === pageClosing) void close();
       if (event.data.type === pageStartupFailed) {
         if (prepare)
@@ -432,7 +511,7 @@ export function EmployeeNativePage({
         if (
           selectedQuery &&
           location.pathname === '/chatflow/4.0' &&
-          nextQuery.current === activeQuery
+          nextQuery.current === displayedQuery.current
         )
           history.replaceState(
             history.state,
@@ -447,52 +526,55 @@ export function EmployeeNativePage({
         local.resolve(event.data.state);
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
-        if (!next.success || !carrier || navigating) return;
-        navigating = true;
-        window.clearTimeout(timer);
-        const params = new URLSearchParams(
-          Object.entries(next.data).filter(
-            (entry): entry is [string, string] => typeof entry[1] === 'string',
-          ),
-        );
-        if (prepare && !next.data.threadId)
-          params.set('new', crypto.randomUUID());
+        if (!next.success || !carrier || navigating || switching) return;
+        const selection = next.data;
         if (
           prepare &&
+          switchReady &&
+          selection.threadId &&
           !document.hidden &&
+          !remoteRevoked &&
+          !detached &&
           location.pathname === '/chatflow/4.0' &&
-          selectedEmployee?.workspaceId === next.data.workspaceId &&
-          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
+          selectedEmployee?.workspaceId === selection.workspaceId &&
+          selectedEmployee.employeeInstanceId ===
+            selection.employeeInstanceId &&
+          selectedEmployee.threadId !== selection.threadId
         ) {
-          // Start exact-target reads while the old page joins. Neither read
-          // opens a carrier or creates a thread.
-          nextWarmup = startEntryWarmup(next.data, new AbortController());
-        }
-        // Both messages refer only to this exact iframe and page scope. The
-        // carrier completion proves the remote side; terminate local entry
-        // work independently and keep the frame until both report back.
-        void retire().then((closed) => {
-          if (replace.current !== applyQuery || detached) return;
-          const warmup = nextWarmup;
-          nextWarmup = undefined;
-          if (closed) {
-            if (superseded || nextQuery.current !== activeQuery) {
-              warmup?.lifetime.abort();
-              activateSelection(nextQuery.current);
-            } else if (warmup) {
-              const query = params.toString();
-              nextQuery.current = query;
-              // Keep cancellation owned until the next effect claims it.
-              pendingWarmup.current = warmup;
-              history.pushState(null, '', '/chatflow/4.0?' + query);
-              activateSelection(query, warmup);
-            } else location.assign('/chatflow/4.0?' + params);
-          } else {
-            warmup?.lifetime.abort();
-            if (prepare) setStatus('unknown');
-            else setFailed(true);
-          }
-        });
+          const target = (switching = { selection });
+          switchTimer = window.setTimeout(() => {
+            if (switching !== target) return;
+            switching = undefined;
+            navigate(selection);
+          }, entryWaitMs);
+          void carrier
+            .switchThread(selection.threadId)
+            .then((issued) => {
+              if (
+                switching !== target ||
+                navigating ||
+                detached ||
+                remoteRevoked
+              )
+                return;
+              if (!issued) {
+                switching = undefined;
+                window.clearTimeout(switchTimer);
+                navigate(selection);
+                return;
+              }
+              target.scopeId = issued.scopeId;
+              frame.current?.contentWindow?.postMessage(
+                {
+                  type: pageThreadScope,
+                  scopeId,
+                  issued,
+                },
+                location.origin,
+              );
+            })
+            .catch(() => finish('failed'));
+        } else navigate(selection);
       }
     };
     window.addEventListener('message', receive);
@@ -510,7 +592,7 @@ export function EmployeeNativePage({
     const restoreQuery = () => {
       if (location.pathname !== '/chatflow/4.0') return;
       nextQuery.current = location.search.slice(1);
-      if (nextQuery.current !== activeQuery) applyQuery();
+      if (nextQuery.current !== displayedQuery.current) applyQuery();
     };
     window.addEventListener('popstate', restoreQuery);
     const parsedEntry = Promise.resolve().then(() =>
@@ -595,6 +677,7 @@ export function EmployeeNativePage({
     return () => {
       window.clearTimeout(timer);
       window.clearTimeout(closingNotice);
+      window.clearTimeout(switchTimer);
       if (warmup) warmup.progress.show = undefined;
       leaving();
       if (loaded.current === documentLoaded) loaded.current = undefined;
@@ -608,7 +691,7 @@ export function EmployeeNativePage({
   }, [activation, activeQuery, prepare, initialUnavailable]);
 
   useEffect(() => {
-    if (nextQuery.current !== activeQuery) replace.current?.();
+    if (nextQuery.current !== displayedQuery.current) replace.current?.();
   }, [query, activeQuery]);
 
   return (

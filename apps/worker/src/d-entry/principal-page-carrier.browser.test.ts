@@ -28,10 +28,14 @@ const browserExecutable =
   process.env.ALLRICE_BROWSER_EXECUTABLE ??
   process.env.ALLRICE_MANAGED_BROWSER_EXECUTABLE;
 
-it.skipIf(!browserExecutable).each([false, true])(
-  'boots the rc.2 composer or reports a stalled application body (stall=%s)',
-  { timeout: 60_000 },
-  async (stall) => {
+it
+  .skipIf(!browserExecutable)
+  .each(['refresh', 'stall', 'switch', 'baseline'] as const)(
+  'rc.2 workbench composer (%s)',
+  { timeout: 120_000 },
+  async (scenario) => {
+    const stall = scenario === 'stall';
+    const switching = scenario === 'switch' || scenario === 'baseline';
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
     const manifest: {
@@ -45,8 +49,10 @@ it.skipIf(!browserExecutable).each([false, true])(
       '.wasm': 'application/wasm',
     };
     const f = await fixture(release);
+    const otherThread = randomUUID();
+    const revokeOther = switching ? f.registerThread(otherThread) : undefined;
     f.host.catalog.items = f.host.catalog.items.map((row) =>
-      String(row.sessionId) === 'root'
+      ['root', 'root-' + otherThread].includes(String(row.sessionId))
         ? { ...row, blank: true, cwd: '/work' }
         : row,
     );
@@ -65,6 +71,28 @@ it.skipIf(!browserExecutable).each([false, true])(
         globalName: 'DEntryCarrier',
         write: false,
       });
+    const realParent:
+      { outputFiles: { path: string; text: string }[] } | undefined = switching
+      ? await require('esbuild').build({
+          stdin: {
+            contents: `import { createRoot } from 'react-dom/client';
+              import { EmployeeNativePage } from './app/chatflow/4.0/employee-native-page';
+              createRoot(document.getElementById('root')).render(
+                <EmployeeNativePage prepare query={location.search.slice(1)} />);`,
+            loader: 'tsx',
+            resolveDir: join(process.cwd(), 'apps/web'),
+          },
+          bundle: true,
+          write: false,
+          outdir: '/fixture-dsh-switch',
+          jsx: 'automatic',
+          loader: {
+            '.woff': 'dataurl',
+            '.woff2': 'dataurl',
+            '.ttf': 'dataurl',
+          },
+        })
+      : undefined;
     const unary: string[] = [];
     const listRead: unknown[] = [];
     const graph = DEntryProfileGraphSchema.parse(release.graph);
@@ -98,6 +126,7 @@ it.skipIf(!browserExecutable).each([false, true])(
     let applicationReads = 0;
     let browserBootstrapReads = 0;
     let scopedBundleReads = 0;
+    let documentLoads = 0;
     f.web.on('request', async (request, response) => {
       const url = new URL(request.url!, f.origin);
       const copy = async (result: Response) => {
@@ -109,6 +138,40 @@ it.skipIf(!browserExecutable).each([false, true])(
       };
       try {
         const scopeId = url.searchParams.get('scopeId');
+        if (switching) {
+          if (url.pathname === '/api/v1/d-entry/identity') {
+            return await copy(
+              Response.json({
+                identity: f.selectionIdentity(
+                  Object.fromEntries(url.searchParams),
+                ),
+              }),
+            );
+          }
+          if (url.pathname === '/api/v1/d-entry/native-prewarm') {
+            request.resume();
+            return response.writeHead(204).end();
+          }
+          if (url.pathname === '/chatflow/4.0') {
+            return response
+              .writeHead(200, { 'content-type': 'text/html' })
+              .end(
+                '<!doctype html><link rel="stylesheet" href="/outer.css"><div id="root"></div><script src="/outer.js"></script>',
+              );
+          }
+          if (url.pathname === '/outer.js' || url.pathname === '/outer.css') {
+            const css = url.pathname.endsWith('.css');
+            const asset = realParent!.outputFiles.find(({ path }) =>
+              path.endsWith(css ? '.css' : '.js'),
+            );
+            return response
+              .writeHead(200, {
+                'content-type': css ? 'text/css' : 'text/javascript',
+                'cache-control': 'public, max-age=31536000, immutable',
+              })
+              .end(asset!.text);
+          }
+        }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           firstRpc ??= performance.now();
           const chunks: Buffer[] = [];
@@ -231,11 +294,21 @@ it.skipIf(!browserExecutable).each([false, true])(
             );
           return;
         }
-        if (url.pathname !== '/employee') {
+        if (
+          url.pathname !== '/employee' &&
+          url.pathname !== '/chatflow/4.0/document'
+        ) {
           response.writeHead(404).end();
           return;
         }
-        const { identity, selection } = f;
+        documentLoads++;
+        const selection = {
+          ...f.selection,
+          threadId: url.searchParams.get('threadId') ?? f.selection.threadId,
+        };
+        const identity = { ...f.identity, threadId: selection.threadId };
+        const nativeId =
+          selection.threadId === otherThread ? 'root-' + otherThread : 'root';
         const version = {
           id: identity.employeeVersionId,
           manifest: { name: 'Fixture employee' },
@@ -252,19 +325,22 @@ it.skipIf(!browserExecutable).each([false, true])(
               versions: [version],
             },
           ],
-          sessions: [
-            {
-              id: selection.threadId,
-              employeeInstanceId: identity.employeeInstanceId,
-              ownerId: identity.personId,
-              updatedAt: '2026-01-01T00:00:00.000Z',
-              createdAt: '2026-01-01T00:00:00.000Z',
-              title: 'Fixture thread',
-            },
-          ],
+          sessions: (switching
+            ? [f.selection.threadId, otherThread]
+            : [selection.threadId]
+          ).map((id) => ({
+            id,
+            employeeInstanceId: identity.employeeInstanceId,
+            ownerId: identity.personId,
+            updatedAt: '2026-01-01T00:00:00.000Z',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            title: id === otherThread ? '第二条已存在对话' : '第一条已存在对话',
+          })),
         };
         if (!scopeId) return response.writeHead(404).end();
-        const bootstrap = await f.publish('bootstrap', scopeId);
+        const bootstrap = await f.publish('bootstrap', scopeId, {
+          threadId: selection.threadId,
+        });
         if (!bootstrap.ok) return response.writeHead(bootstrap.status).end();
         const published = DEntryProfileBootstrapSchema.parse(
           await bootstrap.json(),
@@ -283,7 +359,7 @@ it.skipIf(!browserExecutable).each([false, true])(
           <div id="app" data-shared-mux="1" data-scope-id="${scopeId}" data-thread-id="${selection.threadId}"
             data-workspace-id="${identity.workspaceId}" data-employee-instance-id="${identity.employeeInstanceId}"
             data-organization-id="${identity.organizationId}" data-viewer-id="${identity.personId}"
-            data-native-session-id="root" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"
+            data-native-session-id="${nativeId}" data-binding-ref="${f.owner.bindingRef}" data-graph-rev="${graph.rev}"
             ${stall ? '' : `data-public-asset-root="${publicRoot}" data-public-bundles='${JSON.stringify(bundles.map(({ reference, revision, sha256 }) => ({ reference, revision, sha256 })))}'`}></div>
           <script id="allrice-employee-directory" type="application/json">${JSON.stringify(directory)}</script>
           <script id="allrice-employee-bootstrap" type="application/json">${bootJson}</script>
@@ -342,8 +418,21 @@ it.skipIf(!browserExecutable).each([false, true])(
         });
       });
     }
+    if (scenario === 'baseline') {
+      await page.addInitScript(() => {
+        if (window !== top) return;
+        window.addEventListener('message', (event) => {
+          if (event.data?.type === 'allrice:d-entry:switch-ready')
+            event.stopImmediatePropagation();
+        });
+      });
+    }
     started = performance.now();
-    await page.goto(f.origin);
+    await page.goto(
+      switching
+        ? f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection)
+        : f.origin,
+    );
     if (stall) {
       await expect.poll(() => applicationReads, { timeout: 15_000 }).toBe(1);
       await page.clock.fastForward(30_100);
@@ -377,6 +466,98 @@ it.skipIf(!browserExecutable).each([false, true])(
       );
     }
     expect(await editor.isEditable()).toBe(true);
+    if (switching) {
+      const frame = page.locator('iframe');
+      const mark = randomUUID();
+      await workbench.locator('#app').evaluate((node, value) => {
+        node.dataset.fixtureDocument = value;
+      }, mark);
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false,
+        latency: 200,
+        downloadThroughput: 1_250_000,
+        uploadThroughput: 1_250_000,
+      });
+      const samples: number[] = [];
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const other = attempt % 2 === 0;
+        const target = other ? otherThread : f.selection.threadId;
+        const nativeId = other ? 'root-' + otherThread : 'root';
+        const row = workbench.locator(
+          '[data-row-key="session:' + target + '"]',
+        );
+        const start = performance.now();
+        await row.press('Enter');
+        try {
+          await page.waitForURL(
+            (url) => url.searchParams.get('threadId') === target,
+            { timeout: 8_000, waitUntil: 'commit' },
+          );
+          await workbench
+            .locator(
+              '[data-conversation-session="' +
+                nativeId +
+                '"] [data-composer-input][contenteditable="true"]',
+            )
+            .waitFor({ timeout: 8_000 });
+        } catch (cause) {
+          throw Error(
+            JSON.stringify({
+              attempt,
+              scenario,
+              socketCount,
+              documentLoads,
+              unary,
+              errors,
+            }),
+            { cause },
+          );
+        }
+        samples.push(Math.round(performance.now() - start));
+        expect(await row.getAttribute('aria-selected')).toBe('true');
+        if (scenario === 'switch') {
+          expect(
+            await workbench
+              .locator('#app')
+              .getAttribute('data-fixture-document'),
+          ).toBe(mark);
+          expect(documentLoads).toBe(1);
+          expect(socketCount).toBe(1);
+        }
+        if (attempt === 0) await editor.fill('另一条会话的原生草稿');
+      }
+      expect(await editor.innerText()).toBe('未发送的原生草稿');
+      expect(await frame.count()).toBe(1);
+      if (scenario === 'baseline') {
+        expect(documentLoads).toBe(7);
+        expect(socketCount).toBe(7);
+      } else {
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === otherThread,
+        );
+        expect(await editor.innerText()).toBe('另一条会话的原生草稿');
+        revokeOther!.abort();
+        await expect.poll(() => page.locator('iframe:visible').count()).toBe(0);
+      }
+      console.info(
+        'NATIVE_THREAD_SWITCH_BENCHMARK ' +
+          JSON.stringify({
+            scenario,
+            browser: browser.version(),
+            samples,
+            documentLoads,
+            socketCount,
+          }),
+      );
+      await cdp.detach();
+      await context.close();
+      return;
+    }
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(1);
     const bootstrapDownload = traffic.find(

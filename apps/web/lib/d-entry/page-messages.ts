@@ -1,3 +1,5 @@
+import type { DEntryPageSwitchResultSchema } from '@allrice/contracts';
+
 export const pageClosing = 'allrice:d-entry:close';
 export const pageCompletion = 'allrice:d-entry:completion';
 export const pageNavigate = 'allrice:d-entry:navigate';
@@ -6,3 +8,10 @@ export const pageStartupFailed = 'allrice:d-entry:startup-failed';
 export const pageDocumentReady = 'allrice:d-entry:document-ready';
 export const pageEditorMounted = 'allrice:d-entry:editor-mounted';
 export const pageMuxAttach = 'allrice:d-entry:mux-attach';
+export const pageSwitchReady = 'allrice:d-entry:switch-ready';
+export const pageThreadScope = 'allrice:d-entry:thread-scope';
+export const pageThreadSelected = 'allrice:d-entry:thread-selected';
+export type PageThreadScope = Extract<
+  ReturnType<typeof DEntryPageSwitchResultSchema.parse>,
+  { type: 'switched' }
+>;

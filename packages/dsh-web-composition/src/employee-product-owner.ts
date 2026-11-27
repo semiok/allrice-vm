@@ -1,5 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
+import type {} from '@deepseek-ai/dsh-client-connection/client';
 import type { Workspace } from '../../../apps/web/app/chatflow/chatflow-types';
 import {
   employeeChoice,
@@ -7,7 +9,13 @@ import {
 } from '../../../apps/web/app/chatflow/employee-instances';
 import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
-import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
+import {
+  pageNavigate,
+  pageSwitchReady,
+  pageThreadScope,
+  pageThreadSelected,
+  type PageThreadScope,
+} from '../../../apps/web/lib/d-entry/page-messages';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
 import {
   bindEmployeeSidebar,
@@ -47,6 +55,8 @@ export function installEmployeeProductOwner(ctx: Context) {
   if (!nativeSessionId || !selection.threadId)
     throw Error('Employee session unavailable');
   const threadId = selection.threadId;
+  let activeThreadId = threadId;
+  let activeNativeId = nativeSessionId;
   const sidebar = position<EmployeeSidebarSnapshot>();
   const panels = position<EmployeePanelsSnapshot>();
   const ownerKey = [
@@ -101,6 +111,97 @@ export function installEmployeeProductOwner(ctx: Context) {
       return unsubscribe;
     }, 'AllRice employee native root');
   });
+  ctx.inject(
+    ['uiWorkspace', 'sessions', 'connection', 'sidebarRight'],
+    (native) => {
+      native.effect(() => {
+        let pending:
+          | {
+              scope: PageThreadScope;
+              oldGeneration: ReturnType<
+                typeof native.connection.generation.getSnapshot
+              >;
+              opened: boolean;
+            }
+          | undefined;
+        const update = () => {
+          if (!pending || signal.aborted) return;
+          const generation = native.connection.generation.getSnapshot();
+          if (!generation || generation === pending.oldGeneration) return;
+          const root = native.sessions.list
+            .getSnapshot()
+            .ids.find((id) => id === pending?.scope.nativeSessionId);
+          if (!root) return;
+          if (!pending.opened) {
+            pending.opened = true;
+            native.uiWorkspace.openSession(root);
+          }
+          if (native.sidebarRight.mounted.getSnapshot() !== root) return;
+          const next = pending.scope;
+          pending = undefined;
+          activeNativeId = next.nativeSessionId;
+          activeThreadId = next.threadId;
+          const old = sidebar.getSnapshot();
+          if (old?.tree)
+            sidebar.update({
+              ...old,
+              tree: { ...old.tree, activeId: activeThreadId },
+            });
+          const panel = panels.getSnapshot();
+          if (panel)
+            panels.update({
+              ...panel,
+              scopeKey: next.scopeId,
+              publicationManagement: {
+                organizationId,
+                employeeInstanceId: selection.employeeInstanceId,
+                threadId: activeThreadId,
+              },
+              materials: {
+                ...panel.materials,
+                ownerKey: next.scopeId,
+                sessionId: activeThreadId,
+              },
+              files: {
+                ...panel.files,
+                ownerKey: next.scopeId,
+                sessionId: activeThreadId,
+                refreshKey: next.scopeId,
+              },
+              filePreview: undefined,
+            });
+          parent.postMessage(
+            {
+              type: pageThreadSelected,
+              scopeId,
+              resourceScopeId: next.scopeId,
+            },
+            location.origin,
+          );
+        };
+        const onScope = (event: Event) => {
+          if (signal.aborted) return;
+          pending = {
+            scope: (event as CustomEvent<PageThreadScope>).detail,
+            oldGeneration: native.connection.generation.getSnapshot(),
+            opened: false,
+          };
+          native.connection.reconnect();
+        };
+        document.addEventListener(pageThreadScope, onScope);
+        const cleanup = [
+          native.connection.generation.subscribe(update),
+          native.sessions.list.subscribe(update),
+          native.sidebarRight.mounted.subscribe(update),
+        ];
+        parent.postMessage({ type: pageSwitchReady, scopeId }, location.origin);
+        return () => {
+          document.removeEventListener(pageThreadScope, onScope);
+          cleanup.forEach((unsubscribe) => unsubscribe());
+        };
+      }, 'AllRice authorized thread selection');
+    },
+  );
 
   const workspaceTask = Promise.resolve().then(() => {
     const embedded = document.getElementById(
@@ -143,9 +244,9 @@ export function installEmployeeProductOwner(ctx: Context) {
         tree: {
           workspace,
           sessions,
-          activeId: threadId,
+          activeId: activeThreadId,
           onSelectSession(id) {
-            if (id === threadId) return;
+            if (id === activeThreadId) return;
             const selected = sessions.find((session) => session.id === id);
             if (selected) navigate(sessionEmployeeKey(selected), selected.id);
           },
@@ -297,14 +398,17 @@ export function installEmployeeProductOwner(ctx: Context) {
         ctx,
         {
           getSnapshot: (id) =>
-            signal.aborted || id !== nativeSessionId
+            signal.aborted || id !== activeNativeId
               ? null
               : panels.getSnapshot(),
           subscribe: (_id, listener) => panels.subscribe(listener),
         },
         (id) =>
-          id === nativeSessionId && !signal.aborted
-            ? { selection, viewerId }
+          id === activeNativeId && !signal.aborted
+            ? {
+                selection: { ...selection, threadId: activeThreadId },
+                viewerId,
+              }
             : null,
       );
       refreshUnread();
