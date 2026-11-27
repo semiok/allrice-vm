@@ -256,7 +256,6 @@ suite('installed AllRice native Web composition', () => {
         .getByRole('button', { name: '访问模式，当前：仅可查看' })
         .waitFor();
       await model.click();
-      await page.getByRole('menuitem', { name: /^模型/ }).click();
       await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
       await page.getByRole('button', { name: /当前 Fixture Nova/ }).waitFor();
 
