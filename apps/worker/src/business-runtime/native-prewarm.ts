@@ -114,9 +114,17 @@ function targetGeneration(
   if (!vm) return { vmId: null, instanceId: null, leaseEpoch: 1 };
   if (!Number.isSafeInteger(vm.leaseEpoch)) return;
   if (vm.phase === 'deleted') {
-    if (!allowRetainedRestore || !vm.diskRetained || !vm.vmId) return;
+    if (!allowRetainedRestore || !vm.vmId) return;
     const leaseEpoch = vm.leaseEpoch + 1;
     if (!Number.isSafeInteger(leaseEpoch)) return;
+    if (vm.diskRetained === false)
+      return {
+        vmId: null,
+        instanceId: null,
+        leaseEpoch,
+        replacesVmId: vm.vmId,
+      };
+    if (vm.diskRetained !== true) return;
     return {
       vmId: vm.vmId,
       instanceId: null,
@@ -309,13 +317,35 @@ export function createDEntryNativePrewarmPort(input: {
       );
     if (stamp.vm?.phase === 'deleted')
       return (
-        plan.target.restoreRetained === true &&
+        (plan.target.restoreRetained === true ||
+          plan.target.replacesVmId === stamp.vm.vmId) &&
         exact(plannedGeneration(stamp.vm))
       );
     return exact(stamp.vm) || exact(plannedGeneration(stamp.vm));
   }
   const port: DEntryNativePrewarmPort = {
     isCurrent,
+    async confirmRunning(context, identity, plan, caller) {
+      if (!plan.running || !plan.target.vmId || !plan.target.instanceId) return;
+      const active = AbortSignal.any([admission, caller]);
+      const verified =
+        await currentDEntryNativeDataPort()?.confirmVerifiedEditor?.(
+          context,
+          identity,
+          active,
+        );
+      if (
+        !verified ||
+        verified.proof.aborted ||
+        !compatible(plan.target, verified.binding)
+      )
+        return;
+      const current = AbortSignal.any([active, verified.proof]);
+      if (!(await isCurrent(context, identity, plan, current, 'ready'))) return;
+      await plan.assertTicketThread?.(current);
+      current.throwIfAborted();
+      return current;
+    },
     async prepare(context, identity, caller) {
       const signal = AbortSignal.any([admission, caller]);
       signal.throwIfAborted();

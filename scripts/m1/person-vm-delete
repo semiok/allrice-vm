@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set +x
+set -euo pipefail
+
+uuid='^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$'
+if [[ $# != 3 || ! $1 =~ ^[1-9][0-9]{0,4}$ || $1 -gt 65535 || ! $2 =~ $uuid ]]; then
+  echo "Usage: $0 <local Worker port> <person UUID> <review|retain-disk|purge-disk>" >&2
+  exit 2
+fi
+port=$1
+person=$2
+action=$3
+case $action in review|retain-disk|purge-disk) ;; *) exit 2 ;; esac
+IFS= read -r -s -p 'Platform administrator session token: ' token </dev/tty
+printf '\n' >&2
+[[ $token =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+
+request() {
+  printf 'Authorization: Bearer %s\n' "$token" |
+    curl -q --silent --show-error --fail-with-body --noproxy '*' \
+      --header @- --header 'Content-Type: application/json' \
+      --data-binary "$1" "http://127.0.0.1:$port/internal/platform/person-vm-delete"
+}
+
+review=$(request "$(printf '{"action":"review","personId":"%s"}' "$person")")
+printf '%s\n' "$review"
+[[ $action != review ]] || exit 0
+target=$(printf '%s\n' "$review" | node -e '
+  const { target, confirmationId } = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+  console.log(target.vmId, target.leaseEpoch, confirmationId ?? "-");
+')
+IFS=' ' read -r vm epoch confirmation <<<"$target"
+[[ $vm =~ $uuid && $epoch =~ ^[0-9]+$ ]] || exit 2
+if [[ $action == retain-disk ]]; then
+  payload=$(printf '{"action":"retain-disk","personId":"%s","vmId":"%s","leaseEpoch":%s}' "$person" "$vm" "$epoch")
+else
+  [[ $confirmation =~ $uuid ]] || exit 2
+  IFS= read -r -p 'Permanently remove the encrypted disk? Retype the VM UUID: ' typed </dev/tty
+  [[ $typed == "$vm" ]] || exit 2
+  payload=$(printf '{"action":"purge-disk","personId":"%s","vmId":"%s","confirmationId":"%s"}' "$person" "$vm" "$confirmation")
+fi
+request "$payload"
+printf '\n'

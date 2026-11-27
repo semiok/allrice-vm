@@ -27,6 +27,7 @@ import {
   sameDEntryVmBinding,
 } from './native-owner.js';
 import type { DEntryFixedProfileSource } from './released-profile.js';
+import { dEntryStartupTiming } from './startup-timing.js';
 
 type Selection = { organizationId: string; selection: DEntrySelectionInput };
 export type DEntryPageDependencies = DEntryHttpDependencies & {
@@ -146,34 +147,40 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
   ) {
     // The explicit editor open may bind a new root on an existing Host.
     // This path never starts a VM to make a missing cold source exist.
-    const original = await history(token, input, signal);
+    const timing = dEntryStartupTiming('page-open');
+    const original = await timing.run('history-authority', () =>
+      history(token, input, signal),
+    );
     const existing = input.selection.threadId
-      ? await deps.historyRoot(original.context, input.selection)
+      ? await timing.run('history-root', () =>
+          deps.historyRoot(original.context, input.selection),
+        )
       : null;
     signal.throwIfAborted();
     const data = deps.data();
     if (!data) throw new DEntryNativeUnavailable();
     if (existing && !sameDEntryIdentity(existing.identity, original.identity))
       throw denied();
-    const auth = await currentDEntryRequest(deps, token, input, signal);
+    const auth = await timing.run('current-authority', () =>
+      currentDEntryRequest(deps, token, input, signal),
+    );
     if (
       auth.context.sessionId !== original.context.sessionId ||
       !sameDEntryIdentity(auth.identity, original.identity)
     )
       throw denied();
-    const authority = await deps.watch(
-      auth.context,
-      input.selection,
-      auth.identity,
-      signal,
+    const authority = await timing.run('watch-authority', () =>
+      deps.watch(auth.context, input.selection, auth.identity, signal),
     );
     try {
       const active = AbortSignal.any([signal, authority.revoked]);
-      const current = await currentDEntryNativeOwner(
-        deps.owners,
-        auth.context,
-        auth.identity,
-        active,
+      const current = await timing.run('host-owner-and-roster', () =>
+        currentDEntryNativeOwner(
+          deps.owners,
+          auth.context,
+          auth.identity,
+          active,
+        ),
       );
       if (!current.owner.controlReady()) throw new DEntryNativeUnavailable();
       async function assertHost(caller: AbortSignal) {
@@ -197,14 +204,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         return next.context;
       }
       let root = existing;
-      if (!root && input.selection.threadId && data.prepareEditorRoot) {
-        root = await data.prepareEditorRoot({
-          ...auth,
-          owner: current.owner,
-          async assertCurrent(caller) {
-            await assertHost(caller);
-          },
-          signal: current.signal,
+      const prepareEditorRoot = data.prepareEditorRoot;
+      if (!root && input.selection.threadId && prepareEditorRoot) {
+        root = await timing.run('native-root', () => {
+          return prepareEditorRoot({
+            ...auth,
+            owner: current.owner,
+            async assertCurrent(caller) {
+              await assertHost(caller);
+            },
+            signal: current.signal,
+          });
         });
       }
       const pin = root;
@@ -221,13 +231,15 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         caller.throwIfAborted();
       }
       const operationId = randomUUID();
-      const owner = await data.resolveAdmissionOwner({
-        ...auth,
-        owner: current.owner,
-        operationId,
-        signal: current.signal,
-        access: 'page',
-      });
+      const owner = await timing.run('admission-editor-proof', () =>
+        data.resolveAdmissionOwner({
+          ...auth,
+          owner: current.owner,
+          operationId,
+          signal: current.signal,
+          access: 'page',
+        }),
+      );
       if (
         owner.operationId !== operationId ||
         owner.context.sessionId !== auth.context.sessionId ||
@@ -235,6 +247,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
         !sameDEntryVmBinding(owner.binding, current.view.receipt.binding)
       )
         throw denied();
+      const finishAdmission = timing.begin('admission-activation');
       await runDEntryAdmittedActivity(
         {
           ports: data.admission,
@@ -248,6 +261,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           },
         },
         (admitted) => {
+          finishAdmission();
           const catalog = ownDEntryCatalog(current.owner, admitted);
           const ended = new AbortController();
           const lifetime = AbortSignal.any([admitted, ended.signal]);
@@ -326,7 +340,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     throw denied();
                   return resource;
                 };
-                await assertCurrent(runningSignal);
+                await timing.run('owned-vm-before-open', () =>
+                  assertCurrent(runningSignal),
+                );
                 runningSignal.throwIfAborted();
                 principal = catalog.owner.acquirePrincipal(
                   auth.context,
@@ -348,7 +364,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   },
                   runningSignal,
                 );
-                scope = await principal.run(runningSignal);
+                const startedPrincipal = principal;
+                scope = await timing.run('guest-principal-open', () =>
+                  startedPrincipal.run(runningSignal),
+                );
                 scope.revoked.addEventListener('abort', principalLost, {
                   once: true,
                 });
@@ -363,7 +382,9 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   scope.opened.baseline.owner !== false
                 )
                   throw denied();
-                await assertCurrent(runningSignal);
+                await timing.run('owned-vm-after-open', () =>
+                  assertCurrent(runningSignal),
+                );
                 runningSignal.throwIfAborted();
                 const page: DEntryPageHandle = {
                   scope,
@@ -454,7 +475,8 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   page,
                 });
                 // The send is part of run, even when the page closes mid-send.
-                await opened(page);
+                await timing.run('opened-reply', () => opened(page));
+                timing.ready();
                 if (!lifetime.aborted)
                   await new Promise<void>((resolve) =>
                     lifetime.addEventListener('abort', () => resolve(), {

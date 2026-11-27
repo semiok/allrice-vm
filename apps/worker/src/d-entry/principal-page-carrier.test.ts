@@ -16,6 +16,7 @@ import {
 } from 'node:net';
 import { Readable } from 'node:stream';
 import { expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { DataAccessError } from '@allrice/database';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
 import Llm from '@deepseek-ai/dsh-llm';
@@ -46,6 +47,143 @@ import {
   closePage,
   type ProfileProof,
 } from './principal-page-carrier.fixture.js';
+
+it('reads the sealed language default and persists a native language preference without opening platform settings', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const gateway = host.typertGateway;
+  const dispatch = gateway.invoke.bind(gateway);
+  let preference = 'zh';
+  const writes = vi.fn();
+  const languageView = () => ({
+    ns: 'locale',
+    value: { preference },
+    revision: 2,
+  });
+  const settings = '@deepseek-ai/dsh-api-settings-controller';
+  host.provide('llm', {
+    listConfigurableProviders: () => [{ settingsNs: 'llm-pi-ai' }],
+  } as never);
+  const dispose = host.typert.register({
+    package: settings,
+    face: 'host',
+    schemas: [],
+    model: { services: [], events: [], objects: [] },
+    invocations: ['describe', 'mutate', 'openSettingsDocument'].map(
+      (method) => ({
+        id: `${settings}#settings/${method}`,
+        namespace: 'settings',
+        method,
+        service: 'settingsController',
+        invocation: { kind: 'direct' },
+        parameters: [],
+        result: {
+          mode: 'strict',
+          typeSymbol: 'test#NativeLocaleJson',
+          create: () => z.json(),
+          jsonSchema: {},
+        },
+      }),
+    ),
+  });
+  const dispatchSpy = vi
+    .spyOn(gateway, 'invoke')
+    .mockImplementation(async (request) => {
+      if (request.namespace !== 'settings') return dispatch(request);
+      if (request.method === 'describe')
+        return {
+          writable: true,
+          hasDocument: true,
+          namespaces: [languageView(), { ns: 'llm-pi-ai' }],
+        };
+      writes(request.args);
+      preference = 'en';
+      return languageView();
+    });
+  try {
+    const life = await open(f);
+    const call = (endpoint: string, args: object, token = sessionToken) =>
+      f.invoke(life.scopeId, token, { endpoint, payload: { args } });
+    const describe = async () => {
+      const response = await call('settings/describe', {});
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.result.ok, JSON.stringify(body.result)).toBe(true);
+      return body;
+    };
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'zh' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    expect((await call('settings/describe', {}, otherToken)).status).toBe(404);
+    const ops = [{ op: 'set', path: ['preference'], value: 'en' }];
+    const denied = await call('settings/mutate', {
+      ns: 'llm-pi-ai',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await denied.json()).toMatchObject({ result: { ok: false } });
+    const fullDocument = await call('settings/openSettingsDocument', {});
+    expect(await fullDocument.json()).toMatchObject({ result: { ok: false } });
+    expect(writes).not.toHaveBeenCalled();
+    const second = await open(f);
+    const eventPeer = f.connect(second.scopeId);
+    const events = messages(eventPeer);
+    await once(eventPeer, 'open');
+    send(eventPeer, {
+      type: 'open',
+      streamId: 'locale-events',
+      endpoint: '$events',
+      payload: { args: {} },
+    });
+    expect(await events('locale-events')).toMatchObject({
+      value: { type: 'ready' },
+    });
+    const changed = await call('settings/mutate', {
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await changed.json()).toMatchObject({
+      result: { ok: true, value: { ns: 'locale' } },
+    });
+    expect(writes).toHaveBeenCalledExactlyOnceWith({
+      ns: 'locale',
+      ops,
+      expectedRevision: 2,
+    });
+    expect(await describe()).toMatchObject({
+      result: {
+        ok: true,
+        value: {
+          namespaces: expect.arrayContaining([
+            { ns: 'locale', value: { preference: 'en' }, revision: 2 },
+          ]),
+        },
+      },
+    });
+    f.host.emit({ event: 'settings/document-updated', args: ['locale', 3] });
+    expect(await events('locale-events')).toMatchObject({
+      value: {
+        type: 'emit',
+        event: 'settings/document-updated',
+        args: ['locale', 3],
+      },
+    });
+    closePage(life.peer);
+    expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+    closePage(second.peer);
+  } finally {
+    dispatchSpy.mockRestore();
+    dispose();
+  }
+});
 
 it('qualifies a new 4.0 editor without writing on upgrade, then prepares its root once on explicit open', async () => {
   const f = await fixture(undefined, true);
@@ -1259,7 +1397,7 @@ it('carries native terminal input, resize and output across the owned VM stream'
   host.typert.register(TYPERT);
   const life = await open(f);
   expect(await status(f.connect(life.scopeId, otherToken))).toBe(404);
-  const descriptor = host.typert.local.get('terminal', 'attach');
+  const descriptor = host.typert.local.get('terminal/attach');
   const inputCodec = descriptor?.uplink?.codec.create();
   if (!inputCodec) throw Error('Native terminal input schema missing');
   const wire = host.typertGateway.wireStream;

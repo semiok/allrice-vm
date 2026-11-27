@@ -1,5 +1,12 @@
 import { constants } from 'node:fs';
-import { lstat, open, readlink, symlink, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  open,
+  readlink,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
   PersonVmError,
@@ -121,6 +128,11 @@ export interface PersonVmNativePort extends PersonVmGuestBootstrapPort {
     signal: AbortSignal,
   ): Promise<void>;
   stop(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
+  releaseDiskHome?(
+    vmId: string,
+    mount: string,
+    signal: AbortSignal,
+  ): Promise<void>;
   ping(binding: PersonVmBinding, signal: AbortSignal): Promise<void>;
 }
 
@@ -831,6 +843,21 @@ export class MicrosandboxPersonVm implements PersonVmNativePort {
     const after = await this.status(binding, signal);
     if (after !== 'stopped' && after !== 'absent')
       throw new PersonVmError('CLEANUP_INCOMPLETE');
+  }
+  async releaseDiskHome(vmId: string, mount: string, signal: AbortSignal) {
+    const home = join(this.options.socketRoot, vmId);
+    assertSocketHome(home);
+    signal.throwIfAborted();
+    try {
+      if ((await readlink(home)) !== join(mount, 'microsandbox'))
+        throw new PersonVmError('CLEANUP_INCOMPLETE');
+      signal.throwIfAborted();
+      await unlink(home);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    signal.throwIfAborted();
+    this.homes.delete(vmId);
   }
   async ping(binding: PersonVmBinding, signal: AbortSignal) {
     await this.command(binding, ['ping', this.name(binding)], signal);

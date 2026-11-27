@@ -45,31 +45,70 @@ export function releasedBundleResolver(data: DOMStringMap) {
   }
 }
 
+const profileBundleTimeoutMs = 30_000;
+
+export class EmployeeProfileBundleTimeout extends Error {
+  constructor() {
+    super('Employee profile bundle download timed out');
+  }
+}
+
+async function fetchProfileBundle(
+  url: URL | string,
+  parent: AbortSignal,
+  options: Pick<RequestInit, 'credentials' | 'cache'>,
+) {
+  parent.throwIfAborted();
+  const timeout = new AbortController();
+  const until = AbortSignal.any([parent, timeout.signal]);
+  const timer = setTimeout(
+    () => timeout.abort(new EmployeeProfileBundleTimeout()),
+    profileBundleTimeoutMs,
+  );
+  try {
+    const response = await fetch(url, { ...options, signal: until });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw Error('Employee profile bundle unavailable');
+    }
+    // A 200 with a stalled body is subject to the same deadline as headers.
+    const bytes = await response.arrayBuffer();
+    until.throwIfAborted();
+    return bytes;
+  } catch (error) {
+    until.throwIfAborted();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function readProfileBundle(
   target: URL,
   signal: AbortSignal,
   publicUrl?: string,
 ) {
-  if (publicUrl) {
+  const read = () =>
+    fetchProfileBundle(target, signal, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  try {
+    return await (publicUrl
+      ? fetchProfileBundle(publicUrl, signal, { credentials: 'omit' })
+      : read());
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!publicUrl && !(error instanceof EmployeeProfileBundleTimeout))
+      throw error;
     try {
-      const asset = await fetch(publicUrl, { signal, credentials: 'omit' });
-      if (asset.ok) return await asset.arrayBuffer();
-      await asset.body?.cancel();
-    } catch {
-      // A public-cache or body-stream failure can use the original owner path.
+      return await read();
+    } catch (retryError) {
+      signal.throwIfAborted();
+      if (error instanceof EmployeeProfileBundleTimeout) throw error;
+      throw retryError;
     }
   }
-  signal.throwIfAborted();
-  const response = await fetch(target, {
-    signal,
-    credentials: 'same-origin',
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw Error('Employee profile bundle unavailable');
-  }
-  return response.arrayBuffer();
 }
 
 export function readEmployeeDocument(data: DOMStringMap) {
@@ -93,6 +132,7 @@ export function readEmployeeDocument(data: DOMStringMap) {
 export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
+  onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -272,7 +312,18 @@ export function nativeProfileDocument(
               target,
               signal,
               releasedBundle(resource),
-            );
+            ).catch((error: unknown) => {
+              if (
+                error instanceof EmployeeProfileBundleTimeout &&
+                !signal.aborted
+              ) {
+                // The rc.2 loader also retries bundles, then falls back to
+                // per-module URLs. Fence those reads after our terminal retry.
+                lifetime.abort(error);
+                onBundleTimeout(error);
+              }
+              throw error;
+            });
             signal.throwIfAborted();
             // rc.2 payloads are classic registration scripts. Download belongs
             // to the abortable request; only the received, certified bytes can

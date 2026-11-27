@@ -40,9 +40,12 @@ import {
   type PersonVmNativeActivityPort,
   type PersonVmAdmissionSubscription,
   type PersonVmRuntimePort,
+  type PlatformVmDeletionRequest,
+  type PlatformVmDeletionResult,
 } from '@allrice/person-vm';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
+  primeWorkerEmployeeWebRelease,
   readReleasedGuestProfile,
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
@@ -51,7 +54,10 @@ import {
   personNativeWebRoster,
 } from '../native-web/composition.js';
 import { dEntryNativePublicUrl } from '../native-web/launch.js';
-import { createProductionPersonVmAuthority } from './production-authority.js';
+import {
+  authorizeProductionPersonVmDeletion,
+  createProductionPersonVmAuthority,
+} from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
@@ -139,6 +145,11 @@ export type ProductionPersonVmHostSources = Readonly<{
 type BoundSources = Awaited<ReturnType<ProductionPersonVmHostSources['bind']>>;
 
 export interface ProductionPersonVmHost {
+  deletePersonVm(
+    context: RequestContext,
+    request: PlatformVmDeletionRequest,
+    signal: AbortSignal,
+  ): Promise<PlatformVmDeletionResult>;
   assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
@@ -552,6 +563,7 @@ export function createProductionPersonVmHost(input: {
     try {
       lifetime.throwIfAborted();
       providers = await createProductionPersonVmProviders(lifetime);
+      await primeWorkerEmployeeWebRelease(lifetime);
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every
@@ -593,6 +605,7 @@ export function createProductionPersonVmHost(input: {
           ),
       };
       const vm = new PersonVmService({
+        authorizePlatformDeletion: authorizeProductionPersonVmDeletion,
         store,
         authority: current.authority,
         native: providers.native,
@@ -845,6 +858,19 @@ export function createProductionPersonVmHost(input: {
         });
       }
       return Object.freeze({
+        deletePersonVm(
+          context: RequestContext,
+          request: PlatformVmDeletionRequest,
+          signal: AbortSignal,
+        ) {
+          return own(() =>
+            vm.deleteForPlatform(
+              context,
+              request,
+              AbortSignal.any([signal, lifetime]),
+            ),
+          );
+        },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;
           const reopen = vm.fenceWorkerStartup();

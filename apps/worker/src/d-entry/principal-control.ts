@@ -1,3 +1,4 @@
+import { dEntryStartupTiming } from './startup-timing.js';
 import { sameDEntryIdentity } from '@allrice/contracts';
 import type { Context } from '@deepseek-ai/cordis';
 import type { PromptContentPart } from '@deepseek-ai/dsh-api-session-controller/types';
@@ -304,6 +305,7 @@ export function createDEntryPrincipalControl(
             business.throwIfAborted();
             if (stopped) throw Error('PRINCIPAL_CONTROL_CLOSED');
             started = true;
+            const timing = dEntryStartupTiming('principal-wire');
             const handle = TYPERT_REMOTE.methods[
               'allricePrincipal/openScope'
             ].invoke(root.remote, { issue }, input.carrier);
@@ -340,8 +342,15 @@ export function createDEntryPrincipalControl(
               },
             );
             if (business.aborted || joined) void relay.close().catch(() => {});
-            const first = await opened.promise;
-            business.throwIfAborted();
+            const first = await timing.run(
+              'openScope-first-frame',
+              async () => {
+                const first = await opened.promise;
+                business.throwIfAborted();
+                return first;
+              },
+            );
+            timing.ready();
             function invoke(
               call: DEntryScopedUnaryCall | DEntryPageNativeCall,
               active: AbortSignal,

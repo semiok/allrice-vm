@@ -7,14 +7,33 @@ import {
   type RequestContext,
 } from '@allrice/contracts';
 import {
+  DataAccessError,
+  requireCurrentPlatformAdmin,
   readContentPrincipal,
   requireDEntryNativeIdentity,
+  type getDatabase,
 } from '@allrice/database';
 import {
   PersonVmError,
   type PersonVmAction,
   type PersonVmAuthority,
 } from '@allrice/person-vm';
+
+export async function authorizeProductionPersonVmDeletion(
+  context: RequestContext,
+  signal: AbortSignal,
+  sql?: ReturnType<typeof getDatabase>,
+) {
+  signal.throwIfAborted();
+  try {
+    await requireCurrentPlatformAdmin(context, sql, Boolean(sql));
+  } catch (error) {
+    if (error instanceof DataAccessError)
+      throw new PersonVmError('AUTHORIZATION_DENIED', { cause: error });
+    throw error;
+  }
+  signal.throwIfAborted();
+}
 
 type Operation = {
   context: RequestContext;

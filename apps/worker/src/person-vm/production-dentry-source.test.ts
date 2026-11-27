@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { PersonVmError } from '@allrice/person-vm';
 import type { RequestContext } from '@allrice/contracts';
 import { DataAccessError } from '@allrice/database';
 import type * as Database from '@allrice/database';
@@ -104,6 +105,7 @@ function fixture() {
     },
   }));
   const resolveSendRoute = vi.fn(async () => route);
+  const confirmPhysical = vi.fn(async () => {});
   const signal = lifetime.signal;
   const participant = { participant: 'entry' };
   const admission = { participant: vi.fn(() => participant) };
@@ -151,18 +153,22 @@ function fixture() {
     startup: startup as unknown as Input['startup'],
     admission: admission as unknown as Input['admission'],
     lifetime: signal,
+    confirmPhysical,
     resolveSendRoute,
   });
   cleanup.push(source.close);
-  async function prove() {
+  const verificationOwner = {};
+  async function prove(modelAdapterId?: string) {
     verified = await proof(
       {
         binding,
         endpoint,
         context,
+        ...(modelAdapterId && { modelAdapterId }),
         readModels,
         profile: {
           revoked: signal,
+          verificationOwner,
           readImmutableGraph: vi.fn(),
           readImmutableBundle: vi.fn(),
         },
@@ -187,12 +193,32 @@ function fixture() {
     route,
     assertCurrent,
     readModels,
+    confirmPhysical,
     resolveSendRoute,
     owner,
     host,
     uninstallProof,
   };
 }
+
+it('reuses model catalog proof for the installed adapter and rechecks live route on every page', async () => {
+  const f = fixture();
+  await f.prove('original-adapter');
+  await f.prove('original-adapter');
+  expect(f.readModels).toHaveBeenCalledOnce();
+  expect(f.resolveSendRoute).toHaveBeenCalledTimes(2);
+  expect(f.assertCurrent).toHaveBeenCalledTimes(2);
+
+  await f.prove('replacement-adapter');
+  expect(f.readModels).toHaveBeenCalledTimes(2);
+  f.resolveSendRoute.mockRejectedValueOnce(
+    new DataAccessError('authorization_denied'),
+  );
+  await expect(f.prove('replacement-adapter')).rejects.toMatchObject({
+    code: 'authorization_denied',
+  });
+  expect(f.readModels).toHaveBeenCalledTimes(2);
+});
 
 it('publishes exact-generation readiness only after same Host artifact, native model and managed route verification', async () => {
   const f = fixture();
@@ -217,6 +243,37 @@ it('publishes exact-generation readiness only after same Host artifact, native m
   await f.source.close();
   expect(f.uninstallProof).toHaveBeenCalledOnce();
   expect(currentDEntryNativeDataPort()).toBeUndefined();
+});
+
+it('requires the live physical proof even with the current employee already verified', async () => {
+  const f = fixture();
+  const uninstall = installDEntryNativeOwnerPort({
+    resolve: async () => f.owner,
+  });
+  try {
+    await f.prove();
+    f.confirmPhysical.mockRejectedValueOnce(
+      new PersonVmError('RUNTIME_NOT_READY'),
+    );
+    await expect(
+      f.port.confirmVerifiedEditor!(f.context, f.identity, f.signal),
+    ).resolves.toBeUndefined();
+    const ready = await f.port.confirmVerifiedEditor!(
+      f.context,
+      f.identity,
+      f.signal,
+    );
+    expect(ready?.binding).toEqual(f.binding);
+    expect(ready?.proof.aborted).toBe(false);
+    expect(f.confirmPhysical).toHaveBeenCalledWith(
+      f.context,
+      f.identity,
+      f.binding,
+      expect.any(AbortSignal),
+    );
+  } finally {
+    uninstall();
+  }
 });
 
 it('ties the selected prewarm proof to the revocation of the authenticated Host group', async () => {
