@@ -411,6 +411,24 @@ async function observePromptOrigins(
 
 // Version 1 covers ordered, exact text blocks only. No content or tool
 // arguments cross the owner carrier. An unsupported block has no proof.
+const nativeToolBodyClaims = new Map();
+
+// Only the exact, sealed registration may opt in. A successful around-dispatch
+// result, on its own, cannot mark entry into the registered implementation.
+export function withNativeToolEvidence(tool, version) {
+  if (typeof version !== 'string' || !version || version.length > 256)
+    throw Error('Native tool evidence requires a sealed version');
+  return {
+    ...tool,
+    execute(args, exec) {
+      exec.signal.throwIfAborted();
+      if (!nativeToolBodyClaims.get(exec.token)?.(tool.name, version))
+        throw Error('Native tool invocation proof is unavailable');
+      return tool.execute(args, exec);
+    },
+  };
+}
+
 function adoptedTextDigest(message) {
   const blocks = message.content;
   if (
@@ -627,6 +645,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
             step: frame.step,
             cursor: session.seq - 1,
             calls: new Map(),
+            dispatched: new Set(),
           });
         } else if (frame.type === 'end') {
           const attempt = attempts.get(session);
@@ -671,9 +690,14 @@ export function observeNativePrompts(scope, lifetime, capture) {
         const blocks = attempt.assistant.data.message.content.filter(
           (block) => block.type === 'tool-call' && block.id === callId,
         );
-        if (blocks.length !== 1 || blocks[0].name !== name) return;
+        if (
+          blocks.length !== 1 ||
+          blocks[0].name !== name ||
+          attempt.dispatched.has(callId)
+        )
+          return;
         // More calls than can fit in the authenticated stream are unsupported.
-        if (attempt.calls.size >= 8) return;
+        if (attempt.calls.size >= 64) return;
         attempt.calls.set(
           callId,
           attempt.calls.has(callId)
@@ -706,12 +730,33 @@ export function observeNativePrompts(scope, lifetime, capture) {
         call?.name !== exec.name ||
         !observer ||
         original(scope.agents.get(session.id)) !== original(exec.agent) ||
-        !observers.has(observer.id) ||
-        observer.toolRecords >= 8
+        !observers.has(observer.id)
       )
         return next();
-      attempt.calls.set(exec.callId, null);
-      const result = await next();
+      attempt.calls.delete(exec.callId);
+      attempt.dispatched.add(exec.callId);
+      let sealedVersion;
+      if (nativeToolBodyClaims.has(exec.token)) return next();
+      nativeToolBodyClaims.set(exec.token, (name, version) => {
+        if (
+          name !== exec.name ||
+          sealedVersion ||
+          exec.signal.aborted ||
+          !capture() ||
+          !observers.has(observer.id) ||
+          observer.handlerRecords >= 7
+        )
+          return false;
+        sealedVersion = version;
+        observer.handlerRecords++;
+        return true;
+      });
+      let result;
+      try {
+        result = await next();
+      } finally {
+        nativeToolBodyClaims.delete(exec.token);
+      }
       const claimed = inboxClaims.get(session);
       // rc.2 also sends unregistered names and short-circuited failures
       // through the waterfall. Retain only a successful, still-registered call.
@@ -723,18 +768,21 @@ export function observeNativePrompts(scope, lifetime, capture) {
         claimed.messageId === attempt.human.occurrence.messageId &&
         definition === original(scope.tools.get(exec.name, exec.agent)) &&
         observers.has(observer.id) &&
-        observer.toolRecords < 8
+        (sealedVersion || !observer.registryResult)
       ) {
         const fact = JSON.stringify({
           attemptId: attempt.id,
           assistantSequence: attempt.assistantSeq,
           ...call,
           human: attempt.human,
+          dispatch: sealedVersion
+            ? { kind: 'sealed-handler', version: sealedVersion }
+            : { kind: 'registry-result' },
         });
         if (Buffer.byteLength(fact) <= 2400) {
           try {
             observer.send('tool ' + fact);
-            observer.toolRecords++;
+            if (!sealedVersion) observer.registryResult = true;
           } catch {
             // Losing collection cannot turn into a failed native tool.
           }
@@ -841,7 +889,8 @@ export function observeNativePrompts(scope, lifetime, capture) {
           id,
           key,
           existing,
-          toolRecords: 0,
+          handlerRecords: 0,
+          registryResult: false,
           send,
           finish(type) {
             if (!close()) return;

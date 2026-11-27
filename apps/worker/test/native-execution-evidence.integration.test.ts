@@ -147,6 +147,7 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           sequence: 10,
           callId: 'tool-call-original',
           name: 'schedule_create',
+          dispatch: { kind: 'registry-result' as const },
           human: adopted,
         };
         await recordNativeExecutionTool(

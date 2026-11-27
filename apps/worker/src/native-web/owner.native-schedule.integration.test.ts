@@ -317,6 +317,7 @@ it.skipIf(!cli)(
       attemptId: nativeAttempt.id,
       callId: nativeCallId,
       name: 'schedule_create',
+      dispatch: { kind: 'registry-result' },
       human: {
         occurrence: {
           sessionId,

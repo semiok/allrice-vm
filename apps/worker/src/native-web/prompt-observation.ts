@@ -65,6 +65,15 @@ const nativeToolObservation = z
     name: z.string().min(1).max(256),
     sequence: z.number().int().nonnegative(),
     human: NativeAdoptedTextSchema,
+    dispatch: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('registry-result') }).strict(),
+      z
+        .object({
+          kind: z.literal('sealed-handler'),
+          version: z.string().min(1).max(256),
+        })
+        .strict(),
+    ]),
   })
   .strict();
 

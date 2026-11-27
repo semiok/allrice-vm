@@ -903,19 +903,21 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 },
               };
               selected.set(key, entry);
+              toolRequests.set(scope, new Map());
               retireUndispatched = () => forgetPrompt(key);
               revoked.addEventListener('abort', retire, { once: true });
               void observation.settled
                 .then(async (outcome) => {
+                  toolRequests.delete(scope);
                   if (selected.get(key) !== entry) return;
                   if (outcome === 'discarded') return forgetPrompt(key);
-                  toolRequests.delete(scope);
                   // An ended prompt loses its queue occupancy. Keep its exact
                   // claimed source under the shared authority for native descendants.
                   endedPrompts.add(scope);
                   notifyPromptChange();
                 })
                 .catch(() => {
+                  toolRequests.delete(scope);
                   // Loss of the carrier proves neither discard nor turn end.
                 });
               await waitForPromptFact(observation.ready, admission);
@@ -1379,13 +1381,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                           // Model references and tool facts use separate
                           // transports. A later request cannot evict an older
                           // receipt before the prompt carrier has drained.
-                          let requests = toolRequests.get(scope);
-                          if (!requests)
-                            toolRequests.set(scope, (requests = new Map()));
-                          requests.set(
-                            evidence.request.nativeAttemptId,
-                            evidence,
-                          );
+                          toolRequests
+                            .get(scope)
+                            ?.set(evidence.request.nativeAttemptId, evidence);
                         }
                         return input.issueCall(
                           call,
