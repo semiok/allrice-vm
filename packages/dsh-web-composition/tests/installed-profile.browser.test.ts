@@ -249,8 +249,12 @@ suite('installed AllRice native Web composition', () => {
       await permission.waitFor();
       await model.waitFor();
       await permission.click();
-      await page.getByText('只读', { exact: true }).waitFor();
-      await page.keyboard.press('Escape');
+      await page
+        .getByRole('menuitem', { name: '仅可查看', exact: true })
+        .click();
+      await page
+        .getByRole('button', { name: '访问模式，当前：仅可查看' })
+        .waitFor();
       await model.click();
       await page.getByRole('menuitem', { name: /^模型/ }).click();
       await page.getByRole('menuitemradio', { name: 'Fixture Nova' }).click();
@@ -275,6 +279,19 @@ suite('installed AllRice native Web composition', () => {
         .last()
         .waitFor();
       expect(await running.isVisible()).toBe(true);
+      const capture = async (name: string) => {
+        if (!process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) return;
+        const target = resolve(
+          process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
+        );
+        await mkdir(target, { recursive: true });
+        await page.screenshot({
+          path: join(target, `controls-${name}.png`),
+          fullPage: true,
+          animations: 'disabled',
+        });
+      };
+      await capture('running');
       await writeFile(join(host.root, 'fixture-plugin', 'finish-turn'), '');
       await page
         .getByText('R2 浏览器收到原生回合结果。', { exact: true })
@@ -299,17 +316,7 @@ suite('installed AllRice native Web composition', () => {
           expect(
             await page.evaluate(() => document.documentElement.scrollWidth),
           ).toBeLessThanOrEqual(width);
-          if (process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR) {
-            const target = resolve(
-              process.env.ALLRICE_COMPOSITION_TEST_ARTIFACT_DIR,
-            );
-            await mkdir(target, { recursive: true });
-            await page.screenshot({
-              path: join(target, `controls-${width}-${theme}.png`),
-              fullPage: true,
-              animations: 'disabled',
-            });
-          }
+          await capture(`${width}-${theme}`);
         }
       expect(errors).toEqual([]);
     } catch (error) {
