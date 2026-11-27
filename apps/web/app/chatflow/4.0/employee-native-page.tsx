@@ -129,6 +129,7 @@ export function EmployeeNativePage({
     let retired = false;
     let mounted = false;
     let documentStarted = false;
+    let discardingPendingDocument = false;
     let remoteRevoked = false;
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
@@ -181,6 +182,22 @@ export function EmployeeNativePage({
           return remote !== 'unknown';
         }
         send(pageRevoked);
+        // A request stalled before its first HTML never installed a local
+        // lifecycle. Cancel that navigation, and observe the blank document
+        // before confirming local closure. An issued document still joins.
+        if (!documentStarted) {
+          try {
+            const win = frame.current.contentWindow;
+            const previous = frame.current.contentDocument;
+            if (win && previous?.URL === 'about:blank') {
+              discardingPendingDocument = true;
+              win.stop();
+              win.location.replace('about:blank');
+            }
+          } catch {
+            // An uninspectable document must supply its real completion.
+          }
+        }
         const [remote, entry] = await Promise.all([close(), local.promise]);
         return remote === 'closed' && entry === 'closed';
       })());
@@ -226,7 +243,11 @@ export function EmployeeNativePage({
       if (!scopeId || node !== frame.current || !mounted) return;
       try {
         const doc = node.contentDocument;
-        if (doc?.URL === 'about:blank') return;
+        if (doc?.URL === 'about:blank') {
+          if (discardingPendingDocument && !documentStarted)
+            local.resolve('closed');
+          return;
+        }
         if (!doc) return failedDocument('unknown');
         const address = new URL(doc.URL);
         const path = '/chatflow/4.0/document';
