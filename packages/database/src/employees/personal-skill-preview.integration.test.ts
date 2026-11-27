@@ -947,9 +947,14 @@ suite('browser Skill source preview and confirmation', () => {
     ).toBe(true);
   });
   it('native names: ordinary install and enable cannot shadow an owned scene, and enabled ordinary Skills block a scene save', async () => {
-    const s = await setup(),
-      id = s.assigned.id;
-    const installed = await installWeb(s);
+    const s = await setup();
+    const { id } = await createEmployeeInstance(s.owner.context, {
+      workspaceId: s.owner.workspaceId,
+      assignmentId: s.assigned.id,
+      requestId: randomUUID(),
+      profile: { name: 'Scene test employee' },
+    });
+    const installed = await installWeb(s, id);
     const payload = sceneSkillFixture();
     payload.body =
       '## 工作步骤\n1. 核对资料\n## 交付内容\n- 周报\n## 执行细节\n只读资料。';
