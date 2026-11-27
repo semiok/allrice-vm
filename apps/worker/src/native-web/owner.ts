@@ -171,15 +171,17 @@ export async function openNativeWebOwner(input: {
   function recordingStartup() {
     return !startupComplete || input.startupPending?.() === true;
   }
-  function recordFailure(reason: unknown) {
+  function recordFailure(reason: unknown, failedStep = step) {
     if (!recordingStartup() || startupFailureAudit) return;
     startupFailureAudit = Promise.resolve();
     const diagnostic: NativeWebSetupFailure = {
-      step,
+      step: failedStep,
       ...nativeSetupError(
         reason,
-        transportStatus ??
-          (step === 'control-first-frame' ? controlHandshakeStatus : undefined),
+        (failedStep === step ? transportStatus : undefined) ??
+          (failedStep === 'control-first-frame'
+            ? controlHandshakeStatus
+            : undefined),
       ),
       target: nativeSetupTarget(input.launch.auth.origin),
     };
@@ -517,7 +519,7 @@ export async function openNativeWebOwner(input: {
           return value;
         },
         (error: unknown) => {
-          recordFailure(error);
+          recordFailure(error, name);
           throw error;
         },
       );

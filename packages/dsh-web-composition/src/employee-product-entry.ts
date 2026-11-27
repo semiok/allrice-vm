@@ -82,7 +82,10 @@ function boot(
     if (identity.scopeId !== documentOwner.scopeId)
       throw Error('Employee document scope is unavailable');
     installEmployeeDraftStorage(identity);
-    const document = nativeProfileDocument(container, close);
+    const document = nativeProfileDocument(container, close, (error) => {
+      fail(error);
+      close();
+    });
     profile = document;
     scope.__DSH_TRANSPORT__ = document.transport;
     scope.__ALLRICE_D_ENTRY_LIFETIME__ = document.signal;
@@ -102,7 +105,7 @@ function boot(
           { type: pageEditorMounted, scopeId },
           location.origin,
         );
-      if (result.state !== 'failed') return;
+      if (result.state !== 'failed' || closing) return;
       fail(result.reason);
       close();
     });

@@ -109,9 +109,14 @@ export async function readProfileBundle(
     return await read();
   } catch (error) {
     signal.throwIfAborted();
-    if (!timedOut && error instanceof EmployeeProfileBundleTimeout)
-      return read();
-    throw error;
+    if (timedOut) throw new EmployeeProfileBundleTimeout();
+    if (!(error instanceof EmployeeProfileBundleTimeout)) throw error;
+    try {
+      return await read();
+    } catch {
+      signal.throwIfAborted();
+      throw error;
+    }
   }
 }
 
@@ -136,6 +141,7 @@ export function readEmployeeDocument(data: DOMStringMap) {
 export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
+  onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -315,7 +321,18 @@ export function nativeProfileDocument(
               target,
               signal,
               releasedBundle(resource),
-            );
+            ).catch((error: unknown) => {
+              if (
+                error instanceof EmployeeProfileBundleTimeout &&
+                !signal.aborted
+              ) {
+                // The rc.2 loader also retries bundles, then falls back to
+                // per-module URLs. Fence those reads after our terminal retry.
+                lifetime.abort(error);
+                onBundleTimeout(error);
+              }
+              throw error;
+            });
             signal.throwIfAborted();
             // rc.2 payloads are classic registration scripts. Download belongs
             // to the abortable request; only the received, certified bytes can
