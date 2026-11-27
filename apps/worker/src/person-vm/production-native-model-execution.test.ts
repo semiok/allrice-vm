@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import type { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deferredPromptFact,
+  observeNativePrompt,
   type NativePromptObservation,
 } from '../native-web/prompt-observation.js';
 import type { openNativeWebOwner } from '../native-web/owner.js';
+import { installDEntryNativeOwnerPort } from '../d-entry/native-owner.js';
 import {
   createProductionNativeModelExecution,
   nativeRunExecutionIds,
@@ -65,6 +70,7 @@ const login = (sessionId = randomUUID()): RequestContext => ({
 });
 beforeEach(() => {
   mocks.pin.mockReset().mockResolvedValue({
+    identity,
     vmId: binding.vmId,
     rootNativeSessionId: issue.root.nativeSessionId,
     rootBindingRef: issue.root.rootBindingRef,
@@ -81,8 +87,93 @@ beforeEach(() => {
     );
 });
 
+it('checks the exact adopted message occurrence for billing after the native turn has ended', async () => {
+  const source = {
+    adapterId: 'native-fixture',
+    sessionId: issue.root.nativeSessionId,
+    scopeId: issue.scopeId,
+    requestId: 'native-request',
+  };
+  const adopted = { messageId: 'native-message', turn: 2 };
+  const active = new AbortController().signal;
+  const observer = observeNativePrompt(
+    {
+      async readManagedModelProof(_body, _signal, _image, receive) {
+        receive?.(
+          Buffer.from(
+            `ready\ninserted ${JSON.stringify({ messageId: adopted.messageId })}\nclaimed ${JSON.stringify(adopted)}\nended\n`,
+          ),
+        );
+        return null;
+      },
+    },
+    source,
+    active,
+    1000,
+  );
+  await expect(observer.settled).resolves.toBe('ended');
+  await expect(
+    observer.assertInserted(adopted.messageId, active),
+  ).resolves.toBeUndefined();
+  const { sessionId, scopeId, requestId } = source;
+  const proof = { sessionId, scopeId, requestId, ...adopted };
+  await expect(observer.assertClaimed(active, proof)).resolves.toBeUndefined();
+  for (const mismatch of [
+    { sessionId: 'another-session' },
+    { scopeId: randomUUID() },
+    { messageId: 'another-message' },
+    { turn: 3 },
+  ]) {
+    await expect(
+      observer.assertClaimed(active, { ...proof, ...mismatch }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_FAILED' });
+  }
+  await observer.close();
+});
+
+it.each([
+  [null, 'PROVIDER_FAILED'],
+  ['different-message', 'PROVIDER_FAILED'],
+  ['native-message', undefined],
+])(
+  'validates an acknowledged child insertion before a turn claims it (%s)',
+  async (messageId, code) => {
+    const finish = deferredPromptFact<null>();
+    const active = new AbortController().signal;
+    const observer = observeNativePrompt(
+      {
+        readManagedModelProof(_body, signal, _image, receive) {
+          if (!receive) return Promise.resolve(JSON.stringify({ messageId }));
+          signal.addEventListener('abort', () => finish.reject(signal.reason), {
+            once: true,
+          });
+          receive(Buffer.from('ready\n'));
+          return finish.promise;
+        },
+      },
+      {
+        adapterId: 'native-fixture',
+        sessionId: 'native-child',
+        parentSessionId: issue.root.nativeSessionId,
+        scopeId: issue.scopeId,
+        requestId: 'native-request',
+      },
+      active,
+      1000,
+    );
+    try {
+      await observer.ready;
+      const receipt = observer.assertInserted('native-message', active);
+      if (code) await expect(receipt).rejects.toHaveProperty('code', code);
+      else await expect(receipt).resolves.toBeUndefined();
+    } finally {
+      await observer.close();
+    }
+  },
+);
+
 function nativeFacts() {
-  let inserted = false;
+  let messageId: string | undefined;
   const settled = deferredPromptFact<'discarded' | 'ended'>();
   const closed = deferredPromptFact<void>();
   const observation = {
@@ -92,7 +183,9 @@ function nativeFacts() {
       settled.reject(Error('observer closed'));
       closed.resolve();
     }),
-    inserted: () => inserted,
+    inserted: () => messageId !== undefined,
+    readInsertedMessageId: vi.fn(async () => messageId),
+    assertInserted: vi.fn(async () => {}),
     assertClaimed: vi.fn(async () => {}),
     confirmedReplay: vi.fn(async () => false),
   } satisfies NativePromptObservation;
@@ -100,8 +193,8 @@ function nativeFacts() {
     observation,
     closed: closed.promise,
     settle: settled.resolve,
-    insert() {
-      inserted = true;
+    insert(id = 'fixture-message') {
+      messageId = id;
     },
   };
 }
@@ -112,16 +205,37 @@ async function setup() {
   const readRootWake = vi.fn<() => Promise<RootWake>>(async () => ({
     kind: 'clear',
   }));
+  const readNativeAttemptFor = vi.fn();
+  const adapterId = 'a'.repeat(64);
+  const model = 'fixture-codex';
+  const nativeInstanceId = randomUUID();
+  const endpoint = {
+    workspaceId: identity.workspaceId,
+    employeeInstanceId: identity.employeeInstanceId,
+    employeeVersionId: identity.employeeVersionId,
+    employeeRevision: identity.employeeRevision,
+    hostPort: 12345,
+    guestPort: 12346,
+  };
+  const receipt = { binding, rosterDigest: 'roster', endpoints: [endpoint] };
   const profile = {
-    owner: { modelAdapterId: 'adapter', readNativeRootWakeFor: readRootWake },
+    owner: {
+      modelAdapterId: adapterId,
+      readNativeRootWakeFor: readRootWake,
+      readNativeAttemptFor,
+      nativeInstanceId,
+    },
+    endpoint,
     bindingRef: 'binding',
-    receipt: { rosterDigest: 'roster' },
+    receipt,
     revoked: lifetime.signal,
   };
   const runJournalOwners = vi.fn(() => []);
+  const bindReference = vi.fn();
   const attached = await createProductionNativeModelExecution().attach(
     {
       lifetime: lifetime.signal,
+      providers: { applicationBuild: { manifestDigest: 'fixture-build' } },
       startup: {
         installModelAdapter: () => () => {},
         installModelPromptObserver(observer: Observer) {
@@ -135,26 +249,35 @@ async function setup() {
     {
       routeRevoked: lifetime.signal,
       assertRouteCurrent: async () => lifetime.signal,
+      route: { provider: 'openai-codex', model },
+      bindReference,
     } as unknown as Parameters<Attach>[1],
   );
   return {
     readRootWake,
     runJournalOwners,
+    readNativeAttemptFor,
+    bindReference,
+    resolveReference: attached.references?.[0]?.resolve,
+    selection: { adapterId, provider: 'openai-codex', model },
+    profile,
     async admit(
       context: RequestContext,
       requestId: string,
       native: ReturnType<typeof nativeFacts>,
       mode: 'queue' | 'steer' = 'queue',
+      child?: { sessionId: string; parentSessionId: string },
     ) {
       const result = await observed(
         {
-          endpoint: 'session/prompt',
+          endpoint: child ? 'subagents/prompt' : 'session/prompt',
           binding,
-          adapterId: 'adapter',
+          adapterId,
           context,
           issue,
           requestId,
           mode,
+          child,
           observe: () => native.observation,
         },
         lifetime.signal,
@@ -162,14 +285,22 @@ async function setup() {
       if (!result) throw Error('prompt observation unavailable');
       return result;
     },
-    updateQueue(context: RequestContext) {
+    updateQueue(
+      context: RequestContext,
+      child?: { sessionId: string; parentSessionId: string },
+      itemId = 'queue-item',
+      action: 'edit' | 'remove' | 'steer' = 'remove',
+    ) {
       return observed(
         {
           endpoint: 'session/updateQueue',
           binding,
-          adapterId: 'adapter',
+          adapterId,
           context,
           issue,
+          child,
+          itemId,
+          action,
         },
         lifetime.signal,
       );
@@ -180,6 +311,146 @@ async function setup() {
     },
   };
 }
+
+it('binds only adopted child occurrences when pending and steered messages share a request ID', async () => {
+  const f = await setup();
+  const context = login();
+  const root = SessionId(issue.root.nativeSessionId);
+  const child = { sessionId: SessionId('native-child'), parentSessionId: root };
+  const revoked = new AbortController().signal;
+  const uninstall = installDEntryNativeOwnerPort({
+    async resolve() {
+      return {
+        ...f.profile,
+        revoked,
+        controlReady: () => true,
+        assertCurrent: async () => {},
+        acquirePrincipal: () => {
+          throw Error('Unexpected scope creation');
+        },
+        async readSessions() {
+          const status = {
+            updatedAt: 1,
+            blank: false,
+            running: true,
+            agentAvailable: true,
+          };
+          return {
+            ok: true,
+            value: {
+              items: [
+                { ...status, sessionId: root },
+                { ...status, ...child, origin: 'subagent' },
+              ],
+            },
+          };
+        },
+      };
+    },
+  });
+  try {
+    const resolve = f.resolveReference;
+    if (!resolve) throw Error('Native reference service unavailable');
+    const native = nativeFacts();
+    const requestId = randomUUID();
+    const occurrence = {
+      ...child,
+      requestId,
+      scopeId: issue.scopeId,
+      messageId: 'adopted-child-message',
+      turn: 1,
+    };
+    const admission = await f.admit(context, requestId, native, 'queue', child);
+    native.insert(occurrence.messageId);
+    admission.accepted();
+    const pending = nativeFacts();
+    const second = { ...occurrence, messageId: 'same-request-pending-message' };
+    const waiting = await f.admit(context, requestId, pending, 'queue', child);
+    pending.insert(second.messageId);
+    waiting.accepted();
+    const recipient = 'r'.repeat(43);
+    const attempt = {
+      kind: 'assistant',
+      id: randomUUID(),
+      turn: 1,
+      sourceTurn: 1,
+      cursor: 3,
+      recipient,
+      rootSessionId: root,
+      delegated: true,
+      inheritedPromptIndexes: [],
+    };
+    const resolveReference = () => {
+      const body = Buffer.from(
+        JSON.stringify({
+          ...f.selection,
+          sessionId: child.sessionId,
+          recipient,
+        }),
+      );
+      const request = Object.assign(Readable.from([body]), {
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      });
+      return resolve(request as unknown as IncomingMessage, binding, revoked);
+    };
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [{ ...occurrence, parentSessionId: 'different-parent' }],
+    });
+    await expect(resolveReference()).rejects.toHaveProperty(
+      'code',
+      'AUTHORIZATION_DENIED',
+    );
+    expect(f.bindReference).not.toHaveBeenCalled();
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [occurrence],
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(native.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      occurrence,
+    );
+    expect(pending.observation.assertClaimed).not.toHaveBeenCalled();
+    expect(f.bindReference).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allriceThreadRef: identity.threadId,
+        native: expect.objectContaining({ ...child, rootSessionId: root }),
+      }),
+      expect.any(AbortSignal),
+    );
+    await expect(
+      f.updateQueue(context, child, second.messageId, 'steer'),
+    ).resolves.toBeUndefined();
+    await expect(
+      f.updateQueue(context, child, 'unknown-message', 'steer'),
+    ).rejects.toHaveProperty('code', 'VM_ACTIVE');
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [occurrence, second],
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(pending.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      second,
+    );
+    // Re-reading the same attempt with the same adopted occurrences retains
+    // the original run and attempt record identities.
+    const execution = f.bindReference.mock.lastCall?.[0].execution;
+    expect(execution).toEqual({
+      runId: expect.any(String),
+      executionId: expect.any(String),
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(f.bindReference.mock.lastCall?.[0].execution).toEqual(execution);
+  } finally {
+    uninstall();
+    await f.close();
+  }
+});
 
 it('attaches native terminal retry to the current Worker owner', async () => {
   const f = await setup();
@@ -304,7 +575,7 @@ describe('native delegated execution', () => {
       const a = login();
       const b = login();
       const admitted = await f.admit(a, 'original', original);
-      original.insert();
+      original.insert('adopted-original');
       admitted.accepted();
       original.settle('ended');
       await Promise.resolve();
@@ -312,7 +583,15 @@ describe('native delegated execution', () => {
       f.readRootWake.mockResolvedValue({
         kind: 'delegated',
         turn: 2,
-        promptIds: ['original'],
+        prompts: [
+          {
+            sessionId: issue.root.nativeSessionId,
+            scopeId: issue.scopeId,
+            requestId: 'original',
+            messageId: 'adopted-original',
+            turn: 1,
+          },
+        ],
       });
       const otherSteer = nativeFacts();
       await expect(
@@ -329,6 +608,16 @@ describe('native delegated execution', () => {
         await f.admit(a, 'same-login', nativeFacts(), 'steer')
       ).undispatched();
       expect(original.observation.assertClaimed).toHaveBeenCalledTimes(2);
+      expect(original.observation.assertClaimed).toHaveBeenCalledWith(
+        expect.any(AbortSignal),
+        {
+          sessionId: issue.root.nativeSessionId,
+          scopeId: issue.scopeId,
+          requestId: 'original',
+          messageId: 'adopted-original',
+          turn: 1,
+        },
+      );
 
       f.readRootWake.mockResolvedValue({ kind: 'unproven' });
       await expect(

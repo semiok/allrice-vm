@@ -151,18 +151,11 @@ export const DEntryPageMuxQuerySchema = DEntrySelectionInputSchema.extend({
   organizationId: UuidSchema,
   scopeId: UuidSchema.optional(),
 });
-export const DEntryPageUnarySchema = z.enum([
-  'session/list',
-  'session/attachment',
-  'session/page',
-  'session/projections',
-  'skills/list',
-  'session/prompt',
-  'session/updateQueue',
-  'session/cancel',
-  'session/rename',
-  'session/selectModel',
-]);
+// Connection's canonical namespace/method syntax. A caller can name a method
+// here, but only the admitted guest can resolve and authorize its descriptor.
+export const DEntryPageUnarySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_$.-]+\/[A-Za-z0-9_$.-]+$/u);
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {
     selection: DEntrySelectionInputSchema,
