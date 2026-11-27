@@ -561,6 +561,7 @@ export function createDEntryNativePrewarmPort(input: {
       // exact old epoch through status polling and its original activation.
       if (
         stamp.authorityRevision &&
+        !stamp.upgradeRestart &&
         (retained || (old?.phase === 'running' && !old.leaseOwner))
       ) {
         const reconciled =

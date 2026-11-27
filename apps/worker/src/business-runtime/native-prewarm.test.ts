@@ -2400,6 +2400,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
     expect(updated).toBe(true);
     return signal();
   });
+  const reconcileStoppedEntry = vi.fn(async () => false);
   const uninstall = installDEntryNativeDataPort({
     ...f.base.data,
     assertEditorReady: proof,
@@ -2408,6 +2409,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
     lifetime: f.lifetime.signal,
     requireEditorProof: true,
     ownsRunningBinding: (binding) => binding.instanceId === nextInstance,
+    reconcileStoppedEntry,
     readCoordination: async () => ({
       authorityRevision: 'release-1',
       vm: {
@@ -2417,6 +2419,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
         phase: updated ? 'running' : previousPhase,
         leaseOwner: null,
         hasEgressReceipt: true,
+        nativeCreated: true,
       },
     }),
     async prewarmCurrent(_context, _identity, input) {
@@ -2426,6 +2429,13 @@ it('plans the next epoch before asking an old running binding for editor proof',
         leaseEpoch: 6,
       });
       expect(proof).not.toHaveBeenCalled();
+      input.target?.observeVmStart?.({
+        personId: identity.personId,
+        organizationId: identity.organizationId,
+        vmId,
+        instanceId: nextInstance,
+        leaseEpoch: 6,
+      });
       updated = true;
       return {
         vmId,
@@ -2452,6 +2462,7 @@ it('plans the next epoch before asking an old running binding for editor proof',
       running: false,
       target: plan.target,
     });
+    expect(reconcileStoppedEntry).not.toHaveBeenCalled();
     await expect(
       assembly.port.prewarm(
         context,

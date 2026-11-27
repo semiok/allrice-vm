@@ -83,6 +83,7 @@ async function bootstrapFixture(
     | 'readonlyDshRuntimeDisk'
     | 'readonlyCommandMemoryDirectory'
     | 'employeePortSlots'
+    | 'restartMemory'
   >,
 ) {
   const root = await directory(),
@@ -1156,10 +1157,24 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       expect(f.h.mounts.size).toBe(0);
     },
   );
-  it.each(['ok', 'restore-fails-once'])(
+  it.each(['ok', 'restore-fails-once', 'reserved'])(
     'converts a stopped legacy VM using a verified disk snapshot (%s)',
     async (mode) => {
-      const f = await bootstrapFixture(mode, await readonlyFixture());
+      const assertCurrent = vi.fn(async () => {});
+      const commitRunning = vi.fn(async () => {});
+      const reserve = vi.fn(async () => ({
+        signal: signal(),
+        assertCurrent,
+        commitRunning,
+      }));
+      const f = await bootstrapFixture(
+        mode,
+        await readonlyFixture(),
+        undefined,
+        mode === 'reserved'
+          ? { restartMemory: { memoryMiB: 2048, reserve } }
+          : undefined,
+      );
       const assigned = roster(f, 1);
       const service = new PersonVmService({
         ...f.h.options,
@@ -1215,6 +1230,17 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       const next = await service.resolve(f.rc, signal());
       expect(next.vmId).toBe(binding.vmId);
       expect(next.leaseEpoch).toBeGreaterThan(binding.leaseEpoch);
+      if (mode === 'reserved') {
+        expect(reserve).toHaveBeenCalledExactlyOnceWith(
+          { binding: next, memoryMiB: 2048 },
+          expect.any(AbortSignal),
+        );
+        expect(assertCurrent).toHaveBeenCalled();
+        expect(commitRunning).toHaveBeenCalledExactlyOnceWith(
+          { binding: next, memoryMiB: 2048 },
+          expect.any(AbortSignal),
+        );
+      }
       await f.native.stop(next, signal());
       await service.stop(f.rc, signal());
       const cold = (await f.calls()).length;

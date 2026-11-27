@@ -14,6 +14,7 @@ import {
   DEntryNativeResourceRequestSchema,
   sameDEntryIdentity,
   type DEntryNativePrewarmStatus,
+  type DEntryNativePrewarmTrigger,
 } from '@allrice/contracts';
 import {
   authenticateSession,
@@ -340,7 +341,7 @@ export function createDEntryHttpHandler(
         throw new DEntryNativeUnavailable();
       async function publishExistingPrewarm(
         existing: ReturnType<typeof prewarm.reuse>['existing'],
-        trigger: 'page' | 'input',
+        trigger: DEntryNativePrewarmTrigger,
         verify: NonNullable<DEntryNativePrewarmPort['isCurrent']>,
         preferReady = false,
       ) {

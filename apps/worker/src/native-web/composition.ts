@@ -1217,7 +1217,12 @@ export function createAssignedNativeWebStartup(input: {
     activityCatalogs(binding: PersonVmBinding, signal: AbortSignal) {
       this.assertAuthenticatedGroup(binding, signal);
       const group = running.get(binding.vmId)!;
-      if (group.owners.size !== group.receipt.endpoints.length)
+      if (
+        group.updating ||
+        group.startingEmployees.size ||
+        group.blockedEmployees.size ||
+        group.owners.size !== group.receipt.endpoints.length
+      )
         throw new PersonVmError('RUNTIME_NOT_READY');
       return group.receipt.endpoints.map(({ employeeInstanceId }) =>
         this.catalog(binding, employeeInstanceId),
