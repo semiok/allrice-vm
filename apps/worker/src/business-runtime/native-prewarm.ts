@@ -380,6 +380,21 @@ export function createDEntryNativePrewarmPort(input: {
       (!target.instanceId || vm.instanceId === target.instanceId);
     const takeover = orphanedStarts.get(plan);
     const vm = stamp.vm;
+    if (mode === 'issue') {
+      if (takeover)
+        return (
+          vm?.phase === 'starting' &&
+          vm.diskRetained === true &&
+          !vm.leaseOwner &&
+          matchesInstance(vm, takeover.predecessor)
+        );
+      const latest = plannedGeneration(vm);
+      return Boolean(
+        latest &&
+        (!plan.running || vm?.phase === 'running') &&
+        canSharePrewarmTarget(plan, latest),
+      );
+    }
     if (mode === 'ready')
       return (
         vm?.phase === 'running' &&

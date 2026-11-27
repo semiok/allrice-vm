@@ -400,9 +400,12 @@ export function createDEntryHttpHandler(
         const { context, identity } = next;
         plan.assertTicketThread = authority.assertTicketThread;
         await plan.assertTicketThread?.(signal);
-        if (!(await check(context, identity, plan, signal, 'authority')))
-          throw new DataAccessError('authorization_denied');
+        const canIssue = await check(context, identity, plan, signal, 'issue');
         signal.throwIfAborted();
+        if (!canIssue) {
+          sendPrewarmStatus(response, { state: 'expired' });
+          return true;
+        }
         const { trigger } = prewarmRequest;
         const receipt = { identity, trigger };
         const accepted = prewarm.accept(
@@ -453,8 +456,9 @@ export function createDEntryHttpHandler(
         if (!hot) {
           if (
             plan.running &&
-            !(await check(context, identity, plan, signal, 'authority'))
+            !(await check(context, identity, plan, signal, 'issue'))
           ) {
+            signal.throwIfAborted();
             sendPrewarmStatus(response, { state: 'expired' });
             return true;
           }

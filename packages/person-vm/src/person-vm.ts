@@ -382,12 +382,16 @@ export class PersonVmService
     return view(row); // A persisted running flag is not a readiness assertion.
   }
   private assertPrewarmTarget(
-    row: VmRecord | null,
+    row: Readonly<VmRecord> | null,
     target?: PersonVmPrewarmFence,
     allowRetainedRestore = false,
   ) {
     if (!target) return;
-    this.assertPrewarmDeletionFence(row, target);
+    if (
+      target.deletionFence !== undefined &&
+      (row?.prewarmDeletionFence ?? null) !== target.deletionFence
+    )
+      throw new PersonVmError('LEASE_LOST');
     const running = row?.phase === 'running';
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
     const purged =
@@ -411,16 +415,6 @@ export class PersonVmService
       (target.vmId !== null && target.vmId !== row?.vmId) ||
       (target.instanceId !== null &&
         (!running || target.instanceId !== row?.instanceId))
-    )
-      throw new PersonVmError('LEASE_LOST');
-  }
-  private assertPrewarmDeletionFence(
-    row: Readonly<VmRecord> | null,
-    target: PersonVmPrewarmFence,
-  ) {
-    if (
-      target.deletionFence !== undefined &&
-      (row?.prewarmDeletionFence ?? null) !== target.deletionFence
     )
       throw new PersonVmError('LEASE_LOST');
   }
@@ -510,7 +504,12 @@ export class PersonVmService
       {
         joinOfflinePreparation: true,
         ...(target && {
-          beforeClaim: (row) => this.assertPrewarmDeletionFence(row, target),
+          beforeClaim: (row, _owner, active) => {
+            active.throwIfAborted();
+            signal.throwIfAborted();
+            if (row) this.checkOrganization(row, context.organizationId);
+            this.assertPrewarmTarget(row, target, true);
+          },
         }),
       },
     );
@@ -944,10 +943,11 @@ export class PersonVmService
         joinOfflinePreparation: true,
         ...(target && {
           beforeClaim: (row, ownerToken, active) => {
-            this.assertPrewarmDeletionFence(row, target);
-            if (!startup) return;
             signal.throwIfAborted();
             active.throwIfAborted();
+            if (row) this.checkOrganization(row, context.organizationId);
+            this.assertPrewarmTarget(row, target);
+            if (!startup) return;
             if (
               row?.phase !== 'starting' ||
               !row.instanceId ||

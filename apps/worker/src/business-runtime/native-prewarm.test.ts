@@ -1689,53 +1689,62 @@ it('returns a ticket for a running VM with slow editor proof and keeps just one 
   }
 });
 
-it('keeps the ticket when the last hot readiness recheck is slow and joins that read on shutdown', async () => {
-  const f = fixture(),
-    finish = deferred<void>();
-  let checking: AbortSignal | undefined;
-  const prewarm = vi.fn(async () => signal());
-  const server = await nativeEntryServer(f.base, {
-    ...f.base.deps,
-    prewarm: {
-      isCurrent: async (_context, _identity, _plan, active, mode) => {
-        if (mode === 'ready' && !checking) {
-          checking = active;
-          await finish.promise;
-        }
-        return true;
+it.each([false, true])(
+  'checks the current target after the hot reply budget and joins a slow readiness read on shutdown (target changed: %s)',
+  async (changed) => {
+    const f = fixture(),
+      finish = deferred<void>();
+    let checking: AbortSignal | undefined;
+    const prewarm = vi.fn(async () => signal());
+    const server = await nativeEntryServer(f.base, {
+      ...f.base.deps,
+      prewarm: {
+        isCurrent: async (_context, _identity, _plan, active, mode) => {
+          if (mode === 'ready' && !checking) {
+            checking = active;
+            await finish.promise;
+          }
+          if (mode === 'issue' && checking && changed) return false;
+          return true;
+        },
+        prepare: async () => ({
+          key: 'same-boot',
+          target: f.base.binding,
+          running: true,
+        }),
+        prewarm,
       },
-      prepare: async () => ({
-        key: 'same-boot',
-        target: f.base.binding,
-        running: true,
-      }),
-      prewarm,
-    },
-  });
-  let closing: Promise<void> | undefined;
-  try {
-    const reply = await server.request('native-prewarm', {
-      ...f.base.body,
-      trigger: 'page',
     });
-    expect(reply.status).toBe(202);
-    const { ticket } = await reply.json();
-    expect(checking?.aborted).toBe(true);
-    expect(prewarm).toHaveBeenCalledOnce();
-    expect(
-      await (await prewarmStatus(server, ticket.operationId)).json(),
-    ).toEqual({ state: 'ready' });
-    let joined = false;
-    closing = server.close().then(() => {
-      joined = true;
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(joined).toBe(false);
-  } finally {
-    finish.resolve();
-    await (closing ?? server.close());
-  }
-});
+    let closing: Promise<void> | undefined;
+    try {
+      const reply = await server.request('native-prewarm', {
+        ...f.base.body,
+        trigger: 'page',
+      });
+      expect(checking?.aborted).toBe(true);
+      expect(prewarm).toHaveBeenCalledOnce();
+      if (changed) {
+        expect(reply.status).toBe(410);
+        expect(await reply.json()).toEqual({ state: 'expired' });
+      } else {
+        expect(reply.status).toBe(202);
+        const { ticket } = await reply.json();
+        expect(
+          await (await prewarmStatus(server, ticket.operationId)).json(),
+        ).toEqual({ state: 'ready' });
+      }
+      let joined = false;
+      closing = server.close().then(() => {
+        joined = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(joined).toBe(false);
+    } finally {
+      finish.resolve();
+      await (closing ?? server.close());
+    }
+  },
+);
 
 it('serves short polls over a cold startup longer than 125 seconds and deduplicates POSTs', async () => {
   const f = fixture(true),
