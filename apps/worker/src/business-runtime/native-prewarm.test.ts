@@ -2131,7 +2131,7 @@ it('serves short polls over a cold startup longer than 125 seconds and deduplica
   }
 });
 
-it.each(['cancel', 'dispatch'] as const)(
+it.each(['cancel', 'dispatch', 'cleanup failure'] as const)(
   'exposes the owned capacity wait and only cancels before dispatch (%s)',
   async (outcome) => {
     const f = fixture();
@@ -2163,6 +2163,7 @@ it.each(['cancel', 'dispatch'] as const)(
         dispatched.resolve();
       } finally {
         await joined.promise;
+        if (outcome === 'cleanup failure') throw Error('Join unconfirmed');
       }
     };
     const server = await nativeEntryServer(f.base, {
@@ -2216,8 +2217,11 @@ it.each(['cancel', 'dispatch'] as const)(
         expect(f.base.authorityClose).not.toHaveBeenCalled();
         joined.resolve();
         const cancelled = await cancelling;
-        expect(cancelled.status).toBe(410);
-        expect(await cancelled.json()).toEqual({ state: 'expired' });
+        if (outcome === 'cleanup failure') expect(cancelled.status).toBe(503);
+        else {
+          expect(cancelled.status).toBe(410);
+          expect(await cancelled.json()).toEqual({ state: 'expired' });
+        }
         expect(f.base.authorityClose).toHaveBeenCalledOnce();
         expect((await prewarmStatus(server, id)).status).toBe(410);
       }

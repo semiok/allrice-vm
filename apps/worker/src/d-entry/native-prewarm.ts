@@ -182,6 +182,7 @@ export function createPrewarmOperations(
     expires: number;
     deadline: AbortSignal;
     cancellation: AbortController;
+    cancellationFailed?: true;
     replies: number;
     published: boolean;
     state: DEntryNativePrewarmStatus;
@@ -507,8 +508,13 @@ export function createPrewarmOperations(
             })) || undefined;
           operation.proof?.throwIfAborted();
           signal.throwIfAborted();
-        } catch {
+        } catch (error) {
           failed = true;
+          if (
+            cancellation.signal.aborted &&
+            error !== cancellation.signal.reason
+          )
+            operation.cancellationFailed = true;
         }
         if (
           signal.aborted ||
@@ -634,7 +640,8 @@ export function createPrewarmOperations(
         entry.cancellation.abort();
       }
       await entry.settled;
-      if (!(await entry.release())) throw new DEntryNativeUnavailable();
+      if (!(await entry.release()) || entry.cancellationFailed)
+        throw new DEntryNativeUnavailable();
       return { state: 'expired' };
     },
     async close() {
