@@ -1484,7 +1484,9 @@ suite(
       await f.change({ execution_live: false, first_allowed: false });
       expect(await f.restore()).toBe(document);
       const before = await f.state();
-      await database.db`update allrice_storage_objects set retention_until=clock_timestamp()-interval '1 minute' where id=${id}`;
+      await database.db`update allrice_storage_objects
+        set created_at=clock_timestamp()-interval '2 minutes',
+          retention_until=clock_timestamp()-interval '1 minute' where id=${id}`;
       await expect(f.restore()).rejects.toMatchObject({
         code: 'authorization_denied',
       });
