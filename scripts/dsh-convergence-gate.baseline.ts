@@ -73,6 +73,15 @@ export const baseline: readonly BaselineEntry[] = [
   },
   {
     kind: 'patch',
+    id: 'allrice-managed-web-search-v1',
+    category: '门卫',
+    basis:
+      '在公开 DSH Web provider 与原生会话接缝上复用现有 Search 工具和 DeepSeek backend。宿主校验用户、VM、epoch 及当前授权，限额并随撤销停止。凭据留宿主，无新工具、会话状态机或 PG 表。',
+    approvedBy:
+      '2026-11-27 规划线转达用户授权，先做宿主 Search 及共用 Fetch 骨架。',
+  },
+  {
+    kind: 'patch',
     id: 'allrice-host-model-gateway-v1',
     category: '账本',
     basis:

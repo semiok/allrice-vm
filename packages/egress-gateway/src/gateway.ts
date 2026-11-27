@@ -53,7 +53,7 @@ function close(server: Server) {
     server.closeAllConnections();
   });
 }
-async function sendResponse(
+export async function sendEgressResponse(
   res: ServerResponse,
   response: EgressResponse,
   signal?: AbortSignal,
@@ -96,7 +96,7 @@ async function sendError(
     return;
   }
   try {
-    await sendResponse(
+    await sendEgressResponse(
       res,
       {
         status:
@@ -547,7 +547,7 @@ export function createEgressGateway(
                 },
                 requestSignal,
                 (response, deliverySignal) =>
-                  sendResponse(res, response, deliverySignal),
+                  sendEgressResponse(res, response, deliverySignal),
                 (error, signal) => sendError(res, error, signal),
               );
             } catch (error) {

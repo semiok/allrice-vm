@@ -188,6 +188,13 @@ export async function prepareNativeWebLaunch(
     'utf8',
   );
   const modelOwner = `${directory}/owner-with-model.mjs`;
+  const searchPlugin = `${directory}/allrice-managed-web-search.mjs`;
+  const searchSource = modelAdapter
+    ? await readFile(
+        new URL('../../dsh/allrice-managed-web-search.mjs', import.meta.url),
+        'utf8',
+      )
+    : undefined;
   return Object.freeze({
     binding: Object.freeze({ ...binding }),
     auth,
@@ -212,6 +219,9 @@ export function apply(ctx, config) {
 `,
             },
           ]
+        : []),
+      ...(searchSource
+        ? [{ path: searchPlugin, contents: searchSource, mode: 0o600 }]
         : []),
       ...modelFiles,
       { path: principalPlugin, contents: principalSource, mode: 0o600 },
@@ -265,6 +275,21 @@ export function apply(ctx, config) {
           ...(modelAdapter
             ? [
                 { id: 'llm-pi-ai', disabled: true },
+                { id: 'web-search-deepseek', disabled: true },
+                {
+                  insert: [
+                    {
+                      id: 'allrice-managed-web-search',
+                      name: `file://${searchPlugin}`,
+                      config: {
+                        cliPath: config.cliPath,
+                        origin: modelAdapter.origin,
+                        capability: modelAdapter.capability,
+                        adapterId: auth.modelAdapterId,
+                      },
+                    },
+                  ],
+                },
                 {
                   id: 'agent-default-model',
                   config: {

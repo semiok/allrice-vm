@@ -22,6 +22,7 @@ import {
   sameVmBinding,
   type PersonVmBinding,
 } from '@allrice/person-vm';
+import { webSearchRoute } from './production-web-search.js';
 import type { AssignedNativeWebCatalog } from '../native-web/composition.js';
 
 type Catalog = Omit<AssignedNativeWebCatalog, 'owner'> & {
@@ -53,6 +54,15 @@ export function createProductionEgressAuthority(input: {
     } | null
   >();
 
+  const webSearches = new WeakMap<
+    RequestContext,
+    {
+      binding: PersonVmBinding;
+      signal: AbortSignal;
+      assertCurrent(signal: AbortSignal): Promise<void>;
+    }
+  >();
+
   const authority: EgressAuthority = {
     async context(_binding, signal) {
       input.lifetime.throwIfAborted();
@@ -62,6 +72,19 @@ export function createProductionEgressAuthority(input: {
     async allow(context, binding, routeId, signal) {
       input.lifetime.throwIfAborted();
       signal.throwIfAborted();
+      if (routeId === webSearchRoute) {
+        const search = webSearches.get(context);
+        webSearches.delete(context);
+        if (
+          !search ||
+          search.signal !== signal ||
+          !sameVmBinding(search.binding, binding)
+        )
+          throw denied();
+        await search.assertCurrent(signal);
+        signal.throwIfAborted();
+        return;
+      }
       const request = resolved.get(context);
       if (!request || request.route !== routeId || request.signal !== signal)
         throw denied();
@@ -154,6 +177,23 @@ export function createProductionEgressAuthority(input: {
 
   return Object.freeze({
     authority: Object.freeze(authority),
+    bindWebSearch(
+      context: RequestContext,
+      binding: PersonVmBinding,
+      signal: AbortSignal,
+      assertCurrent: (signal: AbortSignal) => Promise<void>,
+    ) {
+      input.lifetime.throwIfAborted();
+      signal.throwIfAborted();
+      if (
+        webSearches.has(context) ||
+        context.actor.type !== 'user' ||
+        context.actor.id !== binding.personId ||
+        context.organizationId !== binding.organizationId
+      )
+        throw denied();
+      webSearches.set(context, { binding, signal, assertCurrent });
+    },
     /** Register the private clone owned by ManagedHostService.resolve. Gateway
      * passes its exact context and service signal to allow before dispatch.
      * The weak association carries no permit and is consumed before I/O. */

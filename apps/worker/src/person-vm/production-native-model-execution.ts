@@ -36,6 +36,12 @@ import {
 } from '../native-web/prompt-observation.js';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { ProductionNativeModelExecution } from './production-sources.js';
+import {
+  createHostSearch,
+  readGuestSearch,
+  webSearchPath,
+  webSearchRoute,
+} from './production-web-search.js';
 import { reconcileNativeRunTerminals } from './production-native-run-reconciliation.js';
 
 type NativeModelSelection = Readonly<{
@@ -791,10 +797,9 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         void task.then(settle, settle);
         return task;
       }
-      async function resolveSession(
+      async function resolveLiveSession(
         scope: NativeModelSelection,
         sessionId: string,
-        kind: NativeModelAttemptKind,
         signal: AbortSignal,
       ) {
         const active = AbortSignal.any([signal, scope.revoked]);
@@ -829,9 +834,22 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         });
         if (!('nativeAddress' in resource) || !resource.nativeAddress)
           return reject();
+        return { resource, profile, active, address: resource.nativeAddress };
+      }
+      async function resolveSession(
+        scope: NativeModelSelection,
+        sessionId: string,
+        kind: NativeModelAttemptKind,
+        signal: AbortSignal,
+      ) {
+        const { resource, profile, active, address } = await resolveLiveSession(
+          scope,
+          sessionId,
+          signal,
+        );
         const attempt = await profile.owner.readNativeAttemptFor(
-          context,
-          resource.nativeAddress,
+          scope.context,
+          address,
           active,
           kind,
         );
@@ -933,6 +951,103 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
       }
       async function assertCall(call: ModelCallBinding, signal: AbortSignal) {
         await readAuthorizedCall(call, signal);
+      }
+
+      const webSearch = input.webSearch;
+      function searchService(): ManagedHostService[] {
+        if (!webSearch) return [];
+        const { provider, bind } = webSearch;
+        const dispatchSearch = createHostSearch({
+          provider,
+          vm: host.vm,
+          admission: host.admission,
+          requestsPerPersonPerMinute: 10,
+        });
+        return [
+          {
+            id: webSearchRoute,
+            path: webSearchPath,
+            method: 'POST',
+            admissionOwner: 'service',
+            async resolve(request, binding, signal) {
+              return run(signal, async (active) => {
+                const reading = AbortSignal.any([
+                  active,
+                  AbortSignal.timeout(5_000),
+                ]);
+                const wanted = await readGuestSearch(request, reading);
+                const checked = new Set<string>();
+                for (const { scope: probe, observation } of selected.values()) {
+                  if (
+                    probe.adapterId !== wanted.adapterId ||
+                    probe.revoked.aborted ||
+                    !observation.inserted() ||
+                    !sameVmBinding(probe.binding, binding) ||
+                    checked.has(probe.authorityKey) ||
+                    (wanted.sessionId === probe.root && endedPrompts.has(probe))
+                  )
+                    continue;
+                  checked.add(probe.authorityKey);
+                  const fact = await resolveLiveSession(
+                    probe,
+                    wanted.sessionId,
+                    active,
+                  ).catch((error: unknown) => {
+                    if (
+                      probe.revoked.aborted ||
+                      (error instanceof DataAccessError &&
+                        (error.code === 'not_found' ||
+                          error.code === 'authorization_denied'))
+                    )
+                      return null;
+                    throw error;
+                  });
+                  if (
+                    !fact ||
+                    fact.profile.owner.modelAdapterId !== wanted.adapterId ||
+                    fact.resource.rootNativeSessionId !== probe.root
+                  )
+                    continue;
+                  const context = structuredClone(probe.context);
+                  const revoked = AbortSignal.any([
+                    live,
+                    fact.profile.revoked,
+                    probe.revoked,
+                  ]);
+                  async function assertCurrent(caller: AbortSignal) {
+                    const current = AbortSignal.any([caller, revoked]);
+                    current.throwIfAborted();
+                    await probe.assertClaimed(current);
+                    await probe.assertObserved(current);
+                    if (
+                      wanted.sessionId === probe.root &&
+                      endedPrompts.has(probe)
+                    )
+                      throw new EgressError('DENIED');
+                    current.throwIfAborted();
+                  }
+                  bind(context, binding, signal, assertCurrent);
+                  return {
+                    context,
+                    dispatch: (response, caller) =>
+                      dispatchSearch(
+                        {
+                          context,
+                          binding,
+                          signal: revoked,
+                          assertCurrent,
+                        },
+                        wanted,
+                        response,
+                        caller,
+                      ),
+                  };
+                }
+                throw new EgressError('DENIED');
+              });
+            },
+          },
+        ];
       }
 
       const paths = [
@@ -1267,7 +1382,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             return image;
           });
         },
-        references,
+        references: [...references, ...searchService()],
         redeem(call, signal) {
           const entry = calls.get(call.native.callId);
           if (
