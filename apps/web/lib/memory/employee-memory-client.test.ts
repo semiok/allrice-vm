@@ -207,11 +207,17 @@ describe('native memory across chat navigation', () => {
     const oldPane = vi.fn();
     before.subscribe(oldPane);
     const source = {};
-    const sent = Promise.withResolvers<void>();
-    const response = Promise.withResolvers<Response>();
+    let sent!: () => void;
+    let respond!: (response: Response) => void;
+    const dispatched = new Promise<void>((resolve) => {
+      sent = resolve;
+    });
+    const receipt = new Promise<Response>((resolve) => {
+      respond = resolve;
+    });
     const fetcher = vi.fn(() => {
-      sent.resolve();
-      return response.promise;
+      sent();
+      return receipt;
     });
     vi.stubGlobal('fetch', fetcher);
 
@@ -220,14 +226,14 @@ describe('native memory across chat navigation', () => {
       () => {},
       source,
     );
-    await sent.promise;
+    await dispatched;
     retire();
     bind(host, 'second-chat', employee);
     const after = readEmployeeMemoryPageWrites(host, 'second-chat', employee)!;
     const newPane = vi.fn();
     const unsubscribe = after.subscribe(newPane);
     expect(newPane).not.toHaveBeenCalled();
-    response.resolve(ack());
+    respond(ack());
     await write;
     expect(newPane).toHaveBeenCalledExactlyOnceWith(source);
     expect(oldPane).not.toHaveBeenCalled();
