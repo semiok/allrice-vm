@@ -126,6 +126,7 @@ it
     let documentLoads = 0;
     let directoryReads = 0;
     let registered = false;
+    const createReplies: unknown[] = [];
     if (nativeCreate) {
       f.registerRoot.mockImplementation(async (_context, identity, receipt) => {
         expect(receipt.nativeSessionId).toBe(createdNativeId);
@@ -263,6 +264,12 @@ it
           const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
           unary.push(input.endpoint);
           const result = await f.invoke(input.scopeId, sessionToken, input);
+          if (nativeCreate && input.endpoint === 'session/create')
+            createReplies.push({
+              status: result.status,
+              ...(await result.clone().json()),
+              thread: result.headers.get(dEntryRegisteredThreadHeader),
+            });
           if (startupMethods.has(input.endpoint))
             startupReplies.set(
               input.endpoint,
@@ -500,10 +507,34 @@ it
       await expect
         .poll(() => unary.includes('session/create'), { timeout: 15_000 })
         .toBe(true);
-      await page.waitForURL(
-        (url) => url.searchParams.get('threadId') === createdThread,
-        { timeout: 20_000 },
-      );
+      try {
+        await page.waitForURL(
+          (url) => url.searchParams.get('threadId') === createdThread,
+          { timeout: 20_000 },
+        );
+      } catch (error) {
+        throw new Error(
+          JSON.stringify({
+            registered,
+            createReplies,
+            directoryReads,
+            unary,
+            errors,
+            nativeSessions: await workbench
+              .locator('[data-row-key^="session:"]')
+              .evaluateAll((nodes) =>
+                nodes.map((node) => node.getAttribute('data-row-key')),
+              ),
+            text: (
+              await workbench
+                .locator('body')
+                .innerText({ timeout: 1_000 })
+                .catch(() => '')
+            ).slice(0, 450),
+          }),
+          { cause: error },
+        );
+      }
       const row = workbench.locator(
         '[data-row-key="session:' + createdThread + '"]',
       );
