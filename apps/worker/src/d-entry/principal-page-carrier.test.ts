@@ -1349,7 +1349,9 @@ it('uses actual DSH replies for create and fork registration on a page without a
     f.binding.vmId,
     'other',
   );
-  expect(f.findRoot).toHaveBeenCalledTimes(3);
+  expect(
+    f.findRoot.mock.calls.filter((call) => call[3] === 'other'),
+  ).toHaveLength(3);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
@@ -1386,91 +1388,128 @@ it('joins a fork from a registered ancestor but withholds registration after aut
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
 });
 
-it('retains the native terminal through a page reconnect and joins owner cleanup after logout', async () => {
-  const f = await fixture();
-  const { host } = f.host;
-  const web = createRequire(
-    new URL('../../../web/package.json', import.meta.url),
-  );
-  const { TYPERT } = await import(
-    pathToFileURL(
-      web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
-    ).href
-  );
-  host.typert.register(TYPERT);
-  const terminal = {
-    id: 'retained-pty',
-    title: 'Shell',
-    cwd: '/work',
-    shell: { path: '/bin/sh', name: 'sh', args: [] },
-    cols: 80,
-    rows: 24,
-    state: 'running',
-    exitCode: null,
-  };
-  const closing = deferred();
-  const closed = deferred();
-  closes.push(async () => closed.resolve());
-  const invoke = host.typertGateway.invoke.bind(host.typertGateway);
-  const native = vi
-    .spyOn(host.typertGateway, 'invoke')
-    .mockImplementation(async (call) => {
-      if (call.namespace !== 'terminal') return invoke(call);
-      if (call.method === 'create') return terminal;
-      if (call.method !== 'close') throw Error('Unexpected terminal RPC');
-      expect(call.peer.principal.kind).toBe('owner');
-      expect(call.peer.signal.aborted).toBe(false);
-      expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
-      closing.resolve();
-      await closed.promise;
+it.each(['login', 'vm binding'] as const)(
+  'retains the native terminal through a page reconnect and joins owner cleanup after loss of %s',
+  async (loss) => {
+    const f = await fixture();
+    const revokedBinding = new AbortController();
+    const watch = f.watchTerminal.getMockImplementation()!;
+    f.watchTerminal.mockImplementationOnce(async (...args) => {
+      const subscription = await watch(...args);
+      return {
+        ...subscription,
+        revoked: AbortSignal.any([subscription.revoked, revokedBinding.signal]),
+      };
     });
-  const create = (page: Awaited<ReturnType<typeof open>>) =>
-    f.invoke(page.scopeId, sessionToken, {
-      endpoint: 'terminal/create',
-      payload: {
-        args: {
-          agentId: 'root',
-          request: { id: terminal.id, cols: 80, rows: 24 },
+    const { host } = f.host;
+    const web = createRequire(
+      new URL('../../../web/package.json', import.meta.url),
+    );
+    const { TYPERT } = await import(
+      pathToFileURL(
+        web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+      ).href
+    );
+    host.typert.register(TYPERT);
+    const terminal = {
+      id: 'retained-pty',
+      title: 'Shell',
+      cwd: '/work',
+      shell: { path: '/bin/sh', name: 'sh', args: [] },
+      cols: 80,
+      rows: 24,
+      state: 'running',
+      exitCode: null,
+    };
+    const closing = deferred();
+    const closed = deferred();
+    let closeAttempts = 0;
+    closes.push(async () => closed.resolve());
+    const invoke = host.typertGateway.invoke.bind(host.typertGateway);
+    const native = vi
+      .spyOn(host.typertGateway, 'invoke')
+      .mockImplementation(async (call) => {
+        if (call.namespace !== 'terminal') return invoke(call);
+        if (call.method === 'create') {
+          const request = z.object({ id: z.string() }).parse(call.args.request);
+          if (request.id !== terminal.id)
+            throw new RemoteError('terminal/limit-reached', 'Native limit', {
+              limit: 1,
+            });
+          return terminal;
+        }
+        if (call.method === 'list') return [terminal];
+        if (call.method !== 'close') throw Error('Unexpected terminal RPC');
+        expect(call.peer.principal.kind).toBe('owner');
+        expect(call.peer.signal.aborted).toBe(false);
+        expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
+        if (++closeAttempts === 1)
+          throw Error('First native termination failed');
+        closing.resolve();
+        await closed.promise;
+      });
+    const create = (page: Awaited<ReturnType<typeof open>>, id = terminal.id) =>
+      f.invoke(page.scopeId, sessionToken, {
+        endpoint: 'terminal/create',
+        payload: {
+          args: {
+            agentId: 'root',
+            request: { id, cols: 80, rows: 24 },
+          },
         },
-      },
+      });
+    const first = await open(f);
+    expect(await (await create(first)).json()).toMatchObject({
+      result: { ok: true },
     });
-  const first = await open(f);
-  expect(await (await create(first)).json()).toMatchObject({
-    result: { ok: true },
-  });
-  closePage(first.peer);
-  expect(await first.receive()).toMatchObject({ value: { type: 'closed' } });
-  const next = await open(f);
-  expect(await (await create(next)).json()).toMatchObject({
-    result: { ok: true },
-  });
-  expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.
-  closePage(next.peer);
-  expect(await next.receive()).toMatchObject({ value: { type: 'closed' } });
-  expect(native.mock.calls.some(([call]) => call.method === 'close')).toBe(
-    false,
-  );
+    closePage(first.peer);
+    expect(await first.receive()).toMatchObject({ value: { type: 'closed' } });
+    const next = await open(f);
+    expect(await (await create(next)).json()).toMatchObject({
+      result: { ok: true },
+    });
+    expect(await (await create(next, 'unallocated-pty')).json()).toMatchObject({
+      result: { ok: false, error: { code: 'terminal/limit-reached' } },
+    });
+    expect(f.watchTerminal).toHaveBeenCalledTimes(1);
+    expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.
+    closePage(next.peer);
+    expect(await next.receive()).toMatchObject({ value: { type: 'closed' } });
+    expect(native.mock.calls.some(([call]) => call.method === 'close')).toBe(
+      false,
+    );
 
-  f.identityRevoked.abort(new DataAccessError('authentication_required'));
-  await closing.promise;
-  const observed = f.closeControl();
-  let joined = false;
-  void observed.then(
-    () => {
-      joined = true;
-    },
-    () => {
-      joined = true;
-    },
-  );
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  expect(joined).toBe(false);
-  closed.resolve();
-  await observed;
-  expect(
-    native.mock.calls.filter(([call]) => call.method === 'close'),
-  ).toHaveLength(1);
-});
+    if (loss === 'login') {
+      f.identityRevoked.abort(new DataAccessError('authentication_required'));
+    } else {
+      const checks = f.watchTerminal.mock.calls[0]![4];
+      const stale = new DataAccessError('authorization_denied');
+      vi.mocked(f.owner.assertCurrent).mockRejectedValueOnce(stale);
+      await expect(checks.verifyBinding(revokedBinding.signal)).rejects.toBe(
+        stale,
+      );
+      revokedBinding.abort(stale);
+    }
+    await closing.promise;
+    const observed = f.closeControl();
+    let joined = false;
+    void observed.then(
+      () => {
+        joined = true;
+      },
+      () => {
+        joined = true;
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(joined).toBe(false);
+    closed.resolve();
+    await observed;
+    expect(
+      native.mock.calls.filter(([call]) => call.method === 'close'),
+    ).toHaveLength(2);
+  },
+);
 
 it('withholds a successful native create reply after the page loses its VM authority', async () => {
   const f = await fixture(undefined, false, true);

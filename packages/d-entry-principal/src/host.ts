@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { pageDownlink, pageUplink, pumpPageInput } from './page-uplink.js';
 import type { Context } from '@deepseek-ai/cordis';
 import {
@@ -69,6 +70,11 @@ const terminalCreate = z.object({
 const terminalRef = z.object({ agentId: z.string().min(1), id: terminalId });
 const terminalList = z.array(z.object({ id: z.string() }));
 type TerminalRef = z.infer<typeof terminalRef>;
+type TerminalReservation = {
+  ref: TerminalRef;
+  pending: number;
+  possiblyAllocated: boolean;
+};
 const terminalKey = ({ agentId, id }: TerminalRef) =>
   JSON.stringify([agentId, id]);
 const eventRoles = pageEventRoles(API_REMOTE_FORWARDED_EVENTS);
@@ -207,7 +213,7 @@ class Scope implements Projection {
   readonly abort = new AbortController();
   readonly jobs = new Set<Promise<unknown>>();
   readonly children = new Set<{ close(): Promise<void> }>();
-  readonly terminals = new Map<string, TerminalRef>();
+  readonly terminals = new Map<string, TerminalReservation>();
   readonly ready: Promise<void>;
   private closing?: Promise<void>;
   private detach = () => {};
@@ -405,7 +411,7 @@ class Scope implements Projection {
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.closing = Promise.resolve().then(async () => {
+    const attempt = (this.closing = Promise.resolve().then(async () => {
       await Promise.allSettled([this.ready]);
       const children = await Promise.allSettled(
         [...this.children].map((child) => child.close()),
@@ -424,6 +430,12 @@ class Scope implements Projection {
       // The registration waits this very close; withdrawing it must not await
       // itself. It owns no additional I/O beyond the resources joined above.
       void this.unregister?.().catch(() => {});
+    }));
+    void attempt.catch(() => {
+      if (!this.terminals.size) return;
+      // Keep failed PTY cleanup owned and retryable, without reopening the scope.
+      if (this.closing === attempt) this.closing = undefined;
+      this.host.retryTerminalCleanup(this);
     });
     this.active = false;
     this.bindings = [];
@@ -431,7 +443,7 @@ class Scope implements Projection {
     this.eventSessions.clear();
     this.abort.abort(closed());
     this.ctx.remoteAccess.invalidate();
-    return this.closing;
+    return attempt;
   }
 }
 
@@ -447,6 +459,10 @@ class PrincipalService extends TypertRemoteService {
   ];
   readonly scopes = new Map<string, Scope>();
   private readonly terminalOwners = new Map<string, Scope>();
+  private readonly terminalRetries = new Map<
+    Scope,
+    ReturnType<typeof setTimeout>
+  >();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: {
@@ -468,6 +484,8 @@ class PrincipalService extends TypertRemoteService {
     );
     hostContext.effect(() => async () => {
       this.stopped = true;
+      for (const timer of this.terminalRetries.values()) clearTimeout(timer);
+      this.terminalRetries.clear();
       if (this.graphObserver) await this.graphObserver.close();
       else await this.graphRetirement;
     });
@@ -497,28 +515,17 @@ class PrincipalService extends TypertRemoteService {
     });
     try {
       const results = await Promise.allSettled(
-        [...scope.terminals.values()].map(async (ref) => {
-          try {
-            await this.ctx.typertGateway.invoke({
-              namespace: 'terminal',
-              method: 'close',
-              args: ref,
-              peer,
-            });
-          } catch (error) {
-            // The native Agent may already be gone. Only its controller's
-            // inventory can confirm absence after the dispatched jobs joined.
-            const remaining = terminalList.parse(
-              await this.ctx.typertGateway.invoke({
-                namespace: 'terminal',
-                method: 'list',
-                args: { sessionId: ref.agentId },
-                peer,
-              }),
-            );
-            if (remaining.some(({ id }) => id === ref.id)) throw error;
+        [...scope.terminals.values()].map(async ({ ref }) => {
+          // rc.2 keeps the ID closed after a failed provider termination.
+          // Retry promptly to return a real ACK without waiting for its idle timer.
+          for (const wait of [0, 100, 250]) {
+            if (wait) await delay(wait, undefined, { ref: false });
+            if (await this.confirmTerminalClosed(ref, peer)) {
+              this.forgetTerminal(ref);
+              return;
+            }
           }
-          this.forgetTerminal(ref);
+          throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
         }),
       );
       if (results.some((result) => result.status === 'rejected'))
@@ -526,6 +533,47 @@ class PrincipalService extends TypertRemoteService {
     } finally {
       await peer.dispose();
     }
+  }
+  private async confirmTerminalClosed(ref: TerminalRef, peer: PeerScope) {
+    try {
+      await this.ctx.typertGateway.invoke({
+        namespace: 'terminal',
+        method: 'close',
+        args: ref,
+        peer,
+      });
+      return true;
+    } catch {
+      // The native Agent may already have exited. Confirm against the
+      // controller's inventory after all dispatched creation jobs have joined.
+      try {
+        const remaining = terminalList.parse(
+          await this.ctx.typertGateway.invoke({
+            namespace: 'terminal',
+            method: 'list',
+            args: { sessionId: ref.agentId },
+            peer,
+          }),
+        );
+        return remaining.every(({ id }) => id !== ref.id);
+      } catch {
+        return false;
+      }
+    }
+  }
+  retryTerminalCleanup(scope: Scope) {
+    if (this.stopped || this.terminalRetries.has(scope)) return;
+    const timer = setTimeout(() => {
+      this.terminalRetries.delete(scope);
+      if (this.stopped || !scope.terminals.size) return;
+      void scope.close().then(
+        () =>
+          this.hostContext.logger.info('D_ENTRY_TERMINAL_CLEANUP_CONFIRMED'),
+        () => {},
+      ); // Scope retains and reschedules any remaining unconfirmed terminal.
+    }, 5000);
+    timer.unref();
+    this.terminalRetries.set(scope, timer);
   }
   private forgetTerminal(ref: TerminalRef) {
     const key = terminalKey(ref);
@@ -997,6 +1045,7 @@ class PrincipalService extends TypertRemoteService {
           endpoint === 'subagents/prompt';
         if (endpoint === 'session/attachment')
           throw Error('PRINCIPAL_RESOURCE_DENIED');
+        let terminal: TerminalReservation | undefined;
         if (endpoint === 'terminal/create') {
           const { agentId, request } = terminalCreate.parse(args);
           const ref = { agentId, id: request.id };
@@ -1005,16 +1054,43 @@ class PrincipalService extends TypertRemoteService {
           if (existing && existing !== scope)
             throw Error('PRINCIPAL_RESOURCE_DENIED');
           // Reserve before native dispatch, even if its reply is later lost.
-          scope.terminals.set(key, ref);
+          terminal = scope.terminals.get(key) ?? {
+            ref,
+            pending: 0,
+            possiblyAllocated: false,
+          };
+          terminal.pending++;
+          scope.terminals.set(key, terminal);
           this.terminalOwners.set(key, scope);
         }
-        const value = await this.ctx.typertGateway.invoke({
-          namespace: descriptor.namespace,
-          method: descriptor.method,
-          args,
-          peer: modelInput ? scope.currentPeer() : scope.parent,
-          signal: active,
-        });
+        let value: unknown;
+        try {
+          value = await this.ctx.typertGateway.invoke({
+            namespace: descriptor.namespace,
+            method: descriptor.method,
+            args,
+            peer: modelInput ? scope.currentPeer() : scope.parent,
+            signal: active,
+          });
+          if (terminal) terminal.possiblyAllocated = true;
+        } catch (error) {
+          // These rc.2 failures occur before any allocation. A success or
+          // ambiguous failure from a concurrent create still keeps ownership.
+          const code = remoteErrorOf(error)?.code;
+          if (
+            terminal &&
+            code !== 'terminal/limit-reached' &&
+            code !== 'gateway/arguments-invalid'
+          )
+            terminal.possiblyAllocated = true;
+          throw error;
+        } finally {
+          if (terminal) {
+            terminal.pending--;
+            if (!terminal.pending && !terminal.possiblyAllocated)
+              this.forgetTerminal(terminal.ref);
+          }
+        }
         if (endpoint === 'terminal/close')
           this.forgetTerminal(terminalRef.parse(args));
         active.throwIfAborted();

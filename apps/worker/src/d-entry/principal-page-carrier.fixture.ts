@@ -215,6 +215,12 @@ export async function fixture(
   });
   const registerRoot = vi.fn<typeof registerDEntryPageNativeRoot>();
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
+  const watchTerminal = vi.fn<
+    NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
+  >(async (context, selection, identity, active, checks) => {
+    await checks.verifyRoster(active);
+    return f.deps.watch(context, selection, identity, active);
+  });
   const pages = createDEntryPageRequests({
     ...f.deps,
     ...(newRoot && { data: () => ({ ...f.data, prepareEditorRoot }) }),
@@ -226,6 +232,7 @@ export async function fixture(
     historyIdentity,
     registerRoot,
     findRoot,
+    watchTerminal,
     historyRoot: (...args) =>
       pinned ? selectedRoot(...args) : Promise.resolve(null),
   });
@@ -442,6 +449,7 @@ export async function fixture(
     prepareEditorRoot,
     registerRoot,
     findRoot,
+    watchTerminal,
     host,
     connect,
     invoke,

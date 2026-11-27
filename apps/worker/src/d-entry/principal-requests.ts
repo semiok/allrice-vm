@@ -12,6 +12,7 @@ import {
   registerDEntryPageNativeRoot,
   resolveDEntryIdentity,
   runDEntryAdmittedActivity,
+  watchDEntryNativeRosterAuthority,
   type DEntryHistoryRootPin,
   type DEntryPageForkSource,
 } from '@allrice/database';
@@ -37,6 +38,9 @@ type Selection = { organizationId: string; selection: DEntrySelectionInput };
 export type DEntryPageDependencies = DEntryHttpDependencies & {
   historyIdentity: typeof resolveDEntryIdentity;
   historyRoot: typeof getDEntryHistoryRootPin;
+  watchTerminal?(
+    ...args: Parameters<typeof watchDEntryNativeRosterAuthority>
+  ): ReturnType<DEntryHttpDependencies['watch']>;
 } & Partial<typeof pageRootStore>;
 const pageRootStore = {
   findRoot: getDEntryPageNativeRoot,
@@ -168,7 +172,22 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           )
         )
           throw denied();
-        authority = await deps.watch(
+        const verifyOwner = async (signal: AbortSignal) => {
+          await current.owner.assertCurrent(context, signal);
+          if (
+            current.owner.bindingRef !== current.view.bindingRef ||
+            !sameDEntryVmBinding(
+              current.owner.receipt.binding,
+              current.view.receipt.binding,
+            ) ||
+            current.owner.receipt.rosterDigest !==
+              current.view.receipt.rosterDigest
+          )
+            throw denied();
+        };
+        authority = await (
+          deps.watchTerminal ?? watchDEntryNativeRosterAuthority
+        )(
           context,
           {
             workspaceId: identity.workspaceId,
@@ -176,6 +195,7 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           },
           identity,
           current.signal,
+          { verifyBinding: verifyOwner, verifyRoster: verifyOwner },
         );
         const active = authority.revoked;
         active.throwIfAborted();
