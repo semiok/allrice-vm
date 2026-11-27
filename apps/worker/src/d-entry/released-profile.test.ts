@@ -1062,7 +1062,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
 
     const transientOwner = {};
     const canceled = new AbortController();
-    const firstStarted = Promise.withResolvers<void>();
+    const firstStarted = deferred();
     const first = holdReleasedProfile(
       directory,
       {
@@ -1086,7 +1086,7 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
       'AbortError',
     );
     await firstStarted.promise;
-    const independentGraph = Promise.withResolvers<void>();
+    const independentGraph = deferred();
     const independent = holdReleasedProfile(
       directory,
       {

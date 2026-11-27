@@ -187,18 +187,17 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       }
       let root = existing;
       if (!root) {
-        if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
-        const prepare = data.prepareEditorRoot;
-        root = await timing.run('native-root', () =>
-          prepare.call(data, {
+        root = await timing.run('native-root', () => {
+          if (!data.prepareEditorRoot) throw new DEntryNativeUnavailable();
+          return data.prepareEditorRoot({
             ...auth,
             owner: current.owner,
             async assertCurrent(caller) {
               await assertHost(caller);
             },
             signal: current.signal,
-          }),
-        );
+          });
+        });
       }
       const pin = root;
       if (
