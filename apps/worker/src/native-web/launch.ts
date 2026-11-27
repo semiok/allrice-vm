@@ -271,21 +271,8 @@ export function apply(ctx, config) {
                   config: {
                     provider: modelAdapter.provider,
                     model: modelAdapter.model,
-                    reasoningEffort:
-                      modelAdapter.modelInfo.reasoning?.defaultEffort,
                   },
                 },
-                ...(modelAdapter.historicalModels?.length
-                  ? [
-                      {
-                        id: 'compaction-basic',
-                        config: {
-                          summarizationProvider: modelAdapter.provider,
-                          summarizationModel: modelAdapter.model,
-                        },
-                      },
-                    ]
-                  : []),
               ]
             : []),
         ]),

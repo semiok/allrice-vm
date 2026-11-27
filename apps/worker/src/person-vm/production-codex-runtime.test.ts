@@ -123,6 +123,10 @@ it('pins the platform selection to the current Host and reads newer settings for
           id: 'gpt-6.1-sol',
           inputModalities: ['text', 'image'],
         }),
+        expect.objectContaining({
+          id: 'gpt-5.6-sol',
+          inputModalities: ['text', 'image'],
+        }),
       ]),
     });
     const current = await state.settings.mock.results[0]!.value;

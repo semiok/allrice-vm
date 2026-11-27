@@ -682,7 +682,7 @@ it.skipIf(!cli)(
       cleanup,
       undefined,
       undefined,
-      route('gpt-6.1-sol', 'low'),
+      route('gpt-5.6-sol', 'low'),
     );
     const signal = AbortSignal.timeout(20_000);
     const root = await f.owner.createRootFor(f.context, {}, signal);
@@ -736,7 +736,7 @@ it.skipIf(!cli)(
     await f.owner.close();
     const next = await f.restartRetained({
       ...route('gpt-6.2-sol', 'high'),
-      historicalModels: [route('gpt-6.1-sol', 'low').modelInfo],
+      historicalModels: [route('gpt-5.6-sol', 'low').modelInfo],
     });
     await prompt(next.owner, 2);
     expect(assistantInputs[1]!.messages).toEqual(
@@ -771,7 +771,7 @@ it.skipIf(!cli)(
     });
     await prompt(next.owner, 3);
     expect(assistantModels).toEqual([
-      'gpt-6.1-sol',
+      'gpt-5.6-sol',
       'gpt-6.2-sol',
       'gpt-6.2-sol',
     ]);

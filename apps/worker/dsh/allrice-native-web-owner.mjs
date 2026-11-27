@@ -1167,9 +1167,8 @@ export function applyNativeWebOwner(
               },
             },
           });
-          const reasoningEffort = modelInfo.reasoning?.defaultEffort;
           const listeners = [];
-          if (reasoningEffort !== undefined) {
+          if (modelInfo.reasoning?.defaultEffort !== undefined) {
             // A retained session can propose its previous route. Use the
             // current Host route for new requests, preserving explicit effort
             // choices on that route and leaving the journal intact.
@@ -1195,7 +1194,9 @@ export function applyNativeWebOwner(
                   signal.throwIfAborted();
                   if (config.provider === provider && config.model === model)
                     return config;
-                  return { ...config, provider, model, reasoningEffort };
+                  const { reasoningEffort: _previousEffort, ...current } =
+                    config;
+                  return { ...current, provider, model };
                 },
                 outer,
               ),

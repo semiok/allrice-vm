@@ -4,7 +4,7 @@ import LocalCredentials from '@deepseek-ai/dsh-credentials-local';
 import Llm, { type LlmRuntime } from '@deepseek-ai/dsh-llm';
 import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai';
 import {
-  PLATFORM_WORK_MODELS,
+  PlatformModelConfigurationSchema,
   type PlatformModelConfiguration,
 } from '@allrice/contracts';
 import { getDatabase, readPlatformModelSettings } from '@allrice/database';
@@ -98,7 +98,10 @@ async function openCodexGeneration(
   images: ReturnType<typeof createProductionModelImages> | undefined,
 ) {
   lifetime.throwIfAborted();
-  const historicalIds = PLATFORM_WORK_MODELS.filter((id) => id !== model);
+  const historicalIds =
+    PlatformModelConfigurationSchema.shape.workModel.options.filter(
+      (id) => id !== model,
+    );
   const stopped = new AbortController();
   const revoked = AbortSignal.any([lifetime, stopped.signal]);
   const host = new Context();
