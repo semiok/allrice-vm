@@ -1433,9 +1433,11 @@ it.each(['login', 'vm binding'] as const)(
         if (call.method === 'create') {
           const request = z.object({ id: z.string() }).parse(call.args.request);
           if (request.id !== terminal.id)
-            throw new RemoteError('terminal/limit-reached', 'Native limit', {
-              limit: 1,
-            });
+            throw new RemoteError(
+              'gateway/arguments-invalid',
+              'Native validation rejected an unallocated terminal',
+              { endpoint: 'terminal/create' },
+            );
           return terminal;
         }
         if (call.method === 'list') return [terminal];
@@ -1469,7 +1471,7 @@ it.each(['login', 'vm binding'] as const)(
       result: { ok: true },
     });
     expect(await (await create(next, 'unallocated-pty')).json()).toMatchObject({
-      result: { ok: false, error: { code: 'terminal/limit-reached' } },
+      result: { ok: false, error: { code: 'gateway/arguments-invalid' } },
     });
     expect(f.watchTerminal).toHaveBeenCalledTimes(1);
     expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.

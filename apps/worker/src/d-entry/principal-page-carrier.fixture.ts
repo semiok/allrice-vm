@@ -218,9 +218,9 @@ export async function fixture(
   const findRoot = vi.fn<typeof getDEntryPageNativeRoot>();
   const watchTerminal = vi.fn<
     NonNullable<Parameters<typeof createDEntryPageRequests>[0]['watchTerminal']>
-  >(async (context, selection, identity, active, checks) => {
-    await checks.verifyRoster(active);
-    return f.deps.watch(context, selection, identity, active);
+  >(async (...args) => {
+    await args[4].verifyRoster(args[3]);
+    return f.deps.watch();
   });
   const pages = createDEntryPageRequests({
     ...f.deps,
