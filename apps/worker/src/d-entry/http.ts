@@ -267,14 +267,14 @@ export function createDEntryHttpHandler(
           context,
           identity,
           signal,
-          (plan, ready) => {
+          (plan, mode) => {
             if (!deps.prewarm.isCurrent) throw new DEntryNativeUnavailable();
             return deps.prewarm.isCurrent(
               context,
               identity,
               plan,
               signal,
-              ready ? 'ready' : 'operation',
+              mode,
             );
           },
         );

@@ -12,7 +12,9 @@ import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmVerificationMode =
-  'authority' | 'operation' | 'ready' | 'reuse';
+  'authority' | 'operation' | 'ready' | 'failed' | 'reuse';
+type PrewarmReadMode = Exclude<PrewarmVerificationMode, 'authority' | 'reuse'>;
+export type PrewarmReservation = { vmId?: string };
 export type PrewarmPlan = {
   key: string;
   target: PrewarmGeneration;
@@ -20,6 +22,7 @@ export type PrewarmPlan = {
   /** In-process observations only. The HTTP response carries just the ticket. */
   orphanedInstanceId?: string;
   observeTerminalFailure?: true;
+  reservation?: PrewarmReservation;
   reuse?: PrewarmPlan;
   assertTicketThread?(signal: AbortSignal): Promise<void>;
 };
@@ -34,6 +37,26 @@ export function compatiblePrewarmGeneration(
     (!a.vmId || !b.vmId || a.vmId === b.vmId) &&
     (!a.instanceId || !b.instanceId || a.instanceId === b.instanceId)
   );
+}
+
+export function canSharePrewarmTarget(
+  existing: Pick<PrewarmPlan, 'target' | 'reservation'>,
+  requested: PrewarmGeneration,
+) {
+  const target = existing.target;
+  const vmId = target.vmId ?? existing.reservation?.vmId ?? null;
+  return (
+    (!requested.restoreRetained || target.restoreRetained === true) &&
+    (target.replacesVmId === requested.replacesVmId ||
+      (!requested.replacesVmId && vmId !== null && vmId === requested.vmId)) &&
+    compatiblePrewarmGeneration({ ...target, vmId }, requested)
+  );
+}
+
+function readMode(status: DEntryNativePrewarmStatus): PrewarmReadMode {
+  if (status.state === 'ready') return 'ready';
+  if (status.state === 'failed') return 'failed';
+  return 'operation';
 }
 
 /** Trusted composition only. This port grants no catalog or execution access. */
@@ -166,7 +189,7 @@ export function createPrewarmOperations(
           entry.state.state === 'failed' &&
           entry.state.code === 'START_UNAVAILABLE'
         )
-          return 'operation';
+          return 'failed';
       };
       return {
         ...accepted(entry, false),
@@ -238,8 +261,7 @@ export function createPrewarmOperations(
           entry.plan.key === plan.key &&
           (!plan.orphanedInstanceId ||
             entry.plan.orphanedInstanceId === plan.orphanedInstanceId) &&
-          (!plan.target.restoreRetained || entry.plan.target.restoreRetained) &&
-          compatiblePrewarmGeneration(entry.plan.target, plan.target)
+          canSharePrewarmTarget(entry.plan, plan.target)
         ) {
           return accepted(entry, false);
         }
@@ -346,7 +368,7 @@ export function createPrewarmOperations(
       context: RequestContext,
       identity: DEntryIdentity,
       signal: AbortSignal,
-      verify: (plan: PrewarmPlan, ready: boolean) => Promise<boolean>,
+      verify: (plan: PrewarmPlan, mode: PrewarmReadMode) => Promise<boolean>,
     ): Promise<DEntryNativePrewarmStatus> {
       const entry = tickets.get(operationId);
       if (!entry || expired(entry)) return { state: 'expired' };
@@ -356,7 +378,7 @@ export function createPrewarmOperations(
       const ready = state.state === 'ready';
       const orphan = entry.plan.orphanedInstanceId !== undefined;
       if (
-        !(await verify(entry.plan, ready)) ||
+        !(await verify(entry.plan, readMode(state))) ||
         (orphan && entry.revoked.aborted) ||
         (ready && entry.proof?.aborted) ||
         expired(entry)
@@ -369,32 +391,40 @@ export function createPrewarmOperations(
           signal.throwIfAborted();
           // A normal failure joins and closes its observer. A concurrent poll
           // can have captured 'starting' immediately before that close.
+          const closing = entry.state;
           if (
             !orphan &&
             !entry.revoked.aborted &&
             entry.closeJoin &&
-            (entry.state.state === 'starting' ||
-              entry.state.state === 'failed') &&
+            (closing.state === 'starting' || closing.state === 'failed') &&
             !expired(entry)
-          )
-            return entry.state;
+          ) {
+            if (
+              (closing.state === 'failed' &&
+                !(await verify(entry.plan, 'failed'))) ||
+              expired(entry)
+            )
+              return { state: 'expired' };
+            return closing;
+          }
           if (!entry.revoked.aborted && !(error instanceof DataAccessError))
             throw new DEntryNativeUnavailable();
           return { state: 'expired' };
         }
       }
-      // A release can be replaced or lose its unlock proof while the thread
-      // guard joins. Verify that exact orphan again after the async guard.
+      // An orphan release or a newly failed reservation may have changed
+      // while the thread guard was joining.
+      const latest = entry.state;
+      const recheck =
+        orphan || (latest.state === 'failed' && state.state !== 'failed');
       if (
-        (orphan &&
-          (entry.revoked.aborted ||
-            !(await verify(entry.plan, entry.state.state === 'ready')))) ||
+        (recheck && !(await verify(entry.plan, readMode(latest)))) ||
         expired(entry) ||
         (orphan && entry.revoked.aborted) ||
         (ready && entry.proof?.aborted)
       )
         return { state: 'expired' };
-      return entry.state.state === 'failed' ? entry.state : state;
+      return latest.state === 'failed' ? latest : state;
     },
     async close() {
       await Promise.allSettled(pending);

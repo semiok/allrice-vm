@@ -24,11 +24,13 @@ import type {
 import { DEntryNativeUnavailable } from '../d-entry/native-owner.js';
 import { currentDEntryNativeDataPort } from '../d-entry/native-data.js';
 import {
+  canSharePrewarmTarget,
   compatiblePrewarmGeneration as compatible,
   installDEntryNativePrewarmPort,
   type DEntryNativePrewarmPort,
   type PrewarmGeneration as Generation,
   type PrewarmPlan,
+  type PrewarmReservation,
   type PrewarmVerificationMode,
 } from '../d-entry/native-prewarm.js';
 import { installAssignedDEntryNativeCatalog } from './native-catalog.js';
@@ -195,6 +197,7 @@ function exactPrewarmBinding(
 
 type Flight = {
   target: Generation;
+  reservation: PrewarmReservation | undefined;
   join(revoked: AbortSignal): void;
   work: Promise<{ result: PersonVmView; generation: Generation | undefined }>;
 };
@@ -271,6 +274,7 @@ export function createDEntryNativePrewarmPort(input: {
   function shared({
     key,
     target,
+    reservation,
     starting,
     revoked,
     start,
@@ -278,6 +282,7 @@ export function createDEntryNativePrewarmPort(input: {
   }: {
     key: string;
     target: Generation;
+    reservation: PrewarmReservation | undefined;
     starting: boolean;
     revoked: AbortSignal;
     start: (signal: AbortSignal) => Promise<PersonVmView>;
@@ -288,11 +293,7 @@ export function createDEntryNativePrewarmPort(input: {
   }) {
     const group = flights.get(key) ?? new Set<Flight>();
     for (const flight of group) {
-      if (
-        !compatible(flight.target, target) ||
-        (target.restoreRetained && !flight.target.restoreRetained)
-      )
-        continue;
+      if (!canSharePrewarmTarget(flight, target)) continue;
       // A later waiter may already know which physical start was published.
       flight.target = {
         ...flight.target,
@@ -320,6 +321,7 @@ export function createDEntryNativePrewarmPort(input: {
     });
     const flight: Flight = {
       target,
+      reservation,
       work,
       join(signal) {
         if (watchers.has(signal)) return;
@@ -416,6 +418,21 @@ export function createDEntryNativePrewarmPort(input: {
         matchesInstance(vm, takeover.instance) &&
         (!vm.leaseOwner || ownsLease),
       );
+    }
+    if (mode === 'failed' && plan.target.vmId === null) {
+      const reserved = plan.reservation?.vmId;
+      if (reserved) {
+        if (vm?.vmId !== reserved || vm.phase === 'deleted') return false;
+      } else if (plan.target.replacesVmId) {
+        return (
+          vm?.phase === 'deleted' &&
+          vm.diskRetained === false &&
+          vm.vmId === plan.target.replacesVmId &&
+          exact(plannedGeneration(vm))
+        );
+      } else {
+        return vm === null;
+      }
     }
     if (stamp.vm?.phase === 'deleted')
       return (
@@ -583,8 +600,7 @@ export function createDEntryNativePrewarmPort(input: {
           plan &&
           (!revision ||
             !target ||
-            !compatible(target, plan.target) ||
-            (target.restoreRetained && !plan.target.restoreRetained) ||
+            !canSharePrewarmTarget(plan, target) ||
             plan.key !== prewarmKey(context, identity, revision))
         )
           throw new DataAccessError('authorization_denied');
@@ -595,6 +611,9 @@ export function createDEntryNativePrewarmPort(input: {
             !matchesInstance(stamp.vm, takeover.predecessor))
         )
           throw new PersonVmError('LEASE_LOST');
+        const reservation: PrewarmReservation | undefined =
+          plan?.target.vmId === null ? {} : undefined;
+        if (plan && reservation) plan.reservation = reservation;
         const start = (signal: AbortSignal) =>
           input.prewarmCurrent(
             context,
@@ -604,6 +623,11 @@ export function createDEntryNativePrewarmPort(input: {
               ...(plan && {
                 target: {
                   ...plan.target,
+                  ...(reservation && {
+                    observeVmReservation(vmId: string) {
+                      reservation.vmId = vmId;
+                    },
+                  }),
                   ...(takeover && {
                     orphanedStart: {
                       predecessor: takeover.predecessor,
@@ -653,6 +677,7 @@ export function createDEntryNativePrewarmPort(input: {
             ? shared({
                 key: prewarmKey(context, identity, revision),
                 target,
+                reservation,
                 starting: stamp?.vm?.phase === 'starting',
                 revoked,
                 start,
@@ -666,6 +691,7 @@ export function createDEntryNativePrewarmPort(input: {
                 },
               })
             : undefined;
+        if (plan && ticket) plan.reservation = ticket.flight.reservation;
         const warmed = ticket && (await ticket.flight.work);
         async function qualify(result: PersonVmView, generation?: Generation) {
           await current();

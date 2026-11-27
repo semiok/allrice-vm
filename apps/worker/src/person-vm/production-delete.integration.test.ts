@@ -4,6 +4,7 @@ import { lstat, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { DEntryNativePrewarmAcceptedSchema } from '@allrice/contracts';
 import {
   authenticatePlatformSession,
   authenticateSession,
@@ -12,6 +13,7 @@ import {
   createSession,
   ensureBootstrapPortalPrincipal,
   hasExistingDEntryEmployeeOrVm,
+  requireDEntryNativeIdentity,
   revokeSession,
   updateDEntryReleasePolicy,
 } from '@allrice/database';
@@ -21,6 +23,7 @@ import {
   PersonVmDiskPool,
   PersonVmService,
   PostgresPersonVmStore,
+  type PersonVmAuthority,
 } from '@allrice/person-vm';
 import * as client from '../../../../packages/database/src/core/client.ts';
 import { DiskPoolLedger } from '../../../../packages/person-vm/src/disk-pool-ledger.ts';
@@ -31,7 +34,22 @@ import {
   signal,
 } from '../../../../packages/person-vm/src/test-support.ts';
 import { createProductionPersonVmDeleteHttp } from './production-delete-http.js';
-import { authorizeProductionPersonVmDeletion } from './production-authority.js';
+import {
+  authorizeProductionPersonVmDeletion,
+  createProductionPersonVmAuthority,
+} from './production-authority.js';
+import { createProductionCurrentPrewarm } from './production-prewarm.js';
+import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
+import { dEntryHttpDefaults } from '../d-entry/http.js';
+import {
+  installDEntryNativeDataPort,
+  type DEntryNativeDataPort,
+} from '../d-entry/native-data.js';
+import {
+  deferred,
+  nativeEntryFixture,
+  nativeEntryServer,
+} from '../d-entry/native-entry.fixture.js';
 
 const suite =
   process.env.ALLRICE_RUN_DB_INTEGRATION === '1' ? describe : describe.skip;
@@ -44,12 +62,16 @@ suite(
     let worker: ReturnType<typeof createServer>;
     let origin: string;
     let service: PersonVmService;
-    let newService: (usePool?: boolean) => PersonVmService;
+    let newService: (
+      usePool?: boolean,
+      prewarmAuthority?: PersonVmAuthority,
+    ) => PersonVmService;
     let ledger: DiskPoolLedger;
     let store: PostgresPersonVmStore;
     let failKeyRemoval = false;
     let disconnectLeaseOnErase = false;
     let failImageCreation = false;
+    let diskCreateAttempts = 0;
     let failDetach = false;
     let loseDetachReceipt = false;
     let revokeBeforeErase: string | undefined;
@@ -141,6 +163,7 @@ suite(
               })),
             });
           if (args[0] === 'create') {
+            diskCreateAttempts += 1;
             if (failImageCreation)
               throw Error('synthetic failure before APFS image creation');
             await writeFile(args.at(-1)!, 'isolated QA fixture');
@@ -163,7 +186,7 @@ suite(
           return '';
         },
       });
-      newService = (usePool = true) => {
+      newService = (usePool = true, prewarmAuthority) => {
         store = new PostgresPersonVmStore(() => {
           leaseClient = createDedicatedDatabase(fixture.db);
           return leaseClient;
@@ -179,11 +202,16 @@ suite(
               () => {},
             ),
           }),
-          authority: h.options.authority,
+          authority: prewarmAuthority ?? h.options.authority,
+          ...(prewarmAuthority && {
+            egress: h.egress,
+            ownsEgressReceipt: (receipt) => h.active.has(receipt.bindingId),
+          }),
           native: {
             ...h.native,
-            status: async (binding) =>
-              nativeStates.get(binding.vmId) ?? 'absent',
+            status: async (binding, active) =>
+              nativeStates.get(binding.vmId) ??
+              h.native.status(binding, active),
             assertRetainedStartup: async (binding, mount, active) => {
               active.throwIfAborted();
               expect(nativeStates.get(binding.vmId)).toBe('stopped');
@@ -268,6 +296,199 @@ suite(
         false,
       );
     });
+    it.each(['pending reopen', 'first image failure'] as const)(
+      'keeps a purged prewarm ticket expired through replacement (%s)',
+      async (scenario) => {
+        const owner = await createTarget();
+        const personId = owner.actor.id;
+        const admin = await authenticatePlatformSession(token);
+        if (!admin) throw Error('Expected fixture administrator');
+        await updateDEntryReleasePolicy(admin, {
+          revision: 'initial',
+          defaultGeneration: '3.x',
+          selections: [{ organizationId: owner.organizationId, personId }],
+        });
+        const employee = await createEmployeeInstance(owner, {
+          requestId: randomUUID(),
+          workspaceId: owner.workspaceId,
+          expectedOwnerId: personId,
+          profile: { name: 'Disposable employee', description: 'Prewarm QA' },
+        });
+        const login = await createSession(personId);
+        const selection = {
+          workspaceId: owner.workspaceId,
+          employeeInstanceId: employee.id,
+        };
+        const identity = await requireDEntryNativeIdentity(owner, selection);
+        const originalService = service;
+        const originalStore = store;
+        const current = createProductionPersonVmAuthority(stopped.signal);
+        service = newService(true, current.authority);
+        const prewarm = createProductionCurrentPrewarm({
+          vm: service,
+          current,
+        });
+        const firstEntered = deferred<void>();
+        const firstFinished = deferred<void>();
+        const resumeFirst = deferred<void>();
+        const replacementEntered = deferred<void>();
+        const resumeReplacement = deferred<void>();
+        const dispatch = vi.fn(async (...args: Parameters<typeof prewarm>) => {
+          if (args[2].target?.replacesVmId) {
+            replacementEntered.resolve();
+            await resumeReplacement.promise;
+          } else if (scenario === 'pending reopen') {
+            firstEntered.resolve();
+            await resumeFirst.promise;
+            try {
+              return await prewarm(...args);
+            } finally {
+              firstFinished.resolve();
+            }
+          }
+          return prewarm(...args);
+        });
+        const proof = vi.fn<
+          NonNullable<DEntryNativeDataPort['assertEditorReady']>
+        >(async (context, _identity, active, binding) => {
+          if (!binding) throw Error('Expected the exact published binding');
+          await service.assertCurrentBinding(context, binding, active);
+          return stopped.signal;
+        });
+        const uninstallData = installDEntryNativeDataPort({
+          ...nativeEntryFixture().data,
+          assertEditorReady: proof,
+        });
+        const runtime = installAssignedDEntryNativeRuntime({
+          vm: service,
+          startup: { catalog: vi.fn() },
+          prewarmCurrent: dispatch,
+          lifetime: stopped.signal,
+        });
+        const entry = await nativeEntryServer(undefined, dEntryHttpDefaults);
+        const headers = { authorization: `Bearer ${login.token}` };
+        const scope = { organizationId: owner.organizationId, selection };
+        async function openTicket() {
+          const response = await entry.request(
+            'native-prewarm',
+            { ...scope, trigger: 'page' },
+            headers,
+          );
+          expect(response.status).toBe(202);
+          return DEntryNativePrewarmAcceptedSchema.parse(await response.json())
+            .ticket.operationId;
+        }
+        async function status(operationId: string) {
+          const query = new URLSearchParams({
+            organizationId: scope.organizationId,
+            ...selection,
+            operationId,
+          });
+          const response = await fetch(
+            `${entry.origin}/internal/d-entry/native-prewarm/status?${query}`,
+            { headers },
+          );
+          return { status: response.status, json: await response.json() };
+        }
+        async function purge(vmId: string) {
+          const review = await post(token, { action: 'review', personId });
+          expect(review.status).toBe(200);
+          expect(review.json.target.vmId).toBe(vmId);
+          const erased = await post(token, {
+            action: 'purge-disk',
+            personId,
+            vmId,
+            confirmationId: review.json.confirmationId,
+          });
+          expect(erased.status).toBe(200);
+          expect(erased.json.vm).toMatchObject({
+            vmId,
+            phase: 'deleted',
+            diskRetained: false,
+          });
+        }
+        try {
+          const diskAttemptsBefore = diskCreateAttempts;
+          if (scenario === 'pending reopen') {
+            const created = await current.withCurrentSelection(
+              owner,
+              identity,
+              signal(),
+              () => service.create(owner, signal()),
+            );
+            expect(created.phase).toBe('stopped');
+          } else failImageCreation = true;
+          const originalTicket = await openTicket();
+          if (scenario === 'pending reopen') {
+            await firstEntered.promise;
+            expect(await status(originalTicket)).toEqual({
+              status: 200,
+              json: { state: 'starting' },
+            });
+          } else {
+            await vi.waitFor(async () => {
+              expect(await status(originalTicket)).toEqual({
+                status: 200,
+                json: { state: 'failed', code: 'START_UNAVAILABLE' },
+              });
+            });
+            failImageCreation = false;
+          }
+          const predecessor = await store.read(personId);
+          expect(predecessor).toMatchObject({
+            leaseEpoch: 0,
+            instanceId: null,
+          });
+          const originalVmId = predecessor!.vmId;
+          await purge(originalVmId);
+          const expired = { status: 410, json: { state: 'expired' } };
+          expect(await status(originalTicket)).toEqual(expired);
+          const replacementTicket = await openTicket();
+          expect(replacementTicket).not.toBe(originalTicket);
+          await replacementEntered.promise;
+          expect(await openTicket()).toBe(replacementTicket);
+          expect(await status(originalTicket)).toEqual(expired);
+          resumeReplacement.resolve();
+          await vi.waitFor(async () => {
+            expect(await status(replacementTicket)).toEqual({
+              status: 200,
+              json: { state: 'ready' },
+            });
+          });
+          const binding = await service.resolve(owner, signal());
+          expect(binding.vmId).not.toBe(originalVmId);
+          expect(binding.leaseEpoch).toBe(1);
+          expect(await status(originalTicket)).toEqual(expired);
+          if (scenario === 'pending reopen') {
+            resumeFirst.resolve();
+            await firstFinished.promise;
+          }
+          expect(await status(originalTicket)).toEqual(expired);
+          expect(dispatch).toHaveBeenCalledTimes(2);
+          expect(proof).toHaveBeenCalledOnce();
+          expect(diskCreateAttempts - diskAttemptsBefore).toBe(2);
+        } finally {
+          failImageCreation = false;
+          resumeFirst.resolve();
+          resumeReplacement.resolve();
+          try {
+            await entry.close();
+            await runtime.close();
+            const row = await store.read(personId);
+            if (row && row.phase !== 'deleted') {
+              if (row.nativeCreated) nativeStates.set(row.vmId, 'stopped');
+              await purge(row.vmId);
+              nativeStates.delete(row.vmId);
+            }
+          } finally {
+            uninstallData();
+            await current.close();
+            service = originalService;
+            store = originalStore;
+          }
+        }
+      },
+    );
     it('retains the complete image when an administrator is revoked or detach cannot be confirmed', async () => {
       const owner = await createTarget();
       const personId = owner.actor.id;

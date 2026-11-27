@@ -203,6 +203,8 @@ export type PersonVmLeaseReleaseStage = 'written' | 'joined' | 'unconfirmed';
 
 export type PersonVmPrewarmFence = PersonVmPrewarmTarget & {
   assertAuthority(signal: AbortSignal): Promise<void>;
+  /** Host-only observation of a new VM row saved by this request's lease. */
+  observeVmReservation?(vmId: string): void;
   /** Host-only observations for this ticket's exact orphaned start. */
   orphanedStart?: Readonly<{
     predecessor: PersonVmBinding;

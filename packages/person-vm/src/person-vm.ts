@@ -463,6 +463,7 @@ export class PersonVmService
               throw new PersonVmError('AUTHORIZATION_DENIED');
           },
           assertPrewarmAuthority: assertTicket,
+          observeVmReservation: target?.observeVmReservation,
         });
         return view(row);
       },
@@ -570,6 +571,7 @@ export class PersonVmService
       lane: 'foreground' | 'admin';
       assertCurrent(): Promise<void>;
       assertPrewarmAuthority?: PersonVmPrewarmFence['assertAuthority'];
+      observeVmReservation?: PersonVmPrewarmFence['observeVmReservation'];
     },
   ) {
     const pool = this.options.diskPool;
@@ -593,6 +595,7 @@ export class PersonVmService
       row.phase = 'starting';
       await lease.save(row);
       committed = true;
+      if (newIdentity) input.observeVmReservation?.(row.vmId);
       await lease.audit(row, { ...audit, result: 'started' });
     };
     if (!needsCandidate) await commitOwner(signal);
