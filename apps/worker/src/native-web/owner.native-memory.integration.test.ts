@@ -4,7 +4,6 @@ import { createServer } from 'node:http';
 import {
   MemoryOrdinalInputSchema,
   RememberPersonalMemoryInputSchema,
-  type RequestContext,
 } from '@allrice/contracts';
 import type { ModelCallBinding } from '@allrice/model-gateway';
 import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
@@ -15,7 +14,10 @@ import { readLockedDEntryNativeRootPin } from '../../../../packages/database/src
 import { dEntryReleasePolicyKey } from '../../../../packages/database/src/d-entry-release-policy.ts';
 import { createNativeEmployeeMemoryHost } from '../../../../packages/database/src/employee-memory-runtime.ts';
 import { ensureGeneralEmployeeInstance } from '../../../../packages/database/src/employees/employee-instances.ts';
-import { createSession } from '../../../../packages/database/src/identity.ts';
+import {
+  authenticateSession,
+  createSession,
+} from '../../../../packages/database/src/identity.ts';
 import { createRunAuthorityFixture } from '../../../../packages/database/src/run-authority.fixture.ts';
 import { createRuntimeFixtureDatabase } from '../../../../packages/database/src/runtime.fixture.ts';
 import * as buildIdentity from '../../../../packages/database/src/service-build-identity.ts';
@@ -116,15 +118,11 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         employeeVersionId: f.version,
         threadId: f.session,
       };
-      const context: RequestContext = {
-        requestId: randomUUID(),
-        sessionId: login.id,
-        actor: { type: 'user', id: f.user },
+      const context = await authenticateSession(login.token, {
         organizationId: f.org,
         workspaceId: f.workspace,
-        memberships: [],
-        authenticatedAt: new Date().toISOString(),
-      };
+      });
+      if (!context) throw Error('Isolated owner did not authenticate');
       await db.begin(async (tx) => {
         await ensureGeneralEmployeeInstance(tx, f.assignment);
         const release = {
@@ -195,6 +193,7 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         | NonNullable<Awaited<ReturnType<typeof recordNativeExecutionRequest>>>
         | undefined;
       let rootInput: MemoryRootObservation | undefined;
+      let indexDocument: string | undefined;
       let assistantCalls = 0;
 
       async function sealFirstRequest() {
@@ -329,7 +328,8 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         ).rejects.toMatchObject({ code: 'authorization_denied' });
         const issued = await publication.root(context, rootInput, signal);
         expect(firstStep).toBe(receipt.origin.originalExecutionId);
-        expect(issued.memoryIndexDocument).toContain(confirmed.summary);
+        indexDocument = issued.memoryIndexDocument;
+        expect(indexDocument).toContain(confirmed.summary);
         expect(
           await bindNativeMemoryExecutionRef(
             receipt,
@@ -657,7 +657,24 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
           pending!.id,
           mutation,
         );
+      const savedIndex = () => db`
+        select state, document from allrice_employee_memory_contexts where budget_ref=${run.runId}`;
+      const spent = await savedIndex();
+      expect(spent).toEqual([
+        {
+          state: expect.objectContaining({ toolReads: 1 }),
+          document: indexDocument,
+        },
+      ]);
       await db`update person_virtual_machines set phase='stopped' where vm_id=${owner.binding.vmId}`;
+      if (!rootInput) throw Error('No original root input');
+      await expect(
+        publication.root(context, { ...rootInput, mode: 'restore' }, signal),
+      ).resolves.toEqual({
+        executionRef: run.runId,
+        memoryIndexDocument: indexDocument,
+      });
+      expect(await savedIndex()).toEqual(spent);
       await expect(
         host.remember(context, ref, candidate, signal),
       ).rejects.toMatchObject({ code: 'authorization_denied' });
@@ -671,7 +688,6 @@ it.skipIf(!cli || process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
       await expect(
         host.remember(context, ref, candidate, signal),
       ).rejects.toThrow();
-      if (!rootInput) throw Error('No original root input');
       await expect(
         publication.root(context, { ...rootInput, mode: 'restore' }, signal),
       ).rejects.toThrow();
