@@ -4438,7 +4438,14 @@ suite('B1 production Bridge authority assembly / real PostgreSQL', () => {
         const card = page.getByRole('region', { name: '有限后台服务' });
         await card.getByRole('textbox').waitFor();
         expect(await card.innerText()).toContain('仅隔离容器内可达');
-        expect(await card.innerText()).toContain('不是 Rice 的聊天提问');
+        expect(await card.innerText()).toContain(
+          '只发送给这个请求对应的进程，不提交密码或凭证。',
+        );
+        await expect(
+          card
+            .getByRole('textbox', { name: '本地进程请求：输入测试文字' })
+            .count(),
+        ).resolves.toBe(1);
         await card.getByRole('textbox').fill('user-input-once');
         await card
           .getByRole('button', { name: '发送进程输入', exact: true })

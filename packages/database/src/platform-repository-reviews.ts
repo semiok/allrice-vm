@@ -202,6 +202,13 @@ export async function createPlatformRepositoryReview(
   const text =
     '独立审查已发布的固定仓库候选和准确 CI 证据。不得修改、执行、合并或部署。';
   await db.begin(async (tx) => {
+    // Serialize message seeding for this session. A concurrent insert can
+    // otherwise collide on the scoped unique key before the primary key check.
+    const [session] = await tx`select id from allrice_chat_sessions
+      where id=${sessionId} and organization_id=${internal.organizationId}
+        and workspace_id=${internal.workspaceId!} and owner_id=${owner}
+      for no key update`;
+    if (!session) throw new DataAccessError('not_found');
     for (const [id, role, status, content] of [
       [userMessageId, 'user', 'completed', { text, citations: [] }],
       [assistantMessageId, 'assistant', 'pending', { text: '', citations: [] }],
