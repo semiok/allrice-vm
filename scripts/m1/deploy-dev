@@ -50,6 +50,7 @@ LOCK="$HOME/allrice40-dev/.local/deploy.lock"; SNAPSHOTS="$STATE/pre-migrate"; K
 export PATH="$HOME/.local/opt/node-22.23.2/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 RESULT_FILE=""; RESULT_ID=""
 DRAIN_SOCKET=""; RELEASE_STOP_ATTEMPTED=""; RELEASE_STOP_UNCONFIRMED=""
+STARTED_WORKER_PROCESS=""
 KEEP_RELEASES=3; BLOG=""; FAIL_REASON=""; INFLIGHT_MINE=""; LOCKED=""; BUILD_DIR=""; BUILT=""; PLIST_STAGE=""
 WEB_LABEL=ai.bplabs.allrice40-dev-web; WORKER_LABEL=ai.bplabs.allrice40-dev-worker
 WEB_PLIST="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
@@ -69,20 +70,20 @@ recovery_pair() { # Web plist, Worker plist, [expected SHA]
   [ "$(release_of "$1")" = "$rel/apps/web" ] && dev_release_config "$rel" "${3:-$(penv "$2" ALLRICE_RELEASE_SHA)}"
 }
 ready_sha() { # url role release -> prints a matching verified sourceSha
-  curl -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
+  curl -q --noproxy '*' -fsS -m 5 "$1" 2>/dev/null | "$M1_PY" "$M1_TOOLS/service_target.py" ready "$2" "$3"; }
 worker_vm_recovery() { # release pid -> exact ready boot and ownership state
   local port owners proof
   port=$(worker_port) || return 1
   owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
   [ "$owners" = "$2" ] || return 1
-  proof=$(curl -fsS -m 5 "http://127.0.0.1:$port/health/ready" 2>/dev/null |
+  proof=$(curl -q --noproxy '*' -fsS -m 5 "http://127.0.0.1:$port/health/ready" 2>/dev/null |
     "$M1_PY" "$M1_TOOLS/service_target.py" ready worker "$1" "$2") || return 1
   owners=$(/usr/sbin/lsof -nP -t -iTCP:"$port" -sTCP:LISTEN | sort -u) || return 1
   [ "$owners" = "$2" ] && [ -n "$proof" ] || return 1
   printf '%s\n' "$proof"
 }
 worker_boot() { # prints the bootId the ready Worker reports, or nothing; never fails
-  { curl -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
+  { curl -q --noproxy '*' -sS -m 5 "http://127.0.0.1:$(worker_port)/health/ready" 2>/dev/null || true; } | "$M1_PY" -c 'import json,re,sys
 try: b=str(json.load(sys.stdin)["identity"]["bootId"])
 except Exception: b=""
 print(b if re.fullmatch("[0-9a-f-]{36}",b) else "")' ; }
@@ -296,6 +297,10 @@ sys.exit(not (isinstance(keep, dict) and list(keep) == ["SuccessfulExit"] and ke
     [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" = gone ] && port_closed "$port"
     return
   fi
+  if [ "$mode" = restore ] && { [ -z "$boot" ] || [ "$owner" != "$boot drain-required" ]; }; then
+    say "The original Worker is still running without a confirmed recovery action."
+    return 1
+  fi
   verify_no_committed_vm_wakes || return 1
   if [ -z "$boot" ] || [ -z "$DRAIN_TOKEN" ] || ! receipt=$(read_drain_receipt "$boot" "$pid"); then
     if [ "$(job_state "$WORKER_LABEL" "$plist" "$rel")" != "$process" ]; then
@@ -387,6 +392,8 @@ start_both_on() { # sha -> start Worker then Web, both must identify this releas
   local rel; rel=$(release_of) || return 1
   start_job "$WORKER_LABEL" "$WORKER_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(worker_port)/health/ready" "$1" 180 worker "$rel" || { say "worker did not become ready on ${1:0:8}"; return 1; }
+  STARTED_WORKER_PROCESS=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$rel") || return 1
+  [[ "$STARTED_WORKER_PROCESS" =~ ^running\ [1-9][0-9]*$ ]] || return 1
   start_job "$WEB_LABEL" "$WEB_PLIST" || return 1
   wait_ready "http://127.0.0.1:$(web_port)/api/health/ready" "$1" 120 web "$rel" || { say "web did not become ready on ${1:0:8}"; return 1; }
 }
@@ -481,13 +488,17 @@ refuse_restore() { # phase previous_sha reason
   log_deploy kind failed phase "$1" reason "$reason" restored no manualIntervention required log "$BLOG" || true
   return 1
 }
-verify_restored_vm_owner() { # original sealed release, required wake tick (yes/no)
+verify_restored_vm_owner() { # original sealed release, required wake tick (yes/no), optional expected process
   local count process proof
   verify_no_committed_vm_wakes || return 1
   count=$(vm_upgrade_candidates) || return 1
-  if [ "$count" = 0 ] && [ "$2" != yes ]; then return 0; fi
+  if [ "$count" = 0 ] && [ "$2" != yes ]; then
+    [ -z "${3:-}" ] || [ "$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1")" = "$3" ]
+    return
+  fi
   process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$1") || return 1
   [[ "$process" =~ ^running\ [1-9][0-9]*$ ]] || return 1
+  [ -z "${3:-}" ] || [ "$process" = "$3" ] || return 1
   proof=$(worker_vm_recovery "$1" "${process#running }") || return 1
   if [[ "$proof" == *' wake-ready' ]] ||
     { [ "$2" != yes ] && [[ "$proof" == *' host-ready' ]]; }; then
@@ -496,6 +507,18 @@ verify_restored_vm_owner() { # original sealed release, required wake tick (yes/
   fi
   say "Restored Worker VM ownership is unconfirmed. Recovery remains incomplete."
   return 1
+}
+
+resume_restored_web() { # preserve the already running original Worker
+  local sha=$1 rel=$2 state
+  state=$(job_state "$WEB_LABEL" "$WEB_PLIST" "$rel/apps/web") || return 1
+  case "$state" in
+    gone) start_job "$WEB_LABEL" "$WEB_PLIST" || return 1 ;;
+    loaded) "$M1_LAUNCHCTL" kickstart "gui/$M1_UID/$WEB_LABEL" || return 1 ;;
+    running\ *) ;;
+    *) return 1 ;;
+  esac
+  wait_ready "http://127.0.0.1:$(web_port)/api/health/ready" "$sha" 120 web "$rel"
 }
 # Put the saved launchd files back, restart both and check they are healthy on the
 # previous SHA. Every step is checked: on any failure the saved files stay for a person.
@@ -514,10 +537,10 @@ restore() {
     process=$(job_state "$WORKER_LABEL" "$WORKER_PLIST" "$rel") || return 1
     if [[ "$process" =~ ^running\ [1-9][0-9]*$ ]]; then
       proof=$(worker_vm_recovery "$rel" "${process#running }") || proof=""
-      if [[ "$proof" == *' host-ready' || "$proof" == *' wake-ready' ]] &&
+      if [[ "$proof" == *' host-ready' || "$proof" == *' wake-ready' ]]; then
         check_migrations_known "$rel" && check_contract_known "$rel" &&
-        [ "$(ready_sha "http://127.0.0.1:$(web_port)/api/health/ready" web "$rel")" = "$prev" ]; then
-        verify_restored_vm_owner "$rel" "$need_wake"
+          resume_restored_web "$prev" "$rel" &&
+          verify_restored_vm_owner "$rel" "$need_wake" "$process"
         return
       fi
     fi
@@ -536,7 +559,7 @@ restore() {
   start_both_on "$prev" || { say "previous version ${prev:0:8} did NOT come back healthy (migrations applied by the new version stay)"; return 1; }
   # Health alone does not prove this boot recovered its wake owner. Keep
   # the restored Worker running and retain the witness until plans settle.
-  verify_restored_vm_owner "$rel" "$need_wake" || return 1
+  verify_restored_vm_owner "$rel" "$need_wake" "$STARTED_WORKER_PROCESS" || return 1
   say "previous version ${prev:0:8} is healthy again"
 }
 # Keep a final error/signal handler while the EXIT cleanup runs; replacing an

@@ -1216,14 +1216,50 @@ export class PostgresPersonVmStore implements PersonVmStore {
     if (bodyError) throw bodyError;
     return result;
   }
+
+  /** Clear only a lease carried by the atomically published terminal row.
+   * No replacement owner is needed because this path does no physical work. */
+  async releaseJoinedIdleStopLease(
+    binding: PersonVmBinding,
+    requestId: string,
+    now: Date,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const sql = this.openSql();
+    try {
+      return await sql.begin(async (tx) => {
+        await tx`set local statement_timeout = '2s'`;
+        signal.throwIfAborted();
+        const [lock] = await tx`select
+          pg_try_advisory_xact_lock(hashtextextended(${'person-vm:' + binding.personId},0)) as held`;
+        if (lock?.held !== true) return false;
+        // Terminal cleanup publishes the stopped row and success audit in
+        // one transaction. A subsequent same-epoch lease rewrites the tuple.
+        signal.throwIfAborted();
+        const [row] = await tx`update person_virtual_machines vm
+          set lease_owner=null,lease_expires_at=null
+          where vm.person_id=${binding.personId} and vm.organization_id=${binding.organizationId}
+            and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
+            and vm.lease_epoch=${binding.leaseEpoch} and vm.lease_owner is not null
+            and vm.lease_expires_at<=${now} and vm.phase in ('stopped','cold')
+            and vm.disk_retained and vm.egress_receipt is null
+            and exists (select 1 from person_vm_audit a
+              where a.vm_id=vm.vm_id and a.person_id=vm.person_id
+                and a.organization_id=vm.organization_id and a.lease_epoch=vm.lease_epoch
+                and a.xmin=vm.xmin and a.request_id=${requestId}
+                and a.action='stop' and a.result='succeeded')
+          returning vm.vm_id`;
+        return row !== undefined;
+      });
+    } finally {
+      await sql.end({ timeout: 0 });
+    }
+  }
+
   async recover<T>(
     requestedPersonId: string,
-    options: {
-      now: () => Date;
-      ttlMs: number;
-      signal: AbortSignal;
-      joinedIdleStop?: { binding: PersonVmBinding; requestId: string };
-    },
+    options: { now: () => Date; ttlMs: number; signal: AbortSignal },
     work: (lease: VmLease) => Promise<T>,
   ) {
     const personId = requestedPersonId.toLowerCase();
@@ -1255,27 +1291,7 @@ export class PostgresPersonVmStore implements PersonVmStore {
         Date.parse(row.leaseExpiresAt) > options.now().getTime()
       )
         throw new PersonVmError('LEASE_CONFLICT');
-      let joined = false;
-      if (options.joinedIdleStop) {
-        const { binding, requestId } = options.joinedIdleStop;
-        // The final stop publishes the stopped row and its success audit in
-        // one statement, after the native command and cleanup have joined.
-        // A subsequent lease claim (even in the same epoch) rewrites this
-        // tuple and invalidates that proof. Expiry alone is never sufficient.
-        const [proof] = await session.query(
-          () => sql`select 1 from person_virtual_machines vm
-            join person_vm_audit a on a.vm_id=vm.vm_id
-              and a.person_id=vm.person_id and a.organization_id=vm.organization_id
-              and a.lease_epoch=vm.lease_epoch and a.xmin=vm.xmin
-            where vm.person_id=${personId} and vm.organization_id=${binding.organizationId}
-              and vm.vm_id=${binding.vmId} and vm.instance_id=${binding.instanceId}
-              and vm.lease_epoch=${binding.leaseEpoch} and vm.lease_owner=${previousToken}
-              and vm.phase in ('stopped','cold') and vm.disk_retained and vm.egress_receipt is null
-              and a.request_id=${requestId} and a.action='stop' and a.result='succeeded'`,
-        );
-        joined = proof !== undefined;
-      }
-      if (!joined && this.settledOrphans.get(previousToken) !== personId) {
+      if (this.settledOrphans.get(previousToken) !== personId) {
         if (!this.fence) throw new PersonVmError('LEASE_CONFLICT');
         await this.fence.confirmSettled(
           {

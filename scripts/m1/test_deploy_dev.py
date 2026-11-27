@@ -622,6 +622,33 @@ class DeployDevMigrations(unittest.TestCase):
             self.home, 'allrice40-dev/qa/deploy-inflight/state',
         )))
 
+    def test_recovery_starts_missing_web_without_draining_the_restored_worker(self):
+        for mode in ('healthy', 'wake-pending', 'worker-exited'):
+            with self.subTest(mode=mode):
+                self.saved_release(self.initial_release)
+                p = self.run_dd(r'''
+                  job_state() {
+                    if [ "$1" = "$WEB_LABEL" ]; then echo gone
+                    elif [ "$MODE" = worker-exited ] && [ -f "$STATE/web-ready" ]; then echo loaded
+                    else echo 'running 73002'
+                    fi
+                  }
+                  worker_vm_recovery() { echo '661e00de-c0fc-45e6-a1db-bfd158aedad8 wake-ready'; }
+                  start_job() { test "$1" = "$WEB_LABEL" && echo web-started; }
+                  wait_ready() { touch "$STATE/web-ready"; }
+                  verify_no_committed_vm_wakes() { test "$MODE" != wake-pending; }
+                  vm_upgrade_candidates() { echo 0; }
+                  stop_both() { echo unexpected-stop; return 1; }
+                  rm -f "$STATE/web-ready"
+                  recover
+                ''', FILES, CONTRACT='row:1', MODE=mode)
+                self.assertIn('web-started', p.stdout)
+                self.assertNotIn('unexpected-stop', p.stdout)
+                self.assertEqual(p.returncode == 0, mode == 'healthy', p.stdout + p.stderr)
+                self.assertEqual(os.path.isfile(os.path.join(
+                    self.home, 'allrice40-dev/qa/deploy-inflight/state',
+                )), mode != 'healthy')
+
     def test_failed_deploy_does_not_restore_a_version_that_cannot_read_the_journals(self):
         self.saved_release(self.release(store=False))
         script = 'stop_both() { :; }; start_both_on() { echo STARTED; }; if restore; then echo restore=0; else echo restore=1; fi'

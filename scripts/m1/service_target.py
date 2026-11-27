@@ -299,7 +299,7 @@ def main():
                                 and str(proof['pid']) == recovery[0]
                                 and isinstance(boot, str)
                                 and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot)
-                                and proof.get('state') in ('uninstalled', 'host-ready', 'wake-ready')):
+                                and proof.get('state') in ('uninstalled', 'host-ready', 'wake-ready', 'drain-required')):
                             print(boot, proof['state'])
             except ValueError:
                 pass

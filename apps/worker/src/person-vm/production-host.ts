@@ -174,7 +174,7 @@ const UPGRADE_WAIT_MS = 120_000;
 type UpgradeDrainReceipt = Readonly<{ stopped: number; expiresAt: string }>;
 
 export interface ProductionPersonVmHost {
-  wakeRecoveryReady(): boolean;
+  recoveryState(): 'host-ready' | 'wake-ready' | 'drain-required';
   prepareStopWithWake(
     request: PersonVmWakePreparation,
     signal: AbortSignal,
@@ -1305,7 +1305,12 @@ export function createProductionPersonVmHost(input: {
         });
       }
       return Object.freeze({
-        wakeRecoveryReady: () => scheduledWake?.readyForRecovery() === true,
+        recoveryState: () =>
+          upgradeDrainRequested
+            ? 'drain-required'
+            : scheduledWake?.readyForRecovery()
+              ? 'wake-ready'
+              : 'host-ready',
         async prepareStopWithWake(
           request: PersonVmWakePreparation,
           signal: AbortSignal,

@@ -996,9 +996,14 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
     expect(staged).toEqual([]);
   });
 
-  it.each([false, true])(
-    'audits an unconfirmed start after the VM advanced (revoked: %s)',
-    async (revoked) => {
+  it.each([
+    ['starting', false],
+    ['starting', true],
+    ['running', false],
+    ['running', true],
+  ] as const)(
+    'audits an unconfirmed start after the VM advanced to %s (revoked: %s)',
+    async (phase, revoked) => {
       const f = await fixture(),
         planId = randomUUID();
       await expect(
@@ -1009,7 +1014,8 @@ suite('scheduled wake host intent on real PostgreSQL', () => {
       expect(claim).not.toBeNull();
       const owner = randomUUID();
       await db`update person_virtual_machines
-      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase='starting',
+      set lease_epoch=lease_epoch+1,instance_id=${randomUUID()},phase=${phase},
+        egress_receipt=${phase === 'running' ? db.json({}) : null},
         lease_owner=${owner},lease_expires_at=now()-interval '1 second'
       where person_id=${f.binding.personId}`;
       if (revoked) await f.invalidate(planId);

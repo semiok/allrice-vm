@@ -460,8 +460,7 @@ const personVmHost = createProductionPersonVmHost({
   ),
 }).then(
   (host) => {
-    personVmRecovery = () =>
-      host.wakeRecoveryReady() ? 'wake-ready' : 'host-ready';
+    personVmRecovery = () => host.recoveryState();
     return { state: 'installed' as const, host };
   },
   (error: unknown) => {

@@ -597,6 +597,7 @@ it('resumes startup and wake if a drain recovery makes a wake eligible', async (
   expect(nextWake).toHaveBeenCalledTimes(4);
   expect(reopen).toHaveBeenCalledTimes(1);
   expect(wake.resume).toHaveBeenCalledTimes(1);
+  expect(host.recoveryState()).toBe('drain-required');
   await expect(host.assertWorkerShutdownSafe(signal())).rejects.toMatchObject({
     code: 'RUNTIME_NOT_READY',
   });

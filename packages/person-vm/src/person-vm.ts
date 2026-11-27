@@ -2747,17 +2747,22 @@ export class PersonVmService
       await this.finishDispatchedIdleStop(lease, row, latest, current);
       return true;
     };
-    const completed = persisted.leaseOwner
-      ? await store.recover(
-          binding.personId,
-          {
-            ...options,
-            ...(attempt.completed && {
-              joinedIdleStop: { binding, requestId: attempt.requestId },
-            }),
-          },
-          recover,
+    if (persisted.leaseOwner && attempt.completed) {
+      await assertAuthority(signal);
+      if (
+        await store.releaseJoinedIdleStopLease(
+          binding,
+          attempt.requestId,
+          this.now(),
+          signal,
         )
+      ) {
+        this.options.observeOwnedStop?.(binding);
+        return true;
+      }
+    }
+    const completed = persisted.leaseOwner
+      ? await store.recover(binding.personId, options, recover)
       : await store.withLease(binding.personId, options, recover);
     if (completed) this.options.observeOwnedStop?.(binding);
     return completed;
