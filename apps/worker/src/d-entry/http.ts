@@ -496,27 +496,54 @@ export function createDEntryHttpHandler(
         const { context, identity } = next;
         plan.assertTicketThread = authority.assertTicketThread;
         await plan.assertTicketThread?.(signal);
-        let canIssue = await check(context, identity, plan, signal, 'issue');
-        signal.throwIfAborted();
-        let match = prewarm.reuse(context, identity, plan, canIssue);
-        if (canIssue && !match.existing && match.publishedInstance) {
-          // A compatible-looking instance can have appeared after this MVCC
-          // read. Recheck before creating a ticket from the earlier cold plan.
-          canIssue = await check(context, identity, plan, signal, 'issue');
-          signal.throwIfAborted();
-          match = prewarm.reuse(context, identity, plan, canIssue);
-        }
-        if (match.existing || !canIssue) {
-          await publishExistingPrewarm(
-            match.existing,
-            prewarmRequest.trigger,
-            check,
-            canIssue && plan.running === true,
-          );
-          return true;
-        }
         const { trigger } = prewarmRequest;
         const receipt = { identity, trigger };
+        let confirmRunning = plan.running
+          ? deps.prewarm.confirmRunning?.bind(deps.prewarm)
+          : undefined;
+        while (true) {
+          let canIssue = await check(context, identity, plan, signal, 'issue');
+          signal.throwIfAborted();
+          let match = prewarm.reuse(context, identity, plan, canIssue);
+          if (canIssue && !match.existing && match.publishedInstance) {
+            // A compatible-looking instance can have appeared after this MVCC
+            // read. Recheck before creating a ticket from the earlier cold plan.
+            canIssue = await check(context, identity, plan, signal, 'issue');
+            signal.throwIfAborted();
+            match = prewarm.reuse(context, identity, plan, canIssue);
+          }
+          if (match.existing || !canIssue) {
+            await publishExistingPrewarm(
+              match.existing,
+              trigger,
+              check,
+              canIssue && plan.running === true,
+            );
+            return true;
+          }
+          if (!confirmRunning) break;
+          const budget = new AbortController();
+          const probe = AbortSignal.any([signal, budget.signal]);
+          try {
+            const verify = track(
+              confirmRunning(context, identity, plan, probe),
+            );
+            const verified = await Promise.race([
+              verify,
+              delay(2000, undefined, { signal: probe, ref: false }),
+            ]);
+            signal.throwIfAborted();
+            if (verified && !verified.aborted) {
+              sendPrewarmReady(response, receipt);
+              return true;
+            }
+          } finally {
+            budget.abort();
+          }
+          // The probe can overlap another POST's ticket or a change of target.
+          // Recheck both before falling back to ticket admission.
+          confirmRunning = undefined;
+        }
         const accepted = prewarm.accept(
           context,
           identity,

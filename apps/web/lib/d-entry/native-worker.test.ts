@@ -384,4 +384,47 @@ describe('Web original-cookie to fixed Worker adapters', () => {
     ).toBe(400);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+
+  it('accepts native page endpoint names without a Web allowlist and keeps the original login', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+      Response.json({ type: 'server-response' }),
+    );
+    vi.stubGlobal('fetch', fetch);
+    const scopeId = randomUUID();
+    const payload = { args: { request: { query: 'meeting' } } };
+    const invoke = (endpoint: string) =>
+      rpc(
+        new Request(
+          'https://allrice.test/api/v1/d-entry/native-rpc?carrier=page',
+          {
+            method: 'POST',
+            headers: { host: 'allrice.test', origin: 'https://allrice.test' },
+            body: JSON.stringify({
+              selection,
+              scopeId,
+              endpoint,
+              rpcId: 'native-rpc-id',
+              payload,
+            }),
+          },
+        ),
+      );
+    expect((await invoke('session/search')).status).toBe(200);
+    expect((await invoke('session/search/other')).status).toBe(400);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, options] = fetch.mock.calls[0] as [URL, RequestInit];
+    expect(url.pathname + url.search).toBe(
+      '/internal/d-entry/native-rpc?carrier=page',
+    );
+    expect(options.headers).toMatchObject({
+      authorization: `Bearer ${ports.token}`,
+    });
+    expect(JSON.parse(String(options.body))).toMatchObject({
+      scopeId,
+      payload,
+      endpoint: 'session/search',
+      organizationId: identity.organizationId,
+      selection,
+    });
+  });
 });

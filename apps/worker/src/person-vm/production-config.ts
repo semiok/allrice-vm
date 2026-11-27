@@ -165,6 +165,7 @@ const configuration = z
       .object({
         cliPath: guestPath,
         startupTimeoutMs: positive,
+        terminalEnabled: z.boolean().default(true),
         publicOrigin: z.string().refine((value) => {
           try {
             const url = new URL(value);

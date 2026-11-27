@@ -47,6 +47,7 @@ import {
 } from '@allrice/person-vm';
 import { installAssignedDEntryNativeRuntime } from '../business-runtime/native-prewarm.js';
 import {
+  primeWorkerEmployeeWebRelease,
   readReleasedGuestProfile,
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
@@ -572,6 +573,7 @@ export function createProductionPersonVmHost(input: {
     try {
       lifetime.throwIfAborted();
       providers = await createProductionPersonVmProviders(lifetime);
+      await primeWorkerEmployeeWebRelease(lifetime);
       lifetime.throwIfAborted();
       current = createProductionPersonVmAuthority(lifetime);
       // The shared client supplies trusted connection options only. Every

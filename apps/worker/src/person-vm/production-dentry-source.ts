@@ -29,6 +29,7 @@ import {
 } from '../d-entry/native-data.js';
 import {
   currentDEntryNativeOwner,
+  DEntryNativeUnavailable,
   dEntryNativeOwnerPort,
   type ResolvedDEntryNativeOwner,
 } from '../d-entry/native-owner.js';
@@ -36,6 +37,8 @@ import {
   holdReleasedProfile,
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
+
+import { dEntryStartupTiming } from '../d-entry/startup-timing.js';
 
 type Startup = Pick<
   ReturnType<typeof createAssignedNativeWebStartup>,
@@ -90,6 +93,12 @@ export function installProductionDEntrySource(input: {
   vm?: Pick<PersonVmPort, 'resolve' | 'assertCurrentBinding'>;
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
+  confirmPhysical?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
 }) {
   input.lifetime.throwIfAborted();
@@ -251,7 +260,63 @@ export function installProductionDEntrySource(input: {
         proveSelectedEmployee(context, identity, active, expectedBinding),
       );
     },
-    resolveAdmissionOwner({ context, identity, owner, operationId, signal }) {
+    confirmVerifiedEditor(context, identity, signal) {
+      return own(signal, async (active) => {
+        if (!input.confirmPhysical) return;
+        try {
+          const current = await currentDEntryNativeOwner(
+            dEntryNativeOwnerPort,
+            context,
+            identity,
+            active,
+          );
+          const { binding } = current.view.receipt;
+          const employee = identity.employeeInstanceId;
+          // Gate on the existing proof for this exact local owner/employee.
+          // The refresh uses its actual authenticated graph and current route.
+          input.startup.assertVerifiedEditor(binding, current.signal, employee);
+          const proof = await input.startup.ensureVerifiedEditor(
+            context,
+            binding,
+            employee,
+            current.signal,
+          );
+          const group = input.startup.assertAuthenticatedGroup(
+            binding,
+            current.signal,
+          );
+          const confirmed = AbortSignal.any([current.signal, proof, group]);
+          await input.confirmPhysical(context, identity, binding, confirmed);
+          await current.owner.assertCurrent(context, confirmed);
+          sameHost(current.owner, identity);
+          confirmed.throwIfAborted();
+          return { binding, proof: confirmed };
+        } catch (error) {
+          active.throwIfAborted();
+          if (
+            error instanceof DEntryNativeUnavailable ||
+            (error instanceof PersonVmError &&
+              [
+                'NOT_FOUND',
+                'LEASE_CONFLICT',
+                'LEASE_LOST',
+                'RUNTIME_NOT_READY',
+                'WEB_ENDPOINTS_PREPARING',
+              ].includes(error.code))
+          )
+            return;
+          throw error;
+        }
+      });
+    },
+    resolveAdmissionOwner({
+      context,
+      identity,
+      owner,
+      operationId,
+      signal,
+      access,
+    }) {
       return own(signal, async (active) => {
         const binding = owner.receipt.binding;
         if (
@@ -261,7 +326,7 @@ export function installProductionDEntrySource(input: {
           identity.organizationId !== binding.organizationId ||
           context.organizationId !== binding.organizationId ||
           context.workspaceId !== identity.workspaceId ||
-          !identity.threadId
+          (!identity.threadId && access !== 'page')
         )
           denied();
         const scope = structuredClone(context);
@@ -411,12 +476,23 @@ export function installProductionDEntrySource(input: {
       };
     },
   };
+  const modelProofs = new WeakMap<
+    object,
+    {
+      adapterId: string;
+      seal: string;
+      provider: string;
+      model: string;
+      revoked: AbortSignal;
+    }
+  >();
   const uninstallProof = input.startup.installStartingEditorProof(
     (
       { binding, endpoint, context, modelAdapterId, profile, readModels },
       signal,
     ) =>
       own(signal, async (active) => {
+        const timing = dEntryStartupTiming('editor-proof');
         const expected: DEntryIdentity = {
           organizationId: binding.organizationId,
           personId: binding.personId,
@@ -426,7 +502,7 @@ export function installProductionDEntrySource(input: {
           employeeVersionId: endpoint.employeeVersionId,
           threadId: null,
         };
-        const release = await readDEntryReleasePolicy();
+        const release = await timing.run('rollout', readDEntryReleasePolicy);
         active.throwIfAborted();
         if (selectDEntryGeneration(release, expected) !== '4.0') return null;
         // The native startup roster spans the real current workspaces of this
@@ -441,34 +517,79 @@ export function installProductionDEntrySource(input: {
           if (!sameDEntryIdentity(identity, expected)) denied();
           return identity;
         }
-        const identity = await current();
-        const seal = await readWorkerEmployeeWebSeal(active);
-        const editor = await holdReleasedProfile(
-          seal.directory,
-          profile,
-          active,
-          seal.manifestSha256,
+        const identity = await timing.run('current-authority', current);
+        const seal = await timing.run('release-seal', () =>
+          readWorkerEmployeeWebSeal(active),
         );
-        const models = await readModels();
-        const route = await input.resolveSendRoute(
-          { context: scope, identity, binding, modelAdapterId },
-          active,
+        const editor = await timing.run('profile-attestation', () =>
+          holdReleasedProfile(
+            seal.directory,
+            profile,
+            active,
+            seal.manifestSha256,
+          ),
         );
-        if (
-          models.value.default.provider !== route.provider ||
-          models.value.default.model !== route.model ||
-          !models.value.routableProviders.includes(route.provider) ||
-          !models.value.groups.some(
-            ({ id, models }) =>
-              id === route.provider &&
-              models.some(({ id }) => id === route.model),
-          ) ||
-          models.value.failures.some(({ id }) => id === route.provider)
-        )
-          throw new PersonVmError('RUNTIME_NOT_READY');
-        await editor.assertCurrent(active);
-        if (!sameDEntryIdentity(identity, await current())) denied();
-        route.revoked.throwIfAborted();
+        // Route truth remains current even when the immutable profile and the
+        // installed adapter's catalog have already been proved for this epoch.
+        const resolveRoute = () =>
+          timing.run('send-route', () =>
+            input.resolveSendRoute(
+              { context: scope, identity, binding, modelAdapterId },
+              active,
+            ),
+          );
+        const owner = profile.verificationOwner;
+        const old = owner && modelProofs.get(owner);
+        const existing =
+          old &&
+          !old.revoked.aborted &&
+          old.adapterId === modelAdapterId &&
+          old.seal === seal.manifestSha256
+            ? await resolveRoute()
+            : undefined;
+        const route =
+          old &&
+          existing &&
+          !old.revoked.aborted &&
+          existing.provider === old.provider &&
+          existing.model === old.model
+            ? existing
+            : await (async () => {
+                const models = await timing.run('model-catalog', readModels);
+                // Route revocation may only be observed on a current read.
+                const currentRoute = await resolveRoute();
+                if (
+                  models.value.default.provider !== currentRoute.provider ||
+                  models.value.default.model !== currentRoute.model ||
+                  !models.value.routableProviders.includes(
+                    currentRoute.provider,
+                  ) ||
+                  !models.value.groups.some(
+                    ({ id, models }) =>
+                      id === currentRoute.provider &&
+                      models.some(({ id }) => id === currentRoute.model),
+                  ) ||
+                  models.value.failures.some(
+                    ({ id }) => id === currentRoute.provider,
+                  )
+                )
+                  throw new PersonVmError('RUNTIME_NOT_READY');
+                return currentRoute;
+              })();
+        await timing.run('final-authority', async () => {
+          await editor.assertCurrent(active);
+          if (!sameDEntryIdentity(identity, await current())) denied();
+          route.revoked.throwIfAborted();
+        });
+        if (owner && modelAdapterId)
+          modelProofs.set(owner, {
+            adapterId: modelAdapterId,
+            seal: seal.manifestSha256,
+            provider: route.provider,
+            model: route.model,
+            revoked: route.revoked,
+          });
+        timing.ready();
         return route.revoked;
       }),
   );

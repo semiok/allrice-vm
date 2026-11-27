@@ -1027,7 +1027,105 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
         return value;
       },
     };
-    const serving = await holdReleasedProfile(directory, current, lifetime);
+    const source = {
+      ...current,
+      verificationOwner: {},
+      readImmutableBundle: vi.fn(current.readImmutableBundle),
+    };
+    const manifestSha256 = createHash('sha256')
+      .update(await readFile(join(directory, 'artifact.json')))
+      .digest('hex');
+    const serving = await holdReleasedProfile(
+      directory,
+      source,
+      lifetime,
+      manifestSha256,
+    );
+    const nativeReferences = [...native.entries, ...native.batches]
+      .flatMap(({ url }) => [
+        url,
+        url.replaceAll('/client.js', '/client.js.map'),
+      ])
+      .sort();
+    const nativeReads = nativeReferences.length;
+    expect(
+      source.readImmutableBundle.mock.calls
+        .map(([reference]) => reference)
+        .sort(),
+    ).toEqual(nativeReferences);
+    const sameOwner = await holdReleasedProfile(
+      directory,
+      { ...source },
+      lifetime,
+      manifestSha256,
+    );
+    expect(source.readImmutableBundle).toHaveBeenCalledTimes(nativeReads);
+    const staticPath = 'managed/employee-web-entry.js';
+    const bytes = (await sameOwner.readStatic(staticPath, lifetime)).data;
+    bytes.fill(0);
+    expect((await serving.readStatic(staticPath, lifetime)).data).toEqual(
+      Buffer.from('/* fixture static resource */'),
+    );
+    const nextEpoch = { ...source, verificationOwner: {} };
+    await holdReleasedProfile(directory, nextEpoch, lifetime, manifestSha256);
+    expect(source.readImmutableBundle).toHaveBeenCalledTimes(nativeReads * 2);
+
+    const transientOwner = {};
+    const firstStarted = deferred();
+    const denyFirst = deferred();
+    const first = holdReleasedProfile(
+      directory,
+      {
+        ...current,
+        verificationOwner: transientOwner,
+        async readImmutableBundle() {
+          firstStarted.resolve();
+          await denyFirst.promise;
+          throw Error('the first page lost its authority');
+        },
+      },
+      lifetime,
+      manifestSha256,
+    );
+    const denied = expect(first).rejects.toThrow('lost its authority');
+    await firstStarted.promise;
+    function otherScope(signal: AbortSignal) {
+      const graph = deferred();
+      return {
+        graph: graph.promise,
+        proof: holdReleasedProfile(
+          directory,
+          {
+            ...current,
+            verificationOwner: transientOwner,
+            async readImmutableGraph() {
+              graph.resolve();
+              return native;
+            },
+          },
+          signal,
+          manifestSha256,
+        ),
+      };
+    }
+    const canceled = new AbortController();
+    const waiting = otherScope(canceled.signal);
+    const interrupted = expect(waiting.proof).rejects.toHaveProperty(
+      'name',
+      'AbortError',
+    );
+    await waiting.graph;
+    canceled.abort();
+    await interrupted;
+    const independent = otherScope(lifetime);
+    await independent.graph;
+    denyFirst.resolve();
+    await denied;
+    await expect(independent.proof).resolves.toHaveProperty(
+      'manifestSha256',
+      manifestSha256,
+    );
+
     expect(serving.graph).toEqual(native);
     for (const { url, rev } of [...native.entries, ...native.batches]) {
       expect((await serving.readReference(url, rev, lifetime)).data).toEqual(
@@ -1062,7 +1160,13 @@ it('attests each exact resource in independent rc.2 graph orders and rejects a m
           lifetime,
         ),
       ).rejects.toThrow('D entry native owner is not bound');
-      if (corrupt === target.url) expect(requested).toEqual([target.url]);
+      if (corrupt === target.url) {
+        expect(requested).toContain(target.url);
+        expect(requested).not.toContain(
+          target.url.replaceAll('/client.js', '/client.js.map'),
+        );
+        expect(requested).not.toContain(graph.batches[0]!.url);
+      }
     }
     await expect(
       holdReleasedProfile(

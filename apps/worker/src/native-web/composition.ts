@@ -127,7 +127,7 @@ export function createAssignedNativeWebStartup(input: {
   readEmployeeProfile(signal: AbortSignal): Promise<NativeWebGuestProfile>;
   configuration: Pick<
     NativeWebConfiguration,
-    'cliPath' | 'startupTimeoutMs'
+    'cliPath' | 'startupTimeoutMs' | 'terminalEnabled'
   > & {
     publicUrl(endpoint: Endpoint, binding: PersonVmBinding): string;
   };
@@ -1108,7 +1108,8 @@ export function createAssignedNativeWebStartup(input: {
           throw new PersonVmError('RUNTIME_NOT_READY');
         proof.throwIfAborted();
         const enrolled = group.verifiedEmployees.get(employeeInstanceId);
-        if (enrolled && !enrolled.aborted) return enrolled;
+        if (enrolled && !enrolled.aborted && !modelAdapter) return enrolled;
+        // Production rechecks the route even on a sealed profile cache hit.
         group.verifiedEmployees.set(employeeInstanceId, proof);
         return proof;
       });

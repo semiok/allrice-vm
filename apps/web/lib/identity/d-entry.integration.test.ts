@@ -105,6 +105,8 @@ import {
   requireCurrentPlatformAdmin,
   getDEntryNativeRootPin,
   getDEntryHistoryRootPin,
+  getDEntryPageNativeRoot,
+  registerDEntryPageNativeRoot,
   ensureDEntryNativeRoot,
   requireDEntryNativeIdentity,
   readDEntryEmployeeDirectory,
@@ -565,6 +567,157 @@ suite(
         expect(legacy!.n).toBe(0);
         expect(runs!.n).toBe(0);
         expect(create).toHaveBeenCalledTimes(1);
+      } finally {
+        await clearPublished();
+      }
+    });
+
+    it('registers native page create and fork replies exactly once under the current person VM lease', async () => {
+      const f = await enabledFour();
+      const created = creation(f, 'native-page-created');
+      const binding = created.host.binding;
+      const identity = { ...f.identity, threadId: null };
+      const signal = new AbortController().signal;
+      try {
+        await fixture.db`insert into person_virtual_machines
+          (person_id, vm_id, organization_id, phase, disk_tier, instance_id, lease_epoch, native_created, egress_receipt)
+          values (${f.user}, ${binding.vmId}, ${f.org}, 'running', 'warm', ${binding.instanceId},
+            ${binding.leaseEpoch}, true, ${fixture.db.json({ source: 'synthetic-registration' })})`;
+
+        const first = await registerDEntryPageNativeRoot(
+          f.context,
+          identity,
+          created,
+          signal,
+        );
+        expect(first.identity.threadId).toEqual(expect.any(String));
+        expect(first.identity.threadId).not.toBe(f.thread.id);
+        expect(first).toMatchObject({
+          rootNativeSessionId: created.nativeSessionId,
+          vmId: binding.vmId,
+        });
+        expect(
+          await registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            created,
+            signal,
+          ),
+        ).toEqual(first);
+        expect(
+          await getDEntryPageNativeRoot(
+            f.context,
+            identity,
+            binding.vmId,
+            created.nativeSessionId,
+          ),
+        ).toEqual(first);
+
+        const forked = {
+          ...created,
+          nativeSessionId: 'native-page-forked',
+          forkSource: { nativeSessionId: created.nativeSessionId, root: first },
+        };
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            {
+              ...forked,
+              forkSource: {
+                ...forked.forkSource,
+                root: { ...first, rootOriginDigest: 'replaced-source' },
+              },
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        const fork = await registerDEntryPageNativeRoot(
+          f.context,
+          first.identity,
+          forked,
+          signal,
+        );
+        expect(fork.identity.threadId).not.toBe(first.identity.threadId);
+        expect(fork).toMatchObject({
+          rootNativeSessionId: forked.nativeSessionId,
+          forkedFromNativeSessionId: created.nativeSessionId,
+        });
+        expect(
+          await registerDEntryPageNativeRoot(
+            f.context,
+            first.identity,
+            forked,
+            signal,
+          ),
+        ).toEqual(fork);
+        await fixture.db`update allrice_chat_sessions set archived_at=now() where id=${first.identity.threadId}`;
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            { ...forked, nativeSessionId: 'native-rejected-archived-source' },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+        expect(
+          await getDEntryNativeRootPin(f.context, {
+            ...f.selection,
+            threadId: fork.identity.threadId,
+          }),
+        ).toEqual(fork);
+
+        const other = await setup();
+        await fixture.db`insert into allrice_memberships (organization_id, workspace_id, user_id, role)
+          values (${f.org}, ${f.workspace}, ${other.user}, 'member')`;
+        const stranger = await authenticateSession(other.login.token, {
+          organizationId: f.org,
+          workspaceId: f.workspace,
+        });
+        if (!stranger) throw Error('Synthetic member login unavailable');
+        await expect(
+          registerDEntryPageNativeRoot(
+            stranger,
+            identity,
+            {
+              ...created,
+              nativeSessionId: 'native-rejected-actor',
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        await fixture.db`update person_virtual_machines set lease_epoch=lease_epoch + 1 where vm_id=${binding.vmId}`;
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            {
+              ...created,
+              nativeSessionId: 'native-rejected-old-epoch',
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
+
+        const threads =
+          await fixture.db`select id, d_entry_native_root->>'nativeSessionId' as native_session_id
+          from allrice_chat_sessions where organization_id=${f.org} and workspace_id=${f.workspace}
+            and execution_generation='4.0'`;
+        expect(threads).toHaveLength(3);
+        expect(threads).toEqual(
+          expect.arrayContaining([
+            { id: f.thread.id, native_session_id: null },
+            {
+              id: first.identity.threadId,
+              native_session_id: created.nativeSessionId,
+            },
+            {
+              id: fork.identity.threadId,
+              native_session_id: forked.nativeSessionId,
+            },
+          ]),
+        );
       } finally {
         await clearPublished();
       }

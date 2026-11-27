@@ -38,6 +38,11 @@ export interface DEntryNativeDataPort {
     signal: AbortSignal,
     expectedBinding?: PersonVmBinding,
   ): Promise<AbortSignal>;
+  confirmVerifiedEditor?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    signal: AbortSignal,
+  ): Promise<{ binding: PersonVmBinding; proof: AbortSignal } | undefined>;
   /** Explicit editor open on a current running Host. The database owns the
    * durable claim and native root. Read-only discovery never calls this. */
   prepareEditorRoot?(input: {
@@ -53,6 +58,7 @@ export interface DEntryNativeDataPort {
     owner: ResolvedDEntryNativeOwner;
     operationId: string;
     signal: AbortSignal;
+    access?: 'page';
   }): Promise<DEntryAdmissionOwner>;
   acquireRpc?(
     input: {

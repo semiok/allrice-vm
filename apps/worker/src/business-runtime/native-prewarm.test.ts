@@ -1582,6 +1582,111 @@ it('returns Worker 200 on a verified hot path and refuses proof revoked during r
   expect(prewarm).toHaveBeenCalledTimes(2);
 });
 
+it('returns ready for an exact verified running editor without opening a prewarm job', async () => {
+  const f = fixture(true);
+  const { context, body, data } = f.base;
+  await f.h.service.prewarm(context, { trigger: 'page' }, signal());
+  const binding = await f.h.service.resolve(context, signal());
+  const verified = new AbortController();
+  const confirmVerifiedEditor = vi.fn(async () => ({
+    binding,
+    proof: verified.signal,
+  }));
+  const uninstall = installDEntryNativeDataPort({
+    ...data,
+    confirmVerifiedEditor,
+    assertEditorReady: async () => signal(),
+  });
+  cleanups.push(async () => uninstall());
+  const prewarmCurrent = vi.fn(f.prewarmCurrent);
+  const installed = installDEntryNativePrewarm({
+    prewarmCurrent,
+    lifetime: f.lifetime.signal,
+    requireEditorProof: true,
+    readCoordination: f.readCoordination,
+  });
+  cleanups.push(installed.close);
+  const server = await nativeEntryServer(f.base);
+  cleanups.push(server.close);
+
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(confirmVerifiedEditor).toHaveBeenCalledOnce();
+  expect(prewarmCurrent).not.toHaveBeenCalled();
+  expect(f.start).toHaveBeenCalledOnce();
+
+  verified.abort();
+  expect(
+    (await server.request('native-prewarm', { ...body, trigger: 'page' }))
+      .status,
+  ).toBe(200);
+  expect(prewarmCurrent).toHaveBeenCalledOnce();
+  expect(f.start).toHaveBeenCalledOnce();
+});
+
+it('shares one hot ticket when concurrent running-editor probes both fall back', async () => {
+  const f = fixture();
+  const pageProbe = deferred<void>();
+  const inputProbe = deferred<void>();
+  const allowPageFallback = deferred<void>();
+  const allowInputFallback = deferred<void>();
+  const started = deferred<void>();
+  const ready = deferred<AbortSignal>();
+  const confirmRunning = vi
+    .fn<NonNullable<DEntryNativePrewarmPort['confirmRunning']>>()
+    .mockImplementationOnce(async () => {
+      pageProbe.resolve();
+      await allowPageFallback.promise;
+      return undefined;
+    })
+    .mockImplementationOnce(async () => {
+      inputProbe.resolve();
+      await allowInputFallback.promise;
+      return undefined;
+    });
+  const prewarm = vi.fn(() => {
+    started.resolve();
+    return ready.promise;
+  });
+  const server = await nativeEntryServer(f.base, {
+    ...f.base.deps,
+    prewarm: {
+      confirmRunning,
+      isCurrent: async () => true,
+      prepare: async () => ({
+        key: 'same-running-editor',
+        target: f.base.binding,
+        running: true,
+      }),
+      prewarm,
+    },
+  });
+  cleanups.push(server.close);
+  const post = (trigger: 'page' | 'input') =>
+    server.request('native-prewarm', { ...f.base.body, trigger });
+  try {
+    const page = post('page');
+    await pageProbe.promise;
+    const input = post('input');
+    await inputProbe.promise;
+    allowPageFallback.resolve();
+    await started.promise;
+    allowInputFallback.resolve();
+    const [pageReply, inputReply] = await Promise.all([page, input]);
+    expect(pageReply.status).toBe(202);
+    expect(inputReply.status).toBe(202);
+    const accepted = await pageReply.json();
+    expect(await inputReply.json()).toMatchObject({ ticket: accepted.ticket });
+    expect(prewarm).toHaveBeenCalledOnce();
+  } finally {
+    allowPageFallback.resolve();
+    allowInputFallback.resolve();
+    ready.resolve(signal());
+  }
+});
+
 it('uses both the selected editor proof and physical Host readiness on the real hot HTTP path', async () => {
   const f = fixture(true);
   const { context, body, data } = f.base;

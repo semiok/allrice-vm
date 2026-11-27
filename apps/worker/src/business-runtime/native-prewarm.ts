@@ -455,6 +455,27 @@ export function createDEntryNativePrewarmPort(input: {
   }
   const port: DEntryNativePrewarmPort = {
     isCurrent,
+    async confirmRunning(context, identity, plan, caller) {
+      if (!plan.running || !plan.target.vmId || !plan.target.instanceId) return;
+      const active = AbortSignal.any([admission, caller]);
+      const verified =
+        await currentDEntryNativeDataPort()?.confirmVerifiedEditor?.(
+          context,
+          identity,
+          active,
+        );
+      if (
+        !verified ||
+        verified.proof.aborted ||
+        !compatible(plan.target, verified.binding)
+      )
+        return;
+      const current = AbortSignal.any([active, verified.proof]);
+      if (!(await isCurrent(context, identity, plan, current, 'ready'))) return;
+      await plan.assertTicketThread?.(current);
+      current.throwIfAborted();
+      return current;
+    },
     async prepare(context, identity, caller) {
       const signal = AbortSignal.any([admission, caller]);
       signal.throwIfAborted();
