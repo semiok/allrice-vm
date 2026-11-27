@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { finished } from 'node:stream/promises';
+import { TYPERT_REMOTE as Native } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { TYPERT_REMOTE as Schedule } from '@deepseek-ai/dsh-schedule/remote';
 import { afterEach, expect, it } from 'vitest';
 import {
@@ -130,9 +131,9 @@ it.skipIf(!cli)(
     cleanup.push(() => page.close());
     const scope = await page.run(signal);
     expect(scope.opened.baseline.owner).toBe(false);
-    async function invoke<Key extends keyof typeof Schedule.methods>(
-      endpoint: Key,
-      args: Record<string, unknown>,
+    async function invoke(
+      endpoint: keyof typeof Schedule.methods,
+      args: Parameters<typeof scope.invokePage>[0]['args'],
     ) {
       const result = await scope.invokePage(
         { kind: 'page', endpoint, scopeId: pageId, args },
@@ -195,19 +196,22 @@ it.skipIf(!cli)(
         {
           endpoint: 'session/prompt',
           scopeId: executionId,
-          args: {
-            request: {
-              sessionId,
-              requestId: randomUUID(),
-              content: [
-                {
-                  type: 'text',
-                  text: 'Create a test reminder in ten minutes.',
-                },
-              ],
-              mode: 'queue',
-            },
-          },
+          args: Native.methods['session/prompt']
+            .input({ strict: true })
+            .create()
+            .parse({
+              request: {
+                sessionId,
+                requestId: randomUUID(),
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Create a test reminder in ten minutes.',
+                  },
+                ],
+                mode: 'queue',
+              },
+            }),
         },
         signal,
       ),
@@ -215,27 +219,30 @@ it.skipIf(!cli)(
     await nextChange();
 
     const [task] = await hostCatalog();
+    if (!task) throw Error('The native tool did not persist a reminder');
     expect(task).toMatchObject({ sessionId, title, prompt, status: 'active' });
     expect(await catalog()).toEqual([task]);
-    const expected = Schedule.methods['schedule/list'].result
+    const [expected] = Schedule.methods['schedule/list'].result
       .create()
       .parse(await invoke('schedule/list', { request: { sessionId } }));
-    expect(expected).toMatchObject([{ id: task!.id, title, prompt }]);
-    const selector = { sessionId, id: task!.id };
+    if (!expected)
+      throw Error('The native Session list did not include the reminder');
+    expect(expected).toMatchObject({ id: task.id, title, prompt });
+    const selector = { sessionId, id: task.id };
     expect(
       await invoke('schedule/history', { request: { ...selector, limit: 10 } }),
-    ).toMatchObject({ id: task!.id, records: [] });
+    ).toMatchObject({ id: task.id, records: [] });
     const at = new Date(Date.now() + 1_200_000).toISOString();
     expect(
       await invoke('schedule/update', {
         request: {
           ...selector,
-          expected: expected[0],
+          expected,
           change: { kind: 'at', at },
         },
       }),
     ).toMatchObject({
-      id: task!.id,
+      id: task.id,
       updated: true,
       record: { scheduledAt: at },
     });
@@ -250,10 +257,10 @@ it.skipIf(!cli)(
       await invoke('schedule/delete', {
         request: { ...selector, sessionId: other.value.sessionId },
       }),
-    ).toEqual({ id: task!.id, deleted: false, code: 'schedule_not_found' });
+    ).toEqual({ id: task.id, deleted: false, code: 'schedule_not_found' });
     expect(await hostCatalog()).toEqual(updated);
     expect(await invoke('schedule/delete', { request: selector })).toEqual({
-      id: task!.id,
+      id: task.id,
       deleted: true,
     });
     await nextChange();
