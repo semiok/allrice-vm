@@ -84,6 +84,7 @@ export function EmployeeNativePage({
   initialUnavailable?: boolean;
 }) {
   const frame = useRef<HTMLIFrameElement>(null);
+  const frameSelection = useRef<DEntrySelectionInput | undefined>(undefined);
   const [source, setSource] = useState<string>();
   const [failed, setFailed] = useState(false);
   const [status, setStatus] = useState<Status>(
@@ -94,6 +95,7 @@ export function EmployeeNativePage({
     query: string;
     confirmedQuery?: string;
     warmup?: EntryWarmup;
+    retainFrame?: boolean;
     ticket?: DEntryNativePrewarmTicket;
   }>({ query });
   const activeQuery = activation.query;
@@ -141,7 +143,13 @@ export function EmployeeNativePage({
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     const local = pendingPageResult<'closed' | 'unknown'>();
-    setSource(undefined);
+    const retainedDocument = activation.retainFrame
+      ? frame.current?.contentDocument
+      : undefined;
+    if (!activation.retainFrame) {
+      frameSelection.current = undefined;
+      setSource(undefined);
+    }
     setFailed(false);
     setStatus('warming');
     setSettled(false);
@@ -212,6 +220,7 @@ export function EmployeeNativePage({
               win &&
               previous &&
               (previous.URL === 'about:blank' ||
+                previous === retainedDocument ||
                 (matchesDocument(previous.URL) &&
                   !Reflect.get(win, '__ALLRICE_EMPLOYEE_DOCUMENT__')))
             ) {
@@ -247,9 +256,10 @@ export function EmployeeNativePage({
         if (closed) {
           retired = true;
           if (nextQuery.current !== activeQuery) {
-            setActivation({ query: nextQuery.current });
+            activateSelection(nextQuery.current);
             return;
           }
+          frameSelection.current = undefined;
           setSource(undefined);
           setStatus(status);
           setSettled(true);
@@ -299,6 +309,20 @@ export function EmployeeNativePage({
       }
     };
     loaded.current = documentLoaded;
+    function activateSelection(query: string, warmup?: EntryWarmup) {
+      const params = new URLSearchParams(query);
+      const same = (key: 'workspaceId' | 'employeeInstanceId') =>
+        params.getAll(key).length === 1 &&
+        params.get(key) === frameSelection.current?.[key];
+      setActivation({
+        query,
+        warmup,
+        // The previous thread already joined. A fresh authorized document
+        // can use the same frame without creating an outer navigation.
+        retainFrame:
+          !!frame.current && same('workspaceId') && same('employeeInstanceId'),
+      });
+    }
     const applyQuery = () => {
       if (navigating) {
         if (nextWarmup && nextQuery.current !== activeQuery) {
@@ -307,14 +331,14 @@ export function EmployeeNativePage({
           superseded = true;
         }
         if (retired && nextQuery.current !== activeQuery)
-          setActivation({ query: nextQuery.current });
+          activateSelection(nextQuery.current);
         return;
       }
       navigating = true;
       window.clearTimeout(timer);
       void retire().then((closed) => {
         if (replace.current !== applyQuery) return;
-        if (closed) setActivation({ query: nextQuery.current });
+        if (closed) activateSelection(nextQuery.current);
         else if (prepare) setStatus('unknown');
         else setFailed(true);
       });
@@ -394,13 +418,12 @@ export function EmployeeNativePage({
         );
         if (prepare && !next.data.threadId)
           params.set('new', crypto.randomUUID());
-        if (
+        const sameEmployee =
           prepare &&
-          !document.hidden &&
           location.pathname === '/chatflow/4.0' &&
           selectedEmployee?.workspaceId === next.data.workspaceId &&
-          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId
-        ) {
+          selectedEmployee.employeeInstanceId === next.data.employeeInstanceId;
+        if (sameEmployee && !document.hidden) {
           // A navigation from this verified employee can start qualification
           // for the selected thread while the old page joins its transport.
           // This request has no page-carrier or thread-creation side effect.
@@ -428,12 +451,12 @@ export function EmployeeNativePage({
           if (closed) {
             if (superseded || nextQuery.current !== activeQuery) {
               warmup?.lifetime.abort();
-              setActivation({ query: nextQuery.current });
-            } else if (warmup) {
+              activateSelection(nextQuery.current);
+            } else if (sameEmployee) {
               const query = params.toString();
               nextQuery.current = query;
               history.pushState(null, '', '/chatflow/4.0?' + query);
-              setActivation({ query, warmup });
+              activateSelection(query, warmup);
             } else location.assign('/chatflow/4.0?' + params);
           } else {
             warmup?.lifetime.abort();
@@ -466,7 +489,8 @@ export function EmployeeNativePage({
     );
     // The shell owns only its wait; the Worker owns an accepted cold start.
     const showPrewarm = (state: EmployeePrewarmProgress) => {
-      if (!lifetime.signal.aborted && !navigating) setStatus(state);
+      if (!lifetime.signal.aborted && !navigating)
+        setStatus(activation.retainFrame ? 'warming' : state);
     };
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
@@ -537,9 +561,15 @@ export function EmployeeNativePage({
       lifetime.signal.throwIfAborted();
       if (navigating) return;
       selectedEmployee = selection;
+      frameSelection.current = selection;
       params.set('scopeId', issued.scopeId);
       mounted = true;
-      setSource('/chatflow/4.0/document?' + params);
+      const documentUrl = '/chatflow/4.0/document?' + params;
+      const retainedWindow = activation.retainFrame
+        ? frame.current?.contentWindow
+        : undefined;
+      if (retainedWindow) retainedWindow.location.replace(documentUrl);
+      else setSource(documentUrl);
     };
     const setting = setup().catch((error: unknown) => {
       if (lifetime.signal.aborted) return;

@@ -73,7 +73,11 @@ suite('4.0 browser cold entry', () => {
       const allowStarting = deferred<void>();
       const allowReady = deferred<void>();
       const ticket = randomUUID();
+      const sameEmployeeTicket = randomUUID();
+      const sameEmployeeStarting = deferred<void>();
+      const sameEmployeeReady = deferred<void>();
       let polls = 0;
+      let sameEmployeePolls = 0;
       const warmCalls: unknown[] = [],
         births: unknown[] = [],
         documents: string[] = [];
@@ -96,12 +100,13 @@ suite('4.0 browser cold entry', () => {
             firstRetry.resolve(response);
             return;
           }
-          if (warmCalls.length === 4)
+          if (warmCalls.length === 4 || warmCalls.length === 5)
             return response
               .writeHead(202, { 'content-type': 'application/json' })
               .end(
                 JSON.stringify({
-                  operationId: ticket,
+                  operationId:
+                    warmCalls.length === 4 ? ticket : sameEmployeeTicket,
                   expiresAt: new Date(Date.now() + 60_000).toISOString(),
                   pollAfterMs: 1000,
                 }),
@@ -114,10 +119,14 @@ suite('4.0 browser cold entry', () => {
           return response.writeHead(204).end();
         }
         if (address.pathname === '/api/v1/d-entry/native-prewarm/status') {
-          if (
-            request.method !== 'GET' ||
-            address.searchParams.get('operationId') !== ticket
-          )
+          if (request.method !== 'GET') return response.writeHead(404).end();
+          if (address.searchParams.get('operationId') === sameEmployeeTicket) {
+            if (++sameEmployeePolls === 1) return json({ state: 'starting' });
+            sameEmployeeStarting.resolve();
+            await sameEmployeeReady.promise;
+            return json({ state: 'ready' });
+          }
+          if (address.searchParams.get('operationId') !== ticket)
             return response.writeHead(404).end();
           if (++polls === 1) {
             await allowStarting.promise;
@@ -315,8 +324,17 @@ suite('4.0 browser cold entry', () => {
         await assertWaiting('工作台已就绪', '正在打开对话。');
         const iframe = page.locator('iframe');
         await iframe.waitFor({ state: 'attached' });
-        const source = new URL((await iframe.getAttribute('src'))!, f.origin);
-        expect(source.searchParams.get('threadId')).toBe(threadId);
+        const currentDocument = () =>
+          iframe.evaluate(
+            (node) => (node as HTMLIFrameElement).contentDocument?.URL,
+          );
+        await expect
+          .poll(async () => {
+            const url = await currentDocument();
+            return url && new URL(url, f.origin).searchParams.get('threadId');
+          })
+          .toBe(threadId);
+        const source = new URL((await currentDocument())!, f.origin);
         expect(await iframe.isVisible()).toBe(false);
         const child = page.frameLocator('iframe');
         await child
@@ -336,6 +354,10 @@ suite('4.0 browser cold entry', () => {
         return scopeId;
       }
       const oldScope = await showEditor(f.selection.threadId);
+      const originalFrame = page.locator('iframe');
+      await originalFrame.evaluate((node) => {
+        (node as HTMLIFrameElement).dataset.retainedFrameProof = 'current';
+      });
       expect(polls).toBe(3);
       expect(warmCalls).toHaveLength(4);
       const oldDocument = page.frameLocator('iframe').locator('body');
@@ -370,9 +392,26 @@ suite('4.0 browser cold entry', () => {
       await page.waitForURL((url) => url.searchParams.has('new'));
       const next = new URL(page.url()).searchParams.get('new')!;
       expect(next).not.toBe(f.selection.threadId);
-      await showEditor(next);
+      try {
+        await sameEmployeeStarting.promise;
+        await assertWaiting('正在打开对话', '马上就好。');
+        expect(
+          await page.getByRole('heading', { name: '正在启动工作台' }).count(),
+        ).toBe(0);
+        expect(documents).toEqual([f.selection.threadId]);
+      } finally {
+        sameEmployeeReady.resolve();
+      }
+      const newScope = await showEditor(next);
+      expect(newScope).not.toBe(oldScope);
+      expect(
+        await originalFrame.getAttribute('data-retained-frame-proof'),
+      ).toBe('current');
       expect(
         (await f.invokeThread(oldScope, f.selection.threadId)).status,
+      ).toBe(404);
+      expect(
+        (await f.invokeThread(newScope, f.selection.threadId)).status,
       ).toBe(404);
       expect(new URL(page.url()).searchParams.get('threadId')).toBe(next);
       expect(births).toEqual([
