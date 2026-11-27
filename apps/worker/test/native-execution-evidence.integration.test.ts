@@ -407,6 +407,32 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
             signal,
           ),
         ).resolves.toBeNull();
+        const { promise: locked, resolve: announceLock } =
+          Promise.withResolvers<void>();
+        const { promise: unlocked, resolve: releaseLock } =
+          Promise.withResolvers<void>();
+        const blocker = db.begin(async (tx) => {
+          await tx`select id from allrice_runs where id=${runId} for update`;
+          announceLock();
+          await unlocked;
+        });
+        try {
+          await Promise.race([locked, blocker]);
+          await expect(
+            recordNativeMemoryToolCall(
+              receipt,
+              executionRef,
+              memoryTool,
+              signal,
+            ),
+          ).rejects.toMatchObject({ code: '55P03' });
+          const [written] = await db`select id from allrice_run_events
+            where run_id=${runId} and payload->>'kind'='memory-tool'`;
+          expect(written).toBeUndefined();
+        } finally {
+          releaseLock();
+          await blocker;
+        }
         const [toolRef, replay] = await Promise.all([
           recordNativeMemoryToolCall(receipt, executionRef, memoryTool, signal),
           recordNativeMemoryToolCall(receipt, executionRef, memoryTool, signal),
@@ -456,6 +482,23 @@ describe.skipIf(process.env.ALLRICE_RUN_DB_INTEGRATION !== '1')(
         await db`update person_virtual_machines set phase='stopped' where vm_id=${vm.vmId}`;
         await expect(read(toolSelection)).rejects.toThrow();
         await expect(read(firstSelection)).rejects.toThrow();
+        const storedToolSelection = {
+          ...toolSelection,
+          mode: 'stored-call' as const,
+          runId,
+        };
+        await expect(
+          read(storedToolSelection, {
+            ...first.context,
+            sessionId: randomUUID(),
+          }),
+        ).resolves.toMatchObject({
+          nativeRequestRef: toolRef,
+          call: { tool: memoryTool },
+        });
+        await expect(
+          read({ ...storedToolSelection, runId: randomUUID() }),
+        ).rejects.toThrow();
         await expect(read({ mode: 'restore', runId })).resolves.toMatchObject({
           original: receipt.origin,
           first: receipt.request,

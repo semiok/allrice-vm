@@ -114,7 +114,8 @@ const toolSchema = z
 export type NativeMemoryEvidenceSelection =
   | { mode: 'issue'; runId: string; nativeRequestRef: string }
   | { mode: 'restore'; runId: string }
-  | { mode: 'call'; nativeRequestRef: string };
+  | { mode: 'call'; nativeRequestRef: string }
+  | { mode: 'stored-call'; runId: string; nativeRequestRef: string };
 
 const deny = (): never => {
   throw new DataAccessError('authorization_denied');
@@ -151,7 +152,7 @@ export async function readLockedNativeMemoryExecutionEvidence(
     return deny();
   const pin = await readLockedDEntryNativeRootPin(tx, identity);
   if (!pin) return deny();
-  const live = selection.mode !== 'restore';
+  const live = selection.mode === 'issue' || selection.mode === 'call';
   const currentVm = live
     ? requireOne(
         await tx<{ instance_id: string; lease_epoch: string }[]>`
@@ -169,7 +170,7 @@ export async function readLockedNativeMemoryExecutionEvidence(
       ? null
       : UuidSchema.parse(selection.nativeRequestRef);
   const callRow =
-    selection.mode === 'call'
+    selection.mode === 'call' || selection.mode === 'stored-call'
       ? requireOne(
           await tx<{ run_id: string; payload: unknown }[]>`
         select run_id,payload from allrice_run_events where id=${nativeRef}
@@ -183,6 +184,7 @@ export async function readLockedNativeMemoryExecutionEvidence(
     selection.mode === 'call'
       ? callRow!.run_id
       : UuidSchema.parse(selection.runId);
+  if (callRow && callRow.run_id !== runId) return deny();
   const run = requireOne(
     await tx<{ id: string }[]>`
     select id from allrice_runs
@@ -196,12 +198,12 @@ export async function readLockedNativeMemoryExecutionEvidence(
         personId,
         vmId: pin.vmId,
         rootSessionId: pin.rootNativeSessionId,
-        ...(selection.mode !== 'restore' && {
+        ...(live && {
           loginSessionId: context.sessionId,
         }),
       })}
       and (execution_spec->>'forkedFromNativeSessionId') is not distinct from ${pin.forkedFromNativeSessionId ?? null}::text
-      and (${selection.mode === 'restore'} or state='running')
+      and (${!live} or state='running')
     for share
   `,
   );

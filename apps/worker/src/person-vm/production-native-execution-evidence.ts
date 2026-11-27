@@ -399,6 +399,10 @@ export async function recordNativeMemoryToolCall(
   } as const;
   signal.throwIfAborted();
   const id = await getDatabase().begin(async (tx) => {
+    signal.throwIfAborted();
+    await tx`set local lock_timeout = '1000ms'`;
+    await tx`set local statement_timeout = '3000ms'`;
+    signal.throwIfAborted();
     if (!(await lockNativeMemoryRun(tx, run))) return null;
     signal.throwIfAborted();
     const exact = await tx<{ id: string }[]>`
