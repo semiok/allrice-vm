@@ -49,7 +49,10 @@ type Status =
 
 // Only the browser's wait is bounded. The Worker owns each admitted VM start.
 const entryWaitMs = 5 * 60_000;
+const liveSwitchWaitMs = 10_000;
 const closingNoticeMs = 10_000;
+
+type ThreadHandoff = { selection: DEntrySelectionInput; scopeId?: string };
 
 type EntryWarmup = {
   lifetime: AbortController;
@@ -201,8 +204,7 @@ export function EmployeeNativePage({
     let replacing: Promise<boolean> | undefined;
     let detached = false;
     let switchReady = false;
-    let switching:
-      { selection: DEntrySelectionInput; scopeId?: string } | undefined;
+    let switching: ThreadHandoff | undefined;
     let switchTimer: number | undefined;
     const local = pendingPageResult<'closed' | 'unknown'>();
     const retainedDocument = activation.retainFrame
@@ -541,13 +543,13 @@ export function EmployeeNativePage({
             selection.employeeInstanceId &&
           selectedEmployee.threadId !== selection.threadId
         ) {
-          const target: NonNullable<typeof switching> = { selection };
+          const target: ThreadHandoff = { selection };
           switching = target;
           switchTimer = window.setTimeout(() => {
             if (switching !== target) return;
             switching = undefined;
             navigate(selection);
-          }, entryWaitMs);
+          }, liveSwitchWaitMs);
           void carrier
             .switchThread(selection.threadId)
             .then((issued) => {
