@@ -68,6 +68,10 @@ const io = vi.hoisted(() => ({
       ) => void
     >(),
 }));
+vi.mock('../d-entry/released-profile.js', async (original) => ({
+  ...(await original<typeof import('../d-entry/released-profile.js')>()),
+  primeWorkerEmployeeWebRelease: async () => {},
+}));
 vi.mock('./production-disk-preprovision.js', () => ({
   startProductionDiskPreprovision: io.diskPreprovision,
 }));

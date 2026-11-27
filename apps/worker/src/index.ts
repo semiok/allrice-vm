@@ -35,7 +35,6 @@ import {
 import { createDEntryPageMux } from './d-entry/principal-profile-mux.js';
 import { createDEntryPageRpc } from './d-entry/principal-page-rpc.js';
 import { createDEntryProfile } from './d-entry/profile.js';
-import { primeWorkerEmployeeWebRelease } from './d-entry/released-profile.js';
 import { createDEntryMuxHandler } from './d-entry/mux.js';
 import { createWorkerCurrentBusinessRuntime } from './business-runtime/current-producer.js';
 import {
@@ -453,18 +452,12 @@ function refreshDshRuntimeInventory() {
 }
 
 const httpAborter = new AbortController();
-const personVmHost = (async () => {
-  if (serviceBuildIdentity?.mode === 'production')
-    await startup.run('employee_web_release', () =>
-      primeWorkerEmployeeWebRelease(httpAborter.signal),
-    );
-  return createProductionPersonVmHost({
-    lifetime: httpAborter.signal,
-    sources: createProductionPersonVmSources(
-      createProductionNativeModelExecution(),
-    ),
-  });
-})().then(
+const personVmHost = createProductionPersonVmHost({
+  lifetime: httpAborter.signal,
+  sources: createProductionPersonVmSources(
+    createProductionNativeModelExecution(),
+  ),
+}).then(
   (host) => ({ state: 'installed' as const, host }),
   (error: unknown) => {
     console.info('[MET-273] person VM Host unavailable', {
