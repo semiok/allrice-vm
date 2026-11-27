@@ -453,29 +453,35 @@ export function createDEntryNativePrewarmPort(input: {
     if (vm?.phase === 'stopped' && startedElsewhere) return false;
     return exact(vm) || exact(plannedGeneration(vm));
   }
+  async function confirmRunning(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    plan: PrewarmPlan,
+    caller: AbortSignal,
+  ) {
+    if (!plan.running || !plan.target.vmId || !plan.target.instanceId) return;
+    const active = AbortSignal.any([admission, caller]);
+    const verified =
+      await currentDEntryNativeDataPort()?.confirmVerifiedEditor?.(
+        context,
+        identity,
+        active,
+      );
+    if (
+      !verified ||
+      verified.proof.aborted ||
+      !compatible(plan.target, verified.binding)
+    )
+      return;
+    const current = AbortSignal.any([active, verified.proof]);
+    await plan.assertTicketThread?.(current);
+    if (!(await isCurrent(context, identity, plan, current, 'ready'))) return;
+    current.throwIfAborted();
+    return current;
+  }
   const port: DEntryNativePrewarmPort = {
     isCurrent,
-    async confirmRunning(context, identity, plan, caller) {
-      if (!plan.running || !plan.target.vmId || !plan.target.instanceId) return;
-      const active = AbortSignal.any([admission, caller]);
-      const verified =
-        await currentDEntryNativeDataPort()?.confirmVerifiedEditor?.(
-          context,
-          identity,
-          active,
-        );
-      if (
-        !verified ||
-        verified.proof.aborted ||
-        !compatible(plan.target, verified.binding)
-      )
-        return;
-      const current = AbortSignal.any([active, verified.proof]);
-      if (!(await isCurrent(context, identity, plan, current, 'ready'))) return;
-      await plan.assertTicketThread?.(current);
-      current.throwIfAborted();
-      return current;
-    },
+    confirmRunning,
     async prepare(context, identity, caller) {
       const signal = AbortSignal.any([admission, caller]);
       signal.throwIfAborted();
@@ -603,12 +609,14 @@ export function createDEntryNativePrewarmPort(input: {
           input.isLiveSlottedBinding?.(runningBinding)
         ) {
           await current();
-          await plan.assertTicketThread?.(active);
-          if (!(await isCurrent(context, identity, plan, active, 'ready')))
-            throw new DEntryNativeUnavailable();
-          active.throwIfAborted();
-          runningProof.throwIfAborted();
-          return runningProof;
+          const confirmed = await confirmRunning(
+            context,
+            identity,
+            plan,
+            AbortSignal.any([active, runningProof]),
+          );
+          if (!confirmed) throw new DEntryNativeUnavailable();
+          return confirmed;
         }
         if (!plan && input.requireEditorProof && prove) {
           try {

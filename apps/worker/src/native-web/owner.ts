@@ -417,13 +417,14 @@ export async function openNativeWebOwner(input: {
   }
   function retireExitedOwner() {
     const previous = closing;
-    // The exact guest is gone. Join local children without asking its remote
-    // scopes for an ACK or sending a kill to the old job.
+    // Join the exact exited owner locally. Only a confirmed VM stop can
+    // resolve an otherwise unconfirmed native PTY exit.
     closing = Promise.resolve().then(async () => {
       await Promise.allSettled([previous, hostClosing, disconnected]);
       hostClosing = undefined;
       await joinHost();
-      await principals.retireAfterNativeStop();
+      if (nativeStopConfirmed) await principals.retireAfterNativeStop();
+      else await principals.retireAfterJobExit();
       input.lifetime.removeEventListener('abort', aborted);
     });
     ready = false;
@@ -1372,7 +1373,8 @@ export async function openNativeWebOwner(input: {
       retireAfterJobExit(current: PersonVmBinding) {
         if (!sameVmBinding(binding, current))
           throw new PersonVmError('LEASE_LOST');
-        if (nativeJobExited) return retireExitedOwner();
+        if (nativeJobExited && !principals.hasUnconfirmedTerminalExit())
+          return retireExitedOwner();
       },
       /** Only the trusted runtime's confirmed-native-stop hook may use this. */
       async retireAfterNativeStop(

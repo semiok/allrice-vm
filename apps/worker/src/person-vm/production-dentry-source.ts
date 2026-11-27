@@ -281,11 +281,18 @@ export function installProductionDEntrySource(input: {
             employee,
             current.signal,
           );
-          const group = input.startup.assertAuthenticatedGroup(
-            binding,
+          const authenticated = input.startup.assertAuthenticatedEntry
+            ? input.startup.assertAuthenticatedEntry(
+                binding,
+                employee,
+                current.signal,
+              )
+            : input.startup.assertAuthenticatedGroup(binding, current.signal);
+          const confirmed = AbortSignal.any([
             current.signal,
-          );
-          const confirmed = AbortSignal.any([current.signal, proof, group]);
+            proof,
+            authenticated,
+          ]);
           await input.confirmPhysical(context, identity, binding, confirmed);
           await current.owner.assertCurrent(context, confirmed);
           sameHost(current.owner, identity);

@@ -598,6 +598,7 @@ it.each([
   'already exited',
   'exit during close',
   'unknown without exit',
+  'job exit with unconfirmed PTY',
 ] as const)(
   'reclaims a committed archive from a full pool with delayed notification: %s',
   async (scenario) => {
@@ -657,6 +658,7 @@ it.each([
     const keptOwner = catalogOwner();
     const draining = latch(),
       release = latch();
+    const jobExited = new AbortController();
     let observedExit = scenario === 'already exited';
     const localExitJoin = vi.fn(async () => {
       draining.resolve();
@@ -664,6 +666,7 @@ it.each([
     });
     const archivedOwner = {
       ...catalogOwner(),
+      jobExited: jobExited.signal,
       retireAfterJobExit: vi.fn(() =>
         observedExit ? localExitJoin() : undefined,
       ),
@@ -671,6 +674,7 @@ it.each([
         draining.resolve();
         await release.promise;
         if (scenario === 'exit during close') observedExit = true;
+        if (scenario === 'job exit with unconfirmed PTY') jobExited.abort();
         if (scenario !== 'live owner')
           throw new PersonVmError('CLEANUP_INCOMPLETE');
       }),
@@ -735,7 +739,10 @@ it.each([
     } finally {
       release.resolve();
     }
-    if (scenario === 'unknown without exit') {
+    if (
+      scenario === 'unknown without exit' ||
+      scenario === 'job exit with unconfirmed PTY'
+    ) {
       await expect(change).rejects.toMatchObject({
         code: 'WEB_ENDPOINTS_PREPARING',
       });
@@ -743,10 +750,14 @@ it.each([
       expect(archivedOwner.close).toHaveBeenCalledOnce();
       expect(localExitJoin).not.toHaveBeenCalled();
       expect(hotGuest.bootstrap).not.toHaveBeenCalled();
+      expect(() =>
+        f.service.catalog(f.binding, archived!.employeeInstanceId),
+      ).toThrow('WEB_ENDPOINTS_PREPARING');
       expect(f.service.catalog(f.binding, kept!.employeeInstanceId).owner).toBe(
         keptOwner,
       );
       await f.service.retireAfterNativeStop(f.binding, signal());
+      expect(archivedOwner.retireAfterNativeStop).toHaveBeenCalledOnce();
       await f.service.close();
       return;
     }

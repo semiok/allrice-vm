@@ -320,8 +320,8 @@ export function createAssignedNativeWebStartup(input: {
     try {
       await owner.close();
     } catch (error) {
-      // A real job wait can arrive during normal close. It replaces the
-      // remote ACK only once local Host cleanup actually joins.
+      // A real job wait can arrive during normal close. The owner can use it
+      // once local Host cleanup joins and no PTY exit is unconfirmed.
       const exitedDuringClose = owner.retireAfterJobExit(group.binding);
       if (!exitedDuringClose) throw error;
       await exitedDuringClose;
@@ -807,6 +807,31 @@ export function createAssignedNativeWebStartup(input: {
         sameVmBinding(group.binding, binding)
       );
     },
+    slottedEntryReceipt(
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+      signal: AbortSignal,
+    ): PersonVmWebEndpointReceipt | undefined {
+      signal.throwIfAborted();
+      const group = running.get(binding.vmId);
+      if (!group?.slots) return;
+      const { slots } = group;
+      const { endpoint, revoked } = this.catalog(
+        binding,
+        identity.employeeInstanceId,
+      );
+      revoked.throwIfAborted();
+      if (
+        !sameEmployee(endpoint, identity) ||
+        !slots.some(
+          (slot) =>
+            slot.hostPort === endpoint.hostPort &&
+            slot.guestPort === endpoint.guestPort,
+        )
+      )
+        throw new PersonVmError('LEASE_LOST');
+      return { ...group.receipt, slots };
+    },
     assertVerifiedEditor(
       binding: PersonVmBinding,
       signal: AbortSignal,
@@ -1238,6 +1263,11 @@ export function createAssignedNativeWebStartup(input: {
       signal: AbortSignal,
     ): AbortSignal;
     isLiveSlottedBinding(binding: PersonVmBinding): boolean;
+    slottedEntryReceipt(
+      binding: PersonVmBinding,
+      identity: DEntryIdentity,
+      signal: AbortSignal,
+    ): PersonVmWebEndpointReceipt | undefined;
     catalog(
       binding: PersonVmBinding,
       employeeInstanceId: string,

@@ -871,13 +871,18 @@ export class PersonVmService
     await this.options.native.prepare(binding, mount, signal);
     return mount;
   }
-  private async ready(row: VmRecord, signal: AbortSignal) {
-    if (!this.options.runtime || !this.options.egress || !row.egressReceipt)
+  private async pingRunning(row: VmRecord, signal: AbortSignal) {
+    if (!this.options.egress || !row.egressReceipt)
       throw new PersonVmError('RUNTIME_NOT_READY');
     const binding = bindingOf(row);
     row.egressReceipt = this.receipt(binding, row.egressReceipt);
     await this.options.egress.assertActive(row.egressReceipt, signal);
     await this.options.native.ping(binding, signal);
+    return binding;
+  }
+  private async ready(row: VmRecord, signal: AbortSignal) {
+    if (!this.options.runtime) throw new PersonVmError('RUNTIME_NOT_READY');
+    const binding = await this.pingRunning(row, signal);
     const result = await this.options.runtime.readiness(binding, signal);
     if (
       !result ||
@@ -1407,6 +1412,7 @@ export class PersonVmService
     context: RequestContext,
     binding: PersonVmBinding,
     signal: AbortSignal,
+    webSlots?: PersonVmWebEndpointReceipt,
   ) {
     const identity = await this.identity(context, 'start', signal);
     const row = this.required(await this.options.store.read(identity.personId));
@@ -1417,7 +1423,18 @@ export class PersonVmService
       !sameVmBinding(bindingOf(row), binding)
     )
       throw new PersonVmError('LEASE_CONFLICT');
-    await this.confirmRunning(row, context, signal);
+    if (!webSlots) return this.confirmRunning(row, context, signal);
+    // A running v2 pool has fixed physical ports even as other employees are
+    // added or removed. The caller pins the selected authenticated editor.
+    if (!webSlots.slots || !sameVmBinding(webSlots.binding, binding))
+      throw new PersonVmError('LEASE_LOST');
+    if (!this.options.native.assertWebEndpoints)
+      throw new PersonVmError('RUNTIME_NOT_READY');
+    await this.assertNoPendingDisk(row, signal);
+    await this.options.native.assertWebEndpoints(webSlots, signal);
+    await this.pingRunning(row, signal);
+    await this.assertCurrentBinding(context, binding, signal);
+    signal.throwIfAborted();
   }
   async prewarm(
     context: RequestContext,

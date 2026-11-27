@@ -1705,10 +1705,16 @@ it.skipIf(!cli)(
     expect(f.kills()).toBe(1);
   },
 );
-it.skipIf(!cli)(
-  '真实活动 scope 缺远端 ACK 时，先断连接再获 job 退出回执可只 join 原 Host',
+it
+  .skipIf(!cli)
+  .each([
+    'history scope',
+    'unused terminal grant',
+    'unconfirmed owned PTY',
+  ] as const)(
+  'separates exact managed Web-job exit from remote resource closure after transport loss (%s)',
   { tags: [tag], timeout: 30000 },
-  async () => {
+  async (resource) => {
     const create = NativeTransport.nativeWebTransport;
     const disconnect: (() => void)[] = [];
     vi.spyOn(NativeTransport, 'nativeWebTransport').mockImplementation(
@@ -1728,25 +1734,51 @@ it.skipIf(!cli)(
     const active = new AbortController().signal;
     const native = await f.owner.createRootFor(f.context, {}, active);
     if (!native.ok) throw Error('The fixture root could not be created');
-    const activity = f.owner.acquirePrincipal(
-      {
-        scopeId: randomUUID(),
-        access: 'history',
-        identity: {
-          ...f.principalProfile,
-          organizationId: f.owner.binding.organizationId,
-          personId: f.owner.binding.personId,
-          threadId: randomUUID(),
-        },
-        root: {
-          nativeSessionId: native.value.sessionId,
-          rootOriginDigest: 'fixture-root-origin',
-          rootBindingRef: 'fixture-root-binding',
-        },
+    const issue = {
+      scopeId: randomUUID(),
+      identity: {
+        ...f.principalProfile,
+        organizationId: f.owner.binding.organizationId,
+        personId: f.owner.binding.personId,
+        threadId: randomUUID(),
       },
+      root: {
+        nativeSessionId: native.value.sessionId,
+        rootOriginDigest: 'fixture-root-origin',
+        rootBindingRef: 'fixture-root-binding',
+      },
+    };
+    const ownsTerminal = resource === 'unconfirmed owned PTY';
+    const activity = f.owner.acquirePrincipal(
+      resource === 'history scope'
+        ? { ...issue, access: 'history' }
+        : {
+            scopeId: issue.scopeId,
+            identity: { ...issue.identity, threadId: null },
+            access: 'page',
+            terminalOwner: true,
+          },
       active,
+      f.context,
     );
     const scope = await activity.run(active);
+    if (ownsTerminal) {
+      const id = randomUUID();
+      await expect(
+        scope.invokePage(
+          {
+            kind: 'page',
+            scopeId: issue.scopeId,
+            endpoint: 'terminal/create',
+            args: {
+              agentId: native.value.sessionId,
+              request: { id, cols: 80, rows: 24 },
+            },
+          },
+          active,
+        ),
+      ).resolves.toMatchObject({ value: { id, state: 'running' } });
+    }
     const revoked = once(f.owner.revoked, 'abort');
     disconnect.forEach((close) => close());
     await revoked;
@@ -1767,8 +1799,14 @@ it.skipIf(!cli)(
       code: 'CLEANUP_INCOMPLETE',
     });
     const joined = f.owner.retireAfterJobExit(f.owner.binding);
-    expect(joined).toBeDefined();
-    await joined;
+    if (ownsTerminal) {
+      expect(joined).toBeUndefined();
+      // The test supplies the trusted stop hook separately from the job wait.
+      await f.owner.retireAfterNativeStop(f.owner.binding, active);
+    } else {
+      expect(joined).toBeDefined();
+      await joined;
+    }
     expect(f.kills()).toBe(0);
     expect(f.owner.controlReady()).toBe(false);
     expect(scope.revoked.aborted).toBe(true);

@@ -1733,9 +1733,9 @@ it('uses both the selected editor proof and physical Host readiness on the real 
   expect(f.stop).not.toHaveBeenCalled();
 });
 
-it('uses the selected live slot after rechecking HTTP authority and never asks for its old VM roster', async () => {
+it('keeps a live slot ticket failed when local editor proof has no physical receipt', async () => {
   const f = fixture(true);
-  const { context, body, data, identity, binding } = f.base;
+  const { context, body, data, binding } = f.base;
   await f.h.service.prewarm(context, { trigger: 'page' }, signal());
   f.h.setReadiness({ authenticated: true, editorReady: false, canSend: false });
   const proof = vi.fn(async () => new AbortController().signal);
@@ -1761,8 +1761,14 @@ it('uses the selected live slot after rechecking HTTP authority and never asks f
     ...body,
     trigger: 'page',
   });
-  expect(response.status).toBe(200);
-  expect(await response.json()).toEqual({ identity, trigger: 'page' });
+  expect(response.status).toBe(202);
+  const { ticket } = await response.json();
+  expect(
+    await (await prewarmStatus(server, ticket.operationId)).json(),
+  ).toEqual({
+    state: 'failed',
+    code: 'START_UNAVAILABLE',
+  });
   expect(slotted).toHaveBeenCalledWith(
     expect.objectContaining({
       personId: binding.personId,
