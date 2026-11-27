@@ -171,15 +171,17 @@ export async function openNativeWebOwner(input: {
   function recordingStartup() {
     return !startupComplete || input.startupPending?.() === true;
   }
-  function recordFailure(reason: unknown) {
+  function recordFailure(reason: unknown, failedStep = step) {
     if (!recordingStartup() || startupFailureAudit) return;
     startupFailureAudit = Promise.resolve();
     const diagnostic: NativeWebSetupFailure = {
-      step,
+      step: failedStep,
       ...nativeSetupError(
         reason,
-        transportStatus ??
-          (step === 'control-first-frame' ? controlHandshakeStatus : undefined),
+        (failedStep === step ? transportStatus : undefined) ??
+          (failedStep === 'control-first-frame'
+            ? controlHandshakeStatus
+            : undefined),
       ),
       target: nativeSetupTarget(input.launch.auth.origin),
     };
@@ -499,6 +501,9 @@ export async function openNativeWebOwner(input: {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
+  // The same exported object is used by startup proof and admitted page reads.
+  // It is replaced with the actual native owner at every new VM epoch.
+  const profileVerificationOwner = {};
   function verifyEditor<T>(
     caller: AbortSignal,
     guard: (signal: AbortSignal) => Promise<void>,
@@ -514,7 +519,7 @@ export async function openNativeWebOwner(input: {
           return value;
         },
         (error: unknown) => {
-          recordFailure(error);
+          recordFailure(error, name);
           throw error;
         },
       );
@@ -527,6 +532,7 @@ export async function openNativeWebOwner(input: {
       verify(
         {
           revoked: active,
+          verificationOwner: profileVerificationOwner,
           readImmutableGraph: (signal) =>
             editorRead('editor-index', () =>
               readCurrent(signal, guard, readGraph),
@@ -649,6 +655,7 @@ export async function openNativeWebOwner(input: {
       binding,
       revoked: signal,
       modelAdapterId: installedModelAdapter,
+      profileVerificationOwner,
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,
