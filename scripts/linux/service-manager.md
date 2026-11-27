@@ -2,6 +2,8 @@
 
 首轮使用一份发布目录和当前 Web、Worker 入口。发布工具在运行现有 `prepareServiceBuildManifest` 之前，将以下无秘密配置写入 `apps/worker/dist/linux-service-config.json`。同时把同源的 `scripts/linux/service-manager.mjs` 原字节复制为 `apps/worker/dist/linux-service-manager.mjs`。现有 manifest 枚举整个 Worker dist，由它封签配置和开机前挂载检查脚本。在现有封签准备器允许的 Git 发布目录构建和封签，再把完整已封签发布复制到安装根。认定发布以准备步骤交付的独立 `manifestDigest` 为准。
 
+发布操作员在一份独占的构建目录中先备齐这两个文件，再运行 `node scripts/dev-release/prepare-identity.mjs --root="$RELEASE" --release-sha="$SHA"`（需要私有 Host 配置时按现有流程传 `--person-vm-config`）。配置源放在发布树外或已忽略的 `.local/`，保持 Git 树干净。封签生成前结束所有构建和复制操作，生成后固定整份发布目录。线下 fixture 使用现有封签函数和真实 `render` 命令验证输入及篡改，宿主挂载身份由模拟探针覆盖。
+
 ```json
 {
   "platform": "linux/arm64",

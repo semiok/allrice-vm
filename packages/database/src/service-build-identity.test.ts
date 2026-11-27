@@ -10,6 +10,8 @@ import {
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { afterEach, expect, it } from 'vitest';
 import {
   prepareServiceBuildManifest,
@@ -21,8 +23,10 @@ afterEach(async () => {
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
-async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'allrice-build-identity-'));
+async function fixture(beforeSeal?: (root: string) => Promise<void>) {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), 'allrice-build-identity-')),
+  );
   roots.push(root);
   const files: Record<string, string> = {
     'apps/web/server.mjs': 'export const web = true;',
@@ -74,6 +78,7 @@ async function fixture() {
     await mkdir(dirname(link), { recursive: true });
     await symlink(join(root, 'packages', dependency!), link);
   }
+  await beforeSeal?.(root);
   const manifest = await prepareServiceBuildManifest({
     root,
     sourceSha: 'a'.repeat(40),
@@ -101,6 +106,63 @@ async function fixture() {
       }),
   };
 }
+
+it('binds Linux startup inputs and its data mount to the same service seal', async () => {
+  const config = {
+    platform: 'linux/arm64',
+    socketRoot: '/run/ar',
+    dataMount: '/var/lib/allrice40',
+    dataUuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    node: '/opt/allrice40/node/bin/node',
+    webPort: 3000,
+    workerPort: 3101,
+  };
+  const manager = 'apps/worker/dist/linux-service-manager.mjs';
+  const serviceConfig = 'apps/worker/dist/linux-service-config.json';
+  const run = promisify(execFile);
+  const f = await fixture(async (root) => {
+    await writeFile(
+      join(root, manager),
+      await readFile(
+        new URL('../../../scripts/linux/service-manager.mjs', import.meta.url),
+      ),
+    );
+    await writeFile(join(root, serviceConfig), JSON.stringify(config));
+  });
+  for (const role of ['worker', 'web'] as const)
+    expect(await f.verify(role)).toMatchObject({
+      manifestDigest: f.manifest.manifestDigest,
+    });
+  const render = () =>
+    run(
+      process.execPath,
+      [join(f.root, manager), 'render', f.root, f.manifest.manifestDigest],
+      { timeout: 3000 },
+    );
+  const { stdout } = await render();
+  expect(stdout).toContain(
+    `check-mount ${config.dataMount} ${config.dataUuid}`,
+  );
+  await writeFile(
+    join(f.root, serviceConfig),
+    JSON.stringify({ ...config, workerPort: 3102 }),
+  );
+  await expect(render()).rejects.toMatchObject({
+    stderr: expect.stringContaining('Sealed release input changed'),
+  });
+  await expect(f.verify('worker')).rejects.toThrow(
+    'DEV_BUILD_IDENTITY_INVALID',
+  );
+  await writeFile(join(f.root, serviceConfig), JSON.stringify(config));
+  await writeFile(
+    join(f.root, manager),
+    (await readFile(join(f.root, manager), 'utf8')) +
+      '\n// modified mount checker',
+  );
+  await expect(render()).rejects.toMatchObject({
+    stderr: expect.stringContaining('Sealed release input changed'),
+  });
+});
 it('measures actual service files and transitive compiled packages; roles share the sealed manifest but retain distinct artifacts and boots', async () => {
   const f = await fixture(),
     web = await f.verify('web'),

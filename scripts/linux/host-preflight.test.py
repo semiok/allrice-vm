@@ -58,6 +58,24 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'LUKS2'):
             host.verify_luks2(path, UUID, LUKS, Mock(return_value=mount(path)), Mock(return_value='CRYPT-LUKS1-wrong'))
 
+    def test_matching_filesystem_uuid_does_not_accept_another_luks_mapper(self):
+        path = Path('/scratch')
+        wrong_device = '253:8'
+        command = Mock(return_value=mount(path, **{'maj:min': wrong_device}))
+        dm_uuid = Mock(return_value='CRYPT-LUKS2-' + UUID.replace('-', '') + '-qa')
+        with self.assertRaisesRegex(RuntimeError, 'expected LUKS2 volume'):
+            host.verify_luks2(path, UUID, LUKS, command, dm_uuid)
+        dm_uuid.assert_called_once_with(wrong_device)
+
+        one = json.loads(mount(path))['filesystems'][0]
+        two = {**one, 'maj:min': wrong_device}
+        dm_uuid.reset_mock()
+        for entries in ([one, two], [two, one]):
+            command.return_value = json.dumps({'filesystems': entries})
+            with self.assertRaisesRegex(RuntimeError, 'one exact mount'):
+                host.verify_luks2(path, UUID, LUKS, command, dm_uuid)
+        dm_uuid.assert_not_called()
+
 
     def test_reflink_protocol_checks_cow_and_cleans_its_scratch_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
