@@ -5,14 +5,13 @@ import type { SidebarOwnerProps } from '@deepseek-ai/dsh-client-ui-layout/client
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type { SettingsLauncherOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client';
-import type { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
+import { EmployeeCreateDialog } from '../../../apps/web/app/chatflow/employee-create-dialog';
 import { ChatSidebarFrame } from '../../../apps/web/app/chatflow/chat-sidebar-frame';
 import { EmployeeSidebarView } from '../../../apps/web/app/chatflow/employee-sidebar-view';
 import {
   SidebarSettingsButton,
   SidebarSettingsTrigger,
 } from '../../../apps/web/app/chatflow/sidebar-settings-trigger';
-import { dEntryFirstEmployeeLimitMessage } from '../../../apps/web/lib/d-entry/employee-creation';
 import '@allrice/ui/tokens.css';
 import '../../../apps/web/app/styles/sidebar-palette.css';
 
@@ -75,64 +74,70 @@ export function EmployeeSidebar({
     compactSnapshot,
     () => false,
   );
-  const [showCreationLimit, setShowCreationLimit] = useState(false);
+  const [creating, setCreating] = useState(false);
   if (!snapshot) return null;
   const creation = port.createEmployee;
   const closeMobile = () => {
     if (compact && !collapsed) ctx.layout.toggleSidebar();
   };
   return (
-    <ChatSidebarFrame
-      archive={snapshot.archive}
-      employeeArchiveOpen={snapshot.employeeArchiveOpen}
-      collapsed={collapsed}
-      overlay={compact && !collapsed}
-      style={{ height: '100%' }}
-      onCollapsedChange={() => ctx.layout.toggleSidebar()}
-      onCreateEmployee={
-        // Personal creation is offered here only after selecting an employee
-        // and mounting its VM. The first employee dialog lives at bare entry.
-        typeof creation === 'function'
-          ? creation
-          : () => {
-              if (collapsed) ctx.layout.toggleSidebar();
-              setShowCreationLimit(true);
-            }
-      }
-      onOpenArchive={port.openArchive}
-      onOpenAutomations={() => {
-        ctx.layout.selectPanel(
-          'schedules' as Parameters<typeof ctx.layout.selectPanel>[0],
-        );
-        closeMobile();
-      }}
-      automationsActive={panel.activePanelId === 'schedules'}
-      employeeTree={
-        <>
-          {snapshot.error && <p role="alert">{snapshot.error}</p>}
-          {!collapsed &&
-            typeof creation !== 'function' &&
-            showCreationLimit && (
-              <p role="status">{dEntryFirstEmployeeLimitMessage}</p>
-            )}
-          <EmployeeSidebarView
-            {...snapshot.tree}
-            archive={snapshot.archive}
-            collapsed={collapsed}
-            onNewSession={(id) => {
-              snapshot.archive?.setFilter('default');
-              snapshot.tree.onNewSession(id);
-              closeMobile();
-            }}
-            onSelectSession={(id) => {
-              snapshot.tree.onSelectSession(id);
-              closeMobile();
-            }}
-          />
-        </>
-      }
-      settings={renderSlot('sidebar.settings', { wide: !collapsed })}
-    />
+    <>
+      <ChatSidebarFrame
+        archive={snapshot.archive}
+        employeeArchiveOpen={snapshot.employeeArchiveOpen}
+        collapsed={collapsed}
+        overlay={compact && !collapsed}
+        style={{ height: '100%' }}
+        onCollapsedChange={() => ctx.layout.toggleSidebar()}
+        onCreateEmployee={
+          typeof creation === 'function'
+            ? creation
+            : () => {
+                if (collapsed) ctx.layout.toggleSidebar();
+                setCreating(true);
+              }
+        }
+        onOpenArchive={port.openArchive}
+        onOpenAutomations={() => {
+          ctx.layout.selectPanel(
+            'schedules' as Parameters<typeof ctx.layout.selectPanel>[0],
+          );
+          closeMobile();
+        }}
+        automationsActive={panel.activePanelId === 'schedules'}
+        employeeTree={
+          <>
+            {snapshot.error && <p role="alert">{snapshot.error}</p>}
+            <EmployeeSidebarView
+              {...snapshot.tree}
+              archive={snapshot.archive}
+              collapsed={collapsed}
+              onNewSession={(id) => {
+                snapshot.archive?.setFilter('default');
+                snapshot.tree.onNewSession(id);
+                closeMobile();
+              }}
+              onSelectSession={(id) => {
+                snapshot.tree.onSelectSession(id);
+                closeMobile();
+              }}
+            />
+          </>
+        }
+        settings={renderSlot('sidebar.settings', { wide: !collapsed })}
+      />
+      {creating && typeof creation !== 'function' && (
+        <EmployeeCreateDialog
+          {...creation}
+          personal
+          onClose={() => setCreating(false)}
+          onCreated={(instance) => {
+            setCreating(false);
+            creation.onCreated(instance);
+          }}
+        />
+      )}
+    </>
   );
 }
 

@@ -34,6 +34,7 @@ type Status =
   | 'warming'
   | 'accepted'
   | 'starting'
+  | 'waiting-for-capacity'
   | 'opening'
   | 'ready'
   | 'cancelled'
@@ -137,6 +138,7 @@ export function EmployeeNativePage({
     let selectedQuery = activation.confirmedQuery;
     let selectedEmployee: DEntrySelectionInput | undefined;
     let nextWarmup: EntryWarmup | undefined;
+    let pendingNavigation: { target: string; query: string } | undefined;
     let ticket = activation.ticket;
     let resumable = false;
     let superseded = false;
@@ -334,8 +336,8 @@ export function EmployeeNativePage({
     }
     const applyQuery = () => {
       if (navigating) {
-        if (nextWarmup && nextQuery.current !== activeQuery) {
-          nextWarmup.lifetime.abort();
+        if (nextQuery.current !== activeQuery) {
+          nextWarmup?.lifetime.abort();
           nextWarmup = undefined;
           superseded = true;
         }
@@ -417,16 +419,35 @@ export function EmployeeNativePage({
         local.resolve(event.data.state);
       if (event.data.type === pageNavigate) {
         const next = DEntrySelectionInputSchema.safeParse(event.data.selection);
-        if (!next.success || !carrier || navigating) return;
-        navigating = true;
-        window.clearTimeout(timer);
+        if (
+          !next.success ||
+          !carrier ||
+          detached ||
+          remoteRevoked ||
+          superseded ||
+          (navigating && !pendingNavigation)
+        )
+          return;
         const params = new URLSearchParams(
           Object.entries(next.data).filter(
             (entry): entry is [string, string] => typeof entry[1] === 'string',
           ),
         );
+        const target = params.toString();
+        if (pendingNavigation?.target === target) return;
         if (prepare && !next.data.threadId)
           params.set('new', crypto.randomUUID());
+        const duringClose = !!pendingNavigation;
+        pendingNavigation = { target, query: params.toString() };
+        if (duringClose) {
+          // The first target may have an overlapping prewarm. Only the latest
+          // target can consume one, and the old carrier is still joining.
+          nextWarmup?.lifetime.abort();
+          nextWarmup = undefined;
+          return;
+        }
+        navigating = true;
+        window.clearTimeout(timer);
         const sameEmployee =
           prepare &&
           location.pathname === '/chatflow/4.0' &&
@@ -455,18 +476,19 @@ export function EmployeeNativePage({
         // work independently and keep the frame until both report back.
         void retire().then((closed) => {
           if (replace.current !== applyQuery || detached) return;
+          const query = pendingNavigation!.query;
+          pendingNavigation = undefined;
           const warmup = nextWarmup;
           nextWarmup = undefined;
           if (closed) {
             if (superseded || nextQuery.current !== activeQuery) {
               warmup?.lifetime.abort();
               activateSelection(nextQuery.current);
-            } else if (sameEmployee) {
-              const query = params.toString();
+            } else if (prepare && location.pathname === '/chatflow/4.0') {
               nextQuery.current = query;
               history.pushState(null, '', '/chatflow/4.0?' + query);
               activateSelection(query, warmup);
-            } else location.assign('/chatflow/4.0?' + params);
+            } else location.assign('/chatflow/4.0?' + query);
           } else {
             warmup?.lifetime.abort();
             if (prepare) setStatus('unknown');
@@ -651,6 +673,10 @@ const messages = {
   warming: ['正在打开对话', '马上就好。'],
   accepted: ['正在准备你的工作台', '准备好会自动打开对话。'],
   starting: ['正在启动工作台', '第一次启动需要一两分钟，留在这页就行。'],
+  'waiting-for-capacity': [
+    '正在等待工作台名额',
+    '已有 4 个员工在运行。有空位会自动继续，也可以取消等待。',
+  ],
   opening: ['工作台已就绪', '正在打开对话。'],
   failed: ['暂时打不开工作台', '可以点重试，或者返回员工页。'],
   'asset-timeout': [
@@ -678,9 +704,15 @@ function EntryStatus({
   retry(): void;
 }) {
   const [title, description] = messages[status];
-  const starting = ['warming', 'accepted', 'starting', 'opening'].includes(
-    status,
-  );
+  // The current prewarm protocol does not report this reason. Render it only
+  // when a future caller has an authoritative capacity-wait status.
+  const starting = [
+    'warming',
+    'accepted',
+    'starting',
+    'waiting-for-capacity',
+    'opening',
+  ].includes(status);
   const failedOpening = status === 'failed' || status === 'asset-timeout';
   const resumable = status === 'cancelled' || failedOpening;
   const canReturn = status === 'failed' || status === 'selection-unavailable';

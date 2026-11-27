@@ -15,6 +15,26 @@ import {
 } from './employee-profile-form';
 import { readJson } from './chatflow-utils';
 
+async function personalEmployeeCapacityMessage(response: Response) {
+  if (response.status !== 409) return;
+  const body: { error?: { code?: unknown; message?: unknown } } | null =
+    await response
+      .clone()
+      .json()
+      .catch(() => null);
+  if (body?.error?.code !== 'QUOTA_EXCEEDED') return;
+  const message = body.error.message;
+  const limit =
+    typeof message === 'string'
+      ? /^每人最多 ([1-9][0-9]*) 个员工$/.exec(message)?.[1]
+      : undefined;
+  if (limit)
+    return `员工名额已满，最多可以有 ${limit} 个员工。可以关闭此窗口，继续使用已有员工。`;
+  if (message === '当前工作台还没确认停机，停机后可以创建更多员工。')
+    return message;
+  return '暂时无法创建更多员工。可以关闭此窗口，继续使用已有员工。';
+}
+
 type EmployeeCreateDialogProps = {
   onClose: () => void;
   onCreated: (instance: EmployeeInstance) => void;
@@ -76,6 +96,13 @@ export function EmployeeCreateDialog({
           requestId: request.current.id,
         }),
       });
+      if (personal) {
+        const capacity = await personalEmployeeCapacityMessage(response);
+        if (capacity) {
+          if (!controller.signal.aborted) setError(capacity);
+          return;
+        }
+      }
       const result = await readJson<{ instance: EmployeeInstance }>(response);
       if (controller.signal.aborted) return;
       const instance = EmployeeInstanceSchema.parse(result.instance);

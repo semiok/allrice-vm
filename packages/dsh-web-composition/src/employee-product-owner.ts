@@ -158,8 +158,7 @@ export function installEmployeeProductOwner(ctx: Context) {
             const session = sessions.find(
               (row) => sessionEmployeeKey(row) === id,
             );
-            if (session) navigate(id, session.id);
-            else notice('此员工暂没有可打开的工作。');
+            navigate(id, session?.id);
           },
           onNewSession(id) {
             if (employeeChoice(workspace, id)) navigate(id);

@@ -612,60 +612,130 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
   });
 
-  it('shows the temporary limit in the native sidebar instead of submitting another employee', async ({
+  it('opens the personal creation dialog and keeps the sidebar usable after server rejections', async ({
     onTestFinished,
   }) => {
-    const createRequests: string[] = [];
-    const recordCreate = (request: Request) => {
-      if (new URL(request.url()).pathname === '/api/v1/employee-instances')
-        createRequests.push(request.method());
+    const workspace = {
+      organizationId: randomUUID(),
+      workspaceId: randomUUID(),
+      viewerId: randomUUID(),
     };
-    page.on('request', recordCreate);
-    // Leave the live prompt in place until the suite captures a failure.
+    const createRequests: Request[] = [];
+    const failures = [
+      {
+        code: 'CONFLICT',
+        message: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+      },
+      { code: 'QUOTA_EXCEEDED', message: '每人最多 13 个员工' },
+      {
+        code: 'QUOTA_EXCEEDED',
+        message: '当前工作台还没确认停机，停机后可以创建更多员工。',
+      },
+    ];
+    const createEndpoint = '**/api/v1/employee-instances';
+    await page.route(createEndpoint, async (route) => {
+      const request = route.request();
+      const index = createRequests.push(request) - 1;
+      if (index < failures.length)
+        return route.fulfill({ status: 409, json: { error: failures[index] } });
+      const { profile } = request.postDataJSON();
+      const version = {
+        kind: 'tenant_version',
+        employeeVersionId: randomUUID(),
+      };
+      const now = new Date().toISOString();
+      return route.fulfill({
+        status: 201,
+        json: {
+          instance: {
+            id: randomUUID(),
+            assignmentId: randomUUID(),
+            organizationId: workspace.organizationId,
+            workspaceId: workspace.workspaceId,
+            ownerId: workspace.viewerId,
+            kind: 'custom',
+            revision: 1,
+            profile,
+            source: version,
+            creationSource: version,
+            createdAt: now,
+            updatedAt: now,
+          },
+        },
+      });
+    });
     onTestFinished(async () => {
-      page.off('request', recordCreate);
+      await page.unroute(createEndpoint);
       await page.evaluate(() =>
         window.__allriceSidebarTest!.setPersonalCreation(),
       );
     });
     await page.evaluate(
       (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
-      {
-        organizationId: randomUUID(),
-        workspaceId: randomUUID(),
-        viewerId: randomUUID(),
-      },
+      workspace,
     );
     const sidebar = page.locator('#chat-sidebar');
     const create = sidebar.getByRole('button', {
       name: '创建员工',
       exact: true,
     });
-    const collapse = sidebar.getByRole('button', {
-      name: '收起侧边栏',
+    const dialog = page.getByRole('dialog', { name: '创建 AI 员工' });
+    await create.click();
+    expect(createRequests).toHaveLength(0);
+    await dialog.locator('[data-employee-name]').fill('资料助手');
+    const submit = dialog.getByRole('button', {
+      name: '确认创建',
       exact: true,
     });
-    const limit = '暂时每人只能创建一个 4.0 员工，多员工马上开放。';
-    const notice = sidebar.getByRole('status').filter({ hasText: limit });
-    await create.click();
-    await notice.waitFor();
-    expect(await notice.textContent()).toBe(limit);
-
-    await collapse.click();
-    await sidebar
-      .getByRole('button', { name: '展开侧边栏', exact: true })
-      .waitFor();
-    await notice.waitFor({ state: 'hidden' });
-    expect((await sidebar.boundingBox())!.width).toBeLessThan(100);
-    await create.click();
-    await collapse.waitFor();
-    await notice.waitFor();
-    expect(await notice.textContent()).toBe(limit);
-    expect((await notice.boundingBox())!.width).toBeGreaterThanOrEqual(180);
+    for (const message of [
+      failures[0]!.message,
+      '员工名额已满，最多可以有 13 个员工。可以关闭此窗口，继续使用已有员工。',
+      failures[2]!.message,
+    ]) {
+      await submit.click();
+      await dialog
+        .getByRole('alert')
+        .getByText(message, { exact: true })
+        .waitFor();
+    }
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    const details = sidebar.getByRole('button', {
+      name: '查看Rice详情',
+      exact: true,
+    });
+    await details.click();
     expect(
-      await page.getByRole('dialog', { name: '创建 AI 员工' }).count(),
-    ).toBe(0);
-    expect(createRequests).toEqual([]);
+      await page.evaluate(
+        () => window.__allriceSidebarTest!.commands.at(-1)?.name,
+      ),
+    ).toBe('details');
+    await sidebar
+      .getByRole('button', { name: '收起侧边栏', exact: true })
+      .click();
+    await create.click();
+    await sidebar
+      .getByRole('button', { name: '收起侧边栏', exact: true })
+      .waitFor();
+    await dialog.locator('[data-employee-name]').fill('资料助手');
+    await submit.click();
+    await dialog.waitFor({ state: 'detached' });
+    expect(
+      await page.evaluate(
+        () => window.__allriceSidebarTest!.commands.at(-1)?.name,
+      ),
+    ).toBe('created-employee');
+    expect(createRequests).toHaveLength(4);
+    const [first, ...retries] = createRequests.map((request) =>
+      request.postDataJSON(),
+    );
+    expect(first).toMatchObject({
+      workspaceId: workspace.workspaceId,
+      expectedOwnerId: workspace.viewerId,
+      profile: { name: '资料助手' },
+    });
+    expect(first).not.toHaveProperty('assignmentId');
+    expect(retries.slice(0, 2)).toEqual([first, first]);
   });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {
     const sidebar = page.locator('#chat-sidebar');
