@@ -15,6 +15,7 @@ import { setupNativeWebFixture } from './owner.native.fixture.js';
 import {
   deferredPromptFact,
   waitForPromptFact,
+  type NativePromptObservation,
   type NativeToolObservation,
 } from './prompt-observation.js';
 
@@ -46,6 +47,8 @@ it.skipIf(!cli)(
     const capability = 'a'.repeat(43);
     let assistantRequests = 0;
     const proofs = deferredPromptFact<NativeToolObservation>();
+    const seen: NativeToolObservation[] = [];
+    const opened = deferredPromptFact<NativePromptObservation>();
     const nativeCallId = randomUUID();
     const nativeRequestId = randomUUID();
     const humanText = 'Create a test reminder in ten minutes.';
@@ -107,6 +110,15 @@ it.skipIf(!cli)(
                   }),
                 }
               : { type: 'text-delta', index: 0, text: 'Reminder scheduled.' },
+            ...(create
+              ? ['memory_read', 'memory_remember'].map((name, i) => ({
+                  type: 'tool-call-delta',
+                  index: i + 1,
+                  id: randomUUID(),
+                  name,
+                  argumentsDelta: '{}',
+                }))
+              : []),
             {
               type: 'finish',
               reason: { kind: create ? 'tool-calls' : 'stop' },
@@ -142,8 +154,12 @@ it.skipIf(!cli)(
       async (request) => {
         if (request.endpoint !== 'session/prompt')
           throw Error('Unexpected native prompt');
-        const observation = request.observe(signal, proofs.resolve);
+        const observation = request.observe(signal, (fact) => {
+          seen.push(fact);
+          if (fact.callId === nativeCallId) proofs.resolve(fact);
+        });
         await observation.ready;
+        opened.resolve(observation);
         return {
           undispatched: () => observation.close(),
           accepted() {},
@@ -317,6 +333,9 @@ it.skipIf(!cli)(
     expect(tool.sequence).toBeGreaterThan(tool.assistantSequence);
     await nextChange();
 
+    const observation = await waitForPromptFact(opened.promise, signal);
+    expect(await waitForPromptFact(observation.settled, signal)).toBe('ended');
+    expect(seen.map(({ name }) => name)).toEqual(['schedule_create']);
     await execution.close();
 
     const [task] = await hostCatalog();

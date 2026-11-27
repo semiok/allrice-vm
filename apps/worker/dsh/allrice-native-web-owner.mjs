@@ -712,12 +712,15 @@ export function observeNativePrompts(scope, lifetime, capture) {
         return next();
       attempt.calls.set(exec.callId, null);
       const result = await next();
+      const claimed = inboxClaims.get(session);
       // rc.2 also sends unregistered names and short-circuited failures
       // through the waterfall. Retain only a successful, still-registered call.
       if (
         !result.isError &&
         !exec.signal.aborted &&
         capture() &&
+        claimed?.turn === attempt.turn &&
+        claimed.messageId === attempt.human.occurrence.messageId &&
         definition === original(scope.tools.get(exec.name, exec.agent)) &&
         observers.has(observer.id) &&
         observer.toolRecords < 8
