@@ -510,6 +510,23 @@ export class PostgresPersonVmStore implements PersonVmStore {
     }
   }
 
+  async listUpgradeCandidates(signal: AbortSignal) {
+    signal.throwIfAborted();
+    const session = new VmSqlSession(this.openSql());
+    try {
+      const rows = await session.query(
+        () => session.client`select * from person_virtual_machines
+          where phase in ('running','starting') or lease_owner is not null
+            or (phase='failed' and (native_created or egress_receipt is not null))
+          order by person_id`,
+      );
+      signal.throwIfAborted();
+      return rows.map(fromRow);
+    } finally {
+      await session.end();
+    }
+  }
+
   async idleStopReceipt(binding: PersonVmBinding) {
     const session = new VmSqlSession(this.openSql());
     try {

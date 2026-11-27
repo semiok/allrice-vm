@@ -1112,7 +1112,18 @@ async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
     authenticate: dEntryHttpDefaults.authenticate,
     recover: recoverProductionPersonVmModelOwner,
     pending: () =>
-      shutdownStatus !== undefined || host.modelOwnerMaintenancePending(),
+      !stopping ||
+      shutdownStatus !== undefined ||
+      host.modelOwnerMaintenancePending(),
+    upgrade: {
+      bootId: startup.bootId,
+      authenticate: authenticatePlatformSession,
+      drain: (context, signal) => {
+        if (shutdownProbe || stopping)
+          throw new PersonVmError('LEASE_CONFLICT');
+        return host.drainForUpgrade(context, signal);
+      },
+    },
     shutdown: {
       authenticate: authenticatePlatformSession,
       authorize: (context) =>
@@ -1124,6 +1135,7 @@ async function keepLocalShutdownMaintenance(host: ProductionPersonVmHost) {
     const recovery = await listening;
     console.info('[MET-273] authorized local maintenance socket', {
       path: recovery.path,
+      bootId: startup.bootId,
     });
   } catch {
     if (recoveryEndpoint === listening) recoveryEndpoint = undefined;
@@ -1177,5 +1189,9 @@ const stopWorker = (signal: string) => {
       shutdownProbe = undefined;
     });
 };
+void personVmHost.then((result) => {
+  if (!stopping && result.state === 'installed')
+    return keepLocalShutdownMaintenance(result.host);
+});
 process.on('SIGINT', () => stopWorker('SIGINT'));
 process.on('SIGTERM', () => stopWorker('SIGTERM'));

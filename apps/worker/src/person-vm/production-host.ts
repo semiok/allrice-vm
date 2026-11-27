@@ -9,6 +9,7 @@ import {
   readPersonVmDiskPreparationForegroundBusy,
   readPersonVmDiskPreparationRoster,
   readPersonVmDiskPreparationTarget,
+  requireCurrentPlatformAdmin,
 } from '@allrice/database';
 import {
   createModelGateway,
@@ -58,6 +59,7 @@ import { dEntryNativePublicUrl } from '../native-web/launch.js';
 import { createProductionPersonVmAuthority } from './production-authority.js';
 import { startProductionDiskPreprovision } from './production-disk-preprovision.js';
 import { createProductionCurrentPrewarm } from './production-prewarm.js';
+import { withPreviousGatewayFenced } from './production-upgrade-fence.js';
 import { createProductionPersonVmProviders } from './production-providers.js';
 import { ProductionHostConfigurationUnavailable } from './production-config.js';
 import { ProductionPersonVmArtifactsUnavailable } from './production-artifacts.js';
@@ -160,6 +162,10 @@ export interface ProductionPersonVmHost {
     signal: AbortSignal,
   ): Promise<PrepareStopWithWakeResult>;
   assertWorkerShutdownSafe(signal: AbortSignal): Promise<void>;
+  drainForUpgrade(
+    context: RequestContext,
+    signal: AbortSignal,
+  ): Promise<Readonly<{ stopped: number }>>;
   close(): Promise<void>;
   modelOwnerMaintenancePending(): boolean;
   /** Trusted in-process maintenance only. The model authority verifies the
@@ -208,6 +214,9 @@ export function createProductionPersonVmHost(input: {
     ReturnType<typeof startProductionDiskPreprovision> | undefined;
   let gracefulStop = false;
   let pauseIdle = false;
+  let upgradeDraining = false;
+  let shutdownChecking = false;
+  let upgradeDrained: Readonly<{ stopped: number }> | undefined;
   const nativeSubscriptions = new Set<PersonVmAdmissionSubscription>();
   const uncertainPreparation = new Map<
     PersonVmBinding,
@@ -275,6 +284,13 @@ export function createProductionPersonVmHost(input: {
     }
     active.throwIfAborted();
     return result.value;
+  }
+  function ownsRunningBinding(binding: PersonVmBinding) {
+    const retired = retiredReceipts.get(binding.personId);
+    return (
+      Boolean(retired && sameVmBinding(retired.binding, binding)) ||
+      [...receipts].some((receipt) => sameVmBinding(receipt.binding, binding))
+    );
   }
   function sameReceipt(
     left: PersonVmEgressReceipt,
@@ -764,6 +780,35 @@ export function createProductionPersonVmHost(input: {
           );
         },
         settleSupersededBinding,
+        upgradeActivity: {
+          observe(binding, signal, purpose) {
+            return currentWork(signal, (active) => {
+              if (!bound?.nativeActivity)
+                throw new PersonVmError('ACTIVITY_UNKNOWN');
+              return bound.nativeActivity.observe(binding, active, purpose);
+            });
+          },
+          assertSampleCurrent(binding, cursor, active) {
+            if (!bound?.nativeActivity?.assertSampleCurrent)
+              throw new PersonVmError('ACTIVITY_UNKNOWN');
+            bound.nativeActivity.assertSampleCurrent(binding, cursor, active);
+          },
+        },
+        withPreviousGatewayFenced(binding, ports, signal, stop) {
+          if (
+            ownsRunningBinding(binding) ||
+            requireStartup().hasLocalOwner(binding)
+          )
+            throw new PersonVmError('LEASE_CONFLICT');
+          return withPreviousGatewayFenced(ports, signal, async () => {
+            if (
+              ownsRunningBinding(binding) ||
+              requireStartup().hasLocalOwner(binding)
+            )
+              throw new PersonVmError('LEASE_CONFLICT');
+            return stop();
+          });
+        },
         ...providers.configuration.lifecycle,
       });
       personVm = vm;
@@ -994,6 +1039,7 @@ export function createProductionPersonVmHost(input: {
         startup,
         lifetime,
         prewarmCurrent: createProductionCurrentPrewarm({ vm, current }),
+        ownsRunningBinding,
       });
       lifetime.throwIfAborted();
       if (bound.scheduledWake) {
@@ -1105,8 +1151,70 @@ export function createProductionPersonVmHost(input: {
             } as const;
           return scheduledWake.prepareStopWithWake(request, active);
         },
+        async drainForUpgrade(context: RequestContext, signal: AbortSignal) {
+          const active = AbortSignal.any([signal, lifetime]);
+          active.throwIfAborted();
+          const authorize = async (current: AbortSignal) => {
+            current.throwIfAborted();
+            await requireCurrentPlatformAdmin(context, trustedDatabase, false);
+            current.throwIfAborted();
+          };
+          await authorize(active);
+          if (upgradeDraining || shutdownChecking || gracefulStop)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if (upgradeDrained) return upgradeDrained;
+          upgradeDraining = true;
+          pauseIdle = true;
+          const reopen = vm.fenceWorkerStartup();
+          try {
+            await scheduledWake?.pause(active);
+            const candidates = await store.listUpgradeCandidates(active);
+            if (
+              candidates.some(
+                (row) =>
+                  row.phase !== 'running' || row.leaseOwner || !row.instanceId,
+              )
+            )
+              throw new PersonVmError('LEASE_CONFLICT');
+            for (const row of candidates) {
+              active.throwIfAborted();
+              if (!row.instanceId) throw new PersonVmError('LEASE_LOST');
+              await vm.stopRunningForUpgrade(
+                {
+                  vmId: row.vmId,
+                  personId: row.personId,
+                  organizationId: row.organizationId,
+                  instanceId: row.instanceId,
+                  leaseEpoch: row.leaseEpoch,
+                },
+                context.requestId,
+                active,
+                authorize,
+              );
+            }
+            if ((await store.listUpgradeCandidates(active)).length)
+              throw new PersonVmError('CLEANUP_INCOMPLETE');
+            return (upgradeDrained = Object.freeze({
+              stopped: candidates.length,
+            }));
+          } finally {
+            upgradeDraining = false;
+            if (!upgradeDrained) {
+              pauseIdle = false;
+              reopen();
+              scheduledWake?.resume();
+            }
+          }
+        },
         async assertWorkerShutdownSafe(signal: AbortSignal) {
           if (gracefulStop) return;
+          if (upgradeDraining || shutdownChecking)
+            throw new PersonVmError('LEASE_CONFLICT');
+          if (upgradeDrained) {
+            gracefulStop = true;
+            return;
+          }
+          shutdownChecking = true;
           pauseIdle = true;
           const reopen = vm.fenceWorkerStartup();
           try {
@@ -1120,6 +1228,8 @@ export function createProductionPersonVmHost(input: {
             reopen();
             scheduledWake?.resume();
             throw error;
+          } finally {
+            shutdownChecking = false;
           }
         },
         close,

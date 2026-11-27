@@ -85,6 +85,7 @@ function safeError(error: unknown) {
 }
 type IdleStopGuard = Readonly<{
   dispatch?: PersonVmIdleStopDispatch;
+  dispatchAction?: 'stop.upgrade-dispatch';
   requestId: string;
   signal: AbortSignal;
   assertCurrent(signal: AbortSignal): Promise<void>;
@@ -172,8 +173,20 @@ export class PersonVmService
       observeOwnedMount?: (binding: PersonVmBinding) => void;
       observeOwnedStop?: (binding: PersonVmBinding) => void;
       ownsEgressReceipt?: (receipt: PersonVmEgressReceipt) => boolean;
+      /** Prove that no previous host can still accept traffic on this epoch.
+       * The proof is held through the joined native stop and durable write. */
+      withPreviousGatewayFenced?: <T>(
+        binding: PersonVmBinding,
+        ports: readonly number[],
+        signal: AbortSignal,
+        work: () => Promise<T>,
+      ) => Promise<T>;
       /** An unresolved local egress epoch keeps its shared mount reserved. */
       hasUnconfirmedEgress?: (binding: PersonVmBinding) => boolean;
+      upgradeActivity?: Pick<
+        PersonVmNativeActivityPort,
+        'observe' | 'assertSampleCurrent'
+      >;
       settleSupersededBinding?: (
         binding: PersonVmBinding,
         signal: AbortSignal,
@@ -387,13 +400,25 @@ export class PersonVmService
     this.checkOrganization(row, identity.organizationId);
     return view(row); // A persisted running flag is not a readiness assertion.
   }
+  private needsUpgradeStop(row: VmRecord) {
+    if (
+      !row.instanceId ||
+      !row.egressReceipt ||
+      !this.options.ownsEgressReceipt ||
+      !this.options.withPreviousGatewayFenced
+    )
+      return false;
+    return !this.options.ownsEgressReceipt(
+      this.receipt(bindingOf(row), row.egressReceipt),
+    );
+  }
   private assertPrewarmTarget(
     row: VmRecord | null,
     target?: PersonVmPrewarmTarget,
     allowRetainedRestore = false,
   ) {
     if (!target) return;
-    const running = row?.phase === 'running';
+    const running = row?.phase === 'running' && !this.needsUpgradeStop(row);
     const epoch = (row?.leaseEpoch ?? 0) + (running ? 0 : 1);
     if (
       (row?.phase === 'deleted' &&
@@ -970,6 +995,18 @@ export class PersonVmService
         roster.organizationId !== row.organizationId)
     )
       throw new PersonVmError('AUTHORIZATION_DENIED');
+    if (row.phase === 'running' && this.needsUpgradeStop(row)) {
+      if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
+      await assertAuthority?.(signal);
+      await this.stopForUpgrade(
+        lease,
+        row,
+        intent.requestId,
+        signal,
+        true,
+        assertAuthority,
+      );
+    }
     if (row.phase === 'running') {
       if (!context) throw new PersonVmError('AUTHORIZATION_DENIED');
       if (this.options.diskPool && assertAuthority)
@@ -1015,6 +1052,7 @@ export class PersonVmService
     }
     await lease.assertAdmissionOpen(true);
     if (assertAuthority) await assertAuthority(signal);
+    if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     row.leaseEpoch += 1;
     row.instanceId = randomUUID();
     row.phase = 'starting';
@@ -1126,6 +1164,7 @@ export class PersonVmService
       const native = this.options.native;
       const state = await native.status(binding, signal);
       if (assertAuthority) await assertAuthority(signal);
+      if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
       let checkedWebAfterStart = false;
       let capacity: Awaited<ReturnType<PersonVmNativePort['start']>>;
       if (!scheduled && state === 'absent' && !row.nativeCreated) {
@@ -1271,6 +1310,7 @@ export class PersonVmService
     input: { trigger: 'page' | 'input'; target?: PersonVmPrewarmFence },
     signal: AbortSignal,
   ) {
+    if (this.workerDrain) throw new PersonVmError('RUNTIME_NOT_READY');
     if (input.trigger !== 'page' && input.trigger !== 'input')
       throw new PersonVmError('AUTHORIZATION_DENIED');
     const work = () => this.prewarmCurrent(context, signal, input.target);
@@ -1287,6 +1327,8 @@ export class PersonVmService
     const row = await this.options.store.read(identity.personId);
     if (row) this.checkOrganization(row, identity.organizationId);
     this.assertPrewarmTarget(row, target, true);
+    if (row?.phase === 'running' && this.needsUpgradeStop(row))
+      return this.start(context, signal, target);
     if (row?.phase === 'running') {
       await this.assertNoPendingDisk(row, signal);
       if (target) await target.assertAuthority(signal);
@@ -1434,7 +1476,7 @@ export class PersonVmService
       const runDispatch = idle.dispatch;
       const dispatch = {
         requestId: idle.requestId,
-        action: 'stop.idle-dispatch',
+        action: idle.dispatchAction ?? 'stop.idle-dispatch',
       };
       await lease.audit(row, { ...dispatch, result: 'started' });
       let dispatchApproved = false;
@@ -1666,21 +1708,158 @@ export class PersonVmService
       return view(row);
     return this.commitStop(context.requestId, lease, row);
   }
+  private async stopForUpgrade(
+    lease: VmLease,
+    row: VmRecord,
+    requestId: string,
+    signal: AbortSignal,
+    previousWorker: boolean,
+    assertAuthority?: PersonVmPrewarmFence['assertAuthority'],
+  ) {
+    const binding = bindingOf(row);
+    if (row.holds.length) throw new PersonVmError('VM_ACTIVE');
+    await lease.assertAdmissionOpen(true);
+    if (
+      !this.admissionShared ||
+      !row.egressReceipt ||
+      this.options.hasUnconfirmedEgress?.(binding)
+    )
+      throw new PersonVmError('CLEANUP_INCOMPLETE');
+    // The exclusive physical lease makes the running binding unavailable
+    // for new admission. An unresolved participant remains a blocker.
+    await this.admissionShared.transaction(
+      row.personId,
+      signal,
+      async (tx) => {
+        checkAdmissionBinding(tx, binding);
+        for (const participant of ['entry', 'gateway'] as const) {
+          const counts = await this.admissionShared!.counts(tx, participant);
+          if (counts.active || counts.queued || counts.deferred)
+            throw new PersonVmError('VM_ACTIVE');
+        }
+      },
+      true,
+    );
+    signal.throwIfAborted();
+    const stop = async () => {
+      await assertAuthority?.(signal);
+      signal.throwIfAborted();
+      await lease.guard();
+      return this.commitStop(requestId, lease, row, undefined, 'stop.upgrade');
+    };
+    if (previousWorker) {
+      const receipt = this.receipt(binding, row.egressReceipt);
+      if (
+        !this.needsUpgradeStop(row) ||
+        !this.options.withPreviousGatewayFenced
+      )
+        throw new PersonVmError('LEASE_LOST');
+      if (
+        receipt.gatewayPorts.some(
+          (port, index) => port !== row.gatewayPorts[index],
+        ) ||
+        receipt.gatewayPorts.length !== row.gatewayPorts.length
+      )
+        throw new PersonVmError('EGRESS_BINDING_INVALID');
+      return this.options.withPreviousGatewayFenced(
+        binding,
+        receipt.gatewayPorts,
+        signal,
+        stop,
+      );
+    }
+    // Explicit release still checks the native VM for protected work. It
+    // doesn't wait out the automatic idle interval or arm a scheduled wake.
+    const activity = this.options.upgradeActivity;
+    const native =
+      activity && (await activity.observe(binding, signal, 'inspection'));
+    if (
+      !native ||
+      !sameVmBinding(native.activity.binding, binding) ||
+      native.activity.state !== 'known' ||
+      native.coverage.state === 'unknown' ||
+      native.activeScheduleDeliveries !== 0
+    )
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+    if (
+      [
+        native.activity.activeTurns,
+        native.activity.activeJobs,
+        native.activity.activeSubtasks,
+        native.activity.pendingApprovals,
+      ].some((value) => value !== 0)
+    )
+      throw new PersonVmError('VM_ACTIVE');
+    const cursor = native.coverage.cursor;
+    if (!activity?.assertSampleCurrent)
+      throw new PersonVmError('ACTIVITY_UNKNOWN');
+    await assertAuthority?.(signal);
+    signal.throwIfAborted();
+    await lease.guard();
+    return this.commitStop(
+      requestId,
+      lease,
+      row,
+      {
+        requestId,
+        signal,
+        dispatchAction: 'stop.upgrade-dispatch',
+        async assertCurrent(active) {
+          await assertAuthority?.(active);
+          await lease.guard();
+          active.throwIfAborted();
+          activity.assertSampleCurrent!(binding, cursor, active);
+        },
+      },
+      'stop.upgrade',
+    );
+  }
+  async stopRunningForUpgrade(
+    binding: PersonVmBinding,
+    requestId: string,
+    signal: AbortSignal,
+    assertAuthority: PersonVmPrewarmFence['assertAuthority'],
+  ) {
+    if (!this.workerDrain) throw new PersonVmError('AUTHORIZATION_DENIED');
+    return this.options.store.withLease(
+      binding.personId,
+      { now: this.now, ttlMs: this.options.leaseTtlMs },
+      async (lease) => {
+        const active = AbortSignal.any([signal, lease.signal]);
+        active.throwIfAborted();
+        const row = this.required(lease.row);
+        if (!sameVmBinding(bindingOf(row), binding))
+          throw new PersonVmError('LEASE_LOST');
+        if (row.phase === 'stopped' && !row.egressReceipt) return;
+        if (row.phase !== 'running')
+          throw new PersonVmError('ACTIVITY_UNKNOWN');
+        await this.stopForUpgrade(
+          lease,
+          row,
+          requestId,
+          active,
+          this.needsUpgradeStop(row),
+          assertAuthority,
+        );
+      },
+    );
+  }
   private async commitStop(
     requestId: string,
     lease: VmLease,
     row: VmRecord,
     idle?: IdleStopGuard,
+    action = 'stop',
   ) {
     await lease.audit(row, {
       requestId,
-      action: 'stop',
+      action,
       result: 'started',
     });
     try {
       const stoppedAudit: VmAudit = {
         requestId,
-        action: 'stop',
+        action,
         result: 'succeeded',
       };
       if (row.instanceId)
@@ -1693,7 +1872,7 @@ export class PersonVmService
     } catch (error) {
       await lease.audit(row, {
         requestId,
-        action: 'stop',
+        action,
         result: 'failed',
         errorCode: safeError(error).code,
       });

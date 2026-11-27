@@ -12,6 +12,7 @@ import {
 } from '@allrice/database';
 import {
   PersonVmError,
+  type PersonVmBinding,
   type PersonVmPort,
   type PersonVmView,
 } from '@allrice/person-vm';
@@ -31,6 +32,7 @@ type VmStamp = Generation & {
   phase: PersonVmView['phase'];
   diskRetained?: boolean;
   leaseOwner: string | null;
+  hasEgressReceipt?: boolean;
 };
 type VmStampRow = Omit<VmStamp, 'leaseEpoch'> & { leaseEpoch: string };
 type Coordination = { authorityRevision: string | null; vm: VmStamp | null };
@@ -58,6 +60,7 @@ const readCurrentCoordination: ReadCoordination = (identity, sessionId) =>
       select (select row_to_json(stamp) from (
         select vm_id as "vmId", instance_id as "instanceId", phase,
           disk_retained as "diskRetained", lease_owner as "leaseOwner",
+          (egress_receipt is not null) as "hasEgressReceipt",
           lease_epoch::text as "leaseEpoch" from person_virtual_machines
         where person_id=${identity.personId} and organization_id=${identity.organizationId}
       ) stamp) as vm,
@@ -191,6 +194,7 @@ export function createDEntryNativePrewarmPort(input: {
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
   readCoordination?: ReadCoordination;
+  ownsRunningBinding?: (binding: PersonVmBinding) => boolean;
 }) {
   input.lifetime.throwIfAborted();
   const stopped = new AbortController();
@@ -198,6 +202,34 @@ export function createDEntryNativePrewarmPort(input: {
   const pending = new Set<Promise<AbortSignal | undefined>>();
   const flights = new Map<string, Set<Flight>>();
   let closing: Promise<void> | undefined;
+
+  const load = input.readCoordination;
+  const ownsRunningBinding = input.ownsRunningBinding;
+  const readCoordination: ReadCoordination | undefined =
+    load &&
+    (async (identity, sessionId) => {
+      const stamp = await load(identity, sessionId);
+      const vm = stamp.vm;
+      if (
+        vm?.phase === 'running' &&
+        vm.instanceId &&
+        vm.vmId &&
+        vm.hasEgressReceipt &&
+        ownsRunningBinding &&
+        !ownsRunningBinding({
+          personId: identity.personId,
+          organizationId: identity.organizationId,
+          vmId: vm.vmId,
+          instanceId: vm.instanceId,
+          leaseEpoch: vm.leaseEpoch,
+        })
+      ) {
+        // No local owner is only a planning fact. The VM service requires
+        // its physical lease and independent prior-gateway fencing.
+        return { ...stamp, vm: { ...vm, phase: 'stopped' } };
+      }
+      return stamp;
+    });
 
   function shared({
     key,
@@ -287,7 +319,7 @@ export function createDEntryNativePrewarmPort(input: {
   ) {
     const signal = AbortSignal.any([admission, caller]);
     signal.throwIfAborted();
-    const stamp = await input.readCoordination?.(identity, context.sessionId);
+    const stamp = await readCoordination?.(identity, context.sessionId);
     signal.throwIfAborted();
     if (
       !stamp?.authorityRevision ||
@@ -319,7 +351,7 @@ export function createDEntryNativePrewarmPort(input: {
     async prepare(context, identity, caller) {
       const signal = AbortSignal.any([admission, caller]);
       signal.throwIfAborted();
-      const read = input.readCoordination;
+      const read = readCoordination;
       const data = currentDEntryNativeDataPort();
       if (!read || (input.requireEditorProof && !data?.assertEditorReady))
         throw new DEntryNativeUnavailable();
@@ -363,7 +395,16 @@ export function createDEntryNativePrewarmPort(input: {
           ? await prove?.(context, identity, active)
           : undefined;
         runningProof?.throwIfAborted();
-        if (!plan && input.requireEditorProof && prove) {
+        const noPlanStamp =
+          !plan && ownsRunningBinding
+            ? await readCoordination?.(identity, context.sessionId)
+            : undefined;
+        if (
+          !plan &&
+          input.requireEditorProof &&
+          prove &&
+          (!noPlanStamp || noPlanStamp.vm?.phase === 'running')
+        ) {
           try {
             await prove(context, identity, active);
           } catch (error) {
@@ -377,7 +418,7 @@ export function createDEntryNativePrewarmPort(input: {
         // Browser disconnect/uninstallation cannot kill shared running work.
         // Genuine authority revocation still fences this physical operation.
         active.throwIfAborted();
-        const read = input.readCoordination;
+        const read = readCoordination;
         const stamp = await read?.(identity, context.sessionId);
         active.throwIfAborted();
         const revision = stamp?.authorityRevision;
@@ -519,6 +560,7 @@ export function installDEntryNativePrewarm(input: {
   lifetime: AbortSignal;
   requireEditorProof?: boolean;
   readCoordination?: ReadCoordination;
+  ownsRunningBinding?: (binding: PersonVmBinding) => boolean;
 }) {
   const assembly = createDEntryNativePrewarmPort(input);
   let uninstall: () => void;
@@ -550,6 +592,7 @@ export function installAssignedDEntryNativeRuntime(
   > & {
     vm: Pick<PersonVmPort, 'resolve' | 'assertCurrentBinding'>;
     prewarmCurrent: CurrentSelectionPrewarm;
+    ownsRunningBinding?: (binding: PersonVmBinding) => boolean;
   },
 ) {
   const catalog = installAssignedDEntryNativeCatalog(input);

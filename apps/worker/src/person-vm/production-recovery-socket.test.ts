@@ -193,3 +193,59 @@ it('joins authentication for a disconnected client before releasing the maintena
     await socket.close();
   }
 });
+
+it('only drains through the private socket for the authenticated and exact Worker boot', async () => {
+  const context = modelBinding().context;
+  const drain = vi.fn(async () => ({ stopped: 2 }));
+  const socket = await openProductionRecoverySocket({
+    authenticate: async () => null,
+    recover: async () => 0,
+    pending: () => true,
+    upgrade: {
+      bootId: 'worker-upgrade-boot',
+      authenticate: async (token) =>
+        token === 'operator-session' ? context : null,
+      drain,
+    },
+  });
+  function post(token: string, boot: string) {
+    return new Promise<{ status?: number; body: string }>((resolve, reject) => {
+      const req = request(
+        {
+          socketPath: socket.path,
+          path: '/drain-for-upgrade',
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer ' + token,
+            'x-allrice-worker-boot': boot,
+          },
+        },
+        (res) => {
+          res.setEncoding('utf8');
+          let body = '';
+          res.on('data', (chunk: string) => (body += chunk));
+          res.on('end', () => resolve({ status: res.statusCode, body }));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+  }
+  try {
+    expect((await post('employee-session', 'worker-upgrade-boot')).status).toBe(
+      401,
+    );
+    expect((await post('operator-session', 'previous-boot')).status).toBe(409);
+    expect(drain).not.toHaveBeenCalled();
+    expect(await post('operator-session', 'worker-upgrade-boot')).toEqual({
+      status: 200,
+      body: '{"stopped":2,"bootId":"worker-upgrade-boot"}',
+    });
+    expect(drain).toHaveBeenCalledExactlyOnceWith(
+      context,
+      expect.any(AbortSignal),
+    );
+  } finally {
+    await socket.close();
+  }
+});

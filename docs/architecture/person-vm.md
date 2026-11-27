@@ -113,3 +113,15 @@ macOS 对原盘及原密钥建立无覆盖的正式文件引用，核实同 inod
 | 持久绑定和容量       | 适配器核对 inode，持久化正式引用并撤销临时引用。按实际卷的可用块及镜像分配块核算。                                                                                      | 以持久卷标识和密钥保管映射提交同一正式归属，读取对应文件系统或 thin pool 的实际预算。                                            |
 | 公开缓存和根盘       | stock 仅写封签缓存。正式启动沿用 `MicrosandboxPersonVm`。同一封签的领用盘首开对盘内缓存重新验哈希，已验证的本地字节直接供 MSB 用 `flat` 和 `clone=reflink` 建个人根盘。 | 核对同一公开来源，由正常启动适配器使用 XFS 或 btrfs reflink。后续可用公开只读 lower 加个人加密 upper，继续复用同一根盘准备位置。 |
 | Guest 地址和运行时   | 工作台继续用既有可信 Web 封签的 `web.guestAddress` 和实际 MSB 端点检查，库存过程无 guest 地址。生产装配保留现有 MSB provider 及 Darwin Unix socket 路径限制。           | 由对应虚拟化运行时按已启动的绑定和 epoch 返回实际地址，供同一工作台启动与就绪检查消费。                                          |
+
+### 升级时停机与接管
+
+发布负责人在替换 Worker 或切换 DSH 制品前，从当前 Worker 的本机维护日志核对 `path` 与 `bootId`。使用当前平台管理员会话，向命令的标准输入提供令牌。命令行参数、仓库和回执都不存令牌。
+
+```sh
+person-vm-drain --socket "$worker_socket" --boot-id "$worker_boot"
+```
+
+命令通过当前 Worker 的私有 Unix socket 请求排空。成功回执包含对应 `bootId` 和已停机数，Worker 会继续禁止本进程安排新启动，直到发布流程将它替换。失败或断开时核对 `stop.upgrade` 审计。先排查受保护工作、原生回执和当前租约，再决定是否继续切换。已经确认停止的 VM 保留盘和停机记录。
+
+升级接管可识别数据库记录为运行中、当前 Worker 没有 Gateway 回执的保留 VM。只有取得精确物理租约、确认没有受保护的入口或 Gateway 许可且独占了旧 Gateway 端口后，才按原 VM ID 原生停机、卸盘并写入 `stop.upgrade`。后续启动按原盘开启新代次。旧端口仍被监听、租约归属不明或停机未确认时保持拒绝。自动闲停继续使用自己的持续采样和唤醒登记策略。

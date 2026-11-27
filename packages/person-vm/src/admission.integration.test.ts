@@ -195,6 +195,88 @@ suite(
         },
       };
     }
+    it('takes over an old running epoch under its physical lease and keeps the original disk', async () => {
+      const h = await setup();
+      const store = new PostgresPersonVmStore(h.physical.open);
+      const seen: string[] = [];
+      let currentEpoch = 0;
+      let previousStillListening = true;
+      const vm = new PersonVmService({
+        ...h.options,
+        store,
+        ownsEgressReceipt: ({ binding }) => binding.leaseEpoch === currentEpoch,
+        observeOwnedStart(binding) {
+          currentEpoch = binding.leaseEpoch;
+          seen.push('start');
+        },
+        async withPreviousGatewayFenced(binding, ports, _signal, stop) {
+          expect(binding).toEqual(h.binding);
+          expect(ports).toEqual([38990]);
+          const row = await h.peerStore.read(binding.personId);
+          expect(row?.leaseOwner).toBeTruthy();
+          expect(row?.phase).toBe('running');
+          if (previousStillListening) throw new PersonVmError('LEASE_CONFLICT');
+          seen.push('fence');
+          const result = await stop();
+          expect(h.states.get(binding.vmId)).toBe('stopped');
+          expect(h.mounts.has(binding.vmId)).toBe(false);
+          const stopped = await h.peerStore.read(binding.personId);
+          expect(stopped).toMatchObject({
+            phase: 'stopped',
+            diskRetained: true,
+            leaseEpoch: 1,
+          });
+          seen.push('release');
+          return result;
+        },
+      });
+      vm.createAdmissionHost({ openSql: h.physical.open });
+      const requestId = randomUUID();
+      const events = h.log.length;
+      await expect(
+        vm.prewarm(h.rc, { trigger: 'page' }, signal()),
+      ).rejects.toMatchObject({ code: 'LEASE_CONFLICT' });
+      expect(h.log.slice(events)).not.toContain('native:stop');
+      expect(await store.read(h.binding.personId)).toMatchObject({
+        phase: 'running',
+        leaseEpoch: h.binding.leaseEpoch,
+        leaseOwner: null,
+      });
+      previousStillListening = false;
+      await expect(
+        vm.prewarm(
+          { ...h.rc, requestId },
+          {
+            trigger: 'page',
+            target: {
+              vmId: h.binding.vmId,
+              instanceId: null,
+              leaseEpoch: 2,
+              assertAuthority: async () => {},
+            },
+          },
+          signal(),
+        ),
+      ).resolves.toMatchObject({
+        phase: 'running',
+        ready: true,
+        vmId: h.binding.vmId,
+      });
+      expect(seen).toEqual(['fence', 'release', 'start']);
+      expect(h.log.slice(events)).toContain('native:stop');
+      expect(h.log.slice(events)).toContain('native:start');
+      expect(h.log.slice(events)).not.toContain('native:create');
+      const audit = await db`select phase, lease_epoch, disk_retained
+        from person_virtual_machines where person_id=${h.binding.personId}`;
+      expect(audit).toEqual([
+        { phase: 'running', lease_epoch: '2', disk_retained: true },
+      ]);
+      const stops =
+        await db`select result from person_vm_audit where request_id=${requestId}
+        and action='stop.upgrade' order by id`;
+      expect(stops).toEqual([{ result: 'started' }, { result: 'succeeded' }]);
+    });
+
     it('takes a durable journal read lease only across idle admission and then releases it', async () => {
       const h = await setup();
       const store = new PostgresPersonVmStore(h.physical.open);
