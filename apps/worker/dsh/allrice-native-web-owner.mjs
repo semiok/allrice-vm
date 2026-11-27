@@ -464,7 +464,7 @@ export function withNativeMemoryToolPublication(tool, version) {
   return wrapped;
 }
 
-function readMemoryToolVersions(scope, session, toolSchemas) {
+function readMemoryToolVersions(scope, session, toolSchemas, selected) {
   const agent = scope.agents.get(session.id);
   if (!agent || original(agent.session) !== original(session) || !toolSchemas)
     return null;
@@ -474,8 +474,10 @@ function readMemoryToolVersions(scope, session, toolSchemas) {
     const tool = original(scope.tools.get(name, agent));
     const registered = tool && publishedMemoryTools.get(tool);
     return registered &&
+      tool === selected?.[toolId] &&
       found.length === 1 &&
       found[0].description === tool.description &&
+      (found[0].deferLoading === true) === (tool.deferLoading === true) &&
       isDeepStrictEqual(found[0].parameters, tool.parameters)
       ? registered
       : null;
@@ -584,6 +586,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
   const sources = new Map();
   const turns = new WeakMap();
   const attempts = new WeakMap();
+  const memoryAssemblies = new WeakMap();
   const inboxClaims = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
@@ -729,6 +732,37 @@ export function observeNativePrompts(scope, lifetime, capture) {
   );
   if (capture) {
     scope.on(
+      'system-prompt/assemble',
+      (assembly, context, next) => {
+        const agent = context.agent;
+        if (
+          capture() &&
+          agent &&
+          original(scope.agents.get(agent.session.id)) === original(agent)
+        ) {
+          const session = original(agent.session);
+          const tool = (id) => {
+            const name = 'mcp__allrice__' + id;
+            if (!assembly.tools.some((schema) => schema.name === name))
+              return null;
+            const definition = original(scope.tools.get(name, agent));
+            return publishedMemoryTools.has(definition) ? definition : null;
+          };
+          // One assembly per step. An unrelated/re-entrant assembly is not an
+          // authority for this stream, even if it used the same wire schema.
+          if (memoryAssemblies.has(session))
+            memoryAssemblies.set(session, null);
+          else
+            memoryAssemblies.set(session, {
+              memory_read: tool('memory_read'),
+              memory_remember: tool('memory_remember'),
+            });
+        }
+        return next();
+      },
+      { global: true, prepend: true },
+    );
+    scope.on(
       'agent/assistant-stream',
       ({ agent, frame }) => {
         const session = original(agent.session);
@@ -738,6 +772,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
             turn: frame.turn,
             step: frame.step,
             cursor: session.seq - 1,
+            memoryTools: memoryAssemblies.get(session),
             calls: new Map(),
             dispatched: new Set(),
           });
@@ -761,8 +796,10 @@ export function observeNativePrompts(scope, lifetime, capture) {
       'session/event',
       (subject, event) => {
         const session = original(subject);
-        if (event.type === 'step/end' || event.type === 'turn/end')
+        if (event.type === 'step/end' || event.type === 'turn/end') {
           attempts.delete(session);
+          memoryAssemblies.delete(session);
+        }
         const attempt = attempts.get(session);
         if (!attempt?.human) return;
         if (
@@ -1094,7 +1131,18 @@ export function observeNativePrompts(scope, lifetime, capture) {
     });
     return new globalThis.Response(body, { headers });
   };
-  return Object.assign(read, { attest });
+  return Object.assign(read, {
+    attest,
+    memoryToolVersions(session, attemptId, toolSchemas) {
+      const attempt = attempts.get(original(session));
+      return readMemoryToolVersions(
+        scope,
+        session,
+        toolSchemas,
+        attempt?.id === attemptId ? attempt.memoryTools : null,
+      );
+    },
+  });
 }
 
 // Only provenance is kept here. DSH owns delivery, scheduling, and teardown.
@@ -1669,9 +1717,9 @@ export function applyNativeWebOwner(
                       firstMemoryAttempt:
                         origin.request.firstMemoryAttempt === true,
                       originalHuman: origin.request.originalHuman ?? null,
-                      memoryToolVersions: readMemoryToolVersions(
-                        scope,
+                      memoryToolVersions: promptFacts.memoryToolVersions(
                         found.session,
+                        value.nativeAttemptId,
                         origin.request.toolSchemas,
                       ),
                     },

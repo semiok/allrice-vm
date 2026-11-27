@@ -478,6 +478,43 @@ function promptFixture(capture = false, tools = new Map()) {
   };
 }
 
+it('only attests the sealed tool selected by this native prompt assembly, even with same-schema replacement', async () => {
+  const schema = {
+    name: 'mcp__allrice__memory_read',
+    description: 'Read memory',
+    parameters: { type: 'object' },
+    deferLoading: true,
+  };
+  const build = (version) =>
+    withNativeMemoryToolPublication(
+      { ...schema, execute: async () => true },
+      version,
+    );
+  const original = build('version-one');
+  const tools = new Map([[schema.name, original]]);
+  const f = promptFixture(true, tools);
+  try {
+    const [assemble] = f.events.listeners('system-prompt/assemble');
+    const assembly = { tools: [schema] };
+    await assemble(assembly, { agent: f.agent }, async () => assembly);
+    f.events.emit('agent/assistant-stream', {
+      agent: f.agent,
+      frame: { type: 'start', attemptId: 'active', turn: 1, step: 1 },
+    });
+    const versions = (id, schemas = [schema]) =>
+      f.observe.memoryToolVersions(f.agent.session, id, schemas);
+    expect(versions('active').memory_read).toBe('version-one');
+    expect(versions('other').memory_read).toBeNull();
+    expect(
+      versions('active', [{ ...schema, deferLoading: false }]).memory_read,
+    ).toBeNull();
+    tools.set(schema.name, build('version-two'));
+    expect(versions('active').memory_read).toBeNull();
+  } finally {
+    f.lifetime.abort();
+  }
+});
+
 it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
   const f = promptFixture();
   const active = f.issue(),
