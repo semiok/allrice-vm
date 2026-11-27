@@ -476,11 +476,15 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('claimed', first, 7);
     f.agent.inbox.nextTurn = [second];
     f.emit('inserted', second);
-    expect(await f.next(running)).toBe('inserted');
+    expect(await f.next(running)).toBe(
+      'inserted ' + JSON.stringify({ messageId: first.id }),
+    );
     expect(await f.next(running)).toBe(
       'claimed ' + JSON.stringify({ messageId: first.id, turn: 7 }),
     );
-    expect(await f.next(waiting)).toBe('inserted');
+    expect(await f.next(waiting)).toBe(
+      'inserted ' + JSON.stringify({ messageId: second.id }),
+    );
     f.emit('discarded', second);
     f.emit('inserted', { ...second });
     f.agent.inbox.nextTurn = [];
@@ -488,7 +492,7 @@ it('observes a true queue remove and keeps a native edit or steer of the same oc
     f.emit('discarded', second);
     f.emit('inserted', second);
     await Promise.resolve();
-    expect(await f.outcome(queued)).toEqual({ inserted: true });
+    expect(await f.outcome(queued)).toEqual({ messageId: second.id });
     f.agent.inbox.nextStep = [];
     f.emit('discarded', second);
     expect(await f.next(waiting)).toBe('discarded');
@@ -516,18 +520,20 @@ it('does not adopt a pending retry occurrence or another principal using the sam
     expect(await f.next(different)).toBe('ready');
     f.emit('discarded', item);
     f.emit('inserted', item);
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
-    expect(await f.outcome(other)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
+    expect(await f.outcome(other)).toEqual({ messageId: null });
     const newItem = f.message(other);
     f.emit('inserted', newItem);
     f.emit('claimed', newItem, 1);
     f.end(1);
-    expect(await f.next(different)).toBe('inserted');
+    expect(await f.next(different)).toBe(
+      'inserted ' + JSON.stringify({ messageId: newItem.id }),
+    );
     expect(await f.next(different)).toBe(
       'claimed ' + JSON.stringify({ messageId: newItem.id, turn: 1 }),
     );
     expect(await f.next(different)).toBe('ended');
-    expect(await f.outcome(retry)).toEqual({ inserted: false });
+    expect(await f.outcome(retry)).toEqual({ messageId: null });
   } finally {
     f.lifetime.abort();
   }

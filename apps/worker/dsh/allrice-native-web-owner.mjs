@@ -454,7 +454,7 @@ export function observeNativePrompts(scope, lifetime) {
       for (const observer of matches(agent, message)) {
         if (observer.existing.has(message.id) || observer.itemId) continue;
         observer.itemId = message.id;
-        observer.send('inserted');
+        observer.send('inserted ' + JSON.stringify({ messageId: message.id }));
       }
     },
     { global: true },
@@ -536,7 +536,7 @@ export function observeNativePrompts(scope, lifetime) {
       const observer = observers.get(id);
       return observer?.key === key
         ? globalThis.Response.json(
-            { inserted: observer.itemId !== undefined },
+            { messageId: observer.itemId ?? null },
             { headers: { 'cache-control': 'no-store' } },
           )
         : notFound();
@@ -1143,6 +1143,9 @@ export function applyNativeWebOwner(
                 );
                 if (!origin)
                   return new globalThis.Response(null, { status: 404 });
+                const inherited = new Set(
+                  origin.inherited.map((prompt) => JSON.stringify(prompt)),
+                );
                 return globalThis.Response.json(
                   {
                     id: found.id,
@@ -1151,8 +1154,9 @@ export function applyNativeWebOwner(
                     sourceTurn: origin.turn,
                     prompts: origin.prompts,
                     delegated: origin.delegated,
-                    delegatedPromptIds: origin.inherited.map(
-                      ({ requestId }) => requestId,
+                    inheritedPromptIndexes: origin.prompts.flatMap(
+                      (prompt, index) =>
+                        inherited.has(JSON.stringify(prompt)) ? [index] : [],
                     ),
                   },
                   { headers },

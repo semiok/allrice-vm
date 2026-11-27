@@ -75,8 +75,11 @@ const nativePrompts = z
   .max(64)
   .refine(
     (prompts) =>
-      new Set(prompts.map(({ requestId }) => requestId)).size ===
-      prompts.length,
+      new Set(
+        prompts.map(({ sessionId, messageId }) =>
+          JSON.stringify([sessionId, messageId]),
+        ),
+      ).size === prompts.length,
   );
 const nativeRootWake = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('clear') }).strict(),
@@ -167,7 +170,12 @@ export async function openNativeWebOwner(input: {
           child?: { sessionId: string; parentSessionId: string };
           observe(signal: AbortSignal): NativePromptObservation;
         }
-      | { endpoint: 'session/updateQueue' }
+      | {
+          endpoint: 'session/updateQueue';
+          child?: { sessionId: string; parentSessionId: string };
+          itemId: string;
+          action: 'edit' | 'remove' | 'steer';
+        }
     ),
     signal: AbortSignal,
   ): Promise<PrincipalInvocationObservation | undefined>;
@@ -441,6 +449,40 @@ export async function openNativeWebOwner(input: {
         return result;
       }),
     );
+  }
+  async function readChildPromptTarget(
+    context: RequestContext,
+    sessionId: string,
+    active: AbortSignal,
+    expectedParent?: string,
+  ) {
+    const result = await readCurrentSessions(active, (current) =>
+      input.vm.assertCurrentBinding(context, binding, current),
+    );
+    if (!result.ok) throw result.error;
+    const rows = result.value.items;
+    const entries = new Map(
+      rows.map((entry) => [String(entry.sessionId), entry]),
+    );
+    const target = entries.get(sessionId);
+    const rootEntry = nativeSessionRoot(entries, sessionId);
+    const parent =
+      target?.parentSessionId && entries.get(target.parentSessionId);
+    if (
+      entries.size !== rows.length ||
+      target?.origin !== 'subagent' ||
+      !rootEntry ||
+      !parent?.agentAvailable ||
+      (expectedParent !== undefined && expectedParent !== parent.sessionId)
+    )
+      throw new PersonVmError('AUTHORIZATION_DENIED');
+    return {
+      rootSessionId: rootEntry.sessionId,
+      child: {
+        sessionId: target.sessionId,
+        parentSessionId: parent.sessionId,
+      },
+    };
   }
   function readGraph(current: AbortSignal) {
     return transport.readIndex(current).then((html): unknown => {
@@ -761,48 +803,45 @@ export async function openNativeWebOwner(input: {
             }
             if (!context || !installedModelAdapter)
               throw new PersonVmError('AUTHORIZATION_DENIED');
+            const readPagePin = (sessionId: string) =>
+              getDEntryPageNativeRoot(
+                context,
+                issue.identity,
+                binding.vmId,
+                sessionId,
+              );
             let authorized: DEntryPrincipalIssue;
             let child:
               { sessionId: string; parentSessionId: string } | undefined;
+            let pin: Awaited<ReturnType<typeof readPagePin>>;
             let rootSessionId: string;
             if (call.endpoint === 'subagents/prompt') {
               if (issue.access !== 'page')
                 throw new PersonVmError('AUTHORIZATION_DENIED');
               const { childSessionId, parentSessionId } = call.args.request;
-              const result = await readCurrentSessions(active, (current) =>
-                input.vm.assertCurrentBinding(context, binding, current),
-              );
-              if (!result.ok) throw result.error;
-              const rows = result.value.items;
-              const entries = new Map(
-                rows.map((entry) => [String(entry.sessionId), entry]),
-              );
-              const parent = entries.get(parentSessionId);
-              const target = entries.get(childSessionId);
-              const rootEntry = nativeSessionRoot(entries, childSessionId);
-              if (
-                entries.size !== rows.length ||
-                !parent?.agentAvailable ||
-                target?.origin !== 'subagent' ||
-                target.parentSessionId !== parent.sessionId ||
-                !rootEntry
-              )
-                throw new PersonVmError('AUTHORIZATION_DENIED');
-              rootSessionId = rootEntry.sessionId;
-              child = {
-                sessionId: target.sessionId,
-                parentSessionId: parent.sessionId,
-              };
+              ({ rootSessionId, child } = await readChildPromptTarget(
+                context,
+                childSessionId,
+                active,
+                parentSessionId,
+              ));
             } else {
               rootSessionId = call.args.request.sessionId;
+              if (
+                issue.access === 'page' &&
+                call.endpoint === 'session/updateQueue'
+              ) {
+                pin = await readPagePin(rootSessionId);
+                if (!pin)
+                  ({ rootSessionId, child } = await readChildPromptTarget(
+                    context,
+                    rootSessionId,
+                    active,
+                  ));
+              }
             }
             if (issue.access === 'page') {
-              const pin = await getDEntryPageNativeRoot(
-                context,
-                issue.identity,
-                binding.vmId,
-                rootSessionId,
-              );
+              pin ??= await readPagePin(rootSessionId);
               if (
                 !pin ||
                 pin.vmId !== binding.vmId ||
@@ -833,11 +872,18 @@ export async function openNativeWebOwner(input: {
             const write = { binding, adapterId, context, issue: authorized };
             if (call.endpoint === 'session/updateQueue')
               return input.beforePrompt(
-                { ...write, endpoint: call.endpoint },
+                {
+                  ...write,
+                  endpoint: call.endpoint,
+                  child,
+                  itemId: call.args.request.itemId,
+                  action: call.args.request.action.kind,
+                },
                 active,
               );
             const requestId = call.args.request.requestId;
-            return input.beforePrompt(
+            let observed: NativePromptObservation | undefined;
+            const admission = await input.beforePrompt(
               {
                 ...write,
                 endpoint: call.endpoint,
@@ -848,7 +894,7 @@ export async function openNativeWebOwner(input: {
                     : call.args.request.mode,
                 child,
                 observe(current) {
-                  const observed = observeNativePrompt(
+                  observed = observeNativePrompt(
                     transport,
                     {
                       adapterId,
@@ -866,6 +912,14 @@ export async function openNativeWebOwner(input: {
               },
               active,
             );
+            if (!child || !admission) return admission;
+            return {
+              ...admission,
+              assertInserted(messageId, signal) {
+                if (!observed) throw new PersonVmError('PROVIDER_FAILED');
+                return observed.assertInserted(messageId, signal);
+              },
+            };
           },
         );
       },
@@ -1024,7 +1078,7 @@ export async function openNativeWebOwner(input: {
                   sourceTurn: null,
                   rootSessionId: null,
                   delegated: false,
-                  delegatedPromptIds: [] as string[],
+                  inheritedPromptIndexes: [] as number[],
                 };
               const proof = await transport.readManagedModelProof(
                 JSON.stringify({
@@ -1047,14 +1101,14 @@ export async function openNativeWebOwner(input: {
                 prompts?: unknown;
                 rootSessionId?: unknown;
                 delegated?: unknown;
-                delegatedPromptIds?: unknown;
+                inheritedPromptIndexes?: unknown;
               };
               const id = UuidSchema.safeParse(value?.id);
               const prompts = nativePrompts.safeParse(value?.prompts);
               const inherited = z
-                .array(z.string().min(1).max(256))
+                .array(z.number().int().nonnegative())
                 .max(64)
-                .safeParse(value?.delegatedPromptIds);
+                .safeParse(value?.inheritedPromptIndexes);
               if (
                 !id.success ||
                 typeof value.recipient !== 'string' ||
@@ -1077,13 +1131,12 @@ export async function openNativeWebOwner(input: {
                   !inherited.data.length)
               )
                 throw new PersonVmError('PROVIDER_FAILED');
-              const ids = prompts.data.map(({ requestId }) => requestId);
-              const references = new Set(ids);
+              const references = new Set(inherited.data);
               if (
-                new Set(inherited.data).size !== inherited.data.length ||
-                inherited.data.some((id) => !references.has(id)) ||
-                prompts.data.some((prompt) => {
-                  if (inherited.data.includes(prompt.requestId))
+                references.size !== inherited.data.length ||
+                inherited.data.some((index) => index >= prompts.data.length) ||
+                prompts.data.some((prompt, index) => {
+                  if (references.has(index))
                     return (
                       (prompt.sessionId === value.rootSessionId) ===
                       !!prompt.parentSessionId
@@ -1103,8 +1156,8 @@ export async function openNativeWebOwner(input: {
                 sourceTurn: value.sourceTurn as number,
                 rootSessionId: value.rootSessionId,
                 delegated: value.delegated,
-                delegatedPromptIds: inherited.data,
-                promptIds: ids,
+                inheritedPromptIndexes: inherited.data,
+                promptIds: prompts.data.map(({ requestId }) => requestId),
                 prompts: prompts.data,
               };
             } finally {

@@ -41,6 +41,7 @@ export type PrincipalInvocationObservation = Readonly<{
   undispatched(): Promise<void>;
   accepted(): void;
   unknown(): void;
+  assertInserted?(messageId: string, signal: AbortSignal): Promise<void>;
 }>;
 type PrincipalInvocationCall =
   | DEntryScopedUnaryCall
@@ -397,6 +398,17 @@ export function createDEntryPrincipalControl(
                     .parse(result.value);
                   if (value.endpoint !== call.endpoint)
                     throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+                  if (protectedCall?.endpoint === 'subagents/prompt') {
+                    if (!('kind' in value) || !observation?.assertInserted)
+                      throw Error('PRINCIPAL_REMOTE_RESULT_INVALID');
+                    const receipt = Subagents.methods['subagents/prompt'].result
+                      .create()
+                      .parse(value.value);
+                    await observation.assertInserted(
+                      receipt.messageId,
+                      AbortSignal.any([active, business]),
+                    );
+                  }
                   known = true;
                   observation?.accepted();
                   business.throwIfAborted();

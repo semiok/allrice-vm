@@ -5,9 +5,14 @@ import { PersonVmError } from '@allrice/person-vm';
 import { z } from 'zod';
 import type { nativeWebTransport } from './transport.js';
 
+const nativeMessageId = z.string().min(1).max(256);
+const insertedMessage = z.object({ messageId: nativeMessageId }).strict();
+const insertedOutcome = z
+  .object({ messageId: nativeMessageId.nullable() })
+  .strict();
 const adoptedMessage = z
   .object({
-    messageId: z.string().min(1).max(256),
+    messageId: nativeMessageId,
     turn: z.number().int().positive(),
   })
   .strict();
@@ -66,12 +71,39 @@ export function observeNativePrompt(
   const current = AbortSignal.any([signal, close.signal]);
   const request = { ...source, id: randomUUID() };
   const ready = deferredPromptFact<void>();
+  const insertion = deferredPromptFact<string>();
   const claim = deferredPromptFact<z.infer<typeof adoptedMessage>>();
   const failed = () => new PersonVmError('PROVIDER_FAILED');
   let state: 'opening' | 'ready' | 'inserted' | 'claimed' = 'opening';
   let terminal: 'discarded' | 'ended' | undefined;
-  let claimedMessageId: string | undefined;
+  let insertedMessageId: string | undefined;
   let tail = '';
+  function recordInsertion(messageId: string) {
+    if (insertedMessageId && insertedMessageId !== messageId) throw failed();
+    insertedMessageId = messageId;
+    insertion.resolve(messageId);
+  }
+  async function readInsertedMessageId(active: AbortSignal) {
+    const checking = AbortSignal.any([
+      active,
+      current,
+      AbortSignal.timeout(setupTimeoutMs),
+    ]);
+    checking.throwIfAborted();
+    if (insertedMessageId) return insertedMessageId;
+    const response = await transport.readManagedModelProof(
+      JSON.stringify({ ...request, action: 'prompt-outcome' }),
+      checking,
+    );
+    checking.throwIfAborted();
+    // The observer disappears at terminal, but its original stream still
+    // carries the insertion ahead of that terminal.
+    if (!response) return waitForPromptFact(insertion.promise, checking);
+    const outcome = insertedOutcome.safeParse(JSON.parse(response));
+    if (!outcome.success) throw failed();
+    if (outcome.data.messageId) recordInsertion(outcome.data.messageId);
+    return insertedMessageId;
+  }
   const settled = transport
     .readManagedModelProof(
       JSON.stringify({ ...request, action: 'observe-prompt' }),
@@ -85,15 +117,23 @@ export function observeNativePrompt(
           if (record === 'ready' && state === 'opening') {
             state = 'ready';
             ready.resolve();
-          } else if (record === 'inserted' && state === 'ready') {
+          } else if (record.startsWith('inserted ') && state === 'ready') {
+            const item = insertedMessage.safeParse(
+              JSON.parse(record.slice('inserted '.length)),
+            );
+            if (!item.success) throw failed();
             state = 'inserted';
+            recordInsertion(item.data.messageId);
           } else if (record.startsWith('claimed ') && state === 'inserted') {
             const adopted = adoptedMessage.safeParse(
               JSON.parse(record.slice('claimed '.length)),
             );
-            if (!adopted.success) throw failed();
+            if (
+              !adopted.success ||
+              adopted.data.messageId !== insertedMessageId
+            )
+              throw failed();
             state = 'claimed';
-            claimedMessageId = adopted.data.messageId;
             claim.resolve(adopted.data);
           } else if (
             (record === 'discarded' && state === 'inserted') ||
@@ -111,8 +151,10 @@ export function observeNativePrompt(
     });
   void settled.catch((error: unknown) => {
     ready.reject(error);
+    insertion.reject(error);
     claim.reject(error);
   });
+  void insertion.promise.catch(() => {});
   void claim.promise.catch(() => {});
   const readySignal = AbortSignal.any([
     current,
@@ -125,8 +167,11 @@ export function observeNativePrompt(
       close.abort();
       await settled.catch(() => {});
     },
-    inserted: () => state === 'inserted' || state === 'claimed',
-    claimedMessageId: () => claimedMessageId,
+    inserted: () => insertedMessageId !== undefined,
+    readInsertedMessageId,
+    async assertInserted(messageId: string, active: AbortSignal) {
+      if ((await readInsertedMessageId(active)) !== messageId) throw failed();
+    },
     async assertClaimed(
       active: AbortSignal,
       expected?: NativePromptOccurrence,
@@ -149,12 +194,7 @@ export function observeNativePrompt(
     /** Called only after a verified successful native prompt reply. The
      * native RPC commits any new inbox occurrence before acknowledging it. */
     async confirmedReplay() {
-      if (state === 'inserted' || state === 'claimed') return false;
-      const response = await transport.readManagedModelProof(
-        JSON.stringify({ ...request, action: 'prompt-outcome' }),
-        AbortSignal.any([current, AbortSignal.timeout(setupTimeoutMs)]),
-      );
-      return response === '{"inserted":false}';
+      return (await readInsertedMessageId(current)) === undefined;
     },
   };
 }

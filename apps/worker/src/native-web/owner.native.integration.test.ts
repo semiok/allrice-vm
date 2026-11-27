@@ -13,6 +13,7 @@ import { afterEach, expect, it, vi, type MockInstance } from 'vitest';
 import { serverResponseSchema } from '@deepseek-ai/dsh-client-connection';
 import * as Database from '@allrice/database';
 import { TYPERT_REMOTE as NATIVE_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
+import { TYPERT_REMOTE as SUBAGENTS_REMOTE } from '@deepseek-ai/dsh-subagent/remote';
 import type { SessionAddress } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { DEntryPrincipalIssue } from '@allrice/d-entry-principal/types';
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol';
@@ -93,15 +94,12 @@ async function openPromptScope(
   return { activity, issue, scope: await activity.run(signal) };
 }
 
-function observeSinglePrompt(
-  signal: AbortSignal,
-  endpoint: 'session/prompt' | 'subagents/prompt' = 'session/prompt',
-) {
+function observeSinglePrompt(signal: AbortSignal) {
   const observed = deferred<NativePromptObservation>();
   const beforePrompt: NonNullable<
     Parameters<typeof setupNativeWebFixture>[6]
   > = async (request) => {
-    if (request.endpoint !== endpoint)
+    if (request.endpoint !== 'session/prompt')
       throw Error('Expected one scoped prompt');
     const observation = request.observe(signal);
     await observation.ready;
@@ -384,7 +382,7 @@ it.skipIf(!cli)(
 );
 
 it.skipIf(!cli)(
-  'proves a continuable child, both idle parent wakeups, and a scoped browser follow-up',
+  'proves a continuable child, idle parent wakeups, and repeated-ID child queue operations',
   { tags: [tag], timeout: 30000 },
   async () => {
     const rootReady = deferred<{
@@ -400,7 +398,10 @@ it.skipIf(!cli)(
       void ready.promise.catch(() => {});
     const signal = AbortSignal.timeout(25000);
     const { beforePrompt, observed } = observeSinglePrompt(signal);
-    const childPrompt = observeSinglePrompt(signal, 'subagents/prompt');
+    const childObservers: NativePromptObservation[] = [];
+    const queueActions = vi.fn();
+    const repeatedQueued = deferred();
+    const releaseChildTurn = deferred();
     const capability = 'a'.repeat(43);
     const requestId = randomUUID();
     const childRequestId = randomUUID();
@@ -438,6 +439,7 @@ it.skipIf(!cli)(
           if (!isRoot) await (ordinal === 1 ? rootEnded : relayEnded).promise;
           if (!isRoot && !title) childSessionId = session;
           const browserFollowUp = !isRoot && !title && ordinal === 3;
+          if (browserFollowUp) await repeatedQueued.promise;
           const proof = await owner.readNativeAttemptFor(
             context,
             address,
@@ -462,10 +464,10 @@ it.skipIf(!cli)(
           });
           const witness = proof!.prompts[0]!;
           await (
-            await (browserFollowUp ? childPrompt.observed : observed)
+            browserFollowUp ? childObservers[0]! : await observed
           ).assertClaimed(signal, witness);
           if (browserFollowUp) {
-            expect(proof!.delegatedPromptIds).toEqual([]);
+            expect(proof!.inheritedPromptIndexes).toEqual([]);
             childWitness.resolve(witness.messageId);
           }
           if (isRoot && !title) {
@@ -511,6 +513,7 @@ it.skipIf(!cli)(
         if (!entry)
           throw Error('The native adapter did not redeem its reference');
         const { session, ordinal, title: isTitle } = entry;
+        if (session !== root && ordinal === 3) await releaseChildTurn.promise;
         const tool = isTitle
           ? null
           : session === root && ordinal === 1
@@ -553,7 +556,11 @@ it.skipIf(!cli)(
       });
     });
     const origin = await listen(server);
-    cleanup.push(() => closeServer(server));
+    cleanup.push(async () => {
+      repeatedQueued.resolve();
+      releaseChildTurn.resolve();
+      await closeServer(server);
+    });
     const f = await setupNativeWebFixture(
       cli,
       roots,
@@ -571,10 +578,22 @@ it.skipIf(!cli)(
           name: 'fixture-codex',
         },
       },
-      (request, active) =>
-        (request.endpoint === 'subagents/prompt'
-          ? childPrompt.beforePrompt
-          : beforePrompt)(request, active),
+      async (request, active) => {
+        if (request.endpoint === 'session/updateQueue') {
+          queueActions(request.child, request.itemId, request.action);
+          return;
+        }
+        if (request.endpoint !== 'subagents/prompt')
+          return beforePrompt(request, active);
+        const observation = request.observe(signal);
+        childObservers.push(observation);
+        await observation.ready;
+        return {
+          undispatched: () => observation.close(),
+          accepted() {},
+          unknown() {},
+        };
+      },
     );
     const { owner, context } = f;
     const created = await owner.createRootFor(context, {}, signal);
@@ -632,13 +651,18 @@ it.skipIf(!cli)(
     if (!childSessionId) throw Error('Native continuable child unavailable');
     const findRoot = vi
       .spyOn(Database, 'getDEntryPageNativeRoot')
-      .mockResolvedValue({
-        identity: issue.identity,
-        rootNativeSessionId: sessionId,
-        rootBindingRef: issue.root.rootBindingRef,
-        rootOriginDigest: issue.root.rootOriginDigest,
-        vmId: owner.binding.vmId,
-      });
+      .mockImplementation(
+        async (_context, _identity, _vmId, nativeSessionId) =>
+          nativeSessionId === sessionId
+            ? {
+                identity: issue.identity,
+                rootNativeSessionId: sessionId,
+                rootBindingRef: issue.root.rootBindingRef,
+                rootOriginDigest: issue.root.rootOriginDigest,
+                vmId: owner.binding.vmId,
+              }
+            : undefined,
+      );
     const pageActivity = owner.acquirePrincipal(
       {
         scopeId: childScopeId,
@@ -675,8 +699,15 @@ it.skipIf(!cli)(
       'AUTHORIZATION_DENIED',
     );
     expect(findRoot).not.toHaveBeenCalled();
-    const reply = await call(sessionId);
-    expect(reply.value).toEqual({
+    const first = await call(sessionId);
+    const pending = await call(sessionId);
+    const receipt =
+      SUBAGENTS_REMOTE.methods['subagents/prompt'].result.create();
+    const pendingId = receipt.parse(pending.value).messageId;
+    expect(pendingId).not.toBe(receipt.parse(first.value).messageId);
+    expect(childObservers).toHaveLength(2);
+    repeatedQueued.resolve();
+    expect(first.value).toEqual({
       messageId: await waitForPromptFact(childWitness.promise, signal),
     });
     expect(findRoot).toHaveBeenCalledWith(
@@ -685,8 +716,35 @@ it.skipIf(!cli)(
       owner.binding.vmId,
       sessionId,
     );
+    expect(
+      await page.invokePage(
+        {
+          kind: 'page',
+          endpoint: 'session/updateQueue',
+          scopeId: childScopeId,
+          args: {
+            request: {
+              sessionId: childSessionId,
+              itemId: pendingId,
+              action: { kind: 'remove' },
+            },
+          },
+        },
+        signal,
+      ),
+    ).toMatchObject({ value: { accepted: true } });
+    expect(queueActions).toHaveBeenCalledWith(
+      { sessionId: childSessionId, parentSessionId: sessionId },
+      pendingId,
+      'remove',
+    );
+    expect(childObservers).toHaveLength(2);
     await expect(
-      waitForPromptFact((await childPrompt.observed).settled, signal),
+      waitForPromptFact(childObservers[1]!.settled, signal),
+    ).resolves.toBe('discarded');
+    releaseChildTurn.resolve();
+    await expect(
+      waitForPromptFact(childObservers[0]!.settled, signal),
     ).resolves.toBe('ended');
     await pageActivity.close();
   },

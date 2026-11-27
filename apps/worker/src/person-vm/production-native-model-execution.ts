@@ -68,8 +68,9 @@ const promptKey = (adapterId: string, sessionId: string, requestId: string) =>
   JSON.stringify([adapterId, sessionId, requestId]);
 
 export function readNativePromptContributors<
+  Id,
   T extends Pick<PromptOwner, 'authorityKey' | 'revoked'>,
->(ids: readonly string[], read: (id: string) => T | undefined) {
+>(ids: readonly Id[], read: (id: Id) => T | undefined) {
   const first = read(ids[0]!);
   if (!first || first.revoked.aborted) return null;
   const contributors = [first];
@@ -346,7 +347,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           persisted?: boolean;
           delegated: boolean;
           prompts: readonly NativePromptOccurrence[];
-          delegatedPromptIds: readonly string[];
+          inheritedPromptIndexes: readonly number[];
         }
       >();
       const operations = new Set<Promise<unknown>>();
@@ -456,58 +457,74 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           operations.delete(joined);
         }
       }
-      function findPromptContributors(
+      async function readPromptInsertions(
+        adapterId: string,
+        root: string,
+        binding: PersonVmBinding,
+        includes: (scope: PromptOwner) => boolean,
+        signal: AbortSignal,
+      ) {
+        const candidates = [...selected.values()].filter(
+          ({ scope }) =>
+            scope.root === root &&
+            scope.adapterId === adapterId &&
+            sameVmBinding(scope.binding, binding) &&
+            !scope.revoked.aborted &&
+            includes(scope),
+        );
+        const insertions = await Promise.all(
+          candidates.map(async ({ scope, observation }) => {
+            try {
+              const messageId = await observation.readInsertedMessageId(
+                AbortSignal.any([signal, scope.revoked]),
+              );
+              if (messageId && !scope.revoked.aborted)
+                return { scope, messageId };
+            } catch {
+              signal.throwIfAborted();
+            }
+          }),
+        );
+        return insertions.filter((entry) => entry !== undefined);
+      }
+      async function findPromptContributors(
         adapterId: string,
         root: string,
         binding: PersonVmBinding,
         prompts: readonly NativePromptOccurrence[],
+        signal: AbortSignal,
       ) {
-        const candidates = new Map<
-          string,
-          Array<{
-            scope: PromptOwner;
-            observation: NativePromptObservation;
-          }>
-        >();
-        const requested = new Map(
-          prompts.map((prompt) => [prompt.requestId, prompt]),
+        const sourceKey = (
+          source: Pick<
+            PromptOwner,
+            'sessionId' | 'parentSessionId' | 'scopeId' | 'requestId'
+          >,
+        ) =>
+          JSON.stringify([
+            source.sessionId,
+            source.parentSessionId,
+            source.scopeId,
+            source.requestId,
+          ]);
+        const sources = new Set(prompts.map(sourceKey));
+        const insertions = await readPromptInsertions(
+          adapterId,
+          root,
+          binding,
+          (scope) => sources.has(sourceKey(scope)),
+          signal,
         );
-        for (const entry of selected.values()) {
-          const { scope } = entry;
-          const prompt = requested.get(scope.requestId);
-          if (
-            scope.root !== root ||
-            scope.adapterId !== adapterId ||
-            !sameVmBinding(scope.binding, binding) ||
-            scope.revoked.aborted ||
-            !prompt ||
-            prompt.scopeId !== scope.scopeId ||
-            prompt.sessionId !== scope.sessionId ||
-            prompt.parentSessionId !== scope.parentSessionId
-          )
-            continue;
-          const choices = candidates.get(scope.requestId) ?? [];
-          choices.push(entry);
-          candidates.set(scope.requestId, choices);
+        const matches = new Map<string, PromptOwner | undefined>();
+        const key = (
+          source: Parameters<typeof sourceKey>[0],
+          messageId: string,
+        ) => JSON.stringify([sourceKey(source), messageId]);
+        for (const { scope, messageId } of insertions) {
+          const id = key(scope, messageId);
+          matches.set(id, matches.has(id) ? undefined : scope);
         }
-        return readNativePromptContributors(
-          prompts.map(({ requestId }) => requestId),
-          (id) => {
-            const { messageId } = requested.get(id)!;
-            const choices = (candidates.get(id) ?? []).filter(
-              ({ observation }) => {
-                const claimed = observation.claimedMessageId();
-                return !claimed || claimed === messageId;
-              },
-            );
-            const inserted = choices.filter(({ observation }) =>
-              observation.inserted(),
-            );
-            // DSH can return an accepted idempotent replay. Only the
-            // original occurrence's native claim carries execution authority.
-            const actual = inserted.length ? inserted : choices;
-            return actual.length === 1 ? actual[0]!.scope : undefined;
-          },
+        return readNativePromptContributors(prompts, (prompt) =>
+          matches.get(key(prompt, prompt.messageId)),
         );
       }
       function conflictingLogin(
@@ -601,11 +618,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               if (wake.kind === 'clear') return;
               if (wake.kind !== 'delegated')
                 throw new PersonVmError('VM_ACTIVE');
-              const claimed = findPromptContributors(
+              const claimed = await findPromptContributors(
                 adapterId,
                 root.rootNativeSessionId,
                 binding,
                 wake.prompts,
+                current,
               );
               if (!claimed || claimed.first.authorityKey !== authorityKey)
                 throw new PersonVmError('VM_ACTIVE');
@@ -622,6 +640,25 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 conflictingLogin(adapterId, root.rootNativeSessionId, context)
               )
                 throw new PersonVmError('VM_ACTIVE');
+              if (request.child && request.action === 'steer') {
+                const { sessionId, parentSessionId } = request.child;
+                const insertions = await readPromptInsertions(
+                  adapterId,
+                  root.rootNativeSessionId,
+                  binding,
+                  (scope) =>
+                    scope.authorityKey === authorityKey &&
+                    scope.sessionId === sessionId &&
+                    scope.parentSessionId === parentSessionId,
+                  current,
+                );
+                if (
+                  insertions.filter(
+                    ({ messageId }) => messageId === request.itemId,
+                  ).length !== 1
+                )
+                  throw new PersonVmError('VM_ACTIVE');
+              }
               await assertWakeOwner(current);
               current.throwIfAborted();
               if (
@@ -954,8 +991,8 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             attempt.rootSessionId !== call.native.rootSessionId ||
             attempt.delegated !== owned.delegated ||
             JSON.stringify(attempt.prompts) !== JSON.stringify(owned.prompts) ||
-            JSON.stringify(attempt.delegatedPromptIds) !==
-              JSON.stringify(owned.delegatedPromptIds) ||
+            JSON.stringify(attempt.inheritedPromptIndexes) !==
+              JSON.stringify(owned.inheritedPromptIndexes) ||
             resource.rootNativeSessionId !== call.native.rootSessionId ||
             resource.parentNativeSessionId !== call.native.parentSessionId ||
             resource.threadId !== call.allriceThreadRef ||
@@ -1001,7 +1038,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                   coalesced: readonly PromptOwner[];
                   delegated: boolean;
                   prompts: readonly NativePromptOccurrence[];
-                  delegatedPromptIds: readonly string[];
+                  inheritedPromptIndexes: readonly number[];
                 }
               | undefined;
             const checked = new Set<string>();
@@ -1076,11 +1113,12 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 )
               )
                 continue;
-              const proven = findPromptContributors(
+              const proven = await findPromptContributors(
                 wanted.adapterId,
                 probe.root,
                 binding,
                 attempt.prompts,
+                active,
               );
               if (!proven) return reject();
               const { first: scope, contributors: coalesced } = proven;
@@ -1112,7 +1150,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 coalesced,
                 prompts: attempt.prompts,
                 delegated: attempt.delegated,
-                delegatedPromptIds: attempt.delegatedPromptIds,
+                inheritedPromptIndexes: attempt.inheritedPromptIndexes,
                 call: {
                   context: structuredClone(scope.context),
                   vm: binding,
@@ -1151,7 +1189,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               coalesced,
               prompts,
               delegated,
-              delegatedPromptIds,
+              inheritedPromptIndexes,
             } = matched;
             const callId = call.native.callId;
             const deadline = AbortSignal.timeout(30_000);
@@ -1173,7 +1211,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
               route,
               delegated,
               prompts,
-              delegatedPromptIds,
+              inheritedPromptIndexes,
             };
             calls.set(callId, entry);
             effective.addEventListener('abort', revoke, { once: true });
@@ -1196,15 +1234,13 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                       call,
                       authorization,
                       async (admitted) => {
-                        const inherited = new Set(delegatedPromptIds);
+                        const inherited = new Set(inheritedPromptIndexes);
                         const direct = coalesced.filter(
-                          (member) => !inherited.has(member.requestId),
+                          (_, index) => !inherited.has(index),
                         );
                         await assertDelegatedOrigins(
                           scope,
-                          coalesced.filter((member) =>
-                            inherited.has(member.requestId),
-                          ),
+                          coalesced.filter((_, index) => inherited.has(index)),
                           call,
                           admitted,
                         );

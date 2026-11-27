@@ -101,7 +101,7 @@ it('checks the exact adopted message occurrence for billing after the native tur
       async readManagedModelProof(_body, _signal, _image, receive) {
         receive?.(
           Buffer.from(
-            `ready\ninserted\nclaimed ${JSON.stringify(adopted)}\nended\n`,
+            `ready\ninserted ${JSON.stringify({ messageId: adopted.messageId })}\nclaimed ${JSON.stringify(adopted)}\nended\n`,
           ),
         );
         return null;
@@ -112,6 +112,9 @@ it('checks the exact adopted message occurrence for billing after the native tur
     1000,
   );
   await expect(observer.settled).resolves.toBe('ended');
+  await expect(
+    observer.assertInserted(adopted.messageId, active),
+  ).resolves.toBeUndefined();
   const { sessionId, scopeId, requestId } = source;
   const proof = { sessionId, scopeId, requestId, ...adopted };
   await expect(observer.assertClaimed(active, proof)).resolves.toBeUndefined();
@@ -128,8 +131,49 @@ it('checks the exact adopted message occurrence for billing after the native tur
   await observer.close();
 });
 
+it.each([
+  [null, 'PROVIDER_FAILED'],
+  ['different-message', 'PROVIDER_FAILED'],
+  ['native-message', undefined],
+])(
+  'validates an acknowledged child insertion before a turn claims it (%s)',
+  async (messageId, code) => {
+    const finish = deferredPromptFact<null>();
+    const active = new AbortController().signal;
+    const observer = observeNativePrompt(
+      {
+        readManagedModelProof(_body, signal, _image, receive) {
+          if (!receive) return Promise.resolve(JSON.stringify({ messageId }));
+          signal.addEventListener('abort', () => finish.reject(signal.reason), {
+            once: true,
+          });
+          receive(Buffer.from('ready\n'));
+          return finish.promise;
+        },
+      },
+      {
+        adapterId: 'native-fixture',
+        sessionId: 'native-child',
+        parentSessionId: issue.root.nativeSessionId,
+        scopeId: issue.scopeId,
+        requestId: 'native-request',
+      },
+      active,
+      1000,
+    );
+    try {
+      await observer.ready;
+      const receipt = observer.assertInserted('native-message', active);
+      if (code) await expect(receipt).rejects.toHaveProperty('code', code);
+      else await expect(receipt).resolves.toBeUndefined();
+    } finally {
+      await observer.close();
+    }
+  },
+);
+
 function nativeFacts() {
-  let inserted = false;
+  let messageId: string | undefined;
   const settled = deferredPromptFact<'discarded' | 'ended'>();
   const closed = deferredPromptFact<void>();
   const observation = {
@@ -139,8 +183,9 @@ function nativeFacts() {
       settled.reject(Error('observer closed'));
       closed.resolve();
     }),
-    inserted: () => inserted,
-    claimedMessageId: vi.fn(() => undefined),
+    inserted: () => messageId !== undefined,
+    readInsertedMessageId: vi.fn(async () => messageId),
+    assertInserted: vi.fn(async () => {}),
     assertClaimed: vi.fn(async () => {}),
     confirmedReplay: vi.fn(async () => false),
   } satisfies NativePromptObservation;
@@ -148,8 +193,8 @@ function nativeFacts() {
     observation,
     closed: closed.promise,
     settle: settled.resolve,
-    insert() {
-      inserted = true;
+    insert(id = 'fixture-message') {
+      messageId = id;
     },
   };
 }
@@ -240,7 +285,12 @@ async function setup() {
       if (!result) throw Error('prompt observation unavailable');
       return result;
     },
-    updateQueue(context: RequestContext) {
+    updateQueue(
+      context: RequestContext,
+      child?: { sessionId: string; parentSessionId: string },
+      itemId = 'queue-item',
+      action: 'edit' | 'remove' | 'steer' = 'remove',
+    ) {
       return observed(
         {
           endpoint: 'session/updateQueue',
@@ -248,6 +298,9 @@ async function setup() {
           adapterId,
           context,
           issue,
+          child,
+          itemId,
+          action,
         },
         lifetime.signal,
       );
@@ -259,7 +312,7 @@ async function setup() {
   };
 }
 
-it('binds a native child model reference to its adopted scoped contribution and owning root', async () => {
+it('binds only adopted child occurrences when pending and steered messages share a request ID', async () => {
   const f = await setup();
   const context = login();
   const root = SessionId(issue.root.nativeSessionId);
@@ -308,8 +361,13 @@ it('binds a native child model reference to its adopted scoped contribution and 
       turn: 1,
     };
     const admission = await f.admit(context, requestId, native, 'queue', child);
-    native.insert();
+    native.insert(occurrence.messageId);
     admission.accepted();
+    const pending = nativeFacts();
+    const second = { ...occurrence, messageId: 'same-request-pending-message' };
+    const waiting = await f.admit(context, requestId, pending, 'queue', child);
+    pending.insert(second.messageId);
+    waiting.accepted();
     const recipient = 'r'.repeat(43);
     const attempt = {
       kind: 'assistant',
@@ -320,7 +378,7 @@ it('binds a native child model reference to its adopted scoped contribution and 
       recipient,
       rootSessionId: root,
       delegated: true,
-      delegatedPromptIds: [],
+      inheritedPromptIndexes: [],
     };
     const resolveReference = () => {
       const body = Buffer.from(
@@ -356,6 +414,7 @@ it('binds a native child model reference to its adopted scoped contribution and 
       expect.any(AbortSignal),
       occurrence,
     );
+    expect(pending.observation.assertClaimed).not.toHaveBeenCalled();
     expect(f.bindReference).toHaveBeenCalledWith(
       expect.objectContaining({
         allriceThreadRef: identity.threadId,
@@ -363,6 +422,30 @@ it('binds a native child model reference to its adopted scoped contribution and 
       }),
       expect.any(AbortSignal),
     );
+    await expect(
+      f.updateQueue(context, child, second.messageId, 'steer'),
+    ).resolves.toBeUndefined();
+    await expect(
+      f.updateQueue(context, child, 'unknown-message', 'steer'),
+    ).rejects.toHaveProperty('code', 'VM_ACTIVE');
+    f.readNativeAttemptFor.mockResolvedValue({
+      ...attempt,
+      prompts: [occurrence, second],
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(pending.observation.assertClaimed).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      second,
+    );
+    // Re-reading the same attempt with the same adopted occurrences retains
+    // the original run and attempt record identities.
+    const execution = f.bindReference.mock.lastCall?.[0].execution;
+    expect(execution).toEqual({
+      runId: expect.any(String),
+      executionId: expect.any(String),
+    });
+    await expect(resolveReference()).resolves.toMatchObject({ context });
+    expect(f.bindReference.mock.lastCall?.[0].execution).toEqual(execution);
   } finally {
     uninstall();
     await f.close();
@@ -492,7 +575,7 @@ describe('native delegated execution', () => {
       const a = login();
       const b = login();
       const admitted = await f.admit(a, 'original', original);
-      original.insert();
+      original.insert('adopted-original');
       admitted.accepted();
       original.settle('ended');
       await Promise.resolve();
