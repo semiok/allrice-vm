@@ -1,8 +1,16 @@
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
-import { IdentityError } from '@allrice/database';
-import { findDEntryEmployee } from '../../../lib/d-entry/entry-threads';
+import {
+  IdentityError,
+  hasExistingDEntryEmployeeOrVm,
+  preparePersonNativeWebRoster,
+} from '@allrice/database';
+import {
+  findDEntryCreationWorkspace,
+  findDEntryEmployee,
+} from '../../../lib/d-entry/entry-threads';
 import { getRequestContext } from '../../../lib/identity/session';
+import { EmployeeFirstStart } from './employee-first-start';
 import { EmployeeNativePage } from './employee-native-page';
 
 export const dynamic = 'force-dynamic';
@@ -49,21 +57,44 @@ export default async function EmployeeNativeEntryPage({
         />
       );
     if (!auth.context) redirect('/login?next=%2Fchatflow%2F4.0');
-    const result = await findDEntryEmployee(auth.context).then(
-      (selection) => ({ selection, unavailable: false }),
-      () => ({ selection: null, unavailable: true }),
-    );
-    return (
-      <EmployeeNativePage
-        query={
-          result.selection
-            ? new URLSearchParams(result.selection).toString()
-            : ''
+    const context = auth.context;
+    try {
+      let selection = await findDEntryEmployee(context);
+      if (!selection && context.actor.type === 'user') {
+        const workspaceId = await findDEntryCreationWorkspace(context);
+        if (workspaceId) {
+          // Existing assignments can precede their general instances.
+          const { entries } = await preparePersonNativeWebRoster(context);
+          if (
+            !entries.some(
+              (entry) =>
+                !context.workspaceId ||
+                entry.workspaceId === context.workspaceId,
+            )
+          )
+            return (
+              <EmployeeFirstStart
+                organizationId={context.organizationId}
+                workspaceId={workspaceId}
+                viewerId={context.actor.id}
+                creationBlocked={await hasExistingDEntryEmployeeOrVm({
+                  ...context,
+                  workspaceId,
+                })}
+              />
+            );
+          selection = await findDEntryEmployee(context);
         }
-        initialUnavailable={result.unavailable}
-        prepare
-      />
-    );
+      }
+      return (
+        <EmployeeNativePage
+          query={selection ? new URLSearchParams(selection).toString() : ''}
+          prepare
+        />
+      );
+    } catch {
+      return <EmployeeNativePage query="" initialUnavailable prepare />;
+    }
   }
   return <EmployeeNativePage query={query.toString()} prepare />;
 }

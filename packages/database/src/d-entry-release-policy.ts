@@ -24,6 +24,9 @@ export async function readDEntryReleasePolicy(
   sql: ReturnType<typeof getDatabase> | postgres.TransactionSql = getDatabase(),
   lock = false,
 ) {
+  // A missing settings row cannot serialize with the first publication.
+  if (lock)
+    await sql`select pg_advisory_xact_lock_shared(hashtextextended(${dEntryReleasePolicyKey},0))`;
   const [row] = await sql`select value from allrice_settings
     where scope_type='system' and scope_id is null and key=${dEntryReleasePolicyKey}
     ${lock ? sql`for share` : sql``}`;
@@ -41,7 +44,7 @@ export async function getDEntryReleasePolicy(context: RequestContext) {
 }
 
 /** Published by the same platform-admin authority as native_question_mode.
- * Only exact person/employee tuples opt in; global enable is not supported. */
+ * Each selection opts one person into 4.0 within their organization. */
 export async function updateDEntryReleasePolicy(
   context: RequestContext,
   input: unknown,
@@ -52,6 +55,7 @@ export async function updateDEntryReleasePolicy(
   const policy = { ...parsed, revision: randomUUID() };
   await getDatabase().begin(async (tx) => {
     const actor = await requireCurrentPlatformAdmin(context, tx);
+    await tx`select pg_advisory_xact_lock(hashtextextended(${dEntryReleasePolicyKey},0))`;
     const [setting] =
       await tx`insert into allrice_settings(scope_type,key,value,updated_by)
       values('system',${dEntryReleasePolicyKey},${tx.json(policy)},${actor})

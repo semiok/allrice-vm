@@ -30,6 +30,7 @@ describe('ordinary conversation capability freeze', () => {
     expect(response.status).toBe(201);
     expect(mocks.create).toHaveBeenCalledExactlyOnceWith(context, body, {
       freezeAccountCapabilities: true,
+      requireLegacyBrowserWriter: true,
     });
   });
   it('does not create a conversation without authentication', async () => {

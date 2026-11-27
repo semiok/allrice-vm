@@ -10,6 +10,7 @@ import {
   type BrowserContext,
   type Frame,
   type Page,
+  type Request,
 } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startInstalledProfile } from './installed-profile';
@@ -38,6 +39,11 @@ interface SidebarTest {
   settingsLauncher: () => { ready: boolean; open: boolean };
   openSession: (id: string) => void;
   setTheme: (theme: 'light' | 'dark') => void;
+  setPersonalCreation: (scope?: {
+    organizationId: string;
+    workspaceId: string;
+    viewerId: string;
+  }) => void;
   setState: (state: string) => void;
   baseline: (shown: boolean, width?: number) => void;
   controlledOwner: {
@@ -569,6 +575,9 @@ suite('real AllRice sidebar in installed native profiles', () => {
                 sidebar?.firstElementChild,
                 document.querySelector('[data-row-key="session:thread-0"]'),
                 document.querySelector('[aria-label="自动化任务"]'),
+                document.querySelector(
+                  '[role="dialog"][aria-label="创建 AI 员工"]',
+                ),
                 [...(sidebar?.querySelectorAll('button') ?? [])].find(
                   (button) => button.textContent?.startsWith('展开其余'),
                 ),
@@ -603,6 +612,61 @@ suite('real AllRice sidebar in installed native profiles', () => {
     );
   });
 
+  it('shows the temporary limit in the native sidebar instead of submitting another employee', async ({
+    onTestFinished,
+  }) => {
+    const createRequests: string[] = [];
+    const recordCreate = (request: Request) => {
+      if (new URL(request.url()).pathname === '/api/v1/employee-instances')
+        createRequests.push(request.method());
+    };
+    page.on('request', recordCreate);
+    // Leave the live prompt in place until the suite captures a failure.
+    onTestFinished(async () => {
+      page.off('request', recordCreate);
+      await page.evaluate(() =>
+        window.__allriceSidebarTest!.setPersonalCreation(),
+      );
+    });
+    await page.evaluate(
+      (scope) => window.__allriceSidebarTest!.setPersonalCreation(scope),
+      {
+        organizationId: randomUUID(),
+        workspaceId: randomUUID(),
+        viewerId: randomUUID(),
+      },
+    );
+    const sidebar = page.locator('#chat-sidebar');
+    const create = sidebar.getByRole('button', {
+      name: '创建员工',
+      exact: true,
+    });
+    const collapse = sidebar.getByRole('button', {
+      name: '收起侧边栏',
+      exact: true,
+    });
+    const limit = '暂时每人只能创建一个 4.0 员工，多员工马上开放。';
+    const notice = sidebar.getByRole('status').filter({ hasText: limit });
+    await create.click();
+    await notice.waitFor();
+    expect(await notice.textContent()).toBe(limit);
+
+    await collapse.click();
+    await sidebar
+      .getByRole('button', { name: '展开侧边栏', exact: true })
+      .waitFor();
+    await notice.waitFor({ state: 'hidden' });
+    expect((await sidebar.boundingBox())!.width).toBeLessThan(100);
+    await create.click();
+    await collapse.waitFor();
+    await notice.waitFor();
+    expect(await notice.textContent()).toBe(limit);
+    expect((await notice.boundingBox())!.width).toBeGreaterThanOrEqual(180);
+    expect(
+      await page.getByRole('dialog', { name: '创建 AI 员工' }).count(),
+    ).toBe(0);
+    expect(createRequests).toEqual([]);
+  });
   it('preserves the real brand, employee cards, pagination and command entrypoints without any 3.x reader', async () => {
     const sidebar = page.locator('#chat-sidebar');
     expect(

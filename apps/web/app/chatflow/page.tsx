@@ -6,7 +6,7 @@ import {
   localOperationsFeatureEnabled,
   localMcpEnabled,
 } from '@allrice/database';
-import { findDEntryEmployee } from '../../lib/d-entry/entry-threads';
+import { isDEntryPersonReleased } from '../../lib/d-entry/entry-threads';
 import { getRequestContext } from '../../lib/identity/session';
 import { normalizeHost } from '../../lib/portal/config';
 
@@ -29,7 +29,7 @@ export default async function ChatFlowPage({
         headers: requestHeaders,
       }),
     )
-      .then((context) => context && findDEntryEmployee(context))
+      .then((context) => context && isDEntryPersonReleased(context))
       .then(Boolean, () => true);
     if (enterTrial) redirect('/chatflow/4.0');
   }
