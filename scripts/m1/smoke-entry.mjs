@@ -2,6 +2,7 @@
 const ENTRY = '/chatflow/4.0';
 const DOCUMENT = ENTRY + '/document';
 const PROFILE = '/api/v1/d-entry/profile';
+const RELEASED_PROFILE_ASSETS = '/_next/static/dsh-profile/';
 const PREWARM = '/api/v1/d-entry/native-prewarm';
 const SESSIONS = '/api/v1/sessions';
 const RPC = '/api/v1/d-entry/native-rpc';
@@ -124,7 +125,8 @@ export async function smokeNativeEntry(
     } else if (
       method === 'GET' &&
       (url.pathname.startsWith(PROFILE + '/assets/static/') ||
-        url.pathname.startsWith(DOCUMENT + '/'))
+        url.pathname.startsWith(DOCUMENT + '/') ||
+        url.pathname.startsWith(RELEASED_PROFILE_ASSETS))
     ) {
       resources.set(url.href, {
         status,
@@ -249,6 +251,8 @@ export async function smokeNativeEntry(
           loaded: node.ownerDocument.URL,
           nativeSessionId:
             node.ownerDocument.querySelector('#app')?.dataset.nativeSessionId,
+          publicAssetRoot:
+            node.ownerDocument.querySelector('#app')?.dataset.publicAssetRoot,
           assets: [
             ...node.ownerDocument.querySelectorAll(
               '[data-allrice-document-asset]',
@@ -314,22 +318,31 @@ export async function smokeNativeEntry(
       '/assets/static/' +
       path.slice(0, 7).join('/') +
       '/managed/';
-    const vendor = new URL('assets/', loaded).href;
-    const assetUrl = (kind, matcher) =>
-      document.assets.filter(
-        (asset) => asset.kind === kind && matcher(asset.url),
-      );
-    const exact = (address) => (url) => url === address;
+    const publishedRoot = RELEASED_PROFILE_ASSETS + manifest + '/';
+    requireFact(
+      document.publicAssetRoot === undefined ||
+        document.publicAssetRoot === publishedRoot,
+      '原生静态资源目录与发布清单不一致',
+    );
+    const publicRoot = document.publicAssetRoot && origin + publishedRoot;
+    const nativeRoots = [new URL('assets/', loaded).href];
+    if (publicRoot) nativeRoots.push(publicRoot + 'native/assets/');
+    const managedAsset = (name) => (url) =>
+      url === managed + name ||
+      (publicRoot !== undefined && url === publicRoot + 'managed/' + name);
     const nativeStyle = (prefix) => (url) =>
-      url.startsWith(vendor + prefix + '-') &&
-      /^[a-zA-Z0-9_-]+\.css$/.test(
-        url.slice(vendor.length + prefix.length + 1),
-      );
+      nativeRoots.some((root) => {
+        const start = root + prefix + '-';
+        return (
+          url.startsWith(start) &&
+          /^[a-zA-Z0-9_-]+\.css$/.test(url.slice(start.length))
+        );
+      });
     for (const [key, mime, expected, kind] of [
       [
         'javascript',
         /^(?:text|application)\/javascript$/,
-        [exact(managed + 'employee-web-entry.js')],
+        [managedAsset('employee-web-entry.js')],
         'entry',
       ],
       [
@@ -338,14 +351,16 @@ export async function smokeNativeEntry(
         [
           nativeStyle('index'),
           nativeStyle('vendor'),
-          exact(managed + 'employee-web-entry.css'),
+          managedAsset('employee-web-entry.css'),
         ],
         'style',
       ],
     ]) {
       requireFact(
         expected.every((matcher) => {
-          const [asset, duplicate] = assetUrl(kind, matcher);
+          const [asset, duplicate] = document.assets.filter(
+            (asset) => asset.kind === kind && matcher(asset.url),
+          );
           const result = asset && resources.get(asset.url);
           return (
             !duplicate && result?.status === 200 && mime.test(result.media)

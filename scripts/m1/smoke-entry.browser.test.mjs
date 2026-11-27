@@ -19,6 +19,7 @@ const selection = { workspaceId: id(1), employeeInstanceId: id(2) };
 const scopeId = id(3);
 const operationId = id(4);
 const query = new URLSearchParams({ ...selection, scopeId, threadId: id(5) });
+const manifest = 'a'.repeat(64);
 const publication = [
   scopeId,
   selection.workspaceId,
@@ -26,14 +27,31 @@ const publication = [
   id(5),
   'binding',
   'graph',
-  'a'.repeat(64),
+  manifest,
 ].join('/');
 const directory = documentPath + '/' + publication;
 const staticPath = profile + '/assets/static/' + publication;
+const releasedPath = '/_next/static/dsh-profile/' + manifest + '/';
 const json = (value) => JSON.stringify(value);
 
 async function fixture(mode) {
   const traffic = [];
+  const released = mode.startsWith('released');
+  const publicRoot =
+    mode === 'released-foreign-root'
+      ? releasedPath.replace(manifest, 'b'.repeat(64))
+      : releasedPath;
+  const managedPath = released
+    ? publicRoot + 'managed'
+    : staticPath + '/managed';
+  const cssPath =
+    mode === 'foreign-css'
+      ? managedPath.replace('/graph/', '/future/')
+      : mode === 'released-foreign-css'
+        ? managedPath.replace(manifest, 'b'.repeat(64))
+        : managedPath;
+  const vendor = released ? publicRoot + 'native/assets/' : 'assets/';
+  const vendorCss = mode === 'released-mixed' ? 'assets/' : vendor;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://local.test');
     const path = url.pathname;
@@ -118,11 +136,11 @@ async function fixture(mode) {
       return write(
         200,
         `
-      <link data-allrice-document-asset="style" rel="stylesheet" href="assets/index-aa.css">
-      ${mode === 'missing-vendor' ? '' : '<link data-allrice-document-asset="style" rel="stylesheet" href="assets/vendor-bb.css">'}
-      <link data-allrice-document-asset="style" rel="stylesheet" href="${mode === 'foreign-css' ? staticPath.replace('/graph/', '/future/') : staticPath}/managed/employee-web-entry.css">
-      <script data-allrice-document-asset="entry" src="${staticPath}/managed/employee-web-entry.js"></script>
-      <div id="app" data-native-session-id="native-session" hidden><div role="textbox" data-composer-input contenteditable="false" style="min-height:24px" tabindex="0"></div></div><button>发送消息</button>
+      <link data-allrice-document-asset="style" rel="stylesheet" href="${vendor}index-aa.css">
+      ${mode === 'missing-vendor' ? '' : `<link data-allrice-document-asset="style" rel="stylesheet" href="${vendorCss}vendor-bb.css">`}
+      <link data-allrice-document-asset="style" rel="stylesheet" href="${cssPath}/employee-web-entry.css">
+      <script data-allrice-document-asset="entry" src="${managedPath}/employee-web-entry.js"></script>
+      <div id="app" data-native-session-id="native-session" ${released ? `data-public-asset-root="${publicRoot}"` : ''} hidden><div role="textbox" data-composer-input contenteditable="false" style="min-height:24px" tabindex="0"></div></div><button>发送消息</button>
       <script type="module">
         await fetch(${json(profile + '/bootstrap?' + query)});
         const editor = document.querySelector('[data-composer-input]');
@@ -137,11 +155,14 @@ async function fixture(mode) {
         document.querySelector('#app').hidden = false;
       </script>`,
       );
-    if (path === staticPath + '/managed/employee-web-entry.js')
+    if (path === managedPath + '/employee-web-entry.js')
       return write(200, '// native JS', 'text/javascript');
     if (path.endsWith('.css'))
       return write(
-        mode === 'bad-css' && path.includes('/managed/') ? 503 : 200,
+        ['bad-css', 'released-bad-css'].includes(mode) &&
+          path.includes('/managed/')
+          ? 503
+          : 200,
         'div {color:black}',
         'text/css',
       );
@@ -251,6 +272,23 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
     },
   );
 
+  it.each(['released', 'released-mixed'])(
+    'verifies same-release static assets with %s delivery',
+    async (mode) => {
+      await run(mode, async (smoke, receipt, traffic) => {
+        await smoke;
+        expect(receipt.stages).toMatchObject({
+          javascript: [200],
+          css: [200, 200, 200],
+          editor: true,
+        });
+        expect(traffic.map(({ path }) => path)).toContain(
+          releasedPath + 'managed/employee-web-entry.js',
+        );
+      });
+    },
+  );
+
   it.each([
     ['zero', '冒烟账号没有可预热的员工'],
     ['no-vm-host', '当前 Worker 发布未配置真实 VM 宿主'],
@@ -288,6 +326,9 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
     ['bad-css', '原生 css 未返回 200'],
     ['missing-vendor', '原生 css 未返回 200'],
     ['foreign-css', '原生 css 未返回 200'],
+    ['released-foreign-root', '原生静态资源目录与发布清单不一致'],
+    ['released-foreign-css', '原生 css 未返回 200'],
+    ['released-bad-css', '原生 css 未返回 200'],
     ['wrong-thread', '编辑器不属于本次原生工作台'],
     ['disabled', '原生编辑器不可输入'],
     ['warm-disabled', '原生编辑器不可输入'],
