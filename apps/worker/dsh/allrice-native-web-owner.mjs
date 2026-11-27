@@ -1279,9 +1279,12 @@ export function applyNativeWebOwner(
                   signal.throwIfAborted();
                   if (config.provider === provider && config.model === model)
                     return config;
-                  const { reasoningEffort: _previousEffort, ...current } =
-                    config;
-                  return { ...current, provider, model };
+                  return {
+                    ...config,
+                    provider,
+                    model,
+                    reasoningEffort: undefined,
+                  };
                 },
                 outer,
               ),
