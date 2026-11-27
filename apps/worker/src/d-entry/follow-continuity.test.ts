@@ -1,6 +1,7 @@
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 import type { DEntryAuthorityObservation } from '@allrice/database';
 import { openFollowAuthority } from './follow-authority.js';
 import type { SessionFollowFrame } from '@deepseek-ai/dsh-api-session-controller/types';
@@ -23,8 +24,8 @@ function observe(f: Awaited<ReturnType<typeof fixture>>) {
     async (signal) => signal.throwIfAborted(),
   );
   const original = f.deps.watch.getMockImplementation()!;
-  f.deps.watch.mockImplementation(async (...args) => ({
-    ...(await original(...args)),
+  f.deps.watch.mockImplementation(async () => ({
+    ...(await original()),
     observation: {
       subscribe(invalidate) {
         listeners.add(invalidate);
@@ -360,3 +361,69 @@ it.each([true, false])(
   },
   12_000,
 );
+
+it('honors browser backpressure and suppresses a child withdrawn before the next send', async () => {
+  const f = await fixture();
+  observe(f);
+  const watch = watchChild(f);
+  const firstSend = deferred();
+  const finishSend = deferred();
+  const releaseChunks = deferred();
+  const secondProduced = deferred();
+  const sendFrame = WebSocket.prototype.send;
+  const spy = vi
+    .spyOn(WebSocket.prototype, 'send')
+    .mockImplementation(function (this: WebSocket, ...args) {
+      const [data, callback] = args;
+      if (
+        typeof data === 'string' &&
+        typeof callback === 'function' &&
+        data.includes('"streamId":"child"') &&
+        data.includes('"type":"chunk"') &&
+        data.includes('"index":0')
+      ) {
+        Reflect.apply(sendFrame, this, [
+          data,
+          (error?: Error) => {
+            firstSend.resolve();
+            void finishSend.promise.then(() =>
+              Reflect.apply(callback, undefined, [error]),
+            );
+          },
+        ]);
+        return;
+      }
+      Reflect.apply(sendFrame, this, args);
+    });
+  closes.push(async () => {
+    releaseChunks.resolve();
+    finishSend.resolve();
+    spy.mockRestore();
+  });
+  f.host.catalog.followFrames = async function* () {
+    await releaseChunks.promise;
+    yield chunk(0);
+    secondProduced.resolve();
+    yield chunk(1);
+  };
+  const channel = await connect(f);
+  await channel.follow('child', 'root');
+  releaseChunks.resolve();
+  await firstSend.promise;
+  expect(await channel.next('child')).toMatchObject({
+    type: 'item',
+    value: chunk(0),
+  });
+  await secondProduced.promise;
+  const child = summary('child', 'root').sessionId;
+  f.host.catalog.items = f.host.catalog.items.filter(
+    (row) => row.sessionId !== child,
+  );
+  f.host.host.emit('api-session/removed', child);
+  await watch.revoked.promise;
+  finishSend.resolve();
+  expect(await channel.next('child')).toMatchObject({
+    type: 'error',
+    error: { code: 'remote-access/denied' },
+  });
+});
