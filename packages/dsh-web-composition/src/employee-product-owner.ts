@@ -535,22 +535,27 @@ export function installEmployeeProductOwner(ctx: Context) {
         },
       };
       panels.update(initial);
+      const panelSelection = (nativeId: string) => {
+        if (
+          signal.aborted ||
+          switchingScope ||
+          nativeId !== activeNativeSession
+        )
+          return null;
+        const root = registered.get(nativeId);
+        return root?.scopeId === resourceScopeId &&
+          root.threadId === activeThreadId
+          ? { selection: { ...selection, threadId: root.threadId }, viewerId }
+          : null;
+      };
       await bindEmployeePanelsHttp(
         ctx,
         {
           getSnapshot: (id) =>
-            signal.aborted || id !== activeNativeSession
-              ? null
-              : panels.getSnapshot(),
+            panelSelection(id) ? panels.getSnapshot() : null,
           subscribe: (_id, listener) => panels.subscribe(listener),
         },
-        (id) =>
-          id === activeNativeSession && !signal.aborted
-            ? {
-                selection: { ...selection, threadId: activeThreadId },
-                viewerId,
-              }
-            : null,
+        panelSelection,
       );
       refreshUnread();
     })

@@ -11,6 +11,7 @@ export type NativePageSocket = Pick<
 export function borrowPageMux(
   scopeId: string,
   resourceScopeId = scopeId,
+  canSend: () => boolean = () => true,
 ): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
@@ -43,12 +44,18 @@ export function borrowPageMux(
   );
   return {
     get readyState() {
-      return readyState;
+      return readyState === WebSocket.OPEN && !canSend()
+        ? WebSocket.CLOSING
+        : readyState;
     },
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),
     send(data) {
-      if (typeof data !== 'string' || readyState !== WebSocket.OPEN)
+      if (
+        typeof data !== 'string' ||
+        readyState !== WebSocket.OPEN ||
+        !canSend()
+      )
         throw new DOMException(
           'Native resource mux is unavailable',
           'InvalidStateError',

@@ -202,6 +202,10 @@ export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
 export const DEntryPageBorrowSchema = DEntrySelectionInputSchema.extend({
   scopeId: UuidSchema,
 });
+export const DEntryPageSwitchProofSchema = DEntryPageBorrowSchema.extend({
+  requestId: UuidSchema,
+  targetThreadId: UuidSchema,
+});
 const profileToken = z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/);
 export const DEntryProfileBindingSchema = DEntryPageBorrowSchema.extend({
   bindingRef: profileToken,

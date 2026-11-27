@@ -52,6 +52,7 @@ export function installEmployeeDraftStorage({
       receipt.scopeId !== scopeId ||
       typeof receipt.nativeSessionId !== 'string' ||
       !receipt.nativeSessionId ||
+      conversationPrefix + receipt.nativeSessionId === widthKey ||
       namespaces.has(receipt.nativeSessionId)
     )
       return;
@@ -131,6 +132,8 @@ export function installEmployeeDraftStorage({
   return {
     registerDraft,
     registerScope(nativeId: string, threadId: string) {
+      if (conversationPrefix + nativeId === widthKey)
+        throw Error('Employee draft storage is unavailable');
       const next = namespaceFor(threadId);
       const registered = namespaces.get(nativeId);
       if (registered && registered !== next)

@@ -12,6 +12,10 @@ export const pageDocumentReady = 'allrice:d-entry:document-ready';
 export const pageEditorMounted = 'allrice:d-entry:editor-mounted';
 export const pageMuxAttach = 'allrice:d-entry:mux-attach';
 export const pageSwitchReady = 'allrice:d-entry:switch-ready';
+export const pageThreadSwitchPrepare = 'allrice:d-entry:thread-switch-prepare';
+export const pageThreadSwitchPrepared =
+  'allrice:d-entry:thread-switch-prepared';
+export const pageThreadSwitchCancel = 'allrice:d-entry:thread-switch-cancel';
 export const pageThreadScope = 'allrice:d-entry:thread-scope';
 export const pageThreadSelected = 'allrice:d-entry:thread-selected';
 export type PageThreadScope = Extract<

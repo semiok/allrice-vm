@@ -26,6 +26,9 @@ import {
 import {
   pageNativeThreadRegistered,
   pageThreadScope,
+  pageThreadSwitchCancel,
+  pageThreadSwitchPrepare,
+  pageThreadSwitchPrepared,
   type PageNativeThreadRegistration,
   type PageThreadScope,
 } from './page-messages';
@@ -238,6 +241,8 @@ export function nativeProfileDocument(
     lifetime: new AbortController(),
   };
   const pending = new Set<Promise<unknown>>();
+  const threadWrites = new Set<Promise<Response>>();
+  let switching: string | undefined;
   const preloaded = new Map<string, Promise<ArrayBuffer>>();
   const channels = new Map<NativePageSocket, Promise<void>>();
   const done = pendingPageResult<void>();
@@ -283,6 +288,29 @@ export function nativeProfileDocument(
       else done.reject(Error('Native page close is unconfirmed'));
     }
     if (
+      event.data.type === pageThreadSwitchPrepare &&
+      !lifetime.signal.aborted &&
+      !switching &&
+      UuidSchema.safeParse(event.data.requestId).success
+    ) {
+      const { requestId } = event.data;
+      switching = requestId;
+      // A native write stays owned through consumption of its registration
+      // header and response body, not just until the guest first replies.
+      void Promise.allSettled(threadWrites).then(() => {
+        if (switching !== requestId || lifetime.signal.aborted) return;
+        parent.postMessage(
+          { type: pageThreadSwitchPrepared, scopeId, requestId },
+          location.origin,
+        );
+      });
+    }
+    if (
+      event.data.type === pageThreadSwitchCancel &&
+      switching === event.data.requestId
+    )
+      switching = undefined;
+    if (
       event.data.type === pageThreadScope &&
       onThreadScope &&
       !lifetime.signal.aborted &&
@@ -292,10 +320,12 @@ export function nativeProfileDocument(
       if (
         !result.success ||
         result.data.type !== 'switched' ||
-        result.data.scopeId === authority.scopeId
+        result.data.scopeId === authority.scopeId ||
+        result.data.requestId !== switching
       )
         return;
       const next = result.data;
+      switching = undefined;
       const old = peer;
       peer = undefined;
       authority.lifetime.abort();
@@ -395,13 +425,22 @@ export function nativeProfileDocument(
     },
     transport: {
       fetch(input: string | URL, init: RequestInit) {
+        const isThreadWrite =
+          input === 'api/session/create' || input === 'api/session/fork';
+        if (isThreadWrite && switching)
+          return Promise.reject(
+            new DOMException(
+              'Native session switch in progress',
+              'InvalidStateError',
+            ),
+          );
         const current = authority;
         const signal = AbortSignal.any(
           init.signal
             ? [lifetime.signal, current.lifetime.signal, init.signal]
             : [lifetime.signal, current.lifetime.signal],
         );
-        return owned(
+        const task = owned(
           Promise.resolve().then(() => {
             signal.throwIfAborted();
             const endpoint =
@@ -452,6 +491,14 @@ export function nativeProfileDocument(
             });
           }),
         );
+        if (isThreadWrite) {
+          threadWrites.add(task);
+          void task.then(
+            () => threadWrites.delete(task),
+            () => threadWrites.delete(task),
+          );
+        }
+        return task;
       },
       createWebSocket(input: string) {
         lifetime.signal.throwIfAborted();
@@ -462,7 +509,7 @@ export function nativeProfileDocument(
         const socket =
           container.dataset.sharedMux === '1' &&
           window.frameElement?.getAttribute('data-page-mux') === 'v1'
-            ? borrowPageMux(scopeId, authority.scopeId)
+            ? borrowPageMux(scopeId, authority.scopeId, () => !switching)
             : new WebSocket(
                 nativeMuxUrl(
                   location.origin,

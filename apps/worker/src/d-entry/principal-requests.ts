@@ -82,6 +82,12 @@ export type DEntryPageHandle = Readonly<{
     ReturnType<typeof currentDEntryNativeOwner>
   >['view']['receipt']['binding'];
   signal: AbortSignal;
+  confirmThreadSwitch(requestId: string, threadId: string): void;
+  reserveThreadSwitch(
+    requestId: string,
+    threadId: string,
+  ): { drained: Promise<unknown>; release(): void } | undefined;
+  runThreadWrite<T>(invoke: () => Promise<T>): Promise<T>;
   assertCurrent(signal: AbortSignal): Promise<void>;
   watchFollow(
     signal: AbortSignal,
@@ -429,6 +435,10 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
           const lifetime = AbortSignal.any([admitted, ended.signal]);
           const scopeId = randomUUID();
           const children = new Set<Promise<unknown>>();
+          const threadWrites = new Set<Promise<unknown>>();
+          let switching = false;
+          let switchProof:
+            { requestId: string; threadId: string; until: number } | undefined;
           let running: Promise<void> | undefined;
           let principal: DEntryPrincipalActivity | undefined;
           let scope: DEntryPrincipalControlScope | undefined;
@@ -585,6 +595,43 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                   sessionId: auth.context.sessionId,
                   vmBinding: current.view.receipt.binding,
                   signal: lifetime,
+                  confirmThreadSwitch(requestId, threadId) {
+                    lifetime.throwIfAborted();
+                    if (switching || !pin) throw denied();
+                    switchProof = {
+                      requestId,
+                      threadId,
+                      until: performance.now() + 10_000,
+                    };
+                  },
+                  reserveThreadSwitch(requestId, threadId) {
+                    if (
+                      switching ||
+                      switchProof?.requestId !== requestId ||
+                      switchProof.threadId !== threadId ||
+                      switchProof.until <= performance.now()
+                    )
+                      return;
+                    switchProof = undefined;
+                    switching = true;
+                    return {
+                      drained: Promise.allSettled(threadWrites),
+                      release() {
+                        switching = false;
+                      },
+                    };
+                  },
+                  async runThreadWrite(invoke) {
+                    lifetime.throwIfAborted();
+                    if (switching) throw denied();
+                    const task = Promise.resolve().then(invoke);
+                    threadWrites.add(task);
+                    try {
+                      return await task;
+                    } finally {
+                      threadWrites.delete(task);
+                    }
+                  },
                   async watchFollow(caller) {
                     if (!authority.observation) return;
                     return openFollowAuthority(

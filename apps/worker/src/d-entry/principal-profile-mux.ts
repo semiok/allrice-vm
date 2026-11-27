@@ -222,11 +222,18 @@ async function runOwner(
         value: { type: 'switch-unavailable', requestId: command.requestId },
       });
     if (command.threadId === previousPage.identity.threadId) return decline();
+    const reserved = previousPage.reserveThreadSwitch(
+      command.requestId,
+      command.threadId,
+    );
+    if (!reserved) return decline();
     staged = begin(
       { ...input.selection, threadId: command.threadId },
       async (generation, page) => {
         const root = page.root;
         if (!root) throw denied();
+        // A normal handoff must not abort a native create/fork after dispatch.
+        await reserved.drained;
         // New authority is watching before the old registration is fenced.
         // No stream or unary from the old document can use this new scope ID.
         await previousPage.assertCurrent(
@@ -260,17 +267,19 @@ async function runOwner(
     // Wait only for publication. The stage operation itself stays owned until
     // its authorization is revoked or the next generation joins it.
     const generation = staged;
-    handoff = generation.operation.catch(async (error: unknown) => {
-      if (requestedClose || connected.aborted) return;
-      if (
-        error instanceof DEntryPageSwitchUnavailable &&
-        staged === generation
-      ) {
-        staged = undefined;
-        handoff = undefined;
-        await decline();
-      } else if (!generation.stop.signal.aborted) fail(error);
-    });
+    handoff = generation.operation
+      .catch(async (error: unknown) => {
+        if (requestedClose || connected.aborted) return;
+        if (
+          error instanceof DEntryPageSwitchUnavailable &&
+          staged === generation
+        ) {
+          staged = undefined;
+          handoff = undefined;
+          await decline();
+        } else if (!generation.stop.signal.aborted) fail(error);
+      })
+      .finally(reserved.release);
     void handoff.catch(fail);
     // Publication marks completion below at the mount; handoff owns a
     // rejection listener until the generation itself terminates.
@@ -309,9 +318,7 @@ async function runOwner(
         });
       } else if (frame.streamId !== streamId) {
         if (!current?.resources || requestedClose) throw denied();
-        // The parent fences its old port before requesting the handoff.
-        // Drop cancellation and other already queued frames during the cut.
-        if (!staged) current.resources.accept(frame);
+        if (!current.stop.signal.aborted) current.resources.accept(frame);
       } else if (
         frame.type === 'item' &&
         frame.value === 'close' &&

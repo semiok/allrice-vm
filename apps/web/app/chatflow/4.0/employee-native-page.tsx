@@ -20,6 +20,9 @@ import {
   pageNavigate,
   pageSwitchReady,
   pageThreadScope,
+  pageThreadSwitchCancel,
+  pageThreadSwitchPrepare,
+  pageThreadSwitchPrepared,
   pageThreadSelected,
   pageNativeThreadSelected,
   pageRevoked,
@@ -59,7 +62,12 @@ const liveSwitchWaitMs = 10_000;
 const closingNoticeMs = 10_000;
 const closingConfirmationMs = 60_000;
 
-type ThreadHandoff = { selection: DEntrySelectionInput; scopeId?: string };
+type ThreadHandoff = {
+  selection: DEntrySelectionInput & { threadId: string };
+  requestId: string;
+  submitted?: boolean;
+  scopeId?: string;
+};
 
 type EntryWarmup = {
   lifetime: AbortController;
@@ -455,13 +463,12 @@ export function EmployeeNativePage({
       );
       if (prepare && !selection.threadId)
         params.set('new', crypto.randomUUID());
-      if (
+      const sameEmployee =
         prepare &&
-        !document.hidden &&
         location.pathname === '/chatflow/4.0' &&
         selectedEmployee?.workspaceId === selection.workspaceId &&
-        selectedEmployee.employeeInstanceId === selection.employeeInstanceId
-      ) {
+        selectedEmployee.employeeInstanceId === selection.employeeInstanceId;
+      if (sameEmployee && !document.hidden) {
         nextWarmup = startEntryWarmup(selection, new AbortController());
       }
       void retire().then((closed) => {
@@ -472,7 +479,7 @@ export function EmployeeNativePage({
           if (superseded || nextQuery.current !== displayedQuery.current) {
             warmup?.lifetime.abort();
             activateSelection(nextQuery.current);
-          } else if (warmup) {
+          } else if (sameEmployee) {
             const query = params.toString();
             nextQuery.current = query;
             pendingWarmup.current = warmup;
@@ -485,6 +492,39 @@ export function EmployeeNativePage({
           else setFailed(true);
         }
       });
+    }
+    function cancelSwitch(target: ThreadHandoff) {
+      switching = undefined;
+      window.clearTimeout(switchTimer);
+      frame.current?.contentWindow?.postMessage(
+        { type: pageThreadSwitchCancel, scopeId, requestId: target.requestId },
+        location.origin,
+      );
+    }
+    function submitSwitch(target: ThreadHandoff) {
+      if (!carrier) return;
+      target.submitted = true;
+      window.clearTimeout(switchTimer);
+      switchTimer = window.setTimeout(() => {
+        if (switching === target) finish('failed');
+      }, liveSwitchWaitMs);
+      void carrier
+        .switchThread(target.selection.threadId, target.requestId)
+        .then((issued) => {
+          if (switching !== target || navigating || detached || remoteRevoked)
+            return;
+          if (!issued) {
+            cancelSwitch(target);
+            navigate(target.selection);
+            return;
+          }
+          target.scopeId = issued.scopeId;
+          frame.current?.contentWindow?.postMessage(
+            { type: pageThreadScope, scopeId, issued },
+            location.origin,
+          );
+        })
+        .catch(() => finish('failed'));
     }
     const receive = (event: MessageEvent) => {
       if (
@@ -500,6 +540,15 @@ export function EmployeeNativePage({
           event.data.resourceScopeId ?? scopeId,
         );
       if (event.data.type === pageSwitchReady) switchReady = true;
+      if (
+        event.data.type === pageThreadSwitchPrepared &&
+        switching?.requestId === event.data.requestId &&
+        !switching.submitted &&
+        !navigating &&
+        !detached &&
+        !remoteRevoked
+      )
+        submitSwitch(switching);
       if (
         event.data.type === pageThreadSelected &&
         switching?.scopeId &&
@@ -571,7 +620,7 @@ export function EmployeeNativePage({
         if (
           !prepare ||
           !carrier ||
-          switching ||
+          switching?.submitted ||
           event.data.resourceScopeId !== resourceScopeId ||
           !next.success ||
           !next.data.threadId ||
@@ -616,40 +665,22 @@ export function EmployeeNativePage({
             selection.employeeInstanceId &&
           selectedEmployee.threadId !== selection.threadId
         ) {
-          const target: ThreadHandoff = { selection };
+          const target: ThreadHandoff = {
+            selection: { ...selection, threadId: selection.threadId },
+            requestId: crypto.randomUUID(),
+          };
           switching = target;
           switchTimer = window.setTimeout(() => {
-            if (switching !== target) return;
-            switching = undefined;
-            navigate(selection);
+            if (switching === target) cancelSwitch(target);
           }, liveSwitchWaitMs);
-          void carrier
-            .switchThread(selection.threadId)
-            .then((issued) => {
-              if (
-                switching !== target ||
-                navigating ||
-                detached ||
-                remoteRevoked
-              )
-                return;
-              if (!issued) {
-                switching = undefined;
-                window.clearTimeout(switchTimer);
-                navigate(selection);
-                return;
-              }
-              target.scopeId = issued.scopeId;
-              frame.current?.contentWindow?.postMessage(
-                {
-                  type: pageThreadScope,
-                  scopeId,
-                  issued,
-                },
-                location.origin,
-              );
-            })
-            .catch(() => finish('failed'));
+          frame.current?.contentWindow?.postMessage(
+            {
+              type: pageThreadSwitchPrepare,
+              scopeId,
+              requestId: target.requestId,
+            },
+            location.origin,
+          );
         } else navigate(selection);
       }
     };

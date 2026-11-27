@@ -67,11 +67,13 @@ export function openNativePageCarrier(
     nativeMuxUrl(location.origin, identity.organizationId, selection),
   );
   let scopeId: string | undefined;
+  let carrierSelection = selection;
   let nativeMux: MessagePort | undefined;
   let switching:
     | {
         id: string;
         threadId: string;
+        proof: AbortController;
         result: ReturnType<typeof pendingPageResult<SwitchedPage | undefined>>;
       }
     | undefined;
@@ -100,6 +102,7 @@ export function openNativePageCarrier(
     closeMux();
     onRevoked();
     ready.reject(reason);
+    switching?.proof.abort(reason);
     switching?.result.reject(reason);
     switching = undefined;
     // Local transport closure is still observed independently below.
@@ -131,7 +134,7 @@ export function openNativePageCarrier(
         throw Error('Invalid native page frame');
       const frame = parseRemoteStreamServerMessage(event.data);
       if (frame.streamId !== id) {
-        if (requested || switching) return;
+        if (requested) return;
         if (!nativeMux) throw Error('Unexpected native page stream');
         nativeMux.postMessage({ type: 'frame', data: event.data });
         return;
@@ -172,6 +175,7 @@ export function openNativePageCarrier(
             switching = undefined;
             if (value.type === 'switched') {
               scopeId = value.scopeId;
+              carrierSelection = { ...selection, threadId: value.threadId };
               nativeMux?.close();
               nativeMux = undefined;
             }
@@ -224,7 +228,9 @@ export function openNativePageCarrier(
   function close() {
     if (!requested && !complete) {
       requested = true;
-      switching?.result.reject(new DOMException('Page closed', 'AbortError'));
+      const reason = new DOMException('Page closed', 'AbortError');
+      switching?.proof.abort(reason);
+      switching?.result.reject(reason);
       closeMux();
       ready.reject(new DOMException('Page closed', 'AbortError'));
       if (socket.readyState === WebSocket.OPEN) end();
@@ -237,7 +243,7 @@ export function openNativePageCarrier(
     get dispatched() {
       return dispatched;
     },
-    switchThread(threadId: string) {
+    switchThread(threadId: string, requestId: string) {
       if (
         !scopeId ||
         !nativeMux ||
@@ -248,13 +254,35 @@ export function openNativePageCarrier(
       )
         return Promise.resolve(undefined);
       const result = pendingPageResult<SwitchedPage | undefined>();
-      const requestId = crypto.randomUUID();
-      switching = { id: requestId, threadId, result };
-      try {
-        send({ type: 'item', value: { type: 'switch', requestId, threadId } });
-      } catch (error) {
-        failure = fail(error);
-      }
+      const proof = new AbortController();
+      switching = { id: requestId, threadId, proof, result };
+      const query = new URLSearchParams({
+        ...carrierSelection,
+        scopeId,
+        requestId,
+        targetThreadId: threadId,
+      });
+      // A current same-origin cookie must prove that this is the login owning
+      // the published scope, independently of the token captured by the socket.
+      void fetch('/api/v1/d-entry/profile/switch?' + query, {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        redirect: 'error',
+        signal: proof.signal,
+      })
+        .then((response) => {
+          if (response.status !== 204)
+            throw Error('Page switch is not authorized');
+          if (switching?.id === requestId && !requested)
+            send({
+              type: 'item',
+              value: { type: 'switch', requestId, threadId },
+            });
+        })
+        .catch((error: unknown) => {
+          if (switching?.id === requestId && !requested) failure = fail(error);
+        });
       return result.promise;
     },
     attachMux(port: MessagePort, requestedScope = scopeId) {
@@ -278,7 +306,6 @@ export function openNativePageCarrier(
             void close().catch(() => {});
             return;
           }
-          if (switching) return;
           if (
             event.data?.type !== 'frame' ||
             typeof event.data.data !== 'string'

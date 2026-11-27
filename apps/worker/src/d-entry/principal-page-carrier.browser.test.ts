@@ -52,7 +52,9 @@ it
     const stall = scenario === 'stall';
     const switching = scenario === 'switch' || scenario === 'baseline';
     const nativeCreate = scenario.startsWith('native-create');
-    const createAfterSwitch = scenario === 'native-create-linux';
+    const createAfterSwitch =
+      scenario === 'native-create-linux' ||
+      (nativeCreate && process.platform !== 'darwin');
     const realShell = switching || nativeCreate;
     const release = await buildProfileFixture();
     const sealed = await readFile(join(release.directory, 'artifact.json'));
@@ -197,6 +199,10 @@ it
     const createdNativeId = 'native-created';
     let registered = false;
     const createReplies: unknown[] = [];
+    const createdResponse = deferred();
+    const deliverCreatedResponse = deferred();
+    let holdCreatedResponse = false;
+    let switchProofRequests = 0;
     if (nativeCreate) {
       const registerFixture = f.registerRoot.getMockImplementation()!;
       f.registerRoot.mockImplementation(
@@ -329,6 +335,23 @@ it
               .end(asset!.text);
           }
         }
+        if (url.pathname === '/api/v1/d-entry/profile/switch') {
+          switchProofRequests++;
+          const cookie =
+            request.headers.cookie
+              ?.split('; ')
+              .find((part) => part.startsWith('allrice_session='))
+              ?.slice('allrice_session='.length) ?? '';
+          return await copy(
+            await f.proveSwitch(
+              scopeId!,
+              url.searchParams.get('targetThreadId')!,
+              url.searchParams.get('requestId')!,
+              cookie,
+              Object.fromEntries(url.searchParams),
+            ),
+          );
+        }
         if (url.pathname === '/api/v1/d-entry/native-rpc') {
           firstRpc ??= performance.now();
           const chunks: Buffer[] = [];
@@ -342,6 +365,11 @@ it
               ...(await result.clone().json()),
               thread: result.headers.get(dEntryRegisteredThreadHeader),
             });
+          if (holdCreatedResponse && input.endpoint === 'session/create') {
+            holdCreatedResponse = false;
+            createdResponse.resolve();
+            await deliverCreatedResponse.promise;
+          }
           if (startupMethods.has(input.endpoint))
             startupReplies.set(
               input.endpoint,
@@ -927,7 +955,40 @@ it
           ? 'Control+Alt+N'
           : 'Control+Shift+Period';
       try {
+        if (createAfterSwitch) {
+          await workbench.locator('#app').evaluate((node) => {
+            window.addEventListener('message', (event) => {
+              if (
+                event.source === parent &&
+                event.data?.type === 'allrice:d-entry:thread-switch-prepare'
+              )
+                node.dataset.fixturePreparing = 'yes';
+            });
+          });
+          holdCreatedResponse = true;
+        }
         await editor.press(chord, { timeout: 10_000 });
+        if (createAfterSwitch) {
+          try {
+            await createdResponse.promise;
+            const before = switchProofRequests;
+            await workbench
+              .locator('[data-row-key="session:' + f.selection.threadId + '"]')
+              .click();
+            await workbench
+              .locator('#app[data-fixture-preparing="yes"]')
+              .waitFor();
+            expect(switchProofRequests).toBe(before);
+          } finally {
+            deliverCreatedResponse.resolve();
+          }
+          await page.waitForURL(
+            (url) => url.searchParams.get('threadId') === f.selection.threadId,
+          );
+          await workbench
+            .locator('[data-row-key="session:' + createdThread + '"]')
+            .click();
+        }
         await expect
           .poll(() => unary.includes('session/create'), { timeout: 15_000 })
           .toBe(true);
@@ -936,6 +997,7 @@ it
           { timeout: 20_000 },
         );
       } catch (error) {
+        deliverCreatedResponse.resolve();
         throw new Error(
           JSON.stringify({
             platform,

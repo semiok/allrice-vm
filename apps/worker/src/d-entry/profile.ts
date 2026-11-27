@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEntryPageBorrowSchema,
+  DEntryPageSwitchProofSchema,
   DEntryProfileAddressSchema,
   DEntryProfileAssetSchema,
   DEntryProfileBindingSchema,
@@ -144,7 +145,9 @@ export function createDEntryProfile(
           ? 'assets'
           : path === '/internal/d-entry/profile/events'
             ? 'events'
-            : undefined;
+            : path === '/internal/d-entry/profile/switch'
+              ? 'switch'
+              : undefined;
     if (!operation || replies.signal.aborted) return Promise.resolve(false);
     return replies.handle(request, response, async (signal, writeOwned) => {
       function send(
@@ -198,7 +201,10 @@ export function createDEntryProfile(
       }
       try {
         signal.throwIfAborted();
-        if (request.method !== 'GET' || request.headers.origin)
+        if (
+          request.method !== (operation === 'switch' ? 'POST' : 'GET') ||
+          request.headers.origin
+        )
           throw new DataAccessError('not_found');
         const { searchParams } = new URL(request.url!, 'http://worker.invalid');
         if (
@@ -226,6 +232,24 @@ export function createDEntryProfile(
         );
         const { organizationId, scopeId, ...selection } = base;
         const token = dEntryBearer(request);
+        if (operation === 'switch') {
+          const { requestId, targetThreadId } =
+            DEntryPageSwitchProofSchema.extend({
+              organizationId: UuidSchema,
+            }).parse(query);
+          await pages.borrow(
+            token,
+            { organizationId, selection },
+            scopeId,
+            signal,
+            async (page, active) => {
+              active.throwIfAborted();
+              page.confirmThreadSwitch(requestId, targetThreadId);
+            },
+          );
+          await send(signal, {}, () => response.end(), 204);
+          return true;
+        }
         if (operation === 'bootstrap') bootstrapQuery.parse(query);
         const events =
           operation === 'events' ? eventsQuery.parse(query) : undefined;

@@ -107,7 +107,7 @@ export function requestDEntryProfile(
     selection: DEntrySelectionInput;
     signal: AbortSignal;
   },
-  type: 'bootstrap' | 'assets' | 'events',
+  type: 'bootstrap' | 'assets' | 'events' | 'switch',
   selectors: Record<string, string>,
   request?: 'document' | 'static',
 ) {
@@ -119,7 +119,7 @@ export function requestDEntryProfile(
     organizationId: input.context.organizationId,
   }).toString();
   return requestWorker(input.signal, target, {
-    method: 'GET',
+    method: type === 'switch' ? 'POST' : 'GET',
     headers: {
       authorization: `Bearer ${input.token}`,
       ...(request && { 'x-allrice-profile-request': request }),

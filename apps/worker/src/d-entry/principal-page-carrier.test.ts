@@ -222,6 +222,7 @@ it('replaces the bound root on the same page socket and only the target watch re
   const revoked = f.registerThread(target);
   const { peer, scopeId, receive } = await open(f);
   const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
   send(peer, {
     type: 'item',
     streamId: 'life',
@@ -257,11 +258,91 @@ it('replaces the bound root on the same page socket and only the target watch re
   expect((await f.invokeThread(nextScope, target)).status).toBe(404);
 });
 
+it('requires proof from the current browser login even while the original login remains active', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive } = await open(f);
+  const requestId = randomUUID();
+  expect(
+    (await f.proveSwitch(scopeId, target, requestId, otherToken)).status,
+  ).toBe(404);
+  send(peer, {
+    type: 'item',
+    streamId: 'life',
+    value: { type: 'switch', requestId, threadId: target },
+  });
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'switch-unavailable', requestId },
+  });
+  expect(f.owner.acquirePrincipal).toHaveBeenCalledOnce();
+  expect((await f.invokeThread(scopeId, f.selection.threadId)).status).toBe(
+    200,
+  );
+  closePage(peer);
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'closed', scopeId },
+  });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+});
+
+it('drains an already dispatched native create through registration and response before rotating', async () => {
+  const f = await fixture();
+  const target = randomUUID();
+  f.registerThread(target);
+  const { peer, scopeId, receive, revoked } = await open(f);
+  const registering = deferred();
+  const release = deferred();
+  const register = f.registerRoot.getMockImplementation()!;
+  f.registerRoot.mockImplementation(
+    async (context, identity, receipt, active) => {
+      registering.resolve();
+      await release.promise;
+      active.throwIfAborted();
+      return register(context, identity, receipt, active);
+    },
+  );
+  const write = f.invoke(scopeId, sessionToken, {
+    endpoint: 'session/create',
+    payload: { args: { request: {} } },
+  });
+  await registering.promise;
+  const requestId = randomUUID();
+  try {
+    expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
+    send(peer, {
+      type: 'item',
+      streamId: 'life',
+      value: { type: 'switch', requestId, threadId: target },
+    });
+    await vi.waitFor(() => expect(f.pageSignals.size).toBe(2));
+    expect(revoked.aborted).toBe(false);
+  } finally {
+    release.resolve();
+  }
+  const response = await write;
+  expect(response.status).toBe(200);
+  expect(
+    decodeDEntryRegisteredThread(
+      response.headers.get('x-allrice-d-entry-thread'),
+    )?.id,
+  ).toBeDefined();
+  expect(await receive('life')).toMatchObject({
+    value: { type: 'switched', requestId },
+  });
+  expect(revoked.aborted).toBe(true);
+  closePage(peer);
+  expect(await receive('life')).toMatchObject({ value: { type: 'closed' } });
+  expect(await receive('life')).toMatchObject({ type: 'end' });
+});
+
 it('joins a cancelled target lookup and the old page on close during a handoff', async () => {
   const f = await fixture();
   const target = randomUUID();
   f.registerThread(target);
   const { peer, scopeId, receive, revoked } = await open(f);
+  const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
   const entered = deferred();
   const allow = deferred();
   f.authenticate.mockImplementationOnce(async () => {
@@ -272,7 +353,7 @@ it('joins a cancelled target lookup and the old page on close during a handoff',
   send(peer, {
     type: 'item',
     streamId: 'life',
-    value: { type: 'switch', requestId: randomUUID(), threadId: target },
+    value: { type: 'switch', requestId, threadId: target },
   });
   await entered.promise;
   const fenced = once(revoked, 'abort');
@@ -291,6 +372,8 @@ it('joins a staged native scope and acknowledges the old page on close before pu
   const target = randomUUID();
   f.registerThread(target);
   const { peer, scopeId, receive, revoked } = await open(f);
+  const requestId = randomUUID();
+  expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
   const entered = deferred();
   const allow = deferred();
   f.authenticate.mockImplementation(async () => {
@@ -303,7 +386,7 @@ it('joins a staged native scope and acknowledges the old page on close before pu
   send(peer, {
     type: 'item',
     streamId: 'life',
-    value: { type: 'switch', requestId: randomUUID(), threadId: target },
+    value: { type: 'switch', requestId, threadId: target },
   });
   await entered.promise;
   const fenced = once(revoked, 'abort');
@@ -327,6 +410,8 @@ it.each(['employee', 'login', 'tenant', 'epoch'] as const)(
     const target = randomUUID();
     f.registerThread(target);
     const { peer, scopeId, receive } = await open(f);
+    const requestId = randomUUID();
+    expect((await f.proveSwitch(scopeId, target, requestId)).status).toBe(204);
     if (change === 'employee')
       f.historyIdentity.mockResolvedValueOnce({
         ...f.identity,
@@ -352,7 +437,6 @@ it.each(['employee', 'login', 'tenant', 'epoch'] as const)(
           binding: { ...f.binding, leaseEpoch: 2 },
         },
       });
-    const requestId = randomUUID();
     send(peer, {
       type: 'item',
       streamId: 'life',

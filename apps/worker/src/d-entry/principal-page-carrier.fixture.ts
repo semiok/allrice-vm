@@ -547,7 +547,7 @@ export async function fixture(
       },
     });
   function profileUrl(
-    kind: 'bootstrap' | 'assets' | 'events',
+    kind: 'bootstrap' | 'assets' | 'events' | 'switch',
     scopeId: string,
     selectors: Record<string, string> = {},
   ) {
@@ -576,8 +576,28 @@ export async function fixture(
       },
     });
   }
+  function proveSwitch(
+    scopeId: string,
+    targetThreadId: string,
+    requestId: string,
+    token = sessionToken,
+    selection: Record<string, string> = {},
+  ) {
+    return fetch(
+      profileUrl('switch', scopeId, {
+        ...selection,
+        targetThreadId,
+        requestId,
+      }),
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + token },
+      },
+    );
+  }
   return {
     ...f,
+    proveSwitch,
     prepareEditorRoot,
     registerRoot,
     rememberRoot,
