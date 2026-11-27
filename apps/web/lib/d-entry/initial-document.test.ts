@@ -87,6 +87,7 @@ it('hands off each download once and waits for a cancelled body before publishin
   });
   owner.finish('closed');
   expect(fetch.mock.lastCall?.[1].signal?.aborted).toBe(true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
   expect(postMessage).not.toHaveBeenCalledWith(
     expect.objectContaining({ type: pageCompletion }),
     expect.any(String),
