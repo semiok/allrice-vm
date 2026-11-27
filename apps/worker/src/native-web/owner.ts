@@ -499,6 +499,9 @@ export async function openNativeWebOwner(input: {
     if (result.ok) return result.value;
     throw new PersonVmError('PROVIDER_FAILED');
   }
+  // The same exported object is used by startup proof and admitted page reads.
+  // It is replaced with the actual native owner at every new VM epoch.
+  const profileVerificationOwner = {};
   function verifyEditor<T>(
     caller: AbortSignal,
     guard: (signal: AbortSignal) => Promise<void>,
@@ -527,6 +530,7 @@ export async function openNativeWebOwner(input: {
       verify(
         {
           revoked: active,
+          verificationOwner: profileVerificationOwner,
           readImmutableGraph: (signal) =>
             editorRead('editor-index', () =>
               readCurrent(signal, guard, readGraph),
@@ -649,6 +653,7 @@ export async function openNativeWebOwner(input: {
       binding,
       revoked: signal,
       modelAdapterId: installedModelAdapter,
+      profileVerificationOwner,
       nativeInstanceId: job!.jobId,
       /** Connectivity only; never conveys current execution authorization. */
       controlReady: () => ready && !signal.aborted,

@@ -1,7 +1,14 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { readProfileBundle, releasedBundleResolver } from './profile-browser';
+import {
+  EmployeeProfileBundleTimeout,
+  readProfileBundle,
+  releasedBundleResolver,
+} from './profile-browser';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 it('uses a public digest only for the exact graph resource and revision', () => {
   const root = '/_next/static/dsh-profile/' + 'a'.repeat(64) + '/';
@@ -47,11 +54,11 @@ it('falls back through the authenticated no-store path when the public body is i
   const bytes = await readProfileBundle(scoped, signal, direct);
   expect(new TextDecoder().decode(bytes)).toBe('verified');
   expect(request).toHaveBeenNthCalledWith(1, direct, {
-    signal,
+    signal: expect.any(AbortSignal),
     credentials: 'omit',
   });
   expect(request).toHaveBeenNthCalledWith(2, scoped, {
-    signal,
+    signal: expect.any(AbortSignal),
     credentials: 'same-origin',
     cache: 'no-store',
   });
@@ -72,4 +79,67 @@ it('does not fall back after the scoped page is revoked', async () => {
     ),
   ).rejects.toMatchObject({ name: 'AbortError' });
   expect(request).toHaveBeenCalledTimes(1);
+});
+
+it('aborts an incomplete bundle body and retries the authorized request once', async () => {
+  vi.useFakeTimers();
+  const request = vi
+    .fn()
+    .mockImplementationOnce(
+      (_url, { signal }: RequestInit) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              signal?.addEventListener(
+                'abort',
+                () => controller.error(signal.reason),
+                { once: true },
+              );
+            },
+          }),
+        ),
+    )
+    .mockResolvedValueOnce(new Response('verified'));
+  vi.stubGlobal('fetch', request);
+  const parent = new AbortController().signal;
+  const body = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    parent,
+  );
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(new TextDecoder().decode(await body)).toBe('verified');
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(request.mock.calls[0]![1].signal.aborted).toBe(true);
+  expect(parent.aborted).toBe(false);
+});
+
+it('bounds a stalled public bundle plus its scoped fallback', async () => {
+  vi.useFakeTimers();
+  const request = vi.fn((_url, { signal }: RequestInit) =>
+    Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            signal?.addEventListener(
+              'abort',
+              () => controller.error(signal.reason),
+              { once: true },
+            );
+          },
+        }),
+      ),
+    ),
+  );
+  vi.stubGlobal('fetch', request);
+  const result = readProfileBundle(
+    new URL('https://allrice.test/scoped'),
+    new AbortController().signal,
+    '/public.js',
+  );
+  const rejected = expect(result).rejects.toBeInstanceOf(
+    EmployeeProfileBundleTimeout,
+  );
+  await vi.advanceTimersByTimeAsync(60_000);
+  await rejected;
+  expect(request).toHaveBeenCalledTimes(2);
 });

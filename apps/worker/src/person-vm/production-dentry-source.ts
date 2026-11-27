@@ -36,6 +36,8 @@ import {
   readWorkerEmployeeWebSeal,
 } from '../d-entry/released-profile.js';
 
+import { dEntryStartupTiming } from '../d-entry/startup-timing.js';
+
 type Startup = Pick<
   ReturnType<typeof createAssignedNativeWebStartup>,
   | 'catalog'
@@ -319,12 +321,23 @@ export function installProductionDEntrySource(input: {
       };
     },
   };
+  const modelProofs = new WeakMap<
+    object,
+    {
+      adapterId: string;
+      seal: string;
+      provider: string;
+      model: string;
+      revoked: AbortSignal;
+    }
+  >();
   const uninstallProof = input.startup.installStartingEditorProof(
     (
       { binding, endpoint, context, modelAdapterId, profile, readModels },
       signal,
     ) =>
       own(signal, async (active) => {
+        const timing = dEntryStartupTiming('editor-proof');
         const expected: DEntryIdentity = {
           organizationId: binding.organizationId,
           personId: binding.personId,
@@ -334,7 +347,7 @@ export function installProductionDEntrySource(input: {
           employeeVersionId: endpoint.employeeVersionId,
           threadId: null,
         };
-        const release = await readDEntryReleasePolicy();
+        const release = await timing.run('rollout', readDEntryReleasePolicy);
         active.throwIfAborted();
         if (selectDEntryGeneration(release, expected) !== '4.0') return null;
         // The native startup roster spans the real current workspaces of this
@@ -349,34 +362,66 @@ export function installProductionDEntrySource(input: {
           if (!sameDEntryIdentity(identity, expected)) denied();
           return identity;
         }
-        const identity = await current();
-        const seal = await readWorkerEmployeeWebSeal(active);
-        const editor = await holdReleasedProfile(
-          seal.directory,
-          profile,
-          active,
-          seal.manifestSha256,
+        const identity = await timing.run('current-authority', current);
+        const seal = await timing.run('release-seal', () =>
+          readWorkerEmployeeWebSeal(active),
         );
-        const models = await readModels();
-        const route = await input.resolveSendRoute(
-          { context: scope, identity, binding, modelAdapterId },
-          active,
+        const editor = await timing.run('profile-attestation', () =>
+          holdReleasedProfile(
+            seal.directory,
+            profile,
+            active,
+            seal.manifestSha256,
+          ),
         );
-        if (
-          models.value.default.provider !== route.provider ||
-          models.value.default.model !== route.model ||
-          !models.value.routableProviders.includes(route.provider) ||
-          !models.value.groups.some(
-            ({ id, models }) =>
-              id === route.provider &&
-              models.some(({ id }) => id === route.model),
-          ) ||
-          models.value.failures.some(({ id }) => id === route.provider)
-        )
-          throw new PersonVmError('RUNTIME_NOT_READY');
-        await editor.assertCurrent(active);
-        if (!sameDEntryIdentity(identity, await current())) denied();
-        route.revoked.throwIfAborted();
+        // Route truth remains current even when the immutable profile and the
+        // installed adapter's catalog have already been proved for this epoch.
+        const route = await timing.run('send-route', () =>
+          input.resolveSendRoute(
+            { context: scope, identity, binding, modelAdapterId },
+            active,
+          ),
+        );
+        const owner = profile.verificationOwner;
+        const old = owner && modelProofs.get(owner);
+        const canReuse =
+          old &&
+          !old.revoked.aborted &&
+          old.adapterId === modelAdapterId &&
+          old.seal === seal.manifestSha256 &&
+          old.provider === route.provider &&
+          old.model === route.model;
+        if (!canReuse) {
+          await timing.run('model-catalog', async () => {
+            const models = await readModels();
+            if (
+              models.value.default.provider !== route.provider ||
+              models.value.default.model !== route.model ||
+              !models.value.routableProviders.includes(route.provider) ||
+              !models.value.groups.some(
+                ({ id, models }) =>
+                  id === route.provider &&
+                  models.some(({ id }) => id === route.model),
+              ) ||
+              models.value.failures.some(({ id }) => id === route.provider)
+            )
+              throw new PersonVmError('RUNTIME_NOT_READY');
+          });
+        }
+        await timing.run('final-authority', async () => {
+          await editor.assertCurrent(active);
+          if (!sameDEntryIdentity(identity, await current())) denied();
+          route.revoked.throwIfAborted();
+        });
+        if (owner && modelAdapterId)
+          modelProofs.set(owner, {
+            adapterId: modelAdapterId,
+            seal: seal.manifestSha256,
+            provider: route.provider,
+            model: route.model,
+            revoked: route.revoked,
+          });
+        timing.ready();
         return route.revoked;
       }),
   );

@@ -41,6 +41,7 @@ export type PublishedNativeCatalog = Readonly<{
   revoked: AbortSignal;
   owner: Readonly<{
     revoked: AbortSignal;
+    profileVerificationOwner?: object;
     controlReady(): boolean;
     acquirePrincipal(
       issue: DEntryPrincipalIssue,
@@ -187,6 +188,7 @@ export function createDEntryNativeCatalogPort(input: {
             readBundle && {
               fixedProfile: {
                 revoked,
+                verificationOwner: owner.owner.profileVerificationOwner,
                 readImmutableGraph(reading: AbortSignal) {
                   return own(async () => {
                     const who = context;

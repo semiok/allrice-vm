@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 export type StartupPhase =
   | 'service_identity'
   | 'native_primary'
+  | 'employee_web_release'
   | 'native_launch_policy'
   | 'native_journal_contract'
   | 'producer_lifecycle'

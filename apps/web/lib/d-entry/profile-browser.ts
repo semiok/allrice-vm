@@ -45,31 +45,74 @@ export function releasedBundleResolver(data: DOMStringMap) {
   }
 }
 
+const profileBundleTimeoutMs = 30_000;
+
+export class EmployeeProfileBundleTimeout extends Error {
+  constructor() {
+    super('Employee profile bundle download timed out');
+  }
+}
+
+async function fetchProfileBundle(
+  url: URL | string,
+  parent: AbortSignal,
+  options: Pick<RequestInit, 'credentials' | 'cache'>,
+) {
+  parent.throwIfAborted();
+  const timeout = new AbortController();
+  const until = AbortSignal.any([parent, timeout.signal]);
+  const timer = setTimeout(
+    () => timeout.abort(new EmployeeProfileBundleTimeout()),
+    profileBundleTimeoutMs,
+  );
+  try {
+    const response = await fetch(url, { ...options, signal: until });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw Error('Employee profile bundle unavailable');
+    }
+    // A 200 with a stalled body is subject to the same deadline as headers.
+    const bytes = await response.arrayBuffer();
+    until.throwIfAborted();
+    return bytes;
+  } catch (error) {
+    until.throwIfAborted();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function readProfileBundle(
   target: URL,
   signal: AbortSignal,
   publicUrl?: string,
 ) {
+  let timedOut = false;
   if (publicUrl) {
     try {
-      const asset = await fetch(publicUrl, { signal, credentials: 'omit' });
-      if (asset.ok) return await asset.arrayBuffer();
-      await asset.body?.cancel();
-    } catch {
-      // A public-cache or body-stream failure can use the original owner path.
+      return await fetchProfileBundle(publicUrl, signal, {
+        credentials: 'omit',
+      });
+    } catch (error) {
+      signal.throwIfAborted();
+      // The original scoped route remains the fallback for a failed public copy.
+      timedOut = error instanceof EmployeeProfileBundleTimeout;
     }
   }
-  signal.throwIfAborted();
-  const response = await fetch(target, {
-    signal,
-    credentials: 'same-origin',
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw Error('Employee profile bundle unavailable');
+  const read = () =>
+    fetchProfileBundle(target, signal, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+  try {
+    return await read();
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!timedOut && error instanceof EmployeeProfileBundleTimeout)
+      return read();
+    throw error;
   }
-  return response.arrayBuffer();
 }
 
 export function readEmployeeDocument(data: DOMStringMap) {
