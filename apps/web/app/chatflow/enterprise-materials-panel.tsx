@@ -544,7 +544,7 @@ export function EnterpriseMaterialsPanel(props: {
               beforePreview:
                 reference.processing === 'failed' ? (
                   <div className={`${files.error} ${css.failure}`} role="alert">
-                    <span>读取失败：Rice 暂时无法读取这份资料的内容</span>
+                    <span>暂时无法读取这份资料</span>
                     {reference.canRetryProcessing === true && (
                       <button
                         type="button"

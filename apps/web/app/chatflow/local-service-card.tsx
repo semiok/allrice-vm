@@ -232,7 +232,7 @@ export function LocalServiceCard({
             Date.parse(service.hardDeadlineAt) > Date.now() && (
               <div>
                 <label>
-                  进程请求（不是 Rice 的聊天提问）：{request.prompt}
+                  本地进程请求：{request.prompt}
                   <textarea
                     value={text}
                     onChange={(e) => setText(e.target.value)}

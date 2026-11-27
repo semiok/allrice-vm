@@ -74,21 +74,21 @@ export function userQuestionReceiptState(status: InputStatus | undefined) {
       state: 'unknown',
       mark: '?',
       title: '未能确认',
-      note: '没能确认 Rice 是否收到这次回答',
+      note: '没能确认员工是否收到这次回答',
     };
   if (status === 'rejected' || status === 'canceled' || status === 'failed')
     return {
       state: 'rejected',
       mark: '!',
       title: '未被采纳',
-      note: '这次回答没有被 Rice 接收',
+      note: '员工没有收到这次回答',
     };
   return status
     ? {
         state: 'waiting',
         mark: '…',
         title: '已提交',
-        note: '等待 Rice 接收这次回答',
+        note: '等待员工接收这次回答',
       }
     : { state: 'submitted', mark: '•', title: '已提交', note: '' };
 }
