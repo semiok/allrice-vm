@@ -82,7 +82,7 @@ type LocaleUnary = z.infer<typeof DEntryPageLocaleSchema>;
 export type DEntryPageLocaleCall = Readonly<{
   scopeId: string;
   endpoint: LocaleUnary;
-  args: Readonly<Record<string, unknown>>;
+  args: Readonly<Record<string, JsonValue>>;
 }>;
 export type DEntryPageLocaleResult = Readonly<{
   endpoint: LocaleUnary;

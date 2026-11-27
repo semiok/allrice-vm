@@ -13,6 +13,7 @@ import type {
 import { DataAccessError } from '@allrice/database';
 import { TYPERT_REMOTE } from '@deepseek-ai/dsh-api-session-controller/remote';
 import { rpcIdSchema } from '@deepseek-ai/dsh-client-connection';
+import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 import {
   isRemoteJsonValue,
   RemoteError,
@@ -131,6 +132,8 @@ export function createDEntryPageRpc(
             signal,
             async (page, active) => {
               const locale = DEntryPageLocaleSchema.safeParse(input.endpoint);
+              if (locale.success && !isRemoteJsonValue(input.payload.args))
+                throw new SyntaxError('Invalid native language request');
               const authorize = async () =>
                 locale.success || input.endpoint === 'session/list'
                   ? undefined
@@ -146,7 +149,7 @@ export function createDEntryPageRpc(
                 ? {
                     scopeId: input.scopeId,
                     endpoint: locale.data,
-                    args: input.payload.args,
+                    args: input.payload.args as Record<string, JsonValue>,
                   }
                 : invocation
                   ? ({
