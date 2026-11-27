@@ -9,6 +9,7 @@ import {
 
 export async function publishTestPlatformQualityEmployee(
   input: {
+    key?: string;
     name?: string;
     mission?: string;
     workStyle?: string;
@@ -18,7 +19,7 @@ export async function publishTestPlatformQualityEmployee(
 ) {
   const name = input.name ?? 'Isolated quality employee';
   const created = await createPlatformEmployeeDraft({
-    key: 'quality-test-' + randomUUID(),
+    key: input.key ?? 'quality-test-' + randomUUID(),
     name,
   });
   const draft = created?.currentDraft;

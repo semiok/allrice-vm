@@ -4,7 +4,10 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build, type Loader, type PluginBuild } from 'esbuild';
-import { createLegacySidebarSnapshot } from './legacy-sidebar-baseline';
+import {
+  createLegacySidebarSnapshot,
+  legacySnapshotPaths,
+} from './legacy-sidebar-baseline';
 
 export const panelsRev2Head = '4c2e1069e087e645365100850756afe742c35e3d';
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
@@ -93,7 +96,10 @@ export async function writeEmployeePanelsBaseline(
     if (sha256(readBase('apps/web/app/chatflow/' + name)) !== expected)
       throw Error('Approved rev2 component bytes changed: ' + name);
   }
-  const snapshot = createLegacySidebarSnapshot(readBase);
+  const snapshot = createLegacySidebarSnapshot(
+    readBase,
+    legacySnapshotPaths(panelsRev2Head),
+  );
   const common = {
     absWorkingDir: repoRoot,
     nodePaths: [resolve(repoRoot, 'apps/web/node_modules')],

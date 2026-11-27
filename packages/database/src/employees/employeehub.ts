@@ -9,6 +9,7 @@ import {
   assertFrozenEmployeePersona,
 } from './employee-documents.ts';
 import { captureNativeWebRosterChange } from './native-web-capacity.ts';
+import { hasRetiredGeneralEmployeeBinding } from './employee-instance-policy.ts';
 import { freezeConnectedLocalToolNames } from './local-tool-qualification.ts';
 import { readChatNativeRootOrigin } from '../conversation/native-session-binding.ts';
 import {
@@ -1598,6 +1599,9 @@ export async function prepareEmployeeRunBinding(
       sessionId: input.sessionId,
     },
     capabilityBindings(manifest.data).toolNames,
+    instance
+      ? () => hasRetiredGeneralEmployeeBinding(instance, sql)
+      : undefined,
   );
   const memoryIndex = input.employeeDocuments === true && !!instance;
   const customizedTools = withEmployeeCustomizationTools(

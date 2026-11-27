@@ -23,16 +23,45 @@ const replayEntry = new URL(
 const sha256 = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 
+export function legacySnapshotPaths(commit: string) {
+  return new Set(
+    execFileSync('git', ['ls-tree', '-r', '--name-only', commit], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    })
+      .trimEnd()
+      .split('\n'),
+  );
+}
+
 /** Preserve CSS module exports while reading the exact baseline source bytes. */
 export function createLegacySidebarSnapshot(
   readBase: (path: string) => string,
+  pinnedPaths: ReadonlySet<string> = new Set(),
+  onlyPinnedPaths = false,
 ): Plugin {
   return {
     name: 'pinned-allrice-sidebar-base',
     setup(plugin) {
+      // esbuild resolves against the checkout before onLoad. A source
+      // deleted from the live tree is still present in the historical replay.
+      plugin.onResolve({ filter: /^\.\.?\// }, (args) => {
+        const path = resolve(args.resolveDir, args.path);
+        const candidates = [
+          path,
+          ...['.tsx', '.ts', '.jsx', '.js', '.css', '.json'].map(
+            (extension) => path + extension,
+          ),
+        ];
+        const pinned = candidates.find((candidate) =>
+          pinnedPaths.has(relative(repoRoot, candidate).replaceAll('\\', '/')),
+        );
+        if (pinned) return { path: pinned };
+      });
       plugin.onLoad({ filter: /\.(?:[cm]?[jt]sx?|css)$/ }, ({ path }) => {
         const key = relative(repoRoot, path).replaceAll('\\', '/');
         if (!/^(?:apps\/web\/|packages\/(?:ui|contracts)\/)/.test(key)) return;
+        if (onlyPinnedPaths && !pinnedPaths.has(key)) return;
         return {
           contents: readBase(key),
           resolveDir: dirname(path),
@@ -119,7 +148,10 @@ export async function writeLegacySidebarBaseline(
     }
     return text;
   };
-  const snapshot = createLegacySidebarSnapshot(readBase);
+  const snapshot = createLegacySidebarSnapshot(
+    readBase,
+    legacySnapshotPaths(sidebarBaselineHead),
+  );
   const common = {
     absWorkingDir: repoRoot,
     nodePaths: [resolve(repoRoot, 'apps/web/node_modules')],

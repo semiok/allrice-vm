@@ -38,7 +38,7 @@ suite(
       await f?.close();
     });
 
-    async function setup(projectTool = true) {
+    async function setup(projectTool = true, retiredAlias = false) {
       const source = await createEmployeeAdministrationFixture(f.db);
       const project = catalog.skills.find(
         (s) => s.name === 'project-development',
@@ -47,6 +47,7 @@ suite(
       await savePlatformEmployeeDraft(employeeId, {
         definition: {
           ...source.definition,
+          ...(retiredAlias ? { key: 'rice' } : {}),
           capabilities: {
             ...source.definition.capabilities,
             nativeSkillIds: [
@@ -63,6 +64,19 @@ suite(
       });
       await source.preview(employeeId);
       expect((await source.publish(employeeId)).valid).toBe(true);
+      if (retiredAlias) {
+        const [tenant] = await f.db`
+          update allrice_employees e set employee_key='default-assistant'
+          from allrice_platform_employee_tenant_assignments d
+          where d.employee_id=${employeeId} and d.workspace_id=${source.workspaceId}
+            and d.tenant_employee_id=e.id and e.employee_key='rice'
+          returning e.id`;
+        expect(tenant?.id).toBeTruthy();
+        await f.db`
+          update allrice_employee_versions set
+            manifest=manifest || '{"key":"default-assistant","isDefaultRice":true}'::jsonb
+          where employee_id=${tenant!.id}`;
+      }
       const context = (await authenticateSession(
         (await createSession(source.ownerId)).token,
         {
@@ -273,6 +287,23 @@ suite(
       await x.create('custom', custom.id);
       expect(await x.snapshot(custom.id)).toBeNull();
       expect((await x.send(custom.id)).tools).toContain('workspace.project');
+    });
+
+    it('preserves the old no-snapshot restriction for a retired general employee', async () => {
+      const x = await setup(true, true);
+      await x.configure(true);
+      const general = await x.create('general', undefined, false);
+      const custom = await x.create('custom', undefined, false);
+      expect(await x.snapshot(general.id)).toBeNull();
+      expect((await x.send(general.id)).tools).not.toContain(
+        'workspace.project',
+      );
+      expect((await x.send(custom.id)).tools).toContain('workspace.project');
+      const explicitlyEnabled = await x.create('general');
+      expect((await x.snapshot(explicitlyEnabled.id)).enabled).toBe(true);
+      expect((await x.send(explicitlyEnabled.id)).tools).toContain(
+        'workspace.project',
+      );
     });
 
     it('fails closed on foreign scope or malformed/digest-mismatched persisted references', async () => {

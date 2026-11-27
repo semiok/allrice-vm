@@ -106,12 +106,14 @@ jobs:
         run: |
           pinned_sidebar=d8f6ed3fa01bdd6e5d72e55702eb703e5e670d00
           pinned_panels=4c2e1069e087e645365100850756afe742c35e3d
-          for pinned_source in "$pinned_sidebar" "$pinned_panels"; do
+          pinned_brand=9988911c6a2c6c5ff161d219bb2c2aaaecbbbeeb
+          for pinned_source in "$pinned_sidebar" "$pinned_panels" "$pinned_brand"; do
             git cat-file -e "$pinned_source:apps/web/app/layout.tsx" 2>/dev/null ||
               git fetch --no-tags --depth=1 origin "$pinned_source"
             git cat-file -e "$pinned_source:apps/web/app/layout.tsx"
           done
           git cat-file -e "$pinned_panels:apps/web/app/chatflow/enterprise-materials-panel.tsx"
+          git cat-file -e "$pinned_brand:apps/web/app/chatflow/brand-media/panel.tsx"
       - name: Collect remaining standalone browser integration tests
         env:
           ALLRICE_RUN_BROWSER_INTEGRATION: 1

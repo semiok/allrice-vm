@@ -70,6 +70,7 @@ export async function qualifyConversationProjectTools(
   sql: Sql | TransactionSql,
   scope: Scope,
   toolNames: string[],
+  restrictLegacyProject?: () => Promise<boolean>,
 ) {
   if (!toolNames.includes('workspace.project')) return toolNames;
   const [row] = await sql<{ account_capability_snapshot: unknown }[]>`
@@ -79,7 +80,7 @@ export async function qualifyConversationProjectTools(
       and visibility='private' and archived_at is null
   `;
   if (!row) throw new DataAccessError('authorization_denied');
-  let enabled = true;
+  let enabled: boolean;
   if (row.account_capability_snapshot !== null) {
     const result = SnapshotSchema.safeParse(row.account_capability_snapshot);
     if (
@@ -92,6 +93,8 @@ export async function qualifyConversationProjectTools(
     )
       throw new DataAccessError('authorization_denied');
     enabled = result.data.enabled;
+  } else {
+    enabled = !(await restrictLegacyProject?.());
   }
   return enabled
     ? toolNames

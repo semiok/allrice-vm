@@ -55,6 +55,11 @@ import {
 } from './execution/queue.ts';
 import { prepareEmployeeRunBinding } from './employees/employeehub.ts';
 import {
+  getPlatformEmployee,
+  publishPlatformEmployee,
+  savePlatformEmployeeDraft,
+} from './employees/platform-employees.ts';
+import {
   qualityDigest,
   qualityFixture,
   qualityAssertion,
@@ -213,6 +218,70 @@ suite(
       await expect(ensureQualityEmployee(admin)).resolves.toMatchObject({
         assignmentId: initial.assignmentId,
       });
+    });
+
+    it('updates the original reserved assignment for a previously deployed employee alias', async () => {
+      const selected = process.env.ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID;
+      const existingOwner = await ensureBootstrapPortalPrincipal({
+        organizationSlug: 'legacy-quality-test',
+        organizationName: 'Legacy quality test',
+        workspaceSlug: 'control-plane',
+        workspaceName: 'Legacy quality test',
+        email: 'legacy-quality-test@example.test',
+        displayName: 'Legacy quality owner',
+        role: 'member',
+      });
+      await fixture.db`delete from allrice_memberships where user_id=${existingOwner.user.id}`;
+      const context: RequestContext = {
+        ...admin,
+        actor: { type: 'user', id: existingOwner.user.id },
+      };
+      vi.stubEnv(
+        'ALLRICE_PLATFORM_ADMIN_EMAILS',
+        `${adminEmail},${existingOwner.user.email}`,
+      );
+      try {
+        const employeeId = await publishTestPlatformQualityEmployee({
+          key: 'rice',
+        });
+        const first = await ensureQualityEmployee(context);
+        // Restore only the old materialized key in this isolated workspace.
+        const [employee] = await fixture.db`
+          update allrice_employees e set employee_key='default-assistant'
+          from allrice_employee_assignments a
+          where a.id=${first.assignmentId} and a.employee_id=e.id and e.employee_key='rice'
+          returning e.id`;
+        expect(employee?.id).toBeTruthy();
+        const platform = await getPlatformEmployee(employeeId);
+        await savePlatformEmployeeDraft(employeeId, {
+          definition: {
+            ...platform!.currentPublished!.definition,
+            description: 'New revision of the already reserved employee',
+          },
+        });
+        const publication = await publishPlatformEmployee(employeeId, {
+          scope: 'assigned',
+        });
+        expect(publication.errors).toEqual([]);
+        const second = await ensureQualityEmployee(context);
+        expect(second.assignmentId).toBe(first.assignmentId);
+        expect(second.revisionId).toBe(publication.revisionId);
+        expect(second.versionId).not.toBe(first.versionId);
+        const [stored] = await fixture.db`
+          select r.employee_id, r.assignment_id, v.manifest
+          from allrice_platform_quality_deployments r
+          join allrice_employee_versions v on v.id=r.employee_version_id
+          where r.workspace_id=${first.internal.workspace_id}`;
+        expect(stored).toMatchObject({
+          employee_id: employee!.id,
+          assignment_id: first.assignmentId,
+          manifest: { key: 'default-assistant' },
+        });
+        expect(stored?.manifest).not.toHaveProperty('isDefaultRice');
+      } finally {
+        vi.stubEnv('ALLRICE_PLATFORM_QUALITY_EMPLOYEE_ID', selected);
+        vi.stubEnv('ALLRICE_PLATFORM_ADMIN_EMAILS', adminEmail);
+      }
     });
 
     it('concurrent identical requests produce one real private employee Run, preserving company rows and frozen pins', async () => {

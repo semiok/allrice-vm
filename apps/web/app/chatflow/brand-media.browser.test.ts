@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -17,9 +18,20 @@ import type {
   Page,
   Request,
 } from '../../../worker/node_modules/playwright-core/index.js';
+import { createLegacySidebarSnapshot } from '../../../../packages/dsh-web-composition/tests/legacy-sidebar-baseline';
 
-// Actual public primitives, host, entry controller, client and business page.
+// The retired 3.x panel is replayed from the last source before cleanup.
 // HTTP/model/storage outcomes below are synthetic; the PG suite owns authority.
+const retiredBrandPanelHead = '9988911c6a2c6c5ff161d219bb2c2aaaecbbbeeb';
+const retiredBrandPanelPaths = new Set(
+  [
+    'frontend-wiring.tsx',
+    'frontend-wiring.module.css',
+    'images.tsx',
+    'panel.tsx',
+    'panel.module.css',
+  ].map((name) => 'apps/web/app/chatflow/brand-media/' + name),
+);
 const suite =
   process.env.ALLRICE_RUN_BROWSER_INTEGRATION === '1'
     ? describe
@@ -431,6 +443,23 @@ suite('MET-224 main-area brand media text workflow', () => {
       write: false,
       outdir: '/brand-media-fixture',
       jsx: 'automatic',
+      plugins: [
+        {
+          ...createLegacySidebarSnapshot(
+            (path) =>
+              execFileSync(
+                'git',
+                ['show', `${retiredBrandPanelHead}:${path}`],
+                {
+                  encoding: 'utf8',
+                },
+              ),
+            retiredBrandPanelPaths,
+            true,
+          ),
+          name: 'pinned-retired-brand-panel',
+        },
+      ],
       loader: { '.woff2': 'dataurl', '.woff': 'dataurl', '.ttf': 'dataurl' },
       define: { 'process.env.NODE_ENV': '"development"', 'process.env': '{}' },
     });

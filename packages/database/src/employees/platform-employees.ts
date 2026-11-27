@@ -1558,9 +1558,10 @@ export async function compilePlatformEmployee(
 function tenantManifest(
   definition: PlatformEmployeeDefinition,
   runtimePackage: EmployeeRuntimePackage,
+  tenantKey: string,
 ) {
   return employeeManifest({
-    key: definition.key,
+    key: tenantKey,
     name: definition.name,
     description: definition.description,
     role: definition.identity.role,
@@ -1613,17 +1614,23 @@ async function assertStableMaterializedEmployeeKey(
   employeeId: string,
   key: string,
 ) {
-  const rows =
-    await tx`select e.employee_key, r.definition->>'key' as platform_key
+  const rows = await tx<
+    { workspace_id: string; employee_key: string; platform_key: string }[]
+  >`select d.workspace_id, e.employee_key, r.definition->>'key' as platform_key
     from allrice_platform_employee_tenant_assignments d
     join allrice_platform_employee_revisions r on r.employee_id=d.employee_id and r.id=d.revision_id
     join allrice_employees e on e.id=d.tenant_employee_id
       and e.organization_id=d.organization_id and e.workspace_id=d.workspace_id
     where d.employee_id=${employeeId}`;
-  // Use the deployed immutable definition, not
-  // the current draft: drafts may have changed before the first deployment.
-  if (rows.some((row) => row.platform_key !== key || row.employee_key !== key))
-    throw new Error('platform_employee_materialized_key_immutable');
+  // Only an existing deployment may keep the old stored alias. A new
+  // deployment uses the current definition key, with no implicit employee.
+  for (const row of rows) {
+    const legacyAlias =
+      key === 'rice' && row.employee_key === 'default-assistant';
+    if (row.platform_key !== key || (row.employee_key !== key && !legacyAlias))
+      throw new Error('platform_employee_materialized_key_immutable');
+  }
+  return new Map(rows.map((row) => [row.workspace_id, row.employee_key]));
 }
 
 export async function materializePlatformEmployeeRevision(
@@ -1640,7 +1647,7 @@ export async function materializePlatformEmployeeRevision(
 ) {
   if (input.revision.status === 'disabled')
     throw new Error('platform_employee_revision_disabled');
-  await assertStableMaterializedEmployeeKey(
+  const materializedKeys = await assertStableMaterializedEmployeeKey(
     transaction,
     input.employeeId,
     input.definition.key,
@@ -1651,10 +1658,6 @@ export async function materializePlatformEmployeeRevision(
   if (!runtimeProfile.runtimePackage) {
     throw new Error('platform_employee_runtime_package_missing');
   }
-  const manifest = tenantManifest(
-    input.definition,
-    runtimeProfile.runtimePackage,
-  );
   const manifestChecksum = runtimeProfile.runtimePackage.checksum;
   const frozenSkills = frozenPackageSkills(runtimeProfile.runtimePackage);
   assertCurrentPlatformSkillSources(frozenSkills);
@@ -1738,7 +1741,12 @@ export async function materializePlatformEmployeeRevision(
         });
       }
     }
-    const tenantKey = input.definition.key;
+    const tenantKey = materializedKeys.get(workspaceId) ?? input.definition.key;
+    const manifest = tenantManifest(
+      input.definition,
+      runtimeProfile.runtimePackage,
+      tenantKey,
+    );
     const [currentDeployment] = await transaction<
       {
         id: string;

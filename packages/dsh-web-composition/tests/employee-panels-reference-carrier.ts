@@ -329,7 +329,13 @@ export async function writeEmployeePanelsReferenceCarrier(
           },
         },
         {
-          ...createLegacySidebarSnapshot(readBase),
+          ...createLegacySidebarSnapshot(
+            readBase,
+            new Set([
+              ...Object.keys(authority.sources),
+              ...Object.keys(additionalSources),
+            ]),
+          ),
           name: 'pinned-rev2-reference-carrier',
         },
       ],

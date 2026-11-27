@@ -509,6 +509,9 @@ export const EmployeeDefinitionSchema = z
     appearance: EmployeeAppearanceSchema,
     applicableScenarios: z.array(z.string().trim().min(1).max(300)).max(24),
     taskSuggestions: TaskSuggestionsSchema.optional(),
+    // Historical v2 manifests include this field in their stored checksum.
+    // New producers omit it, and it no longer controls employee behavior.
+    isDefaultRice: z.boolean().optional(),
     identity: EmployeeIdentitySchema,
     systemPrompt: z.string().min(1).max(100_000),
     provider: EmployeeProviderSnapshotSchema,

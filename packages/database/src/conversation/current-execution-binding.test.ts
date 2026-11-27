@@ -289,6 +289,32 @@ function run(
 }
 
 describe('current employee source policy: immutable original identities', () => {
+  it('keeps the checksum of a previously published non-Rice manifest', () => {
+    const input = definitionOnly();
+    expect(input.manifest).not.toHaveProperty('isDefaultRice');
+    const previous = Object.fromEntries(
+      Object.entries(manifestOf(input)).flatMap(([key, value]) =>
+        key === 'identity'
+          ? [
+              ['isDefaultRice', false],
+              [key, value],
+            ]
+          : [[key, value]],
+      ),
+    );
+    const configChecksum = runtimePackageChecksum(previous);
+    const historical = { ...input, manifest: previous, configChecksum };
+    const { source } = validateEmployeeExecutionSource(historical);
+    expect(source.configChecksum).toBe(configChecksum);
+    expect(source.manifestDigest).toBe(nativeRootDigest(previous));
+    expect(() =>
+      validateEmployeeExecutionSource({
+        ...historical,
+        manifest: { ...previous, isDefaultRice: true },
+      }),
+    ).toThrow('CURRENT_EXECUTION_SOURCE_CHECKSUM_MISMATCH');
+  });
+
   it.each(['definition', 'plain', 'bundled'] as const)(
     'reads signed pre-A2 %s declarations without granting retired memory tools',
     (format) => {
