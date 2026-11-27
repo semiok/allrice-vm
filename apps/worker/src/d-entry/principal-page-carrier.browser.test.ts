@@ -382,7 +382,10 @@ it.skipIf(!browserExecutable).each([
             schemaVersion: 1,
             profiles: {
               'web:linux': {
-                'session.new': { code: 'KeyN', modifiers: ['primary', 'alt'] },
+                'session.new': {
+                  code: 'Period',
+                  modifiers: ['primary', 'shift'],
+                },
               },
             },
           }),
@@ -518,7 +521,9 @@ it.skipIf(!browserExecutable).each([
         expect(platform).toBe('Linux x86_64');
       const chord = /darwin|mac|iphone|ipad/iu.test(platform)
         ? 'Meta+Alt+N'
-        : 'Control+Alt+N';
+        : /win/iu.test(platform)
+          ? 'Control+Alt+N'
+          : 'Control+Shift+Period';
       try {
         await editor.press(chord, { timeout: 10_000 });
         await expect
