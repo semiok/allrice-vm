@@ -181,9 +181,7 @@ it.skipIf(!browserExecutable)(
     });
     await page.goto(f.origin);
     const workbench = page.frameLocator('iframe');
-    const editor = workbench
-      .locator('textarea:visible,[contenteditable=true]:visible')
-      .first();
+    const editor = workbench.locator('[role="textbox"][data-composer-input]');
     try {
       await editor.fill('未发送的原生草稿', { timeout: 15_000 });
     } catch (error) {
@@ -200,8 +198,14 @@ it.skipIf(!browserExecutable)(
       );
     }
     expect(await editor.isEditable()).toBe(true);
-    expect(firstItems).toContain('session/control:baseline');
-    expect(firstItems).toContain('session/follow:snapshot');
+    await expect
+      .poll(() => firstItems)
+      .toEqual(
+        expect.arrayContaining([
+          'session/control:baseline',
+          'session/follow:snapshot',
+        ]),
+      );
     expect(unary).toContain('session/list');
     expect(unary).not.toContain('dynamicCordisRunner/inventory');
     expect(unary).not.toContain('dynamicCordisRunner/syncInspectManifest');
