@@ -103,5 +103,5 @@ auditSources:
   packages/database/src/bootstrap-identity.ts: 1257cdfbc66c5c6038a5f780871a1f653663581a0584a96336cd8b188b9dcaf5
   packages/project-runtime/src/project-service-supervisor.ts: 1ce6b79bcadabceb4b9bf47cb5ce809fe580d3dfc542d22a769f1d57d83223d0
   packages/project-runtime/src/project-supervisor.ts: 7a832d1e0d549be9568485816708d6e274d1fa0bfe0b3544ac6f01e0603b73f2
-  packages/vm-memory/src/guest-config.ts: 10d670311cb7f29c8f2fffcf38133d7361dbccf6f4d198f58005ba8a5947851d
+  packages/vm-memory/src/guest-config.ts: 524deb38156aadf8d1b30b23af5d2a5e7f7009e976957ffbed18ebe496403a65
   scripts/dev-environment.mjs: e9daa5931b43ea6c4db01bb91a6295e0caf4000e2682635205b666525efe19d3

@@ -17,7 +17,7 @@
 
 prepare/assertActive/revoke 均 host-only，不是可让模型调用的工具。撤销必须幂等到精确 bindingId/epoch，不能把旧实例的延迟撤销作用到新实例。
 
-v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），20 分钟策略只由 host 依据活动事实执行。
+v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个 vmId 保留同一组 gatewayPorts；首次 native create 后把端口固定在存储回执，后续 prepare 若改端口即拒绝。绑定资格与 epoch 每次更新，不能用固定端口当身份。原生 idle-timeout 不启用（detached job 可能不重置原生 idle），闲置停机只由 host 依据活动事实执行，默认 20 分钟。
 
 普通路由的 MET-268/MET-271 调用 host-only `resolve(RequestContext, signal)` 与 `assertCurrentBinding(RequestContext, binding, signal)`。两者重新核本人/企业现权、运行阶段、精确 instance/epoch 与出口活性；不返回 ownerToken、不暴露内部表。RequestContext 必须来自各自可信会话/受管连接，不能由 guest header 或 JSON 反序列化生成。resolve 是本次快照，各次实际请求仍须 assert；启动/停止/接管中的租约不发新路由。
 
@@ -30,6 +30,8 @@ v0.7.16 的 `start` 不接受网络覆盖参数，因此 MET-269 必须为每个
 后端 present；MCP none（模型不获 VM 管理权）；员工 UI none（本卡只提供页面/输入预开机服务接口，后续由已批界面接线）；后台 none（没有新增管理界面授权）；权限 present（每调用重查当前可信身份，删盘单独授权/审计，不默认删盘）。默认关闭/名单由发布入口控制，本包不新增产品开关。
 
 **保守自动停机默认关闭。** 启用后，宿主每 60 秒采样当前 VM 的全部员工。持续看到空闲、没有漏采且未收到忙碌事件，才进入同一物理租约下的唤醒准备与停机。采样间隔可用 `lifecycle.idleSampleIntervalMs` 调整。原生读失败、漏采、Worker 重启或代次变化均重新计时。部分瞬态工作可在采样间发生。最后一次负向读取至原生停机之间也可能出现尚未被宿主观察到的工作。下一次定时触发落入停机预算与 `lifecycle.idleScheduleSafetyMarginMs` 的合计窗口时保留运行，默认安全余量为 30 秒。普通停机、删除和接管仍沿用各自的活动、租约和权限校验。
+
+在 `~/allrice40-dev/config/person-vm-host.json` 设置内存和闲置时长，随常规发布重新封存，由 Worker 启动时读取。内存使用 `memory.policy.physicalBytes`（整数 MiB 对应的字节数，1–4 GiB），闲置时长使用 `lifecycle.idleMs`（毫秒，5–60 分钟）。缺项使用 2 GiB、20 分钟。非法字段独立回落，并在 Worker 日志记录字段和默认值。配置随 Host 启动加载，已有 VM 改变内存上限需要配置 `lifecycle.hostVmBudgetMiB`，并在下一次启动时走既有的容量预留和原生配置读回。
 
 仅 native 已真实 stopped/absent 时，可对账后清理并从确认的 stoppedAt 计算7天转冷。刚确认停止不能因旧 lastActivityAt 立即冷。自己本次启动失败的清理仍撤出口、尝试物理stop、确认后detach。权限撤销强制终止是另片已批需求，不作为普通 idle 回收证明。长周期测试只用时间夹具，未实等20min/7day；不做 Full 快照、不自动删盘。
 

@@ -217,6 +217,7 @@ export * from './employee-business-runtime.ts';
 export * from './d-entry.ts';
 export * from './host-history.ts';
 export {
+  PlatformPersonVmPolicySchema,
   readPlatformPersonVmConfiguration,
   type PlatformPersonVmConfiguration,
 } from './platform-person-vm-configuration.ts';
