@@ -458,11 +458,9 @@ export function observeOriginalRequest(observed, cursor, turn, origin) {
     .slice(start.seq + 1, cursor + 1)
     .filter(
       (event) =>
-        event.type === 'user/message' &&
-        event.data.source?.kind !== 'runtime-context',
+        event.type === 'user/message' && event.data.id === prompt.messageId,
     );
-  if (inputs.length !== 1 || inputs[0].data.id !== prompt.messageId)
-    return empty;
+  if (inputs.length !== 1) return empty;
   const digest = adoptedTextDigest(inputs[0].data);
   return digest
     ? {
@@ -479,6 +477,7 @@ export function observeNativePrompts(scope, lifetime, capture) {
   const sources = new Map();
   const turns = new WeakMap();
   const attempts = new WeakMap();
+  const inboxClaims = new WeakMap();
   const headers = {
     'cache-control': 'no-store',
     'content-type': 'text/plain; charset=utf-8',
@@ -550,12 +549,21 @@ export function observeNativePrompts(scope, lifetime, capture) {
   scope.on(
     'agent/inbox/claimed',
     ({ agent, message, turn }) => {
+      const session = original(agent.session);
+      if (capture?.()) {
+        const previous = inboxClaims.get(session);
+        inboxClaims.set(session, {
+          turn,
+          // More than one actual claim in this turn is ambiguous. DSH's
+          // generated instruction/time notices never enter the inbox.
+          messageId: previous?.turn === turn ? null : message.id,
+        });
+      }
       for (const observer of matches(agent, message)) {
         if (observer.itemId !== message.id || observer.turn !== undefined)
           continue;
         observer.turn = turn;
         if (capture?.()) observer.contentDigest = adoptedTextDigest(message);
-        const session = original(agent.session);
         let active = turns.get(session);
         if (!active) turns.set(session, (active = new Map()));
         let claimed = active.get(turn);
@@ -597,6 +605,9 @@ export function observeNativePrompts(scope, lifetime, capture) {
     'session/event',
     (session, event) => {
       if (event.type !== 'turn/end') return;
+      const native = original(session);
+      if (inboxClaims.get(native)?.turn === event.data.turn)
+        inboxClaims.delete(native);
       for (const observer of turns
         .get(original(session))
         ?.get(event.data.turn) ?? [])
@@ -741,6 +752,12 @@ export function observeNativePrompts(scope, lifetime, capture) {
     )
       return { human: null, proofState: 'no-matching-attempt' };
     const { occurrence } = human;
+    const allClaims = inboxClaims.get(original(session));
+    if (
+      allClaims?.turn !== turn ||
+      allClaims.messageId !== occurrence.messageId
+    )
+      return { human: null, proofState: 'competing-inbox-input' };
     const key = sourceKey(
       occurrence.sessionId,
       undefined,

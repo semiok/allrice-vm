@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { TextDecoder } from 'node:util';
 import {
   nativePromptOccurrence,
@@ -417,10 +417,10 @@ it.each(['unclaimed', 'discarded', 'unrelated'])(
   },
 );
 
-function promptFixture() {
+function promptFixture(capture = false) {
   const events = new EventEmitter();
   const agent = {
-    session: { id: 'root', header: {} },
+    session: { id: 'root', header: {}, seq: 5 },
     inbox: { nextTurn: [], nextStep: [] },
   };
   const lifetime = new globalThis.AbortController();
@@ -431,6 +431,7 @@ function promptFixture() {
       agents: { get: () => agent },
     },
     lifetime.signal,
+    capture ? () => true : undefined,
   );
   const issue = (scopeId = randomUUID(), requestId = randomUUID()) => ({
     id: randomUUID(),
@@ -459,7 +460,19 @@ function promptFixture() {
     });
   const next = async (reader) =>
     new TextDecoder().decode((await reader.read()).value).trim();
-  return { agent, emit, end, issue, message, next, open, outcome, lifetime };
+  return {
+    agent,
+    emit,
+    end,
+    issue,
+    message,
+    next,
+    open,
+    outcome,
+    lifetime,
+    events,
+    observe,
+  };
 }
 
 it('observes a true queue remove and keeps a native edit or steer of the same occurrence', async () => {
@@ -579,16 +592,22 @@ it('keeps the model configuration and rejects competing or non-text input for th
     },
   });
   expect(
-    observe([
-      header,
-      start,
-      user,
+    observe(
+      [
+        header,
+        start,
+        user,
+        {
+          seq: 3,
+          type: 'user/message',
+          data: userPrompt('steer'),
+        },
+      ],
       {
-        seq: 3,
-        type: 'user/message',
-        data: userPrompt('steer'),
+        ...origin,
+        prompts: [occurrence, { ...occurrence, messageId: 'another' }],
       },
-    ]),
+    ),
   ).toEqual({ request: initial.request, human: null });
   expect(
     observe([
@@ -598,10 +617,10 @@ it('keeps the model configuration and rejects competing or non-text input for th
       {
         seq: 3,
         type: 'user/message',
-        data: { source: { kind: 'schedule' } },
+        data: { id: 'clock-notice', source: { kind: 'clock-notice' } },
       },
     ]).human,
-  ).toBeNull();
+  ).toEqual(initial.human);
   expect(
     observe([
       header,
@@ -618,4 +637,51 @@ it('keeps the model configuration and rejects competing or non-text input for th
   expect(
     observe([header, start, user], { ...origin, delegated: true }).human,
   ).toBeNull();
+});
+
+it('binds the real same-ID steer and rejects a second claimed native input', async () => {
+  const f = promptFixture(true);
+  const request = f.issue();
+  const reader = f.open(request);
+  try {
+    const text = 'synthetic original text';
+    const message = {
+      ...f.message(request),
+      content: [{ type: 'text', text }],
+    };
+    f.agent.inbox.nextTurn = [message];
+    f.emit('inserted', message);
+    // The native queue edits send events for this same occurrence into the
+    // next-step inbox before the Agent claims it.
+    f.agent.inbox.nextTurn = [];
+    f.agent.inbox.nextStep = [message];
+    f.emit('inserted', message);
+    f.agent.inbox.nextStep = [];
+    f.emit('claimed', message, 1);
+    f.events.emit('agent/assistant-stream', {
+      agent: f.agent,
+      frame: { type: 'start', attemptId: 'root:1', turn: 1, step: 1 },
+    });
+    const human = {
+      occurrence: nativePromptOccurrence(f.agent.session, message, 1),
+      sequence: 3,
+      digest:
+        'sha256:' +
+        createHash('sha256')
+          .update(JSON.stringify([text]))
+          .digest('hex'),
+    };
+    expect(f.observe.attest(f.agent.session, 'root:1', 4, 1, human)).toEqual({
+      human: { ...human, kind: 'adopted-steering' },
+      proofState: 'adopted',
+    });
+    f.emit('claimed', { id: 'timer', source: { kind: 'schedule' } }, 1);
+    expect(f.observe.attest(f.agent.session, 'root:1', 4, 1, human)).toEqual({
+      human: null,
+      proofState: 'competing-inbox-input',
+    });
+  } finally {
+    f.lifetime.abort();
+    await reader.cancel();
+  }
 });

@@ -139,7 +139,7 @@ it.skipIf(!cli)(
           inputModalities: ['text'],
         },
       },
-      async (request, signal) => {
+      async (request) => {
         if (request.endpoint !== 'session/prompt')
           throw Error('Unexpected native prompt');
         const observation = request.observe(signal, proofs.resolve);

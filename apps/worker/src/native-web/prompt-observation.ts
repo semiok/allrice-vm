@@ -52,6 +52,7 @@ export const NativeRequestObservationSchema = z
       'no-unique-text',
       'no-matching-attempt',
       'no-matching-claim',
+      'competing-inbox-input',
     ]),
   })
   .strict();
