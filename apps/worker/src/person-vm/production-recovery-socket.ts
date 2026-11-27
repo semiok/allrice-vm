@@ -108,19 +108,10 @@ export async function openProductionRecoverySocket(input: {
               expected,
               disconnected.signal,
             );
-            // Once the Host consumes the handoff, this connection no longer
-            // owns completion. A disconnect still retires the same Worker.
-            const depart = () => {
-              response.off('finish', depart);
-              response.off('close', depart);
-              setImmediate(shutdown);
-            };
-            if (response.destroyed) depart();
-            else {
-              response.once('finish', depart);
-              response.once('close', depart);
-            }
+            // The Host already owns the shutdown. Queue it after attempting
+            // the acknowledgement, even if the peer drops the response.
             writeStatus(202);
+            setImmediate(shutdown);
             return;
           }
           const drained = await upgrade.drain(context, disconnected.signal);

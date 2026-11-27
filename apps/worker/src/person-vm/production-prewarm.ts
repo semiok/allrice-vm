@@ -1,12 +1,26 @@
 import type { DEntryIdentity, RequestContext } from '@allrice/contracts';
-import { DataAccessError } from '@allrice/database';
+import {
+  DataAccessError,
+  type withOwnedPersonVmAuthorityTransaction,
+} from '@allrice/database';
 import { PersonVmError, type PersonVmPort } from '@allrice/person-vm';
 import type { createProductionPersonVmAuthority } from './production-authority.js';
+
+export type PrewarmAuthorityTransaction = Parameters<
+  Parameters<typeof withOwnedPersonVmAuthorityTransaction>[3]
+>[0];
+
+type LockedUpgradeTicketCheck = (
+  sql: PrewarmAuthorityTransaction,
+  signal: AbortSignal,
+) => Promise<void>;
 
 export type CurrentSelectionPrewarm = (
   context: RequestContext,
   identity: DEntryIdentity,
-  input: Parameters<PersonVmPort['prewarm']>[1],
+  input: Parameters<PersonVmPort['prewarm']>[1] & {
+    assertLockedUpgradeTicket?: LockedUpgradeTicketCheck;
+  },
   physicalSignal: AbortSignal,
 ) => ReturnType<PersonVmPort['prewarm']>;
 
@@ -34,12 +48,16 @@ export function createProductionCurrentPrewarm(input: {
         physicalSignal,
         () => {
           const dispatch = input.current.dispatchUpgradeStop;
-          const target = request.target;
+          const { assertLockedUpgradeTicket, ...prewarm } = request;
+          const target = prewarm.target;
           return input.vm.prewarm(
             context,
-            request.trigger === 'open' && target && dispatch
+            prewarm.trigger === 'open' &&
+              target &&
+              dispatch &&
+              assertLockedUpgradeTicket
               ? {
-                  ...request,
+                  ...prewarm,
                   target: {
                     ...target,
                     dispatchUpgradeStop: (binding, signal, stop) =>
@@ -48,12 +66,12 @@ export function createProductionCurrentPrewarm(input: {
                         identity,
                         binding,
                         signal,
-                        target.assertAuthority,
+                        assertLockedUpgradeTicket,
                         stop,
                       ),
                   },
                 }
-              : request,
+              : prewarm,
             physicalSignal,
           );
         },

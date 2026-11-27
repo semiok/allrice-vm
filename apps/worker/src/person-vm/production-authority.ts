@@ -202,7 +202,12 @@ export function createProductionPersonVmAuthority(lifetime?: AbortSignal) {
       expected: DEntryIdentity,
       binding: PersonVmBinding,
       signal: AbortSignal,
-      assertTicket: (signal: AbortSignal) => Promise<void>,
+      assertTicket: (
+        sql: Parameters<
+          Parameters<typeof withOwnedPersonVmAuthorityTransaction>[3]
+        >[0],
+        signal: AbortSignal,
+      ) => Promise<void>,
       dispatch: () => Promise<void>,
     ) {
       const operation = operations.getStore();
@@ -251,7 +256,7 @@ export function createProductionPersonVmAuthority(lifetime?: AbortSignal) {
                 and m.active and m.role in ('admin','member')
                 and (m.workspace_id is null or m.workspace_id=${expected.workspaceId})
               order by m.id for share of m nowait`;
-            await assertTicket(locked);
+            await assertTicket(tx, locked);
             guard(operation, locked);
             // The authorization connection orders revocation against dispatch.
             // The native command has its own physical lease and bounded join.
