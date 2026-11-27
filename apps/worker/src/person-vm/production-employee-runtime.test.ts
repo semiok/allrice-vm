@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { PersonVmError, type MicrosandboxPersonVm } from '@allrice/person-vm';
 import { nativeEntryFixture } from '../d-entry/native-entry.fixture.js';
+import { spawnMicrosandboxManagedProbe } from '../../../../packages/person-vm/src/microsandbox-bootstrap.ts';
 import { createProductionEmployeeRuntime } from './production-employee-runtime.js';
 
 it('keeps omission off, with defaults and limits only when the Host enables employee runtime', () => {
@@ -39,8 +40,36 @@ it('only interprets the exact managed read result as an unused HOME tree', async
   )!;
   const check = () =>
     runtime.readUnusedEmployeeHomes(scope, '/synthetic/mount');
-  readAttachedProbe.mockResolvedValueOnce('allrice-employee-homes-unused\n');
+  const command = vi.fn(async ([action]: string[]) => {
+    if (action === 'exec') return 'fixture-home-probe';
+    if (action === 'wait')
+      return JSON.stringify({ code: 0, success: true, timed_out: false });
+    if (action === 'logs')
+      return JSON.stringify({
+        id: 'fixture-home-probe',
+        s: 'stdout',
+        e: null,
+        d: 'allrice-employee-homes-unused\n',
+      });
+    throw new Error(`Unexpected managed probe command: ${action}`);
+  });
+  readAttachedProbe.mockImplementationOnce(async (scope, _mount, spec) => {
+    const job = await spawnMicrosandboxManagedProbe(
+      { scope, name: 'fixture', cleanupTimeoutMs: 1_000, command },
+      spec,
+    );
+    await job.wait(scope.signal);
+    return job.stdout(scope.signal);
+  });
   await expect(check()).resolves.toBe(true);
+  expect(command.mock.calls.map(([args]) => args[0])).toEqual([
+    'exec',
+    'wait',
+    'logs',
+  ]);
+  expect(command.mock.calls[0]![0]).toEqual(
+    expect.arrayContaining(['--workdir', '/bin']),
+  );
   expect(readAttachedProbe).toHaveBeenCalledExactlyOnceWith(
     scope,
     '/synthetic/mount',

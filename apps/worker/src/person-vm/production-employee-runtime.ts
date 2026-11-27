@@ -59,7 +59,8 @@ export function createProductionEmployeeRuntime(
       const output = await native.readAttachedProbe(scope, mount, {
         executable: 'node',
         args: ['--input-type=module', '--eval', program],
-        workdir: '/',
+        // First boot checks the HOME tree before bootstrap creates /work.
+        workdir: '/bin',
       });
       scope.signal.throwIfAborted();
       return output === unused + '\n';
