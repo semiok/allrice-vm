@@ -18,7 +18,6 @@ import {
   AdoptedHumanSourceProjectionSchema,
   CurrentEmployeeBusinessProjectionSchema,
   DefaultPartnerProfile,
-  contextCheckpointChecksum,
   LogicalExecutionBindingProjectionSchema,
   RunMemoryContextV2StateSchema,
   renderMemoryDetailV2,
@@ -30,6 +29,7 @@ import {
 } from '@allrice/contracts';
 import { z } from 'zod';
 import * as client from './core/client.ts';
+import { contextCheckpointChecksum } from './conversation/conversation-checkpoint.ts';
 import {
   createStorageMetadata,
   DataAccessError,
