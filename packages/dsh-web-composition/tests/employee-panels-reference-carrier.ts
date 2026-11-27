@@ -4,7 +4,11 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build, type Loader, type PluginBuild } from 'esbuild';
-import { panelsRev2Head, panelsRev2Sources } from './employee-panels-baseline';
+import {
+  panelsRev2Head,
+  panelsRev2Manifest,
+  panelsRev2Sources,
+} from './employee-panels-baseline';
 import { createLegacySidebarSnapshot } from './legacy-sidebar-baseline';
 import {
   derivePinnedReferenceStyle,
