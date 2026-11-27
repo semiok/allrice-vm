@@ -524,7 +524,16 @@ export function EmployeeNativePage({
             location.origin,
           );
         })
-        .catch(() => finish('failed'));
+        .catch((error: unknown) => {
+          if (switching !== target) return;
+          cancelSwitch(target);
+          if (error instanceof EmployeeEntryError) {
+            if (error.status === 401) return finish('sign-in');
+            if ([403, 404].includes(error.status))
+              return finish('selection-unavailable');
+          }
+          finish('failed');
+        });
     }
     const receive = (event: MessageEvent) => {
       if (

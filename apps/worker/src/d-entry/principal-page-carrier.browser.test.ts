@@ -26,6 +26,7 @@ import {
   buildProfileFixture,
   closes,
   sessionToken,
+  otherToken,
 } from './principal-page-carrier.fixture.js';
 
 const browserExecutable =
@@ -878,6 +879,27 @@ it
         console.info(
           'NATIVE_CROSS_EMPLOYEE newDocument=1 newSocket=1 oldScope=404',
         );
+        await page.goto(
+          f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
+        );
+        await editor.waitFor();
+        const originalLoginScope = await workbench
+          .locator('#app')
+          .getAttribute('data-scope-id');
+        await context.addCookies([
+          { name: 'allrice_session', value: otherToken, url: f.origin },
+        ]);
+        await workbench
+          .locator('[data-row-key="session:' + otherThread + '"]')
+          .press('Enter');
+        await page
+          .getByRole('heading', { name: '暂时打不开这条对话' })
+          .waitFor();
+        await expect.poll(() => page.locator('iframe').count()).toBe(0);
+        expect(f.pageSignals.get(originalLoginScope!)?.aborted).toBe(true);
+        await context.addCookies([
+          { name: 'allrice_session', value: sessionToken, url: f.origin },
+        ]);
         await page.goto(
           f.origin + '/chatflow/4.0?' + new URLSearchParams(f.selection),
         );

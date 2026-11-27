@@ -1,3 +1,4 @@
+import { EmployeeEntryError } from './entry-client';
 import {
   DEntryPageClosedSchema,
   DEntryPageOpenedSchema,
@@ -273,15 +274,23 @@ export function openNativePageCarrier(
       })
         .then((response) => {
           if (response.status !== 204)
-            throw Error('Page switch is not authorized');
-          if (switching?.id === requestId && !requested)
+            throw new EmployeeEntryError(response.status);
+          if (switching?.id !== requestId || requested) return;
+          try {
             send({
               type: 'item',
               value: { type: 'switch', requestId, threadId },
             });
+          } catch (error) {
+            failure = fail(error);
+          }
         })
         .catch((error: unknown) => {
-          if (switching?.id === requestId && !requested) failure = fail(error);
+          if (switching?.id !== requestId || requested) return;
+          switching = undefined;
+          // A check over HTTP does not report the health of the old socket.
+          // The caller uses its existing explicit close-and-join protocol.
+          result.reject(error);
         });
       return result.promise;
     },

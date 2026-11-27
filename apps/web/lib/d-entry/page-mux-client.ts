@@ -1,3 +1,4 @@
+import { parseRemoteStreamClientMessage } from '@deepseek-ai/dsh-api-gateway/stream-protocol';
 import { pageMuxAttach } from './page-messages';
 
 export type NativePageSocket = Pick<
@@ -11,7 +12,7 @@ export type NativePageSocket = Pick<
 export function borrowPageMux(
   scopeId: string,
   resourceScopeId = scopeId,
-  canSend: () => boolean = () => true,
+  canSendInput: () => boolean = () => true,
 ): NativePageSocket {
   const { port1, port2 } = new MessageChannel();
   const events = new EventTarget();
@@ -44,9 +45,7 @@ export function borrowPageMux(
   );
   return {
     get readyState() {
-      return readyState === WebSocket.OPEN && !canSend()
-        ? WebSocket.CLOSING
-        : readyState;
+      return readyState;
     },
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),
@@ -54,7 +53,8 @@ export function borrowPageMux(
       if (
         typeof data !== 'string' ||
         readyState !== WebSocket.OPEN ||
-        !canSend()
+        (!canSendInput() &&
+          parseRemoteStreamClientMessage(data).type === 'item')
       )
         throw new DOMException(
           'Native resource mux is unavailable',

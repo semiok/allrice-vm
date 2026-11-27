@@ -242,7 +242,7 @@ export function nativeProfileDocument(
   };
   const pending = new Set<Promise<unknown>>();
   const threadWrites = new Set<Promise<Response>>();
-  let switching: string | undefined;
+  let switching: { requestId: string; drainsComplete?: boolean } | undefined;
   const preloaded = new Map<string, Promise<ArrayBuffer>>();
   const channels = new Map<NativePageSocket, Promise<void>>();
   const done = pendingPageResult<void>();
@@ -294,11 +294,13 @@ export function nativeProfileDocument(
       UuidSchema.safeParse(event.data.requestId).success
     ) {
       const { requestId } = event.data;
-      switching = requestId;
+      const handoff = { requestId, drainsComplete: false };
+      switching = handoff;
       // A native write stays owned through consumption of its registration
       // header and response body, not just until the guest first replies.
       void Promise.allSettled(threadWrites).then(() => {
-        if (switching !== requestId || lifetime.signal.aborted) return;
+        if (switching !== handoff || lifetime.signal.aborted) return;
+        handoff.drainsComplete = true;
         parent.postMessage(
           { type: pageThreadSwitchPrepared, scopeId, requestId },
           location.origin,
@@ -307,7 +309,7 @@ export function nativeProfileDocument(
     }
     if (
       event.data.type === pageThreadSwitchCancel &&
-      switching === event.data.requestId
+      switching?.requestId === event.data.requestId
     )
       switching = undefined;
     if (
@@ -321,7 +323,7 @@ export function nativeProfileDocument(
         !result.success ||
         result.data.type !== 'switched' ||
         result.data.scopeId === authority.scopeId ||
-        result.data.requestId !== switching
+        result.data.requestId !== switching?.requestId
       )
         return;
       const next = result.data;
@@ -509,7 +511,11 @@ export function nativeProfileDocument(
         const socket =
           container.dataset.sharedMux === '1' &&
           window.frameElement?.getAttribute('data-page-mux') === 'v1'
-            ? borrowPageMux(scopeId, authority.scopeId, () => !switching)
+            ? borrowPageMux(
+                scopeId,
+                authority.scopeId,
+                () => !switching?.drainsComplete,
+              )
             : new WebSocket(
                 nativeMuxUrl(
                   location.origin,
