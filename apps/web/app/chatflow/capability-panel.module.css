@@ -195,21 +195,6 @@
 .cardBody ol {
   padding-inline-start: 20px;
 }
-.connections {
-  margin: 12px 0;
-  padding: 0;
-  list-style: none;
-}
-.connections li {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 6px 0;
-}
-.connections li > :last-child {
-  flex: none;
-  color: var(--dsw-alias-label-secondary);
-}
 @media (pointer: coarse) {
   .groupTitle,
   .cardTitle,

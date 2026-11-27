@@ -714,24 +714,6 @@ header.conversationHeader::after {
   right: 16px;
 }
 
-.attachmentPreviewDialog {
-  width: min(920px, calc(100vw - 32px));
-}
-
-.attachmentPreviewBody {
-  display: grid;
-  min-height: 0;
-  place-items: center;
-  background: var(--dsw-alias-bg-base);
-}
-
-.attachmentPreviewBody img {
-  display: block;
-  max-width: 100%;
-  max-height: min(76vh, 920px);
-  object-fit: contain;
-}
-
 @media (pointer: coarse) {
   .pendingFileRemove {
     opacity: 1;
