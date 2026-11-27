@@ -47,7 +47,15 @@ export function createLegacySidebarSnapshot(
       // esbuild resolves against the checkout before onLoad. A source
       // deleted from the live tree is still present in the historical replay.
       plugin.onResolve({ filter: /^\.\.?\// }, (args) => {
-        const path = resolve(args.resolveDir, args.path);
+        const importer = relative(repoRoot, args.importer).replaceAll(
+          '\\',
+          '/',
+        );
+        const fromRetiredInput = onlyPinnedPaths && pinnedPaths.has(importer);
+        const path = resolve(
+          fromRetiredInput ? dirname(args.importer) : args.resolveDir,
+          args.path,
+        );
         const candidates = [
           path,
           ...['.tsx', '.ts', '.jsx', '.js', '.css', '.json'].map(
@@ -60,11 +68,7 @@ export function createLegacySidebarSnapshot(
         // Preserve esbuild's normal metadata and import resolution whenever
         // the file is still present.
         if (pinned && !existsSync(pinned)) return { path: pinned };
-        const importer = relative(repoRoot, args.importer).replaceAll(
-          '\\',
-          '/',
-        );
-        if (onlyPinnedPaths && pinnedPaths.has(importer))
+        if (fromRetiredInput)
           return plugin.resolve(path, {
             kind: args.kind,
             resolveDir: repoRoot,
@@ -76,7 +80,9 @@ export function createLegacySidebarSnapshot(
         if (onlyPinnedPaths && !pinnedPaths.has(key)) return;
         return {
           contents: readBase(key),
-          resolveDir: dirname(path),
+          resolveDir: onlyPinnedPaths
+            ? resolve(repoRoot, 'apps/web')
+            : dirname(path),
           loader: path.endsWith('.module.css')
             ? 'local-css'
             : (extname(path)

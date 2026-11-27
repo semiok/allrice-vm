@@ -438,7 +438,6 @@ suite('MET-224 main-area brand media text workflow', () => {
       `,
       },
       bundle: true,
-      nodePaths: [resolve('apps/web/node_modules')],
       format: 'esm',
       platform: 'browser',
       write: false,
