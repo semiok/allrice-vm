@@ -57,6 +57,11 @@ import {
   EmployeePanelsWriteRejectedError,
 } from '../chatflow/employee-panel-data-http';
 import { ReferenceSelectionUnavailableError } from '../chatflow/reference-selection';
+import { GET as manageMemory } from '../../app/api/v1/memories/manage/route';
+import { GET as readMemory } from '../../app/api/v1/memories/[id]/route';
+import { GET as readMemorySource } from '../../app/api/v1/memories/[id]/source/route';
+import { POST as confirmMemory } from '../../app/api/v1/memories/[id]/promote/route';
+import { seedPersonalMemoryPair } from '../../../../packages/database/src/workspace/employee-memory-pair.fixture.ts';
 
 // Next's request-local Cookie carrier is replaced, not authentication. The
 // real production session adapter, opaque token and current DB readers run.
@@ -194,6 +199,26 @@ suite(
                 'content-type': 'text/html; charset=utf-8',
               });
               outgoing.end(fixtureDocument);
+              return;
+            }
+            if (url.pathname.startsWith('/api/v1/memories/')) {
+              const [, , , , id, operation] = url.pathname.split('/');
+              const target = { params: Promise.resolve({ id: id! }) };
+              const response =
+                request.method === 'GET' && id === 'manage'
+                  ? await manageMemory(request)
+                  : request.method === 'GET' && operation === 'source'
+                    ? await readMemorySource(request, target)
+                    : request.method === 'GET' && !operation
+                      ? await readMemory(request, target)
+                      : request.method === 'POST' && operation === 'promote'
+                        ? await confirmMemory(request, target)
+                        : new Response(null, { status: 405 });
+              outgoing.writeHead(
+                response.status,
+                Object.fromEntries(response.headers),
+              );
+              outgoing.end(Buffer.from(await response.arrayBuffer()));
               return;
             }
             const pieces = url.pathname.split('/').slice(5);
@@ -676,7 +701,79 @@ suite(
               }),
             });
           });
+          const memory = await seedPersonalMemoryPair(f.db, p.context, {
+            workspaceId: p.selection.workspaceId,
+            instanceId: p.selection.employeeInstanceId,
+            summary: '发布前先复核摘要',
+            details: '这是仅本人可见的记忆正文',
+          });
+          let sourceReads = 0;
+          page.on('request', (request) => {
+            if (
+              new URL(request.url()).pathname ===
+              `/api/v1/memories/${memory.id}/source`
+            )
+              sourceReads++;
+          });
           await page.goto(base + '/fixture/panels');
+          const draft = page.getByRole('textbox', { name: '对话草稿' });
+          await draft.fill('未发送的原对话草稿');
+          const openMemory = page.getByRole('button', {
+            name: '记忆',
+            exact: true,
+          });
+          await openMemory.click();
+          const memoryPane = page.getByRole('region', { name: '个人记忆' });
+          const pending = memoryPane.getByRole('region', { name: '待确认' });
+          await pending.getByRole('button', { name: memory.summary }).click();
+          const memoryDialog = page.getByRole('dialog');
+          await memoryDialog
+            .getByText(memory.details!, { exact: true })
+            .waitFor();
+          expect(sourceReads).toBe(0);
+          const actualSource = page.waitForResponse(
+            (r) =>
+              new URL(r.url()).pathname ===
+              `/api/v1/memories/${memory.id}/source`,
+          );
+          await memoryDialog
+            .getByRole('button', { name: '来源', exact: true })
+            .click();
+          const sourceReceipt = await actualSource;
+          expect(sourceReceipt.status()).toBe(200);
+          expect(await sourceReceipt.json()).toEqual({
+            sourceType: 'user',
+            sourceLabel: expect.any(String),
+            capturedAt: memory.capturedAt,
+          });
+          await memoryDialog
+            .getByRole('region', { name: '记忆来源' })
+            .locator('time')
+            .waitFor();
+          expect(sourceReads).toBe(1);
+          await memoryDialog
+            .getByRole('button', { name: '确认', exact: true })
+            .click();
+          await memoryPane
+            .getByRole('region', { name: '生效中' })
+            .getByText(memory.summary, { exact: true })
+            .waitFor();
+          await page
+            .getByRole('button', { name: '关闭记忆', exact: true })
+            .click();
+          await memoryPane.waitFor({ state: 'detached' });
+          expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+          await openMemory.click();
+          await memoryPane
+            .getByRole('region', { name: '生效中' })
+            .getByText(memory.summary, { exact: true })
+            .waitFor();
+          // The native owner returns to the same selected document and form.
+          expect(await draft.inputValue()).toBe('未发送的原对话草稿');
+          await page
+            .getByRole('button', { name: '交付成果', exact: true })
+            .click();
+
           const files = page.getByRole('region', { name: '交付成果' });
           await files
             .getByRole('alert')

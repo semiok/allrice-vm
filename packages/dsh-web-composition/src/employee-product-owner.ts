@@ -9,6 +9,7 @@ import { unreadKeys } from '../../../apps/web/app/chatflow/workbench-modules';
 import { createEmployeePanelsHttpClient } from '../../../apps/web/lib/chatflow/employee-panel-data-http';
 import { pageNavigate } from '../../../apps/web/lib/d-entry/page-messages';
 import { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
+import { personalEmployeeMemorySourceReader } from '../../../apps/web/lib/memory/employee-memory-client';
 import {
   bindEmployeeSidebar,
   type EmployeeSidebarSnapshot,
@@ -289,6 +290,17 @@ export function installEmployeeProductOwner(ctx: Context) {
                 },
               },
             });
+          },
+        },
+        experience: {
+          management: {
+            scopeId: ownerKey,
+            workspaceId: selection.workspaceId,
+            instanceId: selection.employeeInstanceId,
+            employeeName: employee.currentVersion.manifest.name,
+            headers: requestHeaders,
+            writes: new Map(),
+            readSource: personalEmployeeMemorySourceReader(requestHeaders),
           },
         },
       };

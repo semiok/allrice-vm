@@ -112,6 +112,55 @@ it('treats an archived employee as lost access without treating other 409 errors
   });
 });
 
+describe('native memory tab lifetime', () => {
+  it('sends no write or operation key if the tab closes before dispatch', async () => {
+    const lifetime = new AbortController();
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    const writes: MemoryWriteStore = new Map();
+    const client = employeeMemoryClient(target, writes, {
+      lifetimeSignal: lifetime.signal,
+    });
+    const attempt = client.save(pair, null);
+    const closed = Error('native tab closed');
+    lifetime.abort(closed);
+    await expect(attempt).rejects.toBe(closed);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(writes.size).toBe(0);
+  });
+
+  it('joins the original write receipt while canceling reads on a retired tab', async () => {
+    const lifetime = new AbortController();
+    let sent!: () => void;
+    const dispatch = new Promise<void>((done) => {
+      sent = done;
+    });
+    let reply!: (response: Response) => void;
+    const pending = new Promise<Response>((done) => {
+      reply = done;
+    });
+    const fetcher = vi.fn(async () => {
+      sent();
+      return pending;
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const writes: MemoryWriteStore = new Map();
+    const client = employeeMemoryClient(target, writes, {
+      lifetimeSignal: lifetime.signal,
+    });
+    const attempt = client.save(pair, null);
+    await dispatch;
+    const closed = Error('native tab closed');
+    lifetime.abort(closed);
+    await expect(client.detail(record)).rejects.toBe(closed);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(writes.size).toBe(1);
+    reply(ack({ ...record, state: 'active', revision: 1 }, 201));
+    await expect(attempt).resolves.toMatchObject({ memory: { id: record.id } });
+    expect(writes.size).toBe(0);
+  });
+});
+
 describe('employee memory v2 consumer operation identity', () => {
   it('keeps a lost creation key through GET and later denial while allowing an explicitly different addition', async () => {
     const writes: MemoryWriteStore = new Map();

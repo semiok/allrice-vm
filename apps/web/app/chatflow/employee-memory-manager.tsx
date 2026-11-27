@@ -20,6 +20,8 @@ type Props = {
   headers: Record<string, string>;
   employeeName?: string;
   refreshKey?: string;
+  lifetimeSignal?: AbortSignal;
+  assertCurrent?: () => void;
   active?: boolean;
   writes?: MemoryWriteStore;
   readSource?: EmployeeMemorySourceReader;
@@ -54,6 +56,8 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
     () =>
       employeeMemoryClient(props, props.writes, {
         readSource: props.readSource,
+        lifetimeSignal: props.lifetimeSignal,
+        assertCurrent: props.assertCurrent,
       }),
     [
       props.scopeId,
@@ -62,6 +66,8 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       props.headers,
       props.writes,
       props.readSource,
+      props.lifetimeSignal,
+      props.assertCurrent,
     ],
   );
   useEffect(() => {
@@ -71,6 +77,15 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       generation.current += 1;
     };
   }, []);
+  const available = useCallback(() => {
+    if (!alive.current || props.lifetimeSignal?.aborted) return false;
+    try {
+      props.assertCurrent?.();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [props.assertCurrent, props.lifetimeSignal]);
   const clearPrivate = useCallback(() => {
     generation.current += 1;
     setPage(null);
@@ -83,22 +98,19 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       try {
         return await client.source(row, signal);
       } catch (cause) {
-        if (
-          alive.current &&
-          !signal.aborted &&
-          cause instanceof MemoryAccessLost
-        )
+        if (available() && !signal.aborted && cause instanceof MemoryAccessLost)
           clearPrivate();
         throw cause;
       }
     },
-    [client, clearPrivate],
+    [client, clearPrivate, available],
   );
   const load = useCallback(
     async (signal?: AbortSignal) => {
+      if (!available() || signal?.aborted) return;
       const started = ++generation.current;
       const current = () =>
-        alive.current && !signal?.aborted && generation.current === started;
+        available() && !signal?.aborted && generation.current === started;
       setLoading(true);
       setError('');
       try {
@@ -113,7 +125,7 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
         if (current()) setLoading(false);
       }
     },
-    [client, clearPrivate],
+    [client, clearPrivate, available],
   );
   useEffect(() => {
     const controller = new AbortController();
@@ -134,9 +146,9 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       await operation;
     } catch (cause) {
       // Only a verified 201/200/204 receipt resolves.
-      if (alive.current && cause instanceof MemoryAccessLost) clearPrivate();
+      if (available() && cause instanceof MemoryAccessLost) clearPrivate();
       else if (
-        alive.current &&
+        available() &&
         cause instanceof MemoryClientError &&
         ['memory_limit_reached', 'cas_conflict', 'contract_changed'].includes(
           cause.reason ?? '',
@@ -145,7 +157,7 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
         await load();
       throw cause;
     }
-    if (!alive.current) return;
+    if (!available()) return;
     window.dispatchEvent(
       new CustomEvent('allrice:memory-changed', {
         detail: {
@@ -157,7 +169,7 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
       }),
     );
     // A failed read after acknowledged success is a read error, never a new write.
-    if (alive.current) await load();
+    if (available()) await load();
   }
   return (
     <div
@@ -179,7 +191,7 @@ function Manager(props: Props & { writes: MemoryWriteStore }) {
             return await client.detail(row, signal);
           } catch (cause) {
             if (
-              alive.current &&
+              available() &&
               !signal.aborted &&
               cause instanceof MemoryAccessLost
             )

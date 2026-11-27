@@ -172,7 +172,11 @@ async function digest(value: unknown) {
 export function employeeMemoryClient(
   target: MemoryTarget,
   writes: MemoryWriteStore,
-  options: { readSource?: EmployeeMemorySourceReader } = {},
+  options: {
+    readSource?: EmployeeMemorySourceReader;
+    lifetimeSignal?: AbortSignal;
+    assertCurrent?: () => void;
+  } = {},
 ) {
   const headers = { ...target.headers };
   const sourceTarget = {
@@ -180,6 +184,15 @@ export function employeeMemoryClient(
     instanceId: target.instanceId,
   };
   const sourceReader = options.readSource;
+  const { lifetimeSignal, assertCurrent } = options;
+  const combineSignal = (signal?: AbortSignal) =>
+    signal && lifetimeSignal
+      ? AbortSignal.any([signal, lifetimeSignal])
+      : (signal ?? lifetimeSignal);
+  const check = (signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    assertCurrent?.();
+  };
   const query = () =>
     new URLSearchParams({
       workspaceId: target.workspaceId,
@@ -187,15 +200,19 @@ export function employeeMemoryClient(
     });
   const path = (id: string) => `/api/v1/memories/${encodeURIComponent(id)}`;
   async function read(url: string, signal?: AbortSignal) {
+    const active = combineSignal(signal);
+    check(active);
     const response = await fetch(url, {
       headers,
       cache: 'no-store',
-      signal,
+      signal: active,
     });
+    check(active);
     if (response.status === 409) {
       const problem = ApiErrorSchema.safeParse(
         await response.json().catch(() => null),
       );
+      check(active);
       if (
         problem.success &&
         problem.data.error.code === 'EMPLOYEE_INSTANCE_ARCHIVED'
@@ -204,7 +221,9 @@ export function employeeMemoryClient(
     }
     if ([401, 403, 404].includes(response.status)) throw new MemoryAccessLost();
     if (response.status !== 200) throw new Error(memoryReadFailed);
-    return response.json();
+    const value: unknown = await response.json();
+    check(active);
+    return value;
   }
   async function detail(row: Pick<MemoryRow, 'id'>, signal?: AbortSignal) {
     const value = EmployeeMemoryDetailResponseSchema.parse(
@@ -218,6 +237,7 @@ export function employeeMemoryClient(
     row: MemoryRow | null,
     pair?: MemoryPair,
   ) {
+    check(lifetimeSignal);
     // The complete request signature identifies an intent, excluding CAS. If an
     // uncertain operation is explicitly retried after a refresh, both its key
     // AND original CAS survive. Explicitly changed content is a different
@@ -229,6 +249,9 @@ export function employeeMemoryClient(
       Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)),
     ]);
     const fingerprint = await digest(pair ?? { pairDigest: row?.pairDigest });
+    // A tab can lose its scope during hashing. Join any write already sent,
+    // while refusing to send one from a retired tab.
+    check(lifetimeSignal);
     const slot = `${scope}/${action}/${row?.id ?? 'new'}/${fingerprint}`;
     let identity = writes.get(slot);
     if (!identity) {
@@ -350,14 +373,17 @@ export function employeeMemoryClient(
     },
     detail,
     async source(row: Pick<MemoryRow, 'id'>, signal: AbortSignal) {
-      signal.throwIfAborted();
+      const active = lifetimeSignal
+        ? AbortSignal.any([signal, lifetimeSignal])
+        : signal;
+      check(active);
       if (!sourceReader) throw Error(memorySourceReadFailed);
       const input = MemoryDetailQueryProjectionSchema.parse({
         ...sourceTarget,
         memoryId: row.id,
       });
-      const value = await sourceReader(input, signal);
-      signal.throwIfAborted();
+      const value = await sourceReader(input, active);
+      check(active);
       return MemorySourceViewProjectionSchema.parse(value);
     },
     save: (pair: MemoryPair, row: MemoryRow | null) =>

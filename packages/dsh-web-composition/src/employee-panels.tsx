@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
 import { EnterpriseMaterialsPanel } from '../../../apps/web/app/chatflow/enterprise-materials-panel';
 import { WorkbenchFilesPanel } from '../../../apps/web/app/chatflow/workbench-files-panel';
 import { EmployeeMemorySidebar } from '../../../apps/web/app/chatflow/employee-memory-sidebar';
+import { EmployeeMemoryManager } from '../../../apps/web/app/chatflow/employee-memory-manager';
 import { EmployeeCapabilitiesPanel } from '../../../apps/web/app/chatflow/employee-capabilities-panel';
 import {
   WorkbenchEntries,
@@ -297,6 +298,15 @@ function employeePanelView(
     }
     case 'experience':
       if (!snapshot.experience) return null;
+      if ('management' in snapshot.experience)
+        return (
+          <EmployeeMemoryManager
+            {...snapshot.experience.management}
+            active
+            lifetimeSignal={signal}
+            assertCurrent={current}
+          />
+        );
       return (
         <EmployeeMemorySidebar
           {...guardEmployeePanelProps(snapshot.experience, current)}
