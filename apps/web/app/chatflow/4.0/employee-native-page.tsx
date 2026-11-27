@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives';
 import {
-  DEntryIdentityResultSchema,
   DEntrySelectionInputSchema,
   type DEntryNativePrewarmTicket,
   type DEntrySelectionInput,
@@ -27,6 +26,7 @@ import {
   employeeEntryQuery,
   prepareEmployeeEntry,
   prewarmEmployeeEntry,
+  readEmployeeEntryIdentity,
   type EmployeePrewarmProgress,
 } from '../../../lib/d-entry/entry-client';
 import styles from './employee-native-page.module.css';
@@ -477,6 +477,12 @@ export function EmployeeNativePage({
     const showPrewarm = (state: EmployeePrewarmProgress) => {
       if (!lifetime.signal.aborted && !navigating) setStatus(state);
     };
+    let hotIdentity:
+      | {
+          read: ReturnType<typeof readEmployeeEntryIdentity>;
+          cancel: AbortController;
+        }
+      | undefined;
     const prewarming = prepare
       ? parsedEntry.then(async ({ selection }) => {
           await waitForVisibleEntry(lifetime.signal);
@@ -486,14 +492,29 @@ export function EmployeeNativePage({
             progress.show = showPrewarm;
             if (progress.current) showPrewarm(progress.current);
             await result;
-          } else
-            await prewarmEmployeeEntry(selection, lifetime.signal, {
+          } else {
+            const warming = prewarmEmployeeEntry(selection, lifetime.signal, {
               ticket,
               accepted: (accepted) => {
+                // A cold start or resumed ticket needs a fresh identity
+                // after ready. Its first read may have preceded a long wait.
+                hotIdentity?.cancel.abort();
+                hotIdentity = undefined;
                 ticket = accepted;
               },
               progress: showPrewarm,
             });
+            if (selection.threadId && !ticket) {
+              const cancel = new AbortController();
+              const read = readEmployeeEntryIdentity(
+                selection,
+                AbortSignal.any([lifetime.signal, cancel.signal]),
+              );
+              void read.catch(() => {}); // setup reports it after hot ready.
+              hotIdentity = { read, cancel };
+            }
+            await warming;
+          }
         })
       : undefined;
     void prewarming?.catch(() => {}); // setup reports the same rejection.
@@ -518,22 +539,9 @@ export function EmployeeNativePage({
         params.set('threadId', selection.threadId);
         selectedQuery = params.toString();
       }
-      const response = await fetch('/api/v1/d-entry/identity?' + params, {
-        signal: lifetime.signal,
-        cache: 'no-store',
-        credentials: 'same-origin',
-      });
-      if (!response.ok) throw new EmployeeEntryError(response.status);
-      const { identity } = DEntryIdentityResultSchema.parse(
-        await response.json(),
-      );
+      const identity = await (hotIdentity?.read ??
+        readEmployeeEntryIdentity(selection, lifetime.signal));
       lifetime.signal.throwIfAborted();
-      if (
-        identity.workspaceId !== selection.workspaceId ||
-        identity.employeeInstanceId !== selection.employeeInstanceId ||
-        identity.threadId !== (selection.threadId ?? null)
-      )
-        throw Error('Employee selection changed');
       carrier = openNativePageCarrier(identity, selection, () => {
         remoteRevoked = true;
         send(pageRevoked);

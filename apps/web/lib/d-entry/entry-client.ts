@@ -1,4 +1,5 @@
 import {
+  DEntryIdentityResultSchema,
   DEntryNativePrewarmStatusSchema,
   DEntryNativePrewarmTicketSchema,
   type DEntryNativePrewarmTicket,
@@ -30,6 +31,27 @@ export function employeeEntryQuery(query: string, prepare: boolean) {
   )
     throw new EmployeeEntryError(400);
   return { params, selection: selection.data, operationId: operation.data };
+}
+
+export async function readEmployeeEntryIdentity(
+  selection: DEntrySelectionInput,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const response = await fetch(
+    '/api/v1/d-entry/identity?' + new URLSearchParams(selection),
+    { signal, cache: 'no-store', credentials: 'same-origin' },
+  );
+  if (!response.ok) throw new EmployeeEntryError(response.status);
+  const { identity } = DEntryIdentityResultSchema.parse(await response.json());
+  signal.throwIfAborted();
+  if (
+    identity.workspaceId !== selection.workspaceId ||
+    identity.employeeInstanceId !== selection.employeeInstanceId ||
+    identity.threadId !== (selection.threadId ?? null)
+  )
+    throw Error('Employee selection changed');
+  return identity;
 }
 
 function postEmployeeEntry(path: string, data: object, signal: AbortSignal) {

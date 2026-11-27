@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Browser } from '../../../../worker/node_modules/playwright-core/index.js';
@@ -50,6 +51,10 @@ suite('4.0 browser entry with a running employee', () => {
         });
       const requests: { phase: string; start: number; end?: number }[] = [];
       let birthRequests = 0;
+      let cold = false;
+      let coldIdentities = 0;
+      let readyPolls = 0;
+      const ticket = randomUUID();
       f.web.on('request', async (request, response) => {
         const address = new URL(request.url!, f.origin);
         const html = (body: string) =>
@@ -70,8 +75,24 @@ suite('4.0 browser entry with a running employee', () => {
             request.resume();
             await delay(300);
             timing.end = performance.now();
+            if (cold)
+              return response
+                .writeHead(202, { 'content-type': 'application/json' })
+                .end(
+                  JSON.stringify({
+                    operationId: ticket,
+                    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+                    pollAfterMs: 1000,
+                  }),
+                );
             return response.writeHead(204).end();
           }
+          case '/api/v1/d-entry/native-prewarm/status':
+            readyPolls++;
+            expect(address.searchParams.get('operationId')).toBe(ticket);
+            return response
+              .writeHead(200, { 'content-type': 'application/json' })
+              .end(JSON.stringify({ state: 'ready' }));
           case '/api/v1/d-entry/identity': {
             const timing = {
               phase: 'identity',
@@ -79,8 +100,10 @@ suite('4.0 browser entry with a running employee', () => {
               end: 0,
             };
             requests.push(timing);
+            const reject = cold && ++coldIdentities === 2;
             await delay(240);
             timing.end = performance.now();
+            if (reject) return response.writeHead(403).end();
             return response
               .writeHead(200, { 'content-type': 'application/json' })
               .end(
@@ -168,6 +191,7 @@ suite('4.0 browser entry with a running employee', () => {
             expect(document.start).toBeGreaterThanOrEqual(
               Math.max(prewarm.end!, identity.end!),
             );
+            expect(identity.start).toBeLessThan(prewarm.end!);
             samples.push({
               attempt: attempt + 1,
               mode,
@@ -193,6 +217,23 @@ suite('4.0 browser entry with a running employee', () => {
             samples,
           }),
       );
+      cold = true;
+      const offset = requests.length;
+      const denied = await context.newPage();
+      const deniedSockets: string[] = [];
+      denied.on('websocket', (socket) => deniedSockets.push(socket.url()));
+      await denied.goto(url);
+      await denied.getByRole('alert').waitFor();
+      expect(coldIdentities).toBe(2);
+      expect(readyPolls).toBe(1);
+      expect(
+        requests
+          .slice(offset)
+          .map(({ phase }) => phase)
+          .sort(),
+      ).toEqual(['identity', 'identity', 'prewarm']);
+      expect(await denied.locator('iframe').count()).toBe(0);
+      expect(deniedSockets).toEqual([]);
       await context.close();
     },
   );

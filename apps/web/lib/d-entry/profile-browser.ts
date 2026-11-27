@@ -88,6 +88,7 @@ export async function readProfileBundle(
   target: URL,
   signal: AbortSignal,
   publicUrl?: string,
+  preloaded?: Promise<ArrayBuffer>,
 ) {
   const read = () =>
     fetchProfileBundle(target, signal, {
@@ -95,9 +96,13 @@ export async function readProfileBundle(
       cache: 'no-store',
     });
   try {
-    return await (publicUrl
-      ? fetchProfileBundle(publicUrl, signal, { credentials: 'omit' })
+    signal.throwIfAborted();
+    const bytes = await (publicUrl
+      ? (preloaded ??
+        fetchProfileBundle(publicUrl, signal, { credentials: 'omit' }))
       : read());
+    signal.throwIfAborted();
+    return bytes;
   } catch (error) {
     signal.throwIfAborted();
     if (!publicUrl && !(error instanceof EmployeeProfileBundleTimeout))
@@ -143,6 +148,7 @@ export function nativeProfileDocument(
   const releasedBundle = releasedBundleResolver(container.dataset);
   const lifetime = new AbortController();
   const pending = new Set<Promise<unknown>>();
+  const preloaded = new Map<string, Promise<ArrayBuffer>>();
   const channels = new Map<NativePageSocket, Promise<void>>();
   const done = pendingPageResult<void>();
   const owned = <T>(task: Promise<T>) => {
@@ -186,6 +192,7 @@ export function nativeProfileDocument(
   function stop() {
     if (closing) return closing;
     lifetime.abort();
+    preloaded.clear();
     parent.postMessage({ type: pageClosing, scopeId }, location.origin);
     closing = (async () => {
       const [remote] = await Promise.allSettled([done.promise]);
@@ -227,6 +234,22 @@ export function nativeProfileDocument(
       )
         throw Error('Employee profile changed during startup');
       published = result;
+      // The rc.2 injection interpreter leaves preload rows as hints. Fetch
+      // only the co-sealed public bytes and let the native loader execute them.
+      for (const injection of result.injections) {
+        if (injection.kind !== 'script-preload') continue;
+        const batch = result.graph.batches.find(
+          ({ phase, url }) => phase === 'application' && url === injection.src,
+        );
+        const publicUrl = batch && releasedBundle(batch);
+        if (publicUrl && !preloaded.has(injection.src))
+          preloaded.set(
+            injection.src,
+            owned(
+              fetchProfileBundle(publicUrl, active, { credentials: 'omit' }),
+            ),
+          );
+      }
       return result.injections;
     },
     transport: {
@@ -326,10 +349,13 @@ export function nativeProfileDocument(
             target.searchParams.set('bindingRef', bindingRef);
             target.searchParams.set('reference', resource.url);
             target.searchParams.set('revision', resource.rev);
+            const prefetched = preloaded.get(resource.url);
+            preloaded.delete(resource.url);
             const bytes = await readProfileBundle(
               target,
               signal,
               releasedBundle(resource),
+              prefetched,
             ).catch((error: unknown) => {
               if (
                 error instanceof EmployeeProfileBundleTimeout &&

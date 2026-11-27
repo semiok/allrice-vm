@@ -343,6 +343,15 @@ it.skipIf(!browserExecutable).each([false, true])(
     expect(await editor.isEditable()).toBe(true);
     expect(browserBootstrapReads).toBe(0);
     expect(socketCount).toBe(1);
+    const bootstrapDownload = traffic.find(
+      ({ kind }) => kind === 'public-bootstrap',
+    );
+    const applicationDownload = traffic.find(
+      ({ kind }) => kind === 'public-application',
+    );
+    expect(applicationDownload?.start).toBeLessThan(
+      bootstrapDownload?.end ?? 0,
+    );
     console.info(
       'HOT_NATIVE_BENCHMARK ' +
         JSON.stringify({
