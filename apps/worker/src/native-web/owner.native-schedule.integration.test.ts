@@ -45,7 +45,6 @@ it.skipIf(!cli)(
     const references = new Map<string, boolean>();
     const capability = 'a'.repeat(43);
     let assistantRequests = 0;
-    let readAttempt!: (sessionId: string) => Promise<void>;
     const proofs = deferredPromptFact<NativeToolObservation>();
     const nativeCallId = randomUUID();
     const nativeRequestId = randomUUID();
@@ -153,7 +152,7 @@ it.skipIf(!cli)(
       },
     );
     const signal = AbortSignal.timeout(15000);
-    readAttempt = async (sessionId) => {
+    async function readAttempt(sessionId: string) {
       const attempt = await owner.readNativeAttemptFor(
         context,
         {
@@ -174,7 +173,7 @@ it.skipIf(!cli)(
         cursor: attempt.cursor,
         observation: attempt.observation.human,
       });
-    };
+    }
     const created = await owner.createRootFor(context, {}, signal);
     if (!created.ok) throw Error('Native root unavailable');
     const { sessionId } = created.value;
