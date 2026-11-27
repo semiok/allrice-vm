@@ -210,15 +210,12 @@ export function apply(ctx: Context) {
               const selected = parse(raw);
               const binding = current(nativeSessionId);
               const bound = currentPanelOwner(nativeSessionId as SessionIdOf);
-              if (
-                !binding ||
-                !bound ||
-                (selected.documentId === documentId &&
-                  selected.ownerEpoch !== bound.epoch)
-              )
+              // A restored draft belongs to the initial owner of this
+              // document. Replacing that owner must also fence restored chips.
+              const expectedEpoch =
+                selected.documentId === documentId ? selected.ownerEpoch : 1;
+              if (!binding || !bound || expectedEpoch !== bound.epoch)
                 throw unavailable();
-              // A reloaded draft may requalify in its scoped document. A live
-              // document must continue under the exact owner that inserted it.
               const attempt = AbortSignal.any([signal, active, bound.signal]);
               attempt.throwIfAborted();
               const result = await data.selectMaterial(
