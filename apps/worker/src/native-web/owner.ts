@@ -78,6 +78,19 @@ const nativeRootWake = z.discriminatedUnion('kind', [
     .strict(),
 ]);
 
+const searchOrigin = z
+  .object({
+    rootSessionId: z.string().min(1).max(256),
+    promptIds: z
+      .array(z.string().min(1).max(256))
+      .min(1)
+      .max(64)
+      .refine((ids) => new Set(ids).size === ids.length),
+    turn: z.number().int().positive(),
+  })
+  .strict()
+  .nullable();
+
 export function readNativeModelAttempt(
   snapshot: Pick<
     Extract<SessionFollowFrame, { type: 'snapshot' }>,
@@ -878,6 +891,36 @@ export async function openNativeWebOwner(input: {
             const wake = nativeRootWake.safeParse(JSON.parse(proof));
             if (!wake.success) throw new PersonVmError('PROVIDER_FAILED');
             return wake.data;
+          },
+        );
+      },
+      readNativeSearchOriginFor(
+        context: RequestContext,
+        sessionId: string,
+        caller: AbortSignal,
+      ) {
+        const current = AbortSignal.any([
+          caller,
+          AbortSignal.timeout(input.launch.auth.timeoutMs),
+        ]);
+        return readCurrent(
+          current,
+          (active) => input.vm.assertCurrentBinding(context, binding, active),
+          async (active) => {
+            if (!installedModelAdapter)
+              throw new PersonVmError('RUNTIME_NOT_READY');
+            const proof = await transport.readManagedModelProof(
+              JSON.stringify({
+                action: 'read-search-origin',
+                adapterId: installedModelAdapter,
+                sessionId,
+              }),
+              active,
+            );
+            if (!proof) throw new PersonVmError('PROVIDER_FAILED');
+            const parsed = searchOrigin.safeParse(JSON.parse(proof));
+            if (!parsed.success) throw new PersonVmError('PROVIDER_FAILED');
+            return parsed.data;
           },
         );
       },

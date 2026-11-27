@@ -55,6 +55,7 @@ export type NativeWebModelAdapter = Readonly<{
   provider: string;
   model: string;
   modelInfo: LlmResolvedModelInfo;
+  webSearchEnabled?: boolean;
 }>;
 
 async function managedModelFiles(directory: string, cliPath: string) {
@@ -286,6 +287,7 @@ export function apply(ctx, config) {
                         origin: modelAdapter.origin,
                         capability: modelAdapter.capability,
                         adapterId: auth.modelAdapterId,
+                        enabled: modelAdapter.webSearchEnabled === true,
                       },
                     },
                   ],

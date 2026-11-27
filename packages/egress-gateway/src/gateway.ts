@@ -503,6 +503,9 @@ export function createEgressGateway(
                   req,
                   binding,
                   serviceSignal,
+                  (value) => {
+                    if (value.includes(state.capability)) throw denied();
+                  },
                 );
                 const context = resolved
                   ? resolved.context

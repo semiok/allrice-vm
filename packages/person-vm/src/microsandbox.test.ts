@@ -18,6 +18,7 @@ import { mkdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
+import type * as Os from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DSH_SANDBOX_ROOT,
@@ -42,7 +43,7 @@ import { PERSON_VM_GUEST_CONTROL_READER } from './native-resource.ts';
 import { PERSON_VM_COMMAND_MEMORY_PROGRAM } from './native-command-observer.ts';
 
 vi.mock('node:os', async (source) => ({
-  ...(await source<typeof import('node:os')>()),
+  ...(await source<typeof Os>()),
   networkInterfaces: () => ({
     lo: [{ address: '127.0.0.1' }, { address: '::1' }],
     en0: [{ address: '192.168.0.10' }, { address: 'fe80::8%en0' }],

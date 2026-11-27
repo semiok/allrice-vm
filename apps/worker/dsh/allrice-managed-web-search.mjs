@@ -4,7 +4,10 @@ import { pathToFileURL, URL } from 'node:url';
 export const name = 'allrice-managed-web-search';
 export const inject = ['agents', 'web'];
 
-export async function apply(ctx, { cliPath, origin, capability, adapterId }) {
+export async function apply(
+  ctx,
+  { cliPath, origin, capability, adapterId, enabled },
+) {
   const require = createRequire(cliPath);
   const { WebError } = await import(
     pathToFileURL(require.resolve('@deepseek-ai/dsh-web')).href
@@ -12,8 +15,18 @@ export async function apply(ctx, { cliPath, origin, capability, adapterId }) {
   const endpoint = new URL('/v1/web/search', origin);
   return ctx.web.registerSearchProvider({
     id: 'deepseek-official',
-    available: () => true,
+    available: () => enabled === true,
     async search({ query, maxResults }, signal) {
+      if (enabled !== true)
+        throw new WebError(
+          'Managed search is unavailable',
+          'WEB_PROVIDER_ERROR',
+        );
+      if (query.includes(capability))
+        throw new WebError(
+          'Search query contains a credential',
+          'WEB_PROVIDER_ERROR',
+        );
       const sessionId = ctx.agents.currentInitiator()?.session.id;
       if (!sessionId)
         throw new WebError(

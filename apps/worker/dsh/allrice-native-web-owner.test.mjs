@@ -137,6 +137,7 @@ function fixture() {
     openRoot,
     proof,
     rootWake: delegations.rootWake,
+    searchOrigin: delegations.searchOrigin,
   };
 }
 
@@ -402,4 +403,30 @@ it('does not adopt a pending retry occurrence or another principal using the sam
   } finally {
     f.lifetime.abort();
   }
+});
+
+it('derives Search authority from the exact running turn and native child lineage', () => {
+  const f = fixture();
+  const root = f.agent('root');
+  root.status = 'running';
+  f.openRoot(root, 1, 'original');
+  const child = f.createChild(root, 'child');
+  child.status = 'running';
+  expect(f.searchOrigin('root')).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    promptIds: ['original'],
+  });
+  f.append(root, 'turn/end', { turn: 1 });
+  f.openRoot(root, 2, 'next-login');
+  expect(f.searchOrigin('child')).toEqual({
+    rootSessionId: 'root',
+    turn: 1,
+    promptIds: ['original'],
+  });
+  expect(f.searchOrigin('root')?.promptIds).toEqual(['next-login']);
+  child.status = 'idle';
+  expect(f.searchOrigin('child')).toBeNull();
+  f.append(root, 'turn/end', { turn: 2 });
+  expect(f.searchOrigin('root')).toBeNull();
 });

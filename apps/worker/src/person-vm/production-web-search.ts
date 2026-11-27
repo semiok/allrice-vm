@@ -152,55 +152,63 @@ export function createHostSearch({
       if (permit.disposition !== 'queued') throw new EgressError('UNAVAILABLE');
       const outcome = await admission.queued(
         permit,
-        (queued) =>
-          admission.activate(
-            permit,
-            async (owned) => {
-              const current = AbortSignal.any([
-                active,
-                permit.signal,
-                queued,
-                owned,
-              ]);
-              try {
-                await assertCurrent(current);
-                await vm.assertAdmissionBinding(context, binding, current);
-                current.throwIfAborted();
-                spend(binding.personId);
-                const result = await provider
-                  .search({ query, maxResults }, current)
-                  .catch(() => {
-                    throw new EgressError('UNAVAILABLE');
-                  });
-                const sources = result.sources.slice(0, maxResults ?? 20);
-                const body = Buffer.from(
-                  JSON.stringify({
-                    ...result,
-                    sources,
-                    truncated:
-                      result.truncated ||
-                      sources.length < result.sources.length,
-                  }),
-                );
-                if (body.byteLength > maxResponseBytes)
-                  throw new EgressError('LIMIT_EXCEEDED');
-                await assertCurrent(current);
-                await vm.assertAdmissionBinding(context, binding, current);
-                current.throwIfAborted();
-                await sendEgressResponse(
-                  response,
-                  { status: 200, contentType: 'application/json', body },
-                  current,
-                );
-                return { ok: true as const };
-              } catch (error) {
-                // Provider search joins dispatch/content before returning, and the
-                // shared HTTP writer joins response closure on failure.
-                return { ok: false as const, error };
-              }
-            },
-            queued,
-          ),
+        async (queued) => {
+          let entered = false;
+          try {
+            return await admission.activate(
+              permit,
+              async (owned) => {
+                entered = true;
+                const current = AbortSignal.any([
+                  active,
+                  permit.signal,
+                  queued,
+                  owned,
+                ]);
+                try {
+                  await assertCurrent(current);
+                  await vm.assertAdmissionBinding(context, binding, current);
+                  current.throwIfAborted();
+                  spend(binding.personId);
+                  const result = await provider
+                    .search({ query, maxResults }, current)
+                    .catch(() => {
+                      throw new EgressError('UNAVAILABLE');
+                    });
+                  const sources = result.sources.slice(0, maxResults ?? 20);
+                  const body = Buffer.from(
+                    JSON.stringify({
+                      ...result,
+                      sources,
+                      truncated:
+                        result.truncated ||
+                        sources.length < result.sources.length,
+                    }),
+                  );
+                  if (body.byteLength > maxResponseBytes)
+                    throw new EgressError('LIMIT_EXCEEDED');
+                  await assertCurrent(current);
+                  await vm.assertAdmissionBinding(context, binding, current);
+                  current.throwIfAborted();
+                  await sendEgressResponse(
+                    response,
+                    { status: 200, contentType: 'application/json', body },
+                    current,
+                  );
+                  return { ok: true as const };
+                } catch (error) {
+                  // Provider search joins dispatch/content before returning, and the
+                  // shared HTTP writer joins response closure on failure.
+                  return { ok: false as const, error };
+                }
+              },
+              queued,
+            );
+          } catch (error) {
+            if (entered) throw error;
+            return { ok: false as const, error };
+          }
+        },
         active,
       );
       if (!outcome.ok) throw outcome.error;

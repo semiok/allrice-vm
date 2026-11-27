@@ -95,6 +95,7 @@ function fixture(limit = 1) {
     dispatch,
     authority: { binding, context, signal: stop.signal, assertCurrent },
     stop,
+    admission,
     release,
     search,
     checkBinding,
@@ -186,4 +187,34 @@ it('cancels the upstream and does not emit a result after revocation', async () 
   );
   expect(upstreamAborted).toBe(true);
   expect(f.release).toHaveBeenCalledTimes(1);
+});
+
+it('joins a revoked pre-activation error without retaining an unsafe permit', async () => {
+  const f = fixture();
+  const persisted = new Set(['queued-permit']);
+  let unsafe = false;
+  f.admission.queued = async (_permit, run, signal) => {
+    try {
+      return await run(signal);
+    } catch (err) {
+      unsafe = true;
+      throw err;
+    }
+  };
+  f.admission.activate = async () => {
+    throw new Error('lease revoked during admission');
+  };
+  f.admission.finish = async () => {
+    if (!unsafe) persisted.delete('queued-permit');
+  };
+  await expect(
+    f.dispatch(
+      f.authority,
+      wire,
+      {} as ServerResponse,
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow('lease revoked during admission');
+  expect(f.search).not.toHaveBeenCalled();
+  expect(persisted.size).toBe(0);
 });

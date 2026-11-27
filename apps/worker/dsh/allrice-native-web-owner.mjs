@@ -763,7 +763,22 @@ export function observeDelegatedInputs(scope) {
     },
     global,
   );
-  return { root, claimed, rootWake };
+  function searchOrigin(sessionId) {
+    const agent = liveAgent(sessionId);
+    if (!agent || agent.status !== 'running') return null;
+    const session = original(agent.session);
+    const state = turns.get(session);
+    const origin = currentOrigin(session);
+    if (!state || !origin || origin.ids.length === 0 || origin.ids.length > 64)
+      return null;
+    return {
+      rootSessionId: origin.root.id,
+      promptIds: origin.ids,
+      turn: state.turn,
+    };
+  }
+
+  return { root, claimed, rootWake, searchOrigin };
 }
 
 export function apply(ctx, config) {
@@ -1001,14 +1016,17 @@ export function applyNativeWebOwner(
               const value = await request.json();
               if (
                 value?.adapterId === id &&
-                value.action === 'read-root-wake' &&
+                (value.action === 'read-root-wake' ||
+                  value.action === 'read-search-origin') &&
                 typeof value.sessionId === 'string' &&
                 value.sessionId.length > 0 &&
                 value.sessionId.length <= 256 &&
                 Object.keys(value).length === 3
               )
                 return globalThis.Response.json(
-                  delegations.rootWake(value.sessionId),
+                  value.action === 'read-root-wake'
+                    ? delegations.rootWake(value.sessionId)
+                    : delegations.searchOrigin(value.sessionId),
                   { headers: { 'cache-control': 'no-store' } },
                 );
               if (

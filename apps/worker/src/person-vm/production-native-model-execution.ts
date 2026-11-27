@@ -59,6 +59,7 @@ type PromptOwner = NativeModelSelection &
     root: string;
     authorityKey: string;
     assertObserved(signal: AbortSignal): Promise<void>;
+    assertCurrent(signal: AbortSignal): Promise<void>;
     assertClaimed(signal: AbortSignal): Promise<void>;
   }>;
 
@@ -430,6 +431,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             provider: input.route.provider,
             model: input.route.model,
             modelInfo,
+            webSearchEnabled: input.webSearch !== undefined,
           };
         },
       );
@@ -717,6 +719,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                 revoked,
                 requestId,
                 assertObserved: watch.assertObserved,
+                assertCurrent: watch.assertCurrent,
                 assertClaimed: observation.assertClaimed,
                 runId: randomUUID(),
               });
@@ -801,6 +804,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
         scope: NativeModelSelection,
         sessionId: string,
         signal: AbortSignal,
+        requireRunning = false,
       ) {
         const active = AbortSignal.any([signal, scope.revoked]);
         active.throwIfAborted();
@@ -830,6 +834,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
           owner: current.owner,
           nativeSessionId: sessionId,
           requireLiveAgent: true,
+          requireRunning,
           signal: active,
         });
         if (!('nativeAddress' in resource) || !resource.nativeAddress)
@@ -969,13 +974,14 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
             path: webSearchPath,
             method: 'POST',
             admissionOwner: 'service',
-            async resolve(request, binding, signal) {
+            async resolve(request, binding, signal, assertNoCapability) {
               return run(signal, async (active) => {
                 const reading = AbortSignal.any([
                   active,
                   AbortSignal.timeout(5_000),
                 ]);
                 const wanted = await readGuestSearch(request, reading);
+                assertNoCapability(wanted.query);
                 const checked = new Set<string>();
                 for (const { scope: probe, observation } of selected.values()) {
                   if (
@@ -983,8 +989,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     probe.revoked.aborted ||
                     !observation.inserted() ||
                     !sameVmBinding(probe.binding, binding) ||
-                    checked.has(probe.authorityKey) ||
-                    (wanted.sessionId === probe.root && endedPrompts.has(probe))
+                    checked.has(probe.authorityKey)
                   )
                     continue;
                   checked.add(probe.authorityKey);
@@ -992,6 +997,7 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     probe,
                     wanted.sessionId,
                     active,
+                    true,
                   ).catch((error: unknown) => {
                     if (
                       probe.revoked.aborted ||
@@ -1008,21 +1014,46 @@ export function createProductionNativeModelExecution(): ProductionNativeModelExe
                     fact.resource.rootNativeSessionId !== probe.root
                   )
                     continue;
-                  const context = structuredClone(probe.context);
+                  const { owner } = fact.profile;
+                  const origin = await owner.readNativeSearchOriginFor(
+                    probe.context,
+                    wanted.sessionId,
+                    active,
+                  );
+                  if (!origin || origin.rootSessionId !== probe.root) continue;
+                  const proven = findPromptContributors(
+                    wanted.adapterId,
+                    origin.rootSessionId,
+                    binding,
+                    origin.promptIds,
+                  );
+                  if (
+                    !proven ||
+                    proven.first.authorityKey !== probe.authorityKey
+                  )
+                    continue;
+                  const { first, contributors } = proven;
+                  const context = structuredClone(first.context);
                   const revoked = AbortSignal.any([
                     live,
                     fact.profile.revoked,
-                    probe.revoked,
+                    ...contributors.map((member) => member.revoked),
                   ]);
                   async function assertCurrent(caller: AbortSignal) {
                     const current = AbortSignal.any([caller, revoked]);
                     current.throwIfAborted();
-                    await probe.assertClaimed(current);
-                    await probe.assertObserved(current);
-                    if (
-                      wanted.sessionId === probe.root &&
-                      endedPrompts.has(probe)
-                    )
+                    await Promise.all(
+                      contributors.map(async (member) => {
+                        await member.assertClaimed(current);
+                        await member.assertCurrent(current);
+                      }),
+                    );
+                    const observed = await owner.readNativeSearchOriginFor(
+                      context,
+                      wanted.sessionId,
+                      current,
+                    );
+                    if (JSON.stringify(observed) !== JSON.stringify(origin))
                       throw new EgressError('DENIED');
                     current.throwIfAborted();
                   }
