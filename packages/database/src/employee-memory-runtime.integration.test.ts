@@ -619,6 +619,11 @@ suite(
         principal,
       ))!;
       const context = { ...authenticated, workspaceId: principal.workspaceId };
+      if (custom)
+        await authorizeFixturePlatformAdministrator(
+          database.db,
+          principal.user.id,
+        );
       const assignment = custom
         ? await createEmployee(context, {
             workspaceId: principal.workspaceId,
@@ -874,8 +879,10 @@ suite(
           },
         },
       });
+      const connection = vi
+        .spyOn(client, 'getDatabase')
+        .mockReturnValue(writer);
       try {
-        vi.spyOn(client, 'getDatabase').mockReturnValueOnce(writer);
         const archive = track(
           updateEmployeeStatus(f.context, f.scope.employeeId, {
             workspaceId: f.scope.workspaceId,
@@ -904,6 +911,7 @@ suite(
           },
           { status: 'fulfilled', value: undefined },
         ]);
+        connection.mockReturnValue(database.db);
         expect(await effects(f)).toEqual({
           memories: 1,
           revisions: 1,
@@ -922,6 +930,7 @@ suite(
           operations: 1,
         });
       } finally {
+        connection.mockReturnValue(database.db);
         release.resolve();
         await writer.end({ timeout: 2 });
       }
