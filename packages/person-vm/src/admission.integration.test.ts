@@ -8,6 +8,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 import { createRuntimeFixtureDatabase } from '../../database/src/runtime.fixture.ts';
 import { createPostgresPersonVmScheduledWakeStore } from '../../database/src/capabilities/person-vm-scheduled-wake.ts';
@@ -1750,6 +1751,54 @@ suite(
       expect(await counts(h.rc.actor.id)).toEqual([]);
       await h.host.participant('gateway').thaw(lease, signal());
       await h.peer.participant('entry').thaw(lease, signal());
+    });
+
+    it('recovers the exact public permit after a committed admit loses its acknowledgement', async () => {
+      let armed = false;
+      const source = factory('proxy-lost-ack', async () => {
+        if (!armed) return;
+        armed = false;
+        throw Object.assign(new Error('public admit COMMIT reply lost'), {
+          code: 'ECONNRESET',
+        });
+      });
+      const h = await setup(source.open);
+      await h.host.participant('gateway').observe(h.binding, signal());
+      const transfer = vi.fn(async () => {});
+      armed = true;
+      await expect(
+        h.host.withPublicEgress(h.binding, signal(), transfer),
+      ).rejects.toBeDefined();
+      expect(transfer).not.toHaveBeenCalled();
+      const active = [{ disposition: 'queued', count: 1 }];
+      expect(await counts(h.rc.actor.id)).toEqual(active);
+      await h.peer.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual(active);
+      await h.host.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual([]);
+    });
+
+    it('releases a joined public transfer after a temporary finish write failure', async () => {
+      const h = await setup();
+      await db.unsafe(
+        "create function fixture_block_delete() returns trigger language plpgsql as $$ begin raise exception 'fixture release rejected'; end; $$",
+      );
+      await db.unsafe(
+        'create trigger fixture_block_delete before delete on person_vm_admission_permits for each row execute function fixture_block_delete()',
+      );
+      const transfer = vi.fn(async () => {});
+      await expect(
+        h.host.withPublicEgress(h.binding, signal(), transfer),
+      ).rejects.toThrow('fixture release rejected');
+      expect(transfer).toHaveBeenCalledOnce();
+      expect(await counts(h.rc.actor.id)).toEqual([
+        { disposition: 'active', count: 1 },
+      ]);
+      await db.unsafe(
+        'drop trigger fixture_block_delete on person_vm_admission_permits',
+      );
+      await h.host.recoverJoinedPublicEgress(h.binding.personId, signal());
+      expect(await counts(h.rc.actor.id)).toEqual([]);
     });
 
     it('two independent clients linearize ordinary admission against freeze, never lose a queue to deferred', async () => {
