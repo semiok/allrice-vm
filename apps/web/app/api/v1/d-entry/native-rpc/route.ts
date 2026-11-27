@@ -1,7 +1,7 @@
 import {
   DEntryNativeRpcRequestSchema,
   DEntryPageRpcRequestSchema,
-  UuidSchema,
+  decodeDEntryRegisteredThread,
   dEntryRegisteredThreadHeader,
 } from '@allrice/contracts';
 import { apiProblem } from '../../../../../lib/api-error-response';
@@ -42,14 +42,13 @@ export async function POST(request: Request) {
       page ? 'native-rpc?carrier=page' : 'native-rpc',
       fields,
     );
-    const registeredThread = UuidSchema.safeParse(
-      response.headers.get(dEntryRegisteredThreadHeader),
-    );
+    const registeredThread = response.headers.get(dEntryRegisteredThreadHeader);
     const registered =
       page &&
       response.ok &&
       ['session/create', 'session/fork'].includes(fields.endpoint) &&
-      registeredThread.success;
+      registeredThread &&
+      decodeDEntryRegisteredThread(registeredThread);
     return new Response(response.body, {
       status: response.status,
       headers: {
@@ -57,7 +56,7 @@ export async function POST(request: Request) {
           response.headers.get('content-type') ?? 'application/json',
         'cache-control': 'private, no-store',
         ...(registered && {
-          [dEntryRegisteredThreadHeader]: registeredThread.data,
+          [dEntryRegisteredThreadHeader]: registeredThread,
         }),
       },
     });

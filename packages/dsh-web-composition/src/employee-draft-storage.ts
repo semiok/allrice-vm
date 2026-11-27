@@ -1,7 +1,5 @@
-import {
-  pageNativeThreadRegistered,
-  type PageNativeThreadRegistration,
-} from '../../../apps/web/lib/d-entry/page-messages';
+import { ChatSessionSchema } from '@allrice/contracts';
+import type { PageNativeThreadRegistration } from '../../../apps/web/lib/d-entry/page-messages';
 import type { readEmployeeDocument } from '../../../apps/web/lib/d-entry/profile-browser';
 
 const conversationPrefix = 'dsh.conversation.';
@@ -48,18 +46,32 @@ export function installEmployeeDraftStorage({
   const scoped = (key: string) =>
     (namespaces.get(key.slice(conversationPrefix.length)) ?? initialNamespace) +
     key;
-  document.addEventListener(pageNativeThreadRegistered, (event) => {
-    const receipt = (event as CustomEvent<PageNativeThreadRegistration>).detail;
+  function registerDraft(receipt: PageNativeThreadRegistration) {
     if (
       !receipt ||
       receipt.scopeId !== scopeId ||
+      typeof receipt.nativeSessionId !== 'string' ||
+      !receipt.nativeSessionId ||
       namespaces.has(receipt.nativeSessionId)
     )
       return;
-    const namespace = namespaceFor(receipt.threadId);
+    const parsed = ChatSessionSchema.safeParse(receipt.thread);
+    if (!parsed.success) return;
+    const thread = parsed.data;
+    if (
+      thread.organizationId !== organizationId ||
+      thread.ownerId !== viewerId ||
+      thread.workspaceId !== selection.workspaceId ||
+      (thread.employeeInstanceId ?? thread.employeeAssignmentId) !==
+        selection.employeeInstanceId ||
+      thread.visibility !== 'private' ||
+      thread.archivedAt !== null
+    )
+      return;
+    const namespace = namespaceFor(thread.id);
     namespaces.set(receipt.nativeSessionId, namespace);
     allowedNamespaces.add(namespace);
-  });
+  }
   const storage = window.localStorage;
   const prototype = window.Storage.prototype;
   const { getItem, setItem, removeItem } = prototype;
@@ -116,4 +128,5 @@ export function installEmployeeDraftStorage({
     { capture: true },
   );
   installed = true;
+  return registerDraft;
 }

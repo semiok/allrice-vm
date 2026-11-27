@@ -239,7 +239,9 @@ export function createDEntryPageRpc(
                       'content-length': String(bytes.length),
                       'cache-control': 'private, no-store',
                       ...(registeredThread && {
-                        [dEntryRegisteredThreadHeader]: registeredThread,
+                        [dEntryRegisteredThreadHeader]: encodeURIComponent(
+                          JSON.stringify(registeredThread),
+                        ),
                       }),
                     })
                     .end(bytes),

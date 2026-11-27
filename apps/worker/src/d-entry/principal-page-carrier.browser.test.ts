@@ -117,44 +117,56 @@ it
     );
     f.host.catalog.items = f.host.catalog.items.map((row) =>
       String(row.sessionId) === 'root'
-        ? { ...row, blank: true, cwd: '/work' }
+        ? { ...row, blank: !nativeCreate, cwd: '/work' }
         : row,
     );
     const life = nativeCreate ? undefined : await open(f);
     const createdThread = randomUUID();
     const createdNativeId = 'native-created';
     let documentLoads = 0;
-    let directoryReads = 0;
     let registered = false;
     const createReplies: unknown[] = [];
     if (nativeCreate) {
-      f.registerRoot.mockImplementation(async (_context, identity, receipt) => {
-        expect(receipt.nativeSessionId).toBe(createdNativeId);
-        const root = {
-          identity: { ...identity, threadId: createdThread },
-          rootOriginDigest: 'registered-root-origin',
-          rootBindingRef: receipt.host.bindingRef,
-          rootNativeSessionId: receipt.nativeSessionId,
-          vmId: receipt.host.binding.vmId,
-        };
-        registered = true;
-        f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
-          id === createdNativeId ? root : undefined,
-        );
-        const created = f.host.catalog.items.find(
-          ({ sessionId }) => sessionId === createdNativeId,
-        );
-        if (created) Object.assign(created, { cwd: '/work', blank: true });
-        nativeWorkspace.sessionIds.push(createdNativeId);
-        f.host.host.emit('domain/changed', {
-          domain: 'workspace',
-          table: 'workspaces',
-          operation: 'put',
-          key: nativeWorkspace.id,
-          value: {},
-        });
-        return root;
-      });
+      const registerFixture = f.registerRoot.getMockImplementation()!;
+      f.registerRoot.mockImplementation(
+        async (context, identity, receipt, active) => {
+          expect(receipt.nativeSessionId).toBe(createdNativeId);
+          const registeredFixture = await registerFixture(
+            context,
+            identity,
+            receipt,
+            active,
+          );
+          const root = {
+            ...registeredFixture,
+            identity: { ...identity, threadId: createdThread },
+            thread: { ...registeredFixture.thread, id: createdThread },
+          };
+          registered = true;
+          f.findRoot.mockImplementation(async (_request, _identity, _vm, id) =>
+            id === createdNativeId ? root : undefined,
+          );
+          const created = f.host.catalog.items.find(
+            ({ sessionId }) => sessionId === createdNativeId,
+          );
+          if (created) Object.assign(created, { cwd: '/work', blank: true });
+          nativeWorkspace.sessionIds.push(createdNativeId);
+          f.host.host.emit('domain/changed', {
+            domain: 'workspace',
+            table: 'workspaces',
+            operation: 'put',
+            key: nativeWorkspace.id,
+            value: {
+              path: nativeWorkspace.path,
+              title: nativeWorkspace.title,
+              sessionIds: [...nativeWorkspace.sessionIds],
+              createdAt: nativeWorkspace.createdAt,
+              updatedAt: nativeWorkspace.updatedAt,
+            },
+          });
+          return root;
+        },
+      );
     }
     const shell = nativeCreate
       ? ((await fromComposition('esbuild').build({
@@ -208,38 +220,6 @@ it
           return response.writeHead(204).end();
         if (nativeCreate && url.pathname === '/api/v1/d-entry/identity')
           return await copy(Response.json({ identity: f.identity }));
-        if (
-          nativeCreate &&
-          url.pathname === '/api/v1/sessions/' + createdThread
-        ) {
-          directoryReads++;
-          if (
-            !registered ||
-            url.searchParams.get('workspaceId') !== f.identity.workspaceId
-          )
-            return response.writeHead(404).end();
-          const time = '2026-01-01T00:00:00.000Z';
-          return await copy(
-            Response.json({
-              history: {
-                session: {
-                  id: createdThread,
-                  ownerId: f.identity.personId,
-                  organizationId: f.identity.organizationId,
-                  workspaceId: f.identity.workspaceId,
-                  employeeInstanceId: f.identity.employeeInstanceId,
-                  employeeAssignmentId: randomUUID(),
-                  employeeVersionId: f.identity.employeeVersionId,
-                  visibility: 'private',
-                  title: 'New native conversation',
-                  createdAt: time,
-                  updatedAt: time,
-                  archivedAt: null,
-                },
-              },
-            }),
-          );
-        }
         if (shell && url.pathname === '/chatflow/4.0')
           return response
             .writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -378,6 +358,15 @@ it
       { name: 'allrice_session', value: sessionToken, url: f.origin },
     ]);
     const page = await context.newPage();
+    if (nativeCreate) {
+      // rc.2 restores its saved desktop selection before this test's shortcut.
+      await page.addInitScript(() => {
+        localStorage.setItem(
+          'dsh.sessions.current',
+          JSON.stringify({ sessionId: 'root' }),
+        );
+      });
+    }
     const streams = new Map<string, string>();
     const firstItems: string[] = [];
     const workspaceBaselines: unknown[] = [];
@@ -517,7 +506,6 @@ it
           JSON.stringify({
             registered,
             createReplies,
-            directoryReads,
             unary,
             errors,
             nativeSessions: await workbench
@@ -539,14 +527,45 @@ it
         '[data-row-key="session:' + createdThread + '"]',
       );
       await row.waitFor({ timeout: 15_000 });
-      await editor.fill('原生新会话草稿', { timeout: 15_000 });
+      const draft = '原生新会话草稿';
+      await editor.fill(draft, { timeout: 15_000 });
+      const draftPrefix =
+        'allrice:d-entry:conversation:v1:' +
+        [
+          f.identity.organizationId,
+          f.identity.personId,
+          f.identity.workspaceId,
+          f.identity.employeeInstanceId,
+        ].join('/') +
+        '/';
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              (key) => localStorage.getItem(key),
+              draftPrefix +
+                createdThread +
+                '/dsh.conversation.' +
+                createdNativeId,
+            ),
+          { timeout: 10_000 },
+        )
+        .toContain(draft);
+      expect(
+        await page.evaluate(
+          (key) => localStorage.getItem(key),
+          draftPrefix +
+            f.selection.threadId +
+            '/dsh.conversation.' +
+            createdNativeId,
+        ),
+      ).toBeNull();
       expect(await editor.isEditable()).toBe(true);
       expect(await frame.getAttribute('data-fixture-identity')).toBe(mark);
       expect(
         await workbench.locator('#app').getAttribute('data-fixture-document'),
       ).toBe(mark);
       expect(documentLoads).toBe(1);
-      expect(directoryReads).toBe(1);
       expect(f.registerRoot).toHaveBeenCalledTimes(1);
       await context.close();
       return;

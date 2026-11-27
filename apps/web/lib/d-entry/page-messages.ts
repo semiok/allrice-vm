@@ -1,3 +1,5 @@
+import type { ChatSessionSchema } from '@allrice/contracts';
+
 export const pageClosing = 'allrice:d-entry:close';
 export const pageCompletion = 'allrice:d-entry:completion';
 export const pageNavigate = 'allrice:d-entry:navigate';
@@ -13,5 +15,5 @@ export const pageNativeThreadSelected =
 export type PageNativeThreadRegistration = {
   scopeId: string;
   nativeSessionId: string;
-  threadId: string;
+  thread: ReturnType<typeof ChatSessionSchema.parse>;
 };

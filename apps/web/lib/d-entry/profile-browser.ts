@@ -6,6 +6,7 @@ import {
   type DEntryProfileGraphSchema,
   UuidSchema,
   dEntryRegisteredThreadHeader,
+  decodeDEntryRegisteredThread,
 } from '@allrice/contracts';
 import { z } from 'zod';
 import {
@@ -40,27 +41,28 @@ function publishNativeThread(
   bytes: ArrayBuffer,
   scopeId: string,
   rpcId: string,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
-  const thread = UuidSchema.safeParse(
+  const thread = decodeDEntryRegisteredThread(
     reply.headers.get(dEntryRegisteredThreadHeader),
   );
-  if (!reply.ok || !thread.success) return;
+  if (!reply.ok || !thread) return;
   // Never replace or reinterpret the RPC result that DSH itself consumes.
   try {
     const parsed = createdSessionReply.safeParse(
       JSON.parse(new TextDecoder().decode(bytes)),
     );
     if (!parsed.success || parsed.data.rpcId !== rpcId) return;
+    const receipt = {
+      scopeId,
+      thread,
+      nativeSessionId: parsed.data.result.value.sessionId,
+    };
+    onThreadRegistered?.(receipt);
     document.dispatchEvent(
       new CustomEvent<PageNativeThreadRegistration>(
         pageNativeThreadRegistered,
-        {
-          detail: {
-            scopeId,
-            threadId: thread.data,
-            nativeSessionId: parsed.data.result.value.sessionId,
-          },
-        },
+        { detail: receipt },
       ),
     );
   } catch {
@@ -205,6 +207,7 @@ export function nativeProfileDocument(
   container: HTMLElement,
   onRevoked: () => void,
   onBundleTimeout: (error: EmployeeProfileBundleTimeout) => void,
+  onThreadRegistered?: (receipt: PageNativeThreadRegistration) => void,
 ) {
   const { scopeId, selection, organizationId } = readEmployeeDocument(
     container.dataset,
@@ -332,7 +335,13 @@ export function nativeProfileDocument(
                 (request.method === 'session/create' ||
                   request.method === 'session/fork')
               )
-                publishNativeThread(reply, bytes, scopeId, request.rpcId);
+                publishNativeThread(
+                  reply,
+                  bytes,
+                  scopeId,
+                  request.rpcId,
+                  onThreadRegistered,
+                );
               return new Response(bytes, {
                 status: reply.status,
                 headers: reply.headers,

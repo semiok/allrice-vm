@@ -1,3 +1,4 @@
+import { decodeDEntryRegisteredThread } from '@allrice/contracts';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -1301,9 +1302,10 @@ it('uses actual DSH replies for create and fork registration on a page without a
   expect(await create.json()).toMatchObject({
     result: { ok: true, value: { sessionId: 'native-created' } },
   });
-  expect(create.headers.get('x-allrice-d-entry-thread')).toBe(
-    (await f.registerRoot.mock.results[0]?.value)?.identity.threadId,
-  );
+  expect(
+    decodeDEntryRegisteredThread(create.headers.get('x-allrice-d-entry-thread'))
+      ?.id,
+  ).toBe((await f.registerRoot.mock.results[0]?.value)?.identity.threadId);
   expect(f.host.catalog.creationRequests).toEqual([{}]);
   expect(f.prepareEditorRoot).not.toHaveBeenCalled();
   expect(f.registerRoot).toHaveBeenNthCalledWith(

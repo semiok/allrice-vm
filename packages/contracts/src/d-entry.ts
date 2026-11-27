@@ -1,3 +1,4 @@
+import { ChatSessionSchema } from './workspace.ts';
 import { z } from 'zod';
 import { UuidSchema } from './common.ts';
 
@@ -159,6 +160,17 @@ export const DEntryPageUnarySchema = z
 // Only an acknowledged, currently authorized page create/fork may carry this
 // AllRice thread id. The DSH reply body and rpcId keep their original contract.
 export const dEntryRegisteredThreadHeader = 'x-allrice-d-entry-thread';
+export function decodeDEntryRegisteredThread(header: string | null) {
+  if (!header || header.length > 4096) return;
+  try {
+    const thread = ChatSessionSchema.safeParse(
+      JSON.parse(decodeURIComponent(header)),
+    );
+    if (thread.success) return thread.data;
+  } catch {
+    // Optional presentation receipt; the DSH response remains authoritative.
+  }
+}
 
 export const DEntryPageRpcRequestSchema = DEntryPageScopeReferenceSchema.extend(
   {

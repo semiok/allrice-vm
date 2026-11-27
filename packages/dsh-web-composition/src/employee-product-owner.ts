@@ -182,37 +182,30 @@ export function installEmployeeProductOwner(ctx: Context) {
   function registerThread(event: Event) {
     if (signal!.aborted) return;
     const receipt = (event as CustomEvent<PageNativeThreadRegistration>).detail;
-    if (!receipt || receipt.scopeId !== scopeId) return;
-    const previous = registered.get(receipt.nativeSessionId);
-    if (previous) return;
-    registered.set(receipt.nativeSessionId, receipt.threadId);
+    if (
+      !receipt ||
+      receipt.scopeId !== scopeId ||
+      typeof receipt.nativeSessionId !== 'string' ||
+      !receipt.nativeSessionId
+    )
+      return;
+    if (registered.has(receipt.nativeSessionId)) return;
+    const parsed = ChatSessionSchema.safeParse(receipt.thread);
+    if (!parsed.success) return;
+    const session = parsed.data;
+    if (
+      session.ownerId !== viewerId ||
+      session.organizationId !== organizationId ||
+      session.workspaceId !== selection.workspaceId ||
+      sessionEmployeeKey(session) !== selection.employeeInstanceId ||
+      session.visibility !== 'private' ||
+      session.archivedAt !== null
+    )
+      return;
+    registered.set(receipt.nativeSessionId, session.id);
     void workspaceTask
-      .then(async () => {
-        const path =
-          '/api/v1/sessions/' +
-          encodeURIComponent(receipt.threadId) +
-          '?' +
-          new URLSearchParams({ workspaceId: selection.workspaceId });
-        const response = await fetch(path, {
-          cache: 'no-store',
-          credentials: 'same-origin',
-          headers: requestHeaders,
-          signal,
-        });
-        if (!response.ok) throw Error('Registered thread unavailable');
-        const { history } = await response.json();
-        const session = ChatSessionSchema.parse(history?.session);
+      .then(() => {
         if (signal!.aborted) return;
-        if (
-          session.id !== receipt.threadId ||
-          session.ownerId !== viewerId ||
-          session.organizationId !== organizationId ||
-          session.workspaceId !== selection.workspaceId ||
-          sessionEmployeeKey(session) !== selection.employeeInstanceId ||
-          session.visibility !== 'private' ||
-          session.archivedAt !== null
-        )
-          throw Error('Registered thread scope changed');
         const current = sidebar.getSnapshot();
         if (!current?.tree) return;
         const sessions = [
@@ -229,10 +222,7 @@ export function installEmployeeProductOwner(ctx: Context) {
         });
         followSelection();
       })
-      .catch(() => {
-        if (registered.get(receipt.nativeSessionId) === receipt.threadId)
-          registered.delete(receipt.nativeSessionId);
-      });
+      .catch(() => {});
   }
   document.addEventListener(pageNativeThreadRegistered, registerThread);
 
