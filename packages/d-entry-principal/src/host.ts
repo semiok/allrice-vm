@@ -61,6 +61,16 @@ import {
 import { pageSettingsNamespaces } from './page-capability-policy.js';
 
 const object = z.record(z.string(), z.unknown());
+const terminalId = z.string().min(1).max(128);
+const terminalCreate = z.object({
+  agentId: z.string().min(1),
+  request: z.object({ id: terminalId }),
+});
+const terminalRef = z.object({ agentId: z.string().min(1), id: terminalId });
+const terminalList = z.array(z.object({ id: z.string() }));
+type TerminalRef = z.infer<typeof terminalRef>;
+const terminalKey = ({ agentId, id }: TerminalRef) =>
+  JSON.stringify([agentId, id]);
 const eventRoles = pageEventRoles(API_REMOTE_FORWARDED_EVENTS);
 const configSchema = z
   .object({
@@ -197,6 +207,7 @@ class Scope implements Projection {
   readonly abort = new AbortController();
   readonly jobs = new Set<Promise<unknown>>();
   readonly children = new Set<{ close(): Promise<void> }>();
+  readonly terminals = new Map<string, TerminalRef>();
   readonly ready: Promise<void>;
   private closing?: Promise<void>;
   private detach = () => {};
@@ -400,8 +411,13 @@ class Scope implements Projection {
         [...this.children].map((child) => child.close()),
       );
       while (this.jobs.size) await Promise.allSettled([...this.jobs]);
-      const peer = await Promise.allSettled([this.peer?.dispose()]);
-      if ([...children, ...peer].some((result) => result.status === 'rejected'))
+      const owner = await Promise.allSettled([
+        this.host.closeTerminals(this),
+        this.peer?.dispose(),
+      ]);
+      if (
+        [...children, ...owner].some((result) => result.status === 'rejected')
+      )
         throw Error('PRINCIPAL_JOIN_UNKNOWN');
       this.detach();
       this.host.scopes.delete(this.issue.scopeId);
@@ -430,6 +446,7 @@ class PrincipalService extends TypertRemoteService {
     'sessionController',
   ];
   readonly scopes = new Map<string, Scope>();
+  private readonly terminalOwners = new Map<string, Scope>();
   private readonly scopeControls = new Set<Promise<void>>();
   private stopped = false;
   private graphObserver?: {
@@ -469,6 +486,51 @@ class PrincipalService extends TypertRemoteService {
       if (failures.size)
         throw new AggregateError(failures, 'PRINCIPAL_JOIN_UNKNOWN');
     });
+  }
+  async closeTerminals(scope: Scope) {
+    if (!scope.terminals.size) return;
+    // This is the actual guest Host, not the disconnected browser or its
+    // Worker peer. The local peer is used only for owned terminal cleanup.
+    const peer = this.hostContext.connection.createPeer({
+      principal: { kind: 'owner' },
+      interactions: 'answer',
+    });
+    try {
+      const results = await Promise.allSettled(
+        [...scope.terminals.values()].map(async (ref) => {
+          try {
+            await this.ctx.typertGateway.invoke({
+              namespace: 'terminal',
+              method: 'close',
+              args: ref,
+              peer,
+            });
+          } catch (error) {
+            // The native Agent may already be gone. Only its controller's
+            // inventory can confirm absence after the dispatched jobs joined.
+            const remaining = terminalList.parse(
+              await this.ctx.typertGateway.invoke({
+                namespace: 'terminal',
+                method: 'list',
+                args: { sessionId: ref.agentId },
+                peer,
+              }),
+            );
+            if (remaining.some(({ id }) => id === ref.id)) throw error;
+          }
+          this.forgetTerminal(ref);
+        }),
+      );
+      if (results.some((result) => result.status === 'rejected'))
+        throw Error('PRINCIPAL_TERMINAL_JOIN_UNKNOWN');
+    } finally {
+      await peer.dispose();
+    }
+  }
+  private forgetTerminal(ref: TerminalRef) {
+    const key = terminalKey(ref);
+    this.terminalOwners.get(key)?.terminals.delete(key);
+    this.terminalOwners.delete(key);
   }
   /** Internal Cordis consumer of the installed native graph revision. The
    * existing private stream reports withdrawal before any scope join. */
@@ -935,6 +997,17 @@ class PrincipalService extends TypertRemoteService {
           endpoint === 'subagents/prompt';
         if (endpoint === 'session/attachment')
           throw Error('PRINCIPAL_RESOURCE_DENIED');
+        if (endpoint === 'terminal/create') {
+          const { agentId, request } = terminalCreate.parse(args);
+          const ref = { agentId, id: request.id };
+          const key = terminalKey(ref);
+          const existing = this.terminalOwners.get(key);
+          if (existing && existing !== scope)
+            throw Error('PRINCIPAL_RESOURCE_DENIED');
+          // Reserve before native dispatch, even if its reply is later lost.
+          scope.terminals.set(key, ref);
+          this.terminalOwners.set(key, scope);
+        }
         const value = await this.ctx.typertGateway.invoke({
           namespace: descriptor.namespace,
           method: descriptor.method,
@@ -942,6 +1015,8 @@ class PrincipalService extends TypertRemoteService {
           peer: modelInput ? scope.currentPeer() : scope.parent,
           signal: active,
         });
+        if (endpoint === 'terminal/close')
+          this.forgetTerminal(terminalRef.parse(args));
         active.throwIfAborted();
         const visible =
           endpoint === 'settings/describe'

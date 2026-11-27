@@ -566,8 +566,22 @@ suite(
         const forked = {
           ...created,
           nativeSessionId: 'native-page-forked',
-          forkedFromNativeSessionId: created.nativeSessionId,
+          forkSource: { nativeSessionId: created.nativeSessionId, root: first },
         };
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            {
+              ...forked,
+              forkSource: {
+                ...forked.forkSource,
+                root: { ...first, rootOriginDigest: 'replaced-source' },
+              },
+            },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
         const fork = await registerDEntryPageNativeRoot(
           f.context,
           first.identity,
@@ -587,6 +601,15 @@ suite(
             signal,
           ),
         ).toEqual(fork);
+        await fixture.db`update allrice_chat_sessions set archived_at=now() where id=${first.identity.threadId}`;
+        await expect(
+          registerDEntryPageNativeRoot(
+            f.context,
+            identity,
+            { ...forked, nativeSessionId: 'native-rejected-archived-source' },
+            signal,
+          ),
+        ).rejects.toMatchObject({ code: 'authorization_denied' });
         expect(
           await getDEntryNativeRootPin(f.context, {
             ...f.selection,

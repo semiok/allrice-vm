@@ -460,6 +460,7 @@ export async function fixture(
     pageSignals,
     profileCompletion,
     closeProfile: profile.close,
+    closeControl: control.close,
     async checkUnknownControlClose() {
       controlCloseChecked = true;
       await expect(control.close()).rejects.toThrow('PRINCIPAL_JOIN_UNKNOWN');

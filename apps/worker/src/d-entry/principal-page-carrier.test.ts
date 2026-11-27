@@ -1309,7 +1309,7 @@ it('uses actual DSH replies for create and fork registration on a page without a
     { ...f.identity, threadId: null },
     {
       nativeSessionId: 'native-created',
-      forkedFromNativeSessionId: undefined,
+      forkSource: undefined,
       host: {
         binding: f.binding,
         bindingRef: f.owner.bindingRef,
@@ -1318,19 +1318,135 @@ it('uses actual DSH replies for create and fork registration on a page without a
     },
     expect.any(AbortSignal),
   );
-  const fork = await f.invoke(life.scopeId, sessionToken, {
-    endpoint: 'session/fork',
-    payload: { args: { request: { sessionId: 'other' } } },
-  });
+  const forkOther = () =>
+    f.invoke(life.scopeId, sessionToken, {
+      endpoint: 'session/fork',
+      payload: { args: { request: { sessionId: 'other' } } },
+    });
+  expect(await status(forkOther())).toBe(404);
+  expect(f.host.catalog.items.map(({ sessionId }) => sessionId)).not.toContain(
+    'native-forked',
+  );
+  const root = {
+    identity: { ...f.identity, threadId: f.selection.threadId },
+    rootNativeSessionId: 'other',
+    rootOriginDigest: 'other-owned-root-proof',
+    rootBindingRef: 'other-owned-root-ref',
+    vmId: f.binding.vmId,
+  };
+  f.findRoot.mockResolvedValue(root);
+  const fork = await forkOther();
   expect(await fork.json()).toMatchObject({
     result: { ok: true, value: { sessionId: 'native-forked' } },
   });
   expect(f.registerRoot.mock.calls[1]?.[2]).toMatchObject({
     nativeSessionId: 'native-forked',
-    forkedFromNativeSessionId: 'other',
+    forkSource: { nativeSessionId: 'other', root },
   });
+  expect(f.findRoot).toHaveBeenCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  f.host.catalog.items.push(summary('other-child', 'other'));
+  f.findRoot.mockResolvedValueOnce(root).mockResolvedValueOnce(undefined);
+  const lost = await f.invoke(life.scopeId, sessionToken, {
+    endpoint: 'session/fork',
+    payload: { args: { request: { sessionId: 'other-child' } } },
+  });
+  expect(lost.status).toBe(404);
+  expect(f.findRoot).toHaveBeenLastCalledWith(
+    f.context,
+    { ...f.identity, threadId: null },
+    f.binding.vmId,
+    'other',
+  );
+  expect(f.registerRoot).toHaveBeenCalledTimes(2);
   closePage(life.peer);
   expect(await life.receive()).toMatchObject({ value: { type: 'closed' } });
+});
+
+it('retains the native terminal through a page reconnect and joins owner cleanup after logout', async () => {
+  const f = await fixture();
+  const { host } = f.host;
+  const web = createRequire(
+    new URL('../../../web/package.json', import.meta.url),
+  );
+  const { TYPERT } = await import(
+    pathToFileURL(
+      web.resolve('@deepseek-ai/dsh-api-terminal-controller/typert'),
+    ).href
+  );
+  host.typert.register(TYPERT);
+  const terminal = {
+    id: 'retained-pty',
+    title: 'Shell',
+    cwd: '/work',
+    shell: { path: '/bin/sh', name: 'sh' },
+    cols: 80,
+    rows: 24,
+    state: 'running',
+    exitCode: null,
+  };
+  const closing = deferred();
+  const closed = deferred();
+  const observed = deferred();
+  closes.push(async () => closed.resolve());
+  const invoke = host.typertGateway.invoke.bind(host.typertGateway);
+  const native = vi
+    .spyOn(host.typertGateway, 'invoke')
+    .mockImplementation(async (call) => {
+      if (call.namespace !== 'terminal') return invoke(call);
+      if (call.method === 'create') return terminal;
+      if (call.method !== 'close') throw Error('Unexpected terminal RPC');
+      expect(call.peer.principal.kind).toBe('owner');
+      expect(call.peer.signal.aborted).toBe(false);
+      expect(call.args).toEqual({ agentId: 'root', id: terminal.id });
+      closing.resolve();
+      await closed.promise;
+    });
+  const create = (page: Awaited<ReturnType<typeof open>>) =>
+    f.invoke(page.scopeId, sessionToken, {
+      endpoint: 'terminal/create',
+      payload: {
+        args: {
+          agentId: 'root',
+          request: { id: terminal.id, cols: 80, rows: 24 },
+        },
+      },
+    });
+  const first = await open(f);
+  expect(await (await create(first)).json()).toMatchObject({
+    result: { ok: true },
+  });
+  closePage(first.peer);
+  expect(await first.receive()).toMatchObject({ value: { type: 'closed' } });
+  const next = await open(f);
+  expect(await (await create(next)).json()).toMatchObject({
+    result: { ok: true },
+  });
+  expect(f.deps.watch).toHaveBeenCalledTimes(3); // Two pages and one login owner.
+  closePage(next.peer);
+  expect(await next.receive()).toMatchObject({ value: { type: 'closed' } });
+  expect(native.mock.calls.some(([call]) => call.method === 'close')).toBe(
+    false,
+  );
+
+  f.identityRevoked.abort(new DataAccessError('authentication_required'));
+  await closing.promise;
+  void f.closeControl().then(() => observed.resolve());
+  let joined = false;
+  void observed.promise.then(() => {
+    joined = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(joined).toBe(false);
+  closed.resolve();
+  await observed.promise;
+  expect(
+    native.mock.calls.filter(([call]) => call.method === 'close'),
+  ).toHaveLength(1);
 });
 
 it('withholds a successful native create reply after the page loses its VM authority', async () => {

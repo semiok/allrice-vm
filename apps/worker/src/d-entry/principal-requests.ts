@@ -13,8 +13,11 @@ import {
   resolveDEntryIdentity,
   runDEntryAdmittedActivity,
   type DEntryHistoryRootPin,
+  type DEntryPageForkSource,
 } from '@allrice/database';
+import { nativeSessionRoot } from '@allrice/d-entry-principal/policy';
 import type {
+  DEntryPageNativeCall,
   DEntryPrincipalActivity,
   DEntryPrincipalControlScope,
 } from '@allrice/d-entry-principal/types';
@@ -25,6 +28,7 @@ import {
   DEntryNativeUnavailable,
   resolveDEntryNativeResource,
   sameDEntryVmBinding,
+  type ResolvedDEntryNativeOwner,
 } from './native-owner.js';
 import type { DEntryFixedProfileSource } from './released-profile.js';
 import { dEntryStartupTiming } from './startup-timing.js';
@@ -72,11 +76,19 @@ export type DEntryPageHandle = Readonly<{
     nativeSessionId: string,
     signal: AbortSignal,
   ): Promise<boolean>;
+  authorizeForkSource(
+    nativeSessionId: string,
+    signal: AbortSignal,
+  ): Promise<DEntryPageForkSource>;
   registerNativeSession(
     nativeSessionId: string,
-    forkedFrom: string | undefined,
+    forkSource: DEntryPageForkSource | undefined,
     signal: AbortSignal,
   ): Promise<void>;
+  invokeTerminal(
+    call: DEntryPageNativeCall,
+    signal: AbortSignal,
+  ): ReturnType<DEntryPrincipalControlScope['invokePage']>;
   authorize(
     nativeSessionId: string,
     effect: 'read' | 'write',
@@ -98,6 +110,94 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
       page: DEntryPageHandle;
     }
   >();
+  const terminalScopes = new Map<
+    string,
+    Promise<DEntryPrincipalControlScope>
+  >();
+
+  function terminalScope(
+    context: RequestContext,
+    pageIdentity: DEntryIdentity,
+    pageOwner: ResolvedDEntryNativeOwner,
+  ) {
+    const identity = { ...pageIdentity, threadId: null };
+    const key = JSON.stringify([
+      context.sessionId,
+      identity,
+      pageOwner.bindingRef,
+    ]);
+    const existing = terminalScopes.get(key);
+    if (existing) return existing;
+    const opening = Promise.resolve().then(async () => {
+      let authority: Awaited<ReturnType<typeof deps.watch>> | undefined;
+      let activity: DEntryPrincipalActivity | undefined;
+      let scope: DEntryPrincipalControlScope | undefined;
+      let closing: Promise<void> | undefined;
+      const close = () =>
+        (closing ??= Promise.resolve().then(async () => {
+          authority?.revoked.removeEventListener('abort', lost);
+          scope?.revoked.removeEventListener('abort', lost);
+          const results = await Promise.allSettled([
+            activity?.close(),
+            authority?.close(),
+          ]);
+          if (results.some((result) => result.status === 'rejected'))
+            throw Error('D_ENTRY_TERMINAL_JOIN_UNKNOWN');
+          if (terminalScopes.get(key) === opening) terminalScopes.delete(key);
+        }));
+      function lost() {
+        void close().catch(() => {
+          // Keep this exact binding fenced when native cleanup cannot be confirmed.
+          console.error('[d-entry-terminal] D_ENTRY_TERMINAL_JOIN_UNKNOWN');
+        });
+      }
+      try {
+        // Authorization belongs to the login and employee, independent of the
+        // browser page and its selected thread. This scope owns native PTYs.
+        const current = await currentDEntryNativeOwner(
+          deps.owners,
+          context,
+          identity,
+          pageOwner.revoked,
+        );
+        if (
+          current.view.bindingRef !== pageOwner.bindingRef ||
+          !sameDEntryVmBinding(
+            current.view.receipt.binding,
+            pageOwner.receipt.binding,
+          )
+        )
+          throw denied();
+        authority = await deps.watch(
+          context,
+          {
+            workspaceId: identity.workspaceId,
+            employeeInstanceId: identity.employeeInstanceId,
+          },
+          identity,
+          current.signal,
+        );
+        const active = authority.revoked;
+        active.throwIfAborted();
+        authority.revoked.addEventListener('abort', lost, { once: true });
+        activity = current.owner.acquirePrincipal(
+          context,
+          { scopeId: randomUUID(), identity, access: 'page' },
+          active,
+        );
+        scope = await activity.run(active);
+        scope.revoked.addEventListener('abort', lost, { once: true });
+        active.throwIfAborted();
+        scope.revoked.throwIfAborted();
+        return scope;
+      } catch (error) {
+        await close();
+        throw error;
+      }
+    });
+    terminalScopes.set(key, opening);
+    return opening;
+  }
 
   async function authenticate(
     token: string,
@@ -340,6 +440,34 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                     throw denied();
                   return resource;
                 };
+                const authorizeForkSource = async (
+                  nativeSessionId: string,
+                  active: AbortSignal,
+                ): Promise<DEntryPageForkSource> => {
+                  await assertCurrent(active);
+                  const sessions = await catalog.owner.readSessions(active);
+                  if (!sessions.ok) throw denied();
+                  const items = sessions.value.items;
+                  const entries = new Map(
+                    items.map((row) => [String(row.sessionId), row]),
+                  );
+                  const root = nativeSessionRoot(entries, nativeSessionId);
+                  if (!root || entries.size !== items.length) throw denied();
+                  const vmId = current.view.receipt.binding.vmId;
+                  const registered = await (
+                    deps.findRoot ?? pageRootStore.findRoot
+                  )(auth.context, auth.identity, vmId, root.sessionId);
+                  if (
+                    !registered ||
+                    registered.vmId !== vmId ||
+                    registered.rootNativeSessionId !== root.sessionId ||
+                    registered.forkedFromNativeSessionId !==
+                      root.parentSessionId
+                  )
+                    throw denied();
+                  active.throwIfAborted();
+                  return { nativeSessionId, root: registered };
+                };
                 await timing.run('owned-vm-before-open', () =>
                   assertCurrent(runningSignal),
                 );
@@ -430,18 +558,27 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       )
                     );
                   },
+                  authorizeForkSource,
                   async registerNativeSession(
                     nativeSessionId,
-                    forkedFromNativeSessionId,
+                    forkSource,
                     active,
                   ) {
                     await assertCurrent(active);
+                    if (forkSource) {
+                      const confirmed = await authorizeForkSource(
+                        forkSource.nativeSessionId,
+                        active,
+                      );
+                      if (!sameRoot(forkSource.root, confirmed.root))
+                        throw denied();
+                    }
                     await (deps.registerRoot ?? pageRootStore.registerRoot)(
                       auth.context,
                       auth.identity,
                       {
                         nativeSessionId,
-                        forkedFromNativeSessionId,
+                        forkSource,
                         host: {
                           binding: current.view.receipt.binding,
                           bindingRef: current.view.bindingRef,
@@ -451,6 +588,19 @@ export function createDEntryPageRequests(deps: DEntryPageDependencies) {
                       active,
                     );
                     await assertCurrent(active);
+                  },
+                  async invokeTerminal(call, active) {
+                    active.throwIfAborted();
+                    const terminal = await terminalScope(
+                      auth.context,
+                      auth.identity,
+                      current.owner,
+                    );
+                    await assertCurrent(active);
+                    return terminal.invokePage(
+                      { ...call, scopeId: terminal.opened.scopeId },
+                      active,
+                    );
                   },
                   authorize,
                   invalidate,
