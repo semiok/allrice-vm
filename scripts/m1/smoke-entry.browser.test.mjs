@@ -12,6 +12,7 @@ const { chromium } = require('playwright-core');
 const entry = '/chatflow/4.0';
 const documentPath = entry + '/document';
 const profile = '/api/v1/d-entry/profile';
+const sessions = '/api/v1/sessions';
 const prewarm = '/api/v1/d-entry/native-prewarm';
 const id = (n) => '00000000-0000-4000-8000-' + String(n).padStart(12, '0');
 const selection = { workspaceId: id(1), employeeInstanceId: id(2) };
@@ -80,6 +81,11 @@ async function fixture(mode) {
           ready = result.state === 'ready';
         }
         if (ready) {
+            const opened = await (await fetch(${json(sessions + '?entry=4.0')}, {
+              method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({selection:${json(selection)}})
+            })).json();
+            if (!opened.threadId) throw Error('missing native thread');
             const frame = document.createElement('iframe');
             frame.title = '员工工作区'; frame.src = ${json(documentPath + '?' + query)};
             document.querySelector('main').append(frame);
@@ -100,6 +106,12 @@ async function fixture(mode) {
           : 'ready';
       return write(200, json({ state }), 'application/json');
     }
+    if (path === sessions && url.search === '?entry=4.0' && method === 'POST')
+      return write(
+        200,
+        json({ ...selection, threadId: id(mode === 'wrong-thread' ? 7 : 5) }),
+        'application/json',
+      );
     if (path === documentPath)
       return redirect(directory + '/native/index.html');
     if (path === directory + '/native/index.html')
@@ -229,6 +241,7 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
           ).toEqual([
             '/api/v1/auth/login',
             prewarm,
+            sessions,
             ...(hello ? ['/api/v1/d-entry/native-rpc'] : []),
           ]);
           expect(receipt.stages.hello).toBe(hello ? 'accepted' : undefined);
@@ -275,6 +288,7 @@ suite('4.0 release smoke', { timeout: 15_000 }, () => {
     ['bad-css', '原生 css 未返回 200'],
     ['missing-vendor', '原生 css 未返回 200'],
     ['foreign-css', '原生 css 未返回 200'],
+    ['wrong-thread', '编辑器不属于本次原生工作台'],
     ['disabled', '原生编辑器不可输入'],
     ['warm-disabled', '原生编辑器不可输入'],
     ['unexpected-prompt', '拦截了未经授权或重复的模型消息'],

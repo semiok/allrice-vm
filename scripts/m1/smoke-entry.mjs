@@ -3,6 +3,7 @@ const ENTRY = '/chatflow/4.0';
 const DOCUMENT = ENTRY + '/document';
 const PROFILE = '/api/v1/d-entry/profile';
 const PREWARM = '/api/v1/d-entry/native-prewarm';
+const SESSIONS = '/api/v1/sessions';
 const RPC = '/api/v1/d-entry/native-rpc';
 const LOGIN = '/api/v1/auth/login';
 const FRAME = 'iframe[title="员工工作区"]';
@@ -33,9 +34,10 @@ export async function smokeNativeEntry(
   const origin = new URL(base).origin;
   const fact = receipt.stages;
   const resources = new Map();
-  const bootstraps = new Map();
+  const bootstraps = [];
   let selection;
   let ticket;
+  let openedThread;
   let ready = false;
   let warm = false;
   let allowedPrompt;
@@ -96,8 +98,29 @@ export async function smokeNativeEntry(
       );
       (fact.polls ??= []).push(result.state);
       if (result.state === 'ready') ready = true;
+    } else if (method === 'POST' && url.pathname === SESSIONS) {
+      const requested = response.request().postDataJSON()?.selection;
+      requireFact(
+        (ready || warm) &&
+          !selection.threadId &&
+          !openedThread &&
+          url.search === '?entry=4.0' &&
+          status === 200 &&
+          requested?.workspaceId === selection.workspaceId &&
+          requested?.employeeInstanceId === selection.employeeInstanceId &&
+          requested?.threadId === undefined,
+        '未观察到与预热员工一致的原生会话打开请求',
+      );
+      const opened = await response.json();
+      requireFact(
+        opened?.workspaceId === selection.workspaceId &&
+          opened?.employeeInstanceId === selection.employeeInstanceId &&
+          UUID.test(opened?.threadId ?? ''),
+        '原生会话打开回执与员工选择不一致',
+      );
+      openedThread = opened.threadId;
     } else if (method === 'GET' && url.pathname === PROFILE + '/bootstrap') {
-      bootstraps.set(url.href, status);
+      bootstraps.push([url.href, status]);
     } else if (
       method === 'GET' &&
       (url.pathname.startsWith(PROFILE + '/assets/static/') ||
@@ -256,7 +279,7 @@ export async function smokeNativeEntry(
       source.origin === origin &&
         source.pathname === DOCUMENT &&
         sameEmployee(source.searchParams, selection) &&
-        (!selection.threadId || selection.threadId === thread) &&
+        (selection.threadId ?? openedThread) === thread &&
         UUID.test(scope ?? '') &&
         UUID.test(thread ?? '') &&
         loaded.origin === origin &&
@@ -272,7 +295,7 @@ export async function smokeNativeEntry(
         resources.get(loaded.href)?.status === 200,
       '编辑器不属于本次原生工作台',
     );
-    const bootstrap = [...bootstraps].filter(([address]) => {
+    const bootstrap = bootstraps.filter(([address]) => {
       const url = new URL(address);
       return (
         url.searchParams.get('scopeId') === scope &&
@@ -334,7 +357,6 @@ export async function smokeNativeEntry(
     }
     requireFact(document.editable && document.focused, '原生编辑器不可输入');
     fact.editor = true;
-    if (warm) throw new SmokeSkip('当前 VM 已预热，缺少冷启动 202 证据');
     if (hello) {
       requireFact(document.nativeSessionId, '原生会话未确认');
       receipt.step = 'optional-hello';
