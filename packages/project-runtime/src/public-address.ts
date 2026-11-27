@@ -55,12 +55,23 @@ export async function resolvePublicAddress(
   hostname: string,
   publicAddress: (address: string) => boolean,
 ) {
+  return (await resolvePublicAddresses(hostname, publicAddress))[0]!;
+}
+
+/** An owned lookup does not borrow a background/cache-backed DoH operation. */
+export async function resolvePublicAddresses(
+  hostname: string,
+  publicAddress: (address: string) => boolean,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   const literal = hostname.replace(/^\[|\]$/g, '');
   const key = literal.toLowerCase().replace(/\.$/, '');
   let resolved: DnsAnswer | undefined;
   let answers: Address[] = isIP(literal)
     ? [{ address: literal, family: isIP(literal) }]
     : await lookup(literal, { all: true, verbatim: true });
+  signal?.throwIfAborted();
   if (
     !isIP(literal) &&
     answers.length > 0 &&
@@ -71,7 +82,11 @@ export async function resolvePublicAddress(
         synthetic4.check(item.address, 'ipv4'),
     )
   ) {
-    resolved = await publicDns(key);
+    if (signal && !publicAddress('1.1.1.1')) throw denied();
+    resolved = signal
+      ? await queryPublicDns(key, signal)
+      : await publicDns(key);
+    signal?.throwIfAborted();
     answers = resolved.addresses;
   }
   if (
@@ -85,16 +100,21 @@ export async function resolvePublicAddress(
   // A cache hit still requires fresh system DNS and this caller's full policy.
   // Only positive, validated fallback answers are retained, for their shortest
   // DNS TTL (at most 30 seconds). No stale-on-error or private-address fallback.
-  if (resolved && resolved.expiresAt > Date.now()) {
+  if (!signal && resolved && resolved.expiresAt > Date.now()) {
     if (!verified.has(key) && verified.size >= maximumEntries)
       verified.delete(verified.keys().next().value!);
     verified.set(key, resolved);
   }
-  return { ...answers[0]! };
+  return answers.map((answer) => ({ ...answer }));
 }
 
-function queryPublicDns(hostname: string): Promise<DnsAnswer> {
-  return new Promise((resolve, reject) => {
+async function queryPublicDns(
+  hostname: string,
+  signal?: AbortSignal,
+): Promise<DnsAnswer> {
+  let closed = Promise.resolve(),
+    socketClosed = Promise.resolve();
+  const response = new Promise<DnsAnswer>((resolve, reject) => {
     // Fixed public IP, verified TLS server name; no system DNS recursion,
     // redirect, proxy, custom CA or privileged network exception.
     const request = get(
@@ -104,6 +124,7 @@ function queryPublicDns(hostname: string): Promise<DnsAnswer> {
         path: `/dns-query?name=${encodeURIComponent(hostname)}&type=A`,
         headers: { accept: 'application/dns-json' },
         agent: false,
+        signal,
       },
       (response) => {
         const chunks: Buffer[] = [];
@@ -166,11 +187,26 @@ function queryPublicDns(hostname: string): Promise<DnsAnswer> {
         });
       },
     );
+    if (signal) {
+      closed = new Promise<void>((resolve) => request.once('close', resolve));
+      request.once('socket', (socket) => {
+        if (!socket.closed)
+          socketClosed = new Promise<void>((resolve) =>
+            socket.once('close', resolve),
+          );
+      });
+    }
     const timeout = setTimeout(
       () => request.destroy(new PublicAddressUnavailableError()),
       4000,
     );
     request.once('error', (error) => reject(dnsFailure(error)));
     request.once('close', () => clearTimeout(timeout));
+  });
+  return response.finally(async () => {
+    if (signal) {
+      await closed;
+      await socketClosed;
+    }
   });
 }

@@ -1,6 +1,8 @@
 import { once } from 'node:events';
 import { createServer, request } from 'node:http';
 import type * as Dns from 'node:dns/promises';
+import type * as Https from 'node:https';
+import { connect as startTls } from 'node:tls';
 import type * as Net from 'node:net';
 import { createServer as createTcpServer } from 'node:net';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -15,10 +17,17 @@ const network = vi.hoisted(() => ({
     (hostname: string) => Promise<{ address: string; family: 4 | 6 }[]>
   >(),
   attempted: vi.fn<(options: Net.TcpNetConnectOpts) => void>(),
+  doh: vi.fn(() => {
+    throw Error('DoH must not be dialed in this fixture');
+  }),
 }));
 vi.mock('node:dns/promises', async (original) => ({
   ...(await original<typeof Dns>()),
   lookup: network.dns,
+}));
+vi.mock('node:https', async (original) => ({
+  ...(await original<typeof Https>()),
+  get: network.doh,
 }));
 vi.mock('node:net', async (original) => {
   const net = await original<typeof Net>();
@@ -26,6 +35,13 @@ vi.mock('node:net', async (original) => {
     ...net,
     connect(options: Net.TcpNetConnectOpts) {
       network.attempted(options);
+      if (options.host === '8.8.8.8') {
+        const socket = new net.Socket();
+        queueMicrotask(() =>
+          socket.destroy(Error('unreachable fixture address')),
+        );
+        return socket;
+      }
       if (options.host !== '1.1.1.1') throw Error('unexpected test dial');
       const socket = net.connect({ ...options, host: '127.0.0.1' });
       Object.defineProperty(socket, 'remoteAddress', { value: options.host });
@@ -39,6 +55,7 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((close) => close()));
   network.attempted.mockClear();
   network.dns.mockReset();
+  network.doh.mockClear();
 });
 async function listen(server: Net.Server) {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -202,46 +219,111 @@ it('denies a mixed DNS answer, private redirect target and a retired epoch befor
   expect(network.attempted).not.toHaveBeenCalled();
 });
 
-it('carries opaque CONNECT bytes only after authorization and joins the tunnel on epoch loss', async () => {
-  const upstream = createTcpServer((socket) => socket.pipe(socket));
-  const upstreamPort = await listen(upstream);
+function openTunnel(
+  vm: { port: number },
+  upstreamPort: number,
+  authorization?: string,
+) {
+  const req = request({
+    method: 'CONNECT',
+    host: '127.0.0.1',
+    port: vm.port,
+    path: `public.example:${upstreamPort}`,
+    headers: authorization ? { 'proxy-authorization': authorization } : {},
+  });
+  const result = once(req, 'connect') as Promise<
+    [{ statusCode: number }, Net.Socket, Buffer]
+  >;
+  req.end();
+  return result;
+}
+
+it('uses validated fallback addresses and accepts only parsed HTTP inside a plaintext CONNECT', async () => {
+  const upstream = createServer((req, res) => {
+    expect(req.url).toBe('/protected-target?');
+    expect(req.headers['proxy-authorization']).toBeUndefined();
+    res.end('plain HTTP over CONNECT');
+  });
+  const port = await listen(upstream);
   const vm = await setup();
-  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
-  function connect(authorization?: string) {
-    const req = request({
-      method: 'CONNECT',
-      host: '127.0.0.1',
-      port: vm.port,
-      path: `public.example:${upstreamPort}`,
-      headers: authorization ? { 'proxy-authorization': authorization } : {},
-    });
-    const result = once(req, 'connect') as Promise<
-      [
-        {
-          statusCode: number;
-        },
-        Net.Socket,
-        Buffer,
-      ]
-    >;
-    req.end();
-    return result;
-  }
-  const [challenge, rejected] = await connect();
+  network.dns.mockResolvedValue([
+    { address: '8.8.8.8', family: 4 },
+    { address: '1.1.1.1', family: 4 },
+  ]);
+  const [challenge, rejected] = await openTunnel(vm, port);
   rejected.destroy();
   expect(challenge.statusCode).toBe(407);
   expect(network.dns).not.toHaveBeenCalled();
-  const [response, tunnel] = await connect(vm.authorization);
+
+  const [start, badWire] = await openTunnel(vm, port, vm.authorization);
+  expect(start.statusCode).toBe(200);
+  const badClosed = once(badWire, 'close');
+  badWire.write('not HTTP or TLS\r\n');
+  await badClosed;
+  expect(network.attempted).not.toHaveBeenCalled();
+
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
   expect(response.statusCode).toBe(200);
+  tunnel.write(
+    `GET /protected-target? HTTP/1.1\r\nHost: public.example:${port}\r\nConnection: close\r\n\r\n`,
+  );
+  let body = '';
+  for await (const chunk of tunnel) body += String(chunk);
+  expect(body).toContain('plain HTTP over CONNECT');
+  expect(network.attempted.mock.calls.map(([options]) => options.host)).toEqual(
+    ['8.8.8.8', '1.1.1.1'],
+  );
+});
+
+it('passes a real TLS ClientHello and joins both endpoints on epoch loss', async () => {
+  const received = Promise.withResolvers<Buffer>();
+  const peerClosed = Promise.withResolvers<void>();
+  const port = await listen(
+    createTcpServer((socket) => {
+      socket.once('close', () => peerClosed.resolve());
+      socket.once('data', received.resolve);
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  const client = startTls({ socket: tunnel, servername: 'public.example' });
+  client.on('error', () => {});
   try {
-    const reply = once(tunnel, 'data');
-    tunnel.write('round trip');
-    expect((await reply)[0].toString()).toBe('round trip');
-    const end = once(tunnel, 'close');
+    expect((await received.promise)[0]).toBe(22);
+    const ended = Promise.withResolvers<void>();
+    client.once('close', () => ended.resolve());
     vm.stop.abort();
     await vm.drain();
-    await end;
+    await Promise.all([peerClosed.promise, ended.promise]);
   } finally {
-    tunnel.destroy();
+    client.destroy();
   }
+});
+
+it('joins a pending system lookup and never starts a synthetic DNS fallback after revoke', async () => {
+  const vm = await setup();
+  const began = Promise.withResolvers<void>();
+  const result = Promise.withResolvers<{ address: string; family: 4 }[]>();
+  network.dns.mockImplementation(() => {
+    began.resolve();
+    return result.promise;
+  });
+  const reply = get(vm.port, 'http://waiting.example/', vm.authorization).catch(
+    () => null,
+  );
+  await began.promise;
+  vm.stop.abort();
+  let joined = false;
+  const draining = vm.drain().then(() => {
+    joined = true;
+  });
+  await Promise.resolve();
+  expect(joined).toBe(false);
+  result.resolve([{ address: '198.18.2.16', family: 4 }]);
+  await draining;
+  await reply;
+  expect(network.doh).not.toHaveBeenCalled();
+  expect(network.attempted).not.toHaveBeenCalled();
 });

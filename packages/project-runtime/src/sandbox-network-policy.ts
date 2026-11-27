@@ -96,6 +96,7 @@ export async function resolveSandboxDestination(
 export function sandboxTlsClientHello(
   bytes: Buffer,
   hostname: string,
+  publicProxy = false,
 ): 'pending' | 'valid' {
   const bad = () => {
     throw new SandboxNetworkError('SANDBOX_NETWORK_PROTOCOL');
@@ -152,12 +153,19 @@ export function sandboxTlsClientHello(
         if (u16() !== length - 2 || body[take(1)] !== 0) return bad();
         const nameLength = u16(),
           name = body.subarray(take(nameLength), p);
-        if (p !== end || !name.equals(Buffer.from(hostname, 'ascii')))
+        if (
+          p !== end ||
+          (publicProxy
+            ? name.toString('ascii').toLowerCase() !== hostname.toLowerCase()
+            : !name.equals(Buffer.from(hostname, 'ascii')))
+        )
           return bad();
         sni = name.toString('ascii');
       } else p = end;
     }
-    return sni === hostname ? 'valid' : bad();
+    return sni !== undefined || (publicProxy && isIP(hostname))
+      ? 'valid'
+      : bad();
   }
   return 'pending';
 }

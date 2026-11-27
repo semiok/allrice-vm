@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
+  createServer,
   request as requestHttp,
   type IncomingHttpHeaders,
   type IncomingMessage,
@@ -9,10 +10,11 @@ import { addAbortListener } from 'node:events';
 import { BlockList, connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import type { Duplex } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
+import { finished, pipeline } from 'node:stream/promises';
 import {
-  resolvePublicAddress,
+  resolvePublicAddresses,
   sandboxPublicAddress,
+  sandboxTlsClientHello,
 } from '@allrice/project-runtime';
 import { EgressError } from './contract.js';
 
@@ -43,7 +45,13 @@ export function publicProxyTarget(target: string, tunnel: boolean) {
   const hostname = url.hostname.replace(/^\[|\]$/g, '');
   if (!hostname || /(?:^|\.)(?:localhost|local|home\.arpa)\.?$/i.test(hostname))
     throw denied();
-  return { url, hostname, port };
+  const path = tunnel ? '/' : target.replace(/^http:\/\/[^/?]*/i, '');
+  return {
+    url,
+    hostname,
+    port,
+    path: path.startsWith('/') ? path : '/' + path,
+  };
 }
 
 export function publicProxyAddress(
@@ -85,17 +93,22 @@ async function waitFor<T>(operation: Promise<T>, signal: AbortSignal) {
   }
 }
 
-async function open(hostname: string, port: number, signal: AbortSignal) {
-  const setup = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
-  setup.throwIfAborted();
-  const { address, family } = await waitFor(
-    resolvePublicAddress(hostname, publicProxyAddress),
-    setup,
-  ).catch((error: unknown) => {
-    if (error instanceof Error && error.message === 'PUBLIC_ADDRESS_DENIED')
-      throw denied();
-    throw error;
-  });
+function resolveTarget(hostname: string, signal: AbortSignal) {
+  return resolvePublicAddresses(hostname, publicProxyAddress, signal).catch(
+    (error: unknown) => {
+      if (error instanceof Error && error.message === 'PUBLIC_ADDRESS_DENIED')
+        throw denied();
+      throw error;
+    },
+  );
+}
+
+async function openPinned(
+  { address, family }: { address: string; family: number },
+  port: number,
+  signal: AbortSignal,
+  setup: AbortSignal,
+) {
   setup.throwIfAborted();
   if (!publicProxyAddress(address)) throw denied();
   const socket = connect({ host: address, port, family });
@@ -129,6 +142,24 @@ async function open(hostname: string, port: number, signal: AbortSignal) {
   }
 }
 
+async function open(
+  addresses: Awaited<ReturnType<typeof resolveTarget>>,
+  port: number,
+  signal: AbortSignal,
+) {
+  const overall = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+  for (const address of addresses) {
+    const attempt = AbortSignal.any([overall, AbortSignal.timeout(2_500)]);
+    try {
+      return await openPinned(address, port, signal, attempt);
+    } catch (error) {
+      overall.throwIfAborted();
+      if (error instanceof EgressError && error.code === 'DENIED') throw error;
+    }
+  }
+  throw new EgressError('UNAVAILABLE');
+}
+
 const hopByHop = [
   'connection',
   'keep-alive',
@@ -157,6 +188,157 @@ function responseCode(error: unknown) {
   return error instanceof EgressError && error.code === 'DENIED' ? 403 : 502;
 }
 
+type Target = ReturnType<typeof publicProxyTarget>;
+type Addresses = Awaited<ReturnType<typeof resolveTarget>>;
+
+async function relayHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: Target,
+  addresses: Addresses,
+  signal: AbortSignal,
+) {
+  const transfer = req.headers['transfer-encoding'];
+  if (transfer && transfer.toLowerCase() !== 'chunked') throw denied();
+  const upstream = await open(addresses, target.port, signal);
+  try {
+    signal.throwIfAborted();
+    const headers = forwarded(req.headers);
+    delete headers.expect;
+    if (transfer) headers['transfer-encoding'] = 'chunked';
+    if (req.headers['content-length'])
+      headers['content-length'] = req.headers['content-length'];
+    if (req.headers.expect?.toLowerCase() === '100-continue')
+      res.writeContinue();
+    const out = requestHttp({
+      method: req.method,
+      hostname: target.hostname,
+      port: target.port,
+      path: target.path,
+      headers: { ...headers, host: target.url.host, connection: 'close' },
+      createConnection: () => upstream.socket,
+      signal,
+    });
+    out.on('information', (message) => {
+      const hint = forwarded(message.headers).link;
+      if (message.statusCode === 103 && hint)
+        res.writeEarlyHints({ link: hint });
+    });
+    const response = new Promise<IncomingMessage>((resolve, reject) => {
+      out.once('response', resolve);
+      out.once('error', reject);
+      out.once('close', () => reject(new EgressError('UNAVAILABLE')));
+    }).then((reply) => {
+      res.writeHead(reply.statusCode ?? 502, {
+        ...forwarded(reply.headers),
+        connection: 'close',
+      });
+      return pipeline(reply, res, { signal });
+    });
+    await Promise.all([pipeline(req, out, { signal }), response]);
+  } finally {
+    await upstream.release();
+  }
+}
+
+async function firstBytes(
+  socket: Duplex,
+  head: Buffer,
+  hostname: string,
+  signal: AbortSignal,
+) {
+  let bytes = Buffer.from(head);
+  let complete = false;
+  const request = Promise.withResolvers<Buffer>();
+  function inspect() {
+    if (!bytes.length) return;
+    try {
+      if (
+        bytes[0] === 22 &&
+        sandboxTlsClientHello(bytes, hostname, true) === 'pending'
+      )
+        return;
+      complete = true;
+      socket.pause();
+      request.resolve(bytes);
+    } catch {
+      complete = true;
+      socket.pause();
+      request.reject(denied());
+    }
+  }
+  const data = (chunk: Buffer) => {
+    bytes = Buffer.concat([bytes, chunk]);
+    inspect();
+  };
+  try {
+    socket.on('data', data);
+    inspect();
+    if (!complete) socket.resume();
+    return await waitFor(request.promise, signal);
+  } finally {
+    socket.pause();
+    socket.off('data', data);
+  }
+}
+
+/** Reuse the Node HTTP parser on the already accepted socket. No listener is
+ * opened, and only this CONNECT's exact, already resolved target is reachable. */
+async function httpInsideTunnel(
+  socket: Duplex,
+  initial: Buffer,
+  target: Target,
+  addresses: Addresses,
+  signal: AbortSignal,
+) {
+  let request: Promise<void> | undefined;
+  const parser = createServer({ connectionsCheckingInterval: 0 });
+  const timeout = setTimeout(() => socket.destroy(), 10_000).unref();
+  parser.maxRequestsPerSocket = 1;
+  parser.on('connect', (_req, peer) => peer.destroy());
+  parser.on('upgrade', (_req, peer) => peer.destroy());
+  parser.on('clientError', (_error, peer) => peer.destroy());
+  const relay = (req: IncomingMessage, res: ServerResponse) => {
+    if (request) {
+      res.writeHead(403, { connection: 'close' }).end();
+      return;
+    }
+    clearTimeout(timeout);
+    request = (async () => {
+      try {
+        const path = req.url ?? '';
+        if (!path.startsWith('/') || path.startsWith('//') || !req.headers.host)
+          throw denied();
+        const requestTarget = publicProxyTarget(
+          'http://' + req.headers.host + path,
+          false,
+        );
+        if (
+          requestTarget.hostname !== target.hostname ||
+          requestTarget.port !== target.port
+        )
+          throw denied();
+        await relayHttp(req, res, requestTarget, addresses, signal);
+      } catch (error) {
+        if (res.headersSent || signal.aborted) res.destroy();
+        else res.writeHead(responseCode(error), { connection: 'close' }).end();
+      }
+    })();
+  };
+  parser.on('request', relay);
+  parser.on('checkContinue', relay);
+  const joined = closed(socket);
+  parser.emit('connection', socket);
+  socket.unshift(initial);
+  socket.resume();
+  try {
+    await joined;
+    await request;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /** An HTTP listener capability for one active VM epoch. It cannot authenticate
  * the other routes on the same gateway port. */
 export function createVmPublicProxy(
@@ -177,6 +359,8 @@ export function createVmPublicProxy(
     );
   }
   const challenge = { 'proxy-authenticate': 'Basic realm="VM egress"' };
+  const setup = (signal: AbortSignal) =>
+    AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
   return {
     counts,
     authorizationUrl(origin: string) {
@@ -195,37 +379,12 @@ export function createVmPublicProxy(
       const cancel = () => disconnected.abort();
       res.once('close', cancel);
       const signal = AbortSignal.any([owner, disconnected.signal]);
-      let upstream: Awaited<ReturnType<typeof open>> | undefined;
       try {
         assertActive();
-        const { url, hostname, port } = publicProxyTarget(req.url ?? '', false);
-        upstream = await open(hostname, port, signal);
+        const target = publicProxyTarget(req.url ?? '', false);
+        const addresses = await resolveTarget(target.hostname, setup(signal));
         assertActive();
-        signal.throwIfAborted();
-        const upstreamSocket = upstream.socket;
-        const out = requestHttp({
-          method: req.method,
-          hostname,
-          port,
-          path: url.pathname + url.search,
-          headers: {
-            ...forwarded(req.headers),
-            host: url.host,
-            connection: 'close',
-          },
-          createConnection: () => upstreamSocket,
-          signal,
-        });
-        const answer = new Promise<IncomingMessage>((resolve, reject) => {
-          out.once('response', resolve);
-          out.once('error', reject);
-          out.once('close', () => reject(new EgressError('UNAVAILABLE')));
-        });
-        const relay = answer.then((reply) => {
-          res.writeHead(reply.statusCode ?? 502, forwarded(reply.headers));
-          return pipeline(reply, res, { signal });
-        });
-        await Promise.all([pipeline(req, out, { signal }), relay]);
+        await relayHttp(req, res, target, addresses, signal);
         counts.http++;
       } catch (error) {
         const status = responseCode(error);
@@ -236,7 +395,6 @@ export function createVmPublicProxy(
         }
       } finally {
         res.off('close', cancel);
-        await upstream?.release();
       }
     },
     async connect(req: IncomingMessage, client: Duplex, head: Buffer) {
@@ -267,16 +425,28 @@ export function createVmPublicProxy(
         }
         assertActive();
         const target = publicProxyTarget(req.url ?? '', true);
-        upstream = await open(target.hostname, target.port, signal);
+        const budget = setup(signal);
+        const addresses = await resolveTarget(target.hostname, budget);
+        assertActive();
+        budget.throwIfAborted();
+        established = true;
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        const initial = await firstBytes(client, head, target.hostname, budget);
+        assertActive();
+        counts.connect++;
+        if (initial[0] !== 22) {
+          await httpInsideTunnel(client, initial, target, addresses, signal);
+          return;
+        }
+        upstream = await open(addresses, target.port, signal);
         assertActive();
         signal.throwIfAborted();
-        established = true;
-        counts.connect++;
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head.length) upstream.socket.write(head);
+        upstream.socket.write(initial);
         client.pipe(upstream.socket);
         upstream.socket.pipe(client);
         await Promise.race([clientClosed, upstream.joined]);
+        if (!signal.aborted && upstream.socket.readableEnded)
+          await finished(client, { cleanup: true, readable: false, signal });
       } catch (error) {
         const status = responseCode(error);
         counts[status === 403 ? 'denied' : 'unavailable']++;

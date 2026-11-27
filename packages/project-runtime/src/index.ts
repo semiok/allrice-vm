@@ -13,7 +13,10 @@ export * from './command-output.js';
 export * from './project-events.js';
 export * from './project-staging.js';
 
-export { resolvePublicAddress } from './public-address.js';
+export {
+  resolvePublicAddress,
+  resolvePublicAddresses,
+} from './public-address.js';
 
 export * from './project-preview-relay.js';
 export * from './project-logs.js';

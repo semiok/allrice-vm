@@ -600,6 +600,15 @@ export function createEgressGateway(
             }
           });
         });
+        state.server.on('checkContinue', (req, res) => {
+          const proxy = state.publicProxy;
+          if (proxy && /^https?:\/\//i.test(req.url ?? '')) {
+            ownRequest(() => proxy.http(req, res));
+          } else {
+            res.writeContinue();
+            state.server.emit('request', req, res);
+          }
+        });
         state.server.on('connect', (req, socket, head) => {
           const proxy = state.publicProxy;
           if (!proxy) socket.destroy();

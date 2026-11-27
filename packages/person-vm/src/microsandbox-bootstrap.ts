@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, posix } from 'node:path';
 import { PersonVmError } from './contract.ts';
 import {
   DSH_SANDBOX_ROOT,
+  launchDshPublicProxy,
   launchDshSandbox,
   prepareDshSandbox,
   verifyDshRuntimeDisk,
@@ -581,6 +582,14 @@ export async function bootstrapMicrosandbox(input: {
           ...spec.args,
         ];
       }
+      if (plan.env.ALLRICE_PUBLIC_PROXY_CONFIG)
+        argv = [
+          '/bin/sh',
+          '-c',
+          launchDshPublicProxy,
+          'allrice-public-proxy',
+          ...argv,
+        ];
       return spawn({
         executable: plan.launcher,
         args: argv,
