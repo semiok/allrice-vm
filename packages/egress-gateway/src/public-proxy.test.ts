@@ -24,6 +24,7 @@ const network = vi.hoisted(() => ({
   >(),
   attempted: vi.fn<(options: Net.TcpNetConnectOpts) => void>(),
   beforeDial: vi.fn<() => Promise<void> | undefined>(),
+  captureDial: vi.fn<(socket: Net.Socket) => void>(),
   doh: vi.fn(() => {
     throw Error('DoH must not be dialed in this fixture');
   }),
@@ -58,6 +59,7 @@ vi.mock('node:net', async (original) => {
           if (!socket.destroyed) socket.connect(local);
         });
       Object.defineProperty(socket, 'remoteAddress', { value: options.host });
+      network.captureDial(socket);
       return socket;
     },
   };
@@ -75,6 +77,7 @@ afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((close) => close()));
   network.attempted.mockClear();
   network.beforeDial.mockReset();
+  network.captureDial.mockReset();
   network.dns.mockReset();
   network.doh.mockClear();
 });
@@ -463,6 +466,7 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
     const hello = Buffer.from([22, 3, 3, 0, 1, 2]);
     const tail = Buffer.from([23, 3, 3, 0, 3, 14, 15, 16]);
     const upstream = deferred<Net.Socket>();
+    const proxyPeer = deferred<Net.Socket>();
     const peerClosed = deferred<void>();
     let received = Buffer.alloc(0);
     const port = await listen(
@@ -480,6 +484,7 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
     );
     const vm = await setup();
     network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+    network.captureDial.mockImplementationOnce(proxyPeer.resolve);
     const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
     expect(response.statusCode).toBe(200);
     tunnel.allowHalfOpen = true;
@@ -490,8 +495,17 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
     try {
       await ended;
       expect((await upstream.promise).readableEnded).toBe(false);
-      if (completion === 'guest FIN') tunnel.end(tail);
-      else vm.stop.abort();
+      if (completion === 'guest FIN') {
+        const writable = await proxyPeer.promise;
+        writable.cork();
+        tunnel.end(tail);
+        await clientClosed;
+        await vi.waitFor(() =>
+          expect(writable.writableLength).toBe(tail.length),
+        );
+        expect(writable.destroyed).toBe(false);
+        writable.uncork();
+      } else vm.stop.abort();
       await Promise.all([peerClosed.promise, vm.drain()]);
       expect(received).toEqual(
         completion === 'guest FIN' ? Buffer.concat([initial, tail]) : initial,
@@ -503,6 +517,45 @@ it.each(['guest FIN', 'epoch revoke'] as const)(
     }
   },
 );
+
+it('joins both sockets when an incomplete TLS record fails while the opposite writer is blocked', async () => {
+  const initial = await nativeClientHello();
+  const remote = deferred<Net.Socket>();
+  const proxyPeer = deferred<Net.Socket>();
+  const peerClosed = deferred<void>();
+  const hello = Buffer.from([22, 3, 3, 0, 1, 2]);
+  const tail = Buffer.from([23, 3, 3, 0, 3, 14, 15, 16]);
+  const port = await listen(
+    createTcpServer({ allowHalfOpen: true }, (socket) => {
+      socket.once('close', () => peerClosed.resolve());
+      socket.once('data', () => {
+        socket.write(hello);
+        remote.resolve(socket);
+      });
+    }),
+  );
+  const vm = await setup();
+  network.dns.mockResolvedValue([{ address: '1.1.1.1', family: 4 }]);
+  network.captureDial.mockImplementationOnce(proxyPeer.resolve);
+  const [response, tunnel] = await openTunnel(vm, port, vm.authorization);
+  expect(response.statusCode).toBe(200);
+  const serverFlight = once(tunnel, 'data');
+  const clientClosed = once(tunnel, 'close');
+  tunnel.write(initial);
+  try {
+    await serverFlight;
+    const writable = await proxyPeer.promise;
+    writable.cork();
+    tunnel.end(tail);
+    await vm.inputEnded;
+    await vi.waitFor(() => expect(writable.writableLength).toBe(tail.length));
+    (await remote.promise).end(tail.subarray(0, -1));
+    await Promise.all([clientClosed, peerClosed.promise, vm.drain()]);
+    expect(writable.destroyed).toBe(true);
+  } finally {
+    tunnel.destroy();
+  }
+});
 
 it.each(['coalesced', 'split', 'coalesced before EOF'] as const)(
   'relays %s early TLS records before the first server flight',

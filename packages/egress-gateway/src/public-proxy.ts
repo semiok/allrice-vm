@@ -347,6 +347,27 @@ function finishTlsWrite(destination: Duplex, signal: AbortSignal) {
   return flushed;
 }
 
+async function writeTlsRecords(
+  records: AsyncIterable<Buffer>,
+  destination: Duplex,
+  signal: AbortSignal,
+) {
+  for await (const record of records) {
+    signal.throwIfAborted();
+    await waitFor(
+      new Promise<void>((resolve, reject) => {
+        destination.write(record, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+      signal,
+    );
+  }
+  signal.throwIfAborted();
+  await finishTlsWrite(destination, signal);
+}
+
 async function relayTls(
   client: Duplex,
   peer: Duplex,
@@ -356,51 +377,52 @@ async function relayTls(
 ) {
   const close = new AbortController();
   const active = AbortSignal.any([signal, close.signal]);
+  const stop = addAbortListener(active, () => {
+    client.destroy();
+    peer.destroy();
+  });
   const handshake = AbortSignal.any([active, AbortSignal.timeout(10_000)]);
   let serverHello: boolean | undefined;
   let serverFlight!: (serverHello: boolean) => void;
   const serverReady = new Promise<boolean>((resolve) => {
     serverFlight = resolve;
   });
-  // Each pump owns its destination's FIN. Ending it in pipeline can await a
-  // finish notification that was already consumed by a half-closing socket.
-  const ingress = pipeline(
-    peer,
-    () =>
-      tlsRecords(tlsInput(peer), (record, first) => {
-        if (!first) return;
-        const hello = record[0] === 22 && record[5] === 2;
-        if (!hello && record[0] !== 21) throw denied();
-        serverHello = hello;
-        serverFlight(hello);
-      }),
+  const ingress = writeTlsRecords(
+    tlsRecords(tlsInput(peer), (record, first) => {
+      if (!first) return;
+      const hello = record[0] === 22 && record[5] === 2;
+      if (!hello && record[0] !== 21) throw denied();
+      serverHello = hello;
+      serverFlight(hello);
+    }),
     client,
-    { signal: active, end: false },
-  ).then(() => finishTlsWrite(client, active));
-  const egress = pipeline(
-    client,
-    () =>
-      tlsRecords(tlsInput(client, buffered), (record) => {
-        if (serverHello === true) return;
-        // A TLS 1.3 client can send framed early data before ServerHello.
-        if (
-          serverHello === undefined &&
-          earlyData &&
-          (record[0] === 20 || record[0] === 23)
-        )
-          return;
-        return waitFor(serverReady, handshake).then((hello) => {
-          if (!hello) throw denied();
-        });
-      }),
+    active,
+  );
+  const egress = writeTlsRecords(
+    tlsRecords(tlsInput(client, buffered), (record) => {
+      if (serverHello === true) return;
+      // A TLS 1.3 client can send framed early data before ServerHello.
+      if (
+        serverHello === undefined &&
+        earlyData &&
+        (record[0] === 20 || record[0] === 23)
+      )
+        return;
+      return waitFor(serverReady, handshake).then((hello) => {
+        if (!hello) throw denied();
+      });
+    }),
     peer,
-    { signal: active, end: false },
-  ).then(() => finishTlsWrite(peer, active));
+    active,
+  );
   try {
     await Promise.all([ingress, egress]);
+  } catch (error) {
+    close.abort(error);
+    throw error;
   } finally {
-    close.abort();
     await Promise.allSettled([ingress, egress]);
+    stop[Symbol.dispose]();
   }
 }
 
@@ -521,7 +543,17 @@ export function createVmPublicProxy(
     async connect(req: IncomingMessage, client: Duplex, head: Buffer) {
       const clientClosed = closed(client);
       const disconnected = new AbortController();
-      client.once('close', () => disconnected.abort());
+      let tls = false;
+      client.once('close', (hadError: boolean) => {
+        // A clean TLS close may precede flushing the other direction.
+        if (
+          !tls ||
+          hadError ||
+          !client.readableEnded ||
+          !client.writableFinished
+        )
+          disconnected.abort();
+      });
       client.on('error', () => {});
       client.pause();
       const signal = AbortSignal.any([owner, disconnected.signal]);
@@ -565,6 +597,7 @@ export function createVmPublicProxy(
           );
           return;
         }
+        tls = true;
         upstream = await open(addresses, target.port, signal, true);
         assertActive();
         signal.throwIfAborted();
