@@ -121,11 +121,13 @@ export type DshGatewayRoute = ModelRouteKey &
   Readonly<{
     transport: 'sse';
     classify: GatewayProvider['classify'];
-    /** Host approved for this exact route. Available on OpenAI API only. */
+    /** Host approved for this exact route. Only for a supported provider/model capability. */
     hostedWebSearch?: true;
   }>;
 export interface GatewayProvider {
   readonly hostedWebSearch?: ModelRouteKey;
+  /** Require a confirmed native transport close on every cancellation. */
+  readonly requireTransportProof?: true;
   /** Optional exact Host-owned transport. Only the gateway calls it after it
    * has committed the metered attempt. No Guest data selects the dispatcher. */
   assertDispatchCurrent?(signal: AbortSignal): Promise<void>;

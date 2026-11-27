@@ -17,6 +17,10 @@ type ManagedGuestModelCall = {
   readonly provider: string;
   readonly model: string;
   readonly modelInfo?: LlmResolvedModelInfo;
+  readonly models?: readonly {
+    model: string;
+    modelInfo: LlmResolvedModelInfo;
+  }[];
   readonly lifetime?: AbortSignal;
   /** The authorized native invocation delivers a reference for this call
    * before the adapter sends its first request. The adapter never mints one. */
@@ -64,6 +68,9 @@ export function createDshGatewayProvider(
           }),
         }
       : {}),
+    ...(route.provider === 'deepseek'
+      ? { requireTransportProof: true as const }
+      : {}),
     fetchOwned,
     assertDispatchCurrent,
     async *stream(binding, input, signal) {
@@ -96,7 +103,7 @@ export function createDshGatewayProvider(
           // Guest replay metadata is never authority to replay native OpenAI
           // items under a shared Host credential. Use DSH's normal neutral
           // history conversion on this route, retaining text and tool history.
-          ...(route.provider === 'openai'
+          ...(route.provider === 'openai' || route.provider === 'deepseek'
             ? {
                 messages: input.messages.map((message) => {
                   if (message.role !== 'assistant') return message;
@@ -132,7 +139,9 @@ export class GatewayLlmAdapter extends LlmAdapter {
     if (!route || route.provider !== provider)
       return super.listModels(provider);
     route.lifetime?.throwIfAborted();
-    return [await this.resolveModel(provider, route.model)];
+    return route.models
+      ? route.models.map(({ modelInfo }) => modelInfo)
+      : [await this.resolveModel(provider, route.model)];
   }
   override async resolveModel(
     provider: string,
@@ -143,8 +152,14 @@ export class GatewayLlmAdapter extends LlmAdapter {
     if (!route) return super.resolveModel(provider, model, signal);
     signal?.throwIfAborted();
     route.lifetime?.throwIfAborted();
-    if (route.provider !== provider || route.model !== model)
+    if (route.provider !== provider)
       throw new ModelGatewayError('BINDING_INVALID');
+    if (route.models) {
+      const found = route.models.find((value) => value.model === model);
+      if (!found) throw new ModelGatewayError('BINDING_INVALID');
+      return found.modelInfo;
+    }
+    if (route.model !== model) throw new ModelGatewayError('BINDING_INVALID');
     return route.modelInfo ?? super.resolveModel(provider, model, signal);
   }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -160,7 +175,9 @@ export class GatewayLlmAdapter extends LlmAdapter {
         const { provider, model, sessionId } = options;
         if (
           provider !== this.managed.provider ||
-          model !== this.managed.model ||
+          (this.managed.models
+            ? !this.managed.models.some((value) => value.model === model)
+            : model !== this.managed.model) ||
           !sessionId ||
           !signal
         )

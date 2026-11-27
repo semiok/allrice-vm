@@ -1,3 +1,4 @@
+import { DEEPSEEK_RESPONSES_URL } from './deepseek-api.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { ModelGatewayError } from './contract.ts';
@@ -227,11 +228,15 @@ export function createMeteredTransport(options: {
         let request = new Request(input, requestInit);
         const approved = options.provider.hostedWebSearch;
         const publicResponses =
-          request.url === OPENAI_RESPONSES_URL &&
+          ((options.binding.provider === 'openai' &&
+            request.url === OPENAI_RESPONSES_URL) ||
+            (options.binding.provider === 'deepseek' &&
+              request.url === DEEPSEEK_RESPONSES_URL)) &&
           request.method === 'POST' &&
           classification.kind === 'model' &&
-          classification.protocol === 'openai-responses' &&
-          options.binding.provider === 'openai';
+          classification.protocol === 'openai-responses';
+        const requireCloseProof =
+          publicResponses || options.provider.requireTransportProof;
         const hostedSearch =
           publicResponses &&
           options.binding.native.attemptKind === 'assistant' &&
@@ -268,7 +273,7 @@ export function createMeteredTransport(options: {
         status = response.status;
         if (!response.body) {
           if (
-            publicResponses &&
+            requireCloseProof &&
             !(await nativeClose.waitForSettlement(requestSignal))
           )
             throw new ModelGatewayError('LEDGER_UNAVAILABLE');
@@ -297,7 +302,7 @@ export function createMeteredTransport(options: {
             // reader.cancel is awaited; an abort request alone never releases a slot.
             try {
               await reader.cancel(requestSignal.reason);
-              if (publicResponses && !(await nativeClose.confirmed()))
+              if (requireCloseProof && !(await nativeClose.confirmed()))
                 throw new ModelGatewayError('LEDGER_UNAVAILABLE');
               transportJoined = true;
             } catch (error) {

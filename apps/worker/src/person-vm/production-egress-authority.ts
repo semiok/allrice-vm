@@ -38,11 +38,19 @@ export function createProductionEgressAuthority(input: {
     catalog(binding: PersonVmBinding, employeeInstanceId: string): Catalog;
   };
   modelAuthority: Pick<ModelGatewayAuthority, 'assertCall'>;
-  modelRoute: Pick<ModelCallBinding, 'provider' | 'model'>;
+  modelRoute:
+    | Pick<ModelCallBinding, 'provider' | 'model'>
+    | ((call: ModelCallBinding) => boolean);
   lifetime: AbortSignal;
 }) {
-  const { provider, model } = input.modelRoute;
-  if (!provider || !model) throw new EgressError('POLICY_INVALID');
+  const route = input.modelRoute;
+  if (typeof route !== 'function' && (!route.provider || !route.model))
+    throw new EgressError('POLICY_INVALID');
+  const matchesRoute =
+    typeof route === 'function'
+      ? route
+      : (call: ModelCallBinding) =>
+          call.provider === route.provider && call.model === route.model;
   input.lifetime.throwIfAborted();
   const resolved = new WeakMap<
     RequestContext,
@@ -172,8 +180,7 @@ export function createProductionEgressAuthority(input: {
         context.actor.id !== call.vm.personId ||
         context.organizationId !== call.vm.organizationId ||
         call.executionGeneration !== '4.0' ||
-        call.provider !== provider ||
-        call.model !== model ||
+        !matchesRoute(call) ||
         !UuidSchema.safeParse(call.employeeInstanceId).success ||
         !UuidSchema.safeParse(call.allriceThreadRef).success
       )

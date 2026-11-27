@@ -157,9 +157,11 @@ export async function createProductionCodexRuntime(
   lifetime: AbortSignal,
   ownerId: string,
   readModelImage?: ReadProductionModelImage,
+  approvedModel?: string,
 ) {
   lifetime.throwIfAborted();
   const model =
+    approvedModel ??
     process.env.ALLRICE_DSH_CODEX_MODEL ??
     process.env.ALLRICE_CODEX_MODEL ??
     'gpt-6.1-sol';
