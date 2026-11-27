@@ -107,7 +107,12 @@ export async function readLinuxRelease(root, expectedDigest) {
         throw new Error('Invalid sealed Linux service configuration');
     }
   }
-  return { root, sourceSha: body.sourceSha, config };
+  return {
+    root,
+    sourceSha: body.sourceSha,
+    sourceTree: body.sourceTree,
+    config,
+  };
 }
 
 export function renderUnits({ root, sourceSha, config }) {

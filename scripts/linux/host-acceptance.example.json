@@ -1,0 +1,14 @@
+{
+  "current": {
+    "release": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "manifestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "dataVolume": "vol-01234567890abcdef",
+  "dataUuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "scratchMount": "/mnt/allrice-trial-scratch",
+  "scratchUuid": "11111111-2222-3333-4444-555555555555",
+  "scratchLuksUuid": "66666666-7777-8888-9999-000000000000",
+  "msb": "/opt/allrice40/msb/bin/msb",
+  "rollback": null
+}

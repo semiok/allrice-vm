@@ -75,6 +75,20 @@ def check_sso_profile(target, path):
         raise RuntimeError('the named profile must directly select an Identity Center account and role')
 
 
+class AwsCallError(RuntimeError):
+    def __init__(self, service, operation, result):
+        prefix = r'^(?:aws: \[ERROR\]:\s*)?'
+        code = re.search(prefix + r'An error occurred \(([A-Za-z0-9_.-]+)\) when calling ',
+                         result.stderr, re.M)
+        self.code = code[1] if code else None
+        self.transport = result.returncode == 255 and re.search(
+            prefix + r'(?:Read timeout on endpoint URL:|Connect timeout on endpoint URL:'
+            r'|Could not connect to the endpoint URL:|Connection was closed before we received a valid response from endpoint URL:)',
+            result.stderr, re.M,
+        ) is not None
+        super().__init__(f'AWS {service} {operation} failed (exit {result.returncode})')
+
+
 class AwsCli:
     def __init__(self, target):
         check_sso_profile(target, Path.home() / '.aws/config')
@@ -93,7 +107,7 @@ class AwsCli:
             env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
         )
         if result.returncode:
-            raise RuntimeError(f'AWS {service} {operation} failed (exit {result.returncode})')
+            raise AwsCallError(service, operation, result)
         return json.loads(result.stdout)
 
 
@@ -122,26 +136,32 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def health_ready(target):
+def ready_web_identity(target):
     try:
         with build_opener(NoRedirect()).open(target['healthUrl'], timeout=5) as response:
             data = response.read(65537)
             if response.status != 200 or len(data) > 65536:
-                return False
+                return None
             document = json.loads(data)
             identity = document['identity']
             maintenance = document.get('maintenance')
             open_for_use = maintenance is None or (
                 isinstance(maintenance, dict) and maintenance.get('state') == 'open'
             )
-            return (document['status'] == 'ready' and identity['service'] == 'web'
+            if (document['status'] == 'ready' and identity['service'] == 'web'
                     and identity['environment'] == 'dev' and identity['mode'] == 'production'
                     and identity['repository'] == 'semiok/allrice-vm' and identity['repositoryId'] == 1469490636
                     and identity['sourceSha'] == target['release'] and identity['sourceTree'] == target['tree']
                     and identity['manifestDigest'] == target['manifestDigest']
-                    and open_for_use)
+                    and open_for_use):
+                return identity
     except (URLError, HTTPException, OSError, KeyError, TypeError, ValueError):
-        return False
+        pass
+    return None
+
+
+def health_ready(target):
+    return ready_web_identity(target) is not None
 
 
 def run_power(action, target, aws, *, ready=health_ready, stop_gate=None,
