@@ -267,6 +267,7 @@ it('requires the live physical proof even with the current employee already veri
     expect(ready?.proof.aborted).toBe(false);
     expect(f.confirmPhysical).toHaveBeenCalledWith(
       f.context,
+      f.identity,
       f.binding,
       expect.any(AbortSignal),
     );

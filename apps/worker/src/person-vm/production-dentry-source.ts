@@ -85,7 +85,12 @@ export function installProductionDEntrySource(input: {
   startup: Startup;
   admission: ReturnType<PersonVmService['createAdmissionHost']>;
   lifetime: AbortSignal;
-  confirmPhysical?: PersonVmService['assertRunningReadiness'];
+  confirmPhysical?(
+    context: RequestContext,
+    identity: DEntryIdentity,
+    binding: PersonVmBinding,
+    signal: AbortSignal,
+  ): Promise<void>;
   resolveSendRoute: ResolveProductionDEntrySendRoute;
 }) {
   input.lifetime.throwIfAborted();
@@ -189,7 +194,7 @@ export function installProductionDEntrySource(input: {
             current.signal,
           );
           const confirmed = AbortSignal.any([current.signal, proof, group]);
-          await input.confirmPhysical(context, binding, confirmed);
+          await input.confirmPhysical(context, identity, binding, confirmed);
           await current.owner.assertCurrent(context, confirmed);
           sameHost(current.owner, identity);
           confirmed.throwIfAborted();

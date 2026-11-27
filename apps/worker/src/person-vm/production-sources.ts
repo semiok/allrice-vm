@@ -101,8 +101,10 @@ export function createProductionPersonVmSources(
           startup,
           admission,
           lifetime,
-          confirmPhysical: (context, binding, active) =>
-            host.vm.assertRunningReadiness(context, binding, active),
+          confirmPhysical: (context, identity, binding, active) =>
+            host.current.withCurrentSelection(context, identity, active, () =>
+              host.vm.assertRunningReadiness(context, binding, active),
+            ),
           async resolveSendRoute(input, signal) {
             const active = AbortSignal.any([lifetime, codex.revoked, signal]);
             const generation = await codex.assertCurrent(active);
