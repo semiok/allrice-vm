@@ -631,8 +631,9 @@ suite('real AllRice sidebar in installed native profiles', () => {
     const createRequests: Request[] = [];
     const failures = [
       {
-        code: 'CONFLICT',
-        message: '暂时每人只能创建一个 4.0 员工，多员工马上开放。',
+        code: 'VERSION_CONFLICT',
+        message:
+          '员工配置已变化，或请求标识被用于不同修改。请读取最新版本后重试。',
       },
       { code: 'QUOTA_EXCEEDED', message: '每人最多 13 个员工' },
       {
