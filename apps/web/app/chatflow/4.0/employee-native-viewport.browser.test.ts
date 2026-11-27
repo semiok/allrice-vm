@@ -1,4 +1,4 @@
-import { mkdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { extname, join } from 'node:path';
@@ -241,7 +241,6 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
     } catch (error) {
       throw Error(JSON.stringify(errors), { cause: error });
     }
-    const measurements = [];
     for (const [width, height] of [
       [1440, 900],
       [1920, 1080],
@@ -252,7 +251,6 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       const outer = await iframe.evaluate((frame) => ({
         bottom: frame.getBoundingClientRect().bottom,
         width: frame.getBoundingClientRect().width,
-        viewportWidth: innerWidth,
         scrollHeight: document.scrollingElement!.scrollHeight,
         overflowY: getComputedStyle(document.documentElement).overflowY,
       }));
@@ -269,18 +267,6 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
         scrollHeight: document.scrollingElement!.scrollHeight,
         height: innerHeight,
       }));
-      measurements.push({ width, height, outer, inner });
-      if (process.env.ALLRICE_RUN_NATIVE_VIEWPORT_CAPTURE === '1') {
-        const directory = join(process.cwd(), '.local', 'native-viewport');
-        await mkdir(directory, { recursive: true });
-        await page.screenshot({
-          path: join(directory, `${width}x${height}.png`),
-          animations: 'disabled',
-        });
-        console.log(JSON.stringify({ directory, width, height, outer, inner }));
-      }
-    }
-    for (const { width, height, outer, inner } of measurements) {
       expect(outer.bottom).toBeCloseTo(height, 0);
       expect(outer.width).toBeCloseTo(width, 0);
       expect(outer.scrollHeight).toBe(height);
@@ -288,7 +274,7 @@ it.skipIf(process.env.ALLRICE_RUN_BROWSER_INTEGRATION !== '1')(
       expect(inner.mount).toBeCloseTo(height, 0);
       expect(inner.sidebar).toBeCloseTo(height, 0);
       expect(inner.conversation).toBeCloseTo(height, 0);
-      expect(inner.composer).toBeGreaterThan(height - 80);
+      expect(inner.composer).toBeGreaterThan(height - 32);
       expect(inner.composer).toBeLessThanOrEqual(height);
       expect(inner.scrollHeight).toBe(height);
       expect(outer.overflowY).not.toBe('scroll');
