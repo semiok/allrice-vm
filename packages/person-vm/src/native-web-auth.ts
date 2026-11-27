@@ -11,7 +11,6 @@ export type PersonVmNativeWebAuthRequest = Readonly<{
 }>;
 export type PersonVmNativeWebAuth = Readonly<{
   authenticatedUrl: string;
-  nativeWorkspaceId: string;
   modelAdapterId?: string;
 }>;
 
@@ -47,7 +46,6 @@ export function nativeWebAuthArtifact(request: PersonVmNativeWebAuthRequest) {
         v: 1,
         nonce: request.nonce,
         modelAdapterId: request.modelAdapterId,
-        nativeWorkspaceId: '00000000-0000-4000-8000-000000000000',
         authenticatedUrl: `${origin.origin}/?token=${'a'.repeat(43)}`,
       }),
     ) + 1;
@@ -69,19 +67,14 @@ export function parseNativeWebAuth(
       nonce?: unknown;
       authenticatedUrl?: unknown;
       modelAdapterId?: unknown;
-      nativeWorkspaceId?: unknown;
     };
     if (
       !value ||
       Object.keys(value).sort().join(',') !==
         (request.modelAdapterId === undefined
-          ? 'authenticatedUrl,nativeWorkspaceId,nonce,v'
-          : 'authenticatedUrl,modelAdapterId,nativeWorkspaceId,nonce,v') ||
+          ? 'authenticatedUrl,nonce,v'
+          : 'authenticatedUrl,modelAdapterId,nonce,v') ||
       value.modelAdapterId !== request.modelAdapterId ||
-      typeof value.nativeWorkspaceId !== 'string' ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
-        value.nativeWorkspaceId,
-      ) ||
       value.v !== 1 ||
       value.nonce !== request.nonce ||
       typeof value.authenticatedUrl !== 'string'
@@ -100,7 +93,6 @@ export function parseNativeWebAuth(
       throw new Error();
     return Object.freeze({
       authenticatedUrl: url.href,
-      nativeWorkspaceId: value.nativeWorkspaceId,
       ...(request.modelAdapterId === undefined
         ? {}
         : { modelAdapterId: request.modelAdapterId }),

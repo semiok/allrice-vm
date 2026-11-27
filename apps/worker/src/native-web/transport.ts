@@ -369,17 +369,20 @@ export function nativeWebTransport(
       );
       return data.length ? data.toString('utf8') : null;
     },
-    async readSessionReply(
-      endpoint: 'create' | 'modelCatalog',
+    async readNativeReply(
+      method: 'session/create' | 'session/modelCatalog' | 'workspace/create',
       body: string,
       caller: AbortSignal,
     ) {
       if (!cookie) throw new PersonVmError('PROVIDER_FAILED');
       const { data } = await readOwned(
-        new URL('api/session/' + endpoint, origin),
+        new URL('api/' + method, origin),
         caller,
         {
-          maxBytes: endpoint === 'create' ? 16 * 1024 : nativeIndexByteLimit,
+          maxBytes:
+            method === 'session/modelCatalog'
+              ? nativeIndexByteLimit
+              : 16 * 1024,
           credential: 'api',
           body,
           accepts: ({ statusCode, headers }) =>

@@ -35,7 +35,6 @@ async function fixture() {
   const value = {
     v: 1,
     nonce: request.nonce,
-    nativeWorkspaceId: randomUUID(),
     authenticatedUrl: `${request.origin}?token=${'a'.repeat(43)}`,
   };
   return { request, artifact, value };
@@ -81,7 +80,6 @@ it('实际reader在原子发布前已监听，不丢唤醒；只回已知nonce�
     expect(result.err).toBe('');
     expect(parseNativeWebAuth(result.out, f.request)).toEqual({
       authenticatedUrl: f.value.authenticatedUrl,
-      nativeWorkspaceId: f.value.nativeWorkspaceId,
     });
   } finally {
     if (r.child.exitCode === null) r.child.kill('SIGKILL');
@@ -101,8 +99,6 @@ it('实际reader拒绝symlink/超长，不输出其内容；解析错不携带�
   expect(await r.done).toMatchObject({ code: 1, out: '' });
   for (const value of [
     { ...f.value, nonce: randomUUID() },
-    { ...f.value, nativeWorkspaceId: undefined },
-    { ...f.value, nativeWorkspaceId: 'not-a-native-workspace-id' },
     {
       ...f.value,
       authenticatedUrl: `http://127.0.0.1:32180/?token=${'a'.repeat(43)}`,

@@ -620,10 +620,7 @@ describe('host lifecycle service entrypoints (synthetic runtime; not real VM acc
       readNativeWebAuth: async () => {
         enter();
         await joined;
-        return {
-          authenticatedUrl: 'must not escape',
-          nativeWorkspaceId: randomUUID(),
-        };
+        return { authenticatedUrl: 'must not escape' };
       },
     });
     let reading!: Promise<unknown>;

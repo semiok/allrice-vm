@@ -910,7 +910,13 @@ export function applyNativeWebOwner(
     });
   const observed = ctx.allricePrincipal.observeProfileGraph(ctx.clientModules, {
     current,
-    defaultWorkspace: () => workspace,
+    defaultWorkspace: () =>
+      workspace && {
+        path: workspace.path,
+        async ensure() {
+          return (await ctx.workspaceRegistry.create(workdir)).id;
+        },
+      },
     publish() {
       return (publishing = publish().catch((error) => {
         if (error === canceled) return;
@@ -1299,7 +1305,6 @@ export function applyNativeWebOwner(
           v: 1,
           nonce,
           modelAdapterId: registeredModel?.id,
-          nativeWorkspaceId: workspace.id,
           authenticatedUrl: ctx.connection.authenticatedUrl(baseUrl),
         }),
         { flag: 'wx', mode: 0o600 },

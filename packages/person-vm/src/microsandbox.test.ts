@@ -1304,12 +1304,11 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
         dshHome = await directory(),
         nonce = randomUUID();
       await mkdir(join(dshHome, 'native-web'));
-      const nativeWorkspaceId = randomUUID();
       const localAuthSample = 'QWxsUmljZU5hdGl2ZVdlYkF1dGhGaXh0dXJlT25seTA';
       const authenticatedUrl = `http://127.0.0.1:32179/?token=${localAuthSample}`;
       await writeFile(
         join(dshHome, 'native-web', `auth-${nonce}.json`),
-        JSON.stringify({ v: 1, nonce, authenticatedUrl, nativeWorkspaceId }),
+        JSON.stringify({ v: 1, nonce, authenticatedUrl }),
       );
       const request = {
         dshHome,
@@ -1320,10 +1319,7 @@ describe('Microsandbox public CLI protocol through real child processes (no actu
       let read!: NonNullable<PersonVmBootstrapScope['readNativeWebAuth']>;
       f.h.runtime.start = async (_binding, _signal, scope) => {
         read = scope.readNativeWebAuth!;
-        expect(await read(request)).toEqual({
-          authenticatedUrl,
-          nativeWorkspaceId,
-        });
+        expect(await read(request)).toEqual({ authenticatedUrl });
       };
       await f.service.prewarm(f.rc, { trigger: 'page' }, signal());
       const calls = await f.calls();

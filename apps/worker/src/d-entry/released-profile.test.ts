@@ -240,7 +240,6 @@ async function observerFixture(options?: {
     owner,
     artifacts,
     attachSession,
-    nativeWorkspaceId,
     commands,
     mount,
     loader,
@@ -267,9 +266,6 @@ it('repairs only previously unattached sessions in the employee work directory b
     await f.mount('retained-workspace');
     await waitForAuthNonce(f.artifacts, 'retained-workspace');
     expect(f.attachSession.mock.calls).toEqual([['retained']]);
-    expect(
-      JSON.parse(await readFile(f.artifacts, 'utf8')).nativeWorkspaceId,
-    ).toBe(f.nativeWorkspaceId);
   } finally {
     await f.close();
   }
