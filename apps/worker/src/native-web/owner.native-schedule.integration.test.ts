@@ -18,16 +18,18 @@ const roots: string[] = [];
 const cleanup: (() => Promise<void>)[] = [];
 
 afterEach(async () => {
-  const closed = await Promise.allSettled(
-    cleanup
-      .splice(0)
-      .reverse()
-      .map((close) => close()),
-  );
+  const failures: unknown[] = [];
+  for (const close of cleanup.splice(0).reverse()) {
+    try {
+      await close();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
-  const failure = closed.find((result) => result.status === 'rejected');
-  if (failure?.status === 'rejected') throw failure.reason;
+  if (failures.length)
+    throw new AggregateError(failures, 'Fixture cleanup failed');
 });
 
 it.skipIf(!cli)(
@@ -224,6 +226,8 @@ it.skipIf(!cli)(
       ),
     ).toMatchObject({ value: { accepted: true } });
     await nextChange();
+
+    await execution.close();
 
     const [task] = await hostCatalog();
     if (!task) throw Error('The native tool did not persist a reminder');
