@@ -80,7 +80,7 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
     expect(result.usage?.receiptCount).toBe(0);
     expect(result.usage?.totalTokens).toBeNull();
     expect(JSON.stringify(result)).not.toMatch(
-      /PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT/,
+      /PRIVATE_TEST_SECRET|NEVER_EXPOSE_RAW_SNAPSHOT|Synthetic research goal|Synthetic finished report|Synthetic OK/,
     );
     const [audit] =
       await f.db`select actor_id,metadata from allrice_audit_events where action='tenant.run.inspected' and resource_id=${a.task.runId}`;
@@ -177,11 +177,11 @@ suite('MET-151 PR4 scoped inspection (isolated PostgreSQL)', () => {
       spy.mockRestore();
     }
   });
-  it('keeps long output bounded and identifies omitted chunks', async () => {
+  it('omits tool output while identifying that it exceeded the diagnostic cap', async () => {
     await f.db`insert into allrice_runtime_operation_output(operation_id,sequence,stream,content) select ${a.operation},n,'stdout','x' from generate_series(1,80) n`;
     const result = await inspectTenantRun(admin, a.target, a.task.runId, f.db);
     expect(result.operations[0]?.outputTruncated).toBe(true);
-    expect(result.operations[0]!.output.length).toBeLessThanOrEqual(16000);
+    expect(result.operations[0]!.output).toBe('');
   });
   it('projects expired approval without changing it or executing anything', async () => {
     const id = randomUUID();
