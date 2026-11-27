@@ -27,10 +27,12 @@ export function SidebarSettingsButton({
   collapsed,
   expanded,
   onOpen,
+  dialog = true,
 }: {
   collapsed: boolean;
-  expanded: boolean;
+  expanded?: boolean;
   onOpen: () => void;
+  dialog?: boolean;
 }) {
   return (
     <button
@@ -38,7 +40,7 @@ export function SidebarSettingsButton({
       className={`${native.trigger} ${collapsed ? native.rail : ''}`}
       aria-label="设置"
       title="设置"
-      aria-haspopup="dialog"
+      aria-haspopup={dialog ? 'dialog' : undefined}
       aria-expanded={expanded}
       onClick={onOpen}
     >
