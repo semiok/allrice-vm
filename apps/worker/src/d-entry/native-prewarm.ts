@@ -15,8 +15,12 @@ import { DEntryNativeUnavailable } from './native-owner.js';
 
 export type PrewarmGeneration = PersonVmPrewarmTarget;
 export type PrewarmVerificationMode =
-  'authority' | 'operation' | 'ready' | 'failed' | 'reuse';
-type PrewarmReadMode = Exclude<PrewarmVerificationMode, 'authority' | 'reuse'>;
+  'authority' | 'issue' | 'operation' | 'ready' | 'failed' | 'reuse';
+type PrewarmReadMode = Exclude<
+  PrewarmVerificationMode,
+  'authority' | 'issue' | 'reuse'
+>;
+type PrewarmReuseMode = PrewarmReadMode | 'reuse';
 export type PrewarmReservation = { vmId?: string; instance?: PersonVmBinding };
 export type PrewarmPlan = {
   key: string;
@@ -48,6 +52,10 @@ export function canSharePrewarmTarget(
 ) {
   const target = observedPrewarmTarget(existing);
   return (
+    (requested.instanceId === null ||
+      (requested.vmId !== null &&
+        target.vmId === requested.vmId &&
+        target.instanceId === requested.instanceId)) &&
     (!requested.restoreRetained || target.restoreRetained === true) &&
     (target.replacesVmId === requested.replacesVmId ||
       (!requested.replacesVmId &&
@@ -197,8 +205,7 @@ export function createPrewarmOperations(
         !belongs(entry, context, identity)
       )
         return;
-      const mode = ():
-        Exclude<PrewarmVerificationMode, 'authority'> | undefined => {
+      const mode = (): PrewarmReuseMode | undefined => {
         if (active(entry)) return 'reuse';
         if (entry.state.state === 'ready' && !entry.proof?.aborted)
           return 'ready';
@@ -232,9 +239,7 @@ export function createPrewarmOperations(
         async recheck(
           context: RequestContext,
           identity: DEntryIdentity,
-          verify: (
-            mode: Exclude<PrewarmVerificationMode, 'authority'>,
-          ) => Promise<boolean>,
+          verify: (mode: PrewarmReuseMode) => Promise<boolean>,
         ) {
           const live = () =>
             tickets.get(entry.ticket.operationId) === entry &&
