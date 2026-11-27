@@ -44,6 +44,10 @@ import {
 import {
   createSyntheticPanelsData,
   panelsClock,
+  panelsEmployee,
+  panelsViewer,
+  panelsWorkspace,
+  uid,
   panelStates,
   type PanelsState,
 } from './fixtures/employee-panels/data';
@@ -803,6 +807,113 @@ suite('installed native employee panels with synthetic business owner', () => {
       expect(await body(page, kind).count()).toBe(1);
     }
   });
+
+  it.each([1440, 390])(
+    'uses the installed production reference bridge at %ipx',
+    async (width) => {
+      const data = createSyntheticPanelsData();
+      const selected = data.references[0]!;
+      let revoked = false;
+      await page.route('**/api/v1/d-entry/panels/**', async (route) => {
+        const req = route.request();
+        const url = new URL(req.url());
+        expect(url.searchParams.get('threadId')).toBe(uid(7));
+        expect(req.headers()['x-allrice-expected-viewer-id']).toBe(
+          panelsViewer,
+        );
+        if (url.pathname.endsWith('/selection'))
+          await route.fulfill({
+            json: {
+              ...data.selection(url.pathname.split('/').at(-2)!),
+              canReference: !revoked,
+            },
+          });
+        else if (url.pathname.endsWith('/reference') && req.method() === 'POST')
+          await route.fulfill({ json: { reference: selected } });
+        else if (url.pathname.endsWith('/materials'))
+          await route.fulfill({ json: data.catalog });
+        else if (url.pathname.endsWith('/deliverables'))
+          await route.fulfill({ json: data.files });
+        else await route.fulfill({ status: 404, json: {} });
+      });
+      await context.addInitScript(
+        (identity) => {
+          Object.assign(window, {
+            __ALLRICE_D_ENTRY_LIFETIME__: new AbortController().signal,
+          });
+          const bind = () => {
+            const app = document.getElementById('app');
+            if (!app) return;
+            Object.assign(app.dataset, identity);
+            observer.disconnect();
+          };
+          const observer = new MutationObserver(bind);
+          observer.observe(document, { childList: true, subtree: true });
+          bind();
+        },
+        {
+          scopeId: uid(11),
+          organizationId: uid(4),
+          employeeInstanceId: panelsEmployee,
+          viewerId: panelsViewer,
+          workspaceId: panelsWorkspace,
+          threadId: uid(7),
+          nativeSessionId: sessions[0]!,
+        },
+      );
+      await page.setViewportSize({ width, height: 1000 });
+      await page.reload();
+      await page.waitForFunction(
+        () => window.__allricePanelsIntegration?.evidence().nativeInputReady,
+      );
+      const launch = async (kind: 'materials' | 'files') => {
+        if (width === 1440) {
+          await page
+            .getByLabel('工作台入口')
+            .getByRole('button', {
+              name: new RegExp(`^${labels[kind]}`),
+            })
+            .click();
+        } else {
+          await page
+            .getByRole('button', { name: '打开右侧边栏', exact: true })
+            .click();
+          await page
+            .getByRole('button')
+            .filter({
+              has: page
+                .locator('strong')
+                .filter({ hasText: new RegExp(`^${labels[kind]}$`) }),
+            })
+            .click();
+        }
+        await body(page, kind).waitFor({ state: 'visible' });
+      };
+      const kind = width === 1440 ? 'materials' : 'files';
+      await launch(kind);
+      await body(page, kind)
+        .getByRole('button', { name: /^引用到对话/ })
+        .first()
+        .click();
+      await expect
+        .poll(async () => (await command('input')).occurrences.length)
+        .toBe(1);
+      const inserted = (await command('input')).occurrences[0];
+      expect(inserted).toMatchObject({
+        source: 'allrice-panel-reference',
+        label: selected.fileName,
+      });
+      expect(await command('serializeReference', 0)).toContain(
+        selected.revisionId,
+      );
+      await page.screenshot({
+        path: join(artifacts, `formal-reference-${width}.png`),
+      });
+      revoked = true;
+      await expect(command('serializeReference', 0)).rejects.toThrow();
+    },
+    35_000,
+  );
 
   it('keeps enterprise ＋ and uses actual native insertion acceptance and stale-span refusal', async () => {
     await open('materials');
